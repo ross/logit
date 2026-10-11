@@ -1,0 +1,91 @@
+# A `lua` stage that busy-loops once for about 30 s: the node reads stalled, `/readyz` answers
+# `503 stalled`, the receive queue fills behind it and evicts, and the script resumes on its own.
+# A `mark` with no Docker call covers the stall, which the SUT's own config times, so the checks
+# excuse it and `ready` requires a `stalled` sample inside it. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "lua-stall"
+description = "statsd-vm with a lua stage that busy-loops once: /readyz reads stalled, the receive queue evicts, and the script resumes"
+duration = "8m"           # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"
+cycle = "6m"              # the mark, its recovery, and two progress windows of steady state
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+sut_aggregate = "window"
+sut_script = "enrich"
+wire_loss_outside_faults = 0.0
+
+[[ledger.sink]]           # one per SUT sink the ledger follows to its backend
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+# The loop starts with the 360,000th event, about 175 s after the timeline's zero, since the
+# generator starts a few seconds before it. The mark opens 25 s ahead of that and closes about
+# 90 s after the loop ends, room for a slower or faster host.
+[[step]]
+at = "1m30s"
+action = "mark"
+on = "logit"
+ready = "stalled"
+for = "2m30s"
+
+[[expect]]
+name = "script-stalled"
+service = "logit"
+metric = "logit.component.diagnostics"
+component = "enrich"
+attrs = { key = "script_stalled" }
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1
+
+# The listener keeps reading while the script holds its inbox: the receive queue fills and
+# drop_oldest evicts, counted.
+[[expect]]
+name = "receive-queue-fills"
+service = "logit"
+metric = "logit.component.receive.utilization"
+component = "statsd"
+step = "c0s1"
+window = "during"
+reduce = "max"
+min = 0.9
+
+[[expect]]
+name = "listener-drops-counted"
+service = "logit"
+metric = "logit.component.datagrams.dropped"
+component = "statsd"
+attrs = { reason = "overflow_oldest" }
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1
+
+# The loop ends and the script catches up: no script errors, before or after.
+[[expect]]
+name = "no-script-errors"
+service = "logit"
+metric = "logit.component.errors"
+component = "enrich"
+attrs = { reason = "process" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0

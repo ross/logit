@@ -16,7 +16,9 @@ needs at the code:
 - Logs are captured in chunks every `LOG_CHUNK_EVERY_S` (collect.py's `LogCapture` has the
   boundary rules), and collection at the end fetches only the tail.
 - A `logit` container leaving `running`, or changing `StartedAt`, with no step behind it ends the
-  schedule at once (fail fast). The end sequence, collection, and scoring still run.
+  schedule at once (fail fast). The end sequence, collection, and scoring still run. Inside an
+  `exit` step the container may be `running` or `exited`; its revert starts it only if it
+  exited, and only then is it a start, with a readiness probe.
 - `docker exec` into a paused container blocks, so readiness is never probed while a step holds
   the container paused.
 - The `try`/`finally` around the run collects logs and tears the project down on every exit
@@ -25,12 +27,19 @@ needs at the code:
   ignored stays ignored, so `nohup` keeps a run alive past a closed terminal.
 - After a SIGHUP the terminal can be gone, so output goes through `_print`, which drops it
   rather than fail the run: the run directory holds everything.
+- `prepare()` resolves the stack's services by role from `docker compose config`, which reads
+  the base compose.yaml and the scenario's override with no daemon call, and checks the scenario
+  against them (`scenario.service_problems()`) before anything starts. A run built with `roles=`
+  skips the call; the self-test does that, so it can't reach Docker.
+- Every `backend` service has its own published port, re-read after any revert of a fault on
+  it. Freshness is sampled per `[[ledger.sink]]`, the end sequence waits until every sink's stored
+  total holds, and each sink's export lands in `vm-export/<sink>.jsonl`.
 - An external target (`[target] kind = "external"`) runs without the `local` compose profile,
-  so with no `victoria-metrics`. It passes compose a second `--env-file`: a plain `KEY=value`
-  copy of the variables `SOAK_EXTERNAL_ENV` sets for the target, in a private temporary
-  directory outside the repo and the run directory, removed when `execute()` returns. Nothing
-  queries the destination: no readiness, freshness, flush, or export. The end sequence waits for
-  the SUT sink's queue to empty instead of for the stored total to hold.
+  so with no backend. It passes compose a second `--env-file`: a plain `KEY=value` copy of the
+  variables `SOAK_EXTERNAL_ENV` sets for the target, in a private temporary directory outside
+  the repo and the run directory, removed when `execute()` returns. Nothing queries the
+  destination: no readiness, freshness, flush, or export. The end sequence waits for every SUT
+  sink's queue to empty instead of for the stored totals to hold.
 
 Every time in `timeline.jsonl`, `watchdog.jsonl`, `stats.ndjson`, and `vm-freshness.jsonl` is
 epoch seconds (`t`, `started_at`, `finished_at`), with `offset` measured from the timeline's zero:
@@ -71,8 +80,10 @@ SINK_DRAIN_BOUND_S = 120
 SINK_DRAIN_TAIL_LINES = 400
 # The aggregate window assumed when the SUT config names none.
 DEFAULT_AGGREGATE_INTERVAL_S = 10.0
-# The compose profile holding `victoria-metrics`, enabled for a local target only.
+# The compose profile holding the backends, enabled for a local target only.
 LOCAL_PROFILE = "local"
+# The port a backend serves VictoriaMetrics' API on inside its container.
+BACKEND_PORT = 8428
 
 
 class Abort(Exception):
@@ -123,7 +134,7 @@ def exit_code(results, ended=None):
 
 class Run:
     def __init__(self, root, scenario, duration, seed, keep, out_dir, argv, image,
-                 external_env=None):
+                 external_env=None, roles=None):
         self.root = Path(root)
         self.scenario = scenario
         self.external = scenario.external
@@ -146,10 +157,15 @@ class Run:
         self.project = f"soak-{scenario.name}"
         self.t0 = None
         self.ids = {}
-        self.vm_base = None
+        # `{service: role}`: given (the self-test), else resolved from compose in `prepare()`.
+        self.roles = None if roles is None else dict(roles)
+        # Each backend's base URL, by service.
+        self.vm_base = {}
         self.active = {}
         self.down = set()
         self.paused = set()
+        # Services inside an `exit` step: running, or exited by the event it names.
+        self.exiting = set()
         self.pending_ready = {}
         self.started_at = {}
         self.fail_fast = None
@@ -172,22 +188,45 @@ class Run:
         for role in sorted(self.scenario.configs):
             shutil.copy(self.scenario.config_path(role),
                         self.run_dir / "configs" / self.scenario.configs[role])
-        resolved = self.scenario.to_json(self.duration, self.seed)
-        (self.run_dir / "scenario.resolved.json").write_text(
-            json.dumps(resolved, indent=2, sort_keys=True) + "\n"
-        )
+        compose_files = [self.root / "compose.yaml"]
+        if self.scenario.compose is not None:
+            shutil.copy(self.scenario.compose_path(), self.run_dir / "configs" /
+                        self.scenario.compose)
+            compose_files.append(self.scenario.compose_path())
         if self.external:
             self.private_env = scenario_mod.private_env_copy(self.external_env,
                                                              self.scenario.target["env"])
         env_files = [env_file] + ([self.private_env] if self.external else [])
         profiles = [] if self.external else [LOCAL_PROFILE]
-        self.docker = Docker(self.project, self.root / "compose.yaml", env_files, profiles)
+        self.docker = Docker(self.project, compose_files, env_files, profiles)
+        if self.roles is None:
+            self.roles = self.resolve_roles()
+        scenario_mod.check_services(self.scenario, self.roles)
+        resolved = self.scenario.to_json(self.duration, self.seed, services=self.roles)
+        (self.run_dir / "scenario.resolved.json").write_text(
+            json.dumps(resolved, indent=2, sort_keys=True) + "\n"
+        )
         self.ctx = faults.Context(docker=self.docker, ids=self.ids, netem_image=NETEM_IMAGE)
         self.timeline = collect.Jsonl(self.run_dir / "timeline.jsonl")
         self.watchdog = collect.Jsonl(self.run_dir / "watchdog.jsonl")
         self.stats = collect.Jsonl(self.run_dir / "stats.ndjson")
         self.freshness = collect.Jsonl(self.run_dir / "vm-freshness.jsonl")
         self.capture = collect.LogCapture(self.run_dir, self.docker)
+
+    def resolve_roles(self):
+        """`{service: role}` from the merged compose config, raising `ScenarioError` when compose
+        can't produce it."""
+        result = self.docker.config_json()
+        if not result.ok:
+            raise scenario_mod.ScenarioError([
+                f"docker compose config failed (rc {result.rc}): {result.stderr.strip()[-500:]}"])
+        try:
+            return scenario_mod.roles_from_config(result.stdout)
+        except ValueError as err:
+            raise scenario_mod.ScenarioError([f"docker compose config: {err}"]) from None
+
+    def services(self, *roles):
+        return sorted(name for name, role in self.roles.items() if role in roles)
 
     def say(self, text):
         offset = "" if self.t0 is None else f"[{scenario_mod.format_duration(_now() - self.t0)}] "
@@ -217,7 +256,7 @@ class Run:
             _print(f"soak: compose project '{self.project}' already has containers on this "
                    "daemon.\n  Not this run's to stop. If it is yours, run:\n"
                    f"  {' '.join(self.docker.prefix)} compose -p {self.project} "
-                   f"-f {self.docker.compose_file} down -v")
+                   + "".join(f"-f {path} " for path in self.docker.compose_files) + "down -v")
             return 1
         images = [self.image, NETEM_IMAGE] + ([] if self.external else [VM_IMAGE])
         collect.provenance(self.run_dir, self.root.parent.parent, self.docker,
@@ -258,15 +297,15 @@ class Run:
         self.phase("up_end", rc=result.rc, stderr=result.stderr.strip()[-2000:])
         if not result.ok:
             raise Abort(f"compose up failed: {result.stderr.strip()[-500:]}")
-        if not self.external:
-            self.refresh_vm_base()
+        for backend in self.services(scenario_mod.BACKEND_ROLE):
+            self.refresh_vm_base(backend)
             deadline = _now() + 60
-            while not (self.vm_base and vm.healthy(self.vm_base)):
+            while not (self.vm_base.get(backend) and vm.healthy(self.vm_base[backend])):
                 if _now() > deadline:
-                    raise Abort("VictoriaMetrics never answered /health")
+                    raise Abort(f"{backend} never answered /health")
                 time.sleep(1)
-                self.refresh_vm_base()
-        for service in scenario_mod.LOGIT_SERVICES:
+                self.refresh_vm_base(backend)
+        for service in self.services(*scenario_mod.LOGIT_ROLES):
             info = self.docker.inspect(self.ids[service]) or {}
             self.started_at[service] = (info.get("State") or {}).get("StartedAt")
         self.t0 = _now()
@@ -276,14 +315,14 @@ class Run:
                  f"{scenario_mod.format_duration(self.duration)}{seed}")
 
     def refresh_ids(self):
-        for service in scenario_mod.SERVICES:
+        for service in sorted(self.roles):
             container = self.docker.container_id(service)
             if container:
                 self.ids[service] = container
 
-    def refresh_vm_base(self):
-        address = self.docker.port("victoria-metrics", 8428)
-        self.vm_base = f"http://{address}" if address else None
+    def refresh_vm_base(self, backend):
+        address = self.docker.port(backend, BACKEND_PORT)
+        self.vm_base[backend] = f"http://{address}" if address else None
 
     def loop(self):
         queue = []
@@ -336,8 +375,9 @@ class Run:
             "event": kind, "step": step.id, "action": step.action, "on": step.on,
             "args": step.args, "planned_offset": step.end if kind == "revert" else step.start,
             "started_at": started, "offset": self.offset(started),
-            "affects_udp_ingress": bool(action.affects_udp_ingress(step)),
-            "affects_egress": bool(action.affects_egress(step)),
+            "affects_udp_ingress": bool(action.affects_udp_ingress(step, self.roles)),
+            "affects_egress": bool(action.affects_egress(step, self.roles)),
+            **step.expected(),
         }
         if early:
             record["early"] = True
@@ -345,7 +385,7 @@ class Run:
         record.update(result)
         record["finished_at"] = _now()
         self.timeline.write(record)
-        self.after(kind, step)
+        self.after(kind, step, result)
         show = f" -> {result['netem_show']}" if result.get("netem_show") else ""
         self.say(f"{kind} {step.id} {step.action} on {step.on} rc={result['rc']}{show}")
         if kind == "apply":
@@ -353,11 +393,17 @@ class Run:
         else:
             self.active.pop(step.id, None)
 
-    def after(self, kind, step):
+    def after(self, kind, step, result):
         """Keeps the expected-state sets in step with an action, and queues readiness probes."""
         service = step.on
         restarted = False
-        if step.action in faults.STARTS_ON_REVERT:
+        if step.action == "exit":
+            if kind == "apply":
+                self.exiting.add(service)
+            else:
+                self.exiting.discard(service)
+                restarted = bool(result.get("started"))
+        elif step.action in faults.STARTS_ON_REVERT:
             if kind == "apply":
                 self.down.add(service)
             else:
@@ -368,7 +414,7 @@ class Run:
                 self.paused.add(service)
             else:
                 self.paused.discard(service)
-                if service in scenario_mod.LOGIT_SERVICES:
+                if self.roles.get(service) in scenario_mod.LOGIT_ROLES:
                     self.pending_ready[service] = {"since": _now(), "step": step.id,
                                                    "why": "unpause"}
         elif step.action in faults.STARTS_ON_APPLY and kind == "apply":
@@ -376,12 +422,13 @@ class Run:
         if restarted:
             info = self.docker.inspect(self.ids[service]) or {}
             self.started_at[service] = (info.get("State") or {}).get("StartedAt")
-            if service in scenario_mod.LOGIT_SERVICES:
+            if self.roles.get(service) in scenario_mod.LOGIT_ROLES:
                 self.pending_ready[service] = {"since": _now(), "step": step.id, "why": "start"}
         # Docker can publish a new host port on a start and on a network reconnect, so any
         # revert re-reads it; the freshness poll would otherwise query a dead port.
-        if service == "victoria-metrics" and (restarted or kind == "revert"):
-            self.refresh_vm_base()
+        if (self.roles.get(service) == scenario_mod.BACKEND_ROLE
+                and (restarted or kind == "revert")):
+            self.refresh_vm_base(service)
 
     def poll_ready(self):
         for service, pending in list(self.pending_ready.items()):
@@ -427,13 +474,15 @@ class Run:
                 "health_log": log[-1] if log else None,
             }
             self.watchdog.write(record)
-            if service in scenario_mod.LOGIT_SERVICES and not self.fail_fast:
+            if self.roles.get(service) in scenario_mod.LOGIT_ROLES and not self.fail_fast:
                 self.check_expected(service, record)
 
     def check_expected(self, service, record):
         status = record["status"]
         if service in self.down:
             expected = ("exited",)
+        elif service in self.exiting:
+            expected = ("running", "exited")
         elif service in self.paused:
             expected = ("paused",)
         else:
@@ -453,19 +502,23 @@ class Run:
             self.stats.write({"t": now, "offset": self.offset(now), "svc": service, **sample})
 
     def sample_freshness(self):
-        now = _now()
-        record = {"t": now, "offset": self.offset(now)}
-        if "victoria-metrics" in self.down or "victoria-metrics" in self.paused:
-            record["skipped"] = "victoria-metrics held by a step"
-        elif not self.vm_base:
-            record["error"] = "no published port"
-        else:
-            try:
-                record.update(vm.freshness(self.vm_base, self.scenario.ledger["vm_selector"],
-                                           now, FRESHNESS_LOOKBACK_S))
-            except vm.VmError as err:
-                record["error"] = str(err)
-        self.freshness.write(record)
+        """One record per sink: the age of the newest sample its selector matches."""
+        for sink in self.scenario.sinks:
+            now = _now()
+            backend = sink["backend"]
+            record = {"t": now, "offset": self.offset(now), "sink": sink["id"],
+                      "backend": backend}
+            if backend in self.down or backend in self.paused:
+                record["skipped"] = f"{backend} held by a step"
+            elif not self.vm_base.get(backend):
+                record["error"] = f"{backend} has no published port"
+            else:
+                try:
+                    record.update(vm.freshness(self.vm_base[backend], sink["vm_selector"], now,
+                                               FRESHNESS_LOOKBACK_S))
+                except vm.VmError as err:
+                    record["error"] = str(err)
+            self.freshness.write(record)
 
     # ---- end -----------------------------------------------------------------------------------
 
@@ -494,51 +547,59 @@ class Run:
         if self.external:
             self.phase("end_end")
             return
-        self.refresh_vm_base()
-        export_path = self.run_dir / "vm-export.jsonl"
-        try:
-            vm.force_flush(self.vm_base)
-            text = vm.export_raw(self.vm_base, self.scenario.ledger["vm_selector"], 0,
-                                 timeout=120)
-            export_path.write_text(text)
-            self.phase("vm_exported", series=len(vm.parse_export(text)))
-        except (vm.VmError, TypeError) as err:
-            export_path.write_text("")
-            self.phase("vm_export_failed", error=str(err))
+        export_dir = self.run_dir / "vm-export"
+        export_dir.mkdir()
+        for backend in self.services(scenario_mod.BACKEND_ROLE):
+            self.refresh_vm_base(backend)
+        for sink in self.scenario.sinks:
+            export_path = export_dir / f"{sink['id']}.jsonl"
+            base = self.vm_base.get(sink["backend"])
+            try:
+                vm.force_flush(base)
+                text = vm.export_raw(base, sink["vm_selector"], 0, timeout=120)
+                export_path.write_text(text)
+                self.phase("vm_exported", sink=sink["id"], series=len(vm.parse_export(text)))
+            except (vm.VmError, TypeError) as err:
+                export_path.write_text("")
+                self.phase("vm_export_failed", sink=sink["id"], error=str(err))
         self.phase("end_end")
 
     def wait_quiet(self):
-        """Waits until VictoriaMetrics' total holds for two aggregate windows, bounded at
-        `QUIET_BOUND_S`. The window is the stored samples' spacing: `aggregate` writes each
-        series once per window while it has data, and stops writing an idle one, so newer
-        timestamps can't mark the windows once the generator has stopped."""
-        self.refresh_vm_base()
+        """Waits until every sink's stored total holds for two aggregate windows, bounded at
+        `QUIET_BOUND_S`. The window is the stored samples' spacing, the widest across sinks:
+        `aggregate` writes each series once per window while it has data, and stops writing an
+        idle one, so newer timestamps can't mark the windows once the generator has stopped."""
+        for backend in self.services(scenario_mod.BACKEND_ROLE):
+            self.refresh_vm_base(backend)
         deadline = _now() + QUIET_BOUND_S
-        selector = self.scenario.ledger["vm_selector"]
-        last_total = None
+        last_totals = None
         since = _now()
         hold_s = None
         polls = 0
         while _now() < deadline:
             polls += 1
+            totals = {}
+            spacing = []
             try:
-                vm.force_flush(self.vm_base)
-                series = vm.export(self.vm_base, selector, int(_now() - 300))
+                for sink in self.scenario.sinks:
+                    base = self.vm_base.get(sink["backend"])
+                    vm.force_flush(base)
+                    series = vm.export(base, sink["vm_selector"], int(_now() - 300))
+                    totals[sink["id"]] = vm.last_total(series)
+                    spacing.append(vm.sample_spacing_s(series))
             except (vm.VmError, TypeError):
                 time.sleep(2)
                 continue
-            if hold_s is None:
-                window = vm.sample_spacing_s(series)
-                hold_s = 2 * window if window else None
-            total = vm.last_total(series)
-            if total != last_total:
-                last_total = total
+            if hold_s is None and all(spacing):
+                hold_s = 2 * max(spacing)
+            if totals != last_totals:
+                last_totals = totals
                 since = _now()
             elif hold_s is not None and _now() - since >= hold_s:
-                self.phase("quiet", held=True, total=total, hold_s=hold_s, polls=polls)
+                self.phase("quiet", held=True, totals=totals, hold_s=hold_s, polls=polls)
                 return
             time.sleep(2)
-        self.phase("quiet", held=False, total=last_total, hold_s=hold_s, polls=polls,
+        self.phase("quiet", held=False, totals=last_totals, hold_s=hold_s, polls=polls,
                    bound_s=QUIET_BOUND_S)
 
     def aggregate_interval(self):
@@ -553,12 +614,13 @@ class Run:
 
     def wait_sink_drained(self):
         """For an external target, which nothing queries: waits until a SUT drain at least two
-        aggregate windows after the generator stopped shows the sink's `buffer.batches` at 0
+        aggregate windows after the generator stopped shows every sink's `buffer.batches` at 0
         and its `retrying` at 0 or never set, bounded at `SINK_DRAIN_BOUND_S`. Two windows let
-        `aggregate` flush the last lines the generator sent; the sink's queue then empties once
+        `aggregate` flush the last lines the generator sent; a sink's queue then empties once
         its last send is accepted. Reads the newest `SINK_DRAIN_TAIL_LINES` of the SUT's
-        stdout, which a run in progress hasn't collected yet."""
-        sink = self.scenario.ledger["sut_sink"]
+        stdout, which a run in progress hasn't collected yet. The phase records each sink's
+        state under `sinks`."""
+        sinks = [sink["id"] for sink in self.scenario.sinks]
         stopped = _now()
         hold_s = 2 * self.aggregate_interval()
         deadline = stopped + SINK_DRAIN_BOUND_S
@@ -570,22 +632,23 @@ class Run:
                                            timeout=POLL_TIMEOUT_S)
             tel = telemetry.parse_ndjson(result.stdout.splitlines())
             newest = max(tel.drains, default=None)
-            queued = tel.gauge_series("logit.component.buffer.batches", component=sink)
-            retrying = tel.gauge_series("logit.component.retrying", component=sink)
-            state = {
-                "newest_drain": newest,
-                "buffer_batches": queued[-1][1] if queued else None,
-                "retrying": retrying[-1][1] if retrying else None,
-            }
+            state = {}
+            for sink in sinks:
+                queued = tel.gauge_series("logit.component.buffer.batches", component=sink)
+                retrying = tel.gauge_series("logit.component.retrying", component=sink)
+                state[sink] = {"buffer_batches": queued[-1][1] if queued else None,
+                               "retrying": retrying[-1][1] if retrying else None}
             if (newest is not None and newest >= stopped + hold_s
-                    and state["buffer_batches"] == 0 and not state["retrying"]):
+                    and all(one["buffer_batches"] == 0 and not one["retrying"]
+                            for one in state.values())):
                 self.phase("sink_drained", held=True, hold_s=hold_s, polls=polls,
-                           waited_s=round(_now() - stopped, 3), **state)
+                           waited_s=round(_now() - stopped, 3), newest_drain=newest,
+                           sinks=state)
                 return
             time.sleep(2)
         self.phase("sink_drained", held=False, hold_s=hold_s, polls=polls,
-                   bound_s=SINK_DRAIN_BOUND_S, **state)
-        self.say(f"the {sink} queue didn't empty within {SINK_DRAIN_BOUND_S}s: {state}")
+                   bound_s=SINK_DRAIN_BOUND_S, sinks=state)
+        self.say(f"a sink's queue didn't empty within {SINK_DRAIN_BOUND_S}s: {state}")
 
     def teardown(self):
         try:

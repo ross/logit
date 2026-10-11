@@ -62,9 +62,14 @@ def cmd_run(args):
 
 
 def cmd_list(args):
+    """Lists the shipped scenarios. A scenario with no compose override is checked against the
+    base role map too; an override's services are known only to `docker compose config`, which
+    `run` reads before it starts the stack."""
     for path in scenario.shipped(TOOLS):
         try:
             loaded = scenario.load(path)
+            if loaded.compose is None:
+                scenario.check_services(loaded, scenario.base_roles(loaded))
         except scenario.ScenarioError as err:
             print(f"{path.parent.name}\tINVALID: {err}")
             continue

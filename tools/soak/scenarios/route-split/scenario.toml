@@ -1,0 +1,99 @@
+# statsd-vm with a `route` after `aggregate` splitting the series by a DogStatsD `shard` tag into
+# two targets, each feeding its own sink and VictoriaMetrics, under a stop of one backend and then
+# netem on the other. Each backend holds one shard, so the egress gap is judged on the two
+# backends' summed V (`split = "route"`), and each target's sends against its sink's receipts.
+# The schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "route-split"
+description = "statsd-vm with DogStatsD shard tags routed into two targets, two sinks, and two VictoriaMetrics: one backend stopped, then netem on the other"
+duration = "9m"           # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "120s"         # >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "6m"              # >= last recovery (4m45s) + 2 x progress_window
+compose = "compose.override.yaml"   # adds victoria-metrics-b
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+split = "route"           # the sinks' V add up to what `window` absorbed
+
+[[ledger.sink]]
+id = "vm_a"
+target = "tier_a"
+backend = "victoria-metrics"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+
+[[ledger.sink]]
+id = "vm_b"
+target = "tier_b"
+backend = "victoria-metrics-b"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+[[step]]                  # c0s1: shard 1's backend down
+at = "0s"
+action = "stop"
+on = "victoria-metrics-b"
+for = "90s"
+
+[[step]]                  # c0s2: shard 0's backend answers lossily
+at = "3m"
+action = "netem"
+on = "victoria-metrics"
+args = "loss 30%"
+for = "60s"
+
+# The route sends each target its own batches, and vm_b's queue holds the stop, so vm_a keeps
+# delivering every window.
+[[expect]]
+name = "a-delivers-while-b-stopped"
+service = "logit"
+metric = "logit.component.batches.delivered"
+component = "vm_a"
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 6
+
+[[expect]]
+name = "b-queues-while-stopped"
+service = "logit"
+metric = "logit.component.buffer.batches"
+component = "vm_b"
+step = "c0s1"
+window = "during"
+reduce = "max"
+min = 5
+
+[[expect]]
+name = "nothing-unrouted"
+service = "logit"
+metric = "logit.component.events.dropped"
+component = "split"
+attrs = { reason = "unrouted" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "b-drops-nothing"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "vm_b"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
