@@ -618,7 +618,8 @@ own consumers. `internal`'s **pipeline** is every node reachable from it. The pi
     writes each leftover metric point to the self-log as one structured line,
     `telemetry left undrained at exit`, with the fields `component`, `metric`, `tags`, and `value`,
     or `count` and `sum` for a timing. The level is `warn` for a nonzero `*.dropped` metric whose
-    `reason` isn't one the config asked for (`absorbed`, `unrouted`, `script_drop`), and `debug`
+    `reason` isn't one the config asked for (`absorbed`, `unrouted`, `script_drop`), and that
+    isn't `keep` and `remove`'s reason-less `logit.transform.attributes.dropped`; `debug`
     otherwise: even a dedicated pipeline leaves its own nodes' counts for its last batch, and those
     would otherwise print on every clean exit. It does this on exit 0 and exit 2 alike. That
     covers a mixed pipeline's residual and the final drain's own counts. Spans and captured logs
