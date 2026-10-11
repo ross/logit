@@ -550,6 +550,43 @@ any sink attached to `internal` (directly or through a `keep`/`aggregate`/`lua`)
 any other signal. See [`docs/design/internal-telemetry.md`](design/internal-telemetry.md)'s "Logs"
 section.
 
+### Give `internal` a dedicated pipeline
+
+Give `internal` its own transforms and sinks, with no node shared with a data path. When
+`internal` has a dedicated pipeline, it shuts down last: after every other node has exited, it
+drains once more. That final drain exports the counts recorded while the data flows were stopping:
+a UDP listener's `datagrams.dropped{reason="shutdown"}`, and a sink's or Lua node's
+`batches.dropped{reason="shutdown"}`. If any node in `internal`'s pipeline also carries data, such
+as one `otlp_out` fed by both, `internal` drains once when the shutdown signal arrives and
+shuts down with the data. Later counts then appear only in the self-log (`warn` lines and
+`drain complete`), never in an exported pipeline. The final drain's own `logit.internal.*` counts
+are never exported in either case.
+
+When the backend is the same, add a second sink that points at it. This config sends data and
+`internal`'s telemetry to one collector through two `otlp_out` sinks:
+
+```yaml
+components:
+  statsd:
+    type: statsd_in
+  self:
+    type: internal
+    interval: 10s
+  data_out:
+    type: otlp_out
+    sources: [statsd]
+    endpoint: http://collector:4318
+  self_out:
+    type: otlp_out
+    sources: [self]
+    endpoint: http://collector:4318
+```
+
+A dedicated pipeline can have transforms, such as a `keep_signals` or an `aggregate`, between
+`internal` and its sinks. See [`docs/design/internal-telemetry.md`](design/internal-telemetry.md)
+and the [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md)'s
+"Amendment: internal drains last" section.
+
 ## Sink delivery buffering
 
 Every sink (`influxdb_out`, `stdio_out`, `file_out`, ...) sits behind its own delivery queue,
