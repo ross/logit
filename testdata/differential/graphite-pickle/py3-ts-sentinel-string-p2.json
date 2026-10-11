@@ -1,0 +1,60 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "ts.sentinel-string",
+    {
+     "f64": "0xbff0000000000000",
+     "repr": "-1.0"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    "now"
+   ]
+  ]
+ },
+ "case": "py3-ts-sentinel-string-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "ts.sentinel-string",
+     {
+      "tuple": [
+       "-1",
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "The timestamp '-1'.",
+ "exercises": [
+  "BINUNICODE"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINFLOAT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

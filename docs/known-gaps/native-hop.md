@@ -19,14 +19,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **No OTLP passthrough codec.** Whether the native protocol should carry OTLP-encoded payloads
   unmodified, so a relay forwards OTLP without re-encoding it into native, is undecided and
   undesigned; see [`design/wire-protocol.md`](../design/wire-protocol.md)'s "Open question".
-- **Nothing builds `fuzz/` in `script/check` or CI.** `fuzz/` is its own cargo workspace, so a
-  signature change in `logit-proto` or `logit-core` breaks the targets without failing any check,
-  and the break shows only at the next campaign's `cargo fuzz build`. For example, a
-  decode-budget argument added to the native decoders broke both native batch targets this way.
-  See [ADR `out-of-ci-fuzzing`](../adr/out-of-ci-fuzzing.md).
-  - **Revisit:** add a `cargo check --manifest-path fuzz/Cargo.toml` step to `script/check` if it
-    works on the stable toolchain (`libfuzzer-sys` compiles on stable; only `cargo fuzz run`
-    needs nightly), or else a build step in the nightly image, run by hand.
 - **`logit_in`'s, `internal`'s, and the five HTTP listeners' shutdown grace is fixed at 5s, not
   operator-tunable.** Graph rule 17 rejects a `receive:` block on all seven (`otlp_in`,
   `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver

@@ -1,0 +1,1 @@
+app.db.query.duration_ms:8.361536893675021|ms|#env:prod,service:checkout-api,region:us-east-1,host:web-07,query:select_user,db:primary|c:in-81635

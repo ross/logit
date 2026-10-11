@@ -1579,13 +1579,19 @@ cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out
   wraps each batch in a 4-byte big-endian length prefix (Twisted's `Int32StringReceiver`), which
   means nothing in a self-delimiting datagram, so validation rejects the combination instead of
   mis-framing at runtime. The pickle reader is **restricted**: it accepts the opcodes real senders
-  emit (`pickle.dumps(..., protocol=2)` and `protocol=-1`) and rejects everything that can
-  construct an object, with bounded depth, memo, and item counts, and every declared length
-  validated before anything is allocated. It is deliberately not a general unpickler.
+  emit, every pickle protocol from 0 to 5. That covers carbon's own client and
+  `pickle.dumps(..., protocol=2)` or `protocol=-1`, Python 2 senders such as Diamond and
+  graphitesend (protocol 0, `cPickle`'s default), and Dropwizard Metrics' `PickledGraphite`
+  (protocol 0, written by hand). It rejects everything that can construct an object, with bounded
+  depth, memo, and item counts, and every declared length validated before anything is allocated.
+  It is deliberately not a general unpickler.
 - **Two size bounds may need raising.** `max_line_bytes` (default `8192`) bounds one TCP
   plaintext line. Past it, the line is abandoned and counted once
   (`logit.input.frames.dropped{reason="oversize"}`, diagnostic `framing_error`) and the reader
   drains to the next newline, so the following line still decodes and the connection stays up.
+  A line that passed the bound before its newline arrived counts `reason="drained"` instead,
+  because the connection discards input until that newline: a sender that never sends one shows
+  as one `drained` and nothing after it.
   `max_frame_bytes` (default `"1MiB"`, Twisted's own `MAX_LENGTH`) bounds one pickle frame. A frame
   declaring more is counted the same way but **closes the connection**, because a length-framed
   stream has no resync point to skip to. `logit validate` holds it to `1024..=16MiB`.
@@ -1624,7 +1630,9 @@ the runnable config, with every default present as a comment.
   `statsd_in`, and `receive:` works as it does on a UDP `statsd_in`; the sections above cover
   each.
 - **`max_line_bytes:`** defaults to `64KiB`. A longer line is dropped and counted as
-  `logit.input.frames.dropped{reason="oversize"}`, and the lines around it still decode. `0` is
+  `logit.input.frames.dropped{reason="oversize"}`, and the lines around it still decode. On a
+  stream transport, a line that passed the bound before its newline arrived counts
+  `reason="drained"` instead, because the connection discards input until that newline. `0` is
   rejected (rule 77).
 - **What an event looks like.** A log event timestamped at receipt, with the line as its body: a
   string when the line is valid UTF-8, bytes otherwise. It has no attributes, no severity, and an
@@ -1686,7 +1694,9 @@ components:
   reference server and the Datadog agent accept.
 - **An oversize line costs that line, not the connection.** A line past 64 KiB is dropped and
   counted once (`logit.input.frames.dropped{reason="oversize"}`, diagnostic `framing_error`), the
-  reader drains to the next newline, and the following line still decodes. There is deliberately no
+  reader drains to the next newline, and the following line still decodes. A line that passed
+  64 KiB before its newline arrived counts `reason="drained"` instead, because the connection
+  discards input until that newline. There is deliberately no
   `max_line_bytes` knob: unlike carbon, no statsd server exposes one for you to match.
 - **An unterminated final line is dropped, not delivered.** If a sender closes with a partial line,
   those bytes are counted `logit.input.frames.dropped{reason="truncated"}` and discarded, the same
@@ -1709,7 +1719,7 @@ components:
   should match the number of connected senders),
   `logit.input.connections.rejected{reason="limit"}` (nonzero means the `max_connections` cap is
   binding), `logit.input.frames`/`.frame.bytes` (one frame is one statsd line), and
-  `logit.input.frames.dropped{reason="oversize"|"truncated"}`. On either transport, a malformed
+  `logit.input.frames.dropped{reason="oversize"|"drained"|"truncated"}`. On either transport, a malformed
   *line* is the decoder's `logit.component.diagnostics{key="bad_line"}`, not a framing error.
 
 ### `statsd_in`: DogStatsD over a Unix socket

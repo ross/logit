@@ -84,7 +84,7 @@ guarantee (an OTLP body's `bytes_value` decodes straight into one), while every 
 transform produces is handed to `Value::Str`, whose invariant *is* valid UTF-8 -- so the whole
 message is validated as UTF-8 once, up front, before any field is sliced out of it. One check
 suffices for every field: `delimiter` is a single ASCII byte and `"` is ASCII (rule 32), so every
-boundary `split_row` computes lands on an ASCII byte and never inside a multi-byte sequence, and
+boundary `split_row` (`crates/logit-proto/src/message/csv.rs`) computes lands on an ASCII byte and never inside a multi-byte sequence, and
 `unescape` only ever deletes an ASCII `"` -- both keep a valid whole valid in its parts.
 
 **Diagnostic keys are distinct and independently throttled** (`Diagnostics::warn_throttled`, each

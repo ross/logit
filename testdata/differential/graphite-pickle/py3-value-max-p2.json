@@ -1,0 +1,63 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "value.max",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x7fefffffffffffff",
+     "repr": "1.7976931348623157e+308"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-value-max-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "value.max",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "f64": "0x7fefffffffffffff",
+        "repr": "1.7976931348623157e+308"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "The value 1.7976931348623157e+308.",
+ "exercises": [
+  "BINFLOAT"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINFLOAT",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

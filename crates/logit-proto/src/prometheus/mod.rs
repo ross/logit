@@ -87,10 +87,11 @@
 //! | `flags & NO_RECORDED_VALUE` on a `Gauge` or `Sum`, with [`PrometheusEncoder::with_stale_markers`]`(true)` | [`Point::Stale`] in the family the kind would have chosen anyway (`Sum{monotonic}` → `counter`, `Sum{!monotonic}` → `gauge` + `degraded{metric_kind="non_monotonic_sum"}`, `Gauge` → `gauge` or whatever `prometheus.type` says). Temporality is ignored on this path: a stale marker has no value to be delta about. A flagged `Histogram`/`Summary`/`ExponentialHistogram`/sketch/set stays on the skip row above -- those expand to several derived series and one flag says nothing about which of them existed (`docs/known-gaps/mappings.md`) |
 //! | exemplars | carried onto the family; [`text`] emits them on `_total`/`_bucket` lines in OpenMetrics only, at most one per line, each on the bucket its own value falls in. One that has no line left to sit on -- a counter's second exemplar, two in one bucket's range, one over OpenMetrics' 128-code-point label budget -- is dropped, `logit.output.metrics.degraded{reason="exemplar_dropped"}` (text 0.0.4 drops all of them uncounted: that is the operator's dialect choice, not a lossy mapping) |
 //! | `Event::timestamp` | emitted only when `prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
-//! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.dropped{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `logit_inputs::statsd::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `dropped{reason="unrepresentable"}` path |
+//! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.dropped{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `dropped{reason="unrepresentable"}` path |
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.dropped{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is dropped -- `logit.output.labels.dropped{reason="reserved"}` |
 //! | two names sanitizing onto one wire name | the family whose *model* name sorts first is exposed, the rest are **skipped** -- `logit.output.metrics.skipped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug |
 //! | `unit` / `description` | `# UNIT` (OM only, and only when `_<unit>` suffixes the family name and the unit is `[a-zA-Z0-9_]+` -- the OpenMetrics spec requires it and Prometheus's parser fails the entire body otherwise; dropped counted `logit.output.metrics.degraded{reason="unit_not_suffix"}`) / `# HELP` |
+//! | two families whose `# TYPE` lines carry one name | one is written, the other's series **skipped**, `logit.output.metrics.skipped{reason="name_collision"}` -- see the normalization list below |
 //! | two records, one name, different family types | the first record's type wins, the rest are **skipped**, `logit.output.metrics.skipped{reason="type_conflict"}` -- one name cannot carry two `# TYPE` lines |
 //! | `EventBatch::scope`, `Resource::schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
 //!
@@ -117,8 +118,8 @@
 //! `prometheus_in -> prometheus_out` is a fixed point modulo exactly this list (the round-trip
 //! tests in `crates/logit-proto/tests/prometheus_fixed_point.rs` pin it):
 //!
-//! - family and series reordering: families sorted by name, series by label set, labels by rendered
-//!   name;
+//! - family and series reordering: families sorted by the name on their `# TYPE` line, series by
+//!   label set, labels by rendered name;
 //! - the scraper's own `instance` label, added the way Prometheus's own scrape adds it (above);
 //! - float formatting: shortest round-trip (`1.0` → `1`, `1.458255915e9` → `1458255915`);
 //! - a counter's value sample gains `_total` when the model name lacks it (both dialects), and the
@@ -127,6 +128,13 @@
 //! - `_created`, `# UNIT` and exemplars dropped when the *output* dialect is text 0.0.4, and the
 //!   OpenMetrics-only family types rendered as their nearest text 0.0.4 shape (see [`text`]);
 //! - `# EOF` present per dialect; blank lines, non-`HELP`/`TYPE`/`UNIT` comments dropped;
+//! - two families whose `# TYPE` names coincide (a text 0.0.4 counter `foo` beside a gauge
+//!   `foo_total`, or counters `foo` and `foo_total`) write once: the one whose model name sorts
+//!   first, with each series of the other counted
+//!   `logit.output.metrics.skipped{reason="name_collision"}`, since a second `# TYPE` line for a
+//!   name makes Prometheus reject the whole scrape;
+//! - a family with no line to write (every series stale, or a text 0.0.4 summary holding only
+//!   `_created`) loses its `# HELP` and `# TYPE` lines too;
 //! - a histogram's `+Inf` bucket is authoritative for the total: a `_count` line that disagrees is
 //!   ignored rather than kept as a second, conflicting total the model has nowhere to put;
 //! - a histogram exemplar sits on the bucket its own *value* falls in, which for a conforming
@@ -993,7 +1001,7 @@ fn sketch_summary(sketch: &DdSketch) -> Point {
 
 /// [`logit_core::Histogram`]'s per-bucket counts → the cumulative `le` counts both dialects carry,
 /// plus the total. Bounds are sorted ascending first (the model doesn't promise an order) and a
-/// `+Inf` bucket is appended when the highest bound is finite -- every conforming exposition has
+/// `+Inf` bucket is appended when the highest bound isn't `+Inf` -- every conforming exposition has
 /// one, and the total has to live somewhere.
 pub(crate) fn cumulative_counts(buckets: &[(f64, u64)]) -> (Vec<(f64, u64)>, u64) {
     let mut sorted: Vec<(f64, u64)> = buckets.to_vec();
@@ -1004,7 +1012,7 @@ pub(crate) fn cumulative_counts(buckets: &[(f64, u64)]) -> (Vec<(f64, u64)>, u64
         running = running.saturating_add(count);
         out.push((bound, running));
     }
-    if out.last().map(|(bound, _)| bound.is_finite()).unwrap_or(true) {
+    if out.last().is_none_or(|(bound, _)| *bound != f64::INFINITY) {
         out.push((f64::INFINITY, running));
     }
     (out, running)
@@ -1037,7 +1045,7 @@ fn build_labels(
             continue;
         }
         // A repeated DogStatsD tag key arrives as a `Value::Array` in wire order
-        // (`logit_inputs::statsd::insert_tags`; `statsd_out` re-expands it to one tag per
+        // (`crate::statsd::decode::insert_tags`; `statsd_out` re-expands it to one tag per
         // element). A Prometheus label set is a map -- one name, one value -- so the **last**
         // representable element wins, walked backwards so a trailing unrepresentable element falls
         // through to the one before it. Last, not first, to match `influxdb_out`, and to keep the

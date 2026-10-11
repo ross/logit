@@ -1,0 +1,63 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "ts.long",
+    {
+     "f64": "0x4270000000000000",
+     "repr": "1099511627776.0"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-ts-long-p1",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "ts.long",
+     {
+      "tuple": [
+       {
+        "int": "1099511627776"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "Protocol 1 has no LONG1, so it writes the text LONG too.",
+ "exercises": [
+  "LONG"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINFLOAT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "LONG",
+  "MARK",
+  "STOP",
+  "TUPLE"
+ ],
+ "producer": "cpython3",
+ "protocol": 1
+}

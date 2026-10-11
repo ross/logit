@@ -1,0 +1,94 @@
+{
+ "carbon": {
+  "items": 5,
+  "outcome": "ok",
+  "received": [
+   [
+    "logit-fixture.diamond.cpu.total.user",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x4029000000000000",
+     "repr": "12.5"
+    },
+    "store"
+   ],
+   [
+    "logit-fixture.diamond.loadavg.01",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3fd0000000000000",
+     "repr": "0.25"
+    },
+    "store"
+   ],
+   [
+    "logit-fixture.diamond.café.count",
+    {
+     "f64": "0x41d954fc40400000",
+     "repr": "1700000001.0"
+    },
+    {
+     "f64": "0x4008000000000000",
+     "repr": "3.0"
+    },
+    "store"
+   ],
+   [
+    "logit-fixture.diamond.cpu.total.user",
+    {
+     "f64": "0x41d954fc40800000",
+     "repr": "1700000002.0"
+    },
+    {
+     "f64": "0xbff0000000000000",
+     "repr": "-1.0"
+    },
+    "store"
+   ],
+   [
+    "logit-fixture.diamond.uptime",
+    {
+     "f64": "0x41d954fc40c00000",
+     "repr": "1700000003.0"
+    },
+    {
+     "f64": "0x401c000000000000",
+     "repr": "7.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "interop-graphite-pickle-py2-000",
+ "cpython": {
+  "error": "UnicodeDecodeError",
+  "message": "'ascii' codec can't decode byte 0xc3 in position 25: ordinal not in range(128)"
+ },
+ "description": "testdata/interop/graphite/graphite-pickle-py2-000.raw's one frame, its 4-byte big-endian length prefix (316) stripped.",
+ "length_prefix": 316,
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "FLOAT",
+  "GET",
+  "INT",
+  "LIST",
+  "LONG",
+  "MARK",
+  "PUT",
+  "STOP",
+  "STRING",
+  "TUPLE"
+ ],
+ "source": "interop/graphite/graphite-pickle-py2-000.raw"
+}

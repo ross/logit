@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-09-12
+updated: 2026-10-11
 ---
 
 # Metrics model v2: `Sum` replaces `Counter`, raw/summarized pairs, boxed span fidelity, batch-level `Scope`
@@ -265,9 +265,10 @@ just enough room inside the existing 176-byte envelope for `MetricKind`'s discri
   `sets` modes, their caps, and the fallback-and-count rule).
 - **(2026-09-12) W3 landed, giving `Samples`/`SetMembers` their first producer.**
   [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W3 gave the two raw variants
-  this ADR introduced their first real producer and consumer: `crates/logit-inputs/src/statsd.rs`'s
-  `ms`/`h`/`d`/`s` lines decode straight to `MetricKind::Samples`/`SetMembers` — no sketching, no
-  sample-rate extrapolation, at decode time — and `crates/logit-outputs/src/statsd.rs` encodes both
+  this ADR introduced their first real producer and consumer: `statsd_in`'s decoder (now
+  `crates/logit-proto/src/statsd/`) decodes `ms`/`h`/`d`/`s` lines straight to
+  `MetricKind::Samples`/`SetMembers` — no sketching, no sample-rate extrapolation, at decode
+  time — and `crates/logit-outputs/src/statsd.rs` encodes both
   back to real statsd lines. `statsd_in`'s own copy of the `MAX_SAMPLE_WEIGHT`/`sample_rate_clamped`
   clamp, kept until this workstream per W2's own amendment, is deleted; `aggregate` is now the only
   place that diagnostic fires. `SAMPLES_INLINE`'s sizing (this ADR's own Decision section) is now

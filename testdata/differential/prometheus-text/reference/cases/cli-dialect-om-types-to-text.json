@@ -1,0 +1,151 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "unannotated",
+   "value": "unknown"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "unannotated",
+   "value": "0x4045000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "build",
+   "value": "info"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "version",
+     "1.2.3"
+    ]
+   ],
+   "name": "build_info",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "state",
+   "value": "stateset"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "state",
+     "starting"
+    ]
+   ],
+   "name": "state",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "state",
+     "running"
+    ]
+   ],
+   "name": "state",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "sizes",
+   "value": "gaugehistogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "10"
+    ]
+   ],
+   "name": "sizes_bucket",
+   "value": "0x4014000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "sizes_bucket",
+   "value": "0x401c000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "sizes_gsum",
+   "value": "0x4072c80000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "sizes_gcount",
+   "value": "0x401c000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "http_requests",
+   "value": "counter"
+  },
+  {
+   "kind": "unit",
+   "name": "http_requests",
+   "value": "requests"
+  },
+  {
+   "kind": "help",
+   "name": "http_requests",
+   "value": "Total HTTP requests."
+  },
+  {
+   "exemplar": {
+    "labels": [
+     [
+      "span_id",
+      "fedcba9876543210"
+     ],
+     [
+      "trace_id",
+      "0123456789abcdef0123456789abcdef"
+     ]
+    ],
+    "ts_ms": 1700000000500,
+    "value": "0x3ff0000000000000"
+   },
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "get"
+    ]
+   ],
+   "name": "http_requests_total",
+   "value": "0x4014000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "http_requests_created",
+   "value": "0x41d954fc40000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xf7c96292",
+  "len": 539,
+  "path": "differential/prometheus-text/cases/cli-dialect-om-types-to-text.om"
+ },
+ "parser": "openmetrics"
+}

@@ -1,0 +1,14 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [],
+ "error": {
+  "after_entry": 0,
+  "message": "invalid metric type \"bogus\""
+ },
+ "input": {
+  "crc32c": "0x42f5959e",
+  "len": 25,
+  "path": "differential/prometheus-text/cases/meta-type-bogus-om.om"
+ },
+ "parser": "openmetrics"
+}

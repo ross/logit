@@ -1,0 +1,51 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "g",
+   "value": "gaugehistogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1"
+    ]
+   ],
+   "name": "g_bucket",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "g_bucket",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g_gcount",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g_gsum",
+   "value": "0x4010000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x9f2caa78",
+  "len": 91,
+  "path": "differential/prometheus-text/cases/om-gaugehistogram.om"
+ },
+ "parser": "openmetrics"
+}

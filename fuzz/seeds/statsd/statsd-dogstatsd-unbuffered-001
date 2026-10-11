@@ -1,0 +1,1 @@
+app.http.request.duration_ms:0.05|h|#env:prod,service:checkout-api,region:us-east-1,host:web-07,endpoint:/api/v1/orders,status:200|c:in-81635

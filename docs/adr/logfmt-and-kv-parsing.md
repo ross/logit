@@ -1,6 +1,6 @@
 ---
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-10-11
 ---
 
 # `logfmt` and `kv`: the de-facto key=value parsers, and why they stay two kinds
@@ -24,7 +24,8 @@ both slower and not something users should have to write by hand. This ADR is th
 ## Decision
 
 **Two distinct `ComponentKind`s/`Transform`s, `logfmt` and `kv`, sharing one module
-(`crates/logit-transforms/src/logfmt.rs`) and a scan tail (`merge_into`, `unescape`,
+(`crates/logit-transforms/src/logfmt.rs`, with its scanners in
+`crates/logit-proto/src/message/logfmt.rs`) and a scan tail (`merge_into`, `unescape`,
 `find_bytes`/`trim_ws_range`) but not a mode flag.** `keep`/`remove` and `keep_signals`/
 `drop_signals` are the existing precedent for "separate kinds sharing a module" over "one kind
 with a `mode:` field" -- the two grammars diverge enough (quoting/escaping vs. none, fixed
@@ -32,11 +33,12 @@ delimiters vs. configurable ones) that a shared config surface would need per-mo
 with no shared behavior to actually unify.
 
 **`logfmt`'s grammar is fixed and requires no config beyond `bare_keys`:** whitespace-delimited
-`key=value` tokens, `"`-quoted values with backslash escapes (`\\`, `\"`, `\n`, `\r`, `\t` --
-anything else, including `\uXXXX`/`\xNN`, is preserved verbatim, backslash included), first `=`
-wins (`a=b=c` -> `a` -> `"b=c"`). An unterminated quote fails the *whole line* (token boundaries
-become unknowable past that point) with a throttled `parse_failure` diagnostic and the event
-passed through untouched, exactly `json`'s posture toward a malformed object. A keyless `=`
+`key=value` tokens (`crates/logit-proto/src/message/logfmt.rs`'s module doc holds the token
+boundaries), `"`-quoted values with backslash escapes (`\\`, `\"`, `\n`, `\r`, `\t` -- anything
+else, including `\uXXXX`/`\xNN`, is preserved verbatim, backslash included), first `=` wins
+(`a=b=c` -> `a` -> `"b=c"`). An unterminated quote fails the *whole line* (token boundaries become
+unknowable past that point) with a throttled `parse_failure` diagnostic and the event passed
+through untouched, exactly `json`'s posture toward a malformed object. A keyless `=`
 (`=1 a=2`) only skips that one token and resynchronizes at the next whitespace -- the rest of the
 line still parses. This asymmetry is intentional: an unterminated quote corrupts everything after
 it, a keyless token corrupts nothing but itself.
@@ -67,10 +69,10 @@ matching `logfmt`'s own first-`=`-wins rule). Whitespace around each key and val
 unconditionally** (not a `trim: bool` flag) -- this is what lets `pair_sep: ","` work uniformly on
 both `a=1,b=2` and `a=1, b=2` without an operator needing to think about it, and there's no grammar
 reason a `kv` user would ever want literal leading/trailing whitespace preserved around a key or
-value it can't quote anyway. An empty segment (`a=1&&b=2`) is skipped silently (nothing to report);
-a segment with no `kv_sep` at all follows the same `bare_keys` rule as `logfmt`; a segment whose key
-is empty after trimming is skipped and counted. If no segment anywhere contains `kv_sep`, the whole
-line fails exactly like `logfmt`'s `NoPairs` case.
+value it can't quote anyway. An empty or keyless segment adds nothing, a bareword follows
+`logfmt`'s `bare_keys` rule, and a line where no segment produces a `key<kv_sep>value` pair fails
+like `logfmt`'s `NoPairs` case;
+`crates/logit-proto/src/message/logfmt.rs`'s module doc holds the segment rules.
 
 **Both are rejected at graph-validation time when `kv`'s separators can only ever misbehave**
 (new rule 30, `crates/logit-pipeline/src/graph.rs`): an empty `pair_sep` or `kv_sep`, identical
@@ -95,11 +97,12 @@ last-write-wins, for free, via `AttrMap::insert_sym` overwriting in push order -
 separately, merge only on full success" shape, so a line that fails partway (an unterminated quote)
 never leaves `event.attributes` half-populated.
 
-**Allocation posture: a hand-rolled scanner that tracks its own byte offsets, not `syslog.rs`'s
-pointer-arithmetic `slice_of` or `json.rs`'s guarded `borrowed_str_bytes`.** Neither of those
-existing precedents' constraints apply here: `syslog.rs` needs pointer arithmetic because
-`str::split` hands back offset-less `&str`s, and `json.rs` needs a guarded reconstruction because
-`serde_json` may hand back an unescape scratch buffer outside the input buffer. This scanner never
+**Allocation posture: a hand-rolled scanner that tracks its own byte offsets, not the
+pointer-range `logit_core::subslice::share` that `logit_proto::syslog` and
+`logit_proto::message::json` use.** Neither of those existing precedents' constraints apply here:
+the syslog decoder calls `share` because `str::split` hands back offset-less `&str`s, and the
+JSON parser calls it because `serde_json` may hand back an unescape
+scratch buffer outside the input buffer, which `share` copies. This scanner never
 loses its own indices, so every unquoted or escape-free-quoted value is a plain, infallible
 `raw.slice(a..b)` -- a `Bytes` refcount bump, not a copy. Every key is interned straight off the
 message's own byte slice (`&text[key_start..key_end]`), never through an owned `String` -- safe

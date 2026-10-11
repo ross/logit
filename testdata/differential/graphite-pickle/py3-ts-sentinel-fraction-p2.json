@@ -1,0 +1,67 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "ts.sentinel-fraction",
+    {
+     "f64": "0xbff8000000000000",
+     "repr": "-1.5"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    "now"
+   ]
+  ]
+ },
+ "case": "py3-ts-sentinel-fraction-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "ts.sentinel-fraction",
+     {
+      "tuple": [
+       {
+        "f64": "0xbff8000000000000",
+        "repr": "-1.5"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "decoder_divergence": "carbon's sentinel test is int(timestamp) == -1, so it reads -1.5 as the receipt time; the decoder compares the value to -1.0 and counts bad_timestamp (docs/known-gaps/mappings.md: decode (Graphite), a timestamp carbon reads differently)",
+ "decoder_skips": {
+  "bad_timestamp": 1
+ },
+ "description": "The timestamp -1.5.",
+ "exercises": [
+  "BINFLOAT"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINFLOAT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

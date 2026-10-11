@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-09-25
+updated: 2026-10-11
 ---
 
 # Out-of-CI fuzzing: a `cargo-fuzz` workspace in the unsafe-check image, with every crash landed as a stable test
@@ -54,20 +54,9 @@ the decoder.
 ### Targets
 
 The canonical target table lives only in `script/unsafe-check`'s `FUZZ_TARGETS` array, one
-`<target>|<max_len>|<malloc_limit_mb>` entry per target. Nothing else lists them. In prose, the
-targets cover:
-
-- the native frame envelope, read in a loop with `resync` the way the disk spool reads it;
-- native batch decode, for both batch codecs (v1 and v2 with its provenance trailer);
-- native control messages (`Hello`, `HelloAck`, `Ack`, `Reject`);
-- `DdSketch` bytes (decode, then a `to_bytes` fixed-point oracle) and `DdSketch` merge (two decoded
-  halves merged, then `quantile` and `to_bytes`);
-- `HyperLogLog` bytes (decode, `estimate`, `insert`, `merge`, `to_bytes`, and drop, since the
-  drop is where a wrong allocation `Layout` would surface);
-- OTLP protobuf, OTLP/JSON, and gRPC framing followed by protobuf decode, with the first input
-  byte choosing the signal;
-- Prometheus remote-write decompression (oracle: output never exceeds the cap) and remote-write
-  decode, with the first byte choosing 1.0 or 2.0.
+`<target>|<max_len>|<malloc_limit_mb>|<extra args>` entry per target, where the fourth column
+holds extra libFuzzer arguments (see "The driver"). Nothing else lists them. What each target
+covers is described in prose under the "untrusted-input parsers" amendment below.
 
 ### Seeds, corpus, and artifacts
 
@@ -101,13 +90,25 @@ allocation past the limit is a crash. The limit is set slightly above
 the largest allocation a valid input of `max_len` bytes can need. For the native frame that is 65
 MiB, because a legitimate 64 MiB lz4 frame allocates its full `uncompressed_len`.
 
-A fourth `FUZZ_TARGETS` column holds extra libFuzzer arguments for one target, passed by `fuzz`
-and never by `fuzz-tmin`. The two native batch targets use it to run in fork mode (`-fork=1
--ignore_ooms=0`). The process-wide interner never evicts, so a long-lived fuzz process
-accumulates every dictionary string it decodes until the arena outgrows the malloc limit, and
-fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal. Fork
-mode was checked in the image: it stops at `-max_total_time`, merges new inputs into
-`fuzz/corpus/<target>`, and writes a child's crash to `fuzz/artifacts/<target>/`.
+The fourth `FUZZ_TARGETS` column holds extra libFuzzer arguments for one target, passed by `fuzz`
+and never by `fuzz-tmin`. The two native batch targets, `statsd`, `syslog`, the two graphite
+targets, `collectd`, the two Prometheus decode targets, and `message_json`, `message_logfmt`,
+and `message_kv` use it to run in fork mode (`-fork=1 -ignore_ooms=0`). The process-wide
+interner never evicts, so a long-lived fuzz process accumulates every dictionary string, metric
+name, tag key, SD-ID, PARAM-NAME, carbon path, Prometheus exemplar label name and family name,
+and log-message key it decodes until the arena outgrows the malloc limit, and fork mode restarts
+the process. A key in `message_logfmt` or `message_kv` can run the whole 64 KiB message, and
+long distinct keys grow the never-evicting arena past the 16 MiB limit within one fork child, so
+those two targets skip an input that could hold a key over 32 bytes; a key's length changes
+nothing in either scan.
+`-ignore_ooms=0` keeps an out-of-memory in a child fatal. Fork mode was checked in the image: it
+stops at `-max_total_time`, merges new inputs into `fuzz/corpus/<target>`, and writes a child's
+crash to `fuzz/artifacts/<target>/`. Its first step merges the corpus and the seeds, and that
+merge drops an input that crashes rather than reporting it. With `MAX_VALUES_PER_LIST`'s check
+widened by one, `collectd` ran 120 seconds clean in fork mode, while the same binary outside fork
+mode crashed on the committed seed that crosses the cap. So a fork-mode
+target's `regress-*` seed is checked by its `robustness.rs` test or a run without `-fork`, not by
+`fuzz`.
 
 ### The image
 
@@ -142,12 +143,13 @@ lib test and joins `script/unsafe-check`'s `MIRI_TARGETS`, so Miri runs it.
 
 ### What `script/cibuild` doesn't cover
 
-`fuzz/` is outside the root workspace, so `script/lint`, `script/audit` (`cargo-deny` and
-`cargo-audit`), and `script/test` never build it. Nothing in `fuzz/` ships, and its only
+`fuzz/` is outside the root workspace, so clippy, `script/audit` (`cargo-deny` and
+`cargo-audit`), and `script/test` never reach it. Nothing in `fuzz/` ships, and its only
 dependency outside the root lock's set is `libfuzzer-sys`. `script/format` does reach it, with
-`cargo fmt --manifest-path fuzz/Cargo.toml`, so `rustfmt.toml` holds there too. A `fuzz/` crate
-that no longer compiles against a changed decoder API is found the next time someone runs the
-harness, not by CI.
+`cargo fmt --manifest-path fuzz/Cargo.toml`, so `rustfmt.toml` holds there too, and `script/lint`
+type-checks it on the stable toolchain, so a `fuzz/` crate that no longer compiles against a
+changed decoder API fails CI (the 2026-10-11 amendment). The sanitizer builds and the runs stay
+manual and nightly.
 
 ## Alternatives considered
 
@@ -160,7 +162,7 @@ harness, not by CI.
   nightly, carries `clang`, and has a driver script. A second image would repeat all of that and
   drift from it. Only the target volume needs to be separate.
 - **Structured targets through `arbitrary`.** Rejected for these targets. Every decoder here takes
-  bytes from a peer, so raw bytes are the input space an attacker controls. `arbitrary`-derived
+  bytes from a peer, so raw bytes are the input space a peer writes. `arbitrary`-derived
   inputs start from well-typed values and reach the decoders only through an encoder, which skips
   the malformed inputs the fuzzer exists to find. A later target for an encoder-side invariant can
   use it.
@@ -173,8 +175,9 @@ harness, not by CI.
 - `docs/known-gaps/`'s "`cargo-fuzz` targets over the decoders" entry closes when the harness
   lands. ADR `out-of-ci-unsafe-verification`'s deferral of `cargo-fuzz` is superseded by its
   amendment of the same date.
-- A decoder change that breaks the `fuzz/` build isn't caught by CI. Run
-  `script/unsafe-check fuzz-seed` and a short `fuzz-all` after changing a decoder a target calls.
+- CI type-checks `fuzz/` but never runs a target, so a decoder change that breaks a target's
+  oracle passes CI. Run `script/unsafe-check fuzz-seed` and a short `fuzz-all` after changing a
+  decoder a target calls.
 - A new decoder of untrusted input should get a target: one `[[bin]]`, one `FUZZ_TARGETS` entry,
   and seeds from `seedgen`.
 - A target can only call code in `logit-core` or `logit-proto`. Parsing logic that lives in a
@@ -278,7 +281,8 @@ Two things the campaign turned up about the harness, not the decoders:
 
 - **The native batch targets didn't build.** The decode budget (#370) added a `DecodeBudget`
   argument to `decode_batch` and `decode_batch_v2`, and the two targets still passed one
-  argument. `fuzz/` is outside the cargo workspace, so `script/check` and CI never build it.
+  argument. `fuzz/` is outside the cargo workspace, and no check built it then; `script/lint`
+  now type-checks it (the 2026-10-11 amendment).
   Both targets now decode under `DecodeBudget::default()`, the budget `NativeDecoder` gives a
   frame under the default cap. "Consequences" already says so: run `fuzz-seed` and a short
   `fuzz-all` after changing a decoder a target calls.
@@ -292,3 +296,182 @@ Two things the campaign turned up about the harness, not the decoders:
 After the campaign, both `native_batch_*` targets' `malloc_limit_mb` rose from 16 to 64, because
 a valid batch of more than 16,384 empty events regrows `decode_batch_body`'s events `Vec` past
 16 MiB (about 56 MiB at `max_len`), and none of the campaign's inputs reached that count.
+
+### Campaign at the untrusted-input stack tip (2026-10-11)
+
+Every target ran clean at the tip of the untrusted-input parser stack: the 11 cluster 9 targets
+for 1,800 seconds each and the 14 earlier ones for 600. `stream_framing`, `statsd`, `syslog`, and
+`graphite_plaintext` ran binaries built at `dc38374d`, the head of `untrusted/w13` (#621). The
+other 21 ran binaries rebuilt from that tree plus a doc-comment-only change to `logit-core`, so
+every decoder they ran is the same code, and the result stands for `dc38374d`. `script/unsafe-check fuzz-seed` ran first and rewrote no committed seed, so every
+`regress-*` and `diff-*` seed is in the starting corpus. Image `logit-unsafe-check:local` with
+`nightly-2026-09-01` (`rustc 1.100.0-nightly (0dfb098f3 2026-08-31)`) and `cargo-fuzz` 0.13.2.
+
+All 25 targets were built once with `cargo fuzz build` into a fuzz target volume of their own,
+then run four at a time, longest first, each with `FUZZ_SECONDS=<n> script/unsafe-check fuzz
+<target>` and the extra arguments its `FUZZ_TARGETS` row gives, under `systemd-inhibit
+--what=sleep:idle`, on a 32-core host. During the first four targets (`stream_framing`, `statsd`,
+`syslog`, and `graphite_plaintext`) the host also ran the workspace tests and both differential
+checks. The columns mean what they do in the first table: fork-mode rows compute exec/s from
+executions and seconds and give no corpus size, and a fork-mode run's seconds include libFuzzer
+wrapping up after `-max_total_time`.
+
+| Target | Seconds | Executions | exec/s | Corpus (inputs/size) | Result |
+|---|---|---|---|---|---|
+| `native_frame` | 601 | 7,100,111 | 11,814 | 396 / 1,345 KB | clean |
+| `native_batch` | 633 | 47,849,101 | 75,591 | 852 / n/a | clean (fork mode) |
+| `native_hop_batch` | 633 | 52,643,559 | 83,165 | 863 / n/a | clean (fork mode) |
+| `native_control` | 601 | 162,414,570 | 270,241 | 245 / 7 KB | clean |
+| `sketch_bytes` | 601 | 45,633,443 | 75,929 | 552 / 944 KB | clean |
+| `sketch_merge` | 601 | 27,308,137 | 45,438 | 605 / 1,929 KB | clean |
+| `hll_bytes` | 601 | 155,884,819 | 259,376 | 118 / 23 KB | clean |
+| `otlp_proto` | 601 | 27,745,848 | 46,166 | 2,708 / 1,423 KB | clean |
+| `otlp_json` | 601 | 12,590,211 | 20,949 | 2,713 / 4,171 KB | clean |
+| `otlp_grpc` | 601 | 37,675,556 | 62,688 | 2,839 / 617 KB | clean |
+| `prom_decompress` | 601 | 10,722,781 | 17,842 | 1,035 / 494 KB | clean |
+| `prom_remote_write` | 603 | 5,726,035 | 9,496 | 2,351 / n/a | clean (fork mode) |
+| `prom_text` | 1,845 | 2,928,234 | 1,587 | 2,724 / n/a | clean (fork mode) |
+| `proxy_header` | 601 | 507,045,221 | 843,669 | 162 / 5 KB | clean |
+| `forwarded` | 601 | 313,586,245 | 521,774 | 580 / 17 KB | clean |
+| `stream_framing` | 1,801 | 11,047,865 | 6,134 | 404 / 1,062 KB | clean |
+| `statsd` | 1,838 | 33,723,292 | 18,348 | 1,310 / n/a | clean (fork mode) |
+| `syslog` | 1,838 | 25,667,262 | 13,965 | 1,742 / n/a | clean (fork mode) |
+| `graphite_plaintext` | 1,839 | 13,370,775 | 7,271 | 984 / n/a | clean (fork mode) |
+| `graphite_pickle` | 1,838 | 1,604,989 | 873 | 1,066 / n/a | clean (fork mode) |
+| `collectd` | 1,838 | 16,888,680 | 9,189 | 704 / n/a | clean (fork mode) |
+| `message_json` | 1,843 | 77,079,815 | 41,823 | 3,285 / n/a | clean (fork mode) |
+| `message_csv` | 1,801 | 33,224,847 | 18,448 | 204 / 32 KB | clean |
+| `message_logfmt` | 1,838 | 31,992,832 | 17,406 | 470 / n/a | clean (fork mode) |
+| `message_kv` | 1,837 | 53,008,188 | 28,856 | 576 / n/a | clean (fork mode) |
+
+No target wrote an artifact: no crash, no out-of-memory against its `malloc_limit_mb`, no
+timeout, and no slow unit. Three things the campaign turned up about the harness, none about the
+decoders:
+
+- **A campaign needs its own target volume and a checkout nobody edits while it runs.** Each
+  `fuzz` call runs `cargo fuzz run`, which rebuilds when a source in the checkout changed. A
+  change mid-campaign makes whichever run starts next rebuild, cargo's build-directory lock makes
+  every other starting run wait for it, and each later target relinks its binary against the
+  changed tree. Set `UNSAFE_CHECK_FUZZ_TARGET_VOLUME` so another checkout's build can't replace
+  the binaries either.
+- **A fork-mode run outlasts `-max_total_time` by up to 45 seconds**, the time its last
+  child takes to finish and its corpus to merge, so a schedule should budget for it.
+- **`graphite_pickle` and `prom_text` are the slow targets**, at about 900 and 1,600 exec/s:
+  each input runs a second-generation fixed point (the pickle target in both protocols, the text
+  target parsing and writing three times), so their 1,800 seconds reach fewer executions than a
+  600-second run of most other targets.
+
+## Amendment (2026-10-09): untrusted-input parsers
+
+The inventory's cluster 9, "Untrusted-input parsers", gives every hand-rolled parser of producer
+bytes a target. Most of those parsers live outside `logit-core` and `logit-proto` today, so
+[ADR `parsers-live-in-logit-proto`](parsers-live-in-logit-proto.md) moves them behind the seam
+this ADR's "The `fuzz/` crate" requires first. This amendment records what changes in the
+harness. It holds the prose description of every target, which "Targets" points at; the
+campaign tables under "Running it" keep the names each campaign ran under.
+
+### Targets
+
+`script/unsafe-check`'s `FUZZ_TARGETS` stays the one canonical table. In prose, the existing
+targets cover:
+
+- `native_frame`: the native frame envelope, read in a loop with `resync` the way the disk spool
+  reads it;
+- `native_batch` and `native_hop_batch`: the two native payload shapes, a bare batch and a hop
+  batch with its sender pair and provenance trailer, both under the default decode budget;
+- `native_control`: the native control messages;
+- `sketch_bytes`, `sketch_merge`, and `hll_bytes`: `DdSketch` bytes (decode, then a `to_bytes`
+  fixed-point oracle), `DdSketch` merge (two decoded halves merged, then `quantile` and
+  `to_bytes`), and `HyperLogLog` bytes (decode, `estimate`, `insert`, `merge`, `to_bytes`, and
+  drop, where a wrong allocation `Layout` would surface);
+- `otlp_proto`, `otlp_json`, and `otlp_grpc`: OTLP protobuf, OTLP/JSON, and gRPC framing followed
+  by protobuf decode, with the first input byte choosing the signal;
+- `prom_decompress` and `prom_remote_write`: remote-write decompression (oracle: output never
+  exceeds the cap) and decode, with the first byte choosing 1.0 or 2.0;
+- `proxy_header`: the start of a stream through `logit_proto::proxy::parse`;
+- `forwarded`: one forwarding header's value through `logit_proto::forwarded::parse`.
+
+Cluster 9 adds one target per moved or already-movable parser:
+
+- `stream_framing`: the TCP stream `Framer`, in every framing mode;
+- `statsd` and `syslog`: the two line decoders;
+- `graphite_plaintext`, `graphite_pickle`, and `collectd`: the carbon and collectd decoders, each
+  with a second-generation encode/decode fixed point;
+- `prom_text`: the Prometheus text and OpenMetrics decoder;
+- `message_json`, `message_csv`, `message_logfmt`, and `message_kv`: the log-message tokenizers.
+
+`prom_remote_write` also gains a structured mode, which builds a request from its input so the
+symbol-table rules are reachable, and a fixed-point oracle on every input.
+
+### Seeds and differential corpora
+
+`seedgen` also reads `testdata/interop/{statsd,syslog,graphite,collectd,datadog,prometheus-scrape}/`,
+every corpus under `testdata/differential/`, every `*.in` exposition body under
+`crates/logit-cli/tests/fixtures/prometheus/`, and
+`tools/record-fixtures/prometheus-metadata-target.prom`. A differential corpus differs from
+`testdata/interop/`, which holds captured bytes that don't reproduce: it's generated,
+deterministic, and carries a reference implementation's reading of each case beside the case's
+bytes. `script/differential <corpus>`
+regenerates one, and `script/differential <corpus> --check` regenerates it into a temporary
+directory and fails if it differs from the committed files. No test needs the reference
+implementation installed; tests read the committed reading.
+
+### The `fuzz/` crate
+
+- The seam list under "The `fuzz/` crate" grows by the moves ADR `parsers-live-in-logit-proto`
+  names: `logit_proto::framing`, `logit_proto::statsd`, `logit_proto::syslog`, and
+  `logit_proto::message::{json,csv,logfmt}`.
+- The fuzz crate gains two third-party dependencies, `serde_json` (the reference reading for
+  `message_json`) and `prost` (to build a structured remote-write request). Both are already in
+  `fuzz/Cargo.lock` through the path dependencies, so neither adds a crate version.
+
+### Crash to regression test
+
+A crash's regression test lands in the `tests/robustness.rs` of the crate that owns the decoder,
+whichever crate that is. After the moves that is `logit-proto` for every cluster 9 parser, but
+the rule follows the code, not a list of two files.
+
+### Debug assertions under fuzzing
+
+The driver runs `cargo fuzz run` without `-O`. Without it, the pinned cargo-fuzz 0.13.2 adds
+`-Cdebug-assertions` to the build's `RUSTFLAGS` (`src/project.rs`), and its `-a` help reads
+"Build artifacts with debug assertions and overflow checks enabled (default if not -O)". rustc's
+overflow checks follow debug assertions unless set separately. So every `debug_assert!` in a
+parser fires under fuzzing, and integer overflow panics, in dependencies too: the `hll_bytes`
+finding under "First campaign" is an overflow panic inside `cardinality-estimator`. Don't add
+`-O` to the driver, because it turns both off.
+
+### The `Framer`'s drain state gets an observable
+
+Under `Oversize::DrainToNextLine`, a line that crosses the bound with no `LF` buffered is counted
+once, as `logit.input.frames.dropped{reason="oversize"}`, and the `Framer` then discards every
+byte until the next `LF`. A connection that never sends one, such as a binary protocol pointed at
+a line port, keeps sending bytes into that discard for its whole life, and nothing distinguishes
+it from a single long line that ended. That is reachable by accident, so it gets a free
+observable rather than a `docs/known-gaps/` entry:
+
+- A line that enters the drain state counts `logit.input.frames.dropped{reason="drained"}` in
+  place of `reason="oversize"`, so each dropped line still counts once. A line whose `LF` is
+  already buffered, and every other framing mode's oversize, keeps `reason="oversize"`.
+- The throttled `framing_error` diagnostic for that line says the connection discards input until
+  its next `LF`.
+
+`docs/design/internal-telemetry.md`'s "Layer 3: what only a component knows" table holds the
+canonical `frames.dropped` reasons. `untrusted/w6`, the branch that adds the `stream_framing`
+target, adds `drained` there, to the reason lists in that doc's `statsd_in`, `graphite_in`, and
+`lines_in` sections (the listeners that frame with `DrainToNextLine`), and to those listeners'
+module docs.
+
+## Amendment (2026-10-11): `script/lint` type-checks `fuzz/`
+
+After clippy, `script/lint` runs `cargo check --manifest-path fuzz/Cargo.toml --workspace
+--all-targets` on the stable toolchain the dev and CI images carry. `libfuzzer-sys`'s build script
+compiles libFuzzer with the image's C++ compiler, and only `cargo fuzz build` and `cargo fuzz run`
+need nightly, so the check fits the stable build: it took about 7 seconds from an empty target
+directory. A decoder signature change that breaks a target or `seedgen` now fails `script/check`
+and CI, where before it showed only at the next campaign's build.
+
+The check doesn't build under the sanitizer, run a target, or lint `fuzz/`. A change to what a
+decoder accepts can still break a target's oracle with every check green, so the
+"Consequences" advice stands: run `script/unsafe-check fuzz-seed` and a short `fuzz-all` after
+changing a decoder a target calls.
