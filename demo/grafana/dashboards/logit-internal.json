@@ -144,7 +144,7 @@
       "id": 5,
       "type": "timeseries",
       "title": "logit.output.requests (victoria_out, by class)",
-      "description": "victoria_out's (prometheus_out remote-write) own per-request outcome -- 2xx/4xx/5xx/network_error -- that run_output's single send.duration timer can't distinguish. Filtered on component, because loki_out and tempo_out count the same metric.",
+      "description": "victoria_out's (prometheus_out remote-write) own per-request outcome -- 2xx/4xx/5xx/network_error -- that run_output's single send.duration timer can't distinguish. Filtered on component, because the other sinks count the same metric.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
       "interval": "1m",
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
