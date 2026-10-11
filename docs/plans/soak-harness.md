@@ -192,14 +192,16 @@ for = "45s"
 - Every fault carries `for`, so its revert is scheduled with it. `netem clear` is a revert, never
   a step.
 - No two faults overlap on one container.
-- No netem on a container during its `stop`, `kill`, `pause`, or `partition`, because the qdisc
+- No netem on a container during its `stop`, `kill`, `pause`, `partition`, or `exit`, because the qdisc
   is lost with the namespace and `docker run --network container:<id>` needs a running target.
 - No fault ends inside `cooldown`, and `cooldown` is at least `recovery_bound`.
 - Actions and services are known. W1's actions are `netem`, `pause`, `stop`, `restart`, and
   `partition`, on `logit`, `generator`, or `victoria-metrics`. W3 adds `kill`, on `logit` only:
   the lines a killed generator sent after its last telemetry drain reach the SUT with no G
-  behind them, and `ledger.wire` would net them against real loss.
-- `[ledger] vm_every_window`, optional, is `true` or `false`.
+  behind them, and `ledger.wire` would net them against real loss. W7a adds `mark` and `exit`
+  (below).
+- `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
+  is a component id.
 - A scenario has `cycle` with `[[step]]` tables or a `[random]` table (W4), never both.
   `--seed` is refused for a fixed schedule, because no seed changes it.
 
@@ -261,6 +263,43 @@ not overlap another fault on its container. The watchdog accepts the exit inside
 and the lives cross-check. The ledger pays for it: up to one `internal` interval of the killed
 life's counters is lost, so that life's egress is judged within a band, not for equality (see "Which
 life a hop is judged in").
+
+**Marks and expected exits (W7a)** name an event the SUT's own config causes, such as a Lua
+script that stalls or outgrows its memory cap, so the checks excuse it as they excuse a fault:
+
+```toml
+[[step]]
+at = "1m30s"
+action = "mark"           # no Docker call; its window is an ordinary fault window
+on = "logit"
+ready = "stalled"         # optional: a readiness word `ready` must read inside the window
+for = "2m30s"
+
+[[step]]
+at = "2m50s"
+action = "exit"           # an exit the SUT makes on its own inside the window
+on = "logit"              # logit only
+code = 2                  # the exit code it leaves
+key = "memory_limit_exceeded"   # the self-log key of the ERROR line that explains it
+for = "1m30s"
+```
+
+- A `mark`'s apply and revert make no Docker call. Its window excuses what any fault window
+  does: `progress`, `ready`, sink fault lines in `self_log`, the slopes, and `recovery` judges
+  it. A mark on `logit` is UDP-affecting, because a stalled script backs up into the receive
+  queue. `ready`, allowed on a `mark` only, is one of `starting`, `stalled`, `draining`, or
+  `degraded`.
+- An `exit`'s apply makes no Docker call either. Its revert runs `docker start` when the
+  container has exited, and records `started`; only a revert that started it is a start, with a
+  readiness probe and a new SUT life. `code` and `key` are required on an `exit` and refused
+  elsewhere, and an `exit` is on `logit` only. The process can end at any point in the window,
+  so a netem on its container may not overlap it. While an `exit` is open the driver's fail-fast
+  accepts `running` or `exited`. "The checks" has its rules in `exit`, `self_log`, and `ready`.
+- Neither may appear in a `[random]` schedule, which draws faults; an expected event happens
+  at a time the scenario's own config sets.
+
+**`sut_script` (W7a)**, an optional `[ledger]` key, names a `lua` component between the
+listener and `aggregate`, and adds the script hop to the ledger ("The ledger and identities").
 
 **`vm_every_window` (W3)**, an optional `[ledger]` key, turns on `ledger.windows`: every series
 has a sample in every `aggregate` window of every SUT life that `aggregate` emitted. Set it only
@@ -400,7 +439,8 @@ ticket with `${DOCKER} version` first.
      A failed chunk's record keeps the tail of the CLI's error from its temporary stderr file.
      The cursor is per container id, which a stop and start keep.
    - **Fail fast:** a `logit` container leaving `running`, or a `StartedAt` change, with no step
-     behind it ends the timeline at once. The end sequence and collection still run.
+     behind it ends the timeline at once. The end sequence and collection still run. Inside an
+     `exit` step (W7a) the container may be `running` or `exited`.
 4. End (for an external target, W5, see "External targets"): revert active faults; `docker stop -t 30` the generator; wait until the VictoriaMetrics
    total holds across two aggregate windows (90 s bound); `docker stop -t 60` the SUT, expecting
    exit 0; call VictoriaMetrics `/internal/force_flush`; write `vm-export.jsonl` from
@@ -436,16 +476,30 @@ returned nonzero has none, so nothing after it is excused.
   start or unpause of a `logit` service has a `ready` record. An early revert in the end
   sequence isn't probed, so it needs none.
 - `exit`: every exit falls inside a scheduled `stop`, `restart`, or `kill` with the code that
-  action leaves (0, or 137 for a kill), the final exit is 0, and `OOMKilled` is false.
-- `restarts`: every `StartedAt` change matches a scheduled start or restart.
+  action leaves (0, or 137 for a kill), or inside an `exit` step (W7a), from 1 s before its
+  apply to 1 s after its revert, with the step's `code`; every `exit` step sees its exit, or the
+  row FAILs "expected exit did not happen"; the final exit is 0; and `OOMKilled` is false.
+- `restarts`: every `StartedAt` change matches a scheduled start or restart, an `exit` revert
+  that started the container included.
 - `self_log`: FAIL on an `exiting` line with `code != 0`, a `key == "thread_panicked"` line, or
   the raw `thread '…' panicked at` text, which isn't JSON, so stderr is checked line by line.
   An ERROR line keyed `retrying` is expected inside a fault window and WARNs outside one. A
   WARN line keyed `send_failed`, or whose message is `degraded`, does the same. Any other
-  ERROR line FAILs.
-- `ready`: `Health.Status` is `healthy` outside fault windows, and a container is ready within
-  30 s of each start. A paused container fails the image's `HEALTHCHECK`, so health is judged
-  only outside fault windows.
+  ERROR line FAILs. Inside an `exit` step's window (W7a), the `exiting` line with the step's
+  `code`, an ERROR line keyed the step's `key`, and the `Error: ` text line `main` prints right
+  after that `exiting` line are expected; the step FAILs the row when either of the first two is
+  missing.
+- `ready`: a container is ready within 30 s of each start, and readiness is judged from the
+  status word `logit ready` reports (W7a). The image's `HEALTHCHECK` runs `logit ready` every
+  10 s, and `watchdog.jsonl`'s `health_log` records Docker's newest result, whose `Output` is
+  `ok`, or a word and the HTTP status, as in `stalled (503 Service Unavailable)`. The row reads
+  the first word of each, timed at the result's `Start`, not at the watchdog's poll, and counts
+  each `Start` once. Every sample outside fault windows reads `ok`; a `mark` with `ready = W`
+  needs at least one sample reading W inside its span; and `degraded`, which means a node has
+  exited, is accepted only inside an `exit` step, fault window or not. A paused container fails
+  the `HEALTHCHECK`, so `ok` is judged only outside fault windows. A run directory whose
+  watchdog recorded no `health_log` falls back to `Health.Status` being `healthy` outside fault
+  windows, and a `mark` with `ready` then FAILs, since its word can't be read.
 - `progress`, which tells a hang from a slow drain. Outside fault windows, the SUT sink's
   `batches.delivered` increases in every `progress_window`; stdout NDJSON never gaps more than
   three `internal` intervals while the container runs unpaused; and every VictoriaMetrics
@@ -471,8 +525,10 @@ one event is one increment.
 | D | SUT `logit.component.datagrams.dropped` under every reason, from telemetry, plus `shutdown` drops from stderr, except in a killed life, which writes none |
 | B | SUT `logit.component.diagnostics{key=bad_line}` |
 | E | SUT `logit.component.events.sent{component=statsd}` |
+| X | SUT `logit.component.events.dropped{component=statsd}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`) |
 | A | aggregate `logit.component.events.received` |
 | Ab | aggregate `logit.transform.metrics.absorbed` |
+| L_in, L_emit, L_drop, L_err, L_flush, L_sent | with `[ledger] sut_script` (W7a), the script's `logit.component.events.received`; `logit.script.events.emitted` summed over its `outcome`s, which counts events, one per event an `emit_many` returns; `logit.component.events.dropped{reason="script_drop"}`; `logit.component.errors{reason="process"}`, one per event a script error drops; `logit.component.flush.events`; and `logit.component.events.sent`, which counts what `process()` and `flush()` send alike |
 | V | the reset-aware total of `vm-export.jsonl`: add each series' first value, then every non-negative step, and on a decrease or at a SUT life start add the new value. V splits per SUT life at each series' decreases and at each life start, placing a sample by its timestamp, which is the SUT's own window time; a restart whose first value isn't below the last one shows no decrease. A series should have one segment per SUT life, else WARN |
 
 The generator sets `max_packet_bytes: "32"`, so one datagram carries one line of about 20 bytes,
@@ -490,14 +546,19 @@ from stderr: the listener's `warn` lines go into D, and the `drain complete` lin
 - The final SUT life ends after the generator stops and the VictoriaMetrics total holds (§5's
   end sequence), so nothing arrives after its final drain. `ledger.intake`, `ledger.edge`,
   `ledger.aggregate`, and `ledger.egress` are judged with no tolerance for it.
-- An earlier SUT life ends under load, at a scheduled `stop`, `restart`, or `kill`. A life a
-  `stop` or `restart` ended is compared at its last drain, and its hops are reported. Its residual W − D − B − Ab, what it read but hadn't absorbed
-  by that drain, must lie between 0 and the residual R that can be in flight at the signal: the
+- An earlier SUT life ends under load, at a scheduled `stop`, `restart`, or `kill`, or at an
+  `exit` step's expected exit (W7a), which drains as a `stop` does. A life a `stop`, `restart`,
+  or `exit` ended is compared at its last drain, and its hops are reported. Its residual
+  W − D − B − X − Ab, what it read but had neither absorbed nor dropped, counted, by that drain,
+  must lie between 0 and the residual R that can be in flight at the signal: the
   receive queue (`receive.max_datagrams`) plus 67 batches of at most
   `receive.batch_max_events` each: the accumulator, the batch the listener holds while its send
   waits for a slot on a full inbox, `aggregate`'s 64-slot inbox, and the batch `aggregate` has
-  taken off that inbox but not yet absorbed. The close-time window delivers that residual into
-  V, so `ledger.egress` judges the life's W − D − B − V as it judges the final life's Ab − V.
+  taken off that inbox but not yet absorbed. A script between them (W7a) adds its own 64-slot
+  inbox and the batch it holds, 65 batches more, and its counted drops and errors leave the
+  residual: W − D − B − X − (L_drop + L_err) − (Ab − L_flush). The close-time window delivers
+  that residual into V, so `ledger.egress` judges the life's W − D − B − X − V as it judges the
+  final life's Ab − V.
   The [0, R] bound only catches a residual no shutdown could leave.
 - An earlier SUT life ended by a scheduled `kill` has no final drain, no close-time window, and
   no stderr shutdown lines. Its hops are compared at its last drain, which is an ordinary one,
@@ -551,11 +612,23 @@ The rows:
   cancelled at shutdown loses its counts. A negative gap of up to the generator sink's
   `buffer.batches` at its last drain plus one batch (100 lines each) is allowed.
 - `ledger.intake`: W − D == E + B, for the final life.
-- `ledger.edge`: E == A, a single-consumer edge, for the final life.
+- `ledger.edge`: E == A, a single-consumer edge, for the final life. With `sut_script` (W7a),
+  L_sent == A, the edge from the script to `aggregate`.
+- `ledger.script` (W7a), with `sut_script`, else SKIP: for the final life, E == L_in (the
+  listener's edge into the script), L_in == L_emit + L_drop + L_err (every event emitted,
+  dropped, or failed on), and L_sent == L_emit + L_flush. Earlier lives are reported.
 - `ledger.aggregate`: Ab == A, for the final life.
-- `ledger.egress`, per life: Ab − V for the final life and a killed one, and W − D − B − V for
-  a stopped earlier one, the residual plus Ab − V, because its close-time window delivers the
-  residual to VictoriaMetrics after its last drain. The detail shows both parts. A gap of 0 passes. A
+- `ledger.egress`, per life: Ab − V for the final life and a killed one, and W − D − B − X − V
+  for a stopped earlier one, the residual plus Ab − V, because its close-time window delivers the
+  residual to VictoriaMetrics after its last drain. The detail shows both parts. With
+  `sut_script` (W7a), Ab becomes Ab − L_flush, because each `flush()` event carries one metric
+  whose series `vm_selector` excludes, and a stopped earlier life's gap becomes
+  W − D − B − X − (L_drop + L_err) − V. The subtraction holds only while each flush event carries
+  one metric, which the scenario's script guarantees. The residual of a stopped earlier life
+  passes through the script after its last drain, so the script drops and fails on its share of
+  it where no drain counts them: a positive gap up to the **script band**, the life's
+  (L_drop + L_err) / L_in times the residual, rounded up, plus 2 for the shipped scripts'
+  periodic rules landing on an extra event, passes as "within script band". A gap of 0 passes. A
   positive gap is lost increments. It is reported with
   that life's `drain complete` `batches_dropped` beside it, and is **counted** only when that
   count is above 0. The two are never reconciled: `batches_dropped` counts batches, and under
@@ -617,7 +690,10 @@ The rows:
   diagnostic makes the throughput part WARN, because the generator limited the rate, not the
   SUT.
 - `ledger.summary`, for the final life: uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V),
-  which must be 0, with each term shown beside it and wire loss beside them as "by design". When
+  which must be 0, with each term shown beside it and wire loss beside them as "by design".
+  With `sut_script` (W7a), E − A becomes (E − L_in) + (L_in − L_emit − L_drop − L_err) +
+  (L_emit + L_flush − L_sent) + (L_sent − A), the egress term is Ab − L_flush − V, and the
+  script's L_drop and L_err are shown beside them as counted. When
   `ledger.egress` is counted, its term is shown as counted and the row judges the other three.
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at the sink's own
   telemetry; see "External targets".
@@ -798,22 +874,24 @@ sequence, and §6's checks hold unless an item says otherwise.
 
 **Cheap now.** Each is a scenario directory on the three services plus a small check extension.
 
-1. **Lua in the path.** `statsd_in → lua → aggregate → prometheus_out`, the script rewriting
-   each event and emitting a rollup from `flush()`. No run has driven `run_lua`, or seen `/readyz`
-   read `stalled`, the one not-ready answer for a node that hasn't exited
-   ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Admin endpoint, readiness, and
-   release image"). Variants ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)):
-   a busy loop after N events reads `stalled`, then `ok` (the sandbox has no clock, so the loop
-   is an iteration count sized past the 10 s `stall_after`); a VM over `max_memory` exits 2 with
-   `memory_limit_exceeded` ([`docs/deploying.md`](../deploying.md), "Probes and exit codes"); an
-   error on every Nth event counts `logit.component.errors{reason="process"}`. Faults: the
-   `statsd-vm` schedule in §2. Rows: a script hop in the ledger (received equals emitted plus
-   `script_drop` drops plus errors; A counts `flush()`'s events); `ready` judges the stall.
-   Needs: `[ledger] sut_script`; a no-op `mark` action with `for`, whose window excuses the stall
-   for `progress` and `ready` and names a step for `[[expect]]`; readiness scored from the status
-   word `logit ready` prints, which `watchdog.jsonl`'s `health_log` already holds though only
-   `Health.Status` is judged; and an expected exit (code and self-log key) for `exit` and
-   `self_log`.
+1. **Lua in the path (built in W7a).** `statsd_in → lua → aggregate → prometheus_out`, which
+   drives `run_lua` and `/readyz`'s `stalled`, the one not-ready answer for a node that hasn't
+   exited ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Admin endpoint, readiness,
+   and release image"). Three scenarios
+   ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)):
+   - `lua-path`: under the `statsd-vm` schedule in §2, the script rewrites each event, drops every
+     53rd (`script_drop`), fails on every 97th (`errors{reason="process"}`), and returns one
+     rollup event from `flush()` each window.
+   - `lua-stall`: a busy loop after N events reads `stalled`, then `ok`. The sandbox has no
+     clock, so the loop is an iteration count sized past the 10 s `stall_after`, and a `mark`
+     with `ready = "stalled"` covers it.
+   - `lua-memory`: a VM over `max_memory` exits 2 with `memory_limit_exceeded`
+     ([`docs/deploying.md`](../deploying.md), "Probes and exit codes"), inside an `exit` step
+     whose revert starts the SUT again.
+
+   Rows: `ledger.script` and the script terms in the ledger (§6); `ready` judging the status
+   word; `exit` and `self_log` judging the expected exit. Built with `[ledger] sut_script`, the
+   `mark` and `exit` actions (§2), and readiness scored from `health_log` (§6).
 2. **Two sinks of one kind, failing independently.** `aggregate` fans out to two
    `prometheus_out`, each with its own VictoriaMetrics; faults on one leg, then both overlapping;
    then the same split through `route` and two `target`s
@@ -916,9 +994,9 @@ sequence, and §6's checks hold unless an item says otherwise.
     Needs: a `signal` action and a certificate-rotation action writing into a mounted
     directory.
 
-**The first PR is items 1 and 2 together.** Both touch code the harness has never driven, and
-item 2 forces the compose override, the service list, and the per-sink ledger that items 3, 7,
-and 11 need.
+**Items 1 and 2 land first, as two stacked PRs, W7a and W7b.** Both touch code the harness has
+never driven, and item 2 forces the compose override, the service list, and the per-sink ledger
+that items 3, 7, and 11 need.
 
 ## Workstreams
 
@@ -932,8 +1010,9 @@ and 11 need.
 | W4 | `soak/w4` | `soak/w4: seeded random schedules and hours-long soaks` | M | W3 |
 | W5 | `soak/w5` | `soak/w5: an external Datadog target for soaks` | M | W4 |
 | W6 | `soak/w6` | `soak/w6: the soak harness's next scenarios` | S | W5 |
-| W7 | `soak/w7` | `soak/w7: Lua-in-the-path and two-sink fan-out soaks` | M | W6 |
-| W8 | `soak/w8` | `soak/w8: fan-in, full-spool, slow-destination, and cardinality soaks` | M | W7 |
+| W7a | `soak/w7a` | `soak/w7a: Lua-in-the-path soaks, mark and exit actions, and readiness words` | M | W6 |
+| W7b | `soak/w7b` | `soak/w7b: two-sink fan-out and route soaks, compose overrides, and a ledger per sink` | M | W7a |
+| W8 | `soak/w8` | `soak/w8: fan-in, full-spool, slow-destination, and cardinality soaks` | M | W7b |
 | W9 | `soak/w9` | `soak/w9: a scripted HTTP destination for every response class` | M | W8 |
 | W10 | `soak/w10` | `soak/w10: a native-hop soak between two logit processes` | M | W9 |
 | W11 | `soak/w11` | `soak/w11: TCP-ingress and file-tailing soaks` | M | W10 |
@@ -987,9 +1066,13 @@ and 11 need.
   `statsd-datadog` scenario ("External targets"); self-test fixtures for every `[target]` rule,
   the wait, and `ledger.sent`'s verdicts.
 - **W6**: §10, "Next scenarios", and these rows. Documentation only.
-- **W7**: §10's items 1 and 2: the `mark` action, readiness scored from `health_log`, expected
-  exits, `[ledger] sut_script`, the scenario compose override, the merged service list, and the
-  per-sink ledger, with a scenario per variant.
+- **W7a**: §10's item 1: the `mark` and `exit` actions, readiness scored from the status word in
+  `health_log`, `[ledger] sut_script` and the `ledger.script` row, self-test fixtures for each
+  rule, and the `lua-path`, `lua-stall`, and `lua-memory` scenarios, each run recorded under
+  "Findings".
+- **W7b**: §10's item 2: the scenario compose override, service roles read from the merged
+  compose file, and a ledger per sink, with the `fanout-copy`, `fanout-block`, and `route-split`
+  scenarios.
 - **W8**: items 3 to 6: a ledger over several generators, the tmpfs spool, expected verdicts,
   and the gauge `slope` reducer.
 - **W9**: item 10, the scripted destination, and `ledger.sent` run against it.
@@ -998,7 +1081,7 @@ and 11 need.
 - **W12**: items 11 and 12, the namespace-holder service, per-instance totals, and the `signal`
   and certificate-rotation actions.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7 → W8 → W9 → W10 → W11 → W12, linear. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8 → W9 → W10 → W11 → W12, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
@@ -1676,6 +1759,68 @@ What the run showed:
   to 640 s), and file descriptors stayed flat (logit 15 to 15, generator 11 to 11).
 - **Readiness after the unpause and the restart was 0.1 s**, and all 128 health samples outside
   fault windows were healthy.
+
+### W7a: Lua in the path (2026-10-11)
+
+Every run is from `soak/w7a` on `logit:soak` `sha256:40807aca7887`, rebuilt with `--no-cache` from
+`a1dfd4c9` (the branch changes no Rust), on the development host (32 cores). Each new scenario's
+last run passed every row, and the earlier runs found four gaps in the harness and none in
+`logit`:
+
+| Run | Scenario | Verdict |
+|---|---|---|
+| `20261011T170708Z` | `lua-stall` | every row PASS, re-scored by the final checks too |
+| `20261011T172431Z` | `lua-memory` | no FAIL; `rss_slope` WARNs on the generator (+147.4 MiB/h over a run under an hour) |
+| `20261011T174241Z` | `lua-path` | every row PASS |
+| `20261011T172531Z` | `statsd-vm` | every row PASS: the regression control |
+
+What the runs showed about `logit`:
+
+- **A stalled script reads `stalled` and recovers on its own.** In `lua-stall` the loop on the
+  360,000th event ran about 31 s. The HEALTHCHECK read `stalled (503 Service Unavailable)` at
+  +194 s and +204 s and `ok` from +214 s; `script_stalled` was counted once. The receive queue
+  filled (`receive.utilization` 1) and evicted 40,100 datagrams, counted as `overflow_oldest`,
+  the kernel dropped none, and the run recovered within `recovery_bound`. Docker's
+  `Health.Status` stayed `healthy` throughout, since it needs three failed checks in a row, so
+  only the status word in `health_log` shows the stall.
+- **`max_memory` ends the process cleanly.** In `lua-memory` the VM held 69,832,147 bytes after
+  one full collection at +267 s: one ERROR line keyed `memory_limit_exceeded`, then `exiting`
+  with code 2 and `main`'s `Error: ` line, exit code 2, `drain complete` with no batch dropped,
+  and a restart on the step's revert at +320 s that was ready on the first probe. The trip
+  matches the calibration run, 32 s after the script starts keeping strings.
+- **The script hop balances under faults.** In `lua-path`'s final life, E 643,100 == L_in ==
+  L_emit 624,463 + L_drop 12,133 + L_err 6,504, and L_sent 624,497 == L_emit + L_flush 34, the
+  34 being one rollup event per 10 s window. The egress gap is 0 once L_flush leaves Ab; with
+  the subtraction left out on a copy of the checks, the recorded `20261011T172503Z` FAILs
+  `ledger.egress` and `ledger.summary` by 34, the flush events.
+
+What the runs showed about the harness:
+
+- **`progress` read an expected exit's stdout gap as a hang.** The first `lua-memory` run,
+  `20261011T171152Z`, FAILed "logit stdout went quiet for 58s from +267s": the drain-gap rule
+  excused `stop`, `kill`, `pause`, and `restart` windows only. It now excuses an `exit` step's
+  too, and the self-test pins it.
+- **The ledger missed a batch counted at the listener.** That run's first life FAILed
+  `ledger.egress` with an uncounted gap of 100. After the script node failed, the listener's
+  next batch went into its closed inbox and was counted as
+  `logit.component.events.dropped{reason="closed_consumer"}` 100 on `statsd`, while
+  `events.sent` counted it too. The residual now subtracts the listener's own counted event
+  drops, X. Re-scored, the run passes every row; the second run saw no such batch (X 0).
+- **A stopped life's script drops after its last drain aren't exported.** The second `lua-path`
+  run, `20261011T172503Z`, FAILed `ledger.egress` for its first life with a gap of 3. The life
+  stopped with 100 events read but not yet through the script; after the last drain the
+  script dropped and failed on about 2.9% of them, which no drain exports. `ledger.egress` now
+  passes such a gap inside a script band, the life's drop-and-error share of the residual,
+  rounded up, plus 2 (here 5); re-scored, the run passes every row.
+- **A drop period that divides the series count empties series.** The first `lua-path` run,
+  `20261011T170612Z`, WARNed that two series' resets weren't SUT lives − 1: dropping every 50th
+  event of a generator cycling 100 names dropped `soak_requests_49_total` and
+  `soak_requests_99_total` almost whole. The script drops every 53rd event instead.
+- Two runs started in the same second collide on the run directory: the second fails at once
+  with `FileExistsError`. Starting runs a second apart avoids it.
+- The stall and the memory trip are timed by the SUT's own event count, so a much slower or
+  faster host moves them out of their steps' windows; the calibration is in each scenario's
+  `logit-sut.yaml`.
 
 ## Verification
 
