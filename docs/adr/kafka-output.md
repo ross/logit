@@ -516,9 +516,9 @@ module doc (`crates/logit-outputs/src/kafka/encode.rs`) has the per-format table
    oversize record is; the rest of the batch still goes.
 3. **`native` finds each record's longest run of events that fits by encoding.** A frame shares
    one dictionary across its events, so its size isn't the sum of theirs. The encoder tries the
-   rest of the batch as one frame first, then doubles and bisects over the run length. A frame
-   only grows as events are added, so this finds the same record boundaries the in-order rule
-   above would, at the cost of extra encodes when a batch doesn't fit one record
+   whole batch as one frame first, then, for each record, doubles and bisects over the run
+   length. A frame only grows as events are added, so this finds the same record boundaries the
+   in-order rule above would, at the cost of extra encodes when a batch doesn't fit one record
    (`docs/known-gaps/kafka.md`).
 4. **A batch record has no key, and its timestamp is its first event's.** A key belongs to one
    event, and a batch record's events can each have a different one. Graph rule 82 rejects any

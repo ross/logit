@@ -50,9 +50,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
     the newline.
 - **A `native` batch record over the cap costs several encodes.** A native frame's dictionary is
   shared by its events, so its size isn't the sum of theirs, and `record: batch` finds each
-  record's longest run of events that fits by encoding candidate frames: the rest of the batch
-  whole first, then doubling and bisecting ([ADR `kafka-output`](../adr/kafka-output.md),
-  "Amendment: what W3 settled", item 3).
-  - **Consequence:** a batch that fits one record costs one encode; one that needs `k` records
-    costs about `k` times the logarithm of the events per record more.
+  record's longest run of events that fits by encoding candidate frames: the whole batch once,
+  then, for each record, doubling and bisecting over the run length
+  ([ADR `kafka-output`](../adr/kafka-output.md), "Amendment: what W3 settled", item 3).
+  - **Consequence:** a batch that fits one record costs one encode. One that needs several
+    records costs, per record, about twice the logarithm of its event count in encodes, each of
+    up to twice the record's size.
   - **Workaround:** keep upstream batches under `max_request_bytes`, or raise the cap.

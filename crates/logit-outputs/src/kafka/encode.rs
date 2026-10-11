@@ -23,8 +23,8 @@
 //! next record. An event whose own value is over the budget is dropped and counted in
 //! [`EncodeStats::oversize`]. A native frame's size isn't the sum of its events' (the dictionary
 //! is shared), so `native` finds each record's longest prefix of the remaining events that fits by
-//! encoding candidates: the rest whole first, then by doubling and bisecting. A batch record has
-//! no key, and its timestamp is its first event's.
+//! encoding candidates: the whole batch once, then for each record by doubling and bisecting. A
+//! batch record has no key, and its timestamp is its first event's.
 //!
 //! Under `record: event`, a key is text, as UTF-8 bytes (`docs/adr/kafka-output.md`, item 3), the
 //! same canonical bytes `sample` hashes for a key (`logit_core::sampling::hash_value`):
@@ -360,27 +360,35 @@ impl KafkaEncoder {
             native_frame(&batch.resource, scope, events).filter(|f| f.len() <= self.budget)
         };
         let mut rest = &batch.events[..];
+        let Some(first) = rest.first() else { return };
+        if let Some(frame) = fits(rest) {
+            out.push_with(&frame, RecordMeta { key: None, timestamp: millis(first.timestamp) });
+            return;
+        }
+        // The first pass starts knowing the whole batch doesn't fit. Later passes find their
+        // bound by doubling, because probing the whole rest again would cost every record an
+        // encode of the remaining batch.
+        let mut known_over = Some(rest.len());
         while let Some(first) = rest.first() {
             let meta = RecordMeta { key: None, timestamp: millis(first.timestamp) };
-            if let Some(frame) = fits(rest) {
-                out.push_with(&frame, meta);
-                break;
-            }
+            // A run length that doesn't fit, or one past the end when none is known.
+            let over_at_start = known_over.take().unwrap_or(rest.len() + 1);
             let Some(mut best) = fits(&rest[..1]) else {
                 stats.oversize += 1;
                 rest = &rest[1..];
                 continue;
             };
             // `fit` events fit and `over` don't: double, then bisect between them.
-            let (mut fit, mut over) = (1, rest.len());
+            let (mut fit, mut over) = (1, over_at_start);
             let mut probe = 2;
-            while probe < over {
-                match fits(&rest[..probe]) {
+            while probe < over && fit < rest.len() {
+                let n = probe.min(rest.len());
+                match fits(&rest[..n]) {
                     Some(frame) => {
-                        (fit, best) = (probe, frame);
+                        (fit, best) = (n, frame);
                         probe *= 2;
                     }
-                    None => over = probe,
+                    None => over = n,
                 }
             }
             while over - fit > 1 {
