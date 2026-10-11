@@ -1227,15 +1227,11 @@ class Ledger:
 
     def egress(self, life, sinks):
         """`(status, verdict, gap)` for one life's egress to `sinks`, whose V is summed (one
-        sink under `copy`, all under `route`): `ok`, `counted`, `counted, unattributed` (WARN),
-        `within band`, `surplus`, or `uncounted`.
+        sink under `copy`, all under `route`): `ok`, `counted`, `within band`, `surplus`, or
+        `uncounted`.
 
-        A positive gap is counted by a drop that can explain it. The life's telemetry
-        `batches.dropped{reason="shutdown"}`, every node's, counts a gap only for a group
-        holding every sink: one sink, or all of them under `route`. A group holding some of the
-        sinks is counted by its own sinks' exported `batches.dropped` in the life, and a gap the
-        process-wide count alone could explain WARNs as unattributed, since it may be another
-        sink's drop.
+        A positive gap is counted when the life's telemetry has a batch dropped for shutdown at
+        a node that can explain it (`shutdown_credit`).
 
         The final life's gap is Ab − V, and with a script Ab − L_flush − V, here and below. A
         stopped earlier life's is W − D − B − X − V, less a script's counted drops, the residual
@@ -1256,22 +1252,28 @@ class Ledger:
             return FAIL, ("surplus" if gap < low else "uncounted"), gap
         if life != self.final:
             gap += self.residual(life)
-        dropped = self.get("shutdown_batches", life)
-        whole = set(sinks) == set(self.sinks)
         if gap == 0:
             return PASS, "ok", gap
-        if gap > 0 and (dropped > 0 if whole else self.sink_dropped(life, sinks) > 0):
+        if gap > 0 and self.shutdown_credit(life, sinks) > 0:
             return PASS, "counted", gap
         if self.script and life != self.final and 0 < gap <= self.script_band(life)[0]:
             return PASS, "within script band", gap
-        if gap > 0 and dropped > 0:
-            return WARN, "counted, unattributed", gap
         return FAIL, "uncounted", gap
 
-    def sink_dropped(self, life, sinks):
-        """The batches `sinks` counted dropped, every reason, in `life`'s exported drains."""
-        return sum(self.sut.counter_by_life("logit.component.batches.dropped",
-                                            component=sink).get(life, 0) for sink in sinks)
+    def other_sinks_shutdown(self, life, sinks):
+        """The batches the sinks outside `sinks` dropped for shutdown in `life`."""
+        return sum(self.sut.counter_by_life("logit.component.batches.dropped", component=sink,
+                                            reason="shutdown").get(life, 0)
+                   for sink in self.sinks if sink not in sinks)
+
+    def shutdown_credit(self, life, sinks):
+        """The batches dropped for shutdown in `life` that can explain a gap at `sinks`: every
+        node's, less those of the sinks outside the group. Under `copy` another sink's drop
+        loses nothing this sink was sent, while a drop upstream of the fan-out (the script,
+        `aggregate`) or at this sink can; under `route`, and with one sink, the group holds
+        every sink and the count is the life's whole."""
+        return (self.get("shutdown_batches", life)
+                - self.other_sinks_shutdown(life, sinks))
 
     def script_band(self, life):
         """`(high, text)`: the gap a stopped earlier life may show because its script dropped or
@@ -1588,9 +1590,10 @@ def check_ledger_egress(data):
     """The egress gap per life and per egress group (`Ledger.egress_groups`: each sink under
     `copy`, the sinks' summed V under `route`), Ab − V for the final life and a killed one, and
     W − D − B − X − V for a stopped earlier one: 0 passes; a positive gap with a batch that
-    life's telemetry counts `batches.dropped{reason="shutdown"}` is counted, never reconciled; a killed life's
-    gap passes inside `Ledger.kill_band`; any other gap is uncounted loss, or a surplus below a
-    killed life's band. A sink whose export has no series can't pass."""
+    life's telemetry counts `batches.dropped{reason="shutdown"}` at a node that can explain it
+    (`Ledger.shutdown_credit`) is counted, never reconciled; a killed life's gap passes inside
+    `Ledger.kill_band`; any other gap is uncounted loss, or a surplus below a killed life's
+    band. A sink whose export has no series can't pass."""
     if data.external:
         return Result("ledger.egress", SKIP, f"{NO_BACKEND}; ledger.sent judges the sinks")
     led = _ledger(data)
@@ -1607,7 +1610,6 @@ def check_ledger_egress(data):
         for life in led.lives:
             verdict_status, verdict, gap = led.egress(life, sinks)
             status = worst([status, verdict_status])
-            dropped = led.get("shutdown_batches", life)
             ab_v = led.absorbed(life) - led.v(life, sinks)
             flush = f" (L_flush {_n(led.get('L_flush', life))})" if led.script else ""
             absorbed = (f"{led.ab_text} {_n(led.absorbed(life))}{flush} − "
@@ -1629,11 +1631,12 @@ def check_ledger_egress(data):
                 if verdict == "within script band":
                     part += f" ({led.script_band(life)[1]})"
             if gap > 0 and not (life in led.killed and life != led.final):
-                own = ""
-                if set(sinks) != set(led.sinks):
-                    own = (f", {' + '.join(sinks)} batches.dropped "
-                           f"{_n(led.sink_dropped(life, sinks))}")
-                part += f" (batches dropped for shutdown {_n(dropped)}{own})"
+                others = ""
+                elsewhere = led.other_sinks_shutdown(life, sinks)
+                if elsewhere:
+                    others = f", not counting {_n(elsewhere)} at the other sinks"
+                part += (f" (batches dropped for shutdown "
+                         f"{_n(led.shutdown_credit(life, sinks))}{others})")
             parts.append(part)
         empty = [sink for sink in sinks if not led.series.get(sink)]
         for sink in empty:
@@ -1676,11 +1679,9 @@ def check_ledger_summary(data):
     """The final life's uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), which must
     be 0, with wire loss beside it by design. There is one Ab − V term per egress group, and
     each must be 0 or counted on its own, so a surplus at one sink can't net out loss at
-    another. A term counted only by the process-wide shutdown count while other sinks exist
-    WARNs as unattributed (`Ledger.egress`). With a script, E − A becomes its four script terms
-    (`check_ledger_script`'s three identities and L_sent − A), the egress term is
-    Ab − L_flush − V, and the script's drops and errors are shown beside it, counted. A counted
-    egress term is shown and not judged; on an external target the Ab − V term SKIPs, and the
+    another. With a script, E − A becomes its four script terms (`check_ledger_script`'s three
+    identities and L_sent − A), the egress term is Ab − L_flush − V, and the script's drops and
+    errors are shown beside it, counted. A counted egress term is shown and not judged; on an external target the Ab − V term SKIPs, and the
     row judges the others."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.summary", led)
@@ -1703,7 +1704,6 @@ def check_ledger_summary(data):
     terms.append(("A − Ab", g("A", life) - g("Ab", life)))
     shown = [f"{name} {_n(value)}" for name, value in terms]
     uncounted_egress = False
-    unattributed = False
     if data.external:
         judged = sum(value for _, value in terms)
         shown.append(f"{led.ab_text} − V SKIP ({NO_BACKEND})")
@@ -1711,8 +1711,7 @@ def check_ledger_summary(data):
         judged = sum(value for _, value in terms)
         for _, sinks in led.egress_groups():
             _, verdict, egress_gap = led.egress(life, sinks)
-            counted = verdict in ("counted", "counted, unattributed")
-            unattributed = unattributed or verdict == "counted, unattributed"
+            counted = verdict == "counted"
             if not counted:
                 judged += egress_gap
                 uncounted_egress = uncounted_egress or egress_gap != 0
@@ -1728,8 +1727,6 @@ def check_ledger_summary(data):
         wire = (f"; wire G − (W + K) {_n(led.G - sum(led.W.values()) - sum(led.K.values()))} "
                 "over the run, by design")
     status = PASS if judged == 0 and not uncounted_egress else FAIL
-    if status == PASS and unattributed:
-        status = WARN
     detail = (f"final life {life}: uncounted {_n(judged)} = " + " + ".join(shown)
               + counted_script + wire)
     return Result("ledger.summary", status, detail, _per_life_lines(led))

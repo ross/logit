@@ -706,20 +706,20 @@ The rows:
   **script band**, the life's (L_drop + L_err) / L_in times that base, rounded up, plus 1 for
   each outcome the life shows (a drop, an error), since a periodic rule can land on one more
   event than its share, passes as "within script band". A life whose script dropped and failed
-  on nothing, or with no such events left, has a band of 0. A gap of 0 passes. A
-  positive gap is lost increments. It is reported with
-  that life's `drain complete` `batches_dropped` beside it, and is **counted** only when that
-  life's telemetry `batches.dropped{reason="shutdown"}` is above 0. The two are never reconciled:
-  the count is of batches, and under
+  on nothing, or with no such events left, has a band of 0. A gap of 0 passes. A positive gap
+  is lost increments. It is reported with the life's telemetry
+  `batches.dropped{reason="shutdown"}` that can explain it beside it, and is **counted** only
+  when that count is above 0. The two are never reconciled: the count is of batches, and under
   `temporality: cumulative` a dropped batch loses only the increments since its series' last
-  delivered total, which no log line states. `batches_dropped` is process-wide, and the runtime
-  counts a sink's shutdown drops under the sink's id only after `internal`'s final drain, so no
-  export names the sink a shutdown drop hit. It counts a gap only for an egress group that holds
-  every sink: the one sink, or all of them under `route`. Under `copy` with several sinks, a
-  sink's gap is counted by that sink's own exported `batches.dropped` in the life, and a gap
-  only the process-wide count could explain reads **counted, unattributed** and WARNs, here and
-  in `ledger.summary`, since another sink may have dropped. A killed life's gap passes inside
-  its band (see "Which life a hop is judged in"). Any other gap is **uncounted loss, FAIL**.
+  delivered total, which no log line states. A shutdown drop can explain a group's gap at any
+  node but a sink outside the group: under `copy` (W7b), each sink is its own group, so a drop
+  at the script, `aggregate`, or the sink itself counts the sink's gap, and another sink's drop
+  doesn't, since that sink's copy is all it lost; under `route`, the group holds every sink and
+  every node's drops count the summed gap; with one sink, every node's count. The detail shows
+  the other sinks' drops it left out. The stderr `drain complete` line's `batches_dropped` is
+  process-wide and never counts a gap; it only cross-checks the telemetry total. A killed
+  life's gap passes inside its band (see "Which life a hop is judged in"). Any other gap is
+  **uncounted loss, FAIL**.
 - `ledger.windows`, only under `[ledger] vm_every_window = true`, else SKIP: in every sink's
   export (W7b), per SUT life and series, consecutive samples are at most 1.5 × the SUT
   config's `aggregate` interval apart,
