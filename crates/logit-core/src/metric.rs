@@ -175,7 +175,8 @@ pub struct Samples {
 
 impl Samples {
     /// Upper bound on [`Samples::weight`]: a `@0.0001` rate would otherwise turn one observation
-    /// into ten thousand, and the rate is attacker-influenced wire input.
+    /// into ten thousand, and the rate comes off the wire as the sender declared it, where a
+    /// misconfigured or buggy client can put any value.
     pub const MAX_WEIGHT: u64 = 1000;
 
     /// Unsampled: `sample_rate` is `1.0`.
@@ -692,7 +693,7 @@ struct HllBytesReader<'a> {
 }
 
 /// Rejects a members-list length that `Representation::try_from` would also reject (array
-/// `3..=128`, HLL `== HLL_SLICE_LEN`) before any `Vec` is allocated, so a hostile length fails
+/// `3..=128`, HLL `== HLL_SLICE_LEN`) before any `Vec` is allocated, so a corrupt length fails
 /// cleanly instead of attempting a huge allocation.
 ///
 /// Returns the `Vec::with_capacity` hint `HllBytesReader` needs: the rounded capacity for array,

@@ -1,6 +1,6 @@
 ---
 created: 2026-10-03
-updated: 2026-10-03
+updated: 2026-10-11
 ---
 
 # Crate layout: don't split crates to speed up the dev build
@@ -32,6 +32,9 @@ Three edges put more in front of them:
 - **`logit-outputs` → `logit-inputs` and `logit-script` (dev-dependencies).**
   - `logit-inputs` is used for about 23 encoder-against-decoder round trips through
     `StatsdDecoder` and `SyslogDecoder`, and about 13 transport tests against a real `LogitInput`.
+    Both decoders have since moved to `logit-proto` (ADR
+    [`parsers-live-in-logit-proto`](parsers-live-in-logit-proto.md)), so this dev-dependency now
+    serves only the `LogitInput` tests. The measurements below predate the move.
   - `logit-script` is used for one Lua test in `influxdb.rs`.
 - **`logit-inputs` → `logit-transforms` (dev-dependency),** for one integration test.
 

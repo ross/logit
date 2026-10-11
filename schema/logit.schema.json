@@ -97,6 +97,73 @@
         }
       ]
     },
+    "BucketRange": {
+      "description": "One class in a `bucket` field's `ranges` list: at most one upper bound, and the class name.",
+      "type": "object",
+      "required": [
+        "value"
+      ],
+      "properties": {
+        "le": {
+          "description": "Matches a number at or below this bound. Can't be set together with `lt`.",
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "lt": {
+          "description": "Matches a number strictly below this bound. Can't be set together with `le`.",
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "value": {
+          "description": "The class written to `into` when this range matches. Must be non-empty. Two ranges may write the same class.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BucketSpec": {
+      "description": "One source field's classification, under `bucket`'s `attributes` map.",
+      "type": "object",
+      "required": [
+        "into",
+        "ranges"
+      ],
+      "properties": {
+        "into": {
+          "description": "The attribute the matched range's `value` is written to. Must be non-empty. Naming the source field itself replaces the number with its class in place. Can't name another field this component classifies, or the `into` of another field.",
+          "type": "string"
+        },
+        "keep_source": {
+          "description": "Keep the source attribute after a class is written. Defaults to `true`. `false` removes it, unless `into` names the source field, where the class has already replaced it.",
+          "default": true,
+          "type": "boolean"
+        },
+        "other": {
+          "description": "What `into` becomes when the source value isn't a finite number, or is a number no range matches. Absent (the default) writes nothing in either case.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ranges": {
+          "description": "The classes, tested in order; the first range that matches wins. Must be non-empty. Every bound must be finite, and every range must be able to match: a bound must be larger than the bound before it, except that `le: X` may follow `lt: X` to class the value `X` alone. A range with no bound matches any number, and is allowed only as the last range.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BucketRange"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "BufferConfig": {
       "description": "Per-sink delivery buffer. Meaningful only on a sink; a non-default block on any other kind is rejected. Every field defaults, so the block is never required.",
       "type": "object",
@@ -138,7 +205,7 @@
           "type": "string"
         },
         "overflow": {
-          "description": "What happens once both bounds are full. Defaults to `block`.",
+          "description": "What happens once both bounds are full. Defaults to `block`. A full `block` sink stalls every other sink fed from the same source, so `logit validate` warns when a source feeds two or more sinks that use `block` and have no `disk:`.",
           "default": "block",
           "allOf": [
             {
@@ -164,7 +231,7 @@
       "type": "object",
       "oneOf": [
         {
-          "description": "statsd / DogStatsD-style tagged metrics, over UDP (the default), TCP, or a Unix socket.\n\n`bind` is a `host:port` under `udp`/`tcp`, and the socket file's absolute path, shorter than 108 bytes, under `unix`/`unix_stream` (the Datadog Agent's is `/var/run/datadog/dsd.socket`). The directory must exist; a stale socket file left by an earlier run is replaced, and anything else at the path is refused. The socket file is made mode `socket_mode`, by default `0722` as the Agent's is, so a client running as any user can send; restrict access with the directory's permissions. To listen on UDP and a socket at once, configure two `statsd_in` components.\n\n`transport: unix` behaves as UDP does: the whole `receive:` block applies. Under `transport: unix_stream`, each 4-byte little-endian length prefix frames one packet of newline-separated lines, `handshake_timeout`/`idle_timeout` apply as under TCP, and `receive:`'s queue fields are rejected. A packet declaring more than 64 KiB closes its connection, counted as `logit.input.frames.dropped{reason=\"oversize\"}`: a length-framed stream has no point to resynchronize at.\n\nUnder `transport: tcp` a message is one LF-delimited line; there is no `framing:` field and no octet-counted alternative, because a statsd line may begin with a digit. A line longer than 64 KiB is dropped and counted (`logit.input.frames.dropped{reason=\"oversize\"}`); the connection stays open and the next line still decodes.\n\n`tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS listener. It applies to `transport: tcp` only and is rejected under any other transport. Plain statsd clients have no TLS of their own, so this is for a `logit`-to-`logit` or stunnel-shaped relay hop.\n\nA TCP or `unix_stream` listener has no receive queue (the connection's own flow control is the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply per connection: N live connections can hold up to N times `batch_max_events` in flight.",
+          "description": "statsd / DogStatsD-style tagged metrics, over UDP (the default), TCP, or a Unix socket.\n\n`bind` is a `host:port` under `udp`/`tcp`, and the socket file's absolute path, shorter than 108 bytes, under `unix`/`unix_stream` (the Datadog Agent's is `/var/run/datadog/dsd.socket`). The directory must exist; a stale socket file left by an earlier run is replaced, and anything else at the path is refused. The socket file is made mode `socket_mode`, by default `0722` as the Agent's is, so a client running as any user can send; restrict access with the directory's permissions. To listen on UDP and a socket at once, configure two `statsd_in` components.\n\n`transport: unix` behaves as UDP does: the whole `receive:` block applies. Under `transport: unix_stream`, each 4-byte little-endian length prefix frames one packet of newline-separated lines, `handshake_timeout`/`idle_timeout` apply as under TCP, and `receive:`'s queue fields are rejected. A packet declaring more than 64 KiB closes its connection, counted as `logit.input.frames.dropped{reason=\"oversize\"}`: a length-framed stream has no point to resynchronize at.\n\nUnder `transport: tcp` a message is one LF-delimited line; there is no `framing:` field and no octet-counted alternative, because a statsd line may begin with a digit. A line longer than 64 KiB is dropped and counted (`logit.input.frames.dropped{reason=\"oversize\"}`); the connection stays open and the next line still decodes. A line that passed 64 KiB before its newline arrived counts `reason=\"drained\"` instead: the connection discards input until its next newline.\n\n`tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS listener. It applies to `transport: tcp` only and is rejected under any other transport. Plain statsd clients have no TLS of their own, so this is for a `logit`-to-`logit` or stunnel-shaped relay hop.\n\nA TCP or `unix_stream` listener has no receive queue (the connection's own flow control is the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply per connection: N live connections can hold up to N times `batch_max_events` in flight.",
           "type": "object",
           "required": [
             "bind",
@@ -287,7 +354,7 @@
               "minimum": 0.0
             },
             "max_line_bytes": {
-              "description": "The longest line this listener accepts, not counting its `\\n`, under every transport. A longer line is dropped and counted once as `logit.input.frames.dropped{reason=\"oversize\"}`, and the line after it still decodes; a stream connection skips to the next newline and stays open. A byte-count string (`\"65536\"`, `\"64KiB\"`). Defaults to `\"64KiB\"`; `0` is rejected.",
+              "description": "The longest line this listener accepts, not counting its `\\n`, under every transport. A longer line is dropped and counted once as `logit.input.frames.dropped{reason=\"oversize\"}`, and the line after it still decodes; a stream connection skips to the next newline and stays open, and counts `reason=\"drained\"` instead when the line passed this bound before its newline arrived, because it discards input until that newline. A byte-count string (`\"65536\"`, `\"64KiB\"`). Defaults to `\"64KiB\"`; `0` is rejected.",
               "default": "65536",
               "type": "string"
             },
@@ -429,7 +496,7 @@
               "type": "string"
             },
             "max_line_bytes": {
-              "description": "The longest plaintext line this listener assembles before dropping it and draining to the next newline (counted once as `logit.input.frames.dropped{reason=\"oversize\"}`; the line after it still decodes). A byte-count string (`\"8192\"`, `\"16KiB\"`). Defaults to `\"8192\"`, past any real tagged path while keeping one hostile connection from growing an unbounded read buffer. `0` is rejected. TCP plaintext only; a UDP datagram is its own frame.",
+              "description": "The longest plaintext line this listener assembles before dropping it and draining to the next newline (counted once as `logit.input.frames.dropped{reason=\"oversize\"}`, or `reason=\"drained\"` when the line passed this bound before its newline arrived; the line after it still decodes). A byte-count string (`\"8192\"`, `\"16KiB\"`). Defaults to `\"8192\"`, past any real tagged path while keeping one runaway connection from growing an unbounded read buffer. `0` is rejected. TCP plaintext only; a UDP datagram is its own frame.",
               "default": "8192",
               "type": "string"
             },
@@ -1831,7 +1898,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Forwards an event whose batch resource and/or own attributes match every configured pair, dropping the rest. The config is `set`'s: `resource:`/`attributes:` maps of the same literals, so this matches on what `set` can stamp. Never mutates a forwarded event.\n\nA map is a conjunction: every pair listed, across both maps, must match; there is no `or`. A configured key the event or resource doesn't carry never matches, and \"key present with any value\" is not expressible. Values coerce across numeric representations (`status: 200` matches an integer, float, or string `200`), but a boolean never coerces, and two strings are never compared numerically. At least one of `resource`/`attributes` must be non-empty, every key must be non-empty, and every numeric value must be finite.",
+          "description": "Forwards an event whose batch resource and/or own attributes match every configured pair and carry every listed key, dropping the rest. `resource:` and `attributes:` are `set`'s maps of literals, so this matches on what `set` can stamp. `resource_present:` and `attributes_present:` list keys that must exist with any value, `null` included. Never mutates a forwarded event.\n\nEverything configured must hold: every pair, across both maps, matches and every listed key is present; there is no `or`. A key the event or resource doesn't carry never matches. Values coerce across numeric representations (`status: 200` matches an integer, float, or string `200`), but a boolean never coerces, and two strings are never compared numerically. At least one of the four fields must be non-empty, every key must be non-empty, every numeric value must be finite, and a key may not repeat within a list or appear both in a map and in the matching `_present` list (the pair already requires the key).",
           "type": "object",
           "required": [
             "type"
@@ -1844,6 +1911,14 @@
                 "$ref": "#/definitions/SetValue"
               }
             },
+            "attributes_present": {
+              "description": "Event attribute keys that must exist, with any value.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "buffer": true,
             "receive": true,
             "resource": {
@@ -1851,6 +1926,14 @@
               "type": "object",
               "additionalProperties": {
                 "$ref": "#/definitions/SetValue"
+              }
+            },
+            "resource_present": {
+              "description": "Batch resource keys that must exist, with any value.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
               }
             },
             "sources": true,
@@ -1865,7 +1948,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Drops an event whose batch resource and/or own attributes match every configured pair, forwarding the rest: the complement of `has_attributes` on the same config, taken as a whole, not per pair. An event matching some but not all configured pairs is forwarded, and so is one that never carried a configured key; read it as \"this event isn't one of the ones told to drop\", the else-branch of a `has_attributes` fan-out. Same matching rules and validation as `has_attributes`.",
+          "description": "Drops an event whose batch resource and/or own attributes match every configured pair and carry every listed key, forwarding the rest: the complement of `has_attributes` on the same config, taken as a whole, not per pair. An event matching some but not all of the configuration is forwarded, and so is one that never carried a configured key; read it as \"this event isn't one of the ones told to drop\", the else-branch of a `has_attributes` fan-out. Same matching rules and validation as `has_attributes`.",
           "type": "object",
           "required": [
             "type"
@@ -1878,6 +1961,14 @@
                 "$ref": "#/definitions/SetValue"
               }
             },
+            "attributes_present": {
+              "description": "Event attribute keys that must exist, with any value.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "buffer": true,
             "receive": true,
             "resource": {
@@ -1885,6 +1976,14 @@
               "type": "object",
               "additionalProperties": {
                 "$ref": "#/definitions/SetValue"
+              }
+            },
+            "resource_present": {
+              "description": "Batch resource keys that must exist, with any value.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
               }
             },
             "sources": true,
@@ -1929,6 +2028,34 @@
               "type": "string",
               "enum": [
                 "keep_values"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Classifies a numeric attribute into a named class by range, so a number becomes a bounded string value that `has_attributes`, `drop_attributes`, and `route` can match: `http.request.duration_s` becomes `fast`, `ok`, or `slow` in `http.request.duration_class`. Integers, floats, and strings that parse as a finite number are classified. Never drops an event. An attribute the event doesn't carry is a silent no-op for that field, never a stamp. `attributes` must be non-empty.",
+          "type": "object",
+          "required": [
+            "attributes",
+            "type"
+          ],
+          "properties": {
+            "attributes": {
+              "description": "Applied per event, to `event.attributes`, keyed by the source field.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/BucketSpec"
+              }
+            },
+            "buffer": true,
+            "receive": true,
+            "sources": true,
+            "targets": true,
+            "type": {
+              "type": "string",
+              "enum": [
+                "bucket"
               ]
             }
           },
@@ -2223,7 +2350,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Normalizes a web server's access line, logged under raw OTel semconv attribute names, into its conformant form: composites (`http.request.line`, `url.original`) decomposed into whichever atomic fields are absent, numerics coerced to integers (`\"000\"` becomes `0`), durations in any unit spelling (`_ms`, `_us`, unsuffixed nanoseconds) converted to `_s`, an unknown method rewritten to `_OTHER` with the raw value kept as `http.request.method_original`, `HTTP/` stripped off the protocol version, semconv's sensitive `url.query` values redacted, every free-text field capped and control-byte-cleaned, plus a small, bounded derived set: `user_agent.class`, `http.route`, `error.type`, `span.name`, `span.status`, and the `span.duration_s` mirror `trace_context` resolves a span from. Place it between `json` and `trace_context`. Every canonical name is also accepted with each `.` spelled `-` (`url-path`, `http-request-header-x-forwarded-for`), for an emitter whose key grammar forbids dots (HAProxy's `%{+json}o`); the dotted spelling wins when both are present.\n\nBest-effort per field, never all-or-nothing and never a dropped event: a value that doesn't parse is left as it arrived and counted, while every other field is still normalized. An absent field produces nothing: no default `url.scheme`, no invented route. Every field is optional, and a bare `type: http_access` is meaningful (the built-in user-agent table and default caps still apply).",
+          "description": "Normalizes a web server's access line, logged under raw OTel semconv attribute names, into its conformant form: composites (`http.request.line`, `url.original`) decomposed into whichever atomic fields are absent, numerics coerced to integers (`\"000\"` becomes `0`), durations in any unit spelling (`_ms`, `_us`, unsuffixed nanoseconds) converted to `_s`, an unknown method rewritten to `_OTHER` with the raw value kept as `http.request.method_original`, `HTTP/` stripped off the protocol version, semconv's sensitive `url.query` values redacted, every free-text field capped and control-byte-cleaned, plus a small, bounded derived set: `user_agent.class`, `http.route`, `error.type`, `span.name`, `span.status`, the `span.duration_s` mirror `trace_context` resolves a span from, and, with `status_class: true`, `http.response.status_class`. Place it between `json` and `trace_context`. Every canonical name is also accepted with each `.` spelled `-` (`url-path`, `http-request-header-x-forwarded-for`), for an emitter whose key grammar forbids dots (HAProxy's `%{+json}o`); the dotted spelling wins when both are present.\n\nBest-effort per field, never all-or-nothing and never a dropped event: a value that doesn't parse is left as it arrived and counted, while every other field is still normalized. An absent field produces nothing: no default `url.scheme`, no invented route. Every field is optional, and a bare `type: http_access` is meaningful (the built-in user-agent table and default caps still apply).",
           "type": "object",
           "required": [
             "type"
@@ -2278,6 +2405,11 @@
               }
             },
             "sources": true,
+            "status_class": {
+              "description": "Whether to derive `http.response.status_class` from `http.response.status_code`: `1xx`, `2xx`, `3xx`, `4xx`, or `5xx` for a status from 100 to 599, and `unknown` for any other number, including the `0` that nginx's `000` becomes. Off by default, because it adds one attribute to every event, and that widens a downstream `aggregate`'s series key or a sink's tag set. Turn it on when you tag metrics by status class. A status that is absent produces no class, and a class the producer already sent is kept.",
+              "default": false,
+              "type": "boolean"
+            },
             "targets": true,
             "type": {
               "type": "string",

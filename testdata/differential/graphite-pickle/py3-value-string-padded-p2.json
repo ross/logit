@@ -1,0 +1,60 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "value.padded",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3ff8000000000000",
+     "repr": "1.5"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-value-string-padded-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "value.padded",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       " 1.5 "
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "The value as the string ' 1.5 '.",
+ "divergence": "carbon's float() reads this value; the reader reads only numbers and numeric strings Rust's f64 parse takes (docs/known-gaps/mappings.md: decode (Graphite), a value carbon's float() coerces)",
+ "exercises": [
+  "BINUNICODE"
+ ],
+ "logit": {
+  "datapoints": [],
+  "skipped": 1,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

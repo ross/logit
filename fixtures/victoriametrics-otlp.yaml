@@ -45,11 +45,16 @@ components:
     sources: [otel]
     signals: [traces]
 
+  # The three sinks share `otel`, so each spools to disk: one product that's down fills its own
+  # spool instead of stopping `otel` for the other two.
   victoria_metrics:
     type: otlp_out
     sources: [only_metrics]
     # The OTLP base path; `otlp_out` appends `/v1/metrics`.
     endpoint: http://127.0.0.1:8428/opentelemetry
+    buffer:
+      disk:
+        path: /tmp/logit-spool/victoriametrics-otlp/victoria_metrics
 
   victoria_logs:
     type: otlp_out
@@ -57,8 +62,14 @@ components:
     endpoint: http://127.0.0.1:9428/insert/opentelemetry
     headers:
       VL-Stream-Fields: service.name
+    buffer:
+      disk:
+        path: /tmp/logit-spool/victoriametrics-otlp/victoria_logs
 
   victoria_traces:
     type: otlp_out
     sources: [only_traces]
     endpoint: http://127.0.0.1:10428/insert/opentelemetry
+    buffer:
+      disk:
+        path: /tmp/logit-spool/victoriametrics-otlp/victoria_traces

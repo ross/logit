@@ -1,0 +1,8 @@
+# TYPE q summary
+q{quantile="0.5"} 1
+q{quantile="5"} 2
+q{quantile="-Inf"} 3
+q{quantile="NaN"} 4
+q_sum 1
+q_count 3
+# EOF

@@ -1,0 +1,3 @@
+#	TYPE	m	gauge
+# HELP	m	A gauge.
+m	1

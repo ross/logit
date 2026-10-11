@@ -86,7 +86,7 @@
 //!    `#urgent,urgent` -> `#urgent` (the Datadog agent's rule, so a `Value::Array` is never one
 //!    element long). A repeated key with distinct values is not a normalization: `insert_tags`
 //!    folds it into a `Value::Array` in wire order and `statsd_out` expands it back
-//!    (`crates/logit-inputs/src/statsd.rs`'s "DogStatsD tags"). Fixtures:
+//!    (`crates/logit-proto/src/statsd/mod.rs`'s "DogStatsD tags"). Fixtures:
 //!    `repeated-tag-exact-duplicate-deduped`, `bare-tag-exact-duplicate-deduped`.
 //! 9. **DogStatsD event and service check fields re-emit in canonical order.** `_e` order is
 //!    `d:`/`h:`/`p:`/`t:`/`k:`/`s:`/`#tags`/`c:`; `_sc` order is `d:`/`h:`/`#tags`/`c:`/`m:` (`m:`
@@ -114,11 +114,12 @@
 
 use bytes::Bytes;
 use logit_core::{Event, EventBatch, Value};
-use logit_inputs::statsd::{StatsdDecoder, StatsdInput};
+use logit_inputs::statsd::StatsdInput;
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::statsd::{Format, StatsdEncoder, StatsdOutput};
 use logit_pipeline::test_util::{recv_batch, RECV_TIMEOUT};
 use logit_pipeline::{Delivered, Fanout, Input, Output};
+use logit_proto::statsd::StatsdDecoder;
 use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf};
 use logit_transforms::{Aggregator, Distributions, Sets};
 use std::net::SocketAddr;

@@ -7,6 +7,11 @@ source "${SCRIPT_PATH}/common.sh"
 
 run cargo clippy --workspace --all-targets -- -D warnings
 
+# `fuzz/` is its own workspace, so the clippy run above never builds it. A type check on the
+# stable toolchain finds a decoder signature change that breaks a target or `seedgen`; only
+# `cargo fuzz` needs nightly.
+run cargo check --manifest-path fuzz/Cargo.toml --workspace --all-targets
+
 # logit-pipeline's `fault-injection` feature (crates/logit-pipeline/src/fault.rs) is enabled only as
 # a dev-dependency. Resolver 2 keeps it out of the release binary until a normal dependency enables
 # it, which this catches. Captured first so a failing `cargo tree` aborts under `set -e` instead of
