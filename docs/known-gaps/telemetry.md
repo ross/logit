@@ -96,7 +96,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
   A dedicated pipeline closes this part of the gap: `internal` and its pipeline shut down after
   every other node and drain once more, so those counts are exported, except a shutdown drop
-  counted by a node in `internal`'s own pipeline (the same ADR's "Amendment:
+  that a node in `internal`'s own pipeline counts while it shuts down (the same ADR's "Amendment:
   internal drains last", decisions 10 to 16). Giving `internal` its own sinks, on the same backend
   when needed, is the recommended setup
   ([docs/deploying.md](../deploying.md)'s "Give `internal` a dedicated pipeline"), and

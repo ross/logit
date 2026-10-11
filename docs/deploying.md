@@ -570,9 +570,9 @@ pipeline](#give-internal-a-dedicated-pipeline) exports every data node's shutdow
 
 - The final drain's own `logit.internal.*` counts and the routine counts its pipeline's nodes
   record while handling that batch, all at `debug`.
-- A `batches.dropped` or `events.dropped{reason="shutdown"}` count from a sink or Lua node that
-  carries `internal`'s output, at `warn` under that node's component id. That node shuts down after
-  `internal`'s final drain, so no topology can export its count. `drain complete` includes it in
+- A `batches.dropped` or `events.dropped{reason="shutdown"}` count that a sink or Lua node
+  carrying `internal`'s output records while it shuts down, at `warn` under that node's component
+  id. That node shuts down after `internal`'s final drain, so no topology can export the count. `drain complete` includes it in
   `batches_dropped`.
 
 A mixed pipeline, where `internal` shares a sink or transform with data, also leaves data drop
@@ -613,12 +613,14 @@ naming `internal` and a node it shares.
 
 A dedicated pipeline has two limits:
 
-- It can't export a shutdown drop counted by its own sinks or Lua nodes, because they shut down
-  after the final drain. Those drops appear only in the self-log, as described under
+- It can't export a shutdown drop that its own sinks or Lua nodes count while they shut down,
+  because they shut down after the final drain. Those drops appear only in the self-log, as described under
   `telemetry left undrained at exit` in [Self-logging](#self-logging).
 - A second SIGTERM/SIGINT (exit `130`), SIGKILL, or an out-of-memory kill gets no final drain and
-  no exit summary, so up to one `internal` `interval` of counts is lost. A shorter `interval`
-  narrows the loss.
+  no exit summary. It loses the counts recorded since `internal`'s last drain, up to one
+  `interval`, and every telemetry batch still in `internal`'s pipeline: an `aggregate` window and a
+  sink's in-memory queue, which grows while its destination is down. A sink with `buffer.disk:`
+  keeps its queue for the next start.
 
 A dedicated pipeline makes exit take longer. After the data drain ends, `internal` gets its own
 5 s grace for its final send, and each of its sinks gets its `buffer.shutdown_grace` to deliver

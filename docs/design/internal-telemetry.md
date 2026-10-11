@@ -347,8 +347,8 @@ decisions 10 to 16):
 
 So the final drain carries the counts recorded during the data drain: a data sink's or Lua node's
 `batches.dropped{reason="shutdown"}`, a UDP listener's `datagrams.dropped{reason="shutdown"}`, and an HTTP
-listener's `connections.closed{reason="shutdown"}`. A shutdown drop counted by a node in
-`internal`'s own pipeline comes after the final drain, so it is never exported.
+listener's `connections.closed{reason="shutdown"}`. A shutdown drop that a node in `internal`'s
+own pipeline counts while it shuts down comes after the final drain, so it is never exported.
 `internal`'s grace and each pipeline sink's grace and Lua wedge rule count from the second signal,
 so a long data drain can't use them up. With a mixed pipeline (a sink or transform that also
 carries data) there's one stage, and those counts stay undrained; `graph::resolve` adds a warning
