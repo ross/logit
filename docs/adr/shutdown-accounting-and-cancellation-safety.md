@@ -581,52 +581,57 @@ target's own consumers.
 - A **shared** node is reachable from `internal` and from another input, such as one `otlp_out`
   carrying both data and `internal`'s output.
 - A **telemetry-only** node is reachable from `internal` and from no other input.
-- The **late set** (L) is the largest set of telemetry-only nodes that reach no shared node and
-  take every input from `internal` or another L node. It is closed in both directions: an L node
-  feeds only L nodes, and only `internal` and L nodes feed it. A dedicated telemetry leg, such as
-  `internal` -> `aggregate` -> its own `otlp_out`, is in L. A telemetry-only node that reaches a
+- The **late set** (L) is the largest set of telemetry-only nodes that take every input only from
+  `internal` or another L node, and feed, as consumers or targets, only L nodes. So no L node
+  reaches a shared node, and the set is closed in both directions. A dedicated telemetry leg, such
+  as `internal` -> `aggregate` -> its own `otlp_out`, is in L. A telemetry-only node that reaches a
   shared node is outside L, and so is everything it feeds.
 
 10. **Every node outside L shuts down as it does today.** Stage one is the shutdown signal.
-    `internal` drains once and sends to every consumer, then closes its edges into each direct
-    consumer outside L. Every node outside L sees its inputs close when they would today and
-    counts its grace or wedge rule from stage one. A node that also carries data never waits on
-    `internal`, so the change can't hold data behind a telemetry drain. With no L consumers,
-    `internal` returns at stage one, which is today's behavior.
+    `internal` sends to its consumers outside L and its consumers in L through separate edges, so a
+    full L inbox never delays a send outside L. At stage one, `internal` drains once, sends that
+    batch to its consumers outside L under a grace counted from stage one, and closes those edges. A
+    send to L still in flight doesn't hold this up, and the L consumers get the batch after it.
+    Every node outside L sees its inputs close when they would today and counts its grace or wedge
+    rule from stage one, so the change can't hold data behind a telemetry drain. With no L
+    consumers, `internal` returns at stage one, which is today's behavior.
 11. **L shuts down at stage two.** The runtime sends a second signal once stage one has fired and
     every task outside L, other than `internal`, has exited, finished or failed. Until then
     `internal` keeps draining on its interval into its L edges, so a long data drain is still
-    exported tick by tick. On the second signal it drains once more and returns, and L cascades
-    as today.
+    exported tick by tick. On the second signal it drains once more and returns, and L cascades as
+    today.
 12. **Stage-two graces count from stage two.** `internal`'s 5 s grace (`ReceiveConfig::default()`),
     each L sink's `write_loop` grace, and each L Lua node's wedge rule start at the second signal,
     so a long data drain can't consume them. An L sink idling on an empty queue would otherwise
     reach its grace before `internal`'s final batch arrives, because `write_loop`'s grace runs
     whether or not the queue is open.
-13. **Every wait stays bounded.** Transforms and routers take no signal, and a Lua thread parked
-    on a full inbox isn't busy, so each is bounded by the nodes below it, and in the end by a
-    sink's grace. Stage one is bounded as it is today, because no node outside L feeds, and so
-    waits on, a node in L. If one did, it would deadlock: stage two would wait for it while it
-    waited on an L sink's stage-two grace. Stage two is bounded because an L node's inputs close
-    within `internal`'s stage-two grace, and every node below it is in L, with sinks that count
-    their grace from stage two. Holding a shared node until stage two would lose data: a data
-    `aggregate` fed by `internal` would hold its data past its shared sink's stage-one grace and
-    lose its close-time flush as `closed_consumer`.
-14. **The first-error path is unchanged.** A node failure sends the shutdown signal, stage one
-    runs, and stage two follows. A run with no shutdown signal (`run` passes `pending()`) is also
+13. **Every wait stays bounded.** Transforms and routers take no signal, and a Lua thread parked on
+    a full inbox isn't busy, so each is bounded by the nodes below it, and in the end by a sink's
+    grace. Stage one is bounded as it is today. No node outside L feeds, and so waits on, a node in
+    L, and `internal`'s work toward its consumers outside L has its own stage-one grace that no L
+    edge can delay. Without either, stage one could deadlock: stage two would wait for a node
+    outside L that waited, directly or through `internal`, on an L sink's stage-two grace. No L node
+    feeds a node outside L either, which would hold that node's input open until stage two. Stage
+    two is bounded because an L node's inputs close within `internal`'s stage-two grace, and every
+    node below it is in L, with sinks that count their grace from stage two. Holding a shared node
+    until stage two would lose data: a data `aggregate` fed by `internal` would hold its data past
+    its shared sink's stage-one grace and lose its close-time flush as `closed_consumer`.
+14. **The first-error path is unchanged.** A node failure sends the shutdown signal, stage one runs,
+    and stage two follows. A run with no shutdown signal (`run` passes `pending()`) is also
     unchanged, because stage two needs the signal.
-15. **Telemetry outside L keeps today's residual.** Counts recorded after stage one in a node
-    outside L, and the telemetry that `internal`'s stage-one drain sent through a shared node,
-    get no later export. So `internal` should have its own sinks, pointed at the same backend when
-    needed, such as a second `otlp_out` to the same endpoint. The operator docs recommend this and
-    say why. Nothing enforces it and there is no validation warning, because a shared sink is
-    valid and cheap, and it loses only shutdown-time telemetry.
-16. **The CLI logs what is left.** After every node has exited, it drains the registry once more
-    and writes each leftover metric point to the self-log as one structured line,
-    `telemetry left undrained at exit`, with the fields `component`, `metric`, `tags`, and
-    `value`. The level is `warn` for a nonzero `*.dropped` metric and `info` otherwise. It does
-    this on exit 0 and exit 2 alike. That covers decision 15's residual and the final drain's own
-    counts. Spans and captured logs aren't repeated, because the logs already went to stderr.
+15. **Telemetry outside L keeps today's residual.** Counts recorded after `internal`'s last drain
+    get no export: after its stage-one drain when it has no L consumers, after its stage-two drain
+    otherwise. Telemetry that went through a node outside L also gets nothing after stage one,
+    because those edges close then. So `internal` should have its own sinks, pointed at the same
+    backend when needed, such as a second `otlp_out` to the same endpoint. The operator docs
+    recommend this and say why. Nothing enforces it and there is no validation warning, because a
+    shared sink is valid and cheap, and it loses only shutdown-time telemetry.
+16. **The CLI logs what is left.** After every node has exited, it drains the registry once more and
+    writes each leftover metric point to the self-log as one structured line,
+    `telemetry left undrained at exit`, with the fields `component`, `metric`, `tags`, and `value`.
+    The level is `warn` for a nonzero `*.dropped` metric and `info` otherwise. It does this on exit
+    0 and exit 2 alike. That covers decision 15's residual and the final drain's own counts. Spans
+    and captured logs aren't repeated, because the logs already went to stderr.
 
 Not covered: SIGKILL and out-of-memory kills give no drain at all. Only a shorter `interval`
 narrows that loss.
