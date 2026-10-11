@@ -156,7 +156,9 @@ Entries that share a mechanism and should be verified together, in suggested ord
 9. **Untrusted-input parsers (done, #598–#603, #605, #606, #609, #612, #616, #619–#621, #TBD)** — NET-08,
    CODEC-01..03/05/07/08/10/12/13, XFORM-06/07/08. One fuzz target each; differential tests
    against reference implementations to inform committed fixtures: CPython `pickle` and
-   Prometheus `textparse`, committed under `testdata/differential/`.
+   Prometheus `textparse`, committed under `testdata/differential/`. At the stack tip every
+   cluster 9 target ran clean for 1,800 seconds, and every earlier target for 600 (ADR
+   `out-of-ci-fuzzing`'s "Campaign at the untrusted-input stack tip").
 10. Everything else P1, then P2.
 
 ## How to use this list

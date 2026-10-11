@@ -294,6 +294,67 @@ After the campaign, both `native_batch_*` targets' `malloc_limit_mb` rose from 1
 a valid batch of more than 16,384 empty events regrows `decode_batch_body`'s events `Vec` past
 16 MiB (about 56 MiB at `max_len`), and none of the campaign's inputs reached that count.
 
+### Campaign at the untrusted-input stack tip (2026-10-11)
+
+Every target ran clean at the tip of the untrusted-input parser stack (`dc38374d`, the head of
+`untrusted/w13`, #621): the 11 cluster 9 targets for 1,800 seconds each and the 14 earlier ones
+for 600. `script/unsafe-check fuzz-seed` ran first and rewrote no committed seed, so every
+`regress-*` and `diff-*` seed is in the starting corpus. Image `logit-unsafe-check:local` with
+`nightly-2026-09-01` (`rustc 1.100.0-nightly (0dfb098f3 2026-08-31)`) and `cargo-fuzz` 0.13.2.
+
+All 25 targets were built once with `cargo fuzz build` into a fuzz target volume of their own,
+then run four at a time, longest first, each with `FUZZ_SECONDS=<n> script/unsafe-check fuzz
+<target>` and the extra arguments its `FUZZ_TARGETS` row gives, under `systemd-inhibit
+--what=sleep:idle`, on a 32-core host. During the first four targets (`stream_framing`, `statsd`,
+`syslog`, and `graphite_plaintext`) the host also ran the workspace tests and both differential
+checks. The columns mean what they do in the first table: fork-mode rows compute exec/s from
+executions and seconds and give no corpus size, and a fork-mode run's seconds include libFuzzer
+wrapping up after `-max_total_time`.
+
+| Target | Seconds | Executions | exec/s | Corpus (inputs/size) | Result |
+|---|---|---|---|---|---|
+| `native_frame` | 601 | 7,100,111 | 11,814 | 396 / 1,345 KB | clean |
+| `native_batch` | 633 | 47,849,101 | 75,591 | 852 / n/a | clean (fork mode) |
+| `native_hop_batch` | 633 | 52,643,559 | 83,165 | 863 / n/a | clean (fork mode) |
+| `native_control` | 601 | 162,414,570 | 270,241 | 245 / 7 KB | clean |
+| `sketch_bytes` | 601 | 45,633,443 | 75,929 | 552 / 944 KB | clean |
+| `sketch_merge` | 601 | 27,308,137 | 45,438 | 605 / 1,929 KB | clean |
+| `hll_bytes` | 601 | 155,884,819 | 259,376 | 118 / 23 KB | clean |
+| `otlp_proto` | 601 | 27,745,848 | 46,166 | 2,708 / 1,423 KB | clean |
+| `otlp_json` | 601 | 12,590,211 | 20,949 | 2,713 / 4,171 KB | clean |
+| `otlp_grpc` | 601 | 37,675,556 | 62,688 | 2,839 / 617 KB | clean |
+| `prom_decompress` | 601 | 10,722,781 | 17,842 | 1,035 / 494 KB | clean |
+| `prom_remote_write` | 603 | 5,726,035 | 9,496 | 2,351 / n/a | clean (fork mode) |
+| `prom_text` | 1,845 | 2,928,234 | 1,587 | 2,724 / n/a | clean (fork mode) |
+| `proxy_header` | 601 | 507,045,221 | 843,669 | 162 / 5 KB | clean |
+| `forwarded` | 601 | 313,586,245 | 521,774 | 580 / 17 KB | clean |
+| `stream_framing` | 1,801 | 11,047,865 | 6,134 | 404 / 1,062 KB | clean |
+| `statsd` | 1,838 | 33,723,292 | 18,348 | 1,310 / n/a | clean (fork mode) |
+| `syslog` | 1,838 | 25,667,262 | 13,965 | 1,742 / n/a | clean (fork mode) |
+| `graphite_plaintext` | 1,839 | 13,370,775 | 7,271 | 984 / n/a | clean (fork mode) |
+| `graphite_pickle` | 1,838 | 1,604,989 | 873 | 1,066 / n/a | clean (fork mode) |
+| `collectd` | 1,838 | 16,888,680 | 9,189 | 704 / n/a | clean (fork mode) |
+| `message_json` | 1,843 | 77,079,815 | 41,823 | 3,285 / n/a | clean (fork mode) |
+| `message_csv` | 1,801 | 33,224,847 | 18,448 | 204 / 32 KB | clean |
+| `message_logfmt` | 1,838 | 31,992,832 | 17,406 | 470 / n/a | clean (fork mode) |
+| `message_kv` | 1,837 | 53,008,188 | 28,856 | 576 / n/a | clean (fork mode) |
+
+No target wrote an artifact: no crash, no out-of-memory against its `malloc_limit_mb`, no
+timeout, and no slow unit. Three things the campaign turned up about the harness, none about the
+decoders:
+
+- **Several targets can share one fuzz target volume once it's built.** Each `fuzz` call runs
+  `cargo fuzz run`, which rebuilds only when a source changed, so building every target first and
+  then starting four runs in parallel never had two runs compile at once. Give a concurrent
+  campaign its own volume (`UNSAFE_CHECK_FUZZ_TARGET_VOLUME`) so another checkout's build can't
+  replace the binaries mid-run.
+- **A fork-mode run outlasts `-max_total_time` by up to 45 seconds**, the time its last
+  child takes to finish and its corpus to merge, so a schedule should budget for it.
+- **`graphite_pickle` and `prom_text` are the slow targets**, at about 900 and 1,600 exec/s:
+  each input runs a second-generation fixed point (the pickle target in both protocols, the text
+  target parsing and writing three times), so their 1,800 seconds reach fewer executions than a
+  600-second run of most other targets.
+
 ## Amendment (2026-10-09): untrusted-input parsers
 
 The inventory's cluster 9, "Untrusted-input parsers", gives every hand-rolled parser of producer
