@@ -63,6 +63,10 @@ components:
   # (the parsed fields and the ones the script added) as RFC 5424 structured data, so a receiver
   # can filter on http.route without parsing the message. 32473 is RFC 5424's example enterprise
   # number; use your organization's.
+  #
+  # Both sinks share syslog_in with stats_out, so each spools to disk: a receiver that's down
+  # fills its own spool instead of stopping syslog_in for the others. Put /var/lib/logit on a
+  # persistent volume so a restart keeps the backlog.
   alerts_out:
     type: syslog_out
     sources: [errors]
@@ -71,6 +75,9 @@ components:
     app_name: shop-api
     structured_data:
       sd_id: shop@32473
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/alerts_out
 
   archive_out:
     type: syslog_out
@@ -78,6 +85,9 @@ components:
     endpoint: 127.0.0.1:5515
     structured_data:
       sd_id: shop@32473
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/archive_out
 
   # --- Stats ---------------------------------------------------------------------------------
 
@@ -88,6 +98,10 @@ components:
     sources: [stats]
     interval: 10s
 
+  # A display, so it drops its oldest batches rather than stall the alerts and the archive
+  # when nothing reads stdout.
   stats_out:
     type: stdio_out
     sources: [window]
+    buffer:
+      overflow: drop_oldest
