@@ -42,7 +42,7 @@ merging.
 | W1 | The producer core in `crates/logit-outputs/src/kafka/`, not a new crate ([ADR `crate-layout-and-build-speed`](../adr/crate-layout-and-build-speed.md)): a tokio connection with rustls from `logit_pipeline::tls`; `ApiVersions`, `Metadata`, `InitProducerId`, and `Produce` v3 to v12; record batch v2 through `kafka-protocol`, with all five codecs through its compression hook (gzip through `flate2`, raw snappy through `snap`, lz4 through `lz4_flex`, zstd through `ruzstd`) and none of its codec features; murmur2 and sticky partitioners; idempotent sequence state; an in-process fake broker on the crate's `broker` feature, decompressing through the same codecs plus a xerial snappy reader | murmur2 matches every vector in `murmur2.json`; each compressed batch decodes to the same records as `batches/*-none.segment`, and a batch `kafka_out` encodes decodes through the crate's decoder; a retry against the fake broker carries the same PID, epoch, and base sequences, and a partition batch that settles without being appended bumps the epoch, after which that partition's next batch starts at sequence 0; `cargo-deny` and `cargo-audit` pass with the new crates |
 | W2 | `kafka_out` with `format: json`: `ComponentKind::KafkaOut` (`brokers`, `topic`, `key`, `format`, `compression`, `acks`, `idempotent`, `max_request_bytes`, `timeout`, `headers`, `tls`) and `script/schema`; graph rule 84 (idempotence without `acks: all`, a zero bound, empty `brokers` or one that isn't a `host:port`, an illegal topic name, a bad `tls`), mirrored in `docs/design/pipeline-graph.md`; registration in `crates/logit-cli/src/pipeline.rs`; the module-doc response-class table; `fixtures/kafka-out.yaml` and a KRaft `kafka` service in `compose.yaml`; the AGENTS.md outputs table, `README.md`, `docs/OVERVIEW.md`, `docs/known-gaps/kafka.md`, and `docs/deploying.md` | Each row of the response-class table has a fake-broker test, and each regression test fails with its fix reverted; `logit run fixtures/kafka-out.yaml` against the dev-stack broker writes JSON objects, keys, headers, and partitions that `kafka-console-consumer.sh` and kcat read back as expected |
 | W3 | **Done.** `format: text`, `msgpack`, and `native`, and `record: event \| batch`; rule 84's clause rejecting a `key` with a batch record (no setting is ignored by a format, so rule 84 has no clause for one; [ADR `kafka-output`](../adr/kafka-output.md), "Amendment: what W3 settled"); the msgpack value forms in `crate::msgpack`'s module doc; one walker in `ndjson.rs` writing both JSON and MessagePack | Each format's records decode back to the events that went in, in both record modes (the `kafka_in` round-trip property, checked in-process and against `apache/kafka:4.2.0` through kcat); allocation pins for the new encode paths in `crates/logit-bench/tests/allocations.rs` and `docs/design/memory.md` |
-| W4 | `script/kafka-interop`, out of CI, modeled on `script/victoria-interop`, and one soak scenario in `tools/soak/scenarios/` | Every leg of the interop plan below reports `PASS` or a `GAP` with a known-gaps entry; the soak scenario shows no uncounted loss |
+| W4 | **Done.** `script/kafka-interop`, out of CI, modeled on `script/victoria-interop`, and one soak scenario in `tools/soak/scenarios/` | Every leg of the interop plan below reports `PASS` or a `GAP` with a known-gaps entry; the soak scenario shows no uncounted loss |
 
 Landing order: W0 → W1 → W2 → W3 → W4, linear. Each PR is based on and targets its parent's
 branch and is brought up to date with `git merge origin/main`, never a rebase.
@@ -65,6 +65,41 @@ leg:
 - **Redpanda.** The legs above against Redpanda, with each difference recorded.
 
 The soak scenario restarts the broker mid-run and checks the ledger for uncounted loss.
+
+## Findings (W4)
+
+`script/kafka-interop` against `apache/kafka:4.2.0` and `redpandadata/redpanda:v26.2.3`, run
+2026-10-11 (`perf/results/kafka-interop/20261011T211419Z/`): 21 of 22 rows `PASS`, one `GAP`, no
+`FAIL`, and no `kafka_out` bug.
+
+| Leg | Apache Kafka 4.2.0 | Redpanda v26.2.3 |
+|---|---|---|
+| Partition parity | `PASS`: all 50 keys on the console producer's partition, 6 of 6 partitions used | `PASS`, the same |
+| Codecs `none`, `gzip`, `snappy`, `lz4`, `zstd` | `PASS` each: 100 records, each event once, in both the Java consumer and kcat | `PASS` each, the same |
+| Idempotent dedup | `PASS`: 800 records for 800 events after one `Ambiguous` attempt; the non-idempotent control stored 10 duplicates | `PASS`, the same |
+| TLS, mutual TLS | `PASS`: 50 records each; with no client certificate, 0 records and only `clean` attempts | `PASS`, the same |
+| Timestamps | `PASS`: 90 of 100 records landed, the 10 stamped at 2100-01-01 dropped and counted as `invalid_timestamp` | `GAP`: 0 landed; Redpanda answers `INVALID_TIMESTAMP` naming no record, so each batch of 10 was rejected whole, counted as `rejected` |
+
+What the run showed:
+
+- **The dedup leg isn't vacuous.** For 8 s the broker's packets to the leg were dropped while its
+  requests still arrived, so the broker appended a batch whose response never came. Both sinks
+  timed out once (`Ambiguous`) and resent after the drop cleared. The idempotent sink's resend
+  carried its first attempt's sequence, and the broker discarded it; the control sink's resend
+  was appended again, which is the duplicate the idempotent producer prevents.
+- **Redpanda agrees with Kafka on every leg but one.** It places keyed records where the Java
+  partitioner does, takes all five codecs, deduplicates an idempotent resend, and enforces
+  mutual TLS. Like Kafka 4.x, it refuses a record more than an hour ahead
+  (`message.timestamp.after.max.ms`, 3,600,000 by default), but it fills no `record_errors`, so
+  `kafka_out` can't drop the one record and rejects the partition batch under item 5 of
+  [ADR `kafka-output`](../adr/kafka-output.md). [docs/known-gaps/kafka.md](../known-gaps/kafka.md)
+  records it.
+- **The soak scenario lost nothing.** `script/soak run kafka-broker-restart` (8 minutes 30
+  seconds, `perf/results/soak/20261011T205504Z/`) restarted, paused for 40 s, and stopped for
+  60 s the broker under a 2,000 lines/s statsd stream: every row `PASS`, 1,032,400 increments
+  absorbed and 1,032,400 in the topic, and 25,900 records in the topic for 25,900 accepted. The
+  pause produced one `Ambiguous` attempt, and its resend stored no duplicate. See
+  [docs/plans/soak-harness.md](soak-harness.md)'s "Findings".
 
 ## Verified so far
 
