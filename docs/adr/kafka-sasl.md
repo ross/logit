@@ -212,11 +212,15 @@ W2 built OAUTHBEARER and settled these points the decision above left open:
    a fixed `token` must be an RFC 6750 `b64token`; and each extension key is letters only and
    not `auth`, and each value is non-empty printable ASCII, space, tab, CR, or LF (KIP-342's
    patterns). `Debug` leaves out the token, the client secret, and the extension values.
-2. **The token request follows RFC 6749, not the Java client's default.** It's a form `POST` of
+2. **The token request follows the Java client's default.** It's a form `POST` of
    `grant_type=client_credentials` and the optional `scope`, with the client id and secret in
-   HTTP Basic authentication, each form-urlencoded first as RFC 6749 §2.3.1 requires. The Java
-   client sends them unencoded unless `sasl.oauthbearer.header.urlencode` is `true`; the two
-   agree on any id and secret of letters, digits, and `*-._`.
+   HTTP Basic authentication as they are. RFC 6749 §2.3.1 asks for each to be form-urlencoded
+   first, but Kafka 4.2.0's client does that only when `sasl.oauthbearer.header.urlencode` is
+   `true`, and its default is `false` (KIP-1025), so a provider that works with a Java client at
+   its defaults works with `kafka_out`. The two forms differ only for an id or secret with a
+   character outside letters, digits, and `*-._`. The `scope` is form-urlencoded in the body,
+   which the Java client sends unencoded at its default; the two agree on any scope without a
+   space or a reserved character.
 3. **Reuse and refresh.** A fetched token is reused by every connection until 80% of its
    `expires_in` has passed, measured from before the request. Without `expires_in`, a JWT is
    reused until 80% of the time to its `exp` claim, and any other token isn't reused. Dials that

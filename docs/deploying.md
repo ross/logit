@@ -3187,9 +3187,9 @@ twice `timeout`.
 ```
 
 - **The token request.** The sink sends `client_id` and `client_secret` in HTTP Basic
-  authentication, each form-urlencoded first as RFC 6749 requires. That's the Java client's
-  `sasl.oauthbearer.header.urlencode: true`, not its default, so a secret with characters such as
-  `+` or `%` reaches the provider as it would from a Java client with that setting on.
+  authentication as they are, not form-urlencoded, as the Java client does at its default
+  (`sasl.oauthbearer.header.urlencode: false`). A provider that needs RFC 6749's encoding and a
+  secret with a character such as `+` or `%` refuses the request.
 - **The endpoint's certificate.** It's checked against the bundled Mozilla roots, and `tls:`
   doesn't apply to it, so an endpoint with a private CA can't be used yet. `logit validate`
   requires `https://`, or `http://` to a loopback address.

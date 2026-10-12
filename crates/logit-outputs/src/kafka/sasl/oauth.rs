@@ -12,8 +12,9 @@
 //! (RFC 6749 §4.4) and cached in the authenticator for every connection of the sink:
 //!
 //! - The request is a form `POST` of `grant_type=client_credentials` and the optional `scope`,
-//!   with the client id and secret in HTTP Basic authentication, each form-urlencoded first as
-//!   RFC 6749 §2.3.1 requires (the Java client's `sasl.oauthbearer.header.urlencode: true`).
+//!   with the client id and secret in HTTP Basic authentication as they are, as the Java client
+//!   sends them by default (`sasl.oauthbearer.header.urlencode: false`), not form-urlencoded as
+//!   RFC 6749 §2.3.1 asks.
 //! - It's bounded by the sink's `timeout` and follows no redirect. The endpoint's certificate is
 //!   checked against the bundled Mozilla roots, never the sink's broker `tls:` block.
 //! - A cached token is reused until 80% of its `expires_in` has passed, measured from before the
@@ -376,10 +377,10 @@ fn is_bearer_token(token: &str) -> bool {
         })
 }
 
-/// `Basic base64(urlencode(id) ":" urlencode(secret))`, RFC 6749 §2.3.1.
+/// `Basic base64(id ":" secret)`, as Kafka's `ClientCredentialsRequestFormatter` writes it with
+/// `sasl.oauthbearer.header.urlencode` at its default, `false`.
 pub(crate) fn basic_authorization(client_id: &str, client_secret: &str) -> String {
-    let credentials = format!("{}:{}", form_urlencode(client_id), form_urlencode(client_secret));
-    format!("Basic {}", STANDARD.encode(credentials))
+    format!("Basic {}", STANDARD.encode(format!("{client_id}:{client_secret}")))
 }
 
 fn token_request_body(scope: Option<&str>) -> String {
@@ -454,12 +455,14 @@ mod tests {
         assert!(session.next(b"").is_err(), "an accept after a refusal is broken");
     }
 
+    /// Kafka 4.2.0's `ClientCredentialsRequestFormatter` URL-encodes the id and secret only when
+    /// `sasl.oauthbearer.header.urlencode` is `true`, and `SaslConfigs` defaults it to `false`.
     #[test]
-    fn the_client_credentials_are_form_urlencoded_before_basic_encoding() {
+    fn the_client_credentials_are_basic_encoded_as_they_are() {
         assert_eq!(form_urlencode("a b+c/d%é*-._"), "a+b%2Bc%2Fd%25%C3%A9*-._");
-        let header = basic_authorization("my client", "s3:cr+t");
+        let header = basic_authorization("my client", "s3:cr+t%é");
         let decoded = STANDARD.decode(header.strip_prefix("Basic ").unwrap()).unwrap();
-        assert_eq!(decoded, b"my+client:s3%3Acr%2Bt");
+        assert_eq!(decoded, "my client:s3:cr+t%é".as_bytes());
         assert_eq!(token_request_body(None), "grant_type=client_credentials");
         assert_eq!(
             token_request_body(Some("kafka write")),
