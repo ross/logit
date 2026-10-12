@@ -8,7 +8,9 @@
 # client secret, so no leg can show a refused one.
 #
 #   oauth_cc       client credentials, 60 events at 1/s: each token lives 45 s and is reused
-#                  for 36 s, so the leg runs past the first token's expiry
+#                  for 36 s, and the broker ends each session when its token expires, so the
+#                  sink redials with a second token; its `scope` names the broker, so check.py
+#                  can count its token requests in the `oauth` service's log
 #   oauth_static   a fixed token the script fetched before the legs started, with two SASL
 #                  extensions
 #   oauth_refused  a fixed token that isn't a JWT: the broker refuses it, so `oauth-refused`
@@ -35,7 +37,7 @@ components:
       token_endpoint: http://127.0.0.1/default/token
       client_id: logit
       client_secret: logit-secret
-      scope: kafka
+      scope: kafka-oauth-cc
 
   load_oauth_static:
     type: generate_in

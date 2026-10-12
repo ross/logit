@@ -241,6 +241,10 @@ if (
         http://oauth/default/.well-known/openid-configuration
     ki_compose exec -T redpanda rpk cluster config set oidc_token_audience kafka-interop
     ki_compose exec -T redpanda rpk cluster config set sasl_mechanisms '[SCRAM, PLAIN, OAUTHBEARER]'
+    # Ends every SASL session after 40 s, inside the 45 s token life, as Kafka's
+    # `connections.max.reauth.ms` and token expiry do, so the `oauth-cc` sink redials on a new
+    # token. Redpanda has one value for every listener, so the SCRAM and PLAIN sinks redial too.
+    ki_compose exec -T redpanda rpk cluster config set kafka_sasl_max_reauth_ms 40000
 ) >"${RUN_DIR}/logs/redpanda-oidc-setup.log" 2>&1; then
     echo ok >"${RUN_DIR}/redpanda-oidc.txt"
 else

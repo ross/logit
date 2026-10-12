@@ -343,7 +343,15 @@ def redpanda_oidc_gap(broker):
     return None
 
 
-def leg_oauth(broker, topic, component, events, how):
+def token_requests(scope):
+    """How many client-credentials requests the `oauth` service logged with `scope`; its
+    `DEBUG` log prints each request's body."""
+    path = OUT / "logs" / "oauth.log"
+    log = path.read_text(errors="replace") if path.exists() else ""
+    return len(re.findall(rf"body=grant_type=client_credentials&scope={re.escape(scope)}\)", log))
+
+
+def leg_oauth(broker, topic, component, events, how, min_tokens=0):
     gap = redpanda_oidc_gap(broker)
     if gap:
         return gap
@@ -354,7 +362,15 @@ def leg_oauth(broker, topic, component, events, how):
                         f"requests {shown(classes)}")
     if {r.seq() for r in records} != set(range(events)):
         return "FAIL", f"{topic} doesn't hold each of the {events} events once"
-    return "PASS", f"{len(records)} records, {how}; requests {shown(classes)}"
+    detail = f"{len(records)} records, {how}; requests {shown(classes)}"
+    if min_tokens:
+        # The sink's `scope` names its broker (logit-oauth-*.yaml).
+        tokens = token_requests(f"{broker}-oauth-cc")
+        detail += f"; tokens fetched {tokens}"
+        if tokens < min_tokens:
+            return "FAIL", (f"want at least {min_tokens} tokens fetched, so a redial took a "
+                            f"new one; {detail}")
+    return "PASS", detail
 
 
 def leg_oauth_refused(broker):
@@ -431,7 +447,7 @@ LEGS += [
     ("timestamp", "a record over an hour ahead dropped and counted", leg_timestamp),
     ("oauth-cc", "OAUTHBEARER, client credentials, past the first token's expiry",
      lambda b: leg_oauth(b, "oauth-cc", "oauth_cc", OAUTH_CC_EVENTS,
-                         "over 60 s of 45 s tokens")),
+                         "over 60 s of 45 s tokens", min_tokens=2)),
     ("oauth-static", "OAUTHBEARER, a fixed token (with two SASL extensions on Kafka)",
      lambda b: leg_oauth(b, "oauth-static", "oauth_static", SASL_EVENTS,
                          "a fixed token and two extensions" if b == "kafka" else

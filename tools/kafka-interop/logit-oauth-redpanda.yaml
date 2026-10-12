@@ -9,7 +9,9 @@
 # client secret, so no leg can show a refused one.
 #
 #   oauth_cc       client credentials, 60 events at 1/s: each token lives 45 s and is reused
-#                  for 36 s, so the leg runs past the first token's expiry
+#                  for 36 s, and the script's `kafka_sasl_max_reauth_ms` of 40 s ends each
+#                  session, so the sink redials with a second token; its `scope` names the
+#                  broker, so check.py can count its token requests in the `oauth` service's log
 #   oauth_static   a fixed token the script fetched before the legs started, and no SASL
 #                  extensions: Redpanda reads everything between `auth=Bearer ` and the closing
 #                  `\x01\x01` as the token, so an extension corrupts it and Redpanda drops the
@@ -39,7 +41,7 @@ components:
       token_endpoint: http://127.0.0.1/default/token
       client_id: logit
       client_secret: logit-secret
-      scope: kafka
+      scope: redpanda-oauth-cc
 
   load_oauth_static:
     type: generate_in

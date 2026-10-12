@@ -38,7 +38,7 @@ The legs, each run against both brokers:
 | `dedup` | `logit-dedup-*.yaml` | while the broker's packets to this leg are dropped, an idempotent sink's resend after an `Ambiguous` attempt stores no duplicate, and a non-idempotent control sink beside it stores at least one |
 | `tls`, `mtls`, `mtls-required` | `logit-tls-*.yaml` | 50 events over server TLS and over mutual TLS from the run's private CA; a sink with no client certificate stores nothing |
 | `sasl-plain`, `sasl-scram512`, `sasl-scram256`, `sasl-wrong` | `logit-sasl-*.yaml` | 50 events through `sasl:` with PLAIN over SASL_SSL, SCRAM-SHA-512 over SASL_SSL, and SCRAM-SHA-256 over SASL_PLAINTEXT; a SCRAM-SHA-512 sink with the wrong password stores nothing, counts every attempt as `refused`, holds its queue with `logit.component.retrying` at `1`, and drops no batch as `rejected` |
-| `oauth-cc`, `oauth-static`, `oauth-refused` | `logit-oauth-*.yaml` | 60 events at 1/s through the client-credentials grant, past the 45 s life of the first token; 50 events through a fixed token the script fetched, with two SASL extensions on Kafka; and a fixed token that isn't a JWT, which the broker refuses: nothing stored, every attempt `refused`, the queue held, no batch dropped, and, on Kafka, the leg's log carrying the broker's error challenge status |
+| `oauth-cc`, `oauth-static`, `oauth-refused` | `logit-oauth-*.yaml` | 60 events at 1/s through the client-credentials grant, past the 45 s life of the first token, with at least two tokens fetched, counted in the `oauth` service's log; 50 events through a fixed token the script fetched, with two SASL extensions on Kafka; and a fixed token that isn't a JWT, which the broker refuses: nothing stored, every attempt `refused`, the queue held, no batch dropped, and, on Kafka, the leg's log carrying the broker's error challenge status |
 | `timestamp` | `logit-timestamp-*.yaml` | in each batch of 10, the event stamped at 2100-01-01 is dropped and counted as `invalid_timestamp`, and the other nine land |
 
 The SASL user is `logit` with the password `logit-secret` on Kafka, whose PLAIN entry is a JAAS
@@ -54,7 +54,11 @@ Every token from `oauth` names the subject `logit`, the audience `kafka-interop`
 wrong one. Kafka validates tokens with its own `OAuthBearerValidatorCallbackHandler` against
 `oauth`'s JWKS, with the issuer and audience set in `kafka-server.properties`, and a
 `connections.max.reauth.ms` of 60 s, so each session ends when its token expires. Redpanda
-validates them through its `oidc_*` cluster properties, which the script sets after start.
+validates them through its `oidc_*` cluster properties, which the script sets after start, with
+a `kafka_sasl_max_reauth_ms` of 40 s, so each session ends before its token expires. Redpanda
+has one such bound for every listener, so its SCRAM and PLAIN sinks redial every 40 s too. Each
+`oauth_cc` sink asks for a `scope` that names its broker, and `oauth` logs every token request's
+body at `DEBUG`, so `check.py` counts each sink's tokens in `logs/oauth.log`.
 OAUTHBEARER is a Redpanda Enterprise feature, which a new cluster's 30-day trial license covers;
 if Redpanda refuses the settings, `logs/redpanda-oidc-setup.log` says why and its three
 OAUTHBEARER rows read `GAP`. The OAUTHBEARER legs run in `oauth`'s network namespace, so their
