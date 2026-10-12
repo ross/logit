@@ -415,18 +415,19 @@ metric = "logit.component.buffer.batches"
 component = "victoria_metrics"          # optional; joins `attrs`
 attrs = { reason = "overflow_oldest" }  # optional attribute filters, all strings
 step = "c0s1"                           # an expanded step id, or a 1-based [[step]] index
-window = "during"                       # during | after | through
-reduce = "max"                          # delta | min_delta | max | min | last
+window = "during"                       # during | after | through | run (W8c, no step)
+reduce = "max"                          # delta | min_delta | max | min | last | slope (W8c)
 min = 2                                 # min, max, or both
 ```
 
 | Field | Meaning |
 |---|---|
-| `step` | An expanded step id names one occurrence. An integer names that `[[step]]` table's occurrence in every cycle, and the row FAILs if any occurrence does |
-| `window` | `during` is the fault's span, from its apply starting to its revert finishing; `after` is the `recovery_bound` after it; `through` is both, from the apply starting to `recovery_bound` after the revert finishes. Each is open at its start, because a drain's deltas cover the interval before its timestamp. A bound that must hold for the whole episode, such as a loss counter that must stay 0, reads `through`: a chain blocked behind a sink stays blocked until the sink's next retry after the revert, up to its `retry_max_delay` later, so `during` misses the tail |
-| `reduce` | For a counter (`kind: sum`): `delta` sums the window's drains, and `min_delta` is the smallest single drain, a drain with no point counting 0, because a loss counter isn't emitted while it's 0. For a gauge: `max`, `min`, and `last` over the window's samples and the value in force at its start, because `internal` exports a gauge only in a drain after it was set. The value in force comes only from the SUT life whose drains cover the window's start, so a value an earlier process set doesn't carry into the next; a life that hasn't set the gauge yet leaves it unset. `last` is the value in force at the window's end |
+| `step` | An expanded step id names one occurrence. An integer names that `[[step]]` table's occurrence in every cycle, and the row FAILs if any occurrence does. `window = "run"` takes none |
+| `window` | `during` is the fault's span, from its apply starting to its revert finishing; `after` is the `recovery_bound` after it; `through` is both, from the apply starting to `recovery_bound` after the revert finishes. Each is open at its start, because a drain's deltas cover the interval before its timestamp. A bound that must hold for the whole episode, such as a loss counter that must stay 0, reads `through`: a chain blocked behind a sink stays blocked until the sink's next retry after the revert, up to its `retry_max_delay` later, so `during` misses the tail. `run` (W8c) has no step: it runs from the end of warmup to the start of the end sequence, fault windows included |
+| `reduce` | For a counter (`kind: sum`): `delta` sums the window's drains, and `min_delta` is the smallest single drain, a drain with no point counting 0, because a loss counter isn't emitted while it's 0. For a gauge: `max`, `min`, and `last` over the window's samples and the value in force at its start, because `internal` exports a gauge only in a drain after it was set. The value in force comes only from the SUT life whose drains cover the window's start, so a value an earlier process set doesn't carry into the next; a life that hasn't set the gauge yet leaves it unset. `last` is the value in force at the window's end. `slope` (W8c) is the least-squares slope of the window's own samples, without the value in force, in the metric's unit per hour (`checks.slope()`, times 3,600). A restart resets a process gauge, so `slope` fits each SUT life on its own and judges each life's slope against the bounds; a fit across a restart would read the drop as a negative trend. A life needs `rss_slope`'s minimum, 6 samples spanning 60 s, and the row FAILs when no life in the window has it, as a counter's window with no drain does |
 
-`validate()` refuses an unknown key, a missing field, a `name` that isn't lowercase letters,
+`validate()` refuses an unknown key, a missing field (`step` is required for every window but
+`run`, which refuses one), a `name` that isn't lowercase letters,
 digits, `_`, or `-`, a repeated `name`, a `service` that doesn't run `logit` (checked against
 the role map), an
 unknown `window` or `reduce`, a reducer of the wrong kind for a metric whose kind it knows,
@@ -438,6 +439,28 @@ When the run is scored, the row FAILs when the reduced value is outside its boun
 has no drain (a counter) or the gauge was never set by its end, the run's points for the metric
 are of the other kind, or the step was scheduled but its apply didn't return 0. A scenario with
 no `[[expect]]` gets one `expect` row that SKIPs.
+
+**Expected verdicts (W8c).** A row can be expected to FAIL when the scenario exists to show the
+growth it detects, such as `cardinality`'s interner. An optional top-level `[expected]` table
+maps a row id to a table of services and the verdict each should get:
+
+```toml
+[expected]
+rss_slope = { logit = "FAIL" }   # row id -> service -> PASS | WARN | FAIL
+```
+
+- Only `rss_slope` and `fd_slope` take one. They are the rows that judge each `logit` service
+  apart (§6), so a verdict names what it's about; every other row's FAIL is loss or a hang,
+  which no scenario expects.
+- Each service must run `logit` (checked against the role map), and each verdict is `PASS`,
+  `WARN`, or `FAIL`; a row id outside the two, an empty table, or a value that isn't a table is
+  refused.
+- When the run is scored, a service whose own status equals its expectation scores PASS, its
+  line reading `FAIL, as expected: ...`, and one whose status differs, a SKIP included, FAILs
+  with `expected FAIL, got PASS`. A service with no expectation keeps its own status, and the
+  row takes the worst.
+- `rss_slope` reports growth as WARN under an hour's run, so an expected FAIL holds only at an
+  hour or more; a shorter `--duration` FAILs the row as `expected FAIL, got WARN`.
 
 A scenario may name an external target in a `[target]` table (W5); see "External targets". It
 may instead name a local Kafka broker as its target; see "Kafka targets".
@@ -624,7 +647,11 @@ returned nonzero has none, so nothing after it is excused.
   per life, over samples outside fault windows after warmup, against `rss_growth_mib_per_hour`.
   `logit.process.fds` at the end minus the warmup median is at most `fd_growth`, and returns to
   baseline at the first steady-state sample after each recovery. `docker stats` RSS is the
-  fallback series. Judged slopes covering under 5% of the run after warmup WARN.
+  fallback series. Judged slopes covering under 5% of the run after warmup WARN. From W8c both
+  rows judge each `logit` service apart, the SUT and every generator, with one detail line per
+  service and the worst status, as the per-sink rows do; a generator that interns what the SUT
+  interns grows beside it, and one verdict for both would say nothing about the SUT. A
+  scenario's `[expected]` table can set a service's verdict (§2, "Expected verdicts").
 
 **The ledger and identities (W1b).** One unit runs through the ledger: a datagram is one line is
 one event is one increment.
@@ -878,7 +905,7 @@ The rows:
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at each sink's own
   telemetry; see "External targets".
 - `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
-  window around one step; see "The scenario schema".
+  window around one step, or over the whole run (W8c); see "The scenario schema".
 
 ### 7. The first scenario's configs (W1a)
 
@@ -1185,17 +1212,20 @@ where it needs them, and a small check extension.
    `[[expect]]` on `requests{class="network_error"}` and `retries`, `ledger.egress` at 0, and
    `progress` telling a slow drain from a hang. Built as `slow-destination`, with a 2 s sink
    `timeout:`, a 3 s `delay` on `victoria-metrics`, and a `rate` limit on `logit`.
-6. **High cardinality over hours.** A second `generate_in` with `{seq%N}` in the metric name,
-   N past any count the run reaches, at a low rate (`generate_in` rejects a bare `{seq}` in an
-   interned field). The interner never frees
+6. **High cardinality over hours (built in W8c).** A second `generate_in` with `{seq%N}` in
+   the metric name, N past any count the run reaches, at a low rate (`generate_in` rejects a
+   bare `{seq}` in an interned field). The interner never frees
    ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Event model and interner"), so
    `rss_slope` should FAIL: the harness sees the documented growth and pins its rate. A short
    `series_retention` keeps `aggregate`'s state from masking it. Rows: `rss_slope` and the slope
-   of `logit.process.interner.strings` on `logit`. The generator interns every name too, so
-   its RSS grows beside the SUT's, and `rss_slope` folds both services into one verdict; the row
-   has to judge each service on its own before a FAIL says anything about the SUT. Needs: an
-   expected verdict per row and per service (`rss_slope` FAIL on `logit` scores PASS, the
-   generator's judged apart) and a gauge `slope` reducer.
+   of `logit.process.interner.strings` on `logit`. The generator interns every name too, so its
+   RSS grows beside the SUT's, and the row judges each service on its own, so a FAIL says which
+   process grew. Built as `cardinality`: 200 names a second through the generator's one statsd
+   sink, both inputs in the ledger, a 75-minute run, `series_retention: 3`, and
+   `[expected] rss_slope` FAIL on both services, with `[[expect]]` rows on each service's
+   interner slope over `window = "run"` and on `aggregate`'s evictions. Built with `rss_slope`
+   and `fd_slope` judged per service (§6), `[expected]` verdicts, and the `slope` reducer and
+   `run` window (§2).
 
 **Medium.** Each adds a service, a topology, or a tool.
 
@@ -1346,7 +1376,9 @@ that items 3, 7, and 11 need.
   judged per source and the intake per listener, `sut_transforms` judged hop by hop, and the
   `fanin` scenario. It needs `syslog_out` to count `logit.output.datagrams` over UDP, which
   `fix/syslog-out-datagrams` adds.
-- **W8c**: item 6, a gauge `slope` reducer, and an expected verdict per row and per service.
+- **W8c**: item 6, a gauge `slope` reducer and a `run` window for `[[expect]]`, `rss_slope`
+  and `fd_slope` judged per service, an `[expected]` verdict per row and per service, and the
+  `cardinality` scenario.
 - **W9**: item 10, the scripted destination, and `ledger.sent` run against it.
 - **W10**: item 7, a second SUT service and the ledger one hop longer.
 - **W11**: items 8 and 9, per-line wire counters, a shared volume, and the replay surplus band.

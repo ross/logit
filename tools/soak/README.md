@@ -131,6 +131,16 @@ syslog lines a second over UDP into `lines_in`, one per datagram; `kv`, `keep`, 
 cycle puts netem loss, a partition, and a stop on each generator in turn, and its expectations
 assert that a stopped generator's listener reads nothing while the other keeps reading.
 
+`cardinality` (75 minutes) adds a second `generate_in` to `statsd-vm`'s generator that sends 200
+metric names a second, none of them repeating, through the same statsd sink. The interner never
+frees, so both processes intern every name for the whole run; `aggregate` forgets each name
+three windows later, so its state stays flat. `[expected]` sets `rss_slope` to FAIL on `logit`
+and on `generator`, and its expectations assert each process's interner slope (720,000 strings
+an hour, within 5%), that `aggregate` evicts each name, and that it never reaches its series
+cap. A netem delay on `logit` and a VictoriaMetrics stop give `recovery` faults to judge. Run it
+at its own duration: under an hour, `rss_slope` reports growth as WARN, and the expected FAIL
+FAILs the row.
+
 Four scenarios of 6 to 8 minutes each run one fault of the sink's delivery path and assert its
 effect with `[[expect]]` tables:
 
@@ -415,8 +425,8 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `self_log` | stderr has an `exiting` line with a nonzero code, a panic, or an `ERROR` line other than a sink's `retrying`; sink fault lines outside a fault window `WARN`. Inside an `exit` step, its `exiting` line and an `ERROR` line keyed its `key` are expected, and FAIL the row when either is missing |
 | `ready` | a `logit` container's readiness word, from each image `HEALTHCHECK` result timed at its start, isn't `ok` outside a fault window; a `mark` with `ready` sees no sample with that word; `degraded` appears outside an `exit` step; or a container isn't ready within 30 s of a start. With no `HEALTHCHECK` results recorded, it judges Docker's health status instead |
 | `progress` | a SUT sink delivers nothing in a `progress_window` outside fault windows with work queued (a hang), a `logit` container's telemetry goes quiet, or a sink's newest stored sample is 30 s old (a local target only); a sink still retrying past `recovery_bound` `WARN`s, and so do windows covering under 5% of the run after warmup |
-| `rss_slope` | resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead, and so do slopes covering under 5% of the run after warmup |
-| `fd_slope` | open file descriptors end, or sit after a recovery, more than `fd_growth` above the warmup median |
+| `rss_slope` | a `logit` service's resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead, and so do slopes covering under 5% of the run after warmup. Each service is judged on its own line, and `[expected]` can set its verdict (see [Expected verdicts](#expected-verdicts)) |
+| `fd_slope` | a `logit` service's open file descriptors end, or sit after a recovery, more than `fd_growth` above the warmup median. Each service is judged on its own line, and `[expected]` can set its verdict |
 | `ledger.wire` | for any source, its generator's lines minus what its listener read or the kernel dropped (G − (W + K)), loss by design, exceeds `wire_loss_outside_faults` outside the UDP-affecting fault windows of its own generator and of every service that isn't a generator, with one generator batch of tolerance per window edge, each steady run counting at 0 or more; or its generator's sink counts messages and datagrams apart. The detail lists the gap per source and per run of drain intervals, and the generator's own counted `drop_newest` loss beside it |
 | `ledger.intake` | for any listener, the final SUT life's datagrams read minus dropped differ from the events sent plus bad lines (B: statsd's `bad_line` and `lines_in`'s oversize lines); or an earlier life's read-but-unabsorbed residual summed over the listeners (W − D − B − X − Ab, X being the listeners' own counted event drops) falls outside [0, R], R being each listener's receive queue plus 2 batches, 65 more batches for each node between it and `aggregate`, and 65 for `aggregate` |
 | `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listeners' summed events sent (or, with `sut_script`, the script's) differ from those `aggregate` received; a node in a source's `sut_transforms` received a different number from those sent to it, or sent a different number from those it received; a sink received a different number of events from those sent to it (under `copy` `aggregate`'s events sent, which a fan-out counts once per batch, and under `route` its target's); or `aggregate` received a different number from those it absorbed |
@@ -453,7 +463,8 @@ last flush, and `ledger.replay` catches a replay two or more batches short.
 ### Expectations
 
 A scenario's `[[expect]]` tables add one `expect.<name>` row each, judging one metric reduced
-over a window around one step. The plan's "The scenario schema" is the full reference.
+over a window around one step, or over the whole run. The plan's "The scenario schema" is the
+full reference.
 
 ```toml
 [[expect]]
@@ -462,8 +473,8 @@ service = "logit"                       # logit or a generator
 metric = "logit.component.buffer.batches"
 component = "victoria_metrics"          # and any other attribute under attrs = { ... }
 step = "c0s1"                           # an expanded step id, or a [[step]] index for every cycle
-window = "during"                       # the fault's span; `after`, the recovery_bound after it; `through`, both
-reduce = "max"                          # counters: delta, min_delta; gauges: max, min, last
+window = "during"                       # the fault's span; `after`, the recovery_bound after it; `through`, both; `run`, with no step
+reduce = "max"                          # counters: delta, min_delta; gauges: max, min, last, slope
 min = 2                                 # min, max, or both
 ```
 
@@ -474,6 +485,40 @@ that start only. A bound that must hold for the whole episode, such as a loss co
 stay 0, uses `through`: a chain blocked behind a sink stays blocked until the sink's next retry,
 up to its `retry_max_delay` after the revert. A scenario with no `[[expect]]` gets one `expect`
 row that SKIPs.
+
+`window = "run"` takes no `step`: it runs from the end of warmup to the start of the end
+sequence, fault windows included. `slope` is a gauge's least-squares slope over the window's
+samples, in the metric's unit per hour, so a bound on `logit.process.interner.strings` is in
+strings an hour and one on `logit.process.memory.resident.bytes` in bytes an hour. A restart
+resets a process gauge, so `slope` fits each SUT life on its own and judges each against the
+bounds. A life needs at least 6 samples spanning 60 s, as `rss_slope` does, and the row FAILs
+when no life in the window has them.
+
+```toml
+[[expect]]
+name = "interner-grows"
+service = "logit"
+metric = "logit.process.interner.strings"
+window = "run"
+reduce = "slope"
+min = 300000              # strings an hour
+```
+
+### Expected verdicts
+
+An `[expected]` table sets the verdict a scenario expects of `rss_slope` or `fd_slope` for a
+service, the two rows that judge each `logit` service apart:
+
+```toml
+[expected]
+rss_slope = { logit = "FAIL" }   # row id -> service -> PASS, WARN, or FAIL
+```
+
+A service whose verdict matches scores PASS, and its line reads `FAIL, as expected: ...`. A
+service whose verdict differs FAILs, as in `expected FAIL, got PASS`, so a growth the scenario
+exists to show can't go missing unnoticed. Services with no expectation are judged as usual.
+`rss_slope` reports growth as WARN under an hour's run, so an expected FAIL needs a run of an
+hour or more; a shorter `--duration` FAILs the row.
 
 ### Random schedules
 

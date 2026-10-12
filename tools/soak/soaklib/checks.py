@@ -37,6 +37,9 @@ judges each listener's final life alone. From the edge into `aggregate` on, ever
 listeners' symbols, since their events merge there; a source's `sut_transforms` are judged hop
 by hop in `ledger.edge`. `recovery` judges the listeners' summed ingest against the generators'
 summed warmup rate.
+
+`rss_slope` and `fd_slope` judge each `logit` service on its own line, and a scenario's
+`[expected]` table can set the verdict a service should get on either (`judge_services`).
 """
 
 import bisect
