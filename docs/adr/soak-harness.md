@@ -190,3 +190,16 @@ stderr", no longer hold for those counts:
 - `identity.sink` stays at the last quiet drain before the final one, with its one-batch
   allowance. The per-hop rows stay exact for the final SUT life only, and an earlier stopped
   life keeps its [0, R] residual bound.
+
+## Amendment: a Kafka target's oracle is its topic (2026-10-11)
+
+A scenario can name the stack's own Kafka broker as its target (`[target] kind = "kafka"`). The
+egress oracle is then the topic, read back with the broker image's own tools after the SUT stops,
+not a stored total. The SUT's `aggregate` runs `temporality: delta`, so V is the sum of the
+records' increments and a lost record shows as a deficit. A duplicate would show as a surplus
+that can cancel a loss of the same size, so the harness deduplicates records on the value's raw
+bytes before summing them, and `ledger.egress` FAILs any surplus left. `ledger.topic` compares
+the topic's distinct record count with the records the sink saw accepted, and judges the
+duplicate copies on their own: one FAILs in a SUT life with no producer epoch bump, because the
+broker discards a resend within an epoch, and WARNs after a bump, as `at_least_once` permits.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Kafka targets", has the rules.

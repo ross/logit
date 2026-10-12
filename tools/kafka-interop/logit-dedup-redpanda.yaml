@@ -1,0 +1,54 @@
+# The idempotent-dedup leg of `script/kafka-interop` against Redpanda: 800 events over 40 s into two
+# sinks. While they run, the script drops every packet the broker sends to this container for 8 s
+# (`netem-drop.sh`), so produce requests reach the broker and are appended while their responses
+# never arrive. Each sink's 2 s `timeout` reads the lost response as `Ambiguous` and the retry
+# resends.
+#
+#   idempotent  the default producer: the resend carries its first attempt's sequence, and the
+#               broker discards it, so `dedup` holds each event once
+#   control     `idempotent: false`: the same resend is appended again, which shows the fault
+#               reached an appended batch
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load_idempotent:
+    type: generate_in
+    count: 800
+    rate: 20
+    batch: 10
+    event:
+      log: "dedup {seq}"
+      attributes: { seq: "{seq}" }
+
+  idempotent:
+    type: kafka_out
+    sources: [load_idempotent]
+    brokers: ["redpanda:9092"]
+    topic: dedup
+    timeout: 2s
+    buffer: { retry_max_delay: 1s }
+
+  load_control:
+    type: generate_in
+    count: 800
+    rate: 20
+    batch: 10
+    event:
+      log: "dedup {seq}"
+      attributes: { seq: "{seq}" }
+
+  control:
+    type: kafka_out
+    sources: [load_control]
+    brokers: ["redpanda:9092"]
+    topic: dedup-control
+    idempotent: false
+    timeout: 2s
+    buffer: { retry_max_delay: 1s }
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/dedup-redpanda-telemetry.log
+    format: json

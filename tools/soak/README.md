@@ -22,6 +22,7 @@ script/soak run statsd-vm --duration 5m --keep   # shorter, and leave the stack 
 script/soak run random-faults --duration 8h      # a seeded random schedule; see "Long runs"
 script/soak run random-faults --seed 7           # the same scenario, another schedule
 script/soak run statsd-datadog                   # an external target; needs a key, see "External targets"
+script/soak run kafka-broker-restart             # a Kafka target; see "Kafka targets"
 script/soak check perf/results/soak/<stamp>      # re-score a run offline
 ```
 
@@ -30,13 +31,15 @@ script/soak check perf/results/soak/<stamp>      # re-score a run offline
 A scenario is a directory under `scenarios/`: a `scenario.toml` timeline beside one ordinary
 `logit` config per `logit` service. `compose.yaml` starts three services under the compose
 project `soak-<scenario>`, or the two `logit` services alone for a scenario with an external
-target (see [External targets](#external-targets)):
+target (see [External targets](#external-targets)), or the two with a Kafka broker in place of
+VictoriaMetrics for a Kafka target (see [Kafka targets](#kafka-targets)):
 
 | Service | Image | `soak.role` |
 |---|---|---|
 | `victoria-metrics` | `victoriametrics/victoria-metrics:v1.152.0` | `backend`: `-retentionPeriod=100y`, published on an ephemeral loopback port the driver queries; in the compose profile `local`, which the driver enables for a local target only |
 | `logit` | `logit:soak`, built from the current tree | `sut`: the system under test (SUT), with the scenario's `configs.sut` |
 | `generator` | `logit:soak` | `generator`: the load source, a second `logit` with the scenario's `configs.generator` |
+| `kafka` | `apache/kafka:4.2.0` | `broker`: a single-node KRaft broker, one partition per topic, for a Kafka target only (the compose profile `kafka`); the driver reads its topic back through `docker exec` |
 
 The driver and the checks know a service by its `soak.role` label, never its name. A scenario
 can add services with `compose = "compose.override.yaml"`, a file beside its `scenario.toml`
@@ -133,6 +136,15 @@ expectations assert that the sink drops no batch through any fault, stops retryi
 partition, drops nothing as stale through the partition and the kill, and that the restarted
 process truncates no torn spool tail. It's an external target, so it needs a Datadog API key;
 see [External targets](#external-targets).
+
+`kafka-broker-restart` (8 minutes 30 seconds) sends `statsd-vm`'s stream through a 2 s delta
+`aggregate` into `kafka_out` (JSON records, idempotent, a 10 s `timeout`) to the stack's broker,
+topic `soak`. Its 6.5-minute cycle restarts the broker, pauses it for 40 s, and stops it for
+60 s. Its expectations assert that the sink drops no batch through any fault, the pause leaves at
+least one attempt `Ambiguous`, so the broker has resends to deduplicate, and the sink retries
+during the stop and stops retrying after it. The topic is read back at the end and judged by
+`ledger.egress` and `ledger.topic`, which FAILs a record stored twice; see
+[Kafka targets](#kafka-targets).
 
 ### Faults
 
@@ -244,6 +256,46 @@ resent series point overwrites the stored one, and a resent log is stored again
 ([`docs/known-gaps/datadog.md`](../../docs/known-gaps/datadog.md)), which is why
 `statsd-datadog` sends series only.
 
+## Kafka targets
+
+A scenario whose sink is `kafka_out` declares the stack's own broker as its target:
+
+```toml
+[target]
+kind = "kafka"
+topic = "soak"             # the topic the SUT's kafka_out writes
+```
+
+What changes for a Kafka target:
+
+- The stack runs `kafka` in place of `victoria-metrics`, and needs no env file. A fault may name
+  `kafka` (`netem`, `pause`, `stop`, `restart`, `partition`); a `restart` is a clean broker
+  shutdown and start, which keeps the log and the producer state. A fault on `kafka` is refused
+  for any other target, and one on `victoria-metrics` for this one.
+- The scenario has one `[[ledger.sink]]`, its `kafka_out`, with no `backend` or `vm_selector`;
+  the topic is that sink's V.
+- As for an external target, nothing reads VictoriaMetrics, and the end sequence waits for the
+  sink's queue to empty before it stops the SUT.
+- After the SUT stops, the driver reads the topic in the broker container: each partition's end
+  offset (`kafka-offsets.txt`), then that many records from the beginning
+  (`kafka-topic.ndjson`). `timeline.jsonl` records a `kafka_read` phase, or `kafka_read_failed`.
+- The SUT's `aggregate` must run `temporality: delta`, because V is the sum of every distinct
+  record's `sum` values: each record carries one window's increments. Records are deduplicated
+  on the value's raw bytes first, so a duplicate can't cancel a loss of the same size. Each
+  record, and each duplicate copy, counts toward the SUT life its timestamp falls in.
+- `ledger.egress` and `ledger.summary` judge Ab − V against the topic's distinct records. A
+  surplus FAILs, as on any target. `ledger.windows` SKIPs.
+- `ledger.sent` judges the sink's batches, drops, and refusals as for an external target, with
+  `kafka_out`'s request classes (`ok` accepted).
+- `ledger.topic` compares the topic's distinct record count with the records the sink saw
+  accepted, and judges duplicate copies per SUT life. Within one producer epoch the broker
+  discards a resend, so a duplicate FAILs unless its life ended in a restart or kill, or the
+  sink counted a drop that bumps the epoch there (`rejected`, `invalid_timestamp`,
+  `invalid_record`, `ambiguous_at_most_once`). Those duplicates WARN, as
+  [`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md) permits. A run with a killed SUT
+  life WARNs, rather than FAILs, on a T − A difference in either direction, because a kill loses
+  that life's last telemetry interval and a replayed spool batch counts twice in A.
+
 ## A run
 
 1. `script/soak` runs the self-test, builds `logit:soak` from `Dockerfile` and
@@ -327,11 +379,12 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `ledger.intake` | the final SUT life's datagrams read minus dropped differ from the events sent plus bad lines; or an earlier life's read-but-unabsorbed residual (W − D − B − X − Ab, X being the listener's own counted event drops) falls outside [0, R], R being the receive queue plus 67 batches, and 65 more with a script |
 | `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listener's events sent (or, with `sut_script`, the script's) differ from those `aggregate` received; a sink received a different number of events from those sent to it (under `copy` `aggregate`'s events sent, which a fan-out counts once per batch, and under `route` its target's); or `aggregate` received a different number from those it absorbed |
 | `ledger.script` | with `[ledger] sut_script` only, else SKIP: in the final SUT life, the listener's events sent differ from those the script received, those it received from those it emitted, dropped (`script_drop`), and failed on (`errors{reason="process"}`), or those it sent from those it emitted plus those `flush()` returned |
-| `ledger.egress` | for each sink under `copy`, or for the sinks' sum under `route`: the final SUT life's absorbed increments minus the backend's reset-aware total (Ab − V), or a stopped earlier life's datagrams read minus dropped, bad lines, the listener's counted event drops, and that total (W − D − B − X − V), is nonzero (SKIP on an external target), other than a positive gap in a life whose telemetry counts a batch `batches.dropped{reason="shutdown"}` at a node that can explain it: any node but a sink outside the group, so under `copy` another sink's drop doesn't count a sink's gap, while one at the sink or upstream of the fan-out does; a killed life's Ab − V falls outside its band (below, a surplus: the residual plus one drain interval of ingest; above, uncounted: one aggregate interval plus one drain interval of ingest), with the residual the kill lost reported beside it; or a sink's export matched no series. With a script, its `flush()` events leave Ab, its counted drops and errors leave a stopped life's gap, which the final drain exports because `internal` drains last. A series without one segment per SUT life `WARN`s |
-| `ledger.windows` | under `[ledger] vm_every_window = true` only, and SKIPs on an external target: a series in a SUT life has two samples more than 1.5 aggregate intervals apart, a killed life's last sample is more than 1.1 intervals before the kill, or a later life's first is more than 2 intervals after its start. The interval comes from the SUT config. A wider gap is excused as idle when the `sut_aggregate` component's `batches.sent` is 0 over the drains from a + (interval + p) / 2 to b − (interval − p) / 2, p being the drain period: no window was emitted, so none was lost. A pause, with no drains at all, counts 0. Any batch there FAILs the gap as windows emitted but not stored, whatever fault was running |
+| `ledger.egress` | for each sink under `copy`, or for the sinks' sum under `route`: the final SUT life's absorbed increments minus the backend's reset-aware total (Ab − V), or a stopped earlier life's datagrams read minus dropped, bad lines, the listener's counted event drops, and that total (W − D − B − X − V), is nonzero (SKIP on an external target; on a Kafka target V is the topic's distinct records, and a negative gap is a surplus), other than a positive gap in a life whose telemetry counts a batch `batches.dropped{reason="shutdown"}` at a node that can explain it: any node but a sink outside the group, so under `copy` another sink's drop doesn't count a sink's gap, while one at the sink or upstream of the fan-out does; a killed life's Ab − V falls outside its band (below, a surplus: the residual plus one drain interval of ingest; above, uncounted: one aggregate interval plus one drain interval of ingest), with the residual the kill lost reported beside it; or a sink's export matched no series. With a script, its `flush()` events leave Ab, its counted drops and errors leave a stopped life's gap, which the final drain exports because `internal` drains last. A series without one segment per SUT life `WARN`s |
+| `ledger.windows` | under `[ledger] vm_every_window = true` only, and SKIPs on an external or Kafka target: a series in a SUT life has two samples more than 1.5 aggregate intervals apart, a killed life's last sample is more than 1.1 intervals before the kill, or a later life's first is more than 2 intervals after its start. The interval comes from the SUT config. A wider gap is excused as idle when the `sut_aggregate` component's `batches.sent` is 0 over the drains from a + (interval + p) / 2 to b − (interval − p) / 2, p being the drain period: no window was emitted, so none was lost. A pause, with no drains at all, counts 0. Any batch there FAILs the gap as windows emitted but not stored, whatever fault was running |
 | `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight |
 | `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0, or any one sink's Ab − V isn't, with a script's hop in place of E − A and one Ab − V term per sink under `copy`; a counted egress term is shown and not judged, and on an external target the Ab − V term SKIPs |
-| `ledger.sent` | an external target only, else SKIP: a batch a sink received didn't end in an accepted response; a clean run's detail starts with `SENT`. See [External targets](#external-targets) |
+| `ledger.sent` | an external or Kafka target only, else SKIP: a batch a sink received didn't end in an accepted response; a clean external run's detail starts with `SENT`. See [External targets](#external-targets) |
+| `ledger.topic` | a Kafka target only, else SKIP: the topic wasn't read back; its distinct records number fewer than the sink saw accepted, or more with no dropped attempt to explain them (`WARN` with one, and `WARN` either way across a killed life); or a record is stored twice in a SUT life with no epoch bump (`WARN` after one). See [Kafka targets](#kafka-targets) |
 | `identity.sink` | at the final life's last drain before its final one, a sink's batches received, plus those a disk spool replayed at open, differ from delivered + dropped + queued by more than one batch in flight |
 | `recovery` | within `recovery_bound` of a fault's end, for any sink, no drain interval clear of other faults shows that sink not retrying, its buffer under 5% full or holding at most one batch, the listener's receive queue under 5% full, and ingest at 95% of the warmup rate; a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN`, and so does a run where no fault had an eligible interval |
 | `expect.<name>` | a scenario's own `[[expect]]` bound doesn't hold; see [Expectations](#expectations) |

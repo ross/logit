@@ -1,0 +1,41 @@
+# The single-node Redpanda `script/kafka-interop` runs (compose.yaml's `redpanda` service), with
+# the same three client listeners as `kafka-server.properties`, all advertised as `redpanda`:
+#
+#   plain  :9092  every leg but TLS, and every read-back
+#   tls    :9093  server TLS from the run's private CA
+#   mtls   :9094  the same, and a client certificate from that CA is required
+#
+# `rpk redpanda start` rewrites the file it starts from, so the script copies this one into the
+# run directory and mounts the copy.
+
+redpanda:
+  data_directory: /var/lib/redpanda/data
+  empty_seed_starts_cluster: true
+  seed_servers: []
+  rpc_server: { address: 0.0.0.0, port: 33145 }
+  advertised_rpc_api: { address: redpanda, port: 33145 }
+  admin:
+    - { address: 0.0.0.0, port: 9644 }
+  kafka_api:
+    - { name: plain, address: 0.0.0.0, port: 9092 }
+    - { name: tls, address: 0.0.0.0, port: 9093 }
+    - { name: mtls, address: 0.0.0.0, port: 9094 }
+  advertised_kafka_api:
+    - { name: plain, address: redpanda, port: 9092 }
+    - { name: tls, address: redpanda, port: 9093 }
+    - { name: mtls, address: redpanda, port: 9094 }
+  kafka_api_tls:
+    - name: tls
+      enabled: true
+      cert_file: /tls/broker.crt
+      key_file: /tls/broker.key
+      truststore_file: /tls/ca.pem
+      require_client_auth: false
+    - name: mtls
+      enabled: true
+      cert_file: /tls/broker.crt
+      key_file: /tls/broker.key
+      truststore_file: /tls/ca.pem
+      require_client_auth: true
+  developer_mode: true
+  auto_create_topics_enabled: true

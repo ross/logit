@@ -22,8 +22,16 @@ hyper-util.workspace = true
 tower-service.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-# otlp_out's optional gzip (docs/adr/otlp-compression-and-decompression-bounds.md).
+# otlp_out's optional gzip (docs/adr/otlp-compression-and-decompression-bounds.md), and
+# kafka_out's gzip record batches (docs/adr/kafka-output.md, item 1).
 flate2.workspace = true
+# kafka_out (docs/adr/kafka-output.md, item 1): the protocol codecs and record batch v2, and the
+# three other codecs it compresses through the crate's hook: raw snappy, an LZ4 frame, and zstd.
+# `broker` is for the tests' fake broker; the crate has no feature finer than that to gate on.
+kafka-protocol.workspace = true
+snap.workspace = true
+lz4_flex.workspace = true
+ruzstd.workspace = true
 # otlp_out TLS on both transports (docs/adr/otlp-tls-and-pooled-grpc-client.md): the
 # `rustls::ClientConfig` `logit_pipeline::tls::build_client_config` builds, wrapped around
 # `hyper-util`'s pooled gRPC client by `hyper-rustls`; `webpki-roots` is the Mozilla root set
@@ -44,8 +52,6 @@ logit-pipeline = { workspace = true, features = ["fault-injection", "test-util"]
 # Remote-write sender tests decode the captured body as the vendored prompb message, not this
 # codec's own view of it.
 prost.workspace = true
-# ...and Snappy-decompress it directly, so decoding at all proves the block format, not framed.
-snap.workspace = true
 # influxdb.rs's test that a Lua stage doesn't change an attribute's tag inclusion
 # (`bytes_attribute_stays_excluded_from_tags_after_a_lua_enrichment_stage`).
 logit-script.workspace = true
@@ -56,7 +62,10 @@ logit-inputs.workspace = true
 tracing-subscriber.workspace = true
 # Codec fixed-point property tests (`decode(encode(decode(x))) == decode(x)`).
 proptest.workspace = true
-# `ndjson`'s test that every line it writes parses as JSON.
+# `ndjson`'s test that every line it writes parses as JSON, and the kafka_out sink tests'.
 serde_json.workspace = true
+# `msgpack`'s parity test reads an NDJSON line into a tree that keeps each object's key order,
+# which `serde_json::Value` doesn't.
+serde.workspace = true
 # `test-util` for the paused-clock TLS handshake timeout test in `stream.rs`.
 tokio = { workspace = true, features = ["test-util"] }

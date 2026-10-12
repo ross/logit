@@ -213,7 +213,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **No TLS client has a `server_name` override.** Every TLS sink (`otlp_out`, `datadog_out`,
   `datadog_trace_out`, `splunk_hec_out`, `prometheus_out`'s remote-write sender, `logit_out`,
   `syslog_out`, `statsd_out`) and `prometheus_in`'s scrape client check the peer's certificate
-  against the configured endpoint's own host. An endpoint reached by IP, or through a proxy whose
+  against the configured endpoint's own host, and `kafka_out` against each broker's advertised
+  host. An endpoint reached by IP, or through a proxy whose
   certificate names something else, can't be verified by name. OTel's equivalent knob is
   `tls.server_name_override`.
   - **To close:** it's cheap to add

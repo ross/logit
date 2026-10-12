@@ -2849,6 +2849,122 @@
           "additionalProperties": false
         },
         {
+          "description": "Produces events to an Apache Kafka topic (3.x and 4.x, or anything that speaks the same protocol from Kafka 2.4 on) with the Java producer's defaults: `acks: all`, idempotence on, and keyed records placed on the partition a Java client would pick for the same key. Each event is one record unless `record: batch` packs several into one. A failure Kafka may have partly applied (a timeout, a lost connection) resends the unsettled records; the broker discards most such duplicates, but not across a `logit` restart. `buffer.delivery: at_most_once` drops them instead.",
+          "type": "object",
+          "required": [
+            "brokers",
+            "topic",
+            "type"
+          ],
+          "properties": {
+            "acks": {
+              "description": "Which replicas must have a batch before the broker answers: `all` (the default), `leader`, or `none`, which never waits for an answer and can lose records silently.",
+              "default": "all",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/KafkaAcks"
+                }
+              ]
+            },
+            "brokers": {
+              "description": "Bootstrap brokers, each a `host:port`. `logit` asks the first that answers for the topic's partitions and leaders, then connects to each leader at the address the cluster advertises, so every advertised listener must be reachable from `logit`.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "buffer": true,
+            "compression": {
+              "description": "How record batches are compressed: `none` (the default), `gzip`, `snappy`, `lz4`, or `zstd`. `zstd` needs a broker from Kafka 2.1 on.",
+              "default": "none",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/KafkaCompression"
+                }
+              ]
+            },
+            "format": {
+              "description": "What a record's value holds: `json` (the default), the object `stdio_out`'s `format: json` writes on one line; `text`, the log body alone; `msgpack`, the `json` object as MessagePack; or `native`, `logit`'s own lossless binary format.",
+              "default": "json",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/KafkaFormat"
+                }
+              ]
+            },
+            "headers": {
+              "description": "Headers added to every record, sent in name order. Empty by default.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "idempotent": {
+              "description": "Numbers each batch so the broker discards a resent duplicate. On by default; needs `acks: all`.",
+              "default": true,
+              "type": "boolean"
+            },
+            "key": {
+              "description": "What each record's key is: `none` (the default) sends unkeyed records, all of one batch to one partition; `trace_id` keys by the span's trace id, else the log's, as 32 lowercase hex characters; `{attribute: NAME}` or `{resource: NAME}` keys by that event or resource attribute's value as text. A keyed record goes to the partition the Java client's default partitioner picks for the same key. An event without the value (or with a map or array there) is sent unkeyed, counted.",
+              "default": "none",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/KafkaKey"
+                }
+              ]
+            },
+            "max_request_bytes": {
+              "description": "Caps one record and one produce request, before compression, as the Java producer's `max.request.size` does. A record larger than this alone is dropped, counted. A byte-count string. Defaults to `\"1MiB\"`; `0` is rejected. Keep it at or under the topic's `max.message.bytes`.",
+              "default": "1048576",
+              "type": "string"
+            },
+            "receive": true,
+            "record": {
+              "description": "How many events one record holds: `event`, one each, or `batch`, as many as fit under `max_request_bytes`. Defaults to `batch` for `format: native` and `event` for the others. A `key` other than `none` needs `event`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/KafkaRecord"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sources": true,
+            "targets": true,
+            "timeout": {
+              "description": "Bounds each connect, TLS handshake, write, and wait for a broker's answer, and the wait for a missing topic to be created. Defaults to `30s`; `0s` is rejected.",
+              "default": "30s",
+              "type": "string"
+            },
+            "tls": {
+              "description": "Turns on TLS to every broker when present, and makes it required: a `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. Each broker's certificate is checked against the host it advertises.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "topic": {
+              "description": "The topic every record goes to. With the broker's `auto.create.topics.enable` on, a missing topic is created on first use; otherwise the sink holds its queue until an operator creates it.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "kafka_out"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS) connection, one native frame per batch, one `Ack` before that batch counts as delivered.",
           "type": "object",
           "required": [
@@ -4161,6 +4277,140 @@
       "enum": [
         "reject",
         "replace"
+      ]
+    },
+    "KafkaAcks": {
+      "description": "Which replicas must have a `kafka_out` batch before the broker answers.",
+      "oneOf": [
+        {
+          "description": "Every in-sync replica.",
+          "type": "string",
+          "enum": [
+            "all"
+          ]
+        },
+        {
+          "description": "The partition leader alone.",
+          "type": "string",
+          "enum": [
+            "leader"
+          ]
+        },
+        {
+          "description": "No answer at all: a written request counts as delivered.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
+      ]
+    },
+    "KafkaCompression": {
+      "description": "How `kafka_out` compresses a record batch.",
+      "type": "string",
+      "enum": [
+        "none",
+        "gzip",
+        "snappy",
+        "lz4",
+        "zstd"
+      ]
+    },
+    "KafkaFormat": {
+      "description": "What a `kafka_out` record's value holds.",
+      "oneOf": [
+        {
+          "description": "One JSON object per event, as `stdio_out`'s `format: json` writes it, without the newline. Under `record: batch`, those objects as newline-terminated lines.",
+          "type": "string",
+          "enum": [
+            "json"
+          ]
+        },
+        {
+          "description": "The log record's body as text: a string as it is, raw bytes as they are, a map or array as JSON, and nothing for an empty body. An event with no log record is skipped and counted. Under `record: batch`, the bodies joined by newlines, so a body that holds a newline reads as two.",
+          "type": "string",
+          "enum": [
+            "text"
+          ]
+        },
+        {
+          "description": "The same object as `json`, key for key, as MessagePack, except that raw bytes are a MessagePack `bin` and NaN and the infinities are floats. Under `record: batch`, the objects back to back.",
+          "type": "string",
+          "enum": [
+            "msgpack"
+          ]
+        },
+        {
+          "description": "`logit`'s own binary format, the one `stdio_out`'s `format: native` writes: one frame per record, which `logit` decodes with no loss. Defaults to `record: batch`.",
+          "type": "string",
+          "enum": [
+            "native"
+          ]
+        }
+      ]
+    },
+    "KafkaKey": {
+      "description": "What `kafka_out` keys each record by. Written `key: none`, `key: trace_id`, `key: {attribute: request_id}`, or `key: {resource: service.name}`.",
+      "oneOf": [
+        {
+          "description": "No key: each batch's records go to one partition, picked at random per batch.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
+        {
+          "description": "The span's trace id, else the log record's trace reference, as 32 lowercase hex characters. An all-zero id counts as none.",
+          "type": "string",
+          "enum": [
+            "trace_id"
+          ]
+        },
+        {
+          "description": "A top-level event attribute, named literally (never a path).",
+          "type": "object",
+          "required": [
+            "attribute"
+          ],
+          "properties": {
+            "attribute": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A resource attribute.",
+          "type": "object",
+          "required": [
+            "resource"
+          ],
+          "properties": {
+            "resource": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "KafkaRecord": {
+      "description": "How many events one `kafka_out` record holds.",
+      "oneOf": [
+        {
+          "description": "One record per event.",
+          "type": "string",
+          "enum": [
+            "event"
+          ]
+        },
+        {
+          "description": "As many of a batch's events per record as fit under `max_request_bytes`, in order; an event too large to fit alone is dropped, counted. A batch record has no key, and its timestamp is its first event's.",
+          "type": "string",
+          "enum": [
+            "batch"
+          ]
+        }
       ]
     },
     "LinesTransport": {

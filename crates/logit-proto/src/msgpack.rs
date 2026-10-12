@@ -1,6 +1,6 @@
 //! A hand-rolled MessagePack reader and writer (https://github.com/msgpack/msgpack/blob/master/spec.md),
 //! for the Datadog traces and APM stats codecs (`crate::datadog::traces_msgpack`,
-//! `crate::datadog::stats`).
+//! `crate::datadog::stats`) and `kafka_out`'s `format: msgpack`.
 //!
 //! ## Why this is hand-rolled
 //!
@@ -35,7 +35,9 @@
 //! its own recursion so a deeply nested array-of-arrays can't blow the stack.
 //!
 //! [`Writer`] always chooses the smallest format that fits a given value (the canonical MessagePack
-//! encoding), the same way `native::varint` always emits the shortest LEB128 form.
+//! encoding), the same way `native::varint` always emits the shortest LEB128 form. A map whose
+//! length isn't known up front goes through [`Writer::begin_map`] and [`Writer::end_map`], which
+//! still write the smallest header.
 
 use std::fmt;
 
@@ -681,6 +683,10 @@ fn type_for_prefix(b: u8) -> Result<Type, MsgpackError> {
     })
 }
 
+/// Where [`Writer::begin_map`] wrote a map's placeholder header, for [`Writer::end_map`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapStart(usize);
+
 /// A MessagePack writer over an owned `Vec<u8>`. Always picks the smallest format that fits a
 /// given value -- the canonical encoding -- the same convention `native::varint` follows for its
 /// own varints.
@@ -704,6 +710,52 @@ impl Writer {
 
     pub fn as_slice(&self) -> &[u8] {
         &self.buf
+    }
+
+    /// Forgets what was written, keeping the buffer's capacity.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Starts a map whose length isn't known until its entries are written. Writes a one-byte
+    /// placeholder header; [`Self::end_map`] replaces it with the smallest header for the real
+    /// length, so the map comes out as [`Self::write_map_len`] would have written it.
+    pub fn begin_map(&mut self) -> MapStart {
+        let at = self.buf.len();
+        self.buf.push(0x80);
+        MapStart(at)
+    }
+
+    /// Finishes the map [`Self::begin_map`] started, with `len` key/value pairs written since.
+    /// A `len` over 15 needs a wider header than the placeholder, so the entries move up by 2
+    /// or 4 bytes.
+    pub fn end_map(&mut self, start: MapStart, len: usize) {
+        let at = start.0;
+        debug_assert_eq!(self.buf[at], 0x80, "end_map's start isn't a begin_map placeholder");
+        if len <= 15 {
+            self.buf[at] = 0x80 | len as u8;
+            return;
+        }
+        let mut header = [0u8; 5];
+        let width = if len <= u16::MAX as usize {
+            header[0] = 0xde;
+            header[1..3].copy_from_slice(&(len as u16).to_be_bytes());
+            3
+        } else {
+            debug_assert!(len <= u32::MAX as usize, "map too long for msgpack map32");
+            header[0] = 0xdf;
+            header[1..5].copy_from_slice(&(len as u32).to_be_bytes());
+            5
+        };
+        self.buf.splice(at..at + 1, header[..width].iter().copied());
     }
 
     pub fn write_nil(&mut self) {
@@ -846,6 +898,45 @@ mod tests {
         let mut w = Writer::new();
         f(&mut w);
         w.into_inner()
+    }
+
+    /// A map begun before its length is known comes out byte for byte as one written with its
+    /// length up front, across each header width, and leaves what follows it intact.
+    #[test]
+    fn a_map_ended_late_matches_one_written_with_its_length() {
+        for len in [0usize, 1, 15, 16, 300, 65_535, 65_536] {
+            let entries = |w: &mut Writer| {
+                for i in 0..len {
+                    w.write_u64(i as u64);
+                    w.write_nil();
+                }
+            };
+            let late = written(|w| {
+                w.write_str("before");
+                let start = w.begin_map();
+                entries(w);
+                w.end_map(start, len);
+                w.write_str("after");
+            });
+            let upfront = written(|w| {
+                w.write_str("before");
+                w.write_map_len(len);
+                entries(w);
+                w.write_str("after");
+            });
+            assert_eq!(late, upfront, "len {len}");
+        }
+    }
+
+    #[test]
+    fn clear_forgets_the_bytes() {
+        let mut w = Writer::new();
+        w.write_str("abc");
+        assert_eq!(w.len(), 4);
+        w.clear();
+        assert!(w.is_empty());
+        w.write_nil();
+        assert_eq!(w.as_slice(), &[0xc0]);
     }
 
     // -- Known vectors from the spec -------------------------------------------------------

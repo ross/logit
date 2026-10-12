@@ -4,7 +4,7 @@
 #              graphite-p0, graphite-py2, graphite-dropwizard, one capture each), prometheus,
 #              prometheus-scrape, vmagent, statsd, datadog (= datadog-agent, datadog-tracer,
 #              datadog-dogstatsd-unix), splunk (= splunk-otel, splunk-docker, splunk-sc4s,
-#              splunk-java, then check_splunk_capture.py)
+#              splunk-java, then check_splunk_capture.py), kafka
 #   With no arguments, records every producer in `all` below.
 #
 # Captures wire traffic from real third-party producers into testdata/interop/, so decoders are
@@ -28,6 +28,7 @@ PROM_CFG_DIR="" # set by record_prometheus, removed by cleanup()
 DD_CONF_DIR=""  # set by record_datadog_agent, removed by cleanup()
 # The Datadog producers' shared `/var/run/datadog`: the Agent's sockets, or the capture's.
 DD_VOLUME="logit-record-fixtures-dd-run"
+KAFKA_NET="kafka-record-net"
 # The JDK and Maven the Java producers (`graphite`'s Dropwizard capture, `splunk-java`) build in.
 MAVEN_IMAGE="maven:3.9.16-eclipse-temurin-17"
 
@@ -70,9 +71,9 @@ finish_capture() {
 
 cleanup() {
     ${DOCKER} rm -f -v capture otelcol prometheus vmagent metatarget dd-agent dd-clients \
-        scrape-node scrape-python splunk-dind splunk-sc4s splunk-java >/dev/null 2>&1 || true
+        scrape-node scrape-python splunk-dind splunk-sc4s splunk-java kafka-record-broker kafka-record-javac >/dev/null 2>&1 || true
     ${DOCKER} volume rm "${DD_VOLUME}" >/dev/null 2>&1 || true
-    ${DOCKER} network rm "${NET}" >/dev/null 2>&1 || true
+    ${DOCKER} network rm "${NET}" "${KAFKA_NET}" >/dev/null 2>&1 || true
     # record_prometheus and record_datadog_agent render config into a temp dir; remove it here too
     # so a run that dies mid-capture doesn't leave one behind.
     [ -n "${PROM_CFG_DIR}" ] && rm -rf "${PROM_CFG_DIR}"
@@ -1012,10 +1013,161 @@ record_splunk() {
     return "${status}"
 }
 
+# ---- Kafka --------------------------------------------------------------------------------------
+#
+# One producer, `kafka`, writing testdata/interop/kafka/ (its README has the provenance): reference
+# vectors for `kafka_out` (docs/adr/kafka-output.md), from the Java client in the Apache Kafka
+# image and from kcat (librdkafka), against a single-node KRaft broker.
+#   murmur2.json              the Java client's own partitioner, over a fixed key set
+#   partitioner-crosscheck.tsv  the same keys produced by the console producer and by kcat, and
+#                             the partition each landed on
+#   batches/<producer>-<compression>.{log,txt}  the broker's stored segment and its
+#                             kafka-dump-log.sh rendering, per producer and compression
+#   api-versions.txt          the broker's ApiVersions ranges
+
+KAFKA_OUT="${OUT_ROOT}/kafka"
+KAFKA_IMAGE="apache/kafka:4.2.0"
+KCAT_IMAGE="edenhill/kcat:1.7.1"
+# Compiles Murmur2Vectors.java only; pinned by digest because the tag moves with Maven and JDK
+# patch releases.
+KAFKA_JDK_IMAGE="maven:3.9.16-eclipse-temurin-17@sha256:1a352420f7aba21f5ad08df31bab55f74c013fb491f1ae8ab1dd7ff9ed698584"
+KAFKA_BROKER="kafka-record-broker"
+KAFKA_BIN="/opt/kafka/bin"
+KAFKA_BOOTSTRAP="kafka-record-broker:9092"
+
+# kafka_exec <args...>: runs a command in the broker container, with stdin passed through.
+kafka_exec() { ${DOCKER} exec -i "${KAFKA_BROKER}" "$@"; }
+kafka_topic() { # <name> <partitions>
+    kafka_exec "${KAFKA_BIN}/kafka-topics.sh" --bootstrap-server "${KAFKA_BOOTSTRAP}" --create \
+        --topic "$1" --partitions "$2" >/dev/null
+}
+kcat() { ${DOCKER} run --rm -i --network "${KAFKA_NET}" "${KCAT_IMAGE}" -b "${KAFKA_BOOTSTRAP}" "$@"; }
+
+record_kafka() {
+    echo "== recording: Kafka ${KAFKA_IMAGE} and kcat ${KCAT_IMAGE} =="
+    local work kdir="${TOOLS_DIR}/kafka"
+    work="$(mktemp -d)"
+    mkdir -p "${KAFKA_OUT}/batches"
+    ${DOCKER} network create "${KAFKA_NET}" >/dev/null 2>&1 || true
+    ${DOCKER} rm -f "${KAFKA_BROKER}" >/dev/null 2>&1 || true
+    ${DOCKER} run -d --name "${KAFKA_BROKER}" --network "${KAFKA_NET}" --hostname "${KAFKA_BROKER}" \
+        -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
+        -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+        -e "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://${KAFKA_BOOTSTRAP}" \
+        -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+        -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+        -e "KAFKA_CONTROLLER_QUORUM_VOTERS=1@${KAFKA_BROKER}:9093" \
+        -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+        -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+        "${KAFKA_IMAGE}" >/dev/null
+    local i
+    for i in $(seq 60); do
+        kafka_exec "${KAFKA_BIN}/kafka-broker-api-versions.sh" --bootstrap-server "${KAFKA_BOOTSTRAP}" \
+            >"${work}/api.txt" 2>/dev/null && break
+        sleep 2
+    done
+    [ -s "${work}/api.txt" ] || { echo "record-fixtures: kafka broker never came up" >&2; return 1; }
+
+    # ApiVersions: the four a producer uses first, then the broker's whole answer.
+    {
+        echo "# ${KAFKA_IMAGE} kafka-broker-api-versions.sh, $(date -u +%F)"
+        grep -E '^\s*(Produce|Metadata|InitProducerId|ApiVersions)\(' "${work}/api.txt"
+        echo "# the broker's whole answer"
+        cat "${work}/api.txt"
+    } >"${KAFKA_OUT}/api-versions.txt"
+
+    # murmur2: the Java client's Utils.murmur2, from the kafka-clients jar in the broker image. That
+    # image has a JRE and no javac, so the class is compiled in a JDK image against the same jar.
+    echo "-- murmur2 vectors"
+    mkdir -p "${work}/libs" "${work}/cls"
+    ${DOCKER} cp "${KAFKA_BROKER}:/opt/kafka/libs/." "${work}/libs/"
+    ${DOCKER} run --rm --name kafka-record-javac -v "${work}/libs:/libs:ro,z" -v "${kdir}:/src:ro,z" \
+        -v "${work}/cls:/out:z" "${KAFKA_JDK_IMAGE}" \
+        javac --release 17 -cp '/libs/*' -d /out /src/Murmur2Vectors.java
+    ${DOCKER} cp "${work}/cls/Murmur2Vectors.class" "${KAFKA_BROKER}:/tmp/"
+    local counts=(1 3 6 12 100)
+    python3 -I "${kdir}/murmur2_json.py" keys \
+        | kafka_exec java -cp '/opt/kafka/libs/*:/tmp' Murmur2Vectors "${counts[@]}" >"${work}/m2.txt"
+    python3 -I "${kdir}/murmur2_json.py" format "${counts[@]}" <"${work}/m2.txt" >"${KAFKA_OUT}/murmur2.json"
+
+    # Partitioner cross-check on 6 partitions: console producer, kcat murmur2_random, kcat default.
+    echo "-- partitioner cross-check"
+    local t
+    for t in kafka-record-x-java kafka-record-x-m2 kafka-record-x-def; do kafka_topic "${t}" 6; done
+    python3 -I "${kdir}/murmur2_json.py" textkeys | awk '{ printf "%s\tv-%d\n", $0, NR }' >"${work}/kv.tsv"
+    kafka_exec "${KAFKA_BIN}/kafka-console-producer.sh" --bootstrap-server "${KAFKA_BOOTSTRAP}" \
+        --topic kafka-record-x-java --reader-property parse.key=true <"${work}/kv.tsv" 2>/dev/null
+    awk -F'\t' '{ printf "%s:%s\n", $1, $2 }' "${work}/kv.tsv" >"${work}/kv.colon"
+    kcat -P -t kafka-record-x-m2 -K: -X partitioner=murmur2_random <"${work}/kv.colon"
+    kcat -P -t kafka-record-x-def -K: <"${work}/kv.colon"
+    kafka_exec "${KAFKA_BIN}/kafka-console-consumer.sh" --bootstrap-server "${KAFKA_BOOTSTRAP}" \
+        --topic kafka-record-x-java --from-beginning --timeout-ms 10000 \
+        --formatter-property print.partition=true --formatter-property print.key=true --formatter-property print.value=false \
+        2>/dev/null | sed -n 's/^Partition://p' >"${work}/java.out"
+    local topic out
+    for t in m2:m2 def:def; do
+        topic="kafka-record-x-${t%%:*}"; out="${work}/${t##*:}.out"
+        kcat -C -t "${topic}" -o beginning -e -f '%p\t%k\n' >"${out}"
+    done
+    python3 -I "${kdir}/murmur2_json.py" compare "${work}/java.out" "${work}/m2.out" "${work}/def.out" \
+        <"${KAFKA_OUT}/murmur2.json" >"${KAFKA_OUT}/partitioner-crosscheck.tsv" || {
+        echo "record-fixtures: a console-producer or kcat murmur2_random landing differs from the Java computation" >&2
+        return 1
+    }
+
+    # Stored batches: one single-partition topic per (producer, compression), each given the same
+    # three records with the header h1=hv1. Every record carries the header because the console
+    # producer requires one on every line once parse.headers is set, and kcat -H applies to all.
+    echo "-- stored record batches"
+    local comp producer topic seg
+    local v1 v2 v3 zargs
+    v1="the quick brown fox jumps over the lazy dog, record one"
+    v2="the quick brown fox jumps over the lazy dog, record two"
+    v3="the quick brown fox jumps over the lazy dog, record three"
+    for producer in java kcat; do
+        for comp in none gzip snappy lz4 zstd; do
+            topic="kafka-record-b-${producer}-${comp}"
+            kafka_topic "${topic}" 1
+            if [ "${producer}" = java ]; then
+                printf 'h1:hv1\tkey-1\t%s\nh1:hv1\tkey-2\t%s\nh1:hv1\tkey-3\t%s\n' "${v1}" "${v2}" "${v3}" \
+                    | kafka_exec "${KAFKA_BIN}/kafka-console-producer.sh" --bootstrap-server "${KAFKA_BOOTSTRAP}" \
+                        --topic "${topic}" --reader-property parse.key=true --reader-property parse.headers=true \
+                        --compression-codec "${comp}" 2>/dev/null
+            else
+                zargs=()
+                [ "${comp}" = none ] || zargs=(-z "${comp}")
+                printf 'key-1:%s\nkey-2:%s\nkey-3:%s\n' "${v1}" "${v2}" "${v3}" \
+                    | kcat -P -t "${topic}" -K: -H h1=hv1 "${zargs[@]}" -X queue.buffering.max.ms=500
+            fi
+        done
+    done
+    # Copy each segment and its kafka-dump-log.sh rendering out, after every producer has run.
+    # Each segment is saved as `.segment`, not `.log`: `.gitignore`'s `*.log` would leave it untracked.
+    for producer in java kcat; do
+        for comp in none gzip snappy lz4 zstd; do
+            topic="kafka-record-b-${producer}-${comp}"
+            seg="$(kafka_exec find / -path "*/${topic}-0/*.log" 2>/dev/null | head -1 | tr -d '\r' || true)"
+            kafka_exec cat "${seg}" >"${KAFKA_OUT}/batches/${producer}-${comp}.segment"
+            {
+                echo "# ${KAFKA_IMAGE} kafka-dump-log.sh --files <${topic}-0/00000000000000000000.log> --print-data-log --deep-iteration"
+                kafka_exec "${KAFKA_BIN}/kafka-dump-log.sh" --files "${seg}" --print-data-log --deep-iteration \
+                    | sed '/^Dumping /d'
+            } >"${KAFKA_OUT}/batches/${producer}-${comp}.txt"
+        done
+    done
+    {
+        echo "image ${KAFKA_IMAGE} $(${DOCKER} inspect --format '{{index .RepoDigests 0}}' "${KAFKA_IMAGE}")"
+        echo "image ${KCAT_IMAGE} $(${DOCKER} inspect --format '{{index .RepoDigests 0}}' "${KCAT_IMAGE}")"
+        echo "image ${KAFKA_JDK_IMAGE}"
+    } >&2
+    ${DOCKER} rm -f -v "${KAFKA_BROKER}" >/dev/null 2>&1 || true
+    rm -rf "${work}"
+}
+
 # ---- entry point ----------------------------------------------------------------------------------
 
 all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus
-    prometheus-scrape vmagent statsd datadog splunk)
+    prometheus-scrape vmagent statsd datadog splunk kafka)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -1049,6 +1201,7 @@ for p in "${producers[@]}"; do
     splunk-sc4s) record_splunk_sc4s ;;
     splunk-java) record_splunk_java ;;
     splunk) record_splunk ;;
+    kafka) record_kafka ;;
     datadog)
         record_datadog_dogstatsd_unix
         record_datadog_tracer

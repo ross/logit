@@ -280,6 +280,11 @@
 //!     shutdown, so a mixed one never exports the counts recorded during shutdown
 //!     ([`mixed_internal_pipeline_warning`],
 //!     `docs/adr/shutdown-accounting-and-cancellation-safety.md`, decision 14).
+//! 85. A `kafka_out` with an empty `brokers` or an entry that isn't a `host:port`, a `topic` that
+//!     isn't a legal Kafka topic name, a `key` naming an empty attribute, a `key` other than
+//!     `none` with `record: batch` (`format: native`'s default), `idempotent: true` without
+//!     `acks: all`, a `max_request_bytes` of `0`, `timeout: 0s`, or a `tls` failing rule 34's
+//!     checks (`docs/adr/kafka-output.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -395,6 +400,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | DatadogOut { .. }
         | DatadogTraceOut { .. }
         | SplunkHecOut { .. }
+        | KafkaOut { .. }
         | LogitOut { .. }
         | StdioOut { .. }
         | FileOut { .. }
@@ -464,6 +470,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         DatadogOut { .. } => "datadog_out",
         DatadogTraceOut { .. } => "datadog_trace_out",
         SplunkHecOut { .. } => "splunk_hec_out",
+        KafkaOut { .. } => "kafka_out",
         LogitOut { .. } => "logit_out",
         StdioOut { .. } => "stdio_out",
         FileOut { .. } => "file_out",
@@ -566,6 +573,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::DatadogOut { .. }
             | ComponentKind::DatadogTraceOut { .. }
             | ComponentKind::SplunkHecOut { .. }
+            | ComponentKind::KafkaOut { .. }
             | ComponentKind::StdioOut { .. }
             | ComponentKind::FileOut { .. }
             | ComponentKind::SyslogOut { .. }
@@ -3586,6 +3594,111 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 85: `kafka_out` (`docs/adr/kafka-output.md`). An idempotent producer's sequences mean
+    // nothing to a broker that doesn't wait for every replica, and the Java producer refuses the
+    // same explicit pair. A broker entry is dialed as `host:port`, so one without both fails here
+    // rather than on every attempt. A topic name outside Kafka's own rule (1 to 249 characters of
+    // `[a-zA-Z0-9._-]`, not `.` or `..`) would be refused by the broker for every batch. A batch
+    // record holds many events and carries no key, so a configured key would be ignored. `tls`
+    // gets rule 34's two checks: its presence turns TLS on.
+    for (id, component) in &components {
+        let ComponentKind::KafkaOut {
+            brokers,
+            topic,
+            key,
+            format,
+            record,
+            acks,
+            idempotent,
+            max_request_bytes,
+            timeout,
+            tls,
+            ..
+        } = &component.kind
+        else {
+            continue;
+        };
+        if brokers.is_empty() {
+            anyhow::bail!(
+                "component '{id}': kafka_out 'brokers' is empty -- give at least one host:port \
+                 to bootstrap from"
+            );
+        }
+        for broker in brokers {
+            if !is_host_port(broker) {
+                anyhow::bail!(
+                    "component '{id}': kafka_out 'brokers' entry {broker:?} isn't a host:port"
+                );
+            }
+        }
+        if !is_kafka_topic_name(topic) {
+            anyhow::bail!(
+                "component '{id}': kafka_out 'topic' ({topic:?}) isn't a legal Kafka topic name \
+                 -- 1 to 249 characters of letters, digits, '.', '_', and '-', and not '.' or \
+                 '..'"
+            );
+        }
+        if let logit_config::KafkaKey::Attribute(name) | logit_config::KafkaKey::Resource(name) =
+            key
+        {
+            if name.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': kafka_out 'key' names an empty attribute, which no event \
+                     carries"
+                );
+            }
+        }
+        let batch = match record {
+            Some(record) => *record == logit_config::KafkaRecord::Batch,
+            None => *format == logit_config::KafkaFormat::Native,
+        };
+        if batch && *key != logit_config::KafkaKey::None {
+            let why = if record.is_some() {
+                "'record: batch'"
+            } else {
+                "'format: native', whose records default to 'record: batch',"
+            };
+            anyhow::bail!(
+                "component '{id}': kafka_out 'key' needs one event per record, and {why} packs \
+                 many events into an unkeyed record -- set 'record: event' to key each event's \
+                 record, or 'key: none'"
+            );
+        }
+        if *idempotent && *acks != logit_config::KafkaAcks::All {
+            anyhow::bail!(
+                "component '{id}': kafka_out 'idempotent: true' needs 'acks: all' -- set \
+                 'idempotent: false' to use another 'acks'"
+            );
+        }
+        if *max_request_bytes == 0 {
+            anyhow::bail!(
+                "component '{id}': kafka_out 'max_request_bytes' must be greater than 0 -- 0 \
+                 would drop every record as oversize"
+            );
+        }
+        if timeout.is_zero() {
+            anyhow::bail!(
+                "component '{id}': kafka_out 'timeout: 0s' would fail every request before it \
+                 was sent"
+            );
+        }
+        if let Some(tls) = tls {
+            if tls.cert_file.is_some() != tls.key_file.is_some() {
+                anyhow::bail!(
+                    "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                     mutual TLS, or both omitted -- one alone can't be used"
+                );
+            }
+            if tls.insecure_skip_verify && tls.ca_file.is_some() {
+                anyhow::bail!(
+                    "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both \
+                     be set -- 'insecure_skip_verify' trusts any certificate, which makes a \
+                     specific trusted CA meaningless"
+                );
+            }
+        }
+    }
+
     // Rule 71: a `lua`/`lua_file` `max_memory` of `0` (`docs/adr/lua-runaway-script-bounds.md`).
     // `human_bytes` parses `"0"`, and an empty VM already holds more than that, so the node
     // would fail on its first batch.
@@ -4090,6 +4203,22 @@ fn blocking_sink_warnings(components: &HashMap<String, ResolvedComponent>) -> Ve
             )
         })
         .collect()
+}
+
+/// Rule 85's broker check: a non-empty host and a numeric port, a bracketed IPv6 host included.
+fn is_host_port(entry: &str) -> bool {
+    entry.rsplit_once(':').is_some_and(|(host, port)| {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        !host.is_empty() && port.parse::<u16>().is_ok()
+    })
+}
+
+/// Rule 85's topic check: Kafka's `Topic.validate`.
+fn is_kafka_topic_name(topic: &str) -> bool {
+    (1..=249).contains(&topic.len())
+        && topic != "."
+        && topic != ".."
+        && topic.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Rules 17/18/57's datagram predicate: the kinds the datagram listener driver backs
@@ -6871,6 +7000,205 @@ mod tests {
         }
         let err = datadog_in_err(kind);
         assert!(err.contains("'idle_timeout' must be greater than 0s"), "got: {err}");
+    }
+
+    // ---- rule 85: kafka_out ----------------------------------------------------------------
+
+    /// A `kafka_out` with every optional field at its default.
+    fn kafka_out() -> ComponentKind {
+        ComponentKind::KafkaOut {
+            brokers: vec!["kafka:9092".to_string()],
+            topic: "logs".to_string(),
+            key: logit_config::KafkaKey::default(),
+            format: logit_config::KafkaFormat::default(),
+            record: None,
+            compression: logit_config::KafkaCompression::default(),
+            acks: logit_config::KafkaAcks::default(),
+            idempotent: true,
+            max_request_bytes: logit_config::default_kafka_max_request_bytes(),
+            timeout: logit_config::default_kafka_timeout(),
+            headers: Default::default(),
+            tls: None,
+        }
+    }
+
+    fn kafka_out_with(edit: impl FnOnce(&mut ComponentKind)) -> ComponentKind {
+        let mut kind = kafka_out();
+        edit(&mut kind);
+        kind
+    }
+
+    fn kafka_out_result(kind: ComponentKind) -> anyhow::Result<Graph> {
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+    }
+
+    #[test]
+    fn a_kafka_out_resolves() {
+        kafka_out_result(kafka_out()).expect("the defaults are valid");
+        let kind = kafka_out_with(|k| {
+            if let ComponentKind::KafkaOut { brokers, key, acks, idempotent, tls, topic, .. } = k {
+                *brokers = vec!["a:9092".into(), "[::1]:9093".into()];
+                *topic = "app.logs_v2-x".into();
+                *key = logit_config::KafkaKey::Resource("service.name".into());
+                *acks = logit_config::KafkaAcks::Leader;
+                *idempotent = false;
+                *tls = Some(logit_config::TlsClientConfig::default());
+            }
+        });
+        kafka_out_result(kind).expect("acks: leader without idempotence, and an empty tls block");
+        let kind = kafka_out_with(|k| {
+            if let ComponentKind::KafkaOut { key, format, record, .. } = k {
+                *key = logit_config::KafkaKey::TraceId;
+                *format = logit_config::KafkaFormat::Native;
+                *record = Some(logit_config::KafkaRecord::Event);
+            }
+        });
+        kafka_out_result(kind).expect("a key with native under record: event");
+        let kind = kafka_out_with(|k| {
+            if let ComponentKind::KafkaOut { format, record, .. } = k {
+                *format = logit_config::KafkaFormat::Text;
+                *record = Some(logit_config::KafkaRecord::Batch);
+            }
+        });
+        kafka_out_result(kind).expect("record: batch with no key");
+    }
+
+    /// Rule 85, one clause per case.
+    #[test]
+    fn rule_85_rejects_each_kafka_out_misconfiguration() {
+        use logit_config::{KafkaAcks, KafkaKey, TlsClientConfig};
+        type Edit = Box<dyn FnOnce(&mut ComponentKind)>;
+        let edit = |f: fn(&mut ComponentKind)| -> Edit { Box::new(f) };
+        let cases: Vec<(&str, Edit)> = vec![
+            (
+                "'brokers' is empty",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { brokers, .. } = k {
+                        brokers.clear();
+                    }
+                }),
+            ),
+            (
+                "isn't a host:port",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { brokers, .. } = k {
+                        brokers.push("kafka".into());
+                    }
+                }),
+            ),
+            (
+                "isn't a host:port",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { brokers, .. } = k {
+                        *brokers = vec![":9092".into()];
+                    }
+                }),
+            ),
+            (
+                "isn't a legal Kafka topic name",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { topic, .. } = k {
+                        *topic = "logs/app".into();
+                    }
+                }),
+            ),
+            (
+                "isn't a legal Kafka topic name",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { topic, .. } = k {
+                        *topic = "..".into();
+                    }
+                }),
+            ),
+            (
+                "isn't a legal Kafka topic name",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { topic, .. } = k {
+                        *topic = "t".repeat(250);
+                    }
+                }),
+            ),
+            (
+                "names an empty attribute",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { key, .. } = k {
+                        *key = KafkaKey::Attribute(String::new());
+                    }
+                }),
+            ),
+            (
+                "'record: batch' packs many events into an unkeyed record -- set 'record: event'",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { key, record, .. } = k {
+                        *key = KafkaKey::TraceId;
+                        *record = Some(logit_config::KafkaRecord::Batch);
+                    }
+                }),
+            ),
+            (
+                "'format: native', whose records default to 'record: batch', packs",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { key, format, .. } = k {
+                        *key = KafkaKey::Resource("service.name".into());
+                        *format = logit_config::KafkaFormat::Native;
+                    }
+                }),
+            ),
+            (
+                "'idempotent: true' needs 'acks: all'",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { acks, .. } = k {
+                        *acks = KafkaAcks::None;
+                    }
+                }),
+            ),
+            (
+                "'max_request_bytes' must be greater than 0",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { max_request_bytes, .. } = k {
+                        *max_request_bytes = 0;
+                    }
+                }),
+            ),
+            (
+                "'timeout: 0s'",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { timeout, .. } = k {
+                        *timeout = Duration::ZERO;
+                    }
+                }),
+            ),
+            (
+                "must both be set for mutual TLS",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { tls, .. } = k {
+                        *tls = Some(TlsClientConfig {
+                            cert_file: Some("c.pem".into()),
+                            ..Default::default()
+                        });
+                    }
+                }),
+            ),
+            (
+                "can't both be set",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { tls, .. } = k {
+                        *tls = Some(TlsClientConfig {
+                            ca_file: Some("ca.pem".into()),
+                            insecure_skip_verify: true,
+                            ..Default::default()
+                        });
+                    }
+                }),
+            ),
+        ];
+        for (want, edit) in cases {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("out", vec!["in"], kafka_out_with(edit)),
+            ]));
+            assert!(err.contains("'out'") && err.contains(want), "want {want:?}, got: {err}");
+        }
     }
 
     // ---- rule 70: splunk_hec_out -----------------------------------------------------------

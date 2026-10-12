@@ -57,8 +57,8 @@ stage you add on purpose. See [ADR `lossless-transit`](adr/lossless-transit.md).
   inline in the YAML or loaded from a `.lua` file. Built-in components also cover stateful metric
   aggregation (counters, gauges, sets, and distributions with percentiles), consistent sampling,
   filtering, and routing. Every stage is opt-in.
-- **Emit:** the same protocols as ingest, except file tailing, plus InfluxDB 2.x, standard output,
-  and rotating files. The native `logit` protocol forwards events between nodes.
+- **Emit:** the same protocols as ingest, except file tailing, plus InfluxDB 2.x, Kafka topics,
+  standard output, and rotating files. The native `logit` protocol forwards events between nodes.
 - **Configuration:** YAML, validated against a JSON Schema generated from the Rust config types, so
   the schema can't drift from what the binary accepts. A config is one flat graph of named
   **components**, not a fixed inputs, transforms, and outputs structure. Each component has a

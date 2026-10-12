@@ -19,6 +19,7 @@ still open.
 | [statsd.md](statsd.md) | `statsd_in` and `statsd_out` |
 | [datadog.md](datadog.md) | `datadog_in`, `datadog_out`, `datadog_trace_in`, and `datadog_trace_out` |
 | [splunk.md](splunk.md) | `splunk_hec_in` and `splunk_hec_out` |
+| [kafka.md](kafka.md) | `kafka_out` |
 | [syslog.md](syslog.md) | `syslog_in` and `syslog_out` |
 | [otlp.md](otlp.md) | `otlp_in` and `otlp_out` |
 | [prometheus.md](prometheus.md) | `prometheus_in` and `prometheus_out`, scrape and remote-write |

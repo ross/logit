@@ -22,6 +22,7 @@ use logit_bench::fixtures;
 use logit_core::subslice::within;
 use logit_core::{AttrMap, EventBatch, Registry, Resource, Telemetry, TraceRef, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
+use logit_outputs::kafka::{KafkaEncoder, RecordFormat, RecordKey, RecordMode};
 use logit_outputs::statsd::{Format as StatsdFormat, StatsdEncoder};
 use logit_outputs::stdio::{EventDump, Format};
 use logit_outputs::syslog::{Format as SyslogFormat, SyslogEncoder};
@@ -3076,6 +3077,36 @@ fn measure_framed<M, E: FramedEncoder<Meta = M>>(
 ) -> (E::Stats, Stats) {
     let _ = encoder.encode_into(batch, out);
     measure(|| encoder.encode_into(batch, out))
+}
+
+/// `kafka_out` encoding 100 nginx events, per `format:` and `record:`, through the same warm
+/// `FramedEncoder::encode_into` as the syslog row. `json`, `text`, and `msgpack` render into
+/// buffers the encoder keeps, so a warm call allocates nothing per event or per batch. `native`
+/// pays what [`native_encode_one_event`] pays: 20 per event for the per-field TLV scratch
+/// buffers, and 10 per frame for the dictionary, the section buffers, and the frame. That is 30
+/// per event under `record: event`, one frame each, and 2,010 under `record: batch`, whose 100
+/// events fit in one frame under a 1 MiB cap.
+#[test]
+fn kafka_encode_into_100_events() {
+    let batch = fixtures::nginx_batch(100);
+    let cases = [
+        (RecordFormat::Json, RecordMode::Event, "json, record: event", 0),
+        (RecordFormat::Json, RecordMode::Batch, "json, record: batch", 0),
+        (RecordFormat::Text, RecordMode::Event, "text, record: event", 0),
+        (RecordFormat::Text, RecordMode::Batch, "text, record: batch", 0),
+        (RecordFormat::Msgpack, RecordMode::Event, "msgpack, record: event", 0),
+        (RecordFormat::Msgpack, RecordMode::Batch, "msgpack, record: batch", 0),
+        (RecordFormat::Native, RecordMode::Event, "native, record: event", 3000),
+        (RecordFormat::Native, RecordMode::Batch, "native, record: batch", 2010),
+    ];
+    for (format, record, label, want) in cases {
+        let mut encoder = KafkaEncoder::new(&RecordKey::None, format, record, 1 << 20);
+        let mut out = MessageBuf::default();
+        let (_, stats) = measure_framed(&mut encoder, &batch, &mut out);
+        let records = if record == RecordMode::Event { 100 } else { 1 };
+        assert_eq!(out.len(), records, "{label}");
+        expect_allocs(&format!("kafka_out: encode_into 100 events, {label}"), stats, want);
+    }
 }
 
 /// Zero for 100 single-counter DogStatsD events: every per-metric buffer

@@ -14,11 +14,13 @@
 # `EXTERNAL_ENV_PASSED` names, empty when unset.
 #
 # `victoria-metrics` is in the `local` profile, which the driver enables for a local-target
-# scenario only, so an external target's stack runs without it.
+# scenario only, so an external target's stack runs without it. `kafka` is in the `kafka`
+# profile, which the driver enables for a Kafka-target scenario only, in place of `local`.
 #
-# Every service carries a `soak.role` label, `sut`, `generator`, or `backend`, which is how the
-# driver and the checks know it. A scenario's `compose =` override file is merged onto this one
-# (`-f compose.yaml -f <override>`) and labels any service it adds, such as a second backend.
+# Every service carries a `soak.role` label, `sut`, `generator`, `backend`, or `broker` (the
+# Kafka target's broker), which is how the driver and the checks know it. A scenario's
+# `compose =` override file is merged onto this one (`-f compose.yaml -f <override>`) and labels
+# any service it adds, such as a second backend.
 #
 # No `container_name` and no `name:`, so a second scenario under another project can't collide
 # with this one. The only published ports are the backends': each publishes its own ephemeral
@@ -50,12 +52,48 @@ services:
     ports: ["127.0.0.1::8428"]
     logging: *logging
 
+  # A single-node KRaft broker, the version testdata/interop/kafka/README.md records. One
+  # partition per topic, so the topic's end offset is its record count; topics are created on
+  # first use. The driver reads the target topic back with this image's own tools through
+  # `docker exec`, so nothing is published. A restart keeps its log: the container is never
+  # recreated.
+  kafka:
+    image: apache/kafka:4.2.0
+    profiles: [kafka]
+    labels: { soak.role: broker }
+    hostname: kafka
+    restart: "no"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 1
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server",
+             "localhost:9092"]
+      # Each probe starts a JVM, so after startup it runs twice a minute.
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 120s
+      start_interval: 2s
+    logging: *logging
+
   logit:
     <<: *logit
     labels: { soak.role: sut }
-    # Not required: an external target's stack has no victoria-metrics service to wait for.
+    # Neither is required: each is in a profile only one target's stack runs.
     depends_on:
       victoria-metrics: { condition: service_started, required: false }
+      kafka: { condition: service_healthy, required: false }
     environment:
       DD_API_KEY: ${DD_API_KEY:-}
     volumes: ["${SOAK_SUT_CONFIG:?set by script/soak}:/config.yaml:ro,z"]
