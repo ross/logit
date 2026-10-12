@@ -284,8 +284,12 @@
 //!     isn't a legal Kafka topic name, a `key` naming an empty attribute, a `key` other than
 //!     `none` with `record: batch` (`format: native`'s default), `idempotent: true` without
 //!     `acks: all`, a `max_request_bytes` of `0`, `timeout: 0s`, a `tls` failing rule 34's
-//!     checks, or a `sasl` with an empty `username` (`docs/adr/kafka-output.md`,
-//!     `docs/adr/kafka-sasl.md`).
+//!     checks, a `sasl` with an empty `username`, or an `oauthbearer` `sasl` with both or
+//!     neither of `token` and `token_endpoint`, a `token` that isn't an RFC 6750 bearer token or
+//!     comes with `client_id`, `client_secret`, or `scope`, a `token_endpoint` that isn't
+//!     `https://` or `http://` to a loopback host or lacks `client_id` or `client_secret`, or an
+//!     extension whose key isn't letters only or is `auth`, or whose value is empty or not
+//!     printable ASCII (`docs/adr/kafka-output.md`, `docs/adr/kafka-sasl.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3700,11 +3704,14 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 );
             }
         }
-        if sasl.as_ref().is_some_and(|sasl| sasl.username().is_empty()) {
+        if sasl.as_ref().and_then(|sasl| sasl.username()).is_some_and(str::is_empty) {
             anyhow::bail!(
                 "component '{id}': kafka_out 'sasl.username' is empty -- give the user the broker \
                  knows these credentials by"
             );
+        }
+        if let Some(sasl) = sasl {
+            check_kafka_oauthbearer(id, sasl)?;
         }
     }
 
@@ -4220,6 +4227,109 @@ fn is_host_port(entry: &str) -> bool {
         let host = host.trim_start_matches('[').trim_end_matches(']');
         !host.is_empty() && port.parse::<u16>().is_ok()
     })
+}
+
+/// Rule 85's `sasl: {mechanism: oauthbearer}` checks. No message prints the token, the client
+/// secret, or an extension's value, and the endpoint goes through `redact::url`.
+fn check_kafka_oauthbearer(id: &str, sasl: &logit_config::KafkaSasl) -> anyhow::Result<()> {
+    let logit_config::KafkaSasl::OAuthBearer {
+        token,
+        token_endpoint,
+        client_id,
+        client_secret,
+        scope,
+        extensions,
+    } = sasl
+    else {
+        return Ok(());
+    };
+    match (token, token_endpoint) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "component '{id}': kafka_out 'sasl' sets both 'token' and 'token_endpoint' -- give a \
+             fixed token, or an endpoint to fetch one from, not both"
+        ),
+        (None, None) => anyhow::bail!(
+            "component '{id}': kafka_out 'sasl: {{mechanism: oauthbearer}}' needs 'token' or \
+             'token_endpoint'"
+        ),
+        (Some(token), None) => {
+            if !is_bearer_token(token) {
+                anyhow::bail!(
+                    "component '{id}': kafka_out 'sasl.token' is empty or holds a character a \
+                     bearer token can't carry -- letters, digits, '-', '.', '_', '~', '+', and \
+                     '/', then any '=' padding"
+                );
+            }
+            if client_id.is_some() || client_secret.is_some() || scope.is_some() {
+                anyhow::bail!(
+                    "component '{id}': kafka_out 'sasl.client_id', 'client_secret', and 'scope' \
+                     are for 'token_endpoint', and a fixed 'token' never uses them -- remove them"
+                );
+            }
+        }
+        (None, Some(endpoint)) => {
+            if !is_https_or_loopback_http(endpoint) {
+                anyhow::bail!(
+                    "component '{id}': kafka_out 'sasl.token_endpoint' ({endpoint:?}) must be \
+                     'https://', or 'http://' to a loopback address -- the client secret crosses \
+                     it",
+                    endpoint = redact::url(endpoint)
+                );
+            }
+            if client_id.as_deref().is_none_or(str::is_empty) || client_secret.is_none() {
+                anyhow::bail!(
+                    "component '{id}': kafka_out 'sasl.token_endpoint' needs 'client_id' and \
+                     'client_secret'"
+                );
+            }
+        }
+    }
+    for (key, value) in extensions {
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphabetic()) || key == "auth" {
+            anyhow::bail!(
+                "component '{id}': kafka_out 'sasl.extensions' key {key:?} must be letters only, \
+                 and not 'auth', which carries the token"
+            );
+        }
+        if value.is_empty()
+            || !value.bytes().all(|b| matches!(b, 0x21..=0x7e | b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            anyhow::bail!(
+                "component '{id}': kafka_out 'sasl.extensions' value for {key:?} is empty or \
+                 holds a character outside printable ASCII, space, tab, CR, and LF"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// RFC 6750's `b64token`, the form a bearer token takes: what RFC 7628 puts after
+/// `auth=Bearer `.
+fn is_bearer_token(token: &str) -> bool {
+    let body = token.trim_end_matches('=');
+    !body.is_empty()
+        && body.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
+}
+
+/// An `https://` URL, or an `http://` one whose host is `localhost` or a loopback address.
+fn is_https_or_loopback_http(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("https://") {
+        return !rest.is_empty();
+    }
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split_once(']').map_or("", |(host, _)| host)
+    } else {
+        host_port.split_once(':').map_or(host_port, |(host, _)| host)
+    };
+    host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Rule 85's topic check: Kafka's `Topic.validate`.
@@ -7228,6 +7338,161 @@ mod tests {
                 ("out", vec!["in"], kafka_out_with(edit)),
             ]));
             assert!(err.contains("'out'") && err.contains(want), "want {want:?}, got: {err}");
+        }
+    }
+
+    /// An `oauthbearer` `sasl` block with `edit` applied, on a `kafka_out`.
+    fn kafka_out_oauth(edit: impl FnOnce(&mut logit_config::KafkaSasl)) -> ComponentKind {
+        let mut sasl = logit_config::KafkaSasl::OAuthBearer {
+            token: None,
+            token_endpoint: Some("https://idp.example/oauth2/token".into()),
+            client_id: Some("logit".into()),
+            client_secret: Some("client-secret-value".into()),
+            scope: Some("kafka".into()),
+            extensions: [("logicalCluster".to_string(), "lkc-1".to_string())].into(),
+        };
+        edit(&mut sasl);
+        kafka_out_with(|k| {
+            if let ComponentKind::KafkaOut { sasl: slot, .. } = k {
+                *slot = Some(sasl);
+            }
+        })
+    }
+
+    fn oauth_fields(
+        sasl: &mut logit_config::KafkaSasl,
+    ) -> (
+        &mut Option<String>,
+        &mut Option<String>,
+        &mut Option<String>,
+        &mut Option<String>,
+        &mut BTreeMap<String, String>,
+    ) {
+        let logit_config::KafkaSasl::OAuthBearer {
+            token,
+            token_endpoint,
+            client_id,
+            client_secret,
+            extensions,
+            ..
+        } = sasl
+        else {
+            unreachable!()
+        };
+        (token, token_endpoint, client_id, client_secret, extensions)
+    }
+
+    #[test]
+    fn a_kafka_out_oauthbearer_resolves() {
+        kafka_out_result(kafka_out_oauth(|_| {})).expect("client credentials over https");
+        for endpoint in
+            ["http://127.0.0.1:8080/token", "http://localhost/token", "http://[::1]:80/t"]
+        {
+            kafka_out_result(kafka_out_oauth(|s| {
+                *oauth_fields(s).1 = Some(endpoint.into());
+            }))
+            .unwrap_or_else(|err| panic!("{endpoint}: {err}"));
+        }
+        kafka_out_result(kafka_out_oauth(|s| {
+            let logit_config::KafkaSasl::OAuthBearer {
+                token,
+                token_endpoint,
+                client_id,
+                client_secret,
+                scope,
+                ..
+            } = s
+            else {
+                unreachable!()
+            };
+            *token = Some("eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJsb2dpdCJ9.c2ln-_~+/==".into());
+            (*token_endpoint, *client_id, *client_secret, *scope) = (None, None, None, None);
+        }))
+        .expect("a static token");
+    }
+
+    /// Rule 85's `oauthbearer` clauses, one per case, and none prints a secret.
+    #[test]
+    fn rule_85_rejects_each_oauthbearer_misconfiguration() {
+        type Edit = Box<dyn FnOnce(&mut logit_config::KafkaSasl)>;
+        let edit = |f: fn(&mut logit_config::KafkaSasl)| -> Edit { Box::new(f) };
+        let cases: Vec<(&str, Edit)> = vec![
+            (
+                "sets both 'token' and 'token_endpoint'",
+                edit(|s| *oauth_fields(s).0 = Some("t".into())),
+            ),
+            ("needs 'token' or 'token_endpoint'", edit(|s| *oauth_fields(s).1 = None)),
+            (
+                "'sasl.token' is empty or holds a character",
+                edit(|s| {
+                    let f = oauth_fields(s);
+                    (*f.0, *f.1, *f.2, *f.3) = (Some("bad token-secret".into()), None, None, None);
+                }),
+            ),
+            (
+                "'sasl.token' is empty or holds a character",
+                edit(|s| {
+                    let f = oauth_fields(s);
+                    (*f.0, *f.1, *f.2, *f.3) = (Some(String::new()), None, None, None);
+                }),
+            ),
+            (
+                "are for 'token_endpoint', and a fixed 'token' never uses them",
+                edit(|s| {
+                    let f = oauth_fields(s);
+                    (*f.0, *f.1) = (Some("t".into()), None);
+                }),
+            ),
+            (
+                "must be 'https://', or 'http://' to a loopback address",
+                edit(|s| *oauth_fields(s).1 = Some("http://idp.example/token".into())),
+            ),
+            (
+                "must be 'https://', or 'http://' to a loopback address",
+                edit(|s| *oauth_fields(s).1 = Some("http://127.0.0.1.example/token".into())),
+            ),
+            (
+                "must be 'https://', or 'http://' to a loopback address",
+                edit(|s| *oauth_fields(s).1 = Some("ftp://idp/token".into())),
+            ),
+            ("needs 'client_id' and 'client_secret'", edit(|s| *oauth_fields(s).2 = None)),
+            (
+                "needs 'client_id' and 'client_secret'",
+                edit(|s| *oauth_fields(s).2 = Some(String::new())),
+            ),
+            ("needs 'client_id' and 'client_secret'", edit(|s| *oauth_fields(s).3 = None)),
+            (
+                "key \"auth\" must be letters only",
+                edit(|s| {
+                    oauth_fields(s).4.insert("auth".into(), "x".into());
+                }),
+            ),
+            (
+                "key \"logical_cluster\" must be letters only",
+                edit(|s| {
+                    oauth_fields(s).4.insert("logical_cluster".into(), "x".into());
+                }),
+            ),
+            (
+                "value for \"pool\" is empty or holds a character",
+                edit(|s| {
+                    oauth_fields(s).4.insert("pool".into(), "a\u{1}b-secret".into());
+                }),
+            ),
+            (
+                "value for \"pool\" is empty or holds a character",
+                edit(|s| {
+                    oauth_fields(s).4.insert("pool".into(), String::new());
+                }),
+            ),
+        ];
+        for (want, edit) in cases {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("out", vec!["in"], kafka_out_oauth(edit)),
+            ]));
+            assert!(err.contains("'out'") && err.contains(want), "want {want:?}, got: {err}");
+            assert!(!err.contains("-secret"), "a secret in: {err}");
         }
     }
 
