@@ -10,6 +10,9 @@
 #   jsonbig `format: otlp_json` with `key: trace_id` and a 4 KiB `max_request_bytes`, into
 #           6-partition `jsonbig-*` topics.
 #
+# The sinks share one source, so each drops its oldest batches rather than stall the others. At
+# 20 events a second nothing drops, and a drop would show as a missing item in check.py.
+#
 # `check.py` derives every expected value from the tick number, so the Lua below and its
 # `leg_otlp*` checks must change together.
 admin: { bind: 127.0.0.1:9600 }
@@ -84,12 +87,14 @@ components:
     sources: [mint]
     brokers: ["redpanda:9092"]
     format: otlp_proto
+    buffer: { overflow: drop_oldest }
 
   keyed:
     type: kafka_out
     sources: [mint]
     brokers: ["redpanda:9092"]
     format: otlp_proto
+    buffer: { overflow: drop_oldest }
     key: trace_id
     topics: { logs: keyed-logs, metrics: keyed-metrics, traces: keyed-spans }
 
@@ -98,6 +103,7 @@ components:
     sources: [mint]
     brokers: ["redpanda:9092"]
     format: otlp_proto
+    buffer: { overflow: drop_oldest }
     max_request_bytes: 2KiB
     topics: { logs: big-logs, metrics: big-metrics, traces: big-spans }
 
@@ -106,6 +112,7 @@ components:
     sources: [mint]
     brokers: ["redpanda:9092"]
     format: otlp_json
+    buffer: { overflow: drop_oldest }
     topics: { logs: otlpjson-logs, metrics: otlpjson-metrics, traces: otlpjson-spans }
 
   jsonbig:
@@ -113,6 +120,7 @@ components:
     sources: [mint]
     brokers: ["redpanda:9092"]
     format: otlp_json
+    buffer: { overflow: drop_oldest }
     key: trace_id
     max_request_bytes: 4KiB
     topics: { logs: jsonbig-logs, metrics: jsonbig-metrics, traces: jsonbig-spans }
