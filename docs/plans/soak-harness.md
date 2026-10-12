@@ -379,16 +379,18 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
 
 - A scenario lists one or more sources. Each names all four keys, each a component id, with a
   `service` that is a slug (lowercase letters, digits, `_`, and `-`) no other source names and
-  a `sut_listener` no other source names. Unknown keys are refused.
+  a `sut_listener` no other source names. Unknown keys are refused. A `service` whose compose
+  variable is `SOAK_SUT_CONFIG` or another source's (`generator-lines` and `generator_lines`
+  share one) is refused.
 - `[configs]` has `sut` and one key per source's `service`, and no other. The driver writes each
   generator's absolute config path into `compose.env` under `scenario.config_env(service)`:
   `SOAK_GENERATOR_CONFIG` for `generator`, `SOAK_GENERATOR_LINES_CONFIG` for
   `generator-lines`. An override's generator mounts its own variable at `/config.yaml`.
-- `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct and
-  none of them a listener. Each must forward every event it receives, which `ledger.edge`
-  judges hop by hop, and each adds an inbox and a batch to R ("The ledger and identities"). It
-  can't be combined with `[ledger] sut_script`, whose hop `ledger.script` judges from every
-  listener's E.
+- `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct, none
+  of them a listener, and none on another source's list. Each must forward every event it
+  receives, which `ledger.edge` judges hop by hop, and each adds an inbox and a batch to R ("The
+  ledger and identities"). It can't be combined with `[ledger] sut_script`, whose hop
+  `ledger.script` judges from every listener's E.
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
   stack has a source, because a generator with none would put datagrams into a listener with no
   G behind them.
@@ -2230,7 +2232,7 @@ every run passed every row:
 
 | Run | Scenario | Verdict |
 |---|---|---|
-| `20261012T202959Z` | `fanin` | every row PASS: each source's wire gap lies in its own generator's fault windows, and Ab 3,574,096 = V |
+| `20261012T202959Z` | `fanin` | every row PASS: each source's wire gap lies in its own generator's fault windows, and Ab 3,574,096 = V. The run used a 13-minute cycle and a 16-minute duration; the scenario now has 13m30s and 16m30s, which its last recovery (12m30s) plus two progress windows needs, and wasn't rerun |
 | `20261012T203004Z` | `statsd-vm` | every row PASS: the regression control |
 | `20261012T204714Z` | `fanout-copy` | every row PASS: two sinks, one source |
 | `20261012T210105Z` | `spool-kill-replay` | every row PASS: `ledger.replay` 6 replayed vs 6 queued |
@@ -2306,7 +2308,9 @@ What the work showed about the harness:
   from each listener's `receive:`, B's oversize drops, the per-source precondition, the summed
   recovery baseline and ingest, the refused scalar keys, the source rules, a source's service a
   generator, every generator a source's, several generators in the role map, a config per
-  generator, `compose.env` per generator, and the end sequence stopping each generator.
+  generator, `compose.env` per generator, and the end sequence stopping each generator. Two
+  rules added in review fail it the same way: a transform on two sources' chains, and a service
+  whose compose variable is the SUT's or another source's.
 
 The controls' tables:
 
@@ -2524,8 +2528,8 @@ Overall PASS: every row passed but `ledger.windows`, which a Kafka target SKIPs,
   `logit:soak`. Re-scoring ten preserved runs gives the same statuses. Met: the four scenario
   runs and the `statsd-vm`, `statsd-vm-lost-total`, and `sink-outage-drop-oldest` controls are
   recorded under "Findings", every row PASS.
-- **W8b**: the self-test passes (1,021 expectations), and each harness change fails it when
-  reverted (18 reverts, listed under "Findings"). `fanin` passes `self-test` validation, the
+- **W8b**: the self-test passes (1,023 expectations), and each harness change fails it when
+  reverted (20 reverts, listed under "Findings"). `fanin` passes `self-test` validation, the
   shipped-config test, and `logit validate` in `logit:soak`. Re-scoring runs recorded before W8b
   isn't possible: their resolved scenarios carry the scalar `[ledger]` keys. Met: the `fanin`
   run and the `statsd-vm`, `fanout-copy`, `spool-kill-replay`, and `fanout-stop-outage` controls

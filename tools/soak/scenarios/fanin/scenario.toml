@@ -7,11 +7,11 @@
 
 name = "fanin"
 description = "statsd and syslog lines from two generators into one aggregate and VictoriaMetrics: netem, partition, and stop on each generator in turn"
-duration = "16m"          # warmup + one cycle + cooldown
+duration = "16m30s"       # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "120s"         # >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
-cycle = "13m"             # >= last recovery (12m30s) + 2 x progress_window
+cycle = "13m30s"          # >= last recovery (12m30s) + 2 x progress_window
 compose = "compose.override.yaml"   # adds generator-lines
 
 [configs]                 # the SUT's config, and each generator's under its service name

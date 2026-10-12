@@ -4171,6 +4171,20 @@ def _source_rules(root):
     _refused(path, mutate(lambda r: second(r, sut_transforms=["parse", "lines"])),
              "`sut_transforms` repeats a component or names a listener",
              "a transform that is a listener")
+    _refused(path, mutate(lambda r: (r["ledger"]["source"][0].update(sut_transforms=["parse"]),
+                                     second(r, sut_transforms=["count", "parse"]))),
+             "ledger.source 2: `sut_transforms` names parse, which another source's chain "
+             "lists", "one transform on two sources' chains")
+    _refused(path, mutate(lambda r: (second(r, service="generator_lines"),
+                                     r["ledger"]["source"].append(dict(lines)),
+                                     r["configs"].update(
+                                         {"generator_lines": "logit-generator.yaml"}))),
+             "ledger.source 3: `service` 'generator-lines' would mount its config through "
+             "SOAK_GENERATOR_LINES_CONFIG", "two services sharing one compose variable")
+    _refused(path, mutate(lambda r: (second(r, service="sut"),
+                                     r["configs"].pop("generator-lines"))),
+             "`service` 'sut' would mount its config through SOAK_SUT_CONFIG",
+             "a generator whose variable is the SUT's")
     _refused(path, mutate(lambda r: second(r, sut_transforms="parse")),
              "`sut_transforms` must list the component ids", "a transform list that isn't one")
     _refused(path, mutate(lambda r: (second(r, sut_transforms=["parse"]),
@@ -4189,7 +4203,7 @@ def _source_rules(root):
              "a generator with no source",
              roles={**scenario.BASE_ROLES, "generator-lines": "generator"})
 
-    for service, name in (("logit", "SOAK_SUT_CONFIG"), ("generator", "SOAK_GENERATOR_CONFIG"),
+    for service, name in (("generator", "SOAK_GENERATOR_CONFIG"),
                           ("generator-lines", "SOAK_GENERATOR_LINES_CONFIG")):
         expect(scenario.config_env(service) == name,
                f"{service}'s config is in {name}, got {scenario.config_env(service)}")

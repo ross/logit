@@ -203,7 +203,7 @@ class Run:
         # `--env-file` rather than the environment: `sudo` resets the environment.
         env_file.write_text(
             f"SOAK_IMAGE={self.image}\n"
-            f"SOAK_SUT_CONFIG={self.scenario.config_path('sut')}\n"
+            f"{scenario_mod.SUT_CONFIG_ENV}={self.scenario.config_path('sut')}\n"
             + "".join(f"{scenario_mod.config_env(service)}="
                       f"{self.scenario.config_path(service)}\n"
                       for service in self.scenario.generators)

@@ -123,11 +123,11 @@ Three scenarios give the SUT two sinks of one kind, each to its own VictoriaMetr
 | `fanout-block` | 5 minutes 30 seconds | as `fanout-copy` with 500 ms windows, and the second sink's queue at 2 batches under `overflow: block`, through a 90 s stop of its backend. A fan-out offers each batch to its consumers in turn through one send, so once that sink's queue and inbox fill, `aggregate` waits on it and the healthy sink stops delivering too. A `mark` names the blocked span; the expectations assert the stall, the backpressure reaching the listener, and both sinks recovering |
 | `route-split` | 9 minutes | the generator tags each line `shard:0` or `shard:1` over DogStatsD, and a `route` on `shard` fills two targets, each feeding one sink (`split = "route"`): one backend stopped 90 s, then netem loss on the other. Each backend holds one shard's series, so the egress gap is judged on their sum |
 
-`fanin` (16 minutes) runs two generators of different kinds into one `aggregate` and one sink,
-each with its own `[[ledger.source]]`. `generator` sends `statsd-vm`'s 2,000 statsd lines a
-second into `statsd_in`. `generator-lines`, which the scenario's override adds, sends 2,000
+`fanin` (16 minutes 30 seconds) runs two generators of different kinds into one `aggregate` and
+one sink, each with its own `[[ledger.source]]`. `generator` sends `statsd-vm`'s 2,000 statsd
+lines a second into `statsd_in`. `generator-lines`, which the scenario's override adds, sends 2,000
 syslog lines a second over UDP into `lines_in`, one per datagram; `kv`, `keep`, `kv_metrics`, and
-`keep_signals` turn each into one `soak_lines` increment beside statsd's series. Its 13-minute
+`keep_signals` turn each into one `soak_lines` increment beside statsd's series. Its 13.5-minute
 cycle puts netem loss, a partition, and a stop on each generator in turn, and its expectations
 assert that a stopped generator's listener reads nothing while the other keeps reading.
 

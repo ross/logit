@@ -683,9 +683,10 @@ def _sink_problems(ledger, kind):
 
 def _source_problems(ledger):
     """What the `[[ledger.source]]` tables break: at least one, each a table of known keys with
-    every required key a component id, a distinct generator `service` that is a slug, a
-    distinct `sut_listener`, and an optional `sut_transforms` list of distinct component ids,
-    none of them a listener; and no `sut_transforms` beside `[ledger] sut_script`, whose hop
+    every required key a component id, a distinct generator `service` that is a slug whose
+    `config_env()` is neither `SUT_CONFIG_ENV` nor another source's, a distinct `sut_listener`,
+    and an optional `sut_transforms` list of distinct component ids, none of them a listener or
+    on another source's list; and no `sut_transforms` beside `[ledger] sut_script`, whose hop
     `ledger.script` judges from the listeners' summed E. Whether each `service` is a generator
     needs the role map: `service_problems()`."""
     if "source" not in ledger:
@@ -709,6 +710,12 @@ def _source_problems(ledger):
                                 "letters, digits, `_`, or `-`")
             elif service in services:
                 problems.append(f"{where}: `service` {service!r} repeats another source's")
+            elif config_env(service) in {SUT_CONFIG_ENV} | {
+                    config_env(other) for other in services}:
+                # `generator-lines` and `generator_lines` share one compose variable.
+                problems.append(f"{where}: `service` {service!r} would mount its config "
+                                f"through {config_env(service)}, which the SUT or another "
+                                "source already uses")
             else:
                 services.append(service)
         for key in ("generator_input", "generator_sink", "sut_listener"):
@@ -723,6 +730,9 @@ def _source_problems(ledger):
             else:
                 listeners.append(listener)
     every = set(listeners)
+    # Every transform named so far, across all chains: a node in two chains would be judged
+    # as forwarding both sources' events.
+    named = set()
     for index, source in enumerate(sources):
         where = f"ledger.source {index + 1}"
         if "sut_transforms" not in source:
@@ -735,18 +745,26 @@ def _source_problems(ledger):
         elif len(set(chain)) != len(chain) or set(chain) & every:
             problems.append(f"{where}: `sut_transforms` repeats a component or names a "
                             "listener")
+        elif set(chain) & named:
+            problems.append(f"{where}: `sut_transforms` names "
+                            f"{', '.join(sorted(set(chain) & named))}, which another source's "
+                            "chain lists; each node is on one source's chain")
+        else:
+            named |= set(chain)
         if ledger.get("sut_script") is not None:
             problems.append(f"{where}: `sut_transforms` and [ledger] sut_script can't be "
                             "combined; the script's hop is judged from every listener's E")
     return problems
 
 
+# The compose variable holding the absolute path of the SUT's config, set in `compose.env`.
+SUT_CONFIG_ENV = "SOAK_SUT_CONFIG"
+
+
 def config_env(service):
-    """The compose variable holding the absolute path of `service`'s config, set in
-    `compose.env`: `SOAK_SUT_CONFIG` for the SUT, `SOAK_GENERATOR_CONFIG` for `generator`,
-    `SOAK_GENERATOR_LINES_CONFIG` for `generator-lines`."""
-    if service == SUT_SERVICE:
-        return "SOAK_SUT_CONFIG"
+    """The compose variable holding the absolute path of generator `service`'s config, set in
+    `compose.env`: `SOAK_GENERATOR_CONFIG` for `generator`, `SOAK_GENERATOR_LINES_CONFIG` for
+    `generator-lines`."""
     return "SOAK_" + re.sub(r"[^A-Z0-9]", "_", service.upper()) + "_CONFIG"
 
 
