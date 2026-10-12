@@ -4,19 +4,24 @@
 //!
 //! 1. The environment: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`.
 //! 2. Web identity: `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`, exchanged through an
-//!    unsigned STS `AssumeRoleWithWebIdentity` at the broker's region (EKS IRSA).
+//!    unsigned STS `AssumeRoleWithWebIdentity` at the broker's region (EKS IRSA). A region
+//!    outside the `aws`, `aws-cn`, and `aws-us-gov` partitions is `Refused`
+//!    ([`partition_domain`]).
 //! 3. The shared files: `AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE`, or
 //!    `~/.aws/credentials` and `~/.aws/config`, profile `AWS_PROFILE` or `default`, static keys
-//!    only. The credentials file wins a key both files set.
+//!    only. The credentials file wins a key both files set. A profile `AWS_PROFILE` names must
+//!    hold keys; the implicit `default` without them, such as the `region`-only one
+//!    `aws configure` writes, counts as absent.
 //! 4. The container endpoint: `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` at `169.254.170.2`, else
 //!    `AWS_CONTAINER_CREDENTIALS_FULL_URI`, with `AWS_CONTAINER_AUTHORIZATION_TOKEN` or the file
 //!    `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` names (ECS, EKS Pod Identity).
 //! 5. IMDSv2, unless `AWS_EC2_METADATA_DISABLED` is `true`.
 //!
-//! A source whose variables or profile aren't there is skipped. Unlike the Java chain, a source
-//! that is there and fails ends the lookup with its own error instead of falling through, so a
-//! broken IRSA setup on EKS never authenticates as the node's instance role. With no source
-//! there, the error lists what was looked for.
+//! A source whose variables or profile aren't there, or the implicit `default` profile without
+//! keys, is skipped. Unlike the Java chain, a source that is there and fails ends the lookup
+//! with its own error instead of falling through, so a broken IRSA setup on EKS never
+//! authenticates as the node's instance role. With no source there, the error lists what was
+//! looked for.
 //!
 //! Credentials that carry an expiry are reused by every connection until 5 minutes before it,
 //! and concurrent dials wait on one lookup. Credentials without one (the environment, the files)
@@ -25,7 +30,10 @@
 //! A fault's class follows `super::super`'s response-class table: an endpoint unreachable, timed
 //! out, or answering `429` or `5xx`, and STS's `Throttling` and `IDPCommunicationError`, are
 //! `Clean`; any other answer from an endpoint, and a source misconfigured on this host, are
-//! `Refused`. Every HTTP request is bounded by the sink's `timeout`. No message or `Debug` output
+//! `Refused`. Every HTTP request is bounded by the sink's `timeout`. STS's request honors
+//! `HTTPS_PROXY` and the other proxy variables; the container endpoint's and IMDS's never go
+//! through a proxy, as the Java SDK's don't, because a proxy would see the container
+//! authorization token and the credentials. No message or `Debug` output
 //! carries a secret key, a session token, or a web identity token.
 
 use std::collections::HashMap;
@@ -119,7 +127,10 @@ impl std::fmt::Debug for Credentials {
 pub(crate) struct Chain {
     env: Env,
     endpoints: Endpoints,
+    /// STS's client, which honors `HTTPS_PROXY` and the other proxy variables.
     client: reqwest::Client,
+    /// The container endpoint's and IMDS's client, which ignores every proxy setting.
+    direct: reqwest::Client,
     timeout: Duration,
     cache: Mutex<Option<Cached>>,
     /// Held across a lookup, so concurrent dials wait on one.
@@ -139,10 +150,27 @@ impl Chain {
     }
 
     pub(crate) fn with(env: Env, endpoints: Endpoints, timeout: Duration) -> Self {
+        Self::with_clients(env, endpoints, timeout, || crate::http::client_builder(timeout, None))
+    }
+
+    /// The chain with its HTTP clients built from `base`. The container endpoint's and IMDS's
+    /// drop every proxy `base` sets or the environment names, as the Java SDK opens them with
+    /// `Proxy.NO_PROXY`: a proxy would see the container authorization token and the
+    /// credentials, and couldn't reach a link-local address anyway.
+    fn with_clients(
+        env: Env,
+        endpoints: Endpoints,
+        timeout: Duration,
+        base: impl Fn() -> reqwest::ClientBuilder,
+    ) -> Self {
+        let build = |builder: reqwest::ClientBuilder| {
+            builder.build().expect("reqwest client should build with default TLS settings")
+        };
         Self {
             env,
             endpoints,
-            client: crate::http::build_client(timeout, None),
+            client: build(base()),
+            direct: build(base().no_proxy()),
             timeout,
             cache: Mutex::new(None),
             fetching: tokio::sync::Mutex::new(()),
@@ -264,7 +292,7 @@ impl Chain {
         });
         let base = match &self.endpoints.sts {
             Some(base) => base.clone(),
-            None => format!("https://sts.{region}.{}", partition_domain(region)),
+            None => format!("https://sts.{region}.{}", partition_domain(region)?),
         };
         let url = format!("{}/", base.trim_end_matches('/'));
         let form = |k: &str, v: &str| format!("{k}={}", super::oauth::form_urlencode(v));
@@ -368,6 +396,12 @@ impl Chain {
                 expires: None,
                 source: format!("profile {name:?} in {files}"),
             })),
+            // `aws configure` writes a `[default]` holding only `region`, so only an implicit
+            // `default` without keys counts as absent.
+            (None, None) if explicit.is_some() => Err(anyhow!(
+                "AWS_PROFILE names profile {name:?}, which has no 'aws_access_key_id' in {files}"
+            ))
+            .context(Fault::Refused),
             (None, None) => {
                 absent.push(format!("the shared files (profile {name:?} has no keys)"));
                 Ok(None)
@@ -414,7 +448,7 @@ impl Chain {
             },
         };
         let what = format!("the container credential endpoint {}", redact::url(&url));
-        let mut request = self.client.get(&url);
+        let mut request = self.direct.get(&url);
         if let Some(token) = token {
             request = request.header(reqwest::header::AUTHORIZATION, token);
         }
@@ -430,7 +464,7 @@ impl Chain {
         let base = self.endpoints.imds.trim_end_matches('/');
         let what = format!("IMDS at {base}");
         let request = self
-            .client
+            .direct
             .put(format!("{base}/latest/api/token"))
             .header("x-aws-ec2-metadata-token-ttl-seconds", IMDS_TOKEN_TTL_SECONDS);
         let (status, token) = self.send(request, &what).await?;
@@ -441,7 +475,7 @@ impl Chain {
         let token = String::from_utf8_lossy(&token).trim().to_string();
         let roles_url = format!("{base}/latest/meta-data/iam/security-credentials/");
         let (status, roles) = self
-            .send(self.client.get(&roles_url).header("x-aws-ec2-metadata-token", &token), &what)
+            .send(self.direct.get(&roles_url).header("x-aws-ec2-metadata-token", &token), &what)
             .await?;
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(anyhow!("{what} has no IAM role for this instance (404)"))
@@ -457,7 +491,7 @@ impl Chain {
                 .context(Fault::Refused);
         };
         let request = self
-            .client
+            .direct
             .get(format!("{roles_url}{role}"))
             .header("x-aws-ec2-metadata-token", &token);
         let (status, body) = self.send(request, &what).await?;
@@ -506,13 +540,25 @@ fn status_class(status: reqwest::StatusCode) -> Fault {
     }
 }
 
-/// The domain a region's endpoints are under: `amazonaws.com.cn` for China, else
-/// `amazonaws.com`.
-pub(crate) fn partition_domain(region: &str) -> &'static str {
-    if region.starts_with("cn-") {
-        "amazonaws.com.cn"
-    } else {
-        "amazonaws.com"
+/// The commercial `aws` partition's region prefixes, from its `regionRegex` in the AWS SDKs'
+/// partition metadata.
+const COMMERCIAL_PREFIXES: &[&str] = &["us", "eu", "ap", "sa", "ca", "me", "af", "il", "mx"];
+
+/// The domain a region's endpoints are under, for the three partitions the chain supports:
+/// `amazonaws.com.cn` for `aws-cn` (`cn-`), `amazonaws.com` for `aws-us-gov` (`us-gov-`) and
+/// `aws`. Any other region, such as an ISO partition's (`us-iso-east-1`) or the European
+/// Sovereign Cloud's (`eusc-de-east-1`, under `amazonaws.eu`), is `Refused`.
+pub(crate) fn partition_domain(region: &str) -> anyhow::Result<&'static str> {
+    // ISO regions share the `us` and `eu` prefixes.
+    let iso = region.split('-').any(|label| label.starts_with("iso"));
+    match region.split('-').next().unwrap_or_default() {
+        "cn" => Ok("amazonaws.com.cn"),
+        prefix if !iso && COMMERCIAL_PREFIXES.contains(&prefix) => Ok("amazonaws.com"),
+        _ => Err(anyhow!(
+            "region {region:?} isn't in a partition kafka_out supports for STS: aws, aws-cn, or \
+             aws-us-gov"
+        ))
+        .context(Fault::Refused),
     }
 }
 
@@ -1007,6 +1053,41 @@ mod tests {
         );
     }
 
+    /// A keyless profile counts as absent when it's the implicit `default`, as `aws configure`
+    /// writes one holding only `region`; one `AWS_PROFILE` names is refused.
+    #[tokio::test]
+    async fn a_keyless_profile_is_skipped_only_when_implicit() {
+        let dir = scratch_dir("aws-keyless-profile");
+        std::fs::create_dir_all(dir.join(".aws")).unwrap();
+        std::fs::write(
+            dir.join(".aws/config"),
+            "[default]\nregion = us-east-1\n[profile prod]\nregion = us-west-2\n",
+        )
+        .unwrap();
+        let home = dir.to_str().unwrap();
+        let imds = HttpStub::start().await;
+        imds.answer(imds_answer);
+
+        let found = chain(&[("HOME", home)], Endpoints { imds: imds.url.clone(), ..closed() })
+            .credentials("us-east-1")
+            .await
+            .unwrap();
+        assert_eq!(found.source, "IMDS role \"logit-role\"");
+
+        let requests = imds.requests().len();
+        let chain = chain(
+            &[("HOME", home), ("AWS_PROFILE", "prod")],
+            Endpoints { imds: imds.url.clone(), ..closed() },
+        );
+        let message = failure(&chain, Fault::Refused).await;
+        assert!(
+            message
+                .contains("AWS_PROFILE names profile \"prod\", which has no 'aws_access_key_id'"),
+            "{message}"
+        );
+        assert_eq!(imds.requests().len(), requests, "IMDS isn't asked");
+    }
+
     #[tokio::test]
     async fn a_profile_with_an_unsupported_source_is_refused_naming_the_key() {
         for (key, line) in [
@@ -1097,6 +1178,74 @@ mod tests {
         }
         let chain = chain(&[("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/creds")], closed());
         failure(&chain, Fault::Clean).await;
+    }
+
+    /// The container endpoint and IMDS are reached directly with a proxy configured, so the
+    /// proxy sees neither the container authorization token nor the credentials. STS's request
+    /// goes through it, which shows the proxy is in effect.
+    #[tokio::test]
+    async fn the_container_endpoint_and_imds_bypass_a_proxy() {
+        let proxy = HttpStub::start().await;
+        let proxied = |vars: &[(&str, &str)], endpoints: Endpoints| {
+            let url = proxy.url.clone();
+            Chain::with_clients(env(vars), endpoints, RECV_TIMEOUT, move || {
+                crate::http::client_builder(RECV_TIMEOUT, None)
+                    .proxy(reqwest::Proxy::all(&url).unwrap())
+            })
+        };
+
+        let imds = HttpStub::start().await;
+        imds.answer(imds_answer);
+        let found = proxied(&[], Endpoints { imds: imds.url.clone(), ..closed() })
+            .credentials("us-east-1")
+            .await
+            .unwrap();
+        assert_eq!(found.source, "IMDS role \"logit-role\"");
+        assert_eq!(imds.requests().len(), 3);
+
+        let container = HttpStub::start().await;
+        container.answer(|_, n| (200, credential_json(n, Duration::from_secs(3600))));
+        let vars = [
+            ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/creds"),
+            ("AWS_CONTAINER_AUTHORIZATION_TOKEN", "container-token"),
+        ];
+        let found = proxied(&vars, Endpoints { container: container.url.clone(), ..closed() })
+            .credentials("us-east-1")
+            .await
+            .unwrap();
+        assert_eq!(found.source, "the container endpoint");
+        assert_eq!(container.requests()[0].headers["authorization"], "container-token");
+        assert!(proxy.requests().is_empty(), "{:?}", proxy.requests());
+
+        let dir = scratch_dir("aws-proxy");
+        let token_file = dir.join("token");
+        std::fs::write(&token_file, WEB_TOKEN).unwrap();
+        let vars = [
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", token_file.to_str().unwrap()),
+            ("AWS_ROLE_ARN", "arn:aws:iam::123:role/logit"),
+        ];
+        let endpoints = Endpoints { sts: Some("http://sts.example".to_string()), ..closed() };
+        failure(&proxied(&vars, endpoints), Fault::Refused).await;
+        assert_eq!(proxy.requests()[0].headers["host"], "sts.example");
+    }
+
+    /// Web identity outside the supported partitions is refused before STS is asked, rather
+    /// than asking an `amazonaws.com` host that doesn't exist.
+    #[tokio::test]
+    async fn web_identity_outside_the_supported_partitions_is_refused() {
+        let dir = scratch_dir("aws-partition");
+        let token_file = dir.join("token");
+        std::fs::write(&token_file, WEB_TOKEN).unwrap();
+        let chain = chain(
+            &[
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", token_file.to_str().unwrap()),
+                ("AWS_ROLE_ARN", "arn:aws:iam::123:role/logit"),
+            ],
+            Endpoints { sts: None, ..closed() },
+        );
+        let err = chain.credentials("eusc-de-east-1").await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
+        assert!(format!("{err:#}").contains("\"eusc-de-east-1\" isn't in a partition"), "{err:#}");
     }
 
     #[test]
@@ -1264,8 +1413,24 @@ mod tests {
     }
 
     #[test]
-    fn china_regions_are_under_their_own_domain() {
-        assert_eq!(partition_domain("cn-northwest-1"), "amazonaws.com.cn");
-        assert_eq!(partition_domain("us-gov-west-1"), "amazonaws.com");
+    fn a_regions_partition_gives_its_domain_or_is_refused() {
+        for (region, want) in [
+            ("us-east-1", "amazonaws.com"),
+            ("ap-southeast-7", "amazonaws.com"),
+            ("mx-central-1", "amazonaws.com"),
+            ("cn-northwest-1", "amazonaws.com.cn"),
+            ("us-gov-west-1", "amazonaws.com"),
+        ] {
+            assert_eq!(partition_domain(region).unwrap(), want, "{region}");
+        }
+        for region in
+            ["eusc-de-east-1", "us-iso-east-1", "us-isob-east-1", "eu-isoe-west-1", "xx-east-1"]
+        {
+            let err = partition_domain(region).unwrap_err();
+            assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{region}");
+            let message = format!("{err:#}");
+            assert!(message.contains(&format!("{region:?}")), "{message}");
+            assert!(message.contains("aws, aws-cn, or aws-us-gov"), "{message}");
+        }
     }
 }

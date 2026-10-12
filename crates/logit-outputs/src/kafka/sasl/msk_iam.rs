@@ -21,11 +21,12 @@
 //! signature is what the broker checks. It ties the session lifetime to the credentials' expiry,
 //! and `super::authenticate`'s redial before then fetches fresh ones.
 //!
-//! The region is `region:` when set, else the label before the AWS domain in the broker's host
-//! (`b-1.c.kafka.us-east-1.amazonaws.com`, `boot-x.c1.kafka-serverless.us-west-2.amazonaws.com`,
-//! `.amazonaws.com.cn`, `.api.aws`), as `aws-msk-iam-auth`'s `RegionUtils` reads it, else
-//! `AWS_REGION` or `AWS_DEFAULT_REGION`. With none, the exchange is `Refused`. Credentials come
-//! from [`super::aws_creds::Chain`].
+//! The region is `region:` when set, else the label before an AWS domain at the end of the
+//! broker's host (`b-1.c.kafka.us-east-1.amazonaws.com`,
+//! `boot-x.c1.kafka-serverless.us-west-2.amazonaws.com`, `.amazonaws.com.cn`, `.api.aws`), which
+//! are the `aws`, `aws-cn`, and `aws-us-gov` partitions' domains only
+//! (`docs/known-gaps/kafka.md`), else `AWS_REGION` or `AWS_DEFAULT_REGION`. With none, the
+//! exchange is `Refused`. Credentials come from [`super::aws_creds::Chain`].
 
 use std::sync::{Arc, Mutex};
 

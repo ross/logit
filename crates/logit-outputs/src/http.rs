@@ -72,12 +72,22 @@ pub(crate) fn build_client(
     timeout: Duration,
     tls: Option<&rustls::ClientConfig>,
 ) -> reqwest::Client {
+    client_builder(timeout, tls)
+        .build()
+        .expect("reqwest client should build with the configured TLS settings")
+}
+
+/// [`build_client`]'s settings, unbuilt, for a caller that changes one, such as the proxy.
+pub(crate) fn client_builder(
+    timeout: Duration,
+    tls: Option<&rustls::ClientConfig>,
+) -> reqwest::ClientBuilder {
     let mut builder =
         reqwest::Client::builder().timeout(timeout).redirect(reqwest::redirect::Policy::none());
     if let Some(cfg) = tls {
         builder = builder.use_preconfigured_tls(cfg.clone());
     }
-    builder.build().expect("reqwest client should build with the configured TLS settings")
+    builder
 }
 
 /// How much of a rejection body to read and quote in an error message and a diagnostic. Enough
