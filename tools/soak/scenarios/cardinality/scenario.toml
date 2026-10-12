@@ -35,7 +35,8 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total|soak_cardinality_[0-9]+_to
 [thresholds]
 progress_window = "30s"
 # Each new name costs each process about 100 bytes of live memory, about 70 MiB an hour at 200
-# names a second. The shipped scenarios with a fixed set of names have read -25 to +36 MiB/h.
+# names a second, and the run read +61 to +73 MiB/h. A fixed set of names has read at most
+# +36 MiB/h on a life, apart from a generator's RSS just after a partition.
 rss_growth_mib_per_hour = 48
 fd_growth = 8
 
@@ -77,7 +78,7 @@ min = 684000
 max = 756000
 
 # `aggregate` forgets every name it saw once, so its state doesn't grow: 200 idle evictions a
-# second over the run window's 70 minutes is 840,000, less the last windows' names still held.
+# second over the run window, warmup's end to the end sequence's start, 73 minutes, is 876,000.
 [[expect]]
 name = "aggregate-evicts-each-name"
 service = "logit"
@@ -86,7 +87,7 @@ component = "window"
 attrs = { reason = "idle" }
 window = "run"
 reduce = "delta"
-min = 798000              # 95% of 840,000
+min = 832200              # 95% of 876,000
 
 [[expect]]
 name = "aggregate-never-hits-its-cap"
