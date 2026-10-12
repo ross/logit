@@ -171,7 +171,9 @@
 //! `crate::stream`, shared with `statsd_out` and `graphite_out`; its module doc lists the
 //! fault rules. On TLS a write `Err` is `Fault::Ambiguous`, and on both a batch is called
 //! delivered only after a flush. Both transports count `logit.output.requests` tagged
-//! `class=ok|clean|ambiguous|rejected|refused`.
+//! `class=ok|clean|ambiguous|rejected|refused`. UDP also counts `logit.output.datagrams`, the
+//! datagrams that reached the kernel; it equals `logit.output.messages` there, because each
+//! message is its own datagram, and TCP has no datagrams to count.
 //!
 //! ## Delivery posture
 //!
@@ -1291,6 +1293,7 @@ impl SyslogOutput {
                     udp.send(&self.endpoint, batch, &mut self.frame_buf, &mut report).await;
                 // What reached the kernel, even when the batch then failed.
                 self.telemetry.count("logit.output.messages", sent.entries as f64, &[]);
+                self.telemetry.count("logit.output.datagrams", sent.datagrams as f64, &[]);
                 count_request(&self.telemetry, &result);
                 result
             }
@@ -1906,6 +1909,7 @@ mod tests {
             probe.sum("logit.output.messages.dropped", &[("reason", "oversize_datagram")]);
         assert_eq!(dropped, 1.0);
         assert_eq!(probe.sum("logit.output.messages", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.datagrams", &[]), 2.0);
         assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 1.0);
     }
 
@@ -1922,6 +1926,7 @@ mod tests {
         let err = output.send(&three_messages()).await.expect_err("the third message fails");
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
         assert_eq!(probe.sum("logit.output.messages", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.datagrams", &[]), 2.0);
         assert_eq!(probe.sum("logit.output.requests", &[("class", "ambiguous")]), 1.0);
     }
 
