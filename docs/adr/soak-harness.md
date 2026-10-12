@@ -191,6 +191,16 @@ stderr", no longer hold for those counts:
   allowance. The per-hop rows stay exact for the final SUT life only, and an earlier stopped
   life keeps its [0, R] residual bound.
 
+## Amendment: every drop reason counts a gap (2026-10-11)
+
+`ledger.egress` credits a positive gap with a node's `batches.dropped` under every reason, not
+`shutdown` alone: a queue's or spool's `overflow_oldest` and `overflow_newest`, a spool's
+`disk_full`, and any reason the runtime adds. The count is of batches and is never reconciled
+with the gap. A `rejected` batch, which the destination refused, or a `disk_corrupt` one, which a
+spool couldn't read back, counts the gap but FAILs the life, because neither happens against a
+healthy backend and a later cumulative total can hide the lost increments. The stderr
+cross-check stays `shutdown`-only, since stderr carries no other reason.
+
 ## Amendment: a Kafka target's oracle is its topic (2026-10-11)
 
 A scenario can name the stack's own Kafka broker as its target (`[target] kind = "kafka"`). The

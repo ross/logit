@@ -2063,6 +2063,68 @@ What the work showed about the harness:
   per-sink rule: another sink's drop leaves a short sink uncounted under `copy`, its own drop
   or one at `aggregate` counts it, and either sink's drop counts the summed gap under `route`.
 
+### W8a: counted drops of every reason (2026-10-11)
+
+W8a changes `ledger.egress` to credit a gap with a node's `batches.dropped` under every reason,
+and adds `spool-full`, `spool-enospc`, `slow-destination`, and `fanout-stop-outage`. The code is
+`soak/w8a` at `6c19a0a0`, on the development host (`sailfish`, 32 cores, 128 GB, Docker 29.7.2).
+The four scenario runs used `logit:soak` `sha256:a22432651386`; the control runs used the image
+rebuilt afterward, `sha256:d988f51ca940`, because the first image's creation time predates
+`main`'s head commit. The branch changes no `logit` source, and every run passed every row:
+
+| Run | Scenario | Verdict |
+|---|---|---|
+| `20261012T012640Z` | `spool-full` | every row PASS: `overflow_newest` 1 in the stop's window, `disk_full` 0, `rejected` 0, spool drained |
+| `20261012T010854Z` | `spool-enospc` | every row PASS: `disk_full` 3, `overflow_oldest` 0, `rejected` 0, spool drained |
+| `20261012T014301Z` | `slow-destination` | every row PASS: 8 `network_error` requests and 8 retries in each fault, nothing dropped, `retrying` back to 0 |
+| `20261012T013456Z` | `fanout-stop-outage` | every row PASS: `vm_b` life 0's gap of 123,700 is counted by `overflow_oldest` 3 and `shutdown` 4; `vm_a`'s gap is 0 |
+| `20261012T015248Z` | `statsd-vm` | every row PASS: the regression control |
+| `20261012T015256Z` | `statsd-vm-lost-total` | every row PASS: life 0's gap of 63,300 is counted by `shutdown` 4, as before |
+| `20261012T015851Z` | `sink-outage-drop-oldest` | every row PASS: the queue evicted 175 batches during the stop |
+
+What the runs showed about `logit`:
+
+- **A disk spool counts `overflow_newest` during an outage, not `overflow_oldest`.** A sink under
+  `overflow: drop_oldest` holds its head batch reserved while it retries, so a full spool rejects
+  each arriving batch instead of evicting the head
+  ([ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md), "Bound and overflow").
+  A spooled batch here is about 6,376 bytes, so the 128 KiB `max_bytes` of `spool-full` holds
+  about 20. `disk_full` counts only a write that fails with `ENOSPC`, which `spool-enospc` reaches
+  with a 128 KiB tmpfs below the spool's own 4 MiB bound.
+- **A dropped batch under cumulative temporality leaves no gap.** In `spool-full` and
+  `spool-enospc` the sink dropped 2 and 3 batches in the run, and `ledger.egress` read a gap of 0
+  in both, because a later cumulative total overwrote the totals the dropped batch carried.
+  `identity.sink` balanced anyway: 45 received were 43 delivered and 2 dropped in `spool-full`, and
+  42 delivered and 3 dropped in `spool-enospc`. This is why a `rejected` drop FAILs whatever the
+  gap.
+- **A response slower than the sink's 2 s `timeout` is retried, never dropped.** A 3 s `delay` at
+  VictoriaMetrics lets the destination apply each write while the sink sees a transport error;
+  the resend overwrites the same totals, and `ledger.egress` read 0. Throttling the SUT's egress
+  at `rate 2kbit` timed requests out the same way.
+- **`fanout-stop-outage` is the first real run of the per-sink credit.** Stopping the SUT inside
+  `vm_b`'s backend outage made `vm_b`'s life 0 lose 123,700 increments, counted by 3 batches its
+  queue evicted and 4 it dropped at shutdown, while `vm_a` delivered to its own backend up to the
+  stop and ended with a gap of 0. `recovery` judged 1 of 2 faults: the SUT's stop lies inside
+  `vm_b`'s stop, so the SUT stop has no interval clear of other faults, which is the check's
+  documented eligibility rule.
+
+What the work showed about the harness:
+
+- A netem `rate` of 64 kbit and 8 kbit didn't time out the sink's requests, because the
+  compressed bodies are about 1 KB; 2 kbit did. A throttle scenario must size the rate against
+  the body, not the batch's event count.
+- A tmpfs for the spool needs `mode=1777` and `labels: { soak.role: sut }` in the compose
+  override. `mode=1777` lets the image's unprivileged `logit` user create the spool directory in
+  a mount root owned by root, and the self-test reads service roles from the override's labels
+  alone.
+- No step stops or kills the SUT in `spool-enospc`, because Docker discards a tmpfs when its
+  container stops.
+- The self-test fixtures failed against `main`'s `checks.py` with the new rule reverted:
+  `overflow_oldest`, `disk_full`, a mixed set of reasons, an `overflow` stderr count of 0,
+  `rejected` twice, `disk_corrupt`, an overflow in a killed life, an overflow at the sink's own
+  copy, and an overflow at the router under `route` twice.
+- Re-scoring ten preserved runs with `script/soak check` gave no change in any verdict.
+
 ### A Kafka target: `kafka-broker-restart` (2026-10-11)
 
 Run `20261011T213158Z`: `script/soak run kafka-broker-restart`, the scenario's own 8 minutes 30
@@ -2145,3 +2207,10 @@ Overall PASS: every row passed but `ledger.windows`, which a Kafka target SKIPs,
   same rows, every detail included, plus a `ledger.sent` SKIP. Met: the `statsd-datadog` run
   `20261009T155153Z` is recorded under "Findings", Overall PASS.
 - **W6** is documentation only: `crates/logit-cli/tests/doc_links.rs` passes.
+- **W8a**: the self-test passes (961 expectations), and each new fixture fails it when the rule
+  is reverted (11 fixtures: the `overflow_oldest`, `disk_full`, mixed-reason, stderr-zero,
+  `rejected` (two), `disk_corrupt`, killed-life, own-copy, and `route` (two) cases). Each new
+  scenario passes `self-test` validation, the shipped-config test, and `logit validate` in
+  `logit:soak`. Re-scoring ten preserved runs gives the same statuses. Met: the four scenario
+  runs and the `statsd-vm`, `statsd-vm-lost-total`, and `sink-outage-drop-oldest` controls are
+  recorded under "Findings", every row PASS.
