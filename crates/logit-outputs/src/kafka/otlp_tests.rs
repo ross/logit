@@ -598,12 +598,8 @@ async fn otlp_json_keys_by_trace_id_like_otlp_proto() {
     let mut probe = TelemetryProbe::new();
     let mut out =
         sink(KafkaSettings { key: RecordKey::TraceId, ..json_settings(&cluster) }, &probe);
-    let input = batch(vec![
-        log("a1", Some(a)),
-        log("b1", Some(b)),
-        log("none", None),
-        log("a2", Some(a)),
-    ]);
+    let input =
+        batch(vec![log("a1", Some(a)), log("b1", Some(b)), log("none", None), log("a2", Some(a))]);
     let sums = run(&mut out, &mut probe, vec![input]).await;
     let mut got: Vec<(Option<Vec<u8>>, Vec<Value>)> = records_on(&cluster, LOGS)
         .into_iter()

@@ -618,25 +618,22 @@ impl KafkaEncoder {
         };
         let json = self.format == RecordFormat::OtlpJson;
         let otlp = &mut self.otlp;
-        let mut fits = |events: &[&Event]| match otlp.request(
-            signal,
-            resource,
-            scope,
-            events.iter().copied(),
-        ) {
-            None => Fit::Empty,
-            Some(request) if json => {
-                let mut body = Vec::new();
-                request.write_json(&mut body);
-                if body.len() <= budget {
-                    Fit::Fits(request, Some(body))
-                } else {
-                    Fit::Over
+        let mut fits =
+            |events: &[&Event]| match otlp.request(signal, resource, scope, events.iter().copied())
+            {
+                None => Fit::Empty,
+                Some(request) if json => {
+                    let mut body = Vec::new();
+                    request.write_json(&mut body);
+                    if body.len() <= budget {
+                        Fit::Fits(request, Some(body))
+                    } else {
+                        Fit::Over
+                    }
                 }
-            }
-            Some(request) if request.encoded_len() <= budget => Fit::Fits(request, None),
-            Some(_) => Fit::Over,
-        };
+                Some(request) if request.encoded_len() <= budget => Fit::Fits(request, None),
+                Some(_) => Fit::Over,
+            };
         match fits(&events) {
             Fit::Fits(request, json) => return emit((request, json), out, stats),
             Fit::Empty => return,
