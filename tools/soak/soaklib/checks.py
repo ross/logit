@@ -48,7 +48,7 @@ from pathlib import Path
 
 from . import collect, faults, telemetry, topic, vm
 from .scenario import (EXPECT_REDUCERS, EXTERNAL_TARGET, GENERATOR_ROLE, KAFKA_TARGET,
-                       LOCAL_TARGET, LOGIT_ROLES, parse_duration)
+                       LOCAL_TARGET, LOGIT_ROLES, RUN_WINDOW, parse_duration)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
@@ -799,48 +799,82 @@ def _rss_points(data, service):
     return by_life, "docker stats"
 
 
+def judge_services(data, check_id, judged):
+    """`(status, lines)` for a row that judges each `logit` service apart, from `judged`,
+    `{service: (status, text)}`, and the scenario's `[expected]` verdicts for `check_id`. A
+    service with an expectation scores PASS when its own status equals it, saying so, and FAIL
+    when it doesn't; a service with none keeps its own status. A service the row couldn't judge
+    has status SKIP, which matches no expectation."""
+    expected = (data.resolved.get("expected") or {}).get(check_id) or {}
+    statuses, lines = [], []
+    for service, (status, text) in sorted(judged.items()):
+        want = expected.get(service)
+        if want is None:
+            statuses.append(status)
+            lines.append(f"{service} {status}: {text}")
+        elif want == status:
+            statuses.append(PASS)
+            lines.append(f"{service} {status}, as expected: {text}")
+        else:
+            statuses.append(FAIL)
+            lines.append(f"{service}: expected {want}, got {status}: {text}")
+    for service in sorted(set(expected) - set(judged)):
+        statuses.append(FAIL)
+        lines.append(f"{service}: expected {expected[service]}, got no telemetry")
+    if statuses and all(status == SKIP for status in statuses):
+        return SKIP, lines
+    return worst([status for status in statuses if status != SKIP]), lines
+
+
 def check_rss_slope(data):
+    """Per `logit` service: the least-squares RSS slope of each life over steady samples after
+    warmup, against `rss_growth_mib_per_hour`, a growth WARNing under an hour's run and FAILing
+    from one; WARN when the judged slopes cover under `COVERAGE_MIN_SHARE` of the run. Each
+    service is judged apart and `[expected]` can set its verdict (`judge_services`)."""
     limit = float(data.thresholds.get("rss_growth_mib_per_hour", 64))
     over = WARN if data.duration < SECONDS_PER_HOUR else FAIL
-    status = PASS
-    lines = []
-    judged = []
-    coverage = []
+    judged = {}
+    extra = []
     for service in data.logit_services:
         by_life, source = _rss_points(data, service)
+        status = PASS
+        slopes = []
         judged_s = 0.0
         for life, points in sorted(by_life.items()):
             span = points[-1][0] - points[0][0] if points else 0
             if len(points) < SLOPE_MIN_SAMPLES or span < SLOPE_MIN_SPAN_S:
-                lines.append(f"{service} life {life}: {len(points)} sample(s) over {span:.0f}s, "
+                extra.append(f"{service} life {life}: {len(points)} sample(s) over {span:.0f}s, "
                              "too few to judge")
                 continue
             judged_s += data.steady_span(points)
             per_hour = slope(points) * SECONDS_PER_HOUR / MIB
-            judged.append(f"{service}/{life} {per_hour:+.1f}")
-            line = (f"{service} life {life}: {per_hour:+.1f} MiB/h over {len(points)} samples, "
-                    f"{span:.0f}s ({source})")
-            lines.append(line)
+            slopes.append(f"life {life} {per_hour:+.1f}")
+            extra.append(f"{service} life {life}: {per_hour:+.1f} MiB/h over {len(points)} "
+                         f"samples, {span:.0f}s ({source})")
             if per_hour > limit:
                 status = worst([status, over])
-        if by_life:
-            share, text = data.coverage(judged_s)
-            coverage.append(f"{service} {text}")
-            if share is not None and share < COVERAGE_MIN_SHARE:
-                status = worst([status, WARN])
-                lines.append(f"{service}: slopes cover little of the run: {text}")
-    if not judged:
-        return Result("rss_slope", SKIP, "no life with enough steady-state samples", lines)
-    detail = (f"MiB/h per service/life: {', '.join(judged)} (limit {limit:g}); "
-              f"{'; '.join(coverage)}")
-    return Result("rss_slope", status, detail, lines)
+        if not slopes:
+            judged[service] = (SKIP, "no life with enough steady-state samples")
+            continue
+        share, text = data.coverage(judged_s)
+        if share is not None and share < COVERAGE_MIN_SHARE:
+            status = worst([status, WARN])
+            extra.append(f"{service}: slopes cover little of the run: {text}")
+        judged[service] = (status, f"MiB/h {', '.join(slopes)} (limit {limit:g}); {text}")
+    status, lines = judge_services(data, "rss_slope", judged)
+    if status == SKIP:
+        return Result("rss_slope", SKIP, "no life with enough steady-state samples",
+                      lines + extra)
+    return Result("rss_slope", status, " | ".join(lines), lines + extra)
 
 
 def check_fd_slope(data):
+    """Per `logit` service: open fds at the end, and at the first steady sample after each
+    fault's recovery, at most `fd_growth` over the warmup median. Each service is judged apart
+    and `[expected]` can set its verdict (`judge_services`)."""
     growth = float(data.thresholds.get("fd_growth", 8))
-    status = PASS
-    lines = []
-    summaries = []
+    judged = {}
+    extra = []
     if data.t0 is None:
         return Result("fd_slope", SKIP, "no timeline start")
     for service in data.logit_services:
@@ -851,26 +885,28 @@ def check_fd_slope(data):
                   if ts < data.end]
         warm = [v for ts, v in series if data.t0 <= ts < data.t0 + data.warmup]
         if not warm or not series:
-            lines.append(f"{service}: no warmup samples")
+            judged[service] = (SKIP, "no warmup samples")
             continue
         baseline = statistics.median(warm)
         end_value = series[-1][1]
-        summaries.append(f"{service} {baseline:g}->{end_value:g}")
+        status = PASS
+        problems = []
         if end_value - baseline > growth:
             status = FAIL
-            lines.append(f"{service}: {end_value:g} fds at the end, {baseline:g} in the warmup")
+            problems.append(f"{end_value:g} fds at the end, {baseline:g} in the warmup")
         for fault in data.faults:
             after = fault.end + data.recovery_bound
             sample = next((v for ts, v in series if ts >= after and data.steady(ts)), None)
             if sample is not None and sample - baseline > growth:
                 status = FAIL
-                lines.append(f"{service}: {sample:g} fds {data.recovery_bound:.0f}s after "
-                             f"{fault.step} ({fault.action} on {fault.on}), baseline "
-                             f"{baseline:g}")
-    if not summaries:
-        return Result("fd_slope", SKIP, "no fd samples", lines)
-    detail = f"warmup median -> end: {', '.join(summaries)} (limit +{growth:g})"
-    return Result("fd_slope", status, detail if status == PASS else lines[0], lines)
+                problems.append(f"{sample:g} fds {data.recovery_bound:.0f}s after {fault.step} "
+                                f"({fault.action} on {fault.on}), baseline {baseline:g}")
+        text = f"warmup median {baseline:g} -> end {end_value:g} (limit +{growth:g})"
+        judged[service] = (status, "; ".join([text] + problems))
+    if not judged:
+        return Result("fd_slope", SKIP, "no fd samples")
+    status, lines = judge_services(data, "fd_slope", judged)
+    return Result("fd_slope", status, " | ".join(lines), lines + extra)
 
 
 # ---- the ledger, the sink identity, and recovery --------------------------------------------------
@@ -2646,7 +2682,10 @@ def expect_window(data, fault, window):
     fault's span, apply start to revert finish; `after` is the `recovery_bound` after it; and
     `through` is both, for a bound that must hold until the effect ends, since a blocked chain
     stays blocked until the sink's next retry after the revert. The window is open at its start
-    because a drain's deltas cover the interval before it."""
+    because a drain's deltas cover the interval before it. `run` takes no fault: it is warmup's
+    end through the start of the end sequence."""
+    if window == RUN_WINDOW:
+        return data.t0 + data.warmup, data.end
     if window == "during":
         return fault.start, fault.end
     if window == "through":
@@ -2684,8 +2723,32 @@ def reduce_gauge(tel, metric, attrs, start, end, reduce):
     sample in the window. The value in force comes from the life whose drains cover `start`
     only (a gauge is exported only in a drain after it was set), so a gauge a previous process
     set reads as unset in the next. `last` is the value in force at `end`. `value` is None when
-    the gauge was never set by `end`."""
+    the gauge was never set by `end`.
+
+    `slope` is the least-squares slope of the window's own samples, in the metric's unit per
+    hour, fitted per process life, since a restart resets a process gauge: `value` is
+    `{life: per_hour}` over the lives with at least `SLOPE_MIN_SAMPLES` samples spanning
+    `SLOPE_MIN_SPAN_S`, and None when no life has them."""
     series = tel.gauge_series(metric, **attrs)
+    if reduce == "slope":
+        by_life = {}
+        for ts, v, life in series:
+            if start < ts <= end:
+                by_life.setdefault(life, []).append((ts, v))
+        fitted, notes = {}, []
+        for life, points in sorted(by_life.items()):
+            span = points[-1][0] - points[0][0]
+            fit = slope(points)
+            if len(points) < SLOPE_MIN_SAMPLES or span < SLOPE_MIN_SPAN_S or fit is None:
+                notes.append(f"life {life} {len(points)} sample(s) over {span:.0f}s, too few")
+                continue
+            fitted[life] = fit * SECONDS_PER_HOUR
+            notes.append(f"life {life} {len(points)} samples over {span:.0f}s")
+        if not fitted:
+            return None, ("too few samples to fit a slope (at least "
+                          f"{SLOPE_MIN_SAMPLES} over {SLOPE_MIN_SPAN_S}s in one life)"
+                          + (f": {', '.join(notes)}" if notes else ""))
+        return fitted, ", ".join(notes)
     life = _life_at(tel, start)
     before = [v for ts, v, point_life in series if ts <= start and point_life == life]
     inside = [v for ts, v, _ in series if start < ts <= end]
@@ -2700,7 +2763,10 @@ def reduce_gauge(tel, metric, attrs, start, end, reduce):
 
 def _expect_occurrences(data, exp):
     """`(scheduled ids, faults)`: the step ids the resolved schedule has for this expectation,
-    and the faults among them whose apply returned 0."""
+    and the faults among them whose apply returned 0. A `run` window has one occurrence, the
+    run itself, with no fault."""
+    if exp.get("window") == RUN_WINDOW:
+        return [RUN_WINDOW], [None]
     step = exp.get("step")
     scheduled = [s["id"] for s in data.resolved.get("steps", [])
                  if s.get("id") == step or (isinstance(step, int) and not isinstance(step, bool)
@@ -2717,15 +2783,19 @@ def _expect_one(data, exp):
     lo, hi = exp.get("min"), exp.get("max")
     want = " and ".join(part for part in (
         None if lo is None else f">= {lo:g}", None if hi is None else f"<= {hi:g}") if part)
+    where = (RUN_WINDOW if exp.get("window") == RUN_WINDOW
+             else f"{exp.get('window')} {exp.get('step')}")
     label = (f"{reduce} of {metric}"
              + (f"{{{', '.join(f'{k}={v}' for k, v in sorted(attrs.items()))}}}" if attrs else "")
-             + f" on {service}, {exp.get('window')} {exp.get('step')}")
+             + f" on {service}, {where}")
     scheduled, faults = _expect_occurrences(data, exp)
     if not scheduled:
         return Result(check_id, SKIP, f"{label}: the run's schedule has no such step")
     tel = data.telemetry.get(service)
     if tel is None:
         return Result(check_id, FAIL, f"{label}: no {service} telemetry")
+    if exp.get("window") == RUN_WINDOW and data.t0 is None:
+        return Result(check_id, FAIL, f"{label}: no timeline start, so no run window")
     kind = EXPECT_REDUCERS.get(reduce, "gauge")
     seen = {p.kind for p in tel.matching(metric)}
     if seen and kind not in seen:
@@ -2733,25 +2803,39 @@ def _expect_one(data, exp):
                       f"{metric} points are {', '.join(sorted(seen))}")
     status = PASS
     lines = []
-    applied = {f.step for f in faults}
+    applied = {RUN_WINDOW} if faults == [None] else {f.step for f in faults}
     for step_id in scheduled:
         if step_id not in applied:
             status = FAIL
             lines.append(f"{step_id}: never applied cleanly, so it has no window")
+    def within(value):
+        return (lo is None or value >= lo) and (hi is None or value <= hi)
+
     for fault in faults:
         start, end = expect_window(data, fault, exp.get("window"))
         reducer = reduce_counter if kind == "sum" else reduce_gauge
         value, note = reducer(tel, metric, attrs, start, end, reduce)
+        name = RUN_WINDOW if fault is None else fault.step
         span = f"({data.offset(start)}, {data.offset(end)}]"
         if value is None:
             status = FAIL
-            lines.append(f"{fault.step} {span}: {note}")
+            lines.append(f"{name} {span}: {note}")
             continue
-        ok = (lo is None or value >= lo) and (hi is None or value <= hi)
+        if isinstance(value, dict):
+            # A slope per life, each judged against the bounds.
+            parts = []
+            for life, per_hour in sorted(value.items()):
+                ok = within(per_hour)
+                if not ok:
+                    status = FAIL
+                parts.append(f"life {life} {_n(per_hour)}/h" + ("" if ok else " FAIL"))
+            lines.append(f"{name} {span}: {', '.join(parts)} ({note}), want {want}")
+            continue
+        ok = within(value)
         if not ok:
             status = FAIL
         shown = _n(value) if float(value).is_integer() else f"{value:.3f}"
-        lines.append(f"{fault.step} {span}: {shown} ({note}), want {want}"
+        lines.append(f"{name} {span}: {shown} ({note}), want {want}"
                      + ("" if ok else ", FAIL"))
     detail = f"{label}: " + "; ".join(lines)
     return Result(check_id, status, detail, lines)

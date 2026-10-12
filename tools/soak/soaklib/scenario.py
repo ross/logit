@@ -92,6 +92,7 @@ NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart", "exit")
 TOP_LEVEL_KEYS = {
     "name", "description", "duration", "warmup", "cooldown", "recovery_bound", "cycle",
     "configs", "ledger", "thresholds", "step", "expect", "random", "target", "compose",
+    "expected",
 }
 # The local target, the default; the kind with no backend query; and the local Kafka broker,
 # whose kind is also its service name.
@@ -140,10 +141,16 @@ _COMPONENT_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 THRESHOLD_KEYS = {"progress_window", "rss_growth_mib_per_hour", "fd_growth"}
 EXPECT_KEYS = {"name", "service", "metric", "component", "attrs", "step", "window", "reduce",
                "min", "max"}
-EXPECT_WINDOWS = ("during", "after", "through")
+# `run` is the only window with no step: the whole run after warmup.
+EXPECT_WINDOWS = ("during", "after", "through", "run")
+RUN_WINDOW = "run"
 # Each reducer reads one metric kind: a counter (`sum`, a delta per drain) or a gauge.
 EXPECT_REDUCERS = {"delta": "sum", "min_delta": "sum", "max": "gauge", "min": "gauge",
-                   "last": "gauge"}
+                   "last": "gauge", "slope": "gauge"}
+# The rows an `[expected]` table may set a verdict on: the rows that judge each `logit` service
+# apart, so a verdict names a service. A ledger row's FAIL is loss, never expected.
+EXPECTED_ROWS = ("rss_slope", "fd_slope")
+VERDICTS = ("PASS", "WARN", "FAIL")
 # Kinds of the metrics the shipped expectations name, so `validate()` refuses a reducer of the
 # wrong kind before a run. docs/design/internal-telemetry.md is the canonical list; a metric
 # missing here is checked against the kind its points carry when the run is scored.
@@ -172,6 +179,9 @@ METRIC_KINDS = {
     "logit.component.flush.events": "sum",
     "logit.script.events.emitted": "sum",
     "logit.script.vm.memory": "gauge",
+    "logit.process.interner.strings": "gauge",
+    "logit.process.memory.resident.bytes": "gauge",
+    "logit.transform.series.evicted": "sum",
 }
 _EXPECT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _STEP_ID = re.compile(r"^c(\d+)s(\d+)$")
@@ -313,8 +323,8 @@ class Expectation:
     """One `[[expect]]`: a bound on one metric, reduced over a window around a step.
 
     `step` is an expanded step id (`"c0s1"`) or a 1-based `[[step]]` index (an int), which
-    names that step's occurrence in every cycle. `attrs` holds every attribute filter,
-    `component` included."""
+    names that step's occurrence in every cycle, and None under `window = "run"`. `attrs` holds
+    every attribute filter, `component` included."""
 
     index: int
     name: str
@@ -355,6 +365,8 @@ class Scenario:
                                                   "env": []})
     # The compose override file beside scenario.toml, or None.
     compose: object = None
+    # `[expected]`: `{row id: {service: verdict}}`.
+    expected: dict = field(default_factory=dict)
 
     @property
     def external(self):
@@ -438,6 +450,7 @@ class Scenario:
             },
             "steps": [step.to_json() for step in expand(self, duration, seed)],
             "expect": [e.to_json() for e in self.expectations],
+            "expected": {row: dict(services) for row, services in self.expected.items()},
         }
 
 
@@ -582,7 +595,10 @@ def from_dict(raw, path):
             continue
         for key in sorted(set(raw_one) - EXPECT_KEYS):
             problems.append(f"{where}: unknown key `{key}`")
-        for key in ("name", "service", "metric", "step", "window", "reduce"):
+        required = ["name", "service", "metric", "window", "reduce"]
+        if raw_one.get("window") != RUN_WINDOW:
+            required.insert(3, "step")
+        for key in required:
             if key not in raw_one:
                 problems.append(f"{where}: missing `{key}`")
         attrs = raw_one.get("attrs", {})
@@ -599,21 +615,51 @@ def from_dict(raw, path):
                 attrs["component"] = raw_one["component"]
         expectations.append(Expectation(
             index=index, name=raw_one.get("name", ""), service=raw_one.get("service", ""),
-            metric=raw_one.get("metric", ""), attrs=attrs, step=raw_one.get("step", ""),
+            metric=raw_one.get("metric", ""), attrs=attrs,
+            step=raw_one.get("step", None if raw_one.get("window") == RUN_WINDOW else ""),
             window=raw_one.get("window", ""), reduce=raw_one.get("reduce", ""),
             min=raw_one.get("min"), max=raw_one.get("max"),
         ))
+
+    expected = _parse_expected(raw.get("expected", {}), problems)
 
     scenario = Scenario(
         path=path, name=name, description=description, duration=duration, warmup=warmup,
         cooldown=cooldown, recovery_bound=recovery_bound, cycle=cycle, configs=configs,
         ledger=ledger, thresholds=thresholds, steps=steps, expectations=expectations,
-        random=random_spec, target=target, compose=compose,
+        random=random_spec, target=target, compose=compose, expected=expected,
     )
     if problems:
         raise ScenarioError(problems)
     validate(scenario)
     return scenario
+
+
+def _parse_expected(table, problems):
+    """`{row id: {service: verdict}}` from `[expected]`: each key one of `EXPECTED_ROWS`, each
+    value a table of service names to one of `VERDICTS`. `service_problems()` checks that each
+    service runs `logit`."""
+    if not isinstance(table, dict):
+        problems.append("`expected` must be a table, such as [expected] rss_slope = "
+                        "{ logit = \"FAIL\" }")
+        return {}
+    expected = {}
+    for row, services in table.items():
+        where = f"expected.{row}"
+        if row not in EXPECTED_ROWS:
+            problems.append(f"{where}: only {', '.join(EXPECTED_ROWS)} take an expected verdict, "
+                            "because only they judge each service apart")
+            continue
+        if not isinstance(services, dict) or not services:
+            problems.append(f"{where}: must be a table of services to verdicts, such as "
+                            "{ logit = \"FAIL\" }")
+            continue
+        for service, verdict in services.items():
+            if verdict not in VERDICTS:
+                problems.append(f"{where}.{service}: verdict must be one of "
+                                f"{', '.join(VERDICTS)}, got {verdict!r}")
+        expected[row] = dict(services)
+    return expected
 
 
 def target_json(target):
@@ -1263,7 +1309,11 @@ def _expect_problems(scenario, duration):
         elif len(bounds) == 2 and exp.min > exp.max:
             problems.append(f"{where}: `min` {exp.min:g} is above `max` {exp.max:g}")
         match = _STEP_ID.match(exp.step) if isinstance(exp.step, str) else None
-        if isinstance(exp.step, int) and not isinstance(exp.step, bool):
+        if exp.window == RUN_WINDOW:
+            if exp.step is not None:
+                problems.append(f"{where}: window `run` spans the whole run and takes no "
+                                "`step`")
+        elif isinstance(exp.step, int) and not isinstance(exp.step, bool):
             if not 1 <= exp.step <= len(scenario.steps):
                 problems.append(f"{where}: step index {exp.step} is outside the scenario's "
                                 f"{len(scenario.steps)} [[step]] table(s)")
@@ -1362,6 +1412,11 @@ def service_problems(scenario, roles):
         if exp.service not in runs:
             problems.append(f"expect {exp.index + 1} ({exp.name or '?'}): unknown service "
                             f"`{exp.service}`; telemetry comes from {' or '.join(runs)}")
+    for row, services in scenario.expected.items():
+        for service in services:
+            if service not in runs:
+                problems.append(f"expected.{row}: unknown service `{service}`; {row} judges "
+                                f"{' and '.join(runs)}")
     if scenario.kafka and roles.get(KAFKA_TARGET) != BROKER_ROLE:
         problems.append(f"a kafka target reads its topic from the {BROKER_ROLE} service "
                         f"`{KAFKA_TARGET}`, which the stack doesn't run")

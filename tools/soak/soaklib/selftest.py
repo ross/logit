@@ -2409,6 +2409,203 @@ def _gauge_lives():
     expect(value == 1, f"the value in force inside one life still counts, got {value}")
 
 
+def _service_stdout(end_s, rss, fds, strings, restart_at=None):
+    """A `logit` service's NDJSON every 5 s from +0 to `end_s`: uptime, and `rss(offset)`,
+    `fds(offset)`, and `strings(offset)` as its resident bytes, fds, and interner strings. A
+    `restart_at` offset starts a second life there, its uptime from 1 again."""
+    lines = []
+    for offset in range(0, int(end_s) + 1, 5):
+        stamp = _stamp(T0 + offset)
+        uptime = offset + 1.0 if restart_at is None or offset < restart_at else (
+            offset - restart_at + 1.0)
+        lines.append(_line(stamp, "logit.process.uptime", "gauge", uptime))
+        lines.append(_line(stamp, "logit.component.batches.delivered", "sum", 1,
+                           component="sink"))
+        lines.append(_line(stamp, "logit.process.memory.resident.bytes", "gauge", rss(offset)))
+        lines.append(_line(stamp, "logit.process.fds", "gauge", fds(offset)))
+        lines.append(_line(stamp, "logit.process.interner.strings", "gauge", strings(offset)))
+    return lines
+
+
+def _slope_run(tmp, name, sut=None, gen=None, end_s=3600, **resolved):
+    """A run directory of `end_s` seconds after a 60 s warmup with no faults, `logit` and
+    `generator` NDJSON from `_service_stdout(**sut)` and `(**gen)`, flat by default."""
+    flat = {"rss": lambda o: 50 * 2 ** 20, "fds": lambda o: 10, "strings": lambda o: 100}
+    timeline = [_phase("start", 0, t0=T0), _phase("end_begin", end_s),
+                _phase("end_end", end_s + 50)]
+    run_dir = _run_dir(tmp, name, timeline,
+                       _service_stdout(end_s + 50, **{**flat, **(sut or {})}),
+                       duration=float(end_s), **resolved)
+    (run_dir / "logs" / "generator.stdout").write_text(
+        "\n".join(_service_stdout(end_s + 50, **{**flat, **(gen or {})})) + "\n")
+    return run_dir
+
+
+# 128 MiB an hour, in bytes a second: twice the fixtures' 64 MiB/h limit.
+_FAST_RSS = 128 * 2 ** 20 / 3600
+
+
+def _per_service():
+    """`rss_slope` and `fd_slope` judge each service apart, one detail line each, and an
+    `[expected]` verdict scores a service PASS when it comes out as expected, FAIL when not."""
+    growing = {"rss": lambda o: 50 * 2 ** 20 + _FAST_RSS * o}
+    with tempfile.TemporaryDirectory() as tmp:
+        def row(name, check, **kwargs):
+            return _status(_slope_run(tmp, name, **kwargs), check)
+
+        result = row("rss-plain", checks.check_rss_slope, sut=growing)
+        expect(result.status == checks.FAIL and len(result.detail.split(" | ")) == 2
+               and "generator PASS: MiB/h life 0 +0.0" in result.detail
+               and "logit FAIL: MiB/h life 0 +128.0" in result.detail,
+               f"rss_slope judges each service on its own line, got {result}")
+        result = row("rss-gen-only", checks.check_rss_slope, gen=growing)
+        expect(result.status == checks.FAIL and "generator FAIL" in result.detail
+               and "logit PASS" in result.detail,
+               f"rss_slope names the generator as the service that grew, got {result}")
+        result = row("rss-expected", checks.check_rss_slope, sut=growing,
+                     expected={"rss_slope": {"logit": "FAIL"}})
+        expect(result.status == checks.PASS
+               and "logit FAIL, as expected: MiB/h life 0 +128.0" in result.detail
+               and "generator PASS" in result.detail,
+               f"an expected FAIL scores PASS, got {result}")
+        result = row("rss-expected-missed", checks.check_rss_slope,
+                     expected={"rss_slope": {"logit": "FAIL"}})
+        expect(result.status == checks.FAIL
+               and "logit: expected FAIL, got PASS" in result.detail,
+               f"an expected FAIL that came out PASS FAILs, got {result}")
+        result = row("rss-expected-other", checks.check_rss_slope, sut=growing,
+                     expected={"rss_slope": {"generator": "PASS"}})
+        expect(result.status == checks.FAIL and "logit FAIL" in result.detail
+               and "generator PASS, as expected" in result.detail,
+               f"a service with no expectation is judged normally, got {result}")
+        result = row("rss-expected-warn", checks.check_rss_slope, sut=growing, end_s=1800,
+                     expected={"rss_slope": {"logit": "FAIL"}})
+        expect(result.status == checks.FAIL
+               and "logit: expected FAIL, got WARN" in result.detail,
+               f"growth in a run under an hour WARNs, which an expected FAIL refuses, got "
+               f"{result}")
+        result = row("rss-expected-fd", checks.check_rss_slope, sut=growing,
+                     expected={"fd_slope": {"logit": "FAIL"}})
+        expect(result.status == checks.FAIL,
+               f"an expectation for another row doesn't touch rss_slope, got {result}")
+
+        leaking = {"fds": lambda o: 10 if o < 1800 else 30}
+        result = row("fd-plain", checks.check_fd_slope, gen=leaking)
+        expect(result.status == checks.FAIL and len(result.detail.split(" | ")) == 2
+               and "generator FAIL: warmup median 10 -> end 30" in result.detail
+               and "logit PASS: warmup median 10 -> end 10" in result.detail,
+               f"fd_slope judges each service on its own line, got {result}")
+        result = row("fd-expected", checks.check_fd_slope, gen=leaking,
+                     expected={"fd_slope": {"generator": "FAIL"}})
+        expect(result.status == checks.PASS and "generator FAIL, as expected" in result.detail,
+               f"fd_slope takes an expected FAIL, got {result}")
+        result = row("fd-expected-missed", checks.check_fd_slope,
+                     expected={"fd_slope": {"generator": "FAIL"}})
+        expect(result.status == checks.FAIL
+               and "generator: expected FAIL, got PASS" in result.detail,
+               f"fd_slope FAILs an expected FAIL that came out PASS, got {result}")
+
+
+def _expected_rules(root):
+    path, base = _base(root)
+
+    def with_expected(table):
+        raw = copy.deepcopy(base)
+        raw["expected"] = table
+        return raw
+
+    loaded = scenario.from_dict(with_expected({"rss_slope": {"logit": "FAIL"},
+                                               "fd_slope": {"generator": "PASS"}}), path)
+    scenario.check_services(loaded, scenario.base_roles(loaded))
+    expect(loaded.to_json()["expected"] == {"rss_slope": {"logit": "FAIL"},
+                                            "fd_slope": {"generator": "PASS"}},
+           "the resolved scenario carries [expected]")
+    cases = [
+        ({"ledger.egress": {"logit": "FAIL"}}, "only rss_slope, fd_slope take an expected",
+         "an expectation on a row that doesn't judge per service"),
+        ({"rss_slope": {"logit": "fail"}}, "verdict must be one of PASS, WARN, FAIL",
+         "a lowercase verdict"),
+        ({"rss_slope": {"logit": "SKIP"}}, "verdict must be one of", "a SKIP verdict"),
+        ({"rss_slope": {"victoria-metrics": "FAIL"}}, "unknown service `victoria-metrics`",
+         "an expectation on a service that doesn't run logit"),
+        ({"rss_slope": {}}, "must be a table of services", "an empty row table"),
+        ({"rss_slope": "FAIL"}, "must be a table of services", "a bare verdict"),
+        ("FAIL", "`expected` must be a table", "a non-table [expected]"),
+    ]
+    for table, needle, what in cases:
+        _refused(path, with_expected(table), needle, what)
+
+
+def _slope_reducer():
+    """The `slope` reducer: the window's samples fitted per life, per hour; the `run` window
+    from warmup's end to the end sequence."""
+    def exp(**fields):
+        return {"name": "x", "service": "logit", "metric": "logit.process.interner.strings",
+                "attrs": {}, "step": None, "window": "run", "reduce": "slope", "min": None,
+                "max": None, **fields}
+
+    # 100 strings a second after warmup, 360,000 an hour. Warmup holds 0 and the end sequence
+    # drops to 0, so a window reaching into either fits another slope.
+    after_warmup = {"strings": lambda o: 0 if o <= 60 or o > 3600 else 100 * (o - 60)}
+    with tempfile.TemporaryDirectory() as tmp:
+        counter = 0
+
+        def rows(expectations, **kwargs):
+            nonlocal counter
+            counter += 1
+            run_dir = _slope_run(tmp, f"slope-{counter}", expect=expectations, **kwargs)
+            return [r for r in checks.run_all(run_dir) if r.id.startswith("expect")]
+
+        result = rows([exp(min=359999, max=360001)], sut=after_warmup)[0]
+        expect(result.status == checks.PASS and "life 0 360,000/h" in result.detail
+               and "run (+60s, +3600s]" in result.detail,
+               f"slope over the run window is 100/s as 360,000/h, got {result}")
+        result = rows([exp(min=400000)], sut=after_warmup)[0]
+        expect(result.status == checks.FAIL and "FAIL" in result.detail,
+               f"a slope under its min FAILs, got {result}")
+        result = rows([exp(max=-1)], sut=after_warmup)[0]
+        expect(result.status == checks.FAIL, f"a slope over its max FAILs, got {result}")
+
+        result = rows([exp(min=0)], end_s=85)[0]
+        expect(result.status == checks.FAIL and "too few samples" in result.detail,
+               f"a run window under {checks.SLOPE_MIN_SPAN_S}s FAILs, got {result}")
+
+        # Life 0 grows 100/s to +1800; life 1 starts at 0 there and grows 50/s.
+        two = {"strings": lambda o: 100 * o if o < 1800 else 50 * (o - 1800),
+               "restart_at": 1800}
+        result = rows([exp(min=350000)], sut=two)[0]
+        expect(result.status == checks.FAIL and "life 0 360,000/h" in result.detail
+               and "life 1 180,000/h FAIL" in result.detail,
+               f"slope fits each life and judges each, got {result}")
+        result = rows([exp(min=170000)], sut=two)[0]
+        expect(result.status == checks.PASS,
+               f"a restart's drop isn't fitted as a slope, got {result}")
+        result = rows([exp(metric="logit.process.memory.resident.bytes", min=0, max=1)])[0]
+        expect(result.status == checks.PASS and "life 0 0/h" in result.detail,
+               f"a flat gauge's slope is 0, got {result}")
+
+    path, base = _base(Path(__file__).resolve().parent.parent)
+
+    def with_expect(**changes):
+        raw = copy.deepcopy(base)
+        one = {**VALID_EXPECT, "reduce": "slope", "min": 0, **changes}
+        raw["expect"] = [{k: v for k, v in one.items() if v is not None}]
+        return raw
+
+    loaded = scenario.from_dict(with_expect(window="run", step=None), path)
+    expect(loaded.expectations[0].step is None and loaded.to_json()["expect"][0]["step"] is None,
+           "a run window loads with no step")
+    _refused(path, with_expect(window="run"), "window `run` spans the whole run and takes no",
+             "a run window with a step")
+    _refused(path, with_expect(step=None), "missing `step`", "a step window with no step")
+    _refused(path, with_expect(metric="logit.input.kernel.drops"),
+             "reads a gauge, and logit.input.kernel.drops is a sum", "a slope of a counter")
+    _refused(path, with_expect(metric="logit.process.interner.strings", reduce="delta"),
+             "logit.process.interner.strings is a gauge", "a counter reducer on interner.strings")
+    _refused(path, with_expect(metric="logit.process.memory.resident.bytes", reduce="delta"),
+             "logit.process.memory.resident.bytes is a gauge", "a counter reducer on RSS")
+
+
 def _kill_watchdog():
     """The watchdog around a `kill` of the SUT applied at +60 and reverted (started) by +90: its
     exit code, its start, its readiness probe, and the stdout gap it leaves."""
@@ -4324,12 +4521,13 @@ def run(root, quiet=False):
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
                      _report, _expected_event_rules, _exit_driver, _ready_words, _exit_watchdog,
                      _script_ledger, _sink_ledger, _roles, _sink_rules, _driver_roles,
-                     _sources_ledger, _source_rules, _fanin_driver, _shipped):
+                     _sources_ledger, _source_rules, _fanin_driver, _per_service,
+                     _expected_rules, _slope_reducer, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
-                              _fanin_driver)
+                              _fanin_driver, _expected_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")
