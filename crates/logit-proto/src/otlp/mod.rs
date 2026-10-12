@@ -35,7 +35,10 @@ pub mod grpc;
 pub mod json;
 pub mod logs;
 pub mod metrics;
+mod request;
 pub mod traces;
+
+pub use request::OtlpRequest;
 
 /// The committed `prost` types. Public so a test outside the crate can build a wire message the
 /// encoder never emits, such as a timestamp past `i64::MAX`.
