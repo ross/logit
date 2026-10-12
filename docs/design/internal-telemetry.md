@@ -1834,6 +1834,8 @@ sinks tag one count per request with its status class or `network_error`
   decision 4). A failed connect or TLS handshake is an attempt and counts `clean`; an attempt the
   runtime cancels counts nothing. There's no HTTP status to classify.
 - `logit.output.messages` (count): messages sent.
+- `logit.output.datagrams` (count, UDP only): datagrams that reached the kernel, even when the
+  batch then failed. Each message is its own datagram, so it equals `messages`.
 - `logit.output.events.skipped`: events with no `log` record, so nothing to render as a syslog
   message (ADR `multi-payload-events`).
 - `logit.output.messages.truncated` and
@@ -1868,7 +1870,7 @@ sinks tag one count per request with its status class or `network_error`
   line.
 - `logit.output.datagrams` (`udp` and `unix`): the packed datagrams a batch of lines was sent as.
   It's the number an operator tuning `max_packet_bytes` needs, because `statsd_out` (unlike
-  `syslog_out`) packs several lines per datagram.
+  `syslog_out`, where it equals `messages`) packs several lines per datagram.
 - `logit.output.messages.dropped{reason=...}`, with `reason` one of:
   `"unresolved_gauge_delta"|"unencodable_value"|"empty_name"|"oversize_line"|
   "oversize_datagram"|"dialect_field"|"dialect_event"|"invalid_service_check"|
