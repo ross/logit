@@ -46,12 +46,21 @@ whose API is the one a future multi-topic producer exposes.
 
 ### 1. The record unit
 
-A batch becomes one export request per non-empty signal, through `logit_proto::SignalEncoder`, as
-`otlp_out` encodes it. Each request is one record. `key: trace_id` (item 4) splits a request
-further, and the size cap (item 5) splits it further again; nothing else does.
+A batch becomes one export request per non-empty signal, as `otlp_out` encodes it. Each request is
+one record. `key: trace_id` (item 5) splits a request further, and the size cap (item 6) splits it
+further again; nothing else does.
+
+`SignalEncoder::encode_signals` encodes a whole batch only. Splitting needs a request built from a
+subset of a batch's events, so `logit-proto` gains a function that builds one signal's prost
+request from events picked by reference or index, under the batch's resource and scope. It builds
+no sub-`EventBatch`: cloning one per piece would move `logit-bench`'s allocation pins. `otlp_proto`
+serializes the prost value, and so does `otlp_json` (item 8). Trace-id grouping and the size
+bisect both build their pieces through it.
 
 `record:` is rejected under both OTLP formats. The record unit is fixed, so neither `event` nor
-`batch` describes it.
+`batch` describes it. Checks that read `RecordFormat::default_record` to learn whether a record
+holds many events (`KafkaOutput::new`'s key check, graph rule 85's batch derivation) treat the OTLP
+formats as their own record unit, so a key isn't rejected as if the record were a batch.
 
 ### 2. Topics
 
@@ -63,12 +72,12 @@ format: otlp_proto
 topics: {logs: otlp_logs, metrics: otlp_metrics, traces: otlp_spans}   # the defaults
 ```
 
-- `topic:` becomes optional under the OTLP formats. When it's set, every signal goes to that one
-  topic. Setting both `topic:` and `topics:` is a config error.
-- The other formats still require `topic:`, and reject `topics:`.
+- `topic:` becomes optional in config. The other formats still require it and reject `topics:`.
+  Under the OTLP formats, when `topic:` is set, every signal goes to that one topic. Setting both
+  `topic:` and `topics:` is a config error.
 - Graph rule 85 checks each `topics:` value as it checks `topic:`, and accepts only the keys
   `logs`, `metrics`, and `traces`.
-- **Topics resolve lazily.** A signal's producer opens on that signal's first record, so a
+- **Topics resolve lazily.** A topic's producer opens on its first record, so a
   logs-only pipeline never asks the broker about `otlp_metrics` and never causes the broker to
   auto-create it. A topic that's misconfigured or missing surfaces only when its signal first
   arrives.
@@ -79,10 +88,15 @@ The sink drives a facade, not a `Producer`. Records carry their topic, and the f
 attempts, and settles per topic. Inside it, each topic has its own `Producer`, unchanged: its own
 connections, metadata, missing-topic state, producer id (PID) and epoch, and `Pending`.
 
+The facade is keyed by topic name, so two signals mapped to one topic share one producer. It holds
+only the `ProducerConfig` template, and producers open lazily, including after a rebuild: the
+sink's TLS and credential rebuild drops the producers rather than recreating them, and the next
+record opens each again.
+
 A future topic chosen per event ([ADR `kafka-output`](kafka-output.md), Consequences) replaces the
 facade's internals with one producer that holds several topics' metadata and partition batches
 under one PID, and that sends one produce request per broker across topics. The rework boundary is
-the facade's API: the sink, the encoder, and the per-topic verdicts above it don't change, and
+the facade's API: the sink and the encoder above it don't change, and
 nothing outside the facade constructs a `Producer`.
 
 What a producer per topic costs until then:
@@ -96,12 +110,32 @@ Each signal's partition batches settle on their own, as partitions do within one
 `kafka-output`](kafka-output.md), item 4). A retry resends only the unsettled partition batches,
 so a signal that the broker accepted isn't resent while another signal is retried.
 
-The send's verdict is item 4's rule over every topic's partition batches together: the strongest
-class among the unsettled ones, `Refused` over `Ambiguous` over `Clean`; with none unsettled,
-success if any was accepted, else `Rejected`.
+**Prepare is per topic.** A topic whose prepare fails keeps no `Pending`; the topics that did
+prepare keep theirs, and the next attempt re-prepares only the failed topic. The attempts of the
+topics run concurrently, so one topic's metadata wait, bounded by `timeout`, doesn't stack across
+topics.
 
-So a `Refused` topic holds the whole sink, as a refused signal holds `otlp_out`. A metrics topic
-that the broker won't authorize stops logs and spans behind it, although their own topics accept
+**One verdict, computed by the facade.** A topic that failed to prepare, or whose attempt failed at
+topic level (identity, metadata) before any partition answered, counts as unsettled with that
+error's fault class. The facade reads every topic's raw partition states, with one any-accepted
+flag shared across topics, and applies the rule:
+
+- If anything is unsettled, the verdict is the strongest class among the unsettled: `Refused` over
+  `Ambiguous` over `Clean`.
+- If nothing is unsettled, it's success when anything was accepted, else `Rejected`.
+
+The facade doesn't merge per-topic verdicts by rank. `Pending::verdict` ranks `Rejected` and
+`Clean` alike, so a merged `Rejected` would drop a batch while another topic is still unsettled and
+retryable. The producer therefore exposes its settlements, and not a verdict of its own, to the
+facade.
+
+**Delivery postures span every topic.** Under `buffer.delivery: at_most_once`, an `Ambiguous`
+fault on any topic drops the batch, so a `Refused` metrics topic triggers the drop on the logs
+producer's partition batches. `abandon` at shutdown and the count of records lost likewise cover
+every topic.
+
+A `Refused` topic holds the whole sink, as a refused signal holds `otlp_out`. A metrics topic that
+the broker won't authorize stops logs and spans behind it, although their own topics accept
 writes. The remedy is one `kafka_out` per signal, each behind `has_signal`, and `keep_signals` when
 an event carries more than one signal. Because topics resolve lazily, each of those sinks opens a
 producer for its own signal only.
@@ -120,6 +154,11 @@ attribute, under `key: {resource: NAME}`, go unkeyed: one unkeyed request per si
 `logit.output.records.unkeyed` once per record, as for the other formats. Metrics under
 `key: trace_id` aren't counted there: the key doesn't apply to them.
 
+Each signal's key comes from that signal's own field: a span's from `span.trace_id`, a log's from
+the log's `TraceRef`, which is what its OTLP log record carries. This differs from the per-event
+formats, where `KafkaEncoder::key` prefers the span's id. It is also what the exporter's
+`partition_logs_by_trace_id` keys by.
+
 A keyed request goes to the partition the Java client picks for the same key bytes ([ADR
 `kafka-output`](kafka-output.md), item 3).
 
@@ -131,12 +170,22 @@ property operators use resource keys for: one source's records on one partition.
 
 ### 6. Size
 
-A request over the encoder's budget (`max_request_bytes` less the producer's overhead, as for
-`record: batch`) is split by events into several records, each the longest run of the remaining
+The budget is per record and includes its key: `value_budget` less the key's bytes, since the
+producer counts a record's overhead as `5 + key.len()` in `Producer::prepare`'s cap check. A keyed
+piece that fits the encoder then fits the producer. A request over the budget is split by events into several records, each the longest run of the remaining
 events that fits, found by encoding candidates as `native` does under `record: batch` ([ADR
 `kafka-output`](kafka-output.md), "Amendment: what W3 settled", item 3). Each piece keeps the
-request's key. A single event whose request is over the budget alone is dropped and counted as
-`logit.output.records.dropped{reason="oversize"}`.
+request's key. A single event whose request is over the budget alone is dropped, and each signal record it would
+have formed counts one `logit.output.records.dropped{reason="oversize"}`.
+
+The `records.*` counters count Kafka records, as for the other formats: a rejected record holding
+500 spans counts 1. Events per signal aren't a separate counter. The sink's telemetry table states
+these units.
+
+The OTLP mapping's side-effect counters (`logit.output.metrics.degraded`, `skipped`, and their
+warnings) count once per batch. The encoder counts through a gate, as `otlp_out` does with
+`BatchAccounting`, and every candidate encode after the first runs with it muted: bisect probes,
+and the re-prepare of a topic whose prepare failed.
 
 This diverges from the exporter, which sends the request whole and loses it when the broker
 refuses it. A consumer reading by trace id sees one trace's spans across several records, each a
@@ -144,9 +193,11 @@ valid request on its own.
 
 ### 7. Record timestamp
 
-A record's timestamp is its first event's, as under `record: batch`. The exporter sets none, so
-its records carry produce time. Kafka 4.x's rule against records stamped more than an hour ahead
-applies as it does to the other formats ([ADR `kafka-output`](kafka-output.md), item 6).
+A record's timestamp is produce time, the time the encoder builds it, as the exporter's records
+carry. This differs from the other formats, whose timestamp is the event's. A request holds many
+events, and `INVALID_TIMESTAMP` names records, so one future-stamped event would lose the whole
+request under Kafka 4.x's rule against records stamped more than an hour ahead ([ADR
+`kafka-output`](kafka-output.md), item 6). Event times stay in the OTLP payload.
 
 ### 8. `otlp_json`
 
@@ -187,6 +238,8 @@ split into several records that the receiver still reads.
   85's checks.
 - A sink writing several signals holds a producer, connections, and a PID per topic until a
   multi-topic producer replaces the facade's internals.
+- Consumer sites of `topic:` need updating. `tools/soak/soaklib/scenario.py` matches `kafka_out`
+  by topic, and W1 updates it.
 - A refused signal topic holds every signal in the sink. Operators who need signals isolated run a
   sink per signal.
 - Known gaps, recorded in `docs/known-gaps/kafka.md` as the stream lands:
@@ -195,3 +248,5 @@ split into several records that the receiver still reads.
   - No byte parity with the exporter's `partition_*_by_resource_attributes` keys, so a `logit`
     sink and an exporter writing one topic place the same resource on different partitions.
   - Head-of-line blocking across signals (item 4).
+  - Per-request loss on `Rejected`: the broker rejects a record whole, so one bad record drops
+    every item in its request. The other formats lose one event, or one batch record.
