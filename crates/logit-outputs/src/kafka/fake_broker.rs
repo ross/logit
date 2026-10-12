@@ -22,8 +22,8 @@
 //! session's `session_lifetime_ms` has passed (KIP-368's expiry).
 //!
 //! A test scripts departures from that with [`Step`]s, each consumed by the first request it
-//! matches: an error code, `record_errors`, an append whose answer is lost, a close, or no
-//! answer at all.
+//! matches: an error code, `record_errors`, an append whose answer is lost or held until the
+//! SASL session ends, a close, or no answer at all.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -73,6 +73,8 @@ pub(crate) enum Action {
     RecordErrors(i16, Vec<i32>),
     /// Append every partition as usual, then close without answering: the answer is lost.
     AppendThenClose,
+    /// Append as usual, then hold the answer until the connection's SASL session ends.
+    AnswerAtSessionEnd,
     /// Close without appending or answering.
     Close,
     /// Read the request and never answer; the connection stays open until the client drops it.
@@ -356,6 +358,7 @@ async fn accept_loop(
 /// What a request's handling asks of the connection after it.
 enum Reply {
     Answer(Bytes),
+    AnswerAt(Bytes, Instant),
     Silent,
     Close,
     Hang,
@@ -390,6 +393,12 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         let reply = handle(node, Bytes::from(body), &state, &mut auth);
         match reply {
             Reply::Answer(frame) => {
+                if stream.write_all(&frame).await.is_err() {
+                    return;
+                }
+            }
+            Reply::AnswerAt(frame, at) => {
+                tokio::time::sleep_until(at).await;
                 if stream.write_all(&frame).await.is_err() {
                     return;
                 }
@@ -535,6 +544,15 @@ fn handle(node: i32, mut body: Bytes, state: &Arc<Mutex<State>>, auth: &mut Auth
                 Some(Action::Close | Action::AppendThenClose) => Reply::Close,
                 Some(Action::Hang) => Reply::Hang,
                 _ if request.acks == 0 => Reply::Silent,
+                Some(Action::AnswerAtSessionEnd) => {
+                    let Auth::Done { expires: Some(end) } = auth else {
+                        panic!("AnswerAtSessionEnd needs a SASL session with a lifetime")
+                    };
+                    match frame(&|out| response.encode(out, version).unwrap()) {
+                        Reply::Answer(bytes) => Reply::AnswerAt(bytes, *end),
+                        other => other,
+                    }
+                }
                 _ => frame(&|out| response.encode(out, version).unwrap()),
             }
         }
@@ -766,7 +784,10 @@ fn produce(
                         (Ok(offset), Some(Action::AppendThenError(code))) => {
                             (*code, offset, vec![])
                         }
-                        (Ok(offset), Some(Action::AppendThenClose)) => {
+                        (
+                            Ok(offset),
+                            Some(Action::AppendThenClose | Action::AnswerAtSessionEnd),
+                        ) => {
                             connection = step.clone();
                             (code::NONE, offset, vec![])
                         }

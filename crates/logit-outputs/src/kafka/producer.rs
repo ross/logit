@@ -1022,15 +1022,24 @@ impl BrokerJob {
         }
 
         let mut failed: HashSet<i32> = HashSet::new();
-        let mut alive = true;
+        // Why the connection takes no more requests, once it doesn't.
+        let mut finished: Option<&str> = None;
         for request in pack(parts, max_request_bytes) {
-            let (sendable, behind): (Vec<_>, Vec<_>) =
-                request.into_iter().partition(|(_, p, _)| alive && !failed.contains(p));
+            // `reauth_deadline`'s margin covers one request's wait, and the job writes its
+            // requests one after another, so a later one can reach the deadline. The rest are
+            // `Clean`, and dropping the connection makes the next attempt redial.
+            if finished.is_none() && conn.past_deadline() {
+                finished = Some("not sent: the connection's SASL session is about to end");
+            }
+            let (sendable, behind): (Vec<_>, Vec<_>) = request
+                .into_iter()
+                .partition(|(_, p, _)| finished.is_none() && !failed.contains(p));
             for (i, partition, _) in behind {
-                let why = if alive {
-                    format!("not sent behind an earlier batch of partition {partition} that failed")
-                } else {
-                    "not sent: an earlier request on the connection failed".to_string()
+                let why = match finished {
+                    None => format!(
+                        "not sent behind an earlier batch of partition {partition} that failed"
+                    ),
+                    Some(why) => why.to_string(),
                 };
                 failed.insert(partition);
                 answers.push((i, Outcome::Unanswered { fault: Fault::Clean, why }));
@@ -1048,7 +1057,7 @@ impl BrokerJob {
                     }
                 }
                 Err(err) => {
-                    alive = false;
+                    finished = Some("not sent: an earlier request on the connection failed");
                     let fault = err.fault();
                     let why = format!("{:#}", err.error);
                     for (i, partition, _) in sendable {
@@ -1058,7 +1067,7 @@ impl BrokerJob {
                 }
             }
         }
-        (broker, alive.then_some(conn), answers)
+        (broker, finished.is_none().then_some(conn), answers)
     }
 }
 

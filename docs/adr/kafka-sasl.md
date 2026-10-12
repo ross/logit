@@ -69,11 +69,15 @@ A broker with `connections.max.reauth.ms` set answers `SaslAuthenticate` v1 or l
 `session_lifetime_ms`, and closes a connection that sends anything but a re-authentication after
 that lifetime ends (KIP-368). `Conn` records a deadline: the lifetime minus the sink's `timeout`.
 The producer's reuse check (`Conn::is_open`) reads a connection past its deadline as closed, so
-the producer dials a new one, which is `Clean`. A lifetime of `0` means no deadline.
+the producer dials a new one, which is `Clean`. One attempt can write several produce requests to
+a broker in turn, so the deadline is checked again before each one (`Conn::past_deadline`). Once
+it has passed, the partition batches not yet written are `Clean` and the connection is dropped, so
+the next attempt dials a new one. A lifetime of `0` means no deadline.
 
-This is safe because `kafka_out` keeps one request in flight per broker, and the `timeout` margin
-means a request written before the deadline is answered or failed before the session ends. A broker that closes one mid-request
-anyway gives an `Ambiguous` failure, and the batch's idempotent sequences make its resend safe.
+This is safe because `kafka_out` keeps one request in flight per broker, no request is written
+past the deadline, and the `timeout` margin means a request written before the deadline is
+answered or failed before the session ends. A broker that closes one mid-request anyway gives an
+`Ambiguous` failure, and the batch's idempotent sequences make its resend safe.
 
 ### 4. Fault classes
 

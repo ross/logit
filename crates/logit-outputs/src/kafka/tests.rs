@@ -1005,3 +1005,26 @@ async fn an_expiring_sasl_session_is_redialed_before_the_next_send() {
     assert!(state.authentications > authenticated, "a redial authenticated again");
     assert_eq!(state.partition(TOPIC, 0).records().len(), 2, "each record once");
 }
+
+/// One job writes its requests one after another, so the deadline is checked before each: the
+/// broker holds the first request's answer until the session ends, and the requests after it
+/// wait for the next attempt's connection instead of reaching the expired session.
+#[tokio::test]
+async fn a_sasl_deadline_reached_between_requests_leaves_the_rest_for_a_new_connection() {
+    let cluster = sasl_cluster(1, &[0]).await;
+    // The deadline falls at half the lifetime, so the held answer arrives past it, and well
+    // inside the timeout.
+    cluster.state().sasl.as_mut().unwrap().session_lifetime_ms = 1000;
+    let sasl = Some(authenticator(&sasl_settings("SCRAM-SHA-512", SASL_PASSWORD)));
+    let mut producer =
+        Producer::new(ProducerConfig { sasl, max_request_bytes: 220, ..config(&cluster) }).unwrap();
+    cluster.script(Step::produce(None, Action::AnswerAtSessionEnd));
+    let pending =
+        send_expecting(&mut producer, keyed_for(0, 1, 6), &[Some(Fault::Clean), None]).await;
+    assert!(pending.parts.len() > 1, "cut into {} batches", pending.parts.len());
+
+    let state = cluster.state();
+    assert_eq!(state.expired_closes, 0, "nothing was written to an expired session");
+    assert_eq!(state.received.len(), pending.parts.len(), "every batch went out once");
+    assert_eq!(state.partition(TOPIC, 0).records().len(), 6, "each record once");
+}

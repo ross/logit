@@ -282,10 +282,16 @@ impl Conn {
     /// closed would turn a `Clean` redial into an `Ambiguous` failure. A connection past its SASL
     /// deadline reads as closed, because the broker closes it on the next request.
     pub(crate) async fn is_open(&mut self) -> bool {
-        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if self.past_deadline() {
             return false;
         }
         matches!(poll_pending_close(&mut *self.stream, &mut [0u8; 1]).await, PendingClose::Open)
+    }
+
+    /// Whether the connection's SASL deadline has passed, with no socket poll: the check before
+    /// each request after the first that one broker job writes.
+    pub(crate) fn past_deadline(&self) -> bool {
+        self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     /// Sends `request` at `version` and waits for its response.
