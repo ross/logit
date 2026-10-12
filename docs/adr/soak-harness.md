@@ -194,8 +194,8 @@ stderr", no longer hold for those counts:
 ## Amendment: every drop reason counts a gap (2026-10-11)
 
 `ledger.egress` credits a positive gap with a node's `batches.dropped` under every reason, not
-`shutdown` alone: a queue's or spool's `overflow_oldest` and `overflow_newest`, a spool's
-`disk_full`, and any reason the runtime adds. The count is of batches and is never reconciled
+`shutdown` alone. The plan's [6. The checks](../plans/soak-harness.md#6-the-checks), under "The
+ledger and identities", is the one list of what counts. The count is of batches and is never reconciled
 with the gap. A `rejected` batch, which the destination refused, or a `disk_corrupt` one, which a
 spool couldn't read back, counts the gap but FAILs the life, because neither happens against a
 healthy backend and a later cumulative total can hide the lost increments. The stderr

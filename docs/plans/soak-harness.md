@@ -2122,7 +2122,10 @@ What the work showed about the harness:
 - The self-test fixtures failed against `main`'s `checks.py` with the new rule reverted:
   `overflow_oldest`, `disk_full`, a mixed set of reasons, an `overflow` stderr count of 0,
   `rejected` twice, `disk_corrupt`, an overflow in a killed life, an overflow at the sink's own
-  copy, and an overflow at the router under `route` twice.
+  copy, and an overflow at either sink under `route`, an overflow at another sink under
+  `copy` (`sinks-copy-overflow-elsewhere`, which fails on its detail wording), and the existing
+  shutdown fixtures, which changed only in detail wording ("batches dropped for shutdown N" to
+  "batches dropped: shutdown N").
 - Re-scoring ten preserved runs with `script/soak check` gave no change in any verdict.
 
 ### A Kafka target: `kafka-broker-restart` (2026-10-11)
@@ -2208,8 +2211,9 @@ Overall PASS: every row passed but `ledger.windows`, which a Kafka target SKIPs,
   `20261009T155153Z` is recorded under "Findings", Overall PASS.
 - **W6** is documentation only: `crates/logit-cli/tests/doc_links.rs` passes.
 - **W8a**: the self-test passes (961 expectations), and each new fixture fails it when the rule
-  is reverted (11 fixtures: the `overflow_oldest`, `disk_full`, mixed-reason, stderr-zero,
-  `rejected` (two), `disk_corrupt`, killed-life, own-copy, and `route` (two) cases). Each new
+  is reverted (12 fixtures: the `overflow_oldest`, `disk_full`, mixed-reason, stderr-zero,
+  `rejected` (two), `disk_corrupt`, killed-life, own-copy, `route` (two), and
+  `sinks-copy-overflow-elsewhere` cases). Each new
   scenario passes `self-test` validation, the shipped-config test, and `logit validate` in
   `logit:soak`. Re-scoring ten preserved runs gives the same statuses. Met: the four scenario
   runs and the `statsd-vm`, `statsd-vm-lost-total`, and `sink-outage-drop-oldest` controls are
