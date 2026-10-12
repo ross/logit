@@ -322,6 +322,7 @@ async fn a_retried_prepare_counts_encode_side_points_once() {
     cluster.script(Step {
         api: kafka_protocol::messages::ApiKey::Metadata,
         partition: None,
+        topic: None,
         action: Action::Error(fault::code::LEADER_NOT_AVAILABLE),
     });
     let sums = run(&mut out, &mut probe, vec![batch(keyed_for("a", 0, 1, 2))], fast_retry()).await;

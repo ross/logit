@@ -457,3 +457,7 @@ impl Output for KafkaOutput {
 #[cfg(test)]
 #[path = "sink_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "otlp_tests.rs"]
+mod otlp_tests;

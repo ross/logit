@@ -678,6 +678,7 @@ async fn a_missing_topic_is_refused_only_after_a_refresh_confirms_it() {
         cluster.script(Step {
             api: ApiKey::Metadata,
             partition: None,
+            topic: None,
             action: Action::Error(answer),
         });
     }
@@ -693,6 +694,7 @@ async fn a_loading_coordinator_is_polled_inside_the_attempt() {
         cluster.script(Step {
             api: ApiKey::InitProducerId,
             partition: None,
+            topic: None,
             action: Action::Error(answer),
         });
     };
@@ -934,6 +936,7 @@ async fn sasl_refusals_are_refused_and_never_print_the_password() {
     cluster.script(Step {
         api: ApiKey::SaslAuthenticate,
         partition: None,
+        topic: None,
         action: Action::Error(code::ILLEGAL_SASL_STATE),
     });
     let mut producer = sasl_producer(&cluster, "SCRAM-SHA-256", SASL_PASSWORD);
@@ -967,7 +970,7 @@ async fn a_scram_server_signature_mismatch_is_refused() {
 async fn a_transport_failure_during_the_sasl_exchange_is_clean() {
     for api in [ApiKey::SaslHandshake, ApiKey::SaslAuthenticate] {
         let cluster = sasl_cluster(1, &[0]).await;
-        cluster.script(Step { api, partition: None, action: Action::Close });
+        cluster.script(Step { api, partition: None, topic: None, action: Action::Close });
         let mut producer = sasl_producer(&cluster, "SCRAM-SHA-256", SASL_PASSWORD);
         let message = sasl_refusal(&mut producer, "SCRAM-SHA-256", Fault::Clean).await;
         assert!(message.contains(&format!("{api:?}")), "{message}");

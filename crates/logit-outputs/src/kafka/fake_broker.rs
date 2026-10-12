@@ -84,17 +84,29 @@ pub(crate) enum Action {
 }
 
 /// One scripted departure: the first request of `api` (for `Produce`, naming `partition` when
-/// set) gets `action`.
+/// set; for `Produce` and `Metadata`, naming `topic` when set) gets `action`.
 #[derive(Debug, Clone)]
 pub(crate) struct Step {
     pub(crate) api: ApiKey,
     pub(crate) partition: Option<i32>,
+    pub(crate) topic: Option<String>,
     pub(crate) action: Action,
 }
 
 impl Step {
     pub(crate) fn produce(partition: Option<i32>, action: Action) -> Self {
-        Self { api: ApiKey::Produce, partition, action }
+        Self { api: ApiKey::Produce, partition, topic: None, action }
+    }
+
+    /// `action` for the first `Metadata` request asking about `topic`.
+    pub(crate) fn metadata(topic: &str, action: Action) -> Self {
+        Self { api: ApiKey::Metadata, partition: None, topic: Some(topic.to_string()), action }
+    }
+
+    /// The same step, matching only requests for `topic`.
+    pub(crate) fn on_topic(mut self, topic: &str) -> Self {
+        self.topic = Some(topic.to_string());
+        self
     }
 }
 
@@ -102,6 +114,7 @@ impl Step {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Received {
     pub(crate) node: i32,
+    pub(crate) topic: String,
     pub(crate) partition: i32,
     pub(crate) version: i16,
     pub(crate) acks: i16,
@@ -247,6 +260,8 @@ pub(crate) struct State {
     pub(crate) received: Vec<Received>,
     /// `(node, api, version)` of every request, in arrival order.
     pub(crate) requests: Vec<(i32, ApiKey, i16)>,
+    /// Every topic a `Metadata` request asked about, in arrival order.
+    pub(crate) metadata_topics: Vec<String>,
     pub(crate) accepted_connections: usize,
     /// Connections being served now.
     pub(crate) open_connections: usize,
@@ -257,9 +272,21 @@ pub(crate) struct State {
 
 impl State {
     fn take_step(&mut self, api: ApiKey, partition: Option<i32>) -> Option<Action> {
+        self.take_step_for(api, partition, None)
+    }
+
+    /// [`State::take_step`] for a request about `topic`; a step naming another topic doesn't
+    /// match it.
+    fn take_step_for(
+        &mut self,
+        api: ApiKey,
+        partition: Option<i32>,
+        topic: Option<&str>,
+    ) -> Option<Action> {
         let at = self.script.iter().position(|s| {
             s.api == api
                 && (s.partition.is_none() || partition.is_none() || s.partition == partition)
+                && (s.topic.is_none() || topic.is_none() || s.topic.as_deref() == topic)
         })?;
         Some(self.script.remove(at).action)
     }
@@ -541,7 +568,14 @@ fn handle(node: i32, mut body: Bytes, state: &Arc<Mutex<State>>, auth: &mut Auth
         }
         ApiKey::Metadata => {
             let request = MetadataRequest::decode(&mut body, version).unwrap();
-            let scripted = state.take_step(key, None);
+            let asked: Vec<String> = request
+                .topics
+                .iter()
+                .flatten()
+                .filter_map(|t| t.name.as_ref().map(|n| n.0.to_string()))
+                .collect();
+            let scripted = state.take_step_for(key, None, asked.first().map(String::as_str));
+            state.metadata_topics.extend(asked);
             match scripted {
                 Some(Action::Close) => return Reply::Close,
                 Some(Action::Hang) => return Reply::Hang,
@@ -896,10 +930,12 @@ fn produce(
 ) -> (ProduceResponse, Option<Action>) {
     let asked: Vec<i32> =
         request.topic_data.iter().flat_map(|t| t.partition_data.iter().map(|d| d.index)).collect();
+    let topics: Vec<String> = request.topic_data.iter().map(|t| t.name.0.to_string()).collect();
     let refusal = state.script.iter().position(|s| {
         s.api == ApiKey::Produce
             && matches!(s.action, Action::Close | Action::Hang)
             && s.partition.is_none_or(|p| asked.contains(&p))
+            && s.topic.as_ref().is_none_or(|t| topics.contains(t))
     });
     if let Some(at) = refusal {
         return (ProduceResponse::default(), Some(state.script.remove(at).action));
@@ -911,7 +947,7 @@ fn produce(
         let mut partitions = Vec::new();
         for data in &topic.partition_data {
             let index = data.index;
-            let step = state.take_step(ApiKey::Produce, Some(index));
+            let step = state.take_step_for(ApiKey::Produce, Some(index), Some(&name));
             let mut answer = PartitionProduceResponse::default().with_index(index);
             let records = data.records.clone().expect("a produce request carries records");
             let mut info_buf = records.clone();
@@ -951,6 +987,7 @@ fn produce(
             };
             state.received.push(Received {
                 node,
+                topic: name.clone(),
                 partition: index,
                 version,
                 acks: request.acks,
