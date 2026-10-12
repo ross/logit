@@ -282,8 +282,8 @@
 //!     `docs/adr/shutdown-accounting-and-cancellation-safety.md`, decision 14).
 //! 85. A `kafka_out` with an empty `brokers` or an entry that isn't a `host:port`, a `topic` or a
 //!     `topics` value that isn't a legal Kafka topic name, no `topic` or a `topics` under a
-//!     format other than `otlp_proto`, both `topic` and `topics`, a `record` or a
-//!     `key: {attribute: ..}` under `otlp_proto`, a `key` naming an empty attribute, a `key`
+//!     format other than `otlp_proto` or `otlp_json`, both `topic` and `topics`, a `record` or a
+//!     `key: {attribute: ..}` under either, a `key` naming an empty attribute, a `key`
 //!     other than `none` with `record: batch` (`format: native`'s default), `idempotent: true` without
 //!     `acks: all`, a `max_request_bytes` of `0`, `timeout: 0s`, a `tls` failing rule 34's
 //!     checks, a `sasl` with an empty `username`, or an `oauthbearer` `sasl` with both or
@@ -3645,7 +3645,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 );
             }
         }
-        let otlp = *format == logit_config::KafkaFormat::OtlpProto;
+        let otlp = matches!(
+            format,
+            logit_config::KafkaFormat::OtlpProto | logit_config::KafkaFormat::OtlpJson
+        );
         if otlp {
             if topic.is_some() && topics.is_some() {
                 anyhow::bail!(
@@ -3655,14 +3658,14 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             }
             if record.is_some() {
                 anyhow::bail!(
-                    "component '{id}': kafka_out 'record' doesn't apply to 'format: otlp_proto', \
-                     whose records each hold one export request -- remove 'record'"
+                    "component '{id}': kafka_out 'record' doesn't apply to 'format: otlp_proto' or \
+                     'otlp_json', whose records each hold one export request -- remove 'record'"
                 );
             }
             if let logit_config::KafkaKey::Attribute(_) = key {
                 anyhow::bail!(
                     "component '{id}': kafka_out 'key: {{attribute: ..}}' can't key an \
-                     'otlp_proto' record, whose request holds many events -- use 'trace_id', \
+                     OTLP record, whose request holds many events -- use 'trace_id', \
                      '{{resource: ..}}', or 'none'"
                 );
             }
@@ -3674,8 +3677,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             }
             if topics.is_some() {
                 anyhow::bail!(
-                    "component '{id}': kafka_out 'topics' needs 'format: otlp_proto' -- the other \
-                     formats write every record to 'topic'"
+                    "component '{id}': kafka_out 'topics' needs 'format: otlp_proto' or \
+                     'otlp_json' -- the other formats write every record to 'topic'"
                 );
             }
         }
@@ -7414,10 +7417,18 @@ mod tests {
 
     /// A `kafka_out` under `format: otlp_proto` with no `topic`, `edit` applied.
     fn kafka_otlp_with(edit: impl FnOnce(&mut ComponentKind)) -> ComponentKind {
+        kafka_otlp_format_with(logit_config::KafkaFormat::OtlpProto, edit)
+    }
+
+    /// A `kafka_out` under an OTLP `format` with no `topic`, `edit` applied.
+    fn kafka_otlp_format_with(
+        want: logit_config::KafkaFormat,
+        edit: impl FnOnce(&mut ComponentKind),
+    ) -> ComponentKind {
         kafka_out_with(|k| {
             if let ComponentKind::KafkaOut { topic, format, .. } = k {
                 *topic = None;
-                *format = logit_config::KafkaFormat::OtlpProto;
+                *format = want;
             }
             edit(k);
         })
@@ -7448,6 +7459,12 @@ mod tests {
         for kind in kinds {
             kafka_out_result(kind).expect("valid");
         }
+        kafka_out_result(kafka_otlp_format_with(logit_config::KafkaFormat::OtlpJson, |k| {
+            if let ComponentKind::KafkaOut { key, .. } = k {
+                *key = KafkaKey::TraceId;
+            }
+        }))
+        .expect("otlp_json resolves as otlp_proto does");
     }
 
     /// Rule 85's topic and record-unit clauses, one per case.
@@ -7464,7 +7481,7 @@ mod tests {
                 }),
             ),
             (
-                "'topics' needs 'format: otlp_proto'",
+                "'topics' needs 'format: otlp_proto' or 'otlp_json'",
                 kafka_out_with(|k| {
                     if let ComponentKind::KafkaOut { topics, .. } = k {
                         *topics = Some(KafkaTopics::default());
@@ -7507,7 +7524,7 @@ mod tests {
                 }),
             ),
             (
-                "'record' doesn't apply to 'format: otlp_proto'",
+                "'record' doesn't apply to 'format: otlp_proto' or 'otlp_json'",
                 kafka_otlp_with(|k| {
                     if let ComponentKind::KafkaOut { record, .. } = k {
                         *record = Some(KafkaRecord::Event);
@@ -7515,10 +7532,52 @@ mod tests {
                 }),
             ),
             (
-                "can't key an 'otlp_proto' record",
+                "can't key an OTLP record",
                 kafka_otlp_with(|k| {
                     if let ComponentKind::KafkaOut { key, .. } = k {
                         *key = KafkaKey::Attribute("request_id".into());
+                    }
+                }),
+            ),
+        ];
+        for (want, kind) in cases {
+            let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]));
+            assert!(err.contains("'out'") && err.contains(want), "want {want:?}, got: {err}");
+        }
+        // `otlp_json` takes the same clauses.
+        let json = logit_config::KafkaFormat::OtlpJson;
+        let cases: Vec<(&str, ComponentKind)> = vec![
+            (
+                "sets both 'topic' and 'topics'",
+                kafka_otlp_format_with(json, |k| {
+                    if let ComponentKind::KafkaOut { topic, topics, .. } = k {
+                        *topic = Some("t".into());
+                        *topics = Some(KafkaTopics::default());
+                    }
+                }),
+            ),
+            (
+                "'record' doesn't apply to 'format: otlp_proto' or 'otlp_json'",
+                kafka_otlp_format_with(json, |k| {
+                    if let ComponentKind::KafkaOut { record, .. } = k {
+                        *record = Some(KafkaRecord::Batch);
+                    }
+                }),
+            ),
+            (
+                "can't key an OTLP record",
+                kafka_otlp_format_with(json, |k| {
+                    if let ComponentKind::KafkaOut { key, .. } = k {
+                        *key = KafkaKey::Attribute("request_id".into());
+                    }
+                }),
+            ),
+            (
+                "'topics.metrics' (\"a/b\") isn't a legal Kafka topic name",
+                kafka_otlp_format_with(json, |k| {
+                    if let ComponentKind::KafkaOut { topics, .. } = k {
+                        *topics =
+                            Some(KafkaTopics { metrics: Some("a/b".into()), ..Default::default() });
                     }
                 }),
             ),

@@ -1,4 +1,4 @@
-//! `kafka_out` under `format: otlp_proto` against the in-process fake broker: each signal on its
+//! `kafka_out` under `format: otlp_proto` and `otlp_json` against the in-process fake broker: each signal on its
 //! topic as a valid export request, the multi-topic facade's verdict and postures across topics,
 //! the keys, the size cap, and the counters (`docs/adr/kafka-otlp-formats.md`).
 
@@ -15,8 +15,8 @@ use logit_pipeline::{BatchContext, Fault, Output, SeqId};
 use logit_proto::otlp::generated::opentelemetry::proto::logs::v1::LogsData;
 use logit_proto::otlp::generated::opentelemetry::proto::metrics::v1::MetricsData;
 use logit_proto::otlp::generated::opentelemetry::proto::trace::v1::TracesData;
-use logit_proto::otlp::OtlpEncoder;
-use logit_proto::{Signal, SignalEncoder};
+use logit_proto::otlp::{OtlpDecoder, OtlpEncoder, OtlpEncoding};
+use logit_proto::{Signal, SignalDecoder, SignalEncoder};
 use prost::Message;
 
 use super::*;
@@ -46,6 +46,25 @@ fn settings(cluster: &FakeCluster) -> KafkaSettings {
         topics: Some(SignalTopics::default()),
         ..KafkaSettings::new(vec![cluster.addr(0)], "")
     }
+}
+
+fn json_settings(cluster: &FakeCluster) -> KafkaSettings {
+    KafkaSettings { format: RecordFormat::OtlpJson, ..settings(cluster) }
+}
+
+fn json_encoder() -> OtlpEncoder {
+    OtlpEncoder::new().with_encoding(OtlpEncoding::Json)
+}
+
+/// The log bodies of an OTLP/JSON logs request, read back by `otlp_in`'s decoder.
+fn json_log_bodies(value: &[u8]) -> Vec<Value> {
+    OtlpDecoder::new()
+        .decode_signal_json(Signal::Logs, Bytes::copy_from_slice(value))
+        .expect("a valid OTLP/JSON logs request")
+        .into_iter()
+        .flat_map(|batch| batch.events)
+        .map(|event| event.log.expect("a log").message)
+        .collect()
 }
 
 fn sink(settings: KafkaSettings, probe: &TelemetryProbe) -> KafkaOutput {
@@ -530,6 +549,126 @@ fn an_otlp_format_refuses_a_record_mode_and_an_attribute_key() {
         (KafkaSettings { record: Some(RecordMode::Event), ..base.clone() }, "takes no 'record'"),
         (KafkaSettings { key: RecordKey::Attribute("k".into()), ..base.clone() }, "attribute"),
         (KafkaSettings { format: RecordFormat::Json, ..base.clone() }, "'topics' needs"),
+        (KafkaSettings { topics: None, ..base.clone() }, "no topic"),
+    ] {
+        let err = KafkaOutput::new(settings).err().expect("refused");
+        assert!(err.to_string().contains(want), "{err}");
+    }
+    KafkaOutput::new(KafkaSettings { key: RecordKey::TraceId, ..base }).expect("a trace id key");
+}
+
+/// Under `otlp_json` each signal lands on its topic as the OTLP/JSON `otlp_out`'s encoder writes
+/// for the batch, which `otlp_in`'s decoder reads back to the events the protobuf request holds.
+#[tokio::test]
+async fn otlp_json_writes_each_signal_as_the_json_request_otlp_out_writes() {
+    let cluster = cluster(&[LOGS, METRICS, SPANS], 1).await;
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink(json_settings(&cluster), &probe);
+    let input = mixed();
+    let sums = run(&mut out, &mut probe, vec![input.clone()]).await;
+
+    let want_json = json_encoder().encode_signals(&input).unwrap();
+    let want_proto = OtlpEncoder::new().encode_signals(&input).unwrap();
+    assert_eq!(want_json.len(), 3);
+    for (json, proto) in want_json.iter().zip(&want_proto) {
+        let topic = match json.signal {
+            Signal::Logs => LOGS,
+            Signal::Metrics => METRICS,
+            Signal::Traces => SPANS,
+        };
+        let records = records_on(&cluster, topic);
+        assert_eq!(records.len(), 1, "{topic}");
+        let value = &records[0].2;
+        assert_eq!(value, &json.bytes, "{topic}: the bytes otlp_out's JSON encoder writes");
+        assert_eq!(value[0], b'{', "{topic}: a JSON object, not protobuf");
+        let from_json = OtlpDecoder::new().decode_signal_json(json.signal, value.clone()).unwrap();
+        let from_proto =
+            OtlpDecoder::new().decode_signal(proto.signal, proto.bytes.clone()).unwrap();
+        assert_eq!(from_json, from_proto, "{topic}");
+    }
+    assert_eq!(sum(&sums, "logit.output.records", &[]), 3.0);
+}
+
+/// A trace id key splits an `otlp_json` request as it splits an `otlp_proto` one, and each
+/// piece is a valid OTLP/JSON request.
+#[tokio::test]
+async fn otlp_json_keys_by_trace_id_like_otlp_proto() {
+    let (a, b) = ([0xa1; 16], [0xb2; 16]);
+    let cluster = cluster(&[LOGS], 4).await;
+    let mut probe = TelemetryProbe::new();
+    let mut out =
+        sink(KafkaSettings { key: RecordKey::TraceId, ..json_settings(&cluster) }, &probe);
+    let input = batch(vec![
+        log("a1", Some(a)),
+        log("b1", Some(b)),
+        log("none", None),
+        log("a2", Some(a)),
+    ]);
+    let sums = run(&mut out, &mut probe, vec![input]).await;
+    let mut got: Vec<(Option<Vec<u8>>, Vec<Value>)> = records_on(&cluster, LOGS)
+        .into_iter()
+        .map(|(_, k, v, _)| (k.map(|k| k.to_vec()), json_log_bodies(&v)))
+        .collect();
+    got.sort_by(|x, y| x.0.cmp(&y.0));
+    let strs = |names: &[&str]| names.iter().map(|n| Value::str(*n)).collect::<Vec<_>>();
+    assert_eq!(
+        got,
+        vec![
+            (None, strs(&["none"])),
+            (Some(hex(a)), strs(&["a1", "a2"])),
+            (Some(hex(b)), strs(&["b1"])),
+        ]
+    );
+    assert_eq!(sum(&sums, "logit.output.records.unkeyed", &[]), 1.0);
+}
+
+/// The budget under `otlp_json` is the JSON length: a request is split into runs that each fit
+/// the budget as JSON, which is longer than the protobuf the same events encode to.
+#[tokio::test]
+async fn an_oversize_otlp_json_request_is_split_by_its_json_length() {
+    let input = batch((0..20).map(|i| log(&format!("event {i:02}"), None)).collect());
+    let one = {
+        let mut body = Vec::new();
+        let request = OtlpEncoder::new()
+            .request(Signal::Logs, &input.resource, None, &input.events[..1])
+            .unwrap();
+        request.write_json(&mut body);
+        assert!(body.len() > request.encoded_len(), "JSON is longer than protobuf");
+        body.len()
+    };
+    let overhead = 10_000 - value_budget(10_000, &IndexMap::new());
+    let budget = 4 * one;
+    let cluster = cluster(&[LOGS], 1).await;
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink(
+        KafkaSettings { max_request_bytes: budget + overhead, ..json_settings(&cluster) },
+        &probe,
+    );
+    let sums = run(&mut out, &mut probe, vec![input]).await;
+
+    let records = records_on(&cluster, LOGS);
+    assert!(records.len() > 1, "split into several: {}", records.len());
+    let mut bodies = Vec::new();
+    for (_, _, value, _) in &records {
+        assert!(value.len() <= budget, "{} over {budget}", value.len());
+        bodies.extend(json_log_bodies(value));
+    }
+    let want: Vec<Value> = (0..20).map(|i| Value::str(format!("event {i:02}"))).collect();
+    assert_eq!(bodies, want, "every event, in order");
+    assert_eq!(sum(&sums, "logit.output.records.dropped", &[("reason", "oversize")]), 0.0);
+}
+
+/// `otlp_json` refuses what `otlp_proto` refuses.
+#[test]
+fn otlp_json_refuses_a_record_mode_and_an_attribute_key() {
+    let base = KafkaSettings {
+        format: RecordFormat::OtlpJson,
+        topics: Some(SignalTopics::default()),
+        ..KafkaSettings::new(vec!["127.0.0.1:9".into()], "")
+    };
+    for (settings, want) in [
+        (KafkaSettings { record: Some(RecordMode::Event), ..base.clone() }, "takes no 'record'"),
+        (KafkaSettings { key: RecordKey::Attribute("k".into()), ..base.clone() }, "attribute"),
         (KafkaSettings { topics: None, ..base.clone() }, "no topic"),
     ] {
         let err = KafkaOutput::new(settings).err().expect("refused");

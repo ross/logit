@@ -772,6 +772,11 @@ pub enum KafkaFormat {
     /// exporter writes it and its Kafka receiver reads it: each batch's logs, metrics, and
     /// spans as separate requests, each to its signal's topic (`topics:`). Takes no `record:`.
     OtlpProto,
+    /// The same request as `otlp_proto`, as OTLP/JSON, in the form the OpenTelemetry Collector's
+    /// own JSON marshaler writes and its Kafka receiver reads under `encoding: otlp_json`.
+    /// Topics, keys, and splitting are as for `otlp_proto`; a request is split by its JSON
+    /// length. Takes no `record:`.
+    OtlpJson,
 }
 
 /// Each signal's topic under an OTLP `format:`. A key left out takes the OpenTelemetry Collector
@@ -2955,13 +2960,13 @@ pub enum ComponentKind {
         /// topic's partitions and leaders, then connects to each leader at the address the
         /// cluster advertises, so every advertised listener must be reachable from `logit`.
         brokers: Vec<String>,
-        /// The topic every record goes to. Required except under `format: otlp_proto`, where
+        /// The topic every record goes to. Required except under `format: otlp_proto` or `otlp_json`, where
         /// setting it sends every signal to this one topic in place of `topics:`. With the
         /// broker's `auto.create.topics.enable` on, a missing topic is created on first use;
         /// otherwise the sink holds its queue until an operator creates it.
         #[serde(default)]
         topic: Option<String>,
-        /// Under `format: otlp_proto` only, each signal's topic: `{logs: NAME, metrics: NAME,
+        /// Under `format: otlp_proto` or `otlp_json` only, each signal's topic: `{logs: NAME, metrics: NAME,
         /// traces: NAME}`, any key left out taking its default, `otlp_logs`, `otlp_metrics`, or
         /// `otlp_spans`. Can't be set with `topic:`. A signal's topic is first asked about when
         /// that signal first arrives, so a pipeline that never carries metrics never creates
@@ -2973,8 +2978,8 @@ pub enum ComponentKind {
         /// 32 lowercase hex characters; `{attribute: NAME}` or `{resource: NAME}` keys by that
         /// event or resource attribute's value as text. A keyed record goes to the partition the
         /// Java client's default partitioner picks for the same key. An event without the value
-        /// (or with a map or array there) is sent unkeyed, counted. Under `format: otlp_proto`,
-        /// `trace_id` splits the logs and spans of a batch into one request per trace id (a
+        /// (or with a map or array there) is sent unkeyed, counted. Under `format: otlp_proto` or
+        /// `otlp_json`, `trace_id` splits the logs and spans of a batch into one request per trace id (a
         /// log's own trace id, a span's own), metrics stay one unkeyed request, `{resource:
         /// NAME}` keys every request of a batch alike, and `{attribute: NAME}` is rejected.
         #[serde(default)]
@@ -2983,14 +2988,14 @@ pub enum ComponentKind {
         /// json` writes on one line; `text`, the log body alone; `msgpack`, the `json` object as
         /// MessagePack; `native`, `logit`'s own lossless binary format; or `otlp_proto`, one
         /// OTLP export request of one signal, which the OpenTelemetry Collector's Kafka
-        /// receiver reads. An `otlp_proto` request too large for `max_request_bytes` is split
-        /// into several, each a valid request, and a record's timestamp is the time it was
-        /// written rather than an event's.
+        /// receiver reads; or `otlp_json`, the same request as OTLP/JSON. An OTLP request too large
+        /// for `max_request_bytes` is split into several, each a valid request, and a record's
+        /// timestamp is the time it was written rather than an event's.
         #[serde(default)]
         format: KafkaFormat,
         /// How many events one record holds: `event`, one each, or `batch`, as many as fit under
         /// `max_request_bytes`. Defaults to `batch` for `format: native` and `event` for the
-        /// others but `otlp_proto`, which takes none. A `key` other than `none` needs `event`.
+        /// others but `otlp_proto` and `otlp_json`, which take none. A `key` other than `none` needs `event`.
         #[serde(default)]
         record: Option<KafkaRecord>,
         /// How record batches are compressed: `none` (the default), `gzip`, `snappy`, `lz4`, or
@@ -7371,6 +7376,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("spans"), "{err}");
+    }
+
+    #[test]
+    fn kafka_out_otlp_json_takes_topics_and_no_topic() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "kafka_out", "brokers": ["k:9092"], "format": "otlp_json",
+                "topics": {"metrics": "m"}}"#,
+        )
+        .unwrap();
+        let ComponentKind::KafkaOut { topic, topics, format, .. } = component.kind else {
+            panic!("expected KafkaOut");
+        };
+        assert_eq!(format, KafkaFormat::OtlpJson);
+        assert_eq!(topic, None);
+        assert_eq!(topics, Some(KafkaTopics { metrics: Some("m".into()), ..Default::default() }));
     }
 
     #[test]

@@ -1236,7 +1236,10 @@ fn build_spec(
             tls,
             sasl,
         } => {
-            let otlp = *format == logit_config::KafkaFormat::OtlpProto;
+            let otlp = matches!(
+                format,
+                logit_config::KafkaFormat::OtlpProto | logit_config::KafkaFormat::OtlpJson
+            );
             // Under an OTLP format, `topic:` sends every signal to one topic; without it, each
             // signal takes its `topics:` entry or the exporter's default.
             let signal_topics = (otlp && topic.is_none()).then(|| {
@@ -1264,6 +1267,7 @@ fn build_spec(
                     logit_config::KafkaFormat::Msgpack => RecordFormat::Msgpack,
                     logit_config::KafkaFormat::Native => RecordFormat::Native,
                     logit_config::KafkaFormat::OtlpProto => RecordFormat::OtlpProto,
+                    logit_config::KafkaFormat::OtlpJson => RecordFormat::OtlpJson,
                 },
                 record: record.map(|record| match record {
                     logit_config::KafkaRecord::Event => RecordMode::Event,

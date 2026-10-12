@@ -41,6 +41,15 @@ impl OtlpRequest {
         }
     }
 
+    /// Appends the OTLP/JSON encoding ([`super::json::write_logs`] and its siblings) to `out`.
+    pub fn write_json(&self, out: &mut Vec<u8>) {
+        match self {
+            OtlpRequest::Logs(data) => super::json::write_logs(data, out),
+            OtlpRequest::Metrics(data) => super::json::write_metrics(data, out),
+            OtlpRequest::Traces(data) => super::json::write_traces(data, out),
+        }
+    }
+
     /// The protobuf encoding.
     pub fn encode_to_vec(&self) -> Vec<u8> {
         match self {
