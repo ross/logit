@@ -47,7 +47,7 @@ use logit_outputs::graphite::{GraphiteOutput, Transport as GraphiteOutTransport}
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::kafka::{
     KafkaAcks, KafkaCompression, KafkaOutput, KafkaSasl, KafkaSettings, OAuthToken, RecordFormat,
-    RecordKey, RecordMode,
+    RecordKey, RecordMode, SignalTopics,
 };
 use logit_outputs::logit::LogitOutput;
 use logit_outputs::null::NullOutput;
@@ -1223,6 +1223,7 @@ fn build_spec(
         KafkaOut {
             brokers,
             topic,
+            topics,
             key,
             format,
             record,
@@ -1235,9 +1236,22 @@ fn build_spec(
             tls,
             sasl,
         } => {
+            let otlp = *format == logit_config::KafkaFormat::OtlpProto;
+            // Under an OTLP format, `topic:` sends every signal to one topic; without it, each
+            // signal takes its `topics:` entry or the exporter's default.
+            let signal_topics = (otlp && topic.is_none()).then(|| {
+                let set = topics.clone().unwrap_or_default();
+                let default = SignalTopics::default();
+                SignalTopics {
+                    logs: set.logs.unwrap_or(default.logs),
+                    metrics: set.metrics.unwrap_or(default.metrics),
+                    traces: set.traces.unwrap_or(default.traces),
+                }
+            });
             let settings = KafkaSettings {
                 brokers: brokers.clone(),
-                topic: topic.clone(),
+                topic: topic.clone().unwrap_or_default(),
+                topics: signal_topics,
                 key: match key {
                     logit_config::KafkaKey::None => RecordKey::None,
                     logit_config::KafkaKey::TraceId => RecordKey::TraceId,
@@ -1249,6 +1263,7 @@ fn build_spec(
                     logit_config::KafkaFormat::Text => RecordFormat::Text,
                     logit_config::KafkaFormat::Msgpack => RecordFormat::Msgpack,
                     logit_config::KafkaFormat::Native => RecordFormat::Native,
+                    logit_config::KafkaFormat::OtlpProto => RecordFormat::OtlpProto,
                 },
                 record: record.map(|record| match record {
                     logit_config::KafkaRecord::Event => RecordMode::Event,

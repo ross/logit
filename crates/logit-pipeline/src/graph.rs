@@ -280,9 +280,11 @@
 //!     shutdown, so a mixed one never exports the counts recorded during shutdown
 //!     ([`mixed_internal_pipeline_warning`],
 //!     `docs/adr/shutdown-accounting-and-cancellation-safety.md`, decision 14).
-//! 85. A `kafka_out` with an empty `brokers` or an entry that isn't a `host:port`, a `topic` that
-//!     isn't a legal Kafka topic name, a `key` naming an empty attribute, a `key` other than
-//!     `none` with `record: batch` (`format: native`'s default), `idempotent: true` without
+//! 85. A `kafka_out` with an empty `brokers` or an entry that isn't a `host:port`, a `topic` or a
+//!     `topics` value that isn't a legal Kafka topic name, no `topic` or a `topics` under a
+//!     format other than `otlp_proto`, both `topic` and `topics`, a `record` or a
+//!     `key: {attribute: ..}` under `otlp_proto`, a `key` naming an empty attribute, a `key`
+//!     other than `none` with `record: batch` (`format: native`'s default), `idempotent: true` without
 //!     `acks: all`, a `max_request_bytes` of `0`, `timeout: 0s`, a `tls` failing rule 34's
 //!     checks, a `sasl` with an empty `username`, or an `oauthbearer` `sasl` with both or
 //!     neither of `token` and `token_endpoint`, a `token` that isn't an RFC 6750 bearer token or
@@ -290,7 +292,7 @@
 //!     `https://` or `http://` to a loopback host or lacks `client_id` or `client_secret`, or an
 //!     extension whose key isn't letters only or is `auth`, or whose value is empty or not
 //!     printable ASCII, or an `aws_msk_iam` `sasl` whose `region` isn't an AWS region's shape
-//!     (`docs/adr/kafka-output.md`, `docs/adr/kafka-sasl.md`).
+//!     (`docs/adr/kafka-output.md`, `docs/adr/kafka-sasl.md`, `docs/adr/kafka-otlp-formats.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3605,13 +3607,17 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // same explicit pair. A broker entry is dialed as `host:port`, so one without both fails here
     // rather than on every attempt. A topic name outside Kafka's own rule (1 to 249 characters of
     // `[a-zA-Z0-9._-]`, not `.` or `..`) would be refused by the broker for every batch. A batch
-    // record holds many events and carries no key, so a configured key would be ignored. `tls`
-    // gets rule 34's two checks: its presence turns TLS on. No broker takes an empty SASL
-    // username, so one would be refused on every connection.
+    // record holds many events and carries no key, so a configured key would be ignored. An OTLP
+    // record is one export request, its own unit: `record:` can't describe it, and a request
+    // holds events whose attribute values differ, so no attribute keys it
+    // (`docs/adr/kafka-otlp-formats.md`, items 1, 2, and 5). `tls` gets rule 34's two checks: its
+    // presence turns TLS on. No broker takes an empty SASL username, so one would be refused on
+    // every connection.
     for (id, component) in &components {
         let ComponentKind::KafkaOut {
             brokers,
             topic,
+            topics,
             key,
             format,
             record,
@@ -3639,12 +3645,52 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 );
             }
         }
-        if !is_kafka_topic_name(topic) {
-            anyhow::bail!(
-                "component '{id}': kafka_out 'topic' ({topic:?}) isn't a legal Kafka topic name \
-                 -- 1 to 249 characters of letters, digits, '.', '_', and '-', and not '.' or \
-                 '..'"
-            );
+        let otlp = *format == logit_config::KafkaFormat::OtlpProto;
+        if otlp {
+            if topic.is_some() && topics.is_some() {
+                anyhow::bail!(
+                    "component '{id}': kafka_out sets both 'topic' and 'topics' -- 'topic' sends \
+                     every signal to one topic, 'topics' names each signal's"
+                );
+            }
+            if record.is_some() {
+                anyhow::bail!(
+                    "component '{id}': kafka_out 'record' doesn't apply to 'format: otlp_proto', \
+                     whose records each hold one export request -- remove 'record'"
+                );
+            }
+            if let logit_config::KafkaKey::Attribute(_) = key {
+                anyhow::bail!(
+                    "component '{id}': kafka_out 'key: {{attribute: ..}}' can't key an \
+                     'otlp_proto' record, whose request holds many events -- use 'trace_id', \
+                     '{{resource: ..}}', or 'none'"
+                );
+            }
+        } else {
+            if topic.is_none() {
+                anyhow::bail!(
+                    "component '{id}': kafka_out needs 'topic', the topic every record goes to"
+                );
+            }
+            if topics.is_some() {
+                anyhow::bail!(
+                    "component '{id}': kafka_out 'topics' needs 'format: otlp_proto' -- the other \
+                     formats write every record to 'topic'"
+                );
+            }
+        }
+        let named = topics.iter().flat_map(|t| {
+            [("topics.logs", &t.logs), ("topics.metrics", &t.metrics), ("topics.traces", &t.traces)]
+        });
+        for (field, topic) in std::iter::once(("topic", topic)).chain(named) {
+            let Some(topic) = topic else { continue };
+            if !is_kafka_topic_name(topic) {
+                anyhow::bail!(
+                    "component '{id}': kafka_out '{field}' ({topic:?}) isn't a legal Kafka topic \
+                     name -- 1 to 249 characters of letters, digits, '.', '_', and '-', and not \
+                     '.' or '..'"
+                );
+            }
         }
         if let logit_config::KafkaKey::Attribute(name) | logit_config::KafkaKey::Resource(name) =
             key
@@ -7151,7 +7197,8 @@ mod tests {
     fn kafka_out() -> ComponentKind {
         ComponentKind::KafkaOut {
             brokers: vec!["kafka:9092".to_string()],
-            topic: "logs".to_string(),
+            topic: Some("logs".to_string()),
+            topics: None,
             key: logit_config::KafkaKey::default(),
             format: logit_config::KafkaFormat::default(),
             record: None,
@@ -7182,7 +7229,7 @@ mod tests {
         let kind = kafka_out_with(|k| {
             if let ComponentKind::KafkaOut { brokers, key, acks, idempotent, tls, topic, .. } = k {
                 *brokers = vec!["a:9092".into(), "[::1]:9093".into()];
-                *topic = "app.logs_v2-x".into();
+                *topic = Some("app.logs_v2-x".into());
                 *key = logit_config::KafkaKey::Resource("service.name".into());
                 *acks = logit_config::KafkaAcks::Leader;
                 *idempotent = false;
@@ -7251,7 +7298,7 @@ mod tests {
                 "isn't a legal Kafka topic name",
                 edit(|k| {
                     if let ComponentKind::KafkaOut { topic, .. } = k {
-                        *topic = "logs/app".into();
+                        *topic = Some("logs/app".into());
                     }
                 }),
             ),
@@ -7259,7 +7306,7 @@ mod tests {
                 "isn't a legal Kafka topic name",
                 edit(|k| {
                     if let ComponentKind::KafkaOut { topic, .. } = k {
-                        *topic = "..".into();
+                        *topic = Some("..".into());
                     }
                 }),
             ),
@@ -7267,7 +7314,7 @@ mod tests {
                 "isn't a legal Kafka topic name",
                 edit(|k| {
                     if let ComponentKind::KafkaOut { topic, .. } = k {
-                        *topic = "t".repeat(250);
+                        *topic = Some("t".repeat(250));
                     }
                 }),
             ),
@@ -7361,6 +7408,123 @@ mod tests {
                 ("in", vec![], listener()),
                 ("out", vec!["in"], kafka_out_with(edit)),
             ]));
+            assert!(err.contains("'out'") && err.contains(want), "want {want:?}, got: {err}");
+        }
+    }
+
+    /// A `kafka_out` under `format: otlp_proto` with no `topic`, `edit` applied.
+    fn kafka_otlp_with(edit: impl FnOnce(&mut ComponentKind)) -> ComponentKind {
+        kafka_out_with(|k| {
+            if let ComponentKind::KafkaOut { topic, format, .. } = k {
+                *topic = None;
+                *format = logit_config::KafkaFormat::OtlpProto;
+            }
+            edit(k);
+        })
+    }
+
+    /// `otlp_proto` takes no `topic` (each signal's default topic), a partial `topics`, one
+    /// `topic` for every signal, and a `trace_id` or resource key, which rule 85 doesn't read as
+    /// a key on a batch record.
+    #[test]
+    fn a_kafka_out_otlp_proto_resolves() {
+        use logit_config::{KafkaKey, KafkaTopics};
+        kafka_out_result(kafka_otlp_with(|_| {})).expect("every signal on its default topic");
+        let kinds = [
+            kafka_otlp_with(|k| {
+                if let ComponentKind::KafkaOut { topics, key, .. } = k {
+                    *topics =
+                        Some(KafkaTopics { logs: Some("app.logs".into()), ..Default::default() });
+                    *key = KafkaKey::TraceId;
+                }
+            }),
+            kafka_otlp_with(|k| {
+                if let ComponentKind::KafkaOut { topic, key, .. } = k {
+                    *topic = Some("everything".into());
+                    *key = KafkaKey::Resource("service.name".into());
+                }
+            }),
+        ];
+        for kind in kinds {
+            kafka_out_result(kind).expect("valid");
+        }
+    }
+
+    /// Rule 85's topic and record-unit clauses, one per case.
+    #[test]
+    fn rule_85_rejects_each_kafka_out_topic_and_otlp_misconfiguration() {
+        use logit_config::{KafkaKey, KafkaRecord, KafkaTopics};
+        let cases: Vec<(&str, ComponentKind)> = vec![
+            (
+                "needs 'topic'",
+                kafka_out_with(|k| {
+                    if let ComponentKind::KafkaOut { topic, .. } = k {
+                        *topic = None;
+                    }
+                }),
+            ),
+            (
+                "'topics' needs 'format: otlp_proto'",
+                kafka_out_with(|k| {
+                    if let ComponentKind::KafkaOut { topics, .. } = k {
+                        *topics = Some(KafkaTopics::default());
+                    }
+                }),
+            ),
+            (
+                "sets both 'topic' and 'topics'",
+                kafka_otlp_with(|k| {
+                    if let ComponentKind::KafkaOut { topic, topics, .. } = k {
+                        *topic = Some("t".into());
+                        *topics = Some(KafkaTopics::default());
+                    }
+                }),
+            ),
+            (
+                "'topics.metrics' (\"a/b\") isn't a legal Kafka topic name",
+                kafka_otlp_with(|k| {
+                    if let ComponentKind::KafkaOut { topics, .. } = k {
+                        *topics =
+                            Some(KafkaTopics { metrics: Some("a/b".into()), ..Default::default() });
+                    }
+                }),
+            ),
+            (
+                "'topics.traces' (\"..\") isn't a legal Kafka topic name",
+                kafka_otlp_with(|k| {
+                    if let ComponentKind::KafkaOut { topics, .. } = k {
+                        *topics =
+                            Some(KafkaTopics { traces: Some("..".into()), ..Default::default() });
+                    }
+                }),
+            ),
+            (
+                "'topic' (\"\") isn't a legal Kafka topic name",
+                kafka_otlp_with(|k| {
+                    if let ComponentKind::KafkaOut { topic, .. } = k {
+                        *topic = Some(String::new());
+                    }
+                }),
+            ),
+            (
+                "'record' doesn't apply to 'format: otlp_proto'",
+                kafka_otlp_with(|k| {
+                    if let ComponentKind::KafkaOut { record, .. } = k {
+                        *record = Some(KafkaRecord::Event);
+                    }
+                }),
+            ),
+            (
+                "can't key an 'otlp_proto' record",
+                kafka_otlp_with(|k| {
+                    if let ComponentKind::KafkaOut { key, .. } = k {
+                        *key = KafkaKey::Attribute("request_id".into());
+                    }
+                }),
+            ),
+        ];
+        for (want, kind) in cases {
+            let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]));
             assert!(err.contains("'out'") && err.contains(want), "want {want:?}, got: {err}");
         }
     }
