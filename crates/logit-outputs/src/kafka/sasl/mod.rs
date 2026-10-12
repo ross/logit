@@ -11,7 +11,8 @@
 //! A failure's class follows the module doc's table (`super`, "Response classes"): a transport
 //! failure during the exchange is `Clean`, because no produce byte has been written on the
 //! connection, and a broker's refusal or a server message the mechanism rejects is `Refused`. A
-//! session's own error is `Refused` unless it carries a class. Every message names the mechanism
+//! session's own error is `Refused` unless it carries a class. A broker's error code on any
+//! `SaslAuthenticate` reaches the session through [`Session::refused`]. Every message names the mechanism
 //! and [`Authenticator::principal`], never a secret, and adds [`Session::failure`] to a broker's
 //! refusal.
 
@@ -169,6 +170,10 @@ pub(crate) trait Session: Send {
     fn failure(&self) -> Option<String> {
         None
     }
+
+    /// Called when the broker fails a `SaslAuthenticate` with an error code, whether or not it
+    /// sent a challenge first, so a mechanism can drop a credential the broker refused.
+    fn refused(&mut self) {}
 }
 
 /// The most `SaslAuthenticate` round trips one exchange may take. SCRAM takes two; a session
@@ -234,6 +239,7 @@ pub(crate) async fn authenticate(
             .with_context(|| format!("{who}: SaslAuthenticate with {broker}"))
             .context(Fault::Clean)?;
         if response.error_code != fault::code::NONE {
+            session.refused();
             let mut detail =
                 response.error_message.as_ref().map(|m| format!(": {m}")).unwrap_or_default();
             if let Some(failure) = session.failure() {

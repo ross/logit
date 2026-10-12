@@ -1271,6 +1271,56 @@ async fn token_endpoint_faults_are_clean_when_transient_and_refused_otherwise() 
     held.abort();
 }
 
+/// A `200` whose body the endpoint cuts off, by closing the connection short of its
+/// `Content-Length` or by stalling past the sink's timeout, is a transport fault (`Clean`), not
+/// a token response that isn't JSON (`Refused`).
+#[tokio::test]
+async fn a_cut_off_token_response_is_clean() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for (close, detail) in [(true, "reading token endpoint"), (false, "timed out after 200ms")] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/oauth2/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = vec![0; 4096];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 100\r\n\r\n{\"access_tok",
+                    )
+                    .await;
+                if close {
+                    drop(stream);
+                } else {
+                    open.push(stream);
+                }
+            }
+        });
+        let settings = KafkaSasl::OAuthBearer {
+            token: OAuthToken::ClientCredentials {
+                endpoint: url.clone(),
+                client_id: CLIENT_ID.into(),
+                client_secret: CLIENT_SECRET.into(),
+                scope: None,
+            },
+            extensions: Vec::new(),
+        };
+        let cluster = oauth_cluster(1, &[0], None).await;
+        let sasl = Some(authenticator(&settings, Duration::from_millis(200)));
+        let mut producer = Producer::new(ProducerConfig { sasl, ..config(&cluster) }).unwrap();
+        let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+        let message = format!("{err:#} {err:?}");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "close {close}: {message}");
+        assert!(message.contains(detail), "close {close}: {message}");
+        assert!(!message.contains("isn't JSON"), "close {close}: {message}");
+        assert_eq!(requests_of(&cluster, ApiKey::SaslAuthenticate), 0);
+        server.abort();
+    }
+}
+
 /// A broker refusing the token sends Kafka's error challenge; the client ends the exchange with
 /// a `kvsep`, and the refusal is `Refused` with the challenge's status and no token in it. The
 /// refused token leaves the cache, so the next attempt fetches another and delivers.
@@ -1312,4 +1362,27 @@ async fn a_refused_token_is_refused_with_its_status_and_fetched_again() {
     assert!(message.contains("OAUTHBEARER as a fixed token"), "{message}");
     assert!(message.contains("status \"invalid_token\""), "{message}");
     assert!(!message.contains("wrong-token"), "{message}");
+}
+
+/// Redpanda refuses a token with `SASL_AUTHENTICATION_FAILED` on the first message and no error
+/// challenge. The refused token still leaves the cache, so the next attempt fetches another
+/// rather than resending it until its refresh time.
+#[tokio::test]
+async fn a_token_refused_without_a_challenge_is_fetched_again() {
+    let endpoint = TokenEndpoint::start().await;
+    let cluster = oauth_cluster(1, &[0], Some("token-1")).await;
+    cluster.state().sasl.as_mut().unwrap().oauth_no_challenge = true;
+    let mut producer = oauth_producer(&cluster, &client_credentials(&endpoint, &[]));
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
+    assert!(message.contains("SaslAuthenticationFailed (58)"), "{message}");
+    assert!(!message.contains("the broker refused the token"), "{message}");
+    assert_eq!(requests_of(&cluster, ApiKey::SaslAuthenticate), 1, "no kvsep without a challenge");
+
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+    assert_eq!(endpoint.fetches(), 2);
+    let presented = tokens_presented(&cluster);
+    assert_eq!(presented[0], "token-0", "{presented:?}");
+    assert!(presented[1..].iter().all(|t| t == "token-1"), "{presented:?}");
 }

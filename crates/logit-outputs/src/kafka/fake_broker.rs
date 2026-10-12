@@ -159,6 +159,9 @@ pub(crate) struct Sasl {
     pub(crate) forge_signature: bool,
     /// The one `OAUTHBEARER` token accepted; `None` accepts any.
     pub(crate) oauth_token: Option<String>,
+    /// Refuses an `OAUTHBEARER` token as Redpanda v26.2.3 does: `SASL_AUTHENTICATION_FAILED` on
+    /// the first message, with no error challenge.
+    pub(crate) oauth_no_challenge: bool,
 }
 
 impl Sasl {
@@ -174,6 +177,7 @@ impl Sasl {
             iterations: 4096,
             forge_signature: false,
             oauth_token: None,
+            oauth_no_challenge: false,
         }
     }
 }
@@ -200,6 +204,10 @@ enum Auth {
 /// `OAuthBearerSaslServer`'s error challenge for a token its validator refuses, as Kafka 4.2.0
 /// sends it (`script/kafka-interop`'s `oauth-refused` leg).
 const OAUTH_CHALLENGE: &str = r#"{"status":"invalid_token"}"#;
+
+/// Redpanda v26.2.3's code-58 message for a refused credential (`script/kafka-interop`'s
+/// `oauth-refused` and `sasl-wrong` legs).
+const REDPANDA_REFUSAL: &str = "SASL authentication failed: security: Invalid credentials";
 
 /// The salt every SCRAM credential here uses.
 const SCRAM_SALT: &[u8] = b"fake-broker-salt";
@@ -630,6 +638,9 @@ fn sasl_authenticate(
             });
             if accepted {
                 return done(state, auth, Vec::new());
+            }
+            if sasl.oauth_no_challenge {
+                return fail(code::SASL_AUTHENTICATION_FAILED, REDPANDA_REFUSAL);
             }
             *auth = Auth::OAuthRefused;
             SaslAuthenticateResponse::default().with_auth_bytes(Bytes::from(OAUTH_CHALLENGE))

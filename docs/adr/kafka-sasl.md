@@ -222,7 +222,9 @@ W2 built OAUTHBEARER and settled these points the decision above left open:
    reused until 80% of the time to its `exp` claim, and any other token isn't reused. Dials that
    start together wait on one fetch, behind an async mutex in the authenticator. A broker's
    refusal drops a fetched token from the cache, so the next dial fetches a new one instead of
-   resending a token the broker refused until its refresh time.
+   resending a token the broker refused until its refresh time. `authenticate` tells the session
+   of any error code on a `SaslAuthenticate` through a `Session::refused` method, so a refusal
+   with no error challenge, as Redpanda sends, drops the token too.
 4. **The error challenge's status reaches the error.** On a refused token, Kafka answers the
    first message with an RFC 7628 JSON error and no error code; the session answers with a lone
    `\x01`, and the broker then fails the exchange with `SASL_AUTHENTICATION_FAILED`. The session
@@ -230,10 +232,11 @@ W2 built OAUTHBEARER and settled these points the decision above left open:
    message through a `Session::failure` method, so the error reads `status "invalid_token"`
    whatever text the broker sends with code 58.
 5. **The token endpoint's faults.** Section 4's rows hold. A redirect is `Refused`, since the
-   client follows none and a moved endpoint is a config change. A `2xx` whose body isn't JSON,
-   lacks a string `access_token`, or holds one that isn't an RFC 6750 `b64token` is `Refused`:
-   every fetch gets the same answer, and a token outside `b64token` could carry a `\x01` into
-   the message's framing. The fetch is bounded by the sink's `timeout`, and an error quotes only
+   client follows none and a moved endpoint is a config change. A `2xx` whose whole body isn't
+   JSON, lacks a string `access_token`, or holds one that isn't an RFC 6750 `b64token` is
+   `Refused`: every fetch gets the same answer, and a token outside `b64token` could carry a
+   `\x01` into the message's framing. A `2xx` whose body the timeout or a closed connection cuts
+   off is `Clean`, as a timed-out request is, rather than read as a body that isn't JSON. The fetch is bounded by the sink's `timeout`, and an error quotes only
    the OAuth `error` and `error_description` of the body, never the rest, which may echo the
    request.
 6. **The token endpoint trusts the bundled Mozilla roots only.** The broker `tls:` block

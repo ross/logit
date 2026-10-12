@@ -21,11 +21,14 @@
 //!   `expires_in`, a token that is a JWT is kept until 80% of the time to its `exp` claim, and
 //!   any other token is fetched again for every connection.
 //! - Concurrent dials wait on one fetch. A broker's refusal of a fetched token drops it from the
-//!   cache, so the next dial fetches a new one rather than resending a token the broker refused.
+//!   cache, whether it's an error challenge (Kafka) or a bare `SASL_AUTHENTICATION_FAILED`
+//!   (Redpanda), so the next dial fetches a new one rather than resending a token the broker
+//!   refused.
 //!
 //! An endpoint fault's class follows `super::super`'s response-class table: unreachable, timed
-//! out, `429`, or `5xx` is `Clean`; any other answer but a `2xx` is `Refused`, and so is a `2xx`
-//! without a usable `access_token`. No message carries the token or the client secret, and the
+//! out, `429`, or `5xx` is `Clean`, and so is a `2xx` whose body is cut off by the timeout or a
+//! closed connection; any other answer but a `2xx` is `Refused`, and so is a `2xx` whose whole
+//! body holds no usable `access_token`. No message carries the token or the client secret, and the
 //! endpoint is printed through `logit_core::redact::url`.
 
 use std::sync::{Arc, Mutex};
@@ -161,14 +164,19 @@ impl Session for OAuthSession {
             return Ok(Step::Done);
         }
         self.status = Some(error_status(server));
-        if let Some(endpoint) = &self.endpoint {
-            endpoint.forget(&self.token);
-        }
+        self.refused();
         Ok(Step::Send(vec![KVSEP]))
     }
 
     fn failure(&self) -> Option<String> {
         self.status.as_ref().map(|status| format!("the broker refused the token: {status}"))
+    }
+
+    /// Redpanda fails the exchange with no error challenge, so `next` never sees its refusal.
+    fn refused(&mut self) {
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.forget(&self.token);
+        }
     }
 }
 
@@ -264,8 +272,8 @@ impl Endpoint {
             })
             .context(Fault::Clean)?;
         let status = response.status();
-        let body = crate::http::read_body_bytes(response, MAX_RESPONSE_BYTES).await;
         if !status.is_success() {
+            let body = crate::http::read_body_bytes(response, MAX_RESPONSE_BYTES).await;
             let class = if status.as_u16() == 429 || status.is_server_error() {
                 Fault::Clean
             } else {
@@ -274,6 +282,23 @@ impl Endpoint {
             return Err(anyhow!("token endpoint {shown} answered {status}{}", oauth_error(&body)))
                 .context(class);
         }
+        // A body cut off by the timeout or a closed connection is a transport fault, not an
+        // answer that fails to parse.
+        let body = crate::http::try_read_body_bytes(response, MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|err| {
+                let timed_out = err.is_timeout();
+                let err = anyhow::Error::new(err.without_url());
+                if timed_out {
+                    err.context(format!(
+                        "token endpoint {shown} timed out after {:?} reading its {status} answer",
+                        self.timeout
+                    ))
+                } else {
+                    err.context(format!("reading token endpoint {shown}'s {status} answer"))
+                }
+            })
+            .context(Fault::Clean)?;
         parse_token_response(&body, SystemTime::now())
             .with_context(|| format!("token endpoint {shown} answered {status}"))
             .context(Fault::Refused)
