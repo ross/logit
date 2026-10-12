@@ -31,6 +31,9 @@ needs at the code:
   the base compose.yaml and the scenario's override with no daemon call, and checks the scenario
   against them (`scenario.service_problems()`) before anything starts. A run built with `roles=`
   skips the call; the self-test does that, so it can't reach Docker.
+- Every `generator` service, one per `[[ledger.source]]`, mounts the config `[configs]` names
+  under its service name, through its own `compose.env` variable (`scenario.config_env()`). The
+  end sequence stops every generator before it waits on the sinks.
 - Every `backend` service has its own published port, re-read after any revert of a fault on
   it. Freshness is sampled per `[[ledger.sink]]`, the end sequence waits until every sink's stored
   total holds, and each sink's export lands in `vm-export/<sink>.jsonl`.
@@ -201,14 +204,16 @@ class Run:
         env_file.write_text(
             f"SOAK_IMAGE={self.image}\n"
             f"SOAK_SUT_CONFIG={self.scenario.config_path('sut')}\n"
-            f"SOAK_GENERATOR_CONFIG={self.scenario.config_path('generator')}\n"
+            + "".join(f"{scenario_mod.config_env(service)}="
+                      f"{self.scenario.config_path(service)}\n"
+                      for service in self.scenario.generators)
         )
         shutil.copy(self.scenario.path, self.run_dir / "scenario.toml")
         # The checks read the SUT's `receive:` limits from this copy.
         (self.run_dir / "configs").mkdir()
-        for role in sorted(self.scenario.configs):
-            shutil.copy(self.scenario.config_path(role),
-                        self.run_dir / "configs" / self.scenario.configs[role])
+        for key in sorted(self.scenario.configs):
+            shutil.copy(self.scenario.config_path(key),
+                        self.run_dir / "configs" / self.scenario.configs[key])
         compose_files = [self.root / "compose.yaml"]
         if self.scenario.compose is not None:
             shutil.copy(self.scenario.compose_path(), self.run_dir / "configs" /
@@ -551,9 +556,11 @@ class Run:
             self.act("revert", step, early=True)
         self.inspect_all()
 
-        result = self.docker.run(["stop", "-t", str(GENERATOR_STOP_T), self.ids["generator"]],
-                                 timeout=GENERATOR_STOP_T + 15)
-        self.phase("generator_stopped", rc=result.rc, stderr=result.stderr.strip())
+        for service in self.services(scenario_mod.GENERATOR_ROLE):
+            result = self.docker.run(["stop", "-t", str(GENERATOR_STOP_T), self.ids[service]],
+                                     timeout=GENERATOR_STOP_T + 15)
+            self.phase("generator_stopped", service=service, rc=result.rc,
+                       stderr=result.stderr.strip())
 
         if self.has_vm:
             self.wait_quiet()
@@ -627,7 +634,7 @@ class Run:
         """Waits until every sink's stored total holds for two aggregate windows, bounded at
         `QUIET_BOUND_S`. The window is the stored samples' spacing, the widest across sinks:
         `aggregate` writes each series once per window while it has data, and stops writing an
-        idle one, so newer timestamps can't mark the windows once the generator has stopped."""
+        idle one, so newer timestamps can't mark the windows once the generators have stopped."""
         for backend in self.services(scenario_mod.BACKEND_ROLE):
             self.refresh_vm_base(backend)
         deadline = _now() + QUIET_BOUND_S
@@ -673,9 +680,9 @@ class Run:
 
     def wait_sink_drained(self):
         """For an external or Kafka target, which has no backend to query: waits until a SUT drain at least two
-        aggregate windows after the generator stopped shows every sink's `buffer.batches` at 0
+        aggregate windows after the generators stopped shows every sink's `buffer.batches` at 0
         and its `retrying` at 0 or never set, bounded at `SINK_DRAIN_BOUND_S`. Two windows let
-        `aggregate` flush the last lines the generator sent; a sink's queue then empties once
+        `aggregate` flush the last lines the generators sent; a sink's queue then empties once
         its last send is accepted. Reads the newest `SINK_DRAIN_TAIL_LINES` of the SUT's
         stdout, which a run in progress hasn't collected yet. The phase records each sink's
         state under `sinks`."""

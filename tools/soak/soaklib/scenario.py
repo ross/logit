@@ -31,7 +31,8 @@ that target only, and the ledger's V is the topic it names, read back at the end
 
 Services are known by role, from each compose service's `soak.role` label: `sut` (the `logit`
 under test), `generator`, `backend`, or `broker` (a Kafka target's broker). A scenario may add
-services with a `compose` override file, so the role map comes from the merged compose config,
+services with a `compose` override file, a second generator included, so the role map comes
+from the merged compose config,
 which only the driver can read (`docker compose config`). `load()` checks what needs no service
 list; `service_problems()` checks the rest against a role map: the driver's in `prepare()`
 before the stack starts, and `base_roles()` in `list` and the self-test.
@@ -54,8 +55,9 @@ ROLE_LABEL = "soak.role"
 SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE = "sut", "generator", "backend", "broker"
 ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE)
 LOGIT_ROLES = (SUT_ROLE, GENERATOR_ROLE)
-# The service each `logit` role runs as. One SUT and one generator, under these names.
-SUT_SERVICE, GENERATOR_SERVICE = "logit", "generator"
+# The service the SUT runs as. Generators are any services with the role, each a
+# `[[ledger.source]]`: compose.yaml's `generator`, and any a scenario's override adds.
+SUT_SERVICE = "logit"
 # The role map compose.yaml's labels give with the `local` profile, for what can't run
 # `docker compose config`: `list` and the self-test, which pins it to compose.yaml.
 BASE_ROLES = {"logit": SUT_ROLE, "generator": GENERATOR_ROLE, "victoria-metrics": BACKEND_ROLE}
@@ -114,12 +116,20 @@ STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key"}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
 RANGE_KEYS = {"min", "max"}
-CONFIG_KEYS = {"sut", "generator"}
-LEDGER_KEYS = {
-    "generator_input", "generator_sink", "sut_listener", "sut_aggregate", "sink",
-    "wire_loss_outside_faults",
-}
+# `[configs]` names the SUT's config under `sut` and each generator's under its service name.
+SUT_CONFIG_KEY = "sut"
+LEDGER_KEYS = {"sut_aggregate", "sink", "source", "wire_loss_outside_faults"}
 OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script", "split"}
+# The `[ledger]` keys a `[[ledger.source]]` table replaced, refused with a pointer to it.
+SOURCE_LEDGER_KEYS = ("generator_input", "generator_sink", "sut_listener")
+# A `[[ledger.source]]`: the generator service, its `generate_in` and UDP sink, the SUT listener
+# its datagrams reach, and, optionally, the transforms between that listener and `aggregate`,
+# each of which must forward every event it receives.
+SOURCE_KEYS = {"service", "generator_input", "generator_sink", "sut_listener"}
+OPTIONAL_SOURCE_KEYS = {"sut_transforms"}
+# A generator's service name, which also names its config's compose variable
+# (`config_env()`), so it is a slug.
+_SERVICE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 # How the SUT's sinks share `aggregate`'s output: `copy`, each sink a full copy by fan-out, or
 # `route`, each sink fed by one `target` a `route` fills, so the sinks' V add up to it.
 SPLITS = ("copy", "route")
@@ -366,6 +376,16 @@ class Scenario:
         return list(self.ledger.get("sink") or [])
 
     @property
+    def sources(self):
+        """The `[[ledger.source]]` tables, in order."""
+        return list(self.ledger.get("source") or [])
+
+    @property
+    def generators(self):
+        """The generator services, one per `[[ledger.source]]`, in order."""
+        return [source.get("service") for source in self.sources]
+
+    @property
     def split(self):
         return self.ledger.get("split", "copy")
 
@@ -376,8 +396,9 @@ class Scenario:
     def directory(self):
         return self.path.parent
 
-    def config_path(self, role):
-        return (self.directory / self.configs[role]).resolve()
+    def config_path(self, key):
+        """The config `[configs]` names under `key`: `sut`, or a generator's service name."""
+        return (self.directory / self.configs[key]).resolve()
 
     def seed_for(self, seed=None):
         """The seed a run uses: `seed` (from `--seed`) when given, else the `[random]` table's;
@@ -408,7 +429,8 @@ class Scenario:
             "services": dict(services or {}),
             "target": target_json(self.target),
             "ledger": {**self.ledger, "split": self.split,
-                       "sink": [dict(sink) for sink in self.sinks]},
+                       "sink": [dict(sink) for sink in self.sinks],
+                       "source": [dict(source) for source in self.sources]},
             "thresholds": {
                 "progress_window": self.thresholds["progress_window"],
                 "rss_growth_mib_per_hour": self.thresholds["rss_growth_mib_per_hour"],
@@ -487,8 +509,19 @@ def from_dict(raw, path):
         for key in sorted(VM_LEDGER_KEYS & set(ledger)):
             problems.append(f"ledger.{key} names a VictoriaMetrics query, and the "
                             f"{target['kind']} target has no VictoriaMetrics")
+    if isinstance(ledger, dict):
+        for key in SOURCE_LEDGER_KEYS:
+            if key in ledger:
+                problems.append(f"ledger.{key} is a [[ledger.source]] key; each source names "
+                                "its generator `service`, `generator_input`, `generator_sink`, "
+                                "and `sut_listener`")
+        ledger_optional = ledger_optional | (set(SOURCE_LEDGER_KEYS) & set(ledger))
+    config_keys = {SUT_CONFIG_KEY}
+    if isinstance(ledger, dict) and isinstance(ledger.get("source"), list):
+        config_keys |= {source.get("service") for source in ledger["source"]
+                        if isinstance(source, dict) and isinstance(source.get("service"), str)}
     for table, keys, optional, where in (
-        (configs, CONFIG_KEYS, set(), "configs"),
+        (configs, config_keys, set(), "configs"),
         (ledger, ledger_keys, ledger_optional, "ledger"),
         (thresholds, THRESHOLD_KEYS, set(), "thresholds"),
     ):
@@ -501,9 +534,9 @@ def from_dict(raw, path):
             problems.append(f"{where}: unknown key `{key}`")
     if "progress_window" in thresholds:
         thresholds["progress_window"] = dur(thresholds, "progress_window", "thresholds")
-    for role in CONFIG_KEYS & set(configs):
-        if not (path.parent / configs[role]).is_file():
-            problems.append(f"configs.{role}: {configs[role]} not found beside {path.name}")
+    for key in sorted(config_keys & set(configs) if isinstance(configs, dict) else ()):
+        if not isinstance(configs[key], str) or not (path.parent / configs[key]).is_file():
+            problems.append(f"configs.{key}: {configs[key]} not found beside {path.name}")
     compose = raw.get("compose")
     if compose is not None:
         if not isinstance(compose, str) or not compose or "/" in compose:
@@ -514,6 +547,7 @@ def from_dict(raw, path):
             problems.append(f"compose: {compose} not found beside {path.name}")
     if isinstance(ledger, dict):
         problems += _sink_problems(ledger, target["kind"])
+        problems += _source_problems(ledger)
 
     steps = []
     for index, raw_step in enumerate(raw.get("step", [])):
@@ -645,6 +679,75 @@ def _sink_problems(ledger, kind):
     if split == "route" and len(sinks) < 2:
         problems.append("ledger.split = \"route\" needs two or more [[ledger.sink]] tables")
     return problems
+
+
+def _source_problems(ledger):
+    """What the `[[ledger.source]]` tables break: at least one, each a table of known keys with
+    every required key a component id, a distinct generator `service` that is a slug, a
+    distinct `sut_listener`, and an optional `sut_transforms` list of distinct component ids,
+    none of them a listener; and no `sut_transforms` beside `[ledger] sut_script`, whose hop
+    `ledger.script` judges from the listeners' summed E. Whether each `service` is a generator
+    needs the role map: `service_problems()`."""
+    if "source" not in ledger:
+        return []
+    sources = ledger.get("source")
+    if (not isinstance(sources, list) or not sources
+            or not all(isinstance(t, dict) for t in sources)):
+        return ["ledger.source must be one or more tables, written [[ledger.source]]"]
+    problems = []
+    services, listeners = [], []
+    for index, source in enumerate(sources):
+        where = f"ledger.source {index + 1}"
+        for key in sorted(set(source) - SOURCE_KEYS - OPTIONAL_SOURCE_KEYS):
+            problems.append(f"{where}: unknown key `{key}`")
+        for key in sorted(SOURCE_KEYS - set(source)):
+            problems.append(f"{where}: missing `{key}`")
+        service = source.get("service")
+        if "service" in source:
+            if not isinstance(service, str) or not _SERVICE_NAME.match(service):
+                problems.append(f"{where}: `service` must name a generator service: lowercase "
+                                "letters, digits, `_`, or `-`")
+            elif service in services:
+                problems.append(f"{where}: `service` {service!r} repeats another source's")
+            else:
+                services.append(service)
+        for key in ("generator_input", "generator_sink", "sut_listener"):
+            value = source.get(key)
+            if key in source and (not isinstance(value, str) or not _COMPONENT_ID.match(value)):
+                problems.append(f"{where}: `{key}` must name a component id")
+        listener = source.get("sut_listener")
+        if isinstance(listener, str) and _COMPONENT_ID.match(listener):
+            if listener in listeners:
+                problems.append(f"{where}: `sut_listener` {listener!r} repeats another "
+                                "source's; each source reaches its own listener")
+            else:
+                listeners.append(listener)
+    every = set(listeners)
+    for index, source in enumerate(sources):
+        where = f"ledger.source {index + 1}"
+        if "sut_transforms" not in source:
+            continue
+        chain = source["sut_transforms"]
+        if (not isinstance(chain, list) or not chain
+                or not all(isinstance(c, str) and _COMPONENT_ID.match(c) for c in chain)):
+            problems.append(f"{where}: `sut_transforms` must list the component ids between "
+                            "the listener and aggregate, in order")
+        elif len(set(chain)) != len(chain) or set(chain) & every:
+            problems.append(f"{where}: `sut_transforms` repeats a component or names a "
+                            "listener")
+        if ledger.get("sut_script") is not None:
+            problems.append(f"{where}: `sut_transforms` and [ledger] sut_script can't be "
+                            "combined; the script's hop is judged from every listener's E")
+    return problems
+
+
+def config_env(service):
+    """The compose variable holding the absolute path of `service`'s config, set in
+    `compose.env`: `SOAK_SUT_CONFIG` for the SUT, `SOAK_GENERATOR_CONFIG` for `generator`,
+    `SOAK_GENERATOR_LINES_CONFIG` for `generator-lines`."""
+    if service == SUT_SERVICE:
+        return "SOAK_SUT_CONFIG"
+    return "SOAK_" + re.sub(r"[^A-Z0-9]", "_", service.upper()) + "_CONFIG"
 
 
 def _parse_target(table, problems):
@@ -1180,7 +1283,7 @@ def base_roles(scenario):
 
 
 def logit_services(roles):
-    """The services that run `logit`, the SUT and the generator, sorted."""
+    """The services that run `logit`, the SUT and every generator, sorted."""
     return sorted(name for name, role in roles.items() if role in LOGIT_ROLES)
 
 
@@ -1188,19 +1291,24 @@ def backends(roles):
     return sorted(name for name, role in roles.items() if role == BACKEND_ROLE)
 
 
+def generators(roles):
+    return sorted(name for name, role in roles.items() if role == GENERATOR_ROLE)
+
+
 def role_problems(roles):
-    """What a role map breaks: every service labeled with a known role, and one SUT and one
-    generator, under the names `SUT_SERVICE` and `GENERATOR_SERVICE`."""
+    """What a role map breaks: every service labeled with a known role, one SUT under the name
+    `SUT_SERVICE`, and at least one generator."""
     problems = []
     for name, role in sorted(roles.items()):
         if role not in ROLES:
             problems.append(f"compose service {name}: label {ROLE_LABEL} must be one of "
                             f"{', '.join(ROLES)}, got {role!r}")
-    for role, name in ((SUT_ROLE, SUT_SERVICE), (GENERATOR_ROLE, GENERATOR_SERVICE)):
-        holders = sorted(n for n, r in roles.items() if r == role)
-        if holders != [name]:
-            problems.append(f"the stack needs one {role} service, {name}, and has "
-                            f"{', '.join(holders) or 'none'}")
+    holders = sorted(n for n, r in roles.items() if r == SUT_ROLE)
+    if holders != [SUT_SERVICE]:
+        problems.append(f"the stack needs one {SUT_ROLE} service, {SUT_SERVICE}, and has "
+                        f"{', '.join(holders) or 'none'}")
+    if not generators(roles):
+        problems.append(f"the stack needs at least one {GENERATOR_ROLE} service, and has none")
     return problems
 
 
@@ -1208,7 +1316,8 @@ def service_problems(scenario, roles):
     """Every rule that needs the stack's services, against `roles` (`{service: role}`): the
     role map's own rules; each step's and random fault's `on` a service of the stack, with a
     `kill` or an `exit` on the SUT only; each `[[expect]]` service one that runs `logit`; for a
-    Kafka target, the broker `kafka`; and each local sink's `backend` a backend service."""
+    Kafka target, the broker `kafka`; each `[[ledger.source]]` service a generator, and every
+    generator a source's; and each local sink's `backend` a backend service."""
     problems = role_problems(roles)
     no_backend = ("; an external target's stack runs no backend" if scenario.external else
                   "; a kafka target's stack runs the broker and no backend" if scenario.kafka
@@ -1238,6 +1347,18 @@ def service_problems(scenario, roles):
     if scenario.kafka and roles.get(KAFKA_TARGET) != BROKER_ROLE:
         problems.append(f"a kafka target reads its topic from the {BROKER_ROLE} service "
                         f"`{KAFKA_TARGET}`, which the stack doesn't run")
+    sourced = []
+    for index, source in enumerate(scenario.sources):
+        service = source.get("service")
+        sourced.append(service)
+        if roles.get(service) != GENERATOR_ROLE:
+            problems.append(f"ledger.source {index + 1}: service `{service}` isn't a "
+                            f"{GENERATOR_ROLE} service; the stack's are "
+                            f"{', '.join(generators(roles)) or 'none'}")
+    for service in generators(roles):
+        if service not in sourced:
+            problems.append(f"generator service {service} has no [[ledger.source]], so the "
+                            "ledger would read its datagrams with no G behind them")
     for index, sink in enumerate(scenario.sinks):
         backend = sink.get("backend")
         if backend is not None and roles.get(backend) != BACKEND_ROLE:

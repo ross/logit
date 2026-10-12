@@ -16,11 +16,14 @@ sut = "logit-sut.yaml"
 generator = "logit-generator.yaml"
 
 [ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]         # one per generator the ledger follows into the SUT
+service = "generator"
 generator_input = "load"
 generator_sink = "statsd"
 sut_listener = "statsd"
-sut_aggregate = "window"
-wire_loss_outside_faults = 0.0
 
 [[ledger.sink]]           # one per SUT sink the ledger follows to its backend
 id = "victoria_metrics"

@@ -29,11 +29,14 @@ sut = "logit-sut.yaml"
 generator = "logit-generator.yaml"
 
 [ledger]                  # component ids the checker reads; no VictoriaMetrics query
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]         # one per generator the ledger follows into the SUT
+service = "generator"
 generator_input = "load"
 generator_sink = "statsd"
 sut_listener = "statsd"
-sut_aggregate = "window"
-wire_loss_outside_faults = 0.0
 
 [[ledger.sink]]           # a Kafka target's one sink: its topic is V, read back at the end
 id = "kafka"
