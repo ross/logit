@@ -1,0 +1,82 @@
+# The OAUTHBEARER leg of `script/kafka-interop` against Apache Kafka 4.2.0: three sinks on its
+# OAUTHBEARER listener, SASL_PLAINTEXT on :9098. The broker checks each token's signature against
+# the `oauth` service's (navikt/mock-oauth2-server) JWKS, and its issuer and audience.
+#
+# This process shares the `oauth` service's network namespace (compose.yaml), so the token
+# endpoint is plain HTTP to 127.0.0.1, which `token_endpoint` allows; the mock server stamps the
+# issuer `http://oauth/default` on every token whatever host it was asked on. It accepts any
+# client secret, so no leg can show a refused one.
+#
+#   oauth_cc       client credentials, 60 events at 1/s: each token lives 45 s and is reused
+#                  for 36 s, so the leg runs past the first token's expiry
+#   oauth_static   a fixed token the script fetched before the legs started, with two SASL
+#                  extensions
+#   oauth_refused  a fixed token that isn't a JWT: the broker refuses it, so `oauth-refused`
+#                  stays empty and the sink retries until shutdown
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load_oauth_cc:
+    type: generate_in
+    count: 60
+    rate: 1
+    batch: 1
+    event:
+      log: "oauth {seq}"
+      attributes: { seq: "{seq}" }
+
+  oauth_cc:
+    type: kafka_out
+    sources: [load_oauth_cc]
+    brokers: ["kafka:9098"]
+    topic: oauth-cc
+    sasl:
+      mechanism: oauthbearer
+      token_endpoint: http://127.0.0.1/default/token
+      client_id: logit
+      client_secret: logit-secret
+      scope: kafka
+
+  load_oauth_static:
+    type: generate_in
+    count: 50
+    rate: 5
+    batch: 5
+    event:
+      log: "oauth {seq}"
+      attributes: { seq: "{seq}" }
+
+  oauth_static:
+    type: kafka_out
+    sources: [load_oauth_static]
+    brokers: ["kafka:9098"]
+    topic: oauth-static
+    sasl:
+      mechanism: oauthbearer
+      token: !env KAFKA_INTEROP_OAUTH_TOKEN
+      extensions: { logicalCluster: lkc-interop, identityPoolId: pool-interop }
+
+  load_oauth_refused:
+    type: generate_in
+    count: 50
+    rate: 5
+    batch: 5
+    event:
+      log: "oauth {seq}"
+      attributes: { seq: "{seq}" }
+
+  oauth_refused:
+    type: kafka_out
+    sources: [load_oauth_refused]
+    brokers: ["kafka:9098"]
+    topic: oauth-refused
+    timeout: 2s
+    sasl: { mechanism: oauthbearer, token: not-a.jwt }
+    buffer: { retry_max_delay: 1s, shutdown_grace: 1s }
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/oauth-kafka-telemetry.log
+    format: json

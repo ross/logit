@@ -25,11 +25,13 @@ NETEM_IMAGE="logit-soak-netem:local"
 KAFKA_IMAGE="apache/kafka:4.2.0"
 KCAT_IMAGE="edenhill/kcat:1.7.1"
 PYTHON_IMAGE="python:3.12-slim"
+OAUTH_IMAGE="ghcr.io/navikt/mock-oauth2-server:6.0.2"
 BROKERS=(kafka redpanda)
 # Each topic and its partition count, created on both brokers before any leg starts.
 TOPICS=(parity-logit:6 parity-java:6 codec-none:1 codec-gzip:1 codec-snappy:1 codec-lz4:1
     codec-zstd:1 dedup:3 dedup-control:3 tls:1 mtls:1 mtls-nocert:1 sasl-plain:1
-    sasl-scram512:1 sasl-scram256:1 sasl-wrong:1 timestamp:1)
+    sasl-scram512:1 sasl-scram256:1 sasl-wrong:1 timestamp:1 oauth-cc:1 oauth-static:1
+    oauth-refused:1)
 # The dedup leg's fault: the broker's packets to the leg's container dropped from this many
 # seconds after the legs start, for this long. The leg sends for 40 s.
 NETEM_AT=10
@@ -158,7 +160,8 @@ else
 fi
 
 for config in "${TOOLS_DIR}"/logit-*.yaml; do
-    ${DOCKER} run --rm -v "${config}:/config.yaml:ro,z" "${IMAGE}" validate /config.yaml >/dev/null || {
+    ${DOCKER} run --rm -v "${config}:/config.yaml:ro,z" -e KAFKA_INTEROP_OAUTH_TOKEN=unset \
+        "${IMAGE}" validate /config.yaml >/dev/null || {
         echo "kafka-interop: ${config} failed 'logit validate'" >&2
         exit 1
     }
@@ -172,6 +175,26 @@ chmod 666 "${RUN_DIR}/redpanda/redpanda.yaml"
 
 trap cleanup EXIT
 STARTED=1
+# Kafka fetches the JWKS while it starts its OAUTHBEARER listener, so the token server goes first.
+say "starting the OAuth token server"
+ki_compose up -d oauth >/dev/null
+oauth_python() {
+    ${DOCKER} run --rm --network "${NETWORK}" "${PYTHON_IMAGE}" python3 -I -c "$1"
+}
+oauth_python '
+import time, urllib.request
+for _ in range(120):
+    try:
+        urllib.request.urlopen("http://oauth/default/jwks", timeout=2).read()
+        break
+    except OSError:
+        time.sleep(1)
+else:
+    raise SystemExit("the token server never served its JWKS")
+' || {
+    echo "kafka-interop: the OAuth token server didn't start" >&2
+    exit 1
+}
 say "starting the brokers (run directory ${RUN_DIR})"
 ki_compose up -d --wait --wait-timeout 180 kafka redpanda >/dev/null
 
@@ -181,7 +204,7 @@ ki_compose up -d --wait --wait-timeout 180 kafka redpanda >/dev/null
     echo "repo: $(git -C "${ROOT}" rev-parse HEAD) ($(git -C "${ROOT}" status --porcelain | wc -l) modified path(s))"
     echo "docker: $(${DOCKER} version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
     echo "logit image: $(${DOCKER} image inspect -f '{{.Id}}' "${IMAGE}")"
-    for image in "${KAFKA_IMAGE}" "redpandadata/redpanda:v26.2.3" "${KCAT_IMAGE}"; do
+    for image in "${KAFKA_IMAGE}" "redpandadata/redpanda:v26.2.3" "${KCAT_IMAGE}" "${OAUTH_IMAGE}"; do
         echo "${image}: $(${DOCKER} image inspect -f '{{index .RepoDigests 0}}' "${image}" 2>/dev/null || echo unknown)"
     done
     echo "redpanda version: $(ki_compose exec -T redpanda rpk version 2>/dev/null | head -1)"
@@ -205,6 +228,26 @@ say "creating Redpanda's SASL users"
     exit 1
 }
 
+# OAUTHBEARER on Redpanda is an Enterprise feature. A new cluster runs on a 30-day trial license,
+# so it can be turned on here; when it can't, check.py reads `redpanda-oidc.txt` and reports the
+# OAUTHBEARER rows against Redpanda as GAP rather than FAIL.
+say "turning on Redpanda's OAUTHBEARER"
+if (
+    set -e
+    ki_compose exec -T redpanda rpk cluster license info
+    # The identity provider first: turning OAUTHBEARER on fetches the discovery document and
+    # JWKS from whatever `oidc_discovery_url` holds at that moment.
+    ki_compose exec -T redpanda rpk cluster config set oidc_discovery_url \
+        http://oauth/default/.well-known/openid-configuration
+    ki_compose exec -T redpanda rpk cluster config set oidc_token_audience kafka-interop
+    ki_compose exec -T redpanda rpk cluster config set sasl_mechanisms '[SCRAM, PLAIN, OAUTHBEARER]'
+) >"${RUN_DIR}/logs/redpanda-oidc-setup.log" 2>&1; then
+    echo ok >"${RUN_DIR}/redpanda-oidc.txt"
+else
+    echo failed >"${RUN_DIR}/redpanda-oidc.txt"
+    say "Redpanda refused OAUTHBEARER; see logs/redpanda-oidc-setup.log"
+fi
+
 say "creating topics on both brokers"
 for broker in "${BROKERS[@]}"; do
     for entry in "${TOPICS[@]}"; do
@@ -222,6 +265,18 @@ for broker in "${BROKERS[@]}"; do
             --topic parity-java --reader-property parse.key=true --reader-property key.separator=: \
             >>"${RUN_DIR}/logs/java-producer.log" 2>&1
 done
+
+# The OAUTHBEARER legs' fixed token, fetched last so it outlives their sending by far.
+say "fetching the OAUTHBEARER legs' fixed token"
+token="$(oauth_python '
+import json, urllib.request
+request = urllib.request.Request(
+    "http://oauth/default/token", data=b"grant_type=client_credentials&scope=kafka",
+    headers={"Authorization": "Basic bG9naXQ6bG9naXQtc2VjcmV0",
+             "Content-Type": "application/x-www-form-urlencoded"})
+print(json.load(urllib.request.urlopen(request, timeout=10))["access_token"])
+')"
+echo "KAFKA_INTEROP_OAUTH_TOKEN=${token}" >>"${ENV_FILE}"
 
 LEGS=()
 for config in "${TOOLS_DIR}"/logit-*.yaml; do

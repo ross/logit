@@ -1,0 +1,85 @@
+# The OAUTHBEARER leg of `script/kafka-interop` against Redpanda: three sinks on its SASL
+# listener on :9096, which offers OAUTHBEARER once the script sets `sasl_mechanisms` and the
+# `oidc_*` cluster properties. Redpanda fetches the `oauth` service's (navikt/mock-oauth2-server)
+# discovery document and JWKS, and checks each token's signature, issuer, and audience.
+#
+# This process shares the `oauth` service's network namespace (compose.yaml), so the token
+# endpoint is plain HTTP to 127.0.0.1, which `token_endpoint` allows; the mock server stamps the
+# issuer `http://oauth/default` on every token whatever host it was asked on. It accepts any
+# client secret, so no leg can show a refused one.
+#
+#   oauth_cc       client credentials, 60 events at 1/s: each token lives 45 s and is reused
+#                  for 36 s, so the leg runs past the first token's expiry
+#   oauth_static   a fixed token the script fetched before the legs started, and no SASL
+#                  extensions: Redpanda reads everything between `auth=Bearer ` and the closing
+#                  `\x01\x01` as the token, so an extension corrupts it and Redpanda drops the
+#                  connection
+#   oauth_refused  a fixed token that isn't a JWT: the broker refuses it, so `oauth-refused`
+#                  stays empty and the sink retries until shutdown
+# Both OAUTHBEARER legs share `oauth`'s network namespace, so each binds its own admin port.
+admin: { bind: 127.0.0.1:9601 }
+
+components:
+  load_oauth_cc:
+    type: generate_in
+    count: 60
+    rate: 1
+    batch: 1
+    event:
+      log: "oauth {seq}"
+      attributes: { seq: "{seq}" }
+
+  oauth_cc:
+    type: kafka_out
+    sources: [load_oauth_cc]
+    brokers: ["redpanda:9096"]
+    topic: oauth-cc
+    sasl:
+      mechanism: oauthbearer
+      token_endpoint: http://127.0.0.1/default/token
+      client_id: logit
+      client_secret: logit-secret
+      scope: kafka
+
+  load_oauth_static:
+    type: generate_in
+    count: 50
+    rate: 5
+    batch: 5
+    event:
+      log: "oauth {seq}"
+      attributes: { seq: "{seq}" }
+
+  oauth_static:
+    type: kafka_out
+    sources: [load_oauth_static]
+    brokers: ["redpanda:9096"]
+    topic: oauth-static
+    sasl:
+      mechanism: oauthbearer
+      token: !env KAFKA_INTEROP_OAUTH_TOKEN
+
+  load_oauth_refused:
+    type: generate_in
+    count: 50
+    rate: 5
+    batch: 5
+    event:
+      log: "oauth {seq}"
+      attributes: { seq: "{seq}" }
+
+  oauth_refused:
+    type: kafka_out
+    sources: [load_oauth_refused]
+    brokers: ["redpanda:9096"]
+    topic: oauth-refused
+    timeout: 2s
+    sasl: { mechanism: oauthbearer, token: not-a.jwt }
+    buffer: { retry_max_delay: 1s, shutdown_grace: 1s }
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/oauth-redpanda-telemetry.log
+    format: json
