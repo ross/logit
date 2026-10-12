@@ -184,8 +184,12 @@ these units.
 
 The OTLP mapping's side-effect counters (`logit.output.metrics.degraded`, `skipped`, and their
 warnings) count once per batch. The encoder counts through a gate, as `otlp_out` does with
-`BatchAccounting`, and every candidate encode after the first runs with it muted: bisect probes,
-and the re-prepare of a topic whose prepare failed.
+`BatchAccounting`, and every candidate encode after the first runs with it muted: the bisect's
+probes. A topic whose prepare failed keeps its encoded records across the re-prepare, so the
+retry encodes nothing again.
+
+Under `otlp_json` the budget measures the JSON length, which is longer than the protobuf's, so a
+request splits sooner than under `otlp_proto`.
 
 This diverges from the exporter, which sends the request whole and loses it when the broker
 refuses it. A consumer reading by trace id sees one trace's spans across several records, each a
@@ -208,6 +212,10 @@ hex, 64-bit integers as strings, and enums as integers.
 The encoder is new and hand-rolled in `logit-proto`, beside the OTLP/JSON decoder. `pbjson` can't
 write hex ids, for the reason [ADR `otlp-json-decoding`](otlp-json-decoding.md) rejected it for
 decoding. `otlp_in`'s decoder reads the encoder's output back in tests.
+
+pdata's writer departs from plain protojson in three ways the encoder follows: it writes an unset
+message field as `{}`, omits an all-zero trace or span id, and writes doubles in `json-iterator`'s
+format. `crates/logit-proto/src/otlp/json/encode.rs`'s module doc is the canonical list.
 
 ### 9. Verification
 
@@ -238,8 +246,6 @@ split into several records that the receiver still reads.
   85's checks.
 - A sink writing several signals holds a producer, connections, and a PID per topic until a
   multi-topic producer replaces the facade's internals.
-- Consumer sites of `topic:` need updating. `tools/soak/soaklib/scenario.py` matches `kafka_out`
-  by topic, and W1 updates it.
 - A refused signal topic holds every signal in the sink. Operators who need signals isolated run a
   sink per signal.
 - Known gaps, recorded in `docs/known-gaps/kafka.md` as the stream lands:

@@ -3147,7 +3147,7 @@ components:
     brokers: ["kafka-1:9092", "kafka-2:9092"]
     topic: logs
     key: {attribute: user}   # none (the default) | trace_id | {attribute: ..} | {resource: ..}
-    # format: json           # the default; text | msgpack | native | otlp_proto
+    # format: json           # the default; text | msgpack | native | otlp_proto | otlp_json
     # record: event          # the default but for native; batch
     # compression: none      # the default; gzip | snappy | lz4 | zstd
     # acks: all              # the default; idempotent: true needs it
@@ -3258,6 +3258,7 @@ at the cluster's IAM bootstrap port (`9098` inside AWS, `9198` for public access
 | `msgpack` | the `json` object, key for key, as MessagePack; raw bytes are a `bin` and NaN and the infinities are floats ([`msgpack.rs`](../crates/logit-outputs/src/msgpack.rs)) | `event` |
 | `native` | a frame of `logit`'s own format, which a `logit` reads back with no loss | `batch` |
 | `otlp_proto` | one OTLP protobuf export request of one signal, which the OpenTelemetry Collector's Kafka receiver reads; see "OTLP for a Collector" below | none; `record:` is rejected |
+| `otlp_json` | the same request as OTLP/JSON, which the Collector's Kafka receiver reads with `encoding: otlp_json` | none; `record:` is rejected |
 
 `record: event` sends one event per record, with the event's timestamp as `CreateTime`.
 `record: batch` packs as many of a batch's events into each record as fit under
@@ -3276,7 +3277,10 @@ to one partition per batch, picked at random among those with a leader.
 **OTLP for a Collector.** `format: otlp_proto` writes what the OpenTelemetry Collector's Kafka
 exporter writes and its Kafka receiver reads (with `encoding: otlp_proto`, the receiver's
 default): each record holds one `Export*ServiceRequest`, a batch's logs, metrics, and spans as
-separate requests, each to its signal's topic.
+separate requests, each to its signal's topic. `format: otlp_json` writes the same requests as
+OTLP/JSON, in the form the Collector's own JSON marshaler writes, for a receiver set to
+`encoding: otlp_json`; everything below applies to both. The JSON is larger than the protobuf, so
+`max_request_bytes` splits a request sooner, measured on the JSON.
 
 ```yaml
     format: otlp_proto
@@ -3323,7 +3327,7 @@ in two once, and a half still too large is dropped, counted `reason="rejected"`.
 **Timestamps.** Kafka 4.x rejects a record stamped more than an hour ahead of the broker's clock
 (`log.message.timestamp.after.max.ms`). The broker names it, and the sink drops it, counted
 `reason="invalid_timestamp"`, and delivers the rest of its batch. Fix the clock or the
-`timestamp` stage upstream; the record never reaches the topic. Under `format: otlp_proto` a
+`timestamp` stage upstream; the record never reaches the topic. Under `format: otlp_proto` or `otlp_json` a
 record carries the time it was written, so this doesn't apply.
 
 **Delivery.** A retry resends only the partitions the broker hasn't settled, under the same
@@ -3338,7 +3342,7 @@ table of every broker error it reads.
 
 **What to watch.** `logit.output.requests{class}`, `logit.output.records` for what Kafka
 accepted, `logit.output.records.dropped{reason}`, `logit.output.records.unkeyed`, under
-`format: text`, `logit.output.events.skipped{reason="no_log"}`, and under `format: otlp_proto`,
+`format: text`, `logit.output.events.skipped{reason="no_log"}`, and under `format: otlp_proto` or `otlp_json`,
 `logit.output.metrics.skipped` and `logit.output.metrics.degraded` for metrics OTLP can't carry
 as they are.
 `docs/design/internal-telemetry.md`'s `kafka_out` section has every counter.

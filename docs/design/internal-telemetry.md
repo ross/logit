@@ -2110,7 +2110,7 @@ attempt.
 
 `crates/logit-outputs/src/kafka/`, [ADR `kafka-output`](../adr/kafka-output.md),
 [ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md). Every `records` count is of Kafka
-records: under `format: otlp_proto` one record is one export request, however many log records,
+records: under `format: otlp_proto` or `otlp_json` one record is one export request, however many log records,
 spans, or metrics it holds.
 
 | Name | Kind | Meaning |
@@ -2118,13 +2118,13 @@ spans, or metrics it holds.
 | `logit.output.requests{class}` | count | one per attempt, `class` its fault class (`ok`, `clean`, `ambiguous`, `rejected`, or `refused`) across every topic, however many produce requests the attempt sent |
 | `logit.output.batch.bytes` | count | the record values' bytes, before compression, once per batch |
 | `logit.output.records` | count | records in a partition batch the broker accepted |
-| `logit.output.records.dropped{reason="oversize"}` | count | a record over `max_request_bytes` alone, under `record: batch` an event whose value alone is over it, or under `format: otlp_proto` one per signal record an event too large alone would have formed, never sent, once per batch |
+| `logit.output.records.dropped{reason="oversize"}` | count | a record over `max_request_bytes` alone, under `record: batch` an event whose value alone is over it, or under `format: otlp_proto` or `otlp_json` one per signal record an event too large alone would have formed, never sent, once per batch |
 | `logit.output.records.dropped{reason="rejected"}` | count | the records of a partition batch the broker rejected |
 | `logit.output.records.dropped{reason="invalid_timestamp"\|"invalid_record"}` | count | records the broker named in `record_errors`, dropped before the rest of their partition batch is resent once |
 | `logit.output.records.dropped{reason="ambiguous_at_most_once"}` | count | records left unsettled when `at_most_once` drops a batch after an `Ambiguous` attempt, or drops an `Ambiguous` partition batch before retrying a `Refused` one |
-| `logit.output.records.unkeyed` | count | records sent without a key because the configured `key:` had no value on their event, or under `format: otlp_proto` on their request's events or resource, once per batch |
+| `logit.output.records.unkeyed` | count | records sent without a key because the configured `key:` had no value on their event, or under `format: otlp_proto` or `otlp_json` on their request's events or resource, once per batch |
 | `logit.output.events.skipped{reason="no_log"}` | count | events `format: text` skipped for having no log record, once per batch |
-| `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.degraded{metric_kind}` | count | under `format: otlp_proto`, metrics the OTLP codec skips or degrades, as `otlp_out` counts them, once per batch |
+| `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.degraded{metric_kind}` | count | under `format: otlp_proto` or `otlp_json`, metrics the OTLP codec skips or degrades, as `otlp_out` counts them, once per batch |
 
 `Diagnostics` keys, each throttled: `oversize`, naming the record count and the
 `max_request_bytes` cap, and `rejected`, `invalid_timestamp`, and `invalid_record`, each carrying

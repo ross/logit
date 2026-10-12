@@ -126,7 +126,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     records costs, per record, about twice the logarithm of its event count in encodes, each of
     up to twice the record's size.
   - **Workaround:** keep upstream batches under `max_request_bytes`, or raise the cap.
-- **`otlp_proto` writes no `otelcol.signal` header.** The OpenTelemetry Collector's Kafka
+- **The OTLP formats write no `otelcol.signal` header.** The OpenTelemetry Collector's Kafka
   exporter adds one naming the signal when its `signal_header` is on; `kafka_out` tells signals
   apart by topic only ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md),
   Consequences).
@@ -135,7 +135,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** keep each signal on its own topic, the default, or add the header with
     `headers:` on a sink per signal, each behind `has_signal`.
   - **Revisit trigger:** a consumer that needs the header on a shared topic.
-- **`otlp_proto` has no byte parity with the exporter's resource keys.** The exporter's
+- **The OTLP formats have no byte parity with the exporter's resource keys.** The exporter's
   `partition_metrics_by_resource_attributes` and `partition_logs_by_resource_attributes` key by a
   hash of every resource attribute, computed by a package internal to the Collector.
   `key: {resource: NAME}` keys by one attribute's text instead
@@ -153,8 +153,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** run one `kafka_out` per signal, each behind `has_signal` (and `keep_signals`
     when an event carries more than one signal). Each opens a producer for its own topic only.
   - **Revisit trigger:** a multi-topic producer, or a per-signal queue.
-- **An `otlp_proto` record is lost whole.** The broker rejects a record whole, so a rejected
-  `otlp_proto` record drops every log record, span, or metric in its request, where the other
+- **An OTLP record is lost whole.** The broker rejects a record whole, so a rejected
+  `otlp_proto` or `otlp_json` record drops every log record, span, or metric in its request, where the other
   formats lose one event or one batch record
   ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md), Consequences).
   - **Consequence:** `logit.output.records.dropped{reason="rejected"}` counts 1 for a request

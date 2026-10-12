@@ -33,8 +33,14 @@ differ between runs. `../README.md`'s "Consuming these fixtures" section explain
 
 ## Tests that consume these fixtures
 
-None yet. The OTLP/JSON decoder these fixtures are meant to back-fill now exists
-(`crates/logit-proto/src/otlp/json/`), but no `interop_fixture_*`-style test reads these files.
+- `crates/logit-proto/src/otlp/json/encode_tests.rs`'s
+  `recorded_collector_output_re_encodes_byte_for_byte` decodes every line with the OTLP/JSON
+  decoder and checks that the OTLP/JSON encoder writes the same bytes back, since both are pdata's
+  marshaler output.
+- `crates/logit-proto/tests/robustness.rs`'s `otlp_json_peak_memory_per_input_byte_is_documented`
+  measures decoding `logs.json`.
+
+No `interop_fixture_*`-style test checks the `EventBatch` these files decode to;
 `docs/plans/recorded-interop-fixtures.md`'s "Explicitly deferred" list tracks that test.
 
 ## What isn't covered here (yet)

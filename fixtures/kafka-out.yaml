@@ -37,7 +37,7 @@ components:
     key: {attribute: user}           # none (the default) | trace_id | {attribute: ..} | {resource: ..}
     compression: zstd                # none (the default) | gzip | snappy | lz4 | zstd
     # format: json                   # the default; text (the log body) | msgpack | native |
-    #                                # otlp_proto (fixtures/kafka-otlp.yaml)
+    #                                # otlp_proto | otlp_json (fixtures/kafka-otlp.yaml)
     # record: event                  # the default but for native; batch packs many events per
     #                                # record, unkeyed, so it needs `key: none`
     headers:

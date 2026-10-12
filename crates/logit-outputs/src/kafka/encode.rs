@@ -9,6 +9,7 @@
 //! | `msgpack` | `crate::msgpack`'s map | those maps back to back |
 //! | `native` | a `CODEC_BATCH` frame of a one-event batch under the batch's resource and scope | one `CODEC_BATCH` frame of the events |
 //! | `otlp_proto` | takes no `record:`: one signal's OTLP export request in protobuf, below | |
+//! | `otlp_json` | takes no `record:`: the same request as OTLP/JSON, below | |
 //!
 //! `crate::ndjson`'s doc is the grammar of the JSON object and `crate::msgpack`'s the
 //! MessagePack value forms. A native frame is uncompressed: `compression:` compresses the record
@@ -46,7 +47,9 @@
 //!
 //! # OTLP formats
 //!
-//! `otlp_proto` writes one record per OTLP export request (`docs/adr/kafka-otlp-formats.md`).
+//! `otlp_proto` and `otlp_json` write one record per OTLP export request
+//! (`docs/adr/kafka-otlp-formats.md`); they differ only in the serialization of the request, and
+//! the size budget measures that serialization's length.
 //! A batch becomes one request per signal that has records, in the order logs, traces, metrics,
 //! each built by `OtlpEncoder::request` from the batch's own events under its resource and
 //! scope, and tagged with its signal in [`RecordMeta::signal`], which picks its topic. Two
@@ -109,6 +112,7 @@ pub enum RecordFormat {
     Msgpack,
     Native,
     OtlpProto,
+    OtlpJson,
 }
 
 impl RecordFormat {
@@ -117,7 +121,7 @@ impl RecordFormat {
         match self {
             RecordFormat::Json | RecordFormat::Text | RecordFormat::Msgpack => RecordMode::Event,
             RecordFormat::Native => RecordMode::Batch,
-            RecordFormat::OtlpProto => RecordMode::Request,
+            RecordFormat::OtlpProto | RecordFormat::OtlpJson => RecordMode::Request,
         }
     }
 
@@ -236,7 +240,9 @@ impl Render {
                 Some(&self.body)
             }
             RecordFormat::Native => unreachable!("native frames go through `native_frame`"),
-            RecordFormat::OtlpProto => unreachable!("OTLP requests go through `otlp`"),
+            RecordFormat::OtlpProto | RecordFormat::OtlpJson => {
+                unreachable!("OTLP requests go through `otlp`")
+            }
         }
     }
 }
@@ -490,7 +496,8 @@ struct Group<'e> {
 /// What one candidate encode of a run of events gave.
 enum Fit {
     /// The request fits the budget.
-    Fits(OtlpRequest),
+    /// The request, and its OTLP/JSON when the format is `otlp_json`, written once to measure it.
+    Fits(OtlpRequest, Option<Vec<u8>>),
     /// No event of the run yields a record of the signal: a metric the mapping skips.
     Empty,
     Over,
@@ -599,22 +606,36 @@ impl KafkaEncoder {
         let Group { key, missing, events } = group;
         let budget = self.budget.saturating_sub(key.as_ref().map_or(0, Bytes::len));
         let (resource, scope) = (&batch.resource, batch.scope.as_deref());
-        let emit =
-            |request: OtlpRequest, out: &mut MessageBuf<RecordMeta>, stats: &mut EncodeStats| {
-                let meta = RecordMeta { key: key.clone(), timestamp, signal: Some(signal) };
-                out.push_with(&request.encode_to_vec(), meta);
-                stats.missing_key += usize::from(missing);
+        let emit = |(request, json): (OtlpRequest, Option<Vec<u8>>),
+                    out: &mut MessageBuf<RecordMeta>,
+                    stats: &mut EncodeStats| {
+            let meta = RecordMeta { key: key.clone(), timestamp, signal: Some(signal) };
+            match json {
+                Some(json) => out.push_with(&json, meta),
+                None => out.push_with(&request.encode_to_vec(), meta),
             };
+            stats.missing_key += usize::from(missing);
+        };
+        let json = self.format == RecordFormat::OtlpJson;
         let otlp = &mut self.otlp;
         let mut fits =
             |events: &[&Event]| match otlp.request(signal, resource, scope, events.iter().copied())
             {
                 None => Fit::Empty,
-                Some(request) if request.encoded_len() <= budget => Fit::Fits(request),
+                Some(request) if json => {
+                    let mut body = Vec::new();
+                    request.write_json(&mut body);
+                    if body.len() <= budget {
+                        Fit::Fits(request, Some(body))
+                    } else {
+                        Fit::Over
+                    }
+                }
+                Some(request) if request.encoded_len() <= budget => Fit::Fits(request, None),
                 Some(_) => Fit::Over,
             };
         match fits(&events) {
-            Fit::Fits(request) => return emit(request, out, stats),
+            Fit::Fits(request, json) => return emit((request, json), out, stats),
             Fit::Empty => return,
             Fit::Over => {}
         }
@@ -626,7 +647,7 @@ impl KafkaEncoder {
             while !rest.is_empty() {
                 let over_at_start = known_over.take().unwrap_or(rest.len() + 1);
                 let mut best = match fits(&rest[..1]) {
-                    Fit::Fits(request) => request,
+                    Fit::Fits(request, json) => (request, json),
                     Fit::Empty => {
                         rest = &rest[1..];
                         continue;
@@ -644,8 +665,8 @@ impl KafkaEncoder {
                 while probe < over && fit < rest.len() {
                     let n = probe.min(rest.len());
                     match fits(&rest[..n]) {
-                        Fit::Fits(request) => {
-                            (fit, best) = (n, request);
+                        Fit::Fits(request, json) => {
+                            (fit, best) = (n, (request, json));
                             probe *= 2;
                         }
                         Fit::Empty | Fit::Over => over = n,
@@ -654,7 +675,7 @@ impl KafkaEncoder {
                 while over - fit > 1 {
                     let mid = fit + (over - fit) / 2;
                     match fits(&rest[..mid]) {
-                        Fit::Fits(request) => (fit, best) = (mid, request),
+                        Fit::Fits(request, json) => (fit, best) = (mid, (request, json)),
                         Fit::Empty | Fit::Over => over = mid,
                     }
                 }
@@ -914,7 +935,7 @@ mod tests {
             RecordFormat::Native => {
                 native_events(batch, records).iter().map(|e| ndjson(batch, e)).collect()
             }
-            RecordFormat::Text | RecordFormat::OtlpProto => unreachable!(),
+            RecordFormat::Text | RecordFormat::OtlpProto | RecordFormat::OtlpJson => unreachable!(),
         }
     }
 
