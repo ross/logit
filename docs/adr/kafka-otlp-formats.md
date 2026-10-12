@@ -27,7 +27,7 @@ The exporter's defaults, checked against `opentelemetry-collector-contrib` v0.16
   `partition_metrics_by_resource_attributes` and `partition_logs_by_resource_attributes` key by a
   hash of the resource's attributes, computed with the Collector's internal `xhash` package.
 - No size splitting: a request over the broker's limit fails.
-- No record timestamp: the broker stamps produce time.
+- No record timestamp of its own: the record carries the time the client produced it.
 - An opt-in `signal_header` adds an `otelcol.signal` header naming the signal.
 
 `kafka_out`'s producer serves one topic (`crates/logit-outputs/src/kafka/producer.rs`): its
@@ -114,6 +114,11 @@ producer for its own signal only.
 | `trace_id` | Spans and logs split into one request per trace id, each keyed with the trace id as 32 lowercase hex characters: the bytes the exporter's `partition_traces_by_id` and `partition_logs_by_trace_id` write. Metrics stay one unkeyed request. |
 | `{resource: NAME}` | The whole request keyed by that resource attribute's value, with [ADR `kafka-output`](kafka-output.md)'s key text. An `EventBatch` has one resource, so every request from the batch has the same key. |
 | `{attribute: NAME}` | Rejected by graph rule 85. A request holds many events, and each can have a different value. |
+
+Spans and logs with no trace id, under `key: trace_id`, and a request whose resource lacks the
+attribute, under `key: {resource: NAME}`, go unkeyed: one unkeyed request per signal, counted in
+`logit.output.records.unkeyed` once per record, as for the other formats. Metrics under
+`key: trace_id` aren't counted there: the key doesn't apply to them.
 
 A keyed request goes to the partition the Java client picks for the same key bytes ([ADR
 `kafka-output`](kafka-output.md), item 3).
