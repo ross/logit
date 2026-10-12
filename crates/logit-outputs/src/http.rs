@@ -72,12 +72,22 @@ pub(crate) fn build_client(
     timeout: Duration,
     tls: Option<&rustls::ClientConfig>,
 ) -> reqwest::Client {
+    client_builder(timeout, tls)
+        .build()
+        .expect("reqwest client should build with the configured TLS settings")
+}
+
+/// [`build_client`]'s settings, unbuilt, for a caller that changes one, such as the proxy.
+pub(crate) fn client_builder(
+    timeout: Duration,
+    tls: Option<&rustls::ClientConfig>,
+) -> reqwest::ClientBuilder {
     let mut builder =
         reqwest::Client::builder().timeout(timeout).redirect(reqwest::redirect::Policy::none());
     if let Some(cfg) = tls {
         builder = builder.use_preconfigured_tls(cfg.clone());
     }
-    builder.build().expect("reqwest client should build with the configured TLS settings")
+    builder
 }
 
 /// How much of a rejection body to read and quote in an error message and a diagnostic. Enough
@@ -113,6 +123,24 @@ pub(crate) async fn read_body_bytes(mut response: reqwest::Response, limit: usiz
     }
     buf.truncate(limit);
     buf
+}
+
+/// [`read_body_bytes`], but a read error, such as the request's timeout or a connection closed
+/// mid-body, is returned rather than ending the body, for a caller that parses the body and
+/// must not read a cut-off one as complete.
+pub(crate) async fn try_read_body_bytes(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, reqwest::Error> {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < limit {
+        match response.chunk().await? {
+            Some(chunk) => buf.extend_from_slice(&chunk),
+            None => break,
+        }
+    }
+    buf.truncate(limit);
+    Ok(buf)
 }
 
 /// The first `max` bytes of `body`, trimmed, on a character boundary, with an ellipsis when

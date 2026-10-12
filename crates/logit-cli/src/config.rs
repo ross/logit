@@ -295,6 +295,8 @@ mod tests {
                     Some("logit-test-token".to_string())
                 }
                 "SPLUNK_INTEROP_HEC_INSECURE" => Some("false".to_string()),
+                // `script/kafka-interop`'s fixed OAUTHBEARER token, fetched at run time.
+                "KAFKA_INTEROP_OAUTH_TOKEN" => Some("logit-test-token".to_string()),
                 // The whole header value, `Bearer ` included: `!env` substitutes a field, it
                 // doesn't interpolate into one.
                 "PROMETHEUS_REMOTE_WRITE_AUTHORIZATION" => {

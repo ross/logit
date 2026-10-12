@@ -3154,14 +3154,100 @@ components:
     # max_request_bytes: 1MiB
     # headers: {source: logit}
     # tls: {}                # turns TLS on
+    # sasl: {mechanism: scram_sha_512, username: logit, password: !env KAFKA_PASSWORD}
 ```
 
 **Brokers.** `brokers:` is only where the sink bootstraps. It then connects to each partition's
 leader at the address the cluster advertises (`advertised.listeners`), so every advertised
 address must resolve and be reachable from `logit`, not only the bootstrap ones. A `tls:` block
 turns TLS on for every connection, checking each broker's certificate against the host it
-advertises; `cert_file` and `key_file` add a client certificate for mutual TLS. SASL isn't
-supported.
+advertises; `cert_file` and `key_file` add a client certificate for mutual TLS.
+
+**SASL.** A `sasl:` block authenticates every connection, with `mechanism: plain`,
+`scram_sha_256`, or `scram_sha_512`, a `username`, and a `password`. Give the password with
+`!env` so it stays out of the config file. Without `tls:`, `plain` sends the password in clear,
+so use it only over TLS or on a network you trust; SCRAM never sends it. A broker that refuses the
+credentials or doesn't offer the mechanism is `refused`, and the sink holds its queue until the
+broker accepts them. The error names the mechanism and the user, never the password. When the
+broker limits a session's lifetime (`connections.max.reauth.ms`), the sink dials a new
+connection before the session ends, one `timeout` early, or halfway through a lifetime of up to
+twice `timeout`.
+
+`mechanism: oauthbearer` sends an OAuth 2.0 access token instead, either a fixed `token:`
+(`!env`), or one fetched from `token_endpoint:` with the client-credentials grant:
+
+```yaml
+    sasl:
+      mechanism: oauthbearer
+      token_endpoint: https://idp.example/oauth2/token
+      client_id: logit
+      client_secret: !env KAFKA_CLIENT_SECRET
+      scope: kafka                                # optional
+      extensions: {logicalCluster: lkc-abc123}    # optional; Confluent Cloud needs these
+```
+
+- **The token request.** The sink sends `client_id` and `client_secret` in HTTP Basic
+  authentication as they are, not form-urlencoded, as the Java client does at its default
+  (`sasl.oauthbearer.header.urlencode: false`). A provider that needs RFC 6749's encoding and a
+  secret with a character such as `+` or `%` refuses the request.
+- **The endpoint's certificate.** It's checked against the bundled Mozilla roots, and `tls:`
+  doesn't apply to it, so an endpoint with a private CA can't be used yet. `logit validate`
+  requires `https://`, or `http://` to a loopback address.
+- **Renewal.** One token serves every connection until 80% of its `expires_in` has passed (or of
+  the time to a JWT's `exp` claim when `expires_in` is missing), and a connection dialed after
+  that fetches a new one. A broker with `connections.max.reauth.ms` set ends each session when its
+  token expires, so the sink redials, with a new token, before then. A fixed `token:` is never
+  renewed, so the broker refuses it once it expires.
+- **Faults.** A token endpoint that's unreachable, times out (the sink's `timeout`), or answers
+  `429` or `5xx`, or whose `2xx` body a timeout or closed connection cuts off, is retried as
+  `clean`; any other answer, or a `2xx` without a usable `access_token` in its first 64 KiB, is
+  `refused`. A broker that refuses the token is `refused` too, and the sink fetches a new token
+  for the next attempt. When the broker sends an error challenge, as Kafka does, the error
+  carries its OAuth status (`invalid_token`); Redpanda sends none. Each holds the queue until the endpoint
+  or the broker accepts. The error names the client id and the endpoint, never the secret or the
+  token.
+
+`mechanism: aws_msk_iam` authenticates to Amazon MSK with IAM access control. Point `brokers:`
+at the cluster's IAM bootstrap port (`9098` inside AWS, `9198` for public access) and set
+`tls: {}`, because MSK serves IAM over TLS only:
+
+```yaml
+    brokers: ["b-1.logs.abc123.c2.kafka.us-east-1.amazonaws.com:9098"]
+    tls: {}
+    sasl:
+      mechanism: aws_msk_iam
+      # region: us-east-1   # optional; read from the broker host, then AWS_REGION
+```
+
+- **Credentials.** The sink looks for them as the AWS SDK for Java does, and the first source
+  present is used: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`);
+  `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN` (EKS IRSA); the static keys of profile
+  `AWS_PROFILE`, or `default`, in `~/.aws/credentials` and `~/.aws/config`; the ECS or EKS Pod
+  Identity container endpoint; then the EC2 instance profile through IMDSv2. A source that is
+  present but fails, such as IRSA whose STS call is denied, stops the lookup rather than falling
+  through to the instance role. A profile that uses SSO, `credential_process`, or `role_arn` is
+  refused by name, as is a profile `AWS_PROFILE` names that has no keys; a `default` profile
+  without keys is skipped. Temporary credentials are reused until 5 minutes before they expire, and a
+  session MSK ends at that expiry is redialed with fresh ones first.
+- **The IAM policy.** The role needs `kafka-cluster:Connect` on the cluster,
+  `kafka-cluster:DescribeTopic` and `kafka-cluster:WriteData` on the topic, and, because the
+  sink is an idempotent producer by default, `kafka-cluster:WriteDataIdempotently` on the
+  cluster (MSK's "Create authorization policies" page). Without the last, `InitProducerId` is
+  refused with `CLUSTER_AUTHORIZATION_FAILED`; grant it, or set `idempotent: false` and give up
+  the deduplicated resend.
+- **Proxies.** STS's request honors `HTTPS_PROXY` and `NO_PROXY`. The container endpoint and
+  IMDS are always reached directly, so a proxy never sees their token or credentials.
+- **Partitions.** The sink supports the `aws`, `aws-cn`, and `aws-us-gov` partitions. IRSA in
+  any other region, such as the AWS European Sovereign Cloud's `eusc-de-east-1`, is `refused`
+  ([known gaps](known-gaps/kafka.md)).
+- **IMDS in a container.** IMDSv2's token request needs a hop limit of 2 or more to reach a
+  container on the instance. With the default of 1 it times out, which is `clean` and retried, and
+  the sink never authenticates.
+- **Faults.** STS, the container endpoint, or IMDS unreachable, timing out, or answering `429`
+  or `5xx` is `clean`; any other answer, a source that's misconfigured, or no source at all
+  with `AWS_EC2_METADATA_DISABLED=true` is `refused`. MSK's refusal of the credentials
+  (`Access denied`) is `refused`, and fetched credentials are fetched again for the next attempt.
+  The error names where the credentials came from, never a key or a token.
 
 **Records.** `format:` picks each record's value:
 

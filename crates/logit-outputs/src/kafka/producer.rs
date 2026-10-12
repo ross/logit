@@ -51,6 +51,7 @@ use super::batch::{self, ProducerRecord, Stamp, BATCH_OVERHEAD};
 use super::conn::{Conn, Dialer, PRODUCE_RECORD_ERRORS_MIN, PRODUCE_ZSTD_MIN};
 use super::fault::{self, code, Response};
 use super::partitioner;
+use super::sasl::Authenticator;
 
 /// Java's `metadata.max.age.ms`.
 pub(crate) const METADATA_MAX_AGE: Duration = Duration::from_secs(300);
@@ -102,6 +103,8 @@ pub(crate) struct ProducerConfig {
     pub(crate) max_request_bytes: usize,
     pub(crate) tls: Option<Arc<rustls::ClientConfig>>,
     pub(crate) client_id: String,
+    /// Authenticates every connection when set.
+    pub(crate) sasl: Option<Arc<dyn Authenticator>>,
 }
 
 /// A connection's key: a bootstrap entry by its index, or a broker by its node id.
@@ -311,6 +314,7 @@ impl Producer {
             tls: config.tls.clone(),
             timeout: config.timeout,
             client_id: StrBytes::from_string(config.client_id.clone()),
+            sasl: config.sasl.clone(),
         };
         Ok(Self {
             topic: StrBytes::from_string(config.topic.clone()),
@@ -909,7 +913,8 @@ impl Producer {
         for (node, host, port) in targets {
             match self.dialer.connect(&host, port).await {
                 Ok(conn) => return Ok((node, conn)),
-                // Every broker answers with the same versions; another can't do better.
+                // Every broker answers with the same versions and SASL verdict; another can't
+                // do better.
                 Err(err) if logit_pipeline::classify(&err) == Fault::Refused => return Err(err),
                 Err(err) => last = Some(err),
             }
@@ -1017,15 +1022,24 @@ impl BrokerJob {
         }
 
         let mut failed: HashSet<i32> = HashSet::new();
-        let mut alive = true;
+        // Why the connection takes no more requests, once it doesn't.
+        let mut finished: Option<&str> = None;
         for request in pack(parts, max_request_bytes) {
-            let (sendable, behind): (Vec<_>, Vec<_>) =
-                request.into_iter().partition(|(_, p, _)| alive && !failed.contains(p));
+            // `reauth_deadline`'s margin covers one request's wait, and the job writes its
+            // requests one after another, so a later one can reach the deadline. The rest are
+            // `Clean`, and dropping the connection makes the next attempt redial.
+            if finished.is_none() && conn.past_deadline() {
+                finished = Some("not sent: the connection's SASL session is about to end");
+            }
+            let (sendable, behind): (Vec<_>, Vec<_>) = request
+                .into_iter()
+                .partition(|(_, p, _)| finished.is_none() && !failed.contains(p));
             for (i, partition, _) in behind {
-                let why = if alive {
-                    format!("not sent behind an earlier batch of partition {partition} that failed")
-                } else {
-                    "not sent: an earlier request on the connection failed".to_string()
+                let why = match finished {
+                    None => format!(
+                        "not sent behind an earlier batch of partition {partition} that failed"
+                    ),
+                    Some(why) => why.to_string(),
                 };
                 failed.insert(partition);
                 answers.push((i, Outcome::Unanswered { fault: Fault::Clean, why }));
@@ -1043,7 +1057,7 @@ impl BrokerJob {
                     }
                 }
                 Err(err) => {
-                    alive = false;
+                    finished = Some("not sent: an earlier request on the connection failed");
                     let fault = err.fault();
                     let why = format!("{:#}", err.error);
                     for (i, partition, _) in sendable {
@@ -1053,7 +1067,7 @@ impl BrokerJob {
                 }
             }
         }
-        (broker, alive.then_some(conn), answers)
+        (broker, finished.is_none().then_some(conn), answers)
     }
 }
 

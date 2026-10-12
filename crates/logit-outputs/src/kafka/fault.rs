@@ -26,6 +26,8 @@ pub(crate) mod code {
     pub(crate) const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
     pub(crate) const CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
     pub(crate) const INVALID_TIMESTAMP: i16 = 32;
+    pub(crate) const UNSUPPORTED_SASL_MECHANISM: i16 = 33;
+    pub(crate) const ILLEGAL_SASL_STATE: i16 = 34;
     pub(crate) const UNSUPPORTED_VERSION: i16 = 35;
     pub(crate) const POLICY_VIOLATION: i16 = 44;
     pub(crate) const OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
@@ -33,6 +35,7 @@ pub(crate) mod code {
     pub(crate) const INVALID_PRODUCER_EPOCH: i16 = 47;
     pub(crate) const TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
     pub(crate) const KAFKA_STORAGE_ERROR: i16 = 56;
+    pub(crate) const SASL_AUTHENTICATION_FAILED: i16 = 58;
     pub(crate) const UNKNOWN_PRODUCER_ID: i16 = 59;
     pub(crate) const UNSUPPORTED_COMPRESSION_TYPE: i16 = 76;
     pub(crate) const INVALID_RECORD: i16 = 87;
@@ -116,6 +119,21 @@ pub(crate) fn classify_control(error_code: i16) -> Fault {
     }
 }
 
+/// The class of a non-zero error code in a `SaslHandshake` or `SaslAuthenticate` answer. A
+/// mechanism the broker doesn't offer, an exchange its state machine refuses, and credentials it
+/// won't take each get the same answer on every connection, so they hold the queue; anything
+/// else is a state the broker leaves on its own, as [`classify_control`] reads it.
+pub(crate) fn classify_sasl(error_code: i16) -> Fault {
+    use code::*;
+    match error_code {
+        UNSUPPORTED_SASL_MECHANISM
+        | ILLEGAL_SASL_STATE
+        | SASL_AUTHENTICATION_FAILED
+        | UNSUPPORTED_VERSION => Fault::Refused,
+        _ => Fault::Clean,
+    }
+}
+
 /// `NAME (code)` for a diagnostic, from `kafka-protocol`'s table.
 pub(crate) fn name(error_code: i16) -> String {
     match ResponseError::try_from_code(error_code) {
@@ -173,6 +191,17 @@ mod tests {
         ];
         for (code, want) in rows {
             assert_eq!(classify(code), want, "{}", name(code));
+        }
+    }
+
+    #[test]
+    fn sasl_answers_refuse_for_the_mechanism_the_state_and_the_credentials() {
+        for code in [UNSUPPORTED_SASL_MECHANISM, ILLEGAL_SASL_STATE, SASL_AUTHENTICATION_FAILED, 35]
+        {
+            assert_eq!(classify_sasl(code), Fault::Refused, "{}", name(code));
+        }
+        for code in [15, 7, 999] {
+            assert_eq!(classify_sasl(code), Fault::Clean, "{}", name(code));
         }
     }
 
