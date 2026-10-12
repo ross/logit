@@ -2531,6 +2531,12 @@ def _slope_edges():
                f"a service with samples but no fittable life WARNs beside a good one, got "
                f"{result}")
 
+        # Every service sampled, none fittable, and no expectation: nothing to judge.
+        unfit = _slope_run(tmp, "all-unfittable", end_s=80)
+        result = _status(unfit, checks.check_rss_slope)
+        expect(result.status == checks.SKIP,
+               f"rss_slope SKIPs when no service has a fittable life, got {result}")
+
         expected = {"fd_slope": {"logit": "FAIL"}}
         untimed = _run_dir(tmp, "fd-no-start", end, _sut_stdout(3600), duration=3600.0,
                            expected=expected)
