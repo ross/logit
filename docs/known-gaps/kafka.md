@@ -126,3 +126,45 @@ Entry format and the other areas: [the known-gaps index](README.md).
     records costs, per record, about twice the logarithm of its event count in encodes, each of
     up to twice the record's size.
   - **Workaround:** keep upstream batches under `max_request_bytes`, or raise the cap.
+- **`otlp_proto` writes no `otelcol.signal` header.** The OpenTelemetry Collector's Kafka
+  exporter adds one naming the signal when its `signal_header` is on; `kafka_out` tells signals
+  apart by topic only ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md),
+  Consequences).
+  - **Consequence:** a consumer that reads the signal from that header, rather than from the
+    topic, can't use a `topic:` that every signal shares.
+  - **Workaround:** keep each signal on its own topic, the default, or add the header with
+    `headers:` on a sink per signal, each behind `has_signal`.
+  - **Revisit trigger:** a consumer that needs the header on a shared topic.
+- **`otlp_proto` has no byte parity with the exporter's resource keys.** The exporter's
+  `partition_metrics_by_resource_attributes` and `partition_logs_by_resource_attributes` key by a
+  hash of every resource attribute, computed by a package internal to the Collector.
+  `key: {resource: NAME}` keys by one attribute's text instead
+  ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md), item 5).
+  - **Consequence:** a `logit` sink and an exporter writing one topic place the same resource on
+    different partitions.
+  - **Workaround:** don't mix the two writers on one topic when consumers depend on one
+    resource's records sharing a partition.
+  - **Revisit trigger:** an operator who needs that placement shared.
+- **A refused signal topic holds every signal in the sink.** Each signal's topic settles on its
+  own, but the sink has one queue, so a topic the broker refuses (authorization, a missing topic)
+  holds the logs and spans behind it although their own topics accept writes
+  ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md), item 4).
+  - **Consequence:** one misconfigured topic stops every signal of the sink until it's fixed.
+  - **Workaround:** run one `kafka_out` per signal, each behind `has_signal` (and `keep_signals`
+    when an event carries more than one signal). Each opens a producer for its own topic only.
+  - **Revisit trigger:** a multi-topic producer, or a per-signal queue.
+- **An `otlp_proto` record is lost whole.** The broker rejects a record whole, so a rejected
+  `otlp_proto` record drops every log record, span, or metric in its request, where the other
+  formats lose one event or one batch record
+  ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md), Consequences).
+  - **Consequence:** `logit.output.records.dropped{reason="rejected"}` counts 1 for a request
+    that held hundreds of spans; the events behind it aren't counted.
+  - **Workaround:** a smaller `max_request_bytes` bounds how many events one request holds.
+  - **Revisit trigger:** an operator who needs the loss counted per event.
+- **A sink writing several signals holds a producer per topic.** Each signal's topic has its own
+  producer, so a sink writing three signals holds up to three connections to each broker and
+  three producer ids, and sends a broker three produce requests where one could carry every
+  topic ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md), item 3).
+  - **Consequence:** more connections and producer ids per sink than the Java client or the
+    Collector's exporter uses for the same topics.
+  - **Revisit trigger:** a multi-topic producer, which per-event topics need too.

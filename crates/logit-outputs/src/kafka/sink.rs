@@ -1,38 +1,48 @@
-//! `kafka_out`: the `Output` that drives [`Producer`], with the records [`KafkaEncoder`] writes:
-//! one per event, or under `record: batch` as many events as fit in each.
+//! `kafka_out`: the `Output` that drives [`MultiProducer`], the multi-topic facade, with the
+//! records [`KafkaEncoder`] writes: one per event, under `record: batch` as many events as fit in
+//! each, or under an OTLP format one export request per signal, each to its signal's topic.
 //!
-//! One `logit` batch becomes one [`Pending`]: [`KafkaEncoder`] writes every record, and
-//! [`Producer::prepare`] partitions them and cuts the partition batches once. The sink keeps that
-//! `Pending` across every attempt `write_loop` makes at the batch, so a retry resends only the
-//! partition batches the broker hasn't settled, with each unkeyed record on its first partition
-//! and each partition batch under its first sequence (`docs/adr/kafka-output.md`, "Amendment:
-//! what W1 settled", item 1). It lets go of the `Pending` when a send is final (`Ok`, or a fault
-//! `write_loop` won't retry under the posture), and calls [`Producer::abandon`] on one dropped
-//! with a partition batch unsettled: when the send was final, or when `Output::observe_batch`
-//! starts another batch first, as after a shutdown cut. A batch that encodes to no record (every
-//! event skipped or dropped) succeeds without a request. A caller that never calls
-//! `observe_batch` gets a fresh `Pending` on every `send`. Under `at_most_once`, a `Refused`
-//! send first drops each partition batch left `Ambiguous`, so the retry doesn't resend it
-//! (`docs/adr/kafka-output.md`, "Amendment: what W2 settled", item 5).
+//! One `logit` batch becomes one [`MultiPending`]: [`KafkaEncoder`] writes every record, and each
+//! topic's share is partitioned and cut into partition batches once, on the first attempt whose
+//! `prepare` of that topic succeeds. The sink keeps that `MultiPending` across every attempt
+//! `write_loop` makes at the batch, so a retry prepares only the topics that failed to and
+//! resends only the partition batches the broker hasn't settled, with each unkeyed record on its
+//! first partition and each partition batch under its first sequence
+//! (`docs/adr/kafka-output.md`, "Amendment: what W1 settled", item 1;
+//! `docs/adr/kafka-otlp-formats.md`, item 4). It lets go of the `MultiPending` when a send is
+//! final (`Ok`, or a fault `write_loop` won't retry under the posture), and calls
+//! [`MultiProducer::abandon`] on one dropped with a partition batch unsettled: when the send was
+//! final, or when `Output::observe_batch` starts another batch first, as after a shutdown cut. A
+//! batch that encodes to no record (every event skipped or dropped) succeeds without a request. A
+//! caller that never calls `observe_batch` gets a fresh `MultiPending` on every `send`. Under
+//! `at_most_once`, a `Refused` send first drops each partition batch left `Ambiguous`, on every
+//! topic, so the retry doesn't resend it (`docs/adr/kafka-output.md`, "Amendment: what W2
+//! settled", item 5), and a final `Ambiguous` send counts every topic's unsettled records lost.
 //!
 //! How each response is classified is the module doc's table (`super`, "Response classes").
 //!
 //! ## Telemetry
 //!
+//! Every `records` count is of Kafka records: under an OTLP format a record is one export
+//! request, so a rejected record holding 500 spans counts 1. Events per signal aren't counted
+//! separately.
+//!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.requests{class}` | one per attempt, `class` its result (`crate::count_request`) |
+//! | `logit.output.requests{class}` | one per attempt, `class` its result across every topic (`crate::count_request`) |
 //! | `logit.output.batch.bytes` | the record values' bytes, before compression, once per batch |
 //! | `logit.output.records` | records the broker accepted |
-//! | `logit.output.records.dropped{reason}` | `oversize` (one record over `max_request_bytes`, or under `record: batch` one event whose value alone is over it, never sent), `rejected` (a partition batch the broker rejected), `invalid_timestamp` or `invalid_record` (records the broker named), or `ambiguous_at_most_once` (records left unsettled when `at_most_once` drops an `Ambiguous` batch, or an `Ambiguous` partition batch beside a `Refused` one) |
-//! | `logit.output.records.unkeyed` | records sent without a key because the configured key had no value on their event |
+//! | `logit.output.records.dropped{reason}` | `oversize` (one record over `max_request_bytes`; under `record: batch` one event whose value alone is over it; under an OTLP format one per signal record an event too large alone would have formed; never sent), `rejected` (a partition batch the broker rejected), `invalid_timestamp` or `invalid_record` (records the broker named), or `ambiguous_at_most_once` (records left unsettled when `at_most_once` drops an `Ambiguous` batch, or an `Ambiguous` partition batch beside a `Refused` one, on any topic) |
+//! | `logit.output.records.unkeyed` | records sent without a key because the configured key had no value: on their event, or under an OTLP format on the request's events or resource |
 //! | `logit.output.events.skipped{reason="no_log"}` | events `format: text` skipped for having no log record |
+//! | `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.degraded{metric_kind}` | under an OTLP format, metrics the OTLP mapping skips or degrades (`logit_proto::otlp::metrics`), once per metric |
 //!
-//! `oversize`, `records.unkeyed`, and `events.skipped` are encode-side, counted once per batch; the others follow
-//! the broker's answer, which a retry never meets twice for one partition batch. Each drop but
-//! `ambiguous_at_most_once` raises a throttled diagnostic of the same name: `oversize` names the
-//! record count and the `max_request_bytes` cap, and `rejected`, `invalid_timestamp`, and
-//! `invalid_record` carry the broker's error code and message.
+//! `oversize`, `records.unkeyed`, `events.skipped`, and the OTLP mapping's counters are
+//! encode-side, counted once per batch; the others follow the broker's answer, which a retry
+//! never meets twice for one partition batch. Each drop but `ambiguous_at_most_once` raises a
+//! throttled diagnostic of the same name: `oversize` names the record count and the
+//! `max_request_bytes` cap, and `rejected`, `invalid_timestamp`, and `invalid_record` carry the
+//! broker's error code and message.
 
 use std::path::Path;
 use std::sync::Arc;

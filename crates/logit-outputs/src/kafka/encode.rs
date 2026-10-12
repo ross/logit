@@ -8,6 +8,7 @@
 //! | `text` | the log body: a `Str` or `Bytes` as it is, a `Map` or `Array` in `crate::ndjson`'s value form, a timestamp as RFC 3339, another scalar as its `Display` text, `Null` as nothing | those bodies joined by `\n`, with none after the last |
 //! | `msgpack` | `crate::msgpack`'s map | those maps back to back |
 //! | `native` | a `CODEC_BATCH` frame of a one-event batch under the batch's resource and scope | one `CODEC_BATCH` frame of the events |
+//! | `otlp_proto` | takes no `record:`: one signal's OTLP export request in protobuf, below | |
 //!
 //! `crate::ndjson`'s doc is the grammar of the JSON object and `crate::msgpack`'s the
 //! MessagePack value forms. A native frame is uncompressed: `compression:` compresses the record
@@ -42,6 +43,33 @@
 //! | `Null`, `Array`, `Map`, or no value | no key: the record goes unkeyed, counted in [`EncodeStats::missing_key`] |
 //!
 //! A record's timestamp is the event's, in milliseconds since the Unix epoch, rounded down.
+//!
+//! # OTLP formats
+//!
+//! `otlp_proto` writes one record per OTLP export request (`docs/adr/kafka-otlp-formats.md`).
+//! A batch becomes one request per signal that has records, in the order logs, traces, metrics,
+//! each built by `OtlpEncoder::request` from the batch's own events under its resource and
+//! scope, and tagged with its signal in [`RecordMeta::signal`], which picks its topic. Two
+//! things split a signal's request further, and nothing else does:
+//!
+//! - **The key.** `trace_id` splits logs and spans into one request per trace id, in order of
+//!   first appearance, keyed as the per-event table's first row; each signal reads its own
+//!   field, a log its `TraceRef` and a span its own id, so an event carrying both can key its
+//!   two records differently. The events with none form one unkeyed request, which counts once
+//!   per record in [`EncodeStats::missing_key`]. Metrics stay one unkeyed request and count
+//!   nothing. `{resource: NAME}` keys every request of the batch with that value's text, or
+//!   sends each unkeyed, counted. `{attribute: NAME}` is refused by the sink.
+//! - **The size.** A request's budget is the encoder's less its key's length, the record overhead
+//!   the producer's cap check adds for a key. A request over it is cut by events, each record the
+//!   longest run of the remaining events that fits, found as `native` finds one. A single event
+//!   whose request is over the budget alone is dropped, counted once in
+//!   [`EncodeStats::oversize`] for each signal record it would have formed.
+//!
+//! The first encode of each key group is the one that counts the OTLP mapping's side effects
+//! (`logit.output.metrics.skipped` and `degraded`); every probe of the cut runs with the gate
+//! [`KafkaEncoder::with_counters`] takes muted. A record's timestamp is the time the encoder
+//! wrote it: a request holds many events, and one future-stamped event would otherwise lose the
+//! whole request to Kafka's rule against records stamped more than an hour ahead.
 
 use std::collections::HashMap;
 use std::fmt::Write;

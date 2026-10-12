@@ -1,0 +1,32 @@
+# OTLP in, OTLP out to Kafka: `kafka_out` under `format: otlp_proto` writes what the
+# OpenTelemetry Collector's Kafka exporter writes, so a Collector's Kafka receiver downstream reads
+# it. Each record holds one OTLP export request of one signal, on that signal's topic.
+#
+#   SDK (OTLP/HTTP) --> otlp_in --> kafka_out --> kafka:9092, topics otlp_logs, otlp_metrics,
+#                                                 otlp_spans
+#
+# Start the broker, which `script/server` doesn't, then run this config in the dev container on
+# the compose network, send it OTLP, and count what each topic received:
+#
+#   sudo COMPOSE_PROJECT_NAME=logit docker compose up -d kafka
+#   sudo COMPOSE_PROJECT_NAME=logit docker compose exec kafka \
+#     /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:9092 --topic otlp_spans
+#
+# Each topic is first asked about when its signal first arrives, so a source that sends only
+# spans never creates `otlp_logs` or `otlp_metrics`. The dev broker creates a topic on first use;
+# a production broker usually doesn't, and the sink holds its queue until an operator creates it.
+components:
+  otlp_in:
+    type: otlp_in
+    bind: 0.0.0.0:4318
+    protocol: http
+
+  kafka:
+    type: kafka_out
+    sources: [otlp_in]
+    brokers: ["kafka:9092"]
+    format: otlp_proto
+    # topics: {logs: otlp_logs, metrics: otlp_metrics, traces: otlp_spans}   # the defaults
+    # topic: otlp                    # instead of topics: every signal on one topic
+    key: trace_id                    # one request per trace id for logs and spans; metrics unkeyed
+    compression: zstd

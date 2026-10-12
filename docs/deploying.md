@@ -3147,7 +3147,7 @@ components:
     brokers: ["kafka-1:9092", "kafka-2:9092"]
     topic: logs
     key: {attribute: user}   # none (the default) | trace_id | {attribute: ..} | {resource: ..}
-    # format: json           # the default; text | msgpack | native
+    # format: json           # the default; text | msgpack | native | otlp_proto
     # record: event          # the default but for native; batch
     # compression: none      # the default; gzip | snappy | lz4 | zstd
     # acks: all              # the default; idempotent: true needs it
@@ -3257,6 +3257,7 @@ at the cluster's IAM bootstrap port (`9098` inside AWS, `9198` for public access
 | `text` | the log body alone; an event with no log record is skipped, counted `logit.output.events.skipped{reason="no_log"}` | `event` |
 | `msgpack` | the `json` object, key for key, as MessagePack; raw bytes are a `bin` and NaN and the infinities are floats ([`msgpack.rs`](../crates/logit-outputs/src/msgpack.rs)) | `event` |
 | `native` | a frame of `logit`'s own format, which a `logit` reads back with no loss | `batch` |
+| `otlp_proto` | one OTLP protobuf export request of one signal, which the OpenTelemetry Collector's Kafka receiver reads; see "OTLP for a Collector" below | none; `record:` is rejected |
 
 `record: event` sends one event per record, with the event's timestamp as `CreateTime`.
 `record: batch` packs as many of a batch's events into each record as fit under
@@ -3272,6 +3273,42 @@ on one partition. `{attribute: NAME}` and `{resource: NAME}` key by that value a
 without the value is sent unkeyed and counted `logit.output.records.unkeyed`. Unkeyed records go
 to one partition per batch, picked at random among those with a leader.
 
+**OTLP for a Collector.** `format: otlp_proto` writes what the OpenTelemetry Collector's Kafka
+exporter writes and its Kafka receiver reads (with `encoding: otlp_proto`, the receiver's
+default): each record holds one `Export*ServiceRequest`, a batch's logs, metrics, and spans as
+separate requests, each to its signal's topic.
+
+```yaml
+    format: otlp_proto
+    # topics: {logs: otlp_logs, metrics: otlp_metrics, traces: otlp_spans}   # the defaults
+```
+
+- **Topics.** `topic:` is optional here. Without it, each signal goes to its `topics:` entry, and
+  a signal left out takes the exporter's default above. With it, every signal goes to that one
+  topic; setting both is an error. Each topic is first asked about when its signal first
+  arrives, so a pipeline that never carries metrics never asks for, or auto-creates,
+  `otlp_metrics`, and a missing or misconfigured topic shows only when its signal does.
+- **One refused topic holds every signal.** Each topic settles on its own, and a retry resends
+  only what the broker hasn't accepted, but the sink has one queue: a topic the broker refuses
+  holds the logs and spans behind it. To keep signals apart, run one `kafka_out` per signal, each
+  behind `has_signal`.
+- **Keys.** `key: trace_id` splits a batch's logs and spans into one request per trace id, keyed
+  with the id as the exporter's `partition_traces_by_id` and `partition_logs_by_trace_id` key it;
+  a log keys by its own trace id and a span by its own, and metrics stay one unkeyed request.
+  `key: {resource: NAME}` keys every request of a batch with that resource attribute's value; it
+  isn't the exporter's hash of every resource attribute, so the two place one resource on
+  different partitions. `{attribute: NAME}` is rejected, because a request holds many events.
+- **Size.** A request too large for `max_request_bytes` is split into several, each a valid
+  request on its own, where the exporter would lose it. A consumer reading by trace id can see
+  one trace's spans across several records. An event too large alone is dropped, counted
+  `reason="oversize"` once per signal.
+- **Timestamps.** A record's timestamp is the time `logit` wrote it, as the exporter's are, not
+  an event's; the events' times stay in the payload.
+- **Counting.** Every `records` counter counts Kafka records, so a rejected request holding 500
+  spans counts 1 in `logit.output.records.dropped{reason="rejected"}`.
+
+[`fixtures/kafka-otlp.yaml`](../fixtures/kafka-otlp.yaml) relays OTLP into the default topics.
+
 **Topics.** The topic must exist, or the broker must create it (`auto.create.topics.enable`).
 Against a broker that creates it, the first batch waits while the broker creates the topic, then
 goes out. Against one that doesn't, the first batch waits up to `timeout` for the topic, then
@@ -3286,7 +3323,8 @@ in two once, and a half still too large is dropped, counted `reason="rejected"`.
 **Timestamps.** Kafka 4.x rejects a record stamped more than an hour ahead of the broker's clock
 (`log.message.timestamp.after.max.ms`). The broker names it, and the sink drops it, counted
 `reason="invalid_timestamp"`, and delivers the rest of its batch. Fix the clock or the
-`timestamp` stage upstream; the record never reaches the topic.
+`timestamp` stage upstream; the record never reaches the topic. Under `format: otlp_proto` a
+record carries the time it was written, so this doesn't apply.
 
 **Delivery.** A retry resends only the partitions the broker hasn't settled, under the same
 producer id and sequence numbers, so the broker discards a resend of a batch it already
@@ -3299,8 +3337,10 @@ doc ([`kafka/mod.rs`](../crates/logit-outputs/src/kafka/mod.rs), "Response class
 table of every broker error it reads.
 
 **What to watch.** `logit.output.requests{class}`, `logit.output.records` for what Kafka
-accepted, `logit.output.records.dropped{reason}`, `logit.output.records.unkeyed`, and, under
-`format: text`, `logit.output.events.skipped{reason="no_log"}`.
+accepted, `logit.output.records.dropped{reason}`, `logit.output.records.unkeyed`, under
+`format: text`, `logit.output.events.skipped{reason="no_log"}`, and under `format: otlp_proto`,
+`logit.output.metrics.skipped` and `logit.output.metrics.degraded` for metrics OTLP can't carry
+as they are.
 `docs/design/internal-telemetry.md`'s `kafka_out` section has every counter.
 
 ## Prometheus remote-write: receiving, sending, and picking a version

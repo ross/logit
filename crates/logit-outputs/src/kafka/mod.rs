@@ -2,10 +2,13 @@
 //! producer 4.x's semantics and the divergences `docs/adr/kafka-output.md` names.
 //!
 //! - [`sink`] is the `Output`: one pending batch kept across `write_loop`'s attempts at it.
-//! - [`encode`] writes each record's value, key, and timestamp, one event per record or a run of
-//!   events per record under `record: batch`, in each `format:`.
-//! - [`producer`] partitions a batch, keeps the idempotent producer's identity and sequences,
-//!   and sends each attempt with a verdict per partition batch.
+//! - [`encode`] writes each record's value, key, and timestamp, one event per record, a run of
+//!   events per record under `record: batch`, or one OTLP export request per record, in each
+//!   `format:`.
+//! - [`multi`] is the multi-topic facade the sink drives: a producer per topic, opened on its
+//!   first record, and one verdict across the topics.
+//! - [`producer`] serves one topic: it partitions a batch, keeps the idempotent producer's
+//!   identity and sequences, and sends each attempt with a settlement per partition batch.
 //! - [`conn`] is one broker connection: framing, correlation ids, version negotiation, TLS, and
 //!   the SASL session's deadline.
 //! - [`sasl`] authenticates a connection: the exchange loop and the `PLAIN`, `SCRAM-SHA-256`,
@@ -67,10 +70,12 @@
 //! | `INVALID_PRODUCER_EPOCH` (47) | `Clean`, a new PID from `InitProducerId` | the broker fenced the epoch before appending | `tests::sequence_and_epoch_errors_renew_the_producer_before_the_retry`, `tests::the_fake_broker_fences_a_stale_epoch` |
 //! | Any other code | `Rejected`; settles, gap | the runtime's default for an answer a sink can't attribute; the message names the code | `tests::each_error_code_row_classifies_the_partition_batch` |
 //!
-//! A send's result covers the partition batches still unsettled: the strongest of their classes,
-//! `Refused` over `Ambiguous` over `Clean`. With none unsettled, it succeeds when any was
-//! accepted on this attempt or an earlier one, and otherwise fails `Rejected` with the first
-//! rejection (`producer::Attempt::result`).
+//! A send's result covers the partition batches still unsettled on every topic, and each topic
+//! whose prepare, identity, or metadata failed before any partition answered, as one entry of
+//! that error's class: the strongest of their classes, `Refused` over `Ambiguous` over `Clean`.
+//! With none unsettled, it succeeds when any partition batch of any topic was accepted on this
+//! attempt or an earlier one, and otherwise fails `Rejected` with the first rejection
+//! (`multi::verdict`).
 //!
 //! The ranking doesn't depend on the posture, but what follows a `Refused` result does. Under
 //! `at_most_once`, the sink settles each partition batch left `Ambiguous` as dropped before the
