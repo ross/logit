@@ -46,3 +46,7 @@ components:
     # max_request_bytes: 1MiB        # the default; keep it under the topic's max.message.bytes
     # timeout: 30s                   # the default
     # tls: {}                        # turns TLS on; ca_file, cert_file, key_file as for logit_out
+    # sasl:                          # SASL against a broker that requires it; the dev broker doesn't
+    #   mechanism: scram_sha_512     # plain | scram_sha_256 | scram_sha_512
+    #   username: logit
+    #   password: !env KAFKA_PASSWORD

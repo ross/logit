@@ -3154,14 +3154,24 @@ components:
     # max_request_bytes: 1MiB
     # headers: {source: logit}
     # tls: {}                # turns TLS on
+    # sasl: {mechanism: scram_sha_512, username: logit, password: !env KAFKA_PASSWORD}
 ```
 
 **Brokers.** `brokers:` is only where the sink bootstraps. It then connects to each partition's
 leader at the address the cluster advertises (`advertised.listeners`), so every advertised
 address must resolve and be reachable from `logit`, not only the bootstrap ones. A `tls:` block
 turns TLS on for every connection, checking each broker's certificate against the host it
-advertises; `cert_file` and `key_file` add a client certificate for mutual TLS. SASL isn't
-supported.
+advertises; `cert_file` and `key_file` add a client certificate for mutual TLS.
+
+**SASL.** A `sasl:` block authenticates every connection, with `mechanism: plain`,
+`scram_sha_256`, or `scram_sha_512`, a `username`, and a `password`. Give the password with
+`!env` so it stays out of the config file. Without `tls:`, `plain` sends the password in clear,
+so use it only over TLS or on a network you trust; SCRAM never sends it. A broker that refuses the
+credentials or doesn't offer the mechanism is `refused`, and the sink holds its queue until the
+broker accepts them. The error names the mechanism and the user, never the password. When the
+broker limits a session's lifetime (`connections.max.reauth.ms`), the sink dials a new
+connection before the session ends, one `timeout` early, or halfway through a lifetime of up to
+twice `timeout`.
 
 **Records.** `format:` picks each record's value:
 

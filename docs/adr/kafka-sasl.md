@@ -161,3 +161,37 @@ does today. Nothing drops.
 - A connection to a broker that sets `connections.max.reauth.ms` is redialed once per session
   lifetime, which adds a connect, an optional TLS handshake, `ApiVersions`, and the SASL exchange
   to that period.
+
+## Amendment: what W1 settled (2026-10-11)
+
+W1 built PLAIN and SCRAM and settled these points the decision above left open:
+
+1. **The trait splits per connection.** `Authenticator` is shared by a sink's connections and
+   has `mechanism()`, `principal()` (the user for messages, never a secret), and an async
+   `start(host)` that returns a `Session`. A `Session` is synchronous: `first()` writes the first
+   client message, and `next(server)` reads each broker answer and returns the next message or
+   `Done`. OAUTHBEARER and AWS MSK IAM do their fetching in `start`, cached in the
+   authenticator, and AWS MSK IAM reads the region from `start`'s host. An error from `start` is
+   `Clean` unless it carries a class, so an unreachable token endpoint retries; an error from a
+   session is `Refused` unless it carries one, because a server message the mechanism rejects is
+   rejected the same way on every connection. An exchange that hasn't finished after 8
+   `SaslAuthenticate` round trips is `Refused`.
+2. **A short session lifetime keeps half of itself.** The deadline is the lifetime minus
+   `timeout`, measured from the moment before the last `SaslAuthenticate` was written, which is
+   no later than the broker's own start of the session. When the lifetime is at most twice
+   `timeout`, the margin is half the lifetime instead, so the connection still carries requests.
+   Section 3's guarantee then doesn't hold: a request written near the deadline can outlast the
+   session, and the broker closes the connection. That failure is `Ambiguous`, and the idempotent
+   resend is deduplicated.
+3. **SCRAM takes 4096 to 16384 iterations.** The ceiling is Kafka's own maximum
+   (`ScramMechanism`), so no Kafka broker stores a credential above it, and it bounds the PBKDF2
+   work a broken server message can ask of the connecting task. A server-first message with a
+   mandatory extension (`m=`) is refused, as RFC 5802 requires.
+4. **Two more `Refused` outcomes.** With `sasl:` set, a broker that doesn't offer
+   `SaslHandshake` v1 and a `SaslAuthenticate` version from v0 to v2 is `Refused`, as a broker
+   without `Produce` v3 is. `UNSUPPORTED_VERSION` (35) from either SASL request is `Refused`
+   beside codes 33, 34, and 58, and any other code is `Clean`, as `kafka_out` reads the codes of
+   a `Metadata` or `InitProducerId` answer.
+5. **Graph rule 85 also rejects an empty `sasl.username`,** which no broker takes.
+6. **`Debug` leaves the password out** of both `logit_config::KafkaSasl` and the sink's own
+   `KafkaSasl`, so printing a component or the sink's settings can't leak it.

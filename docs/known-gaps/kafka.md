@@ -2,15 +2,15 @@
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
-- **No SASL.** `kafka_out` authenticates only with TLS and a client certificate (`tls:`); it has
-  no SASL PLAIN, SCRAM, OAUTHBEARER, or AWS MSK IAM ([ADR `kafka-output`](../adr/kafka-output.md),
-  Consequences).
-  - **Consequence:** a cluster that requires SASL, which includes most hosted Kafka services,
-    refuses the connection, and the sink holds its queue.
-  - **Workaround:** a listener on the cluster that takes mutual TLS, or a local relay that holds
-    the SASL credentials.
-  - **Revisit trigger:** stream `ksasl`, which [ADR `kafka-sasl`](../adr/kafka-sasl.md) plans:
-    PLAIN and SCRAM first, then OAUTHBEARER, then AWS MSK IAM.
+- **No SASL OAUTHBEARER or AWS MSK IAM.** `kafka_out`'s `sasl:` takes PLAIN, SCRAM-SHA-256, and
+  SCRAM-SHA-512 only ([ADR `kafka-sasl`](../adr/kafka-sasl.md)).
+  - **Consequence:** a cluster that requires OAUTHBEARER, such as Confluent Cloud with an
+    identity provider, or Amazon MSK with IAM access control, refuses the connection, and the
+    sink holds its queue.
+  - **Workaround:** a listener on the cluster that takes SCRAM, PLAIN, or mutual TLS, or a local
+    relay that holds the credentials.
+  - **Revisit trigger:** stream `ksasl`'s later workstreams, which
+    [ADR `kafka-sasl`](../adr/kafka-sasl.md) plans: OAUTHBEARER, then AWS MSK IAM.
 - **Brokers older than Kafka 2.4 are unsupported.** The producer sends `ApiVersions` at v3 only,
   which Kafka 2.4 introduced, so version negotiation with an older broker fails
   ([ADR `kafka-output`](../adr/kafka-output.md), "Amendment: what W1 settled", item 5).
