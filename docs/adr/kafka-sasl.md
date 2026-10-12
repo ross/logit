@@ -287,8 +287,12 @@ W3 built AWS_MSK_IAM and settled these points the decision above left open:
    share from passing.
 4. **The region.** `region:` when set; else the label right before `.amazonaws.com`,
    `.amazonaws.com.cn`, or `.api.aws` at the end of the broker's host, when it has a region's
-   shape, as `aws-msk-iam-auth`'s `RegionUtils` reads it, which covers provisioned
-   (`*.kafka.<region>.amazonaws.com`) and serverless (`*.kafka-serverless.<region>...`) hosts;
+   shape, which covers provisioned (`*.kafka.<region>.amazonaws.com`) and serverless
+   (`*.kafka-serverless.<region>...`) hosts. `aws-msk-iam-auth`'s `RegionUtils` reads every
+   partition's DNS suffix from the SDK's metadata; `kafka_out` reads those three, the `aws`,
+   `aws-cn`, and `aws-us-gov` partitions' domains. The ISO partitions have no MSK, and the AWS
+   European Sovereign Cloud (`aws-eusc`, `amazonaws.eu`) has MSK but unverified broker host
+   names, so neither is supported (`docs/known-gaps/kafka.md`);
    else `AWS_REGION`, then `AWS_DEFAULT_REGION`, which the Java SDK doesn't read but the AWS CLI
    does. With none, the exchange is `Refused`. Graph rule 85 checks a set `region:`'s shape: a
    two-letter prefix, one or more lowercase words, and a number. There's no `profile:` field:
@@ -299,7 +303,9 @@ W3 built AWS_MSK_IAM and settled these points the decision above left open:
    putting the environment before system properties. `logit` has no system properties, so the
    chain is the five sources of section 5, in that order:
    - Web identity calls STS at the broker's region (`sts.<region>.amazonaws.com`, or
-     `.amazonaws.com.cn` in China) with an unsigned form `POST`. The session name is
+     `.amazonaws.com.cn` in China) with an unsigned form `POST`. A region outside the three
+     supported partitions is `Refused` rather than given an `amazonaws.com` STS host that
+     doesn't exist. Signing needs no partition: the region is only in the credential scope. The session name is
      `AWS_ROLE_SESSION_NAME`, else `logit-<milliseconds>`, as the Java SDK's is
      `aws-sdk-java-<milliseconds>`. A minimal parser reads `AccessKeyId`, `SecretAccessKey`,
      `SessionToken`, `Expiration`, and an error's `Code` and `Message` as leaf elements, from at
@@ -314,12 +320,19 @@ W3 built AWS_MSK_IAM and settled these points the decision above left open:
    - IMDS is IMDSv2 only, at `169.254.169.254`, with a 6-hour session token. The Java SDK falls
      back to IMDSv1 when the token request fails; `kafka_out` doesn't, and lists it in
      `docs/known-gaps/kafka.md`.
+   - The container endpoint and IMDS are asked with an HTTP client that ignores every proxy
+     setting, as the Java SDK opens both with `Proxy.NO_PROXY`: a proxy would see the container
+     authorization token and the credentials in cleartext, and can't reach a link-local
+     address anyway. STS's request honors `HTTPS_PROXY` and `NO_PROXY`, as the Java SDK's STS
+     client uses its configured HTTP client.
    - The IMDS, container, and STS base URLs move only in tests, through a constructor parameter,
      and the environment is read through an injected function, so no test sets a process
      variable another reads.
 6. **A source that is present and fails ends the lookup.** The Java chain catches each
    provider's failure and tries the next. `kafka_out` skips a source only when its variables or
-   profile aren't there; once one is, its answer is final. So IRSA whose STS call is throttled
+   profile aren't there, or when the profile is the implicit `default` and holds no keys, as
+   the `region`-only `[default]` that `aws configure` writes does; once a source is there, its
+   answer is final, so a profile `AWS_PROFILE` names without keys is `Refused`. So IRSA whose STS call is throttled
    is retried as `Clean` instead of authenticating as the node's instance role, and a profile
    using `role_arn`, `credential_process`, or SSO is refused by name instead of skipped. With
    every source absent, IMDS is still asked, and an unreachable IMDS is `Clean`, as section 4's

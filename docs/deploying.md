@@ -3226,7 +3226,8 @@ at the cluster's IAM bootstrap port (`9098` inside AWS, `9198` for public access
   Identity container endpoint; then the EC2 instance profile through IMDSv2. A source that is
   present but fails, such as IRSA whose STS call is denied, stops the lookup rather than falling
   through to the instance role. A profile that uses SSO, `credential_process`, or `role_arn` is
-  refused by name. Temporary credentials are reused until 5 minutes before they expire, and a
+  refused by name, as is a profile `AWS_PROFILE` names that has no keys; a `default` profile
+  without keys is skipped. Temporary credentials are reused until 5 minutes before they expire, and a
   session MSK ends at that expiry is redialed with fresh ones first.
 - **The IAM policy.** The role needs `kafka-cluster:Connect` on the cluster,
   `kafka-cluster:DescribeTopic` and `kafka-cluster:WriteData` on the topic, and, because the
@@ -3234,6 +3235,11 @@ at the cluster's IAM bootstrap port (`9098` inside AWS, `9198` for public access
   cluster (MSK's "Create authorization policies" page). Without the last, `InitProducerId` is
   refused with `CLUSTER_AUTHORIZATION_FAILED`; grant it, or set `idempotent: false` and give up
   the deduplicated resend.
+- **Proxies.** STS's request honors `HTTPS_PROXY` and `NO_PROXY`. The container endpoint and
+  IMDS are always reached directly, so a proxy never sees their token or credentials.
+- **Partitions.** The sink supports the `aws`, `aws-cn`, and `aws-us-gov` partitions. IRSA in
+  any other region, such as the AWS European Sovereign Cloud's `eusc-de-east-1`, is `refused`
+  ([known gaps](known-gaps/kafka.md)).
 - **IMDS in a container.** IMDSv2's token request needs a hop limit of 2 or more to reach a
   container on the instance. With the default of 1 it times out, which is `clean` and retried, and
   the sink never authenticates.

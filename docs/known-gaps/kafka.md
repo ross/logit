@@ -16,6 +16,17 @@ Entry format and the other areas: [the known-gaps index](README.md).
     export-credentials --format env`) or a profile's static keys from a wrapper, or attach the
     role through IRSA, EKS Pod Identity, ECS, or an IMDSv2 instance profile.
   - **Revisit trigger:** an operator whose credentials only one of those sources can supply.
+- **AWS_MSK_IAM supports the `aws`, `aws-cn`, and `aws-us-gov` partitions only.** The ISO
+  partitions have no MSK. The AWS European Sovereign Cloud (`aws-eusc`, `eusc-de-east-1`,
+  under `amazonaws.eu`) offers MSK, but its broker host names are unverified, so `region:`
+  rejects `eusc-de-east-1`, a broker host under `amazonaws.eu` gives no region, and web identity
+  in a region outside the three partitions is refused rather than sent to an STS host that
+  doesn't exist ([ADR `kafka-sasl`](../adr/kafka-sasl.md), "Amendment: what W3 settled").
+  - **Consequence:** a sink in `aws-eusc` can't authenticate through IRSA, and needs the region
+    from `AWS_REGION` to sign at all.
+  - **Workaround:** none for IRSA. With credentials from another source, set `AWS_REGION`.
+  - **Revisit trigger:** an operator running MSK in `aws-eusc`, with a broker host name to
+    verify against.
 - **AWS_MSK_IAM hasn't run against a live MSK cluster.** No broker outside AWS implements its
   server side, so `script/kafka-interop` has no leg for it. The signature is pinned by AWS's SigV4
   test suite and a golden payload from botocore, the payload's fields by `aws-msk-iam-auth`'s
