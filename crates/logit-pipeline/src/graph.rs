@@ -7359,15 +7359,16 @@ mod tests {
         })
     }
 
-    fn oauth_fields(
-        sasl: &mut logit_config::KafkaSasl,
-    ) -> (
-        &mut Option<String>,
-        &mut Option<String>,
-        &mut Option<String>,
-        &mut Option<String>,
-        &mut BTreeMap<String, String>,
-    ) {
+    /// `token`, `token_endpoint`, `client_id`, `client_secret`, and `extensions`.
+    type OAuthFields<'a> = (
+        &'a mut Option<String>,
+        &'a mut Option<String>,
+        &'a mut Option<String>,
+        &'a mut Option<String>,
+        &'a mut BTreeMap<String, String>,
+    );
+
+    fn oauth_fields(sasl: &mut logit_config::KafkaSasl) -> OAuthFields<'_> {
         let logit_config::KafkaSasl::OAuthBearer {
             token,
             token_endpoint,
