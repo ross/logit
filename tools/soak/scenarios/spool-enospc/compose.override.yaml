@@ -1,0 +1,9 @@
+# spool-enospc's spool volume: a size-capped tmpfs at the SUT's spool path, merged onto
+# tools/soak/compose.yaml, so a write past the cap fails with ENOSPC. Docker discards a tmpfs when
+# its container stops, so the scenario never stops or kills the SUT. Mode 1777 lets the image's
+# unprivileged `logit` user create the spool directory in a mount root owned by root.
+services:
+  logit:
+    labels: { soak.role: sut }    # the self-test reads this file's labels alone
+    tmpfs:
+      - /tmp/soak-spool:size=128k,mode=1777

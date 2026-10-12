@@ -1,0 +1,84 @@
+# A 200 s VictoriaMetrics stop against a 128 KiB disk spool under `overflow: drop_oldest`: the
+# spool reaches `max_bytes`, and because the sink holds its head batch reserved while it retries,
+# the spool rejects each arriving batch and counts it `overflow_newest`, never `disk_full`, which
+# is an `ENOSPC` write. The schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "spool-full"
+description = "statsd-vm with a 128 KiB drop_oldest disk spool: a 200s VictoriaMetrics stop fills the spool and rejects the windows that arrive"
+duration = "7m15s"        # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"
+cycle = "5m15s"           # the stop, its recovery, and two progress windows of steady state
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.sink]]           # one per SUT sink the ledger follows to its backend
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+[[step]]
+at = "0s"
+action = "stop"
+on = "victoria-metrics"
+for = "200s"
+
+[[expect]]
+name = "spool-rejects-newest"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "victoria_metrics"
+attrs = { reason = "overflow_newest" }
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "no-disk-full"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "victoria_metrics"
+attrs = { reason = "disk_full" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-rejected"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "victoria_metrics"
+attrs = { reason = "rejected" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+# A drain sharing its tick with `aggregate`'s flush sees the batch pushed on that tick, so a
+# drained queue reads at most 1.
+[[expect]]
+name = "spool-drains"
+service = "logit"
+metric = "logit.component.buffer.batches"
+component = "victoria_metrics"
+step = "c0s1"
+window = "after"
+reduce = "last"
+max = 1

@@ -1072,25 +1072,27 @@ where it needs them, and a small check extension.
    keeps delivering. Faults: `stop` and netem on one backend, then both. Rows: `ledger.egress`,
    `ledger.windows`, `identity.sink`, and `recovery` per sink; an `[[expect]]` on the healthy
    sink's `batches.delivered` during the outage. Built as `fanout-copy`, `fanout-block`, and
-   `route-split` (W7b), and `fanout-stop-outage` (W8a: the SUT stopped inside one backend's stop, so
-   that sink's queue drops at shutdown and the other sink's doesn't), with the scenario `compose` override, service roles read from the merged
-   compose file, and `[[ledger.sink]]` with `split` (§2).
+   `route-split` (W7b), and `fanout-stop-outage` (W8a: the SUT stopped inside one backend's
+   stop, so that sink's queue drops at shutdown and the other sink's doesn't), with the scenario
+   `compose` override, service roles read from the merged compose file, and `[[ledger.sink]]`
+   with `split` (§2).
 3. **Fan-in.** Two generators of different kinds into one `aggregate` and sink: statsd, plus
    `lines_in` with `kv_metrics` or remote-write into `prometheus_in`. Proves series merging and
    per-source loss attribution. Faults: netem, `partition`, and `stop` on each generator in turn.
    Rows: `ledger.wire` per source in its own unit, `ledger.intake` per listener. A remote-write
    leg carries cumulative totals, so it keeps its own series and balances as V does. Needs: item
    2's override, and `[ledger]` listing generators, G summed where the units meet.
-4. **A full spool (built in W8a).** A small `buffer.disk.max_bytes` through a long `victoria-metrics` stop.
-   Reaching `max_bytes` is `overflow`'s case (`drop_oldest` counts `overflow_oldest`);
-   `batches.dropped{reason="disk_full"}` counts only an `ENOSPC` write
+4. **A full spool (built in W8a).** A small `buffer.disk.max_bytes` through a long
+   `victoria-metrics` stop. Reaching `max_bytes` is `overflow`'s case (under `drop_oldest` the sink holds its head
+   batch reserved while it retries, so the spool rejects each arriving batch and counts it
+   `overflow_newest`; `overflow_oldest` needs a head that isn't reserved); `batches.dropped{reason="disk_full"}` counts only an `ENOSPC` write
    ([ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md), "Decision"). Rows:
    `[[expect]]` on the drop reason, `ledger.egress` counted, then `progress` and `recovery`.
    Built as `spool-full` (`max_bytes: 128KiB`, `overflow: drop_oldest`) and `spool-enospc` (a
    128 KiB tmpfs at the spool path from a compose override, below the spool's own bound, and no
    `kill`, because Docker discards a tmpfs when its container stops).
-5. **A slow destination (built in W8a).** Netem `delay` on `victoria-metrics`, or `rate` on `logit`, past the
-   sink's `timeout:`, so a request VictoriaMetrics applied still times out: `prometheus_out`'s
+5. **A slow destination (built in W8a).** Netem `delay` on `victoria-metrics`, or `rate` on
+   `logit`, past the sink's `timeout:`, so a request VictoriaMetrics applied still times out: `prometheus_out`'s
    `Ambiguous` transport-error row (module doc, "Faults, retries and duplicate safety (sender
    mode)"). The retry rewrites the totals, which `temporality: cumulative` overwrites. Rows:
    `[[expect]]` on `requests{class="network_error"}` and `retries`, `ledger.egress` at 0, and

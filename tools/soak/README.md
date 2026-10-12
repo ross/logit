@@ -123,6 +123,16 @@ Three scenarios give the SUT two sinks of one kind, each to its own VictoriaMetr
 | `fanout-block` | 5 minutes 30 seconds | as `fanout-copy` with 500 ms windows, and the second sink's queue at 2 batches under `overflow: block`, through a 90 s stop of its backend. A fan-out offers each batch to its consumers in turn through one send, so once that sink's queue and inbox fill, `aggregate` waits on it and the healthy sink stops delivering too. A `mark` names the blocked span; the expectations assert the stall, the backpressure reaching the listener, and both sinks recovering |
 | `route-split` | 9 minutes | the generator tags each line `shard:0` or `shard:1` over DogStatsD, and a `route` on `shard` fills two targets, each feeding one sink (`split = "route"`): one backend stopped 90 s, then netem loss on the other. Each backend holds one shard's series, so the egress gap is judged on their sum |
 
+Four scenarios of 6 to 8 minutes each run one fault of the sink's delivery path and assert its
+effect with `[[expect]]` tables:
+
+| Scenario | Length | What it drives |
+|---|---|---|
+| `spool-full` | 7 minutes 15 seconds | `spool-kill-replay`'s disk-spooled sink with `max_bytes: 128KiB` under `overflow: drop_oldest`, through a 200 s VictoriaMetrics stop. The spool rejects each window that arrives while the sink holds its head and counts it `overflow_newest`, never `disk_full` or `rejected`, and drains after |
+| `spool-enospc` | 7 minutes 15 seconds | the same stop against a spool on a 128 KiB tmpfs that a compose override mounts at the spool path, below the spool's own 4 MiB bound. A write fails with `ENOSPC` and the sink counts `disk_full`, never `overflow_oldest`. No step stops or kills the SUT, because Docker discards a tmpfs when its container stops |
+| `slow-destination` | 7 minutes 45 seconds | the sink's `timeout` is 2 s. A 3 s netem delay on VictoriaMetrics makes it apply each write whose response arrives late, then a 2 kbit rate limit on the SUT's egress makes a request unable to finish. Each counts `network_error` and a retry, and nothing drops |
+| `fanout-stop-outage` | 6 minutes 15 seconds | `fanout-copy`'s two sinks, with the second's queue at 4 batches under `drop_oldest`. VictoriaMetrics B is stopped 150 s and the SUT is stopped for 30 s, 60 s in, so the second sink's queued batches drop at shutdown and are counted while the first sink drops nothing |
+
 The stall and the memory cap depend on the host's speed: `lua-stall`'s loop count and
 `lua-memory`'s event count are calibrated on the development host, and the comments in their
 `logit-sut.yaml` give the timings. On a much slower or faster host the event falls outside its
