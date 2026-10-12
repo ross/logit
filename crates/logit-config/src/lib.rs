@@ -807,6 +807,121 @@ pub enum KafkaAcks {
     None,
 }
 
+/// How `kafka_out` authenticates to each broker over SASL, chosen by `mechanism`. Give the
+/// password, token, or client secret with `!env` so it stays out of the config file.
+// `Debug` is written by hand so no secret reaches a log line or an error.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "mechanism", rename_all = "snake_case", deny_unknown_fields)]
+pub enum KafkaSasl {
+    /// `PLAIN`: the username and password as they are. Without `tls:`, they cross the network
+    /// in clear, so use it only over TLS or on a network you trust.
+    Plain { username: String, password: String },
+    /// `SCRAM-SHA-256`: a challenge and response that never sends the password and checks
+    /// that the broker holds the same credential.
+    #[serde(rename = "scram_sha_256")]
+    ScramSha256 { username: String, password: String },
+    /// `SCRAM-SHA-512`, as `scram_sha_256` with SHA-512.
+    #[serde(rename = "scram_sha_512")]
+    ScramSha512 { username: String, password: String },
+    /// `OAUTHBEARER`: an OAuth 2.0 access token, either a fixed `token`, or one fetched from
+    /// `token_endpoint` with the client-credentials grant. Set one of the two, not both. Like
+    /// `plain`, the token crosses the network in clear without `tls:`.
+    #[serde(rename = "oauthbearer")]
+    OAuthBearer {
+        /// A fixed access token, sent as given on every connection. It isn't renewed, so a
+        /// broker refuses it once it expires.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        /// The identity provider's token URL, which receives a client-credentials request with
+        /// `client_id` and `client_secret` in HTTP Basic authentication. Must be `https://`, or
+        /// `http://` to a loopback address. The token is reused across connections and fetched
+        /// again once 80% of its `expires_in` has passed. The server's certificate is checked
+        /// against the bundled Mozilla roots; the `tls:` block applies to brokers only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_endpoint: Option<String>,
+        /// The OAuth client id. Required with `token_endpoint`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        /// The OAuth client secret. Required with `token_endpoint`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_secret: Option<String>,
+        /// The `scope` the token request asks for, space-separated. Omitted from the request
+        /// when unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        /// SASL extensions sent beside the token, such as Confluent Cloud's `logicalCluster`
+        /// and `identityPoolId`. Keys are letters only, and `auth` is reserved; values are
+        /// printable ASCII. Empty by default.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        extensions: std::collections::BTreeMap<String, String>,
+    },
+    /// `AWS_MSK_IAM`: Amazon MSK's IAM access control, with AWS credentials from the
+    /// environment, a web identity token file (EKS IRSA), the shared credentials and config
+    /// files (`AWS_PROFILE` picks the profile; static keys only), the ECS or EKS Pod Identity
+    /// container endpoint, or the EC2 instance metadata service, in that order. Connect to the
+    /// brokers' IAM port with `tls:` set.
+    #[serde(rename = "aws_msk_iam")]
+    AwsMskIam {
+        /// The AWS region the brokers are in, such as `us-east-1`. Defaults to the region in
+        /// the broker's MSK host name, then `AWS_REGION`, then `AWS_DEFAULT_REGION`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+    },
+}
+
+impl KafkaSasl {
+    /// The username a mechanism authenticates as; `None` for `oauthbearer`, whose identity is
+    /// inside the token, and `aws_msk_iam`, whose identity is the AWS credentials'.
+    pub fn username(&self) -> Option<&str> {
+        match self {
+            KafkaSasl::Plain { username, .. }
+            | KafkaSasl::ScramSha256 { username, .. }
+            | KafkaSasl::ScramSha512 { username, .. } => Some(username),
+            KafkaSasl::OAuthBearer { .. } | KafkaSasl::AwsMskIam { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for KafkaSasl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |set: bool| if set { "<redacted>" } else { "<unset>" };
+        match self {
+            KafkaSasl::Plain { username, .. }
+            | KafkaSasl::ScramSha256 { username, .. }
+            | KafkaSasl::ScramSha512 { username, .. } => {
+                let name = match self {
+                    KafkaSasl::Plain { .. } => "Plain",
+                    KafkaSasl::ScramSha256 { .. } => "ScramSha256",
+                    _ => "ScramSha512",
+                };
+                f.debug_struct(name)
+                    .field("username", username)
+                    .field("password", &"<redacted>")
+                    .finish()
+            }
+            KafkaSasl::OAuthBearer {
+                token,
+                token_endpoint,
+                client_id,
+                client_secret,
+                scope,
+                extensions,
+            } => f
+                .debug_struct("OAuthBearer")
+                .field("token", &redacted(token.is_some()))
+                .field("token_endpoint", &token_endpoint.as_deref().map(logit_core::redact::url))
+                .field("client_id", client_id)
+                .field("client_secret", &redacted(client_secret.is_some()))
+                .field("scope", scope)
+                .field("extensions", &extensions.keys().collect::<Vec<_>>())
+                .finish(),
+            KafkaSasl::AwsMskIam { region } => {
+                f.debug_struct("AwsMskIam").field("region", region).finish()
+            }
+        }
+    }
+}
+
 /// Which of the Agent's tracer-API forms `datadog_trace_out` sends traces in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub enum DatadogTraceVersion {
@@ -2861,8 +2976,9 @@ pub enum ComponentKind {
         #[serde(default = "default_kafka_max_request_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_request_bytes: u64,
-        /// Bounds each connect, TLS handshake, write, and wait for a broker's answer, and the
-        /// wait for a missing topic to be created. Defaults to `30s`; `0s` is rejected.
+        /// Bounds each connect, TLS handshake, write, and wait for a broker's answer, the wait
+        /// for a missing topic to be created, and each OAuth token request. Defaults to `30s`;
+        /// `0s` is rejected.
         #[serde(default = "default_kafka_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         timeout: Duration,
@@ -2874,6 +2990,16 @@ pub enum ComponentKind {
         /// Mozilla roots. Each broker's certificate is checked against the host it advertises.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
+        /// Authenticates every broker connection over SASL when present: `{mechanism: plain |
+        /// scram_sha_256 | scram_sha_512, username: NAME, password: !env VAR}`, or `{mechanism:
+        /// oauthbearer, token: !env VAR}`, or `{mechanism: oauthbearer, token_endpoint: URL,
+        /// client_id: ID, client_secret: !env VAR}`. Works with or without `tls:`; without it,
+        /// `plain` sends the password and `oauthbearer` the token in clear. A broker or token
+        /// endpoint that refuses the credentials or the mechanism holds the queue until it
+        /// accepts them, and a broker that limits a session's lifetime gets a new connection
+        /// before it ends.
+        #[serde(default)]
+        sasl: Option<KafkaSasl>,
     },
     /// The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS)
     /// connection, one native frame per batch, one `Ack` before that batch counts as delivered.
@@ -7107,6 +7233,7 @@ mod tests {
                 timeout,
                 headers,
                 tls,
+                sasl,
             } => {
                 assert_eq!(brokers, vec!["kafka:9092".to_string()]);
                 assert_eq!(topic, "logs");
@@ -7120,6 +7247,7 @@ mod tests {
                 assert_eq!(timeout, Duration::from_secs(30));
                 assert!(headers.is_empty());
                 assert_eq!(tls, None);
+                assert_eq!(sasl, None);
             }
             other => panic!("expected KafkaOut, got {other:?}"),
         }
@@ -7181,6 +7309,152 @@ mod tests {
             r#"{"type": "kafka_out", "brokers": ["k:9092"], "topic": "t", "linger": "5ms"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn kafka_out_sasl_takes_each_mechanism_and_rejects_an_unknown_key() {
+        let parse = |sasl: &str| {
+            serde_json::from_str::<Component>(&format!(
+                r#"{{"type": "kafka_out", "brokers": ["k:9092"], "topic": "t", "sasl": {sasl}}}"#
+            ))
+            .map(|component| match component.kind {
+                ComponentKind::KafkaOut { sasl, .. } => sasl,
+                other => panic!("expected KafkaOut, got {other:?}"),
+            })
+        };
+        let creds = || ("u".to_string(), "p".to_string());
+        for (mechanism, want) in [
+            ("plain", KafkaSasl::Plain { username: creds().0, password: creds().1 }),
+            ("scram_sha_256", KafkaSasl::ScramSha256 { username: creds().0, password: creds().1 }),
+            ("scram_sha_512", KafkaSasl::ScramSha512 { username: creds().0, password: creds().1 }),
+        ] {
+            let sasl = parse(&format!(
+                r#"{{"mechanism": "{mechanism}", "username": "u", "password": "p"}}"#
+            ))
+            .unwrap();
+            assert_eq!(sasl, Some(want), "{mechanism}");
+        }
+        for bad in [
+            r#"{"mechanism": "plain", "username": "u", "password": "p", "token": "t"}"#,
+            r#"{"mechanism": "scram_sha_256", "username": "u", "password": "p", "iterations": 1}"#,
+            r#"{"mechanism": "plain", "username": "u"}"#,
+            r#"{"mechanism": "gssapi", "username": "u", "password": "p"}"#,
+            r#"{"username": "u", "password": "p"}"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn kafka_out_sasl_oauthbearer_takes_a_token_or_client_credentials() {
+        let parse = |sasl: &str| {
+            serde_json::from_str::<Component>(&format!(
+                r#"{{"type": "kafka_out", "brokers": ["k:9092"], "topic": "t", "sasl": {sasl}}}"#
+            ))
+            .map(|component| match component.kind {
+                ComponentKind::KafkaOut { sasl, .. } => sasl.unwrap(),
+                other => panic!("expected KafkaOut, got {other:?}"),
+            })
+        };
+        let sasl = parse(r#"{"mechanism": "oauthbearer", "token": "eyJ.a.b"}"#).unwrap();
+        assert_eq!(
+            sasl,
+            KafkaSasl::OAuthBearer {
+                token: Some("eyJ.a.b".into()),
+                token_endpoint: None,
+                client_id: None,
+                client_secret: None,
+                scope: None,
+                extensions: Default::default(),
+            }
+        );
+        assert_eq!(sasl.username(), None);
+        let sasl = parse(
+            r#"{"mechanism": "oauthbearer", "token_endpoint": "https://idp/token",
+                "client_id": "c", "client_secret": "s", "scope": "kafka",
+                "extensions": {"logicalCluster": "lkc-1"}}"#,
+        )
+        .unwrap();
+        let KafkaSasl::OAuthBearer { token_endpoint, client_id, scope, extensions, .. } = sasl
+        else {
+            panic!("expected OAuthBearer");
+        };
+        assert_eq!(token_endpoint.as_deref(), Some("https://idp/token"));
+        assert_eq!((client_id.as_deref(), scope.as_deref()), (Some("c"), Some("kafka")));
+        assert_eq!(extensions.get("logicalCluster").map(String::as_str), Some("lkc-1"));
+        assert!(parse(r#"{"mechanism": "oauthbearer", "token": "t", "username": "u"}"#).is_err());
+    }
+
+    #[test]
+    fn kafka_out_sasl_aws_msk_iam_takes_an_optional_region() {
+        let parse = |sasl: &str| {
+            serde_json::from_str::<Component>(&format!(
+                r#"{{"type": "kafka_out", "brokers": ["k:9098"], "topic": "t", "sasl": {sasl}}}"#
+            ))
+            .map(|component| match component.kind {
+                ComponentKind::KafkaOut { sasl, .. } => sasl.unwrap(),
+                other => panic!("expected KafkaOut, got {other:?}"),
+            })
+        };
+        let sasl = parse(r#"{"mechanism": "aws_msk_iam"}"#).unwrap();
+        assert_eq!(sasl, KafkaSasl::AwsMskIam { region: None });
+        assert_eq!(sasl.username(), None);
+        assert_eq!(
+            parse(r#"{"mechanism": "aws_msk_iam", "region": "eu-west-1"}"#).unwrap(),
+            KafkaSasl::AwsMskIam { region: Some("eu-west-1".into()) }
+        );
+        for bad in [
+            r#"{"mechanism": "aws_msk_iam", "profile": "p"}"#,
+            r#"{"mechanism": "aws_msk_iam", "username": "u"}"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    /// The token and the client secret stay out of `Debug`, and so out of any message built
+    /// from a component.
+    #[test]
+    fn kafka_sasl_debug_redacts_the_token_and_the_client_secret() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "kafka_out", "brokers": ["k:9092"], "topic": "t",
+                "sasl": {"mechanism": "oauthbearer",
+                         "token_endpoint": "https://user:url-secret@idp/token",
+                         "client_id": "logit", "client_secret": "client-secret-value",
+                         "extensions": {"logicalCluster": "lkc-1"}}}"#,
+        )
+        .unwrap();
+        let shown = format!("{component:?}");
+        assert!(shown.contains("logit") && shown.contains("logicalCluster"), "{shown}");
+        for secret in ["client-secret-value", "url-secret"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        let sasl = KafkaSasl::OAuthBearer {
+            token: Some("static-token-value".into()),
+            token_endpoint: None,
+            client_id: None,
+            client_secret: None,
+            scope: None,
+            extensions: Default::default(),
+        };
+        assert!(!format!("{sasl:?}").contains("static-token-value"));
+    }
+
+    /// The password stays out of `Debug`, and so out of any message built from a component.
+    #[test]
+    fn kafka_sasl_debug_redacts_the_password() {
+        let sasl = KafkaSasl::ScramSha512 {
+            username: "alice".to_string(),
+            password: "hunter2-secret".to_string(),
+        };
+        let shown = format!("{sasl:?}");
+        assert!(shown.contains("alice"), "{shown}");
+        assert!(!shown.contains("hunter2-secret"), "{shown}");
+        let component: Component = serde_json::from_str(
+            r#"{"type": "kafka_out", "brokers": ["k:9092"], "topic": "t",
+                "sasl": {"mechanism": "plain", "username": "alice", "password": "hunter2-secret"}}"#,
+        )
+        .unwrap();
+        assert!(!format!("{component:?}").contains("hunter2-secret"));
     }
 
     #[test]

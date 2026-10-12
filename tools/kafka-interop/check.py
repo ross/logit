@@ -17,6 +17,8 @@ script has already written, under /out (the run directory):
                                         %a{compression}\n': each record's batch codec
     <leg>-<broker>-telemetry.log        each leg's `internal` telemetry, `stdio_out` `format: json`
     exits.txt                           `<service> <exit code>` per leg
+    redpanda-oidc.txt                   `ok` once Redpanda took OAUTHBEARER, else `failed`
+    logs/<service>.log                  each service's log
 
 Prints one row per leg and broker (docs/plans/kafka-output.md, "Interop plan (W4)"). A row is
 PASS (the leg did what the plan expects), GAP (the broker behaves differently from Apache Kafka in
@@ -37,6 +39,8 @@ PARITY_KEYS = 50
 CODEC_EVENTS = 100
 DEDUP_EVENTS = 800
 TLS_EVENTS = 50
+SASL_EVENTS = 50
+OAUTH_CC_EVENTS = 60
 TIMESTAMP_EVENTS = 100
 # `logit-timestamp-*.yaml` stamps seq 3, 13, ..., 93 at 2100-01-01.
 FUTURE_SEQS = {seq for seq in range(TIMESTAMP_EVENTS) if seq % 10 == 3}
@@ -153,6 +157,20 @@ def telemetry_sum(events, metric, **attrs):
             if item.get("name") == metric and item.get("kind") == "sum":
                 total += float(item["value"])
     return int(total)
+
+
+def telemetry_max(events, metric, **attrs):
+    """The highest value any point of a gauge took: `logit.component.retrying` reads 0 again once
+    the write loop exits, so the last point can't show a hold."""
+    best = 0.0
+    for event in events:
+        have = {**event.get("resource", {}).get("attributes", {}), **event.get("attributes", {})}
+        if any(have.get(k) != v for k, v in attrs.items()):
+            continue
+        for item in event.get("metrics", []):
+            if item.get("name") == metric and item.get("kind") == "gauge":
+                best = max(best, float(item["value"]))
+    return int(best)
 
 
 def requests_by_class(events, component):
@@ -283,6 +301,109 @@ def leg_mtls_required(broker):
     return "PASS", f"refused without a client certificate: 0 records, requests {shown(classes)}"
 
 
+def leg_sasl(broker, topic, component, how):
+    records = read_java(broker, topic)
+    classes = requests_by_class(telemetry("sasl", broker), component)
+    if len(records) != SASL_EVENTS or not classes.get("ok"):
+        return "FAIL", (f"{topic} holds {len(records)} records, want {SASL_EVENTS}; "
+                        f"requests {shown(classes)}")
+    seqs = {r.seq() for r in records}
+    if seqs != set(range(SASL_EVENTS)):
+        return "FAIL", f"{topic} holds {len(seqs)} distinct events, want {SASL_EVENTS}"
+    return "PASS", f"{len(records)} records, {how}; requests {shown(classes)}"
+
+
+def leg_sasl_wrong(broker):
+    events = telemetry("sasl", broker)
+    records = read_java(broker, "sasl-wrong")
+    classes = requests_by_class(events, "sasl_wrong")
+    retrying = telemetry_max(events, "logit.component.retrying", component="sasl_wrong")
+    rejected = telemetry_sum(events, "logit.component.batches.dropped", component="sasl_wrong",
+                             reason="rejected")
+    detail = (f"{len(records)} records, requests {shown(classes)}, retrying peaked at "
+              f"{retrying}, batches.dropped{{reason=rejected}} {rejected}")
+    if records or classes.get("ok"):
+        return "FAIL", f"the broker took a login with the wrong password; {detail}"
+    if not classes.get("refused"):
+        return "FAIL", f"no Refused attempt, so the refusal is unproven; {detail}"
+    if retrying != 1:
+        return "FAIL", f"the sink wasn't holding and retrying; {detail}"
+    if rejected:
+        return "FAIL", f"a refused login dropped a batch; {detail}"
+    return "PASS", f"refused, held, and retried; {detail}"
+
+
+def redpanda_oidc_gap(broker):
+    """The GAP row for an OAUTHBEARER leg on a Redpanda that wouldn't turn OAUTHBEARER on, an
+    Enterprise feature; `None` when the leg can run."""
+    path = OUT / "redpanda-oidc.txt"
+    if broker == "redpanda" and (not path.exists() or path.read_text().strip() != "ok"):
+        return "GAP", ("Redpanda refused OAUTHBEARER, an Enterprise feature "
+                       "(logs/redpanda-oidc-setup.log)")
+    return None
+
+
+def token_requests(scope):
+    """How many client-credentials requests the `oauth` service logged with `scope`; its
+    `DEBUG` log prints each request's body."""
+    path = OUT / "logs" / "oauth.log"
+    log = path.read_text(errors="replace") if path.exists() else ""
+    return len(re.findall(rf"body=grant_type=client_credentials&scope={re.escape(scope)}\)", log))
+
+
+def leg_oauth(broker, topic, component, events, how, min_tokens=0):
+    gap = redpanda_oidc_gap(broker)
+    if gap:
+        return gap
+    records = read_java(broker, topic)
+    classes = requests_by_class(telemetry("oauth", broker), component)
+    if len(records) != events or not classes.get("ok"):
+        return "FAIL", (f"{topic} holds {len(records)} records, want {events}; "
+                        f"requests {shown(classes)}")
+    if {r.seq() for r in records} != set(range(events)):
+        return "FAIL", f"{topic} doesn't hold each of the {events} events once"
+    detail = f"{len(records)} records, {how}; requests {shown(classes)}"
+    if min_tokens:
+        # The sink's `scope` names its broker (logit-oauth-*.yaml).
+        tokens = token_requests(f"{broker}-oauth-cc")
+        detail += f"; tokens fetched {tokens}"
+        if tokens < min_tokens:
+            return "FAIL", (f"want at least {min_tokens} tokens fetched, so a redial took a "
+                            f"new one; {detail}")
+    return "PASS", detail
+
+
+def leg_oauth_refused(broker):
+    gap = redpanda_oidc_gap(broker)
+    if gap:
+        return gap
+    events = telemetry("oauth", broker)
+    records = read_java(broker, "oauth-refused")
+    classes = requests_by_class(events, "oauth_refused")
+    retrying = telemetry_max(events, "logit.component.retrying", component="oauth_refused")
+    rejected = telemetry_sum(events, "logit.component.batches.dropped", component="oauth_refused",
+                             reason="rejected")
+    log_path = OUT / "logs" / f"logit-oauth-{broker}.log"
+    log = log_path.read_text(errors="replace") if log_path.exists() else ""
+    status = re.search(r'the broker refused the token: status "([^"]*)"', log)
+    detail = (f"{len(records)} records, requests {shown(classes)}, retrying peaked at "
+              f"{retrying}, batches.dropped{{reason=rejected}} {rejected}, error challenge status "
+              f"{status.group(1) if status else 'not logged'}")
+    if records or classes.get("ok"):
+        return "FAIL", f"the broker took a token that isn't a JWT; {detail}"
+    if not classes.get("refused"):
+        return "FAIL", f"no Refused attempt, so the refusal is unproven; {detail}"
+    if retrying != 1:
+        return "FAIL", f"the sink wasn't holding and retrying; {detail}"
+    if rejected:
+        return "FAIL", f"a refused token dropped a batch; {detail}"
+    # Redpanda refuses with `SASL_AUTHENTICATION_FAILED` at once, sending no RFC 7628 error
+    # challenge, so only Kafka's refusal carries a status.
+    if broker == "kafka" and not status:
+        return "FAIL", f"no refusal in the leg's log carries the error challenge's status; {detail}"
+    return "PASS", f"refused, held, and retried; {detail}"
+
+
 def leg_timestamp(broker):
     events = telemetry("timestamp", broker)
     dropped = telemetry_sum(events, "logit.output.records.dropped", component="timestamp",
@@ -316,7 +437,23 @@ LEGS += [
     ("tls", "server TLS, private CA", lambda b: leg_tls(b, "tls", "tls")),
     ("mtls", "mutual TLS, client certificate", lambda b: leg_tls(b, "mtls", "mtls")),
     ("mtls-required", "mutual TLS refuses a client without a certificate", leg_mtls_required),
+    ("sasl-plain", "SASL PLAIN over SASL_SSL",
+     lambda b: leg_sasl(b, "sasl-plain", "sasl_plain", "PLAIN over SASL_SSL")),
+    ("sasl-scram512", "SASL SCRAM-SHA-512 over SASL_SSL",
+     lambda b: leg_sasl(b, "sasl-scram512", "sasl_scram512", "SCRAM-SHA-512 over SASL_SSL")),
+    ("sasl-scram256", "SASL SCRAM-SHA-256 over SASL_PLAINTEXT",
+     lambda b: leg_sasl(b, "sasl-scram256", "sasl_scram256", "SCRAM-SHA-256 over SASL_PLAINTEXT")),
+    ("sasl-wrong", "a wrong password is refused and retried", leg_sasl_wrong),
     ("timestamp", "a record over an hour ahead dropped and counted", leg_timestamp),
+    ("oauth-cc", "OAUTHBEARER, client credentials, past the first token's expiry",
+     lambda b: leg_oauth(b, "oauth-cc", "oauth_cc", OAUTH_CC_EVENTS,
+                         "over 60 s of 45 s tokens", min_tokens=2)),
+    ("oauth-static", "OAUTHBEARER, a fixed token (with two SASL extensions on Kafka)",
+     lambda b: leg_oauth(b, "oauth-static", "oauth_static", SASL_EVENTS,
+                         "a fixed token and two extensions" if b == "kafka" else
+                         "a fixed token; Redpanda takes no extensions")),
+    ("oauth-refused", "a token the broker won't take is refused, with its status, and retried",
+     leg_oauth_refused),
 ]
 
 

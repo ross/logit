@@ -1,5 +1,6 @@
 //! One connection to a Kafka broker: a TCP connect, an optional TLS handshake, `ApiVersions`
-//! negotiation, then length-prefixed requests matched to their responses by correlation id.
+//! negotiation, an optional SASL exchange, then length-prefixed requests matched to their
+//! responses by correlation id.
 //!
 //! The caller's timeout bounds the connect, the handshake, each request's write, and each
 //! response wait, each on its own. A failure says whether any byte of the request could have
@@ -11,6 +12,14 @@
 //! v3 to v12, reading the broker's advertised minimum as no constraint, because a 4.x broker
 //! advertises v0 and rejects anything below v3. `Metadata` takes the highest within v4 (the first
 //! with `allow_auto_topic_creation`) to v12, and `InitProducerId` the highest within v0 to v5.
+//! With `sasl:` set, the broker must offer `SaslHandshake` v1, and `SaslAuthenticate` takes the
+//! highest within v0 to v2.
+//!
+//! SASL (`docs/adr/kafka-sasl.md`): [`Dialer::connect`] authenticates the connection through
+//! `super::sasl` before returning it. A broker that sets `connections.max.reauth.ms` gives the
+//! session a lifetime and closes the connection on the first request after it ends, so the
+//! connection gets a deadline ([`reauth_deadline`]) and [`Conn::is_open`] reads it as closed
+//! from then on, which makes the producer dial a new one instead of re-authenticating in band.
 
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -30,12 +39,17 @@ use tokio::time::{timeout, timeout_at, Instant};
 use tokio_rustls::TlsConnector;
 
 use super::fault;
+use super::sasl::{self, Authenticator};
 use crate::tls::{poll_pending_close, AsyncStream, PendingClose};
 
 /// The `Produce` versions `kafka_out` sends.
 pub(crate) const PRODUCE_VERSIONS: RangeInclusive<i16> = 3..=12;
 const METADATA_VERSIONS: RangeInclusive<i16> = 4..=12;
 const INIT_PRODUCER_ID_VERSIONS: RangeInclusive<i16> = 0..=5;
+const SASL_AUTHENTICATE_VERSIONS: RangeInclusive<i16> = 0..=2;
+/// The `SaslHandshake` version `kafka_out` sends: v1, whose exchange runs in `SaslAuthenticate`
+/// requests instead of raw frames.
+pub(crate) const SASL_HANDSHAKE_VERSION: i16 = 1;
 /// The first flexible `ApiVersions` version, which every 2.4 or later broker answers.
 const API_VERSIONS_VERSION: i16 = 3;
 /// The first `Produce` version that can carry zstd.
@@ -52,6 +66,7 @@ pub(crate) struct Dialer {
     pub(crate) tls: Option<Arc<rustls::ClientConfig>>,
     pub(crate) timeout: Duration,
     pub(crate) client_id: StrBytes,
+    pub(crate) sasl: Option<Arc<dyn Authenticator>>,
 }
 
 /// The versions one connection negotiated.
@@ -60,6 +75,9 @@ pub(crate) struct Versions {
     pub(crate) produce: i16,
     pub(crate) metadata: i16,
     pub(crate) init_producer_id: i16,
+    /// `None` when the broker doesn't offer `SaslHandshake` v1 and a `SaslAuthenticate` version
+    /// `kafka_out` sends, which matters only with `sasl:` set.
+    pub(crate) sasl_authenticate: Option<i16>,
 }
 
 /// A failed request: the error, and whether any byte of it could have reached the broker.
@@ -96,12 +114,24 @@ pub(crate) struct Conn {
     correlation: i32,
     client_id: StrBytes,
     timeout: Duration,
+    /// When to stop reusing the connection, because its SASL session ends ([`reauth_deadline`]).
+    deadline: Option<Instant>,
+}
+
+/// When to stop reusing a connection whose SASL session ends at `end`, `lifetime` after it began.
+/// The margin is `timeout`, so a request written before the deadline is answered or failed
+/// before the session ends. A lifetime of twice `timeout` or less gets half the lifetime as its
+/// margin instead, so the connection carries some requests; a request the broker then drops at
+/// the session's end is `Ambiguous`, and the idempotent resend is deduplicated.
+pub(crate) fn reauth_deadline(end: Instant, lifetime: Duration, timeout: Duration) -> Instant {
+    end - timeout.min(lifetime / 2)
 }
 
 impl Dialer {
-    /// Connects to `host:port`, with TLS whose server name is `host`, and negotiates versions.
-    /// Every failure is `Clean`, since no produce byte goes out before this returns, except a
-    /// broker whose versions `kafka_out` can't use, which is `Refused`.
+    /// Connects to `host:port`, with TLS whose server name is `host`, negotiates versions, and
+    /// authenticates when `sasl` is set. Every failure is `Clean`, since no produce byte goes out
+    /// before this returns, except a broker whose versions `kafka_out` can't use and a SASL
+    /// refusal, which are `Refused` (`super::sasl`).
     pub(crate) async fn connect(&self, host: &str, port: u16) -> anyhow::Result<Conn> {
         let tcp = timeout(self.timeout, TcpStream::connect((host, port)))
             .await
@@ -148,10 +178,12 @@ impl Dialer {
                 produce: *PRODUCE_VERSIONS.start(),
                 metadata: *METADATA_VERSIONS.start(),
                 init_producer_id: *INIT_PRODUCER_ID_VERSIONS.start(),
+                sasl_authenticate: None,
             },
             correlation: 0,
             client_id: self.client_id.clone(),
             timeout: self.timeout,
+            deadline: None,
         };
         let request = ApiVersionsRequest::default()
             .with_client_software_name(StrBytes::from_static_str("logit"))
@@ -165,6 +197,19 @@ impl Dialer {
         conn.versions = negotiate(&response)
             .with_context(|| format!("Kafka broker {host}:{port}"))
             .context(Fault::Refused)?;
+        if let Some(auth) = &self.sasl {
+            let Some(version) = conn.versions.sasl_authenticate else {
+                return Err(anyhow!(
+                    "SASL {} as {}: Kafka broker {host}:{port} doesn't offer SaslHandshake v1 \
+                     and SaslAuthenticate v0 to v2",
+                    auth.mechanism(),
+                    auth.principal()
+                ))
+                .context(Fault::Refused);
+            };
+            let end = sasl::authenticate(&mut conn, auth.as_ref(), version, host, port).await?;
+            conn.deadline = end.map(|(end, lifetime)| reauth_deadline(end, lifetime, self.timeout));
+        }
         Ok(conn)
     }
 }
@@ -198,10 +243,15 @@ pub(crate) fn negotiate(response: &ApiVersionsResponse) -> anyhow::Result<Versio
         );
         Ok(hi)
     };
+    let sasl_authenticate =
+        pick(ApiKey::SaslHandshake, SASL_HANDSHAKE_VERSION..=SASL_HANDSHAKE_VERSION, false)
+            .and_then(|_| pick(ApiKey::SaslAuthenticate, SASL_AUTHENTICATE_VERSIONS, false))
+            .ok();
     Ok(Versions {
         produce: pick(ApiKey::Produce, PRODUCE_VERSIONS, true)?,
         metadata: pick(ApiKey::Metadata, METADATA_VERSIONS, false)?,
         init_producer_id: pick(ApiKey::InitProducerId, INIT_PRODUCER_ID_VERSIONS, false)?,
+        sasl_authenticate,
     })
 }
 
@@ -210,7 +260,8 @@ impl Conn {
     /// the stream.
     #[cfg(test)]
     pub(crate) fn over(stream: Box<dyn AsyncStream>, tls: bool, timeout: Duration) -> Self {
-        let versions = Versions { produce: 12, metadata: 12, init_producer_id: 5 };
+        let versions =
+            Versions { produce: 12, metadata: 12, init_producer_id: 5, sasl_authenticate: Some(2) };
         Self {
             stream,
             tls,
@@ -218,6 +269,7 @@ impl Conn {
             correlation: 0,
             client_id: StrBytes::from_static_str("logit"),
             timeout,
+            deadline: None,
         }
     }
 
@@ -227,9 +279,19 @@ impl Conn {
 
     /// Whether a reused connection is still worth writing to: one poll, no wait. A broker closes
     /// an idle connection (`connections.max.idle.ms`), and writing a request into one already
-    /// closed would turn a `Clean` redial into an `Ambiguous` failure.
+    /// closed would turn a `Clean` redial into an `Ambiguous` failure. A connection past its SASL
+    /// deadline reads as closed, because the broker closes it on the next request.
     pub(crate) async fn is_open(&mut self) -> bool {
+        if self.past_deadline() {
+            return false;
+        }
         matches!(poll_pending_close(&mut *self.stream, &mut [0u8; 1]).await, PendingClose::Open)
+    }
+
+    /// Whether the connection's SASL deadline has passed, with no socket poll: the check before
+    /// each request after the first that one broker job writes.
+    pub(crate) fn past_deadline(&self) -> bool {
+        self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     /// Sends `request` at `version` and waits for its response.
@@ -378,7 +440,10 @@ mod tests {
             (ApiKey::InitProducerId, 0, 5),
         ]))
         .unwrap();
-        assert_eq!(versions, Versions { produce: 12, metadata: 12, init_producer_id: 5 });
+        assert_eq!(
+            versions,
+            Versions { produce: 12, metadata: 12, init_producer_id: 5, sasl_authenticate: None }
+        );
     }
 
     #[test]
@@ -389,7 +454,10 @@ mod tests {
             (ApiKey::InitProducerId, 0, 2),
         ]))
         .unwrap();
-        assert_eq!(versions, Versions { produce: 7, metadata: 9, init_producer_id: 2 });
+        assert_eq!(
+            versions,
+            Versions { produce: 7, metadata: 9, init_producer_id: 2, sasl_authenticate: None }
+        );
     }
 
     #[test]
@@ -464,6 +532,56 @@ mod tests {
     async fn a_response_length_past_the_cap_is_ambiguous() {
         let fake = FakeStream::new().reading(ReadStep::Bytes((-1i32).to_be_bytes().to_vec()));
         assert_eq!(request_over(&fake, false).await.fault(), Fault::Ambiguous);
+    }
+
+    /// `SaslAuthenticate` takes the highest version both sides offer up to v2, and only beside
+    /// `SaslHandshake` v1.
+    #[test]
+    fn sasl_negotiates_saslauthenticate_up_to_v2_beside_saslhandshake_v1() {
+        let base =
+            [(ApiKey::Produce, 0, 13), (ApiKey::Metadata, 0, 13), (ApiKey::InitProducerId, 0, 5)];
+        let with = |extra: &[(ApiKey, i16, i16)]| {
+            let all: Vec<_> = base.iter().chain(extra).copied().collect();
+            negotiate(&offered(&all)).unwrap().sasl_authenticate
+        };
+        assert_eq!(
+            with(&[(ApiKey::SaslHandshake, 0, 1), (ApiKey::SaslAuthenticate, 0, 2)]),
+            Some(2)
+        );
+        assert_eq!(
+            with(&[(ApiKey::SaslHandshake, 0, 1), (ApiKey::SaslAuthenticate, 0, 1)]),
+            Some(1)
+        );
+        assert_eq!(
+            with(&[(ApiKey::SaslHandshake, 0, 1), (ApiKey::SaslAuthenticate, 0, 9)]),
+            Some(2)
+        );
+        assert_eq!(with(&[(ApiKey::SaslHandshake, 0, 0), (ApiKey::SaslAuthenticate, 0, 2)]), None);
+        assert_eq!(with(&[(ApiKey::SaslHandshake, 0, 1)]), None);
+        assert_eq!(with(&[]), None);
+    }
+
+    /// The margin is the timeout, or half of a lifetime no longer than twice the timeout.
+    #[test]
+    fn the_reauth_deadline_leaves_the_timeout_or_half_a_short_lifetime() {
+        let end = Instant::now() + Duration::from_secs(3600);
+        let s = Duration::from_secs;
+        assert_eq!(reauth_deadline(end, s(3600), s(30)), end - s(30));
+        assert_eq!(reauth_deadline(end, s(60), s(30)), end - s(30));
+        assert_eq!(reauth_deadline(end, s(40), s(30)), end - s(20));
+        assert_eq!(reauth_deadline(end, s(10), s(30)), end - s(5));
+    }
+
+    /// A connection past its deadline reads as closed with the socket still open.
+    #[tokio::test]
+    async fn a_connection_past_its_sasl_deadline_reads_as_closed() {
+        let fake = FakeStream::new();
+        let mut conn = Conn::over(Box::new(fake.clone()), false, Duration::from_secs(5));
+        assert!(conn.is_open().await);
+        conn.deadline = Some(Instant::now() + Duration::from_secs(3600));
+        assert!(conn.is_open().await);
+        conn.deadline = Some(Instant::now());
+        assert!(!conn.is_open().await);
     }
 
     #[test]

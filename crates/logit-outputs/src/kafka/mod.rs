@@ -6,7 +6,11 @@
 //!   events per record under `record: batch`, in each `format:`.
 //! - [`producer`] partitions a batch, keeps the idempotent producer's identity and sequences,
 //!   and sends each attempt with a verdict per partition batch.
-//! - [`conn`] is one broker connection: framing, correlation ids, version negotiation, TLS.
+//! - [`conn`] is one broker connection: framing, correlation ids, version negotiation, TLS, and
+//!   the SASL session's deadline.
+//! - [`sasl`] authenticates a connection: the exchange loop and the `PLAIN`, `SCRAM-SHA-256`,
+//!   `SCRAM-SHA-512`, `OAUTHBEARER`, and `AWS_MSK_IAM` mechanisms, with `OAUTHBEARER`'s token
+//!   endpoint, and SigV4 and the AWS credential chain for `AWS_MSK_IAM`.
 //! - [`batch`] and [`compression`] write record batch v2 with all five codecs through the
 //!   crate's compression hook, so none of its C codecs is built.
 //! - [`partitioner`] is the Java client's murmur2 keyed partitioner and the per-send sticky
@@ -29,6 +33,19 @@
 //! |---|---|---|---|
 //! | Connect refused or timed out, DNS failure | `Clean` | no request byte left | `tests::a_refused_bootstrap_connect_is_clean`, `tests::a_refused_leader_connect_is_clean` |
 //! | TLS handshake failure | `Clean` | no request byte left | `tests::a_failed_tls_handshake_is_clean` |
+//! | With `sasl:` set, a broker without `SaslHandshake` v1 and `SaslAuthenticate` v0 to v2 | `Refused` | every connection gets the same answer | `tests::sasl_refusals_are_refused_and_never_print_the_password` |
+//! | `UNSUPPORTED_SASL_MECHANISM` (33), `ILLEGAL_SASL_STATE` (34), `UNSUPPORTED_VERSION` (35), `SASL_AUTHENTICATION_FAILED` (58), from `SaslHandshake` or `SaslAuthenticate` | `Refused` | the mechanism, the exchange, or the credentials: a retry repeats the same exchange | `tests::sasl_refusals_are_refused_and_never_print_the_password`, `sink::tests::refused_sasl_credentials_hold_the_queue_until_the_broker_takes_them` |
+//! | Any other code from `SaslHandshake` or `SaslAuthenticate` | `Clean` | a state the broker leaves on its own | `fault::tests::sasl_answers_refuse_for_the_mechanism_the_state_and_the_credentials` |
+//! | A SCRAM server message the client's checks reject: a server signature that doesn't match, a nonce that doesn't extend the client's, an iteration count outside 4096 to 1048576, a mandatory extension (`m=`), an `e=` error | `Refused` | a broker whose signature doesn't match doesn't hold the user's credential, and every check fails the same way on every connection | `tests::a_scram_server_signature_mismatch_is_refused`, `sasl::scram::tests::a_malformed_server_first_message_is_refused`, `sasl::scram::tests::an_iteration_count_outside_the_bounds_is_refused` |
+//! | An `OAUTHBEARER` token refused with an error challenge (RFC 7628, as Kafka does), answered with a `kvsep`, then `SASL_AUTHENTICATION_FAILED` (58); or with 58 on the first message and no challenge (as Redpanda does) | `Refused`; the message carries the challenge's `status` when there is one, and a fetched token leaves the cache | the broker won't take the token; a fetched one is replaced on the next dial rather than resent | `tests::a_refused_token_is_refused_with_its_status_and_fetched_again`, `tests::a_token_refused_without_a_challenge_is_fetched_again` |
+//! | An `OAUTHBEARER` token endpoint unreachable, timed out, or answering `429` or `5xx`, or a `2xx` whose body the timeout or a closed connection cuts off | `Clean` | a transient fault upstream of the broker, before any `SaslAuthenticate` | `tests::token_endpoint_faults_are_clean_when_transient_and_refused_otherwise`, `tests::a_cut_off_token_response_is_clean` |
+//! | An `OAUTHBEARER` token endpoint answering any other non-`2xx` (`invalid_client`, `invalid_scope`, a redirect), or a `2xx` whose body, up to its 64 KiB cap, holds no `access_token` that is an RFC 6750 bearer token | `Refused` | the client, its secret, the scope, or the endpoint URL is wrong: every fetch gets the same answer | `tests::token_endpoint_faults_are_clean_when_transient_and_refused_otherwise`, `sasl::oauth::tests::a_token_response_without_a_usable_token_is_an_error` |
+//! | `AWS_MSK_IAM` credentials the broker refuses: `SASL_AUTHENTICATION_FAILED` (58), `Access denied` | `Refused`; credentials fetched from an endpoint leave the cache | the credentials or their IAM policy are wrong; fetched ones are replaced on the next dial rather than resent | `tests::refused_aws_credentials_are_refused_and_fetched_again` |
+//! | An AWS credential endpoint (STS, the container endpoint, IMDS) unreachable, timed out, or answering `429` or `5xx`, or STS's `Throttling` or `IDPCommunicationError`; IMDS unreachable with no other source configured | `Clean` | a transient fault upstream of the broker, before any `SaslAuthenticate`; a host with no IMDS can't be told from one whose IMDS is down | `tests::aws_credential_endpoint_faults_reach_the_send_with_their_class`, `sasl::aws_creds::tests::sts_faults_are_clean_when_transient_and_refused_otherwise`, `sasl::aws_creds::tests::container_endpoint_faults_are_clean_when_transient_and_refused_otherwise`, `sasl::aws_creds::tests::imds_faults_and_no_source_at_all` |
+//! | An AWS credential endpoint answering any other status (`AccessDenied`, `InvalidIdentityToken`, IMDS's `404` for no role) or an answer without credentials; a source configured on this host but broken (half of a variable pair, an unreadable token file, a full container URI to a host it may not use, a profile `AWS_PROFILE` names that doesn't exist or holds no keys, a profile using `role_arn`, `credential_process`, or SSO, web identity in a region outside the `aws`, `aws-cn`, and `aws-us-gov` partitions); no source at all with IMDS off; no region from `region:`, the broker host, or the environment | `Refused` | the host's credentials, role, or config are wrong: every lookup gets the same answer | `tests::aws_credential_endpoint_faults_reach_the_send_with_their_class`, `tests::aws_msk_iam_reads_the_region_from_the_environment_or_refuses`, `sasl::aws_creds::tests::sts_faults_are_clean_when_transient_and_refused_otherwise`, `sasl::aws_creds::tests::half_a_configured_source_is_refused`, `sasl::aws_creds::tests::a_profile_with_an_unsupported_source_is_refused_naming_the_key`, `sasl::aws_creds::tests::a_keyless_profile_is_skipped_only_when_implicit`, `sasl::aws_creds::tests::web_identity_outside_the_supported_partitions_is_refused`, `sasl::aws_creds::tests::imds_faults_and_no_source_at_all` |
+//! | A transport failure during the SASL exchange | `Clean` | no produce byte has been written on the connection | `tests::a_transport_failure_during_the_sasl_exchange_is_clean` |
+//! | A pooled connection past its SASL session's deadline (`conn::reauth_deadline`) | redialed before writing; no failure | the broker closes a connection whose session has ended on its next request | `tests::an_expiring_sasl_session_is_redialed_before_the_next_send` |
+//! | The SASL deadline passing between two produce requests of one attempt to a broker | `Clean` for the partition batches not yet written; the next attempt redials | none of them was written | `tests::a_sasl_deadline_reached_between_requests_leaves_the_rest_for_a_new_connection` |
 //! | The first write fails or accepts nothing, on plaintext | `Clean` | the broker can't have the request | `conn::tests::a_plaintext_first_write_that_accepts_nothing_is_clean` |
 //! | A pooled connection the broker closed | redialed before writing; no failure | the probe finds the close before any byte is written | `tests::a_pooled_connection_the_broker_closed_is_redialed` |
 //! | A write fails after any byte, or on TLS at all | `Ambiguous` | the broker may have the request | `conn::tests::a_failure_after_part_of_the_request_is_written_is_ambiguous`, `conn::tests::a_tls_write_failure_is_ambiguous` |
@@ -70,11 +87,13 @@ mod fake_broker;
 mod fault;
 mod partitioner;
 mod producer;
+mod sasl;
 mod sink;
 #[cfg(test)]
 mod tests;
 
 pub use encode::{EncodeStats, KafkaEncoder, RecordFormat, RecordKey, RecordMeta, RecordMode};
+pub use sasl::{KafkaSasl, OAuthToken};
 pub use sink::{
     KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings, TlsClientSettings,
     DEFAULT_MAX_REQUEST_BYTES, DEFAULT_TIMEOUT,
