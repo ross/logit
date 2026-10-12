@@ -200,3 +200,53 @@ W1 built PLAIN and SCRAM and settled these points the decision above left open:
 5. **Graph rule 85 also rejects an empty `sasl.username`,** which no broker takes.
 6. **`Debug` leaves the password out** of both `logit_config::KafkaSasl` and the sink's own
    `KafkaSasl`, so printing a component or the sink's settings can't leak it.
+
+## Amendment: what W2 settled (2026-10-11)
+
+W2 built OAUTHBEARER and settled these points the decision above left open:
+
+1. **The config is flat.** `oauthbearer` takes optional `token`, `token_endpoint`, `client_id`,
+   `client_secret`, `scope`, and `extensions` fields rather than a nested enum, so the YAML reads
+   as section 1 shows. Graph rule 85 adds: `client_id` and `client_secret` are required with
+   `token_endpoint`, and none of `client_id`, `client_secret`, or `scope` may come with `token`;
+   a fixed `token` must be an RFC 6750 `b64token`; and each extension key is letters only and
+   not `auth`, and each value is non-empty printable ASCII, space, tab, CR, or LF (KIP-342's
+   patterns). `Debug` leaves out the token, the client secret, and the extension values.
+2. **The token request follows RFC 6749, not the Java client's default.** It's a form `POST` of
+   `grant_type=client_credentials` and the optional `scope`, with the client id and secret in
+   HTTP Basic authentication, each form-urlencoded first as RFC 6749 §2.3.1 requires. The Java
+   client sends them unencoded unless `sasl.oauthbearer.header.urlencode` is `true`; the two
+   agree on any id and secret of letters, digits, and `*-._`.
+3. **Reuse and refresh.** A fetched token is reused by every connection until 80% of its
+   `expires_in` has passed, measured from before the request. Without `expires_in`, a JWT is
+   reused until 80% of the time to its `exp` claim, and any other token isn't reused. Dials that
+   start together wait on one fetch, behind an async mutex in the authenticator. A broker's
+   refusal drops a fetched token from the cache, so the next dial fetches a new one instead of
+   resending a token the broker refused until its refresh time.
+4. **The error challenge's status reaches the error.** On a refused token, Kafka answers the
+   first message with an RFC 7628 JSON error and no error code; the session answers with a lone
+   `\x01`, and the broker then fails the exchange with `SASL_AUTHENTICATION_FAILED`. The session
+   keeps the JSON's `status` (and `scope`), and `authenticate` appends it to the broker's
+   message through a `Session::failure` method, so the error reads `status "invalid_token"`
+   whatever text the broker sends with code 58.
+5. **The token endpoint's faults.** Section 4's rows hold. A redirect is `Refused`, since the
+   client follows none and a moved endpoint is a config change. A `2xx` whose body isn't JSON,
+   lacks a string `access_token`, or holds one that isn't an RFC 6750 `b64token` is `Refused`:
+   every fetch gets the same answer, and a token outside `b64token` could carry a `\x01` into
+   the message's framing. The fetch is bounded by the sink's `timeout`, and an error quotes only
+   the OAuth `error` and `error_description` of the body, never the rest, which may echo the
+   request.
+6. **The token endpoint trusts the bundled Mozilla roots only.** The broker `tls:` block
+   doesn't apply to it, and there's no separate one, so an identity provider behind a private CA
+   can't be used (`docs/known-gaps/kafka.md`). A `token_endpoint_tls:` block would close the gap
+   with no change to the rest of this design.
+7. **Redpanda's OAUTHBEARER is verified too.** Redpanda documents OIDC as an Enterprise feature,
+   but a new cluster runs on a 30-day trial license ("Redpanda Built-In Evaluation Period"), and
+   `script/kafka-interop` starts a new one every run. So the harness turns OAUTHBEARER on against
+   both brokers, and a Redpanda row reads `GAP` only when Redpanda refuses the configuration,
+   rather than always, as the Consequences above expected. Redpanda v26.2.3 differs from Kafka
+   4.2.0 in two ways the sink allows for: it reads everything between `auth=Bearer ` and the
+   closing `\x01\x01` as the token, so a configured extension corrupts the token and Redpanda
+   drops the connection (`Clean`, retried; `docs/known-gaps/kafka.md`), and it refuses a token
+   with `SASL_AUTHENTICATION_FAILED` at once, with no error challenge, so its refusal carries no
+   OAuth status. Kafka 4.2.0 sends the challenge's JSON again as the code-58 message.

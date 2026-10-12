@@ -2,15 +2,43 @@
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
-- **No SASL OAUTHBEARER or AWS MSK IAM.** `kafka_out`'s `sasl:` takes PLAIN, SCRAM-SHA-256, and
-  SCRAM-SHA-512 only ([ADR `kafka-sasl`](../adr/kafka-sasl.md)).
-  - **Consequence:** a cluster that requires OAUTHBEARER, such as Confluent Cloud with an
-    identity provider, or Amazon MSK with IAM access control, refuses the connection, and the
-    sink holds its queue.
-  - **Workaround:** a listener on the cluster that takes SCRAM, PLAIN, or mutual TLS, or a local
-    relay that holds the credentials.
-  - **Revisit trigger:** stream `ksasl`'s later workstreams, which
-    [ADR `kafka-sasl`](../adr/kafka-sasl.md) plans: OAUTHBEARER, then AWS MSK IAM.
+- **No AWS MSK IAM.** `kafka_out`'s `sasl:` takes PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, and
+  OAUTHBEARER ([ADR `kafka-sasl`](../adr/kafka-sasl.md)).
+  - **Consequence:** Amazon MSK with IAM access control refuses the connection, and the sink
+    holds its queue.
+  - **Workaround:** an MSK listener that takes SCRAM or mutual TLS, or a local relay that holds
+    the credentials.
+  - **Revisit trigger:** stream `ksasl`'s W3, which [ADR `kafka-sasl`](../adr/kafka-sasl.md)
+    plans.
+- **OAUTHBEARER gets a token two ways only: fixed, or the client-credentials grant.** There's no
+  token file re-read on change, no JWT-bearer or private-key-JWT client authentication, and no
+  client id and secret in the request body instead of HTTP Basic authentication
+  ([ADR `kafka-sasl`](../adr/kafka-sasl.md), "Amendment: what W2 settled").
+  - **Consequence:** an identity provider that only issues tokens another way, or a token that a
+    sidecar rotates on disk, can't be used directly; a fixed `token:` stops working when it
+    expires.
+  - **Workaround:** a provider client that supports the client-credentials grant with Basic
+    authentication, which every major provider does.
+  - **Revisit trigger:** an operator whose provider needs another grant or client
+    authentication method.
+- **An OAUTHBEARER token endpoint must chain to a bundled Mozilla root.** The sink checks the
+  endpoint's certificate against the bundled roots, and `tls:` applies to the brokers only
+  ([ADR `kafka-sasl`](../adr/kafka-sasl.md), "Amendment: what W2 settled").
+  - **Consequence:** an identity provider behind a private CA, such as an in-house Keycloak,
+    fails the TLS handshake on every fetch, which is `clean` and retried with no end.
+  - **Workaround:** front the endpoint with a certificate from a public CA, or run a relay on
+    the `logit` host and point `token_endpoint` at it over `http://` to loopback.
+  - **Revisit trigger:** an operator with a private-CA identity provider; the fix is a
+    `token_endpoint_tls:` block built by `logit_pipeline::tls`.
+- **Redpanda takes no OAUTHBEARER extensions.** Redpanda v26.2.3 reads everything between
+  `auth=Bearer ` and the closing `\x01\x01` of the client message as the token, so an
+  `extensions:` entry becomes part of it, the token fails to decode, and Redpanda closes the
+  connection. `script/kafka-interop`'s Redpanda `oauth_static` sink sends none
+  ([ADR `kafka-sasl`](../adr/kafka-sasl.md), "Amendment: what W2 settled", item 7).
+  - **Consequence:** a `kafka_out` with `extensions:` against Redpanda never authenticates; each
+    attempt is `clean` and retried with no end.
+  - **Workaround:** leave `extensions:` out against Redpanda, which doesn't read them.
+  - **Revisit trigger:** Redpanda parsing RFC 7628's key-value pairs.
 - **Brokers older than Kafka 2.4 are unsupported.** The producer sends `ApiVersions` at v3 only,
   which Kafka 2.4 introduced, so version negotiation with an older broker fails
   ([ADR `kafka-output`](../adr/kafka-output.md), "Amendment: what W1 settled", item 5).

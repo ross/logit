@@ -50,3 +50,11 @@ components:
     #   mechanism: scram_sha_512     # plain | scram_sha_256 | scram_sha_512
     #   username: logit
     #   password: !env KAFKA_PASSWORD
+    # sasl:                          # OAUTHBEARER with an OAuth 2.0 client-credentials token
+    #   mechanism: oauthbearer
+    #   token_endpoint: https://idp.example/oauth2/token
+    #   client_id: logit
+    #   client_secret: !env KAFKA_CLIENT_SECRET
+    #   scope: kafka                 # optional
+    #   extensions: {logicalCluster: lkc-abc123}  # optional
+    #   # or a fixed token instead of the four above: token: !env KAFKA_TOKEN

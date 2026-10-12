@@ -3173,6 +3173,38 @@ broker limits a session's lifetime (`connections.max.reauth.ms`), the sink dials
 connection before the session ends, one `timeout` early, or halfway through a lifetime of up to
 twice `timeout`.
 
+`mechanism: oauthbearer` sends an OAuth 2.0 access token instead, either a fixed `token:`
+(`!env`), or one fetched from `token_endpoint:` with the client-credentials grant:
+
+```yaml
+    sasl:
+      mechanism: oauthbearer
+      token_endpoint: https://idp.example/oauth2/token
+      client_id: logit
+      client_secret: !env KAFKA_CLIENT_SECRET
+      scope: kafka                                # optional
+      extensions: {logicalCluster: lkc-abc123}    # optional; Confluent Cloud needs these
+```
+
+- **The token request.** The sink sends `client_id` and `client_secret` in HTTP Basic
+  authentication, each form-urlencoded first as RFC 6749 requires. That's the Java client's
+  `sasl.oauthbearer.header.urlencode: true`, not its default, so a secret with characters such as
+  `+` or `%` reaches the provider as it would from a Java client with that setting on.
+- **The endpoint's certificate.** It's checked against the bundled Mozilla roots, and `tls:`
+  doesn't apply to it, so an endpoint with a private CA can't be used yet. `logit validate`
+  requires `https://`, or `http://` to a loopback address.
+- **Renewal.** One token serves every connection until 80% of its `expires_in` has passed (or of
+  the time to a JWT's `exp` claim when `expires_in` is missing), and a connection dialed after
+  that fetches a new one. A broker with `connections.max.reauth.ms` set ends each session when its
+  token expires, so the sink redials, with a new token, before then. A fixed `token:` is never
+  renewed, so the broker refuses it once it expires.
+- **Faults.** A token endpoint that's unreachable, times out (the sink's `timeout`), or answers
+  `429` or `5xx` is retried as `clean`; any other answer, or a `2xx` without a usable
+  `access_token`, is `refused`. A broker that refuses the token is `refused` too, and its error
+  carries the broker's OAuth status (`invalid_token`). Each holds the queue until the endpoint
+  or the broker accepts. The error names the client id and the endpoint, never the secret or the
+  token.
+
 **Records.** `format:` picks each record's value:
 
 | `format:` | Value | Default `record:` |
