@@ -3207,6 +3207,42 @@ twice `timeout`.
   or the broker accepts. The error names the client id and the endpoint, never the secret or the
   token.
 
+`mechanism: aws_msk_iam` authenticates to Amazon MSK with IAM access control. Point `brokers:`
+at the cluster's IAM bootstrap port (`9098` inside AWS, `9198` for public access) and set
+`tls: {}`, because MSK serves IAM over TLS only:
+
+```yaml
+    brokers: ["b-1.logs.abc123.c2.kafka.us-east-1.amazonaws.com:9098"]
+    tls: {}
+    sasl:
+      mechanism: aws_msk_iam
+      # region: us-east-1   # optional; read from the broker host, then AWS_REGION
+```
+
+- **Credentials.** The sink looks for them as the AWS SDK for Java does, and the first source
+  present is used: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with `AWS_SESSION_TOKEN`);
+  `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN` (EKS IRSA); the static keys of profile
+  `AWS_PROFILE`, or `default`, in `~/.aws/credentials` and `~/.aws/config`; the ECS or EKS Pod
+  Identity container endpoint; then the EC2 instance profile through IMDSv2. A source that is
+  present but fails, such as IRSA whose STS call is denied, stops the lookup rather than falling
+  through to the instance role. A profile that uses SSO, `credential_process`, or `role_arn` is
+  refused by name. Temporary credentials are reused until 5 minutes before they expire, and a
+  session MSK ends at that expiry is redialed with fresh ones first.
+- **The IAM policy.** The role needs `kafka-cluster:Connect` on the cluster,
+  `kafka-cluster:DescribeTopic` and `kafka-cluster:WriteData` on the topic, and, because the
+  sink is an idempotent producer by default, `kafka-cluster:WriteDataIdempotently` on the
+  cluster (MSK's "Create authorization policies" page). Without the last, `InitProducerId` is
+  refused with `CLUSTER_AUTHORIZATION_FAILED`; grant it, or set `idempotent: false` and give up
+  the deduplicated resend.
+- **IMDS in a container.** IMDSv2's token request needs a hop limit of 2 or more to reach a
+  container on the instance. With the default of 1 it times out, which is `clean` and retried, and
+  the sink never authenticates.
+- **Faults.** STS, the container endpoint, or IMDS unreachable, timing out, or answering `429`
+  or `5xx` is `clean`; any other answer, a source that's misconfigured, or no source at all
+  with `AWS_EC2_METADATA_DISABLED=true` is `refused`. MSK's refusal of the credentials
+  (`Access denied`) is `refused`, and fetched credentials are fetched again for the next attempt.
+  The error names where the credentials came from, never a key or a token.
+
 **Records.** `format:` picks each record's value:
 
 | `format:` | Value | Default `record:` |

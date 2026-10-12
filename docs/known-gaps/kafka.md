@@ -2,14 +2,29 @@
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
-- **No AWS MSK IAM.** `kafka_out`'s `sasl:` takes PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, and
-  OAUTHBEARER ([ADR `kafka-sasl`](../adr/kafka-sasl.md)).
-  - **Consequence:** Amazon MSK with IAM access control refuses the connection, and the sink
-    holds its queue.
-  - **Workaround:** an MSK listener that takes SCRAM or mutual TLS, or a local relay that holds
-    the credentials.
-  - **Revisit trigger:** stream `ksasl`'s W3, which [ADR `kafka-sasl`](../adr/kafka-sasl.md)
-    plans.
+- **AWS_MSK_IAM reads a subset of the AWS default credential chain.** It takes credentials from
+  the environment, a web identity token file, a profile's static keys in the shared files, the
+  container endpoint, and IMDSv2, in that order. It doesn't run AWS SSO, `credential_process`,
+  or a profile's `role_arn` chaining (`source_profile`, `credential_source`), and a profile that
+  sets one of those keys is refused by name. IMDS is reached at `169.254.169.254` over IPv4
+  only, with no IMDSv1 fallback and no `AWS_EC2_METADATA_SERVICE_ENDPOINT`
+  ([ADR `kafka-sasl`](../adr/kafka-sasl.md), "Amendment: what W3 settled").
+  - **Consequence:** a host whose only credentials come from an unsupported source never
+    authenticates, and the sink holds its queue. An instance that requires IMDSv1, or reaches
+    IMDS over IPv6 only, gets no instance role credentials.
+  - **Workaround:** export the credentials into the environment (`aws configure
+    export-credentials --format env`) or a profile's static keys from a wrapper, or attach the
+    role through IRSA, EKS Pod Identity, ECS, or an IMDSv2 instance profile.
+  - **Revisit trigger:** an operator whose credentials only one of those sources can supply.
+- **AWS_MSK_IAM hasn't run against a live MSK cluster.** No broker outside AWS implements its
+  server side, so `script/kafka-interop` has no leg for it. The signature is pinned by AWS's SigV4
+  test suite and a golden payload from botocore, the payload's fields by `aws-msk-iam-auth`'s
+  source, and the fake broker recomputes each signature
+  ([ADR `kafka-sasl`](../adr/kafka-sasl.md), "Amendment: what W3 settled").
+  - **Consequence:** a difference between MSK and the Java client's source, such as a field MSK
+    checks that the source doesn't show, would surface only in production, as a `refused`
+    authentication that holds the queue.
+  - **Revisit trigger:** a run against a real MSK cluster, as the Splunk Cloud trial was run.
 - **OAUTHBEARER gets a token two ways only: fixed, or the client-credentials grant.** There's no
   token file re-read on change, no JWT-bearer or private-key-JWT client authentication, and no
   client id and secret in the request body instead of HTTP Basic authentication

@@ -58,3 +58,6 @@ components:
     #   scope: kafka                 # optional
     #   extensions: {logicalCluster: lkc-abc123}  # optional
     #   # or a fixed token instead of the four above: token: !env KAFKA_TOKEN
+    # sasl:                          # Amazon MSK IAM, with credentials from the AWS default chain
+    #   mechanism: aws_msk_iam       # needs tls: {} and the brokers' IAM port, 9098
+    #   region: us-east-1            # optional; read from the broker's MSK host name

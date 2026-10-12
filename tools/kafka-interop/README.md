@@ -29,6 +29,11 @@ they require authentication, so every read-back uses the plain listener and need
 `kafka-get-offsets.sh` inside the `kafka` container, against either broker, and kcat in
 `edenhill/kcat:1.7.1` containers on the stack's network.
 
+`AWS_MSK_IAM` has no leg: only Amazon MSK implements its server side, so the harness can't run
+it. Its tests pin the signature against AWS's SigV4 test suite and a golden payload from
+botocore, and the fake broker checks every payload
+([ADR `kafka-sasl`](../../docs/adr/kafka-sasl.md), "Amendment: what W3 settled").
+
 The legs, each run against both brokers:
 
 | Leg | Config | What it checks |

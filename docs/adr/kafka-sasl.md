@@ -1,6 +1,6 @@
 ---
 created: 2026-10-11
-updated: 2026-10-11
+updated: 2026-10-12
 ---
 
 # `kafka_out` SASL: PLAIN, SCRAM, OAUTHBEARER, and AWS MSK IAM, authenticated in the dialer and renewed by redial
@@ -258,3 +258,85 @@ W2 built OAUTHBEARER and settled these points the decision above left open:
    drops the connection (`Clean`, retried; `docs/known-gaps/kafka.md`), and it refuses a token
    with `SASL_AUTHENTICATION_FAILED` at once, with no error challenge, so its refusal carries no
    OAuth status. Kafka 4.2.0 sends the challenge's JSON again as the code-58 message.
+
+## Amendment: what W3 settled (2026-10-12)
+
+W3 built AWS_MSK_IAM and settled these points the decision above left open:
+
+1. **The payload is `aws-msk-iam-auth`'s, field for field.** `AWS4SignedPayloadGenerator` presigns
+   `GET https://<broker host>/?Action=kafka-cluster:Connect` through the AWS SDK for Java v2's
+   `Aws4Signer.presign`, then writes each query parameter as a JSON key in lowercase with its
+   value as it is (not percent-encoded), beside `version`, `host`, and `user-agent`. The
+   signature covers `host` alone and the SHA-256 of an empty payload, not `UNSIGNED-PAYLOAD`,
+   and a session token is in the signed query, as the SDK's presigner puts it there before
+   signing. `host` is the broker's host as the connection names it, with no port. The
+   `user-agent` is `logit/<version>`; the Java client's names itself, and MSK doesn't check it.
+2. **The broker's answer isn't parsed.** MSK answers with JSON holding `version` and
+   `request-id`, and the Java client checks the version. `kafka_out` ends the exchange on any
+   answer that isn't empty: the broker has already checked the signature, and an error code is
+   how it refuses one.
+3. **The vectors.** `sigv4`'s tests pin header-signed and presigned signatures from AWS's SigV4
+   test suite as `awslabs/aws-c-auth` carries it (commit
+   `84a26ea184d9ccd322c8164759510b3604ab13fd`: `get-vanilla`, `get-vanilla-query-order-key-case`,
+   `get-utf8`, `get-vanilla-utf8-query`, `get-vanilla-query-unreserved`,
+   `get-vanilla-with-session-token`, `post-sts-header-before`, and `post-sts-header-after`).
+   `msk_iam`'s tests pin two golden payloads, with and without a session token, whose signatures
+   botocore 1.40.40's `SigV4QueryAuth` computed with its clock frozen, over an MSK broker host;
+   botocore 1.43.112 and a standard-library re-derivation agree. The fake broker recomputes each
+   payload's signature with the same signer, and the golden signatures keep a mistake both sides
+   share from passing.
+4. **The region.** `region:` when set; else the label right before `.amazonaws.com`,
+   `.amazonaws.com.cn`, or `.api.aws` at the end of the broker's host, when it has a region's
+   shape, as `aws-msk-iam-auth`'s `RegionUtils` reads it, which covers provisioned
+   (`*.kafka.<region>.amazonaws.com`) and serverless (`*.kafka-serverless.<region>...`) hosts;
+   else `AWS_REGION`, then `AWS_DEFAULT_REGION`, which the Java SDK doesn't read but the AWS CLI
+   does. With none, the exchange is `Refused`. Graph rule 85 checks a set `region:`'s shape: a
+   two-letter prefix, one or more lowercase words, and a number. There's no `profile:` field:
+   `AWS_PROFILE` picks the profile, as it does for every AWS tool.
+5. **The credential chain's order is `aws-msk-iam-auth`'s.** Its `MSKCredentialProvider` builds
+   the Java SDK v2 providers as environment, system properties, web identity, profile, container,
+   and instance profile, which differs from the SDK's own `DefaultCredentialsProvider` only in
+   putting the environment before system properties. `logit` has no system properties, so the
+   chain is the five sources of section 5, in that order:
+   - Web identity calls STS at the broker's region (`sts.<region>.amazonaws.com`, or
+     `.amazonaws.com.cn` in China) with an unsigned form `POST`. The session name is
+     `AWS_ROLE_SESSION_NAME`, else `logit-<milliseconds>`, as the Java SDK's is
+     `aws-sdk-java-<milliseconds>`. A minimal parser reads `AccessKeyId`, `SecretAccessKey`,
+     `SessionToken`, `Expiration`, and an error's `Code` and `Message` as leaf elements, from at
+     most 64 KiB of the answer.
+   - The shared files follow the Java SDK's parser: `[profile name]` or `[default]` in the config
+     file, where `[profile default]` wins, `[name]` in the credentials file, which wins a key
+     both set, and `#` or `;` comments.
+   - The container endpoint takes `AWS_CONTAINER_AUTHORIZATION_TOKEN` over the file
+     `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` names when both are set, as the Java SDK does, and
+     a full URI that is `https`, or `http` to a loopback address, `169.254.170.2`,
+     `169.254.170.23`, or `fd00:ec2::23`.
+   - IMDS is IMDSv2 only, at `169.254.169.254`, with a 6-hour session token. The Java SDK falls
+     back to IMDSv1 when the token request fails; `kafka_out` doesn't, and lists it in
+     `docs/known-gaps/kafka.md`.
+   - The IMDS, container, and STS base URLs move only in tests, through a constructor parameter,
+     and the environment is read through an injected function, so no test sets a process
+     variable another reads.
+6. **A source that is present and fails ends the lookup.** The Java chain catches each
+   provider's failure and tries the next. `kafka_out` skips a source only when its variables or
+   profile aren't there; once one is, its answer is final. So IRSA whose STS call is throttled
+   is retried as `Clean` instead of authenticating as the node's instance role, and a profile
+   using `role_arn`, `credential_process`, or SSO is refused by name instead of skipped. With
+   every source absent, IMDS is still asked, and an unreachable IMDS is `Clean`, as section 4's
+   row says; the error lists every source looked for. With `AWS_EC2_METADATA_DISABLED=true` as
+   well, it's `Refused`.
+7. **Caching and renewal.** Credentials with an expiry (web identity, the container endpoint,
+   IMDS) are reused by every connection until 5 minutes before it, behind one async lookup as
+   OAUTHBEARER's token is. The environment and the files have no expiry and are read again on
+   every dial. MSK sets a session's lifetime to the credentials' expiry, so the redial of
+   section 3 happens before it with credentials already renewed. A broker's refusal drops
+   fetched credentials from the cache through `Session::refused`, as it drops a token.
+   `authenticate` asks the authenticator for its principal again after `start`, so a refusal
+   names where the credentials came from (`AWS credentials from the environment`).
+8. **STS's transient codes.** STS answers throttling with `400` and the code `Throttling`, and
+   a web identity provider it can't reach with `400` and `IDPCommunicationError`, which the AWS
+   SDKs retry. Both are `Clean`; every other `4xx` is `Refused`.
+9. **The producer's IAM policy needs `WriteDataIdempotently`.** MSK's IAM authorizer doesn't
+   apply KIP-679's rule that `WriteData` on a topic implies idempotent writes, so the default
+   idempotent producer needs `kafka-cluster:WriteDataIdempotently` on the cluster beside
+   `Connect`, `DescribeTopic`, and `WriteData` (`docs/deploying.md`).
