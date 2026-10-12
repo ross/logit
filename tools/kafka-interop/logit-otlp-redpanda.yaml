@@ -1,0 +1,106 @@
+# The OTLP legs of `script/kafka-interop` against Redpanda: 160 ticks, each minting a
+# metrics event (five metric kinds), a log, and a span, written by three `format: otlp_proto`
+# sinks that the Collector's `kafka` receivers (collector.yaml) read back:
+#
+#   proto   the default topics, `otlp_logs`, `otlp_metrics`, and `otlp_spans`, unkeyed.
+#   keyed   `key: trace_id` into 6-partition topics. 16 trace ids recur across the ticks, and
+#           every fourth log has no trace id.
+#   big     a 2 KiB `max_request_bytes`, so one batch's request splits into several records.
+#
+# `check.py` derives every expected value from the tick number, so the Lua below and its
+# `leg_otlp*` checks must change together.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load:
+    type: generate_in
+    count: 160
+    rate: 20
+    batch: 20
+    resource:
+      service.name: kafka-interop-otlp
+    event:
+      attributes: { seq: "{seq}" }
+
+  mint:
+    type: lua
+    sources: [load]
+    script: |
+      function process(event)
+        local s = tonumber(event.attributes.seq)
+        local ts = event.timestamp
+        -- 16 trace ids recur, so one batch holds several spans of a trace.
+        local trace_id = "a1" .. string.format("%030x", s % 16)
+        local span_id = string.format("%016x", s + 1)
+        local attributes = {leg = "otlp", seq = s}
+
+        local metrics = Event.new{
+          timestamp = ts,
+          attributes = attributes,
+          metrics = {
+            {name = "otlp_delta_sum", kind = "sum", value = 1, temporality = "delta"},
+            {name = "otlp_cumulative_sum", kind = "sum", value = s + 1,
+             temporality = "cumulative"},
+            {name = "otlp_gauge", kind = "gauge", value = s * 0.5, unit = "By",
+             description = "a gauge"},
+            {name = "otlp_hist", kind = "histogram", temporality = "delta", sum = 10 + s,
+             buckets = {{bound = 1, count = 1}, {bound = 5, count = s % 3},
+                        {bound = math.huge, count = 2}}},
+            {name = "otlp_exphist", kind = "exponential_histogram", scale = 0, zero_count = 1,
+             count = 4, zero_threshold = 0, sum = 7, temporality = "delta",
+             positive = {offset = 0, counts = {1, 2}}, negative = {offset = 0, counts = {}}},
+          },
+        }
+
+        local log = {message = "otlp log " .. s, severity = "info"}
+        if s % 4 ~= 3 then
+          log.trace_id = trace_id
+          log.span_id = span_id
+        end
+        local logs = Event.new{timestamp = ts, attributes = attributes, log = log}
+
+        local span = Event.new{
+          timestamp = ts,
+          attributes = attributes,
+          span = {
+            trace_id = trace_id,
+            span_id = span_id,
+            name = "otlp-span-" .. s,
+            kind = "server",
+            status = (s % 5 == 0) and "error" or "unset",
+            status_message = (s % 5 == 0) and "boom" or nil,
+            end_timestamp = ts,
+            events = {{timestamp = ts, name = "retry"}},
+          },
+        }
+        return {metrics, logs, span}
+      end
+
+  proto:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["redpanda:9092"]
+    format: otlp_proto
+
+  keyed:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["redpanda:9092"]
+    format: otlp_proto
+    key: trace_id
+    topics: { logs: keyed-logs, metrics: keyed-metrics, traces: keyed-spans }
+
+  big:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["redpanda:9092"]
+    format: otlp_proto
+    max_request_bytes: 2KiB
+    topics: { logs: big-logs, metrics: big-metrics, traces: big-spans }
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/otlp-redpanda-telemetry.log
+    format: json

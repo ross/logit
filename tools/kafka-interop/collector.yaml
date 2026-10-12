@@ -1,0 +1,74 @@
+# The OpenTelemetry Collector `script/kafka-interop` runs against each broker (BROKER names it,
+# `kafka` or `redpanda`), to read what `kafka_out` writes in OTLP formats with the receiver
+# operators already run. Each `kafka/*` receiver reads one group of topics from the start and feeds
+# pipelines whose `file` exporters write every decoded request as one OTLP/JSON line under /out,
+# which `check.py` compares with what `logit-otlp-*.yaml` sent.
+#
+# The `keyed` traces also feed two `kafka` exporters that key each request by its trace id, as
+# `partition_traces_by_id` does: one with the exporter's default partitioner and one with the
+# `murmur2` hasher. check.py compares the partition each trace id lands on from `kafka_out` with
+# the partition from each exporter.
+receivers:
+  kafka/proto:
+    brokers: ["${env:BROKER}:9092"]
+    group_id: interop-proto
+    initial_offset: earliest
+    logs: { topics: [otlp_logs], encoding: otlp_proto }
+    metrics: { topics: [otlp_metrics], encoding: otlp_proto }
+    traces: { topics: [otlp_spans], encoding: otlp_proto }
+
+  kafka/keyed:
+    brokers: ["${env:BROKER}:9092"]
+    group_id: interop-keyed
+    initial_offset: earliest
+    logs: { topics: [keyed-logs], encoding: otlp_proto }
+    metrics: { topics: [keyed-metrics], encoding: otlp_proto }
+    traces: { topics: [keyed-spans], encoding: otlp_proto }
+
+  kafka/big:
+    brokers: ["${env:BROKER}:9092"]
+    group_id: interop-big
+    initial_offset: earliest
+    logs: { topics: [big-logs], encoding: otlp_proto }
+    metrics: { topics: [big-metrics], encoding: otlp_proto }
+    traces: { topics: [big-spans], encoding: otlp_proto }
+
+exporters:
+  file/proto-logs: { path: /out/proto-logs.jsonl, flush_interval: 1s }
+  file/proto-metrics: { path: /out/proto-metrics.jsonl, flush_interval: 1s }
+  file/proto-traces: { path: /out/proto-traces.jsonl, flush_interval: 1s }
+  file/keyed-logs: { path: /out/keyed-logs.jsonl, flush_interval: 1s }
+  file/keyed-metrics: { path: /out/keyed-metrics.jsonl, flush_interval: 1s }
+  file/keyed-traces: { path: /out/keyed-traces.jsonl, flush_interval: 1s }
+  file/big-logs: { path: /out/big-logs.jsonl, flush_interval: 1s }
+  file/big-metrics: { path: /out/big-metrics.jsonl, flush_interval: 1s }
+  file/big-traces: { path: /out/big-traces.jsonl, flush_interval: 1s }
+
+  kafka/exporter-default:
+    brokers: ["${env:BROKER}:9092"]
+    traces: { topic: exporter-default, encoding: otlp_proto }
+    partition_traces_by_id: true
+
+  kafka/exporter-murmur2:
+    brokers: ["${env:BROKER}:9092"]
+    traces: { topic: exporter-murmur2, encoding: otlp_proto }
+    partition_traces_by_id: true
+    record_partitioner:
+      sticky_key:
+        hasher: murmur2
+
+service:
+  telemetry:
+    metrics: { level: none }
+  pipelines:
+    logs/proto: { receivers: [kafka/proto], exporters: [file/proto-logs] }
+    metrics/proto: { receivers: [kafka/proto], exporters: [file/proto-metrics] }
+    traces/proto: { receivers: [kafka/proto], exporters: [file/proto-traces] }
+    logs/keyed: { receivers: [kafka/keyed], exporters: [file/keyed-logs] }
+    metrics/keyed: { receivers: [kafka/keyed], exporters: [file/keyed-metrics] }
+    traces/keyed:
+      receivers: [kafka/keyed]
+      exporters: [file/keyed-traces, kafka/exporter-default, kafka/exporter-murmur2]
+    logs/big: { receivers: [kafka/big], exporters: [file/big-logs] }
+    metrics/big: { receivers: [kafka/big], exporters: [file/big-metrics] }
+    traces/big: { receivers: [kafka/big], exporters: [file/big-traces] }

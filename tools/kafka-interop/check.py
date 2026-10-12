@@ -16,7 +16,10 @@ script has already written, under /out (the run directory):
     readback/redpanda/codec-<c>.batches rpk topic consume -f 'offset: %o compression:
                                         %a{compression}\n': each record's batch codec
     <leg>-<broker>-telemetry.log        each leg's `internal` telemetry, `stdio_out` `format: json`
-    exits.txt                           `<service> <exit code>` per leg
+    readback/<broker>/<topic>.{java,kcat}.tsv  for the OTLP topics, no value: the Java consumer
+                                        prints the key last, and kcat prints the value's size
+    collector/<broker>/<name>.jsonl     what the Collector decoded, one OTLP/JSON request a line
+    exits.txt                           `<service> <exit code>` per leg and Collector
     redpanda-oidc.txt                   `ok` once Redpanda took OAUTHBEARER, else `failed`
     logs/<service>.log                  each service's log
 
@@ -429,6 +432,421 @@ def leg_timestamp(broker):
     return "FAIL", detail
 
 
+# ---- OTLP legs ---------------------------------------------------------------------------------
+#
+# `logit-otlp-*.yaml` mints OTLP_TICKS ticks, OTLP_BATCH to a batch, each a metrics event, a log,
+# and a span derived from the tick number `seq`, so every expected value below is a function of
+# `seq`. The Collector's `kafka` receivers decoded the topics, and its `file` exporters wrote each
+# decoded request as one OTLP/JSON line.
+
+OTLP_TICKS = 160
+OTLP_BATCH = 20
+OTLP_BATCHES = OTLP_TICKS // OTLP_BATCH
+OTLP_TRACES = 16
+OTLP_BIG_BYTES = 2048
+OTLP_METRICS = ("otlp_delta_sum", "otlp_cumulative_sum", "otlp_gauge", "otlp_hist", "otlp_exphist")
+HEX32 = re.compile(r"^[0-9a-f]{32}$")
+
+
+def otlp_trace_id(seq):
+    return "a1" + format(seq % OTLP_TRACES, "030x")
+
+
+def otlp_span_id(seq):
+    return format(seq + 1, "016x")
+
+
+def otlp_log_has_trace(seq):
+    return seq % 4 != 3
+
+
+def murmur2(data):
+    """Kafka's `Utils.murmur2`, which the Java producer's default partitioner hashes keys with."""
+    length = len(data)
+    seed = 0x9747B28C
+    m = 0x5BD1E995
+    h = (seed ^ length) & 0xFFFFFFFF
+    for i in range(0, length - length % 4, 4):
+        k = int.from_bytes(data[i:i + 4], "little")
+        k = (k * m) & 0xFFFFFFFF
+        k ^= k >> 24
+        k = (k * m) & 0xFFFFFFFF
+        h = ((h * m) & 0xFFFFFFFF) ^ k
+    tail = data[length - length % 4:]
+    if len(tail) == 3:
+        h ^= tail[2] << 16
+    if len(tail) >= 2:
+        h ^= tail[1] << 8
+    if len(tail) >= 1:
+        h ^= tail[0]
+        h = (h * m) & 0xFFFFFFFF
+    h ^= h >> 13
+    h = (h * m) & 0xFFFFFFFF
+    h ^= h >> 15
+    return h
+
+
+def java_partition(key, partitions):
+    return (murmur2(key.encode()) & 0x7FFFFFFF) % partitions
+
+
+def collector_lines(broker, name):
+    path = OUT / "collector" / broker / f"{name}.jsonl"
+    if not path.exists():
+        return None
+    return [json.loads(line) for line in path.read_text(errors="replace").splitlines()
+            if line.strip()]
+
+
+def attr_map(attributes):
+    """An OTLP/JSON attribute list as `{key: value}`, a 64-bit integer read back as an int."""
+    result = {}
+    for item in attributes or []:
+        (kind, value), = item["value"].items()
+        result[item["key"]] = int(value) if kind == "intValue" else value
+    return result
+
+
+def number(value):
+    return 0 if value is None else float(value)
+
+
+def point_value(point):
+    """A number data point's value, whichever of `asDouble` and `asInt` carries it."""
+    return number(point["asDouble"] if "asDouble" in point else point.get("asInt"))
+
+
+def collector_logs(broker, prefix):
+    requests = collector_lines(broker, f"{prefix}-logs")
+    if requests is None:
+        return None
+    items = []
+    for request in requests:
+        for resource in request.get("resourceLogs", []):
+            service = attr_map(resource.get("resource", {}).get("attributes")).get("service.name")
+            for scope in resource.get("scopeLogs", []):
+                for record in scope.get("logRecords", []):
+                    items.append((service, record))
+    return items
+
+
+def collector_spans(broker, prefix):
+    requests = collector_lines(broker, f"{prefix}-traces")
+    if requests is None:
+        return None
+    items = []
+    for request in requests:
+        for resource in request.get("resourceSpans", []):
+            service = attr_map(resource.get("resource", {}).get("attributes")).get("service.name")
+            for scope in resource.get("scopeSpans", []):
+                for span in scope.get("spans", []):
+                    items.append((service, span))
+    return items
+
+
+def collector_points(broker, prefix):
+    """Every data point the Collector decoded: `(metric, kind, point)` per point."""
+    requests = collector_lines(broker, f"{prefix}-metrics")
+    if requests is None:
+        return None
+    items = []
+    for request in requests:
+        for resource in request.get("resourceMetrics", []):
+            service = attr_map(resource.get("resource", {}).get("attributes")).get("service.name")
+            for scope in resource.get("scopeMetrics", []):
+                for metric in scope.get("metrics", []):
+                    for kind in ("gauge", "sum", "histogram", "exponentialHistogram"):
+                        if kind in metric:
+                            for point in metric[kind].get("dataPoints", []):
+                                items.append((service, metric, kind, point))
+    return items
+
+
+def check_logs(items):
+    """The first problem in the decoded logs, else `None`."""
+    if len(items) != OTLP_TICKS:
+        return f"{len(items)} log records, want {OTLP_TICKS}"
+    seen = set()
+    for service, record in items:
+        attrs = attr_map(record.get("attributes"))
+        seq = attrs.get("seq")
+        if not isinstance(seq, int) or not 0 <= seq < OTLP_TICKS or seq in seen:
+            return f"a log record's seq is {seq!r}, a repeat or out of range"
+        seen.add(seq)
+        want_trace = otlp_trace_id(seq) if otlp_log_has_trace(seq) else ""
+        want_span = otlp_span_id(seq) if otlp_log_has_trace(seq) else ""
+        problems = []
+        if service != "kafka-interop-otlp":
+            problems.append(f"service.name {service!r}")
+        if record.get("body", {}).get("stringValue") != f"otlp log {seq}":
+            problems.append(f"body {record.get('body')!r}")
+        if record.get("severityNumber") != 9:
+            problems.append(f"severityNumber {record.get('severityNumber')!r}")
+        if record.get("traceId", "") != want_trace:
+            problems.append(f"traceId {record.get('traceId', '')!r}, want {want_trace!r}")
+        if record.get("spanId", "") != want_span:
+            problems.append(f"spanId {record.get('spanId', '')!r}, want {want_span!r}")
+        if attrs.get("leg") != "otlp":
+            problems.append(f"leg {attrs.get('leg')!r}")
+        if problems:
+            return f"log seq {seq}: " + "; ".join(problems)
+    return None
+
+
+def check_spans(items):
+    if len(items) != OTLP_TICKS:
+        return f"{len(items)} spans, want {OTLP_TICKS}"
+    seen = set()
+    for service, span in items:
+        attrs = attr_map(span.get("attributes"))
+        seq = attrs.get("seq")
+        if not isinstance(seq, int) or not 0 <= seq < OTLP_TICKS or seq in seen:
+            return f"a span's seq is {seq!r}, a repeat or out of range"
+        seen.add(seq)
+        error = seq % 5 == 0
+        status = span.get("status", {})
+        problems = []
+        if service != "kafka-interop-otlp":
+            problems.append(f"service.name {service!r}")
+        if span.get("name") != f"otlp-span-{seq}":
+            problems.append(f"name {span.get('name')!r}")
+        if span.get("traceId") != otlp_trace_id(seq):
+            problems.append(f"traceId {span.get('traceId')!r}")
+        if span.get("spanId") != otlp_span_id(seq):
+            problems.append(f"spanId {span.get('spanId')!r}")
+        if span.get("kind") != 2:
+            problems.append(f"kind {span.get('kind')!r}, want 2 (server)")
+        if status.get("code", 0) != (2 if error else 0):
+            problems.append(f"status.code {status.get('code', 0)!r}")
+        if status.get("message", "") != ("boom" if error else ""):
+            problems.append(f"status.message {status.get('message', '')!r}")
+        if [event.get("name") for event in span.get("events", [])] != ["retry"]:
+            problems.append(f"events {span.get('events')!r}")
+        if problems:
+            return f"span seq {seq}: " + "; ".join(problems)
+    return None
+
+
+def check_metrics(items):
+    if len(items) != OTLP_TICKS * len(OTLP_METRICS):
+        return f"{len(items)} data points, want {OTLP_TICKS * len(OTLP_METRICS)}"
+    seen = set()
+    for service, metric, kind, point in items:
+        name = metric.get("name")
+        attrs = attr_map(point.get("attributes"))
+        seq = attrs.get("seq")
+        if name not in OTLP_METRICS or not isinstance(seq, int) or (name, seq) in seen:
+            return f"an unexpected or repeated point: {name!r} seq {seq!r}"
+        seen.add((name, seq))
+        problems = []
+        if service != "kafka-interop-otlp":
+            problems.append(f"service.name {service!r}")
+        if name == "otlp_delta_sum":
+            if kind != "sum" or point_value(point) != 1 \
+                    or metric["sum"].get("aggregationTemporality") != 1 \
+                    or metric["sum"].get("isMonotonic") is not True:
+                problems.append(f"delta sum {kind} {point_value(point)} {metric.get('sum')}")
+        elif name == "otlp_cumulative_sum":
+            if kind != "sum" or point_value(point) != seq + 1 \
+                    or metric["sum"].get("aggregationTemporality") != 2:
+                problems.append(f"cumulative sum {kind} {point_value(point)}")
+        elif name == "otlp_gauge":
+            if kind != "gauge" or point_value(point) != seq * 0.5 \
+                    or metric.get("unit") != "By" or metric.get("description") != "a gauge":
+                problems.append(f"gauge {kind} {point_value(point)} {metric.get('unit')!r}")
+        elif name == "otlp_hist":
+            counts = [int(c) for c in point.get("bucketCounts", [])]
+            if kind != "histogram" or point.get("explicitBounds") != [1, 5] \
+                    or counts != [1, seq % 3, 2] or int(point.get("count", 0)) != 3 + seq % 3 \
+                    or number(point.get("sum")) != 10 + seq:
+                problems.append(f"histogram {point}")
+        elif name == "otlp_exphist":
+            positive = point.get("positive", {})
+            if kind != "exponentialHistogram" or point.get("scale", 0) != 0 \
+                    or int(point.get("zeroCount", 0)) != 1 or int(point.get("count", 0)) != 4 \
+                    or number(point.get("sum")) != 7 or positive.get("offset", 0) != 0 \
+                    or [int(c) for c in positive.get("bucketCounts", [])] != [1, 2]:
+                problems.append(f"exponential histogram {point}")
+        if problems:
+            return f"{name} seq {seq}: " + "; ".join(problems)
+    return None
+
+
+def collector_problem(broker, prefix):
+    """The first mismatch between what the Collector decoded under `prefix` and what was sent."""
+    for signal, read, check in (("logs", collector_logs, check_logs),
+                                ("traces", collector_spans, check_spans),
+                                ("metrics", collector_points, check_metrics)):
+        items = read(broker, prefix)
+        if items is None:
+            return f"the Collector wrote no {prefix}-{signal}.jsonl"
+        problem = check(items)
+        if problem:
+            return f"{signal}: {problem}"
+    return None
+
+
+def sink_summary(broker, component):
+    events = telemetry("otlp", broker)
+    classes = requests_by_class(events, component)
+    dropped = telemetry_sum(events, "logit.output.records.dropped", component=component)
+    return classes, dropped
+
+
+def read_record_meta(broker, topic):
+    """`(partition, key, size)` per record of a topic read back without values: size is kcat's,
+    and the key is kcat's too, so a null key reads as the empty string."""
+    path = OUT / "readback" / broker / f"{topic}.kcat.tsv"
+    if not path.exists():
+        return None
+    records = []
+    for line in path.read_text(errors="replace").splitlines():
+        if line.strip():
+            partition, _offset, _timestamp, key, size = line.split("\t")
+            records.append((int(partition), key, int(size)))
+    return records
+
+
+def java_record_keys(broker, topic):
+    """`(partition, key)` per record from the Java consumer, which prints a null key as `null`."""
+    path = OUT / "readback" / broker / f"{topic}.java.tsv"
+    if not path.exists():
+        return None
+    records = []
+    for line in path.read_text(errors="replace").splitlines():
+        fields = line.split("\t")
+        meta = {}
+        while fields and fields[0].split(":", 1)[0] in ("CreateTime", "LogAppendTime",
+                                                        "NoTimestampType", "Partition", "Offset"):
+            name, value = fields.pop(0).split(":", 1)
+            meta[name] = value
+        key = "\t".join(fields)
+        records.append((int(meta["Partition"]), "" if key == "null" else key))
+    return records
+
+
+def leg_otlp_proto(broker):
+    problem = collector_problem(broker, "proto")
+    classes, dropped = sink_summary(broker, "proto")
+    counts = {}
+    for signal, topic in (("logs", "otlp_logs"), ("metrics", "otlp_metrics"),
+                          ("spans", "otlp_spans")):
+        records = read_record_meta(broker, topic)
+        counts[signal] = None if records is None else len(records)
+    detail = (f"records per default topic {counts}, requests {shown(classes)}, "
+              f"records.dropped {dropped}")
+    if problem:
+        return "FAIL", f"{problem}; {detail}"
+    if set(counts.values()) != {OTLP_BATCHES}:
+        return "FAIL", f"want one record per signal per batch ({OTLP_BATCHES}); {detail}"
+    if dropped or not classes.get("ok"):
+        return "FAIL", detail
+    return "PASS", (f"the Collector decoded {OTLP_TICKS} logs, {OTLP_TICKS} spans, and "
+                    f"{OTLP_TICKS * len(OTLP_METRICS)} data points, each field as sent; {detail}")
+
+
+def leg_otlp_keyed(broker):
+    problem = collector_problem(broker, "keyed")
+    classes, dropped = sink_summary(broker, "keyed")
+    if problem:
+        return "FAIL", problem
+    if dropped or not classes.get("ok"):
+        return "FAIL", f"requests {shown(classes)}, records.dropped {dropped}"
+    wanted = {otlp_trace_id(seq) for seq in range(OTLP_TICKS)}
+    summary = []
+    for signal, topic, traces in (("spans", "keyed-spans", wanted),
+                                  ("logs", "keyed-logs",
+                                   {otlp_trace_id(s) for s in range(OTLP_TICKS)
+                                    if otlp_log_has_trace(s)})):
+        kcat = read_record_meta(broker, topic)
+        java = java_record_keys(broker, topic)
+        if kcat is None or java is None or not kcat:
+            return "FAIL", f"{topic} wasn't read back"
+        if sorted((p, k) for p, k, _ in kcat) != sorted(java):
+            return "FAIL", f"{topic}: kcat and the Java consumer disagree on keys or partitions"
+        placed = {}
+        unkeyed = 0
+        for partition, key, _size in kcat:
+            if key == "":
+                unkeyed += 1
+                continue
+            if not HEX32.match(key):
+                return "FAIL", f"{topic}: key {key!r} isn't 32 lowercase hex characters"
+            placed.setdefault(key, set()).add(partition)
+        if set(placed) != traces:
+            return "FAIL", f"{topic}: keys {len(placed)} distinct, want {len(traces)}"
+        split = sorted(key for key, parts in placed.items() if len(parts) != 1)
+        if split:
+            return "FAIL", f"{topic}: a trace id on several partitions: {split[:3]}"
+        wrong = sorted(key for key, parts in placed.items()
+                       if parts != {java_partition(key, 6)})
+        if wrong:
+            return "FAIL", f"{topic}: {len(wrong)} trace ids off the Java partitioner's partition"
+        summary.append(f"{topic} {len(kcat)} records, {len(placed)} trace ids each on one "
+                       f"partition, {unkeyed} unkeyed")
+    metrics = read_record_meta(broker, "keyed-metrics") or []
+    if len(metrics) != OTLP_BATCHES or any(key for _, key, _ in metrics):
+        return "FAIL", f"keyed-metrics holds {len(metrics)} records, want {OTLP_BATCHES} unkeyed"
+    return "PASS", ("keys are the trace id in 32 lowercase hex characters, on the Java "
+                    f"partitioner's partition; {'; '.join(summary)}; keyed-metrics "
+                    f"{len(metrics)} unkeyed")
+
+
+def exporter_placement(broker, topic):
+    records = read_record_meta(broker, topic)
+    if not records:
+        return None
+    placed = {}
+    for partition, key, _size in records:
+        placed.setdefault(key, set()).add(partition)
+    return placed
+
+
+def leg_otlp_exporter_parity(broker):
+    mine = exporter_placement(broker, "keyed-spans")
+    default = exporter_placement(broker, "exporter-default")
+    murmur = exporter_placement(broker, "exporter-murmur2")
+    if not mine or not default or not murmur:
+        return "FAIL", "a topic holds no records: the Collector's exporter or kafka_out wrote none"
+    if set(default) != set(mine) or set(murmur) != set(mine):
+        return "FAIL", "the exporter and kafka_out keyed different trace ids"
+    for name, placed in (("kafka_out", mine), ("exporter default", default),
+                         ("exporter murmur2", murmur)):
+        if any(len(parts) != 1 for parts in placed.values()):
+            return "FAIL", f"{name} put a trace id on several partitions"
+    differ_default = sorted(key for key in mine if default[key] != mine[key])
+    differ_murmur = sorted(key for key in mine if murmur[key] != mine[key])
+    detail = (f"of {len(mine)} trace ids, the exporter with its default partitioner "
+              f"(sticky_key, Sarama-compatible FNV-1a) put {len(differ_default)} on a different "
+              f"partition than kafka_out, and the exporter with the murmur2 hasher put "
+              f"{len(differ_murmur)}")
+    if differ_murmur:
+        return "FAIL", detail
+    return "PASS", detail
+
+
+def leg_otlp_oversize(broker):
+    problem = collector_problem(broker, "big")
+    classes, dropped = sink_summary(broker, "big")
+    if problem:
+        return "FAIL", problem
+    if dropped or not classes.get("ok"):
+        return "FAIL", f"requests {shown(classes)}, records.dropped {dropped}"
+    counts = {}
+    largest = 0
+    for signal, topic in (("logs", "big-logs"), ("metrics", "big-metrics"), ("spans", "big-spans")):
+        records = read_record_meta(broker, topic) or []
+        counts[signal] = len(records)
+        largest = max([largest] + [size for _, _, size in records])
+    if any(n <= OTLP_BATCHES for n in counts.values()):
+        return "FAIL", (f"a batch's request wasn't split into several records: {counts} for "
+                        f"{OTLP_BATCHES} batches")
+    if largest > OTLP_BIG_BYTES:
+        return "FAIL", f"a record of {largest} bytes exceeds max_request_bytes {OTLP_BIG_BYTES}"
+    return "PASS", (f"{OTLP_BATCHES} batches split into {counts} records, the largest {largest} "
+                    f"bytes under the {OTLP_BIG_BYTES} cap; the Collector decoded every item")
+
+
 LEGS = [("parity", "partition parity with kafka-console-producer.sh", leg_parity)]
 LEGS += [(f"codec-{c}", f"compression: {c} stored, read by Java and kcat",
           lambda b, c=c: leg_codec(b, c)) for c in CODECS]
@@ -454,6 +872,14 @@ LEGS += [
                          "a fixed token; Redpanda takes no extensions")),
     ("oauth-refused", "a token the broker won't take is refused, with its status, and retried",
      leg_oauth_refused),
+    ("otlp-proto", "otlp_proto on the default topics, decoded by a Collector kafkareceiver",
+     leg_otlp_proto),
+    ("otlp-keyed", "key: trace_id puts each trace id's records on one partition, as Java would",
+     leg_otlp_keyed),
+    ("otlp-exporter-parity", "trace-keyed placement beside the Collector's kafkaexporter",
+     leg_otlp_exporter_parity),
+    ("otlp-oversize", "a request over max_request_bytes splits and the receiver reads every item",
+     leg_otlp_oversize),
 ]
 
 
