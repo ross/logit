@@ -9,6 +9,7 @@ use logit_pipeline::{BatchContext, Fault, Output, SeqId, WriteLoopConfig};
 use super::*;
 use crate::kafka::fake_broker::{self, Action, FakeCluster, Received, Step};
 use crate::kafka::partitioner::partition_for_key;
+use crate::kafka::OAuthToken;
 use crate::test_support::{at_most_once, fast_retry, sums_through_write_loop, Sums};
 
 const TOPIC: &str = "logs";
@@ -560,4 +561,32 @@ async fn each_sasl_mechanism_delivers_through_the_sink() {
         assert_eq!(sum(&sums, "logit.output.records", &[]), 1.0, "{mechanism}");
         assert_eq!(messages_in(&cluster, 0), vec!["m".to_string()], "{mechanism}");
     }
+}
+
+/// `OAUTHBEARER` with the client-credentials grant delivers through `write_loop`, fetching its
+/// token from the endpoint once.
+#[tokio::test]
+async fn oauthbearer_client_credentials_deliver_through_the_sink() {
+    let endpoint = fake_broker::TokenEndpoint::start().await;
+    let cluster = cluster(&[0]).await;
+    let mut broker_sasl = fake_broker::Sasl::new("alice", "pw");
+    broker_sasl.oauth_token = Some("token-0".into());
+    cluster.state().sasl = Some(broker_sasl);
+    let sasl = KafkaSasl::OAuthBearer {
+        token: OAuthToken::ClientCredentials {
+            endpoint: endpoint.url.clone(),
+            client_id: "logit".into(),
+            client_secret: "client-secret".into(),
+            scope: None,
+        },
+        extensions: vec![("logicalCluster".into(), "lkc-1".into())],
+    };
+    let shown = format!("{sasl:?}");
+    assert!(shown.contains("logicalCluster") && !shown.contains("client-secret"), "{shown}");
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink(KafkaSettings { sasl: Some(sasl), ..settings(&cluster) }, &probe);
+    let sums = run(&mut out, &mut probe, vec![batch(vec![event("a", "m")])], fast_retry()).await;
+    assert_eq!(sum(&sums, "logit.output.records", &[]), 1.0);
+    assert_eq!(messages_in(&cluster, 0), vec!["m".to_string()]);
+    assert_eq!(endpoint.fetches(), 1);
 }

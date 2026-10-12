@@ -17,7 +17,8 @@
 //!
 //! With [`State::sasl`] set, a connection must authenticate as a broker's SASL listener
 //! requires: `SaslHandshake` v1 naming a configured mechanism, then `SaslAuthenticate` with
-//! `PLAIN` or the server side of SCRAM (RFC 5802), checked against the configured credentials.
+//! `PLAIN`, the server side of SCRAM (RFC 5802), or `OAUTHBEARER` (RFC 7628, refusing a token with
+//! Kafka's error challenge), checked against the configured credentials.
 //! Any request but `ApiVersions` before that closes the connection, as does one after the
 //! session's `session_lifetime_ms` has passed (KIP-368's expiry).
 //!
@@ -156,18 +157,23 @@ pub(crate) struct Sasl {
     /// Answers a valid SCRAM proof with a server signature from another password, as a broker
     /// that doesn't hold the user's credential would.
     pub(crate) forge_signature: bool,
+    /// The one `OAUTHBEARER` token accepted; `None` accepts any.
+    pub(crate) oauth_token: Option<String>,
 }
 
 impl Sasl {
     /// Every mechanism `kafka_out` speaks, for `username` and `password`, with no lifetime.
     pub(crate) fn new(username: &str, password: &str) -> Self {
         Self {
-            mechanisms: ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"].map(String::from).to_vec(),
+            mechanisms: ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512", "OAUTHBEARER"]
+                .map(String::from)
+                .to_vec(),
             username: username.to_string(),
             password: password.to_string(),
             session_lifetime_ms: 0,
             iterations: 4096,
             forge_signature: false,
+            oauth_token: None,
         }
     }
 }
@@ -184,6 +190,8 @@ enum Auth {
         nonce: String,
         auth_prefix: String,
     },
+    /// An `OAUTHBEARER` error challenge is sent.
+    OAuthRefused,
     Done {
         expires: Option<Instant>,
     },
@@ -207,6 +215,8 @@ pub(crate) struct State {
     pub(crate) hide_sasl: bool,
     /// Every successful SASL exchange.
     pub(crate) authentications: usize,
+    /// Every `OAUTHBEARER` client message, in arrival order.
+    pub(crate) oauth_messages: Vec<Vec<u8>>,
     /// When each session that has a lifetime ends, in order.
     pub(crate) session_ends: Vec<Instant>,
     /// Connections closed for a request that arrived after their session ended.
@@ -560,6 +570,17 @@ fn handle(node: i32, mut body: Bytes, state: &Arc<Mutex<State>>, auth: &mut Auth
     }
 }
 
+/// The token of an `OAUTHBEARER` client message in the form Kafka's
+/// `OAuthBearerClientInitialResponse` parses: `n,` an optional `a=` authzid `,`, then `\x01`-led
+/// `key=value` pairs, one of them `auth=Bearer <token>`, and a closing `\x01\x01`.
+fn oauth_token(message: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(message).ok()?;
+    let rest = text.strip_prefix("n,")?;
+    let (_authzid, rest) = rest.split_once(',')?;
+    let pairs = rest.strip_prefix('\x01')?.strip_suffix("\x01\x01")?;
+    pairs.split('\x01').find_map(|pair| pair.strip_prefix("auth=Bearer ")).map(String::from)
+}
+
 /// One `SaslAuthenticate` step of the exchange `auth` is in.
 fn sasl_authenticate(
     state: &mut State,
@@ -597,6 +618,28 @@ fn sasl_authenticate(
         )
     };
     match std::mem::take(auth) {
+        Auth::Handshaken(mechanism) if mechanism == "OAUTHBEARER" => {
+            state.oauth_messages.push(message.to_vec());
+            let token = oauth_token(message);
+            let accepted = token.is_some_and(|token| {
+                sasl.oauth_token.as_ref().is_none_or(|expected| *expected == token)
+            });
+            if accepted {
+                return done(state, auth, Vec::new());
+            }
+            // OAuthBearerSaslServer's challenge for a token its validator refuses.
+            let challenge = r#"{"status":"invalid_token"}"#;
+            *auth = Auth::OAuthRefused;
+            SaslAuthenticateResponse::default().with_auth_bytes(Bytes::from(challenge))
+        }
+        Auth::OAuthRefused if message != [0x01] => {
+            fail(code::ILLEGAL_SASL_STATE, "expected a kvsep after the error challenge")
+        }
+        Auth::OAuthRefused => fail(
+            code::SASL_AUTHENTICATION_FAILED,
+            "Authentication failed during authentication due to invalid credentials with SASL \
+             mechanism OAUTHBEARER",
+        ),
         Auth::Handshaken(mechanism) if mechanism == "PLAIN" => {
             let parts: Vec<&[u8]> = message.split(|&b| b == 0).collect();
             if parts.len() == 3
@@ -874,6 +917,114 @@ fn append(
         }
     }
     Ok(base_offset)
+}
+
+/// One request a [`TokenEndpoint`] received.
+#[derive(Debug, Clone)]
+pub(crate) struct TokenRequest {
+    pub(crate) authorization: String,
+    pub(crate) content_type: String,
+    pub(crate) body: String,
+}
+
+/// What a [`TokenEndpoint`] answers its `n`th request (from 0): a status and a body.
+pub(crate) type TokenAnswer = Box<dyn Fn(usize) -> (u16, String) + Send>;
+
+/// The shared state of a [`TokenEndpoint`].
+pub(crate) struct TokenState {
+    pub(crate) requests: Vec<TokenRequest>,
+    pub(crate) answer: TokenAnswer,
+}
+
+/// An OAuth 2.0 token endpoint on `127.0.0.1` over HTTP/1.1, answering every `POST` with
+/// [`TokenState::answer`]. By default it issues `token-<n>` with an hour's `expires_in`.
+pub(crate) struct TokenEndpoint {
+    pub(crate) url: String,
+    state: Arc<Mutex<TokenState>>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for TokenEndpoint {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl TokenEndpoint {
+    pub(crate) async fn start() -> Self {
+        use http_body_util::{BodyExt, Full};
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/oauth2/token", listener.local_addr().unwrap());
+        let state = Arc::new(Mutex::new(TokenState {
+            requests: Vec::new(),
+            answer: Box::new(|n| {
+                (
+                    200,
+                    format!(
+                        r#"{{"access_token":"token-{n}","token_type":"Bearer","expires_in":3600}}"#
+                    ),
+                )
+            }),
+        }));
+        let shared = state.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let state = shared.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                        let state = state.clone();
+                        async move {
+                            let header = |name: http::header::HeaderName| {
+                                req.headers()
+                                    .get(name)
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or_default()
+                                    .to_string()
+                            };
+                            let request = TokenRequest {
+                                authorization: header(http::header::AUTHORIZATION),
+                                content_type: header(http::header::CONTENT_TYPE),
+                                body: String::new(),
+                            };
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            let (status, text) = {
+                                let mut state = state.lock().unwrap();
+                                let n = state.requests.len();
+                                state.requests.push(TokenRequest {
+                                    body: String::from_utf8_lossy(&body).into_owned(),
+                                    ..request
+                                });
+                                (state.answer)(n)
+                            };
+                            Ok::<_, std::convert::Infallible>(
+                                http::Response::builder()
+                                    .status(status)
+                                    .header(http::header::CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from(text)))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        Self { url, state, task }
+    }
+
+    pub(crate) fn state(&self) -> MutexGuard<'_, TokenState> {
+        self.state.lock().unwrap()
+    }
+
+    /// How many token requests have arrived.
+    pub(crate) fn fetches(&self) -> usize {
+        self.state().requests.len()
+    }
 }
 
 #[cfg(test)]

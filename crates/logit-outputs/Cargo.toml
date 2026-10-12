@@ -44,6 +44,9 @@ webpki-roots.workspace = true
 # attributes.
 ring.workspace = true
 base64.workspace = true
+# kafka_out's OAUTHBEARER (docs/adr/kafka-sasl.md): the token endpoint's answer, a JWT's claims,
+# and a broker's error challenge. Tests also parse what `ndjson` and kafka_out's sinks write.
+serde_json.workspace = true
 tokio.workspace = true
 # TLS for the raw-TCP sinks (`logit_out`, `syslog_out`, `statsd_out`), which don't go through
 # `reqwest`/`hyper`; tests' TLS servers use it too.
@@ -66,8 +69,6 @@ logit-inputs.workspace = true
 tracing-subscriber.workspace = true
 # Codec fixed-point property tests (`decode(encode(decode(x))) == decode(x)`).
 proptest.workspace = true
-# `ndjson`'s test that every line it writes parses as JSON, and the kafka_out sink tests'.
-serde_json.workspace = true
 # `msgpack`'s parity test reads an NDJSON line into a tree that keeps each object's key order,
 # which `serde_json::Value` doesn't.
 serde.workspace = true

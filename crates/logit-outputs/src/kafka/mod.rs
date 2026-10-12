@@ -9,7 +9,7 @@
 //! - [`conn`] is one broker connection: framing, correlation ids, version negotiation, TLS, and
 //!   the SASL session's deadline.
 //! - [`sasl`] authenticates a connection: the exchange loop and the `PLAIN`, `SCRAM-SHA-256`,
-//!   and `SCRAM-SHA-512` mechanisms.
+//!   `SCRAM-SHA-512`, and `OAUTHBEARER` mechanisms, with `OAUTHBEARER`'s token endpoint.
 //! - [`batch`] and [`compression`] write record batch v2 with all five codecs through the
 //!   crate's compression hook, so none of its C codecs is built.
 //! - [`partitioner`] is the Java client's murmur2 keyed partitioner and the per-send sticky
@@ -36,6 +36,9 @@
 //! | `UNSUPPORTED_SASL_MECHANISM` (33), `ILLEGAL_SASL_STATE` (34), `UNSUPPORTED_VERSION` (35), `SASL_AUTHENTICATION_FAILED` (58), from `SaslHandshake` or `SaslAuthenticate` | `Refused` | the mechanism, the exchange, or the credentials: a retry repeats the same exchange | `tests::sasl_refusals_are_refused_and_never_print_the_password`, `sink::tests::refused_sasl_credentials_hold_the_queue_until_the_broker_takes_them` |
 //! | Any other code from `SaslHandshake` or `SaslAuthenticate` | `Clean` | a state the broker leaves on its own | `fault::tests::sasl_answers_refuse_for_the_mechanism_the_state_and_the_credentials` |
 //! | A SCRAM server message the client's checks reject: a server signature that doesn't match, a nonce that doesn't extend the client's, an iteration count outside 4096 to 1048576, a mandatory extension (`m=`), an `e=` error | `Refused` | a broker whose signature doesn't match doesn't hold the user's credential, and every check fails the same way on every connection | `tests::a_scram_server_signature_mismatch_is_refused`, `sasl::scram::tests::a_malformed_server_first_message_is_refused`, `sasl::scram::tests::an_iteration_count_outside_the_bounds_is_refused` |
+//! | An `OAUTHBEARER` error challenge (RFC 7628), answered with a `kvsep`, then `SASL_AUTHENTICATION_FAILED` (58) | `Refused`; the message carries the challenge's `status`, and a fetched token leaves the cache | the broker won't take the token; a fetched one is replaced on the next dial rather than resent | `tests::a_refused_token_is_refused_with_its_status_and_fetched_again` |
+//! | An `OAUTHBEARER` token endpoint unreachable, timed out, or answering `429` or `5xx` | `Clean` | a transient fault upstream of the broker, before any `SaslAuthenticate` | `tests::token_endpoint_faults_are_clean_when_transient_and_refused_otherwise` |
+//! | An `OAUTHBEARER` token endpoint answering any other non-`2xx` (`invalid_client`, `invalid_scope`, a redirect), or a `2xx` without an `access_token` that is an RFC 6750 bearer token | `Refused` | the client, its secret, the scope, or the endpoint URL is wrong: every fetch gets the same answer | `tests::token_endpoint_faults_are_clean_when_transient_and_refused_otherwise`, `sasl::oauth::tests::a_token_response_without_a_usable_token_is_an_error` |
 //! | A transport failure during the SASL exchange | `Clean` | no produce byte has been written on the connection | `tests::a_transport_failure_during_the_sasl_exchange_is_clean` |
 //! | A pooled connection past its SASL session's deadline (`conn::reauth_deadline`) | redialed before writing; no failure | the broker closes a connection whose session has ended on its next request | `tests::an_expiring_sasl_session_is_redialed_before_the_next_send` |
 //! | The SASL deadline passing between two produce requests of one attempt to a broker | `Clean` for the partition batches not yet written; the next attempt redials | none of them was written | `tests::a_sasl_deadline_reached_between_requests_leaves_the_rest_for_a_new_connection` |
@@ -86,7 +89,7 @@ mod sink;
 mod tests;
 
 pub use encode::{EncodeStats, KafkaEncoder, RecordFormat, RecordKey, RecordMeta, RecordMode};
-pub use sasl::KafkaSasl;
+pub use sasl::{KafkaSasl, OAuthToken};
 pub use sink::{
     KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings, TlsClientSettings,
     DEFAULT_MAX_REQUEST_BYTES, DEFAULT_TIMEOUT,

@@ -12,8 +12,10 @@
 //! failure during the exchange is `Clean`, because no produce byte has been written on the
 //! connection, and a broker's refusal or a server message the mechanism rejects is `Refused`. A
 //! session's own error is `Refused` unless it carries a class. Every message names the mechanism
-//! and [`Authenticator::principal`], never a secret.
+//! and [`Authenticator::principal`], never a secret, and adds [`Session::failure`] to a broker's
+//! refusal.
 
+mod oauth;
 mod plain;
 mod scram;
 
@@ -34,12 +36,40 @@ use super::fault;
 pub(crate) use scram::{escape_username, ScramHash};
 
 /// A `kafka_out` sink's SASL credentials. Mirrors `logit_config::KafkaSasl`; its `Debug` leaves
-/// the password out.
+/// the password, the token, and the client secret out.
 #[derive(Clone, PartialEq, Eq)]
 pub enum KafkaSasl {
-    Plain { username: String, password: String },
-    ScramSha256 { username: String, password: String },
-    ScramSha512 { username: String, password: String },
+    Plain {
+        username: String,
+        password: String,
+    },
+    ScramSha256 {
+        username: String,
+        password: String,
+    },
+    ScramSha512 {
+        username: String,
+        password: String,
+    },
+    OAuthBearer {
+        token: OAuthToken,
+        /// Sent in this order.
+        extensions: Vec<(String, String)>,
+    },
+}
+
+/// Where an `OAUTHBEARER` token comes from.
+#[derive(Clone, PartialEq, Eq)]
+pub enum OAuthToken {
+    /// Sent as given.
+    Fixed(String),
+    /// Fetched with the client-credentials grant and cached across connections.
+    ClientCredentials {
+        endpoint: String,
+        client_id: String,
+        client_secret: String,
+        scope: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for KafkaSasl {
@@ -48,13 +78,36 @@ impl std::fmt::Debug for KafkaSasl {
             KafkaSasl::Plain { username, .. } => ("Plain", username),
             KafkaSasl::ScramSha256 { username, .. } => ("ScramSha256", username),
             KafkaSasl::ScramSha512 { username, .. } => ("ScramSha512", username),
+            KafkaSasl::OAuthBearer { token, extensions } => {
+                let keys: Vec<&str> = extensions.iter().map(|(k, _)| k.as_str()).collect();
+                return f
+                    .debug_struct("OAuthBearer")
+                    .field("token", token)
+                    .field("extensions", &keys)
+                    .finish();
+            }
         };
         f.debug_struct(name).field("username", username).field("password", &"<redacted>").finish()
     }
 }
 
-/// The [`Authenticator`] for `settings`.
-pub(crate) fn authenticator(settings: &KafkaSasl) -> Arc<dyn Authenticator> {
+impl std::fmt::Debug for OAuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OAuthToken::Fixed(_) => f.write_str("Fixed(<redacted>)"),
+            OAuthToken::ClientCredentials { endpoint, client_id, scope, .. } => f
+                .debug_struct("ClientCredentials")
+                .field("endpoint", &logit_core::redact::url(endpoint))
+                .field("client_id", client_id)
+                .field("client_secret", &"<redacted>")
+                .field("scope", scope)
+                .finish(),
+        }
+    }
+}
+
+/// The [`Authenticator`] for `settings`. `timeout` bounds each token request.
+pub(crate) fn authenticator(settings: &KafkaSasl, timeout: Duration) -> Arc<dyn Authenticator> {
     match settings.clone() {
         KafkaSasl::Plain { username, password } => Arc::new(plain::Plain { username, password }),
         KafkaSasl::ScramSha256 { username, password } => {
@@ -63,6 +116,20 @@ pub(crate) fn authenticator(settings: &KafkaSasl) -> Arc<dyn Authenticator> {
         KafkaSasl::ScramSha512 { username, password } => {
             Arc::new(scram::Scram { hash: scram::ScramHash::Sha512, username, password })
         }
+        KafkaSasl::OAuthBearer { token: OAuthToken::Fixed(token), extensions } => {
+            Arc::new(oauth::OAuthBearer::fixed(token, extensions))
+        }
+        KafkaSasl::OAuthBearer {
+            token: OAuthToken::ClientCredentials { endpoint, client_id, client_secret, scope },
+            extensions,
+        } => Arc::new(oauth::OAuthBearer::client_credentials(
+            endpoint,
+            &client_id,
+            &client_secret,
+            scope.as_deref(),
+            extensions,
+            timeout,
+        )),
     }
 }
 
@@ -96,6 +163,12 @@ pub(crate) trait Session: Send {
 
     /// Reads the broker's answer to the last client message.
     fn next(&mut self, server: &[u8]) -> anyhow::Result<Step>;
+
+    /// What the session learned of a refusal before the broker failed the exchange, such as an
+    /// `OAUTHBEARER` error challenge's status. Never a secret.
+    fn failure(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The most `SaslAuthenticate` round trips one exchange may take. SCRAM takes two; a session
@@ -161,8 +234,11 @@ pub(crate) async fn authenticate(
             .with_context(|| format!("{who}: SaslAuthenticate with {broker}"))
             .context(Fault::Clean)?;
         if response.error_code != fault::code::NONE {
-            let detail =
+            let mut detail =
                 response.error_message.as_ref().map(|m| format!(": {m}")).unwrap_or_default();
+            if let Some(failure) = session.failure() {
+                detail.push_str(&format!("; {failure}"));
+            }
             return Err(anyhow!(
                 "{who}: {broker} answered SaslAuthenticate {}{detail}",
                 fault::name(response.error_code)

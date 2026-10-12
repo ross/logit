@@ -172,7 +172,7 @@ impl KafkaOutput {
             max_request_bytes: settings.max_request_bytes,
             tls: None,
             client_id: settings.client_id,
-            sasl: settings.sasl.as_ref().map(sasl::authenticator),
+            sasl: settings.sasl.as_ref().map(|sasl| sasl::authenticator(sasl, settings.timeout)),
         };
         let headers = settings
             .headers

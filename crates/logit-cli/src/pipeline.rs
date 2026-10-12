@@ -46,8 +46,8 @@ use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::graphite::{GraphiteOutput, Transport as GraphiteOutTransport};
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::kafka::{
-    KafkaAcks, KafkaCompression, KafkaOutput, KafkaSasl, KafkaSettings, RecordFormat, RecordKey,
-    RecordMode,
+    KafkaAcks, KafkaCompression, KafkaOutput, KafkaSasl, KafkaSettings, OAuthToken, RecordFormat,
+    RecordKey, RecordMode,
 };
 use logit_outputs::logit::LogitOutput;
 use logit_outputs::null::NullOutput;
@@ -1272,17 +1272,7 @@ fn build_spec(
                 timeout: *timeout,
                 headers: headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 client_id: format!("logit-{id}"),
-                sasl: sasl.as_ref().map(|sasl| match sasl.clone() {
-                    logit_config::KafkaSasl::Plain { username, password } => {
-                        KafkaSasl::Plain { username, password }
-                    }
-                    logit_config::KafkaSasl::ScramSha256 { username, password } => {
-                        KafkaSasl::ScramSha256 { username, password }
-                    }
-                    logit_config::KafkaSasl::ScramSha512 { username, password } => {
-                        KafkaSasl::ScramSha512 { username, password }
-                    }
-                }),
+                sasl: sasl.clone().map(kafka_sasl).transpose()?,
             };
             let mut output = KafkaOutput::new(settings)?
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -1951,6 +1941,36 @@ fn to_signal_paths(paths: &logit_config::OtlpPaths) -> SignalPaths {
     }
 }
 
+/// The sink's SASL settings for a `kafka_out` `sasl:` block that graph rule 85 has accepted.
+fn kafka_sasl(sasl: logit_config::KafkaSasl) -> anyhow::Result<KafkaSasl> {
+    use logit_config::KafkaSasl as Config;
+    Ok(match sasl {
+        Config::Plain { username, password } => KafkaSasl::Plain { username, password },
+        Config::ScramSha256 { username, password } => KafkaSasl::ScramSha256 { username, password },
+        Config::ScramSha512 { username, password } => KafkaSasl::ScramSha512 { username, password },
+        Config::OAuthBearer {
+            token,
+            token_endpoint,
+            client_id,
+            client_secret,
+            scope,
+            extensions,
+        } => {
+            let token = match (token, token_endpoint, client_id, client_secret) {
+                (Some(token), None, ..) => OAuthToken::Fixed(token),
+                (None, Some(endpoint), Some(client_id), Some(client_secret)) => {
+                    OAuthToken::ClientCredentials { endpoint, client_id, client_secret, scope }
+                }
+                _ => anyhow::bail!(
+                    "kafka_out 'sasl: {{mechanism: oauthbearer}}' needs 'token', or \
+                     'token_endpoint' with 'client_id' and 'client_secret'"
+                ),
+            };
+            KafkaSasl::OAuthBearer { token, extensions: extensions.into_iter().collect() }
+        }
+    })
+}
+
 /// Config's `TlsClientConfig` into the identically shaped `logit_pipeline::tls::TlsClientSettings`
 /// every sink and `prometheus_in`'s scrape client take.
 fn to_tls_client_settings(
@@ -2208,6 +2228,41 @@ fn to_sample_override(o: &logit_config::SampleOverride) -> logit_transforms::Sam
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `oauthbearer`'s flat config fields map onto the sink's token source.
+    #[test]
+    fn kafka_sasl_maps_oauthbearer_onto_its_token_source() {
+        let config =
+            |token: Option<&str>, endpoint: Option<&str>| logit_config::KafkaSasl::OAuthBearer {
+                token: token.map(String::from),
+                token_endpoint: endpoint.map(String::from),
+                client_id: endpoint.map(|_| "c".to_string()),
+                client_secret: endpoint.map(|_| "s".to_string()),
+                scope: Some("kafka".into()),
+                extensions: [("logicalCluster".to_string(), "lkc-1".to_string())].into(),
+            };
+        let extensions = vec![("logicalCluster".to_string(), "lkc-1".to_string())];
+        assert_eq!(
+            kafka_sasl(config(Some("t"), None)).unwrap(),
+            KafkaSasl::OAuthBearer {
+                token: OAuthToken::Fixed("t".into()),
+                extensions: extensions.clone()
+            }
+        );
+        assert_eq!(
+            kafka_sasl(config(None, Some("https://idp/token"))).unwrap(),
+            KafkaSasl::OAuthBearer {
+                token: OAuthToken::ClientCredentials {
+                    endpoint: "https://idp/token".into(),
+                    client_id: "c".into(),
+                    client_secret: "s".into(),
+                    scope: Some("kafka".into()),
+                },
+                extensions,
+            }
+        );
+        assert!(kafka_sasl(config(None, None)).is_err());
+    }
 
     /// [`super::build_spec`] with no reopen generation and a throwaway TLS reloader, shadowing
     /// it for every test below.
