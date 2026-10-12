@@ -9,7 +9,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     refuses the connection, and the sink holds its queue.
   - **Workaround:** a listener on the cluster that takes mutual TLS, or a local relay that holds
     the SASL credentials.
-  - **Revisit trigger:** the SASL follow-up the ADR lists, PLAIN and SCRAM first.
+  - **Revisit trigger:** stream `ksasl`, which [ADR `kafka-sasl`](../adr/kafka-sasl.md) plans:
+    PLAIN and SCRAM first, then OAUTHBEARER, then AWS MSK IAM.
 - **Brokers older than Kafka 2.4 are unsupported.** The producer sends `ApiVersions` at v3 only,
   which Kafka 2.4 introduced, so version negotiation with an older broker fails
   ([ADR `kafka-output`](../adr/kafka-output.md), "Amendment: what W1 settled", item 5).
