@@ -26,10 +26,10 @@ use super::{Authenticator, Session, Step};
 /// mechanisms (`ScramMechanism`).
 const MIN_ITERATIONS: u32 = 4096;
 
-/// The highest iteration count accepted: Kafka's maximum (`ScramMechanism`), so a broker can't
-/// store a credential above it. The cap bounds the PBKDF2 work a broken server message can ask
-/// of the connecting task.
-const MAX_ITERATIONS: u32 = 16384;
+/// The highest iteration count accepted. It only bounds the PBKDF2 work a garbled server message
+/// can ask of the connecting task, and sits far above any real broker: Kafka caps a credential at
+/// 16384, and Redpanda sets none (it creates credentials at 4096).
+const MAX_ITERATIONS: u32 = 1 << 20;
 
 /// The GS2 header for no channel binding and no authorization identity, and its base64 for the
 /// client-final message's `c=`.
@@ -338,12 +338,14 @@ mod tests {
 
     #[test]
     fn an_iteration_count_outside_the_bounds_is_refused() {
-        for i in ["4095", "1", "16385"] {
+        for i in ["4095", "1", "1048577"] {
             let first = SERVER_FIRST.replace("i=4096", &format!("i={i}"));
-            assert_refused(to_final(ScramHash::Sha256, &first), "SCRAM here takes 4096 to 16384");
+            assert_refused(to_final(ScramHash::Sha256, &first), "SCRAM here takes 4096 to 1048576");
         }
-        let first = SERVER_FIRST.replace("i=4096", "i=16384");
-        to_final(ScramHash::Sha256, &first).expect("Kafka's maximum is accepted");
+        for i in ["16384", "16385", "1048576"] {
+            let first = SERVER_FIRST.replace("i=4096", &format!("i={i}"));
+            to_final(ScramHash::Sha256, &first).expect("a count in range is accepted");
+        }
     }
 
     #[test]

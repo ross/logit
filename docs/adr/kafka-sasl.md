@@ -183,9 +183,10 @@ W1 built PLAIN and SCRAM and settled these points the decision above left open:
    Section 3's guarantee then doesn't hold: a request written near the deadline can outlast the
    session, and the broker closes the connection. That failure is `Ambiguous`, and the idempotent
    resend is deduplicated.
-3. **SCRAM takes 4096 to 16384 iterations.** The ceiling is Kafka's own maximum
-   (`ScramMechanism`), so no Kafka broker stores a credential above it, and it bounds the PBKDF2
-   work a broken server message can ask of the connecting task. A server-first message with a
+3. **SCRAM takes 4096 to 1048576 iterations.** The floor is Kafka's and Redpanda's minimum. The
+   ceiling only bounds the PBKDF2 work a broken server message can ask of the connecting task:
+   Kafka stores no credential above 16384 and Redpanda sets no maximum, so a real broker is never
+   refused. A server-first message with a
    mandatory extension (`m=`) is refused, as RFC 5802 requires.
 4. **Two more `Refused` outcomes.** With `sasl:` set, a broker that doesn't offer
    `SaslHandshake` v1 and a `SaslAuthenticate` version from v0 to v2 is `Refused`, as a broker
