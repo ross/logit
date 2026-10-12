@@ -2122,9 +2122,9 @@ What the work showed about the harness:
 - The self-test fixtures failed against `main`'s `checks.py` with the new rule reverted:
   `overflow_oldest`, `disk_full`, a mixed set of reasons, an `overflow` stderr count of 0,
   `rejected` twice, `disk_corrupt`, an overflow in a killed life, an overflow at the sink's own
-  copy, and an overflow at either sink under `route`, an overflow at another sink under
-  `copy` (`sinks-copy-overflow-elsewhere`, which fails on its detail wording), and the existing
-  shutdown fixtures, which changed only in detail wording ("batches dropped for shutdown N" to
+  copy, an overflow at another sink under `copy` (`sinks-copy-overflow-elsewhere`, which fails
+  on its detail wording), and an overflow at either sink under `route`. The existing shutdown
+  fixtures failed too, on detail wording alone ("batches dropped for shutdown N" became
   "batches dropped: shutdown N").
 - Re-scoring ten preserved runs with `script/soak check` gave no change in any verdict.
 
