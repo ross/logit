@@ -231,9 +231,10 @@ mod tests {
                 .filter(|path| path.is_dir())
                 .map(|dir| dir.join("logit.yaml")),
         );
-        // `perf/scenarios/`, `script/shape-survey`'s capture configs, `script/victoria-interop`'s
-        // and `script/splunk-interop`'s leg configs, and `script/soak`'s scenario configs run only
-        // out of CI, so a field rename must fail here, not on their next run.
+        // `perf/scenarios/`, `script/shape-survey`'s capture configs, `script/victoria-interop`'s,
+        // `script/splunk-interop`'s, and `script/kafka-interop`'s leg configs, and `script/soak`'s
+        // scenario configs run only out of CI, so a field rename must fail here, not on their next
+        // run.
         let perf_scenarios_dir = root.join("perf/scenarios");
         configs.extend(
             std::fs::read_dir(&perf_scenarios_dir)
@@ -248,7 +249,7 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
-        // The two interop harnesses' per-leg configs and each `script/soak` scenario's
+        // The three interop harnesses' per-leg configs and each `script/soak` scenario's
         // per-service configs; those directories' other files are compose, vmagent, and scenario
         // config, so only `logit-*.yaml`.
         let soak_scenarios_dir = root.join("tools/soak/scenarios");
@@ -257,10 +258,11 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.is_dir())
             .collect();
-        let harness_dirs = ["tools/victoria-interop", "tools/splunk-interop"]
-            .into_iter()
-            .map(|harness| root.join(harness))
-            .chain(soak_scenarios);
+        let harness_dirs =
+            ["tools/victoria-interop", "tools/splunk-interop", "tools/kafka-interop"]
+                .into_iter()
+                .map(|harness| root.join(harness))
+                .chain(soak_scenarios);
         for dir in harness_dirs {
             configs.extend(
                 std::fs::read_dir(&dir)

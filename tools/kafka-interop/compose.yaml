@@ -1,0 +1,148 @@
+# The stack `script/kafka-interop` drives: Apache Kafka (KRaft) and Redpanda, each with a plain,
+# a TLS, and a mutual-TLS listener, and one `logit` per leg per broker from the release image. See
+# README.md here, and docs/plans/kafka-output.md's "Interop plan (W4)" for what each leg proves.
+#
+# `script/kafka-interop` runs this under the compose project `kafka-interop` with an
+# `--env-file` it writes, which sets:
+#
+#   KAFKA_INTEROP_OUT    the host run directory: /out in every `logit` service, its `tls/` at
+#                        /tls in every service, and its `redpanda/` at /etc/redpanda
+#   KAFKA_INTEROP_IMAGE  the `logit` release image tag
+#
+# The script starts the brokers first, then every `logit-*` service by name, so `up` with no
+# service names isn't how this file is run. Nothing binds a host port: the read-back runs inside
+# the `kafka` container and in kcat containers on this network. No `container_name`, so a second
+# stack under another project name can't collide with this one.
+
+name: kafka-interop
+
+networks:
+  default:
+    name: kafka-interop-net
+
+x-logit: &logit
+  image: ${KAFKA_INTEROP_IMAGE:-logit:kafka-interop}
+  depends_on:
+    kafka: { condition: service_healthy }
+    redpanda: { condition: service_healthy }
+  # The script stops each leg once its window has passed; nothing restarts one.
+  restart: "no"
+  entrypoint: ["logit", "run", "/config.yaml"]
+  command: []
+
+services:
+  kafka:
+    image: apache/kafka:4.2.0
+    hostname: kafka
+    environment:
+      # Any base64 UUID; the broker's log directory lives and dies with the container.
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - ./kafka-server.properties:/interop/server.properties:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+    # The image's own startup maps environment variables onto server.properties; this file sets
+    # everything, so format the log directory and start the broker on it directly.
+    entrypoint:
+      - bash
+      - -c
+      - >-
+        /opt/kafka/bin/kafka-storage.sh format --ignore-formatted -t "$${CLUSTER_ID}"
+        -c /interop/server.properties >/dev/null
+        && exec /opt/kafka/bin/kafka-server-start.sh /interop/server.properties
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 30s
+      retries: 30
+
+  redpanda:
+    image: redpandadata/redpanda:v26.2.3
+    hostname: redpanda
+    # rpk rewrites redpanda.yaml on start and chowns its new copy to the old file's owner, the
+    # host user who ran the script, which only root may do.
+    user: "0:0"
+    volumes:
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/redpanda:/etc/redpanda:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --default-log-level=warn
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -Eq 'Healthy:[[:space:]]+true'"]
+      interval: 5s
+      timeout: 15s
+      retries: 30
+
+  logit-parity-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-parity-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-parity-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-parity-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-codecs-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-codecs-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-codecs-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-codecs-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-dedup-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-dedup-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-dedup-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-dedup-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-tls-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-tls-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-tls-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-tls-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-timestamp-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-timestamp-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-timestamp-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-timestamp-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z

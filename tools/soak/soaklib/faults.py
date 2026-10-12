@@ -27,7 +27,7 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
 
 from dataclasses import dataclass, field
 
-from .scenario import BACKEND_ROLE, GENERATOR_ROLE, SUT_ROLE
+from .scenario import BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, SUT_ROLE
 
 NETEM_LIMIT = "100000"
 STOP_TIMEOUT_S = 30
@@ -53,7 +53,7 @@ class Action:
     # Whether the fault can lose UDP between the generator and the SUT, which the ledger's wire
     # row judges only outside such windows.
     affects_udp_ingress: object
-    # Whether the fault can delay or fail a SUT sink's delivery to a backend.
+    # Whether the fault can delay or fail a SUT sink's delivery to a backend or a broker.
     affects_egress: object
 
 
@@ -174,8 +174,8 @@ def _on_generator(step, roles):
     return roles.get(step.on) == GENERATOR_ROLE
 
 
-def _on_sut_or_backend(step, roles):
-    return roles.get(step.on) in (SUT_ROLE, BACKEND_ROLE)
+def _on_sut_or_destination(step, roles):
+    return roles.get(step.on) in (SUT_ROLE, BACKEND_ROLE, BROKER_ROLE)
 
 
 def _lifecycle_on_sut_or_generator_partition(step, roles):
@@ -191,37 +191,37 @@ ACTIONS = {
         apply=netem_apply,
         revert=netem_revert,
         affects_udp_ingress=_on_generator,
-        affects_egress=_on_sut_or_backend,
+        affects_egress=_on_sut_or_destination,
     ),
     "pause": Action(
         apply=pause_apply,
         revert=pause_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=_on_sut_or_backend,
+        affects_egress=_on_sut_or_destination,
     ),
     "stop": Action(
         apply=stop_apply,
         revert=stop_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=_on_sut_or_backend,
+        affects_egress=_on_sut_or_destination,
     ),
     "kill": Action(
         apply=kill_apply,
         revert=stop_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=_on_sut_or_backend,
+        affects_egress=_on_sut_or_destination,
     ),
     "restart": Action(
         apply=restart_apply,
         revert=restart_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=_on_sut_or_backend,
+        affects_egress=_on_sut_or_destination,
     ),
     "partition": Action(
         apply=partition_apply,
         revert=partition_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=_on_sut_or_backend,
+        affects_egress=_on_sut_or_destination,
     ),
     # A mark on the SUT holds what it marks, such as a stalled script backing up into the UDP
     # receive queue.
@@ -229,7 +229,7 @@ ACTIONS = {
         apply=no_op,
         revert=no_op,
         affects_udp_ingress=_on_sut,
-        affects_egress=_on_sut_or_backend,
+        affects_egress=_on_sut_or_destination,
     ),
     "exit": Action(
         apply=no_op,

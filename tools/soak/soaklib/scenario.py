@@ -23,14 +23,18 @@ A scenario's target is where the SUT's sinks deliver. The default is local: each
 `[[ledger.sink]]` names the `backend` service the checks query for its V. A `[target]` table
 with `kind = "external"` names a destination outside the stack, such as Datadog, which nothing
 queries: the stack runs without the `local` profile's backends, a sink names no backend, and the
-ledger ends at each sink's own telemetry (docs/plans/soak-harness.md's "External targets").
+ledger ends at each sink's own telemetry (docs/plans/soak-harness.md's "External targets"). A
+`[target]` table with `kind = "kafka"` runs a local Kafka broker, the `kafka` service, in place of
+the `local` profile's backends: its one sink names no backend, faults on `kafka` are allowed for
+that target only, and the ledger's V is the topic it names, read back at the end
+(docs/plans/soak-harness.md's "Kafka targets").
 
 Services are known by role, from each compose service's `soak.role` label: `sut` (the `logit`
-under test), `generator`, or `backend`. A scenario may add services with a `compose` override
-file, so the role map comes from the merged compose config, which only the driver can read
-(`docker compose config`). `load()` checks what needs no service list; `service_problems()`
-checks the rest against a role map: the driver's in `prepare()` before the stack starts, and
-`BASE_ROLES` in `list` and the self-test.
+under test), `generator`, `backend`, or `broker` (a Kafka target's broker). A scenario may add
+services with a `compose` override file, so the role map comes from the merged compose config,
+which only the driver can read (`docker compose config`). `load()` checks what needs no service
+list; `service_problems()` checks the rest against a role map: the driver's in `prepare()`
+before the stack starts, and `base_roles()` in `list` and the self-test.
 """
 
 import json
@@ -44,16 +48,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # The compose label naming a service's role, and the roles. A `sut` and a `generator` run
-# `logit`; a `backend` stores what a sink delivers and answers the checks' queries.
+# `logit`; a `backend` stores what a sink delivers and answers the checks' queries; a `broker`
+# is a Kafka target's broker, which the driver reads the topic back from.
 ROLE_LABEL = "soak.role"
-SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE = "sut", "generator", "backend"
-ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE)
+SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE = "sut", "generator", "backend", "broker"
+ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE)
 LOGIT_ROLES = (SUT_ROLE, GENERATOR_ROLE)
 # The service each `logit` role runs as. One SUT and one generator, under these names.
 SUT_SERVICE, GENERATOR_SERVICE = "logit", "generator"
 # The role map compose.yaml's labels give with the `local` profile, for what can't run
 # `docker compose config`: `list` and the self-test, which pins it to compose.yaml.
 BASE_ROLES = {"logit": SUT_ROLE, "generator": GENERATOR_ROLE, "victoria-metrics": BACKEND_ROLE}
+# What the `kafka` profile adds to the role map in place of the `local` profile's backends.
+KAFKA_ROLES = {"kafka": BROKER_ROLE}
 
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
@@ -84,15 +91,21 @@ TOP_LEVEL_KEYS = {
     "name", "description", "duration", "warmup", "cooldown", "recovery_bound", "cycle",
     "configs", "ledger", "thresholds", "step", "expect", "random", "target", "compose",
 }
-# The local target, the default, and the kind with no backend query.
+# The local target, the default; the kind with no backend query; and the local Kafka broker,
+# whose kind is also its service name.
 LOCAL_TARGET = "victoria-metrics"
 EXTERNAL_TARGET = "external"
-TARGET_KEYS = {"kind", "name", "env"}
+KAFKA_TARGET = "kafka"
+TARGET_KINDS = (LOCAL_TARGET, EXTERNAL_TARGET, KAFKA_TARGET)
+TARGET_KEYS = {"kind", "name", "env", "topic"}
+# Kafka's legal topic names (`Topic.validate`): ASCII letters, digits, `.`, `_`, and `-`, up to
+# 249 characters.
+_TOPIC_NAME = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
 # The variables compose.yaml passes into the SUT's environment for an external target. A
 # `[target] env` entry outside this list would reach no container, so `validate()` refuses it;
 # the self-test checks that compose.yaml passes each one.
 EXTERNAL_ENV_PASSED = ("DD_API_KEY",)
-# The ledger keys that name a VictoriaMetrics query, which an external target has none of.
+# The ledger keys that name a VictoriaMetrics query, which only the local target has.
 VM_LEDGER_KEYS = {"vm_every_window"}
 _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
@@ -326,7 +339,8 @@ class Scenario:
     steps: list = field(default_factory=list)
     expectations: list = field(default_factory=list)
     random: object = None
-    # `{kind, name, env}`; kind `victoria-metrics` (the default) or `external`.
+    # `{kind, name, env}`, plus `topic` for a Kafka target; kind `victoria-metrics` (the
+    # default), `external`, or `kafka`.
     target: dict = field(default_factory=lambda: {"kind": LOCAL_TARGET, "name": LOCAL_TARGET,
                                                   "env": []})
     # The compose override file beside scenario.toml, or None.
@@ -335,6 +349,16 @@ class Scenario:
     @property
     def external(self):
         return self.target.get("kind") == EXTERNAL_TARGET
+
+    @property
+    def kafka(self):
+        return self.target.get("kind") == KAFKA_TARGET
+
+    @property
+    def has_vm(self):
+        """Whether the stack runs the `local` profile's backends, which only the local target
+        does."""
+        return self.target.get("kind") == LOCAL_TARGET
 
     @property
     def sinks(self):
@@ -382,8 +406,7 @@ class Scenario:
             "configs": dict(self.configs),
             "compose": self.compose,
             "services": dict(services or {}),
-            "target": {"kind": self.target["kind"], "name": self.target["name"],
-                       "env": list(self.target["env"])},
+            "target": target_json(self.target),
             "ledger": {**self.ledger, "split": self.split,
                        "sink": [dict(sink) for sink in self.sinks]},
             "thresholds": {
@@ -452,18 +475,18 @@ def from_dict(raw, path):
         cycle = dur(raw, "cycle", "scenario")
 
     target = _parse_target(raw.get("target", {}), problems)
-    external = target["kind"] == EXTERNAL_TARGET
+    no_vm = target["kind"] != LOCAL_TARGET
     configs = raw.get("configs", {})
     ledger = raw.get("ledger", {})
     thresholds = dict(raw.get("thresholds", {}))
-    # An external target has no VictoriaMetrics to query, so the keys naming one are refused
+    # Only the local target has VictoriaMetrics to query, so the keys naming one are refused
     # with their own message rather than ignored.
-    ledger_keys = LEDGER_KEYS - VM_LEDGER_KEYS if external else LEDGER_KEYS
-    ledger_optional = OPTIONAL_LEDGER_KEYS | (VM_LEDGER_KEYS if external else set())
-    if external and isinstance(ledger, dict):
+    ledger_keys = LEDGER_KEYS - VM_LEDGER_KEYS if no_vm else LEDGER_KEYS
+    ledger_optional = OPTIONAL_LEDGER_KEYS | (VM_LEDGER_KEYS if no_vm else set())
+    if no_vm and isinstance(ledger, dict):
         for key in sorted(VM_LEDGER_KEYS & set(ledger)):
-            problems.append(f"ledger.{key} names a VictoriaMetrics query, and an external "
-                            "target has no backend query")
+            problems.append(f"ledger.{key} names a VictoriaMetrics query, and the "
+                            f"{target['kind']} target has no VictoriaMetrics")
     for table, keys, optional, where in (
         (configs, CONFIG_KEYS, set(), "configs"),
         (ledger, ledger_keys, ledger_optional, "ledger"),
@@ -490,7 +513,7 @@ def from_dict(raw, path):
         elif not (path.parent / compose).is_file():
             problems.append(f"compose: {compose} not found beside {path.name}")
     if isinstance(ledger, dict):
-        problems += _sink_problems(ledger, external)
+        problems += _sink_problems(ledger, target["kind"])
 
     steps = []
     for index, raw_step in enumerate(raw.get("step", [])):
@@ -559,13 +582,23 @@ def from_dict(raw, path):
     return scenario
 
 
-def _sink_problems(ledger, external):
+def target_json(target):
+    """The resolved scenario's `target`: `{kind, name, env}`, plus `topic` for Kafka."""
+    out = {"kind": target["kind"], "name": target["name"], "env": list(target["env"])}
+    if "topic" in target:
+        out["topic"] = target["topic"]
+    return out
+
+
+def _sink_problems(ledger, kind):
     """What the `[[ledger.sink]]` tables and `[ledger] split` break: at least one sink, each a
     table of known keys with a distinct component `id`; for a local target a `backend` and a
-    `vm_selector` on every sink, and for an external one neither; and under `split = "route"`
-    at least two sinks, each with a distinct `target`, which `copy` refuses. Whether `backend`
-    names a backend service needs the role map: `service_problems()`."""
+    `vm_selector` on every sink, and for an external or Kafka one neither; for a Kafka target
+    one sink only, the `kafka_out` whose topic is V; and under `split = "route"` at least two
+    sinks, each with a distinct `target`, which `copy` refuses. Whether `backend` names a
+    backend service needs the role map: `service_problems()`."""
     problems = []
+    no_backend = kind != LOCAL_TARGET
     split = ledger.get("split", "copy")
     if split not in SPLITS:
         problems.append(f"ledger.split must be one of {', '.join(SPLITS)}, got {split!r}")
@@ -574,6 +607,9 @@ def _sink_problems(ledger, external):
         return problems
     if not isinstance(sinks, list) or not sinks or not all(isinstance(t, dict) for t in sinks):
         return problems + ["ledger.sink must be one or more tables, written [[ledger.sink]]"]
+    if kind == KAFKA_TARGET and len(sinks) != 1:
+        problems.append("a kafka target has one [[ledger.sink]], the kafka_out whose topic the "
+                        "ledger reads back")
     ids, targets = [], []
     for index, sink in enumerate(sinks):
         where = f"ledger.sink {index + 1}"
@@ -586,9 +622,9 @@ def _sink_problems(ledger, external):
             problems.append(f"{where}: `id` {sink_id!r} repeats another sink's")
         else:
             ids.append(sink_id)
-        if external:
+        if no_backend:
             for key in sorted({"backend", "vm_selector"} & set(sink)):
-                problems.append(f"{where}: `{key}` names a backend query, and an external "
+                problems.append(f"{where}: `{key}` names a backend query, and the {kind} "
                                 "target has no backend")
         else:
             for key in ("backend", "vm_selector"):
@@ -612,10 +648,11 @@ def _sink_problems(ledger, external):
 
 
 def _parse_target(table, problems):
-    """The `[target]` table as `{kind, name, env}`, appending to `problems` what breaks its
-    rules: an unknown key or kind; for an external target, a `name` that isn't a slug or an
-    `env` that isn't a list of distinct variable names compose.yaml passes; and for the local
-    target, any `name` or `env`."""
+    """The `[target]` table as `{kind, name, env}`, plus `topic` for Kafka, appending to
+    `problems` what breaks its rules: an unknown key or kind; for an external target, a `name`
+    that isn't a slug, an `env` that isn't a list of distinct variable names compose.yaml
+    passes, or a `topic`; for a Kafka target, a missing or illegal `topic`, a `name` that isn't
+    a slug, or an `env`; and for the local target, any `name`, `env`, or `topic`."""
     local = {"kind": LOCAL_TARGET, "name": LOCAL_TARGET, "env": []}
     if not isinstance(table, dict):
         problems.append("`target` must be a table, written [target]")
@@ -623,15 +660,35 @@ def _parse_target(table, problems):
     for key in sorted(set(table) - TARGET_KEYS):
         problems.append(f"target: unknown key `{key}`")
     kind = table.get("kind", LOCAL_TARGET)
-    if kind not in (LOCAL_TARGET, EXTERNAL_TARGET):
-        problems.append(f"target.kind must be {LOCAL_TARGET!r} or {EXTERNAL_TARGET!r}, got "
-                        f"{kind!r}")
+    if kind not in TARGET_KINDS:
+        problems.append(f"target.kind must be {LOCAL_TARGET!r}, {EXTERNAL_TARGET!r}, or "
+                        f"{KAFKA_TARGET!r}, got {kind!r}")
         return local
     if kind == LOCAL_TARGET:
-        for key in sorted({"name", "env"} & set(table)):
-            problems.append(f"target.{key} is for an external target; the local target is "
-                            f"{LOCAL_TARGET}")
+        for key in sorted({"name", "env", "topic"} & set(table)):
+            problems.append(f"target.{key} is for an external or kafka target; the local "
+                            f"target is {LOCAL_TARGET}")
         return local
+    if kind == KAFKA_TARGET:
+        if "env" in table:
+            problems.append("target.env is for an external target; the kafka target runs "
+                            "inside the stack and needs no credentials")
+        name = table.get("name", KAFKA_TARGET)
+        if not isinstance(name, str) or not _TARGET_NAME.match(name):
+            problems.append("target.name must be lowercase letters, digits, `_`, or `-`")
+            name = KAFKA_TARGET
+        topic = table.get("topic")
+        if topic is None:
+            problems.append("target: a kafka target needs `topic`, the topic the SUT's "
+                            "kafka_out writes and the ledger reads back")
+            topic = ""
+        elif not isinstance(topic, str) or not _TOPIC_NAME.match(topic) or topic in (".", ".."):
+            problems.append("target.topic must be a legal Kafka topic name: ASCII letters, "
+                            "digits, `.`, `_`, or `-`, up to 249 characters")
+            topic = ""
+        return {"kind": kind, "name": name, "env": [], "topic": topic}
+    if "topic" in table:
+        problems.append("target.topic is for a kafka target")
     name = table.get("name")
     if not isinstance(name, str) or not _TARGET_NAME.match(name):
         problems.append("target.name must be lowercase letters, digits, `_`, or `-`, such as "
@@ -1113,9 +1170,13 @@ def roles_from_config(text):
 
 def base_roles(scenario):
     """`BASE_ROLES` as the driver would resolve it for `scenario` with no override: without the
-    backends, which the `local` profile holds, for an external target."""
-    return {name: role for name, role in BASE_ROLES.items()
-            if not (scenario.external and role == BACKEND_ROLE)}
+    backends, which the `local` profile holds, for any target but the local one, and with
+    `KAFKA_ROLES`, which the `kafka` profile holds, for a Kafka target."""
+    roles = {name: role for name, role in BASE_ROLES.items()
+             if scenario.has_vm or role != BACKEND_ROLE}
+    if scenario.kafka:
+        roles.update(KAFKA_ROLES)
+    return roles
 
 
 def logit_services(roles):
@@ -1146,10 +1207,12 @@ def role_problems(roles):
 def service_problems(scenario, roles):
     """Every rule that needs the stack's services, against `roles` (`{service: role}`): the
     role map's own rules; each step's and random fault's `on` a service of the stack, with a
-    `kill` or an `exit` on the SUT only; each `[[expect]]` service one that runs `logit`; and
-    each local sink's `backend` a backend service."""
+    `kill` or an `exit` on the SUT only; each `[[expect]]` service one that runs `logit`; for a
+    Kafka target, the broker `kafka`; and each local sink's `backend` a backend service."""
     problems = role_problems(roles)
-    no_backend = "; an external target's stack runs no backend" if scenario.external else ""
+    no_backend = ("; an external target's stack runs no backend" if scenario.external else
+                  "; a kafka target's stack runs the broker and no backend" if scenario.kafka
+                  else "")
 
     def on_problems(on, action, where, reason=True):
         if on not in roles:
@@ -1172,6 +1235,9 @@ def service_problems(scenario, roles):
         if exp.service not in runs:
             problems.append(f"expect {exp.index + 1} ({exp.name or '?'}): unknown service "
                             f"`{exp.service}`; telemetry comes from {' or '.join(runs)}")
+    if scenario.kafka and roles.get(KAFKA_TARGET) != BROKER_ROLE:
+        problems.append(f"a kafka target reads its topic from the {BROKER_ROLE} service "
+                        f"`{KAFKA_TARGET}`, which the stack doesn't run")
     for index, sink in enumerate(scenario.sinks):
         backend = sink.get("backend")
         if backend is not None and roles.get(backend) != BACKEND_ROLE:

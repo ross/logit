@@ -1,0 +1,287 @@
+#!/bin/bash
+# Usage: script/kafka-interop
+#
+# Runs every leg of docs/plans/kafka-output.md's "Interop plan (W4)" against a real Apache Kafka
+# and a real Redpanda, reads each topic back with the Java client and kcat, and prints one pass,
+# gap, or fail row per leg. See tools/kafka-interop/README.md for what it runs and what it writes.
+#
+# Not part of script/cibuild: it runs third-party images on the host's docker daemon, and no test
+# depends on it.
+#
+#   KAFKA_INTEROP_SKIP_IMAGE=1   reuse the existing logit:kafka-interop and logit-soak-netem:local
+#   KAFKA_INTEROP_OUT=<dir>      where run directories go (default perf/results/kafka-interop)
+
+set -euo pipefail
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+TOOLS_DIR="${ROOT}/tools/kafka-interop"
+# Everything this run creates is under this compose project, and compose.yaml names its network
+# `kafka-interop-net`, so cleanup can't touch anything else on a shared daemon.
+PROJECT="kafka-interop"
+NETWORK="kafka-interop-net"
+IMAGE="logit:kafka-interop"
+NETEM_IMAGE="logit-soak-netem:local"
+KAFKA_IMAGE="apache/kafka:4.2.0"
+KCAT_IMAGE="edenhill/kcat:1.7.1"
+PYTHON_IMAGE="python:3.12-slim"
+BROKERS=(kafka redpanda)
+# Each topic and its partition count, created on both brokers before any leg starts.
+TOPICS=(parity-logit:6 parity-java:6 codec-none:1 codec-gzip:1 codec-snappy:1 codec-lz4:1
+    codec-zstd:1 dedup:3 dedup-control:3 tls:1 mtls:1 mtls-nocert:1 timestamp:1)
+# The dedup leg's fault: the broker's packets to the leg's container dropped from this many
+# seconds after the legs start, for this long. The leg sends for 40 s.
+NETEM_AT=10
+NETEM_FOR=8
+# How long the legs run, from their start, before the script stops them: the longest leg's 40 s
+# of sending, and time for its retries after the fault.
+LEGS_WINDOW=75
+
+RUN_DIR="${KAFKA_INTEROP_OUT:-${ROOT}/perf/results/kafka-interop}/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "${RUN_DIR}/logs" "${RUN_DIR}/tls" "${RUN_DIR}/redpanda" "${RUN_DIR}/readback"
+# The image's unprivileged `logit` user, the Kafka image's `appuser`, and Redpanda's `redpanda`
+# each have an unrelated uid; world-writable lets each write here.
+chmod 777 "${RUN_DIR}" "${RUN_DIR}/tls" "${RUN_DIR}/redpanda" "${RUN_DIR}/readback"
+
+# `--env-file` rather than the environment: `sudo` resets the environment, and `$DOCKER` is
+# `sudo docker` by default.
+ENV_FILE="${RUN_DIR}/compose.env"
+{
+    echo "KAFKA_INTEROP_OUT=${RUN_DIR}"
+    echo "KAFKA_INTEROP_IMAGE=${IMAGE}"
+} >"${ENV_FILE}"
+
+ki_compose() {
+    ${DOCKER} compose --progress quiet -p "${PROJECT}" -f "${TOOLS_DIR}/compose.yaml" \
+        --env-file "${ENV_FILE}" "$@"
+}
+
+say() {
+    echo "kafka-interop: $*"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >>"${RUN_DIR}/timeline.log"
+}
+
+STARTED=0
+
+# Captures every service's log into the run directory, then removes the project's containers,
+# volumes, and network. Runs on every exit, including a failed start.
+cleanup() {
+    if [ "${STARTED}" -eq 1 ]; then
+        netem clear kafka >/dev/null 2>&1 || true
+        netem clear redpanda >/dev/null 2>&1 || true
+        collect_logs || true
+        ki_compose down -v --remove-orphans >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+collect_logs() {
+    local service
+    for service in $(ki_compose config --services); do
+        ki_compose logs --no-color --no-log-prefix "${service}" >"${RUN_DIR}/logs/${service}.log" 2>&1 || true
+    done
+}
+
+container() {
+    ki_compose ps -a -q "$1"
+}
+
+# netem set|clear <broker> [<ip>]: tools/kafka-interop/netem-drop.sh in the broker's network
+# namespace, appended to netem.log.
+netem() {
+    local action="$1" broker="$2"
+    shift 2
+    {
+        echo "== $(date -u +%Y-%m-%dT%H:%M:%S.%NZ) ${action} ${broker} $*"
+        ${DOCKER} run --rm --network "container:$(container "${broker}")" --cap-add NET_ADMIN \
+            -v "${TOOLS_DIR}/netem-drop.sh:/netem-drop.sh:ro,z" --entrypoint bash "${NETEM_IMAGE}" \
+            /netem-drop.sh "${action}" "$@"
+    } >>"${RUN_DIR}/netem.log" 2>&1
+}
+
+# A Kafka CLI tool from the broker image's /opt/kafka/bin, run inside the `kafka` container.
+kafka_tool() {
+    local tool="$1"
+    shift
+    ki_compose exec -T kafka "/opt/kafka/bin/${tool}" "$@"
+}
+
+# A private CA, a broker certificate for both broker names, and a client certificate, for the
+# TLS legs. EC P-256 keys in PKCS#8, which the Kafka PEM keystore requires, and v3 extensions,
+# which rustls requires. Throwaway keys, readable by every service's user.
+make_tls() {
+    ${DOCKER} run --rm -v "${RUN_DIR}/tls:/tls:z" -w /tls --entrypoint bash "${KAFKA_IMAGE}" -c '
+        set -euo pipefail
+        key() { openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1"; }
+        key ca.key
+        openssl req -x509 -new -key ca.key -out ca.pem -days 2 -subj "/CN=kafka-interop CA" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign"
+        sign() {
+            local name="$1" cn="$2" ext="$3"
+            key "${name}.key"
+            openssl req -new -key "${name}.key" -out "${name}.csr" -subj "/CN=${cn}"
+            printf "%s\n" "${ext}" >"${name}.ext"
+            openssl x509 -req -in "${name}.csr" -CA ca.pem -CAkey ca.key -CAcreateserial \
+                -out "${name}.crt" -days 2 -extfile "${name}.ext" 2>/dev/null
+        }
+        sign broker kafka "subjectAltName=DNS:kafka,DNS:redpanda
+extendedKeyUsage=serverAuth"
+        sign client logit "extendedKeyUsage=clientAuth"
+        cat broker.key broker.crt >broker-keystore.pem
+        chmod 644 ./*
+    '
+}
+
+# A project already up is someone else's run (or a crashed one of ours): stop rather than tear down
+# a stack this invocation didn't start.
+if [ -n "$(ki_compose ps -a -q 2>/dev/null)" ]; then
+    echo "kafka-interop: compose project '${PROJECT}' already has containers on this daemon." >&2
+    echo "  Not this run's to stop. If it is yours, run:" >&2
+    echo "  ${DOCKER} compose -p ${PROJECT} -f ${TOOLS_DIR}/compose.yaml down -v" >&2
+    exit 1
+fi
+
+if [ -n "${KAFKA_INTEROP_SKIP_IMAGE:-}" ]; then
+    for image in "${IMAGE}" "${NETEM_IMAGE}"; do
+        ${DOCKER} image inspect "${image}" >/dev/null 2>&1 || {
+            echo "kafka-interop: KAFKA_INTEROP_SKIP_IMAGE is set but ${image} does not exist" >&2
+            exit 1
+        }
+    done
+else
+    say "building ${IMAGE} from the current tree"
+    ${DOCKER} build -q -f "${ROOT}/Dockerfile" -t "${IMAGE}" "${ROOT}" >/dev/null
+    # The same image script/soak builds for its netem faults.
+    ${DOCKER} build -q -t "${NETEM_IMAGE}" "${ROOT}/tools/soak/netem" >/dev/null
+fi
+
+for config in "${TOOLS_DIR}"/logit-*.yaml; do
+    ${DOCKER} run --rm -v "${config}:/config.yaml:ro,z" "${IMAGE}" validate /config.yaml >/dev/null || {
+        echo "kafka-interop: ${config} failed 'logit validate'" >&2
+        exit 1
+    }
+done
+
+say "generating a private CA and certificates into ${RUN_DIR}/tls"
+make_tls
+# `rpk redpanda start` rewrites its config file, so Redpanda gets a writable copy.
+cp "${TOOLS_DIR}/redpanda.yaml" "${RUN_DIR}/redpanda/redpanda.yaml"
+chmod 666 "${RUN_DIR}/redpanda/redpanda.yaml"
+
+trap cleanup EXIT
+STARTED=1
+say "starting the brokers (run directory ${RUN_DIR})"
+ki_compose up -d --wait --wait-timeout 180 kafka redpanda >/dev/null
+
+{
+    echo "kafka-interop provenance"
+    echo "captured: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "repo: $(git -C "${ROOT}" rev-parse HEAD) ($(git -C "${ROOT}" status --porcelain | wc -l) modified path(s))"
+    echo "docker: $(${DOCKER} version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
+    echo "logit image: $(${DOCKER} image inspect -f '{{.Id}}' "${IMAGE}")"
+    for image in "${KAFKA_IMAGE}" "redpandadata/redpanda:v26.2.3" "${KCAT_IMAGE}"; do
+        echo "${image}: $(${DOCKER} image inspect -f '{{index .RepoDigests 0}}' "${image}" 2>/dev/null || echo unknown)"
+    done
+    echo "redpanda version: $(ki_compose exec -T redpanda rpk version 2>/dev/null | head -1)"
+} >"${RUN_DIR}/provenance.txt"
+
+say "creating topics on both brokers"
+for broker in "${BROKERS[@]}"; do
+    for entry in "${TOPICS[@]}"; do
+        kafka_tool kafka-topics.sh --bootstrap-server "${broker}:9092" --create --if-not-exists \
+            --topic "${entry%%:*}" --partitions "${entry##*:}" --replication-factor 1 >/dev/null
+    done
+done
+
+# The partition-parity leg's reference: the Java client's console producer writing the 50 keys
+# `logit-parity-*.yaml` writes, one record each.
+say "producing the parity keys with kafka-console-producer.sh"
+for broker in "${BROKERS[@]}"; do
+    for n in $(seq 0 49); do echo "user-${n}:java ${n}"; done |
+        kafka_tool kafka-console-producer.sh --bootstrap-server "${broker}:9092" \
+            --topic parity-java --reader-property parse.key=true --reader-property key.separator=: \
+            >>"${RUN_DIR}/logs/java-producer.log" 2>&1
+done
+
+LEGS=()
+for config in "${TOOLS_DIR}"/logit-*.yaml; do
+    name="$(basename "${config}" .yaml)"
+    LEGS+=("${name}")
+done
+say "starting ${#LEGS[@]} legs"
+ki_compose up -d --no-deps "${LEGS[@]}" >/dev/null
+
+sleep "${NETEM_AT}"
+for broker in "${BROKERS[@]}"; do
+    ip="$(${DOCKER} inspect -f "{{(index .NetworkSettings.Networks \"${NETWORK}\").IPAddress}}" \
+        "$(container "logit-dedup-${broker}")")"
+    say "dropping ${broker}'s packets to logit-dedup-${broker} (${ip}) for ${NETEM_FOR}s"
+    netem set "${broker}" "${ip}"
+done
+sleep "${NETEM_FOR}"
+for broker in "${BROKERS[@]}"; do
+    netem clear "${broker}"
+done
+say "netem cleared"
+
+# Every leg sends for at most 40 s. `internal` runs until a signal, so no leg ends on its own:
+# stop each with SIGTERM once the window has passed, which drains its sinks and writes its last
+# telemetry.
+sleep $((LEGS_WINDOW - NETEM_AT - NETEM_FOR))
+say "stopping the legs"
+: >"${RUN_DIR}/exits.txt"
+for leg in "${LEGS[@]}"; do
+    id="$(container "${leg}")"
+    ${DOCKER} stop -t 30 "${id}" >/dev/null
+    echo "${leg} $(${DOCKER} inspect -f '{{.State.ExitCode}}' "${id}")" >>"${RUN_DIR}/exits.txt"
+done
+
+say "reading every topic back with kafka-console-consumer.sh and kcat"
+for broker in "${BROKERS[@]}"; do
+    out="${RUN_DIR}/readback/${broker}"
+    mkdir -p "${out}"
+    chmod 777 "${out}"
+    for entry in "${TOPICS[@]}"; do
+        topic="${entry%%:*}"
+        kafka_tool kafka-get-offsets.sh --bootstrap-server "${broker}:9092" --topic "${topic}" \
+            >"${out}/${topic}.offsets" 2>>"${RUN_DIR}/logs/readback.log" || true
+        # The end offsets bound the read, so the consumer stops at the last record instead of
+        # waiting out its idle timeout; the timeout only bounds a short topic.
+        held="$(awk -F: '{ n += $3 } END { print n + 0 }' "${out}/${topic}.offsets")"
+        : >"${out}/${topic}.java.tsv"
+        if [ "${held}" -gt 0 ]; then
+            kafka_tool kafka-console-consumer.sh --bootstrap-server "${broker}:9092" \
+                --topic "${topic}" --from-beginning --max-messages "${held}" --timeout-ms 20000 \
+                --formatter-property print.timestamp=true --formatter-property print.partition=true \
+                --formatter-property print.offset=true --formatter-property print.key=true \
+                >"${out}/${topic}.java.tsv" 2>>"${RUN_DIR}/logs/readback.log" || true
+        fi
+        ${DOCKER} run --rm --network "${NETWORK}" "${KCAT_IMAGE}" -b "${broker}:9092" -C \
+            -t "${topic}" -o beginning -e -q -f '%p\t%o\t%T\t%k\t%s\n' \
+            >"${out}/${topic}.kcat.tsv" 2>>"${RUN_DIR}/logs/readback.log" || true
+    done
+done
+
+# The codec each stored batch carries, for the codec legs. Kafka's segment files are in its own
+# batch format, so kafka-dump-log.sh reads them; Redpanda's aren't, so rpk prints each record's
+# batch attributes as the broker serves them on a fetch. Both brokers default
+# `compression.type` to `producer`, so a stored batch keeps the codec the sink sent.
+say "reading each codec topic's stored batch codec"
+for codec in none gzip snappy lz4 zstd; do
+    kafka_tool kafka-dump-log.sh \
+        --files "/tmp/kraft-combined-logs/codec-${codec}-0/00000000000000000000.log" \
+        >"${RUN_DIR}/readback/kafka/codec-${codec}.batches" 2>>"${RUN_DIR}/logs/readback.log" || true
+    ki_compose exec -T redpanda rpk topic consume "codec-${codec}" -X brokers=redpanda:9092 \
+        -o start -n 100 -f 'offset: %o compression: %a{compression}\n' \
+        >"${RUN_DIR}/readback/redpanda/codec-${codec}.batches" 2>>"${RUN_DIR}/logs/readback.log" || true
+done
+
+collect_logs
+say "checking the legs"
+status=0
+${DOCKER} run --rm -v "${TOOLS_DIR}:/tools:ro,z" -v "${RUN_DIR}:/out:z" \
+    "${PYTHON_IMAGE}" python3 -I /tools/check.py || status=$?
+
+echo "kafka-interop: results in ${RUN_DIR}/results.md, service logs in ${RUN_DIR}/logs/"
+exit "${status}"

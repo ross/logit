@@ -41,6 +41,20 @@ Entry format and the other areas: [the known-gaps index](README.md).
     from a sender with a fast clock, never reaches the topic.
   - **Workaround:** raise `log.message.timestamp.after.max.ms` on the topic, or fix the clock or
     the `timestamp` stage upstream.
+- **Redpanda rejects a whole batch for one future-stamped record.** Redpanda 26.2 also refuses a
+  record stamped more than an hour ahead with `INVALID_TIMESTAMP` (32), but names no record in
+  `record_errors`, so `kafka_out` can't tell the bad record from the rest and rejects the whole
+  partition batch, counted `logit.output.records.dropped{reason="rejected"}`
+  ([ADR `kafka-output`](../adr/kafka-output.md), item 5). `script/kafka-interop`'s `timestamp`
+  leg shows it: against Apache Kafka 4.2.0, one record in each batch of 10 is dropped; against
+  Redpanda v26.2.3, all 10.
+  - **Consequence:** on Redpanda, one future-stamped event loses every record that shares its
+    partition batch, counted, never silently.
+  - **Workaround:** fix the clock or the `timestamp` stage upstream, or raise the topic's
+    `message.timestamp.after.max.ms` (the cluster's `log_message_timestamp_after_max_ms`), one
+    hour by default, as on Kafka.
+  - **Revisit trigger:** Redpanda filling `record_errors`, or a decision to split a batch that a
+    broker rejects without naming records.
 - **A `text` batch record can't tell a newline inside a body from the one between bodies.**
   `format: text` with `record: batch` joins the log bodies with `\n`, with no escaping or length
   prefix ([ADR `kafka-output`](../adr/kafka-output.md), "Amendment: what W3 settled", item 5).
