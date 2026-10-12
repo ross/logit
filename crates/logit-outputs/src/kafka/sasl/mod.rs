@@ -16,9 +16,12 @@
 //! mechanism and [`Authenticator::principal`], never a secret, and adds [`Session::failure`] to a
 //! broker's refusal.
 
+mod aws_creds;
+mod msk_iam;
 mod oauth;
 mod plain;
 mod scram;
+mod sigv4;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,10 +37,15 @@ use super::conn::{Conn, SASL_HANDSHAKE_VERSION};
 use super::fault;
 
 #[cfg(test)]
+pub(crate) use aws_creds::{Endpoints, Env};
+#[cfg(test)]
 pub(crate) use scram::{escape_username, ScramHash};
+#[cfg(test)]
+pub(crate) use sigv4::{AmzDate, Signer};
 
 /// A `kafka_out` sink's SASL credentials. Mirrors `logit_config::KafkaSasl`; its `Debug` leaves
-/// the password, the token, and the client secret out.
+/// the password, the token, and the client secret out. `AwsMskIam` holds no secret: its
+/// credentials come from the AWS credential chain when a connection is dialed.
 #[derive(Clone, PartialEq, Eq)]
 pub enum KafkaSasl {
     Plain {
@@ -56,6 +64,10 @@ pub enum KafkaSasl {
         token: OAuthToken,
         /// Sent in this order.
         extensions: Vec<(String, String)>,
+    },
+    AwsMskIam {
+        /// The region to sign for; `None` reads it from the broker's host or the environment.
+        region: Option<String>,
     },
 }
 
@@ -87,6 +99,9 @@ impl std::fmt::Debug for KafkaSasl {
                     .field("extensions", &keys)
                     .finish();
             }
+            KafkaSasl::AwsMskIam { region } => {
+                return f.debug_struct("AwsMskIam").field("region", region).finish();
+            }
         };
         f.debug_struct(name).field("username", username).field("password", &"<redacted>").finish()
     }
@@ -107,7 +122,7 @@ impl std::fmt::Debug for OAuthToken {
     }
 }
 
-/// The [`Authenticator`] for `settings`. `timeout` bounds each token request.
+/// The [`Authenticator`] for `settings`. `timeout` bounds each token or credential request.
 pub(crate) fn authenticator(settings: &KafkaSasl, timeout: Duration) -> Arc<dyn Authenticator> {
     match settings.clone() {
         KafkaSasl::Plain { username, password } => Arc::new(plain::Plain { username, password }),
@@ -131,7 +146,24 @@ pub(crate) fn authenticator(settings: &KafkaSasl, timeout: Duration) -> Arc<dyn 
             extensions,
             timeout,
         )),
+        KafkaSasl::AwsMskIam { region } => {
+            Arc::new(msk_iam::MskIam::new(region, aws_creds::Chain::new(timeout)))
+        }
     }
+}
+
+/// An `AWS_MSK_IAM` [`Authenticator`] whose credential chain reads `env` and asks `endpoints`.
+#[cfg(test)]
+pub(crate) fn msk_iam_with(
+    region: Option<&str>,
+    env: Env,
+    endpoints: Endpoints,
+    timeout: Duration,
+) -> Arc<dyn Authenticator> {
+    Arc::new(msk_iam::MskIam::new(
+        region.map(String::from),
+        aws_creds::Chain::with(env, endpoints, timeout),
+    ))
 }
 
 /// What a [`Session`] asks for after reading the broker's answer.
@@ -200,7 +232,7 @@ pub(crate) async fn authenticate(
     host: &str,
     port: u16,
 ) -> anyhow::Result<Option<(Instant, Duration)>> {
-    let who = format!("SASL {} as {}", auth.mechanism(), auth.principal());
+    let mut who = format!("SASL {} as {}", auth.mechanism(), auth.principal());
     let broker = format!("Kafka broker {host}:{port}");
     let request =
         SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str(auth.mechanism()));
@@ -225,6 +257,8 @@ pub(crate) async fn authenticate(
         .await
         .with_context(|| format!("{who}: starting the exchange with {broker}"))
         .map_err(|err| classed(err, Fault::Clean))?;
+    // `AWS_MSK_IAM` learns where its credentials came from in `start`.
+    who = format!("SASL {} as {}", auth.mechanism(), auth.principal());
     let refused = |err: anyhow::Error| {
         classed(err.context(format!("{who}: the exchange with {broker}")), Fault::Refused)
     };

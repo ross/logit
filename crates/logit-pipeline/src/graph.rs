@@ -289,7 +289,8 @@
 //!     comes with `client_id`, `client_secret`, or `scope`, a `token_endpoint` that isn't
 //!     `https://` or `http://` to a loopback host or lacks `client_id` or `client_secret`, or an
 //!     extension whose key isn't letters only or is `auth`, or whose value is empty or not
-//!     printable ASCII (`docs/adr/kafka-output.md`, `docs/adr/kafka-sasl.md`).
+//!     printable ASCII, or an `aws_msk_iam` `sasl` whose `region` isn't an AWS region's shape
+//!     (`docs/adr/kafka-output.md`, `docs/adr/kafka-sasl.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3713,6 +3714,15 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         if let Some(sasl) = sasl {
             check_kafka_oauthbearer(id, sasl)?;
         }
+        if let Some(logit_config::KafkaSasl::AwsMskIam { region: Some(region) }) = sasl {
+            if !is_aws_region(region) {
+                anyhow::bail!(
+                    "component '{id}': kafka_out 'sasl.region' ({region:?}) isn't an AWS region \
+                     -- give one such as 'us-east-1', or omit it to read the region from the \
+                     broker's MSK host name"
+                );
+            }
+        }
     }
 
     // Rule 71: a `lua`/`lua_file` `max_memory` of `0` (`docs/adr/lua-runaway-script-bounds.md`).
@@ -4301,6 +4311,20 @@ fn check_kafka_oauthbearer(id: &str, sasl: &logit_config::KafkaSasl) -> anyhow::
         }
     }
     Ok(())
+}
+
+/// Rule 85's `aws_msk_iam` region check: an AWS region's shape, a two-letter prefix, one or
+/// more lowercase words, and a number, such as `us-east-1` or `us-gov-west-1`.
+fn is_aws_region(region: &str) -> bool {
+    let parts: Vec<&str> = region.split('-').collect();
+    let Some((number, words)) = parts.split_last() else {
+        return false;
+    };
+    parts.len() >= 3
+        && parts[0].len() == 2
+        && words.iter().all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase()))
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// RFC 6750's `b64token`, the form a bearer token takes: what RFC 7628 puts after
@@ -7498,6 +7522,35 @@ mod tests {
             ]));
             assert!(err.contains("'out'") && err.contains(want), "want {want:?}, got: {err}");
             assert!(!err.contains("-secret"), "a secret in: {err}");
+        }
+    }
+
+    /// Rule 85's `aws_msk_iam` clause: a `region` must have an AWS region's shape.
+    #[test]
+    fn rule_85_checks_an_aws_msk_iam_region() {
+        let with_region = |region: Option<&str>| {
+            kafka_out_with(|k| {
+                if let ComponentKind::KafkaOut { sasl, .. } = k {
+                    *sasl = Some(logit_config::KafkaSasl::AwsMskIam {
+                        region: region.map(String::from),
+                    });
+                }
+            })
+        };
+        for region in [None, Some("us-east-1"), Some("us-gov-west-1"), Some("cn-north-1")] {
+            kafka_out_result(with_region(region)).unwrap_or_else(|err| panic!("{region:?}: {err}"));
+        }
+        for region in ["", "us-east", "US-EAST-1", "us-east-1a", "useast1", "us--1", "u-east-1"] {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("out", vec!["in"], with_region(Some(region))),
+            ]));
+            assert!(
+                err.contains("'out'")
+                    && err.contains("'sasl.region'")
+                    && err.contains("isn't an AWS region"),
+                "{region:?}: {err}"
+            );
         }
     }
 

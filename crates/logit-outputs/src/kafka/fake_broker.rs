@@ -17,8 +17,9 @@
 //!
 //! With [`State::sasl`] set, a connection must authenticate as a broker's SASL listener
 //! requires: `SaslHandshake` v1 naming a configured mechanism, then `SaslAuthenticate` with
-//! `PLAIN`, the server side of SCRAM (RFC 5802), or `OAUTHBEARER` (RFC 7628, refusing a token with
-//! Kafka's error challenge), checked against the configured credentials.
+//! `PLAIN`, the server side of SCRAM (RFC 5802), `OAUTHBEARER` (RFC 7628, refusing a token with
+//! Kafka's error challenge), or `AWS_MSK_IAM` (the payload's fields and its SigV4 signature,
+//! recomputed with `super::sasl`'s signer), checked against the configured credentials.
 //! Any request but `ApiVersions` before that closes the connection, as does one after the
 //! session's `session_lifetime_ms` has passed (KIP-368's expiry).
 //!
@@ -56,7 +57,7 @@ use tokio_rustls::TlsAcceptor;
 
 use super::fault::code;
 use super::producer::next_sequence;
-use super::sasl::{escape_username, ScramHash};
+use super::sasl::{escape_username, AmzDate, ScramHash, Signer};
 
 /// How many appended batches per producer per partition the broker remembers for dedup
 /// (`ProducerStateEntry.NUM_BATCHES_TO_RETAIN`).
@@ -162,13 +163,16 @@ pub(crate) struct Sasl {
     /// Refuses an `OAUTHBEARER` token as Redpanda v26.2.3 does: `SASL_AUTHENTICATION_FAILED` on
     /// the first message, with no error challenge.
     pub(crate) oauth_no_challenge: bool,
+    /// The one `AWS_MSK_IAM` session token accepted; `None` accepts a payload with any or none.
+    /// `AWS_MSK_IAM` takes `username` as the access key id and `password` as the secret key.
+    pub(crate) msk_session_token: Option<String>,
 }
 
 impl Sasl {
     /// Every mechanism `kafka_out` speaks, for `username` and `password`, with no lifetime.
     pub(crate) fn new(username: &str, password: &str) -> Self {
         Self {
-            mechanisms: ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512", "OAUTHBEARER"]
+            mechanisms: ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512", "OAUTHBEARER", "AWS_MSK_IAM"]
                 .map(String::from)
                 .to_vec(),
             username: username.to_string(),
@@ -178,6 +182,7 @@ impl Sasl {
             forge_signature: false,
             oauth_token: None,
             oauth_no_challenge: false,
+            msk_session_token: None,
         }
     }
 }
@@ -209,6 +214,9 @@ const OAUTH_CHALLENGE: &str = r#"{"status":"invalid_token"}"#;
 /// `oauth-refused` and `sasl-wrong` legs).
 const REDPANDA_REFUSAL: &str = "SASL authentication failed: security: Invalid credentials";
 
+/// MSK's answer to an accepted `AWS_MSK_IAM` payload.
+const MSK_ACCEPTED: &str = r#"{"version":"2020_10_22","request-id":"fake-request-id"}"#;
+
 /// The salt every SCRAM credential here uses.
 const SCRAM_SALT: &[u8] = b"fake-broker-salt";
 
@@ -229,6 +237,8 @@ pub(crate) struct State {
     pub(crate) authentications: usize,
     /// Every `OAUTHBEARER` client message, in arrival order.
     pub(crate) oauth_messages: Vec<Vec<u8>>,
+    /// Every `AWS_MSK_IAM` payload that parsed as a JSON object, in arrival order.
+    pub(crate) msk_payloads: Vec<serde_json::Map<String, serde_json::Value>>,
     /// When each session that has a lifetime ends, in order.
     pub(crate) session_ends: Vec<Instant>,
     /// Connections closed for a request that arrived after their session ended.
@@ -593,6 +603,82 @@ fn oauth_token(message: &[u8]) -> Option<String> {
     pairs.split('\x01').find_map(|pair| pair.strip_prefix("auth=Bearer ")).map(String::from)
 }
 
+/// Checks an `AWS_MSK_IAM` payload's fields as `aws-msk-iam-auth`'s `AWS4SignedPayloadGenerator`
+/// writes them, and its signature, recomputed for `sasl`'s access key id and secret key. The
+/// reason a payload fails names no secret.
+fn msk_iam_check(
+    sasl: &Sasl,
+    payload: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let field = |name: &str| payload.get(name).and_then(|v| v.as_str());
+    let mut keys: Vec<&str> = payload.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let token = field("x-amz-security-token");
+    let mut want = vec![
+        "action",
+        "host",
+        "user-agent",
+        "version",
+        "x-amz-algorithm",
+        "x-amz-credential",
+        "x-amz-date",
+        "x-amz-expires",
+        "x-amz-signature",
+        "x-amz-signedheaders",
+    ];
+    if token.is_some() {
+        want.push("x-amz-security-token");
+    }
+    want.sort_unstable();
+    if keys != want {
+        return Err(format!("keys {keys:?}"));
+    }
+    let fixed = [
+        ("version", "2020_10_22"),
+        ("action", "kafka-cluster:Connect"),
+        ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
+        ("x-amz-signedheaders", "host"),
+        ("x-amz-expires", "900"),
+    ];
+    for (name, value) in fixed {
+        if field(name) != Some(value) {
+            return Err(format!("{name} {:?}", field(name)));
+        }
+    }
+    if sasl.msk_session_token.is_some() && token != sasl.msk_session_token.as_deref() {
+        return Err("a session token the broker didn't issue".to_string());
+    }
+    let credential: Vec<&str> = field("x-amz-credential").unwrap_or_default().split('/').collect();
+    let [access_key_id, date, region, "kafka-cluster", "aws4_request"] = credential[..] else {
+        return Err(format!("credential scope {credential:?}"));
+    };
+    if access_key_id != sasl.username {
+        return Err("an unknown access key id".to_string());
+    }
+    let datetime = field("x-amz-date").unwrap_or_default();
+    if !datetime.starts_with(date) || datetime.len() != 16 {
+        return Err(format!("x-amz-date {datetime:?} outside scope date {date:?}"));
+    }
+    let signer = Signer {
+        access_key_id,
+        secret_access_key: &sasl.password,
+        region,
+        service: "kafka-cluster",
+    };
+    let date = AmzDate { datetime: datetime.to_string() };
+    let params = signer.presign(
+        field("host").unwrap_or_default(),
+        &[("Action", "kafka-cluster:Connect")],
+        token,
+        &date,
+        900,
+    );
+    if params.last().map(|(_, signature)| signature.as_str()) != field("x-amz-signature") {
+        return Err("a signature that doesn't match".to_string());
+    }
+    Ok(())
+}
+
 /// One `SaslAuthenticate` step of the exchange `auth` is in.
 fn sasl_authenticate(
     state: &mut State,
@@ -650,6 +736,20 @@ fn sasl_authenticate(
         }
         // Kafka 4.2.0 fails the exchange with the challenge as its message.
         Auth::OAuthRefused => fail(code::SASL_AUTHENTICATION_FAILED, OAUTH_CHALLENGE),
+        Auth::Handshaken(mechanism) if mechanism == "AWS_MSK_IAM" => {
+            let parsed = serde_json::from_slice::<serde_json::Value>(message).ok();
+            let Some(serde_json::Value::Object(payload)) = parsed else {
+                return fail(code::SASL_AUTHENTICATION_FAILED, "Invalid authentication payload");
+            };
+            state.msk_payloads.push(payload.clone());
+            match msk_iam_check(&sasl, &payload) {
+                Ok(()) => done(state, auth, MSK_ACCEPTED.as_bytes().to_vec()),
+                Err(why) => fail(
+                    code::SASL_AUTHENTICATION_FAILED,
+                    &format!("[fake-request-id]: Access denied ({why})"),
+                ),
+            }
+        }
         Auth::Handshaken(mechanism) if mechanism == "PLAIN" => {
             let parts: Vec<&[u8]> = message.split(|&b| b == 0).collect();
             if parts.len() == 3
@@ -1034,6 +1134,128 @@ impl TokenEndpoint {
     /// How many token requests have arrived.
     pub(crate) fn fetches(&self) -> usize {
         self.state().requests.len()
+    }
+}
+
+/// One request an [`HttpStub`] received.
+#[derive(Debug, Clone)]
+pub(crate) struct HttpRequest {
+    pub(crate) method: String,
+    /// The path and query.
+    pub(crate) path: String,
+    /// Header names in lowercase.
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: String,
+}
+
+/// What an [`HttpStub`] answers a request, given it and how many came before it: a status and
+/// a body.
+pub(crate) type HttpAnswer = Box<dyn Fn(&HttpRequest, usize) -> (u16, String) + Send>;
+
+/// The shared state of an [`HttpStub`].
+pub(crate) struct HttpStubState {
+    pub(crate) requests: Vec<HttpRequest>,
+    pub(crate) answer: HttpAnswer,
+}
+
+/// An HTTP/1.1 server on `127.0.0.1` that records every request and answers it with
+/// [`HttpStubState::answer`]: a stand-in for STS, a container credential endpoint, or IMDS. It
+/// answers `404` until a test sets an answer.
+pub(crate) struct HttpStub {
+    /// `http://127.0.0.1:<port>`, no trailing `/`.
+    pub(crate) url: String,
+    state: Arc<Mutex<HttpStubState>>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for HttpStub {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl HttpStub {
+    pub(crate) async fn start() -> Self {
+        use http_body_util::{BodyExt, Full};
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(Mutex::new(HttpStubState {
+            requests: Vec::new(),
+            answer: Box::new(|_, _| (404, String::new())),
+        }));
+        let shared = state.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let state = shared.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                        let state = state.clone();
+                        async move {
+                            let method = req.method().to_string();
+                            let path = req
+                                .uri()
+                                .path_and_query()
+                                .map(|p| p.as_str().to_string())
+                                .unwrap_or_default();
+                            let headers = req
+                                .headers()
+                                .iter()
+                                .map(|(name, value)| {
+                                    (
+                                        name.as_str().to_string(),
+                                        value.to_str().unwrap_or_default().to_string(),
+                                    )
+                                })
+                                .collect();
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            let request = HttpRequest {
+                                method,
+                                path,
+                                headers,
+                                body: String::from_utf8_lossy(&body).into_owned(),
+                            };
+                            let (status, text) = {
+                                let mut state = state.lock().unwrap();
+                                let n = state.requests.len();
+                                let answer = (state.answer)(&request, n);
+                                state.requests.push(request);
+                                answer
+                            };
+                            Ok::<_, std::convert::Infallible>(
+                                http::Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::from(text)))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        Self { url, state, task }
+    }
+
+    pub(crate) fn state(&self) -> MutexGuard<'_, HttpStubState> {
+        self.state.lock().unwrap()
+    }
+
+    /// Sets what every request is answered with.
+    pub(crate) fn answer(
+        &self,
+        answer: impl Fn(&HttpRequest, usize) -> (u16, String) + Send + 'static,
+    ) {
+        self.state().answer = Box::new(answer);
+    }
+
+    /// Every request received so far.
+    pub(crate) fn requests(&self) -> Vec<HttpRequest> {
+        self.state().requests.clone()
     }
 }
 

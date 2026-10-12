@@ -855,17 +855,29 @@ pub enum KafkaSasl {
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         extensions: std::collections::BTreeMap<String, String>,
     },
+    /// `AWS_MSK_IAM`: Amazon MSK's IAM access control, with AWS credentials from the
+    /// environment, a web identity token file (EKS IRSA), the shared credentials and config
+    /// files (`AWS_PROFILE` picks the profile; static keys only), the ECS or EKS Pod Identity
+    /// container endpoint, or the EC2 instance metadata service, in that order. Connect to the
+    /// brokers' IAM port with `tls:` set.
+    #[serde(rename = "aws_msk_iam")]
+    AwsMskIam {
+        /// The AWS region the brokers are in, such as `us-east-1`. Defaults to the region in
+        /// the broker's MSK host name, then `AWS_REGION`, then `AWS_DEFAULT_REGION`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+    },
 }
 
 impl KafkaSasl {
     /// The username a mechanism authenticates as; `None` for `oauthbearer`, whose identity is
-    /// inside the token.
+    /// inside the token, and `aws_msk_iam`, whose identity is the AWS credentials'.
     pub fn username(&self) -> Option<&str> {
         match self {
             KafkaSasl::Plain { username, .. }
             | KafkaSasl::ScramSha256 { username, .. }
             | KafkaSasl::ScramSha512 { username, .. } => Some(username),
-            KafkaSasl::OAuthBearer { .. } => None,
+            KafkaSasl::OAuthBearer { .. } | KafkaSasl::AwsMskIam { .. } => None,
         }
     }
 }
@@ -903,6 +915,9 @@ impl std::fmt::Debug for KafkaSasl {
                 .field("scope", scope)
                 .field("extensions", &extensions.keys().collect::<Vec<_>>())
                 .finish(),
+            KafkaSasl::AwsMskIam { region } => {
+                f.debug_struct("AwsMskIam").field("region", region).finish()
+            }
         }
     }
 }
@@ -7368,6 +7383,32 @@ mod tests {
         assert_eq!((client_id.as_deref(), scope.as_deref()), (Some("c"), Some("kafka")));
         assert_eq!(extensions.get("logicalCluster").map(String::as_str), Some("lkc-1"));
         assert!(parse(r#"{"mechanism": "oauthbearer", "token": "t", "username": "u"}"#).is_err());
+    }
+
+    #[test]
+    fn kafka_out_sasl_aws_msk_iam_takes_an_optional_region() {
+        let parse = |sasl: &str| {
+            serde_json::from_str::<Component>(&format!(
+                r#"{{"type": "kafka_out", "brokers": ["k:9098"], "topic": "t", "sasl": {sasl}}}"#
+            ))
+            .map(|component| match component.kind {
+                ComponentKind::KafkaOut { sasl, .. } => sasl.unwrap(),
+                other => panic!("expected KafkaOut, got {other:?}"),
+            })
+        };
+        let sasl = parse(r#"{"mechanism": "aws_msk_iam"}"#).unwrap();
+        assert_eq!(sasl, KafkaSasl::AwsMskIam { region: None });
+        assert_eq!(sasl.username(), None);
+        assert_eq!(
+            parse(r#"{"mechanism": "aws_msk_iam", "region": "eu-west-1"}"#).unwrap(),
+            KafkaSasl::AwsMskIam { region: Some("eu-west-1".into()) }
+        );
+        for bad in [
+            r#"{"mechanism": "aws_msk_iam", "profile": "p"}"#,
+            r#"{"mechanism": "aws_msk_iam", "username": "u"}"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad} should be rejected");
+        }
     }
 
     /// The token and the client secret stay out of `Debug`, and so out of any message built

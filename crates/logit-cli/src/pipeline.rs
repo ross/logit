@@ -1968,6 +1968,7 @@ fn kafka_sasl(sasl: logit_config::KafkaSasl) -> anyhow::Result<KafkaSasl> {
             };
             KafkaSasl::OAuthBearer { token, extensions: extensions.into_iter().collect() }
         }
+        Config::AwsMskIam { region } => KafkaSasl::AwsMskIam { region },
     })
 }
 
@@ -2262,6 +2263,16 @@ mod tests {
             }
         );
         assert!(kafka_sasl(config(None, None)).is_err());
+    }
+
+    #[test]
+    fn kafka_sasl_maps_aws_msk_iam_with_its_region() {
+        for region in [None, Some("us-east-1".to_string())] {
+            assert_eq!(
+                kafka_sasl(logit_config::KafkaSasl::AwsMskIam { region: region.clone() }).unwrap(),
+                KafkaSasl::AwsMskIam { region }
+            );
+        }
     }
 
     /// [`super::build_spec`] with no reopen generation and a throwaway TLS reloader, shadowing

@@ -4557,6 +4557,29 @@
             }
           },
           "additionalProperties": false
+        },
+        {
+          "description": "`AWS_MSK_IAM`: Amazon MSK's IAM access control, with AWS credentials from the environment, a web identity token file (EKS IRSA), the shared credentials and config files (`AWS_PROFILE` picks the profile; static keys only), the ECS or EKS Pod Identity container endpoint, or the EC2 instance metadata service, in that order. Connect to the brokers' IAM port with `tls:` set.",
+          "type": "object",
+          "required": [
+            "mechanism"
+          ],
+          "properties": {
+            "mechanism": {
+              "type": "string",
+              "enum": [
+                "aws_msk_iam"
+              ]
+            },
+            "region": {
+              "description": "The AWS region the brokers are in, such as `us-east-1`. Defaults to the region in the broker's MSK host name, then `AWS_REGION`, then `AWS_DEFAULT_REGION`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },

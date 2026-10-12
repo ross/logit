@@ -12,13 +12,13 @@ use logit_pipeline::test_util::{wait_until, RECV_TIMEOUT};
 use logit_pipeline::Fault;
 
 use super::batch::ProducerRecord;
-use super::fake_broker::{Action, FakeCluster, Received, Sasl, Step, TokenEndpoint};
+use super::fake_broker::{Action, FakeCluster, HttpStub, Received, Sasl, Step, TokenEndpoint};
 use super::fault::code;
 use super::partitioner::partition_for_key;
 use super::producer::{
     Acks, Attempt, Identity, PartState, Pending, Producer, ProducerConfig, Settlement,
 };
-use super::sasl::{authenticator, KafkaSasl, OAuthToken};
+use super::sasl::{authenticator, msk_iam_with, Endpoints, Env, KafkaSasl, OAuthToken};
 
 const TOPIC: &str = "logs";
 /// The first PID the fake broker hands out.
@@ -1385,4 +1385,203 @@ async fn a_token_refused_without_a_challenge_is_fetched_again() {
     let presented = tokens_presented(&cluster);
     assert_eq!(presented[0], "token-0", "{presented:?}");
     assert!(presented[1..].iter().all(|t| t == "token-1"), "{presented:?}");
+}
+
+// ---- AWS_MSK_IAM (docs/adr/kafka-sasl.md) ----------------------------------------------------
+
+const AWS_KEY_ID: &str = "AKIDLOGITTEST";
+const AWS_SECRET: &str = "aws-secret-never-printed";
+const AWS_SESSION: &str = "aws-session-token-never-printed";
+
+/// An [`Env`] over `vars`, so no test changes the process environment.
+fn aws_env(vars: &[(&str, &str)]) -> Env {
+    let vars: std::collections::BTreeMap<String, String> =
+        vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    std::sync::Arc::new(move |name| vars.get(name).cloned())
+}
+
+/// Endpoints for the chain's HTTP sources that answer nothing: a closed port.
+fn no_endpoints() -> Endpoints {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    Endpoints { imds: base.clone(), container: base.clone(), sts: Some(base) }
+}
+
+/// A cluster of `nodes` requiring `AWS_MSK_IAM` for [`AWS_KEY_ID`] and [`AWS_SECRET`].
+async fn msk_cluster(nodes: usize, leaders: &[i32]) -> FakeCluster {
+    let cluster = cluster(nodes, leaders).await;
+    cluster.state().sasl = Some(Sasl::new(AWS_KEY_ID, AWS_SECRET));
+    cluster
+}
+
+fn msk_producer(
+    cluster: &FakeCluster,
+    region: Option<&str>,
+    vars: &[(&str, &str)],
+    endpoints: Endpoints,
+) -> Producer {
+    let sasl = Some(msk_iam_with(region, aws_env(vars), endpoints, RECV_TIMEOUT));
+    Producer::new(ProducerConfig { sasl, ..config(cluster) }).unwrap()
+}
+
+/// `AWS_MSK_IAM` signs a payload per connection, the bootstrap one and each leader's, with the
+/// environment's credentials; the fake broker checks every field and recomputes the signature.
+#[tokio::test]
+async fn aws_msk_iam_authenticates_every_connection_and_delivers() {
+    let cluster = msk_cluster(2, &[0, 1]).await;
+    cluster.state().sasl.as_mut().unwrap().msk_session_token = Some(AWS_SESSION.into());
+    let vars = [
+        ("AWS_ACCESS_KEY_ID", AWS_KEY_ID),
+        ("AWS_SECRET_ACCESS_KEY", AWS_SECRET),
+        ("AWS_SESSION_TOKEN", AWS_SESSION),
+    ];
+    let mut producer = msk_producer(&cluster, Some("eu-west-1"), &vars, no_endpoints());
+    let mut records = keyed_for(0, 2, 2);
+    records.extend(keyed_for(1, 2, 2));
+    send_expecting(&mut producer, records, &[None]).await;
+    assert_eq!((values_in(&cluster, 0).len(), values_in(&cluster, 1).len()), (2, 2));
+    let state = cluster.state();
+    assert_eq!(state.authentications, 3, "bootstrap and both leaders");
+    assert_eq!(state.msk_payloads.len(), 3);
+    for payload in &state.msk_payloads {
+        assert_eq!(payload["host"], "127.0.0.1");
+        assert_eq!(payload["x-amz-security-token"], AWS_SESSION);
+        let credential = payload["x-amz-credential"].as_str().unwrap();
+        assert!(credential.ends_with("/eu-west-1/kafka-cluster/aws4_request"), "{credential}");
+    }
+}
+
+/// Without `region:` and an MSK host, the region comes from `AWS_REGION`, then
+/// `AWS_DEFAULT_REGION`; with none of them, the exchange is `Refused` before any credential
+/// lookup.
+#[tokio::test]
+async fn aws_msk_iam_reads_the_region_from_the_environment_or_refuses() {
+    for (region_var, want) in [("AWS_REGION", "ap-south-1"), ("AWS_DEFAULT_REGION", "sa-east-1")] {
+        let cluster = msk_cluster(1, &[0]).await;
+        let vars = [
+            ("AWS_ACCESS_KEY_ID", AWS_KEY_ID),
+            ("AWS_SECRET_ACCESS_KEY", AWS_SECRET),
+            (region_var, want),
+        ];
+        let mut producer = msk_producer(&cluster, None, &vars, no_endpoints());
+        send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+        let credential = cluster.state().msk_payloads[0]["x-amz-credential"].clone();
+        assert!(credential.as_str().unwrap().contains(&format!("/{want}/")), "{credential}");
+    }
+
+    let cluster = msk_cluster(1, &[0]).await;
+    let vars = [("AWS_ACCESS_KEY_ID", AWS_KEY_ID), ("AWS_SECRET_ACCESS_KEY", AWS_SECRET)];
+    let mut producer = msk_producer(&cluster, None, &vars, no_endpoints());
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
+    assert!(message.contains("no AWS region"), "{message}");
+    assert_eq!(requests_of(&cluster, ApiKey::SaslAuthenticate), 0);
+}
+
+/// Credentials the broker refuses are `Refused`, with MSK's message and no secret; ones fetched
+/// from an endpoint leave the cache, so the next attempt fetches them again and delivers once
+/// the endpoint hands out credentials the broker takes.
+#[tokio::test]
+async fn refused_aws_credentials_are_refused_and_fetched_again() {
+    let cluster = msk_cluster(1, &[0]).await;
+    let vars = [("AWS_ACCESS_KEY_ID", AWS_KEY_ID), ("AWS_SECRET_ACCESS_KEY", "wrong-secret-value")];
+    let mut producer = msk_producer(&cluster, Some("us-east-1"), &vars, no_endpoints());
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
+    assert!(message.contains("SaslAuthenticationFailed (58)"), "{message}");
+    assert!(message.contains("Access denied"), "{message}");
+    assert!(message.contains("AWS_MSK_IAM as AWS credentials from the environment"), "{message}");
+    assert!(!message.contains("wrong-secret-value"), "{message}");
+
+    let stub = HttpStub::start().await;
+    stub.answer(|_, n| {
+        let secret = if n == 0 { "stale-secret-value" } else { AWS_SECRET };
+        (
+            200,
+            format!(
+                r#"{{"AccessKeyId":"{AWS_KEY_ID}","SecretAccessKey":"{secret}",
+                    "Token":"{AWS_SESSION}","Expiration":"2099-01-01T00:00:00Z"}}"#
+            ),
+        )
+    });
+    let full = format!("{}/v2/credentials", stub.url);
+    let vars = [("AWS_CONTAINER_CREDENTIALS_FULL_URI", full.as_str())];
+    let mut producer = msk_producer(&cluster, Some("us-east-1"), &vars, no_endpoints());
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
+    for secret in ["stale-secret-value", AWS_SESSION] {
+        assert!(!message.contains(secret), "{message}");
+    }
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+    assert_eq!(stub.requests().len(), 2, "the refused credentials were fetched again");
+    assert_eq!(values_in(&cluster, 0).len(), 1);
+}
+
+/// A credential endpoint's transient fault is `Clean`, its refusal `Refused`, and the broker
+/// sees no `SaslAuthenticate` for either.
+#[tokio::test]
+async fn aws_credential_endpoint_faults_reach_the_send_with_their_class() {
+    for (status, want) in [(503, Fault::Clean), (403, Fault::Refused)] {
+        let cluster = msk_cluster(1, &[0]).await;
+        let stub = HttpStub::start().await;
+        stub.answer(move |_, _| (status, String::new()));
+        let full = format!("{}/creds", stub.url);
+        let vars = [("AWS_CONTAINER_CREDENTIALS_FULL_URI", full.as_str())];
+        let mut producer = msk_producer(&cluster, Some("us-east-1"), &vars, no_endpoints());
+        let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+        let message = format!("{err:#} {err:?}");
+        assert_eq!(logit_pipeline::classify(&err), want, "{status}: {message}");
+        assert!(message.contains(&format!("answered {status}")), "{message}");
+        assert_eq!(requests_of(&cluster, ApiKey::SaslAuthenticate), 0);
+    }
+}
+
+/// MSK ties a session's lifetime to the credentials' expiry. Credentials are reused until 5
+/// minutes before it, so the redial of a session the broker ended signs with fresh ones.
+#[tokio::test]
+async fn a_redial_after_the_credentials_are_due_signs_with_fresh_ones() {
+    let stub = HttpStub::start().await;
+    // Reused for 1 to 2 s: they expire 5 minutes and 2 seconds after they're issued, in whole
+    // seconds.
+    stub.answer(|_, n| {
+        let expires = std::time::SystemTime::now() + Duration::from_secs(302);
+        let nanos = expires.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
+        let expiration = logit_core::time::format_rfc3339_utc(nanos);
+        (
+            200,
+            format!(
+                r#"{{"AccessKeyId":"{AWS_KEY_ID}","SecretAccessKey":"{AWS_SECRET}",
+                    "Token":"session-{n}","Expiration":"{}Z"}}"#,
+                &expiration[..19]
+            ),
+        )
+    });
+    let cluster = msk_cluster(1, &[0]).await;
+    // The connection's deadline falls at half the lifetime.
+    cluster.state().sasl.as_mut().unwrap().session_lifetime_ms = 1000;
+    let full = format!("{}/creds", stub.url);
+    let vars = [("AWS_CONTAINER_CREDENTIALS_FULL_URI", full.as_str())];
+    let mut producer = msk_producer(&cluster, Some("us-east-1"), &vars, no_endpoints());
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+    let first_sent = tokio::time::Instant::now();
+    assert_eq!(stub.requests().len(), 1);
+
+    let ends = cluster.state().session_ends.clone();
+    let due = first_sent + Duration::from_secs(2);
+    wait_until("the credentials are due and every session has ended", || {
+        let now = tokio::time::Instant::now();
+        now >= due && ends.iter().all(|&end| now >= end)
+    })
+    .await;
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+
+    assert_eq!(stub.requests().len(), 2);
+    let state = cluster.state();
+    let last = state.msk_payloads.last().unwrap();
+    assert_eq!(last["x-amz-security-token"], "session-1");
+    assert_eq!(state.expired_closes, 0);
+    assert_eq!(state.partition(TOPIC, 0).records().len(), 2);
 }
