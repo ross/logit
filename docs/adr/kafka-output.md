@@ -1,6 +1,6 @@
 ---
 created: 2026-10-11
-updated: 2026-10-11
+updated: 2026-10-12
 ---
 
 # `kafka_out`: a pure-Rust producer on `kafka-protocol`, with the Java producer's semantics and named divergences
@@ -355,7 +355,8 @@ one record's value, and the message's `Meta` carries the record's key and partit
 the encoder drops is counted in its `Stats`.
 
 `topic:` and `headers:` are static in this stream: one topic per sink, and the same header map on
-every record. Kafka headers keep their order and, in `kafka-protocol`'s `Record`, can't repeat a
+every record. The `otlp_proto` and `otlp_json` formats write a topic per signal ([ADR
+`kafka-otlp-formats`](kafka-otlp-formats.md)). Kafka headers keep their order and, in `kafka-protocol`'s `Record`, can't repeat a
 key.
 
 Each format stays decodable, so a future `kafka_in` can round-trip it.
@@ -406,7 +407,8 @@ Each format stays decodable, so a future `kafka_in` can round-trip it.
 - Follow-ups, each outside this stream:
   - SASL PLAIN and SCRAM, then OAUTHBEARER and AWS MSK IAM, decided in
     [ADR `kafka-sasl`](kafka-sasl.md);
-  - `otlp_proto` and `otlp_json` formats, for parity with the OTel `kafkaexporter`;
+  - `otlp_proto` and `otlp_json` formats, for parity with the OTel `kafkaexporter`, decided in
+    [ADR `kafka-otlp-formats`](kafka-otlp-formats.md);
   - pipelined produce through `Output::window`;
   - a topic chosen per event;
   - `kafka_in`, a consumer-group client;
