@@ -145,6 +145,18 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** don't mix the two writers on one topic when consumers depend on one
     resource's records sharing a partition.
   - **Revisit trigger:** an operator who needs that placement shared.
+- **The Collector's `kafkaexporter` places a trace id differently by default.** Its key bytes
+  match `kafka_out`'s (32 lowercase hex characters), but its `record_partitioner` defaults to
+  `sticky_key` with a Sarama-compatible FNV-1a hasher, where `kafka_out` hashes with the Java
+  client's murmur2. Measured against Collector v0.162.0 with `partition_traces_by_id: true`: 14 of
+  16 trace ids landed on a different partition, and with the exporter's `murmur2` hasher none did
+  ([ADR `kafka-otlp-formats`](../adr/kafka-otlp-formats.md), item 9; [ADR
+  `kafka-output`](../adr/kafka-output.md), item 3).
+  - **Consequence:** a `logit` sink and a default exporter writing one topic split one trace's
+    records across partitions.
+  - **Workaround:** set `record_partitioner: {sticky_key: {hasher: murmur2}}` on the exporter, or
+    don't mix the two writers on one topic when consumers depend on a trace sharing a partition.
+  - **Revisit trigger:** an operator who needs `kafka_out` to match the exporter's default.
 - **A refused signal topic holds every signal in the sink.** Each signal's topic settles on its
   own, but the sink has one queue, so a topic the broker refuses (authorization, a missing topic)
   holds the logs and spans behind it although their own topics accept writes

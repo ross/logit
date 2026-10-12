@@ -1,11 +1,14 @@
 # The OTLP legs of `script/kafka-interop` against Redpanda: 160 ticks, each minting a
-# metrics event (five metric kinds), a log, and a span, written by three `format: otlp_proto`
-# sinks that the Collector's `kafka` receivers (collector.yaml) read back:
+# metrics event (five metric kinds), a log, and a span, written by five `kafka_out` sinks
+# that the Collector's `kafka` receivers (collector.yaml) read back:
 #
-#   proto   the default topics, `otlp_logs`, `otlp_metrics`, and `otlp_spans`, unkeyed.
+#   proto   `format: otlp_proto` on the default topics, `otlp_logs`, `otlp_metrics`, and `otlp_spans`, unkeyed.
 #   keyed   `key: trace_id` into 6-partition topics. 16 trace ids recur across the ticks, and
 #           every fourth log has no trace id.
 #   big     a 2 KiB `max_request_bytes`, so one batch's request splits into several records.
+#   json    `format: otlp_json` on its own topics, `otlpjson-*`, unkeyed.
+#   jsonbig `format: otlp_json` with `key: trace_id` and a 4 KiB `max_request_bytes`, into
+#           6-partition `jsonbig-*` topics.
 #
 # `check.py` derives every expected value from the tick number, so the Lua below and its
 # `leg_otlp*` checks must change together.
@@ -97,6 +100,22 @@ components:
     format: otlp_proto
     max_request_bytes: 2KiB
     topics: { logs: big-logs, metrics: big-metrics, traces: big-spans }
+
+  json:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["redpanda:9092"]
+    format: otlp_json
+    topics: { logs: otlpjson-logs, metrics: otlpjson-metrics, traces: otlpjson-spans }
+
+  jsonbig:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["redpanda:9092"]
+    format: otlp_json
+    key: trace_id
+    max_request_bytes: 4KiB
+    topics: { logs: jsonbig-logs, metrics: jsonbig-metrics, traces: jsonbig-spans }
 
   self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
   telemetry:

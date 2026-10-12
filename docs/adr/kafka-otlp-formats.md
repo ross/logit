@@ -160,7 +160,10 @@ formats, where `KafkaEncoder::key` prefers the span's id. It is also what the ex
 `partition_logs_by_trace_id` keys by.
 
 A keyed request goes to the partition the Java client picks for the same key bytes ([ADR
-`kafka-output`](kafka-output.md), item 3).
+`kafka-output`](kafka-output.md), item 3). The exporter writes the same key bytes but, by default,
+picks the partition with a Sarama-compatible FNV-1a hasher, so the same trace id lands on a
+different partition unless the exporter sets `record_partitioner: {sticky_key: {hasher:
+murmur2}}`; the `otlp-exporter-parity` leg measured this (item 9).
 
 `kafka_out` doesn't port the exporter's `xhash`-based resource key. That key hashes every resource
 attribute through a package internal to the Collector, so matching it means porting Go internals
@@ -223,7 +226,14 @@ W3 adds legs to `script/kafka-interop` in which a real Collector's `kafkareceive
 release these facts were checked against, reads `kafka_out`'s `otlp_proto` and `otlp_json` topics
 on both Apache Kafka and Redpanda, and the harness compares what the Collector decoded with what
 `logit` sent: every signal, the keyed partitions under `key: trace_id`, and an oversize request
-split into several records that the receiver still reads.
+split into several records that the receiver still reads. The legs run against Collector v0.162.0
+on both brokers and all pass.
+
+The keyed leg also ran a Collector `kafkaexporter` with `partition_traces_by_id: true` against the
+same trace ids and a 6-partition topic. Its keys equal `kafka_out`'s. With its default
+`record_partitioner` it placed 14 of 16 trace ids on a different partition than `kafka_out` did,
+on both brokers; with `sticky_key` and the `murmur2` hasher it placed all 16 on the same one.
+[ADR `kafka-output`](kafka-output.md), item 3 states this.
 
 ## Alternatives considered
 
@@ -253,6 +263,8 @@ split into several records that the receiver still reads.
     topic, can't use `topic:` with several signals.
   - No byte parity with the exporter's `partition_*_by_resource_attributes` keys, so a `logit`
     sink and an exporter writing one topic place the same resource on different partitions.
+  - The exporter's default partitioner places a trace id on a different partition than
+    `kafka_out` does (item 9).
   - Head-of-line blocking across signals (item 4).
   - Per-request loss on `Rejected`: the broker rejects a record whole, so one bad record drops
     every item in its request. The other formats lose one event, or one batch record.

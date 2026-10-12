@@ -725,12 +725,13 @@ def java_record_keys(broker, topic):
     return records
 
 
-def leg_otlp_proto(broker):
-    problem = collector_problem(broker, "proto")
-    classes, dropped = sink_summary(broker, "proto")
+def leg_otlp_unkeyed(broker, prefix, topics):
+    """The sink `prefix` wrote one record per signal per batch, and the Collector decoded every
+    field. `topics` names the logs, metrics, and spans topics."""
+    problem = collector_problem(broker, prefix)
+    classes, dropped = sink_summary(broker, prefix)
     counts = {}
-    for signal, topic in (("logs", "otlp_logs"), ("metrics", "otlp_metrics"),
-                          ("spans", "otlp_spans")):
+    for signal, topic in zip(("logs", "metrics", "spans"), topics):
         records = read_record_meta(broker, topic)
         counts[signal] = None if records is None else len(records)
     detail = (f"records per default topic {counts}, requests {shown(classes)}, "
@@ -745,17 +746,26 @@ def leg_otlp_proto(broker):
                     f"{OTLP_TICKS * len(OTLP_METRICS)} data points, each field as sent; {detail}")
 
 
-def leg_otlp_keyed(broker):
-    problem = collector_problem(broker, "keyed")
-    classes, dropped = sink_summary(broker, "keyed")
+def leg_otlp_proto(broker):
+    return leg_otlp_unkeyed(broker, "proto", ("otlp_logs", "otlp_metrics", "otlp_spans"))
+
+
+def leg_otlp_json(broker):
+    return leg_otlp_unkeyed(broker, "json", ("otlpjson-logs", "otlpjson-metrics",
+                                             "otlpjson-spans"))
+
+
+def leg_otlp_keyed(broker, prefix="keyed"):
+    problem = collector_problem(broker, prefix)
+    classes, dropped = sink_summary(broker, prefix)
     if problem:
         return "FAIL", problem
     if dropped or not classes.get("ok"):
         return "FAIL", f"requests {shown(classes)}, records.dropped {dropped}"
     wanted = {otlp_trace_id(seq) for seq in range(OTLP_TICKS)}
     summary = []
-    for signal, topic, traces in (("spans", "keyed-spans", wanted),
-                                  ("logs", "keyed-logs",
+    for signal, topic, traces in (("spans", f"{prefix}-spans", wanted),
+                                  ("logs", f"{prefix}-logs",
                                    {otlp_trace_id(s) for s in range(OTLP_TICKS)
                                     if otlp_log_has_trace(s)})):
         kcat = read_record_meta(broker, topic)
@@ -784,11 +794,12 @@ def leg_otlp_keyed(broker):
             return "FAIL", f"{topic}: {len(wrong)} trace ids off the Java partitioner's partition"
         summary.append(f"{topic} {len(kcat)} records, {len(placed)} trace ids each on one "
                        f"partition, {unkeyed} unkeyed")
-    metrics = read_record_meta(broker, "keyed-metrics") or []
-    if len(metrics) != OTLP_BATCHES or any(key for _, key, _ in metrics):
-        return "FAIL", f"keyed-metrics holds {len(metrics)} records, want {OTLP_BATCHES} unkeyed"
+    metrics = read_record_meta(broker, f"{prefix}-metrics") or []
+    if len(metrics) < OTLP_BATCHES or any(key for _, key, _ in metrics):
+        return "FAIL", (f"{prefix}-metrics holds {len(metrics)} records, want at least "
+                        f"{OTLP_BATCHES}, unkeyed")
     return "PASS", ("keys are the trace id in 32 lowercase hex characters, on the Java "
-                    f"partitioner's partition; {'; '.join(summary)}; keyed-metrics "
+                    f"partitioner's partition; {'; '.join(summary)}; {prefix}-metrics "
                     f"{len(metrics)} unkeyed")
 
 
@@ -880,6 +891,10 @@ LEGS += [
      leg_otlp_exporter_parity),
     ("otlp-oversize", "a request over max_request_bytes splits and the receiver reads every item",
      leg_otlp_oversize),
+    ("otlp-json", "otlp_json on its own topics, decoded by a Collector kafkareceiver",
+     leg_otlp_json),
+    ("otlp-json-keyed", "otlp_json with key: trace_id and a size cap, read by the receiver",
+     lambda b: leg_otlp_keyed(b, "jsonbig")),
 ]
 
 

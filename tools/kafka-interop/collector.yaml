@@ -33,6 +33,22 @@ receivers:
     metrics: { topics: [big-metrics], encoding: otlp_proto }
     traces: { topics: [big-spans], encoding: otlp_proto }
 
+  kafka/json:
+    brokers: ["${env:BROKER}:9092"]
+    group_id: interop-json
+    initial_offset: earliest
+    logs: { topics: [otlpjson-logs], encoding: otlp_json }
+    metrics: { topics: [otlpjson-metrics], encoding: otlp_json }
+    traces: { topics: [otlpjson-spans], encoding: otlp_json }
+
+  kafka/jsonbig:
+    brokers: ["${env:BROKER}:9092"]
+    group_id: interop-jsonbig
+    initial_offset: earliest
+    logs: { topics: [jsonbig-logs], encoding: otlp_json }
+    metrics: { topics: [jsonbig-metrics], encoding: otlp_json }
+    traces: { topics: [jsonbig-spans], encoding: otlp_json }
+
 exporters:
   file/proto-logs: { path: /out/proto-logs.jsonl, flush_interval: 1s }
   file/proto-metrics: { path: /out/proto-metrics.jsonl, flush_interval: 1s }
@@ -43,6 +59,12 @@ exporters:
   file/big-logs: { path: /out/big-logs.jsonl, flush_interval: 1s }
   file/big-metrics: { path: /out/big-metrics.jsonl, flush_interval: 1s }
   file/big-traces: { path: /out/big-traces.jsonl, flush_interval: 1s }
+  file/json-logs: { path: /out/json-logs.jsonl, flush_interval: 1s }
+  file/json-metrics: { path: /out/json-metrics.jsonl, flush_interval: 1s }
+  file/json-traces: { path: /out/json-traces.jsonl, flush_interval: 1s }
+  file/jsonbig-logs: { path: /out/jsonbig-logs.jsonl, flush_interval: 1s }
+  file/jsonbig-metrics: { path: /out/jsonbig-metrics.jsonl, flush_interval: 1s }
+  file/jsonbig-traces: { path: /out/jsonbig-traces.jsonl, flush_interval: 1s }
 
   kafka/exporter-default:
     brokers: ["${env:BROKER}:9092"]
@@ -72,3 +94,9 @@ service:
     logs/big: { receivers: [kafka/big], exporters: [file/big-logs] }
     metrics/big: { receivers: [kafka/big], exporters: [file/big-metrics] }
     traces/big: { receivers: [kafka/big], exporters: [file/big-traces] }
+    logs/json: { receivers: [kafka/json], exporters: [file/json-logs] }
+    metrics/json: { receivers: [kafka/json], exporters: [file/json-metrics] }
+    traces/json: { receivers: [kafka/json], exporters: [file/json-traces] }
+    logs/jsonbig: { receivers: [kafka/jsonbig], exporters: [file/jsonbig-logs] }
+    metrics/jsonbig: { receivers: [kafka/jsonbig], exporters: [file/jsonbig-metrics] }
+    traces/jsonbig: { receivers: [kafka/jsonbig], exporters: [file/jsonbig-traces] }

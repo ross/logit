@@ -19,6 +19,7 @@ test depends on it running. A run takes about four minutes once the images are b
 | `kafka` | `apache/kafka:4.2.0` | single-node KRaft broker, started on `kafka-server.properties` |
 | `redpanda` | `redpandadata/redpanda:v26.2.3` | single-node Redpanda in `dev-container` mode, started on `redpanda.yaml` |
 | `oauth` | `ghcr.io/navikt/mock-oauth2-server:6.0.2`, pinned by digest | the OAuth 2.0 server the OAUTHBEARER legs fetch tokens from and both brokers validate them against |
+| `collector-<broker>` | `otel/opentelemetry-collector-contrib:0.162.0`, pinned by digest | one per broker, started on `collector.yaml`: `kafkareceiver`s on the OTLP legs' topics, each pipeline ending in a `file` exporter that writes OTLP/JSON to the run directory's `collector/<broker>/`, and `kafkaexporter`s that re-key the `keyed` traces |
 | `logit-<leg>-<broker>` | `logit:kafka-interop`, built from the current tree | one per `logit-<leg>-<broker>.yaml` |
 
 Each broker has five client listeners: plain on `:9092`, TLS on `:9093`, mutual TLS, which
@@ -44,6 +45,10 @@ The legs, each run against both brokers:
 | `tls`, `mtls`, `mtls-required` | `logit-tls-*.yaml` | 50 events over server TLS and over mutual TLS from the run's private CA; a sink with no client certificate stores nothing |
 | `sasl-plain`, `sasl-scram512`, `sasl-scram256`, `sasl-wrong` | `logit-sasl-*.yaml` | 50 events through `sasl:` with PLAIN over SASL_SSL, SCRAM-SHA-512 over SASL_SSL, and SCRAM-SHA-256 over SASL_PLAINTEXT; a SCRAM-SHA-512 sink with the wrong password stores nothing, counts every attempt as `refused`, holds its queue with `logit.component.retrying` at `1`, and drops no batch as `rejected` |
 | `oauth-cc`, `oauth-static`, `oauth-refused` | `logit-oauth-*.yaml` | 60 events at 1/s through the client-credentials grant, past the 45 s life of the first token, with at least two tokens fetched, counted in the `oauth` service's log; 50 events through a fixed token the script fetched, with two SASL extensions on Kafka; and a fixed token that isn't a JWT, which the broker refuses: nothing stored, every attempt `refused`, the queue held, no batch dropped, and, on Kafka, the leg's log carrying the broker's error challenge status |
+| `otlp-proto`, `otlp-json` | `logit-otlp-*.yaml` | 160 ticks, each a metrics event with five kinds (delta and cumulative sums, a gauge with unit and description, an explicit histogram, an exponential histogram), a log, and a span, written as `otlp_proto` to the default topics and as `otlp_json` to `otlpjson-*`: the Collector's `kafkareceiver` decodes 160 logs, 160 spans, and 800 data points, and every checked field (resource name, bodies and severity, trace and span ids in hex, span names, kind, status, and events, metric values, temporality, unit, bucket counts) equals what the tick number implies. One record per signal per batch |
+| `otlp-keyed`, `otlp-json-keyed` | `logit-otlp-*.yaml` | under `key: trace_id`, every record's key is a 32-character lowercase hex trace id, each of 16 trace ids sits on one partition, and that partition is `murmur2(key) % 6`, the Java client's. Logs without a trace id are unkeyed, and metrics stay unkeyed. The Collector decodes the same items. `otlp-json-keyed` adds a 4 KiB `max_request_bytes` |
+| `otlp-exporter-parity` | `logit-otlp-*.yaml`, `collector.yaml` | the `keyed` spans, re-keyed by a Collector `kafkaexporter` with `partition_traces_by_id` into 6-partition topics. With the exporter's default partitioner (`sticky_key`, FNV-1a) 14 of 16 trace ids land on a different partition than `kafka_out` puts them on; with `hasher: murmur2` none does. The row passes on the murmur2 match and reports the default's count ([`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md)) |
+| `otlp-oversize` | `logit-otlp-*.yaml` | with `max_request_bytes: 2KiB`, each batch's request splits into several records, none over the cap, and the Collector still decodes every item |
 | `timestamp` | `logit-timestamp-*.yaml` | in each batch of 10, the event stamped at 2100-01-01 is dropped and counted as `invalid_timestamp`, and the other nine land |
 
 The SASL user is `logit` with the password `logit-secret` on Kafka, whose PLAIN entry is a JAAS
@@ -103,7 +108,8 @@ another sink in the same process.
    2 s `timeout` reads that as `Ambiguous`.
 5. Stops each leg with SIGTERM 75 s after the start. `internal` keeps a `logit` process running
    until a signal, so no leg ends on its own; the stop drains its sinks and writes its last
-   telemetry.
+   telemetry. It then stops each Collector, which flushes its file exporters and its `kafka`
+   exporters before the topics are read.
 6. Reads every topic on both brokers back with `kafka-get-offsets.sh`,
    `kafka-console-consumer.sh`, and kcat. For each codec topic it also reads the codec each
    stored batch carries: `kafka-dump-log.sh` over Kafka's segment file, and
@@ -136,9 +142,10 @@ A run writes `perf/results/kafka-interop/<timestamp>/` (gitignored, or under
 | File | Contents |
 |---|---|
 | `results.md`, `results.json` | one row per leg and broker |
-| `readback/<broker>/<topic>.java.tsv` | `kafka-console-consumer.sh` with the timestamp, partition, offset, and key printed |
-| `readback/<broker>/<topic>.kcat.tsv` | kcat's `%p\t%o\t%T\t%k\t%s` |
+| `readback/<broker>/<topic>.java.tsv` | `kafka-console-consumer.sh` with the timestamp, partition, offset, and key printed (no value for the OTLP topics, whose bytes aren't text) |
+| `readback/<broker>/<topic>.kcat.tsv` | kcat's `%p\t%o\t%T\t%k\t%s` (`%S`, the value's size, for the OTLP topics) |
 | `readback/<broker>/<topic>.offsets` | `kafka-get-offsets.sh`, one `topic:partition:offset` per partition |
+| `collector/<broker>/<name>.jsonl` | what each Collector pipeline decoded, one OTLP/JSON request per line |
 | `readback/<broker>/codec-<c>.batches` | each codec topic's stored codec: `kafka-dump-log.sh` output for Kafka, one `offset: <o> compression: <c>` line per record for Redpanda |
 | `<leg>-<broker>-telemetry.log` | each leg's `internal` telemetry, `stdio_out` `format: json` |
 | `redpanda-oidc.txt` | `ok` once Redpanda took the OAUTHBEARER settings, else `failed` |

@@ -34,11 +34,14 @@ TOPICS=(parity-logit:6 parity-java:6 codec-none:1 codec-gzip:1 codec-snappy:1 co
     sasl-scram512:1 sasl-scram256:1 sasl-wrong:1 timestamp:1 oauth-cc:1 oauth-static:1
     oauth-refused:1
     otlp_logs:1 otlp_metrics:1 otlp_spans:1 keyed-logs:6 keyed-metrics:1 keyed-spans:6
-    big-logs:1 big-metrics:1 big-spans:1 exporter-default:6 exporter-murmur2:6)
+    big-logs:1 big-metrics:1 big-spans:1 exporter-default:6 exporter-murmur2:6
+    otlpjson-logs:1 otlpjson-metrics:1 otlpjson-spans:1 jsonbig-logs:6 jsonbig-metrics:1
+    jsonbig-spans:6)
 # The topics that hold OTLP requests, protobuf bytes a tab-separated reader can't carry. Their
 # read-back prints each record's partition, offset, timestamp, key, and value size, and no value.
 BINARY_TOPICS=(otlp_logs otlp_metrics otlp_spans keyed-logs keyed-metrics keyed-spans big-logs
-    big-metrics big-spans exporter-default exporter-murmur2)
+    big-metrics big-spans exporter-default exporter-murmur2 otlpjson-logs otlpjson-metrics
+    otlpjson-spans jsonbig-logs jsonbig-metrics jsonbig-spans)
 # The dedup leg's fault: the broker's packets to the leg's container dropped from this many
 # seconds after the legs start, for this long. The leg sends for 40 s.
 NETEM_AT=10
