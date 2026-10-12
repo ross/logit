@@ -85,6 +85,7 @@ mod encode;
 #[cfg(test)]
 mod fake_broker;
 mod fault;
+mod multi;
 mod partitioner;
 mod producer;
 mod sasl;
@@ -95,6 +96,6 @@ mod tests;
 pub use encode::{EncodeStats, KafkaEncoder, RecordFormat, RecordKey, RecordMeta, RecordMode};
 pub use sasl::{KafkaSasl, OAuthToken};
 pub use sink::{
-    KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings, TlsClientSettings,
+    KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings, SignalTopics, TlsClientSettings,
     DEFAULT_MAX_REQUEST_BYTES, DEFAULT_TIMEOUT,
 };

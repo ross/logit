@@ -14,10 +14,9 @@ use logit_pipeline::Fault;
 use super::batch::ProducerRecord;
 use super::fake_broker::{Action, FakeCluster, HttpStub, Received, Sasl, Step, TokenEndpoint};
 use super::fault::code;
+use super::multi::Attempt;
 use super::partitioner::partition_for_key;
-use super::producer::{
-    Acks, Attempt, Identity, PartState, Pending, Producer, ProducerConfig, Settlement,
-};
+use super::producer::{Acks, Identity, PartState, Pending, Producer, ProducerConfig, Settlement};
 use super::sasl::{authenticator, msk_iam_with, Endpoints, Env, KafkaSasl, OAuthToken};
 
 const TOPIC: &str = "logs";
@@ -66,8 +65,8 @@ async fn cluster(nodes: usize, leaders: &[i32]) -> FakeCluster {
     cluster
 }
 
-async fn prepare(producer: &mut Producer, records: Vec<ProducerRecord>) -> Pending {
-    producer.prepare(records).await.expect("prepare")
+async fn prepare(producer: &mut Producer, mut records: Vec<ProducerRecord>) -> Pending {
+    producer.prepare(&mut records).await.expect("prepare")
 }
 
 /// The attempt's class: `None` for `Ok`.
@@ -543,7 +542,7 @@ async fn a_refused_bootstrap_connect_is_clean() {
         sasl: None,
     })
     .unwrap();
-    let err = producer.prepare(vec![record(None, "v")]).await.unwrap_err();
+    let err = producer.prepare(&mut vec![record(None, "v")]).await.unwrap_err();
     assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
 }
 
@@ -608,7 +607,7 @@ async fn a_broker_without_produce_v3_is_refused() {
     let cluster = cluster(1, &[0]).await;
     cluster.state().produce_max = 2;
     let mut producer = Producer::new(config(&cluster)).unwrap();
-    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
     assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
 }
 
@@ -655,11 +654,11 @@ async fn a_missing_topic_is_refused_only_after_a_refresh_confirms_it() {
     let cluster = FakeCluster::start(1).await;
     let short = ProducerConfig { timeout: Duration::from_millis(300), ..config(&cluster) };
     let mut producer = Producer::new(short).unwrap();
-    let err = producer.prepare(vec![record(None, "v")]).await.unwrap_err();
+    let err = producer.prepare(&mut vec![record(None, "v")]).await.unwrap_err();
     assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
     let polled = requests_of(&cluster, ApiKey::Metadata);
     assert!(polled >= 2, "the refresh ran: {polled} Metadata requests");
-    let err = producer.prepare(vec![record(None, "v")]).await.unwrap_err();
+    let err = producer.prepare(&mut vec![record(None, "v")]).await.unwrap_err();
     assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
     assert_eq!(requests_of(&cluster, ApiKey::Metadata), polled + 1);
 
@@ -828,7 +827,7 @@ async fn a_failed_tls_handshake_is_clean() {
     // The bundled Mozilla roots don't trust the fixture CA.
     let tls = Some(std::sync::Arc::new(client_config(&tls_settings(|_| {}))));
     let mut producer = Producer::new(ProducerConfig { tls, ..config(&cluster) }).unwrap();
-    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
     assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
     assert!(format!("{err:#}").contains("TLS handshake"), "{err:#}");
 }
@@ -863,7 +862,7 @@ fn sasl_producer(cluster: &FakeCluster, mechanism: &str, password: &str) -> Prod
 /// The error a first send fails with, after asserting its class and that it names the mechanism
 /// and the user but never the password.
 async fn sasl_refusal(producer: &mut Producer, mechanism: &str, want: Fault) -> String {
-    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
     let message = format!("{err:#} {err:?}");
     assert_eq!(logit_pipeline::classify(&err), want, "{message}");
     assert!(message.contains(mechanism) && message.contains(SASL_USER), "{message}");
@@ -1209,7 +1208,7 @@ async fn token_endpoint_faults_are_clean_when_transient_and_refused_otherwise() 
         endpoint.state().answer = Box::new(move |_| (status, body.clone()));
         let cluster = oauth_cluster(1, &[0], None).await;
         let mut producer = oauth_producer(&cluster, &client_credentials(&endpoint, &[]));
-        let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+        let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
         let message = format!("{err:#} {err:?}");
         assert_eq!(logit_pipeline::classify(&err), want, "{status}: {message}");
         assert!(message.contains(detail), "{status}: {message}");
@@ -1238,7 +1237,7 @@ async fn token_endpoint_faults_are_clean_when_transient_and_refused_otherwise() 
         extensions: Vec::new(),
     };
     let mut producer = oauth_producer(&cluster, &settings);
-    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
     let message = format!("{err:#} {err:?}");
     assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{message}");
     assert!(message.contains(&format!("requesting a token from {url}")), "{message}");
@@ -1264,7 +1263,7 @@ async fn token_endpoint_faults_are_clean_when_transient_and_refused_otherwise() 
     };
     let sasl = Some(authenticator(&settings, Duration::from_millis(200)));
     let mut producer = Producer::new(ProducerConfig { sasl, ..config(&cluster) }).unwrap();
-    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
     let message = format!("{err:#} {err:?}");
     assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{message}");
     assert!(message.contains(&format!("token endpoint {url} timed out after 200ms")), "{message}");
@@ -1311,7 +1310,7 @@ async fn a_cut_off_token_response_is_clean() {
         let cluster = oauth_cluster(1, &[0], None).await;
         let sasl = Some(authenticator(&settings, Duration::from_millis(200)));
         let mut producer = Producer::new(ProducerConfig { sasl, ..config(&cluster) }).unwrap();
-        let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+        let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
         let message = format!("{err:#} {err:?}");
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "close {close}: {message}");
         assert!(message.contains(detail), "close {close}: {message}");
@@ -1329,7 +1328,7 @@ async fn a_refused_token_is_refused_with_its_status_and_fetched_again() {
     let endpoint = TokenEndpoint::start().await;
     let cluster = oauth_cluster(1, &[0], Some("token-1")).await;
     let mut producer = oauth_producer(&cluster, &client_credentials(&endpoint, &[]));
-    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
     let message = format!("{err:#} {err:?}");
     assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
     assert!(message.contains("SaslAuthenticationFailed (58)"), "{message}");
@@ -1356,7 +1355,7 @@ async fn a_refused_token_is_refused_with_its_status_and_fetched_again() {
         extensions: vec![],
     };
     let mut producer = oauth_producer(&cluster, &settings);
-    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
     let message = format!("{err:#} {err:?}");
     assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
     assert!(message.contains("OAUTHBEARER as a fixed token"), "{message}");
@@ -1373,7 +1372,7 @@ async fn a_token_refused_without_a_challenge_is_fetched_again() {
     let cluster = oauth_cluster(1, &[0], Some("token-1")).await;
     cluster.state().sasl.as_mut().unwrap().oauth_no_challenge = true;
     let mut producer = oauth_producer(&cluster, &client_credentials(&endpoint, &[]));
-    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
     let message = format!("{err:#} {err:?}");
     assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
     assert!(message.contains("SaslAuthenticationFailed (58)"), "{message}");
@@ -1472,7 +1471,7 @@ async fn aws_msk_iam_reads_the_region_from_the_environment_or_refuses() {
     let cluster = msk_cluster(1, &[0]).await;
     let vars = [("AWS_ACCESS_KEY_ID", AWS_KEY_ID), ("AWS_SECRET_ACCESS_KEY", AWS_SECRET)];
     let mut producer = msk_producer(&cluster, None, &vars, no_endpoints());
-    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
     let message = format!("{err:#} {err:?}");
     assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
     assert!(message.contains("no AWS region"), "{message}");
@@ -1487,7 +1486,7 @@ async fn refused_aws_credentials_are_refused_and_fetched_again() {
     let cluster = msk_cluster(1, &[0]).await;
     let vars = [("AWS_ACCESS_KEY_ID", AWS_KEY_ID), ("AWS_SECRET_ACCESS_KEY", "wrong-secret-value")];
     let mut producer = msk_producer(&cluster, Some("us-east-1"), &vars, no_endpoints());
-    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
     let message = format!("{err:#} {err:?}");
     assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
     assert!(message.contains("SaslAuthenticationFailed (58)"), "{message}");
@@ -1509,7 +1508,7 @@ async fn refused_aws_credentials_are_refused_and_fetched_again() {
     let full = format!("{}/v2/credentials", stub.url);
     let vars = [("AWS_CONTAINER_CREDENTIALS_FULL_URI", full.as_str())];
     let mut producer = msk_producer(&cluster, Some("us-east-1"), &vars, no_endpoints());
-    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
     let message = format!("{err:#} {err:?}");
     assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
     for secret in ["stale-secret-value", AWS_SESSION] {
@@ -1531,7 +1530,7 @@ async fn aws_credential_endpoint_faults_reach_the_send_with_their_class() {
         let full = format!("{}/creds", stub.url);
         let vars = [("AWS_CONTAINER_CREDENTIALS_FULL_URI", full.as_str())];
         let mut producer = msk_producer(&cluster, Some("us-east-1"), &vars, no_endpoints());
-        let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+        let err = producer.prepare(&mut keyed_for(0, 1, 1)).await.unwrap_err();
         let message = format!("{err:#} {err:?}");
         assert_eq!(logit_pipeline::classify(&err), want, "{status}: {message}");
         assert!(message.contains(&format!("answered {status}")), "{message}");
