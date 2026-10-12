@@ -665,7 +665,9 @@ the operator-facing account of all of this.
   (`split = "copy"`), a fan-out whose blocked sink stalls the healthy one through the shared
   send, and a `route` on a DogStatsD tag whose backends' totals add up (`split = "route"`). The
   harness knows each compose service by its `soak.role` label (`sut`, `generator`, `backend`,
-  `broker`).
+  `broker`). `fanin` adds a second generator the same way, `syslog_out` over UDP into `lines_in`
+  beside statsd, with one `[[ledger.source]]` per generator: the wire is judged per source and
+  the intake per listener.
   `random-faults` draws its schedule from
   a seed (a `[random]` table; `--seed N` reproduces a run) and is meant for `--duration 8h`; the
   driver appends container logs in 5-minute chunks so a long run never reads a whole log at

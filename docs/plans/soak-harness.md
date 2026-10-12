@@ -127,11 +127,14 @@ sut = "logit-sut.yaml"
 generator = "logit-generator.yaml"
 
 [ledger]                  # component ids the checker reads; no rates here
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]         # one per generator the ledger follows into the SUT (W8b)
+service = "generator"
 generator_input = "load"
 generator_sink = "statsd"
 sut_listener = "statsd"
-sut_aggregate = "window"
-wire_loss_outside_faults = 0.0
 
 [[ledger.sink]]           # one per SUT sink the ledger follows to its backend
 id = "victoria_metrics"
@@ -207,6 +210,7 @@ for = "45s"
   (below).
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
+- `[[ledger.source]]` (W8b) has the rules under "Sources" below.
 - A scenario has `cycle` with `[[step]]` tables or a `[random]` table (W4), never both.
   `--seed` is refused for a fixed schedule, because no seed changes it.
 
@@ -309,8 +313,9 @@ listener and `aggregate`, and adds the script hop to the ledger ("The ledger and
 **Compose overrides, service roles, and sinks (W7b).** Every compose service carries a
 `soak.role` label: `sut`, `generator`, `backend`, or `broker` (a Kafka target's broker; see
 "Kafka targets"). The harness knows a service by its role, never its name, and keeps one SUT,
-`logit`, and one generator, `generator`. A scenario adds services with an optional top-level
-key naming an override file beside `scenario.toml`:
+`logit`. The base stack's generator is `generator`; from W8b an override can add more (see
+"Sources"). A scenario adds services with an optional top-level key naming an override file
+beside `scenario.toml`:
 
 ```toml
 compose = "compose.override.yaml"   # merged onto tools/soak/compose.yaml
@@ -339,10 +344,54 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
   compose file, which only the driver reads (`docker compose config`, §3): every step's `on`
   and every random fault's is a service of the stack, a `kill` or `exit` is on the role `sut`,
   every `[[expect]]` service runs `logit`, every sink's `backend` has the role `backend`, the
-  stack has one `sut` named `logit` and one `generator` named `generator`, and no service lacks
-  a known role. The driver checks them in `prepare()`, before `up`. `list` and the self-test
+  stack has one `sut` named `logit` and at least one `generator`, every source's `service` has
+  the role `generator` and every `generator` has a source (W8b), and no service lacks a known
+  role. The driver checks them in `prepare()`, before `up`. `list` and the self-test
   can't run compose, so they pass the base role map (`scenario.BASE_ROLES`) for a scenario with
   no override, and the self-test reads a shipped override's labels itself.
+
+**Sources (W8b).** Each `[[ledger.source]]` is one generator and the SUT listener its
+datagrams reach. They replace W1's scalar `[ledger]` keys `generator_input`, `generator_sink`,
+and `sut_listener`, which `load()` now refuses with a pointer to the table. `[configs]` names the
+SUT's config under `sut` and each generator's under its service name:
+
+```toml
+compose = "compose.override.yaml"   # adds generator-lines, labeled soak.role: generator
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+generator-lines = "logit-generator-lines.yaml"
+
+[[ledger.source]]
+service = "generator"     # a service with the role generator
+generator_input = "load"  # its generate_in
+generator_sink = "statsd" # its UDP sink, whose output.messages is G
+sut_listener = "statsd"   # the SUT listener its datagrams reach
+
+[[ledger.source]]
+service = "generator-lines"
+generator_input = "load"
+generator_sink = "syslog"
+sut_listener = "lines"
+sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in order
+```
+
+- A scenario lists one or more sources. Each names all four keys, each a component id, with a
+  `service` that is a slug (lowercase letters, digits, `_`, and `-`) no other source names and
+  a `sut_listener` no other source names. Unknown keys are refused.
+- `[configs]` has `sut` and one key per source's `service`, and no other. The driver writes each
+  generator's absolute config path into `compose.env` under `scenario.config_env(service)`:
+  `SOAK_GENERATOR_CONFIG` for `generator`, `SOAK_GENERATOR_LINES_CONFIG` for
+  `generator-lines`. An override's generator mounts its own variable at `/config.yaml`.
+- `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct and
+  none of them a listener. Each must forward every event it receives, which `ledger.edge`
+  judges hop by hop, and each adds an inbox and a batch to R ("The ledger and identities"). It
+  can't be combined with `[ledger] sut_script`, whose hop `ledger.script` judges from every
+  listener's E.
+- With the role map: every source's `service` is a `generator`, and every `generator` in the
+  stack has a source, because a generator with none would put datagrams into a listener with no
+  G behind them.
 
 **`vm_every_window` (W3)**, an optional `[ledger]` key, turns on `ledger.windows`: every series
 has a sample in every `aggregate` window of every SUT life that `aggregate` emitted. Set it only
@@ -359,7 +408,7 @@ tables, each scored as one `expect.<name>` row:
 ```toml
 [[expect]]
 name = "sink-queue-fills"               # the row id: expect.sink-queue-fills
-service = "logit"                       # whose telemetry: logit or generator
+service = "logit"                       # whose telemetry: logit or a generator
 metric = "logit.component.buffer.batches"
 component = "victoria_metrics"          # optional; joins `attrs`
 attrs = { reason = "overflow_oldest" }  # optional attribute filters, all strings
@@ -404,7 +453,7 @@ service (W4; see "The driver loop and end sequence" for the arithmetic), and
 |---|---|
 | `victoria-metrics` (role `backend`) | `victoriametrics/victoria-metrics:v1.152.0`, `-retentionPeriod=100y`, `ports: ["127.0.0.1::8428"]`, so the host driver polls freshness every 30 s and dumps the final export with no checker container. The driver re-reads the port after any start of this service |
 | `logit` (the SUT, role `sut`) | `depends_on: [victoria-metrics]`, not required from W5, when `victoria-metrics` moved to the compose profile `local` the driver enables for a local target only; `environment:` passes each variable an external target may list (`DD_API_KEY`), empty when unset |
-| `generator` (role `generator`) | `depends_on: {logit: {condition: service_healthy}}` |
+| `generator` (role `generator`) | `depends_on: {logit: {condition: service_healthy}}`. An override can add more generators (W8b), each with `extends` from this one and its own config volume |
 | `kafka` (role `broker`) | `apache/kafka:4.2.0`, a single-node KRaft broker in the compose profile `kafka`, which the driver enables for a Kafka target only; one partition per topic, topics created on first use, a `kafka-broker-api-versions.sh` health check the SUT's optional `depends_on` waits for. No published port: the driver reads the topic through `docker exec` |
 
 Each service's role is its `soak.role` label (W7b). A scenario's `compose` override is passed
@@ -417,8 +466,9 @@ it can reach Docker. An override that adds a service with `extends` names the ba
 `file: compose.yaml`: compose resolves the path against the project directory, the first
 file's, not the override's own.
 
-Configs mount from absolute paths in `compose.env` (`SOAK_SUT_CONFIG`,
-`SOAK_GENERATOR_CONFIG`), which the driver passes with `--env-file`, because `sudo` strips the
+Configs mount from absolute paths in `compose.env` (`SOAK_SUT_CONFIG`, and one variable per
+generator, `SOAK_GENERATOR_CONFIG` for `generator`; §2's "Sources"), which the driver passes
+with `--env-file`, because `sudo` strips the
 environment. `up -d --wait --wait-timeout 120` waits on the image's `logit ready` `HEALTHCHECK`.
 Nothing in a container writes to the run directory in W1, so it needs no `chmod 777`.
 
@@ -440,7 +490,7 @@ A root qdisc on a container's default-route interface shapes that container's eg
 | `on =` | What it impairs |
 |---|---|
 | `logit` | the SUT's remote-write to VictoriaMetrics, not the statsd arriving at it |
-| `generator` | UDP into the SUT |
+| a `generator` | its own UDP into the SUT, and no other generator's |
 | a `backend` | its responses |
 
 Each container has one peer in this scenario, so there is no `tc filter`. Per-peer `u32` filters
@@ -500,7 +550,7 @@ ticket with `${DOCKER} version` first.
    - **Fail fast:** a `logit` container leaving `running`, or a `StartedAt` change, with no step
      behind it ends the timeline at once. The end sequence and collection still run. Inside an
      `exit` step (W7a) the container may be `running` or `exited`.
-4. End (for an external target, W5, see "External targets"): revert active faults; `docker stop -t 30` the generator; wait until every sink's stored
+4. End (for an external target, W5, see "External targets"): revert active faults; `docker stop -t 30` every generator; wait until every sink's stored
    total holds across two aggregate windows (90 s bound); `docker stop -t 60` the SUT, expecting
    exit 0; call each backend's `/internal/force_flush`; write each sink's
    `vm-export/<sink>.jsonl` from its backend's `/api/v1/export` with `match[]=<vm_selector>`
@@ -577,6 +627,15 @@ returned nonzero has none, so nothing after it is excused.
 **The ledger and identities (W1b).** One unit runs through the ledger: a datagram is one line is
 one event is one increment.
 
+From W8b the ledger also follows each `[[ledger.source]]`, a generator and its SUT listener.
+The listener symbols W, K, D, B, E, and X are kept per listener and summed over the listeners;
+G is per source. `ledger.wire` judges each source and `ledger.intake` each listener, with one
+detail line per source or listener and the worst status. From the edge into `aggregate` on,
+every row reads the sums, because the sources' events merge there: `ledger.edge` judges ΣE
+against A, and the residual, `ledger.egress`, `ledger.summary`, the kill band, and `recovery`
+read summed symbols. Both legs of a fan-in run in one unit, a datagram that is one line, one
+event, and one increment, so the sums are of one unit.
+
 From W7b the ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`,
 `identity.sink`, `recovery`, `ledger.edge`'s sink edges, `ledger.egress`, `ledger.windows`,
 `ledger.replay`, and `ledger.sent`) keeps its id, judges each sink, reports one line per sink,
@@ -584,13 +643,14 @@ and takes the worst status; `report.py` is unchanged.
 
 | Symbol | Source |
 |---|---|
-| G | generator `logit.output.messages{component=statsd}`; precondition: equals `logit.output.datagrams` |
-| W | SUT `logit.input.datagrams{component=statsd}` |
-| K | SUT `logit.input.kernel.drops` |
-| D | SUT `logit.component.datagrams.dropped` under every reason, from telemetry; the listener's stderr shutdown lines only cross-check its `shutdown` part, and a killed life counts none |
-| B | SUT `logit.component.diagnostics{key=bad_line}` |
-| E | SUT `logit.component.events.sent{component=statsd}` |
-| X | SUT `logit.component.events.dropped{component=statsd}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`) |
+| G | per source (W8b), its generator's `logit.output.messages{component=<generator_sink>}`; precondition: equals that sink's `logit.output.datagrams` |
+| W | per listener (W8b), SUT `logit.input.datagrams{component=<sut_listener>}` |
+| K | per listener, SUT `logit.input.kernel.drops` |
+| D | per listener, SUT `logit.component.datagrams.dropped` under every reason, from telemetry; the listener's stderr shutdown lines only cross-check its `shutdown` part, and a killed life counts none |
+| B | per listener, SUT `logit.component.diagnostics{key=bad_line}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a statsd line the decoder refused, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule |
+| E | per listener, SUT `logit.component.events.sent{component=<sut_listener>}` |
+| X | per listener, SUT `logit.component.events.dropped{component=<sut_listener>}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`) |
+| T_in[node], T_out[node] | with a source's `sut_transforms` (W8b), each node's `logit.component.events.received` and `logit.component.events.sent` |
 | A | aggregate `logit.component.events.received` |
 | A_sent | aggregate `logit.component.events.sent` (W7b), counted once per send however many consumers a fan-out reaches |
 | S_in[sink], T_sent[target] | each sink's `logit.component.events.received`, and under `split = "route"` its target's `logit.component.events.sent` (W7b) |
@@ -599,7 +659,8 @@ and takes the worst status; `report.py` is unchanged.
 | V[sink] | per sink (W7b), the reset-aware total of `vm-export/<sink>.jsonl`: add each series' first value, then every non-negative step, and on a decrease or at a SUT life start add the new value. V splits per SUT life at each series' decreases and at each life start, placing a sample by its timestamp, which is the SUT's own window time; a restart whose first value isn't below the last one shows no decrease. A series should have one segment per SUT life, else WARN |
 
 The generator sets `max_packet_bytes: "32"`, so one datagram carries one line of about 20 bytes,
-and G uses `output.messages` (what the kernel took), not `events.sent`. While the SUT is down,
+and G uses `output.messages` (what the kernel took), not `events.sent`. A `syslog_out` over UDP
+sends one message per datagram, with no packing to bound, and counts both (W8b). While the SUT is down,
 `statsd_out`'s per-batch name resolution fails `Clean` and nothing is sent.
 
 **Which life a hop is judged in.** Every SUT config gives `internal` a dedicated pipeline, so
@@ -631,7 +692,12 @@ push counts its datagrams as shutdown drops without logging a line.
   residual: W − D − B − X − (L_drop + L_err) − (Ab − L_flush). `aggregate`'s close-time flush
   delivers that residual into V, and the final drain runs after that flush, so `ledger.egress`
   judges the life's W − D − B − X − V as it judges the final life's Ab − V.
-  The [0, R] bound only catches a residual no shutdown could leave.
+  The [0, R] bound only catches a residual no shutdown could leave. With several listeners (W8b)
+  the residual is summed over them, and R is the sum of each listener's own receive queue and 2
+  batches of its own `batch_max_events` (its accumulator and its held batch), 65 more for each
+  node of its source's `sut_transforms`, plus `aggregate`'s 65 and a script's 65 once, in
+  batches of the largest `batch_max_events`. With one listener and no transforms that is the
+  queue plus 67 batches, as above.
 - An earlier SUT life ended by a scheduled `kill` has no final drain, no close-time window, and
   no stderr shutdown lines. Its hops are compared at its last drain, which is an ordinary one,
   and reported; its residual must still lie in [0, R]. The kill loses that residual from the
@@ -671,7 +737,7 @@ The rows:
   drops, and the kernel receive queue at socket close
   ([`docs/known-gaps/intake.md`](../known-gaps/intake.md), "UDP intake"). It is reported,
   bucketed by drain timestamp, and fails only when the loss outside UDP-affecting windows (netem
-  on `generator`; any `logit` stop, kill, pause, restart, or partition) exceeds
+  on a generator; any `logit` stop, kill, pause, restart, or partition) exceeds
   `wire_loss_outside_faults` times the lines sent there, beyond a tolerance of one generator
   batch per window edge. The two processes' drains are out of phase, so G is interpolated
   linearly at each SUT drain timestamp; across a run of steady intervals the interpolation
@@ -683,9 +749,19 @@ The rows:
   final drain runs after its sink's last send and exports it. At the end, G can still fall short
   of W + K, because a send the generator's sink cancels at shutdown loses its counts. A negative
   gap of up to the generator sink's `buffer.batches` at its last drain plus one batch (100 lines
-  each) is allowed.
-- `ledger.intake`: W − D == E + B, for the final life.
-- `ledger.edge`: E == A, a single-consumer edge, for the final life. With `sut_script` (W7a),
+  each) is allowed. From W8b the row judges each source alone: its own G against its listener's
+  W + K, with its own generator's batch as the tolerance, its own end allowance, and its own
+  datagram precondition. A fault on a generator is UDP-affecting for that generator's source
+  only, so its window excuses nothing on another source's wire; a UDP-affecting fault on any
+  service that isn't a generator, such as any `logit` stop, excuses every source. One detail
+  line per source; the worst status wins.
+- `ledger.intake`: W − D == E + B, for the final life, per listener from W8b, one detail line
+  each, a listener off its balance first.
+- `ledger.edge`: E == A, a single-consumer edge, for the final life; from W8b ΣE == A, E summed
+  over the listeners, which every source's events reach. A source's `sut_transforms` (W8b) are
+  judged hop by hop: its listener's E == T_in[first node], T_in == T_out at every node (each
+  forwards every event it receives), T_out[node] == T_in[next node], and the last node's T_out
+  takes that listener's E's place in the sum. With `sut_script` (W7a),
   L_sent == A, the edge from the script to `aggregate`. From W7b, each sink's edge too: under
   `copy`, A_sent == S_in[sink], since a fan-out counts one send per batch; under `route`,
   T_sent[target] == S_in[sink] for the target that feeds it.
@@ -778,15 +854,18 @@ The rows:
 - `recovery`, per fault and per sink: within `recovery_bound` of each fault's end, some SUT
   drain shows the sink's `retrying` at 0,
   `buffer.utilization` under 0.05, or under 1.0 with `buffer.batches` at most 1 (one batch in a
-  2-batch queue is half of it, and one that fills its queue isn't drained), `receive.utilization` under 0.05, and an ingest rate over the drain
-  interval ending there of at least 95% of the warmup baseline. Only intervals after the fault's
+  2-batch queue is half of it, and one that fills its queue isn't drained), `receive.utilization` under 0.05 at every listener, and an ingest rate over the drain
+  interval ending there of at least 95% of the warmup baseline. From W8b the ingest rate is
+  summed over the listeners and the baseline over the generators, each generator's from its own
+  warmup drains. Only intervals after the fault's
   end, inside one SUT life, and clear of every other fault are eligible, because a dense schedule
   often starts the next fault before `recovery_bound` runs out; a fault with no eligible interval
-  is listed as skipped, and with no fault judged the row WARNs. A generator `rate_behind`
-  diagnostic makes the throughput part WARN, because the generator limited the rate, not the
+  is listed as skipped, and with no fault judged the row WARNs. A `rate_behind` diagnostic from
+  any generator makes the throughput part WARN, because the generator limited the rate, not the
   SUT.
 - `ledger.summary`, for the final life: uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V),
   which must be 0, with each term shown beside it and wire loss beside them as "by design".
+  From W8b the first two terms read the listeners' sums, and the wire loss sums every source's.
   With `sut_script` (W7a), E − A becomes (E − L_in) + (L_in − L_emit − L_drop − L_err) +
   (L_emit + L_flush − L_sent) + (L_sent − A), the egress term is Ab − L_flush − V, and the
   script's L_drop and L_err are shown beside them as counted. From W7b there is one egress term
@@ -1035,9 +1114,10 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
 
 ### 10. Next scenarios
 
-Every shipped scenario drives one path, `statsd_in` over UDP into one `aggregate`, on §3's base
-stack plus any services its `compose` override adds. `[ledger]` names one component per hop up
-to `aggregate`, and one `[[ledger.sink]]` per sink after it. The scenarios below widen
+Every shipped scenario drives UDP datagrams into one `aggregate`: `statsd_in`, and from W8b in
+`fanin` `lines_in` beside it, on §3's base stack plus any services its `compose` override adds.
+`[ledger]` names one `[[ledger.source]]` per generator and its listener, and one
+`[[ledger.sink]]` per sink after `aggregate`. The scenarios below widen
 that, grouped by cost; the Workstreams table gives the landing order. Each states what it
 proves, its faults, its rows, and the harness support it needs; §2's validation, §5's end
 sequence, and §6's checks hold unless an item says otherwise.
@@ -1076,12 +1156,17 @@ where it needs them, and a small check extension.
    stop, so that sink's queue drops at shutdown and the other sink's doesn't), with the scenario
    `compose` override, service roles read from the merged compose file, and `[[ledger.sink]]`
    with `split` (§2).
-3. **Fan-in.** Two generators of different kinds into one `aggregate` and sink: statsd, plus
+3. **Fan-in (built in W8b).** Two generators of different kinds into one `aggregate` and sink: statsd, plus
    `lines_in` with `kv_metrics` or remote-write into `prometheus_in`. Proves series merging and
    per-source loss attribution. Faults: netem, `partition`, and `stop` on each generator in turn.
    Rows: `ledger.wire` per source in its own unit, `ledger.intake` per listener. A remote-write
    leg carries cumulative totals, so it keeps its own series and balances as V does. Needs: item
-   2's override, and `[ledger]` listing generators, G summed where the units meet.
+   2's override, and `[ledger]` listing generators, G summed where the units meet. Built as
+   `fanin`, with the `lines_in` leg: `generator-lines` sends RFC 5424 syslog over UDP
+   (`syslog_out`, one message per datagram), and `kv`, `keep`, `kv_metrics`, and
+   `keep_signals` turn each line into one `soak_lines` increment, so both legs stay in the
+   datagram unit and G and W sum where they meet. `[[ledger.source]]` tables (§2's "Sources")
+   list the generators, and the source's `sut_transforms` put the four nodes in `ledger.edge`.
 4. **A full spool (built in W8a).** A small `buffer.disk.max_bytes` through a long
    `victoria-metrics` stop. Reaching `max_bytes` is `overflow`'s case (under `drop_oldest` the sink holds its head
    batch reserved while it retries, so the spool rejects each arriving batch and counts it
@@ -1254,7 +1339,11 @@ that items 3, 7, and 11 need.
 - **W8a**: items 4 and 5, and a stop of the SUT inside a backend's stop: the `spool-full`,
   `spool-enospc`, `slow-destination`, and `fanout-stop-outage` scenarios, with the `ledger.egress`
   credit for counted drops of every reason.
-- **W8b**: item 3, a ledger over several generators.
+- **W8b**: item 3, a ledger over several generators: `[[ledger.source]]` tables replacing the
+  scalar `[ledger]` keys, any number of `generator`-role services with a config each, the wire
+  judged per source and the intake per listener, `sut_transforms` judged hop by hop, and the
+  `fanin` scenario. It needs `syslog_out` to count `logit.output.datagrams` over UDP, which
+  `fix/syslog-out-datagrams` adds.
 - **W8c**: item 6, a gauge `slope` reducer, and an expected verdict per row and per service.
 - **W9**: item 10, the scripted destination, and `ledger.sent` run against it.
 - **W10**: item 7, a second SUT service and the ledger one hop longer.
