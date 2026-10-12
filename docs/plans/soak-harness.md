@@ -2562,11 +2562,14 @@ What the work showed about the harness:
 - `script/soak check` reads `scenario.resolved.json`'s `expected` and `expect` as recorded; the
   eviction bound was corrected after the run, from 798,000 to 832,200 (95% of the run window's
   876,000), which the recorded 876,000 meets.
-- The self-test fixtures failed with each harness change reverted (17 reverts): the per-hour
+- The self-test fixtures failed with each harness change reverted (21 reverts): the per-hour
   conversion, too few samples, the run window's start and end, the per-life fit, the slope
   reducer's registration, the run window refusing a step, the step required elsewhere, the two
   new metric kinds, the `[expected]` row, verdict, service, and table rules, an expected FAIL
-  scoring PASS, an expected FAIL that came out PASS failing, and the per-service rows.
+  scoring PASS, an expected FAIL that came out PASS failing, and the per-service rows. Four
+  rules added in review fail it the same way: a row with no service to judge SKIPs, a service
+  with samples but no fittable life WARNs, and `fd_slope` with no timeline start or no fd
+  samples still reaches `[expected]`, two reverts.
 
 The controls' tables:
 
@@ -2732,8 +2735,8 @@ Overall PASS: every row passed but `ledger.windows`, which a Kafka target SKIPs,
   isn't possible: their resolved scenarios carry the scalar `[ledger]` keys. Met: the `fanin`
   run and the `statsd-vm`, `fanout-copy`, `spool-kill-replay`, and `fanout-stop-outage` controls
   are recorded under "Findings", every row PASS.
-- **W8c**: the self-test passes (1,055 expectations), and each harness change fails it when
-  reverted (17 reverts, listed under "Findings"). `cardinality` passes `self-test` validation,
+- **W8c**: the self-test passes (1,060 expectations), and each harness change fails it when
+  reverted (21 reverts, listed under "Findings"). `cardinality` passes `self-test` validation,
   the shipped-config test, and `script/validate` with no warning. Met: the `cardinality` run
   and the `statsd-vm` and `fanin` controls are recorded under "Findings", `cardinality` and
   `statsd-vm` every row PASS; two `fanin` runs WARN on a generator's RSS after a partition,
