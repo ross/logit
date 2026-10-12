@@ -807,7 +807,7 @@ def judge_services(data, check_id, judged):
     `{service: (status, text)}`, and the scenario's `[expected]` verdicts for `check_id`. A
     service with an expectation scores PASS when its own status equals it, saying so, and FAIL
     when it doesn't; a service with none keeps its own status. A service the row couldn't judge
-    has status SKIP, which matches no expectation."""
+    has status SKIP, which matches no expectation; a row with every service SKIP, or none, SKIPs."""
     expected = (data.resolved.get("expected") or {}).get(check_id) or {}
     statuses, lines = [], []
     for service, (status, text) in sorted(judged.items()):
@@ -824,7 +824,7 @@ def judge_services(data, check_id, judged):
     for service in sorted(set(expected) - set(judged)):
         statuses.append(FAIL)
         lines.append(f"{service}: expected {expected[service]}, got no telemetry")
-    if statuses and all(status == SKIP for status in statuses):
+    if all(status == SKIP for status in statuses):
         return SKIP, lines
     return worst([status for status in statuses if status != SKIP]), lines
 
@@ -838,8 +838,12 @@ def check_rss_slope(data):
     over = WARN if data.duration < SECONDS_PER_HOUR else FAIL
     judged = {}
     extra = []
+    fitted = False
     for service in data.logit_services:
         by_life, source = _rss_points(data, service)
+        if not by_life:
+            judged[service] = (SKIP, "no steady-state RSS samples")
+            continue
         status = PASS
         slopes = []
         judged_s = 0.0
@@ -856,16 +860,18 @@ def check_rss_slope(data):
                          f"samples, {span:.0f}s ({source})")
             if per_hour > limit:
                 status = worst([status, over])
-        if not slopes:
-            judged[service] = (SKIP, "no life with enough steady-state samples")
-            continue
+        fitted = fitted or bool(slopes)
+        # A service with samples but no life long enough to fit judges 0 seconds, which the
+        # coverage rule WARNs, so it can't read as a pass beside another service's good slope.
         share, text = data.coverage(judged_s)
         if share is not None and share < COVERAGE_MIN_SHARE:
             status = worst([status, WARN])
             extra.append(f"{service}: slopes cover little of the run: {text}")
-        judged[service] = (status, f"MiB/h {', '.join(slopes)} (limit {limit:g}); {text}")
+        fits = f"MiB/h {', '.join(slopes)}" if slopes else "no life with enough samples"
+        judged[service] = (status, f"{fits} (limit {limit:g}); {text}")
+    expected = (data.resolved.get("expected") or {}).get("rss_slope")
     status, lines = judge_services(data, "rss_slope", judged)
-    if status == SKIP:
+    if status == SKIP or not (fitted or expected):
         return Result("rss_slope", SKIP, "no life with enough steady-state samples",
                       lines + extra)
     return Result("rss_slope", status, " | ".join(lines), lines + extra)
@@ -878,11 +884,13 @@ def check_fd_slope(data):
     growth = float(data.thresholds.get("fd_growth", 8))
     judged = {}
     extra = []
-    if data.t0 is None:
-        return Result("fd_slope", SKIP, "no timeline start")
     for service in data.logit_services:
         tel = data.telemetry.get(service)
+        if data.t0 is None:
+            judged[service] = (SKIP, "no timeline start")
+            continue
         if tel is None:
+            judged[service] = (SKIP, "no fd samples")
             continue
         series = [(ts, v) for ts, v, _ in tel.gauge_series("logit.process.fds")
                   if ts < data.end]
@@ -906,9 +914,10 @@ def check_fd_slope(data):
                                 f"({fault.action} on {fault.on}), baseline {baseline:g}")
         text = f"warmup median {baseline:g} -> end {end_value:g} (limit +{growth:g})"
         judged[service] = (status, "; ".join([text] + problems))
-    if not judged:
-        return Result("fd_slope", SKIP, "no fd samples")
     status, lines = judge_services(data, "fd_slope", judged)
+    if status == SKIP:
+        return Result("fd_slope", SKIP, "no fd samples" if data.t0 is not None
+                      else "no timeline start", lines + extra)
     return Result("fd_slope", status, " | ".join(lines), lines + extra)
 
 

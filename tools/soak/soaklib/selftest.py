@@ -2506,6 +2506,44 @@ def _per_service():
                f"fd_slope FAILs an expected FAIL that came out PASS, got {result}")
 
 
+def _slope_edges():
+    """The slope rows SKIP with no service to judge, WARN on a service with samples but no
+    fittable life, and let an `[expected]` verdict FAIL where they would otherwise SKIP."""
+    with tempfile.TemporaryDirectory() as tmp:
+        start, end = _phase("start", 0, t0=T0), [_phase("end_begin", 3600),
+                                                   _phase("end_end", 3650)]
+        # A run recorded before the role map has no `services`, so no service to judge.
+        none = _run_dir(tmp, "no-services", [start] + end, _sut_stdout(3600), services={},
+                        duration=3600.0)
+        for check in (checks.check_rss_slope, checks.check_fd_slope):
+            result = _status(none, check)
+            expect(result.status == checks.SKIP,
+                   f"{check.__name__} SKIPs with no service to judge, got {result}")
+
+        # The generator's telemetry stops at +80: five samples after warmup, too few to fit.
+        short = _slope_run(tmp, "unfittable")
+        (short / "logs" / "generator.stdout").write_text("\n".join(
+            _service_stdout(80, lambda o: 50 * 2 ** 20, lambda o: 10, lambda o: 100)) + "\n")
+        result = _status(short, checks.check_rss_slope)
+        expect(result.status == checks.WARN
+               and "generator WARN: no life with enough samples" in result.detail
+               and "logit PASS" in result.detail,
+               f"a service with samples but no fittable life WARNs beside a good one, got "
+               f"{result}")
+
+        expected = {"fd_slope": {"logit": "FAIL"}}
+        untimed = _run_dir(tmp, "fd-no-start", end, _sut_stdout(3600), duration=3600.0,
+                           expected=expected)
+        result = _status(untimed, checks.check_fd_slope)
+        expect(result.status == checks.FAIL and "expected FAIL, got SKIP" in result.detail,
+               f"fd_slope FAILs an expectation it can't judge for want of a start, got {result}")
+        silent = _run_dir(tmp, "fd-no-samples", [start] + end, duration=3600.0,
+                          expected=expected)
+        result = _status(silent, checks.check_fd_slope)
+        expect(result.status == checks.FAIL and "logit" in result.detail,
+               f"fd_slope FAILs an expectation on a service with no fd samples, got {result}")
+
+
 def _expected_rules(root):
     path, base = _base(root)
 
@@ -4521,7 +4559,7 @@ def run(root, quiet=False):
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
                      _report, _expected_event_rules, _exit_driver, _ready_words, _exit_watchdog,
                      _script_ledger, _sink_ledger, _roles, _sink_rules, _driver_roles,
-                     _sources_ledger, _source_rules, _fanin_driver, _per_service,
+                     _sources_ledger, _source_rules, _fanin_driver, _per_service, _slope_edges,
                      _expected_rules, _slope_reducer, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
