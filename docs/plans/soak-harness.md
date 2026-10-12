@@ -2217,6 +2217,223 @@ What the work showed about the harness:
   "batches dropped: shutdown N").
 - Re-scoring ten preserved runs with `script/soak check` gave no change in any verdict.
 
+### W8b: fan-in from two generators (2026-10-12)
+
+W8b replaces the scalar `[ledger]` source keys with `[[ledger.source]]` tables, allows several
+generators, judges the wire per source and the intake per listener, and adds `fanin`. The code
+is `soak/w8b` at `06d8d5d7`, merged with `fix/syslog-out-datagrams` (`63a266c5`), which makes
+`syslog_out` count `logit.output.datagrams` over UDP, on the development host (`sailfish`, 32
+cores, Docker 29.7.2). Every run used `logit:soak` `sha256:11cb9f9847b5`, built with
+`--no-cache` from that merge. The tips merged afterward add `main`'s `quinn-proto` bump, which the
+image predates. Runs went two at a time under separate compose projects, and
+every run passed every row:
+
+| Run | Scenario | Verdict |
+|---|---|---|
+| `20261012T202959Z` | `fanin` | every row PASS: each source's wire gap lies in its own generator's fault windows, and Ab 3,574,096 = V |
+| `20261012T203004Z` | `statsd-vm` | every row PASS: the regression control |
+| `20261012T204714Z` | `fanout-copy` | every row PASS: two sinks, one source |
+| `20261012T210105Z` | `spool-kill-replay` | every row PASS: `ledger.replay` 6 replayed vs 6 queued |
+| `20261012T210110Z` | `fanout-stop-outage` | every row PASS: `vm_b` life 0's gap of 123,700 counted by `overflow_oldest` 3 and `shutdown` 4, as in W8a |
+
+`fanin`'s `results.md` table:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 12 apply/revert action(s) returned 0; 2 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 5 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 2 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 2 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 108 readiness sample(s) read ok outside fault windows; 2 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 5 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 5 of 5, 11 freshness sample(s); 120s of 900s after warmup judged (13%; WARN under 5%) |
+| `rss_slope` | PASS | MiB/h per service/life: generator/0 +10.9, generator/1 +7.4, generator-lines/0 +3.2, generator-lines/1 -3.4, logit/0 -1.7 (limit 64); generator 260s of 900s after warmup judged (29%; WARN under 5%); generator-lines 265s of 900s after warmup judged (29%; WARN under 5%); logit 270s of 900s after warmup judged (30%; WARN under 5%) |
+| `fd_slope` | PASS | warmup median -> end: generator 12->11, generator-lines 12->12, logit 13->13 (limit +8) |
+| `ledger.wire` | PASS | generator -> statsd: G 1,799,400 = W 1,787,299 + K 0 + wire 12,101 (by design: 12,188 in UDP-affecting windows, -64 steady, -23 at the end; steady loss judged 23, each run at 0 or more, against limit 500); the generator's counted drop_newest loss, not in G: 13,400 event(s) in 134 batch(es) \| generator-lines -> lines: G 1,799,200 = W 1,786,797 + K 260 + wire 12,143 (by design: 12,245 in UDP-affecting windows, -136 steady, 34 at the end; steady loss judged 43, each run at 0 or more, against limit 500); the generator's counted drop_newest loss, not in G: 13,800 event(s) in 138 batch(es) |
+| `ledger.intake` | PASS | final life 0 statsd: W − D 1,787,299 vs E + B 1,787,299; final life 0 lines: W − D 1,786,797 vs E + B 1,786,797 (R 349,000 = 10,000 + 2 x 1,000 (statsd) + 10,000 + 262 x 1,000 (lines) + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E[lines] 1,786,797 == T_in[parse] 1,786,797 (into parse); T_in[parse] 1,786,797 == T_out[parse] 1,786,797 (parse forwards every event); T_out[parse] 1,786,797 == T_in[labels] 1,786,797 (into labels); T_in[labels] 1,786,797 == T_out[labels] 1,786,797 (labels forwards every event); T_out[labels] 1,786,797 == T_in[count] 1,786,797 (into count); T_in[count] 1,786,797 == T_out[count] 1,786,797 (count forwards every event); T_out[count] 1,786,797 == T_in[metrics_only] 1,786,797 (into metrics_only); T_in[metrics_only] 1,786,797 == T_out[metrics_only] 1,786,797 (metrics_only forwards every event); Σ(sent into aggregate) 3,574,096 == A 3,574,096 (listeners to aggregate); A_sent 13,500 == S_in[victoria_metrics] 13,500 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 0: Ab 3,574,096 == A 3,574,096 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0 (final): Ab 3,574,096 − V[victoria_metrics] 3,574,096 = 0, ok (split copy; R 349,000 = 10,000 + 2 x 1,000 (statsd) + 10,000 + 262 x 1,000 (lines) + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K) 24,244 over the run, by design |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `identity.sink` | PASS | final life 0 at +988s: victoria_metrics: received 98 vs delivered 98 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `recovery` | PASS | 6 of 6 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 4,000/s |
+| `expect.statsd-idle-while-generator-stopped` | PASS | min_delta of logit.input.datagrams{component=statsd} on logit, during 5: c0s5 (+570s, +630s]: 0 (smallest of 12 drain(s)), want <= 0 |
+| `expect.lines-reads-while-generator-stopped` | PASS | min_delta of logit.input.datagrams{component=lines} on logit, during 5: c0s5 (+570s, +630s]: 10,000 (smallest of 12 drain(s)), want >= 5000 |
+| `expect.lines-idle-while-generator-lines-stopped` | PASS | min_delta of logit.input.datagrams{component=lines} on logit, during 6: c0s6 (+705s, +765s]: 0 (smallest of 12 drain(s)), want <= 0 |
+| `expect.statsd-reads-while-generator-lines-stopped` | PASS | min_delta of logit.input.datagrams{component=statsd} on logit, during 6: c0s6 (+705s, +765s]: 10,000 (smallest of 12 drain(s)), want >= 5000 |
+
+What the runs showed about `logit`:
+
+- **Two listeners' events merge into one `aggregate` with nothing lost past the wire.** Each
+  source sent about 1.8 million lines. `statsd` read 1,787,299 and `lines` 1,786,797, the four
+  nodes between `lines` and `window` forwarded every event, `window` received and absorbed
+  3,574,096, and VictoriaMetrics held 3,574,096 across 150 series: 100 `soak_requests_N_total`
+  and 50 `soak_lines_total{id}`.
+- **A fault on one generator touches only its own source.** The 10% netem loss on `generator`
+  cost its source 12,187 lines and the same fault on `generator-lines` cost its source 12,230,
+  while each source's wire lost under 50 lines in all of its own steady time, the other
+  generator's faults included. While either generator was stopped,
+  its listener read 0 datagrams in at least one drain and the other read 10,000 in every drain.
+- **A partitioned generator's queue costs the SUT's kernel queue after the reconnect.** The 45 s
+  partition of `generator-lines` made `syslog_out` drop 13,800 lines as `drop_newest` and queue
+  the rest. When the network came back at +495 s, the burst cost 260 datagrams to the kernel at
+  the SUT (`logit.input.kernel.drops` on `lines`, in the drain at +498 s), inside the fault's
+  window. The same partition of `generator` dropped 13,400 lines at the generator and none in
+  the kernel.
+- `syslog_out` over UDP sends one message per datagram: G's precondition held on both sources
+  (messages equal datagrams) once the fix counted datagrams.
+
+What the work showed about the harness:
+
+- Compose merges `volumes` by mount target, so an override's generator that `extends` the base
+  `generator` mounts its own config at `/config.yaml` through its own variable,
+  `SOAK_GENERATOR_LINES_CONFIG`, with no `!override` tag.
+- `aggregate` passes an event's log through untouched, so a `lines_in` leg needs
+  `keep_signals: [metrics]` before it; without it every line's log would reach the sink and its
+  event counts.
+- Two runs started in the same second collide on the run directory, which is named by the
+  second: a second `spool-kill-replay` start failed in `prepare()` with `FileExistsError` and
+  started nothing. Starting runs a few seconds apart avoids it.
+- `script/soak check` can't re-score a run recorded before W8b: its `scenario.resolved.json`
+  carries the scalar keys, so the ledger rows read no source.
+- The self-test fixtures failed with each harness change reverted (18 reverts): the per-source
+  fault windows, the per-listener intake, the summed E, the transform hops, R per listener and
+  from each listener's `receive:`, B's oversize drops, the per-source precondition, the summed
+  recovery baseline and ingest, the refused scalar keys, the source rules, a source's service a
+  generator, every generator a source's, several generators in the role map, a config per
+  generator, `compose.env` per generator, and the end sequence stopping each generator.
+
+The controls' tables:
+
+`statsd-vm`, `20261012T203004Z`:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 14 apply/revert action(s) returned 0; 2 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 3 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 2 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 5 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 54 readiness sample(s) read ok outside fault windows; 2 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 7 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 7 of 7, 7 freshness sample(s); 180s of 900s after warmup judged (20%; WARN under 5%) |
+| `rss_slope` | PASS | MiB/h per service/life: generator/0 -6.9, logit/1 +10.6 (limit 64); generator 200s of 900s after warmup judged (22%; WARN under 5%); logit 190s of 900s after warmup judged (21%; WARN under 5%) |
+| `fd_slope` | PASS | warmup median -> end: generator 12->12, logit 12->12 (limit +8) |
+| `ledger.wire` | PASS | G 1,915,600 = W 1,843,541 + K 59,779 + wire 12,280 (by design: 12,167 in UDP-affecting windows, 118 steady, -5 at the end; steady loss judged 118, each run at 0 or more, against limit 500); the generator's counted drop_newest loss, not in G: 16,700 event(s) in 167 batch(es) |
+| `ledger.intake` | PASS | final life 1: W − D 643,400 vs E + B 643,400; life 0: W − D − B − X − Ab 0 within [0, R] (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 1: E 643,400 == A 643,400 (listener to aggregate); A_sent 2,700 == S_in[victoria_metrics] 2,700 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 1: Ab 643,400 == A 643,400 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 1 (final): Ab 643,400 − V[victoria_metrics] 643,400 = 0, ok (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 1: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K) 12,280 over the run, by design |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `identity.sink` | PASS | final life 1 at +990s: victoria_metrics: received 27 vs delivered 27 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `recovery` | PASS | 7 of 7 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect` | SKIP | the scenario has no [[expect]] tables |
+
+`fanout-copy`, `20261012T204714Z`:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 8 apply/revert action(s) returned 0; 0 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 2 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 3 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 6 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 67 readiness sample(s) read ok outside fault windows; 0 start(s) or unpause(s) ready in time |
+| `progress` | PASS | 9 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: vm_a: deliveries in 9 of 9, 9 freshness sample(s); vm_b: deliveries in 9 of 9, 9 freshness sample(s); 240s of 690s after warmup judged (35%; WARN under 5%) |
+| `rss_slope` | PASS | MiB/h per service/life: generator/0 -0.4, logit/0 +1.5 (limit 64); generator 270s of 690s after warmup judged (39%; WARN under 5%); logit 270s of 690s after warmup judged (39%; WARN under 5%) |
+| `fd_slope` | PASS | warmup median -> end: generator 12->12, logit 13->13 (limit +8) |
+| `ledger.wire` | PASS | G 1,512,800 = W 1,512,800 + K 0 + wire 0 (by design: 0 in UDP-affecting windows, -27 steady, 27 at the end; steady loss judged 0, each run at 0 or more, against limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 1,512,800 vs E + B 1,512,800 (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E 1,512,800 == A 1,512,800 (listener to aggregate); A_sent 7,700 == S_in[vm_a] 7,700 (aggregate to vm_a); A_sent 7,700 == S_in[vm_b] 7,700 (aggregate to vm_b) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 0: Ab 1,512,800 == A 1,512,800 (every event absorbed) |
+| `ledger.egress` | PASS | vm_a: life 0 (final): Ab 1,512,800 − V[vm_a] 1,512,800 = 0, ok \| vm_b: life 0 (final): Ab 1,512,800 − V[vm_b] 1,512,800 = 0, ok (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[vm_a] 0 + Ab − V[vm_b] 0; wire G − (W + K) 0 over the run, by design |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `identity.sink` | PASS | final life 0 at +778s: vm_a: received 77 vs delivered 77 + dropped 0 + buffer.batches 0, gap 0; vm_b: received 77 vs delivered 77 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `recovery` | PASS | 4 of 4 fault(s) judged at 2 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect.a-delivers-while-b-stopped` | PASS | delta of logit.component.batches.delivered{component=vm_a} on logit, during c0s1: c0s1 (+60s, +150s]: 9 (over 18 drain(s)), want >= 6 |
+| `expect.b-queues-while-stopped` | PASS | max of logit.component.buffer.batches{component=vm_b} on logit, during c0s1: c0s1 (+60s, +150s]: 9 (10 sample(s) and the value in force at its start), want >= 5 |
+| `expect.b-drops-nothing` | PASS | delta of logit.component.batches.dropped{component=vm_b} on logit, through 1: c0s1 (+60s, +195s]: 0 (over 27 drain(s)), want <= 0 |
+| `expect.a-drops-nothing` | PASS | delta of logit.component.batches.dropped{component=vm_a} on logit, through 3: c0s3 (+390s, +525s]: 0 (over 27 drain(s)), want <= 0 |
+| `expect.b-drops-nothing-overlapping` | PASS | delta of logit.component.batches.dropped{component=vm_b} on logit, through 4: c0s4 (+420s, +555s]: 0 (over 27 drain(s)), want <= 0 |
+
+`spool-kill-replay`, `20261012T210105Z`:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 4 apply/revert action(s) returned 0; 1 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 3 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (1 kill(s)) |
+| `restarts` | PASS | 2 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 3 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 36 readiness sample(s) read ok outside fault windows; 1 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 4 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 4 of 4, 5 freshness sample(s); 90s of 315s after warmup judged (29%; WARN under 5%) |
+| `rss_slope` | PASS | MiB/h per service/life: generator/0 -2.3, logit/1 -25.0 (limit 64); generator 115s of 315s after warmup judged (37%; WARN under 5%); logit 110s of 315s after warmup judged (35%; WARN under 5%) |
+| `fd_slope` | PASS | warmup median -> end: generator 12->11, logit 15->15 (limit +8) |
+| `ledger.wire` | PASS | G 762,400 = W 759,100 + K 0 + wire 3,300 (by design: 3,222 in UDP-affecting windows, -18 steady, 96 at the end; steady loss judged 4, each run at 0 or more, against limit 300); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 1: W − D 510,300 vs E + B 510,300; life 0: W − D − B − X − Ab 0 within [0, R] (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 1: E 510,300 == A 510,300 (listener to aggregate); A_sent 2,300 == S_in[victoria_metrics] 2,300 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 1: Ab 510,300 == A 510,300 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0 (killed): Ab 248,800 − V[victoria_metrics] 248,800 = 0, ok (band [-9,998, 29,994]: ingest 2,000/s over the last drain interval; below, the residual 0 plus one 4.99993s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − Ab 0 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 1 (final): Ab 510,300 − V[victoria_metrics] 510,300 = 0, ok (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | PASS | 100 series over 1 sink(s) x 2 life/lives, widest gap 10.001s (gaps <= 15s (1.5 x the 10s aggregate interval) or idle, with no window batches.sent from a + 7.5s to b - 2.5s (5s drains); a killed life's last sample within 11s (1.1 x) of the kill, a later life's first within 20s (2 x) of its start) |
+| `ledger.replay` | PASS | victoria_metrics: life 1's first drain replayed 6 vs killed life 0's last-drain buffer.batches 6 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 1: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K) 3,300 over the run, by design |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `identity.sink` | PASS | final life 1 at +400s: victoria_metrics: received 23 + replayed 6 vs delivered 29 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `recovery` | PASS | 1 of 2 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect.spool-holds-the-outage` | PASS | max of logit.component.buffer.disk.segments{component=victoria_metrics} on logit, during c0s1: c0s1 (+60s, +210s]: 1 (14 sample(s) and the value in force at its start), want >= 1 |
+| `expect.spool-queues-windows` | PASS | max of logit.component.buffer.batches{component=victoria_metrics} on logit, during c0s1: c0s1 (+60s, +210s]: 12 (14 sample(s) and the value in force at its start), want >= 2 |
+| `expect.spool-replayed-at-restart` | PASS | delta of logit.component.buffer.disk.replayed{component=victoria_metrics} on logit, after c0s2: c0s2 (+150s, +195s]: 6 (over 9 drain(s)), want >= 1 |
+| `expect.no-torn-tail` | PASS | delta of logit.component.buffer.disk.truncated{component=victoria_metrics} on logit, through c0s2: c0s2 (+120s, +195s]: 0 (over 9 drain(s)), want <= 0 |
+| `expect.no-second-replay` | PASS | delta of logit.component.buffer.disk.replayed{component=victoria_metrics} on logit, after c0s1: c0s1 (+210s, +255s]: 0 (over 9 drain(s)), want <= 0 |
+| `expect.sink-never-drops` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics} on logit, through c0s1: c0s1 (+60s, +255s]: 0 (over 33 drain(s)), want <= 0 |
+| `expect.retrying-clears` | PASS | last of logit.component.retrying{component=victoria_metrics} on logit, after c0s1: c0s1 (+210s, +255s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
+
+`fanout-stop-outage`, `20261012T210110Z`:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 4 apply/revert action(s) returned 0; 1 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 3 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 2 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 3 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 36 readiness sample(s) read ok outside fault windows; 1 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 4 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: vm_a: deliveries in 4 of 4, 5 freshness sample(s); vm_b: deliveries in 4 of 4, 5 freshness sample(s); 90s of 315s after warmup judged (29%; WARN under 5%) |
+| `rss_slope` | PASS | MiB/h per service/life: generator/0 -5.3, logit/1 +22.0 (limit 64); generator 115s of 315s after warmup judged (37%; WARN under 5%); logit 110s of 315s after warmup judged (35%; WARN under 5%) |
+| `fd_slope` | PASS | warmup median -> end: generator 12->12, logit 13->13 (limit +8) |
+| `ledger.wire` | PASS | G 762,900 = W 752,600 + K 0 + wire 10,300 (by design: 10,375 in UDP-affecting windows, -47 steady, -28 at the end; steady loss judged 0, each run at 0 or more, against limit 300); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 1: W − D 500,100 vs E + B 500,100; life 0: W − D − B − X − Ab 0 within [0, R] (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 1: E 500,100 == A 500,100 (listener to aggregate); A_sent 2,300 == S_in[vm_a] 2,300 (aggregate to vm_a); A_sent 2,300 == S_in[vm_b] 2,300 (aggregate to vm_b) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 1: Ab 500,100 == A 500,100 (every event absorbed) |
+| `ledger.egress` | PASS | vm_a: life 0: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 1 (final): Ab 500,100 − V[vm_a] 500,100 = 0, ok \| vm_b: life 0: W − D − B − X − V 123,700 = residual 0 + Ab − V 123,700, counted (batches dropped: overflow_oldest 3, shutdown 4); life 1 (final): Ab 500,100 − V[vm_b] 500,100 = 0, ok (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 1: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[vm_a] 0 + Ab − V[vm_b] 0; wire G − (W + K) 10,300 over the run, by design |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `identity.sink` | PASS | final life 1 at +400s: vm_a: received 23 vs delivered 23 + dropped 0 + buffer.batches 0, gap 0; vm_b: received 23 vs delivered 21 + dropped 2 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `recovery` | PASS | 1 of 2 fault(s) judged at 2 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect.b-drops-at-shutdown` | PASS | delta of logit.component.batches.dropped{component=vm_b, reason=shutdown} on logit, during c0s2: c0s2 (+120s, +150s]: 4 (over 2 drain(s)), want >= 1 |
+| `expect.a-drops-nothing` | PASS | delta of logit.component.batches.dropped{component=vm_a} on logit, through c0s1: c0s1 (+60s, +255s]: 0 (over 35 drain(s)), want <= 0 |
+| `expect.b-retrying-clears` | PASS | last of logit.component.retrying{component=vm_b} on logit, after c0s1: c0s1 (+210s, +255s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
+
 ### A Kafka target: `kafka-broker-restart` (2026-10-11)
 
 Run `20261011T213158Z`: `script/soak run kafka-broker-restart`, the scenario's own 8 minutes 30
@@ -2307,3 +2524,9 @@ Overall PASS: every row passed but `ledger.windows`, which a Kafka target SKIPs,
   `logit:soak`. Re-scoring ten preserved runs gives the same statuses. Met: the four scenario
   runs and the `statsd-vm`, `statsd-vm-lost-total`, and `sink-outage-drop-oldest` controls are
   recorded under "Findings", every row PASS.
+- **W8b**: the self-test passes (1,021 expectations), and each harness change fails it when
+  reverted (18 reverts, listed under "Findings"). `fanin` passes `self-test` validation, the
+  shipped-config test, and `logit validate` in `logit:soak`. Re-scoring runs recorded before W8b
+  isn't possible: their resolved scenarios carry the scalar `[ledger]` keys. Met: the `fanin`
+  run and the `statsd-vm`, `fanout-copy`, `spool-kill-replay`, and `fanout-stop-outage` controls
+  are recorded under "Findings", every row PASS.
