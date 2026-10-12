@@ -28,7 +28,8 @@ PYTHON_IMAGE="python:3.12-slim"
 BROKERS=(kafka redpanda)
 # Each topic and its partition count, created on both brokers before any leg starts.
 TOPICS=(parity-logit:6 parity-java:6 codec-none:1 codec-gzip:1 codec-snappy:1 codec-lz4:1
-    codec-zstd:1 dedup:3 dedup-control:3 tls:1 mtls:1 mtls-nocert:1 timestamp:1)
+    codec-zstd:1 dedup:3 dedup-control:3 tls:1 mtls:1 mtls-nocert:1 sasl-plain:1
+    sasl-scram512:1 sasl-scram256:1 sasl-wrong:1 timestamp:1)
 # The dedup leg's fault: the broker's packets to the leg's container dropped from this many
 # seconds after the legs start, for this long. The leg sends for 40 s.
 NETEM_AT=10
@@ -185,6 +186,24 @@ ki_compose up -d --wait --wait-timeout 180 kafka redpanda >/dev/null
     done
     echo "redpanda version: $(ki_compose exec -T redpanda rpk version 2>/dev/null | head -1)"
 } >"${RUN_DIR}/provenance.txt"
+
+# Redpanda's SASL users and mechanisms: its listeners named `sasl` and `sasls` require SASL, and the
+# cluster setting picks which mechanisms they offer. A SCRAM user holds one mechanism's credential
+# and PLAIN checks it, so each SCRAM mechanism gets its own user. Kafka's users come from
+# compose.yaml and kafka-server.properties.
+say "creating Redpanda's SASL users"
+(
+    set -e
+    ki_compose exec -T redpanda rpk cluster config set sasl_mechanisms '[SCRAM, PLAIN]'
+    ki_compose exec -T redpanda rpk security user create logit256 -p logit-secret \
+        --mechanism SCRAM-SHA-256
+    ki_compose exec -T redpanda rpk security user create logit512 -p logit-secret \
+        --mechanism SCRAM-SHA-512
+) >"${RUN_DIR}/logs/redpanda-sasl-setup.log" 2>&1 || {
+    cat "${RUN_DIR}/logs/redpanda-sasl-setup.log" >&2
+    echo "kafka-interop: Redpanda SASL setup failed" >&2
+    exit 1
+}
 
 say "creating topics on both brokers"
 for broker in "${BROKERS[@]}"; do

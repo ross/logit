@@ -37,6 +37,7 @@ PARITY_KEYS = 50
 CODEC_EVENTS = 100
 DEDUP_EVENTS = 800
 TLS_EVENTS = 50
+SASL_EVENTS = 50
 TIMESTAMP_EVENTS = 100
 # `logit-timestamp-*.yaml` stamps seq 3, 13, ..., 93 at 2100-01-01.
 FUTURE_SEQS = {seq for seq in range(TIMESTAMP_EVENTS) if seq % 10 == 3}
@@ -153,6 +154,20 @@ def telemetry_sum(events, metric, **attrs):
             if item.get("name") == metric and item.get("kind") == "sum":
                 total += float(item["value"])
     return int(total)
+
+
+def telemetry_max(events, metric, **attrs):
+    """The highest value any point of a gauge took: `logit.component.retrying` reads 0 again once
+    the write loop exits, so the last point can't show a hold."""
+    best = 0.0
+    for event in events:
+        have = {**event.get("resource", {}).get("attributes", {}), **event.get("attributes", {})}
+        if any(have.get(k) != v for k, v in attrs.items()):
+            continue
+        for item in event.get("metrics", []):
+            if item.get("name") == metric and item.get("kind") == "gauge":
+                best = max(best, float(item["value"]))
+    return int(best)
 
 
 def requests_by_class(events, component):
@@ -283,6 +298,38 @@ def leg_mtls_required(broker):
     return "PASS", f"refused without a client certificate: 0 records, requests {shown(classes)}"
 
 
+def leg_sasl(broker, topic, component, how):
+    records = read_java(broker, topic)
+    classes = requests_by_class(telemetry("sasl", broker), component)
+    if len(records) != SASL_EVENTS or not classes.get("ok"):
+        return "FAIL", (f"{topic} holds {len(records)} records, want {SASL_EVENTS}; "
+                        f"requests {shown(classes)}")
+    seqs = {r.seq() for r in records}
+    if seqs != set(range(SASL_EVENTS)):
+        return "FAIL", f"{topic} holds {len(seqs)} distinct events, want {SASL_EVENTS}"
+    return "PASS", f"{len(records)} records, {how}; requests {shown(classes)}"
+
+
+def leg_sasl_wrong(broker):
+    events = telemetry("sasl", broker)
+    records = read_java(broker, "sasl-wrong")
+    classes = requests_by_class(events, "sasl_wrong")
+    retrying = telemetry_max(events, "logit.component.retrying", component="sasl_wrong")
+    rejected = telemetry_sum(events, "logit.component.batches.dropped", component="sasl_wrong",
+                             reason="rejected")
+    detail = (f"{len(records)} records, requests {shown(classes)}, retrying peaked at "
+              f"{retrying}, batches.dropped{{reason=rejected}} {rejected}")
+    if records or classes.get("ok"):
+        return "FAIL", f"the broker took a login with the wrong password; {detail}"
+    if not classes.get("refused"):
+        return "FAIL", f"no Refused attempt, so the refusal is unproven; {detail}"
+    if retrying != 1:
+        return "FAIL", f"the sink wasn't holding and retrying; {detail}"
+    if rejected:
+        return "FAIL", f"a refused login dropped a batch; {detail}"
+    return "PASS", f"refused, held, and retried; {detail}"
+
+
 def leg_timestamp(broker):
     events = telemetry("timestamp", broker)
     dropped = telemetry_sum(events, "logit.output.records.dropped", component="timestamp",
@@ -316,6 +363,13 @@ LEGS += [
     ("tls", "server TLS, private CA", lambda b: leg_tls(b, "tls", "tls")),
     ("mtls", "mutual TLS, client certificate", lambda b: leg_tls(b, "mtls", "mtls")),
     ("mtls-required", "mutual TLS refuses a client without a certificate", leg_mtls_required),
+    ("sasl-plain", "SASL PLAIN over SASL_SSL",
+     lambda b: leg_sasl(b, "sasl-plain", "sasl_plain", "PLAIN over SASL_SSL")),
+    ("sasl-scram512", "SASL SCRAM-SHA-512 over SASL_SSL",
+     lambda b: leg_sasl(b, "sasl-scram512", "sasl_scram512", "SCRAM-SHA-512 over SASL_SSL")),
+    ("sasl-scram256", "SASL SCRAM-SHA-256 over SASL_PLAINTEXT",
+     lambda b: leg_sasl(b, "sasl-scram256", "sasl_scram256", "SCRAM-SHA-256 over SASL_PLAINTEXT")),
+    ("sasl-wrong", "a wrong password is refused and retried", leg_sasl_wrong),
     ("timestamp", "a record over an hour ahead dropped and counted", leg_timestamp),
 ]
 

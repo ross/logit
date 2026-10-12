@@ -1,6 +1,6 @@
 # The stack `script/kafka-interop` drives: Apache Kafka (KRaft) and Redpanda, each with a plain,
-# a TLS, and a mutual-TLS listener, and one `logit` per leg per broker from the release image. See
-# README.md here, and docs/plans/kafka-output.md's "Interop plan (W4)" for what each leg proves.
+# a TLS, a mutual-TLS, a SASL_PLAINTEXT, and a SASL_SSL listener, and one `logit` per leg per
+# broker from the release image. See README.md here, and docs/plans/kafka-output.md's "Interop plan (W4)" for what each leg proves.
 #
 # `script/kafka-interop` runs this under the compose project `kafka-interop` with an
 # `--env-file` it writes, which sets:
@@ -47,7 +47,9 @@ services:
       - -c
       - >-
         /opt/kafka/bin/kafka-storage.sh format --ignore-formatted -t "$${CLUSTER_ID}"
-        -c /interop/server.properties >/dev/null
+        -c /interop/server.properties
+        --add-scram 'SCRAM-SHA-256=[name=logit,password=logit-secret]'
+        --add-scram 'SCRAM-SHA-512=[name=logit,password=logit-secret]' >/dev/null
         && exec /opt/kafka/bin/kafka-server-start.sh /interop/server.properties
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
@@ -130,6 +132,20 @@ services:
     <<: *logit
     volumes:
       - ./logit-tls-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-sasl-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-sasl-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-sasl-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-sasl-redpanda.yaml:/config.yaml:ro,z
       - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
       - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
 

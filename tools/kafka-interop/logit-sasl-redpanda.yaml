@@ -1,0 +1,89 @@
+# The SASL leg of `script/kafka-interop` against Redpanda: 50 events into four sinks, each a
+# mechanism and listener pair. Users: `logit256` and `logit512` (made with `rpk security user create`;
+# PLAIN checks a user's SCRAM credential).
+# The passwords are throwaways for this stack. The SASL_SSL sinks trust the private CA the script
+# generates into the run directory (mounted at /tls).
+#
+#   sasl_plain     PLAIN over SASL_SSL
+#   sasl_scram512  SCRAM-SHA-512 over SASL_SSL
+#   sasl_scram256  SCRAM-SHA-256 over SASL_PLAINTEXT
+#   sasl_wrong     SCRAM-SHA-512 over SASL_SSL with the wrong password: the broker refuses the
+#                  login, so `sasl-wrong` stays empty and the sink retries until shutdown
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load_sasl_plain:
+    type: generate_in
+    count: 50
+    rate: 5
+    batch: 5
+    event:
+      log: "sasl {seq}"
+      attributes: { seq: "{seq}" }
+
+  sasl_plain:
+    type: kafka_out
+    sources: [load_sasl_plain]
+    brokers: ["redpanda:9097"]
+    topic: sasl-plain
+    tls: { ca_file: /tls/ca.pem }
+    sasl: { mechanism: plain, username: logit512, password: logit-secret }
+
+  load_sasl_scram512:
+    type: generate_in
+    count: 50
+    rate: 5
+    batch: 5
+    event:
+      log: "sasl {seq}"
+      attributes: { seq: "{seq}" }
+
+  sasl_scram512:
+    type: kafka_out
+    sources: [load_sasl_scram512]
+    brokers: ["redpanda:9097"]
+    topic: sasl-scram512
+    tls: { ca_file: /tls/ca.pem }
+    sasl: { mechanism: scram_sha_512, username: logit512, password: logit-secret }
+
+  load_sasl_scram256:
+    type: generate_in
+    count: 50
+    rate: 5
+    batch: 5
+    event:
+      log: "sasl {seq}"
+      attributes: { seq: "{seq}" }
+
+  sasl_scram256:
+    type: kafka_out
+    sources: [load_sasl_scram256]
+    brokers: ["redpanda:9096"]
+    topic: sasl-scram256
+    sasl: { mechanism: scram_sha_256, username: logit256, password: logit-secret }
+
+  load_sasl_wrong:
+    type: generate_in
+    count: 50
+    rate: 5
+    batch: 5
+    event:
+      log: "sasl {seq}"
+      attributes: { seq: "{seq}" }
+
+  sasl_wrong:
+    type: kafka_out
+    sources: [load_sasl_wrong]
+    brokers: ["redpanda:9097"]
+    topic: sasl-wrong
+    timeout: 2s
+    tls: { ca_file: /tls/ca.pem }
+    sasl: { mechanism: scram_sha_512, username: logit512, password: not-the-password }
+    buffer: { retry_max_delay: 1s, shutdown_grace: 1s }
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/sasl-redpanda-telemetry.log
+    format: json

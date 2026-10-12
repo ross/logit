@@ -20,8 +20,10 @@ test depends on it running. A run takes about four minutes once the images are b
 | `redpanda` | `redpandadata/redpanda:v26.2.3` | single-node Redpanda in `dev-container` mode, started on `redpanda.yaml` |
 | `logit-<leg>-<broker>` | `logit:kafka-interop`, built from the current tree | one per `logit-<leg>-<broker>.yaml` |
 
-Each broker has three client listeners: plain on `:9092`, TLS on `:9093`, and mutual TLS, which
-requires a client certificate, on `:9094`. The read-back runs `kafka-console-consumer.sh` and
+Each broker has five client listeners: plain on `:9092`, TLS on `:9093`, mutual TLS, which
+requires a client certificate, on `:9094`, SASL_PLAINTEXT on `:9096`, and SASL_SSL on `:9097`.
+The SASL listeners offer PLAIN, SCRAM-SHA-256, and SCRAM-SHA-512. Only they require
+authentication, so every read-back uses the plain listener and needs no credentials. The read-back runs `kafka-console-consumer.sh` and
 `kafka-get-offsets.sh` inside the `kafka` container, against either broker, and kcat in
 `edenhill/kcat:1.7.1` containers on the stack's network.
 
@@ -33,7 +35,16 @@ The legs, each run against both brokers:
 | `codec-<c>` | `logit-codecs-*.yaml` | 100 events under each `compression` (`none`, `gzip`, `snappy`, `lz4`, `zstd`) are stored under that codec, and decode in both the Java consumer and kcat, each event once |
 | `dedup` | `logit-dedup-*.yaml` | while the broker's packets to this leg are dropped, an idempotent sink's resend after an `Ambiguous` attempt stores no duplicate, and a non-idempotent control sink beside it stores at least one |
 | `tls`, `mtls`, `mtls-required` | `logit-tls-*.yaml` | 50 events over server TLS and over mutual TLS from the run's private CA; a sink with no client certificate stores nothing |
+| `sasl-plain`, `sasl-scram512`, `sasl-scram256`, `sasl-wrong` | `logit-sasl-*.yaml` | 50 events through `sasl:` with PLAIN over SASL_SSL, SCRAM-SHA-512 over SASL_SSL, and SCRAM-SHA-256 over SASL_PLAINTEXT; a SCRAM-SHA-512 sink with the wrong password stores nothing, counts every attempt as `refused`, holds its queue with `logit.component.retrying` at `1`, and drops no batch as `rejected` |
 | `timestamp` | `logit-timestamp-*.yaml` | in each batch of 10, the event stamped at 2100-01-01 is dropped and counted as `invalid_timestamp`, and the other nine land |
+
+The SASL user is `logit` with the password `logit-secret` on Kafka, whose PLAIN entry is a JAAS
+`user_logit` in `kafka-server.properties` and whose SCRAM credentials `kafka-storage.sh format
+--add-scram` writes. Redpanda keeps one credential per user, so the script creates `logit256`
+(SCRAM-SHA-256) and `logit512` (SCRAM-SHA-512) with `rpk security user create`; its PLAIN
+login checks the SCRAM credential, so the `sasl-plain` sink signs in as `logit512`. The script sets
+Redpanda's `sasl_mechanisms` to `[SCRAM, PLAIN]` after start. The passwords are literals in the leg
+configs, like the run's other throwaway material.
 
 Every config passes `logit validate`: `script/validate` and the
 `every_shipped_config_loads_and_validates` test both cover `logit-*.yaml` here. Each sink has
