@@ -15,6 +15,12 @@
 //!   the producer's last five appended batches is answered `NONE` with its original offset and
 //!   not appended again.
 //!
+//! With [`State::sasl`] set, a connection must authenticate as a broker's SASL listener
+//! requires: `SaslHandshake` v1 naming a configured mechanism, then `SaslAuthenticate` with
+//! `PLAIN` or the server side of SCRAM (RFC 5802), checked against the configured credentials.
+//! Any request but `ApiVersions` before that closes the connection, as does one after the
+//! session's `session_lifetime_ms` has passed (KIP-368's expiry).
+//!
 //! A test scripts departures from that with [`Step`]s, each consumed by the first request it
 //! matches: an error code, `record_errors`, an append whose answer is lost, a close, or no
 //! answer at all.
@@ -23,6 +29,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use bytes::{BufMut, Bytes, BytesMut};
 use kafka_protocol::messages::api_versions_response::ApiVersion;
 use kafka_protocol::messages::metadata_response::{
@@ -34,17 +42,20 @@ use kafka_protocol::messages::produce_response::{
 use kafka_protocol::messages::{
     ApiKey, ApiVersionsRequest, ApiVersionsResponse, BrokerId, InitProducerIdRequest,
     InitProducerIdResponse, MetadataRequest, MetadataResponse, ProduceRequest, ProduceResponse,
-    ProducerId, ResponseHeader, TopicName,
+    ProducerId, ResponseHeader, SaslAuthenticateRequest, SaslAuthenticateResponse,
+    SaslHandshakeRequest, SaslHandshakeResponse, TopicName,
 };
 use kafka_protocol::protocol::{decode_request_header_from_buffer, Decodable, Encodable, StrBytes};
 use kafka_protocol::records::{Compression, Record, RecordBatchDecoder};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
 use super::fault::code;
 use super::producer::next_sequence;
+use super::sasl::{escape_username, ScramHash};
 
 /// How many appended batches per producer per partition the broker remembers for dedup
 /// (`ProducerStateEntry.NUM_BATCHES_TO_RETAIN`).
@@ -128,6 +139,57 @@ impl Partition {
     }
 }
 
+/// The SASL a broker requires before any request but `ApiVersions`.
+#[derive(Debug, Clone)]
+pub(crate) struct Sasl {
+    /// The mechanisms `SaslHandshake` accepts.
+    pub(crate) mechanisms: Vec<String>,
+    pub(crate) username: String,
+    pub(crate) password: String,
+    /// What a successful `SaslAuthenticate` (v1 and later) answers as `session_lifetime_ms`; 0
+    /// for no limit.
+    pub(crate) session_lifetime_ms: i64,
+    /// The iteration count a SCRAM server-first message asks for.
+    pub(crate) iterations: u32,
+    /// Answers a valid SCRAM proof with a server signature from another password, as a broker
+    /// that doesn't hold the user's credential would.
+    pub(crate) forge_signature: bool,
+}
+
+impl Sasl {
+    /// Every mechanism `kafka_out` speaks, for `username` and `password`, with no lifetime.
+    pub(crate) fn new(username: &str, password: &str) -> Self {
+        Self {
+            mechanisms: ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"].map(String::from).to_vec(),
+            username: username.to_string(),
+            password: password.to_string(),
+            session_lifetime_ms: 0,
+            iterations: 4096,
+            forge_signature: false,
+        }
+    }
+}
+
+/// Where one connection is in its SASL exchange.
+#[derive(Default)]
+enum Auth {
+    #[default]
+    None,
+    Handshaken(String),
+    /// A SCRAM server-first message is sent.
+    ScramFirst {
+        hash: ScramHash,
+        nonce: String,
+        auth_prefix: String,
+    },
+    Done {
+        expires: Option<Instant>,
+    },
+}
+
+/// The salt every SCRAM credential here uses.
+const SCRAM_SALT: &[u8] = b"fake-broker-salt";
+
 /// The cluster's shared state; tests read and change it through [`FakeCluster::state`].
 #[derive(Debug, Default)]
 pub(crate) struct State {
@@ -137,6 +199,16 @@ pub(crate) struct State {
     /// The highest `Produce` version every node advertises; the minimum is always 0, as a 4.x
     /// broker advertises it.
     pub(crate) produce_max: i16,
+    /// Required before any request but `ApiVersions` when set.
+    pub(crate) sasl: Option<Sasl>,
+    /// Leaves `SaslHandshake` and `SaslAuthenticate` out of `ApiVersions`.
+    pub(crate) hide_sasl: bool,
+    /// Every successful SASL exchange.
+    pub(crate) authentications: usize,
+    /// When each session that has a lifetime ends, in order.
+    pub(crate) session_ends: Vec<Instant>,
+    /// Connections closed for a request that arrived after their session ended.
+    pub(crate) expired_closes: usize,
     pub(crate) script: Vec<Step>,
     pub(crate) received: Vec<Received>,
     /// `(node, api, version)` of every request, in arrival order.
@@ -308,13 +380,14 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
 ) {
     state.lock().unwrap().open_connections += 1;
     let _open = Open(state.clone());
+    let mut auth = Auth::None;
     loop {
         let Ok(len) = stream.read_i32().await else { return };
         let mut body = vec![0; len as usize];
         if stream.read_exact(&mut body).await.is_err() {
             return;
         }
-        let reply = handle(node, Bytes::from(body), &state);
+        let reply = handle(node, Bytes::from(body), &state, &mut auth);
         match reply {
             Reply::Answer(frame) => {
                 if stream.write_all(&frame).await.is_err() {
@@ -333,12 +406,24 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-fn handle(node: i32, mut body: Bytes, state: &Arc<Mutex<State>>) -> Reply {
+fn handle(node: i32, mut body: Bytes, state: &Arc<Mutex<State>>, auth: &mut Auth) -> Reply {
     let header = decode_request_header_from_buffer(&mut body).expect("a valid request header");
     let key = ApiKey::try_from(header.request_api_key).expect("a known API key");
     let version = header.request_api_version;
     let mut state = state.lock().unwrap();
     state.requests.push((node, key, version));
+    let exchange =
+        matches!(key, ApiKey::ApiVersions | ApiKey::SaslHandshake | ApiKey::SaslAuthenticate);
+    if state.sasl.is_some() && !exchange {
+        match auth {
+            Auth::Done { expires } if expires.is_none_or(|end| Instant::now() < end) => {}
+            Auth::Done { .. } => {
+                state.expired_closes += 1;
+                return Reply::Close;
+            }
+            _ => return Reply::Close,
+        }
+    }
     let frame = |body: &dyn Fn(&mut BytesMut)| {
         let mut out = BytesMut::new();
         out.put_i32(0);
@@ -360,12 +445,57 @@ fn handle(node: i32, mut body: Bytes, state: &Arc<Mutex<State>>) -> Reply {
                     .with_min_version(0)
                     .with_max_version(max)
             };
-            let response = ApiVersionsResponse::default().with_api_keys(vec![
+            let mut keys = vec![
                 offered(ApiKey::Produce, state.produce_max),
                 offered(ApiKey::Metadata, 13),
                 offered(ApiKey::ApiVersions, 4),
                 offered(ApiKey::InitProducerId, 5),
-            ]);
+            ];
+            if !state.hide_sasl {
+                keys.push(offered(ApiKey::SaslHandshake, 1));
+                keys.push(offered(ApiKey::SaslAuthenticate, 2));
+            }
+            let response = ApiVersionsResponse::default().with_api_keys(keys);
+            frame(&|out| response.encode(out, version).unwrap())
+        }
+        ApiKey::SaslHandshake => {
+            let request = SaslHandshakeRequest::decode(&mut body, version).unwrap();
+            let offered: Vec<StrBytes> = state
+                .sasl
+                .iter()
+                .flat_map(|s| s.mechanisms.iter().cloned().map(StrBytes::from_string))
+                .collect();
+            let mechanism = request.mechanism.to_string();
+            let error = match state.take_step(key, None) {
+                Some(Action::Error(code)) => code,
+                Some(Action::Close) => return Reply::Close,
+                Some(Action::Hang) => return Reply::Hang,
+                // A listener without SASL answers a handshake this way.
+                _ if state.sasl.is_none() || !matches!(auth, Auth::None) => {
+                    code::ILLEGAL_SASL_STATE
+                }
+                _ if !offered.iter().any(|m| m.as_str() == mechanism) => {
+                    code::UNSUPPORTED_SASL_MECHANISM
+                }
+                _ => {
+                    *auth = Auth::Handshaken(mechanism);
+                    code::NONE
+                }
+            };
+            let response =
+                SaslHandshakeResponse::default().with_error_code(error).with_mechanisms(offered);
+            frame(&|out| response.encode(out, version).unwrap())
+        }
+        ApiKey::SaslAuthenticate => {
+            let request = SaslAuthenticateRequest::decode(&mut body, version).unwrap();
+            let response = match state.take_step(key, None) {
+                Some(Action::Error(code)) => SaslAuthenticateResponse::default()
+                    .with_error_code(code)
+                    .with_error_message(Some(StrBytes::from_static_str("scripted refusal"))),
+                Some(Action::Close) => return Reply::Close,
+                Some(Action::Hang) => return Reply::Hang,
+                _ => sasl_authenticate(&mut state, auth, &request.auth_bytes),
+            };
             frame(&|out| response.encode(out, version).unwrap())
         }
         ApiKey::Metadata => {
@@ -409,6 +539,118 @@ fn handle(node: i32, mut body: Bytes, state: &Arc<Mutex<State>>) -> Reply {
             }
         }
         other => panic!("the fake broker doesn't serve {other:?}"),
+    }
+}
+
+/// One `SaslAuthenticate` step of the exchange `auth` is in.
+fn sasl_authenticate(
+    state: &mut State,
+    auth: &mut Auth,
+    message: &[u8],
+) -> SaslAuthenticateResponse {
+    let fail = |code: i16, why: &str| {
+        SaslAuthenticateResponse::default()
+            .with_error_code(code)
+            .with_error_message(Some(StrBytes::from_string(why.to_string())))
+    };
+    let Some(sasl) = state.sasl.clone() else {
+        return fail(code::ILLEGAL_SASL_STATE, "no SASL on this listener");
+    };
+    let done = |state: &mut State, auth: &mut Auth, server: Vec<u8>| {
+        let lifetime = u64::try_from(sasl.session_lifetime_ms).unwrap_or(0);
+        let expires =
+            (lifetime > 0).then(|| Instant::now() + std::time::Duration::from_millis(lifetime));
+        state.authentications += 1;
+        state.session_ends.extend(expires);
+        *auth = Auth::Done { expires };
+        SaslAuthenticateResponse::default()
+            .with_auth_bytes(Bytes::from(server))
+            .with_session_lifetime_ms(sasl.session_lifetime_ms)
+    };
+    // Kafka's own refusal text for SCRAM.
+    let scram_failed = |hash: ScramHash| {
+        fail(
+            code::SASL_AUTHENTICATION_FAILED,
+            &format!(
+                "Authentication failed during authentication due to invalid credentials with \
+                 SASL mechanism {}",
+                hash.mechanism()
+            ),
+        )
+    };
+    match std::mem::take(auth) {
+        Auth::Handshaken(mechanism) if mechanism == "PLAIN" => {
+            let parts: Vec<&[u8]> = message.split(|&b| b == 0).collect();
+            if parts.len() == 3
+                && parts[1] == sasl.username.as_bytes()
+                && parts[2] == sasl.password.as_bytes()
+            {
+                done(state, auth, Vec::new())
+            } else {
+                fail(
+                    code::SASL_AUTHENTICATION_FAILED,
+                    "Authentication failed: Invalid username or password",
+                )
+            }
+        }
+        Auth::Handshaken(mechanism) => {
+            let hash = match mechanism.as_str() {
+                "SCRAM-SHA-256" => ScramHash::Sha256,
+                "SCRAM-SHA-512" => ScramHash::Sha512,
+                _ => return fail(code::ILLEGAL_SASL_STATE, "an unknown mechanism"),
+            };
+            let first = String::from_utf8_lossy(message).to_string();
+            let Some(bare) = first.strip_prefix("n,,") else {
+                return scram_failed(hash);
+            };
+            let (user, client_nonce) = match bare.split_once(",r=") {
+                Some((user, nonce)) => (user.strip_prefix("n=").unwrap_or_default(), nonce),
+                None => return scram_failed(hash),
+            };
+            if user != escape_username(&sasl.username) {
+                return scram_failed(hash);
+            }
+            let nonce = format!("{client_nonce}fake-server-nonce");
+            let server_first =
+                format!("r={nonce},s={},i={}", BASE64.encode(SCRAM_SALT), sasl.iterations);
+            *auth = Auth::ScramFirst { hash, nonce, auth_prefix: format!("{bare},{server_first}") };
+            SaslAuthenticateResponse::default().with_auth_bytes(Bytes::from(server_first))
+        }
+        Auth::ScramFirst { hash, nonce, auth_prefix } => {
+            let last = String::from_utf8_lossy(message).to_string();
+            let Some((without_proof, proof)) = last.rsplit_once(",p=") else {
+                return scram_failed(hash);
+            };
+            if without_proof != format!("c=biws,r={nonce}") {
+                return scram_failed(hash);
+            }
+            let Ok(proof) = BASE64.decode(proof) else {
+                return scram_failed(hash);
+            };
+            let auth_message = format!("{auth_prefix},{without_proof}");
+            let salted = hash.salted_password(&sasl.password, SCRAM_SALT, sasl.iterations);
+            let stored_key = hash.hash(&hash.hmac(&salted, b"Client Key"));
+            let signature = hash.hmac(&stored_key, auth_message.as_bytes());
+            let client_key: Vec<u8> = proof.iter().zip(&signature).map(|(p, s)| p ^ s).collect();
+            if proof.len() != signature.len() || hash.hash(&client_key) != stored_key {
+                return scram_failed(hash);
+            }
+            let signing = if sasl.forge_signature {
+                hash.salted_password(
+                    &format!("{}-forged", sasl.password),
+                    SCRAM_SALT,
+                    sasl.iterations,
+                )
+            } else {
+                salted
+            };
+            let server_key = hash.hmac(&signing, b"Server Key");
+            let verifier = BASE64.encode(hash.hmac(&server_key, auth_message.as_bytes()));
+            done(state, auth, format!("v={verifier}").into_bytes())
+        }
+        Auth::None | Auth::Done { .. } => {
+            fail(code::ILLEGAL_SASL_STATE, "SaslAuthenticate outside an exchange")
+        }
     }
 }
 

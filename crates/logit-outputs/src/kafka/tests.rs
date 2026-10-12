@@ -12,12 +12,13 @@ use logit_pipeline::test_util::{wait_until, RECV_TIMEOUT};
 use logit_pipeline::Fault;
 
 use super::batch::ProducerRecord;
-use super::fake_broker::{Action, FakeCluster, Received, Step};
+use super::fake_broker::{Action, FakeCluster, Received, Sasl, Step};
 use super::fault::code;
 use super::partitioner::partition_for_key;
 use super::producer::{
     Acks, Attempt, Identity, PartState, Pending, Producer, ProducerConfig, Settlement,
 };
+use super::sasl::{authenticator, KafkaSasl};
 
 const TOPIC: &str = "logs";
 /// The first PID the fake broker hands out.
@@ -34,6 +35,7 @@ fn config(cluster: &FakeCluster) -> ProducerConfig {
         max_request_bytes: 1 << 20,
         tls: None,
         client_id: "logit-test".to_string(),
+        sasl: None,
     }
 }
 
@@ -538,6 +540,7 @@ async fn a_refused_bootstrap_connect_is_clean() {
         max_request_bytes: 1 << 20,
         tls: None,
         client_id: "logit-test".to_string(),
+        sasl: None,
     })
     .unwrap();
     let err = producer.prepare(vec![record(None, "v")]).await.unwrap_err();
@@ -783,6 +786,7 @@ fn idempotence_without_acks_all_is_a_construction_error() {
         max_request_bytes: 1 << 20,
         tls: None,
         client_id: "logit-test".to_string(),
+        sasl: None,
     };
     assert!(Producer::new(config).is_err());
 }
@@ -827,4 +831,177 @@ async fn a_failed_tls_handshake_is_clean() {
     let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
     assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
     assert!(format!("{err:#}").contains("TLS handshake"), "{err:#}");
+}
+
+// ---- SASL (docs/adr/kafka-sasl.md) ---------------------------------------------------------
+
+const SASL_USER: &str = "alice";
+const SASL_PASSWORD: &str = "pw-never-printed";
+
+fn sasl_settings(mechanism: &str, password: &str) -> KafkaSasl {
+    let (username, password) = (SASL_USER.to_string(), password.to_string());
+    match mechanism {
+        "PLAIN" => KafkaSasl::Plain { username, password },
+        "SCRAM-SHA-256" => KafkaSasl::ScramSha256 { username, password },
+        "SCRAM-SHA-512" => KafkaSasl::ScramSha512 { username, password },
+        other => panic!("no mechanism {other}"),
+    }
+}
+
+/// A cluster of `nodes` requiring SASL for [`SASL_USER`] and [`SASL_PASSWORD`].
+async fn sasl_cluster(nodes: usize, leaders: &[i32]) -> FakeCluster {
+    let cluster = cluster(nodes, leaders).await;
+    cluster.state().sasl = Some(Sasl::new(SASL_USER, SASL_PASSWORD));
+    cluster
+}
+
+fn sasl_producer(cluster: &FakeCluster, mechanism: &str, password: &str) -> Producer {
+    let sasl = Some(authenticator(&sasl_settings(mechanism, password)));
+    Producer::new(ProducerConfig { sasl, ..config(cluster) }).unwrap()
+}
+
+/// The error a first send fails with, after asserting its class and that it names the mechanism
+/// and the user but never the password.
+async fn sasl_refusal(producer: &mut Producer, mechanism: &str, want: Fault) -> String {
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), want, "{message}");
+    assert!(message.contains(mechanism) && message.contains(SASL_USER), "{message}");
+    assert!(!message.contains(SASL_PASSWORD), "{message}");
+    message
+}
+
+/// Each mechanism authenticates every connection, the bootstrap one and each leader's, before
+/// any other request.
+#[tokio::test]
+async fn each_sasl_mechanism_authenticates_every_connection_and_delivers() {
+    for mechanism in ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"] {
+        let cluster = sasl_cluster(2, &[0, 1]).await;
+        let mut producer = sasl_producer(&cluster, mechanism, SASL_PASSWORD);
+        let mut records = keyed_for(0, 2, 2);
+        records.extend(keyed_for(1, 2, 2));
+        send_expecting(&mut producer, records, &[None]).await;
+        assert_eq!((values_in(&cluster, 0).len(), values_in(&cluster, 1).len()), (2, 2));
+        let state = cluster.state();
+        assert_eq!(state.authentications, state.accepted_connections, "{mechanism}");
+        assert_eq!(state.accepted_connections, 3, "{mechanism}: bootstrap and both leaders");
+        let handshakes: Vec<i16> = state
+            .requests
+            .iter()
+            .filter(|(_, k, _)| *k == ApiKey::SaslHandshake)
+            .map(|(_, _, v)| *v)
+            .collect();
+        assert_eq!(handshakes, vec![1; 3], "{mechanism}: SaslHandshake v1 per connection");
+        assert!(
+            state
+                .requests
+                .iter()
+                .filter(|(_, k, _)| *k == ApiKey::SaslAuthenticate)
+                .all(|(_, _, v)| *v == 2),
+            "{mechanism}: SaslAuthenticate v2"
+        );
+    }
+}
+
+/// Response-class rows `SASL_AUTHENTICATION_FAILED` (58), `UNSUPPORTED_SASL_MECHANISM` (33),
+/// `ILLEGAL_SASL_STATE` (34), and a broker offering no SASL: each is `Refused`, and the
+/// message carries the broker's reason and no password.
+#[tokio::test]
+async fn sasl_refusals_are_refused_and_never_print_the_password() {
+    for mechanism in ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"] {
+        let cluster = sasl_cluster(1, &[0]).await;
+        let mut producer = sasl_producer(&cluster, mechanism, "wrong-password");
+        let message = sasl_refusal(&mut producer, mechanism, Fault::Refused).await;
+        assert!(message.contains("SaslAuthenticationFailed (58)"), "{message}");
+        assert!(message.contains("Authentication failed"), "the broker's text: {message}");
+        assert!(!message.contains("wrong-password"), "{message}");
+        assert!(values_in(&cluster, 0).is_empty());
+    }
+
+    let cluster = sasl_cluster(1, &[0]).await;
+    cluster.state().sasl.as_mut().unwrap().mechanisms = vec!["PLAIN".into()];
+    let mut producer = sasl_producer(&cluster, "SCRAM-SHA-512", SASL_PASSWORD);
+    let message = sasl_refusal(&mut producer, "SCRAM-SHA-512", Fault::Refused).await;
+    assert!(message.contains("UnsupportedSaslMechanism (33)"), "{message}");
+    assert!(message.contains("it offers [PLAIN]"), "{message}");
+
+    // A listener without SASL answers the handshake ILLEGAL_SASL_STATE.
+    let plaintext = self::cluster(1, &[0]).await;
+    let mut producer = sasl_producer(&plaintext, "PLAIN", SASL_PASSWORD);
+    let message = sasl_refusal(&mut producer, "PLAIN", Fault::Refused).await;
+    assert!(message.contains("IllegalSaslState (34)"), "{message}");
+
+    let cluster = sasl_cluster(1, &[0]).await;
+    cluster.script(Step {
+        api: ApiKey::SaslAuthenticate,
+        partition: None,
+        action: Action::Error(code::ILLEGAL_SASL_STATE),
+    });
+    let mut producer = sasl_producer(&cluster, "SCRAM-SHA-256", SASL_PASSWORD);
+    let message = sasl_refusal(&mut producer, "SCRAM-SHA-256", Fault::Refused).await;
+    assert!(message.contains("IllegalSaslState (34): scripted refusal"), "{message}");
+
+    let cluster = sasl_cluster(1, &[0]).await;
+    cluster.state().hide_sasl = true;
+    let mut producer = sasl_producer(&cluster, "PLAIN", SASL_PASSWORD);
+    let message = sasl_refusal(&mut producer, "PLAIN", Fault::Refused).await;
+    assert!(message.contains("doesn't offer SaslHandshake v1"), "{message}");
+}
+
+/// A broker whose SCRAM server signature doesn't verify doesn't hold the user's credential, and
+/// every connection to it gets the same answer: `Refused`, with no produce request sent.
+#[tokio::test]
+async fn a_scram_server_signature_mismatch_is_refused() {
+    for mechanism in ["SCRAM-SHA-256", "SCRAM-SHA-512"] {
+        let cluster = sasl_cluster(1, &[0]).await;
+        cluster.state().sasl.as_mut().unwrap().forge_signature = true;
+        let mut producer = sasl_producer(&cluster, mechanism, SASL_PASSWORD);
+        let message = sasl_refusal(&mut producer, mechanism, Fault::Refused).await;
+        assert!(message.contains("server signature doesn't match"), "{message}");
+        assert_eq!(requests_of(&cluster, ApiKey::Metadata), 0, "{mechanism}");
+    }
+}
+
+/// A transport failure during the exchange is `Clean`: nothing of a produce request has been
+/// written on the connection. The next attempt authenticates and delivers.
+#[tokio::test]
+async fn a_transport_failure_during_the_sasl_exchange_is_clean() {
+    for api in [ApiKey::SaslHandshake, ApiKey::SaslAuthenticate] {
+        let cluster = sasl_cluster(1, &[0]).await;
+        cluster.script(Step { api, partition: None, action: Action::Close });
+        let mut producer = sasl_producer(&cluster, "SCRAM-SHA-256", SASL_PASSWORD);
+        let message = sasl_refusal(&mut producer, "SCRAM-SHA-256", Fault::Clean).await;
+        assert!(message.contains(&format!("{api:?}")), "{message}");
+        send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+        assert_eq!(values_in(&cluster, 0).len(), 1, "{api:?}");
+    }
+}
+
+/// A connection past its SASL session's deadline is redialed before the next request instead of
+/// being written to, so the broker never closes it for an expired session and the send
+/// succeeds on its first attempt, with each record appended once.
+#[tokio::test]
+async fn an_expiring_sasl_session_is_redialed_before_the_next_send() {
+    let cluster = sasl_cluster(1, &[0]).await;
+    // The lifetime under test. The connection's deadline falls at half of it (a lifetime of
+    // twice the timeout or less keeps half as its margin), 1 s after authentication: that
+    // covers the first send's four loopback round trips by far, and the wait below is 2 s.
+    cluster.state().sasl.as_mut().unwrap().session_lifetime_ms = 2000;
+    let sasl = Some(authenticator(&sasl_settings("SCRAM-SHA-512", SASL_PASSWORD)));
+    let mut producer = Producer::new(ProducerConfig { sasl, ..config(&cluster) }).unwrap();
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+    let authenticated = cluster.state().authentications;
+
+    let ends = cluster.state().session_ends.clone();
+    assert_eq!(ends.len(), authenticated, "every session has a lifetime");
+    wait_until("every SASL session has ended at the broker", || {
+        ends.iter().all(|&end| tokio::time::Instant::now() >= end)
+    })
+    .await;
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+
+    let state = cluster.state();
+    assert_eq!(state.expired_closes, 0, "nothing was written to an expired session");
+    assert!(state.authentications > authenticated, "a redial authenticated again");
+    assert_eq!(state.partition(TOPIC, 0).records().len(), 2, "each record once");
 }

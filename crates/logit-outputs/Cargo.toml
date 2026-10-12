@@ -40,6 +40,10 @@ rustls.workspace = true
 rustls-pki-types.workspace = true
 hyper-rustls.workspace = true
 webpki-roots.workspace = true
+# kafka_out's SASL (docs/adr/kafka-sasl.md): SCRAM's HMAC, PBKDF2, and nonce, and its base64
+# attributes.
+ring.workspace = true
+base64.workspace = true
 tokio.workspace = true
 # TLS for the raw-TCP sinks (`logit_out`, `syslog_out`, `statsd_out`), which don't go through
 # `reqwest`/`hyper`; tests' TLS servers use it too.

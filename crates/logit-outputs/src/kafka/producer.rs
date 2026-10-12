@@ -51,6 +51,7 @@ use super::batch::{self, ProducerRecord, Stamp, BATCH_OVERHEAD};
 use super::conn::{Conn, Dialer, PRODUCE_RECORD_ERRORS_MIN, PRODUCE_ZSTD_MIN};
 use super::fault::{self, code, Response};
 use super::partitioner;
+use super::sasl::Authenticator;
 
 /// Java's `metadata.max.age.ms`.
 pub(crate) const METADATA_MAX_AGE: Duration = Duration::from_secs(300);
@@ -102,6 +103,8 @@ pub(crate) struct ProducerConfig {
     pub(crate) max_request_bytes: usize,
     pub(crate) tls: Option<Arc<rustls::ClientConfig>>,
     pub(crate) client_id: String,
+    /// Authenticates every connection when set.
+    pub(crate) sasl: Option<Arc<dyn Authenticator>>,
 }
 
 /// A connection's key: a bootstrap entry by its index, or a broker by its node id.
@@ -311,6 +314,7 @@ impl Producer {
             tls: config.tls.clone(),
             timeout: config.timeout,
             client_id: StrBytes::from_string(config.client_id.clone()),
+            sasl: config.sasl.clone(),
         };
         Ok(Self {
             topic: StrBytes::from_string(config.topic.clone()),
@@ -909,7 +913,8 @@ impl Producer {
         for (node, host, port) in targets {
             match self.dialer.connect(&host, port).await {
                 Ok(conn) => return Ok((node, conn)),
-                // Every broker answers with the same versions; another can't do better.
+                // Every broker answers with the same versions and SASL verdict; another can't
+                // do better.
                 Err(err) if logit_pipeline::classify(&err) == Fault::Refused => return Err(err),
                 Err(err) => last = Some(err),
             }

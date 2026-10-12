@@ -6,7 +6,10 @@
 //!   events per record under `record: batch`, in each `format:`.
 //! - [`producer`] partitions a batch, keeps the idempotent producer's identity and sequences,
 //!   and sends each attempt with a verdict per partition batch.
-//! - [`conn`] is one broker connection: framing, correlation ids, version negotiation, TLS.
+//! - [`conn`] is one broker connection: framing, correlation ids, version negotiation, TLS, and
+//!   the SASL session's deadline.
+//! - [`sasl`] authenticates a connection: the exchange loop and the `PLAIN`, `SCRAM-SHA-256`,
+//!   and `SCRAM-SHA-512` mechanisms.
 //! - [`batch`] and [`compression`] write record batch v2 with all five codecs through the
 //!   crate's compression hook, so none of its C codecs is built.
 //! - [`partitioner`] is the Java client's murmur2 keyed partitioner and the per-send sticky
@@ -29,6 +32,12 @@
 //! |---|---|---|---|
 //! | Connect refused or timed out, DNS failure | `Clean` | no request byte left | `tests::a_refused_bootstrap_connect_is_clean`, `tests::a_refused_leader_connect_is_clean` |
 //! | TLS handshake failure | `Clean` | no request byte left | `tests::a_failed_tls_handshake_is_clean` |
+//! | With `sasl:` set, a broker without `SaslHandshake` v1 and `SaslAuthenticate` v0 to v2 | `Refused` | every connection gets the same answer | `tests::sasl_refusals_are_refused_and_never_print_the_password` |
+//! | `UNSUPPORTED_SASL_MECHANISM` (33), `ILLEGAL_SASL_STATE` (34), `UNSUPPORTED_VERSION` (35), `SASL_AUTHENTICATION_FAILED` (58), from `SaslHandshake` or `SaslAuthenticate` | `Refused` | the mechanism, the exchange, or the credentials: a retry repeats the same exchange | `tests::sasl_refusals_are_refused_and_never_print_the_password`, `sink::tests::refused_sasl_credentials_hold_the_queue_until_the_broker_takes_them` |
+//! | Any other code from `SaslHandshake` or `SaslAuthenticate` | `Clean` | a state the broker leaves on its own | `fault::tests::sasl_answers_refuse_for_the_mechanism_the_state_and_the_credentials` |
+//! | A SCRAM server message the client's checks reject: a server signature that doesn't match, a nonce that doesn't extend the client's, an iteration count outside 4096 to 16384, an `e=` error | `Refused` | a broker whose signature doesn't match doesn't hold the user's credential, and every check fails the same way on every connection | `tests::a_scram_server_signature_mismatch_is_refused`, `sasl::scram::tests::a_malformed_server_first_message_is_refused`, `sasl::scram::tests::an_iteration_count_outside_the_bounds_is_refused` |
+//! | A transport failure during the SASL exchange | `Clean` | no produce byte has been written on the connection | `tests::a_transport_failure_during_the_sasl_exchange_is_clean` |
+//! | A pooled connection past its SASL session's deadline (`conn::reauth_deadline`) | redialed before writing; no failure | the broker closes a connection whose session has ended on its next request | `tests::an_expiring_sasl_session_is_redialed_before_the_next_send` |
 //! | The first write fails or accepts nothing, on plaintext | `Clean` | the broker can't have the request | `conn::tests::a_plaintext_first_write_that_accepts_nothing_is_clean` |
 //! | A pooled connection the broker closed | redialed before writing; no failure | the probe finds the close before any byte is written | `tests::a_pooled_connection_the_broker_closed_is_redialed` |
 //! | A write fails after any byte, or on TLS at all | `Ambiguous` | the broker may have the request | `conn::tests::a_failure_after_part_of_the_request_is_written_is_ambiguous`, `conn::tests::a_tls_write_failure_is_ambiguous` |
@@ -70,11 +79,13 @@ mod fake_broker;
 mod fault;
 mod partitioner;
 mod producer;
+mod sasl;
 mod sink;
 #[cfg(test)]
 mod tests;
 
 pub use encode::{EncodeStats, KafkaEncoder, RecordFormat, RecordKey, RecordMeta, RecordMode};
+pub use sasl::KafkaSasl;
 pub use sink::{
     KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings, TlsClientSettings,
     DEFAULT_MAX_REQUEST_BYTES, DEFAULT_TIMEOUT,

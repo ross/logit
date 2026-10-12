@@ -50,6 +50,7 @@ use super::batch::{value_budget, ProducerRecord};
 use super::encode::{KafkaEncoder, RecordFormat, RecordKey, RecordMeta, RecordMode};
 use super::fault;
 use super::producer::{Acks, PartState, Pending, Producer, ProducerConfig, Settlement};
+use super::sasl::{self, KafkaSasl};
 use crate::accounting::BatchAccounting;
 pub use crate::tls::TlsClientSettings;
 
@@ -103,6 +104,8 @@ pub struct KafkaSettings {
     pub headers: Vec<(String, String)>,
     /// The `client.id` brokers log and apply quotas by.
     pub client_id: String,
+    /// Authenticates every broker connection when set.
+    pub sasl: Option<KafkaSasl>,
 }
 
 impl KafkaSettings {
@@ -121,6 +124,7 @@ impl KafkaSettings {
             timeout: DEFAULT_TIMEOUT,
             headers: Vec::new(),
             client_id: "logit".to_string(),
+            sasl: None,
         }
     }
 }
@@ -168,6 +172,7 @@ impl KafkaOutput {
             max_request_bytes: settings.max_request_bytes,
             tls: None,
             client_id: settings.client_id,
+            sasl: settings.sasl.as_ref().map(sasl::authenticator),
         };
         let headers = settings
             .headers
