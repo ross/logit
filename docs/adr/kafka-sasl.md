@@ -236,11 +236,12 @@ W2 built OAUTHBEARER and settled these points the decision above left open:
    message through a `Session::failure` method, so the error reads `status "invalid_token"`
    whatever text the broker sends with code 58.
 5. **The token endpoint's faults.** Section 4's rows hold. A redirect is `Refused`, since the
-   client follows none and a moved endpoint is a config change. A `2xx` whose whole body isn't
-   JSON, lacks a string `access_token`, or holds one that isn't an RFC 6750 `b64token` is
-   `Refused`: every fetch gets the same answer, and a token outside `b64token` could carry a
+   client follows none and a moved endpoint is a config change. A `2xx` whose body, read up to
+   a 64 KiB cap, isn't JSON, lacks a string `access_token`, or holds one that isn't an RFC 6750
+   `b64token` is `Refused`: every fetch gets the same answer, and a token outside `b64token` could carry a
    `\x01` into the message's framing. A `2xx` whose body the timeout or a closed connection cuts
-   off is `Clean`, as a timed-out request is, rather than read as a body that isn't JSON. The fetch is bounded by the sink's `timeout`, and an error quotes only
+   off is `Clean`, as a timed-out request is, rather than read as a body that isn't JSON. The
+   fetch is bounded by the sink's `timeout`, and an error quotes only
    the OAuth `error` and `error_description` of the body, never the rest, which may echo the
    request.
 6. **The token endpoint trusts the bundled Mozilla roots only.** The broker `tls:` block

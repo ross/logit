@@ -28,9 +28,9 @@
 //!
 //! An endpoint fault's class follows `super::super`'s response-class table: unreachable, timed
 //! out, `429`, or `5xx` is `Clean`, and so is a `2xx` whose body is cut off by the timeout or a
-//! closed connection; any other answer but a `2xx` is `Refused`, and so is a `2xx` whose whole
-//! body holds no usable `access_token`. No message carries the token or the client secret, and the
-//! endpoint is printed through `logit_core::redact::url`.
+//! closed connection; any other answer but a `2xx` is `Refused`, and so is a `2xx` whose body,
+//! read up to `MAX_RESPONSE_BYTES`, holds no usable `access_token`. No message carries the token
+//! or the client secret, and the endpoint is printed through `logit_core::redact::url`.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -12,9 +12,9 @@
 //! failure during the exchange is `Clean`, because no produce byte has been written on the
 //! connection, and a broker's refusal or a server message the mechanism rejects is `Refused`. A
 //! session's own error is `Refused` unless it carries a class. A broker's error code on any
-//! `SaslAuthenticate` reaches the session through [`Session::refused`]. Every message names the mechanism
-//! and [`Authenticator::principal`], never a secret, and adds [`Session::failure`] to a broker's
-//! refusal.
+//! `SaslAuthenticate` reaches the session through [`Session::refused`]. Every message names the
+//! mechanism and [`Authenticator::principal`], never a secret, and adds [`Session::failure`] to a
+//! broker's refusal.
 
 mod oauth;
 mod plain;

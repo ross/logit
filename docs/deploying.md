@@ -3199,9 +3199,11 @@ twice `timeout`.
   token expires, so the sink redials, with a new token, before then. A fixed `token:` is never
   renewed, so the broker refuses it once it expires.
 - **Faults.** A token endpoint that's unreachable, times out (the sink's `timeout`), or answers
-  `429` or `5xx` is retried as `clean`; any other answer, or a `2xx` without a usable
-  `access_token`, is `refused`. A broker that refuses the token is `refused` too, and its error
-  carries the broker's OAuth status (`invalid_token`). Each holds the queue until the endpoint
+  `429` or `5xx`, or whose `2xx` body a timeout or closed connection cuts off, is retried as
+  `clean`; any other answer, or a `2xx` without a usable `access_token` in its first 64 KiB, is
+  `refused`. A broker that refuses the token is `refused` too, and the sink fetches a new token
+  for the next attempt. When the broker sends an error challenge, as Kafka does, the error
+  carries its OAuth status (`invalid_token`); Redpanda sends none. Each holds the queue until the endpoint
   or the broker accepts. The error names the client id and the endpoint, never the secret or the
   token.
 
