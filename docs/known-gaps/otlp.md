@@ -79,3 +79,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
   2262-04-11T23:47:16.854775807Z, not the original. It's listed under
   [ADR `lossless-transit`](../adr/lossless-transit.md)'s "Permitted normalizations"
   ([ADR `untrusted-input-bounds`](../adr/untrusted-input-bounds.md) has the rule).
+- **`otlp_in` drops `keyStrindex`, `stringValueStrindex`, `entityRefs`, and `metadata`.** These
+  fields belong to the profiles signal and to experimental parts of the data model. The JSON
+  decoder skips them and the protobuf decoder never maps them
+  (`crates/logit-proto/src/otlp/json/mod.rs` and `json/metrics.rs`), so `otlp_out` doesn't send
+  them either. A `stringValueStrindex` value decodes as `Null`.
+  - **Consequence:** a sender that uses string indexes or entity references loses them at
+    `otlp_in`.
+  - **Revisit trigger:** a sender that emits them on logs, metrics, or traces.

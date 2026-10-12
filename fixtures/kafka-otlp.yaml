@@ -25,7 +25,7 @@ components:
     type: kafka_out
     sources: [otlp_in]
     brokers: ["kafka:9092"]
-    format: otlp_proto
+    format: otlp_proto               # or otlp_json, for a receiver set to `encoding: otlp_json`
     # topics: {logs: otlp_logs, metrics: otlp_metrics, traces: otlp_spans}   # the defaults
     # topic: otlp                    # instead of topics: every signal on one topic
     key: trace_id                    # one request per trace id for logs and spans; metrics unkeyed
