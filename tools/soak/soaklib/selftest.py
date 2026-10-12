@@ -1033,7 +1033,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 external=False, sut_extra=(), stderr_extra=(), timeline_extra=(),
                 script=None, l_in_short=0, l_err_unreported=0, l_sent_short=0,
                 sut_end="stop", shutdown_in=("telemetry", "stderr"), dropped_at="sink",
-                kafka=False, topic_extra=(), topic_read=True, topic_records=None, **resolved):
+                dropped_reason="shutdown", kafka=False, topic_extra=(), topic_read=True, topic_records=None, **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
@@ -1041,7 +1041,9 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
     life 1 balances. `shutdown_in` names where the shutdown drops, of datagrams and of
     `life0_dropped`/`life1_dropped` batches, are written: telemetry, as a dedicated `internal`
     pipeline exports them, and stderr, as the listener's `warn` lines and `drain complete`.
-    `dropped_at` names the component whose telemetry carries those batches.
+    `dropped_at` names the component whose telemetry carries those batches, and
+    `dropped_reason` their reason; a reason other than `shutdown` leaves them out of stderr,
+    whose `drain complete` counts shutdown drops alone.
 
     `script` puts a `lua` component, `lua`, between the listener and `window`: a dict of the
     events it drops (`drop`), fails on (`err`), and returns from `flush()` (`flush`) per drain,
@@ -1146,7 +1148,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             batches = life0_dropped if life == 0 else life1_dropped
             if batches:
                 sut.append(_line(stamp, "logit.component.batches.dropped", "sum", batches,
-                                 component=dropped_at, attrs={"reason": "shutdown"}))
+                                 component=dropped_at, attrs={"reason": dropped_reason}))
 
     end_fields = {"code": 2, "key": "memory_limit_exceeded"} if sut_end == "exit" else {}
     timeline = [_phase("start", 0, t0=T0),
@@ -1195,7 +1197,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                           "receive queue but not decoded when this listener was stopped at its "
                           "shutdown grace", component="in"))
     for offset, dropped in ((STOP[0] + 0.6, life0_dropped), (321, life1_dropped)):
-        if dropped and "stderr" in shutdown_in:
+        if dropped and "stderr" in shutdown_in and dropped_reason == "shutdown":
             stderr.append(log(offset, "WARN", "drain complete", duration="1s",
                               batches_dropped=dropped))
         else:
@@ -1399,15 +1401,15 @@ def _sink_ledger():
                             export_edit=short_final("vm_b", 20))
         egress = elsewhere["ledger.egress"].detail
         expect(elsewhere["ledger.egress"].status == checks.FAIL
-               and "V[vm_b] 33,960 = 40, uncounted (batches dropped for shutdown 0, not "
-               "counting 1 at the other sinks)" in egress
+               and "V[vm_b] 33,960 = 40, uncounted (batches dropped: 0, not "
+               "counting shutdown 1 at the other sinks)" in egress
                and elsewhere["ledger.summary"].status == checks.FAIL,
                f"under copy another sink's shutdown drop doesn't count vm_b's gap, got "
                f"{elsewhere['ledger.egress']} / {elsewhere['ledger.summary']}")
         attributed = results("sinks-copy-attributed", life1_dropped=1, dropped_at="vm_b",
                              export_edit=short_final("vm_b", 20))
         expect(attributed["ledger.egress"].status == checks.PASS
-               and "V[vm_b] 33,960 = 40, counted (batches dropped for shutdown 1)"
+               and "V[vm_b] 33,960 = 40, counted (batches dropped: shutdown 1)"
                in attributed["ledger.egress"].detail
                and attributed["ledger.summary"].status == checks.PASS,
                f"under copy a sink's own shutdown drop counts its gap, got "
@@ -1420,8 +1422,8 @@ def _sink_ledger():
                            export_edit=short_both)
         egress = upstream["ledger.egress"].detail
         expect(upstream["ledger.egress"].status == checks.PASS
-               and "V[vm_a] 33,960 = 40, counted (batches dropped for shutdown 1)" in egress
-               and "V[vm_b] 33,960 = 40, counted (batches dropped for shutdown 1)" in egress
+               and "V[vm_a] 33,960 = 40, counted (batches dropped: shutdown 1)" in egress
+               and "V[vm_b] 33,960 = 40, counted (batches dropped: shutdown 1)" in egress
                and upstream["ledger.summary"].status == checks.PASS,
                f"under copy a shutdown drop upstream of the fan-out counts every sink's gap, got "
                f"{upstream['ledger.egress']} / {upstream['ledger.summary']}")
@@ -1430,11 +1432,41 @@ def _sink_ledger():
                                   life1_dropped=1, dropped_at=dropper,
                                   export_edit=short_final(short, 20))
             expect(routed_drop["ledger.egress"].status == checks.PASS
-                   and "= 20, counted (batches dropped for shutdown 1)"
+                   and "= 20, counted (batches dropped: shutdown 1)"
                    in routed_drop["ledger.egress"].detail
                    and routed_drop["ledger.summary"].status == checks.PASS,
                    f"under route {dropper}'s shutdown drop counts the summed gap, got "
                    f"{routed_drop['ledger.egress']} / {routed_drop['ledger.summary']}")
+        # Every reason counts, under the same group rule as a shutdown drop.
+        overflow_elsewhere = results("sinks-copy-overflow-elsewhere", life1_dropped=1,
+                                     dropped_at="vm_a", dropped_reason="overflow_oldest",
+                                     export_edit=short_final("vm_b", 20))
+        expect(overflow_elsewhere["ledger.egress"].status == checks.FAIL
+               and "V[vm_b] 33,960 = 40, uncounted (batches dropped: 0, not counting "
+               "overflow_oldest 1 at the other sinks)" in overflow_elsewhere["ledger.egress"].detail
+               and overflow_elsewhere["ledger.summary"].status == checks.FAIL,
+               f"under copy another sink's overflow drop doesn't count vm_b's gap, got "
+               f"{overflow_elsewhere['ledger.egress']} / {overflow_elsewhere['ledger.summary']}")
+        overflow_own = results("sinks-copy-overflow-own", life1_dropped=1, dropped_at="vm_b",
+                               dropped_reason="overflow_oldest",
+                               export_edit=short_final("vm_b", 20))
+        expect(overflow_own["ledger.egress"].status == checks.PASS
+               and "V[vm_b] 33,960 = 40, counted (batches dropped: overflow_oldest 1)"
+               in overflow_own["ledger.egress"].detail
+               and overflow_own["ledger.summary"].status == checks.PASS,
+               f"under copy a sink's own overflow drop counts its gap, got "
+               f"{overflow_own['ledger.egress']} / {overflow_own['ledger.summary']}")
+        for dropper, short in (("vm_a", "vm_b"), ("vm_b", "vm_a")):
+            routed_overflow = results(f"sinks-route-overflow-{dropper}", split="route",
+                                      life1_dropped=1, dropped_at=dropper,
+                                      dropped_reason="overflow_oldest",
+                                      export_edit=short_final(short, 20))
+            expect(routed_overflow["ledger.egress"].status == checks.PASS
+                   and "= 20, counted (batches dropped: overflow_oldest 1)"
+                   in routed_overflow["ledger.egress"].detail
+                   and routed_overflow["ledger.summary"].status == checks.PASS,
+                   f"under route {dropper}'s overflow drop counts the summed gap, got "
+                   f"{routed_overflow['ledger.egress']} / {routed_overflow['ledger.summary']}")
         half = results("sinks-copy-half", split="copy",
                        export_edit=lambda sink, series: [one for one in series
                                                         if sink == "vm_a"
@@ -1962,9 +1994,53 @@ def _ledger_checks():
                f"{uncounted['ledger.egress']}")
         counted = results("ledger-counted", v0_extra=-500, life0_dropped=3)
         expect(counted["ledger.egress"].status == checks.PASS
-               and "counted (batches dropped for shutdown 3)" in counted["ledger.egress"].detail,
+               and "counted (batches dropped: shutdown 3)" in counted["ledger.egress"].detail,
                f"egress marks a positive gap with a shutdown batch drop as counted, got "
                f"{counted['ledger.egress']}")
+        for reason in ("overflow_oldest", "disk_full"):
+            other = results(f"ledger-counted-{reason}", v0_extra=-500, life0_dropped=3,
+                            dropped_reason=reason)
+            expect(other["ledger.egress"].status == checks.PASS
+                   and f"counted (batches dropped: {reason} 3)" in other["ledger.egress"].detail
+                   and other["ledger.summary"].status == checks.PASS,
+                   f"egress counts a gap by a {reason} batch drop, got {other['ledger.egress']} "
+                   f"/ {other['ledger.summary']}")
+        # Shutdown and overflow drops in one life, stderr's `drain complete` counting the
+        # shutdown ones: the cross-check compares shutdown drops alone and doesn't WARN.
+        overflow = [_line(_stamp(T0 + 50), "logit.component.batches.dropped", "sum", 12,
+                          component="sink", attrs={"reason": "overflow_oldest"})]
+        mixed = results("ledger-counted-mixed", v0_extra=-500, life0_dropped=2,
+                        sut_extra=overflow)
+        expect(mixed["ledger.egress"].status == checks.PASS
+               and "counted (batches dropped: overflow_oldest 12, shutdown 2)"
+               in mixed["ledger.egress"].detail
+               and "drain complete's batches_dropped" not in mixed["ledger.egress"].detail,
+               f"egress names every crediting reason, and its stderr cross-check reads shutdown "
+               f"drops alone, got {mixed['ledger.egress']}")
+        overflow_only = results("ledger-overflow-stderr-zero", v0_extra=-500, sut_extra=overflow)
+        expect(overflow_only["ledger.egress"].status == checks.PASS
+               and "drain complete's batches_dropped" not in overflow_only["ledger.egress"].detail,
+               f"an overflow drop with stderr's drain complete at 0 doesn't WARN, got "
+               f"{overflow_only['ledger.egress']}")
+        # A rejected batch counts the gap and still FAILs both rows, with or without a gap.
+        for name, v1_short in (("ledger-rejected", 40), ("ledger-rejected-no-gap", 0)):
+            rejected = results(name, v1_short=v1_short, life1_dropped=1,
+                               dropped_reason="rejected")
+            for row in ("ledger.egress", "ledger.summary"):
+                expect(rejected[row].status == checks.FAIL
+                       and "FAIL: 1 batch(es) rejected by the destination" in rejected[row].detail,
+                       f"{row} FAILs a rejected batch drop and names it ({name}), got "
+                       f"{rejected[row]}")
+            expect(v1_short == 0 or "40, counted (batches dropped: rejected 1)"
+                   in rejected["ledger.egress"].detail,
+                   f"a rejected batch still counts the gap, got {rejected['ledger.egress']}")
+        corrupt = results("ledger-disk-corrupt", v1_short=40, life1_dropped=1,
+                          dropped_reason="disk_corrupt")
+        expect(corrupt["ledger.egress"].status == checks.FAIL
+               and "1 batch(es) dropped from a corrupt disk spool" in corrupt["ledger.egress"].detail
+               and corrupt["ledger.summary"].status == checks.FAIL,
+               f"a corrupt-spool drop FAILs egress and the summary, got "
+               f"{corrupt['ledger.egress']} / {corrupt['ledger.summary']}")
         log_counted = results("ledger-counted-stderr-only", v0_extra=-500, life0_dropped=3,
                               shutdown_in=("stderr",))
         expect(log_counted["ledger.egress"].status == checks.FAIL
@@ -2145,7 +2221,7 @@ def _script_ledger():
                          dropped_at="lua")
         expect(not exited["ledger.egress"].detail.startswith("SUT telemetry shows")
                and exited["ledger.egress"].status == checks.PASS
-               and "counted (batches dropped for shutdown 3)" in exited["ledger.egress"].detail,
+               and "counted (batches dropped: shutdown 3)" in exited["ledger.egress"].detail,
                f"an exit-ended life is a stopped earlier life with a counted gap, got "
                f"{exited['ledger.egress']}")
         expect(exited["ledger.script"].status == checks.PASS
@@ -2662,7 +2738,7 @@ KILL_KILL = (203, 213)
 
 def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=None, drop=(),
               every_window=True, kill_residual=0, silence=None, idle=(), extra_sent=(),
-              late_report=False, no_drains=None):
+              late_report=False, no_drains=None, sut_extra=()):
     """A three-life run for the ledger: life 1 ends by a kill. The generator and the SUT move
     `PER_DRAIN` lines per 5 s drain (200/s), and the export samples every 10 s. Lives 0 and 2
     balance. Life 1's Ab − V is `kill_gap`, the window the kill discarded; its band is
@@ -2678,7 +2754,8 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
     is a `(start, end)` span with no SUT drain, as a pause leaves. `every_window` sets `[ledger]
     vm_every_window`. `kill_residual` lines are read in the drain before life 1's last and never
     absorbed. `silence` is `(service, action)` of a fault over +240..+270 in life 2, or
-    `(service, action, start, end)` of one over those offsets."""
+    `(service, action, start, end)` of one over those offsets. `sut_extra` adds raw SUT
+    telemetry lines."""
     queued = replayed if queued is None else queued
     gen = []
     for offset in range(5, 301, 5):
@@ -2747,7 +2824,7 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
                      _action("revert", "c0s3", action, on, s_end - 0.2, s_end)]
     timeline += [_phase("end_begin", 300), _phase("end_end", 330)]
     ledger = {**LEDGER, "vm_every_window": True} if every_window else LEDGER
-    run_dir = _run_dir(tmp, name, timeline, sut, ledger=ledger,
+    run_dir = _run_dir(tmp, name, timeline, sut + list(sut_extra), ledger=ledger,
                        configs={"sut": "logit-sut.yaml"})
     (run_dir / "configs").mkdir()
     (run_dir / "configs" / "logit-sut.yaml").write_text(KILL_SUT_CONFIG)
@@ -2807,6 +2884,15 @@ def _kill_ledger():
                f"egress reports the killed life's gap inside its band, got {egress}")
         expect("life 2 (final): Ab 18,000 − V[sink] 18,000 = 0, ok" in egress,
                f"the final life stays exact, got {egress}")
+        overflow = [_line(_stamp(T0 + 180), "logit.component.batches.dropped", "sum", 4,
+                          component="sink", attrs={"reason": "overflow_oldest"})]
+        reported = results("kill-overflow", sut_extra=overflow)
+        expect(reported["ledger.egress"].status == checks.PASS
+               and "within band" in reported["ledger.egress"].detail
+               and "batches dropped: overflow_oldest 4, reported, not judged"
+               in reported["ledger.egress"].detail,
+               f"a killed life's overflow drops are reported beside its band, got "
+               f"{reported['ledger.egress']}")
 
         edge_high = results("kill-high-edge", kill_gap=3000)
         expect(edge_high["ledger.egress"].status == checks.PASS,

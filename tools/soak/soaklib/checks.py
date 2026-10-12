@@ -920,6 +920,11 @@ REFUSAL_KEYS = ("api_key_rejected", "request_refused")
 # bump the epoch with no drop counted, so a duplicate they cause FAILs `ledger.topic` and needs
 # reading by hand.
 EPOCH_BUMP_REASONS = ("rejected", "invalid_timestamp", "invalid_record", "ambiguous_at_most_once")
+# The `batches.dropped` reasons that still count an egress gap but FAIL `ledger.egress` and
+# `ledger.summary` wherever they appear, each with what it says went wrong: against a healthy
+# backend a sink has nothing rejected and a spool reads back nothing corrupt.
+FAULT_DROP_REASONS = {"rejected": "rejected by the destination",
+                      "disk_corrupt": "dropped from a corrupt disk spool"}
 _ANSWERED_RE = re.compile(r"answered (\d{3})")
 
 
@@ -1029,9 +1034,18 @@ class Ledger:
         self.D_tel = sut.counter_by_life("logit.component.datagrams.dropped", component=listener)
         self.D_shutdown = sut.counter_by_life("logit.component.datagrams.dropped",
                                               component=listener, reason="shutdown")
-        # Batches any data node dropped for shutdown, the sink's and a Lua node's alike.
+        # Batches any data node dropped for shutdown, the sink's and a Lua node's alike, which
+        # `drain complete`'s `batches_dropped` cross-checks.
         self.shutdown_batches = sut.counter_by_life("logit.component.batches.dropped",
                                                     reason="shutdown")
+        # `{life: {(component, reason): batches}}` under every reason, which `drop_credit` reads.
+        # The reason set is open: a reason this file doesn't name still counts a gap.
+        self.dropped_batches = {}
+        for point in sut.matching("logit.component.batches.dropped"):
+            if isinstance(point.value, (int, float)) and point.value:
+                key = (point.attributes.get("component"), point.attributes.get("reason"))
+                life = self.dropped_batches.setdefault(point.life, {})
+                life[key] = life.get(key, 0) + point.value
         self.B = sut.counter_by_life("logit.component.diagnostics", component=listener,
                                      key="bad_line")
         self.E = sut.counter_by_life("logit.component.events.sent", component=listener)
@@ -1286,8 +1300,9 @@ class Ledger:
         sink under `copy`, all under `route`): `ok`, `counted`, `within band`, `surplus`, or
         `uncounted`.
 
-        A positive gap is counted when the life's telemetry has a batch dropped for shutdown at
-        a node that can explain it (`shutdown_credit`).
+        A positive gap is counted when the life's telemetry has a batch dropped, for any reason,
+        at a node that can explain it (`drop_credit`). Whatever the gap, a `FAULT_DROP_REASONS`
+        drop in that credit FAILs the life (`fault_drops`), its verdict unchanged.
 
         The final life's gap is Ab − V, and with a script Ab − L_flush − V, here and below. A
         stopped earlier life's is W − D − B − X − V, less a script's counted drops, the residual
@@ -1301,6 +1316,12 @@ class Ledger:
 
         On a Kafka target, V counts each distinct record once, so a negative gap in a life that
         wasn't killed is a `surplus`, never a duplicate: increments V holds and Ab doesn't."""
+        status, verdict, gap = self._egress(life, sinks)
+        if self.fault_drops(life, sinks):
+            status = FAIL
+        return status, verdict, gap
+
+    def _egress(self, life, sinks):
         gap = self.absorbed(life) - self.v(life, sinks)
         if life in self.killed and life != self.final:
             low, high, _ = self.kill_band(life)
@@ -1313,26 +1334,44 @@ class Ledger:
             gap += self.residual(life)
         if gap == 0:
             return PASS, "ok", gap
-        if gap > 0 and self.shutdown_credit(life, sinks) > 0:
+        if gap > 0 and sum(self.drop_credit(life, sinks).values()) > 0:
             return PASS, "counted", gap
         if gap < 0 and self.data.kafka:
             return FAIL, "surplus", gap
         return FAIL, "uncounted", gap
 
-    def other_sinks_shutdown(self, life, sinks):
-        """The batches the sinks outside `sinks` dropped for shutdown in `life`."""
-        return sum(self.sut.counter_by_life("logit.component.batches.dropped", component=sink,
-                                            reason="shutdown").get(life, 0)
-                   for sink in self.sinks if sink not in sinks)
+    def _drops(self, life, keep):
+        """`{reason: batches}` dropped in `life` at the components `keep` accepts."""
+        drops = {}
+        for (component, reason), batches in self.dropped_batches.get(life, {}).items():
+            if keep(component):
+                drops[reason] = drops.get(reason, 0) + batches
+        return drops
 
-    def shutdown_credit(self, life, sinks):
-        """The batches dropped for shutdown in `life` that can explain a gap at `sinks`: every
-        node's, less those of the sinks outside the group. Under `copy` another sink's drop
-        loses nothing this sink was sent, while a drop upstream of the fan-out (the script,
+    def other_sinks_drops(self, life, sinks):
+        """`{reason: batches}` the sinks outside `sinks` dropped in `life`."""
+        others = set(self.sinks) - set(sinks)
+        return self._drops(life, lambda component: component in others)
+
+    def drop_credit(self, life, sinks):
+        """`{reason: batches}` dropped in `life` that can explain a gap at `sinks`: every node's,
+        less those of the sinks outside the group. Under `copy` another sink's drop loses
+        nothing this sink was sent, while a drop upstream of the fan-out (the script,
         `aggregate`) or at this sink can; under `route`, and with one sink, the group holds
         every sink and the count is the life's whole."""
-        return (self.get("shutdown_batches", life)
-                - self.other_sinks_shutdown(life, sinks))
+        others = set(self.sinks) - set(sinks)
+        return self._drops(life, lambda component: component not in others)
+
+    def fault_drops(self, life, sinks):
+        """The `FAULT_DROP_REASONS` drops in `life`'s `drop_credit`, as text, or ""."""
+        credit = self.drop_credit(life, sinks)
+        return ", ".join(f"{_n(credit[reason])} batch(es) {what}"
+                         for reason, what in FAULT_DROP_REASONS.items() if credit.get(reason))
+
+
+def _reasons(drops):
+    """`{reason: batches}` as `overflow_oldest 12, shutdown 2`, or `0`."""
+    return ", ".join(f"{reason} {_n(n)}" for reason, n in sorted(drops.items())) or "0"
 
 
 def _ledger(data):
@@ -1627,11 +1666,12 @@ def check_ledger_egress(data):
     """The egress gap per life and per egress group (`Ledger.egress_groups`: each sink under
     `copy`, the sinks' summed V under `route`), Ab − V for the final life and a killed one, and
     W − D − B − X − V for a stopped earlier one: 0 passes; a positive gap with a batch that
-    life's telemetry counts `batches.dropped{reason="shutdown"}` at a node that can explain it
-    (`Ledger.shutdown_credit`) is counted, never reconciled; a killed life's gap passes inside
+    life's telemetry counts in `batches.dropped`, under any reason, at a node that can explain
+    it (`Ledger.drop_credit`) is counted, never reconciled; a killed life's gap passes inside
     `Ledger.kill_band`; any other gap is uncounted loss, or a surplus below a killed life's
-    band or below 0 on a Kafka target. A sink whose export has no series, or a Kafka topic with
-    no records, can't pass."""
+    band or below 0 on a Kafka target. A `FAULT_DROP_REASONS` drop in a life's credit FAILs it
+    whatever its gap. A sink whose export has no series, or a Kafka topic with no records,
+    can't pass."""
     if data.external:
         return Result("ledger.egress", SKIP, f"{NO_BACKEND}; ledger.sent judges the sinks")
     if data.kafka and data.phases.get("kafka_read") is None:
@@ -1672,13 +1712,21 @@ def check_ledger_egress(data):
                          else "W − D − B − X − V")
                 part = (f"life {life}: {whole} {_n(gap)} = residual "
                         f"{_n(led.residual(life))} + {led.ab_text} − V {_n(ab_v)}, {verdict}")
+            credit = led.drop_credit(life, sinks)
             if gap > 0 and not (life in led.killed and life != led.final):
                 others = ""
-                elsewhere = led.other_sinks_shutdown(life, sinks)
+                elsewhere = led.other_sinks_drops(life, sinks)
                 if elsewhere:
-                    others = f", not counting {_n(elsewhere)} at the other sinks"
-                part += (f" (batches dropped for shutdown "
-                         f"{_n(led.shutdown_credit(life, sinks))}{others})")
+                    others = f", not counting {_reasons(elsewhere)} at the other sinks"
+                part += f" (batches dropped: {_reasons(credit)}{others})"
+            elif credit and life in led.killed and life != led.final:
+                # A SIGKILL counts no shutdown drops, but the life's drains can carry others,
+                # such as a queue's overflow during a sink outage before the kill.
+                part += (f"; batches dropped: {_reasons(credit)}, reported, not judged: the "
+                         "band judges a killed life's gap")
+            fault = led.fault_drops(life, sinks)
+            if fault:
+                part += f"; FAIL: {fault}"
             parts.append(part)
         empty = [sink for sink in sinks if not led.series.get(sink) and sink != led.kafka_sink]
         if led.kafka_sink in sinks:
@@ -1736,8 +1784,9 @@ def check_ledger_summary(data):
     each must be 0 or counted on its own, so a surplus at one sink can't net out loss at
     another. With a script, E − A becomes its four script terms (`check_ledger_script`'s three
     identities and L_sent − A), the egress term is Ab − L_flush − V, and the script's drops and
-    errors are shown beside it, counted. A counted egress term is shown and not judged; on an external target the Ab − V term SKIPs, and the
-    row judges the others. On a Kafka target V counts the topic's distinct records, so a
+    errors are shown beside it, counted. A counted egress term is shown and not judged, but a
+    `FAULT_DROP_REASONS` drop in its group's credit FAILs the row as it FAILs `ledger.egress`;
+    on an external target the Ab − V term SKIPs, and the row judges the others. On a Kafka target V counts the topic's distinct records, so a
     duplicate never enters the sum."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.summary", led)
@@ -1760,6 +1809,7 @@ def check_ledger_summary(data):
     terms.append(("A − Ab", g("A", life) - g("Ab", life)))
     shown = [f"{name} {_n(value)}" for name, value in terms]
     uncounted_egress = False
+    faults = []
     if data.external:
         judged = sum(value for _, value in terms)
         shown.append(f"{led.ab_text} − V SKIP ({NO_BACKEND})")
@@ -1772,8 +1822,12 @@ def check_ledger_summary(data):
                 judged += egress_gap
                 uncounted_egress = uncounted_egress or egress_gap != 0
             v = "ΣV" if len(sinks) > 1 else f"V[{sinks[0]}]"
+            fault = led.fault_drops(life, sinks)
+            if fault:
+                faults.append(fault)
             shown.append(f"{led.ab_text} − {v} {_n(egress_gap)}"
-                         + (f" {verdict}" if counted else ""))
+                         + (f" {verdict}" if counted else "")
+                         + (f" (FAIL: {fault})" if fault else ""))
     counted_script = ""
     if led.script:
         counted_script = (f"; the script's L_drop {_n(g('L_drop', life))} and L_err "
@@ -1782,7 +1836,7 @@ def check_ledger_summary(data):
     if led.gen is not None:
         wire = (f"; wire G − (W + K) {_n(led.G - sum(led.W.values()) - sum(led.K.values()))} "
                 "over the run, by design")
-    status = PASS if judged == 0 and not uncounted_egress else FAIL
+    status = PASS if judged == 0 and not uncounted_egress and not faults else FAIL
     detail = (f"final life {life}: uncounted {_n(judged)} = " + " + ".join(shown)
               + counted_script + wire)
     return Result("ledger.summary", status, detail, _per_life_lines(led))

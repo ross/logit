@@ -705,18 +705,28 @@ The rows:
   one metric, which the scenario's script guarantees. `internal` drains last, so the final drain
   exports the script's drops and errors on a stopped life's residual too, and L_drop and L_err
   include them. A gap of 0 passes. A positive gap is lost increments. It is reported with the
-  life's telemetry `batches.dropped{reason="shutdown"}` that can explain it beside it, and is
-  **counted** only when that count is above 0. The two are never reconciled: the count is of batches, and under
-  `temporality: cumulative` a dropped batch loses only the increments since its series' last
-  delivered total, which no log line states. A shutdown drop can explain a group's gap at any
-  node but a sink outside the group: under `copy` (W7b), each sink is its own group, so a drop
-  at the script, `aggregate`, or the sink itself counts the sink's gap, and another sink's drop
-  doesn't, since that sink's copy is all it lost; under `route`, the group holds every sink and
-  every node's drops count the summed gap; with one sink, every node's count. The detail shows
-  the other sinks' drops it left out. The stderr `drain complete` line's `batches_dropped` is
-  process-wide and never counts a gap; it only cross-checks the telemetry total. A killed
-  life's gap passes inside its band (see "Which life a hop is judged in"). Any other gap is
-  **uncounted loss, FAIL**.
+  life's telemetry `batches.dropped` that can explain it beside it, under every reason, and is
+  **counted** only when that count is above 0. The reason set is open: `shutdown`, a queue's or
+  spool's `overflow_oldest` or `overflow_newest`, a spool's `disk_full`, `disk_io_error`, or
+  `frame_too_large`, and any reason the runtime adds, all count, and the detail names each
+  reason with its count, such as `counted (batches dropped: overflow_oldest 12, shutdown 2)`.
+  The two are never reconciled: the count is of batches, and under `temporality: cumulative` a
+  dropped batch loses only the increments since its series' last delivered total, which no log
+  line states. A drop can explain a group's gap at any node but a sink outside the group: under
+  `copy` (W7b), each sink is its own group, so a drop at the script, `aggregate`, or the sink
+  itself counts the sink's gap, and another sink's drop doesn't, since that sink's copy is all
+  it lost; under `route`, the group holds every sink and every node's drops count the summed
+  gap; with one sink, every node's count. The detail shows the other sinks' drops it left out.
+  A `rejected` batch, which the destination refused, or a `disk_corrupt` one, which a spool
+  couldn't read back, counts the gap like any other drop, but FAILs the life and group it falls
+  in whatever the gap, with the reason named: neither happens against a healthy backend, and
+  under cumulative temporality a later total can hide the rejected batch's increments, leaving
+  a gap of 0. The stderr `drain complete` line's `batches_dropped` counts shutdown drops only,
+  process-wide, and never counts a gap; it only cross-checks telemetry's `shutdown` total. A
+  killed life's gap passes inside its band (see "Which life a hop is judged in"); a SIGKILL
+  counts no shutdown drops, but the life's drains can carry others, such as a queue's overflow
+  during an outage, which the detail reports beside the band without judging them. Any other
+  gap is **uncounted loss, FAIL**.
 - `ledger.windows`, only under `[ledger] vm_every_window = true`, else SKIP: in every sink's
   export (W7b), per SUT life and series, consecutive samples are at most 1.5 × the SUT
   config's `aggregate` interval apart,
@@ -782,7 +792,8 @@ The rows:
   script's L_drop and L_err are shown beside them as counted. From W7b there is one egress term
   per egress group, each of which must be 0 or counted on its own, so a surplus at one sink
   can't net out loss at another. When an egress term is counted, it is shown as counted and the
-  row judges the rest.
+  row judges the rest. A `rejected` or `disk_corrupt` drop in the final life's group FAILs the
+  row as it FAILs `ledger.egress`, named beside its term.
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at each sink's own
   telemetry; see "External targets".
 - `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
@@ -1061,7 +1072,8 @@ where it needs them, and a small check extension.
    keeps delivering. Faults: `stop` and netem on one backend, then both. Rows: `ledger.egress`,
    `ledger.windows`, `identity.sink`, and `recovery` per sink; an `[[expect]]` on the healthy
    sink's `batches.delivered` during the outage. Built as `fanout-copy`, `fanout-block`, and
-   `route-split`, with the scenario `compose` override, service roles read from the merged
+   `route-split` (W7b), and `fanout-stop-outage` (W8a: the SUT stopped inside one backend's stop, so
+   that sink's queue drops at shutdown and the other sink's doesn't), with the scenario `compose` override, service roles read from the merged
    compose file, and `[[ledger.sink]]` with `split` (§2).
 3. **Fan-in.** Two generators of different kinds into one `aggregate` and sink: statsd, plus
    `lines_in` with `kv_metrics` or remote-write into `prometheus_in`. Proves series merging and
@@ -1069,19 +1081,21 @@ where it needs them, and a small check extension.
    Rows: `ledger.wire` per source in its own unit, `ledger.intake` per listener. A remote-write
    leg carries cumulative totals, so it keeps its own series and balances as V does. Needs: item
    2's override, and `[ledger]` listing generators, G summed where the units meet.
-4. **A full spool.** A small `buffer.disk.max_bytes` through a long `victoria-metrics` stop.
+4. **A full spool (built in W8a).** A small `buffer.disk.max_bytes` through a long `victoria-metrics` stop.
    Reaching `max_bytes` is `overflow`'s case (`drop_oldest` counts `overflow_oldest`);
    `batches.dropped{reason="disk_full"}` counts only an `ENOSPC` write
    ([ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md), "Decision"). Rows:
    `[[expect]]` on the drop reason, `ledger.egress` counted, then `progress` and `recovery`.
-   Needs: nothing for `max_bytes`; for `ENOSPC`, a size-capped tmpfs at the spool path from item
-   2's override, and no `kill`, because Docker discards a tmpfs when its container stops.
-5. **A slow destination.** Netem `delay` on `victoria-metrics`, or `rate` on `logit`, past the
+   Built as `spool-full` (`max_bytes: 128KiB`, `overflow: drop_oldest`) and `spool-enospc` (a
+   128 KiB tmpfs at the spool path from a compose override, below the spool's own bound, and no
+   `kill`, because Docker discards a tmpfs when its container stops).
+5. **A slow destination (built in W8a).** Netem `delay` on `victoria-metrics`, or `rate` on `logit`, past the
    sink's `timeout:`, so a request VictoriaMetrics applied still times out: `prometheus_out`'s
    `Ambiguous` transport-error row (module doc, "Faults, retries and duplicate safety (sender
    mode)"). The retry rewrites the totals, which `temporality: cumulative` overwrites. Rows:
    `[[expect]]` on `requests{class="network_error"}` and `retries`, `ledger.egress` at 0, and
-   `progress` telling a slow drain from a hang. Needs: nothing new.
+   `progress` telling a slow drain from a hang. Built as `slow-destination`, with a 2 s sink
+   `timeout:`, a 3 s `delay` on `victoria-metrics`, and a `rate` limit on `logit`.
 6. **High cardinality over hours.** A second `generate_in` with `{seq%N}` in the metric name,
    N past any count the run reaches, at a low rate (`generate_in` rejects a bare `{seq}` in an
    interned field). The interner never frees
@@ -1172,8 +1186,10 @@ that items 3, 7, and 11 need.
 | W6 | `soak/w6` | `soak/w6: the soak harness's next scenarios` | S | W5 |
 | W7a | `soak/w7a` | `soak/w7a: Lua-in-the-path soaks, mark and exit actions, and readiness words` | M | W6 |
 | W7b | `soak/w7b` | `soak/w7b: two-sink fan-out and route soaks, compose overrides, and a ledger per sink` | M | W7a |
-| W8 | `soak/w8` | `soak/w8: fan-in, full-spool, slow-destination, and cardinality soaks` | M | W7b |
-| W9 | `soak/w9` | `soak/w9: a scripted HTTP destination for every response class` | M | W8 |
+| W8a | `soak/w8a` | `soak/w8a: counted drops of every reason, full-spool, slow-destination, and stop-during-outage soaks` | M | W7b |
+| W8b | `soak/w8b` | `soak/w8b: fan-in from two generators` | M | W8a |
+| W8c | `soak/w8c` | `soak/w8c: high-cardinality soaks, a slope reducer, and expected verdicts` | M | W8b |
+| W9 | `soak/w9` | `soak/w9: a scripted HTTP destination for every response class` | M | W8c |
 | W10 | `soak/w10` | `soak/w10: a native-hop soak between two logit processes` | M | W9 |
 | W11 | `soak/w11` | `soak/w11: TCP-ingress and file-tailing soaks` | M | W10 |
 | W12 | `soak/w12` | `soak/w12: rolling-overlap, SIGHUP, and TLS-reload soaks` | M | W11 |
@@ -1233,15 +1249,18 @@ that items 3, 7, and 11 need.
 - **W7b**: §10's item 2: the scenario compose override, service roles read from the merged
   compose file, and a ledger per sink, with the `fanout-copy`, `fanout-block`, and `route-split`
   scenarios.
-- **W8**: items 3 to 6: a ledger over several generators, the tmpfs spool, expected verdicts,
-  and the gauge `slope` reducer.
+- **W8a**: items 4 and 5, and a stop of the SUT inside a backend's stop: the `spool-full`,
+  `spool-enospc`, `slow-destination`, and `fanout-stop-outage` scenarios, with the `ledger.egress`
+  credit for counted drops of every reason.
+- **W8b**: item 3, a ledger over several generators.
+- **W8c**: item 6, a gauge `slope` reducer, and an expected verdict per row and per service.
 - **W9**: item 10, the scripted destination, and `ledger.sent` run against it.
 - **W10**: item 7, a second SUT service and the ledger one hop longer.
 - **W11**: items 8 and 9, per-line wire counters, a shared volume, and the replay surplus band.
 - **W12**: items 11 and 12, the namespace-holder service, per-instance totals, and the `signal`
   and certificate-rotation actions.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8 → W9 → W10 → W11 → W12, linear. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9 → W10 → W11 → W12, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
