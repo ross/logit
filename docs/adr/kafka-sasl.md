@@ -71,8 +71,8 @@ that lifetime ends (KIP-368). `Conn` records a deadline: the lifetime minus the 
 The producer's reuse check (`Conn::is_open`) reads a connection past its deadline as closed, so
 the producer dials a new one, which is `Clean`. A lifetime of `0` means no deadline.
 
-This is safe because `kafka_out` keeps one request in flight per broker, so no request is written
-into a connection the broker is about to close for expiry. A broker that closes one mid-request
+This is safe because `kafka_out` keeps one request in flight per broker, and the `timeout` margin
+means a request written before the deadline is answered or failed before the session ends. A broker that closes one mid-request
 anyway gives an `Ambiguous` failure, and the batch's idempotent sequences make its resend safe.
 
 ### 4. Fault classes
@@ -86,8 +86,8 @@ These rows join the "Response classes" table in the `kafka_out` module doc, the 
 | `ILLEGAL_SASL_STATE` (34) | `Refused` | The exchange broke the broker's state machine; a retry repeats the same exchange. |
 | `SASL_AUTHENTICATION_FAILED` (58) | `Refused` | Wrong credentials, or a token the broker won't take. |
 | A transport failure during the exchange | `Clean` | No produce byte has been written on this connection. |
-| A token, STS, IMDS, or container credential endpoint unreachable, or answering `5xx` | `Clean` | A transient fault upstream of the broker. |
-| One of those endpoints answering `4xx` (`invalid_client`, a bad role) | `Refused` | Its credentials or config are wrong. |
+| A token, STS, IMDS, or container credential endpoint unreachable, or answering `429` or `5xx` | `Clean` | A transient fault upstream of the broker. |
+| One of those endpoints answering any other `4xx` (`invalid_client`, a bad role) | `Refused` | Its credentials or config are wrong. |
 
 A refused authentication holds the queue and retries with no budget, as a failed TLS handshake
 does today. Nothing drops.
