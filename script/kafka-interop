@@ -361,7 +361,7 @@ for broker in "${BROKERS[@]}"; do
         kcat_format='%p\t%o\t%T\t%k\t%s\n'
         if [ "${binary}" = true ]; then
             print_value=false
-            kcat_format='%p\t%o\t%T\t%k\t%S\n'
+            kcat_format='%p\t%o\t%T\t%k\t%S\t%K\n'
         fi
         : >"${out}/${topic}.java.tsv"
         if [ "${held}" -gt 0 ]; then

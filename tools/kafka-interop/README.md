@@ -46,9 +46,9 @@ The legs, each run against both brokers:
 | `sasl-plain`, `sasl-scram512`, `sasl-scram256`, `sasl-wrong` | `logit-sasl-*.yaml` | 50 events through `sasl:` with PLAIN over SASL_SSL, SCRAM-SHA-512 over SASL_SSL, and SCRAM-SHA-256 over SASL_PLAINTEXT; a SCRAM-SHA-512 sink with the wrong password stores nothing, counts every attempt as `refused`, holds its queue with `logit.component.retrying` at `1`, and drops no batch as `rejected` |
 | `oauth-cc`, `oauth-static`, `oauth-refused` | `logit-oauth-*.yaml` | 60 events at 1/s through the client-credentials grant, past the 45 s life of the first token, with at least two tokens fetched, counted in the `oauth` service's log; 50 events through a fixed token the script fetched, with two SASL extensions on Kafka; and a fixed token that isn't a JWT, which the broker refuses: nothing stored, every attempt `refused`, the queue held, no batch dropped, and, on Kafka, the leg's log carrying the broker's error challenge status |
 | `otlp-proto`, `otlp-json` | `logit-otlp-*.yaml` | 160 ticks, each a metrics event with five kinds (delta and cumulative sums, a gauge with unit and description, an explicit histogram, an exponential histogram), a log, and a span, written as `otlp_proto` to the default topics and as `otlp_json` to `otlpjson-*`: the Collector's `kafkareceiver` decodes 160 logs, 160 spans, and 800 data points, and every checked field (resource name, bodies and severity, trace and span ids in hex, span names, kind, status, and events, metric values, temporality, unit, bucket counts) equals what the tick number implies. One record per signal per batch |
-| `otlp-keyed`, `otlp-json-keyed` | `logit-otlp-*.yaml` | under `key: trace_id`, every record's key is a 32-character lowercase hex trace id, each of 16 trace ids sits on one partition, and that partition is `murmur2(key) % 6`, the Java client's. Logs without a trace id are unkeyed, and metrics stay unkeyed. The Collector decodes the same items. `otlp-json-keyed` adds a 4 KiB `max_request_bytes` |
+| `otlp-keyed`, `otlp-json-keyed` | `logit-otlp-*.yaml` | under `key: trace_id`, every record's key is a 32-character lowercase hex trace id, each of 16 trace ids sits on one partition, and that partition is `murmur2(key) % 6`, the Java client's. Logs without a trace id and all metrics are unkeyed, with a null key (kcat's key length -1), not an empty one. The Collector decodes the same items. `otlp-json-keyed` adds a 4 KiB `max_request_bytes`: no record exceeds it, and `jsonbig-metrics` holds more records than batches |
 | `otlp-exporter-parity` | `logit-otlp-*.yaml`, `collector.yaml` | the `keyed` spans, re-keyed by a Collector `kafkaexporter` with `partition_traces_by_id` into 6-partition topics. With the exporter's default partitioner (`sticky_key`, FNV-1a) 14 of 16 trace ids land on a different partition than `kafka_out` puts them on; with `hasher: murmur2` none does. The row passes on the murmur2 match and reports the default's count ([`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md)) |
-| `otlp-oversize` | `logit-otlp-*.yaml` | with `max_request_bytes: 2KiB`, each batch's request splits into several records, none over the cap, and the Collector still decodes every item |
+| `otlp-oversize` | `logit-otlp-*.yaml` | with `max_request_bytes: 2KiB`, each batch's request splits into at least two records per signal, none over the cap and none spanning two batches (checked from the items the Collector decoded in each record), and the Collector still decodes every item |
 | `timestamp` | `logit-timestamp-*.yaml` | in each batch of 10, the event stamped at 2100-01-01 is dropped and counted as `invalid_timestamp`, and the other nine land |
 
 The SASL user is `logit` with the password `logit-secret` on Kafka, whose PLAIN entry is a JAAS
@@ -87,13 +87,16 @@ Redpanda v26.2.3 differs from Kafka in three ways the legs work around or allow 
 Every config passes `logit validate`: `script/validate` and the
 `every_shipped_config_loads_and_validates` test both cover `logit-*.yaml` here. Each sink has
 its own `generate_in`, so a sink that stalls, as `mtls_nocert` does by design, can't hold back
-another sink in the same process.
+another sink in the same process. The exception is `logit-otlp-*.yaml`: its five sinks share one
+`generate_in` and `lua` source, so every sink sees the same events, and each sets `buffer:
+{ overflow: drop_oldest }` so a slow sink drops its oldest batches instead of stalling the others.
+At 20 events a second nothing drops, and a drop would show as a missing item.
 
 ## A run
 
 1. Builds `logit:kafka-interop` from `Dockerfile`, and `logit-soak-netem:local` from
    `tools/soak/netem/` (set `KAFKA_INTEROP_SKIP_IMAGE=1` to reuse both), and validates every leg
-   config with it.
+   config with it and `collector.yaml` with the Collector's `validate`.
 2. Generates a private CA, a broker certificate for the names `kafka` and `redpanda`, and a
    client certificate into the run directory's `tls/`, with `openssl` in the Kafka image. The
    keys are EC P-256 in PKCS#8, which Kafka's PEM keystore requires.
@@ -101,7 +104,7 @@ another sink in the same process.
    `docker compose up --wait`, turns on Redpanda's OAUTHBEARER, creates every topic on both, and
    produces the 50 parity keys with `kafka-console-producer.sh`. Last, it fetches the fixed token
    the `oauth_static` sinks send and passes it to their legs as `KAFKA_INTEROP_OAUTH_TOKEN`.
-4. Starts every leg. 10 s later, for 8 s, it drops every packet each broker sends to its `dedup`
+4. Starts every leg and both Collectors. 10 s later, for 8 s, it drops every packet each broker sends to its `dedup`
    leg, with `netem-drop.sh` run in the broker's network namespace (a `prio` qdisc, a
    `netem loss 100%` band, and a u32 filter on the leg's address). The broker still receives
    the leg's requests and appends them, so their responses are what's lost, and each sink's

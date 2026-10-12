@@ -18,6 +18,7 @@ script has already written, under /out (the run directory):
     <leg>-<broker>-telemetry.log        each leg's `internal` telemetry, `stdio_out` `format: json`
     readback/<broker>/<topic>.{java,kcat}.tsv  for the OTLP topics, no value: the Java consumer
                                         prints the key last, and kcat prints the value's size
+                                        and key length (`%S\t%K`, -1 for a null key)
     collector/<broker>/<name>.jsonl     what the Collector decoded, one OTLP/JSON request a line
     exits.txt                           `<service> <exit code>` per leg and Collector
     redpanda-oidc.txt                   `ok` once Redpanda took OAUTHBEARER, else `failed`
@@ -694,16 +695,17 @@ def sink_summary(broker, component):
 
 
 def read_record_meta(broker, topic):
-    """`(partition, key, size)` per record of a topic read back without values: size is kcat's,
-    and the key is kcat's too, so a null key reads as the empty string."""
+    """`(partition, key, size, key_length)` per record of a topic read back without values.
+    kcat prints a null key and an empty one alike as the empty string, so `key_length`
+    (kcat's `%K`, -1 for a null key) is what tells them apart."""
     path = OUT / "readback" / broker / f"{topic}.kcat.tsv"
     if not path.exists():
         return None
     records = []
     for line in path.read_text(errors="replace").splitlines():
         if line.strip():
-            partition, _offset, _timestamp, key, size = line.split("\t")
-            records.append((int(partition), key, int(size)))
+            partition, _offset, _timestamp, key, size, key_length = line.split("\t")
+            records.append((int(partition), key, int(size), int(key_length)))
     return records
 
 
@@ -755,7 +757,9 @@ def leg_otlp_json(broker):
                                              "otlpjson-spans"))
 
 
-def leg_otlp_keyed(broker, prefix="keyed"):
+def leg_otlp_keyed(broker, prefix="keyed", cap=None):
+    """`cap` is the sink's `max_request_bytes`, which no record may exceed and which splits
+    the metrics requests into more records than batches."""
     problem = collector_problem(broker, prefix)
     classes, dropped = sink_summary(broker, prefix)
     if problem:
@@ -772,12 +776,17 @@ def leg_otlp_keyed(broker, prefix="keyed"):
         java = java_record_keys(broker, topic)
         if kcat is None or java is None or not kcat:
             return "FAIL", f"{topic} wasn't read back"
-        if sorted((p, k) for p, k, _ in kcat) != sorted(java):
+        if sorted((p, k) for p, k, _, _ in kcat) != sorted(java):
             return "FAIL", f"{topic}: kcat and the Java consumer disagree on keys or partitions"
         placed = {}
         unkeyed = 0
-        for partition, key, _size in kcat:
+        for partition, key, size, key_length in kcat:
+            if cap is not None and size > cap:
+                return "FAIL", f"{topic}: a record of {size} bytes exceeds max_request_bytes {cap}"
             if key == "":
+                if key_length != -1:
+                    return "FAIL", (f"{topic}: a record has an empty key (length {key_length}), "
+                                    "not a null one")
                 unkeyed += 1
                 continue
             if not HEX32.match(key):
@@ -795,9 +804,13 @@ def leg_otlp_keyed(broker, prefix="keyed"):
         summary.append(f"{topic} {len(kcat)} records, {len(placed)} trace ids each on one "
                        f"partition, {unkeyed} unkeyed")
     metrics = read_record_meta(broker, f"{prefix}-metrics") or []
-    if len(metrics) < OTLP_BATCHES or any(key for _, key, _ in metrics):
-        return "FAIL", (f"{prefix}-metrics holds {len(metrics)} records, want at least "
-                        f"{OTLP_BATCHES}, unkeyed")
+    if any(size > cap for _, _, size, _ in metrics if cap is not None):
+        return "FAIL", f"{prefix}-metrics holds a record over max_request_bytes {cap}"
+    if any(key or key_length != -1 for _, key, _, key_length in metrics):
+        return "FAIL", f"{prefix}-metrics holds a keyed record"
+    if len(metrics) < (OTLP_BATCHES if cap is None else OTLP_BATCHES + 1):
+        return "FAIL", (f"{prefix}-metrics holds {len(metrics)} records for {OTLP_BATCHES} "
+                        "batches" + ("" if cap is None else ", so no request split"))
     return "PASS", ("keys are the trace id in 32 lowercase hex characters, on the Java "
                     f"partitioner's partition; {'; '.join(summary)}; {prefix}-metrics "
                     f"{len(metrics)} unkeyed")
@@ -808,7 +821,7 @@ def exporter_placement(broker, topic):
     if not records:
         return None
     placed = {}
-    for partition, key, _size in records:
+    for partition, key, _size, _key_length in records:
         placed.setdefault(key, set()).add(partition)
     return placed
 
@@ -836,6 +849,30 @@ def leg_otlp_exporter_parity(broker):
     return "PASS", detail
 
 
+def big_item_batches(broker, name, resources, scopes, items):
+    """For each request line the Collector wrote, the set of batches (`seq // OTLP_BATCH`) its
+    items belong to."""
+    lines = collector_lines(broker, name) or []
+    result = []
+    for request in lines:
+        batches = set()
+        for resource in request.get(resources, []):
+            for scope in resource.get(scopes, []):
+                for item in scope.get(items, []):
+                    if items == "metrics":
+                        points = [point for kind in ("gauge", "sum", "histogram",
+                                                     "exponentialHistogram")
+                                  for point in item.get(kind, {}).get("dataPoints", [])]
+                    else:
+                        points = [item]
+                    for point in points:
+                        seq = attr_map(point.get("attributes")).get("seq")
+                        if isinstance(seq, int):
+                            batches.add(seq // OTLP_BATCH)
+        result.append(tuple(sorted(batches)) if batches else ())
+    return result
+
+
 def leg_otlp_oversize(broker):
     problem = collector_problem(broker, "big")
     classes, dropped = sink_summary(broker, "big")
@@ -848,10 +885,24 @@ def leg_otlp_oversize(broker):
     for signal, topic in (("logs", "big-logs"), ("metrics", "big-metrics"), ("spans", "big-spans")):
         records = read_record_meta(broker, topic) or []
         counts[signal] = len(records)
-        largest = max([largest] + [size for _, _, size in records])
-    if any(n <= OTLP_BATCHES for n in counts.values()):
-        return "FAIL", (f"a batch's request wasn't split into several records: {counts} for "
-                        f"{OTLP_BATCHES} batches")
+        largest = max([largest] + [size for _, _, size, _ in records])
+    # The receiver hands the file exporter one request per record, so a file line is a record.
+    # Each batch's items must arrive in at least two lines, and no line may span two batches.
+    for signal, lines in (("logs", big_item_batches(broker, "big-logs", "resourceLogs",
+                                                    "scopeLogs", "logRecords")),
+                          ("spans", big_item_batches(broker, "big-traces", "resourceSpans",
+                                                     "scopeSpans", "spans")),
+                          ("metrics", big_item_batches(broker, "big-metrics", "resourceMetrics",
+                                                       "scopeMetrics", "metrics"))):
+        if any(len(batches) != 1 for batches in lines):
+            return "FAIL", f"a big-{signal} record holds items of several batches"
+        records_per_batch = {}
+        for (batch,) in lines:
+            records_per_batch[batch] = records_per_batch.get(batch, 0) + 1
+        unsplit = sorted(b for b in range(OTLP_BATCHES) if records_per_batch.get(b, 0) < 2)
+        if unsplit:
+            return "FAIL", (f"big-{signal}: batches {unsplit} arrived in fewer than two "
+                            f"records, so their requests weren't split: {counts}")
     if largest > OTLP_BIG_BYTES:
         return "FAIL", f"a record of {largest} bytes exceeds max_request_bytes {OTLP_BIG_BYTES}"
     return "PASS", (f"{OTLP_BATCHES} batches split into {counts} records, the largest {largest} "
@@ -894,7 +945,7 @@ LEGS += [
     ("otlp-json", "otlp_json on its own topics, decoded by a Collector kafkareceiver",
      leg_otlp_json),
     ("otlp-json-keyed", "otlp_json with key: trace_id and a size cap, read by the receiver",
-     lambda b: leg_otlp_keyed(b, "jsonbig")),
+     lambda b: leg_otlp_keyed(b, "jsonbig", cap=4096)),
 ]
 
 
