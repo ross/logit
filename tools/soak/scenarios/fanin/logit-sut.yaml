@@ -1,0 +1,39 @@
+# The system under test in `script/soak`'s fanin scenario: statsd over UDP and syslog-framed lines
+# over UDP into one 10 s cumulative aggregate and remote-write 1.0 (zstd) to VictoriaMetrics.
+# Each line becomes one counter increment, `soak_lines{id}`, beside statsd's
+# `soak_requests_N`. Its `internal` telemetry goes to stdout as NDJSON for the harness to read.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  lines: { type: lines_in, transport: udp, bind: 0.0.0.0:5514 }
+  # Every node between `lines` and `window` forwards every event it receives, which
+  # `ledger.edge` checks hop by hop: `kv` passes a line it can't parse through unchanged, and
+  # `keep_signals` drops only an event left with no payload, which `count`'s metric rules out.
+  parse:
+    type: kv                        # the RFC 5424 header's words carry no `=` and are skipped
+    sources: [lines]
+    pair_sep: " "
+    kv_sep: "="
+  labels: { type: keep, sources: [parse], fields: [id] }
+  count:
+    type: kv_metrics
+    sources: [labels]
+    counters: [{ name: soak_lines }]   # no `field`: +1 per event
+  metrics_only:                     # else `window` passes each line's log on to the sink
+    type: keep_signals
+    sources: [count]
+    signals: [metrics]
+  window:
+    type: aggregate
+    sources: [statsd, metrics_only]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
