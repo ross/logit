@@ -1,0 +1,30 @@
+# The load source in `script/soak`'s cardinality scenario: statsd-vm's 2,000 counter lines a
+# second over 100 names, plus a second input whose every line carries a metric name no earlier
+# line had. Both go through one UDP sink, one line per datagram, so G counts both. The second
+# input's names intern here too, so this process's interner grows with the SUT's.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 2000
+    batch: 100
+    event:
+      metric: { name: "soak_requests_{seq%100}", kind: sum, value: 1 }
+  card:
+    type: generate_in               # unbounded
+    rate: 200
+    batch: 20
+    event:
+      # The modulus is past any count a run reaches (200/s for 24 hours is 17.28 million), so no
+      # name repeats; a bare `{seq}` is refused in a metric name. The prefix keeps two lines
+      # over the 32-byte packet, so `soak_cardinality_0` and `_1` can't share a datagram.
+      metric: { name: "soak_cardinality_{seq%1000000000}", kind: sum, value: 1 }
+  statsd:
+    type: statsd_out
+    sources: [load, card]
+    endpoint: logit:8125
+    format: statsd
+    max_packet_bytes: "32"          # one line per datagram: the ledger's unit
+    buffer: { overflow: drop_newest, retry_max_delay: 1s }   # never stall generate_in
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
