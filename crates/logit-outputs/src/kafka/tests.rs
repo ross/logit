@@ -12,12 +12,13 @@ use logit_pipeline::test_util::{wait_until, RECV_TIMEOUT};
 use logit_pipeline::Fault;
 
 use super::batch::ProducerRecord;
-use super::fake_broker::{Action, FakeCluster, Received, Step};
+use super::fake_broker::{Action, FakeCluster, HttpStub, Received, Sasl, Step, TokenEndpoint};
 use super::fault::code;
 use super::partitioner::partition_for_key;
 use super::producer::{
     Acks, Attempt, Identity, PartState, Pending, Producer, ProducerConfig, Settlement,
 };
+use super::sasl::{authenticator, msk_iam_with, Endpoints, Env, KafkaSasl, OAuthToken};
 
 const TOPIC: &str = "logs";
 /// The first PID the fake broker hands out.
@@ -34,6 +35,7 @@ fn config(cluster: &FakeCluster) -> ProducerConfig {
         max_request_bytes: 1 << 20,
         tls: None,
         client_id: "logit-test".to_string(),
+        sasl: None,
     }
 }
 
@@ -538,6 +540,7 @@ async fn a_refused_bootstrap_connect_is_clean() {
         max_request_bytes: 1 << 20,
         tls: None,
         client_id: "logit-test".to_string(),
+        sasl: None,
     })
     .unwrap();
     let err = producer.prepare(vec![record(None, "v")]).await.unwrap_err();
@@ -783,6 +786,7 @@ fn idempotence_without_acks_all_is_a_construction_error() {
         max_request_bytes: 1 << 20,
         tls: None,
         client_id: "logit-test".to_string(),
+        sasl: None,
     };
     assert!(Producer::new(config).is_err());
 }
@@ -827,4 +831,757 @@ async fn a_failed_tls_handshake_is_clean() {
     let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
     assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
     assert!(format!("{err:#}").contains("TLS handshake"), "{err:#}");
+}
+
+// ---- SASL (docs/adr/kafka-sasl.md) ---------------------------------------------------------
+
+const SASL_USER: &str = "alice";
+const SASL_PASSWORD: &str = "pw-never-printed";
+
+fn sasl_settings(mechanism: &str, password: &str) -> KafkaSasl {
+    let (username, password) = (SASL_USER.to_string(), password.to_string());
+    match mechanism {
+        "PLAIN" => KafkaSasl::Plain { username, password },
+        "SCRAM-SHA-256" => KafkaSasl::ScramSha256 { username, password },
+        "SCRAM-SHA-512" => KafkaSasl::ScramSha512 { username, password },
+        other => panic!("no mechanism {other}"),
+    }
+}
+
+/// A cluster of `nodes` requiring SASL for [`SASL_USER`] and [`SASL_PASSWORD`].
+async fn sasl_cluster(nodes: usize, leaders: &[i32]) -> FakeCluster {
+    let cluster = cluster(nodes, leaders).await;
+    cluster.state().sasl = Some(Sasl::new(SASL_USER, SASL_PASSWORD));
+    cluster
+}
+
+fn sasl_producer(cluster: &FakeCluster, mechanism: &str, password: &str) -> Producer {
+    let sasl = Some(authenticator(&sasl_settings(mechanism, password), RECV_TIMEOUT));
+    Producer::new(ProducerConfig { sasl, ..config(cluster) }).unwrap()
+}
+
+/// The error a first send fails with, after asserting its class and that it names the mechanism
+/// and the user but never the password.
+async fn sasl_refusal(producer: &mut Producer, mechanism: &str, want: Fault) -> String {
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), want, "{message}");
+    assert!(message.contains(mechanism) && message.contains(SASL_USER), "{message}");
+    assert!(!message.contains(SASL_PASSWORD), "{message}");
+    message
+}
+
+/// Each mechanism authenticates every connection, the bootstrap one and each leader's, before
+/// any other request.
+#[tokio::test]
+async fn each_sasl_mechanism_authenticates_every_connection_and_delivers() {
+    for mechanism in ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"] {
+        let cluster = sasl_cluster(2, &[0, 1]).await;
+        let mut producer = sasl_producer(&cluster, mechanism, SASL_PASSWORD);
+        let mut records = keyed_for(0, 2, 2);
+        records.extend(keyed_for(1, 2, 2));
+        send_expecting(&mut producer, records, &[None]).await;
+        assert_eq!((values_in(&cluster, 0).len(), values_in(&cluster, 1).len()), (2, 2));
+        let state = cluster.state();
+        assert_eq!(state.authentications, state.accepted_connections, "{mechanism}");
+        assert_eq!(state.accepted_connections, 3, "{mechanism}: bootstrap and both leaders");
+        let handshakes: Vec<i16> = state
+            .requests
+            .iter()
+            .filter(|(_, k, _)| *k == ApiKey::SaslHandshake)
+            .map(|(_, _, v)| *v)
+            .collect();
+        assert_eq!(handshakes, vec![1; 3], "{mechanism}: SaslHandshake v1 per connection");
+        assert!(
+            state
+                .requests
+                .iter()
+                .filter(|(_, k, _)| *k == ApiKey::SaslAuthenticate)
+                .all(|(_, _, v)| *v == 2),
+            "{mechanism}: SaslAuthenticate v2"
+        );
+    }
+}
+
+/// Response-class rows `SASL_AUTHENTICATION_FAILED` (58), `UNSUPPORTED_SASL_MECHANISM` (33),
+/// `ILLEGAL_SASL_STATE` (34), and a broker offering no SASL: each is `Refused`, and the
+/// message carries the broker's reason and no password.
+#[tokio::test]
+async fn sasl_refusals_are_refused_and_never_print_the_password() {
+    for mechanism in ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"] {
+        let cluster = sasl_cluster(1, &[0]).await;
+        let mut producer = sasl_producer(&cluster, mechanism, "wrong-password");
+        let message = sasl_refusal(&mut producer, mechanism, Fault::Refused).await;
+        assert!(message.contains("SaslAuthenticationFailed (58)"), "{message}");
+        assert!(message.contains("Authentication failed"), "the broker's text: {message}");
+        assert!(!message.contains("wrong-password"), "{message}");
+        assert!(values_in(&cluster, 0).is_empty());
+    }
+
+    let cluster = sasl_cluster(1, &[0]).await;
+    cluster.state().sasl.as_mut().unwrap().mechanisms = vec!["PLAIN".into()];
+    let mut producer = sasl_producer(&cluster, "SCRAM-SHA-512", SASL_PASSWORD);
+    let message = sasl_refusal(&mut producer, "SCRAM-SHA-512", Fault::Refused).await;
+    assert!(message.contains("UnsupportedSaslMechanism (33)"), "{message}");
+    assert!(message.contains("it offers [PLAIN]"), "{message}");
+
+    // A listener without SASL answers the handshake ILLEGAL_SASL_STATE.
+    let plaintext = self::cluster(1, &[0]).await;
+    let mut producer = sasl_producer(&plaintext, "PLAIN", SASL_PASSWORD);
+    let message = sasl_refusal(&mut producer, "PLAIN", Fault::Refused).await;
+    assert!(message.contains("IllegalSaslState (34)"), "{message}");
+
+    let cluster = sasl_cluster(1, &[0]).await;
+    cluster.script(Step {
+        api: ApiKey::SaslAuthenticate,
+        partition: None,
+        action: Action::Error(code::ILLEGAL_SASL_STATE),
+    });
+    let mut producer = sasl_producer(&cluster, "SCRAM-SHA-256", SASL_PASSWORD);
+    let message = sasl_refusal(&mut producer, "SCRAM-SHA-256", Fault::Refused).await;
+    assert!(message.contains("IllegalSaslState (34): scripted refusal"), "{message}");
+
+    let cluster = sasl_cluster(1, &[0]).await;
+    cluster.state().hide_sasl = true;
+    let mut producer = sasl_producer(&cluster, "PLAIN", SASL_PASSWORD);
+    let message = sasl_refusal(&mut producer, "PLAIN", Fault::Refused).await;
+    assert!(message.contains("doesn't offer SaslHandshake v1"), "{message}");
+}
+
+/// A broker whose SCRAM server signature doesn't verify doesn't hold the user's credential, and
+/// every connection to it gets the same answer: `Refused`, with no produce request sent.
+#[tokio::test]
+async fn a_scram_server_signature_mismatch_is_refused() {
+    for mechanism in ["SCRAM-SHA-256", "SCRAM-SHA-512"] {
+        let cluster = sasl_cluster(1, &[0]).await;
+        cluster.state().sasl.as_mut().unwrap().forge_signature = true;
+        let mut producer = sasl_producer(&cluster, mechanism, SASL_PASSWORD);
+        let message = sasl_refusal(&mut producer, mechanism, Fault::Refused).await;
+        assert!(message.contains("server signature doesn't match"), "{message}");
+        assert_eq!(requests_of(&cluster, ApiKey::Metadata), 0, "{mechanism}");
+    }
+}
+
+/// A transport failure during the exchange is `Clean`: nothing of a produce request has been
+/// written on the connection. The next attempt authenticates and delivers.
+#[tokio::test]
+async fn a_transport_failure_during_the_sasl_exchange_is_clean() {
+    for api in [ApiKey::SaslHandshake, ApiKey::SaslAuthenticate] {
+        let cluster = sasl_cluster(1, &[0]).await;
+        cluster.script(Step { api, partition: None, action: Action::Close });
+        let mut producer = sasl_producer(&cluster, "SCRAM-SHA-256", SASL_PASSWORD);
+        let message = sasl_refusal(&mut producer, "SCRAM-SHA-256", Fault::Clean).await;
+        assert!(message.contains(&format!("{api:?}")), "{message}");
+        send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+        assert_eq!(values_in(&cluster, 0).len(), 1, "{api:?}");
+    }
+}
+
+/// A connection past its SASL session's deadline is redialed before the next request instead of
+/// being written to, so the broker never closes it for an expired session and the send
+/// succeeds on its first attempt, with each record appended once.
+#[tokio::test]
+async fn an_expiring_sasl_session_is_redialed_before_the_next_send() {
+    let cluster = sasl_cluster(1, &[0]).await;
+    // The lifetime under test. The connection's deadline falls at half of it (a lifetime of
+    // twice the timeout or less keeps half as its margin), 1 s after authentication: that
+    // covers the first send's four loopback round trips by far, and the wait below is 2 s.
+    cluster.state().sasl.as_mut().unwrap().session_lifetime_ms = 2000;
+    let sasl = Some(authenticator(&sasl_settings("SCRAM-SHA-512", SASL_PASSWORD), RECV_TIMEOUT));
+    let mut producer = Producer::new(ProducerConfig { sasl, ..config(&cluster) }).unwrap();
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+    let authenticated = cluster.state().authentications;
+
+    let ends = cluster.state().session_ends.clone();
+    assert_eq!(ends.len(), authenticated, "every session has a lifetime");
+    wait_until("every SASL session has ended at the broker", || {
+        ends.iter().all(|&end| tokio::time::Instant::now() >= end)
+    })
+    .await;
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+
+    let state = cluster.state();
+    assert_eq!(state.expired_closes, 0, "nothing was written to an expired session");
+    assert!(state.authentications > authenticated, "a redial authenticated again");
+    assert_eq!(state.partition(TOPIC, 0).records().len(), 2, "each record once");
+}
+
+/// One job writes its requests one after another, so the deadline is checked before each: the
+/// broker holds the first request's answer until the session ends, and the requests after it
+/// wait for the next attempt's connection instead of reaching the expired session.
+#[tokio::test]
+async fn a_sasl_deadline_reached_between_requests_leaves_the_rest_for_a_new_connection() {
+    let cluster = sasl_cluster(1, &[0]).await;
+    // The deadline falls at half the lifetime, so the held answer arrives past it, and well
+    // inside the timeout.
+    cluster.state().sasl.as_mut().unwrap().session_lifetime_ms = 1000;
+    let sasl = Some(authenticator(&sasl_settings("SCRAM-SHA-512", SASL_PASSWORD), RECV_TIMEOUT));
+    let mut producer =
+        Producer::new(ProducerConfig { sasl, max_request_bytes: 220, ..config(&cluster) }).unwrap();
+    cluster.script(Step::produce(None, Action::AnswerAtSessionEnd));
+    let pending =
+        send_expecting(&mut producer, keyed_for(0, 1, 6), &[Some(Fault::Clean), None]).await;
+    assert!(pending.parts.len() > 1, "cut into {} batches", pending.parts.len());
+
+    let state = cluster.state();
+    assert_eq!(state.expired_closes, 0, "nothing was written to an expired session");
+    assert_eq!(state.received.len(), pending.parts.len(), "every batch went out once");
+    assert_eq!(state.partition(TOPIC, 0).records().len(), 6, "each record once");
+}
+
+// ---- OAUTHBEARER (docs/adr/kafka-sasl.md) ----------------------------------------------------
+
+const CLIENT_ID: &str = "logit-client";
+const CLIENT_SECRET: &str = "client-secret-never-printed";
+
+fn client_credentials(endpoint: &TokenEndpoint, extensions: &[(&str, &str)]) -> KafkaSasl {
+    KafkaSasl::OAuthBearer {
+        token: OAuthToken::ClientCredentials {
+            endpoint: endpoint.url.clone(),
+            client_id: CLIENT_ID.to_string(),
+            client_secret: CLIENT_SECRET.to_string(),
+            scope: Some("kafka".to_string()),
+        },
+        extensions: extensions.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+    }
+}
+
+fn oauth_producer(cluster: &FakeCluster, settings: &KafkaSasl) -> Producer {
+    let sasl = Some(authenticator(settings, RECV_TIMEOUT));
+    Producer::new(ProducerConfig { sasl, ..config(cluster) }).unwrap()
+}
+
+/// A cluster of `nodes` requiring `OAUTHBEARER` with `token`, or any token for `None`.
+async fn oauth_cluster(nodes: usize, leaders: &[i32], token: Option<&str>) -> FakeCluster {
+    let cluster = cluster(nodes, leaders).await;
+    let mut sasl = Sasl::new(SASL_USER, SASL_PASSWORD);
+    sasl.oauth_token = token.map(String::from);
+    cluster.state().sasl = Some(sasl);
+    cluster
+}
+
+/// The token each `OAUTHBEARER` message carried, in arrival order.
+fn tokens_presented(cluster: &FakeCluster) -> Vec<String> {
+    cluster
+        .state()
+        .oauth_messages
+        .iter()
+        .map(|m| {
+            let text = String::from_utf8_lossy(m);
+            let rest = text.split_once("auth=Bearer ").unwrap().1;
+            rest[..rest.find('\u{1}').unwrap()].to_string()
+        })
+        .collect()
+}
+
+/// A fixed token authenticates every connection, and its extensions ride in every message.
+#[tokio::test]
+async fn oauthbearer_with_a_fixed_token_delivers_with_its_extensions() {
+    let cluster = oauth_cluster(2, &[0, 1], Some("fixed.token-1")).await;
+    let extensions = vec![
+        ("identityPoolId".to_string(), "pool-1".to_string()),
+        ("logicalCluster".to_string(), "lkc-1".to_string()),
+    ];
+    let settings = KafkaSasl::OAuthBearer {
+        token: OAuthToken::Fixed("fixed.token-1".into()),
+        extensions: extensions.clone(),
+    };
+    let mut producer = oauth_producer(&cluster, &settings);
+    let mut records = keyed_for(0, 2, 2);
+    records.extend(keyed_for(1, 2, 2));
+    send_expecting(&mut producer, records, &[None]).await;
+    assert_eq!((values_in(&cluster, 0).len(), values_in(&cluster, 1).len()), (2, 2));
+    let state = cluster.state();
+    assert_eq!(state.authentications, 3, "bootstrap and both leaders");
+    assert_eq!(
+        state.oauth_messages,
+        vec![
+            b"n,,\x01auth=Bearer fixed.token-1\x01identityPoolId=pool-1\x01logicalCluster=lkc-1\x01\x01"
+                .to_vec();
+            3
+        ]
+    );
+}
+
+/// The client-credentials request is a form POST with the client in Basic authentication, and
+/// its token serves every connection of the sink: one fetch for three connections, and one for
+/// several dials that start at once.
+#[tokio::test]
+async fn client_credentials_fetch_one_token_for_every_connection() {
+    let endpoint = TokenEndpoint::start().await;
+    let cluster = oauth_cluster(2, &[0, 1], Some("token-0")).await;
+    let mut producer = oauth_producer(&cluster, &client_credentials(&endpoint, &[]));
+    let mut records = keyed_for(0, 2, 1);
+    records.extend(keyed_for(1, 2, 1));
+    send_expecting(&mut producer, records, &[None]).await;
+    assert_eq!(cluster.state().authentications, 3);
+    assert_eq!(tokens_presented(&cluster), vec!["token-0"; 3]);
+    assert_eq!(endpoint.fetches(), 1);
+    let request = endpoint.state().requests[0].clone();
+    assert_eq!(request.body, "grant_type=client_credentials&scope=kafka");
+    assert_eq!(request.content_type, "application/x-www-form-urlencoded");
+    assert_eq!(
+        request.authorization,
+        format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("{CLIENT_ID}:{CLIENT_SECRET}")
+            )
+        )
+    );
+
+    let endpoint = TokenEndpoint::start().await;
+    let auth = authenticator(&client_credentials(&endpoint, &[]), RECV_TIMEOUT);
+    let mut starts = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let auth = auth.clone();
+        starts.spawn(async move { auth.start("broker").await.map(|_| ()) });
+    }
+    while let Some(started) = starts.join_next().await {
+        started.unwrap().unwrap();
+    }
+    assert_eq!(endpoint.fetches(), 1, "concurrent dials wait on one fetch");
+}
+
+/// A token is reused until 80% of its `expires_in` has passed; a connection dialed after that,
+/// here the redial of a session the broker gave a lifetime, presents a newly fetched token.
+#[tokio::test]
+async fn a_redial_after_the_token_is_due_presents_a_new_one() {
+    let endpoint = TokenEndpoint::start().await;
+    // Reused for 800 ms.
+    endpoint.state().answer =
+        Box::new(|n| (200, format!(r#"{{"access_token":"token-{n}","expires_in":1}}"#)));
+    let cluster = oauth_cluster(1, &[0], None).await;
+    // The connection's deadline falls at half the lifetime.
+    cluster.state().sasl.as_mut().unwrap().session_lifetime_ms = 1000;
+    let mut producer = oauth_producer(&cluster, &client_credentials(&endpoint, &[]));
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+    let first_sent = tokio::time::Instant::now();
+    assert_eq!(endpoint.fetches(), 1);
+
+    let ends = cluster.state().session_ends.clone();
+    let due = first_sent + Duration::from_millis(800);
+    wait_until("the token is due and every session has ended", || {
+        let now = tokio::time::Instant::now();
+        now >= due && ends.iter().all(|&end| now >= end)
+    })
+    .await;
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+
+    assert_eq!(endpoint.fetches(), 2);
+    let presented = tokens_presented(&cluster);
+    assert_eq!(presented.last().map(String::as_str), Some("token-1"), "{presented:?}");
+    assert!(!presented.contains(&"token-2".to_string()), "{presented:?}");
+    assert_eq!(cluster.state().expired_closes, 0);
+    assert_eq!(values_in(&cluster, 0).len(), 2);
+}
+
+/// Token endpoint rows: unreachable, `429`, and `5xx` are `Clean`; any other answer and a `2xx`
+/// without a usable token are `Refused`. No message carries the client secret, and the broker
+/// sees no `SaslAuthenticate` for a token it was never sent.
+#[tokio::test]
+async fn token_endpoint_faults_are_clean_when_transient_and_refused_otherwise() {
+    let cases: Vec<(u16, &str, Fault, &str)> = vec![
+        (
+            401,
+            r#"{"error":"invalid_client"}"#,
+            Fault::Refused,
+            "401 Unauthorized: \"invalid_client\"",
+        ),
+        (
+            400,
+            r#"{"error":"invalid_scope","error_description":"no kafka"}"#,
+            Fault::Refused,
+            "\"invalid_scope\" (\"no kafka\")",
+        ),
+        (403, "forbidden", Fault::Refused, "403 Forbidden"),
+        (302, "", Fault::Refused, "302 Found"),
+        (200, "<html>sign in</html>", Fault::Refused, "isn't JSON"),
+        (200, r#"{"access_token":"a b"}"#, Fault::Refused, "can't carry"),
+        (429, "", Fault::Clean, "429 Too Many Requests"),
+        (500, "", Fault::Clean, "500 Internal Server Error"),
+        (503, "", Fault::Clean, "503 Service Unavailable"),
+    ];
+    for (status, body, want, detail) in cases {
+        let endpoint = TokenEndpoint::start().await;
+        let body = body.to_string();
+        endpoint.state().answer = Box::new(move |_| (status, body.clone()));
+        let cluster = oauth_cluster(1, &[0], None).await;
+        let mut producer = oauth_producer(&cluster, &client_credentials(&endpoint, &[]));
+        let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+        let message = format!("{err:#} {err:?}");
+        assert_eq!(logit_pipeline::classify(&err), want, "{status}: {message}");
+        assert!(message.contains(detail), "{status}: {message}");
+        assert!(message.contains(&endpoint.url) && message.contains(CLIENT_ID), "{message}");
+        assert!(!message.contains(CLIENT_SECRET), "{message}");
+        assert_eq!(requests_of(&cluster, ApiKey::SaslAuthenticate), 0, "{status}");
+
+        // Once the endpoint issues a token, the next attempt delivers.
+        endpoint.state().answer =
+            Box::new(|n| (200, format!(r#"{{"access_token":"token-{n}","expires_in":60}}"#)));
+        send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+        assert_eq!(values_in(&cluster, 0).len(), 1, "{status}");
+    }
+
+    // Nothing listening: a port bound and released.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}/oauth2/token");
+    let cluster = oauth_cluster(1, &[0], None).await;
+    let settings = KafkaSasl::OAuthBearer {
+        token: OAuthToken::ClientCredentials {
+            endpoint: url.clone(),
+            client_id: CLIENT_ID.into(),
+            client_secret: CLIENT_SECRET.into(),
+            scope: None,
+        },
+        extensions: Vec::new(),
+    };
+    let mut producer = oauth_producer(&cluster, &settings);
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{message}");
+    assert!(message.contains(&format!("requesting a token from {url}")), "{message}");
+    assert!(!message.contains(CLIENT_SECRET), "{message}");
+
+    // An endpoint that accepts the connection and never answers, against a short timeout.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/oauth2/token", silent.local_addr().unwrap());
+    let held = tokio::spawn(async move {
+        let mut open = Vec::new();
+        while let Ok((stream, _)) = silent.accept().await {
+            open.push(stream);
+        }
+    });
+    let settings = KafkaSasl::OAuthBearer {
+        token: OAuthToken::ClientCredentials {
+            endpoint: url.clone(),
+            client_id: CLIENT_ID.into(),
+            client_secret: CLIENT_SECRET.into(),
+            scope: None,
+        },
+        extensions: Vec::new(),
+    };
+    let sasl = Some(authenticator(&settings, Duration::from_millis(200)));
+    let mut producer = Producer::new(ProducerConfig { sasl, ..config(&cluster) }).unwrap();
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{message}");
+    assert!(message.contains(&format!("token endpoint {url} timed out after 200ms")), "{message}");
+    held.abort();
+}
+
+/// A `200` whose body the endpoint cuts off, by closing the connection short of its
+/// `Content-Length` or by stalling past the sink's timeout, is a transport fault (`Clean`), not
+/// a token response that isn't JSON (`Refused`).
+#[tokio::test]
+async fn a_cut_off_token_response_is_clean() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for (close, detail) in [(true, "reading token endpoint"), (false, "timed out after 200ms")] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/oauth2/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = vec![0; 4096];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 100\r\n\r\n{\"access_tok",
+                    )
+                    .await;
+                if close {
+                    drop(stream);
+                } else {
+                    open.push(stream);
+                }
+            }
+        });
+        let settings = KafkaSasl::OAuthBearer {
+            token: OAuthToken::ClientCredentials {
+                endpoint: url.clone(),
+                client_id: CLIENT_ID.into(),
+                client_secret: CLIENT_SECRET.into(),
+                scope: None,
+            },
+            extensions: Vec::new(),
+        };
+        let cluster = oauth_cluster(1, &[0], None).await;
+        let sasl = Some(authenticator(&settings, Duration::from_millis(200)));
+        let mut producer = Producer::new(ProducerConfig { sasl, ..config(&cluster) }).unwrap();
+        let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+        let message = format!("{err:#} {err:?}");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "close {close}: {message}");
+        assert!(message.contains(detail), "close {close}: {message}");
+        assert!(!message.contains("isn't JSON"), "close {close}: {message}");
+        assert_eq!(requests_of(&cluster, ApiKey::SaslAuthenticate), 0);
+        server.abort();
+    }
+}
+
+/// A broker refusing the token sends Kafka's error challenge; the client ends the exchange with
+/// a `kvsep`, and the refusal is `Refused` with the challenge's status and no token in it. The
+/// refused token leaves the cache, so the next attempt fetches another and delivers.
+#[tokio::test]
+async fn a_refused_token_is_refused_with_its_status_and_fetched_again() {
+    let endpoint = TokenEndpoint::start().await;
+    let cluster = oauth_cluster(1, &[0], Some("token-1")).await;
+    let mut producer = oauth_producer(&cluster, &client_credentials(&endpoint, &[]));
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
+    assert!(message.contains("SaslAuthenticationFailed (58)"), "{message}");
+    assert!(
+        message.contains(r#"the broker refused the token: status "invalid_token""#),
+        "{message}"
+    );
+    assert!(message.contains("OAUTHBEARER as client \"logit-client\""), "{message}");
+    for secret in ["token-0", CLIENT_SECRET] {
+        assert!(!message.contains(secret), "{message}");
+    }
+    let exchange: Vec<Vec<u8>> = cluster.state().oauth_messages.clone();
+    assert_eq!(exchange.len(), 1);
+    assert_eq!(requests_of(&cluster, ApiKey::SaslAuthenticate), 2, "the token, then a kvsep");
+
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+    assert_eq!(endpoint.fetches(), 2);
+    assert_eq!(tokens_presented(&cluster).last().map(String::as_str), Some("token-1"));
+
+    // A fixed token's refusal names no token either.
+    let cluster = oauth_cluster(1, &[0], Some("the-right-token")).await;
+    let settings = KafkaSasl::OAuthBearer {
+        token: OAuthToken::Fixed("wrong-token".into()),
+        extensions: vec![],
+    };
+    let mut producer = oauth_producer(&cluster, &settings);
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
+    assert!(message.contains("OAUTHBEARER as a fixed token"), "{message}");
+    assert!(message.contains("status \"invalid_token\""), "{message}");
+    assert!(!message.contains("wrong-token"), "{message}");
+}
+
+/// Redpanda refuses a token with `SASL_AUTHENTICATION_FAILED` on the first message and no error
+/// challenge. The refused token still leaves the cache, so the next attempt fetches another
+/// rather than resending it until its refresh time.
+#[tokio::test]
+async fn a_token_refused_without_a_challenge_is_fetched_again() {
+    let endpoint = TokenEndpoint::start().await;
+    let cluster = oauth_cluster(1, &[0], Some("token-1")).await;
+    cluster.state().sasl.as_mut().unwrap().oauth_no_challenge = true;
+    let mut producer = oauth_producer(&cluster, &client_credentials(&endpoint, &[]));
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
+    assert!(message.contains("SaslAuthenticationFailed (58)"), "{message}");
+    assert!(!message.contains("the broker refused the token"), "{message}");
+    assert_eq!(requests_of(&cluster, ApiKey::SaslAuthenticate), 1, "no kvsep without a challenge");
+
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+    assert_eq!(endpoint.fetches(), 2);
+    let presented = tokens_presented(&cluster);
+    assert_eq!(presented[0], "token-0", "{presented:?}");
+    assert!(presented[1..].iter().all(|t| t == "token-1"), "{presented:?}");
+}
+
+// ---- AWS_MSK_IAM (docs/adr/kafka-sasl.md) ----------------------------------------------------
+
+const AWS_KEY_ID: &str = "AKIDLOGITTEST";
+const AWS_SECRET: &str = "aws-secret-never-printed";
+const AWS_SESSION: &str = "aws-session-token-never-printed";
+
+/// An [`Env`] over `vars`, so no test changes the process environment.
+fn aws_env(vars: &[(&str, &str)]) -> Env {
+    let vars: std::collections::BTreeMap<String, String> =
+        vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    std::sync::Arc::new(move |name| vars.get(name).cloned())
+}
+
+/// Endpoints for the chain's HTTP sources that answer nothing: a closed port.
+fn no_endpoints() -> Endpoints {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    Endpoints { imds: base.clone(), container: base.clone(), sts: Some(base) }
+}
+
+/// A cluster of `nodes` requiring `AWS_MSK_IAM` for [`AWS_KEY_ID`] and [`AWS_SECRET`].
+async fn msk_cluster(nodes: usize, leaders: &[i32]) -> FakeCluster {
+    let cluster = cluster(nodes, leaders).await;
+    cluster.state().sasl = Some(Sasl::new(AWS_KEY_ID, AWS_SECRET));
+    cluster
+}
+
+fn msk_producer(
+    cluster: &FakeCluster,
+    region: Option<&str>,
+    vars: &[(&str, &str)],
+    endpoints: Endpoints,
+) -> Producer {
+    let sasl = Some(msk_iam_with(region, aws_env(vars), endpoints, RECV_TIMEOUT));
+    Producer::new(ProducerConfig { sasl, ..config(cluster) }).unwrap()
+}
+
+/// `AWS_MSK_IAM` signs a payload per connection, the bootstrap one and each leader's, with the
+/// environment's credentials; the fake broker checks every field and recomputes the signature.
+#[tokio::test]
+async fn aws_msk_iam_authenticates_every_connection_and_delivers() {
+    let cluster = msk_cluster(2, &[0, 1]).await;
+    cluster.state().sasl.as_mut().unwrap().msk_session_token = Some(AWS_SESSION.into());
+    let vars = [
+        ("AWS_ACCESS_KEY_ID", AWS_KEY_ID),
+        ("AWS_SECRET_ACCESS_KEY", AWS_SECRET),
+        ("AWS_SESSION_TOKEN", AWS_SESSION),
+    ];
+    let mut producer = msk_producer(&cluster, Some("eu-west-1"), &vars, no_endpoints());
+    let mut records = keyed_for(0, 2, 2);
+    records.extend(keyed_for(1, 2, 2));
+    send_expecting(&mut producer, records, &[None]).await;
+    assert_eq!((values_in(&cluster, 0).len(), values_in(&cluster, 1).len()), (2, 2));
+    let state = cluster.state();
+    assert_eq!(state.authentications, 3, "bootstrap and both leaders");
+    assert_eq!(state.msk_payloads.len(), 3);
+    for payload in &state.msk_payloads {
+        assert_eq!(payload["host"], "127.0.0.1");
+        assert_eq!(payload["x-amz-security-token"], AWS_SESSION);
+        let credential = payload["x-amz-credential"].as_str().unwrap();
+        assert!(credential.ends_with("/eu-west-1/kafka-cluster/aws4_request"), "{credential}");
+    }
+}
+
+/// Without `region:` and an MSK host, the region comes from `AWS_REGION`, then
+/// `AWS_DEFAULT_REGION`; with none of them, the exchange is `Refused` before any credential
+/// lookup.
+#[tokio::test]
+async fn aws_msk_iam_reads_the_region_from_the_environment_or_refuses() {
+    for (region_var, want) in [("AWS_REGION", "ap-south-1"), ("AWS_DEFAULT_REGION", "sa-east-1")] {
+        let cluster = msk_cluster(1, &[0]).await;
+        let vars = [
+            ("AWS_ACCESS_KEY_ID", AWS_KEY_ID),
+            ("AWS_SECRET_ACCESS_KEY", AWS_SECRET),
+            (region_var, want),
+        ];
+        let mut producer = msk_producer(&cluster, None, &vars, no_endpoints());
+        send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+        let credential = cluster.state().msk_payloads[0]["x-amz-credential"].clone();
+        assert!(credential.as_str().unwrap().contains(&format!("/{want}/")), "{credential}");
+    }
+
+    let cluster = msk_cluster(1, &[0]).await;
+    let vars = [("AWS_ACCESS_KEY_ID", AWS_KEY_ID), ("AWS_SECRET_ACCESS_KEY", AWS_SECRET)];
+    let mut producer = msk_producer(&cluster, None, &vars, no_endpoints());
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
+    assert!(message.contains("no AWS region"), "{message}");
+    assert_eq!(requests_of(&cluster, ApiKey::SaslAuthenticate), 0);
+}
+
+/// Credentials the broker refuses are `Refused`, with MSK's message and no secret; ones fetched
+/// from an endpoint leave the cache, so the next attempt fetches them again and delivers once
+/// the endpoint hands out credentials the broker takes.
+#[tokio::test]
+async fn refused_aws_credentials_are_refused_and_fetched_again() {
+    let cluster = msk_cluster(1, &[0]).await;
+    let vars = [("AWS_ACCESS_KEY_ID", AWS_KEY_ID), ("AWS_SECRET_ACCESS_KEY", "wrong-secret-value")];
+    let mut producer = msk_producer(&cluster, Some("us-east-1"), &vars, no_endpoints());
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
+    assert!(message.contains("SaslAuthenticationFailed (58)"), "{message}");
+    assert!(message.contains("Access denied"), "{message}");
+    assert!(message.contains("AWS_MSK_IAM as AWS credentials from the environment"), "{message}");
+    assert!(!message.contains("wrong-secret-value"), "{message}");
+
+    let stub = HttpStub::start().await;
+    stub.answer(|_, n| {
+        let secret = if n == 0 { "stale-secret-value" } else { AWS_SECRET };
+        (
+            200,
+            format!(
+                r#"{{"AccessKeyId":"{AWS_KEY_ID}","SecretAccessKey":"{secret}",
+                    "Token":"{AWS_SESSION}","Expiration":"2099-01-01T00:00:00Z"}}"#
+            ),
+        )
+    });
+    let full = format!("{}/v2/credentials", stub.url);
+    let vars = [("AWS_CONTAINER_CREDENTIALS_FULL_URI", full.as_str())];
+    let mut producer = msk_producer(&cluster, Some("us-east-1"), &vars, no_endpoints());
+    let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+    let message = format!("{err:#} {err:?}");
+    assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{message}");
+    for secret in ["stale-secret-value", AWS_SESSION] {
+        assert!(!message.contains(secret), "{message}");
+    }
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+    assert_eq!(stub.requests().len(), 2, "the refused credentials were fetched again");
+    assert_eq!(values_in(&cluster, 0).len(), 1);
+}
+
+/// A credential endpoint's transient fault is `Clean`, its refusal `Refused`, and the broker
+/// sees no `SaslAuthenticate` for either.
+#[tokio::test]
+async fn aws_credential_endpoint_faults_reach_the_send_with_their_class() {
+    for (status, want) in [(503, Fault::Clean), (403, Fault::Refused)] {
+        let cluster = msk_cluster(1, &[0]).await;
+        let stub = HttpStub::start().await;
+        stub.answer(move |_, _| (status, String::new()));
+        let full = format!("{}/creds", stub.url);
+        let vars = [("AWS_CONTAINER_CREDENTIALS_FULL_URI", full.as_str())];
+        let mut producer = msk_producer(&cluster, Some("us-east-1"), &vars, no_endpoints());
+        let err = producer.prepare(keyed_for(0, 1, 1)).await.unwrap_err();
+        let message = format!("{err:#} {err:?}");
+        assert_eq!(logit_pipeline::classify(&err), want, "{status}: {message}");
+        assert!(message.contains(&format!("answered {status}")), "{message}");
+        assert_eq!(requests_of(&cluster, ApiKey::SaslAuthenticate), 0);
+    }
+}
+
+/// MSK ties a session's lifetime to the credentials' expiry. Credentials are reused until 5
+/// minutes before it, so the redial of a session the broker ended signs with fresh ones.
+#[tokio::test]
+async fn a_redial_after_the_credentials_are_due_signs_with_fresh_ones() {
+    let stub = HttpStub::start().await;
+    // Reused for 1 to 2 s: they expire 5 minutes and 2 seconds after they're issued, in whole
+    // seconds.
+    stub.answer(|_, n| {
+        let expires = std::time::SystemTime::now() + Duration::from_secs(302);
+        let nanos = expires.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
+        let expiration = logit_core::time::format_rfc3339_utc(nanos);
+        (
+            200,
+            format!(
+                r#"{{"AccessKeyId":"{AWS_KEY_ID}","SecretAccessKey":"{AWS_SECRET}",
+                    "Token":"session-{n}","Expiration":"{}Z"}}"#,
+                &expiration[..19]
+            ),
+        )
+    });
+    let cluster = msk_cluster(1, &[0]).await;
+    // The connection's deadline falls at half the lifetime.
+    cluster.state().sasl.as_mut().unwrap().session_lifetime_ms = 1000;
+    let full = format!("{}/creds", stub.url);
+    let vars = [("AWS_CONTAINER_CREDENTIALS_FULL_URI", full.as_str())];
+    let mut producer = msk_producer(&cluster, Some("us-east-1"), &vars, no_endpoints());
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+    let first_sent = tokio::time::Instant::now();
+    assert_eq!(stub.requests().len(), 1);
+
+    let ends = cluster.state().session_ends.clone();
+    let due = first_sent + Duration::from_secs(2);
+    wait_until("the credentials are due and every session has ended", || {
+        let now = tokio::time::Instant::now();
+        now >= due && ends.iter().all(|&end| now >= end)
+    })
+    .await;
+    send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+
+    assert_eq!(stub.requests().len(), 2);
+    let state = cluster.state();
+    let last = state.msk_payloads.last().unwrap();
+    assert_eq!(last["x-amz-security-token"], "session-1");
+    assert_eq!(state.expired_closes, 0);
+    assert_eq!(state.partition(TOPIC, 0).records().len(), 2);
 }

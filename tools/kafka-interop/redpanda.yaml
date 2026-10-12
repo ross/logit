@@ -4,6 +4,11 @@
 #   plain  :9092  every leg but TLS, and every read-back
 #   tls    :9093  server TLS from the run's private CA
 #   mtls   :9094  the same, and a client certificate from that CA is required
+#   sasl   :9096  SASL authentication, no TLS
+#   sasls  :9097  SASL authentication over server TLS
+#
+# Only the two SASL listeners set `authentication_method: sasl`, so the others stay open.
+# Cluster-wide `sasl_mechanisms` and the SASL users are set by `script/kafka-interop` after start.
 #
 # `rpk redpanda start` rewrites the file it starts from, so the script copies this one into the
 # run directory and mounts the copy.
@@ -20,10 +25,14 @@ redpanda:
     - { name: plain, address: 0.0.0.0, port: 9092 }
     - { name: tls, address: 0.0.0.0, port: 9093 }
     - { name: mtls, address: 0.0.0.0, port: 9094 }
+    - { name: sasl, address: 0.0.0.0, port: 9096, authentication_method: sasl }
+    - { name: sasls, address: 0.0.0.0, port: 9097, authentication_method: sasl }
   advertised_kafka_api:
     - { name: plain, address: redpanda, port: 9092 }
     - { name: tls, address: redpanda, port: 9093 }
     - { name: mtls, address: redpanda, port: 9094 }
+    - { name: sasl, address: redpanda, port: 9096 }
+    - { name: sasls, address: redpanda, port: 9097 }
   kafka_api_tls:
     - name: tls
       enabled: true
@@ -37,5 +46,11 @@ redpanda:
       key_file: /tls/broker.key
       truststore_file: /tls/ca.pem
       require_client_auth: true
+    - name: sasls
+      enabled: true
+      cert_file: /tls/broker.crt
+      key_file: /tls/broker.key
+      truststore_file: /tls/ca.pem
+      require_client_auth: false
   developer_mode: true
   auto_create_topics_enabled: true

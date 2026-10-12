@@ -2932,10 +2932,22 @@
                 }
               ]
             },
+            "sasl": {
+              "description": "Authenticates every broker connection over SASL when present: `{mechanism: plain | scram_sha_256 | scram_sha_512, username: NAME, password: !env VAR}`, or `{mechanism: oauthbearer, token: !env VAR}`, or `{mechanism: oauthbearer, token_endpoint: URL, client_id: ID, client_secret: !env VAR}`. Works with or without `tls:`; without it, `plain` sends the password and `oauthbearer` the token in clear. A broker or token endpoint that refuses the credentials or the mechanism holds the queue until it accepts them, and a broker that limits a session's lifetime gets a new connection before it ends.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/KafkaSasl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "sources": true,
             "targets": true,
             "timeout": {
-              "description": "Bounds each connect, TLS handshake, write, and wait for a broker's answer, and the wait for a missing topic to be created. Defaults to `30s`; `0s` is rejected.",
+              "description": "Bounds each connect, TLS handshake, write, and wait for a broker's answer, the wait for a missing topic to be created, and each OAuth token request. Defaults to `30s`; `0s` is rejected.",
               "default": "30s",
               "type": "string"
             },
@@ -4410,6 +4422,164 @@
           "enum": [
             "batch"
           ]
+        }
+      ]
+    },
+    "KafkaSasl": {
+      "description": "How `kafka_out` authenticates to each broker over SASL, chosen by `mechanism`. Give the password, token, or client secret with `!env` so it stays out of the config file.",
+      "oneOf": [
+        {
+          "description": "`PLAIN`: the username and password as they are. Without `tls:`, they cross the network in clear, so use it only over TLS or on a network you trust.",
+          "type": "object",
+          "required": [
+            "mechanism",
+            "password",
+            "username"
+          ],
+          "properties": {
+            "mechanism": {
+              "type": "string",
+              "enum": [
+                "plain"
+              ]
+            },
+            "password": {
+              "type": "string"
+            },
+            "username": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`SCRAM-SHA-256`: a challenge and response that never sends the password and checks that the broker holds the same credential.",
+          "type": "object",
+          "required": [
+            "mechanism",
+            "password",
+            "username"
+          ],
+          "properties": {
+            "mechanism": {
+              "type": "string",
+              "enum": [
+                "scram_sha_256"
+              ]
+            },
+            "password": {
+              "type": "string"
+            },
+            "username": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`SCRAM-SHA-512`, as `scram_sha_256` with SHA-512.",
+          "type": "object",
+          "required": [
+            "mechanism",
+            "password",
+            "username"
+          ],
+          "properties": {
+            "mechanism": {
+              "type": "string",
+              "enum": [
+                "scram_sha_512"
+              ]
+            },
+            "password": {
+              "type": "string"
+            },
+            "username": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`OAUTHBEARER`: an OAuth 2.0 access token, either a fixed `token`, or one fetched from `token_endpoint` with the client-credentials grant. Set one of the two, not both. Like `plain`, the token crosses the network in clear without `tls:`.",
+          "type": "object",
+          "required": [
+            "mechanism"
+          ],
+          "properties": {
+            "client_id": {
+              "description": "The OAuth client id. Required with `token_endpoint`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "client_secret": {
+              "description": "The OAuth client secret. Required with `token_endpoint`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "extensions": {
+              "description": "SASL extensions sent beside the token, such as Confluent Cloud's `logicalCluster` and `identityPoolId`. Keys are letters only, and `auth` is reserved; values are printable ASCII. Empty by default.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "mechanism": {
+              "type": "string",
+              "enum": [
+                "oauthbearer"
+              ]
+            },
+            "scope": {
+              "description": "The `scope` the token request asks for, space-separated. Omitted from the request when unset.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "token": {
+              "description": "A fixed access token, sent as given on every connection. It isn't renewed, so a broker refuses it once it expires.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "token_endpoint": {
+              "description": "The identity provider's token URL, which receives a client-credentials request with `client_id` and `client_secret` in HTTP Basic authentication. Must be `https://`, or `http://` to a loopback address. The token is reused across connections and fetched again once 80% of its `expires_in` has passed. The server's certificate is checked against the bundled Mozilla roots; the `tls:` block applies to brokers only.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`AWS_MSK_IAM`: Amazon MSK's IAM access control, with AWS credentials from the environment, a web identity token file (EKS IRSA), the shared credentials and config files (`AWS_PROFILE` picks the profile; static keys only), the ECS or EKS Pod Identity container endpoint, or the EC2 instance metadata service, in that order. Connect to the brokers' IAM port with `tls:` set.",
+          "type": "object",
+          "required": [
+            "mechanism"
+          ],
+          "properties": {
+            "mechanism": {
+              "type": "string",
+              "enum": [
+                "aws_msk_iam"
+              ]
+            },
+            "region": {
+              "description": "The AWS region the brokers are in, such as `us-east-1`. Defaults to the region in the broker's MSK host name, then `AWS_REGION`, then `AWS_DEFAULT_REGION`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },

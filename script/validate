@@ -34,6 +34,9 @@ export SPLUNK_INTEROP_HEC_URL="${SPLUNK_INTEROP_HEC_URL:-http://splunk:8088/serv
 export SPLUNK_INTEROP_HEC_TOKEN="${SPLUNK_INTEROP_HEC_TOKEN:-logit-dev-token}"
 export SPLUNK_INTEROP_ACK_TOKEN="${SPLUNK_INTEROP_ACK_TOKEN:-logit-dev-token}"
 export SPLUNK_INTEROP_HEC_INSECURE="${SPLUNK_INTEROP_HEC_INSECURE:-false}"
+# tools/kafka-interop/logit-oauth-*.yaml's fixed OAUTHBEARER token, which script/kafka-interop
+# fetches from its token server.
+export KAFKA_INTEROP_OAUTH_TOKEN="${KAFKA_INTEROP_OAUTH_TOKEN:-logit-dev-token}"
 
 if ! in_project_environment; then
     run ./script/validate "$@"

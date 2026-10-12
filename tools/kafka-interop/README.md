@@ -18,12 +18,21 @@ test depends on it running. A run takes about four minutes once the images are b
 |---|---|---|
 | `kafka` | `apache/kafka:4.2.0` | single-node KRaft broker, started on `kafka-server.properties` |
 | `redpanda` | `redpandadata/redpanda:v26.2.3` | single-node Redpanda in `dev-container` mode, started on `redpanda.yaml` |
+| `oauth` | `ghcr.io/navikt/mock-oauth2-server:6.0.2`, pinned by digest | the OAuth 2.0 server the OAUTHBEARER legs fetch tokens from and both brokers validate them against |
 | `logit-<leg>-<broker>` | `logit:kafka-interop`, built from the current tree | one per `logit-<leg>-<broker>.yaml` |
 
-Each broker has three client listeners: plain on `:9092`, TLS on `:9093`, and mutual TLS, which
-requires a client certificate, on `:9094`. The read-back runs `kafka-console-consumer.sh` and
+Each broker has five client listeners: plain on `:9092`, TLS on `:9093`, mutual TLS, which
+requires a client certificate, on `:9094`, SASL_PLAINTEXT on `:9096`, and SASL_SSL on `:9097`.
+The SASL listeners offer PLAIN, SCRAM-SHA-256, and SCRAM-SHA-512, and Redpanda's also offers
+OAUTHBEARER; Kafka has a sixth listener, SASL_PLAINTEXT with OAUTHBEARER only, on `:9098`. Only
+they require authentication, so every read-back uses the plain listener and needs no credentials. The read-back runs `kafka-console-consumer.sh` and
 `kafka-get-offsets.sh` inside the `kafka` container, against either broker, and kcat in
 `edenhill/kcat:1.7.1` containers on the stack's network.
+
+`AWS_MSK_IAM` has no leg: only Amazon MSK implements its server side, so the harness can't run
+it. Its tests pin the signature against AWS's SigV4 test suite and a golden payload from
+botocore, and the fake broker checks every payload
+([ADR `kafka-sasl`](../../docs/adr/kafka-sasl.md), "Amendment: what W3 settled").
 
 The legs, each run against both brokers:
 
@@ -33,7 +42,42 @@ The legs, each run against both brokers:
 | `codec-<c>` | `logit-codecs-*.yaml` | 100 events under each `compression` (`none`, `gzip`, `snappy`, `lz4`, `zstd`) are stored under that codec, and decode in both the Java consumer and kcat, each event once |
 | `dedup` | `logit-dedup-*.yaml` | while the broker's packets to this leg are dropped, an idempotent sink's resend after an `Ambiguous` attempt stores no duplicate, and a non-idempotent control sink beside it stores at least one |
 | `tls`, `mtls`, `mtls-required` | `logit-tls-*.yaml` | 50 events over server TLS and over mutual TLS from the run's private CA; a sink with no client certificate stores nothing |
+| `sasl-plain`, `sasl-scram512`, `sasl-scram256`, `sasl-wrong` | `logit-sasl-*.yaml` | 50 events through `sasl:` with PLAIN over SASL_SSL, SCRAM-SHA-512 over SASL_SSL, and SCRAM-SHA-256 over SASL_PLAINTEXT; a SCRAM-SHA-512 sink with the wrong password stores nothing, counts every attempt as `refused`, holds its queue with `logit.component.retrying` at `1`, and drops no batch as `rejected` |
+| `oauth-cc`, `oauth-static`, `oauth-refused` | `logit-oauth-*.yaml` | 60 events at 1/s through the client-credentials grant, past the 45 s life of the first token, with at least two tokens fetched, counted in the `oauth` service's log; 50 events through a fixed token the script fetched, with two SASL extensions on Kafka; and a fixed token that isn't a JWT, which the broker refuses: nothing stored, every attempt `refused`, the queue held, no batch dropped, and, on Kafka, the leg's log carrying the broker's error challenge status |
 | `timestamp` | `logit-timestamp-*.yaml` | in each batch of 10, the event stamped at 2100-01-01 is dropped and counted as `invalid_timestamp`, and the other nine land |
+
+The SASL user is `logit` with the password `logit-secret` on Kafka, whose PLAIN entry is a JAAS
+`user_logit` in `kafka-server.properties` and whose SCRAM credentials `kafka-storage.sh format
+--add-scram` writes. Redpanda keeps one credential per user, so the script creates `logit256`
+(SCRAM-SHA-256) and `logit512` (SCRAM-SHA-512) with `rpk security user create`; its PLAIN
+login checks the SCRAM credential, so the `sasl-plain` sink signs in as `logit512`. The script sets
+Redpanda's `sasl_mechanisms` to `[SCRAM, PLAIN]` after start. The passwords are literals in the leg
+configs, like the run's other throwaway material.
+
+Every token from `oauth` names the subject `logit`, the audience `kafka-interop`, and the issuer
+`http://oauth/default`, and lives 45 s; it takes any client secret, so there's no leg for a
+wrong one. Kafka validates tokens with its own `OAuthBearerValidatorCallbackHandler` against
+`oauth`'s JWKS, with the issuer and audience set in `kafka-server.properties`, and a
+`connections.max.reauth.ms` of 60 s, so each session ends when its token expires. Redpanda
+validates them through its `oidc_*` cluster properties, which the script sets after start, with
+a `kafka_sasl_max_reauth_ms` of 40 s, so each session ends before its token expires. Redpanda
+has one such bound for every listener, so its SCRAM and PLAIN sinks redial every 40 s too. Each
+`oauth_cc` sink asks for a `scope` that names its broker, and `oauth` logs every token request's
+body at `DEBUG`, so `check.py` counts each sink's tokens in `logs/oauth.log`.
+OAUTHBEARER is a Redpanda Enterprise feature, which a new cluster's 30-day trial license covers;
+if Redpanda refuses the settings, `logs/redpanda-oidc-setup.log` says why and its three
+OAUTHBEARER rows read `GAP`. The OAUTHBEARER legs run in `oauth`'s network namespace, so their
+token endpoint is `http://127.0.0.1`, which `token_endpoint` allows over plain HTTP.
+
+Redpanda v26.2.3 differs from Kafka in three ways the legs work around or allow for:
+
+- It fetches the JWKS from the discovery document's `jwks_uri` without its port, so `oauth`
+  listens on port 80.
+- It reads everything between `auth=Bearer ` and the closing `\x01\x01` as the token, so a SASL
+  extension corrupts the token and Redpanda drops the connection. Its `oauth_static` sink sends
+  none ([`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md)).
+- It refuses a token with `SASL_AUTHENTICATION_FAILED` at once, without RFC 7628's error
+  challenge, so its refusal carries no OAuth status.
 
 Every config passes `logit validate`: `script/validate` and the
 `every_shipped_config_loads_and_validates` test both cover `logit-*.yaml` here. Each sink has
@@ -48,8 +92,10 @@ another sink in the same process.
 2. Generates a private CA, a broker certificate for the names `kafka` and `redpanda`, and a
    client certificate into the run directory's `tls/`, with `openssl` in the Kafka image. The
    keys are EC P-256 in PKCS#8, which Kafka's PEM keystore requires.
-3. Starts both brokers with `docker compose up --wait`, creates every topic on both, and produces
-   the 50 parity keys with `kafka-console-producer.sh`.
+3. Starts `oauth` and waits for its JWKS, then starts both brokers with
+   `docker compose up --wait`, turns on Redpanda's OAUTHBEARER, creates every topic on both, and
+   produces the 50 parity keys with `kafka-console-producer.sh`. Last, it fetches the fixed token
+   the `oauth_static` sinks send and passes it to their legs as `KAFKA_INTEROP_OAUTH_TOKEN`.
 4. Starts every leg. 10 s later, for 8 s, it drops every packet each broker sends to its `dedup`
    leg, with `netem-drop.sh` run in the broker's network namespace (a `prio` qdisc, a
    `netem loss 100%` band, and a u32 filter on the leg's address). The broker still receives
@@ -71,7 +117,7 @@ another sink in the same process.
 
 A row is `PASS` (the leg did what the plan expects), `GAP` (the broker differs from Apache Kafka
 in a way [`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md) records), or `FAIL`. Only
-Redpanda's `timestamp` row can read `GAP`; Apache Kafka is the reference, so any other outcome
+Redpanda's `timestamp` and OAUTHBEARER rows can read `GAP`; Apache Kafka is the reference, so any other outcome
 there is a `FAIL`. The script exits 1 on any `FAIL`.
 
 Each leg fails when it can't prove what it checks:
@@ -95,6 +141,7 @@ A run writes `perf/results/kafka-interop/<timestamp>/` (gitignored, or under
 | `readback/<broker>/<topic>.offsets` | `kafka-get-offsets.sh`, one `topic:partition:offset` per partition |
 | `readback/<broker>/codec-<c>.batches` | each codec topic's stored codec: `kafka-dump-log.sh` output for Kafka, one `offset: <o> compression: <c>` line per record for Redpanda |
 | `<leg>-<broker>-telemetry.log` | each leg's `internal` telemetry, `stdio_out` `format: json` |
+| `redpanda-oidc.txt` | `ok` once Redpanda took the OAUTHBEARER settings, else `failed` |
 | `exits.txt`, `timeline.log`, `netem.log` | each leg's exit code, the run's phases, and the qdiscs and filters each netem step set |
 | `provenance.txt`, `logs/<service>.log`, `tls/` | image digests and versions, every service's log, and the run's certificates |
 

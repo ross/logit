@@ -404,7 +404,8 @@ Each format stays decodable, so a future `kafka_in` can round-trip it.
 - Unkeyed records cluster per `logit` batch. A topic fed by one small, steady producer fills
   partitions less evenly over a short window than Java's byte-based switch would.
 - Follow-ups, each outside this stream:
-  - SASL PLAIN and SCRAM, then OAUTHBEARER and AWS MSK IAM;
+  - SASL PLAIN and SCRAM, then OAUTHBEARER and AWS MSK IAM, decided in
+    [ADR `kafka-sasl`](kafka-sasl.md);
   - `otlp_proto` and `otlp_json` formats, for parity with the OTel `kafkaexporter`;
   - pipelined produce through `Output::window`;
   - a topic chosen per event;
