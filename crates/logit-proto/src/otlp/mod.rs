@@ -5,8 +5,8 @@
 //! **This module doc is the mapping table** for what all three signals share. Each sibling module
 //! doc has its own: [`common`] (`Value` ↔ `AnyValue`, attributes, resource and scope), [`logs`]
 //! (`Severity`, `BodyFormat`, trace context), [`traces`], and [`metrics`] (temporality and the
-//! kinds OTLP can't carry natively). [`json`] is the OTLP/JSON dialect layer, and [`grpc`] is
-//! gRPC message framing and bounded gzip inflation.
+//! kinds OTLP can't carry natively). [`json`] is the OTLP/JSON layer in both directions, and
+//! [`grpc`] is gRPC message framing and bounded gzip inflation.
 //!
 //! **Wire types.** This codec encodes and decodes `TracesData`/`LogsData`/`MetricsData`, not
 //! `Export*ServiceRequest`. The two are wire-identical (one `repeated Resource* = 1` field), so
@@ -50,6 +50,17 @@ use logit_core::{AttrMap, Diagnostics, Event, EventBatch, Telemetry};
 use prost::Message;
 use std::sync::Arc;
 
+/// The body encoding [`OtlpEncoder`] writes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OtlpEncoding {
+    /// Protobuf, OTLP's default.
+    #[default]
+    Protobuf,
+    /// OTLP/JSON as the OTel Collector's pdata marshaler writes it ([`json::write_logs`] and its
+    /// siblings).
+    Json,
+}
+
 /// Encodes an [`EventBatch`] into OTLP, one payload per non-empty [`Signal`].
 ///
 /// Holds [`Telemetry`]/[`Diagnostics`] handles so the lossy metric paths ([`metrics`]'s module
@@ -58,11 +69,18 @@ use std::sync::Arc;
 pub struct OtlpEncoder {
     telemetry: Telemetry,
     diagnostics: Diagnostics,
+    encoding: OtlpEncoding,
 }
 
 impl OtlpEncoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Selects the payload body encoding; protobuf unless set.
+    pub fn with_encoding(mut self, encoding: OtlpEncoding) -> Self {
+        self.encoding = encoding;
+        self
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
@@ -125,7 +143,7 @@ impl SignalEncoder for OtlpEncoder {
             };
             payloads.push(SignalPayload {
                 signal: Signal::Logs,
-                bytes: Bytes::from(data.encode_to_vec()),
+                bytes: self.body(&data, json::write_logs),
                 records,
             });
         }
@@ -144,7 +162,7 @@ impl SignalEncoder for OtlpEncoder {
             };
             payloads.push(SignalPayload {
                 signal: Signal::Traces,
-                bytes: Bytes::from(data.encode_to_vec()),
+                bytes: self.body(&data, json::write_traces),
                 records,
             });
         }
@@ -163,11 +181,24 @@ impl SignalEncoder for OtlpEncoder {
             };
             payloads.push(SignalPayload {
                 signal: Signal::Metrics,
-                bytes: Bytes::from(data.encode_to_vec()),
+                bytes: self.body(&data, json::write_metrics),
                 records,
             });
         }
         Ok(payloads)
+    }
+}
+
+impl OtlpEncoder {
+    fn body<M: Message>(&self, data: &M, write_json: fn(&M, &mut Vec<u8>)) -> Bytes {
+        match self.encoding {
+            OtlpEncoding::Protobuf => Bytes::from(data.encode_to_vec()),
+            OtlpEncoding::Json => {
+                let mut out = Vec::new();
+                write_json(data, &mut out);
+                Bytes::from(out)
+            }
+        }
     }
 }
 
@@ -339,8 +370,7 @@ mod tests {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
-    #[test]
-    fn a_batch_carrying_all_three_signals_encodes_as_three_separate_payloads() {
+    fn all_three_signals() -> Vec<Event> {
         let log = Event::log(
             1,
             AttrMap::new(),
@@ -350,7 +380,7 @@ mod tests {
                 body_format: logit_core::BodyFormat::Raw,
                 trace: None,
                 event_name: None,
-                observed_timestamp: 0,
+                observed_timestamp: 5,
                 dropped_attributes_count: 0,
             },
         );
@@ -376,14 +406,51 @@ mod tests {
                 ext: None,
             },
         );
+        vec![log, metric, span]
+    }
 
+    #[test]
+    fn a_batch_carrying_all_three_signals_encodes_as_three_separate_payloads() {
         let mut encoder = OtlpEncoder::new();
-        let payloads = encoder.encode_signals(&batch(vec![log, metric, span])).unwrap();
+        let payloads = encoder.encode_signals(&batch(all_three_signals())).unwrap();
         let signals: Vec<Signal> = payloads.iter().map(|p| p.signal).collect();
         assert_eq!(signals.len(), 3, "got signals: {signals:?}");
         assert!(signals.contains(&Signal::Logs));
         assert!(signals.contains(&Signal::Metrics));
         assert!(signals.contains(&Signal::Traces));
+    }
+
+    #[test]
+    fn the_json_encoding_writes_the_protobuf_requests_as_otlp_json() {
+        let batch = batch(all_three_signals());
+        let proto = OtlpEncoder::new().encode_signals(&batch).unwrap();
+        let json =
+            OtlpEncoder::new().with_encoding(OtlpEncoding::Json).encode_signals(&batch).unwrap();
+        assert_eq!(proto.len(), 3);
+        assert_eq!(json.len(), 3);
+        for (p, j) in proto.iter().zip(&json) {
+            assert_eq!((p.signal, p.records), (j.signal, j.records));
+            let mut want = Vec::new();
+            match p.signal {
+                Signal::Logs => json::write_logs(
+                    &logs_pb::LogsData::decode(p.bytes.clone()).unwrap(),
+                    &mut want,
+                ),
+                Signal::Traces => json::write_traces(
+                    &trace_pb::TracesData::decode(p.bytes.clone()).unwrap(),
+                    &mut want,
+                ),
+                Signal::Metrics => json::write_metrics(
+                    &metrics_pb::MetricsData::decode(p.bytes.clone()).unwrap(),
+                    &mut want,
+                ),
+            }
+            assert_eq!(j.bytes, want, "{:?}", p.signal);
+            let from_proto = OtlpDecoder::new().decode_signal(p.signal, p.bytes.clone()).unwrap();
+            let from_json =
+                OtlpDecoder::new().decode_signal_json(j.signal, j.bytes.clone()).unwrap();
+            assert_eq!(from_json, from_proto, "{:?}", p.signal);
+        }
     }
 
     #[test]
