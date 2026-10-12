@@ -7453,6 +7453,10 @@ mod tests {
             ),
             (
                 "must be 'https://', or 'http://' to a loopback address",
+                edit(|s| *oauth_fields(s).1 = Some("http://10.0.0.1:8080/token".into())),
+            ),
+            (
+                "must be 'https://', or 'http://' to a loopback address",
                 edit(|s| *oauth_fields(s).1 = Some("ftp://idp/token".into())),
             ),
             ("needs 'client_id' and 'client_secret'", edit(|s| *oauth_fields(s).2 = None)),

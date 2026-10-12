@@ -197,6 +197,10 @@ enum Auth {
     },
 }
 
+/// `OAuthBearerSaslServer`'s error challenge for a token its validator refuses, as Kafka 4.2.0
+/// sends it (`script/kafka-interop`'s `oauth-refused` leg).
+const OAUTH_CHALLENGE: &str = r#"{"status":"invalid_token"}"#;
+
 /// The salt every SCRAM credential here uses.
 const SCRAM_SALT: &[u8] = b"fake-broker-salt";
 
@@ -627,19 +631,14 @@ fn sasl_authenticate(
             if accepted {
                 return done(state, auth, Vec::new());
             }
-            // OAuthBearerSaslServer's challenge for a token its validator refuses.
-            let challenge = r#"{"status":"invalid_token"}"#;
             *auth = Auth::OAuthRefused;
-            SaslAuthenticateResponse::default().with_auth_bytes(Bytes::from(challenge))
+            SaslAuthenticateResponse::default().with_auth_bytes(Bytes::from(OAUTH_CHALLENGE))
         }
         Auth::OAuthRefused if message != [0x01] => {
             fail(code::ILLEGAL_SASL_STATE, "expected a kvsep after the error challenge")
         }
-        Auth::OAuthRefused => fail(
-            code::SASL_AUTHENTICATION_FAILED,
-            "Authentication failed during authentication due to invalid credentials with SASL \
-             mechanism OAUTHBEARER",
-        ),
+        // Kafka 4.2.0 fails the exchange with the challenge as its message.
+        Auth::OAuthRefused => fail(code::SASL_AUTHENTICATION_FAILED, OAUTH_CHALLENGE),
         Auth::Handshaken(mechanism) if mechanism == "PLAIN" => {
             let parts: Vec<&[u8]> = message.split(|&b| b == 0).collect();
             if parts.len() == 3
