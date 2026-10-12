@@ -1,6 +1,6 @@
 ---
 created: 2026-10-11
-updated: 2026-10-11
+updated: 2026-10-12
 ---
 
 # `kafka_out`: a pure-Rust producer on `kafka-protocol`, with the Java producer's semantics and named divergences
@@ -136,9 +136,15 @@ A key is text, as UTF-8 bytes, so a consumer and the console tools can show it:
 
 The trace id's form matches the OpenTelemetry Collector's `kafkaexporter`, whose
 `partition_traces_by_id` and `partition_logs_by_trace_id` key a record with the trace id as lowercase
-hex (`traceutil.TraceIDToHexOrEmptyString`, which calls Go's `hex.EncodeToString`). A record that
-`kafka_out` and that exporter key by the same trace lands on the same partition. As in the
-exporter's log path, an all-zero trace id counts as no value.
+hex (`traceutil.TraceIDToHexOrEmptyString`, which calls Go's `hex.EncodeToString`), so the key
+bytes are the same. The partition isn't, with the exporter's defaults. Its `record_partitioner`
+defaults to `sticky_key` with a Sarama-compatible FNV-1a hasher, where `kafka_out` uses the Java
+client's murmur2. Against v0.162.0 on Apache Kafka 4.2.0 and Redpanda, 14 of 16 trace ids landed
+on a different partition from the exporter's default than from `kafka_out`, and none did with the
+exporter's `record_partitioner: {sticky_key: {hasher: murmur2}}`
+(`script/kafka-interop`'s `otlp-exporter-parity` leg;
+[known gaps](../known-gaps/kafka.md)). As in the exporter's log path, an all-zero trace id counts
+as no value.
 
 librdkafka's default partitioner, `consistent_random` (CRC32), doesn't match Java's: it placed 19
 of 23 keys on a different partition in the recorded cross-check. Its `murmur2_random` partitioner
@@ -355,7 +361,8 @@ one record's value, and the message's `Meta` carries the record's key and partit
 the encoder drops is counted in its `Stats`.
 
 `topic:` and `headers:` are static in this stream: one topic per sink, and the same header map on
-every record. Kafka headers keep their order and, in `kafka-protocol`'s `Record`, can't repeat a
+every record. The `otlp_proto` and `otlp_json` formats write a topic per signal ([ADR
+`kafka-otlp-formats`](kafka-otlp-formats.md)). Kafka headers keep their order and, in `kafka-protocol`'s `Record`, can't repeat a
 key.
 
 Each format stays decodable, so a future `kafka_in` can round-trip it.
@@ -406,7 +413,8 @@ Each format stays decodable, so a future `kafka_in` can round-trip it.
 - Follow-ups, each outside this stream:
   - SASL PLAIN and SCRAM, then OAUTHBEARER and AWS MSK IAM, decided in
     [ADR `kafka-sasl`](kafka-sasl.md);
-  - `otlp_proto` and `otlp_json` formats, for parity with the OTel `kafkaexporter`;
+  - `otlp_proto` and `otlp_json` formats, for parity with the OTel `kafkaexporter`, decided in
+    [ADR `kafka-otlp-formats`](kafka-otlp-formats.md);
   - pipelined produce through `Output::window`;
   - a topic chosen per event;
   - `kafka_in`, a consumer-group client;
