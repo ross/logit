@@ -807,6 +807,49 @@ pub enum KafkaAcks {
     None,
 }
 
+/// How `kafka_out` authenticates to each broker over SASL, chosen by `mechanism`. Give the
+/// password with `!env` so it stays out of the config file.
+// `Debug` is written by hand so the password never reaches a log line or an error.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "mechanism", rename_all = "snake_case", deny_unknown_fields)]
+pub enum KafkaSasl {
+    /// `PLAIN`: the username and password as they are. Without `tls:`, they cross the network
+    /// in clear, so use it only over TLS or on a network you trust.
+    Plain { username: String, password: String },
+    /// `SCRAM-SHA-256`: a challenge and response that never sends the password and checks
+    /// that the broker holds the same credential.
+    #[serde(rename = "scram_sha_256")]
+    ScramSha256 { username: String, password: String },
+    /// `SCRAM-SHA-512`, as `scram_sha_256` with SHA-512.
+    #[serde(rename = "scram_sha_512")]
+    ScramSha512 { username: String, password: String },
+}
+
+impl KafkaSasl {
+    /// The username every mechanism here authenticates as.
+    pub fn username(&self) -> &str {
+        match self {
+            KafkaSasl::Plain { username, .. }
+            | KafkaSasl::ScramSha256 { username, .. }
+            | KafkaSasl::ScramSha512 { username, .. } => username,
+        }
+    }
+}
+
+impl std::fmt::Debug for KafkaSasl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            KafkaSasl::Plain { .. } => "Plain",
+            KafkaSasl::ScramSha256 { .. } => "ScramSha256",
+            KafkaSasl::ScramSha512 { .. } => "ScramSha512",
+        };
+        f.debug_struct(name)
+            .field("username", &self.username())
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Which of the Agent's tracer-API forms `datadog_trace_out` sends traces in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub enum DatadogTraceVersion {
@@ -2874,6 +2917,13 @@ pub enum ComponentKind {
         /// Mozilla roots. Each broker's certificate is checked against the host it advertises.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
+        /// Authenticates every broker connection over SASL when present: `{mechanism: plain |
+        /// scram_sha_256 | scram_sha_512, username: NAME, password: !env VAR}`. Works with or
+        /// without `tls:`; without it, `plain` sends the password in clear. A broker that
+        /// refuses the credentials or the mechanism holds the queue until it accepts them, and
+        /// a broker that limits a session's lifetime gets a new connection before it ends.
+        #[serde(default)]
+        sasl: Option<KafkaSasl>,
     },
     /// The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS)
     /// connection, one native frame per batch, one `Ack` before that batch counts as delivered.
@@ -7107,6 +7157,7 @@ mod tests {
                 timeout,
                 headers,
                 tls,
+                sasl,
             } => {
                 assert_eq!(brokers, vec!["kafka:9092".to_string()]);
                 assert_eq!(topic, "logs");
@@ -7120,6 +7171,7 @@ mod tests {
                 assert_eq!(timeout, Duration::from_secs(30));
                 assert!(headers.is_empty());
                 assert_eq!(tls, None);
+                assert_eq!(sasl, None);
             }
             other => panic!("expected KafkaOut, got {other:?}"),
         }
@@ -7181,6 +7233,58 @@ mod tests {
             r#"{"type": "kafka_out", "brokers": ["k:9092"], "topic": "t", "linger": "5ms"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn kafka_out_sasl_takes_each_mechanism_and_rejects_an_unknown_key() {
+        let parse = |sasl: &str| {
+            serde_json::from_str::<Component>(&format!(
+                r#"{{"type": "kafka_out", "brokers": ["k:9092"], "topic": "t", "sasl": {sasl}}}"#
+            ))
+            .map(|component| match component.kind {
+                ComponentKind::KafkaOut { sasl, .. } => sasl,
+                other => panic!("expected KafkaOut, got {other:?}"),
+            })
+        };
+        let creds = || ("u".to_string(), "p".to_string());
+        for (mechanism, want) in [
+            ("plain", KafkaSasl::Plain { username: creds().0, password: creds().1 }),
+            ("scram_sha_256", KafkaSasl::ScramSha256 { username: creds().0, password: creds().1 }),
+            ("scram_sha_512", KafkaSasl::ScramSha512 { username: creds().0, password: creds().1 }),
+        ] {
+            let sasl = parse(&format!(
+                r#"{{"mechanism": "{mechanism}", "username": "u", "password": "p"}}"#
+            ))
+            .unwrap();
+            assert_eq!(sasl, Some(want), "{mechanism}");
+        }
+        for bad in [
+            r#"{"mechanism": "plain", "username": "u", "password": "p", "token": "t"}"#,
+            r#"{"mechanism": "scram_sha_256", "username": "u", "password": "p", "iterations": 1}"#,
+            r#"{"mechanism": "plain", "username": "u"}"#,
+            r#"{"mechanism": "gssapi", "username": "u", "password": "p"}"#,
+            r#"{"username": "u", "password": "p"}"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    /// The password stays out of `Debug`, and so out of any message built from a component.
+    #[test]
+    fn kafka_sasl_debug_redacts_the_password() {
+        let sasl = KafkaSasl::ScramSha512 {
+            username: "alice".to_string(),
+            password: "hunter2-secret".to_string(),
+        };
+        let shown = format!("{sasl:?}");
+        assert!(shown.contains("alice"), "{shown}");
+        assert!(!shown.contains("hunter2-secret"), "{shown}");
+        let component: Component = serde_json::from_str(
+            r#"{"type": "kafka_out", "brokers": ["k:9092"], "topic": "t",
+                "sasl": {"mechanism": "plain", "username": "alice", "password": "hunter2-secret"}}"#,
+        )
+        .unwrap();
+        assert!(!format!("{component:?}").contains("hunter2-secret"));
     }
 
     #[test]

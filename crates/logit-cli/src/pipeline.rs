@@ -46,7 +46,8 @@ use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::graphite::{GraphiteOutput, Transport as GraphiteOutTransport};
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::kafka::{
-    KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings, RecordFormat, RecordKey, RecordMode,
+    KafkaAcks, KafkaCompression, KafkaOutput, KafkaSasl, KafkaSettings, RecordFormat, RecordKey,
+    RecordMode,
 };
 use logit_outputs::logit::LogitOutput;
 use logit_outputs::null::NullOutput;
@@ -1232,6 +1233,7 @@ fn build_spec(
             timeout,
             headers,
             tls,
+            sasl,
         } => {
             let settings = KafkaSettings {
                 brokers: brokers.clone(),
@@ -1270,6 +1272,17 @@ fn build_spec(
                 timeout: *timeout,
                 headers: headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 client_id: format!("logit-{id}"),
+                sasl: sasl.as_ref().map(|sasl| match sasl.clone() {
+                    logit_config::KafkaSasl::Plain { username, password } => {
+                        KafkaSasl::Plain { username, password }
+                    }
+                    logit_config::KafkaSasl::ScramSha256 { username, password } => {
+                        KafkaSasl::ScramSha256 { username, password }
+                    }
+                    logit_config::KafkaSasl::ScramSha512 { username, password } => {
+                        KafkaSasl::ScramSha512 { username, password }
+                    }
+                }),
             };
             let mut output = KafkaOutput::new(settings)?
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))

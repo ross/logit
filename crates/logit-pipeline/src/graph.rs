@@ -283,8 +283,9 @@
 //! 85. A `kafka_out` with an empty `brokers` or an entry that isn't a `host:port`, a `topic` that
 //!     isn't a legal Kafka topic name, a `key` naming an empty attribute, a `key` other than
 //!     `none` with `record: batch` (`format: native`'s default), `idempotent: true` without
-//!     `acks: all`, a `max_request_bytes` of `0`, `timeout: 0s`, or a `tls` failing rule 34's
-//!     checks (`docs/adr/kafka-output.md`).
+//!     `acks: all`, a `max_request_bytes` of `0`, `timeout: 0s`, a `tls` failing rule 34's
+//!     checks, or a `sasl` with an empty `username` (`docs/adr/kafka-output.md`,
+//!     `docs/adr/kafka-sasl.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3600,7 +3601,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // rather than on every attempt. A topic name outside Kafka's own rule (1 to 249 characters of
     // `[a-zA-Z0-9._-]`, not `.` or `..`) would be refused by the broker for every batch. A batch
     // record holds many events and carries no key, so a configured key would be ignored. `tls`
-    // gets rule 34's two checks: its presence turns TLS on.
+    // gets rule 34's two checks: its presence turns TLS on. No broker takes an empty SASL
+    // username, so one would be refused on every connection.
     for (id, component) in &components {
         let ComponentKind::KafkaOut {
             brokers,
@@ -3613,6 +3615,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             max_request_bytes,
             timeout,
             tls,
+            sasl,
             ..
         } = &component.kind
         else {
@@ -3696,6 +3699,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      specific trusted CA meaningless"
                 );
             }
+        }
+        if sasl.as_ref().is_some_and(|sasl| sasl.username().is_empty()) {
+            anyhow::bail!(
+                "component '{id}': kafka_out 'sasl.username' is empty -- give the user the broker \
+                 knows these credentials by"
+            );
         }
     }
 
@@ -7019,6 +7028,7 @@ mod tests {
             timeout: logit_config::default_kafka_timeout(),
             headers: Default::default(),
             tls: None,
+            sasl: None,
         }
     }
 
@@ -7046,6 +7056,15 @@ mod tests {
             }
         });
         kafka_out_result(kind).expect("acks: leader without idempotence, and an empty tls block");
+        let kind = kafka_out_with(|k| {
+            if let ComponentKind::KafkaOut { sasl, .. } = k {
+                *sasl = Some(logit_config::KafkaSasl::Plain {
+                    username: "u".into(),
+                    password: String::new(),
+                });
+            }
+        });
+        kafka_out_result(kind).expect("sasl without tls, and an empty password");
         let kind = kafka_out_with(|k| {
             if let ComponentKind::KafkaOut { key, format, record, .. } = k {
                 *key = logit_config::KafkaKey::TraceId;
@@ -7187,6 +7206,17 @@ mod tests {
                             ca_file: Some("ca.pem".into()),
                             insecure_skip_verify: true,
                             ..Default::default()
+                        });
+                    }
+                }),
+            ),
+            (
+                "'sasl.username' is empty",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { sasl, .. } = k {
+                        *sasl = Some(logit_config::KafkaSasl::ScramSha256 {
+                            username: String::new(),
+                            password: "p".into(),
                         });
                     }
                 }),

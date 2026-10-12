@@ -2932,6 +2932,18 @@
                 }
               ]
             },
+            "sasl": {
+              "description": "Authenticates every broker connection over SASL when present: `{mechanism: plain | scram_sha_256 | scram_sha_512, username: NAME, password: !env VAR}`. Works with or without `tls:`; without it, `plain` sends the password in clear. A broker that refuses the credentials or the mechanism holds the queue until it accepts them, and a broker that limits a session's lifetime gets a new connection before it ends.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/KafkaSasl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "sources": true,
             "targets": true,
             "timeout": {
@@ -4410,6 +4422,83 @@
           "enum": [
             "batch"
           ]
+        }
+      ]
+    },
+    "KafkaSasl": {
+      "description": "How `kafka_out` authenticates to each broker over SASL, chosen by `mechanism`. Give the password with `!env` so it stays out of the config file.",
+      "oneOf": [
+        {
+          "description": "`PLAIN`: the username and password as they are. Without `tls:`, they cross the network in clear, so use it only over TLS or on a network you trust.",
+          "type": "object",
+          "required": [
+            "mechanism",
+            "password",
+            "username"
+          ],
+          "properties": {
+            "mechanism": {
+              "type": "string",
+              "enum": [
+                "plain"
+              ]
+            },
+            "password": {
+              "type": "string"
+            },
+            "username": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`SCRAM-SHA-256`: a challenge and response that never sends the password and checks that the broker holds the same credential.",
+          "type": "object",
+          "required": [
+            "mechanism",
+            "password",
+            "username"
+          ],
+          "properties": {
+            "mechanism": {
+              "type": "string",
+              "enum": [
+                "scram_sha_256"
+              ]
+            },
+            "password": {
+              "type": "string"
+            },
+            "username": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`SCRAM-SHA-512`, as `scram_sha_256` with SHA-512.",
+          "type": "object",
+          "required": [
+            "mechanism",
+            "password",
+            "username"
+          ],
+          "properties": {
+            "mechanism": {
+              "type": "string",
+              "enum": [
+                "scram_sha_512"
+              ]
+            },
+            "password": {
+              "type": "string"
+            },
+            "username": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },
