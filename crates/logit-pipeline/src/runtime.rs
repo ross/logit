@@ -1865,17 +1865,12 @@ async fn run_router(
                     None => continue,
                 },
             };
-            // `Fanout::deliver` returns early on zero consumers and counts nothing, so unrouted
-            // events must be counted here. A router with targets and no ordinary consumers is
-            // legal (rule 50); its forward partition is the events no route claimed.
-            if slot == 0 && destination.is_empty() {
-                telemetry.count(
-                    "logit.component.events.dropped",
-                    out.events.len() as f64,
-                    &[("reason", "unrouted")],
-                );
-                continue;
-            }
+            // `Fanout::deliver` returns early on zero consumers and counts nothing. Graph rule 50
+            // gives every router an ordinary consumer, so the forward partition always has one.
+            debug_assert!(
+                !destination.is_empty(),
+                "router destination slot {slot} has no consumer"
+            );
             destination.send_with_own_context(out, ctx).await;
         }
     }
@@ -2606,7 +2601,6 @@ fn run_lua_loop(
                     &resource,
                     &scope,
                     ctx,
-                    &telemetry,
                 );
                 span.events(sent);
             }
@@ -2806,7 +2800,6 @@ fn run_lua_loop(
             &resource,
             &scope,
             ctx,
-            &telemetry,
         );
         drop(guard);
         if sent > 0 {
@@ -2859,8 +2852,8 @@ fn lua_slot_of(mark: Option<u16>, slots: usize) -> usize {
 /// [`BatchContext`], each buffer taken with `std::mem::take` (see [`RouterScratch`]). Returns the
 /// number of events handed over, for the caller's span. Used by both `run_lua` paths.
 ///
-/// Counts an unconsumed forward partition as `events.dropped{reason="unrouted"}`, as
-/// `run_router` does, since `Fanout::deliver` counts nothing on zero consumers.
+/// `Fanout::deliver` counts nothing on zero consumers; graph rule 50 gives a `lua` node with
+/// `targets:` an ordinary consumer, so no partition goes uncounted.
 fn send_lua_partitions(
     dests: &mut [Vec<Event>],
     fanout: &Fanout,
@@ -2868,7 +2861,6 @@ fn send_lua_partitions(
     resource: &Arc<Resource>,
     scope: &Option<Arc<Scope>>,
     ctx: BatchContext,
-    telemetry: &Telemetry,
 ) -> u64 {
     let mut sent = 0u64;
     for (slot, dest) in dests.iter_mut().enumerate() {
@@ -2887,14 +2879,7 @@ fn send_lua_partitions(
                 None => continue,
             },
         };
-        if slot == 0 && destination.is_empty() {
-            telemetry.count(
-                "logit.component.events.dropped",
-                events.len() as f64,
-                &[("reason", "unrouted")],
-            );
-            continue;
-        }
+        debug_assert!(!destination.is_empty(), "lua destination slot {slot} has no consumer");
         destination.send_blocking_with_own_context(
             EventBatch { resource: resource.clone(), scope: scope.clone(), events },
             ctx,
@@ -11731,99 +11716,6 @@ mod tests {
         );
     }
 
-    /// With no ordinary consumers, unrouted events are counted as dropped and the run terminates.
-    #[tokio::test]
-    async fn unrouted_events_are_counted_when_a_router_has_no_ordinary_consumers() {
-        let g = routed_graph(vec![
-            (
-                "in",
-                vec![],
-                vec![],
-                ComponentKind::StatsdIn {
-                    bind: "127.0.0.1:0".to_string(),
-                    transport: logit_config::StatsdTransport::default(),
-                    tls: None,
-                    handshake_timeout: logit_config::default_handshake_timeout(),
-                    idle_timeout: None,
-                    max_connections: logit_config::default_max_connections(),
-                    peer: false,
-                    reuse_port: false,
-                    proxy_protocol: false,
-                    socket_mode: None,
-                },
-            ),
-            (
-                "split",
-                vec!["in"],
-                vec!["a"],
-                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
-            ),
-            ("a", vec![], vec![], ComponentKind::Target {}),
-            ("sink_a", vec!["a"], vec![], influxdb_out()),
-        ]);
-
-        let (tx_a, rx_a) = std::sync::mpsc::channel();
-        let batch = one_batch(vec![
-            tagged_event("routed", Some("a")),
-            tagged_event("unrouted_one", None),
-            tagged_event("unrouted_two", Some("zzz")),
-        ]);
-
-        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
-        specs.insert(
-            "in".to_string(),
-            NodeSpec::Input(
-                Box::new(FiniteInput { batch: Some(batch) }),
-                InputRuntimeConfig::default(),
-            ),
-        );
-        specs.insert(
-            "split".to_string(),
-            NodeSpec::Router(Box::new(SplitByAttr::new("stream", &[("a", 0)]))),
-        );
-        specs.insert("a".to_string(), NodeSpec::Target);
-        specs.insert("sink_a".to_string(), recording_sink(tx_a));
-
-        let registry = Registry::new();
-        let telemetry: HashMap<String, Telemetry> = ["in", "split", "a", "sink_a"]
-            .into_iter()
-            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
-            .collect();
-
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            run_with_telemetry(g, specs, telemetry, Readiness::disabled(), std::future::pending()),
-        )
-        .await
-        .expect("a router whose forward partition has nowhere to go must not hang the run")
-        .expect("run should complete without error");
-
-        let routed = rx_a.recv_timeout(Duration::from_secs(1)).expect("sink_a gets the routed one");
-        assert_eq!(routed.events.len(), 1);
-
-        let events = registry.drain(0);
-        let dropped = events
-            .iter()
-            .filter(|e| e.attributes.get("component").and_then(|v| v.as_str()) == Some("split"))
-            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("unrouted"))
-            .find_map(|e| {
-                e.metrics.iter().find_map(|m| match &m.kind {
-                    MetricKind::Sum(s)
-                        if logit_core::interner::resolve(m.name)
-                            == "logit.component.events.dropped" =>
-                    {
-                        Some(s.value)
-                    }
-                    _ => None,
-                })
-            });
-        assert_eq!(
-            dropped,
-            Some(2.0),
-            "both unrouted events should be counted under the router, got: {events:?}"
-        );
-    }
-
     /// Downstream of a target, `previous` is the target's id and `origin` is still the listener.
     #[tokio::test]
     async fn previous_downstream_of_a_target_is_the_targets_id_and_origin_is_untouched() {
@@ -12064,9 +11956,11 @@ mod tests {
             ),
             ("shared", vec![], vec![], ComponentKind::Target {}),
             ("sink", vec!["shared"], vec![], influxdb_out()),
+            ("rest", vec!["split_a", "split_b"], vec![], influxdb_out()),
         ]);
 
         let (tx, rx) = std::sync::mpsc::channel();
+        let (tx_rest, _rx_rest) = std::sync::mpsc::channel();
         let batch =
             one_batch(vec![tagged_event("from_a", Some("a")), tagged_event("from_b", Some("b"))]);
 
@@ -12078,7 +11972,7 @@ mod tests {
                 InputRuntimeConfig::default(),
             ),
         );
-        // Each router claims one event for `shared`; the other is dropped as unrouted.
+        // Each router claims one event for `shared`; the other goes to `rest`.
         specs.insert(
             "split_a".to_string(),
             NodeSpec::Router(Box::new(SplitByAttr::new("stream", &[("a", 0)]))),
@@ -12089,6 +11983,7 @@ mod tests {
         );
         specs.insert("shared".to_string(), NodeSpec::Target);
         specs.insert("sink".to_string(), recording_sink(tx));
+        specs.insert("rest".to_string(), recording_sink(tx_rest));
 
         tokio::time::timeout(Duration::from_secs(5), run(g, specs))
             .await

@@ -34,9 +34,9 @@ impl Leftover {
     /// else is routine. Both are exclusion lists, so a reason or metric added later warns until
     /// someone decides it is intended.
     fn is_loss(&self) -> bool {
-        /// Drops a transform or router makes because the config says to: an aggregate or filter
-        /// absorbing an event, a route with no matching target, and a script returning no event.
-        const INTENDED_REASONS: [&str; 3] = ["absorbed", "unrouted", "script_drop"];
+        /// Drops a transform makes because the config says to: an aggregate or filter absorbing
+        /// an event, and a script returning no event.
+        const INTENDED_REASONS: [&str; 2] = ["absorbed", "script_drop"];
         /// Config-intended drops counted with no `reason` tag. A component that adds a counter
         /// named `*.dropped` for something the config asked for and tags no reason must add the
         /// metric here, or every clean exit logs it at `warn`.
@@ -175,10 +175,10 @@ mod tests {
             tags: format!("reason={reason}"),
             reading: Reading::Value(3.0),
         };
-        for intended in ["absorbed", "unrouted", "script_drop"] {
+        for intended in ["absorbed", "script_drop"] {
             assert!(!dropped(intended).is_loss(), "{intended}");
         }
-        for lost in ["shutdown", "rejected", "ambiguous_at_most_once", "a_new_reason"] {
+        for lost in ["shutdown", "rejected", "ambiguous_at_most_once", "unrouted", "a_new_reason"] {
             assert!(dropped(lost).is_loss(), "{lost}");
         }
     }

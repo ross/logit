@@ -521,7 +521,6 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.process.duration` | timing | `run_transform`, `run_lua`, `run_router` (whole batch — for a router this spans `route_batch`'s partition, not any one destination's send) |
 | `logit.component.events.dropped{reason="absorbed"}` | count | `Transform::process` returned `false` |
 | `logit.component.events.dropped{reason="script_drop"}` | count | Lua `ProcessOutcome::Drop` |
-| `logit.component.events.dropped{reason="unrouted"}` | count | `run_router` or `run_lua`: events no route or `event:to(..)` claimed, at a node with targets and no ordinary consumers. See below. |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
 | `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window` |
 | `logit.component.retries` | count | a retried delivery attempt or windowed round, `deliver_with_retry` or `deliver_window` (`write_loop`) |
@@ -558,12 +557,10 @@ a wedge, with an error naming the node. The batch that crossed the cap has alrea
 batches still waiting in its inbox count as `batches.dropped`/`events.dropped{reason="shutdown"}`
 under its own id. A memory failure is not a panic, so it never logs `thread_panicked`.
 
-**`unrouted` is counted explicitly** ([ADR `target-components`](../adr/target-components.md)).
-`Fanout` returns early on zero consumers and counts nothing, and the ADR's rule is that unrouted
-events are dropped and counted, never silently. A router *with* ordinary consumers never emits
-this reason, because its unrouted events go to those consumers. A `lua`/`lua_file` component with
-`targets:` and no ordinary consumers follows the same rule, on both its batch path and its
-`flush()`.
+**An unrouted event has no counter of its own** ([ADR `target-components`](../adr/target-components.md)).
+Graph rule 50 rejects a router (`route`, or `lua`/`lua_file` with `targets:`) that has no
+ordinary consumer, so every event no target claims reaches one. A config that discards those
+events names a `null_out` as that consumer, whose `events.received` counts them.
 
 **`absorbed` is imprecise for filters.** `process_batch` records
 `logit.component.events.dropped{reason="absorbed"}` whenever a transform returns `false`, including
@@ -1394,8 +1391,8 @@ those values as *fields*, not as a rendered message.
 **Layer 2 only**, for the same reason as `generate_in`. `run_router`/`route_batch` already record
 `batches.received`/`events.received`/`process.duration`, and every destination's own `Fanout`
 counts what it sent, so a native equality match has nothing further worth a counter. An event
-`route` can't place lands on its router's `Forward` partition, which is what
-`events.dropped{reason="unrouted"}` counts when that router has no ordinary consumers.
+`route` can't place lands on its router's `Forward` partition, and so on its ordinary consumers,
+which every router has.
 
 ##### `aggregate`
 

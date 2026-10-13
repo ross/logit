@@ -143,7 +143,7 @@ pub enum ComponentKind {
     Csv { columns: Vec<String>, delimiter: char },
     // Equality-only routing: one key read per event, one target per matching value
     // (docs/adr/target-components.md). An unrouted event goes to this component's ordinary
-    // consumers.
+    // consumers, which it must have (a null_out to discard them).
     Route { by: RouteBy, routes: BTreeMap<String, String> },
     // Keeps a fraction of events by a hashed key (trace_id, an attribute, or a resource
     // attribute), so every event sharing a key gets the same verdict in every process;
@@ -229,9 +229,10 @@ literal argument string.
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, `kafka_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
-Rule 50 relaxes rule 7's "≥1 consumer" for *routers* only. A router's ordinary consumers receive
-only its *unrouted* events, so a router may have none; its unrouted events are then dropped and
-counted, never lost silently ([ADR `target-components`](../adr/target-components.md)).
+Rule 50 holds a *router* to rule 7's "≥1 consumer" with its own message. A router's ordinary
+consumers receive its *unrouted* events, so a router with none would lose them; an operator who
+wants them gone names a `null_out` as that consumer, so the discard shows in the graph
+([ADR `target-components`](../adr/target-components.md)).
 
 Role is never derived from topology ("no sources → listener", "nothing reads it → sink"). ADR
 `component-graph-configuration` rejected that because a typo'd source reference would silently
@@ -484,9 +485,9 @@ component is one that appears in several `sources` lists, with nothing to specia
   each incoming batch it routes every event by *borrowing* it, counts per destination,
   `reserve_exact`s, moves each event into its destination's buffer (`route_batch`), and sends
   **one batch per non-empty destination under one child `BatchContext` and one span**. One
-  incoming batch is one hop however many ways it forks, the same rule ordinary fan-out follows. A
-  router with targets and no ordinary consumers is legal; its forward partition is dropped and
-  counted `logit.component.events.dropped{reason="unrouted"}`, never silently.
+  incoming batch is one hop however many ways it forks, the same rule ordinary fan-out follows.
+  Rule 50 gives every router an ordinary consumer, so its forward partition always has a
+  destination.
 - **Shutdown cascades by channel closure** from listeners toward sinks. A node whose inbox closes
   drains it and exits, which drops its `Fanout`'s senders and closes its consumers' inboxes in
   turn. With `shutdown.delay` set and the process `Ready` at the signal, the runtime's shutdown

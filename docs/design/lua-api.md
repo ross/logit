@@ -271,11 +271,9 @@ was called on, so `return event:to("host_stream")` is the idiomatic one-liner, a
   `targets:`.
 - **An unmarked event goes to the component's own consumers**, the components that list it in
   `sources:`. That ordinary outbound edge is the else-branch; you don't need a chain of
-  complementary filters. A router with targets and **no** ordinary consumers is a legal config,
-  and it drops and counts its unmarked events as
-  `logit.component.events.dropped{reason="unrouted"}` (`docs/design/internal-telemetry.md`). This
-  includes unmarked events from `flush()`: an `interval:`-bearing router with no ordinary
-  consumers loses any unmarked output its `flush()` emits.
+  complementary filters. A component with `targets:` and **no** ordinary consumer fails
+  validation, because its unmarked events, including unmarked output from `flush()`, would have
+  nowhere to go. To discard them on purpose, list the component in a `null_out`'s `sources:`.
 - **`event:clone()` copies the mark**, so a script fanning a routed event out gets two events
   headed the same way; `copy:to(nil)` (or `copy:to("other")`) makes them diverge. The mark is
   per-*event*, not per-call: `return {a:to("x"), b}` sends `a` to `x` and `b` to the component's
