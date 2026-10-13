@@ -277,7 +277,6 @@ proptest! {
 /// newline. A key holding `\,` miscounts the other way, so a later string value's opening quote
 /// is missed and a newline inside it ends the line.
 #[test]
-#[ignore = "encoder: write `\"` in a field key as `\\\"`, and skip a field key with `\\` before `,` or `=`"]
 fn a_field_key_that_desyncs_the_line_splitter_is_never_written() {
     for key in ["a\\=b\"c", "x\\,"] {
         let neighbor = point("n", &[], &[("f", MetricValue::I64(1))], &[], 6);

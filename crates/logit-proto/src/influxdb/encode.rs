@@ -13,9 +13,10 @@
 //! tag value, and field key, a backslash escapes only a following `,`, space, or `=`; before
 //! anything else, another backslash included, it is a literal backslash. So the encoder writes a
 //! backslash as itself, never `\\`, and escapes `,` and space with one backslash everywhere and `=`
-//! in a tag key, tag value, or field key. A measurement never carries `\=`: `influxd` accepts it
-//! and stores a series no query can read. Inside a quoted string field value the rules differ:
-//! `\` is written `\\` and `"` is written `\"`.
+//! in a tag key, tag value, or field key. A field key also writes `"` as `\"`, which `influxd`
+//! reads back as `"`. A measurement never carries `\=`: `influxd` accepts it and stores a series
+//! no query can read. Inside a quoted string field value the rules differ: `\` is written `\\`
+//! and `"` is written `\"`.
 //!
 //! That grammar has no spelling for some keys, and the encoder skips them rather than write a line
 //! `influxd` would read differently or reject with the whole batch:
@@ -23,7 +24,10 @@
 //! - any key ending in `\`, since that backslash would escape the delimiter after it;
 //! - a measurement with a `\` directly before `,`, space, or `=`: `influxd` stores the series but
 //!   no query reads it back;
-//! - a field key holding `\"`, which `influxd` reads as `"`.
+//! - a field key with a `\` directly before `,`, space, `=`, or `"`. Written, the backslash and
+//!   the escape after it make `\\`, which `influxd`'s line splitter (and [`super::line::lines`])
+//!   skips as a pair, leaving the delimiter or quote bare: a bare `"` opens a quote that swallows
+//!   the newline, and a bare delimiter shifts every quote after it.
 //!
 //! A tag is skipped alone (`logit.output.tags.dropped{reason="unencodable"}`); a measurement or
 //! field key skips its point or field (`logit.output.metrics.skipped{reason="unencodable_key"}`).
@@ -316,7 +320,7 @@ impl Ctx<'_> {
                 }
             }
             separator(self.fields);
-            push_escaped_key(self.fields, key);
+            push_escaped_field_key(self.fields, key);
             self.fields.push('=');
             push_typed_value(self.fields, value);
             written += 1;
@@ -337,7 +341,7 @@ impl Ctx<'_> {
                 continue;
             }
             separator(self.fields);
-            push_escaped_key(self.fields, field);
+            push_escaped_field_key(self.fields, field);
             self.fields.push('=');
             push_quoted(self.fields, text);
             written += 1;
@@ -814,10 +818,13 @@ fn tag_encodable(s: &str) -> bool {
     !s.contains(['\n', '\r']) && !s.ends_with('\\')
 }
 
-/// A carrier field key with a spelling: non-empty, as [`tag_encodable`], and no `\"`, which
-/// `influxd` reads back as `"`.
+/// A carrier field key with a spelling: non-empty, as [`tag_encodable`], and no `\` directly
+/// before a character [`push_escaped_field_key`] escapes (this module's "Escaping").
 fn field_key_encodable(s: &str) -> bool {
-    !s.is_empty() && tag_encodable(s) && !s.contains("\\\"")
+    let bytes = s.as_bytes();
+    !s.is_empty()
+        && tag_encodable(s)
+        && bytes.windows(2).all(|w| w[0] != b'\\' || !matches!(w[1], b',' | b' ' | b'=' | b'"'))
 }
 
 /// Appends a measurement, escaping `,` and space. `=` and `\` go as themselves.
@@ -832,6 +839,11 @@ fn push_escaped_measurement(out: &mut String, s: &str) {
 /// Appends a tag key, tag value, or field key, escaping `,`, `=`, and space. `\` goes as itself.
 fn push_escaped_key(out: &mut String, s: &str) {
     push_escaped(out, s, &[',', '=', ' ']);
+}
+
+/// Appends a carrier field key: as [`push_escaped_key`], and `"` written `\"`.
+fn push_escaped_field_key(out: &mut String, s: &str) {
+    push_escaped(out, s, &[',', '=', ' ', '"']);
 }
 
 /// Appends `s` to `out`, prefixing each of `needs_escape` with a backslash. Copies in runs between
@@ -1179,6 +1191,28 @@ mod tests {
         )]);
         assert_eq!(out, "m h=3i 1700000000000000000\n");
         assert_eq!(stats.skipped_unencodable_key, 2);
+    }
+
+    /// A field key writes `"` as `\"` (probe row 2.11 `f\"k` stored `f"k`). A `\` before a
+    /// character the key escapes is skipped: written, it makes a `\\` pair `influxd`'s line
+    /// splitter skips, leaving a bare `=` or `"` that breaks the line.
+    #[test]
+    fn a_field_key_escapes_a_quote_and_skips_a_backslash_before_an_escape() {
+        let mut event = carrier_event("m", &[("q\"k", MetricValue::I64(1))]);
+        event.attributes.insert("influxdb.field.s\"t", "v");
+        assert_eq!(encode(vec![event]), "m q\\\"k=1i,s\\\"t=\"v\" 1700000000000000000\n");
+
+        let (out, stats) = encode_stats(vec![carrier_event(
+            "m",
+            &[
+                ("a\\=b", MetricValue::I64(1)),
+                ("x\\,", MetricValue::I64(2)),
+                ("c\\ d", MetricValue::I64(3)),
+                ("ok\\x", MetricValue::I64(4)),
+            ],
+        )]);
+        assert_eq!(out, "m ok\\x=4i 1700000000000000000\n");
+        assert_eq!(stats.skipped_unencodable_key, 3);
     }
 
     /// Inside quotes, `\` is written `\\` and `"` is `\"`; `,`, space, and `=` need nothing
