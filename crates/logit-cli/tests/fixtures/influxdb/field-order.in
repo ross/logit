@@ -1,0 +1,1 @@
+log,host=a msg="started, ok",code=3i,level="info",ms=1.5 1700000000000000000

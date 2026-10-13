@@ -1,0 +1,4 @@
+weather,city=paris,country=fr temp=21,wind=3.5,hum="high" 1700000000000000000
+weather,city=lyon,country=fr temp=18 1700000000000000000
+weather,city=paris,country=fr temp=19 1700000060000000000
+dup f=2i 1700000000000000000

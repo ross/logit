@@ -1,0 +1,19 @@
+# Leg 11 of `script/victoria-interop`: `influxdb_in` receiving a line-protocol write that
+# `influxdb_out` relays to VictoriaMetrics's `/api/v2/write`. `check.py` posts the body here and
+# straight to VictoriaMetrics, then compares what each path stored. `org` and `bucket` are
+# ignored by VictoriaMetrics, and so is the token.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  influx_in:
+    type: influxdb_in
+    bind: 0.0.0.0:8087
+
+  victoria_metrics:
+    type: influxdb_out
+    sources: [influx_in]
+    url: http://victoria-metrics:8428
+    org: vi-org
+    bucket: vi-bucket
+    token: unused-by-victoriametrics

@@ -354,6 +354,7 @@ below reflect that rerun, the rest reflect the original run.
 | 8 | Worked | 53 records under `app_name:vi-syslog`, `_msg` the message with no length prefix, so VictoriaLogs detects `syslog_out`'s octet counting; `format=rfc5424`, stream `{app_name, hostname, proc_id}` |
 | 9 | Worked | `prometheus_in` scrapes `/federate?match[]=vi_rw1_gauge` every 5 s: `vi_rw1_gauge` comes back a `Gauge` with `prometheus.type="untyped"` and its wire timestamp kept |
 | 10 | Fixed, plus W2 | Before W2: vmagent's first zstd request got `415` (`logit.input.writes{class="unsupported"}` = 1), vmagent logged "Downgrading protocol from VictoriaMetrics to Prometheus remote write for all future requests", and every later request was Snappy and `class="ok"`. Fixed in `9bce48fd` (`fix(proto): sort a remote-write label set instead of skipping it`) for the label-sorting bug the original leg-10 row described. After W2 (`prometheus_in` accepts zstd), vmagent's first request already succeeds: `class="ok",encoding="zstd"` for every write (22 in the window), `class="unsupported"` stays 0, and vmagent's log never shows the downgrade; both `vi_expose_*` series arrive with nothing skipped |
+| 11 | Worked | 2026-10-13: `influxdb_in` -> `influxdb_out` -> VictoriaMetrics against the same body posted straight to VictoriaMetrics (`logit-influx-relay.yaml`): same 12 series, labels, timestamps, and distinct values. VictoriaMetrics stores a bool as 1/0 and the string field as `0` (it does not ignore it) on both paths. It stores an exact duplicate point as a second sample at the same timestamp; `influxdb_in` merges it first (normalization 2), so the relayed series has one |
 
 The run's own table, verbatim (legs 1z and 10 from the `cacf17bf` rerun, the rest from the
 original `73ca4931` run):
@@ -370,6 +371,7 @@ original `73ca4931` run):
 | 8 | syslog_out TCP -> VictoriaLogs syslog | PASS | 53 records, _msg='victoria-interop syslog line 52' (no length prefix: octet counting detected), format=rfc5424, _stream={app_name="vi-syslog",hostname="vi-syslog-host",proc_id="-"} |
 | 9 | prometheus_in scrape <- VictoriaMetrics /federate | PASS | 10 scrapes of vi_rw1_gauge, rendered `vi_rw1_gauge gauge=42`, prometheus.type=untyped, wire timestamp kept |
 | 10 | vmagent remote-write -> prometheus_in bind: | PASS | writes class=ok,encoding=zstd 22 (class=ok total 22), class=unsupported 0; vmagent log does not show the downgrade; received ['vi_expose_gauge', 'vi_expose_requests_total'] vi_expose_* series; 0 series skipped |
+| 11 | influxdb_in -> influxdb_out -> VictoriaMetrics, against a direct write | PASS | 12 series over fields ['idle', 'note', 'usage_system', 'usage_user'] and 20 points on the direct path, identical by series, labels, timestamps, and distinct values on the relayed path; a bool is stored as 1/0 and the string field (note) as 0 on both paths, so the comparison expects the same loss on both; VictoriaMetrics keeps the duplicate point as 4 extra sample(s) at one timestamp, which influxdb_in merges before it relays |
 ```
 
 ### Gaps for W3

@@ -1,0 +1,60 @@
+# An InfluxDB 2.x relay: `influxdb_in` stands in for InfluxDB's write API, and `influxdb_out`
+# forwards every write to the `influxdb` service compose.yaml seeds (org `logit`, bucket
+# `metrics`). A Telegraf `outputs.influxdb_v2`, an InfluxDB client library, or another `logit`'s
+# `influxdb_out` points at this host's port 8087 instead of InfluxDB's 8086, and nothing else on
+# the client changes (docs/adr/influxdb-line-protocol-relay.md).
+#
+# The relay is lossless modulo the normalization list in `crates/logit-proto/src/influxdb/mod.rs`'s
+# module doc: duplicate points in one body merge, tag order is canonicalized, string fields leave
+# after the numeric ones, numbers leave in their shortest spelling, and every point leaves with a
+# nanosecond timestamp (one that arrived with none gets its receipt time). Each write's `org` and
+# `bucket` ride on the batch as the resource attributes `influxdb.org` and `influxdb.bucket`, which
+# are never tags; this sink writes to its own `org`/`bucket` below, whatever the client named.
+#
+# Run it with `script/server fixtures/influxdb-relay.yaml`. compose.yaml's `dev` service publishes
+# no ports, so drive the listener from inside that container (`docker compose exec dev bash`;
+# `script/console` starts a separate one) with `curl`:
+#
+#   curl -i -XPOST 'http://localhost:8087/api/v2/write?org=logit&bucket=metrics&precision=s' \
+#     -H "Authorization: Token $INFLUXDB_TOKEN" \
+#     --data-binary 'cpu,host=web-1,cpu=cpu0 usage_user=1.5,usage_idle=98.5 1700000000'
+#
+# or with a Telegraf on the compose network, whose `outputs.influxdb_v2` needs only its URL
+# changed:
+#
+#   [[outputs.influxdb_v2]]
+#     urls = ["http://logit:8087"]
+#     token = "$INFLUXDB_TOKEN"
+#     organization = "logit"
+#     bucket = "metrics"
+#
+# then read the points back in InfluxDB's UI on port 8086. A write this listener can't parse is a
+# `400` naming the line, as InfluxDB answers, and nothing of that body is forwarded.
+components:
+  influx_in:
+    type: influxdb_in
+    # Port 8087, so this listener and the seeded InfluxDB's 8086 can share a host.
+    bind: 0.0.0.0:8087
+    # Clients keep the token they send InfluxDB; this listener checks it and the sink sends its
+    # own. Omit `tokens:` to accept any request.
+    tokens: [!env INFLUXDB_TOKEN]
+    # Every field below is its default; omit it for the same effect.
+    # max_request_bytes: "25MiB" # per body, as sent and after gzip; a larger one is a `413`
+    # handshake_timeout: 5s      # per pre-request phase (PROXY header, TLS accept, first byte)
+    # idle_timeout: 5m           # off by default; set it well above a client's flush interval
+    # max_connections: 1024
+    # peer: false                # true stamps network.peer.address/port on every point
+    # tls:                       # presence turns TLS on with no plaintext fallback
+    #   cert_file: /etc/logit/tls/server.pem
+    #   key_file: /etc/logit/tls/server.key
+
+  influx_out:
+    type: influxdb_out
+    sources: [influx_in]
+    url: http://influxdb:8086
+    org: logit
+    bucket: metrics
+    token: !env INFLUXDB_TOKEN
+    # buffer: (all defaults, docs/adr/buffered-sink-delivery.md). `delivery:` defaults to
+    #   at_least_once: InfluxDB overwrites a point with the same measurement, tag set, and
+    #   timestamp, so a resent batch lands once.

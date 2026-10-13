@@ -80,6 +80,10 @@ services:
     <<: *logit
     volumes: ["./logit-influx.yaml:/config.yaml:ro,z"]
 
+  logit-influx-relay:
+    <<: *logit
+    volumes: ["./logit-influx-relay.yaml:/config.yaml:ro,z"]
+
   logit-graphite:
     <<: *logit
     volumes: ["./logit-graphite.yaml:/config.yaml:ro,z"]

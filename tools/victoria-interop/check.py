@@ -303,6 +303,76 @@ def leg_10():
     return "PASS", detail
 
 
+# One fixed write body for leg 11, with %s standing for the measurement. It has typed fields (float,
+# integer, bool, string), an exact duplicate point, a tag value escaped with a space, a comma, and
+# an equals sign, a point with no tags beyond host, and a second host.
+INFLUX_BODY = (
+    "%(m)s,host=a,region=us\\ west usage_user=1.5,usage_system=2i,idle=true,note=\"x\" 1700000000\n"
+    "%(m)s,host=a,region=us\\ west usage_user=2.5,usage_system=3i,idle=false,note=\"y\" 1700000010\n"
+    "%(m)s,host=a,region=us\\ west usage_user=2.5,usage_system=3i,idle=false,note=\"y\" 1700000010\n"
+    "%(m)s,host=b,dc=x\\,y\\=z usage_user=0.25,usage_system=7i,idle=false,note=\"z\" 1700000000\n"
+    "%(m)s,host=c usage_user=1000,usage_system=0i,idle=true,note=\"\" 1700000020\n"
+)
+
+
+def influx_stored(measurement):
+    """{(name without the measurement, sorted labels): values} VictoriaMetrics holds for it."""
+    rows = vm_export(f'{{__name__=~"{measurement}_.*"}}')
+    stored = {}
+    for row in rows:
+        metric = dict(row["metric"])
+        name = metric.pop("__name__")[len(measurement) + 1:]
+        stored[(name, tuple(sorted(metric.items())))] = list(zip(row["timestamps"], row["values"]))
+    return stored
+
+
+def leg_11():
+    headers = {"Content-Type": "text/plain; charset=utf-8", "Authorization": "Token unused"}
+    relay = "viir_relay"
+    direct = "viir_direct"
+    params = q({"org": "o", "bucket": "b", "precision": "s"})
+    status, body = post(f"http://logit-influx-relay:8087/api/v2/write?{params}",
+                        (INFLUX_BODY % {"m": relay}).encode(), headers)
+    if status != 204:
+        return "FAIL", f"influxdb_in answered {status} {body.strip()[:120]!r}"
+    status, body = post(f"{VM}/api/v2/write?{params}",
+                        (INFLUX_BODY % {"m": direct}).encode(), headers)
+    if status != 204:
+        return "FAIL", f"VictoriaMetrics answered {status} {body.strip()[:120]!r} to the direct write"
+
+    # Each write reaches search a few seconds after its 2xx, and the relayed one also waits on
+    # influxdb_out's flush.
+    via, straight = {}, {}
+    for _ in range(40):
+        via, straight = influx_stored(relay), influx_stored(direct)
+        if via and straight and len(via) == len(straight):
+            break
+        time.sleep(1)
+    if not straight:
+        return "FAIL", "the direct write stored no viir_direct_* series"
+    if not via:
+        return "FAIL", "the relayed write stored no viir_relay_* series"
+    fields = sorted({name for name, _ in straight})
+    if set(via) != set(straight):
+        return "FAIL", (f"series differ: only relayed {sorted(set(via) - set(straight))}, only "
+                        f"direct {sorted(set(straight) - set(via))}")
+    # The decoder merges an exact duplicate point (normalization 2 in `logit_proto::influxdb`),
+    # where VictoriaMetrics stores both copies at one timestamp, so compare the distinct samples.
+    differing = sorted(f"{k}: relayed {via[k]} direct {straight[k]}" for k in straight
+                       if sorted(set(via[k])) != sorted(set(straight[k])))
+    duplicated = sum(len(v) - len(set(v)) for v in straight.values())
+    if differing:
+        return "FAIL", f"values differ for {differing}"
+    return "PASS", (
+        f"{len(straight)} series over fields {fields} and {sum(len(v) for v in straight.values())} "
+        f"points on the direct path, identical by series, labels, timestamps, and distinct values "
+        f"on the relayed path; a bool is stored as 1/0 and the string field (note) as 0 on both "
+        f"paths, so the comparison expects the same loss on both; VictoriaMetrics keeps the "
+        f"duplicate point as {duplicated} extra sample(s) at one timestamp, which influxdb_in "
+        f"merges before it relays"
+    )
+
+
 LEGS = [
     (1, "prometheus_out version: 1 -> VictoriaMetrics /api/v1/write", leg_1),
     ("1z", "prometheus_out version: 1, compression: zstd -> VictoriaMetrics /api/v1/write", leg_1z),
@@ -315,6 +385,7 @@ LEGS = [
     (8, "syslog_out TCP -> VictoriaLogs syslog", leg_8),
     (9, "prometheus_in scrape <- VictoriaMetrics /federate", leg_9),
     (10, "vmagent remote-write -> prometheus_in bind:", leg_10),
+    (11, "influxdb_in -> influxdb_out -> VictoriaMetrics, against a direct write", leg_11),
 ]
 
 
