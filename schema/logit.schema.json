@@ -1035,6 +1035,103 @@
           "additionalProperties": false
         },
         {
+          "description": "A stand-in for InfluxDB 2.x's write API: what an `influxdb_out`, Telegraf's `influxdb_v2` output, or any InfluxDB 2.x client's URL points at. Serves `POST /api/v2/write` with a line protocol body (gzip accepted) and `org` or `orgID`, `bucket`, and `precision` in the query string, `GET /ping`, and `GET /health`, answering influxd's own JSON error bodies. A request with `Authorization: Token <t>` or `Bearer <t>` is checked against `tokens:`. `org`, `orgID`, and `bucket` become the resource attributes `influxdb.org`, `influxdb.org_id`, and `influxdb.bucket`. A body with any line that doesn't parse is refused whole with `400`, and nothing of it is delivered. When the pipeline can't start taking a request's data within 5s, the request gets `503` with `Retry-After: 1`, nothing of it is delivered, and the client retries it. The v1 `/write` endpoint isn't served.",
+          "type": "object",
+          "required": [
+            "bind",
+            "type"
+          ],
+          "properties": {
+            "bind": {
+              "description": "The `host:port` to listen on. InfluxDB's port is `8086`.",
+              "type": "string"
+            },
+            "buffer": true,
+            "forwarded": {
+              "description": "The forwarding header that names each request's client: `x_forwarded_for` (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header is read, even when another is present, and only its first instance. A usable address replaces `client.address` and `client.port` for that request as a pair, ahead of the client a PROXY header names: the header's port, when it has one, becomes `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY header's client, if any, standing, and so does a value with no usable address (`unknown`, an obfuscated name, anything that isn't an IP address), which is also counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port` always report the socket peer.\n\nMake the port reachable only through the proxy, and have the proxy overwrite the header rather than append to one the client sent: any client that can connect to it directly, or whose header the proxy keeps, can send its own header and name any address as `client.address`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ForwardedHeader"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "handshake_timeout": {
+              "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then the TLS accept when `tls:` is set, or on a plaintext listener the wait for its first byte. Each phase gets its own budget, so a silent connection costs up to twice this value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
+              "default": "5s",
+              "type": "string"
+            },
+            "idle_timeout": {
+              "description": "How long one connection may sit with no request in flight before this listener closes it and frees its connection-cap slot, with `otlp_in`'s semantics. Off unless set; `0s` is rejected. Write clients keep their connections open between batches, so set it well above a client's flush interval if you set it at all. It also bounds a request body that stalls mid-upload, answered `408`.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_connections": {
+              "description": "The most connections this listener serves at once. One arriving past it is closed at once and counted `logit.input.connections.rejected{reason=\"limit\"}`, never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so keep the total across listeners under the process's `nofile` limit.",
+              "default": 1024,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "max_request_bytes": {
+              "description": "Caps one write request body, both as sent and after gzip decompression; a larger one gets `413`. A byte-count string. Defaults to `\"25MiB\"`. InfluxDB itself sets no limit by default, so this is a choice made here to bound memory; raise it for senders that batch more. `0` is rejected.",
+              "default": "26214400",
+              "type": "string"
+            },
+            "peer": {
+              "description": "Stamps each event with the address of the socket peer that sent it, as `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer reports the proxy's address. Every event of a request carries the same values, and either attribute replaces a same-named one decoded from the request. No reverse DNS lookup is made.\n\nEvery sender's address becomes an attribute on its events, so series keyed by attributes split by sender, and a sink that writes attributes receives the address. Drop it with a `remove` stage ahead of a sink that shouldn't see it.",
+              "default": false,
+              "type": "boolean"
+            },
+            "proxy_protocol": {
+              "description": "Requires every connection to open with a PROXY protocol header, version 1 or 2, as a load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps the original client it names on each event as `client.address` and `client.port`. Off by default. The header is read before any TLS handshake, within `handshake_timeout`. A connection without a valid header is closed and counted as `logit.input.connections.rejected{reason=\"proxy_header\"}`. A header that names no client, such as a proxy's own health check, keeps the connection and stamps nothing. Either attribute replaces a same-named one decoded from the request; `peer:` still reports the proxy.\n\nMake the port reachable only through the proxy: any client that can connect to it directly can send its own header and name any address as `client.address`.",
+              "default": false,
+              "type": "boolean"
+            },
+            "receive": true,
+            "reuse_port": {
+              "description": "Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an overlapping replacement during a rolling upgrade, can bind the same `bind:` address at the same time. The kernel then splits connections between them by source address and port. Both processes must set it and run as the same effective user, or the second bind fails with an address-in-use error. Off by default.",
+              "default": false,
+              "type": "boolean"
+            },
+            "sources": true,
+            "targets": true,
+            "tls": {
+              "description": "Terminates TLS on this listener when present; plaintext when omitted.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsServerConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "tokens": {
+              "description": "The API tokens this listener accepts, from each write request's `Authorization: Token <token>` or `Authorization: Bearer <token>` header. A request with no token, or one not listed, gets `401`. Empty, the default, accepts any request, whatever token it carries. `/ping` and `/health` never need a token. Take each entry from the environment (`!env INFLUXDB_TOKEN`) rather than writing a token into the file. A token is never kept on an event. An empty entry, or one with leading or trailing whitespace, is rejected.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "influxdb_in"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "Tails one or more files as a log source, one line per event; rotation-, truncation-, and checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final path component (`/var/log/app/*.log`) and matches any run of non-`/` characters. An empty list or entry is rejected.",
           "type": "object",
           "required": [

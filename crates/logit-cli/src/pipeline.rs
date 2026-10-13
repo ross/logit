@@ -25,6 +25,7 @@ use logit_inputs::datadog_trace::DatadogTraceInput;
 use logit_inputs::docker::{ContainerFilter, DockerInput};
 use logit_inputs::generate::{GenerateInput, GenerateMetricKind};
 use logit_inputs::graphite::GraphiteInput;
+use logit_inputs::influxdb::InfluxDbInput;
 use logit_inputs::internal::InternalInput;
 use logit_inputs::lines::LinesInput;
 use logit_inputs::logit::LogitInput;
@@ -287,6 +288,7 @@ fn listener_connection_budget(graph: &graph::Graph) -> usize {
             | OtlpIn { max_connections, .. }
             | DatadogIn { max_connections, .. }
             | SplunkHecIn { max_connections, .. }
+            | InfluxDbIn { max_connections, .. }
             | LogitIn { max_connections, .. } => *max_connections,
             DatadogTraceIn { bind, socket, max_connections, .. }
                 if bind.is_some() || socket.is_some() =>
@@ -715,6 +717,38 @@ fn build_spec(
                 .with_max_request_bytes(usize::try_from(*max_request_bytes).unwrap_or(usize::MAX))
                 .with_max_ack_channels(*max_ack_channels)
                 .with_max_pending_acks(*max_pending_acks);
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir, tls_reloader)?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        InfluxDbIn {
+            bind,
+            tls,
+            tokens,
+            max_request_bytes,
+            handshake_timeout,
+            idle_timeout,
+            max_connections,
+            peer,
+            proxy_protocol,
+            forwarded,
+            reuse_port,
+        } => {
+            let mut input = InfluxDbInput::new(bind.clone())
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                // Read twice, as on `otlp_in`: the pre-request budget and an idle close's grace.
+                .with_handshake_timeout(*handshake_timeout)
+                .with_idle_timeout(*idle_timeout)
+                .with_max_connections(*max_connections)
+                .with_peer(*peer)
+                .with_proxy_protocol(*proxy_protocol)
+                .with_forwarded(forwarded.map(to_forwarded_header))
+                .with_reuse_port(*reuse_port)
+                .with_tokens(tokens.clone())
+                // Saturates on a 32-bit target: a cap past the address space is no cap.
+                .with_max_request_bytes(usize::try_from(*max_request_bytes).unwrap_or(usize::MAX));
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir, tls_reloader)?;
             }
