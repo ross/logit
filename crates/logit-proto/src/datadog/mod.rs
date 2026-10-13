@@ -402,7 +402,7 @@
 //! | an unknown key; a `nil` value | skipped; the field's zero value (msgp's own rules) | -- |
 //! | one `ClientGroupedStats` of a bucket | one `Event::metric`; `timestamp` = the bucket's `Start` (ns) | a `Start` above `i64::MAX`: clamped, `logit.input.stats.degraded{reason="bucket_start_overflow"}` |
 //! | a bucket with no groups | nothing | `skipped{reason="empty_bucket"}` |
-//! | `Hits`, `Errors`, `TopLevelHits` | `datadog.stats.hits`, `.errors`, `.top_level_hits`: delta monotonic `Sum` of the `uint64` as `f64`, always present | above 2^53 and not exactly representable: `degraded{reason="inexact_count"}` |
+//! | `Hits`, `Errors`, `TopLevelHits` | `datadog.stats.hits`, `.errors`, `.top_level_hits`: delta monotonic `Sum` of the `uint64` as `U64`, exact, always present | -- |
 //! | `Duration` | `datadog.stats.duration`: the same, unit `ns` | the same |
 //! | `OkSummary`, `ErrorSummary` | `datadog.stats.ok_summary`, `.error_summary`: `Distribution` under `Mapping::logarithmic(gamma, indexOffset, 2048)`, sparse `binCounts` and `contiguousBinCounts` both read (a key in both sums), `zeroCount`; the summary (`count`/`min`/`max`/`sum`) derived from the bins; absent when the wire bytes are empty | -- |
 //! | a summary whose `interpolation` isn't `NONE` | that record dropped; its keys aren't the logarithmic mapping's | `skipped{reason="interpolation"}` |
@@ -445,7 +445,7 @@
 //!
 //! `datadog_in -> datadog_out` on one stats route, and `datadog_trace_in -> datadog_trace_out` on
 //! `/v0.6/stats`, is a fixed point modulo this list (`tests/datadog_stats_fixed_point.rs` pins
-//! items 1-5):
+//! items 1-4):
 //!
 //! 1. every map key is written, in Go field order, zero values included: a tracer's omitted key or
 //!    `nil` leaves as the explicit zero value, and an unknown key is dropped;
@@ -455,8 +455,7 @@
 //!    merge, their groups in first-seen order;
 //! 4. an intake `StatsPayload` leaves as one `StatsPayload` per `ClientStatsPayload` (batching),
 //!    its envelope restated on each;
-//! 5. a count above 2^53 that `f64` can't hold exactly is rounded, and counted;
-//! 6. on `/v0.6/stats`, a `Lang`, `TracerVersion`, or `ContainerID` the payload left empty leaves
+//! 5. on `/v0.6/stats`, a `Lang`, `TracerVersion`, or `ContainerID` the payload left empty leaves
 //!    in the payload when the request's matching header carried it, as it does behind an Agent.
 
 pub mod generated;

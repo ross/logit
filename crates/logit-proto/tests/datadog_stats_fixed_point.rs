@@ -474,14 +474,12 @@ fn summary() -> impl Strategy<Value = (Vec<u8>, Option<DdSketch>)> {
     ]
 }
 
-const MAX_EXACT: u64 = 1 << 53;
-
 prop_compose! {
     fn group()(
         strings in prop::collection::vec(text(), 9),
         name in "[a-z.]{0,10}",
         http_status_code in prop_oneof![Just(0u32), 100..600u32],
-        counts in prop::collection::vec(0..MAX_EXACT, 4),
+        counts in prop::collection::vec(any::<u64>(), 4),
         ok in summary(),
         err in summary(),
         synthetics: bool,

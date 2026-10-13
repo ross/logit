@@ -39,11 +39,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// `datadog.stats.hits` / `.errors` / `.top_level_hits`: the group's weighted span counts, each a
-/// delta monotonic `Sum`.
+/// delta monotonic `Sum` of the wire `uint64` as `U64`.
 pub const METRIC_HITS: &str = "datadog.stats.hits";
 pub const METRIC_ERRORS: &str = "datadog.stats.errors";
 pub const METRIC_TOP_LEVEL_HITS: &str = "datadog.stats.top_level_hits";
-/// `datadog.stats.duration`: the group's total span duration, a delta monotonic `Sum` in `ns`.
+/// `datadog.stats.duration`: the group's total span duration, a delta monotonic `U64` `Sum` in
+/// `ns`.
 pub const METRIC_DURATION: &str = "datadog.stats.duration";
 /// `datadog.stats.ok_summary` / `.error_summary`: the duration sketches, each a `Distribution`
 /// under the wire's own logarithmic mapping.
@@ -662,11 +663,12 @@ impl DatadogDecoder {
             (METRIC_TOP_LEVEL_HITS, g.top_level_hits),
             (METRIC_DURATION, g.duration),
         ] {
-            let f = v as f64;
-            if f as u64 != v {
-                self.stats_degraded("inexact_count");
-            }
-            let mut record = MetricRecord::new(intern(name), MetricKind::counter(f));
+            let kind = MetricKind::Sum(Sum {
+                value: MetricValue::U64(v),
+                temporality: Temporality::Delta,
+                monotonic: true,
+            });
+            let mut record = MetricRecord::new(intern(name), kind);
             if name == METRIC_DURATION {
                 record.unit = Some(intern(DURATION_UNIT));
             }
@@ -929,8 +931,8 @@ impl DatadogEncoder {
             self.stats_out_degraded("bad_count");
             return 0;
         }
-        // `u64::MAX as f64` is exactly 2^64, which is what a wire `u64::MAX` decodes to, so that
-        // round trip stays silent; only a value strictly above it saturates lossily.
+        // `u64::MAX as f64` is 2^64, the nearest `f64` to `u64::MAX`, so it saturates silently;
+        // only a value strictly above it saturates lossily.
         if v > u64::MAX as f64 {
             self.stats_out_degraded("count_overflow");
             return u64::MAX;
@@ -1133,6 +1135,15 @@ fn write_strings(w: &mut Writer, v: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decoded stats count: a delta monotonic `U64` `Sum`.
+    fn count(v: u64) -> MetricKind {
+        MetricKind::Sum(Sum {
+            value: MetricValue::U64(v),
+            temporality: Temporality::Delta,
+            monotonic: true,
+        })
+    }
     use crate::datadog::generated::ddsketch::IndexMapping;
     use logit_core::Registry;
 
@@ -1419,10 +1430,10 @@ mod tests {
                 METRIC_ERROR_SUMMARY
             ]
         );
-        assert_eq!(e.metrics[0].kind, MetricKind::counter(10.0));
-        assert_eq!(e.metrics[1].kind, MetricKind::counter(2.0));
-        assert_eq!(e.metrics[2].kind, MetricKind::counter(7.0));
-        assert_eq!(e.metrics[3].kind, MetricKind::counter(12_345.0));
+        assert_eq!(e.metrics[0].kind, count(10));
+        assert_eq!(e.metrics[1].kind, count(2));
+        assert_eq!(e.metrics[2].kind, count(7));
+        assert_eq!(e.metrics[3].kind, count(12_345));
         assert_eq!(e.metrics[3].unit.map(resolve), Some("ns"));
         let MetricKind::Distribution(ok) = &e.metrics[4].kind else { panic!("ok summary") };
         assert_eq!(*ok.mapping(), log_mapping());
@@ -1561,7 +1572,7 @@ mod tests {
             .collect();
         assert_eq!(names, [Value::str("a"), Value::str("c")]);
         assert_eq!(batch.events[0].timestamp, 1_000);
-        assert_eq!(batch.events[0].metrics[0].kind, MetricKind::counter(3.0));
+        assert_eq!(batch.events[0].metrics[0].kind, count(3));
         assert_eq!(batch.events[0].attributes.get(ATTR_SERVICE_NAME), None, "nil is empty");
         assert_eq!(
             batch.resource.attributes.get(RESOURCE_ATTR_TRACER_HOSTNAME),
@@ -1684,7 +1695,7 @@ mod tests {
                 MetricRecord::new(intern(METRIC_HITS), MetricKind::counter(2.5)),
                 MetricRecord::new(intern(METRIC_ERRORS), MetricKind::counter(-1.0)),
                 MetricRecord::new(intern(METRIC_TOP_LEVEL_HITS), MetricKind::counter(2e19)),
-                // Exactly 2^64, what a wire `u64::MAX` decodes to: saturates without a count.
+                // 2^64, the nearest `f64` to `u64::MAX`: saturates without a count.
                 MetricRecord::new(intern(METRIC_DURATION), MetricKind::counter(u64::MAX as f64)),
                 MetricRecord::new(intern("other"), MetricKind::gauge(1.0)),
                 MetricRecord::new(intern(METRIC_OK_SUMMARY), MetricKind::Distribution(agent)),
@@ -1714,13 +1725,13 @@ mod tests {
         assert_eq!(n("logit.output.tags.dropped", "unrepresentable"), 1.0);
         let back = DatadogDecoder::new().decode_client_stats_v06(&out, 0).unwrap();
         let m = &back.events[0].metrics;
-        assert_eq!(m[0].kind, MetricKind::counter(3.0), "2.5 rounds half away from zero");
-        assert_eq!(m[1].kind, MetricKind::counter(0.0));
+        assert_eq!(m[0].kind, count(3), "2.5 rounds half away from zero");
+        assert_eq!(m[1].kind, count(0));
         let by_name = |name: &str| m.iter().find(|r| resolve(r.name) == name).unwrap().kind.clone();
-        assert_eq!(by_name(METRIC_TOP_LEVEL_HITS), MetricKind::counter(u64::MAX as f64));
-        assert_eq!(by_name(METRIC_DURATION), MetricKind::counter(u64::MAX as f64));
+        assert_eq!(by_name(METRIC_TOP_LEVEL_HITS), count(u64::MAX));
+        assert_eq!(by_name(METRIC_DURATION), count(u64::MAX));
 
-        // A wire `u64::MAX` decodes to 2^64 and re-encodes to `u64::MAX` without a count.
+        // A wire `u64::MAX` decodes as `U64` and re-encodes to `u64::MAX` without a count.
         let (mut e2, registry2) = encoder();
         let out2 = e2.encode_client_stats_v06(&back).unwrap();
         let overflowed = registry2
@@ -1733,6 +1744,35 @@ mod tests {
         assert_eq!(overflowed, 0);
         let again = DatadogDecoder::new().decode_client_stats_v06(&out2, 0).unwrap();
         assert_eq!(again.events[0].metrics, back.events[0].metrics);
+    }
+
+    /// A wire count of `2^53 + 1`, which no `f64` holds, decodes as that `U64` and re-encodes as
+    /// the same `uint64`.
+    #[test]
+    fn a_count_above_2_pow_53_round_trips_exactly() {
+        const ABOVE: u64 = (1 << 53) + 1;
+        let (mut e, _registry) = encoder();
+        let batch = stats_batch(
+            vec![
+                MetricRecord::new(intern(METRIC_HITS), count(ABOVE)),
+                MetricRecord::new(intern(METRIC_ERRORS), count(ABOVE - 2)),
+                MetricRecord::new(intern(METRIC_TOP_LEVEL_HITS), count(ABOVE)),
+                MetricRecord::new(intern(METRIC_DURATION), count(ABOVE)),
+            ],
+            &[],
+        );
+        let out = e.encode_client_stats_v06(&batch).unwrap();
+        let back = DatadogDecoder::new().decode_client_stats_v06(&out, 0).unwrap();
+        let by_name = |name: &str| {
+            let m = &back.events[0].metrics;
+            m.iter().find(|r| resolve(r.name) == name).unwrap().kind.clone()
+        };
+        assert_eq!(by_name(METRIC_HITS), count(ABOVE));
+        assert_eq!(by_name(METRIC_ERRORS), count(ABOVE - 2));
+        assert_eq!(by_name(METRIC_TOP_LEVEL_HITS), count(ABOVE));
+        assert_eq!(by_name(METRIC_DURATION), count(ABOVE));
+        let again = DatadogEncoder::new().encode_client_stats_v06(&back).unwrap();
+        assert_eq!(again, out, "the re-encoded body carries the same counts");
     }
 
     #[test]
