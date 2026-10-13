@@ -1166,10 +1166,12 @@ class Ledger:
             self.L_in = sut.counter_by_life("logit.component.events.received", component=script)
             # Counts events: an `emit_many` outcome adds one per event it returns.
             self.L_emit = sut.counter_by_life("logit.script.events.emitted", component=script)
-            self.L_drop = sut.counter_by_life("logit.component.events.dropped", component=script,
-                                              reason="script_drop")
-            self.L_err = sut.counter_by_life("logit.component.errors", component=script,
-                                             reason="process")
+            # A `nil` return is an intended discard; an error loses its one input event, which
+            # the runtime counts as loss beside `errors{reason="process"}`.
+            self.L_drop = sut.counter_by_life("logit.component.events.discarded",
+                                              component=script)
+            self.L_err = sut.counter_by_life("logit.component.events.dropped", component=script,
+                                             reason="script_error")
             self.L_flush = sut.counter_by_life("logit.component.flush.events", component=script)
             self.L_sent = sut.counter_by_life("logit.component.events.sent", component=script)
 
@@ -1418,8 +1420,8 @@ class Ledger:
         return self.get("Ab", life) - (self.get("L_flush", life) if self.script else 0)
 
     def script_dropped(self, life):
-        """The events a script dropped (`script_drop`) or failed on (`errors{process}`), both
-        counted, 0 with no script."""
+        """The events a script discarded (`events.discarded`) or lost to an error
+        (`events.dropped{reason="script_error"}`), both counted, 0 with no script."""
         if not self.script:
             return 0
         return self.get("L_drop", life) + self.get("L_err", life)
@@ -1849,8 +1851,8 @@ def check_ledger_edge(data):
 
 def check_ledger_script(data):
     """For a `[ledger] sut_script`, else SKIP, the final life's script hop: E == L_in (the
-    listener's edge), L_in == L_emit + L_drop + L_err (every event emitted, dropped, or failed
-    on), and L_sent == L_emit + L_flush (what it sent is what `process()` emitted plus what
+    listener's edge), L_in == L_emit + L_drop + L_err (every event emitted, discarded, or lost
+    to a script error), and L_sent == L_emit + L_flush (what it sent is what `process()` emitted plus what
     `flush()` returned). Earlier lives are reported."""
     if not data.ledger.get("sut_script"):
         return Result("ledger.script", SKIP, "no [ledger] sut_script")

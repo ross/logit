@@ -3666,7 +3666,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   constant time via a nanosecond remainder, so a process stalled for hours does not replay every missed tick.
 - **Why sensitive:** hot-path; cancellation (`inbox.recv()` inside a `timeout` must be cancel-safe or a batch is
   lost); data-loss (a missed close-time flush silently discards an aggregation window); custom (the cadence math);
-  accounting (`flush.events`, `events.dropped{reason="absorbed"}`).
+  accounting (`flush.events`, `events.discarded`).
 - **Invariants to verify:**
   - `tokio::sync::mpsc::Receiver::recv` is cancel-safe, so a `timeout` elapse never consumes a batch.
   - The close-time flush runs exactly once, only for a transform with an interval (the `if next_flush.is_some()` in the closed-inbox arm).
@@ -3700,7 +3700,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 - **Location:** `runtime.rs` (`process_batch`); trait at `transform.rs` (`Transform`).
 - **What it does:** The per-batch body of `run_transform`: reads `scope` out, offers it to `observe_scope`,
   applies `map_resource`, then `events.retain_mut(|e| transform.process(&resource, e))` in place, calls
-  `end_batch`, and counts `before - after` as `events.dropped{reason="absorbed"}`. Returns `None` for an empty
+  `end_batch`, and counts `before - after` as `events.discarded`. Returns `None` for an empty
   result so no empty batch is ever sent.
 - **Why sensitive:** hot-path (per event, per batch, on every transform node); custom (the in-place
   `retain_mut` shape exists specifically to avoid memcpy'ing an 864-byte `Event`); accounting.
@@ -4038,8 +4038,8 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   correctness of "every `logit` process reaches the same verdict independently" rests entirely there, not in
   `logit-pipeline`.
 - `logit_core::telemetry`'s `MAX_LINKS_PER_SPAN = 32` (`telemetry.rs`) silently bounds what `run_flush`
-  (`runtime.rs`, its `span.links(links)`) attaches; the drop is counted as
-  `logit.internal.span.links.dropped{reason="cardinality"}`.
+  (`runtime.rs`, its `span.links(links)`) attaches; a link past the cap is counted as
+  `logit.internal.span.links.omitted{reason="cardinality"}`.
 - `InMemoryBuffer::peek` sets `head_reserved` (`crates/logit-proto/src/buffer.rs`, `InMemoryBuffer::peek`) and only `commit`
   clears it — this reservation lifecycle crosses three crates and is the subtlest shared invariant I found.
 - ~~`Output::observe_batch` (`output.rs`) is implemented only by `logit_out`; whoever surveys
@@ -6573,7 +6573,7 @@ the telemetry buffers are `std::collections::HashMap`.
   equaled `MAX_WEIGHT`, so `@0.001` (weight 1000, unclamped) and an empty record reported, and a
   clamped record held raw never did. Fixed with `Samples::is_clamped`, which `aggregate` also asks
   of the held records at fallback. `sketch()` drops a non-finite value with no counter;
-  `aggregate` now counts what it drops as `logit.transform.samples.non_finite_dropped`.
+  `aggregate` now counts what it leaves out as `logit.transform.samples.omitted{reason="non_finite"}`.
 
 ---
 
@@ -6620,7 +6620,7 @@ the telemetry buffers are `std::collections::HashMap`.
 ### CORE-10 — Deterministic span sampling and `SpanGuard` span minting
 - **Location:** `crates/logit-core/src/telemetry.rs` (`DEFAULT_SPAN_SAMPLE_RATE = 0.1`, `trace_is_sampled`; `Telemetry::span`; `now_unix_nanos`, with the `#[cfg(test)]` clock override; `PendingSpan`, `started_at` rationale; `SpanGuard`, `link` cap, `finish_inner`'s saturating `start + elapsed`; `ComponentBuffer::span_event`; `Timer`, record-on-`Drop`)
 - **What it does:** Every node visit mints at most one span, kept or dropped by a hash of the `trace_id` alone so every `logit` process in a split topology reaches the same verdict with no propagated bit. The end timestamp is `start + Instant::elapsed()`, never a second wall-clock read, so an NTP correction can't produce `end < start`.
-- **Why sensitive:** numeric (a float comparison against `rate * 2^53`, NaN handling, the 53-bit truncation choice), hot-path (called per node visit per batch), accounting (`logit.internal.spans.dropped`, `span.links.dropped`), concurrency (the sample rate is copied into each buffer at construction to avoid a second lock).
+- **Why sensitive:** numeric (a float comparison against `rate * 2^53`, NaN handling, the 53-bit truncation choice), hot-path (called per node visit per batch), accounting (`logit.internal.spans.dropped`, `span.links.omitted`), concurrency (the sample rate is copied into each buffer at construction to avoid a second lock).
 - **Invariants to verify:**
   - `trace_is_sampled` keeps approximately `rate` of uniformly distributed trace ids, exactly at `rate == 1.0` (the `!(rate < 1.0)` form in `trace_is_sampled` is deliberately NaN-permissive) and none at `rate <= 0.0`.
   - The verdict depends only on `trace_id` — two processes with the same configured rate agree for every id.

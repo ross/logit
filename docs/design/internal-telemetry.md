@@ -232,10 +232,10 @@ A point's `PointKey` map coalesces repeats at the same `(name, tags)` key. Two s
 identity to coalesce on, so `ComponentBuffer` holds spans in a separate, unkeyed `Vec`, capped at
 `MAX_SPANS_PER_COMPONENT` (512). That's a volume bound, not a cardinality one: nothing else bounds
 how many spans accumulate except drain interval × sample rate. `SpanGuard::link`/`links` also cap
-each span's own link list at `MAX_LINKS_PER_SPAN` (32). Both drop and count rather than grow:
-`logit.internal.spans.dropped{reason="buffer_full"}` on the buffer (drained alongside
-`points.dropped`), and `logit.internal.span.links.dropped{reason="cardinality"}`, recorded
-immediately on the guard.
+each span's own link list at `MAX_LINKS_PER_SPAN` (32). Both count rather than grow: a span past
+the buffer cap is lost, as `logit.internal.spans.dropped{reason="buffer_full"}` (drained alongside
+`points.dropped`), and a link past the span's cap is left off a span that's still exported, as
+`logit.internal.span.links.omitted{reason="cardinality"}`, recorded immediately on the guard.
 
 ### Span versus point, side by side
 
@@ -519,8 +519,8 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.batches.received` / `.events.received` | count | `run_transform`, `run_output`, `run_lua`, `run_router`. For `run_output`, this includes every batch its shutdown sweep takes from the inbox |
 | `logit.component.batches.delivered` / `.events.delivered` | count | `write_loop`, once per batch `Output::send` delivered. At shutdown a sink's `batches.received` equals `batches.delivered` plus `batches.dropped` under every reason plus what a disk spool still holds, and the same for events |
 | `logit.component.process.duration` | timing | `run_transform`, `run_lua`, `run_router` (whole batch — for a router this spans `route_batch`'s partition, not any one destination's send) |
-| `logit.component.events.dropped{reason="absorbed"}` | count | `Transform::process` returned `false` |
-| `logit.component.events.dropped{reason="script_drop"}` | count | Lua `ProcessOutcome::Drop` |
+| `logit.component.events.discarded` | count | `Transform::process` returned `false`, or a Lua `process()` returned `nil` (`ProcessOutcome::Drop`): an event the config removed by design. Untagged, and recorded only when nonzero |
+| `logit.component.events.dropped{reason="script_error"}` | count | `run_lua`, one per event whose `process()` call raised an error: that event is lost. Counted beside `errors{reason="process"}` |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
 | `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window` |
 | `logit.component.retries` | count | a retried delivery attempt or windowed round, `deliver_with_retry` or `deliver_window` (`write_loop`) |
@@ -561,11 +561,6 @@ under its own id. A memory failure is not a panic, so it never logs `thread_pani
 Graph rule 50 rejects a router (`route`, or `lua`/`lua_file` with `targets:`) that has no
 ordinary consumer, so every event no target claims reaches one. A config that discards those
 events names a `null_out` as that consumer, whose `events.received` counts them.
-
-**`absorbed` is imprecise for filters.** `process_batch` records
-`logit.component.events.dropped{reason="absorbed"}` whenever a transform returns `false`, including
-every drop by the signal, attribute, and provenance filters and by `sample`. Those components' own
-layer-3 counters say why.
 
 **A `target` emits the layer-2 *producer* set and nothing else.** It has no task, no inbox, and no
 receive side: it's one `Fanout` carrying the target's own id and telemetry handle
@@ -1408,14 +1403,14 @@ which every router has.
 | `logit.transform.samples.fallback{reason="rate_mismatch"\|"cap"}` | count | a `samples`-mode series gave up raw retention and became a sketch |
 | `logit.transform.set_members.fallback{reason="cap"}` | count | a `members`-mode series gave up raw retention and became an estimate |
 | `logit.transform.samples.weight_clamped` | count | a record's sample rate implied more than `Samples::MAX_WEIGHT` observations per value (`Samples::is_clamped`), counted when its weight is applied: on absorb into a sketch, or when a raw `distributions: samples` series falls back |
-| `logit.transform.samples.non_finite_dropped` | count | `NaN` or infinite `Samples` values dropped while sketching, since they have no bin |
+| `logit.transform.samples.omitted{reason="non_finite"}` | count | `NaN` or infinite `Samples` values left out of a sketch, since they have no bin; the record's other values still merge |
 | `logit.transform.metrics.absorbed` | count | metric records merged into a series. With `.passed_through` it accounts for every record `process` receives: `metrics_in == absorbed + passed_through` summed over every reason |
 | `logit.transform.metrics.passed_through{reason="no_recorded_value"}` | count | an OTLP `NO_RECORDED_VALUE`-flagged record forwarded unmerged, because it has no reading to fold into a series |
 | `logit.transform.metrics.passed_through{reason="no_merge_rule"}` | count | a record of a kind this stage doesn't merge, forwarded: a cumulative `Sum`, an `ExponentialHistogram`, a `Summary`, and a `Histogram` outside `temporality: cumulative` or already cumulative |
 | `logit.transform.metrics.passed_through{reason="kind_conflict"}` | count | a record forwarded because its series holds another kind |
 | `logit.transform.metrics.passed_through{reason="histogram_bounds_mismatch"}` | count | a histogram forwarded because its bucket bounds differ from its series' |
 | `logit.transform.metrics.passed_through{reason="non_finite"}` | count | a delta `Sum` whose value is `NaN` or infinite, forwarded so a cumulative total stays finite |
-| `logit.transform.links.dropped{reason="contexts"}` | count | contributing span contexts past the fixed per-series cap (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8) that a flushed event's links can't carry, one per merged record whose context the full series doesn't link, so a context seen in two batches counts twice. Unrelated to `max_retained_series`: no series is lost |
+| `logit.transform.links.omitted{reason="contexts"}` | count | contributing span contexts past the fixed per-series cap (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8) that a flushed event's links can't carry, one per merged record whose context the full series doesn't link, so a context seen in two batches counts twice. Unrelated to `max_retained_series`: no series is lost |
 
 Series retention across the window boundary comes from
 `docs/adr/aggregation-window-semantics.md`'s gauge-retention amendment and its cumulative
@@ -1485,7 +1480,7 @@ configured columns).
 
 `crates/logit-transforms/src/keep.rs`.
 
-`logit.transform.attributes.kept` / `.dropped`: the other half of `aggregate`'s cardinality story,
+`logit.transform.attributes.kept` / `.omitted`: the other half of `aggregate`'s cardinality story,
 showing how much `keep` suppresses before events reach `aggregate`. Neither kind has `Diagnostics`,
 because pure attribute filtering has nothing to warn about, so `Telemetry` is attached directly
 rather than through the `Diagnostics` bridge.
@@ -1528,13 +1523,12 @@ minted `SpanRecord`'s id came from the line or from `mint_id`. This is the `kv_m
 [ADR `attribute-filtering-components`](../adr/attribute-filtering-components.md),
 [ADR `provenance-filtering-components`](../adr/provenance-filtering-components.md).
 
-All seven share `logit.transform.events.filtered`, `1.0` per dropped event. `has_signal`,
-`has_attributes`/`drop_attributes`, and `has_provenance`/`drop_provenance` also record `0.0` on the
-forward path, which registers the series rather than leaving it absent; `keep_signals`/
-`drop_signals` record it only when stripping leaves an event with no payload. Those two also
-record `logit.transform.payloads.stripped{signal}` (count), one per payload slot actually cleared;
-no other filter mutates a forwarded event, so none has a `.payloads.stripped`-style counter. None has `Diagnostics`, because matching a fixed set or clearing a fixed signal set can't
-fail.
+None of the seven counts the events it removes: the runtime's `logit.component.events.discarded`
+does, under the filter's own id. `keep_signals`/`drop_signals` record
+`logit.transform.payloads.stripped{signal}` (count), one per payload slot cleared, because
+the event survives a strip; no other filter mutates a forwarded event, so the other five record
+nothing of their own. None has `Diagnostics`, because matching a fixed set or clearing a fixed
+signal set can't fail.
 
 `has_attributes`/`drop_attributes` deliberately have **no cache-miss counter** for their
 resource-match cache (`Matcher`, `Set::map_resource`'s `Arc::ptr_eq` idiom applied to a read).
@@ -1548,7 +1542,7 @@ advertise a cost that isn't there.
 [ADR `value-allowlist-cardinality-clamp`](../adr/value-allowlist-cardinality-clamp.md).
 
 `logit.transform.values.allowed`/`.clamped`, tagged `field`: the value-side counterpart to
-`keep`'s `.attributes.kept`/`.dropped`, read per configured field rather than in aggregate, because
+`keep`'s `.attributes.kept`/`.omitted`, read per configured field rather than in aggregate, because
 two fields on one component can clamp at very different rates. `.values.normalized`, also tagged
 `field`, fires only when a `normalize:` step changed the value; counting the common
 already-conforming case would make the rate unreadable. `field` is safe as a tag because the fields
@@ -1569,8 +1563,8 @@ counts as neither. `field` is safe as a tag because the fields are config-declar
 `crates/logit-transforms/src/shape.rs`,
 [ADR `shape-observer-component`](../adr/shape-observer-component.md).
 
-Three drop counters and nothing else: `logit.transform.batches.dropped` (a flush window's per-batch
-table hit its 4096-batch cap), and `logit.transform.keys.untracked` and
+Three bookkeeping counters and nothing else: `logit.transform.batches.untracked` (a flush window's
+per-batch table hit its 4096-batch cap), and `logit.transform.keys.untracked` and
 `logit.transform.keysets.untracked` (an observation the cumulative table's `max_tracked_*` cap
 turned away, emitted once per flush rather than once per event). All three are **counts of things
 not recorded**, which a bounded table must never drop silently. All three are untagged on purpose:
@@ -1625,15 +1619,14 @@ get counters only.
 `crates/logit-transforms/src/sample.rs`,
 [ADR `consistent-sampling-component`](../adr/consistent-sampling-component.md).
 
-- `logit.transform.events.filtered`, shared with the filters above: the batch's dropped count,
-  emitted even at `0` so the series registers.
-- `logit.transform.sample.decisions{outcome="kept"|"dropped",
+- `logit.transform.sample.decisions{outcome="kept"|"discarded",
   by="key"|"random"|"override"|"missing"}` (count, non-zero cells only). `override` is an
   `always_keep` hit, `key` a hashed verdict, and `random` a keyless sampler's draw. `missing` is an
   event whose configured key was absent, whatever `missing:` then did with it (a random draw
   included), so that cell counts exactly the events the key didn't cover.
 
-Unlike the filters, both are **tallied in plain integers per event and emitted once per batch from
+The runtime's `logit.component.events.discarded` counts the discarded events themselves; this
+counter adds why. It's **tallied in plain integers per event and emitted once per batch from
 `end_batch`** (`kv_metrics`' pattern): a sampler sits on every event of the high-volume streams it
 exists for, where a `Telemetry::count` per event is the cost. No `Diagnostics`: nothing here can
 fail.

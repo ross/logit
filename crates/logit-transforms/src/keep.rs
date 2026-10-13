@@ -76,7 +76,7 @@ impl Transform for Remove {
 ///
 /// `AttrMap::iter` yields sorted-`Symbol` order, so the survivors keep their relative order.
 ///
-/// Records `logit.transform.attributes.kept`/`.dropped`: the other end of the cardinality story
+/// Records `logit.transform.attributes.kept`/`.omitted`: the other end of the cardinality story
 /// `aggregate`'s `logit.transform.series.active` gauge tells, showing whether `keep` is bounding
 /// what reaches `aggregate` (`docs/design/internal-telemetry.md`).
 fn filtered(attrs: &AttrMap, telemetry: &Telemetry, retain: impl Fn(&str) -> bool) -> AttrMap {
@@ -88,7 +88,7 @@ fn filtered(attrs: &AttrMap, telemetry: &Telemetry, retain: impl Fn(&str) -> boo
         }
     }
     telemetry.count("logit.transform.attributes.kept", out.len() as f64, &[]);
-    telemetry.count("logit.transform.attributes.dropped", (attrs.len() - out.len()) as f64, &[]);
+    telemetry.count("logit.transform.attributes.omitted", (attrs.len() - out.len()) as f64, &[]);
     out
 }
 
@@ -221,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn keep_records_kept_and_dropped_attribute_counts() {
+    fn keep_records_kept_and_omitted_attribute_counts() {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("keep_fields", "keep", "transform");
         let mut keep = Keep::new(vec!["a".to_string(), "c".to_string()]).with_telemetry(telemetry);
@@ -231,11 +231,12 @@ mod tests {
 
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.transform.attributes.kept"), Some(2.0));
-        assert_eq!(counter_value(&events, "logit.transform.attributes.dropped"), Some(1.0));
+        assert_eq!(counter_value(&events, "logit.transform.attributes.omitted"), Some(1.0));
+        assert_eq!(counter_value(&events, "logit.transform.attributes.dropped"), None);
     }
 
     #[test]
-    fn remove_records_kept_and_dropped_attribute_counts() {
+    fn remove_records_kept_and_omitted_attribute_counts() {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("remove_fields", "remove", "transform");
         let mut remove = Remove::new(vec!["a".to_string()]).with_telemetry(telemetry);
@@ -245,7 +246,8 @@ mod tests {
 
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.transform.attributes.kept"), Some(2.0));
-        assert_eq!(counter_value(&events, "logit.transform.attributes.dropped"), Some(1.0));
+        assert_eq!(counter_value(&events, "logit.transform.attributes.omitted"), Some(1.0));
+        assert_eq!(counter_value(&events, "logit.transform.attributes.dropped"), None);
     }
 
     #[test]

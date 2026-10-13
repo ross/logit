@@ -25,7 +25,7 @@
 
 use crate::value_matches;
 use logit_core::interner::{intern, Symbol};
-use logit_core::{Event, Resource, Telemetry, Value};
+use logit_core::{Event, Resource, Value};
 use logit_pipeline::Transform;
 use std::sync::Arc;
 
@@ -107,7 +107,6 @@ impl Matcher {
 /// Never mutates a forwarded event. See the module doc for the matching rules.
 pub struct HasAttributes {
     matcher: Matcher,
-    telemetry: Telemetry,
 }
 
 impl HasAttributes {
@@ -120,13 +119,7 @@ impl HasAttributes {
     /// Builds the filter; the signature is [`crate::Set::new`]'s, since it matches what `set`
     /// stamps.
     pub fn new(resource: Vec<(String, Value)>, attributes: Vec<(String, Value)>) -> Self {
-        Self { matcher: Matcher::new(resource, attributes), telemetry: Telemetry::default() }
-    }
-
-    /// Attaches a telemetry handle; matching fixed values can't fail, so no `Diagnostics`.
-    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry;
-        self
+        Self { matcher: Matcher::new(resource, attributes) }
     }
 
     #[cfg(test)]
@@ -137,8 +130,7 @@ impl HasAttributes {
 
 impl Transform for HasAttributes {
     fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
-        let matched = self.matcher.matches(resource, event);
-        forward(matched, &self.telemetry)
+        self.matcher.matches(resource, event)
     }
 }
 
@@ -148,7 +140,6 @@ impl Transform for HasAttributes {
 /// Unlike `drop_signals`, it drops whole events and never touches a payload.
 pub struct DropAttributes {
     matcher: Matcher,
-    telemetry: Telemetry,
 }
 
 impl DropAttributes {
@@ -160,12 +151,7 @@ impl DropAttributes {
 
     /// Builds the filter; see [`HasAttributes::new`].
     pub fn new(resource: Vec<(String, Value)>, attributes: Vec<(String, Value)>) -> Self {
-        Self { matcher: Matcher::new(resource, attributes), telemetry: Telemetry::default() }
-    }
-
-    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry;
-        self
+        Self { matcher: Matcher::new(resource, attributes) }
     }
 
     #[cfg(test)]
@@ -179,22 +165,17 @@ impl Transform for DropAttributes {
         let matched = self.matcher.matches(resource, event);
         // This `!` is the only difference from `HasAttributes`: an event drops only when every
         // pair matches, not when any one does.
-        forward(!matched, &self.telemetry)
+        !matched
     }
-}
-
-/// Records the verdict and returns `keep`.
-///
-/// The `0.0` on the forward path registers `events.filtered` so it reads zero rather than absent.
-fn forward(keep: bool, telemetry: &Telemetry) -> bool {
-    telemetry.count("logit.transform.events.filtered", if keep { 0.0 } else { 1.0 }, &[]);
-    keep
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{AttrMap, BodyFormat, LogRecord, MetricKind, MetricRecord, Registry};
+    use logit_core::{
+        AttrMap, BodyFormat, EventBatch, LogRecord, MetricKind, MetricRecord, Registry,
+    };
+    use logit_pipeline::runtime::process_batch;
 
     fn event_with_attrs(attrs: &[(&str, Value)]) -> Event {
         let mut map = AttrMap::new();
@@ -513,28 +494,25 @@ mod tests {
     // -- telemetry ----------------------------------------------------------------------------
 
     #[test]
-    fn both_record_filtered_events() {
+    fn a_filtered_event_counts_as_discarded_not_dropped() {
         let registry = Registry::new();
-        let has_telemetry = registry.telemetry_for("stream_a", "has_attributes", "transform");
-        let mut has = HasAttributes::new(vec![], vec![("stream".to_string(), Value::str("a"))])
-            .with_telemetry(has_telemetry);
-        let resource = default_resource();
-
-        let mut event_a = event_with_attrs(&[("stream", Value::str("a"))]);
-        has.process(&resource, &mut event_a);
-        let mut event_b = event_with_attrs(&[("stream", Value::str("b"))]);
-        has.process(&resource, &mut event_b);
-
-        let events = registry.drain(0);
-        assert_eq!(counter_value(&events, "logit.transform.events.filtered"), Some(1.0));
-    }
-
-    #[test]
-    fn a_disabled_telemetry_handle_is_the_default() {
+        let telemetry = registry.telemetry_for("stream_a", "has_attributes", "transform");
         let mut has = HasAttributes::new(vec![], vec![("stream".to_string(), Value::str("a"))]);
-        let resource = default_resource();
-        let mut event = event_with_attrs(&[("stream", Value::str("a"))]);
-        assert!(has.process(&resource, &mut event));
+        let batch = EventBatch {
+            resource: default_resource(),
+            scope: None,
+            events: vec![
+                event_with_attrs(&[("stream", Value::str("a"))]),
+                event_with_attrs(&[("stream", Value::str("b"))]),
+            ],
+        };
+
+        let out = process_batch(&mut has, batch, &telemetry);
+
+        assert_eq!(out.map(|b| b.events.len()), Some(1));
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.component.events.discarded"), Some(1.0));
+        assert_eq!(counter_value(&events, "logit.component.events.dropped"), None);
     }
 
     // -- key presence -------------------------------------------------------------------------

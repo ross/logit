@@ -1797,13 +1797,9 @@ pub fn process_batch(
     // cost (`docs/design/internal-telemetry.md`).
     transform.end_batch();
     drop(process_timer);
-    let absorbed = (before - events.len()) as u64;
-    if absorbed > 0 {
-        telemetry.count(
-            "logit.component.events.dropped",
-            absorbed as f64,
-            &[("reason", "absorbed")],
-        );
+    let discarded = (before - events.len()) as u64;
+    if discarded > 0 {
+        telemetry.count("logit.component.events.discarded", discarded as f64, &[]);
     }
     if events.is_empty() {
         None
@@ -2731,7 +2727,7 @@ fn run_lua_loop(
         // events otherwise. A target slot grows normally: a script returns its verdict with the
         // event, so there's no count to reserve from, unlike `route_batch`.
         scratch.dests[0].reserve_exact(batch.events.len());
-        let mut dropped: u64 = 0;
+        let mut discarded: u64 = 0;
         let mut errors: u64 = 0;
         let slots = scratch.dests.len();
         for event in batch.events {
@@ -2754,7 +2750,7 @@ fn run_lua_loop(
                         scratch.dests[lua_slot_of(mark, slots)].push(event);
                     }
                 }
-                Ok(ProcessOutcome::Drop) => dropped += 1,
+                Ok(ProcessOutcome::Drop) => discarded += 1,
                 Err(err) => {
                     errors += 1;
                     diag.warn_throttled("script_error", format_args!("script error: {err}"));
@@ -2767,15 +2763,18 @@ fn run_lua_loop(
         // Once per batch: how a script leaking VM-side state becomes visible
         // (`docs/design/internal-telemetry.md`).
         telemetry.gauge("logit.script.vm.memory", worker.used_memory() as f64, &[]);
-        if dropped > 0 {
-            telemetry.count(
-                "logit.component.events.dropped",
-                dropped as f64,
-                &[("reason", "script_drop")],
-            );
+        if discarded > 0 {
+            telemetry.count("logit.component.events.discarded", discarded as f64, &[]);
         }
         if errors > 0 {
             telemetry.count("logit.component.errors", errors as f64, &[("reason", "process")]);
+            // `ScriptWorker::process` takes the event by value and returns nothing on `Err`, so
+            // each error loses its one input event.
+            telemetry.count(
+                "logit.component.events.dropped",
+                errors as f64,
+                &[("reason", "script_error")],
+            );
             // Any script error, even mixed with successful emits, marks the span failed at the
             // call site whose error path fired, as `write_loop` does. Without it, a batch whose
             // every event errored would record a successful zero-event span.
@@ -4539,6 +4538,94 @@ mod tests {
             SpanStatus::Error,
             "a mixed success/error batch must not drain as a successful span"
         );
+    }
+
+    /// A script's `nil` return is `events.discarded`; a script error loses its event, counted as
+    /// `events.dropped{reason="script_error"}` beside `errors{reason="process"}`.
+    #[tokio::test]
+    async fn run_lua_counts_a_nil_return_as_discarded_and_an_error_as_dropped() {
+        let script = "n = 0\n\
+                       function process(event)\n\
+                       \x20 n = n + 1\n\
+                       \x20 if n == 1 then return nil end\n\
+                       \x20 if n == 2 then error('boom') end\n\
+                       \x20 return event\n\
+                       end"
+        .to_string();
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "enrich".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua { script: script.clone(), interval: None, max_memory: None },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![
+                counter_event("hits", 1.0),
+                counter_event("hits", 2.0),
+                counter_event("hits", 3.0),
+            ],
+        };
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua { script, interval: None, runtime: LuaRuntimeConfig::default() },
+        );
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx: result_tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            RECV_TIMEOUT,
+            run_with_telemetry(g, specs, telemetry, Readiness::disabled(), std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        let received = result_rx.recv_timeout(RECV_TIMEOUT).expect("output should receive a batch");
+        assert_eq!(received.events.len(), 1, "only the third event is returned");
+        let totals = Totals::of(registry.drain(0));
+        let enrich = |name, tags: &[(&str, &str)]| {
+            let mut all = vec![("component", "enrich")];
+            all.extend_from_slice(tags);
+            totals.sum(name, &all)
+        };
+        assert_eq!(enrich("logit.component.events.discarded", &[]), 1.0);
+        assert_eq!(
+            enrich("logit.component.events.dropped", &[("reason", "script_error")]),
+            1.0,
+            "the event the script errored on is lost"
+        );
+        assert_eq!(enrich("logit.component.events.dropped", &[]), 1.0, "no other drop reason");
+        assert_eq!(enrich("logit.component.errors", &[("reason", "process")]), 1.0);
     }
 
     /// `flush_now` samples VM memory even when no batch ever arrived.
