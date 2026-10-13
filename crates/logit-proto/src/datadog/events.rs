@@ -124,7 +124,7 @@ impl DatadogDecoder {
                 }
                 for (source, items) in groups {
                     let Json::Array(items) = items else {
-                        self.skip_event("malformed");
+                        self.drop_event("malformed");
                         self.diagnostics.warn_throttled(
                             "malformed_event",
                             "datadog events envelope group is not an array",
@@ -156,14 +156,14 @@ impl DatadogDecoder {
         received_at: i64,
     ) -> Option<Event> {
         let Json::Object(obj) = item else {
-            self.skip_event("malformed");
+            self.drop_event("malformed");
             self.diagnostics.warn_throttled("malformed_event", "datadog event is not an object");
             return None;
         };
         let title = str_of(obj, "msg_title").or_else(|| str_of(obj, "title"));
         let text = str_of(obj, "msg_text").or_else(|| str_of(obj, "text"));
         if title.is_none() && text.is_none() {
-            self.skip_event("no_title");
+            self.drop_event("no_title");
             return None;
         }
         let timestamp = obj.get("timestamp").or_else(|| obj.get("date_happened")).and_then(seconds);
@@ -219,8 +219,8 @@ impl DatadogDecoder {
         ))
     }
 
-    fn skip_event(&self, reason: &'static str) {
-        self.telemetry.count("logit.input.events.skipped", 1.0, &[("reason", reason)]);
+    fn drop_event(&self, reason: &'static str) {
+        self.telemetry.count("logit.input.events.dropped", 1.0, &[("reason", reason)]);
     }
 }
 
@@ -324,7 +324,7 @@ impl DatadogEncoder {
         let dropped = render_tags(attrs.iter().map(|(k, v)| (*k, *v)), &keys.consumed(), &mut tags);
         if dropped.unrepresentable > 0 {
             self.telemetry.count(
-                "logit.output.tags.dropped",
+                "logit.output.tags.omitted",
                 dropped.unrepresentable as f64,
                 &[("reason", "unrepresentable")],
             );
@@ -474,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn events_without_title_or_text_are_skipped_and_counted() {
+    fn events_without_title_or_text_are_dropped_and_counted() {
         let registry = Registry::new();
         let mut decoder = DatadogDecoder::new().with_telemetry(registry.telemetry_for(
             "datadog_in",
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(batch.events.len(), 1);
         assert_eq!(attr(&batch.events[0], "statsd.event.title"), Some(""));
         assert_eq!(batch.events[0].timestamp, RECEIVED_AT);
-        assert_eq!(counted(&registry, "logit.input.events.skipped", ("reason", "no_title")), 1.0);
+        assert_eq!(counted(&registry, "logit.input.events.dropped", ("reason", "no_title")), 1.0);
     }
 
     #[test]
@@ -533,7 +533,7 @@ mod tests {
             r#"{"apiKey":"","events":{"api":[{"msg_title":"from a transform","msg_text":"x","timestamp":5,"host":"","alert_type":"error"}]},"internalHostname":""}"#
         );
         assert_eq!(
-            counted(&registry, "logit.output.tags.dropped", ("reason", "unrepresentable")),
+            counted(&registry, "logit.output.tags.omitted", ("reason", "unrepresentable")),
             1.0
         );
 

@@ -555,7 +555,22 @@ pub(crate) enum Undelivered {
 }
 
 impl Undelivered {
-    /// The `reason` (`logit.input.batches.dropped`) and `class` (`logit.input.requests`) value.
+    /// Counts the undelivered batches. A deadline that passed is
+    /// `logit.input.batches.deferred`, untagged, because the client still holds the body and
+    /// retries the `503`; a closed consumer is
+    /// `logit.input.batches.dropped{reason="closed_consumer"}`.
+    pub(crate) fn record(self, telemetry: &Telemetry) {
+        match self {
+            Undelivered::Busy(n) => telemetry.count("logit.input.batches.deferred", n as f64, &[]),
+            Undelivered::Closed(n) => telemetry.count(
+                "logit.input.batches.dropped",
+                n as f64,
+                &[("reason", "closed_consumer")],
+            ),
+        }
+    }
+
+    /// The `class` (`logit.input.requests`) value, and the `503` body's message.
     pub(crate) fn reason(self) -> &'static str {
         match self {
             Undelivered::Busy(_) => "busy",

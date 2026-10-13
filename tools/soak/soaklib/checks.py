@@ -2408,15 +2408,18 @@ def _sent_one(data, led, sink, flag, lines):
     record_drops = _by_attr(sut, "logit.output.records.dropped", "reason", component=sink)
     for reason, value in sorted(record_drops.items()):
         if reason in REJECTED_RECORD_REASONS:
+            # `rejected` counts both a rejected request's entries and the series a 2xx body
+            # names, so it quotes whichever of the two the sink logged.
+            groups = [("request_rejected", "oversize")]
+            if reason == "rejected":
+                groups.append(("series_rejected",))
+            found = [quoted(*keys) for keys in groups
+                     if any(entry.key in keys for entry in diagnostics)]
+            evidence = "; ".join(found) or quoted(*groups[0])
             flag(FAIL, f"{sink}: {_n(value)} record(s) dropped {reason}, refused by the "
-                       "destination or too large to send "
-                       f"({quoted('request_rejected', 'oversize')})")
+                       f"destination or too large to send ({evidence})")
         else:
             flag(WARN, f"{sink}: {_n(value)} record(s) dropped {reason} before sending, counted")
-    named = sum(sut.counter_by_life("logit.output.records.rejected", component=sink).values())
-    if named:
-        flag(FAIL, f"{sink}: {_n(named)} record(s) named dropped in an accepted response's body "
-                   f"({quoted('series_rejected')})")
     skipped_metrics = _by_attr(sut, "logit.output.metrics.skipped", "reason", component=sink)
     skipped_metrics.update({f"metric_kind={k}": v for k, v in _by_attr(
         sut, "logit.output.metrics.skipped", "metric_kind", component=sink).items()

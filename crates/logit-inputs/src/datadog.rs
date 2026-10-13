@@ -95,8 +95,8 @@
 //! delivery, through [`Fanout::send_with_deadline`]: a batch reaches every downstream consumer or
 //! none. When the deadline passes, the request is answered `503` with `Retry-After: 1` and
 //! `{"status":"error","errors":["busy"]}`, counted `logit.input.requests{class="busy"}`, and the
-//! batches not yet delivered are counted `logit.input.batches.dropped{reason="busy"}`, disjoint
-//! from `logit.component.batches.sent`. The Agent retries a `503` with backoff, which makes the
+//! batches not yet delivered are counted `logit.input.batches.deferred`, disjoint from
+//! `logit.component.batches.sent`: the Agent still holds them. The Agent retries a `503` with backoff, which makes the
 //! pair at-least-once end to end:
 //!
 //! - **The timed-out batch is delivered to no consumer.** `send_with_deadline` reserves room on
@@ -113,9 +113,10 @@
 //! catches up.
 //!
 //! A batch no consumer takes, because every consumer of the listener has closed, gets the same
-//! `503` and `Retry-After: 1` with `closed_consumer` in place of `busy`: in the body, in
-//! `logit.input.requests{class}`, and in `logit.input.batches.dropped{reason}`, which counts that
-//! batch and every later one of the request. The refused batch was offered, so unlike a timed-out
+//! `503` and `Retry-After: 1` with `closed_consumer` in place of `busy`, in the body and in
+//! `logit.input.requests{class}`, and is counted
+//! `logit.input.batches.dropped{reason="closed_consumer"}`, that batch and every later one of the
+//! request. The refused batch was offered, so unlike a timed-out
 //! one it also counts in `logit.component.batches.sent`.
 //!
 //! # Telemetry
@@ -127,8 +128,9 @@
 //! `unknown_route`, `method`, `oversize`, `auth`, `encoding`, `malformed_encoding`, `malformed`,
 //! `stalled`, or `body_read` (a body that failed for a reason other than its size, such as a
 //! client disconnecting mid-upload). `logit.input.requests.acknowledged{route}` counts a payload
-//! answered without a send, and `logit.input.batches.dropped{reason}` (`busy` or
-//! `closed_consumer`) the batches a `503` left undelivered. The
+//! answered without a send, `logit.input.batches.deferred` the batches a busy `503` left
+//! undelivered, and `logit.input.batches.dropped{reason="closed_consumer"}` those no consumer
+//! took. The
 //! connection metrics are `otlp_in`'s verbatim. `docs/design/internal-telemetry.md`'s `datadog_in`
 //! section is the operator-facing account.
 
@@ -893,11 +895,7 @@ async fn respond(
         Ok(()) => (name, OK, route.success()),
         Err(undelivered) => {
             let reason = undelivered.reason();
-            shared.telemetry.count(
-                "logit.input.batches.dropped",
-                undelivered.count() as f64,
-                &[("reason", reason)],
-            );
+            undelivered.record(&shared.telemetry);
             let mut diag = shared.diag.clone();
             let _ = match undelivered {
                 Undelivered::Busy(_) => diag.warn_throttled(
@@ -1155,8 +1153,8 @@ mod tests {
             );
         }
         assert!(
-            !events.has("logit.input.events.skipped", &[("reason", "no_title")]),
-            "host metadata is not a skipped event"
+            !events.has("logit.input.events.dropped", &[("reason", "no_title")]),
+            "host metadata is not a dropped event"
         );
     }
 
@@ -1403,7 +1401,8 @@ mod tests {
 
         let events = Totals::of(registry.drain(0));
         assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 1.0);
-        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 1.0);
+        assert_eq!(events.sum("logit.input.batches.deferred", &[]), 1.0);
+        assert_eq!(events.sum("logit.input.batches.dropped", &[]), 0.0);
     }
 
     /// A batch no consumer takes is answered as busy is, but counted `closed_consumer` and
@@ -1426,7 +1425,7 @@ mod tests {
             events.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]),
             1.0
         );
-        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 0.0);
+        assert_eq!(events.sum("logit.input.batches.deferred", &[]), 0.0);
         assert_eq!(events.sum("logit.input.requests", &[("class", "closed_consumer")]), 1.0);
         assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 0.0);
     }
@@ -1459,7 +1458,8 @@ mod tests {
 
         let events = Totals::of(registry.drain(0));
         assert_eq!(events.sum("logit.component.batches.sent", &[]), 1.0);
-        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 1.0);
+        assert_eq!(events.sum("logit.input.batches.deferred", &[]), 1.0);
+        assert_eq!(events.sum("logit.input.batches.dropped", &[]), 0.0);
     }
 
     #[tokio::test]

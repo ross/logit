@@ -2650,8 +2650,8 @@ timeout, and then the same retry.
   downstream has closed, and the Agent's retry delivers the payload after a restart.
 - **Watch `logit.input.requests{class="busy"}`.** A steady rate means the pipeline can't keep up
   with its Agents, and the Agents' retry queues are absorbing the difference.
-  `logit.input.batches.dropped{reason="busy"}` counts the batches those `503`s left undelivered:
-  deferred to the Agent, not lost. It and `logit.component.batches.sent` are disjoint: a batch
+  `logit.input.batches.deferred` counts the batches those `503`s left undelivered: deferred to
+  the Agent, not lost. It and `logit.component.batches.sent` are disjoint: a batch
   counts under one or the other, never both.
 
 **What to watch.** `logit.input.requests{route, class}` shows which routes are arriving and how
@@ -2724,7 +2724,7 @@ the directory's permissions, or set `socket_mode:` (a quoted octal string, such 
 
 **A full pipeline loses spans.** When the pipeline doesn't accept a request's batch within 2
 seconds, `datadog_trace_in` answers `503` with `Retry-After: 1`, counted
-`logit.input.batches.dropped{reason="busy"}`. Unlike `datadog_in`'s Agent, which retries for
+`logit.input.batches.deferred`. Unlike `datadog_in`'s Agent, which retries for
 minutes, a tracer retries a few times and then drops the payload. So a stall longer than the
 window in [ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md)'s
 decision 11 is loss. A request no consumer took (every consumer directly downstream has closed)
@@ -2734,7 +2734,8 @@ long outage) large enough to absorb a stall, so the channel `datadog_trace_in` s
 draining.
 
 **What to watch.** `logit.input.spans` counts spans delivered, `logit.input.requests{route, class}`
-which routes arrive, `logit.input.batches.dropped{reason="busy"}` loss, and
+which routes arrive, `logit.input.batches.deferred` batches a tracer may or may not resend in
+time (read a sustained rate as loss), and
 `logit.input.requests.rejected{reason="unsupported_route"}` a tracer trying a feature this listener
 doesn't speak. A nonzero `logit.input.connections.rejected{reason="limit"}` means the
 `max_connections` cap, shared by the TCP listener and the Unix socket, is binding.
@@ -2838,7 +2839,8 @@ under either posture.
 A `413` counts the request's entries `oversize`, and any
 other `4xx` or `3xx` counts them `records.dropped{reason="rejected"}`; neither is retried, and the
 send goes on to the next request. A series `202` whose body names series Datadog dropped (a point
-too far in the future, say) counts each `records.rejected{route="series"}` and isn't retried.
+too far in the future, say) counts each `records.dropped{route="series", reason="rejected"}`
+and isn't retried.
 The send is delivered if any request was accepted, and fails
 as `rejected`, and is dropped, only when none was. The default posture, `at_least_once`, can still
 deliver a resend: of the request that drew the ambiguous answer, and of every request of a
@@ -3028,7 +3030,7 @@ channel at once. Neither the channel nor the id enters an event.
 
 **A full pipeline gets `503`.** When the pipeline doesn't take a request's first batch within 5
 seconds, the request gets `503` code 9 with `Retry-After: 1`, counted
-`logit.input.requests{class="busy"}`, and its batches `logit.input.batches.dropped{reason="busy"}`.
+`logit.input.requests{class="busy"}`, and its batches `logit.input.batches.deferred`.
 Nothing of the body was taken, and HEC clients retry a code 9. A body with several envelopes
 decodes to one batch per envelope; once the first is delivered, the rest wait for the pipeline
 without a deadline and the request gets `200`, so a retry never repeats part of a body. From a

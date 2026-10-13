@@ -1798,11 +1798,7 @@ async fn write_response(
         let mut batch = vec![EventBatch { resource, scope: None, events }];
         request_peer.stamp_batches(&mut batch);
         if let Err(undelivered) = crate::http::deliver_detached(sink, batch).await {
-            telemetry.count(
-                "logit.input.batches.dropped",
-                undelivered.count() as f64,
-                &[("reason", undelivered.reason())],
-            );
+            undelivered.record(telemetry);
             diag.warn_throttled(
                 "closed_consumer",
                 format_args!(

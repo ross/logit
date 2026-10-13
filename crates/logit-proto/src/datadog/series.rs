@@ -7,6 +7,7 @@
 //! decoded `Event::timestamp` is always a whole second too, including a `received_at` stand-in.
 
 use super::generated::agentpayload::{metric_payload, Metadata, MetricPayload, Origin};
+use super::outcomes::{MetricIn, MetricOut};
 use super::service_checks::{
     ATTR_SERVICE_CHECK_HOST, ATTR_SERVICE_CHECK_MESSAGE, ATTR_SERVICE_CHECK_NAME,
     ATTR_SERVICE_CHECK_STATUS,
@@ -319,9 +320,10 @@ fn batch(events: Vec<Event>) -> EventBatch {
 }
 
 impl DatadogDecoder {
-    pub(super) fn skipped(&self, reason: &'static str, n: usize) {
+    pub(super) fn metric_not_decoded(&self, outcome: MetricIn, n: usize) {
         if n > 0 {
-            self.telemetry.count("logit.input.metrics.skipped", n as f64, &[("reason", reason)]);
+            let reason = outcome.reason();
+            self.telemetry.count(outcome.metric(), n as f64, &[("reason", reason)]);
         }
     }
 
@@ -330,8 +332,9 @@ impl DatadogDecoder {
     }
 
     /// Drops one series (or sketch) whose shape is wrong, keeping the rest of the request.
-    pub(super) fn bad_series(&mut self, key: &'static str, why: impl std::fmt::Display) {
-        self.skipped(key, 1);
+    pub(super) fn bad_series(&mut self, outcome: MetricIn, why: impl std::fmt::Display) {
+        self.metric_not_decoded(outcome, 1);
+        let key = outcome.reason();
         self.diagnostics.warn_throttled(key, format!("datadog: {key} dropped: {why}"));
     }
 
@@ -351,7 +354,7 @@ impl DatadogDecoder {
         let attrs = series.attributes();
         for (seconds, value) in points {
             if !value.is_finite() {
-                self.skipped("non_finite_value", 1);
+                self.metric_not_decoded(MetricIn::NonFiniteValue, 1);
                 continue;
             }
             let (timestamp, defaulted) = point_timestamp(seconds, received_at);
@@ -376,11 +379,14 @@ impl DatadogDecoder {
         let mut out = Vec::new();
         for s in &payload.series {
             if s.metric.is_empty() {
-                self.bad_series("bad_series", "a series has no metric name");
+                self.bad_series(MetricIn::BadSeries, "a series has no metric name");
                 continue;
             }
             let Some(wire_type) = WireType::from_proto(s.r#type.into()) else {
-                self.bad_series("bad_series", format_args!("unknown metric type {}", s.r#type));
+                self.bad_series(
+                    MetricIn::BadSeries,
+                    format_args!("unknown metric type {}", s.r#type),
+                );
                 continue;
             };
             let mut series = WireSeries {
@@ -413,10 +419,10 @@ impl DatadogDecoder {
             match v2_json_series(item) {
                 Ok((metric, unit, series, points)) => {
                     let (points, bad) = points;
-                    self.skipped("bad_point", bad);
+                    self.metric_not_decoded(MetricIn::BadPoint, bad);
                     self.push_points(&mut out, metric, unit, &series, points, received_at);
                 }
-                Err(why) => self.bad_series("bad_series", why),
+                Err(why) => self.bad_series(MetricIn::BadSeries, why),
             }
         }
         Ok(batch(out))
@@ -438,13 +444,13 @@ impl DatadogDecoder {
                     for point in points {
                         match point {
                             V1Point::Ok(ts, v) => kept.push((ts, v)),
-                            V1Point::Null => self.skipped("null_value", 1),
-                            V1Point::Bad => self.skipped("bad_point", 1),
+                            V1Point::Null => self.metric_not_decoded(MetricIn::NullValue, 1),
+                            V1Point::Bad => self.metric_not_decoded(MetricIn::BadPoint, 1),
                         }
                     }
                     self.push_points(&mut out, metric, unit, &series, kept, received_at);
                 }
-                Err(why) => self.bad_series("bad_series", why),
+                Err(why) => self.bad_series(MetricIn::BadSeries, why),
             }
         }
         Ok(batch(out))
@@ -473,7 +479,7 @@ impl DatadogDecoder {
             let (metric, series, points) = match parsed {
                 Ok(p) => p,
                 Err(why) => {
-                    self.bad_series("bad_series", why);
+                    self.bad_series(MetricIn::BadSeries, why);
                     continue;
                 }
             };
@@ -481,11 +487,11 @@ impl DatadogDecoder {
             let attrs = series.attributes();
             for point in points {
                 let Some((seconds, values)) = distribution_point(point) else {
-                    self.skipped("bad_point", 1);
+                    self.metric_not_decoded(MetricIn::BadPoint, 1);
                     continue;
                 };
                 if values.is_empty() {
-                    self.skipped("empty_distribution", 1);
+                    self.metric_not_decoded(MetricIn::EmptyDistribution, 1);
                     continue;
                 }
                 let (timestamp, defaulted) = point_timestamp(seconds, received_at);
@@ -779,17 +785,18 @@ fn resource_entry(v: &Value) -> Option<(String, String)> {
 }
 
 impl DatadogEncoder {
-    pub(super) fn out_skipped(&self, tag: (&'static str, &'static str)) {
-        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[tag]);
+    pub(super) fn metric_not_sent(&self, outcome: MetricOut) {
+        let (metric, tag) = outcome.counter();
+        self.telemetry.count(metric, 1.0, &[tag]);
     }
 
     pub(super) fn out_degraded(&self, reason: &'static str) {
         self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("reason", reason)]);
     }
 
-    pub(super) fn tags_dropped(&self, reason: &'static str, n: usize) {
+    pub(super) fn tags_omitted(&self, reason: &'static str, n: usize) {
         if n > 0 {
-            self.telemetry.count("logit.output.tags.dropped", n as f64, &[("reason", reason)]);
+            self.telemetry.count("logit.output.tags.omitted", n as f64, &[("reason", reason)]);
         }
     }
 
@@ -862,8 +869,8 @@ impl DatadogEncoder {
                 unrepresentable += 1;
             }
         }
-        self.tags_dropped("unrepresentable", unrepresentable);
-        self.tags_dropped("no_wire_form", c.unwritable(route));
+        self.tags_omitted("unrepresentable", unrepresentable);
+        self.tags_omitted("no_wire_form", c.unwritable(route));
         c
     }
 
@@ -874,11 +881,11 @@ impl DatadogEncoder {
             MetricKind::Sum(sum) => match (sum.temporality, sum.monotonic) {
                 (Temporality::Delta, true) => (WireType::Count, sum.value),
                 (Temporality::Delta, false) => {
-                    self.out_skipped(("metric_kind", "non_monotonic_delta_sum"));
+                    self.metric_not_sent(MetricOut::Kind("non_monotonic_delta_sum"));
                     return None;
                 }
                 (Temporality::Cumulative, _) => {
-                    self.out_skipped(("metric_kind", "cumulative_sum"));
+                    self.metric_not_sent(MetricOut::Kind("cumulative_sum"));
                     return None;
                 }
             },
@@ -889,21 +896,24 @@ impl DatadogEncoder {
             }
             // Their own routes: `encode_distribution_points` and `encode_sketches`.
             MetricKind::Samples(_) | MetricKind::Distribution(_) => return None,
-            MetricKind::GaugeDelta(_)
-            | MetricKind::SetMembers(_)
+            MetricKind::GaugeDelta(_) => {
+                self.metric_not_sent(MetricOut::GaugeDelta);
+                return None;
+            }
+            MetricKind::SetMembers(_)
             | MetricKind::Histogram(_)
             | MetricKind::ExponentialHistogram(_)
             | MetricKind::Summary(_) => {
-                self.out_skipped(("metric_kind", record.kind.name()));
+                self.metric_not_sent(MetricOut::Kind(record.kind.name()));
                 return None;
             }
         };
         if record.is_no_recorded_value() {
-            self.out_skipped(("reason", "no_recorded_value"));
+            self.metric_not_sent(MetricOut::NoRecordedValue);
             return None;
         }
         if !value.is_finite() {
-            self.out_skipped(("reason", "non_finite_value"));
+            self.metric_not_sent(MetricOut::NonFiniteValue);
             return None;
         }
         Some((wire_type, value))
@@ -1048,13 +1058,13 @@ impl DatadogEncoder {
             for record in &event.metrics[first_metric(&batch.resource, event)..] {
                 let MetricKind::Samples(samples) = &record.kind else { continue };
                 if record.is_no_recorded_value() {
-                    self.out_skipped(("reason", "no_recorded_value"));
+                    self.metric_not_sent(MetricOut::NoRecordedValue);
                     continue;
                 }
                 let finite: Vec<f64> =
                     samples.values.iter().copied().filter(|v| v.is_finite()).collect();
                 if finite.len() != samples.values.len() {
-                    self.out_skipped(("reason", "non_finite_value"));
+                    self.metric_not_sent(MetricOut::NonFiniteValue);
                 }
                 if finite.is_empty() {
                     continue;
@@ -1242,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_null_values_and_bad_series_are_skipped_and_counted() {
+    fn v1_null_values_are_skipped_and_bad_series_dropped() {
         let body = br#"{"series":[
             {"metric":"a","points":[[1700000000,null],[1700000000.7,3]]},
             {"metric":"b","points":[[1700000000,1]],"type":"histogram"},
@@ -1255,21 +1265,23 @@ mod tests {
         // A fractional v1 timestamp truncates to its second.
         assert_eq!(batch.events[0].timestamp, TS);
         let events = registry.drain(0);
-        let total = |reason: &str| -> f64 {
+        let total = |metric: &str, reason: &str| -> f64 {
             events
                 .iter()
                 .filter(|e| e.attributes.get("reason").and_then(Value::as_str) == Some(reason))
                 .flat_map(|e| e.metrics.iter())
-                .filter(|m| resolve(m.name) == "logit.input.metrics.skipped")
+                .filter(|m| resolve(m.name) == metric)
                 .map(|m| match m.kind {
                     MetricKind::Sum(Sum { value, .. }) => value,
                     _ => 0.0,
                 })
                 .sum()
         };
-        assert_eq!(total("null_value"), 1.0);
-        assert_eq!(total("bad_series"), 2.0);
-        assert_eq!(total("bad_point"), 1.0);
+        let (skipped, dropped) = ("logit.input.metrics.skipped", "logit.input.metrics.dropped");
+        assert_eq!(total(skipped, "null_value"), 1.0);
+        assert_eq!(total(dropped, "bad_series"), 2.0);
+        assert_eq!(total(dropped, "bad_point"), 1.0);
+        assert_eq!(total(skipped, "bad_series") + total(skipped, "bad_point"), 0.0);
     }
 
     #[test]
@@ -1369,7 +1381,7 @@ mod tests {
         assert_eq!(a.get(ATTR_ORIGIN_CATEGORY), Some(&Value::U64(2)));
         assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(1.0));
         assert_eq!(
-            counted(&registry, "logit.input.metrics.skipped", ("reason", "bad_series")),
+            counted(&registry, "logit.input.metrics.dropped", ("reason", "bad_series")),
             1.0
         );
     }
@@ -1431,8 +1443,10 @@ mod tests {
         };
         assert!(has("logit.output.metrics.degraded", "reason", "set_estimate"));
         assert!(has("logit.output.metrics.skipped", "metric_kind", "cumulative_sum"));
-        assert!(has("logit.output.metrics.skipped", "metric_kind", "gauge_delta"));
-        assert!(has("logit.output.metrics.skipped", "reason", "non_finite_value"));
+        assert!(has("logit.output.metrics.dropped", "reason", "unresolved_gauge_delta"));
+        assert!(!has("logit.output.metrics.skipped", "metric_kind", "gauge_delta"));
+        assert!(has("logit.output.metrics.dropped", "reason", "non_finite_value"));
+        assert!(!has("logit.output.metrics.skipped", "reason", "non_finite_value"));
         assert!(!has("logit.output.metrics.skipped", "metric_kind", "samples"));
     }
 

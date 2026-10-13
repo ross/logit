@@ -3689,8 +3689,8 @@ def _datadog_lines(rejected_at=None, retry_at=(), stale=0, skipped=0, records=Tr
         lines.append(_line(_stamp(T0 + 250), "logit.output.metrics.skipped", "sum", skipped,
                            component="sink", attrs={"metric_kind": "cumulative_sum"}))
     if named:
-        lines.append(_line(_stamp(T0 + 250), "logit.output.records.rejected", "sum", named,
-                           component="sink", attrs={"route": "series"}))
+        lines.append(_line(_stamp(T0 + 250), "logit.output.records.dropped", "sum", named,
+                           component="sink", attrs={"route": "series", "reason": "rejected"}))
     if queued_at is not None:
         lines.append(_line(_stamp(T0 + queued_at), "logit.component.batches.received", "sum",
                            3, component="sink"))
@@ -3812,22 +3812,24 @@ def _external_checks():
                       {"component": "sink", "key": "series_rejected"})
         named = results("external-named", sut_extra=_datadog_lines(named=2),
                         stderr_extra=[series_202])["ledger.sent"]
-        expect(named.status == checks.FAIL and "2 record(s) named dropped" in named.detail
-               and "a 2xx whose body named dropped series: series_rejected" in named.detail,
+        expect(named.status == checks.FAIL and "2 record(s) dropped rejected" in named.detail
+               and "a 2xx whose body named dropped series: series_rejected" in named.detail
+               and "no request_rejected" not in named.detail,
                f"records named in a 202 body FAIL quoting series_rejected, got {named}")
         both = results("external-202-then-400", sut_extra=_datadog_lines(rejected_at=250),
                        stderr_extra=[series_202, rejection])["ledger.sent"]
         expect(both.status == checks.FAIL and "status 400: request_rejected" in both.detail
-               and "a 2xx whose body" not in both.detail,
-               f"a 400's drop quotes the 400, not an earlier 202, got {both}")
+               and "a 2xx whose body named dropped series: series_rejected"
+               in " ".join(both.lines),
+               f"a 400 and a 202 that both drop records are both quoted, got {both}")
         early_400 = (240,) + rejection[1:]
         late_202 = (250,) + series_202[1:]
         named_late = results("external-400-then-202", sut_extra=_datadog_lines(named=2),
                              stderr_extra=[early_400, late_202])["ledger.sent"]
         expect(named_late.status == checks.FAIL
                and "a 2xx whose body named dropped series: series_rejected" in named_late.detail
-               and "status 400" not in named_late.detail,
-               f"named records quote series_rejected, not an earlier 400, got {named_late}")
+               and "status 400: request_rejected" in named_late.detail,
+               f"named records quote series_rejected beside an earlier 400, got {named_late}")
         pre_send = (250, "WARN", "dropped one event on the series route: it encodes to 9000000 "
                     "bytes (800000 compressed), over the route's per-request limit",
                     {"component": "sink", "key": "oversize"})
