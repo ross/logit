@@ -1,0 +1,8 @@
+method: POST
+path: /api/v2/write?bucket=fixture-identity&org=fixture-org
+host: capture:8086
+user-agent: Telegraf/1.40.2 Go/1.27.1
+transfer-encoding: chunked
+authorization: Token 00000000-0000-0000-0000-000000000000
+content-type: text/plain; charset=utf-8
+accept-encoding: gzip

@@ -4,7 +4,7 @@
 #              graphite-p0, graphite-py2, graphite-dropwizard, one capture each), prometheus,
 #              prometheus-scrape, vmagent, statsd, datadog (= datadog-agent, datadog-tracer,
 #              datadog-dogstatsd-unix), splunk (= splunk-otel, splunk-docker, splunk-sc4s,
-#              splunk-java, then check_splunk_capture.py), kafka
+#              splunk-java, then check_splunk_capture.py), influxdb, kafka
 #   With no arguments, records every producer in `all` below.
 #
 # Captures wire traffic from real third-party producers into testdata/interop/, so decoders are
@@ -71,7 +71,7 @@ finish_capture() {
 
 cleanup() {
     ${DOCKER} rm -f -v capture otelcol prometheus vmagent metatarget dd-agent dd-clients \
-        scrape-node scrape-python splunk-dind splunk-sc4s splunk-java kafka-record-broker kafka-record-javac >/dev/null 2>&1 || true
+        telegraf scrape-node scrape-python splunk-dind splunk-sc4s splunk-java kafka-record-broker kafka-record-javac >/dev/null 2>&1 || true
     ${DOCKER} volume rm "${DD_VOLUME}" >/dev/null 2>&1 || true
     ${DOCKER} network rm "${NET}" "${KAFKA_NET}" >/dev/null 2>&1 || true
     # record_prometheus and record_datadog_agent render config into a temp dir; remove it here too
@@ -1013,6 +1013,32 @@ record_splunk() {
     return "${status}"
 }
 
+# ---- influxdb ------------------------------------------------------------------------------------
+
+INFLUXDB_TELEGRAF_IMAGE="docker.io/library/telegraf:1.40.2@sha256:aedc74ac64c623b6e6760545a8ff56a63b99a798bba3d361279a2887642798cf"
+
+# Telegraf's `outputs.influxdb_v2`, twice (telegraf-influxdb-v2.conf): the default gzip body and
+# `content_encoding = "identity"`, written to a capture sink standing where InfluxDB 2.x would, on
+# port 8086, answering `204` to every write. The inputs are cpu, mem, system, and an `inputs.file`
+# over telegraf-influxdb-lines.txt. Telegraf streams its gzip body without a Content-Length, so
+# the sink runs with --accept-chunked. Six writes are three 5 s flushes of both outputs.
+record_influxdb() {
+    echo "== recording: Telegraf outputs.influxdb_v2 (${INFLUXDB_TELEGRAF_IMAGE}) =="
+    local out="${OUT_ROOT}/influxdb"
+    ${DOCKER} run --rm "${INFLUXDB_TELEGRAF_IMAGE}" telegraf --version 2>&1 | sed 's/^/  [telegraf] /'
+    start_capture http 8086 "${out}" telegraf 0 90 --name-by-path --accept-chunked \
+        --require /api/v2/write=6
+    ${DOCKER} run -d --name telegraf --network "${NET}" \
+        -v "${TOOLS_DIR}/telegraf-influxdb-v2.conf:/etc/telegraf/telegraf.conf:ro,z" \
+        -v "${TOOLS_DIR}/telegraf-influxdb-lines.txt:/etc/telegraf/lines.txt:ro,z" \
+        "${INFLUXDB_TELEGRAF_IMAGE}" >/dev/null
+    local status=0
+    finish_capture || status=$?
+    ${DOCKER} logs telegraf 2>&1 | grep -E ' [EW]! ' | head -20 | sed 's/^/  [telegraf] /' || true
+    ${DOCKER} rm -f telegraf >/dev/null 2>&1 || true
+    return "${status}"
+}
+
 # ---- Kafka --------------------------------------------------------------------------------------
 #
 # One producer, `kafka`, writing testdata/interop/kafka/ (its README has the provenance): reference
@@ -1167,7 +1193,7 @@ record_kafka() {
 # ---- entry point ----------------------------------------------------------------------------------
 
 all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus
-    prometheus-scrape vmagent statsd datadog splunk kafka)
+    prometheus-scrape vmagent statsd datadog splunk influxdb kafka)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -1201,6 +1227,7 @@ for p in "${producers[@]}"; do
     splunk-sc4s) record_splunk_sc4s ;;
     splunk-java) record_splunk_java ;;
     splunk) record_splunk ;;
+    influxdb) record_influxdb ;;
     kafka) record_kafka ;;
     datadog)
         record_datadog_dogstatsd_unix

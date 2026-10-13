@@ -35,7 +35,7 @@ use logit_proto::prometheus::PrometheusDecoder;
 use logit_proto::proxy::V2_SIGNATURE;
 use logit_proto::{FramedEncoder, MessageBuf, Signal, SignalEncoder, SignalPayload};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -294,7 +294,7 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         add("collectd", name, bytes);
     }
 
-    for (name, bytes) in influxdb_line_seeds() {
+    for (name, bytes) in influxdb_line_seeds(testdata)? {
         add("influxdb_line", name, bytes);
     }
 
@@ -645,7 +645,7 @@ mod influxdb_lines;
 /// per shape `crates/logit-proto/src/influxdb/mod.rs`'s grammar table names, each under the ns
 /// selector `0`: escapes in every position, every number and boolean form, string escapes and a
 /// quoted newline, comments and whitespace, duplicates that merge, and lines that fail.
-fn influxdb_line_seeds() -> Vec<(String, Vec<u8>)> {
+fn influxdb_line_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     let prefixed = |selector: u8, body: &[u8]| [&[selector][..], body].concat();
     let mut out: Vec<(String, Vec<u8>)> = (0..4u8)
         .map(|selector| {
@@ -696,7 +696,34 @@ fn influxdb_line_seeds() -> Vec<(String, Vec<u8>)> {
     ] {
         out.push((format!("constructed-{name}"), prefixed(0, body)));
     }
-    out
+    out.extend(influxdb_recorded_seeds(testdata)?);
+    Ok(out)
+}
+
+/// Under the ns selector `0`: each Telegraf `/api/v2/write` body in
+/// `testdata/interop/influxdb/`, gunzipped where its sidecar says `content-encoding: gzip`.
+fn influxdb_recorded_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let dir = testdata.join("interop/influxdb");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)?
+        .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()?;
+    names.retain(|name| name.ends_with(".bin"));
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let stem = name.trim_end_matches(".bin");
+        let raw = std::fs::read(dir.join(&name))?;
+        let sidecar = std::fs::read_to_string(dir.join(format!("{stem}.headers")))?;
+        let body = if sidecar.lines().any(|line| line == "content-encoding: gzip") {
+            let mut body = Vec::new();
+            flate2::read::GzDecoder::new(&raw[..]).read_to_end(&mut body)?;
+            body
+        } else {
+            raw
+        };
+        out.push((format!("recorded-{stem}"), [&[0u8][..], &body].concat()));
+    }
+    Ok(out)
 }
 
 /// `p = 'robustness.host.cpu;env=prod'; pickle.dumps([(p, (1700000000, 0.5)),
