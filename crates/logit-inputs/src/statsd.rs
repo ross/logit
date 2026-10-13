@@ -91,7 +91,7 @@
 //! `logit.component.receive.flushed{reason}` from the per-connection batch assembly, and
 //! `framing_error`/`connection_error` diagnostics. `unix` reports what `udp` does, but a full
 //! Unix datagram queue blocks or refuses the sender instead of dropping, so
-//! `logit.input.kernel.drops` stays at zero there (`crate::udp`'s module doc). `unix_stream`
+//! `logit.input.kernel.dropped` stays at zero there (`crate::udp`'s module doc). `unix_stream`
 //! reports what `tcp` does, less the `logit.input.accept_queue.*` gauges.
 //!
 //! The decoder's own `bad_line` diagnostic (`logit_proto::statsd`'s module doc, "Malformed input")
@@ -214,11 +214,20 @@ impl StatsdInput {
 
     /// Attaches a telemetry handle for the drivers' layer-3 counters
     /// (`docs/design/internal-telemetry.md`): datagrams and bytes on UDP, connections and frames on
-    /// TCP, which `Fanout`-level `events.sent` can't tell apart from one busy client.
+    /// TCP, which `Fanout`-level `events.sent` can't tell apart from one busy client. The decoder
+    /// gets it too, for `logit.input.messages.dropped`.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.inner = match self.inner {
-            Inner::Udp(listener) => Inner::Udp(listener.with_telemetry(telemetry)),
-            Inner::Tcp(listener) => Inner::Tcp(listener.with_telemetry(telemetry)),
+            Inner::Udp(listener) => Inner::Udp(
+                listener
+                    .with_telemetry(telemetry.clone())
+                    .map_decoder(|d| d.with_telemetry(telemetry)),
+            ),
+            Inner::Tcp(listener) => Inner::Tcp(
+                listener
+                    .with_telemetry(telemetry.clone())
+                    .map_decoder(|d| d.with_telemetry(telemetry)),
+            ),
         };
         self
     }

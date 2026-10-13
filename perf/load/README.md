@@ -263,7 +263,7 @@ apply to a VM that exposes none of those knobs.
 
 0. **The kernel socket sampler reported at all.** `getsockopt(SO_MEMINFO)` needs Linux 4.12+ and a
    sandbox that permits it. Where it isn't available, W1's sampler disables itself for the process
-   after one failed call and says so in a log line that carries no counter. `logit.input.kernel.drops`
+   after one failed call and says so in a log line that carries no counter. `logit.input.kernel.dropped`
    then reads as a flat zero, the accounting below can't close, and every repeat would fail blaming
    a `--settle` that was never the problem. The check looks for the *presence* of a
    `receive_buffer.*` gauge rather than its value, since each of those numbers is legitimately zero

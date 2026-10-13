@@ -456,7 +456,7 @@ What an operator sees in the graphs:
   while it decodes what it already queued. Whatever the kernel held for the socket at the close
   is discarded, with no `logit` counter recording it. A reader that keeps up holds that queue near
   empty; a reader stalled under `overflow: block` can lose a full `SO_RCVBUF`.
-- **Per-socket counters cover one process each.** `logit.input.kernel.drops` and the
+- **Per-socket counters cover one process each.** `logit.input.kernel.dropped` and the
   `receive_buffer.*` and `accept_queue.*` gauges describe each pod's own socket, not the port.
 - **An `aggregate` window splits.** A flow that moves mid-window has that window summed in both
   processes, and each emits a partial value for the same series.
@@ -558,7 +558,7 @@ that recorded the point.
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
 | `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
-| `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for a nonzero `*.dropped` count whose `reason` isn't one the config asked for (`absorbed`, `unrouted`, `script_drop`), other than `keep` and `remove`'s `logit.transform.attributes.dropped`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
+| `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for any nonzero `*.dropped` count, whatever its `reason`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
 `telemetry left undrained at exit` is the last word on counts recorded after `internal`'s final
@@ -654,6 +654,26 @@ A dedicated pipeline can have transforms, such as a `keep_signals` or an `aggreg
 `internal` and its sinks. See [`docs/design/internal-telemetry.md`](design/internal-telemetry.md)
 and the [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md)'s
 "Amendment: internal drains last" section.
+
+## Alerting on loss
+
+**Alert on any nonzero `logit.*.dropped` count, grouped by its `component` and `reason`
+attributes.** Every `*.dropped` counter is loss: data that should have left `logit` and didn't.
+Its `reason` says where to look, so you don't need a list of reasons to exclude. An outcome your
+config asked for never counts as dropped: a filter, `sample`, `aggregate`, or Lua script removing
+an event counts `logit.component.events.discarded`, and a tag or field removed from a record that's
+still delivered counts `*.omitted`. The full vocabulary is in
+[internal-telemetry.md](design/internal-telemetry.md#loss-vocabulary).
+
+Two signals are back-pressure, not loss. Watch them, because a sustained value means a stage
+isn't keeping up and loss may follow:
+
+- `logit.input.batches.deferred`: an HTTP listener answered `503` and the client kept the data to
+  retry. A client with a short retry window, such as a dd-trace tracer, drops its payload once it
+  gives up, and `logit` can't count that.
+- `logit.component.retrying` (gauge, on a sink): `1` while the sink retries a failing head. A hold
+  drops nothing, so `*.dropped` doesn't move until the queue behind it overflows or shutdown
+  cuts it. Alert on this gauge staying at `1`.
 
 ## Sink delivery buffering
 
@@ -837,8 +857,8 @@ buffering:
 - `logit.component.batches.dropped` (count, tagged `reason`): `overflow_oldest`/`overflow_newest`
   (a `drop_*` policy dropped something), `rejected` (the destination refused the batch for its own
   content), `ambiguous_at_most_once` (a send of unknown outcome under `at_most_once`), or
-  `shutdown` (the queue, or batches still waiting to enter it, held data when the sink stopped). Any sustained nonzero rate is data
-  loss worth alerting on. The `reason` says whether the cause is an overflowing queue, a failing
+  `shutdown` (the queue, or batches still waiting to enter it, held data when the sink stopped). Any nonzero count is data loss
+  worth alerting on ([Alerting on loss](#alerting-on-loss)). The `reason` says whether the cause is an overflowing queue, a failing
   destination, or a slow drain racing shutdown.
 - `logit.component.retrying` (gauge): `1` while a sink holds a failing head. A hold drops nothing,
   so it never shows in `batches.dropped`.
@@ -958,8 +978,8 @@ rotation renames each retained file; `logit validate` rejects a larger value.
 
 **What to watch.** The metrics above still apply, with these differences:
 `buffer.utilization`/`.bytes` are sized against `buffer.disk.max_bytes`; `batches.dropped` gains
-the `reason`s `frame_too_large`, `disk_corrupt`, `disk_full`, and `disk_io_error`; and a
-disk-backed sink emits `reason="shutdown"` only under `at_most_once`, when the shutdown grace cuts
+the `reason`s `frame_too_large`, `disk_corrupt`, `disk_torn`, `disk_full`, and `disk_io_error`;
+and a disk-backed sink emits `reason="shutdown"` only under `at_most_once`, when the shutdown grace cuts
 off the batches in flight (an ambiguous outcome that posture drops). Nothing else is dropped at
 shutdown, because the spool keeps it. Also watch:
 
@@ -969,8 +989,10 @@ shutdown, because the spool keeps it. Also watch:
   from the first tick on. A nonzero value on every restart under normal operation means something
   keeps the queue from ever fully draining.
 - `logit.component.buffer.disk.truncated` (count): a torn tail found and truncated at open. Nonzero
-  means the previous process ended mid-write, which an ordinary `SIGKILL` does. Note it; don't
-  alert on it alone.
+  means the previous process ended mid-write, which an ordinary `SIGKILL` does, or a power loss
+  tore unsynced bytes. The batch lost with the tail counts `batches.dropped{reason="disk_torn"}`
+  at the same open, unless the persisted cursor shows it committed; it counts no
+  `events.dropped`, because a partial record's event count is unreadable.
 - `logit.component.buffer.disk.errors{op}` (count): a failed spool filesystem operation, `op` one
   of `cursor`, `flush`, `fsync`, `create`, `truncate`, or `unlink`. Alert on any nonzero value: the
   durability level above no longer holds. A failed `cursor` write means more replay after a
@@ -1008,7 +1030,7 @@ reason. Behind a sink's queue is an in-process drain that can afford to wait. Be
 listener's queue is the kernel's socket receive buffer, which *can't* wait. Setting
 `receive.overflow: block` doesn't prevent loss under sustained overload; it moves the loss from a
 place `logit` can act on (`logit.component.datagrams.dropped`, a queue you can size) to one it can
-only report (`logit.input.kernel.drops`, the kernel discarding datagrams before `recv_from` sees
+only report (`logit.input.kernel.dropped`, the kernel discarding datagrams before `recv_from` sees
 them). Mature UDP listeners (syslog-ng, rsyslog, Telegraf, gostatsd) make the same choice, and most
 can't report the second number at all.
 
@@ -1110,28 +1132,29 @@ For a UDP listener:
   read syscalls that returned them. Their ratio is the mean fill described under
   [`read_batch`](#read_batch-how-many-datagrams-one-syscall-takes), and the only number that says
   whether that knob does anything for this listener.
-- `logit.input.datagrams.truncated` (count, Linux only): datagrams longer than the 65,507-byte read
-  slot, delivered only as far as the slot holds. This happens only on an **IPv6** listener: IPv6
-  permits a 65,527-byte payload, so the last 20 bytes of a maximum-size IPv6 datagram have nowhere
-  to go. `recv_from` truncated the same datagrams without reporting it; `recvmmsg` reports it.
-  Anything but zero means a sender is emitting datagrams larger than any IPv4 path could carry; fix
-  it at the sender.
 - `logit.component.receive.utilization` (gauge): the fill ratio of whichever of `max_datagrams`/
   `max_bytes` is closer to tripping. Sustained values near 1.0 mean decode is falling behind the
   socket; under `block`, it is also back-pressuring the sender (or, for a local process, the OS).
 - `logit.component.datagrams.dropped` / `.bytes.dropped` (count, tagged `reason`:
   `overflow_oldest`/`overflow_newest`): every datagram this listener chose to drop. This is the drop
   you can size your way out of, by raising `receive.max_datagrams`/`max_bytes` or speeding up
-  what's downstream. A sustained nonzero rate means the listener is overloaded relative to how fast
-  downstream decodes and consumes; size `receive:` or the downstream chain against it.
-- `logit.input.kernel.drops` (count, Linux only): datagrams the *kernel* discarded before
+  what's downstream. Any nonzero count is loss; a sustained rate means the listener is overloaded
+  relative to how fast downstream decodes and consumes, so size `receive:` or the downstream chain
+  against it.
+
+  The same counter's `reason="truncated"` (Linux only) is a datagram longer than the 65,507-byte
+  read slot, which the kernel cut short, so the listener drops it rather than decode a partial
+  payload. It happens only on an **IPv6** listener, which permits a 65,527-byte payload, or a Unix
+  datagram socket. Anything but zero means a sender is emitting datagrams larger than any IPv4 path
+  could carry; fix it at the sender.
+- `logit.input.kernel.dropped{reason="socket"}` (count, Linux only): datagrams the *kernel* discarded before
   `recv_from` could return them, read from the listening socket itself. It is the same number
   `/proc/net/udp`'s `drops` column shows for this socket. It is a separate loss from the queue
-  counter above; the two add up. Any sustained nonzero rate means datagrams arrive faster than this
-  process takes them off the socket.
+  counter above; the two add up. Any nonzero count is loss; a sustained rate means datagrams arrive
+  faster than this process takes them off the socket.
 - `logit.input.receive_buffer.utilization` (gauge), with
   `logit.input.receive_buffer.used.bytes` / `.bytes` behind it: how full the kernel's socket buffer
-  is, sampled once a second. It is the leading indicator for `kernel.drops`: the kernel drops at
+  is, sampled once a second. It is the leading indicator for `kernel.dropped`: the kernel drops at
   1.0, so a value climbing toward it is the warning and the drops are the event. A reading slightly
   over 1.0 is normal at saturation, because the kernel charges an arriving packet before testing
   the total against the ceiling.
@@ -1842,7 +1865,9 @@ components:
   `logit.input.connections.rejected{reason="limit"}` (nonzero means the `max_connections` cap is
   binding), `logit.input.frames`/`.frame.bytes` (one frame is one statsd line), and
   `logit.input.frames.dropped{reason="oversize"|"drained"|"truncated"}`. On either transport, a malformed
-  *line* is the decoder's `logit.component.diagnostics{key="bad_line"}`, not a framing error.
+  *line* is the decoder's `logit.input.messages.dropped{reason="malformed"}` (diagnostic `bad_line`),
+  not a framing error, and a datagram or frame that isn't UTF-8 is
+  `logit.input.frames.dropped{reason="undecodable"}`.
 
 ### `statsd_in`: DogStatsD over a Unix socket
 
@@ -1878,7 +1903,7 @@ components:
 - **`transport: unix` behaves like UDP.** One datagram carries one or more newline-separated lines,
   and the whole `receive:` block applies. The kernel counters differ: a full Unix datagram queue
   makes the *client's* send block or fail with `EAGAIN` rather than dropping in the kernel, so
-  `logit.input.kernel.drops` stays at zero and any loss shows up in the client's own telemetry
+  `logit.input.kernel.dropped` stays at zero and any loss shows up in the client's own telemetry
   (`datadog-go` counts dropped packets). `logit.input.receive_buffer.*` is still reported.
 - **`transport: unix_stream` is the Agent's `dogstatsd_stream_socket`.** Each packet (one
   datagram's worth of lines) follows its length as a 4-byte little-endian integer; clients use
@@ -1926,11 +1951,11 @@ reference. Before deploying one:
   choosing, however the sender packed them, so this setting (together with the inflation above,
   which pushes that 1296-byte capture over the default cap) decides egress framing. A single value
   list too large to fit alone is dropped whole and counted
-  `logit.output.metrics.skipped{reason="oversize_value_list"}`, not split.
+  `logit.output.metrics.dropped{reason="oversize_value_list"}`, not split.
 - **Set `hostname:` if the pipeline carries metrics that didn't come from `collectd_in`.** A relayed
   list already carries its origin's host on `collectd.host`, so a pure relay never needs it. Metrics
   from a `statsd_in`/`internal` with no `collectd.host` or `host.name`, and no `hostname:` set, are
-  dropped and counted `logit.output.metrics.skipped{reason="no_host"}` with a `no_host` diagnostic.
+  dropped and counted `logit.output.metrics.dropped{reason="no_host"}` with a `no_host` diagnostic.
   That is deliberate: collectd's receiver rejects an empty host, and inventing one would merge every
   unlabeled sender into one host's metrics.
 
@@ -1958,7 +1983,7 @@ one:
   into a filesystem path: a `;env=prod` tag suffix becomes literal `;` characters in a **whisper
   directory name**, not a rejected line. There is no error; `carbon-cache` creates directories
   nobody intended. If the destination might be an older Graphite, set `tags: drop`: every attribute
-  is then left off the wire (counted `logit.output.tags.dropped{reason="dialect"}`). Confirm an
+  is then left off the wire (counted `logit.output.tags.omitted{reason="dialect"}`). Confirm an
   unfamiliar cluster's tag support before using `tags: carbon` against it.
 - **`multi_value: skip` (the default) drops what carbon's one-number-per-datapoint wire can't
   carry.** `Samples`, `Distribution`, `Histogram`, `ExponentialHistogram`, `Summary`, `Set`, and
@@ -2278,11 +2303,16 @@ see [ADR
   throttled `logit.component.diagnostics{key="scan_error"}` naming the first failing path and its
   errno. A sustained nonzero rate is a permissions or descriptor-limit problem to fix; until it's
   fixed, a file renamed out of that directory stays open.
-- `logit.component.diagnostics{key="long_line"|"truncated"}` (count, via the `Diagnostics` bridge):
-  a line dropped whole for exceeding `max_line_bytes`, or a tracked file's length shrinking under
-  it (rare, but real for a tool that recreates a log file in place instead of renaming it away
-  first). A long line is never truncated and passed through, because a truncated line would hand a
-  downstream JSON parser something that looks well-formed but isn't the real line.
+- `logit.component.diagnostics{key="long_line"}` (count, via the `Diagnostics` bridge): a line
+  dropped whole for exceeding `max_line_bytes`, also counted
+  `logit.input.frames.dropped{reason="oversize"}`. A long line is never truncated and passed
+  through, because a truncated line would hand a downstream JSON parser something that looks
+  well-formed but isn't the real line.
+- `logit.component.diagnostics{key="truncated"}` and `logit.input.files.truncated` (counts): a
+  tracked file's length shrinking under it. That's rare, but real for a tool that recreates a log
+  file in place instead of renaming it away first. The file is reread from its start, and an
+  unterminated line held from before the truncation is discarded and counted
+  `logit.input.frames.dropped{reason="truncated"}`.
 - `logit.component.diagnostics{key="metadata_error"}` (`docker_in` only): a container's
   `config.v2.json` couldn't be read or parsed. That container's lines still flow, with a
   `container.id`-only resource instead of the full identity. A missing file is retried on every poll
@@ -2325,6 +2355,26 @@ format: {pattern: "%Y-%m-%d %H:%M:%S.%f UTC"}
 # nginx and Apache $time_local. The offset in the value makes it an instant; timezone is not read.
 format: {pattern: "%d/%b/%Y:%H:%M:%S %z"}
 ```
+
+## Routing: every router needs a consumer for unrouted events
+
+A router (`route`, or `lua`/`lua_file` with `targets:`) sends each event it doesn't direct into a
+`target` to its ordinary consumers, the components that list it in `sources:`. `logit validate`
+rejects a router with none, because those events would otherwise vanish uncounted. To discard
+them on purpose, name a `null_out` as that consumer, so the discard shows in the config:
+
+```yaml
+split:
+  type: route
+  sources: [in]
+  by: { attribute: stream }
+  routes: { host: host_target, app: app_target }
+unrouted:
+  type: null_out
+  sources: [split]
+```
+
+`null_out` counts what it discards under `logit.component.events.received`, as any sink does.
 
 ## Series retention
 
@@ -2371,8 +2421,8 @@ value, the mitigation is on the sending side: send an absolute value periodicall
   series was first seen, labeled `Cumulative` and stamped with that first-seen time
   (`start_timestamp`) so a consumer can tell a real restart from a decrease.
 
-A Prometheus scrape carries the cumulative shape, and `prometheus_out` skips delta records instead
-of resolving them itself (`docs/adr/prometheus-scrape-and-exposition.md`), so
+A Prometheus scrape carries the cumulative shape, and `prometheus_out` drops delta records, counted
+`logit.output.metrics.dropped{reason="unresolved_delta"}`, instead of resolving them itself (`docs/adr/prometheus-scrape-and-exposition.md`), so
 `statsd_in -> aggregate(temporality: cumulative) -> prometheus_out` is the intended pipeline.
 
 `cumulative` relies on the `series_retention`/`max_retained_series` pair above to keep running
@@ -2491,8 +2541,8 @@ way); against another transform or a Lua stage, one of the two always clones.
   counted instead of tracked, so `logit.shape.distinct_keys` and `.distinct_keysets` become lower
   bounds and `.keyset_share.top1`/`.top5` under-report. Raise the cap or, better, put a `keep` in
   front of the tap so it measures the key-set you intend to carry.
-- `logit.transform.keys.untracked`/`.keysets.untracked` (count): the matching drop counters.
-- `logit.transform.batches.dropped`: more than 4096 batches arrived in one flush window. Shorten
+- `logit.transform.keys.untracked`/`.keysets.untracked` (count): what those caps turned away.
+- `logit.transform.batches.untracked`: more than 4096 batches arrived in one flush window. Shorten
   `interval`, or accept that the per-batch distribution samples the window instead of covering all
   of it.
 
@@ -2652,8 +2702,8 @@ timeout, and then the same retry.
   downstream has closed, and the Agent's retry delivers the payload after a restart.
 - **Watch `logit.input.requests{class="busy"}`.** A steady rate means the pipeline can't keep up
   with its Agents, and the Agents' retry queues are absorbing the difference.
-  `logit.input.batches.dropped{reason="busy"}` counts the batches those `503`s left undelivered:
-  deferred to the Agent, not lost. It and `logit.component.batches.sent` are disjoint: a batch
+  `logit.input.batches.deferred` counts the batches those `503`s left undelivered: deferred to
+  the Agent, not lost. It and `logit.component.batches.sent` are disjoint: a batch
   counts under one or the other, never both.
 
 **What to watch.** `logit.input.requests{route, class}` shows which routes are arriving and how
@@ -2726,7 +2776,7 @@ the directory's permissions, or set `socket_mode:` (a quoted octal string, such 
 
 **A full pipeline loses spans.** When the pipeline doesn't accept a request's batch within 2
 seconds, `datadog_trace_in` answers `503` with `Retry-After: 1`, counted
-`logit.input.batches.dropped{reason="busy"}`. Unlike `datadog_in`'s Agent, which retries for
+`logit.input.batches.deferred`. Unlike `datadog_in`'s Agent, which retries for
 minutes, a tracer retries a few times and then drops the payload. So a stall longer than the
 window in [ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md)'s
 decision 11 is loss. A request no consumer took (every consumer directly downstream has closed)
@@ -2736,7 +2786,8 @@ long outage) large enough to absorb a stall, so the channel `datadog_trace_in` s
 draining.
 
 **What to watch.** `logit.input.spans` counts spans delivered, `logit.input.requests{route, class}`
-which routes arrive, `logit.input.batches.dropped{reason="busy"}` loss, and
+which routes arrive, `logit.input.batches.deferred` batches a tracer may or may not resend in
+time (read a sustained rate as loss), and
 `logit.input.requests.rejected{reason="unsupported_route"}` a tracer trying a feature this listener
 doesn't speak. A nonzero `logit.input.connections.rejected{reason="limit"}` means the
 `max_connections` cap, shared by the TCP listener and the Unix socket, is binding.
@@ -2840,7 +2891,8 @@ under either posture.
 A `413` counts the request's entries `oversize`, and any
 other `4xx` or `3xx` counts them `records.dropped{reason="rejected"}`; neither is retried, and the
 send goes on to the next request. A series `202` whose body names series Datadog dropped (a point
-too far in the future, say) counts each `records.rejected{route="series"}` and isn't retried.
+too far in the future, say) counts each `records.dropped{route="series", reason="rejected"}`
+and isn't retried.
 The send is delivered if any request was accepted, and fails
 as `rejected`, and is dropped, only when none was. The default posture, `at_least_once`, can still
 deliver a resend: of the request that drew the ambiguous answer, and of every request of a
@@ -2999,7 +3051,8 @@ attributes `host.name`, `com.splunk.source`, `com.splunk.sourcetype`, and `com.s
 `fields` become event attributes. An `event` object in the OTel exporter's span shape decodes to
 a span, `"event":"metric"` (or no `event`, with a measurement in `fields`) to metrics, and
 anything else to a log. An object with no `event` and no measurement, or a blank `event`, is
-skipped and counted, and every valid object in the body is delivered. Splunk Enterprise 10.4.3
+dropped, counted `logit.input.events.dropped{reason="no_event"|"blank_event"}`, and every valid
+object in the body is delivered. Splunk Enterprise 10.4.3
 skips an object with `fields` and no `event` and answers `200`, but answers an object with neither
 `400` code 12 and a blank `event` `400` code 13, indexing the objects before it and none after.
 An object that isn't valid JSON is answered as Splunk answers it: the objects before it are
@@ -3024,13 +3077,13 @@ them. `/ack` needs a channel (`400` code 10 without one) and answers an id issue
 `true` once, since the id already means the data reached the pipeline, and any other id `false`:
 one already reported, one never issued, or one from another channel. The listener keeps
 `max_ack_channels` channels, evicting the one used least recently, and the most recent
-`max_pending_acks` ids per channel; an id either bound drops answers `false`, counted
-`logit.input.acks.dropped{reason}`. Raise `max_ack_channels` when more clients than that send a
+`max_pending_acks` ids per channel; an id either bound evicts answers `false`, counted
+`logit.input.acks.evicted{reason}`. Raise `max_ack_channels` when more clients than that send a
 channel at once. Neither the channel nor the id enters an event.
 
 **A full pipeline gets `503`.** When the pipeline doesn't take a request's first batch within 5
 seconds, the request gets `503` code 9 with `Retry-After: 1`, counted
-`logit.input.requests{class="busy"}`, and its batches `logit.input.batches.dropped{reason="busy"}`.
+`logit.input.requests{class="busy"}`, and its batches `logit.input.batches.deferred`.
 Nothing of the body was taken, and HEC clients retry a code 9. A body with several envelopes
 decodes to one batch per envelope; once the first is delivered, the rest wait for the pipeline
 without a deadline and the request gets `200`, so a retry never repeats part of a body. From a
@@ -3412,8 +3465,8 @@ table of every broker error it reads.
 **What to watch.** `logit.output.requests{class}`, `logit.output.records` for what Kafka
 accepted, `logit.output.records.dropped{reason}`, `logit.output.records.unkeyed`, under
 `format: text`, `logit.output.events.skipped{reason="no_log"}`, and under `format: otlp_proto` or `otlp_json`,
-`logit.output.metrics.skipped` and `logit.output.metrics.degraded` for metrics OTLP can't carry
-as they are.
+`logit.output.metrics.skipped`, `logit.output.metrics.dropped`, and
+`logit.output.metrics.degraded` for metrics OTLP can't carry as they are.
 `docs/design/internal-telemetry.md`'s `kafka_out` section has every counter.
 
 ## Prometheus remote-write: receiving, sending, and picking a version
@@ -3598,7 +3651,7 @@ flow with `keep_signals` (or `has_signal`) so each sink sees only its product's 
 
 **Put `aggregate` with `temporality: cumulative` ahead of metrics bound for VictoriaMetrics.**
 VictoriaMetrics keeps no temporality. A delta `Sum` sent over OTLP is stored as its raw
-per-interval points, so `rate()` and `increase()` over it are wrong, and `prometheus_out` skips a
+per-interval points, so `rate()` and `increase()` over it are wrong, and `prometheus_out` drops a
 delta `Sum` outright. The `aggregate` keeps a running total, as it does ahead of any Prometheus
 receiver ([Counter temporality](#counter-temporality-delta-vs-cumulative)).
 

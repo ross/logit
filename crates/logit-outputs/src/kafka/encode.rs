@@ -69,10 +69,10 @@
 //!   [`EncodeStats::oversize`] for each signal record it would have formed.
 //!
 //! The first encode of each key group is the one that counts the OTLP mapping's side effects
-//! (`logit.output.metrics.skipped` and `degraded`); every probe of the cut runs with the gate
-//! [`KafkaEncoder::with_counters`] takes muted. A record's timestamp is the time the encoder
-//! wrote it: a request holds many events, and one future-stamped event would otherwise lose the
-//! whole request to Kafka's rule against records stamped more than an hour ahead.
+//! (`logit.output.metrics.skipped`, `dropped`, and `degraded`); every probe of the cut runs with
+//! the gate [`KafkaEncoder::with_counters`] takes muted. A record's timestamp is the time the
+//! encoder wrote it: a request holds many events, and one future-stamped event would otherwise
+//! lose the whole request to Kafka's rule against records stamped more than an hour ahead.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -302,8 +302,8 @@ impl KafkaEncoder {
         }
     }
 
-    /// Counts the OTLP mapping's side effects (`logit.output.metrics.degraded` and `skipped`,
-    /// and their warnings) through views of `telemetry` and `diag` gated by `gate`, the sink's
+    /// Counts the OTLP mapping's side effects (`logit.output.metrics.degraded`, `skipped`, and
+    /// `dropped`, and their warnings) through views of `telemetry` and `diag` gated by `gate`, the sink's
     /// batch accounting gate.
     pub fn with_counters(
         mut self,

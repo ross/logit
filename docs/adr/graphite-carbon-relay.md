@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-09
+updated: 2026-10-13
 ---
 
 # Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch
@@ -628,3 +628,16 @@ Python reads it into.
 
 The bound still costs nothing: every magnitude is read from a slice already validated against the
 input, so a larger cap moves no allocation. The allowlist is unchanged.
+
+## Amendment (2026-10-13): loss vocabulary
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), a malformed line or pickle item is loss, so the decoder counts
+`logit.input.metrics.dropped{reason}` with the same five reasons it counted under
+`input.metrics.skipped`, and a pickle frame it rejects whole counts
+`logit.input.frames.dropped{reason="undecodable"}` from the TCP driver. On the encode side,
+`output.tags.dropped` becomes `output.tags.omitted` with the same reasons, an unresolved
+`GaugeDelta` becomes `output.metrics.dropped{reason="unresolved_gauge_delta"}`, and every
+fault reason (`unencodable_value`, `unencodable_timestamp`, `empty_name`, `oversize_line`,
+`oversize_datapoint`) moves from `metrics.skipped` to `metrics.dropped`. `no_recorded_value` and a
+kind under `multi_value: skip` stay `metrics.skipped`. `crates/logit-proto/src/graphite/mod.rs`'s
+module doc is the canonical table.

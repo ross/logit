@@ -63,7 +63,7 @@ const MAX_LOGS_PER_COMPONENT: usize = 256;
 
 /// Caps [`SpanLink`]s per span, so a flush absorbing many batches can't grow one span without
 /// limit (the same reason as `aggregate`'s `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`). A link past the
-/// cap is counted immediately as `logit.internal.span.links.dropped{reason="cardinality"}`.
+/// cap is left off and counted as `logit.internal.span.links.omitted{reason="cardinality"}`.
 const MAX_LINKS_PER_SPAN: usize = 32;
 
 /// The `span_sample_rate` an `internal` component gets when it doesn't set one.
@@ -405,13 +405,13 @@ impl SpanGuard {
         }
     }
 
-    /// Attaches one contributing-context link, dropped and counted
-    /// (`logit.internal.span.links.dropped{reason="cardinality"}`) past [`MAX_LINKS_PER_SPAN`].
+    /// Attaches one contributing-context link, omitted and counted
+    /// (`logit.internal.span.links.omitted{reason="cardinality"}`) past [`MAX_LINKS_PER_SPAN`].
     pub fn link(&mut self, link: SpanLink) {
         let Some(span) = &mut self.span else { return };
         if span.links.len() >= MAX_LINKS_PER_SPAN {
             self.telemetry.count(
-                "logit.internal.span.links.dropped",
+                "logit.internal.span.links.omitted",
                 1.0,
                 &[("reason", "cardinality")],
             );
@@ -1494,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn links_beyond_the_per_span_cap_are_dropped_and_counted() {
+    fn links_beyond_the_per_span_cap_are_omitted_and_counted() {
         let registry = Registry::with_span_sampling(1.0);
         let telemetry = registry.telemetry_for("x", "aggregate", "transform");
         let mut span = telemetry.span("flush", SpanKind::Internal, trace_id(1), span_id(1), None);
@@ -1516,19 +1516,25 @@ mod tests {
         let record = span_event.span.as_ref().expect("span record");
         assert_eq!(record.links.len(), MAX_LINKS_PER_SPAN, "the cap, not one more");
 
-        let dropped_count: f64 = events
-            .iter()
-            .filter_map(|e| {
-                e.metrics.iter().find_map(|m| {
-                    (crate::interner::resolve(m.name) == "logit.internal.span.links.dropped")
-                        .then_some(match &m.kind {
+        let omitted_count = |name: &str| -> f64 {
+            events
+                .iter()
+                .filter_map(|e| {
+                    e.metrics.iter().find_map(|m| {
+                        (crate::interner::resolve(m.name) == name).then_some(match &m.kind {
                             MetricKind::Sum(s) => s.value.as_f64(),
                             _ => 0.0,
                         })
+                    })
                 })
-            })
-            .sum();
-        assert_eq!(dropped_count, 3.0, "3 links beyond the cap should be dropped and counted");
+                .sum()
+        };
+        assert_eq!(
+            omitted_count("logit.internal.span.links.omitted"),
+            3.0,
+            "3 links beyond the cap should be omitted and counted"
+        );
+        assert_eq!(omitted_count("logit.internal.span.links.dropped"), 0.0);
     }
 
     #[test]

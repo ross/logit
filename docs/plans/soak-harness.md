@@ -674,9 +674,9 @@ and takes the worst status; `report.py` is unchanged.
 |---|---|
 | G | per source (W8b), its generator's `logit.output.messages{component=<generator_sink>}`; precondition: equals that sink's `logit.output.datagrams` |
 | W | per listener (W8b), SUT `logit.input.datagrams{component=<sut_listener>}` |
-| K | per listener, SUT `logit.input.kernel.drops` |
+| K | per listener, SUT `logit.input.kernel.dropped` |
 | D | per listener, SUT `logit.component.datagrams.dropped` under every reason, from telemetry; the listener's stderr shutdown lines only cross-check its `shutdown` part, and a killed life counts none |
-| B | per listener, SUT `logit.component.diagnostics{key=bad_line}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a statsd line the decoder refused, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule |
+| B | per listener, SUT `logit.input.messages.dropped{reason=malformed}` plus `logit.input.frames.dropped{reason=undecodable}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a line the decoder refused, a datagram it refused whole, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule |
 | E | per listener, SUT `logit.component.events.sent{component=<sut_listener>}` |
 | X | per listener, SUT `logit.component.events.dropped{component=<sut_listener>}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`) |
 | T_in[node], T_out[node] | with a source's `sut_transforms` (W8b), each node's `logit.component.events.received` and `logit.component.events.sent` |
@@ -684,7 +684,7 @@ and takes the worst status; `report.py` is unchanged.
 | A_sent | aggregate `logit.component.events.sent` (W7b), counted once per send however many consumers a fan-out reaches |
 | S_in[sink], T_sent[target] | each sink's `logit.component.events.received`, and under `split = "route"` its target's `logit.component.events.sent` (W7b) |
 | Ab | aggregate `logit.transform.metrics.absorbed` |
-| L_in, L_emit, L_drop, L_err, L_flush, L_sent | with `[ledger] sut_script` (W7a), the script's `logit.component.events.received`; `logit.script.events.emitted` summed over its `outcome`s, which counts events, one per event an `emit_many` returns; `logit.component.events.dropped{reason="script_drop"}`; `logit.component.errors{reason="process"}`, one per event a script error drops; `logit.component.flush.events`; and `logit.component.events.sent`, which counts what `process()` and `flush()` send alike |
+| L_in, L_emit, L_drop, L_err, L_flush, L_sent | with `[ledger] sut_script` (W7a), the script's `logit.component.events.received`; `logit.script.events.emitted` summed over its `outcome`s, which counts events, one per event an `emit_many` returns; `logit.component.events.discarded`, one per event `process()` returns `nil` for; `logit.component.events.dropped{reason="script_error"}`, one per event a script error loses, counted beside `logit.component.errors{reason="process"}`; `logit.component.flush.events`; and `logit.component.events.sent`, which counts what `process()` and `flush()` send alike |
 | V[sink] | per sink (W7b), the reset-aware total of `vm-export/<sink>.jsonl`: add each series' first value, then every non-negative step, and on a decrease or at a SUT life start add the new value. V splits per SUT life at each series' decreases and at each life start, placing a sample by its timestamp, which is the SUT's own window time; a restart whose first value isn't below the last one shows no decrease. A series should have one segment per SUT life, else WARN |
 
 The generator sets `max_packet_bytes: "32"`, so one datagram carries one line of about 20 bytes,
@@ -904,6 +904,16 @@ The rows:
   row as it FAILs `ledger.egress`, named beside its term.
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at each sink's own
   telemetry; see "External targets".
+- `drops` (2026-10-13): every `logit.*.dropped` counter the SUT emitted that no row above
+  judges. Under [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md) the name
+  alone says a count is loss, so the row reads every such name rather than a list. It leaves
+  out the terms the ledger balances (every `batches.dropped`, a node's `events.dropped` beside a
+  batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B terms, and the
+  script's L_err) and, on an external or Kafka target, the sink's `records.dropped` and
+  `metrics.dropped`, which `ledger.sent` judges. A `rejected` or `disk_corrupt` reason FAILs;
+  any other WARNs. On an external target `ledger.egress` SKIPs, so `ledger.sent` FAILs a
+  `rejected` or `disk_corrupt` batch drop at a sink, and one at any other node stays in this
+  row.
 - `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
   window around one step, or over the whole run (W8c); see "The scenario schema".
 
@@ -1030,17 +1040,21 @@ and a diagnostic, and "Telemetry"). This list is the canonical copy of its verdi
 - The final life's `buffer.batches` above 0 at that drain, or the last `sink_drained` phase in
   `timeline.jsonl` with `held` false: FAIL, naming the batches left unsent. The identity
   balances a queued batch, so it can't catch one the run ended with.
-- A batch dropped `rejected`, records dropped `rejected` or `oversize`, or records a series
-  `202` body names (`logit.output.records.rejected`): FAIL, with the status and the first
-  stderr line with the key that explains it: `request_rejected` or `oversize` for a record drop
-  (refused by the destination, or too large to send), and `series_rejected` for a `202` body. Under per-request verdicts a rejected request drops its
-  records and the batch survives when another request was accepted, so both counters are read.
+- A batch dropped `rejected`, or records dropped `rejected` or `oversize`: FAIL, with the
+  status and the first stderr line with the key that explains it. A record drop quotes
+  `request_rejected` or `oversize` (refused by the destination, or too large to send).
+  `records.dropped{reason="rejected"}` also counts the series a `202` body names, so it quotes
+  `request_rejected`, `series_rejected`, or both, whichever the sink logged. Under per-request
+  verdicts a rejected request drops its records and the batch survives when another request
+  was accepted, so both the batch and the record counter are read.
+- On an external target, a batch dropped `disk_corrupt` (2026-10-13): FAIL, because
+  `ledger.egress`, which FAILs it on a local or Kafka target, SKIPs there.
 - An `api_key_rejected` or `request_refused` line from the sink on stderr: FAIL, quoting the
   first. The sink reads that answer as `Refused` and holds its queue with no exit, so the run
   can't deliver until the key or the endpoint is fixed.
 - No `logit.output.requests` point, or none of class `2xx`: FAIL.
 - Any other counted drop (a batch's `overflow_*` or `shutdown` reason, a record's `stale`, `too_many_tags`, or other pre-send reason, the
-  encoder's `metrics.skipped`): WARN.
+  encoder's `metrics.skipped`, and its `metrics.dropped` for an encode fault): WARN.
 - A life whose stderr `drain complete` `batches_dropped` differs from its telemetry
   `batches.dropped{reason="shutdown"}`: WARN.
 - A request of class other than `2xx` (`4xx` holds a `429` too, `5xx`, `network_error`) in a
@@ -1159,8 +1173,9 @@ where it needs them, and a small check extension.
    exited ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Admin endpoint, readiness,
    and release image"). Three scenarios
    ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)):
-   - `lua-path`: under the `statsd-vm` schedule in §2, the script rewrites each event, drops every
-     53rd (`script_drop`), fails on every 97th (`errors{reason="process"}`), and returns one
+   - `lua-path`: under the `statsd-vm` schedule in §2, the script rewrites each event, discards every
+     53rd (`events.discarded`), fails on every 97th (`events.dropped{reason="script_error"}` beside
+     `errors{reason="process"}`), and returns one
      rollup event from `flush()` each window.
    - `lua-stall`: a busy loop after N events reads `stalled`, then `ok`. The sandbox has no
      clock, so the loop is an iteration count sized past the 10 s `stall_after`, and a `mark`

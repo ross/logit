@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-09-17
+updated: 2026-10-13
 ---
 
 # `Transform::process` transforms in place: `&mut Event -> bool`, not `Event -> Option<Event>`
@@ -249,3 +249,9 @@ that drift.
   per-attribute work, gained nothing measurable from the same removed `Vec` and memcpy. Where the
   rest of a wide event's time goes (`AttrMap` inline capacity, interning, `Value` drops) is a
   separate question with its own notes, not part of this decision.
+
+## Amendment: the removed count is `events.discarded` (2026-10-13)
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the length `retain_mut` removed is counted as `logit.component.events.discarded`
+(untagged, only when nonzero) instead of `events.dropped{reason="absorbed"}`. The allocation pins
+are unchanged.

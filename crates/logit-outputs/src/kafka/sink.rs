@@ -35,7 +35,7 @@
 //! | `logit.output.records.dropped{reason}` | `oversize` (one record over `max_request_bytes`; under `record: batch` one event whose value alone is over it; under an OTLP format one per signal record an event too large alone would have formed; never sent), `rejected` (a partition batch the broker rejected), `invalid_timestamp` or `invalid_record` (records the broker named), or `ambiguous_at_most_once` (records left unsettled when `at_most_once` drops an `Ambiguous` batch, or an `Ambiguous` partition batch beside a `Refused` one, on any topic) |
 //! | `logit.output.records.unkeyed` | records sent without a key because the configured key had no value: on their event, or under an OTLP format on the request's events or resource |
 //! | `logit.output.events.skipped{reason="no_log"}` | events `format: text` skipped for having no log record |
-//! | `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.degraded{metric_kind}` | under an OTLP format, metrics the OTLP mapping skips or degrades (`logit_proto::otlp::metrics`), once per metric |
+//! | `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, `logit.output.metrics.degraded{metric_kind}` | under an OTLP format, metrics the OTLP mapping skips, drops, or degrades (`logit_proto::otlp::metrics`), once per metric |
 //!
 //! `oversize`, `records.unkeyed`, `events.skipped`, and the OTLP mapping's counters are
 //! encode-side, counted once per batch; the others follow the broker's answer, which a retry

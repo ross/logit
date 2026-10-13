@@ -34,8 +34,8 @@
 //!   written `\\,` or `\\=` and reads back as written, because the splitter counts `,` and `=`
 //!   only after a bare space has ended the tag section.
 //!
-//! A tag is skipped alone (`logit.output.tags.dropped{reason="unencodable"}`); a measurement or
-//! field key skips its point or field (`logit.output.metrics.skipped{reason="unencodable_key"}`).
+//! A tag is omitted alone (`logit.output.tags.omitted{reason="unencodable"}`); a measurement or
+//! field key drops its point or field (`logit.output.metrics.dropped{reason="unencodable_key"}`).
 //!
 //! **Every per-line buffer is a struct field**, cleared and refilled rather than reallocated, so a
 //! warm encode allocates only the body, a key per new series, and the series maps' growth
@@ -78,32 +78,32 @@ pub struct EncodeStats {
     /// `*.normalized` reason: the other elements are discarded.
     pub tags_normalized_multi_value: usize,
     /// A tag whose value has no plain-text form (`Null`, `Bytes`, `Timestamp`, `Map`, or an
-    /// `Array` with no representable element): `logit.output.tags.dropped{reason="unrepresentable"}`.
-    pub tags_dropped_unrepresentable: usize,
-    /// An empty tag key or value, which `influxd` rejects: `tags.dropped{reason="empty"}`.
-    pub tags_dropped_empty: usize,
+    /// `Array` with no representable element): `logit.output.tags.omitted{reason="unrepresentable"}`.
+    pub tags_omitted_unrepresentable: usize,
+    /// An empty tag key or value, which `influxd` rejects: `tags.omitted{reason="empty"}`.
+    pub tags_omitted_empty: usize,
     /// A tag key or value with a newline, ending in `\`, or with `\` directly before a space
-    /// (this module's "Escaping"): `tags.dropped{reason="unencodable"}`.
-    pub tags_dropped_unencodable: usize,
+    /// (this module's "Escaping"): `tags.omitted{reason="unencodable"}`.
+    pub tags_omitted_unencodable: usize,
     /// A tag key `influxd` reserves (`_measurement`, `_field`, `time`):
-    /// `tags.dropped{reason="reserved"}`.
-    pub tags_dropped_reserved: usize,
+    /// `tags.omitted{reason="reserved"}`.
+    pub tags_omitted_reserved: usize,
     /// A record on a carrier event that doesn't fit the carrier line (its name lacks the
     /// `<measurement>.` prefix, or its kind isn't a `Gauge` or `Sum`), written as its own line:
     /// `logit.output.metrics.normalized{reason="carrier_mismatch"}`.
     pub metrics_normalized_carrier_mismatch: usize,
-    /// A non-finite `Gauge`/`Sum` value, or carrier field: `metrics.skipped{reason="unencodable_value"}`.
-    pub skipped_unencodable_value: usize,
+    /// A non-finite `Gauge`/`Sum` value, or carrier field: `metrics.dropped{reason="unencodable_value"}`.
+    pub dropped_unencodable_value: usize,
     /// A field or point whose measurement or field key has no line-protocol spelling (this
-    /// module's "Escaping"): `metrics.skipped{reason="unencodable_key"}`, once per field.
-    pub skipped_unencodable_key: usize,
-    /// A carrier field named `time`, which `influxd` refuses: `metrics.skipped{reason="reserved_key"}`.
-    pub skipped_reserved_key: usize,
-    /// A string field over `influxd`'s 1 MiB cap: `metrics.skipped{reason="oversize_value"}`.
-    pub skipped_oversize_value: usize,
+    /// module's "Escaping"): `metrics.dropped{reason="unencodable_key"}`, once per field.
+    pub dropped_unencodable_key: usize,
+    /// A carrier field named `time`, which `influxd` refuses: `metrics.dropped{reason="reserved_key"}`.
+    pub dropped_reserved_key: usize,
+    /// A string field over `influxd`'s 1 MiB cap: `metrics.dropped{reason="oversize_value"}`.
+    pub dropped_oversize_value: usize,
     /// A line whose field set came out empty with no field drop counted above (a `Histogram`
-    /// with no finite bound, a `Summary` with no finite quantile): `metrics.skipped{reason="no_fields"}`.
-    pub skipped_no_fields: usize,
+    /// with no finite bound, a `Summary` with no finite quantile): `metrics.dropped{reason="no_fields"}`.
+    pub dropped_no_fields: usize,
     /// A record flagged [`MetricRecord::FLAG_NO_RECORDED_VALUE`]: line protocol has no "no
     /// reading" marker. `metrics.skipped{reason="no_recorded_value"}`.
     pub skipped_no_recorded_value: usize,
@@ -111,14 +111,14 @@ pub struct EncodeStats {
     /// `metrics.skipped{metric_kind="set_members"|"exponential_histogram"}`.
     pub skipped_set_members: usize,
     pub skipped_exponential_histogram: usize,
-    /// An unresolved `GaugeDelta`: `metrics.skipped{metric_kind="gauge_delta"}`.
-    pub skipped_gauge_delta: usize,
+    /// An unresolved `GaugeDelta`: `metrics.dropped{reason="unresolved_gauge_delta"}`.
+    pub dropped_unresolved_gauge_delta: usize,
     /// A measurement starting with `#`, which `influxd` reads as a comment line:
-    /// `metrics.skipped{reason="comment_measurement"}`.
-    pub skipped_comment_measurement: usize,
+    /// `metrics.dropped{reason="comment_measurement"}`.
+    pub dropped_comment_measurement: usize,
     /// A series with no free timestamp slot left before `i64::MAX`:
-    /// `metrics.skipped{reason="timestamp_overflow"}`.
-    pub skipped_timestamp_overflow: usize,
+    /// `metrics.dropped{reason="timestamp_overflow"}`.
+    pub dropped_timestamp_overflow: usize,
 }
 
 /// Encodes an [`EventBatch`] as InfluxDB line protocol.
@@ -285,11 +285,11 @@ impl Ctx<'_> {
         match outcome {
             Fields::Written => {}
             Fields::ValueDropped => {
-                self.stats.skipped_unencodable_value += 1;
+                self.stats.dropped_unencodable_value += 1;
                 return;
             }
             Fields::Empty => {
-                self.stats.skipped_no_fields += 1;
+                self.stats.dropped_no_fields += 1;
                 return;
             }
         }
@@ -320,7 +320,7 @@ impl Ctx<'_> {
             }
             if let MetricValue::F64(f) = value {
                 if !f.is_finite() {
-                    self.stats.skipped_unencodable_value += 1;
+                    self.stats.dropped_unencodable_value += 1;
                     continue;
                 }
             }
@@ -342,7 +342,7 @@ impl Ctx<'_> {
                 continue;
             }
             if text.len() > MAX_FIELD_VALUE_BYTES {
-                self.stats.skipped_oversize_value += 1;
+                self.stats.dropped_oversize_value += 1;
                 continue;
             }
             separator(self.fields);
@@ -411,7 +411,7 @@ impl Ctx<'_> {
             // Its own key: a `GaugeDelta` here means the pipeline lacks an `aggregate`, not that
             // the metric is malformed (`docs/adr/relative-gauge-adjustments.md`).
             KindSkip::GaugeDelta => {
-                self.stats.skipped_gauge_delta += 1;
+                self.stats.dropped_unresolved_gauge_delta += 1;
                 self.diag.warn_throttled(
                     "gauge_delta_unresolved",
                     "a relative gauge adjustment reached a sink unresolved -- add an `aggregate` \
@@ -422,12 +422,12 @@ impl Ctx<'_> {
     }
 
     /// Whether `measurement` can lead a line; when it can't, the line's `fields` fields are
-    /// counted skipped.
+    /// counted dropped.
     fn measurement_ok(&mut self, measurement: &str, fields: usize) -> bool {
         // A line starting with '#' is a line-protocol comment: InfluxDB would discard it while
         // the write still reports success.
         if measurement.starts_with('#') {
-            self.stats.skipped_comment_measurement += fields;
+            self.stats.dropped_comment_measurement += fields;
             self.diag.warn_throttled(
                 "encode_error",
                 format_args!(
@@ -438,20 +438,20 @@ impl Ctx<'_> {
             return false;
         }
         if !measurement_encodable(measurement) {
-            self.stats.skipped_unencodable_key += fields;
+            self.stats.dropped_unencodable_key += fields;
             return false;
         }
         true
     }
 
-    /// Whether `key` can be a carrier field key; when it can't, the field is counted skipped.
+    /// Whether `key` can be a carrier field key; when it can't, the field is counted dropped.
     fn field_key_ok(&mut self, key: &str) -> bool {
         if key == RESERVED_FIELD_KEY {
-            self.stats.skipped_reserved_key += 1;
+            self.stats.dropped_reserved_key += 1;
             return false;
         }
         if !field_key_encodable(key) {
-            self.stats.skipped_unencodable_key += 1;
+            self.stats.dropped_unencodable_key += 1;
             return false;
         }
         true
@@ -492,7 +492,7 @@ impl Ctx<'_> {
         let next_free =
             self.series.get_mut(&self.line[..series_key_len]).expect("just inserted if missing");
         let Some(timestamp) = allocate_timestamp(next_free, self.visited, timestamp) else {
-            self.stats.skipped_timestamp_overflow += fields;
+            self.stats.dropped_timestamp_overflow += fields;
             let series = &self.line[..series_key_len];
             self.diag.warn_throttled(
                 "encode_error",
@@ -515,7 +515,7 @@ impl Ctx<'_> {
 
 /// Renders one event's `,key=value,key=value` tag suffix into `suffix` (cleared first): resource
 /// attributes, with event attributes overriding on a key collision. Infallible: a tag that can't
-/// be represented is dropped alone, counted in `stats`, rather than failing the point.
+/// be represented is omitted alone, counted in `stats`, rather than failing the point.
 ///
 /// Every `influxdb.`- and `statsd.`-prefixed key is skipped, uncounted: those are carriers
 /// (rule (b), `docs/adr/lossless-transit.md`), not tags.
@@ -566,21 +566,21 @@ fn render_tag_suffix(
             _ => tag_value(scratch, value),
         };
         let Some(value) = rendered else {
-            stats.tags_dropped_unrepresentable += 1;
+            stats.tags_omitted_unrepresentable += 1;
             continue;
         };
         // InfluxDB 2.x rejects an empty tag key or value, and line protocol can't escape a
         // newline; either would corrupt or reject the line. Drop this tag, not the point.
         if key.is_empty() || value.is_empty() {
-            stats.tags_dropped_empty += 1;
+            stats.tags_omitted_empty += 1;
             continue;
         }
         if !tag_encodable(key) || !tag_encodable(value) {
-            stats.tags_dropped_unencodable += 1;
+            stats.tags_omitted_unencodable += 1;
             continue;
         }
         if RESERVED_TAG_KEYS.contains(&key) {
-            stats.tags_dropped_reserved += 1;
+            stats.tags_omitted_reserved += 1;
             continue;
         }
         // Counted past every drop check: the counter means "a collapsed multi-value tag reached
@@ -673,8 +673,9 @@ fn render_sketch_fields(out: &mut String, sketch: &DdSketch) {
 /// - `Summary`: fields keyed by the raw quantile, not a rounded percentage, since rounding isn't
 ///   collision-free (0.991 and 0.994 both round to "p99" and would overwrite each other).
 /// - `Set`: its `HyperLogLog` estimate as an unsigned `value`.
-/// - `SetMembers` (raw members, no scalar to render), `ExponentialHistogram` (no line-protocol
-///   shape; `docs/plans/lossless-transit.md`), and an unresolved `GaugeDelta` are skipped.
+/// - `SetMembers` (raw members, no scalar to render) and `ExponentialHistogram` (no line-protocol
+///   shape; `docs/plans/lossless-transit.md`) are skipped, and an unresolved `GaugeDelta` is
+///   dropped.
 ///
 /// **Field names are written unescaped.** Each is a literal (`value`, `count`, `sum`) or built from
 /// formatted numbers (`p50`, `bucket_1.5`, `q0.99`), and no `f64`/`u32` rendering contains a
@@ -1180,7 +1181,7 @@ mod tests {
             &[("tk", "v\\"), ("k\\", "v"), ("a\\ b", "v"), ("env", "prod")],
         )]);
         assert_eq!(out, "page.views,env=prod value=1 1700000000000000000\n");
-        assert_eq!(stats.tags_dropped_unencodable, 3);
+        assert_eq!(stats.tags_omitted_unencodable, 3);
 
         let (out, stats) = encode_stats(vec![metric_event(
             "page.views",
@@ -1188,7 +1189,7 @@ mod tests {
             &[("c", "x\\,y"), ("d", "v\\=x")],
         )]);
         assert_eq!(out, "page.views,c=x\\\\,y,d=v\\\\=x value=1 1700000000000000000\n");
-        assert_eq!(stats.tags_dropped_unencodable, 0);
+        assert_eq!(stats.tags_omitted_unencodable, 0);
 
         for name in ["p01g\\", "p01h\\,x", "p01e\\=f", "a\\ b"] {
             let (out, stats) = encode_stats(vec![
@@ -1196,7 +1197,7 @@ mod tests {
                 metric_event("ok", MetricKind::counter(1.0), &[]),
             ]);
             assert_eq!(out, "ok value=1 1700000000000000000\n", "{name:?}");
-            assert_eq!(stats.skipped_unencodable_key, 1, "{name:?}");
+            assert_eq!(stats.dropped_unencodable_key, 1, "{name:?}");
         }
 
         let (out, stats) = encode_stats(vec![carrier_event(
@@ -1208,7 +1209,7 @@ mod tests {
             ],
         )]);
         assert_eq!(out, "m h=3i 1700000000000000000\n");
-        assert_eq!(stats.skipped_unencodable_key, 2);
+        assert_eq!(stats.dropped_unencodable_key, 2);
     }
 
     /// A field key writes `"` as `\"` (probe row 2.11 `f\"k` stored `f"k`). A `\` before a
@@ -1230,7 +1231,7 @@ mod tests {
             ],
         )]);
         assert_eq!(out, "m ok\\x=4i 1700000000000000000\n");
-        assert_eq!(stats.skipped_unencodable_key, 3);
+        assert_eq!(stats.dropped_unencodable_key, 3);
     }
 
     /// Inside quotes, `\` is written `\\` and `"` is `\"`; `,`, space, and `=` need nothing
@@ -1255,7 +1256,7 @@ mod tests {
         event.attributes.insert("nested", Value::Map(Box::new(AttrMap::new())));
         let (out, stats) = encode_stats(vec![event]);
         assert_eq!(out, "page.views,env=prod value=1 1700000000000000000\n");
-        assert_eq!(stats.tags_dropped_unrepresentable, 2);
+        assert_eq!(stats.tags_omitted_unrepresentable, 2);
     }
 
     /// `influxd` rejects the whole write for a reserved tag key (probe rows 7.1 to 7.3), and a
@@ -1268,14 +1269,14 @@ mod tests {
             &[("time", "x"), ("_field", "y"), ("_measurement", "z"), ("_time", "ok")],
         )]);
         assert_eq!(out, "m,_time=ok value=1 1700000000000000000\n");
-        assert_eq!(stats.tags_dropped_reserved, 3);
+        assert_eq!(stats.tags_omitted_reserved, 3);
 
         let (out, stats) = encode_stats(vec![carrier_event(
             "m",
             &[("time", MetricValue::I64(1)), ("f", MetricValue::I64(2))],
         )]);
         assert_eq!(out, "m f=2i 1700000000000000000\n");
-        assert_eq!(stats.skipped_reserved_key, 1);
+        assert_eq!(stats.dropped_reserved_key, 1);
     }
 
     #[test]
@@ -1338,7 +1339,7 @@ mod tests {
         let (out, stats) = encode_stats(vec![event_with_array_tag("team", Vec::new())]);
         assert_eq!(out, "page.views value=1 1700000000000000000\n");
         assert_eq!(stats.tags_normalized_multi_value, 0);
-        assert_eq!(stats.tags_dropped_unrepresentable, 1);
+        assert_eq!(stats.tags_omitted_unrepresentable, 1);
 
         let (out, stats) = encode_stats(vec![event_with_array_tag(
             "team",
@@ -1346,7 +1347,7 @@ mod tests {
         )]);
         assert_eq!(out, "page.views value=1 1700000000000000000\n");
         assert_eq!(stats.tags_normalized_multi_value, 0);
-        assert_eq!(stats.tags_dropped_unrepresentable, 1);
+        assert_eq!(stats.tags_omitted_unrepresentable, 1);
     }
 
     /// The stats are zeroed per `encode`, not accumulated across batches.
@@ -1398,7 +1399,7 @@ mod tests {
         ]);
         assert!(!out.contains("conns"), "got: {out}");
         assert!(out.contains("page.views value=1"), "got: {out}");
-        assert_eq!(stats.skipped_gauge_delta, 1);
+        assert_eq!(stats.dropped_unresolved_gauge_delta, 1);
     }
 
     /// A `GaugeDelta` reports `gauge_delta_unresolved`, not the generic `encode_error`.
@@ -1430,8 +1431,8 @@ mod tests {
         let (out, stats) =
             encode_stats(vec![metric_event("bad", MetricKind::counter(f64::NAN), &[])]);
         assert_eq!(out, "", "a NaN-only line should produce no output, not `value=NaN`");
-        assert_eq!(stats.skipped_unencodable_value, 1);
-        assert_eq!(stats.skipped_no_fields, 0, "the value drop already explains the line");
+        assert_eq!(stats.dropped_unencodable_value, 1);
+        assert_eq!(stats.dropped_no_fields, 0, "the value drop already explains the line");
     }
 
     /// A `Histogram` with no finite bound has no field to write, and says so.
@@ -1449,7 +1450,7 @@ mod tests {
             &[],
         )]);
         assert_eq!(out, "");
-        assert_eq!(stats.skipped_no_fields, 1);
+        assert_eq!(stats.dropped_no_fields, 1);
     }
 
     #[test]
@@ -1466,7 +1467,7 @@ mod tests {
         ]);
         assert!(!out.contains("#requests"), "got: {out}");
         assert!(out.contains("page.views value=1"), "got: {out}");
-        assert_eq!(stats.skipped_comment_measurement, 1);
+        assert_eq!(stats.dropped_comment_measurement, 1);
     }
 
     #[test]
@@ -1478,7 +1479,7 @@ mod tests {
         )]);
         assert!(!out.contains("env="), "empty tag should be dropped entirely: {out}");
         assert!(out.contains("page.views value=1"), "the rest of the point should survive: {out}");
-        assert_eq!(stats.tags_dropped_empty, 1);
+        assert_eq!(stats.tags_omitted_empty, 1);
     }
 
     #[test]
@@ -1493,7 +1494,7 @@ mod tests {
         assert!(out.contains("ok.after value=1"), "got: {out}");
         assert!(!out.contains("injected"), "got: {out}");
         assert_eq!(out.lines().count(), 3, "expected exactly 3 well-formed lines, got: {out}");
-        assert_eq!(stats.tags_dropped_unencodable, 1);
+        assert_eq!(stats.tags_omitted_unencodable, 1);
     }
 
     /// A record name with a line break can't lead a line.
@@ -1504,7 +1505,7 @@ mod tests {
             metric_event("ok", MetricKind::counter(1.0), &[]),
         ]);
         assert_eq!(out, "ok value=1 1700000000000000000\n");
-        assert_eq!(stats.skipped_unencodable_key, 1);
+        assert_eq!(stats.dropped_unencodable_key, 1);
     }
 
     #[test]
@@ -1745,13 +1746,13 @@ mod tests {
             carrier_event("m", &[("a", MetricValue::F64(f64::NAN)), ("b", MetricValue::F64(2.0))]);
         let (out, stats) = encode_stats(vec![event]);
         assert_eq!(out, "m b=2 1700000000000000000\n");
-        assert_eq!(stats.skipped_unencodable_value, 1);
+        assert_eq!(stats.dropped_unencodable_value, 1);
 
         let event = carrier_event("m", &[("a", MetricValue::F64(f64::INFINITY))]);
         let (out, stats) = encode_stats(vec![event]);
         assert_eq!(out, "");
-        assert_eq!(stats.skipped_unencodable_value, 1);
-        assert_eq!(stats.skipped_no_fields, 0);
+        assert_eq!(stats.dropped_unencodable_value, 1);
+        assert_eq!(stats.dropped_no_fields, 0);
     }
 
     /// A batch with no carrier encodes as it did before the carrier existed: one line per
@@ -1794,7 +1795,7 @@ mod tests {
             .insert("influxdb.field.big", "a".repeat(MAX_FIELD_VALUE_BYTES + 1).as_str());
         let (out, stats) = encode_stats(vec![event]);
         assert_eq!(out, "m f=1i 1700000000000000000\n");
-        assert_eq!(stats.skipped_oversize_value, 1);
+        assert_eq!(stats.dropped_oversize_value, 1);
     }
 
     /// A string value with a raw newline goes raw: `influxd` keeps it in the value (probe row 3.4).

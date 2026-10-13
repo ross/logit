@@ -841,3 +841,18 @@ type; what changes is the type a series emits.
 
 A widened series doesn't narrow back: once its total is `F64`, every later fold is `F64`. A
 consumer that needs a fixed type per series feeds `aggregate` one type per series.
+## Amendment: omitted samples and links (2026-10-13)
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), two `aggregate` counters are renamed, because each counts a piece left out of a
+record that still merges or flushes: `logit.transform.samples.non_finite_dropped` becomes
+`logit.transform.samples.omitted{reason="non_finite"}`, and `logit.transform.links.dropped{reason=
+"contexts"}` becomes `logit.transform.links.omitted{reason="contexts"}`. An event `aggregate`
+absorbs entirely is `logit.component.events.discarded`; `logit.transform.metrics.absorbed` keeps
+its name, so `metrics_in == absorbed + passed_through` is unchanged.
+
+## Amendment (2026-10-13): `prometheus_out` drops a delta
+
+The cumulative-mode amendment's "Who needs it" says `prometheus_out` skips a delta `Sum` or
+`Histogram`. It's counted as loss, `logit.output.metrics.dropped{reason="unresolved_delta"}`,
+because a config with a cumulative `aggregate` upstream would have delivered it
+([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)).

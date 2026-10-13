@@ -515,7 +515,7 @@ mod tests {
             assert!(
                 counted(
                     &registry,
-                    "logit.output.metrics.skipped",
+                    "logit.output.metrics.dropped",
                     ("reason", "oversize_value_list")
                 ),
                 "expected the encoder's own cap to have dropped the value list as oversize in \
@@ -543,7 +543,7 @@ mod tests {
         let batch = batch_with(vec![counter_event("hits", 1.0)]);
         output.send(&batch).await.expect("nothing encodable means no I/O");
 
-        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "no_host")));
+        assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "no_host")));
         assert!(counted(&diag_registry, "logit.component.diagnostics", ("key", "no_host")));
     }
 
@@ -579,7 +579,7 @@ mod tests {
         output.send(&batch).await.expect("nothing encodable means no I/O");
 
         assert!(
-            counted(&registry, "logit.output.metrics.skipped", ("reason", "no_host")),
+            counted(&registry, "logit.output.metrics.dropped", ("reason", "no_host")),
             "expected the codec's own no_host counter, fed through this sink's shared Telemetry"
         );
     }
@@ -614,7 +614,7 @@ mod tests {
         // diagnostic.
         let batch = || batch_with(vec![relay_event("web1", "load", 1.0), counter_event("x", 1.0)]);
         const ENCODE_SIDE: [(&str, &[(&str, &str)]); 3] = [
-            ("logit.output.metrics.skipped", &[("reason", "no_host")]),
+            ("logit.output.metrics.dropped", &[("reason", "no_host")]),
             ("logit.component.diagnostics", &[("key", "no_host")]),
             ("logit.output.batch.bytes", &[]),
         ];
@@ -667,7 +667,7 @@ mod tests {
             batch_with(vec![log_event()]),
             batch,
             &[
-                ("logit.output.metrics.skipped", &[("reason", "no_host")]),
+                ("logit.output.metrics.dropped", &[("reason", "no_host")]),
                 ("logit.component.diagnostics", &[("key", "no_host")]),
                 ("logit.output.batch.bytes", &[]),
             ],

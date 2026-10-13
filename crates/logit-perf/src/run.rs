@@ -48,7 +48,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// A generated scenario's settle covers only the in-process drain, which `--settle`'s 1 s default
 /// covers. A driven one waits, in order, for the kernel's receive queue to drain after the blast,
 /// the listener's guaranteed final `SO_MEMINFO` sample (taken when the read loop exits, so the
-/// last interval of `logit.input.kernel.drops` isn't lost), and `internal`'s final drain on
+/// last interval of `logit.input.kernel.dropped` isn't lost), and `internal`'s final drain on
 /// shutdown, which carries both into the dump.
 ///
 /// 3 s because the first two are bounded by a 1 s sampling interval and the third by the leg's
@@ -693,7 +693,7 @@ struct InputStats {
     /// `logit.input.reads`: read syscalls made. `datagrams / reads` is the mean fill of one
     /// `recvmmsg(2)` batch (`docs/adr/udp-intake-batching-and-socket-visibility.md`).
     reads: u64,
-    /// `logit.input.kernel.drops`: datagrams the kernel discarded before a read returned them. A
+    /// `logit.input.kernel.dropped`: datagrams the kernel discarded before a read returned them. A
     /// delta per sample, summed here; not emitted when zero, so an absent metric is 0.
     kernel_drops: u64,
     /// `logit.component.datagrams.dropped{reason=overflow_*}`: `ReceiveQueue` eviction, loss
@@ -721,7 +721,7 @@ struct InputStats {
 
 const INPUT_DATAGRAMS: &str = "logit.input.datagrams";
 const INPUT_READS: &str = "logit.input.reads";
-const KERNEL_DROPS: &str = "logit.input.kernel.drops";
+const KERNEL_DROPS: &str = "logit.input.kernel.dropped";
 const RCVBUF_UTILIZATION: &str = "logit.input.receive_buffer.utilization";
 const RCVBUF_USED: &str = "logit.input.receive_buffer.used.bytes";
 const DATAGRAMS_DROPPED: &str = "logit.component.datagrams.dropped";
@@ -797,7 +797,7 @@ fn self_check(
             "{}: the kernel's per-socket counters were never reported -- {} datagrams arrived but \
              no `logit.input.receive_buffer.*` sample appeared in the whole run. \
              `getsockopt(SO_MEMINFO)` needs Linux 4.12+ and a sandbox that permits it; without it \
-             `logit.input.kernel.drops` is unknowable, so a driven scenario cannot account for \
+             `logit.input.kernel.dropped` is unknowable, so a driven scenario cannot account for \
              where its datagrams went and its drop rate would read as a flat zero. Run the child's \
              own stderr to see the listener's one-off warning",
             scenario.name,
@@ -1805,7 +1805,7 @@ mod tests {
 
     #[test]
     fn a_kernel_drops_metric_that_never_appeared_reads_as_zero() {
-        // `logit.input.kernel.drops` is not emitted when its delta is zero, so "absent" has to
+        // `logit.input.kernel.dropped` is not emitted when its delta is zero, so "absent" has to
         // mean "none", not "unknown".
         let stats =
             input_stats(&[point("statsd", INPUT_DATAGRAMS, MetricKind::counter(5.0))], "statsd");

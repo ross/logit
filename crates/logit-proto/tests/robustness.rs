@@ -2997,7 +2997,7 @@ type PrometheusParsed = (Result<Vec<MetricFamily>, CodecError>, Reasons);
 /// Lines after `# TYPE h histogram`, the buckets they make, and what they count.
 type HistogramCase = (&'static str, &'static [(f64, u64)], Reasons);
 
-/// A parse with telemetry, returning every `logit.input.metrics.{skipped,degraded}` reason and its
+/// A parse with telemetry, returning every `logit.input.metrics.{dropped,degraded}` reason and its
 /// count.
 fn prometheus_parse(body: &[u8], dialect: Dialect) -> PrometheusParsed {
     let registry = logit_core::Registry::new();
@@ -3107,8 +3107,8 @@ fn prometheus_text_count_values_round_saturate_or_skip() {
                 assert_eq!(
                     reasons,
                     [
-                        ("logit.input.metrics.skipped{incomplete_series}".to_string(), 1),
-                        ("logit.input.metrics.skipped{malformed_line}".to_string(), 1),
+                        ("logit.input.metrics.dropped{incomplete_series}".to_string(), 1),
+                        ("logit.input.metrics.dropped{malformed_line}".to_string(), 1),
                     ],
                     "{value}"
                 );
@@ -3195,13 +3195,13 @@ fn prometheus_text_label_escapes_at_the_end_of_a_value() {
     for line in [r#"e{a="x\"} 1"#, r#"e{a="x\"#, r#"e{a="x\\\"} 1"#, r#"e{a="x"#] {
         let (result, reasons) = prometheus_parse(line.as_bytes(), Dialect::Text0_0_4);
         assert!(result.unwrap().is_empty(), "{line}");
-        assert_eq!(reasons, [("logit.input.metrics.skipped{malformed_line}".to_string(), 1)]);
+        assert_eq!(reasons, [("logit.input.metrics.dropped{malformed_line}".to_string(), 1)]);
     }
 }
 
 /// Out-of-order buckets are sorted; a missing `+Inf` comes from `_count`, or from the highest
 /// bucket when `_count` is smaller or absent; a `_count` that disagrees with `+Inf` loses to it,
-/// degraded rather than skipped.
+/// degraded rather than dropped.
 #[test]
 fn prometheus_text_histogram_reconstruction() {
     let degraded =
@@ -3280,7 +3280,7 @@ fn prometheus_text_a_repeated_le_or_quantile_is_a_duplicate_label() {
         assert!(result.unwrap().is_empty(), "{body}");
         assert_eq!(
             reasons,
-            [("logit.input.metrics.skipped{duplicate_label}".to_string(), 1)],
+            [("logit.input.metrics.dropped{duplicate_label}".to_string(), 1)],
             "{body}"
         );
     }
@@ -3313,9 +3313,9 @@ fn prometheus_text_writes_a_fixed_point() {
         text::write_with(&families, Dialect::Text0_0_4, &mut out, &mut encoder);
         let written = String::from_utf8(out).unwrap();
         assert_eq!(written, expected, "{body}");
-        let counted = telemetry_reasons(&registry, "logit.output.metrics.skipped");
+        let counted = telemetry_reasons(&registry, "logit.output.metrics.");
         let expected_counts: Vec<(String, u64)> = (collisions > 0)
-            .then(|| ("logit.output.metrics.skipped{name_collision}".to_string(), collisions))
+            .then(|| ("logit.output.metrics.dropped{name_collision}".to_string(), collisions))
             .into_iter()
             .collect();
         assert_eq!(counted, expected_counts, "{body}");

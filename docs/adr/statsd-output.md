@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-11
+updated: 2026-10-13
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -804,3 +804,24 @@ this ADR deferred. `statsd_out` takes `multi_value: skip | expand`, `expand` by 
 ADR's first amendment describes is unchanged and stays the only lossless one.
 `crates/logit-outputs/src/statsd.rs`'s module doc, "Multi-value kinds: `multi_value`", is the
 canonical copy of the type-letter table.
+
+## Amendment (2026-10-13): loss vocabulary
+
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md) splits what this record counted as `logit.output.messages.dropped`, so that name now
+means only a line that should have left and didn't. The other reasons move:
+
+| Before | After |
+|---|---|
+| `messages.dropped{reason="dialect_event"}` | `messages.skipped{reason="dialect"}`: the operator's `format: statsd` has no event or service-check form |
+| `messages.dropped{reason="no_recorded_value"}` | `messages.skipped{reason="no_recorded_value"}` |
+| `messages.dropped{reason="dialect_field"}` | `fields.omitted{reason="dialect"}`: the line is still sent |
+| `messages.dropped{reason="invalid_event_field"}` | `fields.omitted{reason="invalid_value"}` |
+| `messages.dropped{reason="unencodable_value"}` for an out-of-range `sample_rate`, whose line is still sent without `@rate` | `fields.omitted{reason="invalid_value"}` |
+| `tags.dropped{reason="dialect"\|"unrepresentable"}` | `tags.omitted`, same reasons |
+
+The `EncodeStats` fields follow: `skipped_dialect_events`, `skipped_no_recorded_value`,
+`omitted_dialect_fields`, `omitted_invalid_values` (both `invalid_value` causes), and
+`tags_omitted_*`, and the test this record cites as
+`a_real_event_dropped_under_statsd_also_tallies_its_tags_into_tags_dropped_dialect` is
+`a_real_event_skipped_under_statsd_also_tallies_its_tags_into_tags_omitted_dialect`.
+`crates/logit-outputs/src/statsd.rs`'s `report_encode_stats` is the canonical mapping.

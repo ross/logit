@@ -13,22 +13,22 @@
 //!
 //! | Input | Decision |
 //! |---|---|
-//! | a sample name that *is* a declared family's name | that family, in the role its type gives a bare name ([`bare_name_role`]): a counter/gauge/stateset/unknown value, a summary's quantile line. A histogram has no bare-named sample, so this is `skipped{reason="unknown_suffix"}` |
+//! | a sample name that *is* a declared family's name | that family, in the role its type gives a bare name ([`bare_name_role`]): a counter/gauge/stateset/unknown value, a summary's quantile line. A histogram has no bare-named sample, so this is `dropped{reason="unknown_suffix"}` |
 //! | a sample name that is a declared family's name plus a suffix that type gives meaning to ([`SUFFIXES`], [`suffix_applies`]) | that family, in the suffix's role |
-//! | a sample name that is a declared family's name plus a suffix that type has *no* meaning for (`x_sum` under `# TYPE x counter`) | `skipped{reason="unknown_suffix"}` |
+//! | a sample name that is a declared family's name plus a suffix that type has *no* meaning for (`x_sum` under `# TYPE x counter`) | `dropped{reason="unknown_suffix"}` |
 //! | a sample name that is an **implicit** family's name plus a suffix (`x_sum` where `x` was itself only an undeclared sample) | *not* that family -- a fresh implicit family of its own, see below |
 //! | any other sample name | a fresh family of the assembler's *implicit* type -- [`FamilyType::Untyped`] for text 0.0.4, [`FamilyType::Unknown`] for OpenMetrics and remote-write |
 //! | `le`/`quantile` | part of the [`Point`], not of the series identity: stripped from the label set before it becomes the series key |
-//! | a second value for one (family, label set, role) | `skipped{reason="duplicate_series"}`, first wins ([`replace_once`]) |
-//! | a label set naming one label twice, `le` or `quantile` included | `skipped{reason="duplicate_label"}` -- an invalid label set, so the whole sample goes |
-//! | a series whose samples don't add up to its type's value (a counter with only a `_created`, a histogram with no buckets) | `skipped{reason="incomplete_series"}` at [`Assembler::finish`] |
+//! | a second value for one (family, label set, role) | `dropped{reason="duplicate_series"}`, first wins ([`replace_once`]) |
+//! | a label set naming one label twice, `le` or `quantile` included | `dropped{reason="duplicate_label"}` -- an invalid label set, so the whole sample goes |
+//! | a series whose samples don't add up to its type's value (a counter with only a `_created`, a histogram with no buckets) | `dropped{reason="incomplete_series"}` at [`Assembler::finish`] |
 //!
 //! Declarations ([`Assembler::declare_type`]/[`Assembler::declare_help`]/[`Assembler::declare_unit`])
 //! may arrive in any order and either side of the samples they describe -- a `# TYPE` for an
 //! already-implicit family retypes it in place, which is the leniency [`super::text`]'s module doc
 //! promises. Samples already *routed* into another family are not re-homed by a late declaration;
 //! they stay where they landed. A second declaration that *conflicts* with the first is
-//! `skipped{reason="duplicate_type"|"duplicate_metadata"}` and the first wins; a second that says
+//! `dropped{reason="duplicate_type"|"duplicate_metadata"}` and the first wins; a second that says
 //! the same thing is neither counted nor an error, since every format lets a producer repeat
 //! itself and a counter an operator reads as "input was dropped" should not fire when nothing was.
 //!
@@ -39,13 +39,13 @@
 //! exactly that and nothing said what it was: a guess about one name, not a statement about a
 //! family that has parts. Since [`suffix_applies`] is false for every role under
 //! [`FamilyType::Unknown`]/[`FamilyType::Untyped`], a match there could only ever end in the
-//! `unknown_suffix` skip above -- so the suffix scan steps over it and the raw name opens its own
+//! `unknown_suffix` drop above -- so the suffix scan steps over it and the raw name opens its own
 //! implicit family instead.
 //!
 //! The rule matters for the one classic kind whose *bare* name is a sample. A summary with no
 //! metadata behind it arrives as `x{quantile=…}`, `x_sum`, `x_count`, and remote-write sorts a
 //! request's series by name, so the bare one lands first and opens the implicit `x`. Without this
-//! rule its two suffixed siblings would both be skipped; the recorded Prometheus 3.14 corpus
+//! rule its two suffixed siblings would both be dropped; the recorded Prometheus 3.14 corpus
 //! (`testdata/interop/prometheus/README.md`) exercises it. A histogram has no bare-named sample, so
 //! it never hits this path. The flat decode is *flatter* than the producer's shape; it is not
 //! lossier.
@@ -83,9 +83,9 @@
 //!
 //! | Situation | Declared | Seeded |
 //! |---|---|---|
-//! | bare name under a type that has no bare-named sample (`histogram`, `gaugehistogram`, `info`) | `skipped{reason="unknown_suffix"}` | the family is un-declared and the sample opens it as an implicit one, `degraded{reason="seed_mismatch"}` |
-//! | a suffix the type gives no meaning to (`foo_sum` under a counter `foo`) | `skipped{reason="unknown_suffix"}` | the raw name gets an implicit family of its own, `degraded{reason="seed_mismatch"}` |
-//! | a `_bucket`/quantile sample with no `le`/`quantile` label to read | `skipped{reason="malformed_line"}` | as above, `degraded{reason="seed_mismatch"}` |
+//! | bare name under a type that has no bare-named sample (`histogram`, `gaugehistogram`, `info`) | `dropped{reason="unknown_suffix"}` | the family is un-declared and the sample opens it as an implicit one, `degraded{reason="seed_mismatch"}` |
+//! | a suffix the type gives no meaning to (`foo_sum` under a counter `foo`) | `dropped{reason="unknown_suffix"}` | the raw name gets an implicit family of its own, `degraded{reason="seed_mismatch"}` |
+//! | a `_bucket`/quantile sample with no `le`/`quantile` label to read | `dropped{reason="malformed_line"}` | as above, `degraded{reason="seed_mismatch"}` |
 //!
 //! The give-way only applies while the seeded family holds **no series**. Once a sibling sample of
 //! the same input has routed into it, the input itself agrees with the seed about the shape, and a
@@ -119,7 +119,7 @@
 //!
 //! [`Point`]: super::Point
 
-use super::{FamilyType, MetricFamily, Point, PrometheusDecoder, Series};
+use super::{DecodeDrop, FamilyType, MetricFamily, Point, PrometheusDecoder, Series};
 use logit_core::trace::{parse_span_id, parse_trace_id};
 use logit_core::{parse_decimal_nanos, AttrMap, Exemplar, TraceRef, Value};
 use std::collections::HashMap;
@@ -362,7 +362,7 @@ impl<'a> Assembler<'a> {
         let idx = self.family_index(base);
         if self.families[idx].typed {
             if self.families[idx].kind != kind {
-                decoder.skipped("duplicate_type");
+                decoder.dropped(DecodeDrop::DuplicateType);
             }
             return;
         }
@@ -398,7 +398,7 @@ impl<'a> Assembler<'a> {
     fn set_help(&mut self, idx: usize, help: Option<String>, decoder: &mut PrometheusDecoder) {
         match &self.families[idx].help {
             Some(existing) if Some(existing) == help.as_ref() => {}
-            Some(_) => decoder.skipped("duplicate_metadata"),
+            Some(_) => decoder.dropped(DecodeDrop::DuplicateMetadata),
             None => self.families[idx].help = help,
         }
     }
@@ -406,7 +406,7 @@ impl<'a> Assembler<'a> {
     fn set_unit(&mut self, idx: usize, unit: Option<String>, decoder: &mut PrometheusDecoder) {
         match &self.families[idx].unit {
             Some(existing) if Some(existing) == unit.as_ref() => {}
-            Some(_) => decoder.skipped("duplicate_metadata"),
+            Some(_) => decoder.dropped(DecodeDrop::DuplicateMetadata),
             None => self.families[idx].unit = unit,
         }
     }
@@ -455,14 +455,14 @@ impl<'a> Assembler<'a> {
             Role::Count => match count_value(value) {
                 Some(c) => replace_once(&mut series.count, c),
                 None => {
-                    decoder.skipped("malformed_line");
+                    decoder.dropped(DecodeDrop::MalformedLine);
                     return false;
                 }
             },
             Role::Created => match created_nanos(value, value_text) {
                 Some(ts) => replace_once(&mut series.created, ts),
                 None => {
-                    decoder.skipped("malformed_line");
+                    decoder.dropped(DecodeDrop::MalformedLine);
                     return false;
                 }
             },
@@ -478,7 +478,7 @@ impl<'a> Assembler<'a> {
                         }
                     }
                     _ => {
-                        decoder.skipped("malformed_line");
+                        decoder.dropped(DecodeDrop::MalformedLine);
                         return false;
                     }
                 }
@@ -486,7 +486,7 @@ impl<'a> Assembler<'a> {
             Role::Quantile => {
                 let q = slot.extra.unwrap_or(f64::NAN);
                 if q.is_nan() {
-                    decoder.skipped("malformed_line");
+                    decoder.dropped(DecodeDrop::MalformedLine);
                     return false;
                 }
                 if series.quantiles.iter().any(|(existing, _)| *existing == q) {
@@ -498,7 +498,7 @@ impl<'a> Assembler<'a> {
             }
         };
         if duplicate {
-            decoder.skipped("duplicate_series");
+            decoder.dropped(DecodeDrop::DuplicateSeries);
             return false;
         }
         // A timestamp rides the family's value-bearing samples; a `_created` sample's own "value"
@@ -515,7 +515,7 @@ impl<'a> Assembler<'a> {
             if matches!(slot.role, Role::Primary | Role::Bucket) {
                 series.exemplars.push(exemplar);
             } else {
-                decoder.degraded("exemplar_dropped");
+                decoder.degraded("exemplar_omitted");
             }
         }
         true
@@ -529,7 +529,7 @@ impl<'a> Assembler<'a> {
     ///
     /// Repeating the same instant is not a duplicate: a 2.0 series repeats `start_timestamp` on
     /// every one of its samples, and each of those reaches this once. A *different* instant for one
-    /// series is `skipped{reason="duplicate_series"}`, first wins, as everywhere else.
+    /// series is `dropped{reason="duplicate_series"}`, first wins, as everywhere else.
     pub(super) fn push_created(
         &mut self,
         sample_name: &str,
@@ -542,7 +542,7 @@ impl<'a> Assembler<'a> {
         match series.created {
             Some(existing) if existing == created_nanos => true,
             Some(_) => {
-                decoder.skipped("duplicate_series");
+                decoder.dropped(DecodeDrop::DuplicateSeries);
                 false
             }
             None => {
@@ -579,7 +579,7 @@ impl<'a> Assembler<'a> {
     /// which series it meant and dropping one for sitting on the "wrong" sample would lose data the
     /// wire carried. And this **creates nothing** -- no family, no series: an exemplar is an
     /// example of a reading, so a series with no reading here is one this assembler should not be
-    /// made to invent (it would come back out as an `incomplete_series` skip, having swallowed the
+    /// made to invent (it would come back out as an `incomplete_series` drop, having swallowed the
     /// exemplar on the way).
     pub(super) fn push_exemplar(
         &mut self,
@@ -615,7 +615,7 @@ impl<'a> Assembler<'a> {
         // duplicate too, not a bound plus a series label of the same name.
         labels.sort_by(|a, b| a.0.cmp(&b.0));
         if labels.windows(2).any(|w| w[0].0 == w[1].0) {
-            decoder.skipped("duplicate_label");
+            decoder.dropped(DecodeDrop::DuplicateLabel);
             return None;
         }
         // `le`/`quantile` are part of the point, not the series identity: strip them out before the
@@ -624,14 +624,14 @@ impl<'a> Assembler<'a> {
             Role::Bucket => match take_label(&mut labels, "le").map(|v| parse_number(&v)) {
                 Some(Some(bound)) => Some(bound),
                 _ => {
-                    decoder.skipped("malformed_line");
+                    decoder.dropped(DecodeDrop::MalformedLine);
                     return None;
                 }
             },
             Role::Quantile => match take_label(&mut labels, "quantile").map(|v| parse_number(&v)) {
                 Some(Some(q)) => Some(q),
                 _ => {
-                    decoder.skipped("malformed_line");
+                    decoder.dropped(DecodeDrop::MalformedLine);
                     return None;
                 }
             },
@@ -681,14 +681,14 @@ impl<'a> Assembler<'a> {
                 self.reopen_implicit(idx);
                 return Some((idx, Role::Primary, false));
             }
-            decoder.skipped("unknown_suffix");
+            decoder.dropped(DecodeDrop::UnknownSuffix);
             return None;
         }
         for (suffix, role) in SUFFIXES {
             let Some(base) = name.strip_suffix(suffix) else { continue };
             let Some(idx) = self.index.get(base).copied() else { continue };
             // Only a declared base claims a suffix (module doc): matching an implicit family here
-            // could only reach the `unknown_suffix` skip below, so the raw name opens its own.
+            // could only reach the `unknown_suffix` drop below, so the raw name opens its own.
             if !self.families[idx].typed {
                 continue;
             }
@@ -702,7 +702,7 @@ impl<'a> Assembler<'a> {
                 // at `finish`.
                 break;
             }
-            decoder.skipped("unknown_suffix");
+            decoder.dropped(DecodeDrop::UnknownSuffix);
             return None;
         }
         let idx = self.family_index(name);
@@ -950,17 +950,17 @@ fn finish_series(
         return Some(Series { labels, point: Point::Stale, timestamp, created, exemplars });
     }
     let point = match kind {
-        FamilyType::Counter => Point::Counter(value_or_skip(value, decoder)?),
-        FamilyType::Gauge => Point::Gauge(value_or_skip(value, decoder)?),
-        FamilyType::Unknown | FamilyType::Untyped => Point::Unknown(value_or_skip(value, decoder)?),
+        FamilyType::Counter => Point::Counter(value_or_drop(value, decoder)?),
+        FamilyType::Gauge => Point::Gauge(value_or_drop(value, decoder)?),
+        FamilyType::Unknown | FamilyType::Untyped => Point::Unknown(value_or_drop(value, decoder)?),
         FamilyType::Info => {
-            value_or_skip(value, decoder)?;
+            value_or_drop(value, decoder)?;
             Point::Info
         }
-        FamilyType::StateSet => Point::StateSet(value_or_skip(value, decoder)? != 0.0),
+        FamilyType::StateSet => Point::StateSet(value_or_drop(value, decoder)? != 0.0),
         FamilyType::Histogram | FamilyType::GaugeHistogram => {
             if buckets.is_empty() {
-                decoder.skipped("incomplete_series");
+                decoder.dropped(DecodeDrop::IncompleteSeries);
                 return None;
             }
             buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -980,7 +980,7 @@ fn finish_series(
         }
         FamilyType::Summary => {
             if quantiles.is_empty() && sum.is_none() && count.is_none() && created.is_none() {
-                decoder.skipped("incomplete_series");
+                decoder.dropped(DecodeDrop::IncompleteSeries);
                 return None;
             }
             quantiles.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -990,11 +990,11 @@ fn finish_series(
     Some(Series { labels, point, timestamp, created, exemplars })
 }
 
-fn value_or_skip(value: Option<f64>, decoder: &mut PrometheusDecoder) -> Option<f64> {
+fn value_or_drop(value: Option<f64>, decoder: &mut PrometheusDecoder) -> Option<f64> {
     match value {
         Some(v) => Some(v),
         None => {
-            decoder.skipped("incomplete_series");
+            decoder.dropped(DecodeDrop::IncompleteSeries);
             None
         }
     }

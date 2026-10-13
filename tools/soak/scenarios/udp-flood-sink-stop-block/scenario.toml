@@ -54,7 +54,7 @@ min = 2
 [[expect]]
 name = "kernel-drops"
 service = "logit"
-metric = "logit.input.kernel.drops"
+metric = "logit.input.kernel.dropped"
 component = "statsd"
 step = "c0s1"
 window = "during"

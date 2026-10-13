@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-10-08
+updated: 2026-10-13
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -373,3 +373,31 @@ check and logs requests drew `202` with no sign of a drop, so what those routes 
   intake's. It follows `otlp_out`'s partial success
   ([ADR `sink-fault-classes`](sink-fault-classes.md)), and counts once per batch for the request that drew it, like the other
   answers a destination gives.
+
+## Amendment: loss counter names (2026-10-13)
+
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md) renames the counters this record
+names, so that any nonzero `*.dropped` is loss. The decisions above stand; only the names change:
+
+- **A busy `503` is `logit.input.batches.deferred`**, untagged, on both listeners, in place of
+  `logit.input.batches.dropped{reason="busy"}`. The Agent keeps the payload and retries it.
+  Decision 11 still holds for `datadog_trace_in`: a tracer gives up after about 15 s, so a
+  sustained deferred rate there is loss the counter can't tell from deferral.
+- **A series named in a `202` body is
+  `logit.output.records.dropped{route="series", reason="rejected"}`**, in place of
+  `records.rejected{route="series"}`. It still comes out of `records`, and a request is either
+  answered `2xx` or rejected, so no entry counts under both.
+- **The codec's malformed and unsupported input is `dropped`.** A bad series, point, sketch,
+  check, event, log, span, or stats element, a legacy `distributions` entry, an
+  `idxTracerPayloads` entry, and an interpolated stats summary count `logit.input.*.dropped`.
+  Nothing to carry (a `null` value, an empty distribution, sketch, or stats bucket) stays
+  `skipped`.
+- **On encode,** an unresolved `GaugeDelta` is
+  `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`; a non-finite value, an
+  oversized sketch, and a check with no valid status are `metrics.dropped`; and a stats record of
+  no known shape is `logit.output.stats.dropped{reason="unrecognized_record"}`. A kind the series
+  route has no form for stays `metrics.skipped{metric_kind}`. A tag left off a delivered record is
+  `logit.output.tags.omitted`, every reason unchanged.
+
+`crates/logit-proto/src/datadog/mod.rs`'s module doc has every counter, and
+[internal-telemetry.md](../design/internal-telemetry.md) has the operator-facing tables.
