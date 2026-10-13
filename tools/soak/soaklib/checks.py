@@ -2898,12 +2898,75 @@ def check_expect(data):
     return [_expect_one(data, exp) for exp in expectations]
 
 
+def _balanced_drop(led, name, component, reason, batch_drops):
+    """Whether another row already judges this `*.dropped` term, so `drops` leaves it out."""
+    # Every node's `batches.dropped` is judged by `ledger.egress`, `ledger.summary`, and
+    # `identity.sink` (a torn tail included), and a node's `events.dropped` beside a batch drop
+    # of the same reason counts the same loss. `bytes.dropped` counts `datagrams.dropped`'s
+    # datagrams again.
+    if name in ("logit.component.batches.dropped", "logit.component.bytes.dropped"):
+        return True
+    if name == "logit.component.events.dropped" and (component, reason) in batch_drops:
+        return True
+    if component in led.listeners:
+        if name in ("logit.component.datagrams.dropped", "logit.input.kernel.dropped",
+                    "logit.component.events.dropped"):
+            return True  # D, K, and X
+        if (name, reason) in (("logit.input.messages.dropped", "malformed"),
+                              ("logit.input.frames.dropped", "undecodable"),
+                              ("logit.input.frames.dropped", "oversize")):
+            return True  # B
+    if (component == led.script and name == "logit.component.events.dropped"
+            and reason == "script_error"):
+        return True  # L_err
+    if component in led.sinks and not led.data.has_vm and name in (
+            "logit.output.records.dropped", "logit.output.metrics.dropped"):
+        return True  # `ledger.sent` judges these on an external or Kafka target
+    return False
+
+
+def check_drops(data):
+    """Every `logit.*.dropped` counter the SUT emitted that no other row judges: loss by the
+    name alone (ADR `telemetry-loss-vocabulary`). A `FAULT_DROP_REASONS` reason FAILs, any
+    other WARNs. Terms the ledger and the sink rows balance stay with them."""
+    led = _ledger(data)
+    skipped = _skip_without_sut("drops", led)
+    if skipped:
+        return skipped
+    batch_drops = {(point.attributes.get("component"), point.attributes.get("reason"))
+                   for point in led.sut.matching("logit.component.batches.dropped")
+                   if isinstance(point.value, (int, float)) and point.value}
+    names = sorted({point.name for point in led.sut.points
+                    if point.name.startswith("logit.") and point.name.endswith(".dropped")})
+    totals = {}
+    for name in names:
+        for point in led.sut.matching(name):
+            if not isinstance(point.value, (int, float)) or not point.value:
+                continue
+            component = point.attributes.get("component", "?")
+            reason = point.attributes.get("reason", "?")
+            if _balanced_drop(led, name, component, reason, batch_drops):
+                continue
+            key = (name, component, reason)
+            totals[key] = totals.get(key, 0) + point.value
+    if not totals:
+        return Result("drops", PASS, "no *.dropped count outside the ledger and the sink rows")
+    status = PASS
+    lines = []
+    for (name, component, reason), value in sorted(totals.items()):
+        verdict = FAIL if reason in FAULT_DROP_REASONS else WARN
+        status = worst([status, verdict])
+        lines.append(f"{component}: {name}{{reason=\"{reason}\"}} {_n(value)}")
+    return Result("drops", status, f"{len(lines)} *.dropped count(s) outside the ledger: "
+                  + "; ".join(lines), lines)
+
+
 CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_intake,
     check_ledger_edge, check_ledger_script, check_ledger_aggregate, check_ledger_egress,
     check_ledger_windows, check_ledger_replay, check_ledger_summary, check_ledger_sent,
-    check_ledger_topic, check_identity_sink, check_recovery, check_expect,
+    check_ledger_topic, check_identity_sink, check_drops, check_recovery, check_expect,
 )
 
 

@@ -904,6 +904,14 @@ The rows:
   row as it FAILs `ledger.egress`, named beside its term.
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at each sink's own
   telemetry; see "External targets".
+- `drops` (2026-10-13): every `logit.*.dropped` counter the SUT emitted that no row above
+  judges. Under [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md) the name
+  alone says a count is loss, so the row reads every such name rather than a list. It leaves
+  out the terms the ledger balances (every `batches.dropped`, a node's `events.dropped` beside a
+  batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B terms, and the
+  script's L_err) and, on an external or Kafka target, the sink's `records.dropped` and
+  `metrics.dropped`, which `ledger.sent` judges. A `rejected` or `disk_corrupt` reason FAILs;
+  any other WARNs.
 - `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
   window around one step, or over the whole run (W8c); see "The scenario schema".
 

@@ -11,7 +11,9 @@ and at a life start with none, and a two-life run whose final life balances and 
 life's residual reaches V, each rule broken in turn: a shutdown drop telemetry and stderr both
 carry counted once, and either copy alone WARNed, a counted and an
 uncounted egress gap, an earlier life's residual that never reaches V, an empty export, wire loss
-in and out of a fault window and at the end, the sink identity, and recovery, a two-batch sink
+in and out of a fault window and at the end, the sink identity, `drops` (a WARN for each
+`*.dropped` no other row judges, a FAIL for a rejected one, and a PASS for the terms the ledger
+balances), and recovery, a two-batch sink
 queue holding one batch and a one-batch queue it fills included. Empty SUT telemetry, and lives the timeline disagrees with,
 SKIP every ledger row. For `[[expect]]`, it covers every validation rule and each reducer
 against a synthetic run: the window's open start, `through` reaching past the revert, a drain
@@ -44,7 +46,8 @@ file check and its `export` and quote grammar, the private plain copy compose re
 directory, mode, content, and removal, an early return from `execute()` included), the compose arguments and profile each kind of run gets, the end sequence's wait for
 the sink's queue to empty, and the checks over an external two-life run: `ledger.sent` reading
 SENT, a rejected batch and rejected records each FAILing with the status and the sink's text, a
-non-2xx answer inside and outside a fault window, counted drops and encoder skips WARNing, a
+non-2xx answer inside and outside a fault window, counted drops and encoder skips WARNing (and
+left out of `drops`), a
 batch neither delivered nor dropped, and no request telemetry; the rows that read V SKIP; and a
 local run's `ledger.sent` SKIPs.
 
@@ -1934,6 +1937,37 @@ def _ledger_checks():
                          "ledger.egress", "ledger.summary", "identity.sink", "recovery"):
             expect(clean[check_id].status == checks.PASS,
                    f"{check_id} PASSes the balanced two-life fixture, got {clean[check_id]}")
+        expect(clean["drops"].status == checks.PASS,
+               f"drops PASSes when the ledger balances every *.dropped term (a listener's "
+               f"shutdown datagrams), got {clean['drops']}")
+        stamp = _stamp(T0 + 200)
+        unjudged = results("ledger-drops-unjudged", sut_extra=(
+            _line(stamp, "logit.component.events.dropped", "sum", 3, component="window",
+                  attrs={"reason": "closed_consumer"}),
+            _line(stamp, "logit.output.metrics.dropped", "sum", 4, component="sink",
+                  attrs={"reason": "unresolved_gauge_delta"})))
+        expect(unjudged["drops"].status == checks.WARN
+               and "window: logit.component.events.dropped{reason=\"closed_consumer\"} 3"
+               in unjudged["drops"].detail
+               and "sink: logit.output.metrics.dropped{reason=\"unresolved_gauge_delta\"} 4"
+               in unjudged["drops"].detail,
+               f"drops WARNs every *.dropped no other row judges, by component and reason, "
+               f"got {unjudged['drops']}")
+        refused = results("ledger-drops-rejected", sut_extra=(
+            _line(stamp, "logit.output.records.dropped", "sum", 2, component="sink",
+                  attrs={"reason": "rejected"}),))
+        expect(refused["drops"].status == checks.FAIL,
+               f"drops FAILs a rejected drop, got {refused['drops']}")
+        balanced = results("ledger-drops-balanced", life1_dropped=2, sut_extra=(
+            _line(stamp, "logit.input.kernel.dropped", "sum", 5, component="in",
+                  attrs={"reason": "socket"}),
+            _line(stamp, "logit.input.messages.dropped", "sum", 0, component="in",
+                  attrs={"reason": "malformed"}),
+            _line(_stamp(T0 + 320), "logit.component.events.dropped", "sum", 200,
+                  component="sink", attrs={"reason": "shutdown"})))
+        expect(balanced["drops"].status == checks.PASS,
+               f"drops leaves out the terms the ledger and identity.sink balance (K, a sink's "
+               f"batch drop and its events), got {balanced['drops']}")
         led = checks.Ledger(checks.RunData(Path(tmp) / "ledger-clean"))
         expect(led.D_log == {0: 20} and led.D_shutdown == {0: 20} and led.D(0) == 20
                and "D 20 (20 at shutdown; stderr says 20)" in " ".join(clean["ledger.intake"].lines),
@@ -2169,6 +2203,9 @@ def _script_ledger():
                          "ledger.egress", "ledger.summary"):
             expect(clean[check_id].status == checks.PASS,
                    f"{check_id} PASSes the balanced script fixture, got {clean[check_id]}")
+        expect(clean["drops"].status == checks.PASS,
+               f"drops leaves the script's events.dropped{{reason=\"script_error\"}} to "
+               f"ledger.script, got {clean['drops']}")
         expect("script to aggregate" in clean["ledger.edge"].detail,
                f"edge judges the script's edge, got {clean['ledger.edge']}")
         expect("Ab − L_flush" in clean["ledger.egress"].detail
@@ -3790,6 +3827,9 @@ def _external_checks():
                and "2 metric(s) dropped by the encoder, never sent (non_finite_value 2)"
                in " ".join(stale["ledger.sent"].lines),
                f"a counted pre-send drop and an encoder skip WARN, got {stale['ledger.sent']}")
+        expect(stale["drops"].status == checks.PASS,
+               f"drops leaves an external sink's records.dropped and metrics.dropped to "
+               f"ledger.sent, got {stale['drops']}")
         short = results("external-undelivered", sut_extra=_datadog_lines(), undelivered=1)
         expect(short["ledger.sent"].status == checks.FAIL
                and "outside [0, 1]" in short["ledger.sent"].detail,
