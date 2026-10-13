@@ -5,6 +5,12 @@ updated: 2026-10-13
 
 # Enabling plan: `influxdb_in`/`influxdb_out` — a lossless InfluxDB line-protocol relay
 
+## Status
+
+W0 to W2 are done: the ADRs, `MetricValue`, and the codec with its `influxd` probe. W3 adds the
+`influxdb_in` listener, its config and graph rule, the operator docs, and the closing assessment
+below.
+
 ## Context
 
 `logit` has `influxdb_out` (InfluxDB 2.x line protocol, `POST /api/v2/write`) and no
@@ -252,6 +258,18 @@ the listener:
     Every response carries `X-Influxdb-Version`. A wrong method on the write route is `405` with
     `Allow: OPTIONS, POST`. The v1 `POST /write?db=` route works only when a DBRP mapping for `db`
     exists; otherwise it is `404` `no dbrp mapping found`. It stays out of scope here.
+
+## Closing assessment
+
+`influxdb_in -> influxdb_out` is a fixed point modulo the numbered normalizations in
+`crates/logit-proto/src/influxdb/mod.rs`'s module doc. The residual debt is listed once, in
+[`docs/known-gaps/influxdb.md`](../known-gaps/influxdb.md) (the unsupported v1 route, no query or
+delete API, `org` and `bucket` carried but not routed, destination faults the producer never sees,
+and the places the listener's answers differ from `influxd`) and in the `encode (InfluxDB)` and
+`decode (InfluxDB)` rows of [`docs/known-gaps/mappings.md`](../known-gaps/mappings.md) (what
+`influxdb_out` drops or reshapes from other protocols, and the carrier at other sinks). A
+Telegraf-to-`logit`-to-InfluxDB run with a Flux comparison is the one verification this plan lists
+that needs a real stack.
 
 ## Open risks
 

@@ -1,11 +1,11 @@
 //! Connection-level plumbing shared by this crate's `hyper`-based listeners (`otlp_in`,
-//! `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`, and
-//! `splunk_hec_in`): the connection builders that pin hyper's HTTP/2 settings ([`auto_builder`],
+//! `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`,
+//! `splunk_hec_in`, and `influxdb_in`): the connection builders that pin hyper's HTTP/2 settings ([`auto_builder`],
 //! [`h2_builder`]), the idle-timeout tracker ([`Activity`], [`InFlight`]), the connection driver
 //! that acts on it ([`drive_connection`]), and the bounded request-body read
 //! ([`collect_with_stall_bound`], which holds one buffer per body however many reads it arrives
-//! in). All five listeners build and read through these. The two Datadog listeners and
-//! `splunk_hec_in` also share their request helpers here: `Content-Encoding` and `Content-Type`
+//! in). All six listeners build and read through these. The two Datadog listeners,
+//! `splunk_hec_in`, and `influxdb_in` also share their request helpers here: `Content-Encoding` and `Content-Type`
 //! parsing, bounded decompression, the JSON response shapes, the constant-time key check, and the
 //! deadline-bounded delivery.
 //!

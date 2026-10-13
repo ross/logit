@@ -39,6 +39,7 @@ Relaying a protocol to itself is lossless. Each of these pairs is a transparent 
 - `datadog_in` to `datadog_out`
 - `datadog_trace_in` to `datadog_trace_out`
 - `splunk_hec_in` to `splunk_hec_out`
+- `influxdb_in` to `influxdb_out`
 
 A relay can regroup events into different batches and apply a short, named list of normalizations,
 but it drops no information. Summarizing, such as summing counters over a window, happens only in a
@@ -47,8 +48,8 @@ stage you add on purpose. See [ADR `lossless-transit`](adr/lossless-transit.md).
 ## Scope
 
 - **Ingest:** statsd and DogStatsD, collectd, Graphite (plaintext and pickle), syslog (RFC 3164
-  and 5424), OTLP logs, metrics, and traces, Prometheus scraping and remote-write, and the native
-  `logit` protocol. Listeners use UDP, TCP, or TLS, depending on the protocol. File tailing handles
+  and 5424), OTLP logs, metrics, and traces, Prometheus scraping and remote-write, InfluxDB 2.x line protocol, and the
+  native `logit` protocol. Listeners use UDP, TCP, or TLS, depending on the protocol. File tailing handles
   rotation and keeps a checkpoint (`tail_in`), including Docker's json-file container logs,
   enriched with each container's identity without access to the Docker socket (`docker_in`). See
   [ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md).
@@ -57,7 +58,7 @@ stage you add on purpose. See [ADR `lossless-transit`](adr/lossless-transit.md).
   inline in the YAML or loaded from a `.lua` file. Built-in components also cover stateful metric
   aggregation (counters, gauges, sets, and distributions with percentiles), consistent sampling,
   filtering, and routing. Every stage is opt-in.
-- **Emit:** the same protocols as ingest, except file tailing, plus InfluxDB 2.x, Kafka topics,
+- **Emit:** the same protocols as ingest, except file tailing, plus Kafka topics,
   standard output, and rotating files. The native `logit` protocol forwards events between nodes.
 - **Configuration:** YAML, validated against a JSON Schema generated from the Rust config types, so
   the schema can't drift from what the binary accepts. A config is one flat graph of named

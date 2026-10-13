@@ -83,6 +83,7 @@ Listeners live in `crates/logit-inputs`, codecs in `crates/logit-proto`.
 | `datadog_in` | `crates/logit-inputs/src/datadog.rs` | Datadog's intake API over HTTP (series, sketches, checks, events, logs, APM traces and stats), gzip/deflate/zstd, `503` when busy | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `datadog_trace_in` | `crates/logit-inputs/src/datadog_trace.rs` | the Datadog Agent's APM API for dd-trace tracers (`/v0.3`–`/v0.7/traces` msgpack, `/v0.6/stats`, `/info`) over TCP and/or a Unix socket; keeps every span, `503` (a tracer's loss) when busy | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `splunk_hec_in` | `crates/logit-inputs/src/splunk.rs` | a stand-in for Splunk's HTTP Event Collector (HEC): `/event` JSON and `/raw` lines from any HEC client (Docker's `splunk` driver, Splunk's logging libraries, the OTel `splunk_hec` exporter, SC4S), gzip, an optional `tokens:` allowlist, the objects before a code 6 delivered as Splunk indexes them, per-channel `ackId`s that `/ack` answers `true` once, as a `useACK` token does, `503` code 9 only when nothing of the body was taken, and a `503` code 18 `/health` after it | [ADR `splunk-hec-relay`](docs/adr/splunk-hec-relay.md) |
+| `influxdb_in` | `crates/logit-inputs/src/influxdb.rs` (listener), `crates/logit-proto/src/influxdb/` (codec) | a stand-in for InfluxDB 2.x's write API: `POST /api/v2/write` line protocol from Telegraf's `outputs.influxdb_v2`, the InfluxDB client libraries, or `influxdb_out`, gzip, an optional `tokens:` allowlist, `/ping` and `/health`, `org`/`orgID`/`bucket` as `influxdb.*` resource attributes, a body with any bad line refused whole with `400`, `503` when busy; no v1 `/write`, no query API | [ADR `influxdb-line-protocol-relay`](docs/adr/influxdb-line-protocol-relay.md) |
 | `prometheus_in` | `crates/logit-inputs/src/prometheus.rs` | scrapes `/metrics` targets, or receives remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
 | `tail_in` | `crates/logit-inputs/src/tail/` | rotation- and checkpoint-aware file tailing | [ADR `file-tailing-and-docker-json-logs`](docs/adr/file-tailing-and-docker-json-logs.md) |
 | `docker_in` | `crates/logit-inputs/src/docker.rs` | Docker json-file container logs, enriched from a sibling `config.v2.json`; no docker socket | same ADR as `tail_in` |
@@ -96,7 +97,7 @@ Sinks live in `crates/logit-outputs`.
 
 | Kind | Code | What it does | Decision record |
 |---|---|---|---|
-| `influxdb_out` | `crates/logit-outputs/src/influxdb.rs` | InfluxDB 2.x line protocol over the write API | [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md), [ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md) |
+| `influxdb_out` | `crates/logit-outputs/src/influxdb.rs` | InfluxDB 2.x line protocol over the write API | [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md), [ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md), [ADR `influxdb-line-protocol-relay`](docs/adr/influxdb-line-protocol-relay.md) |
 | `stdio_out` | `crates/logit-outputs/src/stdio.rs`, render in `human.rs` | an exhaustive, sectioned text block per event (default, `message: escaped \| multiline`), `format: json` (one object per event per line, `ndjson.rs`, what every harness reader consumes), or `format: native`; its file target is `file_out` with an empty rotation policy | [ADR `human-render-block-format`](docs/adr/human-render-block-format.md), [ADR `stream-json-format`](docs/adr/stream-json-format.md), [ADR `file-output-native-format`](docs/adr/file-output-native-format.md) |
 | `file_out` | `crates/logit-outputs/src/file.rs` | rotating file sink sharing `stdio_out`'s implementation | [ADR `rotating-file-output`](docs/adr/rotating-file-output.md) |
 | `syslog_out` | `crates/logit-outputs/src/syslog.rs` | RFC 3164/5424 over UDP, TCP, or TLS (RFC 5425) | [ADR `syslog-output`](docs/adr/syslog-output.md) |
@@ -233,12 +234,13 @@ Details an agent needs beyond the table:
 
 ### Lossless like-protocol relays
 
-Nine like-protocol pairs must each relay losslessly, modulo a named list of permitted
+Ten like-protocol pairs must each relay losslessly, modulo a named list of permitted
 normalizations ([ADR `lossless-transit`](docs/adr/lossless-transit.md); the rule itself is under
 [Design constraints that aren't optional](#design-constraints-that-arent-optional)).
 [docs/plans/lossless-transit.md](docs/plans/lossless-transit.md) has the closing assessment for
 the first three pairs, [docs/plans/datadog-relay.md](docs/plans/datadog-relay.md) for the two
-Datadog pairs, and [docs/plans/splunk-relay.md](docs/plans/splunk-relay.md) for the Splunk pair. What the model and codecs carry for them:
+Datadog pairs, and [docs/plans/splunk-relay.md](docs/plans/splunk-relay.md) for the Splunk pair, and
+[docs/plans/influxdb-relay.md](docs/plans/influxdb-relay.md) for the InfluxDB pair. What the model and codecs carry for them:
 
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
@@ -399,6 +401,26 @@ Per pair:
   HEC, through SC4S or the Splunk OTel Collector, standing in for HEC, and Observability Cloud
   over `otlp_out`, unverified), which way to send, and the rules that lose data when missed.
 
+- **`influxdb_in -> influxdb_out`** (InfluxDB 2.x line protocol over the v2 write API):
+  `crates/logit-proto/src/influxdb/` is one codec whose `mod.rs` doc is the mapping table, the
+  permitted-normalization list, and "Deviations from influxd". A point decodes to one `Event`: the
+  measurement as the attribute `influxdb.measurement`, tags as event attributes, each numeric or
+  boolean field as a typed `Gauge` named `<measurement>.<field>` ([ADR
+  `typed-metric-scalar`](docs/adr/typed-metric-scalar.md)), and each string field as
+  `influxdb.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as `influxdb.org`,
+  `influxdb.org_id`, and `influxdb.bucket`, and `influxdb_out` writes to its own configured org
+  and bucket, so a `route` on the bucket picks a destination. The presence of
+  `influxdb.measurement` selects the carrier path on `influxdb_out`; those attributes are ordinary
+  labels at every other sink, so a `remove` belongs ahead of one. A tag key under the
+  `influxdb.` prefix is dropped, counted. `influxdb_in` parses the whole body before building any
+  event, so a bad line delivers nothing and the whole request is one batch, delivered all or
+  nothing. It acknowledges with `204` once the batch is in every downstream inbox, so a
+  destination's `422`, `404`, or `401` reaches `influxdb_out`'s fault classes and never the
+  producer. Neither side is duplicate-safe
+  ([ADR `influxdb-line-protocol-relay`](docs/adr/influxdb-line-protocol-relay.md),
+  [docs/plans/influxdb-relay.md](docs/plans/influxdb-relay.md),
+  [docs/known-gaps/influxdb.md](docs/known-gaps/influxdb.md)).
+
 ### Listener I/O
 
 - **UDP**: `statsd_in` and `syslog_in` are thin wrappers over a shared
@@ -439,8 +461,8 @@ Per pair:
   `network.peer.address`/`network.peer.port`. On TCP, `proxy_protocol:` requires a PROXY v1/v2
   header (`logit_proto::proxy`, a fuzz target) ahead of any TLS and stamps the origin it names as
   `client.address`/`client.port`. The shared TCP, UDP, and Unix drivers stamp per connection or
-  datagram. The five HTTP listeners (`otlp_in`, `datadog_in`, `datadog_trace_in`,
-  `splunk_hec_in`, and `prometheus_in`'s remote-write receiver) build the values once per
+  datagram. The six HTTP listeners (`otlp_in`, `datadog_in`, `datadog_trace_in`,
+  `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver) build the values once per
   connection (`crates/logit-inputs/src/peer.rs`) and stamp every batch a request decodes into.
   They also take `forwarded: x_forwarded_for | forwarded | x_real_ip`, which reads the one named
   header on each request (`logit_proto::forwarded`, shared with `http_access`, a fuzz target) and
@@ -493,7 +515,7 @@ Per pair:
   ([ADR `env-yaml-tag`](docs/adr/env-yaml-tag.md)), which is why `influxdb_out`'s `token` is a
   plain string, not an env-specific field.
 - **Lifecycle**: [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md)
-  covers signal-driven shutdown. The five HTTP listeners own their connection tasks and close
+  covers signal-driven shutdown. The six HTTP listeners own their connection tasks and close
   them on the signal ([ADR `idle-connection-timeout`](docs/adr/idle-connection-timeout.md)'s
   shutdown amendment). `crates/logit-inputs/src/statsd.rs` and
   `crates/logit-outputs/src/influxdb.rs` are the reference listener and sink.
@@ -915,7 +937,8 @@ not a style preference:
   non-mergeable shortcut.
 - **`statsd_in -> statsd_out`, `otlp_in -> otlp_out`, `syslog_in -> syslog_out`, `prometheus_in ->
   prometheus_out`, `collectd_in -> collectd_out`, `graphite_in -> graphite_out`, `datadog_in ->
-  datadog_out`, `datadog_trace_in -> datadog_trace_out`, and `splunk_hec_in -> splunk_hec_out`
+  datadog_out`, `datadog_trace_in -> datadog_trace_out`, `splunk_hec_in -> splunk_hec_out`, and
+  `influxdb_in -> influxdb_out`
   must each be a lossless relay**,
   modulo a named list of permitted normalizations (batching, tag reordering, a sink-configured
   dialect change) — [ADR `lossless-transit`](docs/adr/lossless-transit.md). A
@@ -1002,9 +1025,9 @@ crates/
   logit-core        internal event model: Event, Value, Resource, metric kinds, interner, self-telemetry
   logit-config      YAML config types + generated JSON Schema
   logit-script      LuaJIT embedding (mlua), the Event proxy
-  logit-proto       codec traits, native wire format, output buffering, framing (the stream `Framer` every TCP listener frames with), statsd (statsd_in's decoder), syslog (syslog_in's decoder), message (the json, csv, logfmt, and kv parse cores the transforms wrap)
+  logit-proto       codec traits, native wire format, output buffering, framing (the stream `Framer` every TCP listener frames with), statsd (statsd_in's decoder), syslog (syslog_in's decoder), message (the json, csv, logfmt, and kv parse cores the transforms wrap), influxdb (the InfluxDB line-protocol codec: lexer, decoder, encoder, error body)
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
-  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target; the listener), syslog (the listener), graphite, lines (lines_in), collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
+  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target; the listener), syslog (the listener), graphite, lines (lines_in), collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), influxdb (influxdb_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), splunk (splunk_hec_out), kafka (kafka_out), logit (logit_out), null_out (load-test discard sink)
                     shared drivers: `stream` (the pooled TCP, TLS, and Unix-stream send of statsd, syslog, and graphite), `datagram` (the packer and UDP/Unix-datagram send of statsd, syslog, graphite, and collectd), `accounting` (`BatchAccounting`, the once-per-batch encode-side counting gate; ADR `sink-send-path-and-attempt-accounting`)
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, timestamp (event.timestamp from an attribute), scale, has_signal, keep_signals, drop_signals, has_attributes, drop_attributes, has_provenance, drop_provenance, keep_values, bucket (numeric range into a named class), logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), sample (consistent, keyed sampling on a frozen XXH64 hash), route (implements logit-pipeline::Router)
@@ -1026,7 +1049,7 @@ where `script/perf run`/`attribute`/`flamegraph` write their (gitignored) output
 
 `testdata/differential/` holds those corpora: generated and deterministic, unlike `testdata/interop/`'s captures, each case's bytes beside a JSON file with the reference's reading and the verdict `logit` must give, and a `divergence` on every case where the two differ. `prometheus-text/` differs in its inputs: its `cases/` are hand-built and committed as inputs, its readings sit under `reference/`, and it reads `testdata/interop/prometheus-scrape/`'s recorded bodies in place. Its tests read it with `std::fs` and no reference installed, and `fuzz/seedgen` turns every case into a seed; [its README](testdata/differential/README.md) has the rest.
 
-`fuzz/` is the cargo-fuzz harness `script/unsafe-check fuzz` drives ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)), its own workspace outside the root one like `tools/protogen`, so `libfuzzer-sys` never enters the stable build: one target per file in `fuzz_targets/`, 26 today, each also a row of `script/unsafe-check`'s `FUZZ_TARGETS` (depending on `logit-core` and `logit-proto` only), `seedgen/` (a plain binary that writes `seeds/<target>/` deterministically from `testdata/interop/{otlp,prometheus,prometheus-scrape,statsd,syslog,graphite,collectd,datadog}/`, every corpus under `testdata/differential/`, every `*.in` body under `crates/logit-cli/tests/fixtures/prometheus/`, `tools/record-fixtures/prometheus-metadata-target.prom`, `crates/logit-proto/tests/support/influxdb_lines.rs`, and encoder round trips), and the committed `seeds/`, where a `regress-*` file is a minimized crash input. `fuzz/corpus/`, `fuzz/artifacts/`, `fuzz/coverage/`, and `fuzz/target/` are gitignored; `script/format` covers the workspace and `script/lint` type-checks it on stable (`cargo check`), while clippy, `cargo-deny`, and `cargo-audit` don't.
+`fuzz/` is the cargo-fuzz harness `script/unsafe-check fuzz` drives ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)), its own workspace outside the root one like `tools/protogen`, so `libfuzzer-sys` never enters the stable build: one target per file in `fuzz_targets/`, 26 today, each also a row of `script/unsafe-check`'s `FUZZ_TARGETS` (depending on `logit-core` and `logit-proto` only), `seedgen/` (a plain binary that writes `seeds/<target>/` deterministically from `testdata/interop/{otlp,prometheus,prometheus-scrape,statsd,syslog,graphite,collectd,datadog,influxdb}/`, every corpus under `testdata/differential/`, every `*.in` body under `crates/logit-cli/tests/fixtures/prometheus/`, `tools/record-fixtures/prometheus-metadata-target.prom`, `crates/logit-proto/tests/support/influxdb_lines.rs`, and encoder round trips), and the committed `seeds/`, where a `regress-*` file is a minimized crash input. `fuzz/corpus/`, `fuzz/artifacts/`, `fuzz/coverage/`, and `fuzz/target/` are gitignored; `script/format` covers the workspace and `script/lint` type-checks it on stable (`cargo check`), while clippy, `cargo-deny`, and `cargo-audit` don't.
 
 `perf/load/*.yaml` are the **sidecar load specs** for real-socket scenarios
 ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)):
