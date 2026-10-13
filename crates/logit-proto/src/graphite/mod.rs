@@ -172,7 +172,7 @@
 //! 10. Sanitizer substitutions, empty-tag drops and rendered-name collision drops (all counted).
 //! 11. [`Tags::Drop`] drops the tag set entirely (counted).
 //! 12. A `Sum`'s temporality and monotonicity are dropped; the value goes on the wire bare. A
-//!     **named normalization, not a skip**: unlike `prometheus_out`, which skips a delta `Sum`
+//!     **named normalization, not a skip**: unlike `prometheus_out`, which drops a delta `Sum`
 //!     because exposition has a competing cumulative meaning, carbon's wire has no opinion on
 //!     either, so the number is carried faithfully and only the model's extra facts are lost.
 //! 13. A pickle sender's spelling (protocol version, opcode choice, memo use) leaves as

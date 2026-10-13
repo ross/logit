@@ -3981,7 +3981,7 @@ pub enum AggregateTemporality {
     /// A `Sum`/`Histogram` accumulator survives the flush and keeps summing, so every window
     /// emits the running total since the series was first seen, stamped with the series' start
     /// time: when it was first seen, clamped into the window it opened in. Required by
-    /// `prometheus_out`, which skips delta records.
+    /// `prometheus_out`, which drops delta records.
     /// A running total lives only as long as `series_retention` and `max_retained_series` keep
     /// its series, so both must be at least `1`.
     Cumulative,

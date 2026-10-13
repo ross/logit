@@ -317,7 +317,8 @@ Per pair:
     write protocol, `ruzstd`-encoded, `version: 1` only (graph rule 56), with no fallback to
     Snappy. It sends one `POST` per batch with no retry in the sink; its posture is the default
     `at_least_once` because a sample's identity at a receiver is `(label set, timestamp)`.
-  - Native histograms are skipped and counted in both directions, pending their own follow-up.
+  - Native histograms are dropped and counted in both remote-write directions, pending their own
+    follow-up, and skipped on exposition, which has no syntax for them.
 
   Examples: [fixtures/prometheus-remote-write-receive.yaml](fixtures/prometheus-remote-write-receive.yaml),
   [fixtures/prometheus-remote-write-send.yaml](fixtures/prometheus-remote-write-send.yaml).
@@ -700,7 +701,8 @@ the operator-facing account of all of this.
 
 - A second transport for the native hop, gRPC for L7 infrastructure or QUIC for a WAN hop
   (`docs/known-gaps/native-hop.md`).
-- Prometheus native histograms, skipped and counted in both directions.
+- Prometheus native histograms, dropped and counted on remote-write in both directions and skipped
+  on exposition.
 - An Agent-equivalent Datadog trace processor (normalization, `_top_level` marking, sampling, a
   stats concentrator), so tracer spans could reach Datadog with no real Agent in the path
   ([docs/plans/datadog-relay.md](docs/plans/datadog-relay.md) §14).

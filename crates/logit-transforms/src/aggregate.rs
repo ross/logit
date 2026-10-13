@@ -45,7 +45,7 @@
 //!
 //! An incoming *cumulative* `Sum` passes through in both modes: re-summing a running total would
 //! double-count it. `docs/adr/prometheus-scrape-and-exposition.md` covers the consumer that needs
-//! this mode (`prometheus_out` skips delta records).
+//! this mode (`prometheus_out` drops delta records).
 
 use bytes::Bytes;
 use logit_core::interner::Symbol;
