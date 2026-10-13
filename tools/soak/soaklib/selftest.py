@@ -347,8 +347,8 @@ def _expect_rules(root):
         (dict(reduce="mean"), "unknown reduce `mean`", "an unknown reducer"),
         (dict(reduce="delta"), "reads a sum, and logit.component.buffer.batches is a gauge",
          "a counter reducer on a gauge"),
-        (dict(metric="logit.input.kernel.drops", reduce="max"),
-         "reads a gauge, and logit.input.kernel.drops is a sum", "a gauge reducer on a counter"),
+        (dict(metric="logit.input.kernel.dropped", reduce="max"),
+         "reads a gauge, and logit.input.kernel.dropped is a sum", "a gauge reducer on a counter"),
         (dict(min=None), "needs `min`, `max`, or both", "an expectation without bounds"),
         (dict(max=1), "`min` 2 is above `max` 1", "min above max"),
         (dict(min="2"), "must be numbers", "a bound that isn't a number"),
@@ -1118,10 +1118,11 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             for metric, value, attrs in (
                     ("logit.component.events.received", l_in, None),
                     ("logit.script.events.emitted", emit, {"outcome": "emit"}),
-                    ("logit.component.events.dropped", drop, {"reason": "script_drop"}),
-                    ("logit.component.errors", err
+                    ("logit.component.events.discarded", drop, None),
+                    ("logit.component.events.dropped", err
                      - (l_err_unreported if life == 1 and offset == 200 else 0),
-                     {"reason": "process"}),
+                     {"reason": "script_error"}),
+                    ("logit.component.errors", err, {"reason": "process"}),
                     ("logit.component.flush.events", flush, None),
                     ("logit.component.events.sent", l_sent, None)):
                 sut.append(_line(stamp, metric, "sum", value, component="lua", attrs=attrs))
@@ -2274,7 +2275,7 @@ def _expect_run(tmp, name, expectations, apply_rc=0, second_cycle=False):
       `reason=overflow_oldest`, and 7 at +140 under `reason=shutdown`.
     - `logit.component.buffer.batches{component=sink}`: set to 5 at +50, 2 at +120, 0 at +200,
       and 3 at +330. Nothing else sets it, as a gauge only drains after it's set.
-    - `logit.input.kernel.drops{component=in}`: 5 at +200, after the revert.
+    - `logit.input.kernel.dropped{component=in}`: 5 at +200, after the revert.
     - `logit.component.inbox.full{component=window}` exported as a gauge, a kind mismatch."""
     stdout = []
     for offset in range(5, 451, 5):
@@ -2293,7 +2294,7 @@ def _expect_run(tmp, name, expectations, apply_rc=0, second_cycle=False):
             stdout.append(_line(stamp, "logit.component.buffer.batches", "gauge", value,
                                 component="sink"))
         if offset == 200:
-            stdout.append(_line(stamp, "logit.input.kernel.drops", "sum", 5, component="in"))
+            stdout.append(_line(stamp, "logit.input.kernel.dropped", "sum", 5, component="in"))
         stdout.append(_line(stamp, "logit.component.inbox.full", "gauge", 1, component="window"))
     timeline = [_phase("start", 0, t0=T0),
                 _action("apply", "c0s1", "stop", "victoria-metrics", 100, rc=apply_rc),
@@ -2346,12 +2347,12 @@ def _expect_checks():
         one("attrs filter on reason", checks.PASS, metric="logit.component.datagrams.dropped",
             attrs={"component": "in", "reason": "overflow_oldest"}, min=130, max=130)
         one("a loss counter never emitted in the window reads 0", checks.PASS,
-            metric="logit.input.kernel.drops", max=0)
+            metric="logit.input.kernel.dropped", max=0)
         # through is (+100, +235]: 27 drains, two missing.
         one("through spans the fault and its recovery_bound", checks.PASS, window="through",
             min=25000, max=25000)
         one("through sees a counter that moves after the revert", checks.FAIL,
-            window="through", metric="logit.input.kernel.drops", max=0)
+            window="through", metric="logit.input.kernel.dropped", max=0)
         one("a counter that should stay 0 FAILs when it moved", checks.FAIL,
             metric="logit.component.datagrams.dropped", max=0)
 
@@ -2642,8 +2643,8 @@ def _slope_reducer():
     _refused(path, with_expect(window="run"), "window `run` spans the whole run and takes no",
              "a run window with a step")
     _refused(path, with_expect(step=None), "missing `step`", "a step window with no step")
-    _refused(path, with_expect(metric="logit.input.kernel.drops"),
-             "reads a gauge, and logit.input.kernel.drops is a sum", "a slope of a counter")
+    _refused(path, with_expect(metric="logit.input.kernel.dropped"),
+             "reads a gauge, and logit.input.kernel.dropped is a sum", "a slope of a counter")
     _refused(path, with_expect(metric="logit.process.interner.strings", reduce="delta"),
              "logit.process.interner.strings is a gauge", "a counter reducer on interner.strings")
     _refused(path, with_expect(metric="logit.process.memory.resident.bytes", reduce="delta"),
@@ -3662,13 +3663,15 @@ def _sink_drain(root):
 
 
 def _datadog_lines(rejected_at=None, retry_at=(), stale=0, skipped=0, records=True,
-                   batch=True, cls="2xx", reason="rejected", named=0, queued_at=None):
+                   batch=True, cls="2xx", reason="rejected", named=0, queued_at=None,
+                   unsent=0):
     """`datadog_out` telemetry for the ledger fixture's SUT drains: one request answered `cls`
     and 100 records accepted per drain, plus what each keyword adds. A rejection at
     `rejected_at` drops its records (`records`, under `reason`) and its batch (`batch`): a
     request rejected while another of the batch's was accepted drops records only. `named`
     records come out of an accepted body at +250; `queued_at` adds three batches received
-    there and never sent, for a `buffer_batches=3` fixture."""
+    there and never sent, for a `buffer_batches=3` fixture; `unsent` metrics are dropped by the
+    encoder at +250."""
     drains = [o for o in range(5, STOP[0], 5)] + [o for o in range(135, 321, 5)]
     lines = []
     for offset in drains:
@@ -3698,9 +3701,12 @@ def _datadog_lines(rejected_at=None, retry_at=(), stale=0, skipped=0, records=Tr
     if skipped:
         lines.append(_line(_stamp(T0 + 250), "logit.output.metrics.skipped", "sum", skipped,
                            component="sink", attrs={"metric_kind": "cumulative_sum"}))
+    if unsent:
+        lines.append(_line(_stamp(T0 + 250), "logit.output.metrics.dropped", "sum", unsent,
+                           component="sink", attrs={"reason": "non_finite_value"}))
     if named:
-        lines.append(_line(_stamp(T0 + 250), "logit.output.records.rejected", "sum", named,
-                           component="sink", attrs={"route": "series"}))
+        lines.append(_line(_stamp(T0 + 250), "logit.output.records.dropped", "sum", named,
+                           component="sink", attrs={"route": "series", "reason": "rejected"}))
     if queued_at is not None:
         lines.append(_line(_stamp(T0 + queued_at), "logit.component.batches.received", "sum",
                            3, component="sink"))
@@ -3766,10 +3772,13 @@ def _external_checks():
                and "no request_rejected line on stderr" in
                unquoted["ledger.sent"].detail,
                f"a rejection with no stderr line still FAILs, got {unquoted['ledger.sent']}")
-        stale = results("external-stale", sut_extra=_datadog_lines(stale=7, skipped=3))
+        stale = results("external-stale", sut_extra=_datadog_lines(stale=7, skipped=3,
+                                                                    unsent=2))
         expect(stale["ledger.sent"].status == checks.WARN
                and "7 record(s) dropped stale" in " ".join(stale["ledger.sent"].lines)
-               and "3 metric(s) skipped" in " ".join(stale["ledger.sent"].lines),
+               and "3 metric(s) skipped" in " ".join(stale["ledger.sent"].lines)
+               and "2 metric(s) dropped by the encoder, never sent (non_finite_value 2)"
+               in " ".join(stale["ledger.sent"].lines),
                f"a counted pre-send drop and an encoder skip WARN, got {stale['ledger.sent']}")
         short = results("external-undelivered", sut_extra=_datadog_lines(), undelivered=1)
         expect(short["ledger.sent"].status == checks.FAIL
@@ -3822,22 +3831,24 @@ def _external_checks():
                       {"component": "sink", "key": "series_rejected"})
         named = results("external-named", sut_extra=_datadog_lines(named=2),
                         stderr_extra=[series_202])["ledger.sent"]
-        expect(named.status == checks.FAIL and "2 record(s) named dropped" in named.detail
-               and "a 2xx whose body named dropped series: series_rejected" in named.detail,
+        expect(named.status == checks.FAIL and "2 record(s) dropped rejected" in named.detail
+               and "a 2xx whose body named dropped series: series_rejected" in named.detail
+               and "no request_rejected" not in named.detail,
                f"records named in a 202 body FAIL quoting series_rejected, got {named}")
         both = results("external-202-then-400", sut_extra=_datadog_lines(rejected_at=250),
                        stderr_extra=[series_202, rejection])["ledger.sent"]
         expect(both.status == checks.FAIL and "status 400: request_rejected" in both.detail
-               and "a 2xx whose body" not in both.detail,
-               f"a 400's drop quotes the 400, not an earlier 202, got {both}")
+               and "a 2xx whose body named dropped series: series_rejected"
+               in " ".join(both.lines),
+               f"a 400 and a 202 that both drop records are both quoted, got {both}")
         early_400 = (240,) + rejection[1:]
         late_202 = (250,) + series_202[1:]
         named_late = results("external-400-then-202", sut_extra=_datadog_lines(named=2),
                              stderr_extra=[early_400, late_202])["ledger.sent"]
         expect(named_late.status == checks.FAIL
                and "a 2xx whose body named dropped series: series_rejected" in named_late.detail
-               and "status 400" not in named_late.detail,
-               f"named records quote series_rejected, not an earlier 400, got {named_late}")
+               and "status 400: request_rejected" in named_late.detail,
+               f"named records quote series_rejected beside an earlier 400, got {named_late}")
         pre_send = (250, "WARN", "dropped one event on the series route: it encodes to 9000000 "
                     "bytes (800000 compressed), over the route's per-request limit",
                     {"component": "sink", "key": "oversize"})

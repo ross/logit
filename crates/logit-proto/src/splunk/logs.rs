@@ -22,19 +22,19 @@
 //! | `message` `Map` / `Array` / number / `Bool` | `event` as JSON | -- |
 //! | `message` `Bytes` | `event` string, lossy UTF-8 | -- |
 //! | `message` `Timestamp` | `event` RFC 3339 string | -- |
-//! | `message` `Null`, an empty `Str` or `Bytes`, or a non-finite `F64` | nothing: HEC rejects a blank `event` for the whole request (code 12 or 13) | `logit.output.events.skipped{reason="blank_event"}` |
+//! | `message` `Null`, an empty `Str` or `Bytes`, or a non-finite `F64` | nothing: HEC rejects a blank `event` for the whole request (code 12 or 13) | `logit.output.events.dropped{reason="blank_event"}` |
 //! | `severity`, when neither severity attribute is present | `otel.log.severity.text` (`Info`, …) and `.number` (the band's base, `9`, …) | -- |
 //! | either severity attribute | that attribute alone, verbatim | -- |
 //! | `event_name`, when no `otel.log.name` attribute | `otel.log.name` | -- |
 //! | `trace`, when neither a `trace_id` nor a `span_id` attribute is present | `trace_id` and, when the ref has one, `span_id`, lowercase hex; `flags` has no field | -- |
-//! | on a log whose message (`Str` or `Bytes`) is the text `metric`: an attribute starting `metric_name:`, and `metric_name` and `_value` when both are present | dropped: the decoder would read the object as a metric event | `logit.output.tags.dropped{reason="reserved_key"}`, one per key |
+//! | on a log whose message (`Str` or `Bytes`) is the text `metric`: an attribute starting `metric_name:`, and `metric_name` and `_value` when both are present | omitted: the decoder would read the object as a metric event | `logit.output.tags.omitted{reason="reserved_key"}`, one per key |
 //!
 //! `body_format`, `observed_timestamp`, and `dropped_attributes_count` have no HEC field, and
 //! decode from the wire's shape (`Json` for an object or array, else `Raw`; `0`; `0`).
 
 use super::metrics::{METRIC_EVENT, MULTI_METRIC_PREFIX, SINGLE_METRIC_NAME, SINGLE_METRIC_VALUE};
 use super::{
-    begin_object, write_fields, BatchContext, ObjectMeta, SplunkDecoder, SplunkEncoder,
+    begin_object, write_fields, BatchContext, ObjectMeta, SplunkDecoder, SplunkEncoder, Unencoded,
     ATTR_LOG_NAME, ATTR_SEVERITY_NUMBER, ATTR_SEVERITY_TEXT, ATTR_SPAN_ID, ATTR_TRACE_ID,
 };
 use crate::json::{flatten_into, json_to_value, value_text, write_str, write_value};
@@ -157,7 +157,7 @@ impl SplunkEncoder {
             _ => text.as_deref() == Some(""),
         };
         if blank {
-            self.telemetry.count("logit.output.events.skipped", 1.0, &[("reason", "blank_event")]);
+            self.unencoded(Unencoded::BlankEvent, 1);
             self.diagnostics.warn_throttled(
                 "blank_event",
                 "log with an empty message not sent: HEC rejects a blank event",
@@ -181,7 +181,7 @@ impl SplunkEncoder {
                         || (pair && (key == SINGLE_METRIC_NAME || key == SINGLE_METRIC_VALUE))
                 })
                 .collect();
-            self.reserved_key_dropped(reserved.len());
+            self.reserved_key_omitted(reserved.len());
             for key in reserved {
                 fields.remove_sym(key);
             }
@@ -364,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn blank_messages_are_skipped_and_counted() {
+    fn blank_messages_are_dropped_and_counted() {
         let registry = Registry::new();
         let events = [Value::Null, Value::str(""), Value::F64(f64::NAN)]
             .into_iter()
@@ -375,7 +375,7 @@ mod tests {
         encoder(&registry).encode_objects(&batch, &mut out);
         assert!(out.is_empty());
         assert_eq!(
-            counted(&registry, "logit.output.events.skipped", ("reason", "blank_event")),
+            counted(&registry, "logit.output.events.dropped", ("reason", "blank_event")),
             3.0
         );
     }
@@ -398,7 +398,7 @@ mod tests {
             br#"{"time":0,"event":"metric","fields":{"keep":"x"}}"#
         );
         assert_eq!(
-            counted(&registry, "logit.output.tags.dropped", ("reason", "reserved_key")),
+            counted(&registry, "logit.output.tags.omitted", ("reason", "reserved_key")),
             1.0
         );
     }
@@ -418,7 +418,7 @@ mod tests {
             let once: Vec<u8> = out.iter().flatten().copied().collect();
             assert_eq!(decode(std::str::from_utf8(&once).unwrap()), batches, "{fields}");
             assert_eq!(
-                counted(&registry, "logit.output.tags.dropped", ("reason", "reserved_key")),
+                counted(&registry, "logit.output.tags.omitted", ("reason", "reserved_key")),
                 0.0
             );
         }
@@ -441,7 +441,7 @@ mod tests {
             br#"{"time":0,"event":"metric","fields":{"metric_namespace":"prod"}}"#
         );
         assert_eq!(
-            counted(&registry, "logit.output.tags.dropped", ("reason", "reserved_key")),
+            counted(&registry, "logit.output.tags.omitted", ("reason", "reserved_key")),
             2.0
         );
     }
@@ -467,11 +467,11 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out.iter().next().unwrap(), br#"{"time":0,"event":"metric"}"#);
         assert_eq!(
-            counted(&registry, "logit.output.tags.dropped", ("reason", "reserved_key")),
+            counted(&registry, "logit.output.tags.omitted", ("reason", "reserved_key")),
             1.0
         );
         assert_eq!(
-            counted(&registry, "logit.output.events.skipped", ("reason", "blank_event")),
+            counted(&registry, "logit.output.events.dropped", ("reason", "blank_event")),
             1.0
         );
     }

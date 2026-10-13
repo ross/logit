@@ -9,6 +9,7 @@
 
 use super::generated::agentpayload::sketch_payload::{sketch::Dogsketch, Sketch};
 use super::generated::agentpayload::{CommonMetadata, SketchPayload};
+use super::outcomes::{MetricIn, MetricOut};
 use super::series::{first_metric, OriginCodes, Route, WireSeries};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
 use super::{
@@ -49,9 +50,9 @@ impl DatadogDecoder {
         })?;
         let mut out = Vec::new();
         for s in &payload.sketches {
-            self.skipped("legacy_distribution", s.distributions.len());
+            self.metric_not_decoded(MetricIn::LegacyDistribution, s.distributions.len());
             if s.metric.is_empty() {
-                self.bad_series("bad_sketch", "a sketch has no metric name");
+                self.bad_series(MetricIn::BadSketch, "a sketch has no metric name");
                 continue;
             }
             let name = intern(&s.metric);
@@ -66,11 +67,11 @@ impl DatadogDecoder {
                 let sketch = match dogsketch_to_sketch(dog) {
                     Ok(Some(sketch)) => sketch,
                     Ok(None) => {
-                        self.skipped("empty_sketch", 1);
+                        self.metric_not_decoded(MetricIn::EmptySketch, 1);
                         continue;
                     }
                     Err(why) => {
-                        self.bad_series("bad_sketch", why);
+                        self.bad_series(MetricIn::BadSketch, why);
                         continue;
                     }
                 };
@@ -192,7 +193,7 @@ impl DatadogEncoder {
             for record in &event.metrics[first_metric(&batch.resource, event)..] {
                 let MetricKind::Distribution(sketch) = &record.kind else { continue };
                 if record.is_no_recorded_value() {
-                    self.out_skipped(("reason", "no_recorded_value"));
+                    self.metric_not_sent(MetricOut::NoRecordedValue);
                     continue;
                 }
                 let Some(dog) = self.dogsketch(sketch, event.timestamp) else { continue };
@@ -234,7 +235,7 @@ impl DatadogEncoder {
             .map(|count| u64::from(wire_count(count).div_ceil(MAX_BIN_COUNT)))
             .sum();
         if entries > MAX_DOGSKETCH_ENTRIES {
-            self.out_skipped(("reason", "oversized_sketch"));
+            self.metric_not_sent(MetricOut::OversizedSketch);
             self.diagnostics.warn_throttled(
                 "oversized_sketch",
                 format!(
@@ -244,7 +245,7 @@ impl DatadogEncoder {
             );
             return None;
         }
-        // After the cap, so a dropped sketch counts as skipped only.
+        // After the cap, so a sketch past it counts dropped only.
         if is_rebinned {
             self.out_degraded("rebinned");
         }
@@ -277,7 +278,7 @@ impl DatadogEncoder {
         // `i64::MAX`; saturate rather than wrap to a negative `cnt` the next hop rejects.
         let cnt = i64::try_from(sketch.count()).unwrap_or(i64::MAX);
         if k.is_empty() && cnt == 0 {
-            self.out_skipped(("reason", "empty_sketch"));
+            self.metric_not_sent(MetricOut::EmptySketch);
             return None;
         }
         let sum = sketch.sum();
@@ -395,6 +396,18 @@ mod tests {
             .collect()
     }
 
+    /// Each counted point as `metric{reason}`.
+    fn counters(registry: &Registry) -> Vec<String> {
+        let mut out = Vec::new();
+        for e in registry.drain(0) {
+            let Some(reason) = e.attributes.get("reason").and_then(Value::as_str) else { continue };
+            for m in &e.metrics {
+                out.push(format!("{}{{{reason}}}", resolve(m.name)));
+            }
+        }
+        out
+    }
+
     #[test]
     fn a_dogsketch_decodes_bin_for_bin() {
         let (mut d, _, registry) = with_registry();
@@ -412,11 +425,15 @@ mod tests {
         assert_eq!(s.zero_count(), 4.0);
         assert_eq!(s.count(), 65555);
         assert_eq!((s.min(), s.max(), s.sum()), (Some(-3.0), Some(9.0), 12.0));
-        assert!(reasons(&registry).contains(&"legacy_distribution".to_string()));
+        let c = counters(&registry);
+        assert!(
+            c.contains(&"logit.input.metrics.dropped{legacy_distribution}".to_string()),
+            "{c:?}"
+        );
     }
 
     #[test]
-    fn malformed_and_empty_dogsketches_are_skipped() {
+    fn malformed_dogsketches_are_dropped_and_empty_ones_skipped() {
         let (mut d, _, registry) = with_registry();
         let body = payload(vec![
             dog(vec![1, 2], vec![1], 1),
@@ -425,9 +442,10 @@ mod tests {
             dog(vec![1], vec![1], 1),
         ]);
         assert_eq!(d.decode_sketches(&body, 0).unwrap().events.len(), 1);
-        let r = reasons(&registry);
-        assert!(r.contains(&"bad_sketch".to_string()));
-        assert!(r.contains(&"empty_sketch".to_string()));
+        let c = counters(&registry);
+        assert!(c.contains(&"logit.input.metrics.dropped{bad_sketch}".to_string()), "{c:?}");
+        assert!(c.contains(&"logit.input.metrics.skipped{empty_sketch}".to_string()), "{c:?}");
+        assert!(!c.contains(&"logit.input.metrics.skipped{bad_sketch}".to_string()), "{c:?}");
     }
 
     #[test]
@@ -491,7 +509,9 @@ mod tests {
             .encode_sketches(&batch_of(heavy(256, 4.0e9)))
             .map(|body| SketchPayload::decode(body).unwrap().sketches[0].dogsketches[0].k.len());
         assert_eq!(entries, None);
-        assert!(reasons(&registry).contains(&"oversized_sketch".to_string()));
+        let c = counters(&registry);
+        assert!(c.contains(&"logit.output.metrics.dropped{oversized_sketch}".to_string()), "{c:?}");
+        assert!(!c.contains(&"logit.output.metrics.skipped{oversized_sketch}".to_string()));
     }
 
     /// The cap is inclusive: 16 bins of `65535 * 65536` are 16 * 65536 = 2^20 entries.
@@ -510,7 +530,7 @@ mod tests {
         assert!(reasons(&registry).contains(&"oversized_sketch".to_string()));
     }
 
-    /// A logarithmic sketch dropped past the cap counts as skipped, not also as re-binned.
+    /// A logarithmic sketch dropped past the cap counts dropped, not also re-binned.
     #[test]
     fn a_dropped_logarithmic_sketch_is_not_counted_as_rebinned() {
         let (_, mut e, registry) = with_registry();

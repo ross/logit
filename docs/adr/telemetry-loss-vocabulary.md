@@ -140,6 +140,29 @@ Three rules hold across the table:
   [Loss with no counter](#loss-with-no-counter)). The rule says it belongs under `*.dropped`;
   adding those counters is follow-up work this record tracks.
 
+## Amendment (2026-10-13): counters for decode-side loss
+
+The decode failures the "Loss with no counter" list named now count under `*.dropped`, each beside
+the diagnostic it already raised, which keeps its key:
+
+| Loss | Counter | Diagnostic |
+|---|---|---|
+| A datagram or framed message the decoder rejects whole, in the shared UDP, Unix, and TCP drivers (`statsd_in`'s invalid UTF-8, `collectd_in`'s first part malformed, `graphite_in`'s undecodable pickle frame) | `input.frames.dropped{reason="undecodable"}` | `bad_datagram`, `bad_frame` (and `bad_pickle`) |
+| A line or message `statsd_in` or `syslog_in` rejects; the rest of its datagram or frame still decodes | `input.messages.dropped{reason="malformed"}` | `bad_line` |
+| `collectd_in`: the rest of a datagram behind a malformed part, after decoded lists | `input.frames.dropped{reason="malformed_part"}` | `bad_part` |
+| `collectd_in`: the rest of a datagram behind an Encryption part | `input.frames.dropped{reason="encrypted"}` | `encrypted_packet_dropped` |
+| `collectd_in`: a value list with an empty host, plugin, or type, one per data source | `input.metrics.dropped{reason="incomplete_identity"}` | `incomplete_identity` |
+| `collectd_in`: a notification that fails validation | `input.events.dropped{reason="invalid_notification"}` | `notification_dropped` |
+
+`input.frames.dropped` already counted a frame the TCP framer refused (`oversize`, `drained`,
+`malformed`, `truncated`), and `lines_in` counts an oversize line under it on every transport, so a
+frame lost after framing extends the same counter rather than adding a name. On a datagram
+transport the frame is the datagram. It isn't `component.datagrams.dropped`: a datagram the decoder
+rejected was dequeued and has its `receive.latency` sample, so counting it there would break the
+UDP listener identity. `input.messages.dropped` mirrors `output.messages.dropped`, which counts a
+statsd line or a syslog message on the sink side. `bad_part` and `incomplete_identity` weren't on
+the list but lose data the same way, so they get counters too.
+
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
 `*.rejected` name and reason that existed on 2026-10-13, verified against the emit sites in
@@ -256,12 +279,6 @@ belongs under `*.dropped`; none has a counter yet:
 
 - `influxdb_out` skips an unresolved relative gauge (diagnostic `gauge_delta_unresolved`), a
   `NO_RECORDED_VALUE` record, `SetMembers`, and `ExponentialHistogram` with diagnostics only.
-- `statsd_in`, `syslog_in`, and `collectd_in` count no decode failure; a UDP datagram that fails
-  to decode raises `bad_datagram` and a TCP frame raises `bad_frame`.
-- `collectd_in` drops an encrypted packet (`encrypted_packet_dropped`) and an invalid
-  notification (`notification_dropped`) with diagnostics only.
-- `graphite_in` counts a bad pickle item, but a wholly undecodable pickle frame raises only
-  `bad_pickle`.
 - The disk spool's `component.buffer.disk.truncated` counts torn-tail repairs at open, not the
   batch lost with the tail. [Counted on 2026-10-13; see
   [Amendment: a torn tail's batch is counted](#amendment-a-torn-tails-batch-is-counted-2026-10-13).]

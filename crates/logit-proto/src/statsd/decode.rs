@@ -11,9 +11,13 @@ use logit_core::subslice;
 use logit_core::{
     interner::{intern, KeyCache},
     AttrMap, BodyFormat, Diagnostics, Event, LogRecord, MetricKind, MetricRecord, Resource,
-    Samples, Scope, Severity, Symbol, Value,
+    Samples, Scope, Severity, Symbol, Telemetry, Value,
 };
 use std::sync::{Arc, LazyLock};
+
+/// A line the decoder rejected, by `reason`: `malformed`, beside the throttled `bad_line`
+/// diagnostic. Every other line of its datagram or packet still decodes.
+const MESSAGES_DROPPED: &str = "logit.input.messages.dropped";
 
 /// Decodes statsd/DogStatsD bytes into events; testable without a socket.
 ///
@@ -21,7 +25,8 @@ use std::sync::{Arc, LazyLock};
 /// (`crates/logit-inputs/src/tcp.rs`'s module doc). A clone shares the one
 /// `Arc<Resource>`, which must stay shared: `logit_pipeline::BatchAccumulator::absorb` keys on
 /// `Arc::ptr_eq`, so a resource per connection would stop two connections' events sharing a batch.
-/// It also shares its `Diagnostics` throttle counts, so `bad_line` throttles listener-wide.
+/// It also shares its `Diagnostics` throttle counts, so `bad_line` throttles listener-wide, and its
+/// `Telemetry` handle, so every connection's dropped lines count under one component.
 ///
 /// On TCP the driver hands this one already-delimited line, so [`Self::decode_into`]'s `\n` split
 /// is a single iteration. A UDP or Unix datagram, and a `unix_stream` length-prefixed packet, may
@@ -32,6 +37,8 @@ use std::sync::{Arc, LazyLock};
 pub struct StatsdDecoder {
     resource: Arc<Resource>,
     diag: Diagnostics,
+    /// Where a rejected line counts `logit.input.messages.dropped{reason="malformed"}`.
+    telemetry: Telemetry,
     /// Tag keys memoised `&str -> Symbol`: a client's tag names repeat on every line, so after the
     /// first each is a `memcmp`, not an interner probe. The `statsd.*` carrier keys are in `KEYS`.
     keys: KeyCache,
@@ -39,11 +46,21 @@ pub struct StatsdDecoder {
 
 impl StatsdDecoder {
     pub fn new(resource: Arc<Resource>) -> Self {
-        Self { resource, diag: Diagnostics::default(), keys: KeyCache::new() }
+        Self {
+            resource,
+            diag: Diagnostics::default(),
+            telemetry: Telemetry::default(),
+            keys: KeyCache::new(),
+        }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
+        self
+    }
+
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
         self
     }
 
@@ -76,10 +93,11 @@ impl Decoder for StatsdDecoder {
                 continue;
             }
             // Per-line isolation: clients pack independent metrics into one datagram, so a bad
-            // line is reported and skipped without discarding the others.
+            // line is reported and dropped without discarding the others.
             match parse_line(&bytes, line, received_at, &mut self.keys) {
                 Ok(mut line_events) => out.append(&mut line_events),
                 Err(err) => {
+                    self.telemetry.count(MESSAGES_DROPPED, 1.0, &[("reason", "malformed")]);
                     self.diag.warn_throttled("bad_line", err);
                 }
             }
@@ -1603,6 +1621,36 @@ mod tests {
             })
             .collect();
         (events, keys)
+    }
+
+    /// The total of `logit.input.messages.dropped{reason}` in `registry`. Drains, so call once.
+    fn messages_dropped(registry: &logit_core::Registry, reason: &str) -> f64 {
+        registry
+            .drain(0)
+            .iter()
+            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some(reason))
+            .flat_map(|e| &e.metrics)
+            .filter(|m| logit_core::interner::resolve(m.name) == "logit.input.messages.dropped")
+            .map(|m| match &m.kind {
+                MetricKind::Sum(sum) => sum.value,
+                other => panic!("messages.dropped must be a counter, got {other:?}"),
+            })
+            .sum()
+    }
+
+    /// A rejected line counts `logit.input.messages.dropped{reason="malformed"}`, once per line,
+    /// and its neighbors still decode.
+    #[test]
+    fn a_rejected_line_is_counted_dropped_and_its_neighbors_decode() {
+        let registry = logit_core::Registry::new();
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
+            .with_telemetry(registry.telemetry_for("statsd_in", "statsd_in", "listener"));
+        let mut events = Vec::new();
+        decoder
+            .decode_into(Bytes::from_static(b"a:1|c\nnot a line\nb:2|c\nc:x|c"), 0, &mut events)
+            .expect("a bad line never fails the datagram");
+        assert_eq!(events.len(), 2);
+        assert_eq!(messages_dropped(&registry, "malformed"), 2.0);
     }
 
     #[test]

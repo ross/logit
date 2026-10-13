@@ -110,7 +110,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `influxdb_out`, and so on), nothing tracks whether the data survives that delivery, and any
     non-`logit_out` sink's `send` means only "the immediate destination accepted the write". The
     receive side is attributable (`logit.component.datagrams.dropped`,
-    `logit.input.kernel.drops`;
+    `logit.input.kernel.dropped`;
     [ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)).
   - [ADR `delivery-semantics`](../adr/delivery-semantics.md), item 3, makes end-to-end
     acknowledgment a non-goal: an input's acknowledgment means accepted into the pipeline, and

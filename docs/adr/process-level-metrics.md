@@ -1,6 +1,6 @@
 ---
 created: 2026-09-28
-updated: 2026-09-28
+updated: 2026-10-13
 ---
 
 # Process-level metrics from procfs and the allocator
@@ -145,3 +145,10 @@ The difference between `resident` and `allocated` is not a leak by itself. It co
 - The `internal` `interval` field's doc and `internal-telemetry.md`'s "`internal`: the drain"
   section list the new metrics.
 - `demo/`'s internal dashboard gains resident-memory and CPU panels.
+
+## Amendment (2026-10-13): the delta `Sum` counter at `prometheus_out`
+
+Without a cumulative `aggregate`, `prometheus_out` counts the delta `Sum` as
+`logit.output.metrics.dropped{reason="unresolved_delta"}`, not
+`logit.output.metrics.skipped{metric_kind="delta_sum"}`
+([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)).

@@ -114,7 +114,7 @@
 //! `logit.input.connections.rejected{reason="limit"}`, `logit.input.frames`/`.frame.bytes` (a
 //! frame is one plaintext line or one pickle payload; the prefix's 4 bytes aren't counted),
 //! `logit.input.frames.dropped{reason}`, and `logit.component.receive.flushed{reason}`. The
-//! decoder's `logit.input.metrics.skipped{reason}` is reported under both.
+//! decoder's `logit.input.metrics.dropped{reason}` is reported under both.
 
 use crate::tcp::{TcpListener, TcpListenerConfig, TlsServerSettings};
 use crate::udp::{UdpListener, UdpListenerConfig};
@@ -823,7 +823,7 @@ mod tests {
 
         let drained = running.registry.drain(0);
         assert_eq!(
-            metric_sum(&drained, "logit.input.metrics.skipped", Some(("reason", "bad_line"))),
+            metric_sum(&drained, "logit.input.metrics.dropped", Some(("reason", "bad_line"))),
             1.0,
             "the decoder's own telemetry handle"
         );
@@ -1004,6 +1004,36 @@ mod tests {
             "the payload the decoder was handed -- the shared driver counts the frame, not the \
              length prefix it stripped to find it (`logit.input.frame.bytes` means the same thing \
              on every listener on that driver)"
+        );
+
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    /// A pickle frame the decoder rejects whole is counted `logit.input.frames.dropped{reason=
+    /// "undecodable"}` by the TCP driver, and the frame after it on the same connection decodes.
+    #[tokio::test]
+    async fn an_undecodable_pickle_frame_is_counted_dropped_and_the_next_frame_decodes() {
+        let mut running = start(|input| input, Transport::Tcp, Protocol::Pickle).await;
+        let mut stream = running.connect().await;
+        // `0xff` is no pickle opcode, so the reader refuses the payload before reading an item.
+        let mut bad = 4u32.to_be_bytes().to_vec();
+        bad.extend_from_slice(&[0xff; 4]);
+        stream.write_all(&bad).await.unwrap();
+        stream.write_all(&pickle_frame(&[("after.bad", 1_700_000_000, 1.0)])).await.unwrap();
+
+        let batch = running.next_batch("the frame after the undecodable one").await;
+        assert_eq!(resolve(batch.events[0].metrics[0].name), "after.bad");
+
+        let drained = running.registry.drain(0);
+        assert_eq!(
+            metric_sum(&drained, "logit.input.frames.dropped", Some(("reason", "undecodable"))),
+            1.0
+        );
+        assert_eq!(metric_sum(&drained, "logit.input.frames", None), 2.0);
+        assert_eq!(
+            metric_sum(&drained, "logit.component.diagnostics", Some(("key", "bad_pickle"))),
+            1.0
         );
 
         running.shutdown.send(true).ok();

@@ -636,7 +636,7 @@ components:
         http.termination_state,
       ]
 
-  # `temporality: cumulative` because `victoria_out` below skips a delta `Sum`: remote-write
+  # `temporality: cumulative` because `victoria_out` below drops a delta `Sum`: remote-write
   # carries running totals, so `web.requests`/`web.bytes_sent` arrive as `_total` counters that
   # PromQL's `rate()` reads. A `Distribution` tumbles in either mode, so each window's
   # `web.request_time` is that window's own sketch, which `victoria_out` renders as a summary

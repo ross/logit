@@ -1,5 +1,5 @@
 {
- "divergence": "a quantile label that isn't a number: skipped `malformed_line`, where Prometheus stores a series (docs/known-gaps/mappings.md: A line Prometheus's text parser keeps that this decoder skips)",
+ "divergence": "a quantile label that isn't a number: dropped `malformed_line`, where Prometheus stores a series (docs/known-gaps/mappings.md: A line Prometheus's text parser keeps that this decoder drops)",
  "divergent": [
   [
    "q",

@@ -534,7 +534,9 @@ async fn the_mappings_counters_count_once_across_probes_and_a_retried_prepare() 
     let sums = run(&mut out, &mut probe, vec![input]).await;
     assert!(records_on(&cluster, METRICS).len() > 2, "the request was split");
     assert_eq!(sum(&sums, "logit.output.requests", &[("class", "clean")]), 1.0, "a retry");
-    assert_eq!(sum(&sums, "logit.output.metrics.skipped", &[("metric_kind", "gauge_delta")]), 12.0);
+    let unresolved = &[("reason", "unresolved_gauge_delta")];
+    assert_eq!(sum(&sums, "logit.output.metrics.dropped", unresolved), 12.0);
+    assert_eq!(sum(&sums, "logit.output.metrics.skipped", &[("metric_kind", "gauge_delta")]), 0.0);
 }
 
 /// `record:` and an attribute key are refused under an OTLP format, and `topics` under another.

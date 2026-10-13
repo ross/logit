@@ -4,9 +4,10 @@
 admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
 components:
   statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
-  # Every event is rewritten, every 53rd dropped, and every 97th fails, so `ledger.script` sees
+  # Every event is rewritten, every 53rd discarded, and every 97th fails, so `ledger.script` sees
   # all three outcomes. Neither period divides the generator's 100 names, so every series keeps
-  # samples in every life. An event the script fails on is dropped and counted under
+  # samples in every life. A discarded event counts `events.discarded`; an event the script fails
+  # on is lost and counted `events.dropped{reason="script_error"}` beside
   # `errors{reason="process"}`. `flush()` returns one event carrying one metric each window: the
   # ledger subtracts `flush.events` from what `aggregate` absorbed, which holds only while each
   # flush event carries one metric, and `soak_lua_seen` stays outside `vm_selector`.

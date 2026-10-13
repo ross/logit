@@ -48,8 +48,9 @@ A case is three files:
 - `<stem>.txt` (a text 0.0.4 body) or `<stem>.om` (an OpenMetrics one), byte for byte;
 - `<stem>.headers`, the response's `content-type: <value>` line, or empty for a missing header;
 - `<stem>.expect.json`, what `logit` must make of it: `result` (`ok` or `malformed`), `skips` and
-  `degraded` (each `logit.input.metrics.skipped`/`degraded` reason and its count, from the parse
-  and the model mapping), and, where `logit` reads a series Prometheus read differently, `divergent`
+  `degraded` (each reason and its count, from the parse and the model mapping: `skips` holds
+  `logit.input.metrics.dropped` and `logit.input.metrics.skipped` together, and `degraded` holds
+  `logit.input.metrics.degraded`), and, where `logit` reads a series Prometheus read differently, `divergent`
   (each such series, `[name, [[label, value], ...]]`, in Prometheus's order) and `divergence` (why,
   ending with the `docs/known-gaps/mappings.md` row it names).
 

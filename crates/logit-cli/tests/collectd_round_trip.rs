@@ -1354,7 +1354,7 @@ async fn a_sampled_statsd_counter_with_a_fractional_value_is_dropped_and_counted
     sink.send(&batch).await.expect("a fully-dropped batch is not a send error");
 
     assert!(
-        counted(&registry, "logit.output.metrics.skipped", ("reason", "unencodable_value")),
+        counted(&registry, "logit.output.metrics.dropped", ("reason", "unencodable_value")),
         "the drop must be counted, not silent"
     );
 }
@@ -1390,7 +1390,7 @@ async fn a_tagged_statsd_gauge_relays_as_a_gauge_with_its_tag_counted_away() {
     // Both sinks share one `Telemetry`, so the tag is counted once per sink.
     let totals = Totals::of(registry.drain(0));
     assert_eq!(
-        totals.sum("logit.output.tags.dropped", &[("reason", "no_wire_form")]),
+        totals.sum("logit.output.tags.omitted", &[("reason", "no_wire_form")]),
         2.0,
         "`env` has no wire form, and is counted once on each of the two sinks this case sends \
          through"

@@ -19,10 +19,10 @@
 //! | `metric_type` `"Gauge"` or absent | every record `Gauge`; the field is consumed | -- |
 //! | `metric_type` any other value (the exporter's `Histogram`, `Summary`) | every record `Gauge`; the field stays an attribute, verbatim | -- |
 //! | every other field | an attribute, as the parent module's table says | -- |
-//! | `metric_name:` with an empty name | the record is skipped | `logit.input.metrics.skipped{reason="bad_name"}` |
-//! | a value that is neither a number, one of the three strings, nor a string holding a finite number | the record is skipped | `skipped{reason="bad_value"}` |
-//! | the single-metric form naming a record the multi-metric form already carries | the multi-metric record wins | `skipped{reason="duplicate_name"}` |
-//! | `metric_name` without `_value`, `_value` without `metric_name`, or a non-string or empty `metric_name` | the pair is skipped | `skipped{reason="incomplete_single_metric"}` |
+//! | `metric_name:` with an empty name | the record is dropped | `logit.input.metrics.dropped{reason="bad_name"}` |
+//! | a value that is neither a number, one of the three strings, nor a string holding a finite number | the record is dropped | `dropped{reason="bad_value"}` |
+//! | the single-metric form naming a record the multi-metric form already carries | the multi-metric record wins | `dropped{reason="duplicate_name"}` |
+//! | `metric_name` without `_value`, `_value` without `metric_name`, or a non-string or empty `metric_name` | the pair is dropped | `dropped{reason="incomplete_single_metric"}` |
 //! | a metric event left with no record | the event is skipped | `logit.input.events.skipped{reason="no_metric"}` |
 //!
 //! ## Encode
@@ -38,14 +38,14 @@
 //! | `Sum{Cumulative, monotonic}` | `metric_name:<n>: v`, `metric_type` `"Sum"` | -- |
 //! | a delta or non-monotonic `Sum` | as above: `metric_type` `"Sum"` has no temporality or monotonicity carrier | `logit.output.metrics.degraded{metric_kind="delta_sum"\|"non_monotonic_sum"}` |
 //! | a non-finite value | the string `"+Inf"`, `"-Inf"`, or `"NaN"` | -- |
-//! | `GaugeDelta` | skipped: not a Splunk concept, and an `aggregate` resolves it upstream | `skipped{metric_kind="gauge_delta"}` |
-//! | `ExponentialHistogram` | skipped under both `MultiValue` settings, as the exporter does | `skipped{metric_kind="exponential_histogram"}` |
-//! | a record flagged `NO_RECORDED_VALUE` | skipped | `skipped{metric_kind="no_recorded_value"}` |
+//! | `GaugeDelta` | dropped: not a Splunk concept, and an `aggregate` resolves it upstream | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` |
+//! | `ExponentialHistogram` | skipped under both `MultiValue` settings, as the exporter does | `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` |
+//! | a record flagged `NO_RECORDED_VALUE` | skipped | `skipped{reason="no_recorded_value"}` |
 //! | `Samples`, `Distribution`, `Set`, `SetMembers`, `Histogram`, `Summary` under `MultiValue::Skip` | skipped | `skipped{metric_kind="samples"\|"distribution"\|"set"\|"set_members"\|"histogram"\|"summary"}` |
 //! | the same under `MultiValue::Expand` | the table below | `degraded{metric_kind=…}`, once per record |
 //! | a name outside `[A-Za-z0-9_.:]`, starting with a digit or `_`, or containing `metric_name` | each other character → `_`, `metric_name` → `metricname`, then an `m` prefix on a leading digit or `_` | `logit.output.metrics.normalized{reason="name_sanitized"}` |
-//! | a name another record of the same object already wrote (after sanitizing) | skipped | `skipped{reason="duplicate_name"}` |
-//! | a `metric_name`, `_value`, or `metric_name:*` attribute; a `metric_type` attribute on an event with a `Sum`; an `le` or `qt` attribute on an expanded bucket or quantile object | dropped from that object | `logit.output.tags.dropped{reason="reserved_key"}` |
+//! | a name another record of the same object already wrote (after sanitizing) | dropped | `dropped{reason="duplicate_name"}` |
+//! | a `metric_name`, `_value`, or `metric_name:*` attribute; a `metric_type` attribute on an event with a `Sum`; an `le` or `qt` attribute on an expanded bucket or quantile object | omitted from that object | `logit.output.tags.omitted{reason="reserved_key"}` |
 //!
 //! `unit`, `description`, `start_timestamp`, `exemplars`, and `flags` have no HEC field.
 //!
@@ -68,8 +68,8 @@
 //! the shortest round-trip form Go's `FormatFloat(v, 'f', -1, 64)` also writes.
 
 use super::{
-    begin_object, write_fields, BatchContext, ObjectMeta, SplunkDecoder, SplunkEncoder,
-    ATTR_METRIC_TYPE,
+    begin_object, write_fields, BatchContext, ObjectMeta, SplunkDecoder, SplunkEncoder, Undecoded,
+    Unencoded, ATTR_METRIC_TYPE,
 };
 use crate::json::{flatten_into, json_to_value, write_str, write_value};
 use crate::prometheus::cumulative_counts;
@@ -135,11 +135,11 @@ impl SplunkDecoder {
         for (key, value) in &fields {
             if let Some(name) = key.strip_prefix(MULTI_METRIC_PREFIX) {
                 if name.is_empty() {
-                    self.skip_metric("bad_name");
+                    self.undecoded(Undecoded::BadName);
                 } else if let Some(v) = metric_value(value) {
                     records.push((name.to_string(), v));
                 } else {
-                    self.skip_metric("bad_value");
+                    self.undecoded(Undecoded::BadValue);
                 }
             } else if key == SINGLE_METRIC_NAME
                 || key == SINGLE_METRIC_VALUE
@@ -154,17 +154,17 @@ impl SplunkDecoder {
             (None, None) => {}
             (Some(Json::String(name)), Some(value)) if !name.is_empty() => {
                 if records.iter().any(|(n, _)| n == name) {
-                    self.skip_metric("duplicate_name");
+                    self.undecoded(Undecoded::DuplicateName);
                 } else if let Some(v) = metric_value(value) {
                     records.push((name.clone(), v));
                 } else {
-                    self.skip_metric("bad_value");
+                    self.undecoded(Undecoded::BadValue);
                 }
             }
-            _ => self.skip_metric("incomplete_single_metric"),
+            _ => self.undecoded(Undecoded::IncompleteSingleMetric),
         }
         if records.is_empty() {
-            self.skip_event("no_metric");
+            self.undecoded(Undecoded::NoMetric);
             return None;
         }
         records.sort_by(|a, b| a.0.cmp(&b.0));
@@ -182,10 +182,6 @@ impl SplunkDecoder {
         let metrics: MetricList =
             records.into_iter().map(|(n, v)| MetricRecord::new(intern(&n), kind(v))).collect();
         Some(Event { timestamp, attributes, log: None, metrics, span: None })
-    }
-
-    fn skip_metric(&self, reason: &'static str) {
-        self.telemetry.count("logit.input.metrics.skipped", 1.0, &[("reason", reason)]);
     }
 }
 
@@ -288,7 +284,7 @@ impl SplunkEncoder {
                     || key.starts_with(MULTI_METRIC_PREFIX)
             })
             .collect();
-        let mut reserved_dropped = reserved.len();
+        let mut reserved_omitted = reserved.len();
         for key in reserved {
             dims.remove_sym(key);
         }
@@ -299,7 +295,7 @@ impl SplunkEncoder {
         let mut objects = Objects::default();
         for record in &event.metrics {
             if record.is_no_recorded_value() {
-                self.skip_kind("no_recorded_value");
+                self.unencoded(Unencoded::NoRecordedValue, 1);
                 continue;
             }
             let name = self.sanitized(resolve(record.name));
@@ -313,10 +309,12 @@ impl SplunkEncoder {
                     }
                     objects.scalar(&sum_type, name, sum.value);
                 }
-                MetricKind::GaugeDelta(_) => self.skip_kind("gauge_delta"),
-                MetricKind::ExponentialHistogram(_) => self.skip_kind("exponential_histogram"),
+                MetricKind::GaugeDelta(_) => self.unencoded(Unencoded::UnresolvedGaugeDelta, 1),
+                MetricKind::ExponentialHistogram(_) => {
+                    self.unencoded(Unencoded::Kind("exponential_histogram"), 1);
+                }
                 kind => match self.multi_value {
-                    MultiValue::Skip => self.skip_kind(kind.name()),
+                    MultiValue::Skip => self.unencoded(Unencoded::Kind(kind.name()), 1),
                     MultiValue::Expand => {
                         self.degrade_kind(kind.name());
                         expand(kind, &name, &mut objects);
@@ -325,21 +323,17 @@ impl SplunkEncoder {
             }
         }
         if type_attr.is_some() && objects.objects.iter().any(|o| o.metric_type == sum_type) {
-            reserved_dropped += 1;
+            reserved_omitted += 1;
         }
         if objects.duplicates > 0 {
-            self.telemetry.count(
-                "logit.output.metrics.skipped",
-                objects.duplicates as f64,
-                &[("reason", "duplicate_name")],
-            );
+            self.unencoded(Unencoded::DuplicateName, objects.duplicates);
         }
 
         for object in &objects.objects {
             let mut fields = dims.clone();
             if let Some((dim, value)) = &object.extra {
                 if fields.get(dim).is_some() {
-                    reserved_dropped += 1;
+                    reserved_omitted += 1;
                 }
                 fields.insert(dim, Value::str(value.as_str()));
             }
@@ -362,7 +356,7 @@ impl SplunkEncoder {
                 ObjectMeta { event_index, signal: Signal::Metrics, records: object.values.len() },
             );
         }
-        self.reserved_key_dropped(reserved_dropped);
+        self.reserved_key_omitted(reserved_omitted);
     }
 
     fn sanitized(&self, name: &str) -> String {
@@ -375,10 +369,6 @@ impl SplunkEncoder {
             );
         }
         sanitized.into_owned()
-    }
-
-    fn skip_kind(&self, kind: &'static str) {
-        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("metric_kind", kind)]);
     }
 
     fn degrade_kind(&self, kind: &'static str) {
@@ -564,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_measurements_are_skipped_and_counted() {
+    fn bad_measurements_are_dropped_and_counted() {
         let registry = Registry::new();
         let batches = decoder(&registry)
             .decode_events(
@@ -582,8 +572,13 @@ mod tests {
             ("incomplete_single_metric", 1.0),
         ] {
             assert_eq!(
-                counted(&registry, "logit.input.metrics.skipped", ("reason", reason)),
+                counted(&registry, "logit.input.metrics.dropped", ("reason", reason)),
                 n,
+                "{reason}"
+            );
+            assert_eq!(
+                counted(&registry, "logit.input.metrics.skipped", ("reason", reason)),
+                0.0,
                 "{reason}"
             );
         }
@@ -686,8 +681,16 @@ mod tests {
         let registry3 = Registry::new();
         objects_of(&mut encoder(&registry3), &batch);
         assert_eq!(
-            counted(&registry3, "logit.output.metrics.skipped", ("metric_kind", "gauge_delta")),
+            counted(
+                &registry3,
+                "logit.output.metrics.dropped",
+                ("reason", "unresolved_gauge_delta")
+            ),
             1.0
+        );
+        assert_eq!(
+            counted(&registry3, "logit.output.metrics.skipped", ("metric_kind", "gauge_delta")),
+            0.0
         );
     }
 
@@ -853,11 +856,11 @@ mod tests {
             1.0
         );
         assert_eq!(
-            counted(&registry, "logit.output.metrics.skipped", ("reason", "duplicate_name")),
+            counted(&registry, "logit.output.metrics.dropped", ("reason", "duplicate_name")),
             1.0
         );
         assert_eq!(
-            counted(&registry, "logit.output.tags.dropped", ("reason", "reserved_key")),
+            counted(&registry, "logit.output.tags.omitted", ("reason", "reserved_key")),
             2.0
         );
     }
@@ -869,12 +872,16 @@ mod tests {
         batch.events[0].metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         assert!(objects_of(&mut encoder(&registry), &batch).is_empty());
         assert_eq!(
+            counted(&registry, "logit.output.metrics.skipped", ("reason", "no_recorded_value")),
+            1.0
+        );
+        assert_eq!(
             counted(
                 &registry,
                 "logit.output.metrics.skipped",
                 ("metric_kind", "no_recorded_value")
             ),
-            1.0
+            0.0
         );
     }
 }

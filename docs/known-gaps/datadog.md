@@ -131,8 +131,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `Histogram`.** An Agent turns a DogStatsD `h` or `ms` into `.avg`, `.count`, `.median`,
   `.95percentile`, and `.max` series. `aggregate` in front of `datadog_out` sends a sketch
   instead, which Datadog computes quantiles from. `datadog_out` skips a `Histogram`,
-  `ExponentialHistogram`, `Summary`, `GaugeDelta`, `SetMembers`, and a cumulative or non-monotonic
-  `Sum`, counted `logit.output.metrics.skipped{metric_kind}`.
+  `ExponentialHistogram`, `Summary`, `SetMembers`, and a cumulative or non-monotonic `Sum`,
+  counted `logit.output.metrics.skipped{metric_kind}`, and drops an unresolved `GaugeDelta`,
+  counted `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`.
   - **Consequence:** dashboards built on an Agent's `.95percentile`-style series find no data
     when the same metrics arrive through `aggregate` and `datadog_out`; query the distribution
     instead. An OTLP explicit-bucket histogram reaches Datadog only through `otlp_out`.
@@ -177,7 +178,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   each bin's count into `uint16` entries without bound.
   - **Consequence:** a sketch with per-bin counts in the millions across many bins (a statsd
     sample-rate typo extrapolated through `aggregate`) never reaches Datadog. It's counted
-    `logit.output.metrics.skipped{reason="oversized_sketch"}` with diag `oversized_sketch`.
+    `logit.output.metrics.dropped{reason="oversized_sketch"}` with diag `oversized_sketch`.
     [ADR `deployment-threat-model`](../adr/deployment-threat-model.md) treats that as an accident to
     bound, not data to scale down ([ADR `untrusted-input-bounds`](../adr/untrusted-input-bounds.md)
     has the rule).
@@ -185,7 +186,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   describe a body, not a record:
   - `spans.degraded{reason="no_wire_form"}` and `{reason="json_text"}` for a batch-resource
     carrier.
-  - `tags.dropped{reason="no_wire_form"|"unrepresentable"}` for a stats payload's resource
+  - `tags.omitted{reason="no_wire_form"|"unrepresentable"}` for a stats payload's resource
     attributes.
   - `stats.degraded{reason="negative_timestamp"}`.
 

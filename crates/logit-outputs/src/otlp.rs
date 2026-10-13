@@ -117,7 +117,9 @@
 //! `Export*ServiceResponse.partial_success`, parsed by hand ([`parse_partial_success`]) because
 //! `logit-proto` doesn't generate the collector-service types. A partial rejection is still a
 //! successful `send` (the accepted part landed; a retry would duplicate it), counted as
-//! `logit.output.records.rejected{signal}` with a throttled `otlp_partial_success` warning.
+//! `logit.output.records.dropped{signal, reason="rejected"}` with a throttled
+//! `otlp_partial_success` warning. A request answered `2xx` never takes the whole-signal
+//! `Rejected` path above, so no record is counted twice.
 
 use crate::accounting::BatchAccounting;
 use crate::Output;
@@ -354,9 +356,9 @@ impl OtlpOutput {
     fn record_partial_success(&mut self, signal: Signal, rejected: i64, error_message: &str) {
         if rejected > 0 {
             self.telemetry.count(
-                "logit.output.records.rejected",
+                "logit.output.records.dropped",
                 rejected as f64,
-                &[("signal", signal.as_str())],
+                &[("signal", signal.as_str()), ("reason", "rejected")],
             );
             self.diag.warn_throttled(
                 "otlp_partial_success",
@@ -899,6 +901,7 @@ mod tests {
     use super::*;
     use hyper_util::rt::TokioIo;
     use logit_core::{AttrMap, Event, MetricKind, MetricRecord, Registry, Resource};
+    use logit_pipeline::test_util::Totals;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1157,21 +1160,10 @@ mod tests {
         let mut output = http_output(addr).with_telemetry(telemetry);
         output.send(&metric_batch()).await.expect("a partial success is still Ok");
 
-        let events = registry.drain(0);
-        let rejected = events
-            .iter()
-            .find_map(|e| {
-                e.metrics.iter().find_map(|m| match &m.kind {
-                    MetricKind::Sum(s)
-                        if logit_core::interner::resolve(m.name)
-                            == "logit.output.records.rejected" =>
-                    {
-                        Some(s.value)
-                    }
-                    _ => None,
-                })
-            })
-            .unwrap_or(0.0);
+        let totals = Totals::of(registry.drain(0));
+        let rejected = totals
+            .sum("logit.output.records.dropped", &[("signal", "metrics"), ("reason", "rejected")]);
+        assert!(!totals.has("logit.output.records.rejected", &[]), "the retired name");
         assert_eq!(rejected, 2.0, "the rejected count should be counted, not silently dropped");
     }
 
@@ -1725,21 +1717,10 @@ mod tests {
         let mut output = grpc_output(addr).with_telemetry(telemetry);
         output.send(&metric_batch()).await.expect("partial success is still Ok");
 
-        let events = registry.drain(0);
-        let rejected = events
-            .iter()
-            .find_map(|e| {
-                e.metrics.iter().find_map(|m| match &m.kind {
-                    MetricKind::Sum(s)
-                        if logit_core::interner::resolve(m.name)
-                            == "logit.output.records.rejected" =>
-                    {
-                        Some(s.value)
-                    }
-                    _ => None,
-                })
-            })
-            .unwrap_or(0.0);
+        let totals = Totals::of(registry.drain(0));
+        let rejected = totals
+            .sum("logit.output.records.dropped", &[("signal", "metrics"), ("reason", "rejected")]);
+        assert!(!totals.has("logit.output.records.rejected", &[]), "the retired name");
         assert_eq!(rejected, 1.0);
     }
 
@@ -2106,7 +2087,7 @@ mod tests {
     }
 
     const ENCODE_SIDE: [SumSeries<'static>; 2] = [
-        ("logit.output.metrics.skipped", &[("metric_kind", "gauge_delta")]),
+        ("logit.output.metrics.dropped", &[("reason", "unresolved_gauge_delta")]),
         ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
     ];
 
@@ -2178,8 +2159,8 @@ mod tests {
         assert_eq!(bodies.len(), 2, "one request per attempt");
         assert_eq!(bodies[0], bodies[1], "the retry sends the first attempt's bytes");
         assert_eq!(one[0], bodies[1]);
-        let rejected = [("signal", "metrics")];
-        assert_eq!(sum_of(&retried, "logit.output.records.rejected", &rejected), 2.0);
+        let rejected = [("signal", "metrics"), ("reason", "rejected")];
+        assert_eq!(sum_of(&retried, "logit.output.records.dropped", &rejected), 2.0);
         let partial = [("key", "otlp_partial_success")];
         assert_eq!(sum_of(&retried, "logit.component.diagnostics", &partial), 1.0);
         assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &[]);

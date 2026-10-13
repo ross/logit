@@ -36,9 +36,9 @@
 //! - `SetMembers(members)`, `Set(hll)`: **skipped**; OTLP has no cardinality type to carry a set
 //!   or an estimate. Counts `logit.output.metrics.skipped{metric_kind="set_members"|"set"}` and
 //!   warns, throttled.
-//! - `GaugeDelta`: **skipped**. It's an unresolved relative adjustment (ADR
+//! - `GaugeDelta`: **dropped**. It's an unresolved relative adjustment (ADR
 //!   `relative-gauge-adjustments`), never an absolute value. Counts
-//!   `logit.output.metrics.skipped{metric_kind="gauge_delta"}` and warns under
+//!   `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` and warns under
 //!   `gauge_delta_unresolved`.
 //!
 //! **Lossy metric kinds.** OTLP has no mergeable-sketch type. `ExponentialHistogram` is the nearest
@@ -334,7 +334,11 @@ pub(crate) fn encode_metric(
         // `relative-gauge-adjustments`). The diagnostic key is `influxdb_out`'s, so one grep
         // finds this failure at every sink.
         MetricKind::GaugeDelta(_) => {
-            telemetry.count("logit.output.metrics.skipped", 1.0, &[("metric_kind", "gauge_delta")]);
+            telemetry.count(
+                "logit.output.metrics.dropped",
+                1.0,
+                &[("reason", "unresolved_gauge_delta")],
+            );
             diagnostics.warn_throttled(
                 "gauge_delta_unresolved",
                 format_args!(
@@ -847,7 +851,7 @@ mod tests {
     /// A `GaugeDelta` is dropped, not encoded as an absolute value, and reported under
     /// `gauge_delta_unresolved`.
     #[test]
-    fn a_gauge_delta_is_skipped_and_reports_its_own_diagnostic_key() {
+    fn a_gauge_delta_is_dropped_and_reports_its_own_diagnostic_key() {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
         let diag_registry = Registry::new();
@@ -857,10 +861,16 @@ mod tests {
             encode_metric(&event(), &record(MetricKind::GaugeDelta(5.0)), &telemetry, &mut diag);
         assert!(result.is_none(), "a GaugeDelta metric must not produce a Metric at all");
         let events = registry.drain(0);
-        let skipped = events.iter().find(|e| {
-            e.attributes.get("metric_kind").and_then(|v| v.as_str()) == Some("gauge_delta")
-        });
-        assert!(skipped.is_some(), "should count logit.output.metrics.skipped{{metric_kind}}");
+        let points = |name: &str, (key, value): (&str, &str)| {
+            events
+                .iter()
+                .filter(|e| e.attributes.get(key).and_then(|v| v.as_str()) == Some(value))
+                .flat_map(|e| e.metrics.iter())
+                .filter(|m| logit_core::interner::resolve(m.name) == name)
+                .count()
+        };
+        assert_eq!(points("logit.output.metrics.dropped", ("reason", "unresolved_gauge_delta")), 1);
+        assert_eq!(points("logit.output.metrics.skipped", ("metric_kind", "gauge_delta")), 0);
         let diag_events = diag_registry.drain(0);
         let reported = diag_events.iter().find(|e| {
             e.attributes.get("key").and_then(|v| v.as_str()) == Some("gauge_delta_unresolved")
