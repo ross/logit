@@ -3022,13 +3022,13 @@ them. `/ack` needs a channel (`400` code 10 without one) and answers an id issue
 `true` once, since the id already means the data reached the pipeline, and any other id `false`:
 one already reported, one never issued, or one from another channel. The listener keeps
 `max_ack_channels` channels, evicting the one used least recently, and the most recent
-`max_pending_acks` ids per channel; an id either bound drops answers `false`, counted
-`logit.input.acks.dropped{reason}`. Raise `max_ack_channels` when more clients than that send a
+`max_pending_acks` ids per channel; an id either bound evicts answers `false`, counted
+`logit.input.acks.evicted{reason}`. Raise `max_ack_channels` when more clients than that send a
 channel at once. Neither the channel nor the id enters an event.
 
 **A full pipeline gets `503`.** When the pipeline doesn't take a request's first batch within 5
 seconds, the request gets `503` code 9 with `Retry-After: 1`, counted
-`logit.input.requests{class="busy"}`, and its batches `logit.input.batches.dropped{reason="busy"}`.
+`logit.input.requests{class="busy"}`, and its batches `logit.input.batches.deferred`.
 Nothing of the body was taken, and HEC clients retry a code 9. A body with several envelopes
 decodes to one batch per envelope; once the first is delivered, the rest wait for the pipeline
 without a deadline and the request gets `200`, so a retry never repeats part of a body. From a
@@ -3343,8 +3343,8 @@ table of every broker error it reads.
 **What to watch.** `logit.output.requests{class}`, `logit.output.records` for what Kafka
 accepted, `logit.output.records.dropped{reason}`, `logit.output.records.unkeyed`, under
 `format: text`, `logit.output.events.skipped{reason="no_log"}`, and under `format: otlp_proto` or `otlp_json`,
-`logit.output.metrics.skipped` and `logit.output.metrics.degraded` for metrics OTLP can't carry
-as they are.
+`logit.output.metrics.skipped`, `logit.output.metrics.dropped`, and
+`logit.output.metrics.degraded` for metrics OTLP can't carry as they are.
 `docs/design/internal-telemetry.md`'s `kafka_out` section has every counter.
 
 ## Prometheus remote-write: receiving, sending, and picking a version

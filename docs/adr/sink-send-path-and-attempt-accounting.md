@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-05
+updated: 2026-10-13
 ---
 
 # Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed
@@ -1116,3 +1116,12 @@ reject, are the peer refusing every frame, so each is `Refused`: the head holds 
 backoff, bounded by the sink's `buffer:`. `logit_out`'s pre-connect too-large error is `Rejected`,
 dropped at once, where decision 3's `class=permanent` accounting read `Permanent`. The
 `class` label's `permanent` value is renamed with the variant in W1 of the `fault/` stream.
+
+## Amendment: `otlp_out`'s partial rejections count as `records.dropped` (2026-10-13)
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the records a collector
+rejects through a `2xx`'s `partial_success` are
+`logit.output.records.dropped{signal, reason="rejected"}`, the series a whole-signal rejection
+already counts, instead of `records.rejected{signal}`. They stay per attempt, on an ungated handle.
+A request is either answered `2xx` or rejected whole, so no record is counted under both paths.
+`splunk_hec_out`'s `tags.dropped` is now `tags.omitted`, and stays encode-side.

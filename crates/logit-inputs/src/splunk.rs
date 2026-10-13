@@ -103,7 +103,7 @@
 //! ([`crate::datadog`]'s "Backpressure" section has the mechanism). When the deadline passes, the
 //! request is answered `503` `{"text":"Server is busy","code":9}` with `Retry-After: 1`, counted
 //! `logit.input.requests{class="busy"}`, and every batch of the body is counted
-//! `logit.input.batches.dropped{reason="busy"}`. Every HEC client retries a code 9.
+//! `logit.input.batches.deferred`. Every HEC client retries a code 9.
 //!
 //! **Once the first batch is delivered, the rest wait without a deadline.** A `/event` body
 //! carrying several envelopes decodes to one batch per resource, and a `503` after one of them was
@@ -133,11 +133,12 @@
 //! that failed for a reason other than its size, such as a client disconnecting mid-upload). A code
 //! 6 that follows a delivered prefix is `class="rejected"`, `reason="malformed"`, and its objects
 //! are counted where any delivered batch's are, on the listener's fanout edge.
-//! `logit.input.batches.dropped{reason}` (`busy` or `closed_consumer`) counts the batches a `503`
-//! or a closed-consumer `500` left undelivered.
+//! `logit.input.batches.deferred` counts the batches a busy `503` left with the client to resend,
+//! and `logit.input.batches.dropped{reason="closed_consumer"}` the batches a closed consumer
+//! refused.
 //! Acknowledgment: `logit.input.acks.issued`, `logit.input.acks.polled{result}` (`acked`, or
-//! `unknown` for an id not pending on the polled channel), `logit.input.acks.dropped{reason}`
-//! (`expired` past `max_pending_acks`, `evicted` with its channel), and
+//! `unknown` for an id not pending on the polled channel), `logit.input.acks.evicted{reason}`
+//! (`expired` past `max_pending_acks`, `channel` with its channel), and
 //! `logit.input.ack_channels.evicted`. A `503` `/health` is counted `class="busy"`. The
 //! connection metrics are `otlp_in`'s verbatim. `docs/design/internal-telemetry.md`'s
 //! `splunk_hec_in` section is the operator-facing account.
@@ -686,9 +687,9 @@ struct LedgerState {
     clock: u64,
 }
 
-/// What one [`AckLedger::issue`] dropped, counted by the caller outside the lock.
+/// What one [`AckLedger::issue`] evicted, counted by the caller outside the lock.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Dropped {
+struct Evicted {
     expired: u64,
     evicted_channels: u64,
     evicted_ids: u64,
@@ -711,8 +712,8 @@ impl AckLedger {
 
     /// Issues `channel`'s next id, creating the channel (and evicting the least recently used one
     /// at the cap) when it is new.
-    fn issue(&self, channel: &[u8]) -> (u64, Dropped) {
-        let mut dropped = Dropped::default();
+    fn issue(&self, channel: &[u8]) -> (u64, Evicted) {
+        let mut evicted = Evicted::default();
         let mut state = self.lock();
         state.clock += 1;
         let clock = state.clock;
@@ -723,9 +724,9 @@ impl AckLedger {
                     .iter()
                     .min_by_key(|(_, acks)| acks.last_used)
                     .map(|(key, _)| key.clone());
-                if let Some(evicted) = oldest.and_then(|key| state.channels.remove(&key)) {
-                    dropped.evicted_channels += 1;
-                    dropped.evicted_ids += evicted.pending_count();
+                if let Some(channel) = oldest.and_then(|key| state.channels.remove(&key)) {
+                    evicted.evicted_channels += 1;
+                    evicted.evicted_ids += channel.pending_count();
                 }
             }
             state.channels.insert(channel.into(), ChannelAcks::default());
@@ -733,8 +734,8 @@ impl AckLedger {
         let acks = state.channels.get_mut(channel).expect("inserted above");
         acks.last_used = clock;
         let (id, expired) = acks.issue(self.max_pending);
-        dropped.expired = expired;
-        (id, dropped)
+        evicted.expired = expired;
+        (id, evicted)
     }
 
     /// Answers one poll: each id `true` once if it is pending on `channel`, else `false`. A
@@ -1142,11 +1143,7 @@ async fn respond(
                 }
             }
             Err(Undelivered::Busy(_)) => {
-                shared.telemetry.count(
-                    "logit.input.batches.dropped",
-                    total as f64,
-                    &[("reason", "busy")],
-                );
+                shared.telemetry.count("logit.input.batches.deferred", total as f64, &[]);
                 shared.diag.clone().warn_throttled(
                     "busy",
                     format_args!(
@@ -1197,17 +1194,17 @@ fn count_closed(shared: &Shared, n: usize) {
     );
 }
 
-/// Issues `channel`'s next `ackId` and counts it, with anything the ledger's bounds dropped.
+/// Issues `channel`'s next `ackId` and counts it, with anything the ledger's bounds evicted.
 fn issue_ack_id(shared: &Shared, channel: &[u8]) -> u64 {
-    let (id, dropped) = shared.acks.issue(channel);
+    let (id, evicted) = shared.acks.issue(channel);
     let t = &shared.telemetry;
     t.count("logit.input.acks.issued", 1.0, &[]);
-    if dropped.expired > 0 {
-        t.count("logit.input.acks.dropped", dropped.expired as f64, &[("reason", "expired")]);
+    if evicted.expired > 0 {
+        t.count("logit.input.acks.evicted", evicted.expired as f64, &[("reason", "expired")]);
     }
-    if dropped.evicted_channels > 0 {
-        t.count("logit.input.ack_channels.evicted", dropped.evicted_channels as f64, &[]);
-        t.count("logit.input.acks.dropped", dropped.evicted_ids as f64, &[("reason", "evicted")]);
+    if evicted.evicted_channels > 0 {
+        t.count("logit.input.ack_channels.evicted", evicted.evicted_channels as f64, &[]);
+        t.count("logit.input.acks.evicted", evicted.evicted_ids as f64, &[("reason", "channel")]);
     }
     id
 }
@@ -1587,8 +1584,9 @@ mod tests {
 
         let events = Totals::of(registry.drain(0));
         assert_eq!(events.sum("logit.input.ack_channels.evicted", &[]), 1.0);
-        assert_eq!(events.sum("logit.input.acks.dropped", &[("reason", "evicted")]), 1.0);
-        assert_eq!(events.sum("logit.input.acks.dropped", &[("reason", "expired")]), 1.0);
+        assert_eq!(events.sum("logit.input.acks.evicted", &[("reason", "channel")]), 1.0);
+        assert_eq!(events.sum("logit.input.acks.evicted", &[("reason", "expired")]), 1.0);
+        assert!(!events.has("logit.input.acks.dropped", &[]), "the retired name");
     }
 
     /// `/health` answers on `GET` and `HEAD` with no token, even when tokens are configured.
@@ -1773,7 +1771,8 @@ mod tests {
         let events = Totals::of(registry.drain(0));
         // The `503` post and the two busy `/health` answers.
         assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 3.0);
-        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 1.0);
+        assert_eq!(events.sum("logit.input.batches.deferred", &[]), 1.0);
+        assert!(!events.has("logit.input.batches.dropped", &[]), "a busy 503 is not loss");
     }
 
     /// A first batch no consumer takes is answered as a full downstream is, but counted
@@ -1803,7 +1802,7 @@ mod tests {
             events.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]),
             1.0
         );
-        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 0.0);
+        assert_eq!(events.sum("logit.input.batches.deferred", &[]), 0.0);
         assert_eq!(events.sum("logit.input.requests", &[("class", "closed_consumer")]), 1.0);
         assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 0.0);
         assert_eq!(events.sum("logit.input.acks.issued", &[]), 0.0);
@@ -2469,13 +2468,13 @@ mod tests {
     #[test]
     fn the_ledger_evicts_the_least_recently_used_channel() {
         let ledger = AckLedger::new(2, 10);
-        assert_eq!(ledger.issue(b"a"), (0, Dropped::default()));
+        assert_eq!(ledger.issue(b"a"), (0, Evicted::default()));
         assert_eq!(ledger.issue(b"b").0, 0);
         assert_eq!(ledger.issue(b"b").0, 1);
         assert_eq!(ledger.poll(b"a", &[7]), [(7, false)], "a poll touches a");
-        let (id, dropped) = ledger.issue(b"c");
+        let (id, evicted) = ledger.issue(b"c");
         assert_eq!(id, 0);
-        assert_eq!(dropped, Dropped { expired: 0, evicted_channels: 1, evicted_ids: 2 });
+        assert_eq!(evicted, Evicted { expired: 0, evicted_channels: 1, evicted_ids: 2 });
         assert_eq!(ledger.poll(b"b", &[0, 1]), [(0, false), (1, false)]);
         assert_eq!(ledger.poll(b"a", &[0]), [(0, true)]);
         assert_eq!(ledger.issue(b"b").0, 0, "an evicted channel starts over at 0");
