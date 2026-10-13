@@ -2295,8 +2295,8 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   - `logit.input.lines` counts lines *offered to the decoder*, so it excludes lines dropped by
     `LineSplitter` for `max_line_bytes` and includes lines the decoder then rejects — confirm the
     doc says exactly that, since `lines` ≠ events emitted in both directions.
-  - Oversized dropped lines have a diagnostic (`read_one`'s `long_line`) but no dedicated counter; `bad_line`
-    likewise only surfaces via `logit.component.diagnostics{key}`. Verify that's sufficient to
+  - Oversized dropped lines have a diagnostic (`read_one`'s `long_line`) and, since 2026-10-13,
+    `logit.input.frames.dropped{reason="oversize"}`; `bad_line` only surfaces via `logit.component.diagnostics{key}`. Verify that's sufficient to
     reconcile input bytes against emitted events.
   - `files.open` (a gauge of `self.files.len()` in `scan`) counts `Draining`/`Deselected` entries too.
   - `watch.watches` reports intended, not live, watches (in `scan`) — verify the doc's claim and

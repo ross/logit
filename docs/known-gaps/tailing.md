@@ -144,7 +144,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **An envelope over the cap is dropped by the splitter without the decoder seeing it, so a dropped
   *closing* fragment lets the next line on that stream splice onto the held partial.**
   `docker_in`'s `LineSplitter` drops a json-file line longer than its envelope bound
-  (`envelope_cap` in `crates/logit-inputs/src/docker.rs`) whole and counts it `long_line`, and
+  (`envelope_cap` in `crates/logit-inputs/src/docker.rs`) whole and counts it (`long_line` and
+  `logit.input.frames.dropped{reason="oversize"}`), and
   `DockerDecoder` never learns a line went missing. If the dropped line was a message's closing
   fragment, the held partial stays open and the next same-stream line joins it.
   - **To close:** the splitter must report drops in sequence, and a `TailDecoder` hook must
