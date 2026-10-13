@@ -5043,7 +5043,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   and every unrecognized gRPC status defaults to `Permanent`);
   nontrivial-3p-use(hyper-util/hyper-rustls) (`http2_only` + `https_or_http` + the
   "`alpn_protocols` must be empty on the way in or `with_tls_config` panics" contract in `build_grpc_client`'s doc comment);
-  accounting (`logit.output.requests{signal,class}`, `logit.output.records.rejected{signal}`).
+  accounting (`logit.output.requests{signal,class}`, `logit.output.records.dropped{signal, reason="rejected"}`).
 - **Invariants to verify:**
   - `tls.alpn_protocols` is empty for every `ClientConfig` reaching `build_grpc_client` — both
     `default_client_tls_config` and `crate::tls::build_client_config` must never set it, or the
@@ -5079,7 +5079,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     a malformed status therefore causes retries rather than a permanent failure.
     **Medium confidence it's the right call.**
   - `parse_partial_success` failures are silent by design (`(0, "")`), so a receiver reporting
-    rejections in a shape this parser mis-reads under-counts `logit.output.records.rejected`.
+    rejections in a shape this parser mis-reads under-counts `logit.output.records.dropped{reason="rejected"}`.
     **Medium confidence.**
   - A `rejected` value above `i64::MAX` wraps negative at the `rejected = v as i64` cast in
     `parse_partial_success_message` and is then silently ignored by the `rejected > 0` guard in
@@ -8085,7 +8085,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     (the loop in `runtime.rs`'s `deliver_with_retry`), and every sink here re-encodes and re-emits its full drop/normalization
     counter set at the top of `send`. A `Fault::Clean` retry (connect refused, DNS failure,
     plaintext zero-byte write) therefore **double-counts every encode-side drop** —
-    `logit.output.messages.dropped{reason=…}`, `logit.output.tags.dropped`,
+    `logit.output.messages.dropped{reason=…}`, `logit.output.tags.omitted`,
     `logit.output.batch.bytes`. I found no ADR or known-gaps entry acknowledging this; grepping
     `buffered-sink-delivery.md` and `known-gaps/` for re-encode/double-count turned up nothing.
     High confidence on the mechanism; unverified whether anyone has measured it.
