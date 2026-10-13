@@ -46,7 +46,7 @@
 //! and every `.` substituted with `_`: `0.99 → q0_99`, `1.5 → bucket_1_5`,
 //! `-0.5 → bucket_-0_5`, `f64::INFINITY → bucket_inf`. `Display` emits only `-`, digits, at most
 //! one `.`, and `inf`/`-inf`/`NaN`, so two distinct bounds never render to one token (the
-//! collision argument in `crates/logit-outputs/src/influxdb.rs`'s `render_fields`, which rejects
+//! collision argument in `crates/logit-proto/src/influxdb/encode.rs`'s `render_fields`, which rejects
 //! a *rounded* percentile). Graphite needs the substitution because `.` is its hierarchy
 //! separator.
 

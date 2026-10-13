@@ -42,7 +42,7 @@ onto the same Lua representation on the way into a script.
 
 ## Why it matters
 
-The variant changes what a sink writes. `crates/logit-outputs/src/influxdb.rs`'s `tag_value`
+The variant changes what a sink writes. `crates/logit-proto/src/influxdb/encode.rs`'s `tag_value`
 treats `Value::Str` and `Value::Bytes` attributes differently: a `Str` becomes an InfluxDB tag,
 and a `Bytes` is excluded from the write. So an **identity round-trip** through a script could
 silently flip an attribute from excluded to included as a tag, with no error and no signal to the

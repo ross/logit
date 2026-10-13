@@ -1798,15 +1798,32 @@ sinks tag one count per request with its status class or `network_error`
 
 ##### `influxdb_out`
 
-`crates/logit-outputs/src/influxdb.rs`.
+The sink is `crates/logit-outputs/src/influxdb.rs`; the encoder is `crates/logit-proto/src/influxdb/encode.rs`,
+whose `EncodeStats` is the source for the counters below. The sink emits them once per batch, however
+many attempts the runtime makes.
 
 - `logit.output.requests{class="2xx|4xx|5xx|network_error"}`, `logit.output.request.duration` (per
   attempt), and `logit.output.batch.bytes`: the encode and HTTP-response detail a generic
   `send.duration` timer can't distinguish.
-- `logit.output.tags.normalized{reason="multi_value"}`: a multi-valued tag (from a relayed,
-  repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) rendered as its last
-  representable element, once per attribute. Line protocol has no multi-value tag, so this is the
-  fallback. Lossy; see above.
+
+| Counter | What it counts |
+|---|---|
+| `logit.output.tags.normalized{reason="multi_value"}` | a multi-valued tag (from a relayed, repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) rendered as its last representable element, once per attribute. Line protocol has no multi-value tag, so this is the fallback. Lossy; see above |
+| `logit.output.tags.dropped{reason="unrepresentable"}` | a tag whose value has no plain-text form: `Null`, `Bytes`, `Timestamp`, `Map`, or an `Array` with no representable element |
+| `logit.output.tags.dropped{reason="empty"}` | a tag with an empty key or value, which `influxd` rejects |
+| `logit.output.tags.dropped{reason="unencodable"}` | a tag key or value with a newline or a trailing backslash, which line protocol can't spell |
+| `logit.output.tags.dropped{reason="reserved"}` | a tag key `influxd` reserves: `_measurement`, `_field`, or `time` |
+| `logit.output.metrics.normalized{reason="carrier_mismatch"}` | a record on an `influxdb.measurement` carrier event that doesn't fit the carrier line (its name lacks the `<measurement>.` prefix, or its kind isn't a `Gauge` or `Sum`), written as its own line |
+| `logit.output.metrics.skipped{reason="unencodable_value"}` | a non-finite `Gauge` or `Sum` value, or carrier field |
+| `logit.output.metrics.skipped{reason="unencodable_key"}` | a measurement or field key with no line-protocol spelling, once per field |
+| `logit.output.metrics.skipped{reason="reserved_key"}` | a carrier field named `time`, which `influxd` refuses |
+| `logit.output.metrics.skipped{reason="oversize_value"}` | a string field over `influxd`'s 1 MiB field cap |
+| `logit.output.metrics.skipped{reason="no_fields"}` | a line left with no field: a `Histogram` with no finite bound, or a `Summary` with no finite quantile |
+| `logit.output.metrics.skipped{reason="no_recorded_value"}` | a record flagged `NO_RECORDED_VALUE`; line protocol has no "no reading" marker |
+| `logit.output.metrics.skipped{reason="comment_measurement"}` | a measurement starting with `#`, which `influxd` reads as a comment line |
+| `logit.output.metrics.skipped{reason="timestamp_overflow"}` | a series with no free timestamp slot left before `i64::MAX` |
+| `logit.output.metrics.skipped{metric_kind="set_members"\|"exponential_histogram"\|"gauge_delta"}` | a kind with no line-protocol shape; `gauge_delta` is an unresolved `GaugeDelta` |
+
 - A `MetricKind::GaugeDelta` reaching this encoder unresolved means the pipeline is missing an
   `aggregate` component (`docs/adr/relative-gauge-adjustments.md`). It reports under its own
   `logit.component.diagnostics{key="gauge_delta_unresolved"}`, not the generic `encode_error` every

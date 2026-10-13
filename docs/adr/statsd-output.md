@@ -668,8 +668,8 @@ resource-level scalar whole; `format: statsd` counting `tags_dropped_dialect` pe
 real-decoder relay round-tripping `#team:a,team:b` byte-for-byte; and the `mod fixed_point`
 proptest's `tags()` generator widened to a 2-element key pool with an `Option<value>` per token, so
 repeats and bare/valued mixes are generated routinely, with `decode_encode_decode_is_a_fixed_point`
-holding unchanged. `crates/logit-outputs/src/influxdb.rs` gained: an `Array` rendering its last
-element and counting `multi_value_tags == 1`; the last element being unrepresentable falling back to
+holding unchanged. `crates/logit-proto/src/influxdb/encode.rs` (then `crates/logit-outputs/src/influxdb.rs`) gained: an `Array` rendering its last
+element and counting `tags_normalized_multi_value == 1`; the last element being unrepresentable falling back to
 the previous one; an empty array dropping the tag with no count; and
 `logit.output.tags.normalized` being emitted even when the encoded body is empty.
 `crates/logit-cli/tests/fixtures/statsd/` dropped `repeated-tag-key-collapses-to-last-value.{in,expected}`

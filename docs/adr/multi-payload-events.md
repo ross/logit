@@ -134,7 +134,7 @@ before this ADR.
 - ~80 call sites across `logit-core`, `logit-script`, `logit-pipeline`, `logit-inputs`,
   `logit-transforms`, and `logit-outputs` that constructed or matched on `Payload` were mechanically
   updated; two — `aggregate::process` and `influxdb`'s line encoder — needed real structural changes
-  (see the ADR `aggregation-window-semantics` amendment and `crates/logit-outputs/src/influxdb.rs`'s `render_tag_suffix`
+  (see the ADR `aggregation-window-semantics` amendment and `crates/logit-proto/src/influxdb/encode.rs`'s `render_tag_suffix`
   split, respectively).
 - `logit-inputs::statsd` is deliberately **unchanged** in observable behavior: it still emits one
   event per `:`-separated value in a multi-value line, each carrying exactly one metric, rather than
@@ -142,7 +142,7 @@ before this ADR.
   opportunistic behavior change unrelated to what this ADR exists to enable; `statsd.rs`'s
   `only_metric` test helper now asserts this shape explicitly so a future attempt at folding fails
   loudly there instead of silently changing seventeen tests' meaning.
-- `crates/logit-outputs/src/influxdb.rs`'s `allocate_timestamp` (the per-series "smallest free
+- `crates/logit-proto/src/influxdb/encode.rs`'s `allocate_timestamp` (the per-series "smallest free
   timestamp slot" union-find allocator) needed **no algorithmic change**: distinct metric names on
   one event produce distinct series keys and never collide; a repeated metric name on one event
   takes the existing same-series collision path, producing byte-identical output to the equivalent

@@ -37,7 +37,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     (`crates/logit-proto/src/influxdb/`, its module doc's "Encode" section,
     [ADR `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md)). The rows cover
     what another protocol's data loses through `influxdb_out`, and what the `influxdb.*` carrier
-    does at other sinks.
+    does at other sinks. `docs/design/internal-telemetry.md`'s `influxdb_out` section lists every counter.
 
   | Direction | Mapping | Counter | Why |
   |---|---|---|---|

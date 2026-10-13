@@ -421,7 +421,7 @@ reflects an NTP correction.
 **The `+ i` is not decoration, and it was not in this ADR's first draft.** A sink keyed on
 (series, timestamp) treats two points sharing both as *one* point. `influxdb_out` is the live case:
 line protocol overwrites on exactly that key, and its `allocate_timestamp` disambiguation
-(`crates/logit-outputs/src/influxdb.rs`) is cleared at the top of every `Encoder::encode` — it is
+(`crates/logit-proto/src/influxdb/encode.rs`) is cleared at the top of every `Encoder::encode` — it is
 deliberately batch-scoped, so it only ever resolves collisions *inside* one output batch. A whole
 read batch stamped with a single instant would routinely produce same-series same-timestamp points
 straddling an output-batch boundary, where nothing disambiguates them and the later silently

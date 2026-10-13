@@ -147,7 +147,7 @@ Number tokens format `f64` with `{}` and substitute `.` → `_` (`0.99 → q0_99
 at most one `.`, so no two distinct finite values can format to the same string before the
 substitution, and the substitution itself (one character for one character, no merging) can't
 introduce a new collision. This is a materially different argument from `render_fields`'s doc
-comment in `crates/logit-outputs/src/influxdb.rs`: that comment rejects *rounding* a quantile to a
+comment in `crates/logit-proto/src/influxdb/encode.rs`: that comment rejects *rounding* a quantile to a
 fixed-width label (`0.991` and `0.994` both round to `p99` and collide), a lossy transform this
 codec never performs. Graphite forces the substitution not to avoid a collision like influxdb's,
 but because `.` is the wire's own hierarchy separator — the number itself is carried in full,
@@ -248,7 +248,7 @@ but sharing no code with either.
 `graphite_out.duplicate_safe() -> true`: Whisper (Carbon's on-disk storage) is last-write-wins per
 `(path, second)` — re-sending the same batch on retry overwrites the same slots with the same
 values, not a second, distinct data point. This is
-[`InfluxDbOutput::duplicate_safe`'s doc comment](../../crates/logit-outputs/src/influxdb.rs)'s
+the "Delivery posture" paragraph of [`influxdb_out`'s module doc](../../crates/logit-outputs/src/influxdb.rs)'s
 argument (an identical `(measurement, tag set, timestamp)` write is an idempotent overwrite, not a
 duplicate point) applied to Whisper instead of InfluxDB's own idempotent-write semantics, and makes
 `graphite_out` the **first non-HTTP sink with a real destination** to report `duplicate_safe: true`
