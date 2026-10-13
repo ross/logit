@@ -6,7 +6,7 @@
 //! OTLP targets' signal (`0` logs, `1` metrics, `2` traces), `prom_decompress`'s encoding,
 //! `prom_remote_write`'s version and mode, `prom_text`'s dialect, `stream_framing`'s four bytes of mode, bound, and chunking,
 //! `syslog`'s line splitting (`1` on, `0` off), `graphite_pickle`'s mode (`0` a payload, `1` a
-//! build spec), `collectd`'s two-byte cut position, and the four `message_*` targets' entry point,
+//! build spec), `collectd`'s two-byte cut position, `influxdb_line`'s precision, and the four `message_*` targets' entry point,
 //! delimiter, `bare_keys`, or separator pair ([`message_seeds`]). [`generate`] is deterministic, so a rerun
 //! rewrites the same bytes and leaves `git status` clean.
 
@@ -292,6 +292,10 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
 
     for (name, bytes) in collectd_seeds(testdata)? {
         add("collectd", name, bytes);
+    }
+
+    for (name, bytes) in influxdb_line_seeds() {
+        add("influxdb_line", name, bytes);
     }
 
     for (target, seeds) in message_seeds() {
@@ -631,6 +635,68 @@ fn graphite_plaintext_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec
         out.push((format!("constructed-{name}"), datagram.to_vec()));
     }
     Ok(out)
+}
+
+#[path = "../../../crates/logit-proto/tests/support/influxdb_lines.rs"]
+mod influxdb_lines;
+
+/// `crates/logit-proto/tests/support/influxdb_lines.rs`'s Telegraf-shaped body under each
+/// precision selector (only `0`, ns, is in range for its timestamps), and one constructed body
+/// per shape `crates/logit-proto/src/influxdb/mod.rs`'s grammar table names, each under the ns
+/// selector `0`: escapes in every position, every number and boolean form, string escapes and a
+/// quoted newline, comments and whitespace, duplicates that merge, and lines that fail.
+fn influxdb_line_seeds() -> Vec<(String, Vec<u8>)> {
+    let prefixed = |selector: u8, body: &[u8]| [&[selector][..], body].concat();
+    let mut out: Vec<(String, Vec<u8>)> = (0..4u8)
+        .map(|selector| {
+            let body = influxdb_lines::INFLUX_LINES.as_bytes();
+            (format!("telegraf-precision-{selector}"), prefixed(selector, body))
+        })
+        .collect();
+    for (name, body) in [
+        ("escapes", &br#"m\,a\ b=c,t\,k=v\=x\ y f\,k=1i,f\"k=2i 1"#[..]),
+        ("backslashes", br#"m\\x,t=a\\b,u=b\x f=1i,g="q\\\"s\\\\" 2"#),
+        ("trailing-backslash", b"m\\\\ f=1i\nm,t=v\\\\ f=1i\nm f\\\\=1i"),
+        (
+            "numbers",
+            b"m a=1,b=-0,c=.5,d=5.,e=1.5e+3,f=1E-3,g=007i,h=-9223372036854775808i,\
+              i=18446744073709551615u,j=1.7976931348623157e308 3",
+        ),
+        (
+            "bad-numbers",
+            b"m f=+1\nm f=inf\nm f=NaN\nm f=0x10\nm f=1e309\nm f=1.0i\nm f=-1u\n\
+              m f=9223372036854775808i",
+        ),
+        ("booleans", b"m a=t,b=T,c=true,d=True,e=TRUE,f=f,g=F,h=false,i=False,j=FALSE 4\nm f=tRUE"),
+        ("strings", b"m s=\"a\\\"b\\\\c\",t=\"x\\ny\",u=\"a, b=c d\",v=\"line1\nline2\" 5"),
+        ("whitespace", b"# comment\n   # indented\n\n   m   f=1i    6   \nm,a=b  \t f=2i\n"),
+        ("crlf-tab-comment", b"m f=1i\r\nm\tf=1i\nm f=1i #trailing\n"),
+        (
+            "duplicates",
+            b"m,t=1 x=1i 7\nm,t=1 y=2i 7\nm,t=1 x=9i 7\nm,b=2,a=1 x=1i 7\nm,a=1,b=2 y=1 7\n\
+              m f=1i,f=2i",
+        ),
+        ("type-change", b"m f=1i,g=\"s\" 8\nm f=\"now\",g=2.5 8\nm f=1i,f=2.5"),
+        (
+            "reserved",
+            b"m,_measurement=x f=1i\nm,time=x f=1i\nm time=1i\n\
+              m,influxdb.measurement=x,influxdb.z=1 f=1i\n_m,_time=x _value=1i",
+        ),
+        (
+            "timestamps",
+            b"m f=1i -1\nm f=1i 0\nm f=1i 9223372036854775806\nm f=1i 9223372036854775807\n\
+              m f=1i 1.5\nm f=1i 1 2",
+        ),
+        (
+            "malformed",
+            b",t=v f=1i\nm,=v f=1i\nm,t= f=1i\nm,t f=1i\nm =1i\nm f=\nm f=1i,\nm g\nm f=\"open\nm",
+        ),
+        ("no-timestamp", b"a f=1i\nb f=1i\na,t=1 f=2i\na f=3i"),
+        ("utf8", "m,a=\u{e9}\u{1f600} \u{e9}=\"\u{1f600}\" 9".as_bytes()),
+    ] {
+        out.push((format!("constructed-{name}"), prefixed(0, body)));
+    }
+    out
 }
 
 /// `p = 'robustness.host.cpu;env=prod'; pickle.dumps([(p, (1700000000, 0.5)),
@@ -1318,6 +1384,7 @@ mod tests {
                 "graphite_pickle",
                 "graphite_plaintext",
                 "hll_bytes",
+                "influxdb_line",
                 "message_csv",
                 "message_json",
                 "message_kv",

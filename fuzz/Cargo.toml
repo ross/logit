@@ -165,6 +165,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "influxdb_line"
+path = "fuzz_targets/influxdb_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "collectd"
 path = "fuzz_targets/collectd.rs"
 test = false

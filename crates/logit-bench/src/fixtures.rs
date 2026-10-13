@@ -63,6 +63,14 @@ pub const NGINX_SYSLOG_LINE: &str = concat!(
     r#""body_bytes_sent":612,"request_time":0.001,"upstream_response_time":"0.004"}"#
 );
 
+#[path = "../../logit-proto/tests/support/influxdb_lines.rs"]
+mod influxdb_lines;
+
+/// A Telegraf-shaped InfluxDB write body: 20 lines, 18 points once the decoder merges `system`'s
+/// three lines at one instant. Its provenance is on the definition, which
+/// `logit-proto`'s fixed-point and robustness tests and the fuzz seed generator share.
+pub use influxdb_lines::INFLUX_LINES;
+
 /// A statsd datagram line with DogStatsD tags, whose metric name reaches `interner::intern`
 /// straight off the network (`docs/design/memory.md` §4, "Interning: the bargain, and its bounds").
 pub const STATSD_LINE: &str = "page.views:1|c|@0.5|#env:prod,region:us-east-1,service:web";
