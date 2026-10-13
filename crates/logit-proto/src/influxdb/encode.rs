@@ -28,9 +28,11 @@
 //!   the escape after it make `\\`, which `influxd`'s line splitter (and [`super::line::lines`])
 //!   skips as a pair, leaving the delimiter or quote bare: a bare `"` opens a quote that swallows
 //!   the newline, and a bare delimiter shifts every quote after it;
-//! - a tag key or value with a `\` directly before `,`, space, or `=`, for the same reason: the
-//!   `\\` pair leaves the delimiter bare, the splitter leaves the tag section there, and a `"`
-//!   later in the tags or a string field's newline then splits or merges lines.
+//! - a tag key or value with a `\` directly before a space, for the same reason: the `\\` pair
+//!   leaves the space bare, the splitter leaves the tag section there, and a `"` later in the tags
+//!   or a string field's newline then splits or merges lines. A `\` before `,` or `=` in a tag is
+//!   written `\\,` or `\\=` and reads back as written, because the splitter counts `,` and `=`
+//!   only after a bare space has ended the tag section.
 //!
 //! A tag is skipped alone (`logit.output.tags.dropped{reason="unencodable"}`); a measurement or
 //! field key skips its point or field (`logit.output.metrics.skipped{reason="unencodable_key"}`).
@@ -80,9 +82,8 @@ pub struct EncodeStats {
     pub tags_dropped_unrepresentable: usize,
     /// An empty tag key or value, which `influxd` rejects: `tags.dropped{reason="empty"}`.
     pub tags_dropped_empty: usize,
-    /// A tag key or value with a newline, ending in `\`, or with `\` directly before `,`, space,
-    /// or `=` (this module's "Escaping"):
-    /// `tags.dropped{reason="unencodable"}`.
+    /// A tag key or value with a newline, ending in `\`, or with `\` directly before a space
+    /// (this module's "Escaping"): `tags.dropped{reason="unencodable"}`.
     pub tags_dropped_unencodable: usize,
     /// A tag key `influxd` reserves (`_measurement`, `_field`, `time`):
     /// `tags.dropped{reason="reserved"}`.
@@ -818,11 +819,10 @@ fn measurement_encodable(s: &str) -> bool {
 }
 
 /// A tag key or value with a spelling (this module's "Escaping"): no line break, no trailing `\`,
-/// and no `\` directly before a character [`push_escaped_key`] escapes.
+/// and no `\` directly before a space. `\` before `,` or `=` is written `\\,` or `\\=` and reads
+/// back as written, because the line splitter counts `,` and `=` only after a bare space.
 fn tag_encodable(s: &str) -> bool {
-    !s.contains(['\n', '\r'])
-        && !s.ends_with('\\')
-        && s.as_bytes().windows(2).all(|w| w[0] != b'\\' || !matches!(w[1], b',' | b' ' | b'='))
+    !s.contains(['\n', '\r']) && !s.ends_with('\\') && !s.contains("\\ ")
 }
 
 /// A carrier field key with a spelling: non-empty, as [`tag_encodable`], and no `\` directly
@@ -1139,15 +1139,16 @@ mod tests {
     /// `influxd` 2.9.1 keeps `\\` there as two backslashes, so doubling one on egress doubles it
     /// at every hop. Provenance, `docs/plans/influxdb-relay.md`'s "Settled by probe":
     /// `p01c\\x f=1i` stored measurement `p01c\\x` (row 1.3); `p02d,t\\k=v\\x f=1i` stored tag
-    /// `t\\k`=`v\\x` (row 2.4); `f\\k=4i` stored field key `f\\k` (row 2.7).
+    /// `t\\k`=`v\\x` (row 2.4); `f\\k=4i` stored field key `f\\k` (row 2.7); `p21_d,a=v\\=x`
+    /// stored `v\=x` (row 2.13).
     #[test]
     fn a_backslash_is_written_as_itself_outside_a_string_value() {
         let out = encode(vec![metric_event(
             "p01c\\x",
             MetricKind::Gauge(MetricValue::I64(1)),
-            &[("t\\k", "v\\x")],
+            &[("t\\k", "v\\x"), ("a", "v\\=x")],
         )]);
-        assert_eq!(out, "p01c\\x,t\\k=v\\x value=1i 1700000000000000000\n");
+        assert_eq!(out, "p01c\\x,t\\k=v\\x,a=v\\\\=x value=1i 1700000000000000000\n");
 
         let mut event = carrier_event("p02g", &[("f\\k", MetricValue::I64(4))]);
         event.attributes.insert("t", "v");
@@ -1168,24 +1169,26 @@ mod tests {
     /// 2.6 `p02f,tk=v\ f=1i` (400 `invalid tag format`), 1.6/1.7 (a measurement ending in `\`,
     /// 400 `missing fields`), and 2.8 `f\\=1i` (400 `invalid value`). A measurement with `\`
     /// before `,`, space, or `=` is stored unreadable (rows 1.5, 1.8). A tag key or value with `\`
-    /// before `,`, space, or `=` would leave a `\\` pair and a bare delimiter that desyncs the
-    /// line splitter. The tag drops alone; the measurement or field key drops its point or field.
+    /// before a space would leave a `\\` pair and a bare space that desyncs the line splitter;
+    /// `\` before `,` or `=` in a tag reads back as written. The tag drops alone; the measurement
+    /// or field key drops its point or field.
     #[test]
     fn a_key_that_ends_in_a_backslash_is_skipped_and_counted() {
         let (out, stats) = encode_stats(vec![metric_event(
             "page.views",
             MetricKind::counter(1.0),
-            &[
-                ("tk", "v\\"),
-                ("k\\", "v"),
-                ("a\\ b", "v"),
-                ("c", "x\\,y"),
-                ("d", "v\\=x"),
-                ("env", "prod"),
-            ],
+            &[("tk", "v\\"), ("k\\", "v"), ("a\\ b", "v"), ("env", "prod")],
         )]);
         assert_eq!(out, "page.views,env=prod value=1 1700000000000000000\n");
-        assert_eq!(stats.tags_dropped_unencodable, 5);
+        assert_eq!(stats.tags_dropped_unencodable, 3);
+
+        let (out, stats) = encode_stats(vec![metric_event(
+            "page.views",
+            MetricKind::counter(1.0),
+            &[("c", "x\\,y"), ("d", "v\\=x")],
+        )]);
+        assert_eq!(out, "page.views,c=x\\\\,y,d=v\\\\=x value=1 1700000000000000000\n");
+        assert_eq!(stats.tags_dropped_unencodable, 0);
 
         for name in ["p01g\\", "p01h\\,x", "p01e\\=f", "a\\ b"] {
             let (out, stats) = encode_stats(vec![

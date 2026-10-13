@@ -287,8 +287,8 @@ fn a_field_key_that_desyncs_the_line_splitter_is_never_written() {
     }
 }
 
-/// A tag key or value with `\` before `,`, space, or `=` leaves as `\\` and a bare delimiter,
-/// so the line splitter leaves the tag section early: a `"` in a tag value then opens a quote
+/// A tag key or value with `\` before a space leaves as `\\` and a bare space, so the line
+/// splitter leaves the tag section early: a `"` in a tag value then opens a quote
 /// that merges the next line, and a string field's newline splits the line. The tag is dropped
 /// instead, and the rest of the batch survives.
 #[test]
@@ -307,6 +307,28 @@ fn a_tag_that_desyncs_the_line_splitter_is_never_written() {
             EventBatch { resource: source.resource.clone(), scope: None, events: decoded };
         assert_eq!(encode(&round_tripped), encoded, "encode(decode(encode(b))) == encode(b)");
     }
+}
+
+/// A tag key or value with `\` before `,` or `=` leaves as `\\,` or `\\=`, which reads back as
+/// written: the line splitter counts `,` and `=` only after a bare space, so the pair can't end
+/// the tag section early. A `"` in the tags and a string field's newline stay in their line.
+#[test]
+fn a_tag_with_a_backslash_before_a_comma_or_equals_is_a_fixed_point() {
+    let neighbor = point("n", &[], &[("value", MetricValue::I64(2))], &[], 6);
+    assert_fixed_point(batch(vec![
+        point(
+            "m",
+            &[("a", "v\\=x"), ("k\\,x", "c\"d"), ("k\\=y", "x\\,y\"z")],
+            &[("value", MetricValue::I64(1))],
+            &[],
+            5,
+        ),
+        neighbor.clone(),
+    ]));
+    assert_fixed_point(batch(vec![
+        point("m", &[("t", "x\\=y\\,z\"")], &[], &[("s", "one\ntwo")], 5),
+        neighbor,
+    ]));
 }
 
 #[test]

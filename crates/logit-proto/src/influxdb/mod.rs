@@ -111,7 +111,7 @@
 //! | `Array` | its last representable element | `tags.normalized{reason="multi_value"}` (lossy) |
 //! | `Null`, `Bytes`, `Timestamp`, `Map`, a non-UTF-8 `Str`, an `Array` with no representable element | dropped | `tags.dropped{reason="unrepresentable"}` |
 //! | an empty key or value | dropped | `tags.dropped{reason="empty"}` |
-//! | a key or value with a line break, ending in `\`, or with `\` directly before `,`, a space, or `=` | dropped | `tags.dropped{reason="unencodable"}` |
+//! | a key or value with a line break, ending in `\`, or with `\` directly before a space | dropped | `tags.dropped{reason="unencodable"}` |
 //! | key `_measurement`, `_field`, or `time` | dropped: influxd rejects the whole write | `tags.dropped{reason="reserved"}` |
 //! | key under `influxdb.` or `statsd.` | not a tag | -- |
 //!
@@ -135,8 +135,9 @@
 //!    spelling arrived.
 //! 6. Escaping: the encoder writes only the escapes the grammar requires, so a backslash a sender
 //!    wrote doubled leaves as it was read, and a key the grammar can't spell is dropped, counted:
-//!    a dropped measurement or field key is `skipped{reason="unencodable_key"}`, a dropped tag is
-//!    `tags.dropped{reason="unencodable"}`.
+//!    a measurement or field key ending in `\` or with `\` before a delimiter is
+//!    `skipped{reason="unencodable_key"}`, and a tag key or value ending in `\` or with `\` before
+//!    a space is `tags.dropped{reason="unencodable"}`.
 //! 7. Timestamps: every point leaves with a timestamp in nanoseconds, so `precision` isn't
 //!    carried, and a point that arrived with none leaves with its receipt time (see item 14).
 //! 8. Comments, blank lines, and runs of spaces are dropped. A CRLF line ending, a tab separator,
