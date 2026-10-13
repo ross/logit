@@ -1030,17 +1030,19 @@ and a diagnostic, and "Telemetry"). This list is the canonical copy of its verdi
 - The final life's `buffer.batches` above 0 at that drain, or the last `sink_drained` phase in
   `timeline.jsonl` with `held` false: FAIL, naming the batches left unsent. The identity
   balances a queued batch, so it can't catch one the run ended with.
-- A batch dropped `rejected`, records dropped `rejected` or `oversize`, or records a series
-  `202` body names (`logit.output.records.rejected`): FAIL, with the status and the first
-  stderr line with the key that explains it: `request_rejected` or `oversize` for a record drop
-  (refused by the destination, or too large to send), and `series_rejected` for a `202` body. Under per-request verdicts a rejected request drops its
-  records and the batch survives when another request was accepted, so both counters are read.
+- A batch dropped `rejected`, or records dropped `rejected` or `oversize`: FAIL, with the
+  status and the first stderr line with the key that explains it. A record drop quotes
+  `request_rejected` or `oversize` (refused by the destination, or too large to send).
+  `records.dropped{reason="rejected"}` also counts the series a `202` body names, so it quotes
+  `request_rejected`, `series_rejected`, or both, whichever the sink logged. Under per-request
+  verdicts a rejected request drops its records and the batch survives when another request
+  was accepted, so both the batch and the record counter are read.
 - An `api_key_rejected` or `request_refused` line from the sink on stderr: FAIL, quoting the
   first. The sink reads that answer as `Refused` and holds its queue with no exit, so the run
   can't deliver until the key or the endpoint is fixed.
 - No `logit.output.requests` point, or none of class `2xx`: FAIL.
 - Any other counted drop (a batch's `overflow_*` or `shutdown` reason, a record's `stale`, `too_many_tags`, or other pre-send reason, the
-  encoder's `metrics.skipped`): WARN.
+  encoder's `metrics.skipped`, and its `metrics.dropped` for an encode fault): WARN.
 - A life whose stderr `drain complete` `batches_dropped` differs from its telemetry
   `batches.dropped{reason="shutdown"}`: WARN.
 - A request of class other than `2xx` (`4xx` holds a `429` too, `5xx`, `network_error`) in a

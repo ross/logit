@@ -51,7 +51,7 @@
 //! **`/intake/` carries events and host metadata on one route.** A body that is a JSON object
 //! with no `events` member and no event title or text is host metadata: it is acknowledged and
 //! counted like the routes above rather than decoded, so a metadata flush doesn't count as a
-//! skipped event in the codec's telemetry. A body that decodes to no events for another reason is
+//! dropped event in the codec's telemetry. A body that decodes to no events for another reason is
 //! answered the same way, without a send.
 //!
 //! # Request handling
