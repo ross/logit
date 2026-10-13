@@ -296,7 +296,7 @@ fuzz_target!(|data: &[u8]| {
                 let count = |reason: &str| first.skipped.get(reason).copied().unwrap_or(0);
                 assert_eq!(count("invalid_labels"), invalid, "built: invalid_labels");
                 assert_eq!(count("native_histogram"), histograms, "built: native_histogram");
-                assert_eq!(decoded.histograms_skipped, histograms, "built: histograms_skipped");
+                assert_eq!(decoded.histograms_dropped, histograms, "built: histograms_dropped");
             }
             (result, verdict) => {
                 panic!(
