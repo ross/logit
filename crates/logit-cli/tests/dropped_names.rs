@@ -5,8 +5,8 @@
 //! A name is a string literal of the form `"logit.<dotted lowercase>.dropped"` in a `.rs` file
 //! under `crates/*/src`. Test code is left out, because a negative assertion names a retired
 //! counter to show it's gone: a file whose name contains `test`, and each file from its first
-//! `#[cfg(test)]` module on. A `#[cfg(test)]` item outside such a module is scanned, so a retired
-//! name there fails the check.
+//! inline `#[cfg(test)]` module on. A `#[cfg(test)] mod x;` declaration doesn't end the scan, since
+//! shipped code follows it, and a `#[cfg(test)]` item outside an inline module is scanned too.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -41,14 +41,17 @@ fn dropped_literals(text: &str) -> Vec<&str> {
     names
 }
 
-/// `text` up to its first `#[cfg(test)]` attribute on a module (`mod`, or `#[path]` and then
-/// `mod`).
+/// `text` up to its first `#[cfg(test)]` attribute on an inline module: a `mod` line that doesn't
+/// end in `;`. A `#[path]` module is a declaration, so it never ends the scan.
 fn shipped_part(text: &str) -> &str {
     let mut offset = 0;
     let mut previous_was_cfg_test = false;
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        if previous_was_cfg_test && (trimmed.starts_with("mod ") || trimmed.starts_with("#[path")) {
+        if previous_was_cfg_test
+            && trimmed.starts_with("mod ")
+            && !trimmed.trim_end().ends_with(';')
+        {
             let cfg_line = text[..offset].trim_end_matches('\n').rfind('\n').map_or(0, |i| i + 1);
             return &text[..cfg_line];
         }
@@ -92,10 +95,11 @@ fn every_dropped_counter_is_documented() {
 fn the_scan_reads_literals_and_stops_at_test_code() {
     let text = "let a = \"logit.input.frames.dropped\";\nlet b = \"logit.input.frames\";\n\
                 #[cfg(test)]\nfn helper() { \"logit.input.kernel.dropped\" }\n\
+                #[cfg(test)]\nmod verification;\nlet c = \"logit.input.logs.dropped\";\n\
                 #[cfg(test)]\nmod tests { \"logit.output.tags.dropped\" }\n";
     assert_eq!(
         dropped_literals(shipped_part(text)),
-        ["logit.input.frames.dropped", "logit.input.kernel.dropped"]
+        ["logit.input.frames.dropped", "logit.input.kernel.dropped", "logit.input.logs.dropped"]
     );
-    assert_eq!(dropped_literals(text).len(), 3);
+    assert_eq!(dropped_literals(text).len(), 4);
 }
