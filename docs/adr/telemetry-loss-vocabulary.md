@@ -163,6 +163,16 @@ UDP listener identity. `input.messages.dropped` mirrors `output.messages.dropped
 statsd line or a syslog message on the sink side. `bad_part` and `incomplete_identity` weren't on
 the list but lose data the same way, so they get counters too.
 
+## Amendment (2026-10-13): a counter for a disk spool's torn tail
+
+The disk spool's torn tail, from the "Loss with no counter" list, now counts
+`component.batches.dropped{reason="disk_torn"}`: one per torn tail `DiskQueue::open` truncates,
+unless the persisted cursor shows the torn record was committed before the crash. The sink counted `batches.received` for that batch before its push, and no
+process counted it delivered or dropped, so it's loss. A partial record holds no readable event
+count, so no `events.dropped` is counted with it. `component.buffer.disk.truncated` stays the
+count of repairs. [ADR `disk-backed-sink-buffer`](disk-backed-sink-buffer.md)'s amendment of the
+same date has the bounds of the count and how it enters the sink identity.
+
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
 `*.rejected` name and reason that existed on 2026-10-13, verified against the emit sites in
@@ -279,16 +289,3 @@ belongs under `*.dropped`; none has a counter yet:
 
 - `influxdb_out` skips an unresolved relative gauge (diagnostic `gauge_delta_unresolved`), a
   `NO_RECORDED_VALUE` record, `SetMembers`, and `ExponentialHistogram` with diagnostics only.
-- The disk spool's `component.buffer.disk.truncated` counts torn-tail repairs at open, not the
-  batch lost with the tail. [Counted on 2026-10-13; see
-  [Amendment: a torn tail's batch is counted](#amendment-a-torn-tails-batch-is-counted-2026-10-13).]
-
-## Amendment: a torn tail's batch is counted (2026-10-13)
-
-The disk spool now counts `component.batches.dropped{reason="disk_torn"}`, one per torn tail
-`DiskQueue::open` truncates, unless the persisted cursor shows the torn record was committed
-before the crash. The sink counted `batches.received` for that batch before its push, and no
-process counted it delivered or dropped, so it's loss. A partial record holds no readable event
-count, so no `events.dropped` is counted with it. `component.buffer.disk.truncated` stays the
-count of repairs. [ADR `disk-backed-sink-buffer`](disk-backed-sink-buffer.md)'s amendment of the
-same date has the bounds of the count and how it enters the sink identity.
