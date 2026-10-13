@@ -25,7 +25,7 @@
 //!
 //! `Format::DogStatsd` (default) emits the `|#k:v,k:v` tag segment. `Format::Statsd` omits it
 //! entirely (not an empty `|#`, which some plain-statsd receivers reject) and counts every tag it
-//! drops (`EncodeStats::tags_dropped_dialect`). The unit is a **wire tag**, not an attribute: a
+//! omits (`EncodeStats::tags_omitted_dialect`). The unit is a **wire tag**, not an attribute: a
 //! multi-value tag (see "Multi-value tags") counts once per element, one `k:v` token each.
 //!
 //! `Format::Statsd` also normalizes two shapes only DogStatsD can express: a `Samples`
@@ -33,8 +33,8 @@
 //! wire type collapses to `ms` (counted `EncodeStats::type_normalized_dialect`). These are the
 //! "sink-configured dialect change" and "splitting a multi-value line" normalizations
 //! `docs/adr/lossless-transit.md` permits by name. `|c:<container-id>`, `|e:<external-data>`,
-//! `|card:<cardinality>` and `|T<timestamp>` have no plain-statsd equivalent and are dropped, not
-//! normalized.
+//! `|card:<cardinality>` and `|T<timestamp>` have no plain-statsd equivalent and are omitted from
+//! the line, not normalized.
 //!
 //! A metric value is the statsd wire's one number: an `F64` prints as a float, an `I64` or `U64`
 //! as its exact integer digits (so `2^53 + 1` survives), and a `Bool` as `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}`
@@ -95,7 +95,7 @@
 //!   element-wise union would emit tags nothing sent.
 //!
 //! An element [`tag_value`] can't render (`Null`, `Bytes`, `Timestamp`, `Map`, a nested `Array`)
-//! is skipped and counted `EncodeStats::tags_dropped_unrepresentable` **per element**; an array
+//! is skipped and counted `EncodeStats::tags_omitted_unrepresentable` **per element**; an array
 //! whose every element drops emits no tag and leaves no stray `,`. A tag named `statsd.type` in the
 //! `#` segment can decode to an `Array` too; it matches no [`Carriers`] arm (each expects a
 //! `Value::Str`/`Value::U64`) and is filtered out of the tag segment uncounted, like any
@@ -152,8 +152,8 @@
 //! extras, and never `@<rate>`: a summary already absorbed each sample's rate, and a rate on a
 //! `|c` line would extrapolate twice. Each line is its own [`MessageBuf`] entry (a negative pair
 //! is one), so the packer can split an expansion across datagrams, and a line over
-//! `max_packet_bytes` drops alone. Under `Format::Statsd`, `tags_dropped_dialect` counts per wire
-//! tag per event, as for every event, and `dropped_dialect_fields` counts per expanded line.
+//! `max_packet_bytes` drops alone. Under `Format::Statsd`, `tags_omitted_dialect` counts per wire
+//! tag per event, as for every event, and `omitted_dialect_fields` counts per expanded line.
 //! A non-finite component is skipped and the rest of the record is still written; a non-finite
 //! bare `Sum` is dropped, counted `dropped_unencodable_value`, and not counted degraded.
 //!
@@ -285,7 +285,7 @@
 //! `e:`, `card:` follow the tags and precede `m:` (`append_origin_fields`); that client writes a
 //! service check's `c:` and `card:` after `m:` instead, and the Agent and the decoder accept any
 //! order. Under `Format::Statsd` none has
-//! anywhere to go, so each is dropped and counted (`EncodeStats::dropped_dialect_fields`).
+//! anywhere to go, so each is omitted and counted (`EncodeStats::omitted_dialect_fields`).
 //!
 //! `statsd.*` attributes (`statsd.type`, `statsd.container_id`, `statsd.timestamp`, and the
 //! rest) are protocol-namespaced carriers, not tags: `build_tag_suffix` filters the prefix out of
@@ -307,7 +307,7 @@
 //!
 //! - A metrics-empty event gets one *unmerged* [`is_dogstatsd_event`] lookup (event attributes,
 //!   then resource). The common "not an event" case skips [`build_tag_suffix`]'s full merged walk
-//!   and counts only `skipped_no_metrics`, without inflating `tags_dropped_dialect` for tags
+//!   and counts only `skipped_no_metrics`, without inflating `tags_omitted_dialect` for tags
 //!   nothing would render. Only a "yes" runs the full walk, for the other carriers the line needs.
 //! - An event with metrics (a service check, or an ordinary metric event) always runs the full
 //!   walk, and service-check detection reads `Carriers::service_check_name` off it.
@@ -355,7 +355,7 @@
 //!   ([`is_forbidden_in_extended_field`]). Each sits in a `|letter:value` field a decode ends at
 //!   the next `|`, as for a tag value, but none has a tag value's colon-splitting ambiguity.
 //! - Event priority/alert type: never sanitized. A value in the fixed set is written verbatim; any
-//!   other is omitted and counted `EncodeStats::dropped_invalid_event_fields`, since an
+//!   other is omitted and counted `EncodeStats::omitted_invalid_values`, since an
 //!   out-of-set value has no sanitized form that means the same thing. The line is still emitted,
 //!   so this is its own counter rather than `dropped_unencodable_value`, which reports a message
 //!   drop.
@@ -364,10 +364,10 @@
 //!   wherever it sits, as `statsd_in` does.
 //!
 //! **`Format::Statsd` has no wire form for either shape** (no `_e`/`_sc` sigil), so the whole
-//! event is dropped and counted (`EncodeStats::dropped_dialect_events`) before anything else about
+//! event is skipped and counted (`EncodeStats::skipped_dialect_events`) before anything else about
 //! it is inspected; a service check's gauge isn't emitted as `name:v|g` either. Either shape
-//! dropped this way has already run the full merged walk, so its ordinary attributes are also
-//! tallied into `tags_dropped_dialect`: both counters incrementing for one dropped line is
+//! skipped this way has already run the full merged walk, so its ordinary attributes are also
+//! tallied into `tags_omitted_dialect`: both counters incrementing for one skipped line is
 //! expected, not a double count.
 //!
 //! `statsd.event.*`/`statsd.service_check.*` are carriers like `statsd.type`: the same
@@ -430,9 +430,9 @@ pub struct EncodeStats {
     pub skipped_no_metrics: usize,
     pub dropped_gauge_delta: usize,
     /// A `NO_RECORDED_VALUE`-flagged point. statsd has no "no value here" concept, so unlike
-    /// `otlp_out` this sink can't keep the point flagged; it drops it rather than write its default
+    /// `otlp_out` this sink can't keep the point flagged; it skips it rather than write its default
     /// value as a fabricated sample (`docs/known-gaps/mappings.md`'s cross-protocol table).
-    pub dropped_no_recorded_value: usize,
+    pub skipped_no_recorded_value: usize,
     /// Records of a multi-value kind dropped under [`MultiValue::Skip`], one per record, by
     /// `metric_kind`. See the module doc's "Multi-value kinds: `multi_value`" section.
     pub skipped_kinds: KindCounts,
@@ -441,23 +441,23 @@ pub struct EncodeStats {
     /// `multi_value`" section.
     pub degraded_kinds: KindCounts,
     /// One bucket for every kind of unencodable input: a non-finite value in a
-    /// `Samples`/`Sum`/`Gauge`/`GaugeDelta`; an out-of-range `Samples.sample_rate` (the line is
-    /// still written, without `@rate`); an empty `Samples`/`SetMembers` record; or an event whose
-    /// log `message` isn't a UTF-8 `Value::Str`, or whose `statsd.event.title` isn't valid UTF-8
-    /// ([`is_dogstatsd_event`] accepts any `Value::Str`), which drops the whole event
-    /// ([`render_event`]). An out-of-set event priority/alert type still emits its line, so it
-    /// counts in [`Self::dropped_invalid_event_fields`] instead.
+    /// `Samples`/`Sum`/`Gauge`/`GaugeDelta`; an empty `Samples`/`SetMembers` record; or an event
+    /// whose log `message` isn't a UTF-8 `Value::Str`, or whose `statsd.event.title` isn't valid
+    /// UTF-8 ([`is_dogstatsd_event`] accepts any `Value::Str`), which drops the whole event
+    /// ([`render_event`]). An out-of-range `Samples.sample_rate` or an out-of-set event
+    /// priority/alert type still emits its line, so it counts in [`Self::omitted_invalid_values`]
+    /// instead.
     pub dropped_unencodable_value: usize,
     pub dropped_empty_name: usize,
     pub dropped_oversize_line: usize,
-    /// Tags dropped because [`Format::Statsd`] has no tag segment. Counted **per wire tag**: an
+    /// Tags omitted because [`Format::Statsd`] has no tag segment. Counted **per wire tag**: an
     /// `Array` attribute counts once per element, and an empty `Array` counts nothing. See the
     /// module doc's "Dialects" section.
-    pub tags_dropped_dialect: usize,
+    pub tags_omitted_dialect: usize,
     /// A tag [`tag_value`] can't render (`Null`, `Bytes`, `Timestamp`, `Map`, a nested `Array`),
     /// or whose key is empty or sanitizes to nothing. Counted **per wire tag**, as
-    /// [`Self::tags_dropped_dialect`] is. See the module doc's "Multi-value tags" section.
-    pub tags_dropped_unrepresentable: usize,
+    /// [`Self::tags_omitted_dialect`] is. See the module doc's "Multi-value tags" section.
+    pub tags_omitted_unrepresentable: usize,
     /// A timer's `h`/`d` wire type (`statsd.type`) collapsed to `ms` under `Format::Statsd`.
     /// Counted once per `Samples` record, not per split line.
     pub type_normalized_dialect: usize,
@@ -465,25 +465,25 @@ pub struct EncodeStats {
     /// once per value.
     pub bool_values: usize,
     /// `statsd.container_id`/`statsd.external_data`/`statsd.cardinality`/`statsd.timestamp`
-    /// dropped under `Format::Statsd`
-    /// (`append_dialect_extras`). Counted once per field per emitted line, so a negative-gauge pair
+    /// omitted under `Format::Statsd` (`append_dialect_extras`), from a line that is still sent. Counted once per field per emitted line, so a negative-gauge pair
     /// or a multi-member `SetMembers` record counts once per physical line.
-    pub dropped_dialect_fields: usize,
+    pub omitted_dialect_fields: usize,
     /// A `SetMembers` member that differs from its raw bytes after lossy UTF-8 and
     /// [`is_forbidden_in_set_member`]'s substitution. See the module doc's "Sanitization" section.
     pub members_sanitized: usize,
-    /// An event or service check dropped whole under [`Format::Statsd`], which has no `_e`/`_sc`
-    /// wire form. See the module doc's "DogStatsD events and service checks" section.
-    pub dropped_dialect_events: usize,
+    /// An event or service check skipped whole under [`Format::Statsd`], which has no `_e`/`_sc`
+    /// wire form: the operator's choice of dialect, so `messages.skipped`, not a loss. See the module doc's "DogStatsD events and service checks" section.
+    pub skipped_dialect_events: usize,
     /// A service check whose first metric isn't a `Gauge`, or with no status in `0..=3` from either
     /// the `statsd.service_check.status` carrier or the gauge's rounded value. See
     /// [`render_service_check`].
     pub dropped_invalid_service_check: usize,
-    /// An event priority/alert type outside its fixed set: that one field is omitted and the line
-    /// is still emitted. Not `dropped_unencodable_value`, whose
-    /// `logit.output.messages.dropped{reason="unencodable_value"}` would claim the whole message
-    /// was dropped. See [`render_event`].
-    pub dropped_invalid_event_fields: usize,
+    /// A field omitted from a line that is still emitted because its value is out of range: an
+    /// event priority/alert type outside its fixed set ([`render_event`]), or a `Samples`
+    /// `sample_rate` outside `(0, 1]`, written without `@rate`. Not `dropped_unencodable_value`,
+    /// whose `logit.output.messages.dropped{reason="unencodable_value"}` would claim the whole
+    /// message was dropped.
+    pub omitted_invalid_values: usize,
 }
 
 /// A metric kind with no single statsd line, as the `metric_kind` tag on
@@ -676,8 +676,8 @@ impl FramedEncoder for StatsdEncoder {
 
                 if self.format == Format::Statsd {
                     // No `Format::Statsd` wire form. The walk above already counted this event's
-                    // attributes into `tags_dropped_dialect`; both counters rising is expected.
-                    stats.dropped_dialect_events += 1;
+                    // attributes into `tags_omitted_dialect`; both counters rising is expected.
+                    stats.skipped_dialect_events += 1;
                     continue;
                 }
 
@@ -723,7 +723,7 @@ impl FramedEncoder for StatsdEncoder {
 
             if is_service_check && self.format == Format::Statsd {
                 // No `Format::Statsd` wire form; drop before inspecting anything else.
-                stats.dropped_dialect_events += 1;
+                stats.skipped_dialect_events += 1;
                 continue;
             }
 
@@ -854,7 +854,7 @@ struct Carriers<'a> {
 /// Builds this event's DogStatsD tag segment into `suffix` (cleared first, **no** leading `|#`;
 /// [`append_tags`] adds that only if `suffix` is non-empty), walking [`crate::attrs::merged`]
 /// (event attributes override the resource's on key collision). Under [`Format::Statsd`] `suffix`
-/// stays empty and every would-be wire tag counts into `stats.tags_dropped_dialect`.
+/// stays empty and every would-be wire tag counts into `stats.tags_omitted_dialect`.
 ///
 /// Each tag goes through [`push_one_tag`], once per scalar attribute and once per **element** of a
 /// `Value::Array` (module doc's "Multi-value tags"). The same walk captures the `statsd.*` carriers
@@ -929,7 +929,7 @@ fn build_tag_suffix<'a>(
 
         if format == Format::Statsd {
             // Per wire tag: an `Array` counts once per element, an empty one not at all.
-            stats.tags_dropped_dialect += match value {
+            stats.tags_omitted_dialect += match value {
                 Value::Array(elements) => elements.len(),
                 _ => 1,
             };
@@ -953,7 +953,7 @@ fn build_tag_suffix<'a>(
 
 /// Appends one `key[:value]` wire tag to `suffix`, comma-separated, returning whether it did. On
 /// an empty key, a key that sanitizes to nothing, or a `value` [`tag_value`] can't render, it
-/// counts `stats.tags_dropped_unrepresentable` and leaves `suffix` **byte-identical to entry**,
+/// counts `stats.tags_omitted_unrepresentable` and leaves `suffix` **byte-identical to entry**,
 /// separator included, so an array whose every element drops leaves no stray `,`.
 ///
 /// Scalar tags and each `Array` element share this, so both get the same grammar, sanitization,
@@ -967,7 +967,7 @@ fn push_one_tag(
     stats: &mut EncodeStats,
 ) -> bool {
     if key_str.is_empty() {
-        stats.tags_dropped_unrepresentable += 1;
+        stats.tags_omitted_unrepresentable += 1;
         return false;
     }
     // `Bool(true)` is what `logit_proto::statsd::decode::parse_line` produces for a bare tag
@@ -975,7 +975,7 @@ fn push_one_tag(
     let bare = matches!(value, Value::Bool(true));
     let rendered_value = if bare { None } else { tag_value(scratch, value) };
     if !bare && rendered_value.is_none() {
-        stats.tags_dropped_unrepresentable += 1;
+        stats.tags_omitted_unrepresentable += 1;
         return false;
     }
 
@@ -989,7 +989,7 @@ fn push_one_tag(
         // Unreachable while substitution never shortens a non-empty key; a defensive guard that
         // rewinds to entry, separator included.
         suffix.truncate(restore_to);
-        stats.tags_dropped_unrepresentable += 1;
+        stats.tags_omitted_unrepresentable += 1;
         return false;
     }
     if let Some(v) = rendered_value {
@@ -1009,7 +1009,7 @@ fn append_tags(line: &mut String, tag_suffix: &str) {
 
 /// Appends `|c:<container-id>`, `|e:<external-data>`, `|card:<cardinality>`, then
 /// `|T<timestamp>` under [`Format::DogStatsd`], or counts each present field into
-/// `EncodeStats::dropped_dialect_fields` under [`Format::Statsd`]. Called after [`append_tags`] on
+/// `EncodeStats::omitted_dialect_fields` under [`Format::Statsd`]. Called after [`append_tags`] on
 /// every physical metric line, both lines of a negative-gauge pair included, since each is its own
 /// statsd line on the wire. `|T` is the carrier's wire seconds, never `event.timestamp` (module
 /// doc's "`|c:<container-id>` and `|T<timestamp>`").
@@ -1028,7 +1028,7 @@ fn append_dialect_extras(line: &mut String, ctx: &mut EncodeCtx) {
                 ctx.cardinality.is_some(),
                 ctx.timestamp_secs.is_some(),
             ];
-            ctx.stats.dropped_dialect_fields += present.iter().filter(|&&p| p).count();
+            ctx.stats.omitted_dialect_fields += present.iter().filter(|&&p| p).count();
         }
     }
 }
@@ -1118,7 +1118,7 @@ fn render_event(
             line.push_str(p);
         }
         Some(p) => {
-            ctx.stats.dropped_invalid_event_fields += 1;
+            ctx.stats.omitted_invalid_values += 1;
             ctx.diag.warn_throttled(
                 "invalid_event_field",
                 format_args!(
@@ -1135,7 +1135,7 @@ fn render_event(
             line.push_str(t);
         }
         Some(t) => {
-            ctx.stats.dropped_invalid_event_fields += 1;
+            ctx.stats.omitted_invalid_values += 1;
             ctx.diag.warn_throttled(
                 "invalid_event_field",
                 format_args!(
@@ -1284,7 +1284,7 @@ fn render_metric(
     }
 
     if metric.is_no_recorded_value() {
-        ctx.stats.dropped_no_recorded_value += 1;
+        ctx.stats.skipped_no_recorded_value += 1;
         ctx.diag.warn_throttled(
             "no_recorded_value",
             format_args!(
@@ -1625,7 +1625,7 @@ fn render_samples(
     let rate_valid = rate.is_finite() && rate > 0.0 && rate <= 1.0;
     let write_rate = rate != 1.0 && rate_valid;
     if rate != 1.0 && !rate_valid {
-        ctx.stats.dropped_unencodable_value += 1;
+        ctx.stats.omitted_invalid_values += 1;
         ctx.diag.warn_throttled(
             "unencodable_value",
             format_args!(
@@ -2003,79 +2003,35 @@ impl StatsdOutput {
     }
 }
 
-/// Counts one `encode_into` call's [`EncodeStats`].
+/// Counts one `encode_into` call's [`EncodeStats`]. Each name follows
+/// `docs/adr/telemetry-loss-vocabulary.md`: a line that should have left and didn't is
+/// `messages.dropped`, a line the dialect or a flagged point leaves nothing to write for is
+/// `messages.skipped`, and a field left off a line that is still sent is `fields.omitted`.
 fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     telemetry.count("logit.output.events.skipped", stats.skipped_no_metrics as f64, &[]);
-    telemetry.count(
-        "logit.output.messages.dropped",
-        stats.dropped_gauge_delta as f64,
-        &[("reason", "unresolved_gauge_delta")],
-    );
-    telemetry.count(
-        "logit.output.messages.dropped",
-        stats.dropped_no_recorded_value as f64,
-        &[("reason", "no_recorded_value")],
-    );
-    telemetry.count(
-        "logit.output.messages.dropped",
-        stats.dropped_unencodable_value as f64,
-        &[("reason", "unencodable_value")],
-    );
-    telemetry.count(
-        "logit.output.messages.dropped",
-        stats.dropped_empty_name as f64,
-        &[("reason", "empty_name")],
-    );
-    telemetry.count(
-        "logit.output.messages.dropped",
-        stats.dropped_oversize_line as f64,
-        &[("reason", "oversize_line")],
-    );
-    telemetry.count(
-        "logit.output.tags.dropped",
-        stats.tags_dropped_dialect as f64,
-        &[("reason", "dialect")],
-    );
-    telemetry.count(
-        "logit.output.tags.dropped",
-        stats.tags_dropped_unrepresentable as f64,
-        &[("reason", "unrepresentable")],
-    );
-    telemetry.count(
-        "logit.output.messages.dropped",
-        stats.dropped_dialect_fields as f64,
-        &[("reason", "dialect_field")],
-    );
-    telemetry.count(
-        "logit.output.messages.dropped",
-        stats.dropped_dialect_events as f64,
-        &[("reason", "dialect_event")],
-    );
-    telemetry.count(
-        "logit.output.messages.dropped",
-        stats.dropped_invalid_service_check as f64,
-        &[("reason", "invalid_service_check")],
-    );
-    telemetry.count(
-        "logit.output.messages.dropped",
-        stats.dropped_invalid_event_fields as f64,
-        &[("reason", "invalid_event_field")],
-    );
-    telemetry.count(
-        "logit.output.messages.normalized",
-        stats.type_normalized_dialect as f64,
-        &[("reason", "dialect")],
-    );
-    telemetry.count(
-        "logit.output.messages.normalized",
-        stats.members_sanitized as f64,
-        &[("reason", "member_sanitized")],
-    );
-    telemetry.count(
-        "logit.output.metrics.normalized",
-        stats.bool_values as f64,
-        &[("reason", "bool_value")],
-    );
+    let counts: [(&str, &str, usize); 14] = [
+        ("logit.output.messages.dropped", "unresolved_gauge_delta", stats.dropped_gauge_delta),
+        ("logit.output.messages.dropped", "unencodable_value", stats.dropped_unencodable_value),
+        ("logit.output.messages.dropped", "empty_name", stats.dropped_empty_name),
+        ("logit.output.messages.dropped", "oversize_line", stats.dropped_oversize_line),
+        (
+            "logit.output.messages.dropped",
+            "invalid_service_check",
+            stats.dropped_invalid_service_check,
+        ),
+        ("logit.output.messages.skipped", "no_recorded_value", stats.skipped_no_recorded_value),
+        ("logit.output.messages.skipped", "dialect", stats.skipped_dialect_events),
+        ("logit.output.fields.omitted", "dialect", stats.omitted_dialect_fields),
+        ("logit.output.fields.omitted", "invalid_value", stats.omitted_invalid_values),
+        ("logit.output.tags.omitted", "dialect", stats.tags_omitted_dialect),
+        ("logit.output.tags.omitted", "unrepresentable", stats.tags_omitted_unrepresentable),
+        ("logit.output.messages.normalized", "dialect", stats.type_normalized_dialect),
+        ("logit.output.messages.normalized", "member_sanitized", stats.members_sanitized),
+        ("logit.output.metrics.normalized", "bool_value", stats.bool_values),
+    ];
+    for (name, reason, n) in counts {
+        telemetry.count(name, n as f64, &[("reason", reason)]);
+    }
     for (metric_kind, n) in stats.skipped_kinds.tagged() {
         telemetry.count("logit.output.metrics.skipped", n as f64, &[("metric_kind", metric_kind)]);
     }
@@ -2362,10 +2318,10 @@ mod tests {
         assert_eq!(stats.skipped_no_metrics, 1);
     }
 
-    /// A plain log line counts only `skipped_no_metrics`, not `tags_dropped_dialect` too, which a
+    /// A plain log line counts only `skipped_no_metrics`, not `tags_omitted_dialect` too, which a
     /// `syslog_in -> statsd_out` relay would otherwise inflate on every line.
     #[test]
-    fn a_plain_log_event_under_statsd_is_skipped_without_touching_tags_dropped_dialect() {
+    fn a_plain_log_event_under_statsd_is_skipped_without_touching_tags_omitted_dialect() {
         let mut attributes = AttrMap::new();
         attributes.insert("host", "web1");
         attributes.insert("env", "prod");
@@ -2386,7 +2342,7 @@ mod tests {
         let (msgs, stats) = encode_with_format(vec![event], Format::Statsd);
         assert!(msgs.is_empty());
         assert_eq!(stats.skipped_no_metrics, 1);
-        assert_eq!(stats.tags_dropped_dialect, 0);
+        assert_eq!(stats.tags_omitted_dialect, 0);
     }
 
     #[test]
@@ -2449,7 +2405,7 @@ mod tests {
             Format::Statsd,
         );
         assert_eq!(msgs[0], "hits:1|c");
-        assert_eq!(stats.tags_dropped_dialect, 1);
+        assert_eq!(stats.tags_omitted_dialect, 1);
     }
 
     // -- Multi-value tags (a repeated tag key) ---------------------------------------------------
@@ -2540,7 +2496,7 @@ mod tests {
         )]);
         assert_eq!(msgs[0], "hits:1|c|#team:a");
         assert_eq!(
-            stats.tags_dropped_unrepresentable, 3,
+            stats.tags_omitted_unrepresentable, 3,
             "the counter's unit is a wire tag: `Null`, `Map` and a nested `Array` each cost one"
         );
     }
@@ -2553,7 +2509,7 @@ mod tests {
             &[("team", Value::Array(vec![Value::Null, Value::Timestamp(1)]))],
         )]);
         assert_eq!(msgs[0], "hits:1|c", "no `|#`, and no stray `,` inside one either");
-        assert_eq!(stats.tags_dropped_unrepresentable, 2);
+        assert_eq!(stats.tags_omitted_unrepresentable, 2);
     }
 
     #[test]
@@ -2578,7 +2534,7 @@ mod tests {
             assert!(!push_one_tag(&mut suffix, &mut scratch, "team", &element, &mut stats));
         }
         assert_eq!(suffix, "env:prod");
-        assert_eq!(stats.tags_dropped_unrepresentable, 2);
+        assert_eq!(stats.tags_omitted_unrepresentable, 2);
     }
 
     /// No encode-side dedupe (module doc's "Multi-value tags").
@@ -2631,7 +2587,7 @@ mod tests {
         );
         assert_eq!(msgs[0], "hits:1|c");
         assert_eq!(
-            stats.tags_dropped_dialect, 2,
+            stats.tags_omitted_dialect, 2,
             "the counter's unit is a wire tag, so a two-element array costs two, not one"
         );
 
@@ -2643,7 +2599,7 @@ mod tests {
             )],
             Format::Statsd,
         );
-        assert_eq!(stats.tags_dropped_dialect, 0);
+        assert_eq!(stats.tags_omitted_dialect, 0);
     }
 
     // -- Sanitization ---------------------------------------------------------------------------
@@ -2700,7 +2656,7 @@ mod tests {
         flagged.metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         let (msgs, stats) = encode(vec![flagged]);
         assert!(msgs.is_empty(), "a flagged point must not be written at all: {msgs:?}");
-        assert_eq!(stats.dropped_no_recorded_value, 1);
+        assert_eq!(stats.skipped_no_recorded_value, 1);
     }
 
     #[test]
@@ -3027,8 +2983,8 @@ mod tests {
             ["d.count:2|c", "d.sum:3|c", "d.min:1|g", "d.max:2|g"].map(String::from).to_vec();
         expected.extend(quantile_lines("d", &sketch, ""));
         assert_eq!(msgs, expected);
-        assert_eq!(stats.tags_dropped_dialect, 1, "one wire tag, counted once per event");
-        assert_eq!(stats.dropped_dialect_fields, 18, "two extras on each of nine lines");
+        assert_eq!(stats.tags_omitted_dialect, 1, "one wire tag, counted once per event");
+        assert_eq!(stats.omitted_dialect_fields, 18, "two extras on each of nine lines");
     }
 
     #[test]
@@ -3269,6 +3225,51 @@ mod tests {
         }
     }
 
+    /// Every [`EncodeStats`] count lands on its own name and reason, the loss vocabulary's split
+    /// of what was one `messages.dropped` counter: a distinct value per field shows a count moved
+    /// to the wrong row, and the old names stay empty.
+    #[test]
+    fn report_encode_stats_names_each_count_per_the_loss_vocabulary() {
+        let stats = EncodeStats {
+            dropped_gauge_delta: 1,
+            dropped_unencodable_value: 2,
+            dropped_empty_name: 3,
+            dropped_oversize_line: 4,
+            dropped_invalid_service_check: 5,
+            skipped_no_recorded_value: 6,
+            skipped_dialect_events: 7,
+            omitted_dialect_fields: 8,
+            omitted_invalid_values: 9,
+            tags_omitted_dialect: 10,
+            tags_omitted_unrepresentable: 11,
+            ..EncodeStats::default()
+        };
+        let mut probe = TelemetryProbe::new();
+        report_encode_stats(&probe.telemetry("out", "statsd_out", "sink"), &stats);
+        let expected: [(&str, &str, f64); 11] = [
+            ("logit.output.messages.dropped", "unresolved_gauge_delta", 1.0),
+            ("logit.output.messages.dropped", "unencodable_value", 2.0),
+            ("logit.output.messages.dropped", "empty_name", 3.0),
+            ("logit.output.messages.dropped", "oversize_line", 4.0),
+            ("logit.output.messages.dropped", "invalid_service_check", 5.0),
+            ("logit.output.messages.skipped", "no_recorded_value", 6.0),
+            ("logit.output.messages.skipped", "dialect", 7.0),
+            ("logit.output.fields.omitted", "dialect", 8.0),
+            ("logit.output.fields.omitted", "invalid_value", 9.0),
+            ("logit.output.tags.omitted", "dialect", 10.0),
+            ("logit.output.tags.omitted", "unrepresentable", 11.0),
+        ];
+        for (name, reason, n) in expected {
+            assert_eq!(probe.sum(name, &[("reason", reason)]), n, "{name}{{reason={reason}}}");
+        }
+        assert_eq!(probe.sum("logit.output.messages.dropped", &[]), 15.0, "only the five losses");
+        assert_eq!(probe.sum("logit.output.tags.dropped", &[]), 0.0);
+        for reason in ["no_recorded_value", "dialect_event", "dialect_field", "invalid_event_field"]
+        {
+            assert_eq!(probe.sum("logit.output.messages.dropped", &[("reason", reason)]), 0.0);
+        }
+    }
+
     #[test]
     fn skip_warns_unsupported_metric_kind_and_expand_warns_nothing() {
         for (multi_value, warned) in [(MultiValue::Skip, true), (MultiValue::Expand, false)] {
@@ -3398,7 +3399,8 @@ mod tests {
         samples.sample_rate = -1.0;
         let (msgs, stats) = encode(vec![metric_event("timer", MetricKind::Samples(samples), &[])]);
         assert_eq!(msgs, vec!["timer:1|ms"]);
-        assert_eq!(stats.dropped_unencodable_value, 1);
+        assert_eq!(stats.omitted_invalid_values, 1);
+        assert_eq!(stats.dropped_unencodable_value, 0, "the line is still sent");
     }
 
     #[test]
@@ -3618,7 +3620,7 @@ mod tests {
             Format::Statsd,
         );
         assert_eq!(msgs, vec!["hits:1|c"]);
-        assert_eq!(stats.dropped_dialect_fields, 2);
+        assert_eq!(stats.omitted_dialect_fields, 2);
     }
 
     #[test]
@@ -3695,7 +3697,7 @@ mod tests {
             Format::Statsd,
         );
         assert_eq!(msgs, vec!["hits:1|c"]);
-        assert_eq!(stats.dropped_dialect_fields, 4);
+        assert_eq!(stats.omitted_dialect_fields, 4);
     }
 
     /// Cardinality is sanitized as a tag value. External data keeps its own `,` separators (and
@@ -3841,7 +3843,7 @@ mod tests {
         let (msgs, stats) = encode(vec![event]);
         assert_eq!(msgs, vec!["_e{1,1}:t|x"]);
         // A dropped field on an emitted line, not a dropped message.
-        assert_eq!(stats.dropped_invalid_event_fields, 1);
+        assert_eq!(stats.omitted_invalid_values, 1);
         assert_eq!(stats.dropped_unencodable_value, 0);
     }
 
@@ -3851,7 +3853,7 @@ mod tests {
             event_line_event("t", "x", &[("statsd.event.alert_type", Value::str("critical"))]);
         let (msgs, stats) = encode(vec![event]);
         assert_eq!(msgs, vec!["_e{1,1}:t|x"]);
-        assert_eq!(stats.dropped_invalid_event_fields, 1);
+        assert_eq!(stats.omitted_invalid_values, 1);
         assert_eq!(stats.dropped_unencodable_value, 0);
     }
 
@@ -4071,18 +4073,18 @@ mod tests {
         let sc = service_check_event("chk", MetricKind::gauge(0.0), &[]);
         let (msgs, stats) = encode_with_format(vec![ev, sc], Format::Statsd);
         assert!(msgs.is_empty());
-        assert_eq!(stats.dropped_dialect_events, 2);
+        assert_eq!(stats.skipped_dialect_events, 2);
     }
 
     /// Unlike a plain log line, a real event ran the full walk, so both counters rise (module
     /// doc's "DogStatsD events and service checks" section).
     #[test]
-    fn a_real_event_dropped_under_statsd_also_tallies_its_tags_into_tags_dropped_dialect() {
+    fn a_real_event_skipped_under_statsd_also_tallies_its_tags_into_tags_omitted_dialect() {
         let ev = event_line_event("t", "x", &[("env", "prod".into())]);
         let (msgs, stats) = encode_with_format(vec![ev], Format::Statsd);
         assert!(msgs.is_empty());
-        assert_eq!(stats.dropped_dialect_events, 1);
-        assert_eq!(stats.tags_dropped_dialect, 1);
+        assert_eq!(stats.skipped_dialect_events, 1);
+        assert_eq!(stats.tags_omitted_dialect, 1);
     }
 
     // -- Packing and framing ------------------------------------------------------------------
@@ -5957,7 +5959,7 @@ mod tests {
 
     const ENCODE_SIDE: [(&str, &[(&str, &str)]); 5] = [
         ("logit.output.messages.dropped", &[("reason", "unresolved_gauge_delta")]),
-        ("logit.output.tags.dropped", &[("reason", "unrepresentable")]),
+        ("logit.output.tags.omitted", &[("reason", "unrepresentable")]),
         ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
         ("logit.output.metrics.degraded", &[("metric_kind", "distribution")]),
         ("logit.output.batch.bytes", &[]),

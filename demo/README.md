@@ -157,7 +157,7 @@ Two things differ from the metric names in `logit.yaml`, and the dashboard's Pro
 Prometheus spelling:
 
 - Dots become underscores, and a counter gains `_total`: `web.requests` is `web_requests_total`.
-- The `aggregate` runs with `temporality: cumulative`, because `prometheus_out` skips a delta
+- The `aggregate` runs with `temporality: cumulative`, because `prometheus_out` drops a delta
   counter. A distribution such as `web.request_time` becomes a summary:
   `web_request_time{quantile="0.5"}` through `{quantile="0.99"}`, one per 10-second window.
 

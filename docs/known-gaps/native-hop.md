@@ -85,7 +85,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **The disk-backed sink spool has an accepted power-loss window.** Every cursor write is
   `fsync`ed (tmp file, then directory); a segment is `fsync`ed only when it rotates away and at
   shutdown, not per push (the ADR's "Durability" section and its amendment). A power loss, though
-  not a process crash, can lose the active segment's most recent un-`fsync`ed writes. A
+  not a process crash, can lose the active segment's most recent un-`fsync`ed writes. Of those,
+  the next open counts only a torn final record, as `batches.dropped{reason="disk_torn"}`; records
+  lost whole leave no bytes and aren't counted. The same count can also include a batch already
+  counted: a write that failed and was counted `disk_full` or `disk_io_error`, if no later push
+  repaired its bytes before the process exited, or a record delivered and committed after the
+  last cursor persist (every `checkpoint_interval`) whose bytes the power loss tore. A
   `disk.sync: every_push` knob that closes the window at a throughput cost is a plausible
   follow-up, not built.
 - **No spool sharing, compaction, or encryption for the disk-backed sink buffer.** Each sink gets
@@ -106,7 +111,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `influxdb_out`, and so on), nothing tracks whether the data survives that delivery, and any
     non-`logit_out` sink's `send` means only "the immediate destination accepted the write". The
     receive side is attributable (`logit.component.datagrams.dropped`,
-    `logit.input.kernel.drops`;
+    `logit.input.kernel.dropped`;
     [ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)).
   - [ADR `delivery-semantics`](../adr/delivery-semantics.md), item 3, makes end-to-end
     acknowledgment a non-goal: an input's acknowledgment means accepted into the pipeline, and

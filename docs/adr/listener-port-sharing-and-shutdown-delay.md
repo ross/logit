@@ -1,6 +1,6 @@
 ---
 created: 2026-10-07
-updated: 2026-10-07
+updated: 2026-10-13
 ---
 
 # Listener port sharing with `SO_REUSEPORT`, a SIGTERM drain delay, and an admin Unix socket
@@ -270,3 +270,8 @@ not defended.
   gains the delay.
 - An operator running an overlap accepts split summaries, duplicated multicast, and a split
   Prometheus exposition for its duration, and sizes the termination grace for delay plus drain.
+
+## Amendment (2026-10-13): `kernel.dropped`
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the kernel's per-socket counter this record cites as `logit.input.kernel.drops` is
+`logit.input.kernel.dropped{reason="socket"}`.

@@ -62,8 +62,8 @@
 //! | `fields` object | event attributes (a span's: resource attributes), each value typed as [`crate::json`] converts it, a nested map flattened to dotted keys by [`crate::json::flatten_into`] (an empty map dropped, an array holding a container as its JSON text) | -- |
 //! | objects with an equal resource | one batch, in first-appearance order | -- |
 //! | `event` absent or `null`, with a `metric_name:<n>` field or both `metric_name` and `_value` | a metric event ([`metrics`]), as Splunk indexes it | see [`metrics`] |
-//! | `event` absent or `null` otherwise | skipped; the rest delivered | `logit.input.events.skipped{reason="no_event"}` |
-//! | `event` `""` | skipped; the rest delivered | `skipped{reason="blank_event"}` |
+//! | `event` absent or `null` otherwise | dropped; the rest delivered | `logit.input.events.dropped{reason="no_event"}` |
+//! | `event` `""` | dropped; the rest delivered | `dropped{reason="blank_event"}` |
 //! | `event` `"metric"` with a `metric_name:<n>` field, or both `metric_name` and `_value` | a metric event ([`metrics`]) | see [`metrics`] |
 //! | `event` an object carrying valid `trace_id`, `span_id`, `start_time`, `end_time` | a span event ([`spans`]) | see [`spans`] |
 //! | any other `event` | a log event ([`logs`]) | see [`logs`] |
@@ -82,7 +82,7 @@
 //! | Model | Wire | Counter |
 //! |---|---|---|
 //! | `Event::timestamp` (a span's: its start) | `time`, seconds with up to nine decimals ([`time::write_hec_time`]) | -- |
-//! | a carrier that isn't a `Str` | omitted | `logit.output.tags.dropped{reason="unrepresentable"}`, once per batch |
+//! | a carrier that isn't a `Str` | omitted | `logit.output.tags.omitted{reason="unrepresentable"}`, once per batch |
 //! | every other resource attribute, then every event attribute (the event's winning on a key) | `fields`, a `Map` flattened to dotted keys by [`crate::json::flatten_into`] (a span's event attributes go in its `attributes` instead) | -- |
 //! | an event with no log, metric, or span | nothing | `logit.output.events.skipped{reason="no_payload"}` |
 //!
@@ -404,8 +404,8 @@ impl SplunkDecoder {
                 }
                 return;
             }
-            None | Some(Json::Null) => return self.skip_event("no_event"),
-            Some(Json::String(s)) if s.is_empty() => return self.skip_event("blank_event"),
+            None | Some(Json::Null) => return self.undecoded(Undecoded::NoEvent),
+            Some(Json::String(s)) if s.is_empty() => return self.undecoded(Undecoded::BlankEvent),
             Some(event) => event,
         };
 
@@ -493,8 +493,96 @@ impl SplunkDecoder {
         self.telemetry.count("logit.input.events.degraded", 1.0, &[("reason", reason)]);
     }
 
-    fn skip_event(&self, reason: &'static str) {
-        self.telemetry.count("logit.input.events.skipped", 1.0, &[("reason", reason)]);
+    pub(super) fn undecoded(&self, why: Undecoded) {
+        let (metric, reason) = why.counter();
+        self.telemetry.count(metric, 1.0, &[("reason", reason)]);
+    }
+}
+
+/// Every object or measurement the decoder leaves out of its batches, and the counter and reason
+/// each one is counted under. Malformed input is loss (`dropped`); a metric event with nothing
+/// left to carry is `skipped`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Undecoded {
+    NoEvent,
+    BlankEvent,
+    NoMetric,
+    BadName,
+    BadValue,
+    DuplicateName,
+    IncompleteSingleMetric,
+}
+
+impl Undecoded {
+    #[cfg(test)]
+    const ALL: [Self; 7] = [
+        Self::NoEvent,
+        Self::BlankEvent,
+        Self::NoMetric,
+        Self::BadName,
+        Self::BadValue,
+        Self::DuplicateName,
+        Self::IncompleteSingleMetric,
+    ];
+
+    fn counter(self) -> (&'static str, &'static str) {
+        const EVENTS_DROPPED: &str = "logit.input.events.dropped";
+        const METRICS_DROPPED: &str = "logit.input.metrics.dropped";
+        match self {
+            Self::NoEvent => (EVENTS_DROPPED, "no_event"),
+            Self::BlankEvent => (EVENTS_DROPPED, "blank_event"),
+            Self::NoMetric => ("logit.input.events.skipped", "no_metric"),
+            Self::BadName => (METRICS_DROPPED, "bad_name"),
+            Self::BadValue => (METRICS_DROPPED, "bad_value"),
+            Self::DuplicateName => (METRICS_DROPPED, "duplicate_name"),
+            Self::IncompleteSingleMetric => (METRICS_DROPPED, "incomplete_single_metric"),
+        }
+    }
+}
+
+/// Every object or record the encoder leaves off the wire, and the counter and tag each one is
+/// counted under. A gap the destination can't take or an upstream stage didn't resolve is loss
+/// (`dropped`); a kind the format has no form for, the operator's `multi_value: skip`, or a record
+/// with nothing to carry is `skipped`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unencoded {
+    /// An event with no log, metric, or span.
+    NoPayload,
+    /// A log whose message HEC would reject as a blank `event`.
+    BlankEvent,
+    /// A record flagged `NO_RECORDED_VALUE`.
+    NoRecordedValue,
+    /// A `GaugeDelta` no `aggregate` upstream resolved.
+    UnresolvedGaugeDelta,
+    /// A metric name another record of the same object already wrote.
+    DuplicateName,
+    /// A kind HEC has no form for, or one `MultiValue::Skip` leaves out, by its
+    /// [`MetricKind::name`](logit_core::MetricKind::name).
+    Kind(&'static str),
+}
+
+impl Unencoded {
+    #[cfg(test)]
+    const ALL: [Self; 6] = [
+        Self::NoPayload,
+        Self::BlankEvent,
+        Self::NoRecordedValue,
+        Self::UnresolvedGaugeDelta,
+        Self::DuplicateName,
+        Self::Kind("histogram"),
+    ];
+
+    fn counter(self) -> (&'static str, (&'static str, &'static str)) {
+        const METRICS_DROPPED: &str = "logit.output.metrics.dropped";
+        const METRICS_SKIPPED: &str = "logit.output.metrics.skipped";
+        match self {
+            Self::NoPayload => ("logit.output.events.skipped", ("reason", "no_payload")),
+            Self::BlankEvent => ("logit.output.events.dropped", ("reason", "blank_event")),
+            Self::NoRecordedValue => (METRICS_SKIPPED, ("reason", "no_recorded_value")),
+            Self::UnresolvedGaugeDelta => (METRICS_DROPPED, ("reason", "unresolved_gauge_delta")),
+            Self::DuplicateName => (METRICS_DROPPED, ("reason", "duplicate_name")),
+            Self::Kind(kind) => (METRICS_SKIPPED, ("metric_kind", kind)),
+        }
     }
 }
 
@@ -733,7 +821,7 @@ impl SplunkEncoder {
         let (envelope, unrepresentable) = Envelope::from_resource(&batch.resource);
         if unrepresentable > 0 {
             self.telemetry.count(
-                "logit.output.tags.dropped",
+                "logit.output.tags.omitted",
                 unrepresentable as f64,
                 &[("reason", "unrepresentable")],
             );
@@ -741,11 +829,7 @@ impl SplunkEncoder {
         let ctx = BatchContext { envelope, resource: &batch.resource };
         for (event_index, event) in batch.events.iter().enumerate() {
             if event.log.is_none() && event.metrics.is_empty() && event.span.is_none() {
-                self.telemetry.count(
-                    "logit.output.events.skipped",
-                    1.0,
-                    &[("reason", "no_payload")],
-                );
+                self.unencoded(Unencoded::NoPayload, 1);
                 continue;
             }
             if let Some(log) = &event.log {
@@ -775,14 +859,19 @@ impl SplunkEncoder {
         fields
     }
 
-    fn reserved_key_dropped(&self, n: usize) {
+    fn reserved_key_omitted(&self, n: usize) {
         if n > 0 {
             self.telemetry.count(
-                "logit.output.tags.dropped",
+                "logit.output.tags.omitted",
                 n as f64,
                 &[("reason", "reserved_key")],
             );
         }
+    }
+
+    pub(super) fn unencoded(&self, why: Unencoded, n: usize) {
+        let (metric, tag) = why.counter();
+        self.telemetry.count(metric, n as f64, &[tag]);
     }
 }
 
@@ -975,9 +1064,9 @@ pub(crate) mod tests {
         let prefix = decoder(&registry).decode_events_prefix(body.as_bytes(), RECEIVED_AT);
         assert_eq!(prefix.error.and_then(|e| e.invalid_event_number), Some(3));
         let hosts: Vec<usize> = prefix.batches.iter().map(|b| b.events.len()).collect();
-        assert_eq!(hosts, [1, 1], "h1's a, then h2's b; the blank object skipped");
+        assert_eq!(hosts, [1, 1], "h1's a, then h2's b; the blank object dropped");
         assert_eq!(
-            counted(&registry, "logit.input.events.skipped", ("reason", "blank_event")),
+            counted(&registry, "logit.input.events.dropped", ("reason", "blank_event")),
             1.0,
             "the blank object after the error isn't decoded"
         );
@@ -1047,11 +1136,12 @@ pub(crate) mod tests {
         for reason in ["non_string_envelope", "unknown_envelope_key", "bad_fields", "bad_time"] {
             assert_eq!(counted(&registry, "logit.input.events.degraded", ("reason", reason)), 1.0);
         }
-        assert_eq!(counted(&registry, "logit.input.events.skipped", ("reason", "no_event")), 2.0);
+        assert_eq!(counted(&registry, "logit.input.events.dropped", ("reason", "no_event")), 2.0);
         assert_eq!(
-            counted(&registry, "logit.input.events.skipped", ("reason", "blank_event")),
+            counted(&registry, "logit.input.events.dropped", ("reason", "blank_event")),
             1.0
         );
+        assert_eq!(counted(&registry, "logit.input.events.skipped", ("reason", "no_event")), 0.0);
     }
 
     #[test]
@@ -1109,7 +1199,7 @@ pub(crate) mod tests {
         encoder(&registry).encode_objects(&batch, &mut out);
         assert_eq!(out.iter().next().unwrap(), br#"{"time":1,"host":"h","event":"a"}"#);
         assert_eq!(
-            counted(&registry, "logit.output.tags.dropped", ("reason", "unrepresentable")),
+            counted(&registry, "logit.output.tags.omitted", ("reason", "unrepresentable")),
             1.0
         );
     }
@@ -1129,5 +1219,28 @@ pub(crate) mod tests {
             counted(&registry, "logit.output.events.skipped", ("reason", "no_payload")),
             1.0
         );
+    }
+
+    /// Loss is `*.dropped` tagged `reason`, and nothing else is: the classification each variant
+    /// carries, pinned so a new variant has to take a side.
+    #[test]
+    fn every_loss_is_counted_dropped_and_nothing_else_is() {
+        for why in Undecoded::ALL {
+            let (metric, reason) = why.counter();
+            let loss = !matches!(why, Undecoded::NoMetric);
+            assert_eq!(metric.ends_with(".dropped"), loss, "{why:?}: {metric}");
+            assert!(!loss || metric.starts_with("logit.input."), "{why:?}: {metric}");
+            assert!(!reason.contains("dropped") && !reason.contains("skipped"), "{why:?}");
+        }
+        for why in Unencoded::ALL {
+            let (metric, (key, value)) = why.counter();
+            let loss = matches!(
+                why,
+                Unencoded::BlankEvent | Unencoded::UnresolvedGaugeDelta | Unencoded::DuplicateName
+            );
+            assert_eq!(metric.ends_with(".dropped"), loss, "{why:?}: {metric}");
+            assert!(!loss || key == "reason", "{why:?}: a loss is tagged reason, not {key}");
+            assert!(!value.contains("dropped") && !value.contains("skipped"), "{why:?}");
+        }
     }
 }

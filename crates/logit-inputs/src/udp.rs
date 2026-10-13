@@ -19,7 +19,7 @@
 //! `dogstatsd_socket`) and drives it through the same read loop, queue, and decode loop, over the
 //! [`DatagramSocket`] seam. What differs is the bind ([`crate::unix`]) and what the kernel counters
 //! mean: on `AF_UNIX` a full receive queue makes the *sender's* `send` block or fail with `EAGAIN`
-//! rather than dropping in the kernel, so `logit.input.kernel.drops` stays at zero there and the
+//! rather than dropping in the kernel, so `logit.input.kernel.dropped` stays at zero there and the
 //! loss, if any, is the client's to count (`net/unix/af_unix.c`, `unix_dgram_sendmsg`).
 //!
 //! **Peer address.** With [`UdpListener::with_peer`] on, the read half records each datagram's
@@ -79,6 +79,24 @@ pub static RECEIVE_QUEUE_METRICS: QueueMetrics = QueueMetrics {
     items_dropped: "logit.component.datagrams.dropped",
     units_dropped: "logit.component.bytes.dropped",
 };
+
+/// A frame a listener read and lost before it became events, by `reason`. On a datagram transport
+/// the frame is the datagram, so a datagram counted here has its `receive.latency` sample and sits
+/// outside `logit.component.datagrams.dropped`.
+pub const FRAMES_DROPPED: &str = "logit.input.frames.dropped";
+
+/// The [`FRAMES_DROPPED`] reason for a frame its decoder rejected whole: this driver's
+/// `bad_datagram` and the stream driver's `bad_frame`.
+pub const UNDECODABLE: &str = "undecodable";
+
+/// The `reason` on [`RECEIVE_QUEUE_METRICS`]' two `*.dropped` names for a datagram the kernel
+/// truncated (`MSG_TRUNC`), which the read side counts and never queues.
+const TRUNCATED: &str = "truncated";
+
+/// Datagrams the kernel discarded before a read returned them, by `reason`: today only `socket`,
+/// the socket's own `SK_MEMINFO_DROPS`. Apart from `logit.component.datagrams.dropped`, because
+/// none of them was ever read, so none is in `logit.input.datagrams`.
+pub const KERNEL_DROPPED: &str = "logit.input.kernel.dropped";
 
 pub type ReceiveQueue = BoundedQueue<Datagram>;
 
@@ -156,9 +174,9 @@ impl UdpListenerConfig {
 /// **It is not the largest payload a UDP datagram can carry.** IPv6's payload-length field
 /// excludes the 40-byte header, so an IPv6 UDP datagram may carry up to 65,527 bytes, 20 more than
 /// this. The kernel copies such a datagram up to this bound and discards the rest; [`BatchReader`]
-/// sees that happen (`MSG_TRUNC` in the returned `msg_flags`) and counts it as
-/// `logit.input.datagrams.truncated`. Jumbograms (RFC 2675, past 65,535) are a separate thing, and
-/// no mainstream kernel's UDP path supports them.
+/// sees that happen (`MSG_TRUNC` in the returned `msg_flags`) and drops the datagram, counted
+/// `logit.component.datagrams.dropped{reason="truncated"}`. Jumbograms (RFC 2675, past 65,535)
+/// are a separate thing, and no mainstream kernel's UDP path supports them.
 const MAX_DATAGRAM_BYTES: usize = 65_507;
 
 /// The largest `receive.read_batch` this driver accepts. Graph rule 57 rejects a larger value
@@ -814,9 +832,10 @@ fn report_receive_buffer(
 /// are unbiased: see `docs/design/pipeline-graph.md`'s "Cancellation points".
 ///
 /// **Telemetry is per batch, not per datagram.** One [`BatchReader::read_batch`] call is one
-/// `logit.input.reads`, one `logit.input.datagrams` of however many it returned, one
+/// `logit.input.reads`, one `logit.input.datagrams` of however many it read, one
 /// `logit.input.datagram.bytes` of their total, and, only when nonzero, one
-/// `logit.input.datagrams.truncated`. `datagrams / reads` is the mean fill of the syscall batch: a
+/// `logit.component.datagrams.dropped`/`bytes.dropped{reason="truncated"}` pair for the datagrams
+/// it read truncated and never queued. `datagrams / reads` is the mean fill of the syscall batch: a
 /// fill pinned at `read_batch` says the knob is the limit; a fill near 1 says the traffic never
 /// batches and the knob is irrelevant. Per batch because each count takes `ComponentBuffer`'s
 /// mutex, which `decode_loop` contends for from the other side of the same component.
@@ -853,13 +872,22 @@ async fn read_loop<S: DatagramSocket>(
         if let Err(err) = read {
             return Err(describe_read_failure(socket, err));
         }
+        // A truncated datagram was read but never queued: it counts toward `input.datagrams` and
+        // `datagrams.dropped` both, so the listener identity holds with no `receive.latency`
+        // sample for it.
+        let (truncated, truncated_bytes) = reader.truncated();
         let bytes: usize = half.batch.iter().map(|datagram| datagram.bytes.len()).sum();
         telemetry.count("logit.input.reads", 1.0, &[]);
-        telemetry.count("logit.input.datagrams", half.batch.len() as f64, &[]);
-        telemetry.count("logit.input.datagram.bytes", bytes as f64, &[]);
-        let truncated = reader.truncated();
+        telemetry.count("logit.input.datagrams", (half.batch.len() as u64 + truncated) as f64, &[]);
+        telemetry.count(
+            "logit.input.datagram.bytes",
+            (bytes as u64).saturating_add(truncated_bytes) as f64,
+            &[],
+        );
         if truncated > 0 {
-            telemetry.count("logit.input.datagrams.truncated", truncated as f64, &[]);
+            let tags = [("reason", TRUNCATED)];
+            telemetry.count(RECEIVE_QUEUE_METRICS.items_dropped, truncated as f64, &tags);
+            telemetry.count(RECEIVE_QUEUE_METRICS.units_dropped, truncated_bytes as f64, &tags);
         }
         // Unbiased: `half.batch` may still be full on return (see [`ReadHalf`]).
         tokio::select! {
@@ -1058,14 +1086,15 @@ const _: () = {
 /// allocations each time. Rebuilding is a short loop of stores with no allocation.
 /// [`assert_batch_read_future_is_send`] pins the property at compile time.
 ///
-/// **`MSG_TRUNC` is detected and counted.** Each slot is [`MAX_DATAGRAM_BYTES`], which covers
-/// every IPv4 datagram but not the largest IPv6 one, so on an IPv6 listener the kernel can copy
-/// what fits and discard the rest. `msg_len` can't show it: it's the copied length, so it reads
-/// `MAX_DATAGRAM_BYTES`, the same as a datagram that fit precisely. The kernel reports it in
-/// `msg_hdr.msg_flags` instead. Each one is counted as `logit.input.datagrams.truncated`, and the
-/// truncated payload is still delivered. Growing the slots to 65,527 isn't worth 20 bytes x
-/// `read_batch` of address space and a constant that stops matching every other 65,507 in the
-/// codebase, for a case only a jumbo IPv6 sender produces.
+/// **`MSG_TRUNC` is detected, and the datagram dropped.** Each slot is [`MAX_DATAGRAM_BYTES`],
+/// which covers every IPv4 datagram but not the largest IPv6 one, so on an IPv6 listener the kernel
+/// can copy what fits and discard the rest. `msg_len` can't show it: it's the copied length, so it
+/// reads `MAX_DATAGRAM_BYTES`, the same as a datagram that fit precisely. The kernel reports it in
+/// `msg_hdr.msg_flags` instead. A truncated payload is never decoded, since a decoder would read
+/// its cut tail as a malformed or, worse, a shorter valid message; [`read_loop`] counts it as
+/// `logit.component.datagrams.dropped{reason="truncated"}`. Growing the slots to 65,527 isn't
+/// worth 20 bytes x `read_batch` of address space and a constant that stops matching every other
+/// 65,507 in the codebase, for a case only a jumbo IPv6 sender produces.
 #[cfg(target_os = "linux")]
 struct BatchReader {
     /// `vlen` contiguous [`MAX_DATAGRAM_BYTES`] slots, one per `iovec`, allocated once. Its virtual
@@ -1082,9 +1111,10 @@ struct BatchReader {
     /// Each returned message's `msg_hdr.msg_flags`, copied out the same way. Only
     /// [`libc::MSG_TRUNC`] is read; the other flags describe conditions this path can't produce.
     flags: Vec<i32>,
-    /// How many datagrams the last `read_batch` call truncated. Reset per call: [`read_loop`]
-    /// reports it once per batch.
+    /// How many datagrams the last `read_batch` call read truncated and dropped, and their copied
+    /// bytes. Reset per call: [`read_loop`] reports them once per batch.
     truncated: u64,
+    truncated_bytes: u64,
     /// Under `peer:`, backing words for one `sockaddr_storage` per header, which the kernel fills
     /// with that message's source address. `None` with `peer` off: every `msg_name` stays NULL.
     names: Option<Vec<u64>>,
@@ -1106,6 +1136,7 @@ impl BatchReader {
             lens: vec![0u32; vlen],
             flags: vec![0i32; vlen],
             truncated: 0,
+            truncated_bytes: 0,
             names: peer.then(|| vec![0u64; vlen * NAME_WORDS]),
             name_lens: if peer { vec![0u32; vlen] } else { Vec::new() },
             last_unix: None,
@@ -1114,7 +1145,8 @@ impl BatchReader {
     }
 
     /// Waits for the socket to be readable, then takes up to `vlen` datagrams off it in one
-    /// `recvmmsg(2)` and appends them to `out`. Returns how many it appended.
+    /// `recvmmsg(2)` and appends every one that wasn't truncated to `out`. Returns how many it
+    /// appended.
     ///
     /// **One `now_nanos()` per syscall, offset by the datagram's index within the batch**, the
     /// named accuracy concession in ADR `udp-intake-batching-and-socket-visibility`. This path
@@ -1138,8 +1170,7 @@ impl BatchReader {
     /// **A zero-length datagram is legal UDP and is delivered as one**: an empty `Bytes`, counted
     /// like any other. What it means is the decoder's business.
     ///
-    /// **A truncated datagram is delivered too**, as far as it was copied, and counted (see
-    /// [`BatchReader::truncated`]).
+    /// **A truncated datagram is not appended**, only counted (see [`BatchReader::truncated`]).
     ///
     /// **Cancellation loses nothing.** `async_io` suspends in two places
     /// (`Registration::async_io`, `tokio/src/runtime/io/registration.rs`, tag `tokio-1.53.1`: the
@@ -1233,6 +1264,8 @@ impl BatchReader {
 
         let base = now_nanos();
         self.truncated = 0;
+        self.truncated_bytes = 0;
+        let mut appended = 0;
         for i in 0..received {
             // A dead clamp, kept as defence in depth. `udp_recvmsg` (`net/ipv4/udp.c`;
             // `udpv6_recvmsg` identically) computes `err = copied; if (flags & MSG_TRUNC) err =
@@ -1241,8 +1274,8 @@ impl BatchReader {
             // length, `<= iov_len = MAX_DATAGRAM_BYTES`; a longer datagram shows in the output
             // `msg_flags` (below). The clamp means a broken value could only shorten the slice,
             // never index past the slot. The `debug_assert_eq!` keeps the claim honest in every
-            // test build; `an_oversized_ipv6_datagram_is_delivered_truncated_and_counted` drives
-            // the truncating case through it.
+            // test build; `an_oversized_ipv6_datagram_is_dropped_and_counted_never_decoded`
+            // drives the truncating case through it.
             let len = (self.lens[i] as usize).min(MAX_DATAGRAM_BYTES);
             debug_assert_eq!(
                 self.lens[i] as usize, len,
@@ -1251,6 +1284,8 @@ impl BatchReader {
             );
             if self.flags[i] & libc::MSG_TRUNC != 0 {
                 self.truncated += 1;
+                self.truncated_bytes += len as u64;
+                continue;
             }
             let start = i * MAX_DATAGRAM_BYTES;
             let peer = self.names.as_deref().and_then(|names| {
@@ -1264,17 +1299,19 @@ impl BatchReader {
                 received_at: base.saturating_add(i as i64),
                 peer,
             });
+            appended += 1;
         }
-        Ok(received)
+        Ok(appended)
     }
 }
 
 #[cfg(target_os = "linux")]
 impl BatchReader {
-    /// How many datagrams the last [`BatchReader::read_batch`] returned were longer than a slot
-    /// and copied only as far as one (IPv6 only; see this type's doc). Per call, not cumulative.
-    fn truncated(&self) -> u64 {
-        self.truncated
+    /// How many datagrams the last [`BatchReader::read_batch`] read were longer than a slot and
+    /// copied only as far as one (IPv6 only; see this type's doc), and those copied bytes. None of
+    /// them was appended. Per call, not cumulative.
+    fn truncated(&self) -> (u64, u64) {
+        (self.truncated, self.truncated_bytes)
     }
 }
 
@@ -1569,10 +1606,10 @@ impl BatchReader {
         Self { buf: vec![0u8; MAX_DATAGRAM_BYTES], peer }
     }
 
-    /// Always `0`: `recv_from` reports only how many bytes it copied, never whether it discarded
-    /// any, so `logit.input.datagrams.truncated` is Linux-only.
-    fn truncated(&self) -> u64 {
-        0
+    /// Always none: `recv_from` reports only how many bytes it copied, never whether it discarded
+    /// any, so a truncated datagram is detected and dropped only on Linux.
+    fn truncated(&self) -> (u64, u64) {
+        (0, 0)
     }
 
     /// One datagram, appended to `out`; returns `1` on success. Cancel-safe as
@@ -1687,7 +1724,7 @@ async fn read_loop_sampled<S: DatagramSocket>(
 /// `docs/design/pipeline-graph.md`'s "Cancellation points".
 ///
 /// Measured on a release build, eight senders flooding one listener for 10 s at about 90% kernel
-/// loss: with the read arm first, 0 of 10 one-second windows carried `kernel.drops` or the buffer
+/// loss: with the read arm first, 0 of 10 one-second windows carried kernel drops or the buffer
 /// gauges; 41-47M drops surfaced as one lump from the final sample after SIGTERM. With the timer
 /// arm first, 11 of 11 windows carried them, the final sample still landed separately with a
 /// non-zero residual, and throughput didn't measurably move (4.7M datagrams read, against
@@ -1754,8 +1791,8 @@ impl ReceiveBufferSampler {
 
     /// One `getsockopt`, and the four metrics it feeds.
     ///
-    /// `logit.input.kernel.drops` is reported only when the delta is nonzero, like every other
-    /// loss counter here; the gauges alongside it show the sampler is alive.
+    /// `logit.input.kernel.dropped{reason="socket"}` is reported only when the delta is nonzero,
+    /// like every other loss counter here; the gauges alongside it show the sampler is alive.
     ///
     /// `logit.input.receive_buffer.bytes` is re-emitted every sample though it never changes after
     /// bind: `ComponentBuffer::drain` (`logit_core::telemetry`) `mem::take`s its point map, so a
@@ -1781,7 +1818,7 @@ impl ReceiveBufferSampler {
                 };
                 let message = format_args!(
                     "the kernel's per-socket receive counters are not available for this \
-                     listener: {err}{hint}; logit.input.kernel.drops, \
+                     listener: {err}{hint}; logit.input.kernel.dropped, \
                      logit.input.receive_buffer.used.bytes and .utilization will not be reported"
                 );
                 // A non-Linux build (or one with no raw descriptors) can't act on this, and
@@ -1801,7 +1838,7 @@ impl ReceiveBufferSampler {
         };
         let dropped = self.drops.delta(info.drops);
         if dropped > 0 {
-            self.telemetry.count("logit.input.kernel.drops", dropped as f64, &[]);
+            self.telemetry.count(KERNEL_DROPPED, dropped as f64, &[("reason", "socket")]);
         }
         self.telemetry.gauge("logit.input.receive_buffer.bytes", f64::from(info.rcvbuf), &[]);
         self.telemetry.gauge(
@@ -1965,6 +2002,9 @@ async fn decode_loop<D: Decoder + Send>(
                 }
                 Err(err) => {
                     // A malformed datagram from one client shouldn't take the whole listener down.
+                    // Not `datagrams.dropped`: this datagram has its `receive.latency` sample, so
+                    // counting it there would break the listener identity.
+                    telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", UNDECODABLE)]);
                     diag.warn_throttled("bad_datagram", err);
                 }
             }
@@ -2522,7 +2562,9 @@ mod tests {
         );
     }
 
-    /// A malformed datagram is diagnosed and skipped without stopping the decode loop.
+    /// A malformed datagram is diagnosed, counted `logit.input.frames.dropped{reason=
+    /// "undecodable"}`, and skipped without stopping the decode loop. It was dequeued, so it has
+    /// its `receive.latency` sample and no `datagrams.dropped`.
     #[tokio::test]
     async fn a_malformed_datagram_is_skipped_without_stopping_the_decode_loop() {
         let socket = bind_ephemeral().await;
@@ -2530,7 +2572,8 @@ mod tests {
         let queue = test_queue(OverflowPolicy::DropOldest, 10, &Telemetry::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (fanout, mut rx) = recording_fanout(10);
-        let telemetry = Telemetry::default();
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         let mut decoder = TestDecoder::new();
 
         // A third joined future, so both loops are running while the datagrams are sent.
@@ -2579,6 +2622,10 @@ mod tests {
             vec!["good-1", "good-2"],
             "the malformed datagram must be skipped, not stop the good ones either side of it"
         );
+        let events = registry.drain(0);
+        assert_eq!(counter_with_reason(&events, FRAMES_DROPPED, UNDECODABLE), 1.0);
+        assert_eq!(counter(&events, RECEIVE_QUEUE_METRICS.items_dropped), 0.0);
+        assert_eq!(latency_samples(&events), 3.0, "all three were dequeued and handed over");
     }
 
     /// With no `receive_buffer_bytes`, `bind_socket` still gauges the kernel's default grant, and
@@ -2731,16 +2778,25 @@ mod tests {
     #[cfg(target_os = "linux")]
     const TINY_RECEIVE_BUFFER: u64 = 8 * 1024;
 
-    /// Every `logit.input.kernel.drops` delta in `events`, summed.
+    /// Every `logit.input.kernel.dropped{reason="socket"}` delta in `events`, summed. Every point
+    /// under that name must carry the reason, so a point that lost its tag fails here rather than
+    /// reading as zero.
     #[cfg(target_os = "linux")]
     fn kernel_drops(events: &[Event]) -> f64 {
         events
             .iter()
-            .flat_map(|event| &event.metrics)
-            .filter(|m| logit_core::interner::resolve(m.name) == "logit.input.kernel.drops")
-            .map(|m| match &m.kind {
-                logit_core::MetricKind::Sum(sum) => sum.value.as_f64(),
-                other => panic!("kernel.drops must be a counter, got {other:?}"),
+            .flat_map(|event| event.metrics.iter().map(move |m| (event, m)))
+            .filter(|(_, m)| logit_core::interner::resolve(m.name) == KERNEL_DROPPED)
+            .map(|(event, m)| {
+                assert_eq!(
+                    event.attributes.get("reason").and_then(|v| v.as_str()),
+                    Some("socket"),
+                    "kernel.dropped must carry reason=socket"
+                );
+                match &m.kind {
+                    logit_core::MetricKind::Sum(sum) => sum.value.as_f64(),
+                    other => panic!("kernel.dropped must be a counter, got {other:?}"),
+                }
             })
             .sum()
     }
@@ -2885,7 +2941,7 @@ mod tests {
         );
     }
 
-    /// **`logit.input.kernel.drops` equals `/proc/net/udp`'s `drops` column**, to the packet, on
+    /// **`logit.input.kernel.dropped` equals `/proc/net/udp`'s `drops` column**, to the packet, on
     /// the same socket at the same moment.
     ///
     /// Both read the same field: `sk_get_meminfo` (`net/core/sock.c`) does
@@ -2962,7 +3018,7 @@ mod tests {
         );
         assert_eq!(
             reported, settled as f64,
-            "logit.input.kernel.drops must equal the settled count for this socket, to the packet"
+            "logit.input.kernel.dropped must equal the settled count for this socket, to the packet"
         );
         assert_eq!(
             direct, settled,
@@ -4136,14 +4192,16 @@ mod tests {
         }
     }
 
-    /// A 65,527-byte IPv6 datagram is delivered truncated to a slot and counted as
-    /// `logit.input.datagrams.truncated`.
+    /// A 65,527-byte IPv6 datagram, which the kernel truncates to a slot, is never queued for the
+    /// decoder (see [`assert_truncated_dropped`]).
     ///
     /// **Skips rather than fails where IPv6 loopback isn't usable**: a container with no `::1`, or
     /// whose loopback won't carry a fragmented 65 KB datagram.
+    /// [`a_truncated_unix_datagram_is_dropped_and_counted_never_decoded`] covers the same path
+    /// everywhere.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn an_oversized_ipv6_datagram_is_delivered_truncated_and_counted() {
+    async fn an_oversized_ipv6_datagram_is_dropped_and_counted_never_decoded() {
         /// The largest IPv6 payload, 20 bytes past a slot.
         const IPV6_MAX_PAYLOAD: usize = 65_527;
 
@@ -4177,11 +4235,36 @@ mod tests {
             println!("skipping: cannot send a {IPV6_MAX_PAYLOAD}-byte datagram here ({err})");
             return;
         }
+        sender.send_to(b"ok", addr).await.expect("a 2-byte datagram sends");
 
+        let datagram = read_one(&socket, telemetry).await;
+        assert_truncated_dropped(&datagram, &registry.drain(0));
+    }
+
+    /// A Unix datagram longer than a slot is truncated by the kernel the same way, with no IPv6
+    /// loopback needed: `AF_UNIX` carries a datagram up to the sender's `SO_SNDBUF`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_truncated_unix_datagram_is_dropped_and_counted_never_decoded() {
+        let path = scratch_dir("udp-truncated-unix").join("listen.sock");
+        let socket = tokio::net::UnixDatagram::bind(&path).expect("bind a Unix datagram socket");
+        let client = tokio::net::UnixDatagram::unbound().expect("an unbound client socket");
+        client.send_to(&vec![b'z'; MAX_DATAGRAM_BYTES + 1000], &path).await.expect("send");
+        client.send_to(b"ok", &path).await.expect("send");
+
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let datagram = read_one(&socket, telemetry).await;
+        assert_truncated_dropped(&datagram, &registry.drain(0));
+    }
+
+    /// Runs [`read_loop`] over `socket` until the queue yields one datagram, then stops it.
+    #[cfg(target_os = "linux")]
+    async fn read_one<S: DatagramSocket>(socket: &S, telemetry: Telemetry) -> Datagram {
         let queue = test_queue(OverflowPolicy::DropOldest, 8, &Telemetry::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let read = read_loop(
-            &socket,
+            socket,
             Arc::clone(&queue),
             telemetry,
             Diagnostics::default(),
@@ -4199,26 +4282,32 @@ mod tests {
             .await
             .expect("shutdown should stop the read loop promptly")
             .expect("should shut down without error");
+        datagram
+    }
 
+    /// After an oversized datagram and then `ok`: the queue yielded `ok`, the read side counted the
+    /// truncated one `datagrams.dropped`/`bytes.dropped{reason="truncated"}`, and every datagram
+    /// and byte read is either queued or dropped, the listener identity.
+    #[cfg(target_os = "linux")]
+    fn assert_truncated_dropped(datagram: &Datagram, events: &[Event]) {
         assert_eq!(
-            datagram.bytes.len(),
-            MAX_DATAGRAM_BYTES,
-            "a datagram longer than a slot is delivered as far as the slot holds"
+            datagram.bytes.as_ref(),
+            b"ok",
+            "the truncated datagram must never reach the queue; the one after it does"
         );
-        assert!(
-            datagram.bytes.iter().all(|&b| b == b'z'),
-            "and every byte of what was delivered is the payload's own"
+        let truncated = (
+            counter_with_reason(events, RECEIVE_QUEUE_METRICS.items_dropped, "truncated"),
+            counter_with_reason(events, RECEIVE_QUEUE_METRICS.units_dropped, "truncated"),
         );
-        let events = registry.drain(0);
+        assert_eq!(truncated, (1.0, MAX_DATAGRAM_BYTES as f64), "dropped, with the bytes copied");
+        assert_eq!(counter(events, "logit.input.datagrams.truncated"), 0.0);
+        let read = counter(events, "logit.input.datagrams");
+        let dropped = counter(events, RECEIVE_QUEUE_METRICS.items_dropped);
+        assert_eq!((read, dropped), (2.0, 1.0), "read = queued (1) + every dropped reason");
         assert_eq!(
-            counter(&events, "logit.input.datagrams.truncated"),
-            1.0,
-            "the 20 bytes the slot could not hold must be counted, not silently dropped"
-        );
-        assert_eq!(
-            counter(&events, "logit.input.datagrams"),
-            1.0,
-            "a truncated datagram is still a datagram -- it is delivered, so it is counted as one"
+            counter(events, "logit.input.datagram.bytes"),
+            (MAX_DATAGRAM_BYTES + 2) as f64,
+            "bytes read = bytes queued + bytes dropped"
         );
     }
 

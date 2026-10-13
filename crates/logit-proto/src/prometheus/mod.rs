@@ -75,25 +75,25 @@
 //! | `Sum{Cumulative, monotonic}` | `counter` |
 //! | `Sum{Cumulative, !monotonic}` | `gauge` -- Prometheus has no non-monotonic counter; `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}` |
 //! | a `Sum` or `Gauge` value of `I64`/`U64`/`Bool` | the sample's double, on both wires: an integer's nearest `f64`, a `Bool` `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}` |
-//! | `Sum{Delta}` / `Histogram{Delta}` | **skipped**, `logit.output.metrics.skipped{metric_kind="delta_sum"\|"delta_histogram"}` + `warn_throttled("delta_temporality_unresolved")` -- put an `aggregate` with `temporality: cumulative` in front of the sink |
+//! | `Sum{Delta}` / `Histogram{Delta}` | **dropped**, `logit.output.metrics.dropped{reason="unresolved_delta"}` + `warn_throttled("delta_temporality_unresolved")` -- put an `aggregate` with `temporality: cumulative` in front of the sink |
 //! | `Gauge` | `gauge`, or whatever `prometheus.type` says (consumed): `untyped`/`unknown`/`info`/`stateset` |
-//! | `GaugeDelta` | **skipped**, `logit.output.metrics.skipped{metric_kind="gauge_delta"}` + `warn_throttled("gauge_delta_unresolved")` (the same greppable key every other sink uses) |
+//! | `GaugeDelta` | **dropped**, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` + `warn_throttled("gauge_delta_unresolved")` (the same counter and greppable key every other sink uses) |
 //! | `Histogram{Cumulative}` | `histogram`: running-sum buckets, `+Inf` = total, `_sum` only when `Some`; `min`/`max` dropped (known-gaps row); `prometheus.type: "gaugehistogram"` → `_gsum`/`_gcount` |
 //! | `Summary` | `summary` + `_created` (OM) |
 //! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_sum` + `_count`; `_sum` is [`DdSketch::sum`], exact unlike a quantile (approximate only when [`DdSketch::stats_exact`] is `false`, i.e. the sketch's stats were derived from its bins) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
 //! | `Samples` | `Samples::sketch()`, then exactly as above -- `degraded{metric_kind="samples"}` |
 //! | `Set` / `SetMembers` | `gauge` of `estimate()` / the distinct member count -- `degraded{metric_kind="set"\|"set_members"}` |
-//! | `ExponentialHistogram` | **skipped**, `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` -- neither text dialect has native-histogram syntax |
+//! | `ExponentialHistogram` | for exposition, **skipped**, `logit.output.metrics.skipped{metric_kind="exponential_histogram"}`: neither text dialect has native-histogram syntax. For remote-write ([`PrometheusEncoder::with_destination`]), **dropped**, `logit.output.metrics.dropped{reason="native_histogram"}`: the wire carries native histograms, and this codec doesn't map them yet |
 //! | `flags & NO_RECORDED_VALUE` | **skipped**, `logit.output.metrics.skipped{reason="no_recorded_value"}` (`MetricRecord::flags`' own doc: every non-OTLP sink must treat a flagged point as carrying no reading) -- unless [`PrometheusEncoder::with_stale_markers`]`(true)`, see the row below |
 //! | `flags & NO_RECORDED_VALUE` on a `Gauge` or `Sum`, with [`PrometheusEncoder::with_stale_markers`]`(true)` | [`Point::Stale`] in the family the kind would have chosen anyway (`Sum{monotonic}` → `counter`, `Sum{!monotonic}` → `gauge` + `degraded{metric_kind="non_monotonic_sum"}`, `Gauge` → `gauge` or whatever `prometheus.type` says). Temporality is ignored on this path: a stale marker has no value to be delta about. A flagged `Histogram`/`Summary`/`ExponentialHistogram`/sketch/set stays on the skip row above -- those expand to several derived series and one flag says nothing about which of them existed (`docs/known-gaps/mappings.md`) |
-//! | exemplars | carried onto the family; [`text`] emits them on `_total`/`_bucket` lines in OpenMetrics only, at most one per line, each on the bucket its own value falls in. One that has no line left to sit on -- a counter's second exemplar, two in one bucket's range, one over OpenMetrics' 128-code-point label budget -- is dropped, `logit.output.metrics.degraded{reason="exemplar_dropped"}` (text 0.0.4 drops all of them uncounted: that is the operator's dialect choice, not a lossy mapping) |
+//! | exemplars | carried onto the family; [`text`] emits them on `_total`/`_bucket` lines in OpenMetrics only, at most one per line, each on the bucket its own value falls in. One that has no line left to sit on -- a counter's second exemplar, two in one bucket's range, one over OpenMetrics' 128-code-point label budget -- is dropped, `logit.output.metrics.degraded{reason="exemplar_omitted"}` (text 0.0.4 drops all of them uncounted: that is the operator's dialect choice, not a lossy mapping) |
 //! | `Event::timestamp` | emitted only when `prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
-//! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.dropped{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `dropped{reason="unrepresentable"}` path |
-//! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.dropped{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is dropped -- `logit.output.labels.dropped{reason="reserved"}` |
-//! | two names sanitizing onto one wire name | the family whose *model* name sorts first is exposed, the rest are **skipped** -- `logit.output.metrics.skipped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug |
+//! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.omitted{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `omitted{reason="unrepresentable"}` path |
+//! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.omitted{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is omitted -- `logit.output.labels.omitted{reason="reserved"}` |
+//! | two names sanitizing onto one wire name | the family whose *model* name sorts first is exposed, the rest are **dropped** -- `logit.output.metrics.dropped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug |
 //! | `unit` / `description` | `# UNIT` (OM only, and only when `_<unit>` suffixes the family name and the unit is `[a-zA-Z0-9_]+` -- the OpenMetrics spec requires it and Prometheus's parser fails the entire body otherwise; dropped counted `logit.output.metrics.degraded{reason="unit_not_suffix"}`) / `# HELP` |
-//! | two families whose `# TYPE` lines carry one name | one is written, the other's series **skipped**, `logit.output.metrics.skipped{reason="name_collision"}` -- see the normalization list below |
-//! | two records, one name, different family types | the first record's type wins, the rest are **skipped**, `logit.output.metrics.skipped{reason="type_conflict"}` -- one name cannot carry two `# TYPE` lines |
+//! | two families whose `# TYPE` lines carry one name | one is written, the other's series **dropped**, `logit.output.metrics.dropped{reason="name_collision"}` -- see the normalization list below |
+//! | two records, one name, different family types | the first record's type wins, the rest are **dropped**, `logit.output.metrics.dropped{reason="type_conflict"}` -- one name cannot carry two `# TYPE` lines |
 //! | `EventBatch::scope`, `Resource::schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
 //!
 //! ## Well-known attributes (`prometheus.*`) and target identity
@@ -132,7 +132,7 @@
 //! - two families whose `# TYPE` names coincide (a text 0.0.4 counter `foo` beside a gauge
 //!   `foo_total`, or counters `foo` and `foo_total`) write once: the one whose model name sorts
 //!   first, with each series of the other counted
-//!   `logit.output.metrics.skipped{reason="name_collision"}`, since a second `# TYPE` line for a
+//!   `logit.output.metrics.dropped{reason="name_collision"}`, since a second `# TYPE` line for a
 //!   name makes Prometheus reject the whole scrape;
 //! - a family with no line to write (every series stale, or a text 0.0.4 summary holding only
 //!   `_created`) loses its `# HELP` and `# TYPE` lines too;
@@ -148,7 +148,7 @@
 //!   `network.peer.*` or `client.*` added to every event after decode, an opt-in addition the
 //!   sender never sent, and one of ADR `lossless-transit`'s "Permitted normalizations".
 //!
-//! Everything else is an error or a counted skip, never a silent reinterpretation.
+//! Everything else is an error or a counted drop or skip, never a silent reinterpretation.
 
 /// The committed, pre-generated prompb protobuf types (`docs/adr/committed-pregenerated-otlp-protobuf.md`'s
 /// scheme, extended to this second proto family -- see `crates/logit-proto/proto/README.md`'s
@@ -375,7 +375,7 @@ impl MetricFamily {
     }
 }
 
-/// Counts the decode side's skips (and carries the throttled-diagnostics handle a parse needs).
+/// Counts the decode side's drops (and carries the throttled-diagnostics handle a parse needs).
 /// `Telemetry::default()`/`Diagnostics::default()` make every call a no-op, so a decoder used as a
 /// pure codec -- [`text::parse`] with no component attached -- costs nothing to carry.
 pub struct PrometheusDecoder {
@@ -422,10 +422,10 @@ impl PrometheusDecoder {
         self
     }
 
-    /// `logit.input.metrics.skipped{reason}` -- one greppable counter for every "this input is
-    /// wrong in a way we can step over" path, with the reason as a compile-time tag value.
-    pub(crate) fn skipped(&self, reason: &'static str) {
-        self.telemetry.count("logit.input.metrics.skipped", 1.0, &[("reason", reason)]);
+    /// `logit.input.metrics.dropped{reason}` -- one greppable counter for every sample or series
+    /// the decoder stepped over.
+    pub(crate) fn dropped(&self, reason: DecodeDrop) {
+        self.telemetry.count("logit.input.metrics.dropped", 1.0, &[("reason", reason.reason())]);
     }
 
     /// `logit.input.metrics.degraded{reason}` -- the input was kept, but something in it was
@@ -440,6 +440,129 @@ impl PrometheusDecoder {
     }
 }
 
+/// Why the decode side dropped a sample or series, each counted
+/// `logit.input.metrics.dropped{reason}`. Every reason is malformed input or a kind this codec
+/// can't decode, so every one is loss; the module docs of [`assemble`], [`text`], and
+/// [`remote_write`] say when each applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecodeDrop {
+    MalformedLine,
+    MalformedMetadata,
+    DuplicateType,
+    DuplicateMetadata,
+    DuplicateSeries,
+    DuplicateLabel,
+    UnknownSuffix,
+    IncompleteSeries,
+    EmptyHistogram,
+    NonMonotonicBuckets,
+    InvalidLabels,
+    NativeHistogram,
+}
+
+impl DecodeDrop {
+    #[cfg(test)]
+    const ALL: [DecodeDrop; 12] = [
+        DecodeDrop::MalformedLine,
+        DecodeDrop::MalformedMetadata,
+        DecodeDrop::DuplicateType,
+        DecodeDrop::DuplicateMetadata,
+        DecodeDrop::DuplicateSeries,
+        DecodeDrop::DuplicateLabel,
+        DecodeDrop::UnknownSuffix,
+        DecodeDrop::IncompleteSeries,
+        DecodeDrop::EmptyHistogram,
+        DecodeDrop::NonMonotonicBuckets,
+        DecodeDrop::InvalidLabels,
+        DecodeDrop::NativeHistogram,
+    ];
+
+    fn reason(self) -> &'static str {
+        match self {
+            DecodeDrop::MalformedLine => "malformed_line",
+            DecodeDrop::MalformedMetadata => "malformed_metadata",
+            DecodeDrop::DuplicateType => "duplicate_type",
+            DecodeDrop::DuplicateMetadata => "duplicate_metadata",
+            DecodeDrop::DuplicateSeries => "duplicate_series",
+            DecodeDrop::DuplicateLabel => "duplicate_label",
+            DecodeDrop::UnknownSuffix => "unknown_suffix",
+            DecodeDrop::IncompleteSeries => "incomplete_series",
+            DecodeDrop::EmptyHistogram => "empty_histogram",
+            DecodeDrop::NonMonotonicBuckets => "non_monotonic_buckets",
+            DecodeDrop::InvalidLabels => "invalid_labels",
+            DecodeDrop::NativeHistogram => "native_histogram",
+        }
+    }
+}
+
+/// Why the encode side didn't write a record or series, and the counter that says so. A
+/// `*.skipped` outcome had nothing to carry or no form in the destination's format; a `*.dropped`
+/// one is loss a different config or a later `logit` would have delivered
+/// ([ADR `telemetry-loss-vocabulary`](../../../../docs/adr/telemetry-loss-vocabulary.md)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NotEncoded {
+    /// A `NO_RECORDED_VALUE` record with no stale marker to become.
+    NoRecordedValue,
+    /// A [`Point::Stale`] series in an exposition body, which has no stale-marker syntax.
+    Stale,
+    /// An `ExponentialHistogram` bound for exposition, whose text dialects have no syntax for it.
+    ExponentialHistogram,
+    /// An `ExponentialHistogram` bound for remote-write, which carries native histograms this
+    /// codec doesn't map yet.
+    NativeHistogram,
+    /// A delta `Sum` or `Histogram` with no cumulative `aggregate` upstream.
+    UnresolvedDelta,
+    /// A `GaugeDelta` with no `aggregate` upstream.
+    UnresolvedGaugeDelta,
+    TypeConflict,
+    NameCollision,
+    InvalidLabels,
+    NoTimestamp,
+}
+
+impl NotEncoded {
+    #[cfg(test)]
+    const ALL: [NotEncoded; 10] = [
+        NotEncoded::NoRecordedValue,
+        NotEncoded::Stale,
+        NotEncoded::ExponentialHistogram,
+        NotEncoded::NativeHistogram,
+        NotEncoded::UnresolvedDelta,
+        NotEncoded::UnresolvedGaugeDelta,
+        NotEncoded::TypeConflict,
+        NotEncoded::NameCollision,
+        NotEncoded::InvalidLabels,
+        NotEncoded::NoTimestamp,
+    ];
+
+    /// The counter name and its one tag.
+    fn counter(self) -> (&'static str, (&'static str, &'static str)) {
+        const SKIPPED: &str = "logit.output.metrics.skipped";
+        const DROPPED: &str = "logit.output.metrics.dropped";
+        match self {
+            NotEncoded::NoRecordedValue => (SKIPPED, ("reason", "no_recorded_value")),
+            NotEncoded::Stale => (SKIPPED, ("reason", "stale")),
+            NotEncoded::ExponentialHistogram => (SKIPPED, ("metric_kind", "exponential_histogram")),
+            NotEncoded::NativeHistogram => (DROPPED, ("reason", "native_histogram")),
+            NotEncoded::UnresolvedDelta => (DROPPED, ("reason", "unresolved_delta")),
+            NotEncoded::UnresolvedGaugeDelta => (DROPPED, ("reason", "unresolved_gauge_delta")),
+            NotEncoded::TypeConflict => (DROPPED, ("reason", "type_conflict")),
+            NotEncoded::NameCollision => (DROPPED, ("reason", "name_collision")),
+            NotEncoded::InvalidLabels => (DROPPED, ("reason", "invalid_labels")),
+            NotEncoded::NoTimestamp => (DROPPED, ("reason", "no_timestamp")),
+        }
+    }
+}
+
+/// Which wire an encode feeds. It decides how an `ExponentialHistogram` is counted: exposition
+/// has no syntax for one, and remote-write has a native-histogram field this codec doesn't fill.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Destination {
+    #[default]
+    Exposition,
+    RemoteWrite,
+}
+
 /// Counts the encode side's lossy paths -- the mirror of [`PrometheusDecoder`], same builders, same
 /// disabled-by-default no-op behavior as [`crate::otlp::OtlpEncoder`].
 #[derive(Default)]
@@ -448,6 +571,7 @@ pub struct PrometheusEncoder {
     diagnostics: Diagnostics,
     timestamps_always: bool,
     stale_markers: bool,
+    destination: Destination,
 }
 
 impl PrometheusEncoder {
@@ -478,6 +602,13 @@ impl PrometheusEncoder {
         self
     }
 
+    /// The wire this encode feeds. Default [`Destination::Exposition`]; a remote-write sender sets
+    /// [`Destination::RemoteWrite`].
+    pub fn with_destination(mut self, destination: Destination) -> Self {
+        self.destination = destination;
+        self
+    }
+
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
@@ -488,12 +619,11 @@ impl PrometheusEncoder {
         self
     }
 
-    fn skipped_kind(&self, metric_kind: &'static str) {
-        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("metric_kind", metric_kind)]);
-    }
-
-    fn skipped_reason(&self, reason: &'static str) {
-        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("reason", reason)]);
+    /// Counts one record or series the encoder didn't write, under the counter
+    /// [`NotEncoded::counter`] names.
+    fn not_encoded(&self, outcome: NotEncoded) {
+        let (metric, tag) = outcome.counter();
+        self.telemetry.count(metric, 1.0, &[tag]);
     }
 
     fn degraded(&self, metric_kind: &'static str) {
@@ -520,8 +650,8 @@ impl PrometheusEncoder {
         self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("reason", reason)]);
     }
 
-    fn label_dropped(&self, reason: &'static str) {
-        self.telemetry.count("logit.output.labels.dropped", 1.0, &[("reason", reason)]);
+    fn label_omitted(&self, reason: &'static str) {
+        self.telemetry.count("logit.output.labels.omitted", 1.0, &[("reason", reason)]);
     }
 
     /// `logit.output.labels.normalized{reason}` -- a label that reached the wire, but not in the
@@ -555,20 +685,20 @@ pub fn families_to_events(
     families_to_events_with(families, received_at_nanos, decoder, &mut |_, _| {})
 }
 
-/// [`families_to_events`] plus a report of what it stepped over: `on_skipped` is called once per
+/// [`families_to_events`] plus a report of what it stepped over: `on_dropped` is called once per
 /// [`Series`] that has no model kind at all (an empty histogram, a histogram whose cumulative
 /// bucket counts decrease -- see [`point_to_kind`]), with the family it belonged to.
 ///
-/// The counted-skip telemetry is already emitted either way; this exists for a caller that has to
+/// The counted-drop telemetry is already emitted either way; this exists for a caller that has to
 /// report, per call, *how much* of its input survived -- a remote-write receiver owes its sender
 /// an `X-Prometheus-Remote-Write-Samples-Written` count of what it kept, and the
 /// assembler's own accepted total is a statement about an earlier stage than this one. Pair it with
-/// [`remote_write::wire_samples`] to turn the skipped series back into the wire samples they were.
+/// [`remote_write::wire_samples`] to turn the dropped series back into the wire samples they were.
 pub fn families_to_events_with(
     families: &[MetricFamily],
     received_at_nanos: i64,
     decoder: &mut PrometheusDecoder,
-    on_skipped: &mut dyn FnMut(&MetricFamily, &Series),
+    on_dropped: &mut dyn FnMut(&MetricFamily, &Series),
 ) -> Vec<Event> {
     let mut out = Vec::new();
     for family in families {
@@ -577,7 +707,7 @@ pub fn families_to_events_with(
         let description = family.help.as_deref().map(intern);
         for series in &family.series {
             let Some((kind, flags)) = point_to_kind(&series.point, family.kind, decoder) else {
-                on_skipped(family, series);
+                on_dropped(family, series);
                 continue;
             };
             let mut attributes = AttrMap::new();
@@ -693,27 +823,27 @@ fn stale_kind(family: FamilyType) -> MetricKind {
 
 /// Cumulative `le` counts → [`logit_core::Histogram`]'s per-bucket counts, by successive
 /// difference. A family with no buckets at all, or whose cumulative counts decrease (which no
-/// conforming exposition produces and which would yield a negative bucket count), is skipped:
-/// `logit.input.metrics.skipped{reason="empty_histogram"|"non_monotonic_buckets"}`. Bucket bounds
+/// conforming exposition produces and which would yield a negative bucket count), is dropped:
+/// `logit.input.metrics.dropped{reason="empty_histogram"|"non_monotonic_buckets"}`. Bucket bounds
 /// are assumed sorted ascending -- [`text::parse`] sorts them, and so does the encode side.
 fn per_bucket_counts(
     cumulative: &[(f64, u64)],
     decoder: &mut PrometheusDecoder,
 ) -> Option<Vec<(f64, u64)>> {
     if cumulative.is_empty() {
-        decoder.skipped("empty_histogram");
+        decoder.dropped(DecodeDrop::EmptyHistogram);
         return None;
     }
     let mut buckets = Vec::with_capacity(cumulative.len());
     let mut running = 0u64;
     for (bound, cumulative_count) in cumulative {
         let Some(delta) = cumulative_count.checked_sub(running) else {
-            decoder.skipped("non_monotonic_buckets");
+            decoder.dropped(DecodeDrop::NonMonotonicBuckets);
             decoder.diagnostics().warn_throttled(
                 "prometheus_non_monotonic_buckets",
                 format_args!(
                     "histogram bucket counts decrease at le={bound} -- the series is not \
-                     cumulative; skipping it"
+                     cumulative; dropping it"
                 ),
             );
             return None;
@@ -746,7 +876,7 @@ pub fn events_to_families<'a>(
         for record in &event.metrics {
             let stale = record.is_no_recorded_value();
             if stale && !encoder.stale_markers {
-                encoder.skipped_reason("no_recorded_value");
+                encoder.not_encoded(NotEncoded::NoRecordedValue);
                 continue;
             }
             let converted = if stale {
@@ -790,7 +920,7 @@ pub fn events_to_families<'a>(
                     if existing.family.kind != kind {
                         // Two records sharing one name but disagreeing on type: the wire has exactly
                         // one `# TYPE` line per name, so the second one has nowhere to go.
-                        encoder.skipped_reason("type_conflict");
+                        encoder.not_encoded(NotEncoded::TypeConflict);
                     } else {
                         existing.family.series.push(series.take().expect("built above"));
                     }
@@ -801,7 +931,7 @@ pub fn events_to_families<'a>(
                     displaced = existing.family.series.len().max(1);
                     start_family = true;
                 }
-                Some(_) => encoder.skipped_reason("name_collision"),
+                Some(_) => encoder.not_encoded(NotEncoded::NameCollision),
                 None => start_family = true,
             }
             if !start_family {
@@ -809,7 +939,7 @@ pub fn events_to_families<'a>(
             }
             let series = series.take().expect("only the matching-family arm consumes it");
             for _ in 0..displaced {
-                encoder.skipped_reason("name_collision");
+                encoder.not_encoded(NotEncoded::NameCollision);
             }
             let key = key.into_owned();
             families.insert(
@@ -872,7 +1002,7 @@ fn record_to_point(
                 (FamilyType::Gauge, Point::Gauge(encoder.scalar(s.value)))
             }
             (Temporality::Delta, _) => {
-                encoder.skipped_kind("delta_sum");
+                encoder.not_encoded(NotEncoded::UnresolvedDelta);
                 warn_delta(encoder, resolve(record.name));
                 return None;
             }
@@ -887,7 +1017,7 @@ fn record_to_point(
             _ => (FamilyType::Gauge, Point::Gauge(encoder.scalar(*v))),
         },
         MetricKind::GaugeDelta(_) => {
-            encoder.skipped_kind("gauge_delta");
+            encoder.not_encoded(NotEncoded::UnresolvedGaugeDelta);
             encoder.diagnostics.warn_throttled(
                 "gauge_delta_unresolved",
                 format_args!(
@@ -899,7 +1029,7 @@ fn record_to_point(
         }
         MetricKind::Histogram(h) => {
             if h.temporality == Temporality::Delta {
-                encoder.skipped_kind("delta_histogram");
+                encoder.not_encoded(NotEncoded::UnresolvedDelta);
                 warn_delta(encoder, resolve(record.name));
                 return None;
             }
@@ -912,15 +1042,29 @@ fn record_to_point(
             (kind, Point::Histogram { buckets, sum: h.sum, count })
         }
         MetricKind::ExponentialHistogram(_) => {
-            encoder.skipped_kind("exponential_histogram");
-            encoder.diagnostics.warn_throttled(
-                "prometheus_exponential_histogram_skipped",
-                format_args!(
-                    "metric '{}' is an ExponentialHistogram, which neither Prometheus text 0.0.4 \
-                     nor OpenMetrics 1.0 can express -- skipped",
-                    resolve(record.name)
-                ),
-            );
+            let name = resolve(record.name);
+            match encoder.destination {
+                Destination::Exposition => {
+                    encoder.not_encoded(NotEncoded::ExponentialHistogram);
+                    encoder.diagnostics.warn_throttled(
+                        "prometheus_exponential_histogram_skipped",
+                        format_args!(
+                            "metric '{name}' is an ExponentialHistogram, which neither \
+                             Prometheus text 0.0.4 nor OpenMetrics 1.0 can express -- skipped"
+                        ),
+                    );
+                }
+                Destination::RemoteWrite => {
+                    encoder.not_encoded(NotEncoded::NativeHistogram);
+                    encoder.diagnostics.warn_throttled(
+                        "prometheus_exponential_histogram_skipped",
+                        format_args!(
+                            "metric '{name}' is an ExponentialHistogram, and this sender doesn't \
+                             write remote-write native histograms -- dropped"
+                        ),
+                    );
+                }
+            }
             return None;
         }
         MetricKind::Summary(s) => (
@@ -962,7 +1106,7 @@ fn declared_type(event: &Event) -> Option<FamilyType> {
 /// [`PrometheusEncoder::with_stale_markers`]. `None` -- skipped and counted exactly as an unflagged
 /// skip would be -- for every kind that expands to more than one wire series.
 ///
-/// Temporality is not consulted: `Sum{Delta}` is normally skipped because Prometheus
+/// Temporality is not consulted: `Sum{Delta}` is normally dropped because Prometheus
 /// cannot express a delta *reading*, and a stale marker has no reading to be delta about. The
 /// family type otherwise follows [`record_to_point`]'s own choices, so a series that went stale
 /// lands on the same family it was on while it had values.
@@ -988,7 +1132,7 @@ fn stale_point(
             _ => FamilyType::Gauge,
         },
         _ => {
-            encoder.skipped_reason("no_recorded_value");
+            encoder.not_encoded(NotEncoded::NoRecordedValue);
             return None;
         }
     };
@@ -1081,12 +1225,12 @@ fn build_labels(
             _ => label_value(value),
         };
         let Some(rendered) = rendered else {
-            encoder.label_dropped("unrepresentable");
+            encoder.label_omitted("unrepresentable");
             continue;
         };
         let name = sanitize_label_name(key);
         if Some(name.as_ref()) == generated {
-            encoder.label_dropped("reserved");
+            encoder.label_omitted("reserved");
             continue;
         }
         candidates.push((key, name, rendered));
@@ -1095,7 +1239,7 @@ fn build_labels(
     let mut labels: Vec<(String, String)> = Vec::with_capacity(candidates.len());
     for (_, name, value) in candidates {
         if labels.iter().any(|(existing, _)| existing.as_str() == name.as_ref()) {
-            encoder.label_dropped("collision");
+            encoder.label_omitted("collision");
             continue;
         }
         labels.push((name.into_owned(), value));
@@ -1447,7 +1591,7 @@ mod tests {
     }
 
     #[test]
-    fn a_histogram_whose_cumulative_counts_decrease_is_skipped_and_counted() {
+    fn a_histogram_whose_cumulative_counts_decrease_is_dropped_and_counted() {
         let (registry, telemetry) = telemetry();
         let mut decoder = PrometheusDecoder::new().with_telemetry(telemetry);
         let point = Point::Histogram {
@@ -1460,19 +1604,19 @@ mod tests {
         assert!(events.is_empty(), "a non-cumulative bucket list must not decode");
         assert!(counted(
             &registry,
-            "logit.input.metrics.skipped",
+            "logit.input.metrics.dropped",
             ("reason", "non_monotonic_buckets")
         ));
     }
 
     #[test]
-    fn a_histogram_with_no_buckets_at_all_is_skipped_and_counted() {
+    fn a_histogram_with_no_buckets_at_all_is_dropped_and_counted() {
         let (registry, telemetry) = telemetry();
         let mut decoder = PrometheusDecoder::new().with_telemetry(telemetry);
         let point = Point::Histogram { buckets: vec![], sum: None, count: 0 };
         let families = vec![family("h", FamilyType::Histogram, vec![Series::new(vec![], point)])];
         assert!(families_to_events(&families, RECEIVED_AT, &mut decoder).is_empty());
-        assert!(counted(&registry, "logit.input.metrics.skipped", ("reason", "empty_histogram")));
+        assert!(counted(&registry, "logit.input.metrics.dropped", ("reason", "empty_histogram")));
     }
 
     // --- encode: one test per row of the module doc's encode table ------------------------------
@@ -1507,13 +1651,13 @@ mod tests {
     }
 
     #[test]
-    fn a_delta_sum_is_skipped_and_names_aggregates_cumulative_mode() {
+    fn a_delta_sum_is_dropped_and_names_aggregates_cumulative_mode() {
         let (families, registry, diag) = encode_counted(
             &Resource::default(),
             &event_with(&[], record("m", MetricKind::counter(1.0))),
         );
         assert!(families.is_empty());
-        assert!(counted(&registry, "logit.output.metrics.skipped", ("metric_kind", "delta_sum")));
+        assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "unresolved_delta")));
         assert!(counted(
             &diag,
             "logit.component.diagnostics",
@@ -1522,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn a_delta_histogram_is_skipped_and_counted() {
+    fn a_delta_histogram_is_dropped_and_counted() {
         let kind = MetricKind::Histogram(Histogram {
             buckets: vec![(1.0, 1), (f64::INFINITY, 0)],
             temporality: Temporality::Delta,
@@ -1533,11 +1677,7 @@ mod tests {
         let (families, registry, _) =
             encode_counted(&Resource::default(), &event_with(&[], record("m", kind)));
         assert!(families.is_empty());
-        assert!(counted(
-            &registry,
-            "logit.output.metrics.skipped",
-            ("metric_kind", "delta_histogram")
-        ));
+        assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "unresolved_delta")));
     }
 
     #[test]
@@ -1563,13 +1703,17 @@ mod tests {
     }
 
     #[test]
-    fn a_gauge_delta_is_skipped_under_the_shared_diagnostic_key() {
+    fn a_gauge_delta_is_dropped_under_the_shared_diagnostic_key() {
         let (families, registry, diag) = encode_counted(
             &Resource::default(),
             &event_with(&[], record("m", MetricKind::GaugeDelta(MetricValue::F64(1.0)))),
         );
         assert!(families.is_empty());
-        assert!(counted(&registry, "logit.output.metrics.skipped", ("metric_kind", "gauge_delta")));
+        assert!(counted(
+            &registry,
+            "logit.output.metrics.dropped",
+            ("reason", "unresolved_gauge_delta")
+        ));
         assert!(counted(&diag, "logit.component.diagnostics", ("key", "gauge_delta_unresolved")));
     }
 
@@ -1735,7 +1879,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exponential_histogram_is_skipped_and_counted() {
+    fn an_exponential_histogram_is_counted_by_destination() {
         let kind = MetricKind::ExponentialHistogram(ExpHistogram {
             scale: 1,
             zero_count: 0,
@@ -1748,14 +1892,110 @@ mod tests {
             min: None,
             max: None,
         });
-        let (families, registry, _) =
-            encode_counted(&Resource::default(), &event_with(&[], record("m", kind)));
+        let event = event_with(&[], record("m", kind));
+
+        // Exposition has no syntax for one: a format skip.
+        let (families, registry, _) = encode_counted(&Resource::default(), &event);
         assert!(families.is_empty());
-        assert!(counted(
-            &registry,
-            "logit.output.metrics.skipped",
-            ("metric_kind", "exponential_histogram")
-        ));
+        let points = drained_points(&registry);
+        assert!(points.contains(&(
+            "logit.output.metrics.skipped".into(),
+            "metric_kind".into(),
+            "exponential_histogram".into()
+        )));
+        assert!(!points.iter().any(|(name, ..)| name == "logit.output.metrics.dropped"));
+
+        // Remote-write carries native histograms this codec doesn't map: loss.
+        let (registry, telemetry) = telemetry();
+        let mut encoder = PrometheusEncoder::new()
+            .with_destination(Destination::RemoteWrite)
+            .with_telemetry(telemetry);
+        let families =
+            events_to_families(std::iter::once((&Resource::default(), &event)), &mut encoder);
+        assert!(families.is_empty());
+        let points = drained_points(&registry);
+        assert!(points.contains(&(
+            "logit.output.metrics.dropped".into(),
+            "reason".into(),
+            "native_histogram".into()
+        )));
+        assert!(!points.iter().any(|(name, ..)| name == "logit.output.metrics.skipped"));
+    }
+
+    /// Every `(name, tag key, tag value)` point `registry` recorded. Drains, so call once.
+    fn drained_points(registry: &Registry) -> Vec<(String, String, String)> {
+        let mut points = Vec::new();
+        for event in registry.drain(0) {
+            for metric in &event.metrics {
+                for (key, value) in event.attributes.iter() {
+                    let key = resolve(key);
+                    if matches!(key, "reason" | "metric_kind") {
+                        let value = value.as_str().unwrap_or_default().to_string();
+                        points.push((resolve(metric.name).to_string(), key.to_string(), value));
+                    }
+                }
+            }
+        }
+        points
+    }
+
+    #[test]
+    fn every_decode_drop_counts_input_metrics_dropped_under_its_own_reason() {
+        let mut seen = BTreeSet::new();
+        for reason in DecodeDrop::ALL {
+            let (registry, telemetry) = telemetry();
+            PrometheusDecoder::new().with_telemetry(telemetry).dropped(reason);
+            let points = drained_points(&registry);
+            assert_eq!(
+                points,
+                [(
+                    "logit.input.metrics.dropped".to_string(),
+                    "reason".to_string(),
+                    reason.reason().to_string()
+                )],
+                "{reason:?}"
+            );
+            assert!(seen.insert(reason.reason()), "{reason:?} shares a reason");
+            assert!(
+                !reason.reason().contains("dropped"),
+                "{reason:?}: a reason never contains `dropped`, which names loss in a metric name"
+            );
+        }
+    }
+
+    #[test]
+    fn every_not_encoded_outcome_counts_under_the_loss_vocabulary() {
+        let mut seen = BTreeSet::new();
+        for outcome in NotEncoded::ALL {
+            let (registry, telemetry) = telemetry();
+            PrometheusEncoder::new().with_telemetry(telemetry).not_encoded(outcome);
+            let (metric, (key, value)) = outcome.counter();
+            assert_eq!(
+                drained_points(&registry),
+                [(metric.to_string(), key.to_string(), value.to_string())],
+                "{outcome:?}"
+            );
+            assert!(seen.insert((metric, value)), "{outcome:?} shares a counter");
+            let dropped = matches!(
+                outcome,
+                NotEncoded::NativeHistogram
+                    | NotEncoded::UnresolvedDelta
+                    | NotEncoded::UnresolvedGaugeDelta
+                    | NotEncoded::TypeConflict
+                    | NotEncoded::NameCollision
+                    | NotEncoded::InvalidLabels
+                    | NotEncoded::NoTimestamp
+            );
+            let expected = if dropped {
+                "logit.output.metrics.dropped"
+            } else {
+                "logit.output.metrics.skipped"
+            };
+            assert_eq!(metric, expected, "{outcome:?}");
+            if dropped {
+                assert_eq!(key, "reason", "{outcome:?}: a drop is tagged by reason only");
+            }
+        }
     }
 
     #[test]
@@ -1834,7 +2074,7 @@ mod tests {
     }
 
     #[test]
-    fn every_representable_value_kind_stringifies_and_the_rest_are_counted_dropped() {
+    fn every_representable_value_kind_stringifies_and_the_rest_are_counted_omitted() {
         let event = event_with(
             &[
                 ("s", Value::from("text")),
@@ -1857,7 +2097,7 @@ mod tests {
             families[0].series[0].labels,
             labels(&[("b", "true"), ("f", "1.5"), ("i", "-3"), ("s", "text"), ("u", "7")])
         );
-        assert!(counted(&registry, "logit.output.labels.dropped", ("reason", "unrepresentable")));
+        assert!(counted(&registry, "logit.output.labels.omitted", ("reason", "unrepresentable")));
     }
 
     /// Every `(point name, reason)` pair the registry holds, from **one** drain -- [`counted`]
@@ -1899,7 +2139,7 @@ mod tests {
         let points = label_points(&registry);
         assert!(has_point(&points, "logit.output.labels.normalized", "multi_value"), "{points:?}");
         assert!(
-            !has_point(&points, "logit.output.labels.dropped", "unrepresentable"),
+            !has_point(&points, "logit.output.labels.omitted", "unrepresentable"),
             "a normalized label is not also a dropped one: {points:?}"
         );
     }
@@ -1926,7 +2166,7 @@ mod tests {
     /// An array with no element to fall back to is `dropped{reason="unrepresentable"}`, not
     /// normalized.
     #[test]
-    fn an_all_unrepresentable_array_label_is_dropped_unrepresentable_not_normalized() {
+    fn an_all_unrepresentable_array_label_is_omitted_unrepresentable_not_normalized() {
         for elements in [Vec::new(), vec![Value::Null, Value::Timestamp(1)]] {
             let event = event_with(
                 &[("team", Value::Array(elements))],
@@ -1936,7 +2176,7 @@ mod tests {
             assert!(families[0].series[0].labels.is_empty());
             let points = label_points(&registry);
             assert!(
-                has_point(&points, "logit.output.labels.dropped", "unrepresentable"),
+                has_point(&points, "logit.output.labels.omitted", "unrepresentable"),
                 "{points:?}"
             );
             assert!(
@@ -1956,11 +2196,11 @@ mod tests {
         );
         let (families, registry, _) = encode_counted(&Resource::default(), &event);
         assert_eq!(families[0].series[0].labels, labels(&[("a_b", "second")]), "`a-b` < `a.b`");
-        assert!(counted(&registry, "logit.output.labels.dropped", ("reason", "collision")));
+        assert!(counted(&registry, "logit.output.labels.omitted", ("reason", "collision")));
     }
 
     #[test]
-    fn an_attribute_colliding_with_a_generated_label_is_dropped_and_counted() {
+    fn an_attribute_colliding_with_a_generated_label_is_omitted_and_counted() {
         let histogram = MetricKind::Histogram(Histogram {
             buckets: vec![(1.0, 1), (f64::INFINITY, 0)],
             temporality: Temporality::Cumulative,
@@ -1971,14 +2211,14 @@ mod tests {
         let event = event_with(&[("le", Value::from("0.5"))], record("m", histogram));
         let (families, registry, _) = encode_counted(&Resource::default(), &event);
         assert!(families[0].series[0].labels.is_empty(), "`le` belongs to the bucket lines");
-        assert!(counted(&registry, "logit.output.labels.dropped", ("reason", "reserved")));
+        assert!(counted(&registry, "logit.output.labels.omitted", ("reason", "reserved")));
 
         let summary =
             MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 });
         let event = event_with(&[("quantile", Value::from("0.5"))], record("m", summary));
         let (families, registry, _) = encode_counted(&Resource::default(), &event);
         assert!(families[0].series[0].labels.is_empty());
-        assert!(counted(&registry, "logit.output.labels.dropped", ("reason", "reserved")));
+        assert!(counted(&registry, "logit.output.labels.omitted", ("reason", "reserved")));
     }
 
     #[test]
@@ -2014,7 +2254,7 @@ mod tests {
         );
         assert_eq!(families.len(), 1);
         assert_eq!(families[0].kind, FamilyType::Gauge);
-        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "type_conflict")));
+        assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "type_conflict")));
     }
 
     #[test]
@@ -2104,7 +2344,7 @@ mod tests {
         assert_eq!(families[0].name, "a_b");
         // `a-b` < `a.b`, so the dashed one wins however the events arrive.
         assert_eq!(families[0].series[0].point, Point::Gauge(2.0));
-        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "name_collision")));
+        assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "name_collision")));
     }
 
     /// The same, with the winner arriving *second*: the already-started family is displaced.
@@ -2122,7 +2362,7 @@ mod tests {
         );
         assert_eq!(families.len(), 1);
         assert_eq!(families[0].series[0].point, Point::Gauge(2.0));
-        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "name_collision")));
+        assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "name_collision")));
     }
 
     /// A name that needs sanitizing but collides with nothing is renamed, not counted.
@@ -2134,7 +2374,7 @@ mod tests {
         let event = event_with(&[], record("a.b", MetricKind::gauge(1.0)));
         let families = events_to_families(std::iter::once((&resource, &event)), &mut encoder);
         assert_eq!(families[0].name, "a_b");
-        assert!(!counted(&registry, "logit.output.metrics.skipped", ("reason", "name_collision")));
+        assert!(!counted(&registry, "logit.output.metrics.dropped", ("reason", "name_collision")));
     }
 
     // --- stale markers and the three transport switches ----------------------------------------
@@ -2259,7 +2499,7 @@ mod tests {
         let cases = [
             (None, sum(Temporality::Cumulative), FamilyType::Counter),
             // Temporality is not consulted: a stale marker has no reading to be delta about, so
-            // the `delta_sum` skip that would apply to a *valued* record does not apply here.
+            // the `unresolved_delta` drop that would apply to a *valued* record does not apply here.
             (None, sum(Temporality::Delta), FamilyType::Counter),
             (None, MetricKind::gauge(0.0), FamilyType::Gauge),
             (Some("unknown"), MetricKind::gauge(0.0), FamilyType::Unknown),

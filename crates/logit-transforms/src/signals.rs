@@ -50,18 +50,11 @@ pub enum MatchMode {
 pub struct HasSignal {
     signals: SignalSet,
     mode: MatchMode,
-    telemetry: Telemetry,
 }
 
 impl HasSignal {
     pub fn new(signals: SignalSet, mode: MatchMode) -> Self {
-        Self { signals, mode, telemetry: Telemetry::default() }
-    }
-
-    /// Attaches a telemetry handle; matching a fixed signal set can't fail, so no `Diagnostics`.
-    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry;
-        self
+        Self { signals, mode }
     }
 }
 
@@ -71,7 +64,7 @@ impl Transform for HasSignal {
         let has_metrics = !event.metrics.is_empty();
         let has_span = event.span.is_some();
 
-        let matched = match self.mode {
+        match self.mode {
             MatchMode::AnyOf => self.signals.contains(has_log, has_metrics, has_span),
             MatchMode::Only => {
                 let within = (has_log <= self.signals.logs)
@@ -79,14 +72,6 @@ impl Transform for HasSignal {
                     && (has_span <= self.signals.traces);
                 within && self.signals.contains(has_log, has_metrics, has_span)
             }
-        };
-
-        if matched {
-            self.telemetry.count("logit.transform.events.filtered", 0.0, &[]);
-            true
-        } else {
-            self.telemetry.count("logit.transform.events.filtered", 1.0, &[]);
-            false
         }
     }
 }
@@ -148,8 +133,7 @@ impl Transform for DropSignals {
 
 /// Clears every payload slot not named in `keep`; `false` (drop) if nothing survives.
 ///
-/// Records `logit.transform.payloads.stripped{signal}` per slot cleared, and
-/// `logit.transform.events.filtered` on a drop.
+/// Records `logit.transform.payloads.stripped{signal}` per slot cleared.
 fn strip(event: &mut Event, keep: SignalSet, telemetry: &Telemetry) -> bool {
     if event.log.is_some() && !keep.logs {
         event.log = None;
@@ -164,19 +148,17 @@ fn strip(event: &mut Event, keep: SignalSet, telemetry: &Telemetry) -> bool {
         telemetry.count("logit.transform.payloads.stripped", 1.0, &[("signal", "traces")]);
     }
 
-    if event.log.is_none() && event.metrics.is_empty() && event.span.is_none() {
-        telemetry.count("logit.transform.events.filtered", 1.0, &[]);
-        false
-    } else {
-        true
-    }
+    event.log.is_some() || !event.metrics.is_empty() || event.span.is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use logit_core::interner::intern;
-    use logit_core::{AttrMap, BodyFormat, LogRecord, MetricKind, MetricRecord, Registry, Value};
+    use logit_core::{
+        AttrMap, BodyFormat, EventBatch, LogRecord, MetricKind, MetricRecord, Registry, Value,
+    };
+    use logit_pipeline::runtime::process_batch;
 
     fn default_resource() -> Arc<Resource> {
         Arc::new(Resource::default())
@@ -341,17 +323,22 @@ mod tests {
     }
 
     #[test]
-    fn has_signal_records_filtered_events() {
+    fn a_filtered_event_counts_as_discarded_not_dropped() {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("trace_only", "has_signal", "transform");
-        let mut has_signal = HasSignal::new(traces(), MatchMode::AnyOf).with_telemetry(telemetry);
-        let resource = default_resource();
+        let mut has_signal = HasSignal::new(traces(), MatchMode::AnyOf);
+        let batch = EventBatch {
+            resource: default_resource(),
+            scope: None,
+            events: vec![span_event(), metric_event()],
+        };
 
-        has_signal.process(&resource, &mut span_event());
-        has_signal.process(&resource, &mut metric_event());
+        let out = process_batch(&mut has_signal, batch, &telemetry);
 
+        assert_eq!(out.map(|b| b.events.len()), Some(1));
         let events = registry.drain(0);
-        assert_eq!(counter_value(&events, "logit.transform.events.filtered"), Some(1.0));
+        assert_eq!(counter_value(&events, "logit.component.events.discarded"), Some(1.0));
+        assert_eq!(counter_value(&events, "logit.component.events.dropped"), None);
     }
 
     #[test]
@@ -365,12 +352,5 @@ mod tests {
 
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.transform.payloads.stripped"), Some(1.0));
-    }
-
-    #[test]
-    fn a_disabled_telemetry_handle_is_the_default() {
-        let mut has_signal = HasSignal::new(traces(), MatchMode::AnyOf);
-        let resource = default_resource();
-        assert!(has_signal.process(&resource, &mut span_event()));
     }
 }

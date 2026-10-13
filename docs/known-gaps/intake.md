@@ -68,7 +68,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   same `BatchReader` interface (`crates/logit-inputs/src/udp.rs`), because `recvmmsg` has no
   portable equivalent worth a second implementation, and `logit` ships Linux containers only. On
   those targets, `read_batch` still validates and sizes the decode half's `pop_many`, but the read
-  half ignores it, and `logit.input.datagrams.truncated` stays at zero.
+  half ignores it, and `logit.component.datagrams.dropped{reason="truncated"}` stays at zero: a
+  `recv_from` build can't see the kernel cut a datagram short, so it decodes the partial payload.
 - **No runtime `recvmmsg(2)` → `recvmsg(2)` fallback when a sandbox blocks the syscall.** On Linux
   a UDP listener always calls `recvmmsg(2)`. A seccomp profile (or an LSM) that refuses it returns
   `ENOSYS`/`EPERM` on the first call, which `read_loop` treats as fatal: the listener fails and the
@@ -186,7 +187,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   the decode loop drains the queue in user space (`crates/logit-inputs/src/udp.rs`), so an
   `SO_REUSEPORT` group re-hashes the closing socket's flows to the survivors straight away. The
   kernel discards whatever sat in that socket's receive queue at the close.
-  `logit.input.kernel.drops` is the kernel's count of datagrams dropped on a full buffer, and
+  `logit.input.kernel.dropped` is the kernel's count of datagrams dropped on a full buffer, and
   `datagrams.dropped{reason="shutdown"}` covers only what `logit` had already read, so neither
   records them.
   - **Consequence:** a reader that keeps up holds that queue near empty, so the loss is small. A

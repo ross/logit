@@ -1,8 +1,10 @@
-//! `null_out`: a sink that drops everything
-//! ([ADR `load-test-harness`](../../../../docs/adr/load-test-harness.md)). Paired with
+//! `null_out`: a sink that discards everything. It's the explicit discard an operator names in the
+//! graph, such as the consumer of a router's unrouted events, which graph rule 50 requires
+//! ([ADR `target-components`](../../../../docs/adr/target-components.md)). Paired with
 //! `generate_in`, it measures everything upstream of a sink with no encoder, socket, or filesystem
-//! in the number. Also useful for running a config's listener and transform chain against a real
-//! process with nothing downstream.
+//! in the number ([ADR `load-test-harness`](../../../../docs/adr/load-test-harness.md)). Also
+//! useful for running a config's listener and transform chain against a real process with nothing
+//! downstream.
 //!
 //! ## Config
 //!

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-05
+updated: 2026-10-13
 ---
 
 # Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed
@@ -1116,3 +1116,27 @@ reject, are the peer refusing every frame, so each is `Refused`: the head holds 
 backoff, bounded by the sink's `buffer:`. `logit_out`'s pre-connect too-large error is `Rejected`,
 dropped at once, where decision 3's `class=permanent` accounting read `Permanent`. The
 `class` label's `permanent` value is renamed with the variant in W1 of the `fault/` stream.
+
+## Amendment: `otlp_out`'s partial rejections count as `records.dropped` (2026-10-13)
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the records a collector
+rejects through a `2xx`'s `partial_success` are
+`logit.output.records.dropped{signal, reason="rejected"}`, the series a whole-signal rejection
+already counts, instead of `records.rejected{signal}`. They stay per attempt, on an ungated handle.
+A request is either answered `2xx` or rejected whole, so no record is counted under both paths.
+
+## Amendment: the loss vocabulary's other renames (2026-10-13)
+
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md) renames the rest of the counters
+this record names, and none changes class:
+
+- Decision 1's encode-side `logit.output.tags.dropped` is `logit.output.tags.omitted` on every
+  sink that counts it (`statsd_out`, `graphite_out`, `collectd_out`, `splunk_hec_out`,
+  `datadog_out`, and `datadog_trace_out`), with the same reasons. `prometheus_out`'s
+  `labels.dropped` is `labels.omitted`, and `syslog_out`'s `structured_data.dropped` is
+  `structured_data.omitted`. The record is still delivered without the piece, so the count isn't
+  loss. Each stays encode-side, once per batch.
+- `datadog_out`'s `records.rejected{route="series"}`, the series a `202`'s body names, is
+  `records.dropped{route="series", reason="rejected"}`, still counted per attempt that meets it.
+
+Where the sections above use an old name, read the new one.

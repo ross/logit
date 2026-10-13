@@ -50,11 +50,11 @@ pub struct EncodeStats {
     pub dropped_unencodable_value: usize,
     /// A record flagged [`MetricRecord::FLAG_NO_RECORDED_VALUE`]. Carbon has no "no reading"
     /// marker, so writing the default payload would fabricate a sample.
-    pub dropped_no_recorded_value: usize,
+    pub skipped_no_recorded_value: usize,
     /// A [`MetricKind::GaugeDelta`], which means a missing `aggregate` stage, not a bad metric.
     pub dropped_gauge_delta: usize,
     /// An event whose timestamp floors to a non-positive second. Counted once per record, as
-    /// every other sink's `metrics.skipped` is.
+    /// every other sink's `metrics.dropped` is.
     pub dropped_unencodable_timestamp: usize,
     /// A record whose name sanitized to nothing: carbon rejects an empty path.
     pub dropped_empty_name: usize,
@@ -62,17 +62,17 @@ pub struct EncodeStats {
     pub dropped_oversize_line: usize,
     /// A single pickle datapoint that cannot fit an empty `max_frame_bytes` frame, dropped whole.
     pub dropped_oversize_datapoint: usize,
-    /// An attribute dropped because [`Tags::Drop`] is configured.
-    pub tags_dropped_dialect: usize,
+    /// An attribute omitted because [`Tags::Drop`] is configured.
+    pub tags_omitted_dialect: usize,
     /// An attribute whose `Value` has no faithful carbon tag spelling (`Null`, `Bytes`, a
     /// `Timestamp`, a `Map`, or an `Array` with no representable element).
-    pub tags_dropped_unrepresentable: usize,
+    pub tags_omitted_unrepresentable: usize,
     /// A tag whose name or value was empty after sanitizing. Carbon's parser would reject the
     /// whole line.
-    pub tags_dropped_empty: usize,
+    pub tags_omitted_empty: usize,
     /// A tag whose rendered name collided with another's; the one whose **original** name sorts
     /// first survives.
-    pub tags_dropped_collision: usize,
+    pub tags_omitted_collision: usize,
     /// A [`Value::Array`] rendered as its last representable element. **Lossy**, unlike every other
     /// `*.normalized` reason: the other elements are discarded (as at `influxdb_out`).
     pub tags_normalized_multi_value: usize,
@@ -571,7 +571,7 @@ fn build_tag_suffix(
             continue;
         }
         if tags == Tags::Drop {
-            ctx.tag_dropped_dialect();
+            ctx.tag_omitted_dialect();
             continue;
         }
 
@@ -588,7 +588,7 @@ fn build_tag_suffix(
             scalar => render_scalar(scratch, scalar),
         };
         if !rendered {
-            ctx.tag_dropped_unrepresentable();
+            ctx.tag_omitted_unrepresentable();
             continue;
         }
         if is_multi_value {
@@ -603,7 +603,7 @@ fn build_tag_suffix(
         if name_end == name_start || value_end == name_end {
             // Carbon rejects an empty tag name or value with the whole line; drop the tag instead.
             text.truncate(name_start);
-            ctx.tag_dropped_empty();
+            ctx.tag_omitted_empty();
             continue;
         }
         let original_start = text.len();
@@ -631,7 +631,7 @@ fn build_tag_suffix(
     for slot in slots.iter() {
         if let Some(previous) = &previous {
             if arena[previous.clone()] == arena[slot.rendered.clone()] {
-                ctx.tag_dropped_collision();
+                ctx.tag_omitted_collision();
                 continue;
             }
         }
@@ -767,9 +767,9 @@ impl Ctx<'_> {
     fn drop_gauge_delta(&mut self) {
         self.stats.dropped_gauge_delta += 1;
         self.telemetry.count(
-            "logit.output.metrics.skipped",
+            "logit.output.metrics.dropped",
             1.0,
-            &[("metric_kind", "gauge_delta")],
+            &[("reason", "unresolved_gauge_delta")],
         );
         self.diag.warn_throttled(
             "gauge_delta_unresolved",
@@ -781,7 +781,7 @@ impl Ctx<'_> {
     fn drop_unencodable_value(&mut self, name: &str, value: f64) {
         self.stats.dropped_unencodable_value += 1;
         self.telemetry.count(
-            "logit.output.metrics.skipped",
+            "logit.output.metrics.dropped",
             1.0,
             &[("reason", "unencodable_value")],
         );
@@ -795,7 +795,7 @@ impl Ctx<'_> {
     }
 
     fn drop_no_recorded_value(&mut self, name: &str) {
-        self.stats.dropped_no_recorded_value += 1;
+        self.stats.skipped_no_recorded_value += 1;
         self.telemetry.count(
             "logit.output.metrics.skipped",
             1.0,
@@ -810,12 +810,12 @@ impl Ctx<'_> {
         );
     }
 
-    /// `records` is how many records the dropped event carried, since `metrics.skipped` is
+    /// `records` is how many records the dropped event carried, since `metrics.dropped` is
     /// per-record at every sink.
     fn drop_unencodable_timestamp(&mut self, timestamp: i64, records: usize) {
         self.stats.dropped_unencodable_timestamp += records;
         self.telemetry.count(
-            "logit.output.metrics.skipped",
+            "logit.output.metrics.dropped",
             records as f64,
             &[("reason", "unencodable_timestamp")],
         );
@@ -830,7 +830,7 @@ impl Ctx<'_> {
 
     fn drop_empty_name(&mut self, name: &str) {
         self.stats.dropped_empty_name += 1;
-        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("reason", "empty_name")]);
+        self.telemetry.count("logit.output.metrics.dropped", 1.0, &[("reason", "empty_name")]);
         self.diag.warn_throttled(
             "empty_metric_name",
             format_args!(
@@ -842,7 +842,7 @@ impl Ctx<'_> {
 
     fn drop_oversize_line(&mut self, len: usize, max_packet_bytes: usize) {
         self.stats.dropped_oversize_line += 1;
-        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("reason", "oversize_line")]);
+        self.telemetry.count("logit.output.metrics.dropped", 1.0, &[("reason", "oversize_line")]);
         self.diag.warn_throttled(
             "oversize_line",
             format_args!(
@@ -855,7 +855,7 @@ impl Ctx<'_> {
     fn drop_oversize_datapoint(&mut self, len: usize, max_frame_bytes: usize) {
         self.stats.dropped_oversize_datapoint += 1;
         self.telemetry.count(
-            "logit.output.metrics.skipped",
+            "logit.output.metrics.dropped",
             1.0,
             &[("reason", "oversize_datapoint")],
         );
@@ -868,24 +868,24 @@ impl Ctx<'_> {
         );
     }
 
-    fn tag_dropped_dialect(&mut self) {
-        self.stats.tags_dropped_dialect += 1;
-        self.telemetry.count("logit.output.tags.dropped", 1.0, &[("reason", "dialect")]);
+    fn tag_omitted_dialect(&mut self) {
+        self.stats.tags_omitted_dialect += 1;
+        self.telemetry.count("logit.output.tags.omitted", 1.0, &[("reason", "dialect")]);
     }
 
-    fn tag_dropped_unrepresentable(&mut self) {
-        self.stats.tags_dropped_unrepresentable += 1;
-        self.telemetry.count("logit.output.tags.dropped", 1.0, &[("reason", "unrepresentable")]);
+    fn tag_omitted_unrepresentable(&mut self) {
+        self.stats.tags_omitted_unrepresentable += 1;
+        self.telemetry.count("logit.output.tags.omitted", 1.0, &[("reason", "unrepresentable")]);
     }
 
-    fn tag_dropped_empty(&mut self) {
-        self.stats.tags_dropped_empty += 1;
-        self.telemetry.count("logit.output.tags.dropped", 1.0, &[("reason", "empty")]);
+    fn tag_omitted_empty(&mut self) {
+        self.stats.tags_omitted_empty += 1;
+        self.telemetry.count("logit.output.tags.omitted", 1.0, &[("reason", "empty")]);
     }
 
-    fn tag_dropped_collision(&mut self) {
-        self.stats.tags_dropped_collision += 1;
-        self.telemetry.count("logit.output.tags.dropped", 1.0, &[("reason", "collision")]);
+    fn tag_omitted_collision(&mut self) {
+        self.stats.tags_omitted_collision += 1;
+        self.telemetry.count("logit.output.tags.omitted", 1.0, &[("reason", "collision")]);
     }
 
     fn tag_normalized_multi_value(&mut self) {
@@ -1063,7 +1063,7 @@ mod tests {
             assert!(lines.is_empty(), "{value}");
             assert_eq!(stats.dropped_unencodable_value, 1, "{value}");
             assert_eq!(
-                counted(&registry, "logit.output.metrics.skipped", ("reason", "unencodable_value")),
+                counted(&registry, "logit.output.metrics.dropped", ("reason", "unencodable_value")),
                 1.0
             );
         }
@@ -1075,7 +1075,7 @@ mod tests {
         ev.metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         let (lines, _, stats, registry) = encode_with(&batch(vec![ev]), |e| e);
         assert!(lines.is_empty());
-        assert_eq!(stats.dropped_no_recorded_value, 1);
+        assert_eq!(stats.skipped_no_recorded_value, 1);
         assert_eq!(
             counted(&registry, "logit.output.metrics.skipped", ("reason", "no_recorded_value")),
             1.0
@@ -1089,7 +1089,11 @@ mod tests {
         assert!(lines.is_empty());
         assert_eq!(stats.dropped_gauge_delta, 1);
         assert_eq!(
-            counted(&registry, "logit.output.metrics.skipped", ("metric_kind", "gauge_delta")),
+            counted(
+                &registry,
+                "logit.output.metrics.dropped",
+                ("reason", "unresolved_gauge_delta")
+            ),
             1.0
         );
     }
@@ -1116,7 +1120,7 @@ mod tests {
             assert_eq!(
                 counted(
                     &registry,
-                    "logit.output.metrics.skipped",
+                    "logit.output.metrics.dropped",
                     ("reason", "unencodable_timestamp")
                 ),
                 2.0
@@ -1196,9 +1200,9 @@ mod tests {
         ]);
         let (lines, _, stats, registry) = encode_with(&batch(vec![ev]), |e| e);
         assert_eq!(lines, vec!["sys.cpu;keep=yes 1 1700000000"]);
-        assert_eq!(stats.tags_dropped_unrepresentable, 4);
+        assert_eq!(stats.tags_omitted_unrepresentable, 4);
         assert_eq!(
-            counted(&registry, "logit.output.tags.dropped", ("reason", "unrepresentable")),
+            counted(&registry, "logit.output.tags.omitted", ("reason", "unrepresentable")),
             4.0
         );
     }
@@ -1222,7 +1226,7 @@ mod tests {
         let ev = tagged(&[("team", Value::Array(vec![])), ("keep", Value::from("y"))]);
         let (lines, _, stats, _) = encode_with(&batch(vec![ev]), |e| e);
         assert_eq!(lines, vec!["sys.cpu;keep=y 1 1700000000"]);
-        assert_eq!(stats.tags_dropped_unrepresentable, 1, "an empty array is unrepresentable");
+        assert_eq!(stats.tags_omitted_unrepresentable, 1, "an empty array is unrepresentable");
     }
 
     #[test]
@@ -1231,8 +1235,8 @@ mod tests {
         let (lines, _, stats, registry) =
             encode_with(&batch(vec![ev]), |e| e.with_tags(Tags::Drop));
         assert_eq!(lines, vec!["sys.cpu 1 1700000000"]);
-        assert_eq!(stats.tags_dropped_dialect, 2);
-        assert_eq!(counted(&registry, "logit.output.tags.dropped", ("reason", "dialect")), 2.0);
+        assert_eq!(stats.tags_omitted_dialect, 2);
+        assert_eq!(counted(&registry, "logit.output.tags.omitted", ("reason", "dialect")), 2.0);
     }
 
     /// `statsd.` and `collectd.` carriers are skipped **uncounted**.
@@ -1245,8 +1249,8 @@ mod tests {
         ]);
         let (lines, _, stats, _) = encode_with(&batch(vec![ev]), |e| e);
         assert_eq!(lines, vec!["sys.cpu;env=prod 1 1700000000"]);
-        assert_eq!(stats.tags_dropped_dialect, 0);
-        assert_eq!(stats.tags_dropped_unrepresentable, 0);
+        assert_eq!(stats.tags_omitted_dialect, 0);
+        assert_eq!(stats.tags_omitted_unrepresentable, 0);
     }
 
     // -- sanitization -----------------------------------------------------------------------------
@@ -1314,8 +1318,8 @@ mod tests {
             tagged(&[("", Value::from("v")), ("k", Value::from("")), ("ok", Value::from("y"))]);
         let (lines, _, stats, registry) = encode_with(&batch(vec![ev]), |e| e);
         assert_eq!(lines, vec!["sys.cpu;ok=y 1 1700000000"]);
-        assert_eq!(stats.tags_dropped_empty, 2);
-        assert_eq!(counted(&registry, "logit.output.tags.dropped", ("reason", "empty")), 2.0);
+        assert_eq!(stats.tags_omitted_empty, 2);
+        assert_eq!(counted(&registry, "logit.output.tags.omitted", ("reason", "empty")), 2.0);
     }
 
     #[test]
@@ -1329,7 +1333,7 @@ mod tests {
         assert!(lines.is_empty());
         assert_eq!(stats.dropped_empty_name, 1);
         assert_eq!(
-            counted(&registry, "logit.output.metrics.skipped", ("reason", "empty_name")),
+            counted(&registry, "logit.output.metrics.dropped", ("reason", "empty_name")),
             1.0
         );
     }
@@ -1344,8 +1348,8 @@ mod tests {
             vec!["sys.cpu;a_b=bang 1 1700000000"],
             "'a!b' sorts before 'a;b', so its value is the one kept"
         );
-        assert_eq!(stats.tags_dropped_collision, 1);
-        assert_eq!(counted(&registry, "logit.output.tags.dropped", ("reason", "collision")), 1.0);
+        assert_eq!(stats.tags_omitted_collision, 1);
+        assert_eq!(counted(&registry, "logit.output.tags.omitted", ("reason", "collision")), 1.0);
     }
 
     // -- multi-value kinds -------------------------------------------------------------------------
@@ -1707,7 +1711,7 @@ mod tests {
         assert!(lines.is_empty(), "never split -- half a line is a corrupt series");
         assert_eq!(stats.dropped_oversize_line, 1);
         assert_eq!(
-            counted(&registry, "logit.output.metrics.skipped", ("reason", "oversize_line")),
+            counted(&registry, "logit.output.metrics.dropped", ("reason", "oversize_line")),
             1.0
         );
     }
@@ -1811,7 +1815,7 @@ mod tests {
         assert!(messages.is_empty());
         assert_eq!(stats.dropped_oversize_datapoint, 1);
         assert_eq!(
-            counted(&registry, "logit.output.metrics.skipped", ("reason", "oversize_datapoint")),
+            counted(&registry, "logit.output.metrics.dropped", ("reason", "oversize_datapoint")),
             1.0
         );
     }

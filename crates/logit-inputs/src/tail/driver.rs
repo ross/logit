@@ -891,6 +891,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             return;
         }
         let prev_offset = tracked.offset;
+        let discarded_partial = tracked.splitter.holds_partial();
         tracked.offset = 0;
         // Discard, not emit, the held partial (or a stale `dropping`): it belongs to content
         // that's gone, and would otherwise be spliced onto, or swallow, the new first line. The
@@ -903,6 +904,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let path = tracked.path.clone();
         self.diag.warn_throttled("truncated", truncated_message(&path, prev_offset, len));
         self.telemetry.count("logit.input.files.truncated", 1.0, &[]);
+        if discarded_partial {
+            self.telemetry.count("logit.input.frames.dropped", 1.0, &[("reason", "truncated")]);
+        }
         // The persisted offset is now past the file's end. A write before the next read must
         // replace it with `0`: the head fingerprint would reject it at a restart, but only as a
         // counted `resume_rejected`, and only if the head changed.
@@ -1245,6 +1249,13 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             tracked.offset += n as u64;
             stats.dropped_lines
         };
+        if dropped > 0 {
+            self.telemetry.count(
+                "logit.input.frames.dropped",
+                f64::from(dropped),
+                &[("reason", "oversize")],
+            );
+        }
         for _ in 0..dropped {
             self.diag.warn_throttled(
                 "long_line",
@@ -2015,12 +2026,14 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"aaaaaaaaaa\n").unwrap();
 
+        let mut probe = TelemetryProbe::new();
         let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&path)],
             LineFactory,
             fast_config(ReadFrom::Beginning),
-        );
+        )
+        .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
         let running = spawn_tailer(tailer, fanout);
 
         let events = recv_events(&mut rx, 1).await;
@@ -2031,6 +2044,12 @@ mod tests {
 
         let events2 = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events2), vec!["new"]);
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+        assert_eq!(
+            probe.sum("logit.input.frames.dropped", &[]),
+            0.0,
+            "nothing was held, so nothing was lost"
+        );
 
         running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
@@ -2233,6 +2252,11 @@ mod tests {
             "the dropped line's tail must not be emitted as a line"
         );
         assert_eq!(diag.occurrences("long_line"), 2, "the re-selected file drops the line again");
+        assert_eq!(
+            probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]),
+            2.0,
+            "each drop of the oversized line is counted, not only diagnosed"
+        );
 
         running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
@@ -2950,12 +2974,14 @@ mod tests {
         // post-truncation length (10), so `scan` sees a truncation.
         std::fs::write(&path, b"a\nb\npartialpartial").unwrap();
 
+        let mut probe = TelemetryProbe::new();
         let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&path)],
             LineFactory,
             fast_config(ReadFrom::Beginning),
-        );
+        )
+        .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
         let running = spawn_tailer(tailer, fanout);
 
         let events = recv_events(&mut rx, 2).await;
@@ -2970,6 +2996,13 @@ mod tests {
             vec!["restarted"],
             "the pre-truncation partial must not be spliced onto the first post-truncation line"
         );
+
+        assert_eq!(
+            probe.sum("logit.input.frames.dropped", &[("reason", "truncated")]),
+            1.0,
+            "the discarded partial is counted lost"
+        );
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
 
         running.stop().await;
         assert!(rx.try_recv().is_err(), "the discarded partial must not resurface on close");

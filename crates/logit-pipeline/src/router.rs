@@ -26,8 +26,8 @@ use std::sync::Arc;
 /// compares or hashes a string.
 ///
 /// `Forward` is the router's own outbound edge (whoever lists it in `sources:`): the else-branch.
-/// A router with targets and no ordinary consumers is a legal config; its `Forward` events are
-/// dropped and counted `logit.component.events.dropped{reason="unrouted"}`.
+/// Graph rule 50 rejects a router with no ordinary consumer, so a `Forward` event always has
+/// somewhere to go; an operator who wants those events gone lists the router in a `null_out`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Destination {
     Forward,

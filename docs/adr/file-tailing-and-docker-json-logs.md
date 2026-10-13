@@ -598,3 +598,14 @@ one after the restart.
 The cross-stream replay gap in `docs/known-gaps/tailing.md` ("`held_from` is the oldest held
 line across both streams") now applies at a clean stop as well as after a crash. The checkpoint
 format and the config are unchanged.
+
+## Amendment: counted line loss (2026-10-13)
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the line splitter's loss
+gets counters beside its diagnostics. A line dropped whole for `max_line_bytes` counts
+`logit.input.frames.dropped{reason="oversize"}`, the dropped-line counter the "Long lines are
+dropped whole" section names, as `lines_in` counts one. An in-place truncation still counts
+`logit.input.files.truncated`; the unterminated line it discards, held from before the
+truncation, counts `logit.input.frames.dropped{reason="truncated"}`. `docker_in`'s decoder, which
+drops a reassembled message over the bound and resets its held partial entries at a truncation,
+has no telemetry handle and still reports only `long_line`.

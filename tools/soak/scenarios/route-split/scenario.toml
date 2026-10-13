@@ -80,16 +80,27 @@ window = "during"
 reduce = "max"
 min = 5
 
+# `unrouted` is the router's null_out consumer. A counter that stays zero emits no point, so
+# `split-routes` pairs this with a positive read on the router.
 [[expect]]
 name = "nothing-unrouted"
 service = "logit"
-metric = "logit.component.events.dropped"
-component = "split"
-attrs = { reason = "unrouted" }
+metric = "logit.component.events.received"
+component = "unrouted"
 step = "c0s1"
 window = "through"
 reduce = "delta"
 max = 0
+
+[[expect]]
+name = "split-routes"
+service = "logit"
+metric = "logit.component.events.received"
+component = "split"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+min = 1
 
 [[expect]]
 name = "b-drops-nothing"

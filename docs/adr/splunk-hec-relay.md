@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-10-04
+updated: 2026-10-13
 ---
 
 # Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment
@@ -572,3 +572,26 @@ non-2xx body, not the status alone, and three statements above change:
 
 The table, with its evidence, is the "Faults, retries, and duplicate safety" section of
 `crates/logit-outputs/src/splunk.rs`'s module doc.
+
+## Amendment: loss counters renamed (2026-10-13)
+
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md) reserves `*.dropped` for loss, so
+the counters this record's decisions name move as follows. Behavior doesn't change.
+
+- `splunk_hec_in`: an object with no `event` or a blank one is
+  `logit.input.events.dropped{reason="no_event"|"blank_event"}`, and a malformed measurement is
+  `logit.input.metrics.dropped{reason="bad_name"|"bad_value"|"duplicate_name"|"incomplete_single_metric"}`.
+  A metric event left with no record stays `events.skipped{reason="no_metric"}`.
+- `splunk_hec_in`: a busy `503`'s batches are `logit.input.batches.deferred`, because the client
+  keeps them and retries. An id the ack ledger expires or evicts with its channel is
+  `logit.input.acks.evicted{reason="expired"|"channel"}`: the data was delivered, and only the
+  bookkeeping is gone.
+- `splunk_hec_out`: a blank log is `logit.output.events.dropped{reason="blank_event"}`, an
+  unresolved `GaugeDelta` is `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, a
+  duplicate metric name is `metrics.dropped{reason="duplicate_name"}`, and a `NO_RECORDED_VALUE`
+  record is `metrics.skipped{reason="no_recorded_value"}`, tagged `reason` instead of
+  `metric_kind`. A carrier or reserved key left off an object is `logit.output.tags.omitted`.
+  A kind HEC has no form for, or one `multi_value: skip` leaves out, stays
+  `metrics.skipped{metric_kind}`.
+
+The codec module docs under `crates/logit-proto/src/splunk/` hold the full mapping.

@@ -297,7 +297,10 @@ fn event_fate(event: &Event) -> Fate {
     }
 }
 
-/// `logit.input.metrics.skipped` by reason.
+/// The datapoints the decoder didn't turn into events, by reason: `logit.input.metrics.dropped`
+/// and `logit.input.metrics.skipped` folded together. The corpus's `decoder_skips` predates the
+/// split between the two names (`docs/adr/telemetry-loss-vocabulary.md`) and names a reason, not a
+/// counter, so it stays as generated.
 fn skipped(registry: &Registry) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     for event in registry.drain(0) {
@@ -305,7 +308,8 @@ fn skipped(registry: &Registry) -> BTreeMap<String, u64> {
             continue;
         };
         for m in &event.metrics {
-            if logit_core::interner::resolve(m.name) == "logit.input.metrics.skipped" {
+            let name = logit_core::interner::resolve(m.name);
+            if name == "logit.input.metrics.dropped" || name == "logit.input.metrics.skipped" {
                 let MetricKind::Sum(sum) = &m.kind else { panic!("not a counter") };
                 *out.entry(reason.to_string()).or_default() += sum.value.as_f64() as u64;
             }

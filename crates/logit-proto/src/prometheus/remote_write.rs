@@ -59,10 +59,10 @@
 //! | a sample whose value is the stale NaN ([`super::STALE_NAN_BITS`]) | [`Point::Stale`] for that series in that group |
 //! | `Sample.start_timestamp` (2.0, ms, `0` = unset) | [`Series::created`] |
 //! | `Exemplar` | the shared exemplar mapping ([`assemble::exemplar_from_labels`]): `trace_id`/`span_id` → [`logit_core::TraceRef`], the rest → `filtered_attributes`. Attached in a pass of its own, once every series' samples are grouped, to the group where *that series* has a reading at the exemplar's own timestamp -- else the latest group where it has one at all. Never to a group where it has none, a stale marker included: see [`Decoded::exemplars`] |
-//! | `histograms[]` (native histograms) | **skipped**, counted `logit.input.metrics.skipped{reason="native_histogram"}` and reported in [`Decoded::histograms_skipped`] -- `docs/known-gaps/prometheus.md`'s native-histogram row |
+//! | `histograms[]` (native histograms) | **dropped**, counted `logit.input.metrics.dropped{reason="native_histogram"}` and reported in [`Decoded::histograms_dropped`] -- `docs/known-gaps/prometheus.md`'s native-histogram row |
 //!
 //! Everything else is the assembler's, unchanged: suffix routing, `le`/`quantile` stripping, the
-//! cumulative-bucket rules, the skip reasons.
+//! cumulative-bucket rules, the drop reasons.
 //!
 //! ### Metadata the request doesn't carry
 //!
@@ -75,7 +75,7 @@
 //! caller to learn from. What is remembered, for how long, and how much of it is the caller's
 //! decision -- `prometheus_in`'s `metadata_cache:` makes it.
 //!
-//! ### Malformed input: what is a `400`, and what is a counted skip
+//! ### Malformed input: what is a `400`, and what is a counted drop
 //!
 //! [`CodecError::Malformed`] is reserved for a request that is *structurally* broken, where no part
 //! of it can be trusted -- the receiver answers `400` and keeps nothing:
@@ -92,22 +92,22 @@
 //! - 2.0: `symbols[0]` is not the empty string, a `labels_refs` list has an odd length, or a
 //!   symbol reference the decode reads is out of range. A bad index means the whole table is being
 //!   read wrongly. The decode reads every series' labels, and the metadata and exemplars of each
-//!   series whose labels are valid; a series skipped as `invalid_labels` has neither read.
+//!   series whose labels are valid; a series dropped as `invalid_labels` has neither read.
 //!
-//! Anything wrong with *one series* is a counted skip instead, because a request from a real sender
+//! Anything wrong with *one series* is a counted drop instead, because a request from a real sender
 //! is worth keeping the rest of:
 //!
 //! | Reason | What it counts |
 //! |---|---|
 //! | `invalid_labels` | a series with no `__name__`, an empty label name or value, or a repeated label name -- all of which both specs forbid a sender from producing. A label set out of byte order is sorted, not skipped: both specs forbid that too, but vmagent sends it and Prometheus's and VictoriaMetrics's own receivers accept it |
-//! | `native_histogram` | one entry of a `histograms[]` list (above), on a series whose labels are valid; a series skipped as `invalid_labels` counts once, there |
+//! | `native_histogram` | one entry of a `histograms[]` list (above), on a series whose labels are valid; a series dropped as `invalid_labels` counts once, there |
 //! | `duplicate_type` / `duplicate_metadata` | a second metadata entry naming a *different* type, help or unit for one family. A sender repeating what it already said is not counted, which matters here because 2.0 repeats a family's `Metadata` on every one of its wire series |
 //!
-//! And one *degradation*, `logit.input.metrics.degraded{reason="exemplar_dropped"}`: an exemplar
+//! And one *degradation*, `logit.input.metrics.degraded{reason="exemplar_omitted"}`: an exemplar
 //! with no reading to be an example of -- its series has no reading anywhere in the request (a
-//! stale marker is not one), or the series was itself skipped above. The two counters are not
+//! stale marker is not one), or the series was itself dropped above. The two counters are not
 //! additive: a series with bad labels and three exemplars raises one `invalid_labels` **and**
-//! three `exemplar_dropped`, because they answer different questions (how many series went, and
+//! three `exemplar_omitted`, because they answer different questions (how many series went, and
 //! how much of what the sender sent was not stored).
 //!
 //! ## Encode: families → protobuf
@@ -135,10 +135,10 @@
 //!
 //! | Situation | Result |
 //! |---|---|
-//! | [`Series::timestamp`] is `None` | the series is **skipped**, `logit.output.metrics.skipped{reason="no_timestamp"}`. The wire has no way to omit a timestamp, so a caller on this path runs the encoder with [`super::PrometheusEncoder::with_timestamps_always`]`(true)` and never produces one |
-//! | a label with an empty value, or named `__name__`/`le`/`quantile` where the codec generates that name itself | the label is dropped, `logit.output.labels.dropped{reason="empty_value"\|"reserved"}` -- both specs forbid an empty value, and a repeated name is an invalid label set rather than a confusing one |
-//! | an exemplar on a family with no `_total`/`_bucket` series (a gauge, an `info`, a `stateset`, a summary), or one whose value is `NaN` and so falls in no bucket | dropped, `logit.output.metrics.degraded{reason="exemplar_dropped"}` -- the same rule and the same counter the OpenMetrics writer uses |
-//! | a family with an empty name | **skipped**, `logit.output.metrics.skipped{reason="invalid_labels"}`; `__name__` may not be empty |
+//! | [`Series::timestamp`] is `None` | the series is **dropped**, `logit.output.metrics.dropped{reason="no_timestamp"}`. The wire has no way to omit a timestamp, so a caller on this path runs the encoder with [`super::PrometheusEncoder::with_timestamps_always`]`(true)` and never produces one |
+//! | a label with an empty value, or named `__name__`/`le`/`quantile` where the codec generates that name itself | the label is omitted, `logit.output.labels.omitted{reason="empty_value"\|"reserved"}` -- both specs forbid an empty value, and a repeated name is an invalid label set rather than a confusing one |
+//! | an exemplar on a family with no `_total`/`_bucket` series (a gauge, an `info`, a `stateset`, a summary), or one whose value is `NaN` and so falls in no bucket | dropped, `logit.output.metrics.degraded{reason="exemplar_omitted"}` -- the same rule and the same counter the OpenMetrics writer uses |
+//! | a family with an empty name | **dropped**, `logit.output.metrics.dropped{reason="invalid_labels"}`; `__name__` may not be empty |
 //! | two readings of one series whose nanosecond timestamps truncate to the same millisecond | the **later** reading wins and the earlier is dropped, `logit.output.metrics.degraded{reason="sub_ms_collapsed"}` per dropped reading. One label set may not carry two samples at one timestamp -- Prometheus and Mimir answer `400 duplicate sample for timestamp` and the sender treats that as permanent, so emitting both would cost the whole request rather than the one reading |
 //! | a counter's family name in 1.0's `MetricMetadata` | its value sample's name, `_total` included, whatever the model name: decode gives a counter that name either way, so this keeps a re-encode a fixed point |
 //! | [`Series::created`], **version 1.0 only** | dropped, uncounted. 1.0 has no field for it at all; this is the operator's choice of wire version, listed with the permitted normalizations below the way text 0.0.4's `_created` drop is |
@@ -179,8 +179,8 @@ pub use super::assemble::{Declaration, Declarations};
 use super::generated::io::prometheus::write::v2 as pb2;
 use super::generated::prometheus as pb1;
 use super::{
-    is_stale_nan, text, FamilyType, MetricFamily, Point, PrometheusDecoder, PrometheusEncoder,
-    Series, STALE_NAN_BITS,
+    is_stale_nan, text, DecodeDrop, FamilyType, MetricFamily, NotEncoded, Point, PrometheusDecoder,
+    PrometheusEncoder, Series, STALE_NAN_BITS,
 };
 use crate::CodecError;
 use logit_core::Exemplar;
@@ -194,7 +194,7 @@ pub const HEADER_VERSION: &str = "x-prometheus-remote-write-version";
 /// 2.0's report of how many samples the receiver stored -- set on 2xx *and* 4xx.
 pub const HEADER_SAMPLES_WRITTEN: &str = "x-prometheus-remote-write-samples-written";
 /// 2.0's report of how many native histograms the receiver stored, which for this codec is always
-/// `0` ([`Decoded::histograms_skipped`] counts what it did *not* store).
+/// `0` ([`Decoded::histograms_dropped`] counts what it did *not* store).
 pub const HEADER_HISTOGRAMS_WRITTEN: &str = "x-prometheus-remote-write-histograms-written";
 /// 2.0's report of how many exemplars the receiver stored.
 pub const HEADER_EXEMPLARS_WRITTEN: &str = "x-prometheus-remote-write-exemplars-written";
@@ -284,14 +284,14 @@ pub struct Decoded {
     /// counted, because the header is a report of what the receiver kept.
     pub samples: u64,
     /// Exemplars stored, for `X-Prometheus-Remote-Write-Exemplars-Written`. Every exemplar this
-    /// codec could not place is counted `logit.input.metrics.degraded{reason="exemplar_dropped"}`
+    /// codec could not place is counted `logit.input.metrics.degraded{reason="exemplar_omitted"}`
     /// instead -- whether its series carried no reading this codec kept (a stale marker is not
-    /// one), or the series was skipped as `invalid_labels` -- so the difference from what was sent
+    /// one), or the series was dropped as `invalid_labels` -- so the difference from what was sent
     /// is in one counter.
     pub exemplars: u64,
-    /// Native-histogram entries skipped, each also counted
-    /// `logit.input.metrics.skipped{reason="native_histogram"}`.
-    pub histograms_skipped: u64,
+    /// Native-histogram entries dropped, each also counted
+    /// `logit.input.metrics.dropped{reason="native_histogram"}`.
+    pub histograms_dropped: u64,
     /// What **this request** declared -- 1.0's `metadata[]`, 2.0's inline `Metadata` with a
     /// type that is not `UNSPECIFIED` -- deduped to one entry per family and keyed by the family's
     /// own name. Not the table the decode ran against: a [`decode_with`] seed is the caller's, and
@@ -444,7 +444,7 @@ impl Routed<'_> {
     /// carrying several timestamps for one series cannot say which sample an exemplar came from:
     /// a choice the wire forces (see the permitted-normalization list). It must never pick a group
     /// in which the series has no sample: a reading-less series invented to hang it on becomes an
-    /// `incomplete_series` skip that swallows the exemplar.
+    /// `incomplete_series` drop that swallows the exemplar.
     fn group_for(&self, timestamp_nanos: i64) -> Option<i64> {
         if self.groups.binary_search(&timestamp_nanos).is_ok() {
             return Some(timestamp_nanos);
@@ -498,7 +498,7 @@ impl<'a> Groups<'a> {
 ///
 /// Only a *conflict* is counted -- a second entry naming a different type, help or unit for one
 /// family. A sender repeating what it already said is not a dropped input, and
-/// `skipped{reason="duplicate_metadata"}` is a counter operators read as one.
+/// `dropped{reason="duplicate_metadata"}` is a counter operators read as one.
 fn merge_declaration(
     declarations: &mut Declarations,
     name: &str,
@@ -512,7 +512,7 @@ fn merge_declaration(
         return;
     };
     if existing.kind != kind {
-        decoder.skipped("duplicate_type");
+        decoder.dropped(DecodeDrop::DuplicateType);
     }
     for (slot, incoming) in [(&mut existing.help, help), (&mut existing.unit, unit)] {
         match (&slot, incoming) {
@@ -520,13 +520,13 @@ fn merge_declaration(
             (None, incoming) => *slot = incoming,
             (Some(_), None) => {}
             (Some(held), Some(incoming)) if **held == *incoming => {}
-            (Some(_), Some(_)) => decoder.skipped("duplicate_metadata"),
+            (Some(_), Some(_)) => decoder.dropped(DecodeDrop::DuplicateMetadata),
         }
     }
 }
 
 /// Attaches one exemplar to the group [`Routed::group_for`] chooses, counting
-/// `logit.input.metrics.degraded{reason="exemplar_dropped"}` when there is nowhere to put it --
+/// `logit.input.metrics.degraded{reason="exemplar_omitted"}` when there is nowhere to put it --
 /// a series with no reading this codec kept (a stale marker is not one), or one that carried
 /// exemplars and no samples at all. Returns whether it was stored, which is what
 /// `X-Prometheus-Remote-Write-Exemplars-Written` reports.
@@ -542,7 +542,7 @@ fn attach_exemplar(
             |assembler| assembler.push_exemplar(routed.name, routed.labels.clone(), exemplar),
         );
     if !stored {
-        decoder.degraded("exemplar_dropped");
+        decoder.degraded("exemplar_omitted");
     }
     stored
 }
@@ -688,7 +688,7 @@ fn decode_v1(
         pairs.clear();
         pairs.extend(series.labels.iter().map(|l| (l.name.as_str(), l.value.as_str())));
         let Some((name, labels)) = series_labels(&pairs) else {
-            decoder.skipped("invalid_labels");
+            decoder.dropped(DecodeDrop::InvalidLabels);
             routed.push(None);
             continue;
         };
@@ -709,8 +709,8 @@ fn decode_v1(
             }
         }
         for _ in &series.histograms {
-            decoded.histograms_skipped += 1;
-            decoder.skipped("native_histogram");
+            decoded.histograms_dropped += 1;
+            decoder.dropped(DecodeDrop::NativeHistogram);
         }
         touched.sort_unstable();
         touched.dedup();
@@ -730,11 +730,11 @@ fn decode_v1(
     // `Routed::group_for` for why this cannot be done as the samples go past.
     for (series, routed) in request.timeseries.iter().zip(&routed) {
         let Some(routed) = routed else {
-            // The series was skipped as `invalid_labels`. Each of its exemplars is counted too:
+            // The series was dropped as `invalid_labels`. Each of its exemplars is counted too:
             // an operator reconciling "exemplars sent" against
             // `X-Prometheus-Remote-Write-Exemplars-Written` needs every unwritten one to appear.
             for _ in &series.exemplars {
-                decoder.degraded("exemplar_dropped");
+                decoder.degraded("exemplar_omitted");
             }
             continue;
         };
@@ -857,7 +857,7 @@ fn decode_v2(
         match series_labels(&pairs) {
             Some(series) => resolved.push(Some(series)),
             None => {
-                decoder.skipped("invalid_labels");
+                decoder.dropped(DecodeDrop::InvalidLabels);
                 resolved.push(None);
             }
         }
@@ -938,8 +938,8 @@ fn decode_v2(
             }
         }
         for _ in &series.histograms {
-            decoded.histograms_skipped += 1;
-            decoder.skipped("native_histogram");
+            decoded.histograms_dropped += 1;
+            decoder.dropped(DecodeDrop::NativeHistogram);
         }
         touched.sort_unstable();
         touched.dedup();
@@ -958,11 +958,11 @@ fn decode_v2(
     // Pass four: exemplars.
     for (series, routed) in request.timeseries.iter().zip(&routed) {
         let Some(routed) = routed else {
-            // The series was skipped as `invalid_labels`; each exemplar is counted, as in
+            // The series was dropped as `invalid_labels`; each exemplar is counted, as in
             // `decode_v1`. Their labels are not resolved: nothing will read them, and a bad
             // symbol reference inside one is not worth failing an otherwise-fine request over.
             for _ in &series.exemplars {
-                decoder.degraded("exemplar_dropped");
+                decoder.degraded("exemplar_omitted");
             }
             continue;
         };
@@ -1038,7 +1038,7 @@ pub fn encode_counted(
         for family in families {
             for series in &family.series {
                 let Some(timestamp) = series.timestamp else {
-                    encoder.skipped_reason("no_timestamp");
+                    encoder.not_encoded(NotEncoded::NoTimestamp);
                     continue;
                 };
                 flat.clear();
@@ -1202,7 +1202,7 @@ fn flatten(
     // and this transport has no reason to widen it.
     let drop_exemplars = |encoder: &mut PrometheusEncoder| {
         for _ in &series.exemplars {
-            encoder.degraded_reason("exemplar_dropped");
+            encoder.degraded_reason("exemplar_omitted");
         }
     };
     match &series.point {
@@ -1279,7 +1279,7 @@ fn flatten(
                 });
             }
             for _ in used.iter().filter(|claimed| !**claimed) {
-                encoder.degraded_reason("exemplar_dropped");
+                encoder.degraded_reason("exemplar_omitted");
             }
             if let Some(sum) = sum {
                 let suffix = if gauge_histogram { "_gsum" } else { "_sum" };
@@ -1322,7 +1322,7 @@ fn label_set(
     encoder: &mut PrometheusEncoder,
 ) -> Option<Vec<(String, String)>> {
     if name.is_empty() {
-        encoder.skipped_reason("invalid_labels");
+        encoder.not_encoded(NotEncoded::InvalidLabels);
         return None;
     }
     let mut out: Vec<(String, String)> = Vec::with_capacity(labels.len() + 2);
@@ -1332,13 +1332,13 @@ fn label_set(
         // drops an attribute that would collide with `le`/`quantile`, so this is the guard for a
         // hand-built family rather than a path a pipeline reaches.
         if key == "__name__" || extra.is_some_and(|(generated, _)| key == generated) {
-            encoder.label_dropped("reserved");
+            encoder.label_omitted("reserved");
             continue;
         }
         if value.is_empty() {
             // Both specs forbid an empty label value, and Prometheus treats one as the label not
             // being there at all -- so dropping it is what the receiver would have done anyway.
-            encoder.label_dropped("empty_value");
+            encoder.label_omitted("empty_value");
             continue;
         }
         out.push((key.clone(), value.clone()));
@@ -1351,7 +1351,7 @@ fn label_set(
     let mut deduped: Vec<(String, String)> = Vec::with_capacity(out.len());
     for label in out {
         if deduped.last().is_some_and(|(existing, _)| *existing == label.0) {
-            encoder.label_dropped("collision");
+            encoder.label_omitted("collision");
             continue;
         }
         deduped.push(label);

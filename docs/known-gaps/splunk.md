@@ -63,7 +63,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   [ADR `deployment-threat-model`](../adr/deployment-threat-model.md): a client that sends a channel
   and never polls, or many short-lived channels.
   - **Consequence:** an id on an evicted channel, or one that expired, answers `false`, and a
-    client polling for it times out; `logit.input.acks.dropped{reason}` counts it.
+    client polling for it times out; `logit.input.acks.evicted{reason}` counts it.
     `splunk_hec_out` then fails the batch `Ambiguous`, and resends it under the default,
     `at_least_once`.
   - **Workaround:** raise `max_ack_channels` above the number of clients that send a channel at

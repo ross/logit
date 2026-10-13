@@ -12,7 +12,8 @@ use logit_core::interner::{intern, KeyCache};
 use logit_core::subslice;
 use logit_core::time::{parse_rfc3339_to_nanos, TimestampError};
 use logit_core::{
-    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Scope, Severity, Symbol, Value,
+    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Scope, Severity, Symbol,
+    Telemetry, Value,
 };
 use std::sync::{Arc, LazyLock};
 
@@ -22,11 +23,13 @@ use std::sync::{Arc, LazyLock};
 /// (`crates/logit-inputs/src/tcp.rs`'s module doc). A clone shares its `Diagnostics` throttle
 /// counts (`logit_core::Diagnostics`' type doc), so `bad_line` throttles listener-wide. It must: a
 /// peer looping connect, one bad message, close would otherwise report its "1st" occurrence once
-/// per connection forever.
+/// per connection forever. Its `Telemetry` handle is shared the same way.
 #[derive(Clone)]
 pub struct SyslogDecoder {
     resource: Arc<Resource>,
     diag: Diagnostics,
+    /// Where a rejected message counts `logit.input.messages.dropped{reason="malformed"}`.
+    telemetry: Telemetry,
     /// See [`Self::with_line_splitting`].
     line_splitting: bool,
     /// SD-IDs and PARAM-NAMEs memoised `&str -> Symbol`: they repeat on every line, so after the
@@ -36,11 +39,22 @@ pub struct SyslogDecoder {
 
 impl SyslogDecoder {
     pub fn new(resource: Arc<Resource>) -> Self {
-        Self { resource, diag: Diagnostics::default(), line_splitting: true, keys: KeyCache::new() }
+        Self {
+            resource,
+            diag: Diagnostics::default(),
+            telemetry: Telemetry::default(),
+            line_splitting: true,
+            keys: KeyCache::new(),
+        }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
+        self
+    }
+
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
         self
     }
 
@@ -56,8 +70,9 @@ impl SyslogDecoder {
         self
     }
 
-    /// Parses one delimited message into `out`, or reports a throttled `bad_line`; both arms of
-    /// [`Decoder::decode_into`] use it.
+    /// Parses one delimited message into `out`, or counts it
+    /// `logit.input.messages.dropped{reason="malformed"}` and reports a throttled `bad_line`; both
+    /// arms of [`Decoder::decode_into`] use it.
     fn absorb_line(&mut self, line: Bytes, received_at: i64, out: &mut Vec<Event>) {
         // Only an empty record is skipped; whitespace-only content is MSG data, not framing.
         if line.is_empty() {
@@ -66,6 +81,11 @@ impl SyslogDecoder {
         match parse_line(&line, received_at, &mut self.diag, &mut self.keys) {
             Ok(event) => out.push(event),
             Err(err) => {
+                self.telemetry.count(
+                    "logit.input.messages.dropped",
+                    1.0,
+                    &[("reason", "malformed")],
+                );
                 self.diag.warn_throttled("bad_line", err);
             }
         }
@@ -1111,6 +1131,35 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(message_str(&events[0]), "a");
         assert_eq!(message_str(&events[1]), "b");
+    }
+
+    /// The total of `logit.input.messages.dropped{reason}` in `registry`. Drains, so call once.
+    fn messages_dropped(registry: &logit_core::Registry, reason: &str) -> f64 {
+        registry
+            .drain(0)
+            .iter()
+            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some(reason))
+            .flat_map(|e| &e.metrics)
+            .filter(|m| logit_core::interner::resolve(m.name) == "logit.input.messages.dropped")
+            .map(|m| match &m.kind {
+                logit_core::MetricKind::Sum(sum) => sum.value.as_f64(),
+                other => panic!("messages.dropped must be a counter, got {other:?}"),
+            })
+            .sum()
+    }
+
+    /// A rejected message counts `logit.input.messages.dropped{reason="malformed"}`.
+    #[test]
+    fn a_rejected_message_is_counted_dropped() {
+        let registry = logit_core::Registry::new();
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()))
+            .with_telemetry(registry.telemetry_for("syslog_in", "syslog_in", "listener"));
+        let mut events = Vec::new();
+        decoder
+            .decode_into(Bytes::from_static(b"<13>a\nnot a syslog line\n<13>b"), 0, &mut events)
+            .expect("a bad line never fails the datagram");
+        assert_eq!(events.len(), 2);
+        assert_eq!(messages_dropped(&registry, "malformed"), 1.0);
     }
 
     #[test]

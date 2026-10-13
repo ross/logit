@@ -1,6 +1,6 @@
 ---
 created: 2026-09-18
-updated: 2026-10-09
+updated: 2026-10-13
 ---
 
 # UDP intake batching and socket visibility
@@ -1292,3 +1292,19 @@ Provisional until the perf VM re-measures it.
 difference at sixteen, so that cadence is "within noise" on this box, not "zero". Every-pop's +11%
 on the same scenario, with its fill dropping from 2.9 to 2.3, is the cost of polling the socket too
 often: more `recvmmsg` calls per event.
+
+## Amendment (2026-10-13): the kernel counter's name, and a truncated datagram is dropped
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `logit.input.kernel.drops` is `logit.input.kernel.dropped{reason="socket"}`. The
+`kernel` segment keeps the meaning this record gave it, and the counter stays apart from
+`logit.component.datagrams.dropped`, because the kernel discarded those datagrams before a read
+returned them.
+
+`logit.input.datagrams.truncated` is removed. A datagram `recvmmsg` returns with `MSG_TRUNC` is no
+longer queued and decoded as far as the slot held: a decoder could read the cut tail as a malformed
+message or as a shorter valid one. The read side counts it
+`logit.component.datagrams.dropped{reason="truncated"}`, with its copied bytes under
+`bytes.dropped`, and still counts it in `logit.input.datagrams`, so the listener identity
+(`input.datagrams` equals the `receive.latency` sample count plus every `datagrams.dropped` reason)
+holds with no latency sample for it. A Unix datagram socket can deliver a datagram past the slot
+too, so the case isn't IPv6-only.

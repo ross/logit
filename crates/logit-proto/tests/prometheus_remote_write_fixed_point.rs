@@ -14,7 +14,7 @@
 //!    `prometheus_fixed_point.rs` uses, parsed to families, sent through `encode`/`decode`, and
 //!    written back out equal to what writing them directly produces.
 //! 3. hand-built wire cases for the things a round trip cannot reach on its own: a 1.0 request
-//!    with no metadata at all, the 2.0 symbol-table errors, the label-validation skips, the label
+//!    with no metadata at all, the 2.0 symbol-table errors, the label-validation drops, the label
 //!    sort order, and the stale NaN.
 //!
 //! **What the generators leave out**, for the reasons `prometheus_fixed_point.rs`'s
@@ -25,9 +25,9 @@
 //!   and is generated and asserted.
 //! - sub-millisecond timestamps: both versions carry milliseconds, which is a named normalization.
 //! - a label value that is empty, or a repeated label name: both specs forbid a sender from
-//!   producing either, and this codec drops them on the way out and skips them on the way in. Their
-//!   own hand-built tests below cover that, and cover a label set out of byte order, which the
-//!   decoder sorts rather than skips.
+//!   producing either, and this codec omits the label on the way out and drops the series on the
+//!   way in. Their own hand-built tests below cover that, and cover a label set out of byte order,
+//!   which the decoder sorts rather than drops.
 //! - more than one exemplar per series, and exemplars on anything but a counter: an exemplar hangs
 //!   off a `TimeSeries` rather than a sample in both versions, so a series with several timestamps
 //!   cannot say which sample an exemplar came from. Hand-built tests cover placement instead.
@@ -58,7 +58,7 @@ fn round_trip(groups: &[Vec<MetricFamily>], version: Version) -> Decoded {
     decode(&body, version, &mut PrometheusDecoder::new()).expect("our own encoding must decode")
 }
 
-/// Decodes with telemetry attached and returns every `logit.input.metrics.{skipped,degraded}`
+/// Decodes with telemetry attached and returns every `logit.input.metrics.{dropped,degraded}`
 /// reason it recorded. `round_trip` compares families only, which cannot see a decoder that reaches
 /// the right answer while counting input it did not drop -- a counter an operator reads as data
 /// loss.
@@ -388,9 +388,9 @@ fn version_1_with_metadata_assembles_one_histogram() {
     );
 }
 
-/// A bad label set skips one series, not the request: the good series still decodes.
+/// A bad label set drops one series, not the request: the good series still decodes.
 #[test]
-fn an_invalid_label_set_skips_one_series_rather_than_the_request() {
+fn an_invalid_label_set_drops_one_series_rather_than_the_request() {
     let bad: [&[(&str, &str)]; 6] = [
         // no `__name__`
         &[("code", "200")],
@@ -653,7 +653,7 @@ fn histogram_exemplars_are_placed_on_the_bucket_their_value_falls_in() {
 }
 
 /// Encodes with telemetry attached and returns every `logit.output.*` reason it recorded --
-/// `metrics.{skipped,degraded}` and `labels.dropped` alike -- alongside the body.
+/// `metrics.{dropped,skipped,degraded}` and `labels.omitted` alike -- alongside the body.
 fn encode_reasons(groups: &[Vec<MetricFamily>], version: Version) -> (Vec<u8>, Vec<(String, u64)>) {
     let registry = Registry::new();
     let mut encoder = PrometheusEncoder::new().with_telemetry(registry.telemetry_for(
@@ -818,9 +818,9 @@ fn from_content_type_recognizes_both_versions_and_rejects_the_rest() {
     assert_eq!(Version::from_content_type(Version::V2.content_type()), v2);
 }
 
-/// Native histograms are counted in `histograms_skipped`, not decoded.
+/// Native histograms are counted in `histograms_dropped`, not decoded.
 #[test]
-fn native_histograms_are_counted_and_skipped() {
+fn native_histograms_are_counted_and_dropped() {
     let decoded = decode_v1(pb1::WriteRequest {
         timeseries: vec![pb1::TimeSeries {
             labels: vec![label("__name__", "native")],
@@ -829,7 +829,7 @@ fn native_histograms_are_counted_and_skipped() {
         }],
         metadata: Vec::new(),
     });
-    assert_eq!(decoded.histograms_skipped, 2);
+    assert_eq!(decoded.histograms_dropped, 2);
     assert_eq!(decoded.samples, 0);
     assert!(decoded.groups.is_empty(), "nothing to put in a group");
 }
@@ -936,7 +936,7 @@ fn a_declared_but_unsampled_family_never_appears_in_any_group() {
 
 /// Repeated identical metadata (2.0 repeats it per series) never counts `duplicate_metadata`.
 #[test]
-fn a_faithful_round_trip_counts_nothing_as_skipped_or_degraded() {
+fn a_faithful_round_trip_counts_nothing_as_dropped_or_degraded() {
     for (label, body) in
         [("text 0.0.4 corpus", TEXT_FIXTURE), ("openmetrics corpus", OPENMETRICS_FIXTURE)]
     {
@@ -1039,7 +1039,7 @@ fn an_exemplar_lands_on_its_own_series_whichever_order_the_series_arrive_in() {
     assert_eq!(forwards.exemplars, 1);
     assert_eq!(forwards.groups.len(), 2, "two timestamps, two groups");
     // Group 0 is 1000, where `b` lives; group 1 is 2000, where `a` does. The exemplar is on `b`,
-    // and `a`'s group holds only `a` -- no phantom `b` series, and so no `incomplete_series` skip.
+    // and `a`'s group holds only `a` -- no phantom `b` series, and so no `incomplete_series` drop.
     assert_eq!(forwards.groups[0].len(), 1);
     assert_eq!(forwards.groups[0][0].name, "b");
     assert_eq!(forwards.groups[0][0].series[0].exemplars.len(), 1);
@@ -1050,7 +1050,7 @@ fn an_exemplar_lands_on_its_own_series_whichever_order_the_series_arrive_in() {
 
 /// An exemplar on a sample-less series is dropped, counted, and absent from `Decoded::exemplars`.
 #[test]
-fn an_exemplar_with_no_sample_to_sit_on_is_dropped_and_counted() {
+fn an_exemplar_with_no_sample_to_sit_on_is_omitted_and_counted() {
     let request = pb1::WriteRequest {
         timeseries: vec![pb1::TimeSeries {
             labels: vec![label("__name__", "orphan")],
@@ -1066,12 +1066,12 @@ fn an_exemplar_with_no_sample_to_sit_on_is_dropped_and_counted() {
     let (decoded, reasons) = decode_reasons(&request.encode_to_vec(), Version::V1);
     assert_eq!(decoded.exemplars, 0, "nothing was stored, so nothing is reported as written");
     assert!(decoded.groups.is_empty(), "no samples means no groups and no phantom series");
-    assert_eq!(reasons, [("exemplar_dropped".to_string(), 1)]);
+    assert_eq!(reasons, [("exemplar_omitted".to_string(), 1)]);
 }
 
-/// An exemplar on an `invalid_labels` series counts `exemplar_dropped` as well.
+/// An exemplar on an `invalid_labels` series counts `exemplar_omitted` as well.
 #[test]
-fn exemplars_on_a_series_with_invalid_labels_are_counted_as_dropped() {
+fn exemplars_on_a_series_with_invalid_labels_are_counted_as_omitted() {
     let exemplar = |value: f64| pb1::Exemplar {
         labels: vec![label("detail", "lost")],
         value,
@@ -1080,7 +1080,7 @@ fn exemplars_on_a_series_with_invalid_labels_are_counted_as_dropped() {
     let request = pb1::WriteRequest {
         timeseries: vec![
             pb1::TimeSeries {
-                // No `__name__`: the series is skipped as `invalid_labels`, and its two exemplars
+                // No `__name__`: the series is dropped as `invalid_labels`, and its two exemplars
                 // go with it.
                 labels: vec![label("code", "200")],
                 samples: vec![pb1::Sample { value: 1.0, timestamp: 1_605_281_325_000 }],
@@ -1100,8 +1100,8 @@ fn exemplars_on_a_series_with_invalid_labels_are_counted_as_dropped() {
     assert_eq!(decoded.exemplars, 0, "nothing stored, so nothing reported as written");
     assert_eq!(
         reasons,
-        [("exemplar_dropped".to_string(), 2), ("invalid_labels".to_string(), 1)],
-        "one skip for the series, and one degrade per exemplar it took with it"
+        [("exemplar_omitted".to_string(), 2), ("invalid_labels".to_string(), 1)],
+        "one drop for the series, and one degrade per exemplar it took with it"
     );
 }
 
@@ -1795,7 +1795,7 @@ fn a_seeded_histogram_gives_way_to_a_bucket_with_no_le() {
     assert_eq!(reasons, [("seed_mismatch".to_string(), 1)]);
 }
 
-/// Once the request corroborates the seed, a contradicting sample is skipped as usual.
+/// Once the request corroborates the seed, a contradicting sample is dropped as usual.
 #[test]
 fn a_seeded_type_still_applies_once_the_request_corroborates_it() {
     let (decoded, reasons) = decode_v1_with_reasons(
