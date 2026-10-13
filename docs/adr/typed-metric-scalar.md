@@ -43,8 +43,8 @@ variant.
   `COUNTER` and `ABSOLUTE` as `U64`, `DERIVE` as `I64`, and `GAUGE` as `F64`. The InfluxDB codec
   reads `1.0` as `F64`, `1i` as `I64`, `1u` as `U64`, and `true`/`false` as `Bool`. Every other
   decoder has an untyped wire and produces `F64`.
-- **Out of scope.** `Exemplar.value` stays `f64`, so an OTLP exemplar's `as_int` stays a
-  `docs/known-gaps/mappings.md` row. The multi-number kinds (`Samples`, `Distribution`,
+- **Out of scope.** `Exemplar.value` stays `f64`, so an OTLP exemplar's `as_int` becomes a
+  new `docs/known-gaps/mappings.md` row. The multi-number kinds (`Samples`, `Distribution`,
   `Histogram`, `Summary`, and the rest) keep their `f64` fields: no protocol `logit` relays types
   their values.
 
@@ -52,8 +52,8 @@ variant.
 
 `influxdb_out` writes `I64` as `Ni`, `U64` as `Nu`, and `Bool` as `true`/`false`, for every event,
 not only for events relayed from `influxdb_in`, and whether or not the event carries the
-line-protocol carrier. `logit` is pre-release and no stored data depends on today's all-float
-output.
+line-protocol carrier. `logit` is pre-release and no stored data depends on today's float
+`value` field for `Gauge` and `Sum`.
 
 Every other metric sink has a numeric-only wire: `otlp_out`, `prometheus_out`, `graphite_out`,
 `statsd_out`, `collectd_out`, `datadog_out`, `splunk_hec_out`, and `kafka_out` under
@@ -84,11 +84,15 @@ Every result whose type differs from an input's is counted
 
 A metric value reads in Lua as a double, which is LuaJIT's only number type. `Bool` reads as `0` or
 `1`. A read that can't be exact, an integer above 2^53, is counted
-`logit.transform.metrics.normalized{reason="inexact_read"}`.
+`logit.transform.metrics.normalized{reason="inexact_read"}`. An attribute or a metric's `count`
+above 2^53 reads as a decimal string instead (`exact_u64_to_lua` in
+`crates/logit-script/src/value.rs`); a value reads as a double so arithmetic and comparison keep
+working.
 
-A write that equals the current value's `as_f64()` is a no-op and keeps the variant, the rule
-[ADR `lua-value-identity-preservation`](lua-value-identity-preservation.md) set for attributes
-(`lua_value_matches` in `crates/logit-script/src/value.rs`). Any other write stores `F64`.
+A write that equals the current value's `as_f64()` is a no-op and keeps the variant. That's the
+principle of [ADR `lua-value-identity-preservation`](lua-value-identity-preservation.md), not its
+code: `lua_value_matches` compares against `value_to_lua`'s form, which differs for `Bool` and
+above 2^53, so the metric path needs its own check. Any other write stores `F64`.
 `Event.new` takes an optional `type = "f64" | "i64" | "u64" | "bool"` beside a metric's value, and
 `event:to_table()` emits `type` only for a non-`F64` value, so a float-only script sees no change.
 
@@ -130,7 +134,8 @@ replay into a newer one. `docs/design/wire-protocol.md` and the bake-off's wire 
 - **Closes two existing losses.** An OTLP `as_int` point relays as `as_int`, and a collectd
   `COUNTER` above 2^53 relays as the sender's number. `docs/known-gaps/mappings.md`'s
   `decode (collectd)` precision row closes, and new rows record `Bool` written as `1`/`0` at
-  numeric-only sinks and a `U64` above `i64::MAX` leaving OTLP as a double.
+  numeric-only sinks, a `U64` above `i64::MAX` leaving OTLP as a double, and an OTLP exemplar's
+  `as_int` decoded as a double.
 - `MetricValue` is expected to be 16 bytes and `Sum` to grow to 24, with `MetricKind` still bound
   by `Samples`'s size.
   `crates/logit-core/tests/type_sizes.rs` gains exact pins for both, and `docs/design/memory.md`

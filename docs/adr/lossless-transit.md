@@ -260,10 +260,7 @@ like-protocol pair in scope under this ADR, alongside `statsd`, `otlp`, `syslog`
 typed `Gauge` records on one event, the all-or-nothing write, and the listener's responses, and
 [`docs/plans/influxdb-relay.md`](../plans/influxdb-relay.md) for the workstreams closing it. Its
 permitted normalizations are numbered in that ADR, and
-`crates/logit-proto/src/influxdb/mod.rs`'s module doc will carry the same numbers (batching;
-duplicate points in one body merged, last write wins per field; tag and field order; number
-spelling and escaping; timestamps leaving in nanoseconds, receipt time for none; comments and
-blank lines dropped; the cross-source 1 ns nudge).
+`crates/logit-proto/src/influxdb/mod.rs`'s module doc will carry the same numbers.
 
 The pair needs a typed metric scalar, which the model didn't have:
 [ADR `typed-metric-scalar`](typed-metric-scalar.md) replaces the `f64` in `Gauge`, `GaugeDelta`,
