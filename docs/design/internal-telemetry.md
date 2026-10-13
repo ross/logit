@@ -462,20 +462,21 @@ The last word of a count's name says whether anything was lost
 record of every rename). **Any nonzero `*.dropped` is loss to investigate**, and an outcome the
 config asked for never uses the word:
 
-| Name | Meaning |
-|---|---|
-| `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. Always tagged `reason`. |
-| `logit.component.events.discarded` | A filter, `sample`, `aggregate`, or Lua script removed an event because the config asked it to. Untagged. |
-| `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, or sample value) removed from a record that's still delivered. |
-| `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. |
-| `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. |
-| `*.evicted`, `*.untracked` | An entry left a bounded bookkeeping table. No data was lost. |
-| `logit.input.batches.deferred` | A listener answered busy (`503`). The client keeps the data and retries, so this is back-pressure, not loss. |
-| `logit.input.connections.rejected`, `logit.input.requests.rejected` | A listener refused a connection or request and told the peer, which still holds the data. |
+| Name | Meaning | Tags |
+|---|---|---|
+| `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
+| `logit.component.events.discarded` | A filter, `sample`, `aggregate`, or Lua script removed an event because the config asked it to. | None. |
+| `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, or sample value) removed from a record that's still delivered. | `reason` where more than one cause exists. |
+| `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
+| `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. | `reason`, `metric_kind`, or `field`. |
+| `*.evicted`, `*.untracked` | An entry left a bounded bookkeeping table. No data was lost. | `reason` where more than one cause exists. |
+| `logit.input.batches.deferred` | A listener answered busy (`503`). The client keeps the data and retries, so this is back-pressure, not loss. | None. |
+| `logit.input.connections.rejected`, `logit.input.requests.rejected` | A listener refused a connection or request and told the peer, which still holds the data. | `reason`. |
 
-A `reason` value never repeats one of these verbs: it says why, and the name says what happened.
-Diagnostic keys (`gauge_delta_unresolved`, say) name a self-log line, not a count, and don't
-follow this vocabulary.
+A `reason` value never contains `dropped`, so the word appears only in a loss metric's name. A
+reason says why (`rejected`, `truncated`), and the name says what happened. Diagnostic keys
+(`gauge_delta_unresolved`, say) name a self-log line, not a count, and don't follow this
+vocabulary.
 
 Every point also carries its component's identity as `component`, `kind`, and `role` attributes.
 Those three tag keys are reserved; see [Metrics from Lua scripts](#metrics-from-lua-scripts).
@@ -1289,6 +1290,7 @@ own read-side counters:
 | `logit.input.lines` / `.line.bytes` | count | the read-side counterpart of `statsd_in`'s per-datagram pair, at line granularity: every line offered to the decoder, a rejected one and the unterminated line emitted at close included, and not a line dropped for `max_line_bytes` |
 | `logit.input.files.open` | gauge | sampled after every `scan` |
 | `.files.rotated` / `.files.truncated` | count | a known path now naming another inode (each such path in a scan, so a rotation chain under a wildcard counts every renamed name), or the same inode shrinking |
+| `logit.input.frames.dropped{reason="oversize"\|"truncated"}` | count | `oversize`: a line over `max_line_bytes`, dropped whole by the line splitter (with the `long_line` diagnostic), once each time it's read, so again after a restart; `truncated`: the unterminated line held from before an in-place truncation, discarded at it |
 | `.scan.errors{op="read_dir"\|"stat"}` | count | the number of failed listings, or failed `stat`s, in one `scan`, recorded once per scan per operation that had one. A failure retires no tracked file it may name: `read_dir` is a pattern's directory, `stat` a matched path (or `docker_in`'s container directory) that failed with anything but `NotFound` or `NotADirectory`. A missing directory is not an error. The rule's canonical table is `crates/logit-inputs/src/tail/pattern.rs`'s module doc. See [ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md), decision 1 |
 | `.files.resume_rejected` | count | a resume refused, so the file starts at `0` instead: the file is shorter than the recorded head, its head bytes hash differently, or the offset is past its length. The fingerprint comes from a checkpoint entry or a de-selection retention. Decision 2 of the same ADR |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | every batch no consumer took, the refused one included. The driver then stops writing the checkpoint, which stays at the last one written (at or before the last line a consumer took), and stops. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`; batches after it that were never offered appear only here. |

@@ -44,22 +44,21 @@ second name, and no compatibility window.
 
 ### The vocabulary
 
-| Name | Meaning | Tags |
-|---|---|---|
-| `*.dropped` | Loss: data that should have left `logit` and didn't. Queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, and a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`. Other tags (`signal`, `route`) as the counter needs. |
-| `component.events.discarded` | A transform, filter, sampler, `aggregate`, or script removed an event by design. | None. The component's `component` and `kind` attributes say which. |
-| `*.omitted` | A piece removed from a record that's still delivered: a tag, a label, a structured-data element, an attribute, a field, a link, or a sample value. | `reason` where more than one cause exists. |
-| `*.skipped` | Nothing was there to carry, the operator chose to leave it out, or the destination format has no form for the kind. | `reason` or `metric_kind`. |
-| `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. | `reason`, `metric_kind`, or `field`, unchanged. |
-| `*.evicted`, `*.untracked` | Bookkeeping in a bounded table: an entry aged out or past a cap, with no data lost. | `reason` where more than one cause exists. |
-| `input.batches.deferred` | A listener answered busy (`503`); the client keeps the data and retries. | None. |
-| `input.connections.rejected`, `input.requests.rejected` | A listener refused a connection or request and told the peer. The peer still holds the data. Unchanged. | `reason`, unchanged. |
+The vocabulary is `*.dropped` for loss, `component.events.discarded` for an event removed by
+design, `*.omitted` for a piece removed from a delivered record, `*.skipped`, `*.degraded`,
+`*.truncated`, `*.normalized`, `*.evicted`, `*.untracked`, `input.batches.deferred`, and the
+unchanged `input.connections.rejected` and `input.requests.rejected`. Each name's meaning and tags
+are in one table, the operator's copy:
+[internal-telemetry.md](../design/internal-telemetry.md#loss-vocabulary)'s "Loss vocabulary".
+`*.dropped` always carries `reason` and never `metric_kind`, so a loss is always attributed to a
+cause.
 
-Three rules hold across the table:
+Three rules hold across the vocabulary:
 
-- **A reason value never contains a vocabulary verb.** `exemplar_dropped` becomes
-  `exemplar_omitted`, and `collectd_out`'s `notification_dropped` reason becomes
-  `invalid_notification`. A reason says why, and the metric name says what happened.
+- **A reason value never contains `dropped`.** The word appears only in a loss metric's name,
+  so a search for it finds loss and nothing else. `exemplar_dropped` becomes `exemplar_omitted`,
+  and `collectd_out`'s `notification_dropped` reason becomes `invalid_notification`. Other
+  vocabulary words can name a cause (`rejected`, `truncated`, `exemplar_omitted`).
 - **Diagnostic keys are a separate vocabulary and don't change.** A key such as
   `gauge_delta_unresolved` or `encrypted_packet_dropped` names a throttled self-log line, not a
   count.
@@ -103,7 +102,8 @@ Three rules hold across the table:
     queueing it, so it gets no `receive.latency` sample and the identity still holds.
     `input.datagrams.truncated` is removed.
   - An unresolved relative gauge is `output.metrics.dropped{reason="unresolved_gauge_delta"}` in
-    every sink, `statsd_out`'s existing reason. A delta `Sum` or `Histogram` at
+    every sink but `statsd_out`, which counts the same reason under `output.messages.dropped`,
+    as it already did. A delta `Sum` or `Histogram` at
     `prometheus_out` is `output.metrics.dropped{reason="unresolved_delta"}`.
 - **`logit.transform.metrics.absorbed` keeps its name.** It isn't loss, and the soak ledger's
   aggregate identity reads it.
@@ -175,10 +175,10 @@ same date has the bounds of the count and how it enters the sink identity.
 
 ## Amendment (2026-10-13): close-out
 
-- **The operator copy of the vocabulary** is
+- **The vocabulary table lives in one place,**
   [internal-telemetry.md](../design/internal-telemetry.md#loss-vocabulary)'s "Loss vocabulary",
   and `docs/deploying.md`'s "Alerting on loss" gives the one alerting rule. This record keeps the
-  decision and the migration record; neither copy repeats the other's tables.
+  decision, its rules, and the migration record.
 - **Two classifications stay as the migration record has them**, by the maintainer's call:
   - `prometheus_out`'s `output.metrics.degraded{reason="sub_ms_collapsed"}` stays `degraded`.
     Of two readings of one series whose timestamps share a millisecond, the series is delivered
@@ -193,9 +193,10 @@ same date has the bounds of the count and how it enters the sink identity.
 - **The soak harness reads every `*.dropped` as loss.** Its `drops` row surfaces every
   `logit.*.dropped` counter the system under test emits that no ledger row balances
   ([ADR `soak-harness`](soak-harness.md), `tools/soak/README.md`).
-- **`influxdb_out` is the one entry left under [Loss with no counter](#loss-with-no-counter).**
-  The `influx` stream, which rewrites `influxdb_out` and adds `influxdb_in`, adopts this vocabulary
-  for both, so its counters land there rather than here.
+- **[Loss with no counter](#loss-with-no-counter) keeps three entries.** The `influx` stream,
+  which rewrites `influxdb_out` and adds `influxdb_in`, adopts this vocabulary for both, so
+  `influxdb_out`'s counters land there rather than here. `kafka_out`'s `format: text` and
+  `docker_in`'s decoder are follow-ups.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
@@ -217,7 +218,8 @@ row reading "unchanged" keeps its name and every reason listed.
 | HTTP listeners, `tail_in`, `docker_in`, `logit_in` | `input.batches.dropped` (`closed_consumer`, `rejected`) | unchanged |
 | `splunk_hec_in` | `input.acks.dropped` (`expired`) | `input.acks.evicted` (`expired`) |
 | `splunk_hec_in` | `input.acks.dropped` (`evicted`: ids evicted with their channel) | `input.acks.evicted` (`channel`) |
-| `tail_in`, `docker_in` | `input.files.truncated` | unchanged |
+| `tail_in`, `docker_in` | `input.files.truncated` (a tailed file shrank in place, so it's reread from offset 0) | unchanged: a file event, not loss. The partial line it held from before the truncation is discarded, which now counts `input.frames.dropped` (`truncated`) |
+| `tail_in`, `docker_in` | a line over `max_line_bytes`, dropped by the line splitter with diagnostic `long_line` only | `input.frames.dropped` (`oversize`), as `lines_in` counts one |
 | `prometheus_in` | `input.metadata_cache.truncated` | unchanged |
 | `graphite_in` | `input.metrics.skipped` (`bad_line`, `bad_tag`, `bad_timestamp`, `non_finite_value`, `bad_shape`) | `input.metrics.dropped`, same reasons |
 | `graphite_in` | `input.tags.normalized` (`duplicate_key`) | unchanged |
@@ -243,7 +245,8 @@ row reading "unchanged" keeps its name and every reason listed.
 
 A kind a sink can't carry is classified by cause. Under an operator's `multi_value: skip`
 (`graphite_out`, `splunk_hec_out`, and `statsd_out`), or where the wire format has no form for the
-kind (`collectd_out`'s summarized kinds, `otlp_out`'s `set` and `set_members`, `datadog_out`'s
+kind (`collectd_out`'s summarized kinds and its non-monotonic delta `Sum`
+(`metric_kind="non_monotonic_delta_sum"`), since no collectd data-source type can go down, `otlp_out`'s `set` and `set_members`, `datadog_out`'s
 series route, `prometheus_out`'s exposition dialects, and `splunk_hec_out`'s
 `exponential_histogram`, as the OTel `splunk_hec` exporter does), it stays
 `output.metrics.skipped{metric_kind}`. A row naming several sinks leaves off their `_out` suffix.
@@ -304,13 +307,21 @@ series route, `prometheus_out`'s exposition dialects, and `splunk_hec_out`'s
 | `aggregate` | `transform.metrics.absorbed`, `transform.metrics.passed_through`, `transform.series.evicted` | unchanged |
 | `shape` | `transform.batches.dropped` (untagged) | `transform.batches.untracked` (untagged) |
 | transforms | `transform.{scaled,matched,derived,rows,timestamp,trace_context}.skipped` (every reason: the event is forwarded untouched) | unchanged |
+| `logfmt`, `kv` | `transform.pairs.skipped` (untagged: an empty segment, an empty key, or a bareword under `bare_keys: false`) | unchanged: the token adds no attribute, but the message keeps it, and nothing was there to carry or the operator chose it |
 | transforms | `transform.values.normalized`, `transform.http_access.{normalized,truncated}` | unchanged |
 | `internal` | `internal.points.dropped` (`cardinality`), `internal.spans.dropped` (`buffer_full`), `internal.logs.dropped` (`buffer_full`) | unchanged |
 | `internal` | `internal.span.links.dropped` (`cardinality`) | `internal.span.links.omitted` (`cardinality`) |
 
 ### Loss with no counter
 These lose data and report it only through a diagnostic, or not at all. Under this rule each
-belongs under `*.dropped`; none has a counter yet:
+belongs under `*.dropped`, or under `*.skipped` where the entry says so; none has a counter yet:
 
 - `influxdb_out` skips an unresolved relative gauge (diagnostic `gauge_delta_unresolved`), a
   `NO_RECORDED_VALUE` record, `SetMembers`, and `ExponentialHistogram` with diagnostics only.
+- `kafka_out` under `format: text` writes a record from an event's log alone, so a mixed
+  event's metrics and span leave with no count. The operator chose the format, so these belong
+  under `*.skipped`, not `*.dropped`; a metrics-only event already counts
+  `output.events.skipped{reason="no_log"}`.
+- `docker_in`'s decoder drops a message whose reassembled partial entries pass `max_line_bytes`
+  (diagnostic `long_line`), and discards a held partial entry when its file is truncated, with
+  no counter: the decoder has no telemetry handle.

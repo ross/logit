@@ -659,7 +659,10 @@ and the [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-account
 
 **Alert on any nonzero `logit.*.dropped` count, grouped by its `component` and `reason`
 attributes.** Every `*.dropped` counter is loss: data that should have left `logit` and didn't.
-Its `reason` says where to look, so you don't need a list of reasons to exclude. An outcome your
+Its `reason` says where to look, so you don't need a list of reasons to exclude.
+`influxdb_out` is the exception: it drops a metric it can't encode with only a
+`logit.component.diagnostics` count (`key="gauge_delta_unresolved"` for an unresolved relative
+gauge, `key="encode_error"` for the rest), so alert on those two keys for it as well. An outcome your
 config asked for never counts as dropped: a filter, `sample`, `aggregate`, or Lua script removing
 an event counts `logit.component.events.discarded`, and a tag or field removed from a record that's
 still delivered counts `*.omitted`. The full vocabulary is in
@@ -2302,8 +2305,10 @@ see [ADR
   errno. A sustained nonzero rate is a permissions or descriptor-limit problem to fix; until it's
   fixed, a file renamed out of that directory stays open.
 - `logit.component.diagnostics{key="long_line"|"truncated"}` (count, via the `Diagnostics` bridge):
-  a line dropped whole for exceeding `max_line_bytes`, or a tracked file's length shrinking under
-  it (rare, but real for a tool that recreates a log file in place instead of renaming it away
+  a line dropped whole for exceeding `max_line_bytes`, also counted
+  `logit.input.frames.dropped{reason="oversize"}`, or a tracked file's length shrinking under
+  it (`logit.input.files.truncated`; an unterminated line held from before it is discarded and
+  counted `logit.input.frames.dropped{reason="truncated"}`) (rare, but real for a tool that recreates a log file in place instead of renaming it away
   first). A long line is never truncated and passed through, because a truncated line would hand a
   downstream JSON parser something that looks well-formed but isn't the real line.
 - `logit.component.diagnostics{key="metadata_error"}` (`docker_in` only): a container's

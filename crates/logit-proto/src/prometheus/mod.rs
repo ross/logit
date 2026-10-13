@@ -1939,10 +1939,8 @@ mod tests {
             );
             assert!(seen.insert(reason.reason()), "{reason:?} shares a reason");
             assert!(
-                !["dropped", "skipped", "omitted", "discarded"]
-                    .iter()
-                    .any(|v| reason.reason().contains(v)),
-                "{reason:?}: a reason never names a vocabulary verb"
+                !reason.reason().contains("dropped"),
+                "{reason:?}: a reason never contains `dropped`, which names loss in a metric name"
             );
         }
     }
