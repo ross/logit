@@ -168,7 +168,7 @@ gzip decompression, and answers `413` past it. Raise it if a client sends larger
 
 When the pipeline doesn't take a request's first batch within 5 seconds, `splunk_hec_in` answers
 `503` code 9 with `Retry-After: 1` rather than holding the connection, counted
-`logit.input.batches.deferred`. As on Splunk, that answer means nothing of the body
+`logit.input.batches.dropped{reason="busy"}`. As on Splunk, that answer means nothing of the body
 was taken, and HEC clients retry a code 9, so this defers delivery rather than losing it. A
 `/event` body that carries several envelopes decodes into one batch per envelope; once the first
 is delivered, the listener waits for the pipeline to take the rest, however long that is, and

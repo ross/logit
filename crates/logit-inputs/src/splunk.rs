@@ -103,7 +103,7 @@
 //! ([`crate::datadog`]'s "Backpressure" section has the mechanism). When the deadline passes, the
 //! request is answered `503` `{"text":"Server is busy","code":9}` with `Retry-After: 1`, counted
 //! `logit.input.requests{class="busy"}`, and every batch of the body is counted
-//! `logit.input.batches.deferred`. Every HEC client retries a code 9.
+//! `logit.input.batches.dropped{reason="busy"}`. Every HEC client retries a code 9.
 //!
 //! **Once the first batch is delivered, the rest wait without a deadline.** A `/event` body
 //! carrying several envelopes decodes to one batch per resource, and a `503` after one of them was
@@ -133,9 +133,8 @@
 //! that failed for a reason other than its size, such as a client disconnecting mid-upload). A code
 //! 6 that follows a delivered prefix is `class="rejected"`, `reason="malformed"`, and its objects
 //! are counted where any delivered batch's are, on the listener's fanout edge.
-//! `logit.input.batches.deferred` counts the batches a busy `503` left undelivered, and
-//! `logit.input.batches.dropped{reason="closed_consumer"}` those a closed-consumer `503` or `500`
-//! left undelivered.
+//! `logit.input.batches.dropped{reason}` (`busy` or `closed_consumer`) counts the batches a `503`
+//! or a closed-consumer `500` left undelivered.
 //! Acknowledgment: `logit.input.acks.issued`, `logit.input.acks.polled{result}` (`acked`, or
 //! `unknown` for an id not pending on the polled channel), `logit.input.acks.dropped{reason}`
 //! (`expired` past `max_pending_acks`, `evicted` with its channel), and
@@ -1143,8 +1142,11 @@ async fn respond(
                 }
             }
             Err(Undelivered::Busy(_)) => {
-                // Nothing of the body was taken, so every batch is deferred, not only the first.
-                Undelivered::Busy(total).record(&shared.telemetry);
+                shared.telemetry.count(
+                    "logit.input.batches.dropped",
+                    total as f64,
+                    &[("reason", "busy")],
+                );
                 shared.diag.clone().warn_throttled(
                     "busy",
                     format_args!(
@@ -1771,8 +1773,7 @@ mod tests {
         let events = Totals::of(registry.drain(0));
         // The `503` post and the two busy `/health` answers.
         assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 3.0);
-        assert_eq!(events.sum("logit.input.batches.deferred", &[]), 1.0);
-        assert_eq!(events.sum("logit.input.batches.dropped", &[]), 0.0);
+        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 1.0);
     }
 
     /// A first batch no consumer takes is answered as a full downstream is, but counted
@@ -1802,7 +1803,7 @@ mod tests {
             events.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]),
             1.0
         );
-        assert_eq!(events.sum("logit.input.batches.deferred", &[]), 0.0);
+        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 0.0);
         assert_eq!(events.sum("logit.input.requests", &[("class", "closed_consumer")]), 1.0);
         assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 0.0);
         assert_eq!(events.sum("logit.input.acks.issued", &[]), 0.0);

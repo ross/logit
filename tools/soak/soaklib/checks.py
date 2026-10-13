@@ -2431,6 +2431,15 @@ def _sent_one(data, led, sink, flag, lines):
         detail = ", ".join(f"{k} {_n(v)}" for k, v in sorted(skipped_metrics.items()))
         flag(WARN, f"{sink}: {_n(total_skipped)} metric(s) skipped by the encoder, never sent"
                    + (f" ({detail})" if detail else ""))
+    # An encode fault (a non-finite value, an oversized sketch, an unresolved GaugeDelta).
+    dropped_metrics = _by_attr(sut, "logit.output.metrics.dropped", "reason", component=sink)
+    dropped_metrics.pop("?", None)
+    total_dropped = sum(sut.counter_by_life("logit.output.metrics.dropped",
+                                            component=sink).values())
+    if total_dropped:
+        detail = ", ".join(f"{k} {_n(v)}" for k, v in sorted(dropped_metrics.items()))
+        flag(WARN, f"{sink}: {_n(total_dropped)} metric(s) dropped by the encoder, never sent"
+                   + (f" ({detail})" if detail else ""))
 
     for text in off_identity:
         flag(FAIL, text)

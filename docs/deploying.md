@@ -3030,7 +3030,7 @@ channel at once. Neither the channel nor the id enters an event.
 
 **A full pipeline gets `503`.** When the pipeline doesn't take a request's first batch within 5
 seconds, the request gets `503` code 9 with `Retry-After: 1`, counted
-`logit.input.requests{class="busy"}`, and its batches `logit.input.batches.deferred`.
+`logit.input.requests{class="busy"}`, and its batches `logit.input.batches.dropped{reason="busy"}`.
 Nothing of the body was taken, and HEC clients retry a code 9. A body with several envelopes
 decodes to one batch per envelope; once the first is delivered, the rest wait for the pipeline
 without a deadline and the request gets `200`, so a retry never repeats part of a body. From a

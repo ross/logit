@@ -3652,13 +3652,15 @@ def _sink_drain(root):
 
 
 def _datadog_lines(rejected_at=None, retry_at=(), stale=0, skipped=0, records=True,
-                   batch=True, cls="2xx", reason="rejected", named=0, queued_at=None):
+                   batch=True, cls="2xx", reason="rejected", named=0, queued_at=None,
+                   unsent=0):
     """`datadog_out` telemetry for the ledger fixture's SUT drains: one request answered `cls`
     and 100 records accepted per drain, plus what each keyword adds. A rejection at
     `rejected_at` drops its records (`records`, under `reason`) and its batch (`batch`): a
     request rejected while another of the batch's was accepted drops records only. `named`
     records come out of an accepted body at +250; `queued_at` adds three batches received
-    there and never sent, for a `buffer_batches=3` fixture."""
+    there and never sent, for a `buffer_batches=3` fixture; `unsent` metrics are dropped by the
+    encoder at +250."""
     drains = [o for o in range(5, STOP[0], 5)] + [o for o in range(135, 321, 5)]
     lines = []
     for offset in drains:
@@ -3688,6 +3690,9 @@ def _datadog_lines(rejected_at=None, retry_at=(), stale=0, skipped=0, records=Tr
     if skipped:
         lines.append(_line(_stamp(T0 + 250), "logit.output.metrics.skipped", "sum", skipped,
                            component="sink", attrs={"metric_kind": "cumulative_sum"}))
+    if unsent:
+        lines.append(_line(_stamp(T0 + 250), "logit.output.metrics.dropped", "sum", unsent,
+                           component="sink", attrs={"reason": "non_finite_value"}))
     if named:
         lines.append(_line(_stamp(T0 + 250), "logit.output.records.dropped", "sum", named,
                            component="sink", attrs={"route": "series", "reason": "rejected"}))
@@ -3756,10 +3761,13 @@ def _external_checks():
                and "no request_rejected line on stderr" in
                unquoted["ledger.sent"].detail,
                f"a rejection with no stderr line still FAILs, got {unquoted['ledger.sent']}")
-        stale = results("external-stale", sut_extra=_datadog_lines(stale=7, skipped=3))
+        stale = results("external-stale", sut_extra=_datadog_lines(stale=7, skipped=3,
+                                                                    unsent=2))
         expect(stale["ledger.sent"].status == checks.WARN
                and "7 record(s) dropped stale" in " ".join(stale["ledger.sent"].lines)
-               and "3 metric(s) skipped" in " ".join(stale["ledger.sent"].lines),
+               and "3 metric(s) skipped" in " ".join(stale["ledger.sent"].lines)
+               and "2 metric(s) dropped by the encoder, never sent (non_finite_value 2)"
+               in " ".join(stale["ledger.sent"].lines),
                f"a counted pre-send drop and an encoder skip WARN, got {stale['ledger.sent']}")
         short = results("external-undelivered", sut_extra=_datadog_lines(), undelivered=1)
         expect(short["ledger.sent"].status == checks.FAIL
