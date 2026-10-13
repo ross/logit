@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-10-04
+updated: 2026-10-13
 ---
 
 # Disk-backed durable buffering for a sink's delivery queue
@@ -514,3 +514,30 @@ ahead of the batch, and a record written with the pair in its trailer is skipped
   embedded in a payload as a phantom record, gains a consequence on the native hop: a phantom
   that carries the current identity and a high number raises `logit_in`'s mark for that
   identity, and the real records after it are then dropped as resends.
+
+## Amendment: the batch lost with a torn tail is counted dropped (2026-10-13)
+
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md) puts every loss under `*.dropped`.
+A torn tail that `DiskQueue::open` truncates is a lost batch, so `open` now counts one
+`batches.dropped{reason="disk_torn"}` beside `buffer.disk.truncated`, which stays the count of
+repairs.
+
+- **Why it's loss.** `drain_inbox` counts `batches.received` before it pushes, so the sink
+  received every batch whose record is torn, and no process counted it delivered or dropped. A
+  torn record is either a push that never finished (a `SIGKILL` mid-write) or a record that was
+  flushed and counted queued but not yet `fsync`ed when power failed.
+- **A committed record isn't loss.** If the persisted cursor points past the torn record's start,
+  the record was delivered and committed before the crash, so `open` counts the repair and no
+  drop.
+- **No events are counted.** A partial record holds no readable event count, so `open` emits no
+  `events.dropped{reason="disk_torn"}`.
+- **It's a lower bound, with two overcounts.** A power loss can lose records whole, and those
+  leave no bytes to count. Two cases count a batch that was already counted:
+  - A write that failed, was counted `disk_full` or `disk_io_error`, and left bytes that no later
+    push repaired before the process exited counts again as `disk_torn` at the next open.
+  - The cursor persists only every `checkpoint_interval` (1 s by default), and a push flushes
+    without an `fsync`. A record delivered and committed after the last cursor persist, then torn
+    by a power loss, counts delivered and then `disk_torn`.
+- **The sink identity across a restart.** Like `buffer.disk.replayed`, a `disk_torn` drop settles
+  a batch an earlier process received, so a per-process identity adds it to the received side:
+  `received + replayed + disk_torn = delivered + dropped + queued`.

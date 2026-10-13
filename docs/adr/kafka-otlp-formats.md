@@ -1,6 +1,6 @@
 ---
 created: 2026-10-12
-updated: 2026-10-12
+updated: 2026-10-13
 ---
 
 # `kafka_out` OTLP formats: one export request per signal per record, a topic per signal, and a producer per topic behind a multi-topic facade
@@ -268,3 +268,11 @@ on both brokers; with `sticky_key` and the `murmur2` hasher it placed all 16 on 
   - Head-of-line blocking across signals (item 4).
   - Per-request loss on `Rejected`: the broker rejects a record whole, so one bad record drops
     every item in its request. The other formats lose one event, or one batch record.
+
+## Amendment: an unresolved relative gauge is dropped (2026-10-13)
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the OTLP mapping counts an
+unresolved `GaugeDelta` as `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, not
+`metrics.skipped{metric_kind="gauge_delta"}`. `kafka_out` under `otlp_proto` or `otlp_json`
+inherits the rename. The side-effect counters this record calls once per batch are now
+`metrics.degraded`, `metrics.skipped`, and `metrics.dropped`, all behind the same gate.

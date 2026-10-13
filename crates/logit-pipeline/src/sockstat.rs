@@ -168,7 +168,7 @@ pub struct SockMeminfo {
     /// on UDP, rarer causes such as a failed checksum or a filter verdict). Free-running and
     /// wrapping (an `atomic_t` read into a `u32`, never reset), so feed samples through
     /// [`DropCounter::delta`]. Equal to `/proc/net/udp[6]`'s `drops` column, so
-    /// `logit.input.kernel.drops` can be checked by hand.
+    /// `logit.input.kernel.dropped` can be checked by hand.
     pub drops: u32,
 }
 

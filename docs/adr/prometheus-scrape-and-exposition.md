@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-10
+updated: 2026-10-13
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -518,3 +518,29 @@ That was wrong: `DdSketch::sum` is an exact running sum, added on `merge`, and a
 `DdSketch::stats_exact()` is `false` (stats derived from bins after a decode). `graphite_out` and
 `splunk_hec_out` already emitted it. `prometheus_out`, `otlp_out` (whose `SummaryDataPoint.sum`
 carried `0.0`), and `influxdb_out` (a `sum=` field beside `count=` and the percentiles) now do too.
+
+## Amendment (2026-10-13): loss counters follow the telemetry loss vocabulary
+
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md) renames the counters this record
+names, so that every count of loss is a `*.dropped`:
+
+- Every reason the scrape decoder counted under `logit.input.metrics.skipped` (`malformed_line`,
+  `malformed_metadata`, `duplicate_type`, `duplicate_metadata`, `duplicate_series`,
+  `duplicate_label`, `unknown_suffix`, `incomplete_series`, `empty_histogram`,
+  `non_monotonic_buckets`) is `logit.input.metrics.dropped`, same reason.
+- A delta `Sum` or `Histogram` at `prometheus_out` is
+  `logit.output.metrics.dropped{reason="unresolved_delta"}`, and a `GaugeDelta` is
+  `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, in place of
+  `skipped{metric_kind="delta_sum"|"delta_histogram"|"gauge_delta"}`. The diagnostic keys don't
+  change.
+- `type_conflict` and `name_collision` move from `logit.output.metrics.skipped` to
+  `logit.output.metrics.dropped`.
+- `logit.output.labels.dropped` is `logit.output.labels.omitted`, every reason: the series is
+  still exposed.
+- The exemplar reason `exemplar_dropped` is `exemplar_omitted`, on both
+  `logit.input.metrics.degraded` and `logit.output.metrics.degraded`.
+
+An exposition's `ExponentialHistogram` stays `skipped{metric_kind="exponential_histogram"}`, and a
+flagged or stale record stays `skipped{reason="no_recorded_value"|"stale"}`: neither text dialect
+has a form for them. The canonical tables are `crates/logit-proto/src/prometheus/mod.rs`'s and
+`text.rs`'s module docs.

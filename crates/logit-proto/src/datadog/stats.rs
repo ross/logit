@@ -12,6 +12,7 @@
 //! dropped and counted while the walk resumes after it; only a body that isn't msgpack at all, or
 //! a malformed top level, fails the request.
 
+use super::outcomes::StatsIn;
 use super::{
     merged_get, DatadogDecoder, DatadogEncoder, ATTR_RESOURCE_NAME, ATTR_SERVICE_NAME,
     ATTR_SPAN_KIND, ATTR_SPAN_TYPE, RESOURCE_ATTR_AGENT_ENV, RESOURCE_ATTR_AGENT_HOSTNAME,
@@ -423,27 +424,28 @@ fn read_group(buf: &[u8]) -> Result<ClientGroupedStats, MsgpackError> {
 }
 
 impl DatadogDecoder {
-    fn stats_skipped(&self, reason: &'static str) {
-        self.telemetry.count("logit.input.stats.skipped", 1.0, &[("reason", reason)]);
+    fn stats_not_decoded(&self, outcome: StatsIn) {
+        self.telemetry.count(outcome.metric(), 1.0, &[("reason", outcome.reason())]);
     }
 
     fn stats_degraded(&self, reason: &'static str) {
         self.telemetry.count("logit.input.stats.degraded", 1.0, &[("reason", reason)]);
     }
 
-    fn stats_malformed(&mut self, reason: &'static str, err: MsgpackError) {
-        self.stats_skipped(reason);
+    fn stats_malformed(&mut self, outcome: StatsIn, err: MsgpackError) {
+        self.stats_not_decoded(outcome);
+        let reason = outcome.reason();
         self.diagnostics
             .warn_throttled("malformed_stats", format!("datadog stats: {reason} dropped: {err}"));
     }
 
     /// The elements of a `Stats` array, each parsed by `parse` on its own slice; one that fails
-    /// is dropped and counted `reason`.
+    /// is dropped and counted `outcome`.
     fn read_elements<'a, T>(
         &mut self,
         buf: &'a [u8],
         r: &mut Reader<'a>,
-        reason: &'static str,
+        outcome: StatsIn,
         mut parse: impl FnMut(&mut Self, &'a [u8]) -> Result<T, MsgpackError>,
     ) -> Result<Vec<T>, MsgpackError> {
         let mut out = Vec::new();
@@ -454,7 +456,7 @@ impl DatadogDecoder {
             let item = next_value(buf, r)?;
             match parse(self, item) {
                 Ok(v) => out.push(v),
-                Err(e) => self.stats_malformed(reason, e),
+                Err(e) => self.stats_malformed(outcome, e),
             }
         }
         Ok(out)
@@ -469,8 +471,8 @@ impl DatadogDecoder {
                 b"Duration" => b.duration = read_u64(&mut r)?,
                 b"AgentTimeShift" => b.agent_time_shift = read_i64(&mut r)?,
                 b"Stats" => {
-                    b.stats =
-                        self.read_elements(buf, &mut r, "malformed_group", |_, g| read_group(g))?
+                    b.stats = self
+                        .read_elements(buf, &mut r, StatsIn::MalformedGroup, |_, g| read_group(g))?
                 }
                 _ => r.skip_value()?,
             }
@@ -499,8 +501,12 @@ impl DatadogDecoder {
                 b"ProcessTagsHash" => p.process_tags_hash = read_u64(&mut r)?,
                 b"ProcessTags" => p.process_tags = read_string(&mut r)?,
                 b"Stats" => {
-                    p.stats =
-                        self.read_elements(buf, &mut r, "malformed_bucket", Self::read_bucket)?
+                    p.stats = self.read_elements(
+                        buf,
+                        &mut r,
+                        StatsIn::MalformedBucket,
+                        Self::read_bucket,
+                    )?
                 }
                 _ => r.skip_value()?,
             }
@@ -522,7 +528,7 @@ impl DatadogDecoder {
                     p.stats = self.read_elements(
                         buf,
                         &mut r,
-                        "malformed_payload",
+                        StatsIn::MalformedPayload,
                         Self::read_client_payload,
                     )?
                 }
@@ -603,7 +609,7 @@ impl DatadogDecoder {
         let mut events = Vec::new();
         for bucket in &client.stats {
             if bucket.stats.is_empty() {
-                self.stats_skipped("empty_bucket");
+                self.stats_not_decoded(StatsIn::EmptyBucket);
                 continue;
             }
             let timestamp = i64::try_from(bucket.start).unwrap_or_else(|_| {
@@ -682,9 +688,9 @@ impl DatadogDecoder {
                 Ok(sketch) => {
                     records.push(MetricRecord::new(intern(name), MetricKind::Distribution(sketch)))
                 }
-                Err(SketchError::Interpolation) => self.stats_skipped("interpolation"),
+                Err(SketchError::Interpolation) => self.stats_not_decoded(StatsIn::Interpolation),
                 Err(SketchError::Malformed(why)) => {
-                    self.stats_skipped("bad_sketch");
+                    self.stats_not_decoded(StatsIn::BadSketch);
                     self.diagnostics.warn_throttled(
                         "bad_stats_sketch",
                         format!("datadog stats: {name} dropped: {why}"),
@@ -707,16 +713,16 @@ fn str_array(v: &[String]) -> Value {
 // ---------------------------------------------------------------------------------------------
 
 impl DatadogEncoder {
-    fn stats_out_skipped(&self, reason: &'static str) {
-        self.telemetry.count("logit.output.stats.skipped", 1.0, &[("reason", reason)]);
+    fn stats_out_dropped(&self, reason: &'static str) {
+        self.telemetry.count("logit.output.stats.dropped", 1.0, &[("reason", reason)]);
     }
 
     fn stats_out_degraded(&self, reason: &'static str) {
         self.telemetry.count("logit.output.stats.degraded", 1.0, &[("reason", reason)]);
     }
 
-    fn tag_dropped(&self, reason: &'static str) {
-        self.telemetry.count("logit.output.tags.dropped", 1.0, &[("reason", reason)]);
+    fn tag_omitted(&self, reason: &'static str) {
+        self.telemetry.count("logit.output.tags.omitted", 1.0, &[("reason", reason)]);
     }
 
     /// A tracer's `/v0.6/stats` body: one msgpack `ClientStatsPayload` from every event that is
@@ -745,7 +751,7 @@ impl DatadogEncoder {
         };
         for key in [RESOURCE_ATTR_STATS_CLIENT_COMPUTED, RESOURCE_ATTR_STATS_SPLIT_PAYLOAD] {
             if matches!(attrs.get(key), Some(v) if !matches!(v, Value::Bool(_))) {
-                self.tag_dropped("unrepresentable");
+                self.tag_omitted("unrepresentable");
             }
         }
         let mut w = Writer::new();
@@ -817,7 +823,7 @@ impl DatadogEncoder {
                 && !PAYLOAD_SCALARS.contains(&key)
                 && !(envelope && ENVELOPE_KEYS.contains(&key))
             {
-                self.tag_dropped("no_wire_form");
+                self.tag_omitted("no_wire_form");
             }
         }
         Some(client)
@@ -840,7 +846,7 @@ impl DatadogEncoder {
             Some(v) => match as_u64(v).and_then(|v| u32::try_from(v).ok()) {
                 Some(code) => code,
                 None => {
-                    self.tag_dropped("unrepresentable");
+                    self.tag_omitted("unrepresentable");
                     0
                 }
             },
@@ -849,7 +855,7 @@ impl DatadogEncoder {
             None => false,
             Some(Value::Bool(b)) => *b,
             Some(_) => {
-                self.tag_dropped("unrepresentable");
+                self.tag_omitted("unrepresentable");
                 false
             }
         };
@@ -859,7 +865,7 @@ impl DatadogEncoder {
                 Some("true") => 1,
                 Some("false") => 2,
                 _ => {
-                    self.tag_dropped("unrepresentable");
+                    self.tag_omitted("unrepresentable");
                     0
                 }
             },
@@ -870,14 +876,14 @@ impl DatadogEncoder {
             Some(v) => match as_i64(v) {
                 Some(s) => s,
                 None => {
-                    self.tag_dropped("unrepresentable");
+                    self.tag_omitted("unrepresentable");
                     0
                 }
             },
         };
         for (key, _) in event.attributes.iter() {
             if !is_group_key(resolve(key)) {
-                self.tag_dropped("no_wire_form");
+                self.tag_omitted("no_wire_form");
             }
         }
 
@@ -898,7 +904,7 @@ impl DatadogEncoder {
                 (METRIC_ERROR_SUMMARY, MetricKind::Distribution(d)) => {
                     g.error_summary = self.summary(d)
                 }
-                _ => self.stats_out_skipped("unrecognized_record"),
+                _ => self.stats_out_dropped("unrecognized_record"),
             }
         }
         (g, duration, shift)
@@ -944,7 +950,7 @@ impl DatadogEncoder {
         match v? {
             v @ Value::Str(_) => v.as_str().map(str::to_owned),
             _ => {
-                self.tag_dropped("unrepresentable");
+                self.tag_omitted("unrepresentable");
                 None
             }
         }
@@ -954,7 +960,7 @@ impl DatadogEncoder {
         match v {
             None => 0,
             Some(v) => as_u64(v).unwrap_or_else(|| {
-                self.tag_dropped("unrepresentable");
+                self.tag_omitted("unrepresentable");
                 0
             }),
         }
@@ -968,13 +974,13 @@ impl DatadogEncoder {
                 .filter_map(|item| {
                     let s = item.as_str().map(str::to_owned);
                     if s.is_none() {
-                        self.tag_dropped("unrepresentable");
+                        self.tag_omitted("unrepresentable");
                     }
                     s
                 })
                 .collect(),
             Some(_) => {
-                self.tag_dropped("unrepresentable");
+                self.tag_omitted("unrepresentable");
                 Vec::new()
             }
         }
@@ -1479,14 +1485,17 @@ mod tests {
         let batch = d.decode_client_stats_v06(&body(&client(vec![g])), 0).unwrap();
         assert_eq!(batch.events[0].metrics.len(), 4);
         let drained = registry.drain(0);
-        let count = |reason: &str| {
+        let count = |metric: &str, reason: &str| {
             drained
                 .iter()
                 .filter(|e| e.attributes.get("reason").and_then(Value::as_str) == Some(reason))
+                .filter(|e| e.metrics.iter().any(|m| resolve(m.name) == metric))
                 .count()
         };
-        assert_eq!(count("bad_sketch"), 1);
-        assert_eq!(count("interpolation"), 1);
+        let (dropped, skipped) = ("logit.input.stats.dropped", "logit.input.stats.skipped");
+        assert_eq!(count(dropped, "bad_sketch"), 1);
+        assert_eq!(count(dropped, "interpolation"), 1);
+        assert_eq!(count(skipped, "bad_sketch") + count(skipped, "interpolation"), 0);
     }
 
     /// A hand-written v0.6 body: keys out of order, an unknown key, `nil`s for zero values, a
@@ -1610,7 +1619,7 @@ mod tests {
             assert_eq!(a.get(RESOURCE_ATTR_STATS_CLIENT_COMPUTED), Some(&Value::Bool(true)));
             assert_eq!(a.get(RESOURCE_ATTR_STATS_SPLIT_PAYLOAD), Some(&Value::Bool(true)));
         }
-        assert_eq!(counted(&registry, "logit.input.stats.skipped", "malformed_payload"), 1.0);
+        assert_eq!(counted(&registry, "logit.input.stats.dropped", "malformed_payload"), 1.0);
         let out = DatadogEncoder::new().encode_stats_payload(&batches[0]).unwrap();
         let again = DatadogDecoder::new().decode_stats_payload(&out, 0).unwrap();
         assert_eq!(again, batches[..1]);
@@ -1691,9 +1700,9 @@ mod tests {
         assert_eq!(n("logit.output.stats.degraded", "bad_count"), 1.0);
         assert_eq!(n("logit.output.stats.degraded", "count_overflow"), 1.0, "2e19 only");
         assert_eq!(n("logit.output.stats.degraded", "agent_mapping"), 1.0);
-        assert_eq!(n("logit.output.stats.skipped", "unrecognized_record"), 1.0);
-        assert_eq!(n("logit.output.tags.dropped", "no_wire_form"), 1.0);
-        assert_eq!(n("logit.output.tags.dropped", "unrepresentable"), 1.0);
+        assert_eq!(n("logit.output.stats.dropped", "unrecognized_record"), 1.0);
+        assert_eq!(n("logit.output.tags.omitted", "no_wire_form"), 1.0);
+        assert_eq!(n("logit.output.tags.omitted", "unrepresentable"), 1.0);
         let back = DatadogDecoder::new().decode_client_stats_v06(&out, 0).unwrap();
         let m = &back.events[0].metrics;
         assert_eq!(m[0].kind, MetricKind::counter(3.0), "2.5 rounds half away from zero");

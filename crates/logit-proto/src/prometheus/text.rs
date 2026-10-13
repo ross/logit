@@ -57,15 +57,15 @@
 //! rejecting a legal timestamp. `_created` is read the same way, from the sample's own digits rather
 //! than from its already-parsed value.
 //!
-//! ## Malformed input: what is skipped, and what fails the whole body
+//! ## Malformed input: what is dropped, and what fails the whole body
 //!
 //! [`CodecError::Malformed`] is reserved for framing this codec cannot step over:
 //!
 //! - an OpenMetrics body with no trailing `# EOF`;
 //! - any content after `# EOF`.
 //!
-//! Everything else is skipped at line or series granularity and counted
-//! `logit.input.metrics.skipped{reason=...}` on the [`PrometheusDecoder`]'s telemetry -- a scrape of
+//! Everything else is dropped at line or series granularity and counted
+//! `logit.input.metrics.dropped{reason=...}` on the [`PrometheusDecoder`]'s telemetry -- a scrape of
 //! a mostly-good endpoint is worth keeping:
 //!
 //! | Reason | What it counts |
@@ -79,13 +79,13 @@
 //! | `unknown_suffix` | a sample whose name is a **declared** family's name plus a suffix that type has no meaning for (`foo_sum` under `# TYPE foo counter`). An *implicit* family never claims a suffix: with no `# TYPE` anywhere, `foo` and `foo_sum` are two untyped families and neither sample is lost |
 //! | `incomplete_series` | a series with no value at all for its type: a counter with only a `_created`, a histogram with no buckets |
 //!
-//! One further skip reason (`non_monotonic_buckets`, with `empty_histogram` for a bucket-less
+//! One further drop reason (`non_monotonic_buckets`, with `empty_histogram` for a bucket-less
 //! histogram) comes from the model mapping in [`super::families_to_events`] rather than from
 //! parsing: a bucket list that decreases is only *detectable* as the cumulative → per-bucket
 //! conversion runs, and that conversion is dialect-independent. Two *degradations* are
 //! counted here: `logit.input.metrics.degraded{reason="histogram_count_mismatch"}`, when a
 //! histogram's `_count`/`_gcount` line disagrees with its `+Inf` bucket -- the `+Inf` line wins,
-//! since the model holds one total, not two -- and `{reason="exemplar_dropped"}`, an OpenMetrics
+//! since the model holds one total, not two -- and `{reason="exemplar_omitted"}`, an OpenMetrics
 //! exemplar on a line other than a value sample or a `_bucket` (a `_count`, say), which
 //! OpenMetrics forbids and the model has nowhere to keep.
 //!
@@ -123,7 +123,7 @@
 //! - two families whose `# TYPE` lines would carry one name (a text 0.0.4 counter `foo` and a gauge
 //!   `foo_total`) can't both be written, since a second `# TYPE` line for a name makes Prometheus
 //!   reject the scrape: the one whose model name sorts first is written, and each series of the
-//!   other is counted `logit.output.metrics.skipped{reason="name_collision"}`;
+//!   other is counted `logit.output.metrics.dropped{reason="name_collision"}`;
 //! - a family with no line to write (every series stale, or a summary holding only a `_created`
 //!   in text 0.0.4) loses its metadata lines too.
 //!
@@ -131,13 +131,16 @@
 //! than one exemplar"), each placed on the bucket **its own value falls in** -- for a conforming
 //! producer that is the bucket it arrived on, and for a non-conforming one it is a relocation, which
 //! is on [`super`]'s permitted-normalization list. Everything with no line left to sit on is dropped
-//! and counted `logit.output.metrics.degraded{reason="exemplar_dropped"}` (a counter's second
+//! and counted `logit.output.metrics.degraded{reason="exemplar_omitted"}` (a counter's second
 //! exemplar, two in one bucket's range, one over OpenMetrics' 128-code-point label budget). In text
 //! 0.0.4 every exemplar is dropped and none of it is counted: that is the operator's dialect choice,
 //! not a lossy mapping.
 
 use super::assemble::{self, Assembler, Sample};
-use super::{FamilyType, MetricFamily, Point, PrometheusDecoder, PrometheusEncoder, Series};
+use super::{
+    DecodeDrop, FamilyType, MetricFamily, NotEncoded, Point, PrometheusDecoder, PrometheusEncoder,
+    Series,
+};
 use crate::CodecError;
 use logit_core::interner::resolve;
 use logit_core::trace::to_hex;
@@ -207,8 +210,8 @@ pub fn parse(bytes: &[u8], dialect: Dialect) -> Result<Vec<MetricFamily>, CodecE
     parse_with(bytes, dialect, &mut PrometheusDecoder::new())
 }
 
-/// [`parse`], reporting every skipped line/series on `decoder`'s telemetry and diagnostics -- see
-/// the module doc's skip table.
+/// [`parse`], reporting every dropped line/series on `decoder`'s telemetry and diagnostics -- see
+/// the module doc's drop table.
 pub fn parse_with(
     bytes: &[u8],
     dialect: Dialect,
@@ -252,7 +255,7 @@ impl Parser {
             return Err(CodecError::Malformed("content after `# EOF`".into()));
         }
         let Ok(text) = std::str::from_utf8(raw) else {
-            decoder.skipped("malformed_line");
+            decoder.dropped(DecodeDrop::MalformedLine);
             return Ok(());
         };
         match text.strip_prefix('#') {
@@ -285,7 +288,7 @@ impl Parser {
             "TYPE" => {
                 let (name, keyword) = split_field(remainder);
                 let Some(kind) = FamilyType::from_keyword(keyword) else {
-                    decoder.skipped("malformed_metadata");
+                    decoder.dropped(DecodeDrop::MalformedMetadata);
                     return;
                 };
                 let Some(name) = metadata_name(name, decoder) else { return };
@@ -305,7 +308,7 @@ impl Parser {
 
     fn sample(&mut self, line: &str, decoder: &mut PrometheusDecoder) {
         let Some(sample) = parse_sample(line, self.dialect) else {
-            decoder.skipped("malformed_line");
+            decoder.dropped(DecodeDrop::MalformedLine);
             return;
         };
         self.assembler.push(sample, decoder);
@@ -326,7 +329,7 @@ impl Parser {
 /// which is why this check stays here rather than in the assembler.
 fn metadata_name<'a>(name: &'a str, decoder: &mut PrometheusDecoder) -> Option<&'a str> {
     if name.is_empty() || !is_metric_name(name) {
-        decoder.skipped("malformed_metadata");
+        decoder.dropped(DecodeDrop::MalformedMetadata);
         return None;
     }
     Some(name)
@@ -578,10 +581,10 @@ pub fn write(families: &[MetricFamily], dialect: Dialect, out: &mut Vec<u8>) {
 }
 
 /// [`write`], counting what it has to drop on `encoder`'s telemetry:
-/// `logit.output.metrics.degraded{reason="unit_not_suffix"|"exemplar_dropped"}` and
-/// `logit.output.metrics.skipped{reason="stale"|"name_collision"}`. Text 0.0.4's
-/// wholesale exemplar and `_created`/`# UNIT` drops are *not* counted -- those are the operator's
-/// dialect choice, listed with the permitted normalizations rather than as lossy mappings.
+/// `logit.output.metrics.degraded{reason="unit_not_suffix"|"exemplar_omitted"}`,
+/// `logit.output.metrics.skipped{reason="stale"}`, and
+/// `logit.output.metrics.dropped{reason="name_collision"}`. Text 0.0.4's wholesale exemplar and
+/// `_created`/`# UNIT` drops are *not* counted -- those are the operator's dialect choice, listed with the permitted normalizations rather than as lossy mappings.
 pub fn write_with(
     families: &[MetricFamily],
     dialect: Dialect,
@@ -614,7 +617,7 @@ pub fn write_with(
         // is counted.
         if previous.is_some_and(|previous| previous == base) {
             for _ in &family.series {
-                writer.encoder.skipped_reason("name_collision");
+                writer.encoder.not_encoded(NotEncoded::NameCollision);
             }
             continue;
         }
@@ -695,7 +698,7 @@ impl Writer<'_> {
                 if om {
                     // One line, so one exemplar: OpenMetrics has nowhere to put the rest.
                     for _ in series.exemplars.iter().skip(1) {
-                        self.encoder.degraded_reason("exemplar_dropped");
+                        self.encoder.degraded_reason("exemplar_omitted");
                     }
                 }
                 self.sample(&series.labels, None, *v, series, exemplar);
@@ -735,7 +738,7 @@ impl Writer<'_> {
                     // has no line left to sit on.
                     let unplaced = self.used.iter().filter(|claimed| !**claimed).count();
                     for _ in 0..unplaced {
-                        self.encoder.degraded_reason("exemplar_dropped");
+                        self.encoder.degraded_reason("exemplar_omitted");
                     }
                 }
                 // A gaugehistogram's `_gcount` exists if and only if its `_gsum` does
@@ -755,7 +758,7 @@ impl Writer<'_> {
                 // Neither exposition dialect can spell a stale marker, and a bare `NaN` sample
                 // would read as a real reading of NaN at every scraper. Only
                 // `with_stale_markers(true)` builds one.
-                self.encoder.skipped_reason("stale");
+                self.encoder.not_encoded(NotEncoded::Stale);
             }
             Point::Summary { quantiles, sum, count } => {
                 // A summary has no line OpenMetrics allows an exemplar on -- only `_total` and
@@ -792,7 +795,7 @@ impl Writer<'_> {
             return;
         }
         for _ in &series.exemplars {
-            self.encoder.degraded_reason("exemplar_dropped");
+            self.encoder.degraded_reason("exemplar_omitted");
         }
     }
 
@@ -872,7 +875,7 @@ impl Writer<'_> {
             if exemplar.is_some_and(|e| !exemplar_fits(e)) {
                 // Over OpenMetrics' 128-code-point exemplar label budget: emitting it would make the
                 // line invalid, and truncating a trace id would make it a lie.
-                self.encoder.degraded_reason("exemplar_dropped");
+                self.encoder.degraded_reason("exemplar_omitted");
             }
             if let Some(exemplar) = exemplar.filter(|e| exemplar_fits(e)) {
                 self.out.extend_from_slice(b" # ");
@@ -1371,7 +1374,7 @@ mod tests {
             .filter(|event| {
                 event.metrics.iter().any(|m| {
                     let name = logit_core::interner::resolve(m.name);
-                    name == "logit.input.metrics.skipped" || name == "logit.input.metrics.degraded"
+                    name == "logit.input.metrics.dropped" || name == "logit.input.metrics.degraded"
                 })
             })
             .filter_map(|event| {
@@ -2005,10 +2008,10 @@ mod tests {
         assert_eq!(families[0].series[0].labels.len(), 2);
     }
 
-    // --- skips and degradations, each observed through telemetry ---------------------------------
+    // --- drops and degradations, each observed through telemetry ---------------------------------
 
     #[test]
-    fn a_malformed_sample_line_is_skipped_and_counted() {
+    fn a_malformed_sample_line_is_dropped_and_counted() {
         let (families, reasons) = parse_reasons("good 1\n1bad 2\nalso_bad\n", Dialect::Text0_0_4);
         assert_eq!(family_names(&families), vec!["good"]);
         assert!(reasons.contains(&"malformed_line".to_string()));
@@ -2016,7 +2019,7 @@ mod tests {
 
     /// Prometheus 3's quoted UTF-8 name syntax is a documented gap, not something to half-parse.
     #[test]
-    fn a_prometheus_3_quoted_utf8_name_is_skipped_and_counted() {
+    fn a_prometheus_3_quoted_utf8_name_is_dropped_and_counted() {
         let (families, reasons) = parse_reasons(
             "{\"my.dotted.metric\", \"error.message\"=\"Not Found\"} 1\n",
             Dialect::Text0_0_4,
@@ -2026,7 +2029,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_metadata_is_skipped_and_leaves_the_family_untyped() {
+    fn malformed_metadata_is_dropped_and_leaves_the_family_untyped() {
         let (families, reasons) =
             parse_reasons("# TYPE foo nonsense\n# HELP 1bad help\nfoo 1\n", Dialect::Text0_0_4);
         assert_eq!(families[0].kind, FamilyType::Untyped);
@@ -2034,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_conflicting_type_line_is_skipped_and_counted() {
+    fn a_second_conflicting_type_line_is_dropped_and_counted() {
         let (families, reasons) =
             parse_reasons("# TYPE foo counter\n# TYPE foo gauge\nfoo 1\n", Dialect::Text0_0_4);
         assert_eq!(families[0].kind, FamilyType::Counter, "the first `# TYPE` wins");
@@ -2042,7 +2045,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_help_line_is_skipped_and_counted() {
+    fn a_second_help_line_is_dropped_and_counted() {
         let (families, reasons) =
             parse_reasons("# HELP foo first\n# HELP foo second\nfoo 1\n", Dialect::Text0_0_4);
         assert_eq!(families[0].help.as_deref(), Some("first"));
@@ -2050,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_series_is_skipped_and_counted() {
+    fn a_repeated_series_is_dropped_and_counted() {
         let (families, reasons) =
             parse_reasons("foo{a=\"1\"} 1\nfoo{a=\"1\"} 2\n", Dialect::Text0_0_4);
         assert_eq!(families[0].series[0].point, Point::Unknown(1.0));
@@ -2064,21 +2067,21 @@ mod tests {
     }
 
     #[test]
-    fn a_line_naming_one_label_twice_is_skipped_and_counted() {
+    fn a_line_naming_one_label_twice_is_dropped_and_counted() {
         let (families, reasons) = parse_reasons("foo{a=\"1\",a=\"2\"} 1\n", Dialect::Text0_0_4);
         assert!(families.is_empty());
         assert!(reasons.contains(&"duplicate_label".to_string()));
     }
 
     #[test]
-    fn a_sample_with_a_suffix_its_family_type_has_no_meaning_for_is_skipped_and_counted() {
+    fn a_sample_with_a_suffix_its_family_type_has_no_meaning_for_is_dropped_and_counted() {
         let (families, reasons) =
             parse_reasons("# TYPE foo counter\nfoo 1\nfoo_sum 2\n", Dialect::Text0_0_4);
         assert_eq!(families[0].series.len(), 1);
         assert!(reasons.contains(&"unknown_suffix".to_string()));
     }
 
-    /// With no `# TYPE` anywhere, `foo_total` is a family of its own, not an `unknown_suffix` skip
+    /// With no `# TYPE` anywhere, `foo_total` is a family of its own, not an `unknown_suffix` drop
     /// (`assemble.rs`'s "What an assembler decides" table).
     #[test]
     fn a_suffix_never_routes_against_an_undeclared_family() {
@@ -2092,11 +2095,11 @@ mod tests {
             assert_eq!(family.kind, FamilyType::Untyped);
             assert_eq!(family.series.len(), 1);
         }
-        assert!(reasons.is_empty(), "nothing is skipped or degraded: {reasons:?}");
+        assert!(reasons.is_empty(), "nothing is dropped or degraded: {reasons:?}");
     }
 
     #[test]
-    fn a_series_with_no_value_for_its_type_is_skipped_and_counted() {
+    fn a_series_with_no_value_for_its_type_is_dropped_and_counted() {
         let (families, reasons) =
             parse_reasons("# TYPE foo counter\nfoo_created 1605281325\n", Dialect::Text0_0_4);
         assert!(families.is_empty(), "a `_created` alone is not a counter");
@@ -2122,7 +2125,7 @@ mod tests {
     }
 
     #[test]
-    fn a_non_utf8_line_is_skipped_and_counted() {
+    fn a_non_utf8_line_is_dropped_and_counted() {
         let (registry, telemetry) = telemetry();
         let mut decoder = PrometheusDecoder::new().with_telemetry(telemetry);
         let mut body = b"good 1\nbad".to_vec();
@@ -2135,7 +2138,7 @@ mod tests {
         }));
     }
 
-    /// A family whose every series was skipped leaves nothing to write, metadata included.
+    /// A family whose every series was dropped leaves nothing to write, metadata included.
     #[test]
     fn a_family_with_no_usable_series_is_dropped_entirely() {
         let families =
@@ -2259,7 +2262,7 @@ mod tests {
 
     /// A counter has room for one exemplar: an OTLP `Sum` carrying three loses two, counted.
     #[test]
-    fn a_counters_extra_exemplars_are_dropped_and_counted() {
+    fn a_counters_extra_exemplars_are_omitted_and_counted() {
         let family = counter_with_exemplars(vec![
             exemplar(0.1, &[("n", "1")]),
             exemplar(0.2, &[("n", "2")]),
@@ -2267,7 +2270,7 @@ mod tests {
         ]);
         let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
         assert_eq!(body, "# TYPE requests counter\nrequests_total 17 # {n=\"1\"} 0.1\n# EOF\n");
-        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 2.0)]);
+        assert_eq!(counts, vec![("exemplar_omitted".to_string(), 2.0)]);
     }
 
     /// Two exemplars whose values land in one bucket's range: the second is dropped, counted.
@@ -2287,13 +2290,13 @@ mod tests {
         }];
         let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
         assert!(body.contains("latency_bucket{le=\"0.1\"} 2 # {n=\"1\"} 0.05\n"), "{body}");
-        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
+        assert_eq!(counts, vec![("exemplar_omitted".to_string(), 1.0)]);
     }
 
     /// An exemplar whose value falls in no bucket at all (`NaN`, or above the highest bound when
     /// there is no `+Inf` bucket) is dropped rather than attached to an arbitrary line.
     #[test]
-    fn an_exemplar_with_no_bucket_to_sit_on_is_dropped_and_counted() {
+    fn an_exemplar_with_no_bucket_to_sit_on_is_omitted_and_counted() {
         let mut family = MetricFamily::new("latency", FamilyType::Histogram);
         family.series = vec![Series {
             exemplars: vec![exemplar(f64::NAN, &[("n", "1")])],
@@ -2304,23 +2307,23 @@ mod tests {
         }];
         let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
         assert!(!body.contains('#') || !body.contains("{n="), "{body}");
-        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
+        assert_eq!(counts, vec![("exemplar_omitted".to_string(), 1.0)]);
     }
 
     /// An exemplar over OpenMetrics' 128-code-point label budget is dropped, counted.
     #[test]
-    fn an_over_budget_exemplar_label_set_is_dropped_and_counted() {
+    fn an_over_budget_exemplar_label_set_is_omitted_and_counted() {
         let long = "x".repeat(200);
         let family = counter_with_exemplars(vec![exemplar(0.1, &[("detail", &long)])]);
         let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
         assert_eq!(body, "# TYPE requests counter\nrequests_total 17\n# EOF\n");
-        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
+        assert_eq!(counts, vec![("exemplar_omitted".to_string(), 1.0)]);
     }
 
     /// A gauge's exemplars are dropped, counted; `otlp_in` produces them on `Gauge` and on the
     /// non-monotonic `Sum` this codec renders as a gauge.
     #[test]
-    fn a_gauges_exemplars_are_dropped_and_counted() {
+    fn a_gauges_exemplars_are_omitted_and_counted() {
         let mut family = MetricFamily::new("temperature", FamilyType::Gauge);
         family.series = vec![Series {
             exemplars: vec![exemplar(0.1, &[("n", "1")]), exemplar(0.2, &[("n", "2")])],
@@ -2328,12 +2331,12 @@ mod tests {
         }];
         let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
         assert_eq!(body, "# TYPE temperature gauge\ntemperature 21.5\n# EOF\n");
-        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 2.0)]);
+        assert_eq!(counts, vec![("exemplar_omitted".to_string(), 2.0)]);
     }
 
     /// Same for a summary, including the `Distribution`/`Samples` that reach the wire as one.
     #[test]
-    fn a_summarys_exemplars_are_dropped_and_counted() {
+    fn a_summarys_exemplars_are_omitted_and_counted() {
         let mut family = MetricFamily::new("rpc_seconds", FamilyType::Summary);
         family.series = vec![Series {
             exemplars: vec![exemplar(0.1, &[])],
@@ -2344,19 +2347,19 @@ mod tests {
         }];
         let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
         assert!(!body.contains('#') || !body.contains(" # {"), "{body}");
-        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
+        assert_eq!(counts, vec![("exemplar_omitted".to_string(), 1.0)]);
     }
 
     /// Same for `info` and `stateset`.
     #[test]
-    fn an_info_and_a_stateset_exemplar_are_dropped_and_counted() {
+    fn an_info_and_a_stateset_exemplar_are_omitted_and_counted() {
         let mut info = MetricFamily::new("build", FamilyType::Info);
         info.series = vec![Series {
             exemplars: vec![exemplar(1.0, &[])],
             ..Series::new(vec![], Point::Info)
         }];
         let (_, counts) = write_counted(&[info], Dialect::OpenMetrics1_0);
-        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
+        assert_eq!(counts, vec![("exemplar_omitted".to_string(), 1.0)]);
 
         let mut state = MetricFamily::new("state", FamilyType::StateSet);
         state.series = vec![Series {
@@ -2364,7 +2367,7 @@ mod tests {
             ..Series::new(vec![("state".to_string(), "on".to_string())], Point::StateSet(true))
         }];
         let (_, counts) = write_counted(&[state], Dialect::OpenMetrics1_0);
-        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
+        assert_eq!(counts, vec![("exemplar_omitted".to_string(), 1.0)]);
     }
 
     /// Text 0.0.4 drops every exemplar uncounted: a permitted normalization, not a degradation.

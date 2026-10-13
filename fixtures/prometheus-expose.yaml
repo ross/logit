@@ -6,8 +6,8 @@
 # the example runs standalone; any other metrics source works the same way.
 #
 # The `aggregate` stage is not optional. Prometheus counters are cumulative and `prometheus_out`
-# never accumulates a delta: a delta `Sum`/`Histogram` reaching it is skipped and counted
-# (`logit.output.metrics.skipped{metric_kind="delta_sum"}`) with a diagnostic naming the fix.
+# never accumulates a delta: a delta `Sum`/`Histogram` reaching it is dropped and counted
+# (`logit.output.metrics.dropped{reason="unresolved_delta"}`) with a diagnostic naming the fix.
 # `aggregate`'s `temporality: cumulative` keeps a per-series running total across windows and
 # emits `Sum{Cumulative}` with `start_timestamp` set. Drop it and the gauges still work while every
 # counter stops being exposed.

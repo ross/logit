@@ -2,9 +2,8 @@
 //! kinds (`lua`'s `event:to(..)` is the other). `by:` names one key to read per event (the
 //! batch's provenance `origin`/`previous`, an event attribute, or a resource attribute), and
 //! `routes:` maps each value of it to a target id. An absent key, or a value no route names, is
-//! `Destination::Forward`: it goes to the router's own consumers, or, with none,
-//! `logit_pipeline::runtime::run_router` drops and counts it as
-//! `logit.component.events.dropped{reason="unrouted"}`.
+//! `Destination::Forward`: it goes to the router's own consumers, which graph rule 50 requires
+//! (a `null_out` among them when the operator wants those events discarded).
 //!
 //! **Every route value is resolved to its target's slot once, in [`Route::new`].** `targets` is
 //! [`logit_pipeline::graph::targets_of`]'s output, the slot order the node runtime builds its
@@ -27,7 +26,7 @@
 //! anything more is a `lua` component with `targets:` (`docs/adr/routing-by-condition-is-lua.md`).
 //!
 //! **No layer-3 telemetry, and so no `Telemetry` field.** The runtime's `run_router`/`route_batch`
-//! already count batches and events on every destination's `Fanout`, plus the unrouted drops.
+//! already count batches and events on every destination's `Fanout`.
 
 use crate::value_matches;
 use logit_config::{ProvenanceField, RouteBy};
