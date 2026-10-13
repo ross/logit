@@ -85,10 +85,8 @@ gRPC is unchanged: OTLP/gRPC is defined only over protobuf framing, and no OTel 
 
 All three signals accept JSON, not traces alone: a per-signal content-type matrix is *more*
 branching in `handle_http`, not less, and the shared `AnyValue`/`KeyValue`/`Resource`/scope layer
-is most of the cost regardless of how many signals use it. `exemplars` is parsed nowhere in the
-JSON layer and always decodes empty — `otlp::metrics::decode_metric` never reads a data point's
-`exemplars` field on the *protobuf* path either, so preserving them in JSON only would be
-asymmetric effort spent on a field nothing downstream looks at.
+is most of the cost regardless of how many signals use it. A data point's `exemplars` are parsed
+in JSON as in protobuf (`json/metrics.rs`), so both encodings carry them.
 
 ## Alternatives considered
 
