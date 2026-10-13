@@ -230,9 +230,8 @@ InfluxDB's storage, not either component, is what makes most resends harmless:
 ### Permitted normalizations
 
 Per [ADR `lossless-transit`](lossless-transit.md), the following count as normalization, not loss,
-for `influxdb_in -> influxdb_out`. `crates/logit-proto/src/influxdb/mod.rs`'s module doc will
-carry the same list with the same numbers when `influx/w2` lands, and the two lists must stay
-numbered alike:
+for `influxdb_in -> influxdb_out`. `crates/logit-proto/src/influxdb/mod.rs`'s module doc carries
+the same list with the same numbers, and the two lists must stay numbered alike:
 
 1. Batching: the writes `influxdb_out` sends needn't match the requests `influxdb_in` received.
 2. Duplicate points in one body (same measurement, tag set, and timestamp) merge, last write wins
@@ -270,6 +269,8 @@ tag key, tag value, and field key:
   tag key, tag value, and field key, and a backslash before it is dropped. `=` isn't special in a
   measurement, so the encoder writes it bare there. `\=` in a measurement is accepted by `influxd`
   with `204` and the data is unreadable afterward, so the encoder never writes it.
+- A field key also unescapes `\"` to a quote (probe row 2.11). A tag value, tag key, and
+  measurement keep a backslash before `"` literal (probe row 2.9).
 - A backslash before anything else, another backslash included, stays a literal backslash. `\\`
   is not an escape: it decodes to two backslashes. The encoder writes a backslash as itself and
   escapes only `,`, space, and (outside a measurement) `=`, each with one backslash.
@@ -283,18 +284,28 @@ tag key, tag value, and field key:
 
 ### Deviations from `influxd`
 
-`influxdb_in` differs from `influxd` in these places, each a choice:
+`crates/logit-proto/src/influxdb/mod.rs`'s module doc ("Deviations from influxd") is the canonical
+list; this section summarizes it. Each deviation is a choice or a consequence of the model:
 
-- A `time` field key and a same-line field type conflict (`f=1i,f=2.5`) answer `400` where `influxd`
-  answers `422`. The listener keeps no per-bucket type table, so it doesn't police types and a
-  later value wins even across types. A same-line duplicate field key takes the last value
-  (normalization 13).
-- The decoder enforces neither the 1 MiB field-value limit nor the 65,535-byte series-key limit.
+- A `time` field key and a same-line field type conflict (`f=1i,f=2.5`) are parse errors (`400`),
+  where `influxd` answers `422`. The conflict text is `influxd`'s. The same type repeated on one
+  line takes the last value at the first position (normalization 13). Across lines the decoder
+  keeps no type table: a later value wins even across types, and a conflict is the destination's
+  `422`.
+- Neither the 1 MiB field-value limit nor the 65,535-byte series-key limit is enforced.
   `max_request_bytes` bounds the body; the destination applies its own limits.
+- A name or string value that isn't UTF-8 is a `400`, because the model's `Value::Str` is UTF-8.
+- The error names the first bad line only. `influxd` lists every bad line, joined by `\n`.
+- The line splitter keeps `influxd`'s quirks: a comment line containing `="` swallows the lines
+  after it until a quote closes, and a backslash before a newline continues the line.
+- Reason strings follow the probe, except that `invalid field format` replaces `influxd`'s
+  `invalid value: field-key=...`.
 - A `Content-Encoding` other than `gzip` or identity answers `415`, where `influxd` ignores the
   header and parses the raw bytes.
 - A field type conflict across lines or requests is the destination's `422`, which `influxdb_out`
   reads as `Rejected` (decision 10), not a response from the listener.
+- The encoder's 1 ns nudge (normalization 9) can push a point at the timestamp ceiling out of
+  range. The encoder then skips it, counted `skipped{reason="timestamp_overflow"}`.
 
 ## Alternatives considered
 
