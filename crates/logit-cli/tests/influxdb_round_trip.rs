@@ -272,7 +272,8 @@ async fn precision_s() {
 async fn reserved_prefix() {
     let mut h = assert_case("reserved-prefix").await;
     let totals = h.probe.poll();
-    assert_eq!(totals.sum("logit.input.tags.dropped", &[("reason", "reserved_prefix")]), 1.0);
+    assert_eq!(totals.sum("logit.input.tags.omitted", &[("reason", "reserved_prefix")]), 1.0);
+    assert!(!totals.has("logit.input.tags.dropped", &[]), "the point is delivered");
 }
 
 /// Every `.in` file is covered by a test above or by `trailing_backslash`, and every `.expected`

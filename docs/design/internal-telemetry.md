@@ -1293,12 +1293,13 @@ connection refused for its PROXY header.
 | `logit.input.request.duration` | timing | one per request, every exit included, time spent waiting on a busy downstream too |
 | `logit.input.request.bytes` | count | the body size as sent (before gzip decompression), once the body has been read |
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `oversize` (`413`, as sent or decompressed), `auth` (`401`), `encoding` (`415`, anything but identity or lowercase gzip), `malformed_encoding` (`400`, a gzip stream that doesn't decompress), `precision` (`400`), `no_bucket` (`404`), `no_org` (`400`), `malformed` (`400`, a line that fails to parse), `stalled` (`408`, only with `idle_timeout:` set), or `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload) |
-| `logit.input.batches.dropped{reason}` | count | batches a `503` left undelivered: `busy` or `closed_consumer`. Disjoint from `logit.component.batches.sent` for `busy` |
-| `logit.input.tags.dropped{reason="reserved_prefix"}` | count | tags the decoder dropped because their key starts with `influxdb.`, which would collide with the carrier attributes. Counted by the codec, under this component's id |
+| `logit.input.batches.deferred` | count | batches a busy `503` left with the client to resend, disjoint from `logit.component.batches.sent` |
+| `logit.input.batches.dropped{reason="closed_consumer"}` | count | batches no consumer took, answered `503`. The refused batch is also counted in `logit.component.batches.sent` and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}` |
+| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | tags the decoder left off a point because their key starts with `influxdb.`, which would collide with the carrier attributes. The point is delivered. Counted by the codec, under this component's id |
 
 **A busy request is not a lost one**, as on `splunk_hec_in`: after 5 seconds without the pipeline
-taking the request's batch, the request gets `503` with `Retry-After: 1`, counted `class="busy"`,
-and nothing of it is delivered, so the client resends it whole. A request's body decodes to one
+taking the request's batch, the request gets `503` with `Retry-After: 1`, counted `class="busy"`
+and `batches.deferred`, and nothing of it is delivered, so the client resends it whole. A request's body decodes to one
 batch, delivered all or nothing under one deadline.
 
 `Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a plaintext peer that

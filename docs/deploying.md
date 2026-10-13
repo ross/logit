@@ -3144,7 +3144,8 @@ passes it through undecoded. A body labeled `gzip` that doesn't decompress gets 
 
 **All or nothing.** A body with any line that doesn't parse gets `400` and delivers nothing, so a
 producer's resend of the whole body repeats nothing. A `503` with `Retry-After: 1` means the
-pipeline didn't take the body within 5 seconds and nothing of it was taken.
+pipeline didn't take the body within 5 seconds and nothing of it was taken, counted
+`logit.input.batches.deferred`; the producer keeps the body and resends it.
 
 **What arrives.** Each point becomes one event with its tags as attributes and `influxdb.measurement` naming the
 measurement. Each numeric or boolean field becomes a gauge named `MEASUREMENT.FIELD`, and each
@@ -3168,8 +3169,9 @@ retries), are all invisible to the producer, which believes its writes succeeded
 
 **What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
 answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened. A nonzero
-`logit.input.tags.dropped{reason="reserved_prefix"}` means a producer sends a tag key starting
-with `influxdb.`, which the decoder drops because it would collide with the carrier. A nonzero
+`logit.input.tags.omitted{reason="reserved_prefix"}` means a producer sends a tag key starting
+with `influxdb.`, which the decoder leaves off the point because it would collide with the
+carrier. A sustained `logit.input.batches.deferred` means the pipeline isn't keeping up. A nonzero
 `logit.input.connections.rejected{reason="limit"}` means the `max_connections` cap is binding.
 `docs/design/internal-telemetry.md`'s `influxdb_in` section has every counter.
 

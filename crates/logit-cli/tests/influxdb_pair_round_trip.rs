@@ -173,7 +173,10 @@ async fn every_seed_relays_its_batch_unchanged() {
     assert_eq!(totals.sum("logit.input.requests", &[("route", "write"), ("class", "ok")]), sent);
     assert_eq!(totals.sum("logit.input.requests.rejected", &[]), 0.0);
     assert_eq!(totals.sum("logit.output.requests", &[("class", "2xx")]), sent);
-    assert_eq!(totals.sum("logit.output.tags.dropped", &[]), 0.0);
+    // `influxdb_out`'s unit tests show each of these counted nonzero, so a zero here isn't a
+    // name nothing emits.
+    assert_eq!(totals.sum("logit.output.tags.omitted", &[]), 0.0);
+    assert_eq!(totals.sum("logit.output.metrics.dropped", &[]), 0.0);
     assert_eq!(totals.sum("logit.output.metrics.skipped", &[]), 0.0);
 }
 

@@ -66,8 +66,9 @@
 //!
 //! Per request: `logit.input.requests{route, class}`, `logit.input.request.duration`, and
 //! `logit.input.request.bytes`. Rejections: `logit.input.requests.rejected{reason}`. A decoded
-//! batch a `503` left undelivered: `logit.input.batches.dropped{reason}`. The decoder counts
-//! `logit.input.tags.dropped{reason="reserved_prefix"}`. The connection metrics are `otlp_in`'s
+//! batch a `503` left undelivered: `logit.input.batches.deferred` when the pipeline was busy, since
+//! the client still holds the body, and `logit.input.batches.dropped{reason="closed_consumer"}` when
+//! no consumer is open. The decoder counts `logit.input.tags.omitted{reason="reserved_prefix"}`. The connection metrics are `otlp_in`'s
 //! verbatim. The reasons, classes, and meanings are in `docs/design/internal-telemetry.md`'s
 //! `influxdb_in` section.
 
@@ -816,7 +817,7 @@ async fn respond(
     match deliver_with_deadline(&shared.sink, vec![batch], shared.busy_after).await {
         Ok(()) => (name, OK, empty(StatusCode::NO_CONTENT)),
         Err(undelivered @ Undelivered::Busy(_)) => {
-            shared.telemetry.count("logit.input.batches.dropped", 1.0, &[("reason", "busy")]);
+            undelivered.record(&shared.telemetry);
             shared.diag.clone().warn_throttled(
                 "busy",
                 format_args!(
@@ -828,11 +829,7 @@ async fn respond(
             (name, undelivered_class(undelivered), unavailable())
         }
         Err(undelivered @ Undelivered::Closed(_)) => {
-            shared.telemetry.count(
-                "logit.input.batches.dropped",
-                1.0,
-                &[("reason", "closed_consumer")],
-            );
+            undelivered.record(&shared.telemetry);
             shared.diag.clone().warn_throttled(
                 "closed_consumer",
                 format_args!(
@@ -1581,7 +1578,11 @@ mod tests {
         assert!(rx.try_recv().is_err(), "the 503'd batch was never delivered");
         let totals = Totals::of(registry.drain(0));
         assert_eq!(totals.sum("logit.input.requests", &[("class", "busy")]), 1.0);
-        assert_eq!(totals.sum("logit.input.batches.dropped", &[("reason", "busy")]), 1.0);
+        assert_eq!(totals.sum("logit.input.batches.deferred", &[]), 1.0);
+        assert!(
+            !totals.has("logit.input.batches.dropped", &[]),
+            "a busy 503 is deferred, not lost"
+        );
     }
 
     #[tokio::test]
@@ -1598,6 +1599,7 @@ mod tests {
         );
         assert_eq!(totals.sum("logit.input.requests", &[("class", "closed_consumer")]), 1.0);
         assert_eq!(totals.sum("logit.input.requests", &[("class", "busy")]), 0.0);
+        assert!(!totals.has("logit.input.batches.deferred", &[]), "a closed consumer is loss");
     }
 
     // ---- telemetry and connections --------------------------------------------------------------
@@ -1616,7 +1618,8 @@ mod tests {
         assert_eq!(totals.sum("logit.input.requests", &[("route", "ping")]), 1.0);
         assert_eq!(totals.sum("logit.input.requests", &[("route", "health")]), 1.0);
         assert_eq!(totals.sum("logit.input.request.bytes", &[]), body.len() as f64);
-        assert_eq!(totals.sum("logit.input.tags.dropped", &[("reason", "reserved_prefix")]), 1.0);
+        assert_eq!(totals.sum("logit.input.tags.omitted", &[("reason", "reserved_prefix")]), 1.0);
+        assert!(!totals.has("logit.input.tags.dropped", &[]), "the point is delivered");
     }
 
     #[tokio::test]
