@@ -15,14 +15,17 @@ sut = "logit-sut.yaml"
 generator = "logit-generator.yaml"
 
 [ledger]
-generator_input = "load"
-generator_sink = "statsd"
-sut_listener = "statsd"
 sut_aggregate = "window"
 wire_loss_outside_faults = 0.0
 # Every series is written about 200 times a window, so each has a sample in every window, and a
 # spooled window lost to a kill shows as a gap.
 vm_every_window = true
+
+[[ledger.source]]         # one per generator the ledger follows into the SUT
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
 
 [[ledger.sink]]           # one per SUT sink the ledger follows to its backend
 id = "victoria_metrics"

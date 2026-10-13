@@ -1,0 +1,26 @@
+# The system under test in `script/soak`'s cardinality scenario: statsd-vm's SUT, with an
+# `aggregate` that forgets a series after three idle windows, so a name seen once leaves its
+# state 40 s later and the interner, which never frees, is what grows. Its `internal` telemetry
+# goes to stdout as NDJSON for the harness to read.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    interval: 10s
+    temporality: cumulative
+    # The 100 repeating names are written every window and never idle this long, so only a
+    # fault holding the generator for 30 s or more would evict one; no step does.
+    series_retention: 3
+    # 2,100 series written per window and 6,000 idle ones held: the default cap of 10,000 would
+    # leave too little room for a slow window.
+    max_retained_series: 20000
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

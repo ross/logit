@@ -38,7 +38,7 @@ VictoriaMetrics for a Kafka target (see [Kafka targets](#kafka-targets)):
 |---|---|---|
 | `victoria-metrics` | `victoriametrics/victoria-metrics:v1.152.0` | `backend`: `-retentionPeriod=100y`, published on an ephemeral loopback port the driver queries; in the compose profile `local`, which the driver enables for a local target only |
 | `logit` | `logit:soak`, built from the current tree | `sut`: the system under test (SUT), with the scenario's `configs.sut` |
-| `generator` | `logit:soak` | `generator`: the load source, a second `logit` with the scenario's `configs.generator` |
+| `generator` | `logit:soak` | `generator`: a load source, a second `logit` with the scenario's `configs.generator`. An override can add more, each with the config `[configs]` names under its service name and its own `[[ledger.source]]` |
 | `kafka` | `apache/kafka:4.2.0` | `broker`: a single-node KRaft broker, one partition per topic, for a Kafka target only (the compose profile `kafka`); the driver reads its topic back through `docker exec` |
 
 The driver and the checks know a service by its `soak.role` label, never its name. A scenario
@@ -123,6 +123,34 @@ Three scenarios give the SUT two sinks of one kind, each to its own VictoriaMetr
 | `fanout-block` | 5 minutes 30 seconds | as `fanout-copy` with 500 ms windows, and the second sink's queue at 2 batches under `overflow: block`, through a 90 s stop of its backend. A fan-out offers each batch to its consumers in turn through one send, so once that sink's queue and inbox fill, `aggregate` waits on it and the healthy sink stops delivering too. A `mark` names the blocked span; the expectations assert the stall, the backpressure reaching the listener, and both sinks recovering |
 | `route-split` | 9 minutes | the generator tags each line `shard:0` or `shard:1` over DogStatsD, and a `route` on `shard` fills two targets, each feeding one sink (`split = "route"`): one backend stopped 90 s, then netem loss on the other. Each backend holds one shard's series, so the egress gap is judged on their sum |
 
+`fanin` (16 minutes 30 seconds) runs two generators of different kinds into one `aggregate` and
+one sink, each with its own `[[ledger.source]]`. `generator` sends `statsd-vm`'s 2,000 statsd
+lines a second into `statsd_in`. `generator-lines`, which the scenario's override adds, sends 2,000
+syslog lines a second over UDP into `lines_in`, one per datagram; `kv`, `keep`, `kv_metrics`, and
+`keep_signals` turn each into one `soak_lines` increment beside statsd's series. Its 13.5-minute
+cycle puts netem loss, a partition, and a stop on each generator in turn, and its expectations
+assert that a stopped generator's listener reads nothing while the other keeps reading.
+
+`cardinality` (75 minutes) adds a second `generate_in` to `statsd-vm`'s generator that sends 200
+metric names a second, none of them repeating, through the same statsd sink. The interner never
+frees, so both processes intern every name for the whole run; `aggregate` forgets each name
+three windows later, so its state stays flat. `[expected]` sets `rss_slope` to FAIL on `logit`
+and on `generator`, and its expectations assert each process's interner slope (720,000 strings
+an hour, within 5%), that `aggregate` evicts each name, and that it never reaches its series
+cap. A netem delay on `logit` and a VictoriaMetrics stop give `recovery` faults to judge. Run it
+at its own duration: under an hour, `rss_slope` reports growth as WARN, and the expected FAIL
+FAILs the row.
+
+Four scenarios of 6 to 8 minutes each run one fault of the sink's delivery path and assert its
+effect with `[[expect]]` tables:
+
+| Scenario | Length | What it drives |
+|---|---|---|
+| `spool-full` | 7 minutes 15 seconds | `spool-kill-replay`'s disk-spooled sink with `max_bytes: 128KiB` under `overflow: drop_oldest`, through a 200 s VictoriaMetrics stop. The spool rejects each window that arrives while the sink holds its head and counts it `overflow_newest`, never `disk_full` or `rejected`, and drains after |
+| `spool-enospc` | 7 minutes 15 seconds | the same stop against a spool on a 128 KiB tmpfs that a compose override mounts at the spool path, below the spool's own 4 MiB bound. A write fails with `ENOSPC` and the sink counts `disk_full`, never `overflow_oldest`. No step stops or kills the SUT, because Docker discards a tmpfs when its container stops |
+| `slow-destination` | 7 minutes 45 seconds | the sink's `timeout` is 2 s. A 3 s netem delay on VictoriaMetrics makes it apply each write whose response arrives late, then a 2 kbit rate limit on the SUT's egress makes a request unable to finish. Each counts `network_error` and a retry, and nothing drops |
+| `fanout-stop-outage` | 6 minutes 15 seconds | `fanout-copy`'s two sinks, with the second's queue at 4 batches under `drop_oldest`. VictoriaMetrics B is stopped 150 s and the SUT is stopped for 30 s, 60 s in, so the second sink's queued batches drop at shutdown and are counted while the first sink drops nothing |
+
 The stall and the memory cap depend on the host's speed: `lua-stall`'s loop count and
 `lua-memory`'s event count are calibrated on the development host, and the comments in their
 `logit-sut.yaml` give the timings. On a much slower or faster host the event falls outside its
@@ -173,7 +201,9 @@ for = "1m30s"
 ```
 
 A root qdisc shapes the target's egress only: `netem` on `logit` impairs its remote-write (or,
-for an external target, all its traffic to the internet), not the statsd arriving at it. To impair the UDP into the SUT, put `netem` on `generator`. The driver
+for an external target, all its traffic to the internet), not the statsd arriving at it. To
+impair the UDP into the SUT, put `netem` on a generator, which impairs that generator's source
+alone. The driver
 appends `limit 100000` to `args` unless they set a `limit`, so netem's own queue never drops.
 
 ## External targets
@@ -236,7 +266,7 @@ What changes for an external target:
   `partition` on `logit` shape or cut its egress to the internet; `kill`, `stop`, and `pause` on
   `logit` work as for a local target.
 - The driver makes no VictoriaMetrics readiness check, freshness poll, flush, or export. At the
-  end it stops the generator, then waits, up to 120 s, for a SUT drain at least two aggregate
+  end it stops every generator, then waits, up to 120 s, for a SUT drain at least two aggregate
   windows later that shows every sink's `buffer.batches` at 0 and `retrying` at 0 or never set,
   before it stops the SUT. `timeline.jsonl` records the wait as a `sink_drained` phase.
 - `ledger.egress` and `ledger.windows` SKIP, and `ledger.summary` shows its Ab − V term as SKIP
@@ -312,7 +342,7 @@ What changes for a Kafka target:
    30 s, and appends each
    container's new log lines every 5 minutes. A `logit`
    container that exits or restarts with no step behind it ends the schedule at once.
-4. At the end it reverts active faults, stops the generator, waits until every sink's stored
+4. At the end it reverts active faults, stops every generator, waits until every sink's stored
    total holds across two aggregate windows, stops the SUT (expecting exit 0), and exports each
    sink's series from its backend. For an external target it waits for every SUT sink's queue
    to empty instead, and exports nothing.
@@ -345,6 +375,28 @@ A run writes `perf/results/soak/<UTC stamp>/` (gitignored, or under `SOAK_OUT`):
 Each check skips fault windows, a fault's span plus the scenario's `recovery_bound`, where its
 rule only holds in steady state. The plan's "The checks" has the full rules.
 
+The ledger follows each `[[ledger.source]]`, a generator and the SUT listener its datagrams
+reach. `ledger.wire` judges each source on its own, against the fault windows of its own
+generator and of every service that isn't a generator, and `ledger.intake` judges each
+listener's final life; each reports a line per source or listener and takes the worst status.
+From the edge into `aggregate` on, the listeners' counts are summed, because their events merge
+there. Nodes between a listener and `aggregate` are listed in `sut_transforms`, and each must
+forward every event it receives.
+
+```toml
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"              # one config per generator, under its service
+generator-lines = "logit-generator-lines.yaml"
+
+[[ledger.source]]         # one per generator
+service = "generator-lines"                     # a service with soak.role generator
+generator_input = "load"                        # its generate_in
+generator_sink = "syslog"                       # its UDP sink, G's source
+sut_listener = "lines"                          # the SUT listener it reaches
+sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional: nodes to aggregate
+```
+
 The ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`, `identity.sink`,
 `recovery`, `ledger.edge`, `ledger.egress`, `ledger.windows`, `ledger.replay`, and
 `ledger.sent`) judges each sink, reports a line per sink, and takes the worst status. Under
@@ -373,27 +425,27 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `self_log` | stderr has an `exiting` line with a nonzero code, a panic, or an `ERROR` line other than a sink's `retrying`; sink fault lines outside a fault window `WARN`. Inside an `exit` step, its `exiting` line and an `ERROR` line keyed its `key` are expected, and FAIL the row when either is missing |
 | `ready` | a `logit` container's readiness word, from each image `HEALTHCHECK` result timed at its start, isn't `ok` outside a fault window; a `mark` with `ready` sees no sample with that word; `degraded` appears outside an `exit` step; or a container isn't ready within 30 s of a start. With no `HEALTHCHECK` results recorded, it judges Docker's health status instead |
 | `progress` | a SUT sink delivers nothing in a `progress_window` outside fault windows with work queued (a hang), a `logit` container's telemetry goes quiet, or a sink's newest stored sample is 30 s old (a local target only); a sink still retrying past `recovery_bound` `WARN`s, and so do windows covering under 5% of the run after warmup |
-| `rss_slope` | resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead, and so do slopes covering under 5% of the run after warmup |
-| `fd_slope` | open file descriptors end, or sit after a recovery, more than `fd_growth` above the warmup median |
-| `ledger.wire` | the generator's lines minus what the SUT read or the kernel dropped (G − (W + K)), loss by design, exceeds `wire_loss_outside_faults` outside UDP-affecting fault windows, with one generator batch of tolerance per window edge, each steady run counting at 0 or more; the detail lists the gap per run of drain intervals, and the generator's own counted `drop_newest` loss beside it |
-| `ledger.intake` | the final SUT life's datagrams read minus dropped differ from the events sent plus bad lines; or an earlier life's read-but-unabsorbed residual (W − D − B − X − Ab, X being the listener's own counted event drops) falls outside [0, R], R being the receive queue plus 67 batches, and 65 more with a script |
-| `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listener's events sent (or, with `sut_script`, the script's) differ from those `aggregate` received; a sink received a different number of events from those sent to it (under `copy` `aggregate`'s events sent, which a fan-out counts once per batch, and under `route` its target's); or `aggregate` received a different number from those it absorbed |
+| `rss_slope` | a `logit` service's resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead, and so do slopes covering under 5% of the run after warmup. Each service is judged on its own line, and `[expected]` can set its verdict (see [Expected verdicts](#expected-verdicts)) |
+| `fd_slope` | a `logit` service's open file descriptors end, or sit after a recovery, more than `fd_growth` above the warmup median. Each service is judged on its own line, and `[expected]` can set its verdict |
+| `ledger.wire` | for any source, its generator's lines minus what its listener read or the kernel dropped (G − (W + K)), loss by design, exceeds `wire_loss_outside_faults` outside the UDP-affecting fault windows of its own generator and of every service that isn't a generator, with one generator batch of tolerance per window edge, each steady run counting at 0 or more; or its generator's sink counts messages and datagrams apart. The detail lists the gap per source and per run of drain intervals, and the generator's own counted `drop_newest` loss beside it |
+| `ledger.intake` | for any listener, the final SUT life's datagrams read minus dropped differ from the events sent plus bad lines (B: statsd's `bad_line` and `lines_in`'s oversize lines); or an earlier life's read-but-unabsorbed residual summed over the listeners (W − D − B − X − Ab, X being the listeners' own counted event drops) falls outside [0, R], R being each listener's receive queue plus 2 batches, 65 more batches for each node between it and `aggregate`, and 65 for `aggregate` |
+| `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listeners' summed events sent (or, with `sut_script`, the script's) differ from those `aggregate` received; a node in a source's `sut_transforms` received a different number from those sent to it, or sent a different number from those it received; a sink received a different number of events from those sent to it (under `copy` `aggregate`'s events sent, which a fan-out counts once per batch, and under `route` its target's); or `aggregate` received a different number from those it absorbed |
 | `ledger.script` | with `[ledger] sut_script` only, else SKIP: in the final SUT life, the listener's events sent differ from those the script received, those it received from those it emitted, dropped (`script_drop`), and failed on (`errors{reason="process"}`), or those it sent from those it emitted plus those `flush()` returned |
-| `ledger.egress` | for each sink under `copy`, or for the sinks' sum under `route`: the final SUT life's absorbed increments minus the backend's reset-aware total (Ab − V), or a stopped earlier life's datagrams read minus dropped, bad lines, the listener's counted event drops, and that total (W − D − B − X − V), is nonzero (SKIP on an external target; on a Kafka target V is the topic's distinct records, and a negative gap is a surplus), other than a positive gap in a life whose telemetry counts a batch `batches.dropped{reason="shutdown"}` at a node that can explain it: any node but a sink outside the group, so under `copy` another sink's drop doesn't count a sink's gap, while one at the sink or upstream of the fan-out does; a killed life's Ab − V falls outside its band (below, a surplus: the residual plus one drain interval of ingest; above, uncounted: one aggregate interval plus one drain interval of ingest), with the residual the kill lost reported beside it; or a sink's export matched no series. With a script, its `flush()` events leave Ab, its counted drops and errors leave a stopped life's gap, which the final drain exports because `internal` drains last. A series without one segment per SUT life `WARN`s |
+| `ledger.egress` | for each sink under `copy`, or for the sinks' sum under `route`: the final SUT life's absorbed increments minus the backend's reset-aware total (Ab − V), or a stopped earlier life's datagrams read minus dropped, bad lines, the listener's counted event drops, and that total (W − D − B − X − V), is nonzero (SKIP on an external target; on a Kafka target V is the topic's distinct records, and a negative gap is a surplus), other than a positive gap in a life whose telemetry counts a batch `batches.dropped` under any reason at a node that can explain it: any node but a sink outside the group, so under `copy` another sink's drop doesn't count a sink's gap, while one at the sink or upstream of the fan-out does (every reason counts; see "The ledger and identities" in the plan's [6. The checks](../../docs/plans/soak-harness.md#6-the-checks-w1a-w1b)); a `rejected` or `disk_corrupt` batch counts the gap but FAILs the life whatever its size; a killed life's Ab − V falls outside its band (below, a surplus: the residual plus one drain interval of ingest; above, uncounted: one aggregate interval plus one drain interval of ingest), with the residual the kill lost reported beside it; or a sink's export matched no series. With a script, its `flush()` events leave Ab, its counted drops and errors leave a stopped life's gap, which the final drain exports because `internal` drains last. A series without one segment per SUT life `WARN`s |
 | `ledger.windows` | under `[ledger] vm_every_window = true` only, and SKIPs on an external or Kafka target: a series in a SUT life has two samples more than 1.5 aggregate intervals apart, a killed life's last sample is more than 1.1 intervals before the kill, or a later life's first is more than 2 intervals after its start. The interval comes from the SUT config. A wider gap is excused as idle when the `sut_aggregate` component's `batches.sent` is 0 over the drains from a + (interval + p) / 2 to b − (interval − p) / 2, p being the drain period: no window was emitted, so none was lost. A pause, with no drains at all, counts 0. Any batch there FAILs the gap as windows emitted but not stored, whatever fault was running |
 | `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight |
-| `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0, or any one sink's Ab − V isn't, with a script's hop in place of E − A and one Ab − V term per sink under `copy`; a counted egress term is shown and not judged, and on an external target the Ab − V term SKIPs |
+| `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0, or any one sink's Ab − V isn't, with a script's hop in place of E − A and one Ab − V term per sink under `copy`; a counted egress term is shown and not judged, unless a `rejected` or `disk_corrupt` drop is in its group's credit, which FAILs the row; on an external target the Ab − V term SKIPs |
 | `ledger.sent` | an external or Kafka target only, else SKIP: a batch a sink received didn't end in an accepted response; a clean external run's detail starts with `SENT`. See [External targets](#external-targets) |
 | `ledger.topic` | a Kafka target only, else SKIP: the topic wasn't read back; its distinct records number fewer than the sink saw accepted, or more with no dropped attempt to explain them (`WARN` with one, and `WARN` either way across a killed life); or a record is stored twice in a SUT life with no epoch bump (`WARN` after one). See [Kafka targets](#kafka-targets) |
 | `identity.sink` | at the final life's last drain before its final one, a sink's batches received, plus those a disk spool replayed at open, differ from delivered + dropped + queued by more than one batch in flight |
-| `recovery` | within `recovery_bound` of a fault's end, for any sink, no drain interval clear of other faults shows that sink not retrying, its buffer under 5% full or holding at most one batch, the listener's receive queue under 5% full, and ingest at 95% of the warmup rate; a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN`, and so does a run where no fault had an eligible interval |
+| `recovery` | within `recovery_bound` of a fault's end, for any sink, no drain interval clear of other faults shows that sink not retrying, its buffer under 5% full or holding at most one batch, every listener's receive queue under 5% full, and the listeners' summed ingest at 95% of the generators' summed warmup rate; a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN`, and so does a run where no fault had an eligible interval |
 | `expect.<name>` | a scenario's own `[[expect]]` bound doesn't hold; see [Expectations](#expectations) |
 
 The plan's "The ledger and identities" defines each symbol. Every SUT config gives `internal` a
 dedicated pipeline (`self -> telemetry`), so its final drain runs after every data node has
 exited and exports the shutdown drops: the listener's `datagrams.dropped{reason="shutdown"}`
-goes into D, and a node's `batches.dropped{reason="shutdown"}` is what makes a positive
-`ledger.egress` gap counted. A SUT config that sends `self` anywhere else loses those counts, so
+goes into D, and a node's `batches.dropped`, under any reason, is what makes a positive
+`ledger.egress` gap counted. Only the stderr cross-check is limited to `shutdown`. A SUT config that sends `self` anywhere else loses those counts, so
 keep its pipeline dedicated. The stderr copies, the listener's `warn` lines and `drain complete`'s
 `batches_dropped`, only cross-check telemetry: `ledger.intake` and `ledger.egress` `WARN` when a
 life's stderr count exceeds telemetry's, and are never added to it. A telemetry count above
@@ -411,17 +463,18 @@ last flush, and `ledger.replay` catches a replay two or more batches short.
 ### Expectations
 
 A scenario's `[[expect]]` tables add one `expect.<name>` row each, judging one metric reduced
-over a window around one step. The plan's "The scenario schema" is the full reference.
+over a window around one step, or over the whole run. The plan's "The scenario schema" is the
+full reference.
 
 ```toml
 [[expect]]
 name = "sink-queue-fills"
-service = "logit"                       # logit or generator
+service = "logit"                       # logit or a generator
 metric = "logit.component.buffer.batches"
 component = "victoria_metrics"          # and any other attribute under attrs = { ... }
 step = "c0s1"                           # an expanded step id, or a [[step]] index for every cycle
-window = "during"                       # the fault's span; `after`, the recovery_bound after it; `through`, both
-reduce = "max"                          # counters: delta, min_delta; gauges: max, min, last
+window = "during"                       # the fault's span; `after`, the recovery_bound after it; `through`, both; `run`, with no step
+reduce = "max"                          # counters: delta, min_delta; gauges: max, min, last, slope
 min = 2                                 # min, max, or both
 ```
 
@@ -432,6 +485,40 @@ that start only. A bound that must hold for the whole episode, such as a loss co
 stay 0, uses `through`: a chain blocked behind a sink stays blocked until the sink's next retry,
 up to its `retry_max_delay` after the revert. A scenario with no `[[expect]]` gets one `expect`
 row that SKIPs.
+
+`window = "run"` takes no `step`: it runs from the end of warmup to the start of the end
+sequence, fault windows included. `slope` is a gauge's least-squares slope over the window's
+samples, in the metric's unit per hour, so a bound on `logit.process.interner.strings` is in
+strings an hour and one on `logit.process.memory.resident.bytes` in bytes an hour. A restart
+resets a process gauge, so `slope` fits each SUT life on its own and judges each against the
+bounds. A life needs at least 6 samples spanning 60 s, as `rss_slope` does, and the row FAILs
+when no life in the window has them.
+
+```toml
+[[expect]]
+name = "interner-grows"
+service = "logit"
+metric = "logit.process.interner.strings"
+window = "run"
+reduce = "slope"
+min = 300000              # strings an hour
+```
+
+### Expected verdicts
+
+An `[expected]` table sets the verdict a scenario expects of `rss_slope` or `fd_slope` for a
+service, the two rows that judge each `logit` service apart:
+
+```toml
+[expected]
+rss_slope = { logit = "FAIL" }   # row id -> service -> PASS, WARN, or FAIL
+```
+
+A service whose verdict matches scores PASS, and its line reads `FAIL, as expected: ...`. A
+service whose verdict differs FAILs, as in `expected FAIL, got PASS`, so a growth the scenario
+exists to show can't go missing unnoticed. Services with no expectation are judged as usual.
+`rss_slope` reports growth as WARN under an hour's run, so an expected FAIL needs a run of an
+hour or more; a shorter `--duration` FAILs the row.
 
 ### Random schedules
 

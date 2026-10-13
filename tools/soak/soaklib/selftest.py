@@ -73,6 +73,16 @@ a sink short or empty while the other balances, a surplus at one sink that can't
 at the other, the summed V under `route`, a reset on one backend only, a sink edge short of
 what was sent to it, and `identity.sink`, `recovery`, and `progress` naming the sink that broke.
 
+For several generators, it covers every `[[ledger.source]]` and per-generator `[configs]` rule
+(the old scalar `[ledger]` keys refused, a missing or empty list, a missing or unknown key, two
+sources on one generator or one listener, a source on a service that isn't a generator, a
+generator with no source, and `sut_transforms`), each generator's compose variable, the fault
+predicates per source, `compose.env` and the end sequence with two generators, and a two-source
+run: wire loss inside its own generator's fault window passing and inside the other's FAILing,
+each source's datagram precondition, an imbalance on one listener FAILing named, the listeners'
+summed E against A, a source's transforms judged hop by hop, `lines_in`'s oversize drops in B,
+R per listener from its own `receive:`, and `recovery` against the summed rate.
+
 No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
 suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
 a slip in a part's own stand-ins included, gets rc 127 from `Docker.run`'s `OSError` instead of
@@ -216,8 +226,8 @@ def _rules(root):
              "doesn't fit one whole cycle", "a duration shorter than one cycle")
     _refused(path, mutate(lambda r: r.update(durration="10m")), "unknown top-level key",
              "a misspelled key")
-    _refused(path, mutate(lambda r: r["ledger"].pop("sut_listener")),
-             "ledger: missing `sut_listener`", "a missing ledger key")
+    _refused(path, mutate(lambda r: r["ledger"].pop("sut_aggregate")),
+             "ledger: missing `sut_aggregate`", "a missing ledger key")
     _refused(path, copy.deepcopy(base), "--seed applies to a [random] schedule only",
              "--seed on a fixed schedule", seed=7)
     _refused(path, copy.deepcopy(base), "leaves no time", "a duration inside warmup+cooldown",
@@ -1016,7 +1026,8 @@ def _vm_resets():
            f"V credits each segment to its own life, got {by_life} {total} {mismatched}")
 
 
-LEDGER = {"generator_input": "load", "generator_sink": "out", "sut_listener": "in",
+LEDGER = {"source": [{"service": "generator", "generator_input": "load",
+                      "generator_sink": "out", "sut_listener": "in"}],
           "sut_aggregate": "window", "wire_loss_outside_faults": 0.0, "split": "copy",
           "sink": [{"id": "sink", "backend": "victoria-metrics",
                     "vm_selector": "{__name__=~\"x_[0-9]+_total\"}"}]}
@@ -1033,7 +1044,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 external=False, sut_extra=(), stderr_extra=(), timeline_extra=(),
                 script=None, l_in_short=0, l_err_unreported=0, l_sent_short=0,
                 sut_end="stop", shutdown_in=("telemetry", "stderr"), dropped_at="sink",
-                kafka=False, topic_extra=(), topic_read=True, topic_records=None, **resolved):
+                dropped_reason="shutdown", kafka=False, topic_extra=(), topic_read=True, topic_records=None, **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
@@ -1041,7 +1052,9 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
     life 1 balances. `shutdown_in` names where the shutdown drops, of datagrams and of
     `life0_dropped`/`life1_dropped` batches, are written: telemetry, as a dedicated `internal`
     pipeline exports them, and stderr, as the listener's `warn` lines and `drain complete`.
-    `dropped_at` names the component whose telemetry carries those batches.
+    `dropped_at` names the component whose telemetry carries those batches, and
+    `dropped_reason` their reason; a reason other than `shutdown` leaves them out of stderr,
+    whose `drain complete` counts shutdown drops alone.
 
     `script` puts a `lua` component, `lua`, between the listener and `window`: a dict of the
     events it drops (`drop`), fails on (`err`), and returns from `flush()` (`flush`) per drain,
@@ -1146,7 +1159,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             batches = life0_dropped if life == 0 else life1_dropped
             if batches:
                 sut.append(_line(stamp, "logit.component.batches.dropped", "sum", batches,
-                                 component=dropped_at, attrs={"reason": "shutdown"}))
+                                 component=dropped_at, attrs={"reason": dropped_reason}))
 
     end_fields = {"code": 2, "key": "memory_limit_exceeded"} if sut_end == "exit" else {}
     timeline = [_phase("start", 0, t0=T0),
@@ -1195,7 +1208,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                           "receive queue but not decoded when this listener was stopped at its "
                           "shutdown grace", component="in"))
     for offset, dropped in ((STOP[0] + 0.6, life0_dropped), (321, life1_dropped)):
-        if dropped and "stderr" in shutdown_in:
+        if dropped and "stderr" in shutdown_in and dropped_reason == "shutdown":
             stderr.append(log(offset, "WARN", "drain complete", duration="1s",
                               batches_dropped=dropped))
         else:
@@ -1399,15 +1412,15 @@ def _sink_ledger():
                             export_edit=short_final("vm_b", 20))
         egress = elsewhere["ledger.egress"].detail
         expect(elsewhere["ledger.egress"].status == checks.FAIL
-               and "V[vm_b] 33,960 = 40, uncounted (batches dropped for shutdown 0, not "
-               "counting 1 at the other sinks)" in egress
+               and "V[vm_b] 33,960 = 40, uncounted (batches dropped: 0, not "
+               "counting shutdown 1 at the other sinks)" in egress
                and elsewhere["ledger.summary"].status == checks.FAIL,
                f"under copy another sink's shutdown drop doesn't count vm_b's gap, got "
                f"{elsewhere['ledger.egress']} / {elsewhere['ledger.summary']}")
         attributed = results("sinks-copy-attributed", life1_dropped=1, dropped_at="vm_b",
                              export_edit=short_final("vm_b", 20))
         expect(attributed["ledger.egress"].status == checks.PASS
-               and "V[vm_b] 33,960 = 40, counted (batches dropped for shutdown 1)"
+               and "V[vm_b] 33,960 = 40, counted (batches dropped: shutdown 1)"
                in attributed["ledger.egress"].detail
                and attributed["ledger.summary"].status == checks.PASS,
                f"under copy a sink's own shutdown drop counts its gap, got "
@@ -1420,8 +1433,8 @@ def _sink_ledger():
                            export_edit=short_both)
         egress = upstream["ledger.egress"].detail
         expect(upstream["ledger.egress"].status == checks.PASS
-               and "V[vm_a] 33,960 = 40, counted (batches dropped for shutdown 1)" in egress
-               and "V[vm_b] 33,960 = 40, counted (batches dropped for shutdown 1)" in egress
+               and "V[vm_a] 33,960 = 40, counted (batches dropped: shutdown 1)" in egress
+               and "V[vm_b] 33,960 = 40, counted (batches dropped: shutdown 1)" in egress
                and upstream["ledger.summary"].status == checks.PASS,
                f"under copy a shutdown drop upstream of the fan-out counts every sink's gap, got "
                f"{upstream['ledger.egress']} / {upstream['ledger.summary']}")
@@ -1430,11 +1443,41 @@ def _sink_ledger():
                                   life1_dropped=1, dropped_at=dropper,
                                   export_edit=short_final(short, 20))
             expect(routed_drop["ledger.egress"].status == checks.PASS
-                   and "= 20, counted (batches dropped for shutdown 1)"
+                   and "= 20, counted (batches dropped: shutdown 1)"
                    in routed_drop["ledger.egress"].detail
                    and routed_drop["ledger.summary"].status == checks.PASS,
                    f"under route {dropper}'s shutdown drop counts the summed gap, got "
                    f"{routed_drop['ledger.egress']} / {routed_drop['ledger.summary']}")
+        # Every reason counts, under the same group rule as a shutdown drop.
+        overflow_elsewhere = results("sinks-copy-overflow-elsewhere", life1_dropped=1,
+                                     dropped_at="vm_a", dropped_reason="overflow_oldest",
+                                     export_edit=short_final("vm_b", 20))
+        expect(overflow_elsewhere["ledger.egress"].status == checks.FAIL
+               and "V[vm_b] 33,960 = 40, uncounted (batches dropped: 0, not counting "
+               "overflow_oldest 1 at the other sinks)" in overflow_elsewhere["ledger.egress"].detail
+               and overflow_elsewhere["ledger.summary"].status == checks.FAIL,
+               f"under copy another sink's overflow drop doesn't count vm_b's gap, got "
+               f"{overflow_elsewhere['ledger.egress']} / {overflow_elsewhere['ledger.summary']}")
+        overflow_own = results("sinks-copy-overflow-own", life1_dropped=1, dropped_at="vm_b",
+                               dropped_reason="overflow_oldest",
+                               export_edit=short_final("vm_b", 20))
+        expect(overflow_own["ledger.egress"].status == checks.PASS
+               and "V[vm_b] 33,960 = 40, counted (batches dropped: overflow_oldest 1)"
+               in overflow_own["ledger.egress"].detail
+               and overflow_own["ledger.summary"].status == checks.PASS,
+               f"under copy a sink's own overflow drop counts its gap, got "
+               f"{overflow_own['ledger.egress']} / {overflow_own['ledger.summary']}")
+        for dropper, short in (("vm_a", "vm_b"), ("vm_b", "vm_a")):
+            routed_overflow = results(f"sinks-route-overflow-{dropper}", split="route",
+                                      life1_dropped=1, dropped_at=dropper,
+                                      dropped_reason="overflow_oldest",
+                                      export_edit=short_final(short, 20))
+            expect(routed_overflow["ledger.egress"].status == checks.PASS
+                   and "= 20, counted (batches dropped: overflow_oldest 1)"
+                   in routed_overflow["ledger.egress"].detail
+                   and routed_overflow["ledger.summary"].status == checks.PASS,
+                   f"under route {dropper}'s overflow drop counts the summed gap, got "
+                   f"{routed_overflow['ledger.egress']} / {routed_overflow['ledger.summary']}")
         half = results("sinks-copy-half", split="copy",
                        export_edit=lambda sink, series: [one for one in series
                                                         if sink == "vm_a"
@@ -1594,7 +1637,7 @@ def _roles(root):
              "logit-2", "two SUTs"),
             ({"sut": "sut", "generator": "generator"}, "one sut service, logit, and has sut",
              "a SUT under another name"),
-            ({"logit": "sut"}, "one generator service, generator, and has none",
+            ({"logit": "sut"}, "at least one generator service, and has none",
              "no generator")):
         problems = scenario.role_problems(bad)
         expect(any(needle in problem for problem in problems),
@@ -1962,9 +2005,53 @@ def _ledger_checks():
                f"{uncounted['ledger.egress']}")
         counted = results("ledger-counted", v0_extra=-500, life0_dropped=3)
         expect(counted["ledger.egress"].status == checks.PASS
-               and "counted (batches dropped for shutdown 3)" in counted["ledger.egress"].detail,
+               and "counted (batches dropped: shutdown 3)" in counted["ledger.egress"].detail,
                f"egress marks a positive gap with a shutdown batch drop as counted, got "
                f"{counted['ledger.egress']}")
+        for reason in ("overflow_oldest", "disk_full"):
+            other = results(f"ledger-counted-{reason}", v0_extra=-500, life0_dropped=3,
+                            dropped_reason=reason)
+            expect(other["ledger.egress"].status == checks.PASS
+                   and f"counted (batches dropped: {reason} 3)" in other["ledger.egress"].detail
+                   and other["ledger.summary"].status == checks.PASS,
+                   f"egress counts a gap by a {reason} batch drop, got {other['ledger.egress']} "
+                   f"/ {other['ledger.summary']}")
+        # Shutdown and overflow drops in one life, stderr's `drain complete` counting the
+        # shutdown ones: the cross-check compares shutdown drops alone and doesn't WARN.
+        overflow = [_line(_stamp(T0 + 50), "logit.component.batches.dropped", "sum", 12,
+                          component="sink", attrs={"reason": "overflow_oldest"})]
+        mixed = results("ledger-counted-mixed", v0_extra=-500, life0_dropped=2,
+                        sut_extra=overflow)
+        expect(mixed["ledger.egress"].status == checks.PASS
+               and "counted (batches dropped: overflow_oldest 12, shutdown 2)"
+               in mixed["ledger.egress"].detail
+               and "drain complete's batches_dropped" not in mixed["ledger.egress"].detail,
+               f"egress names every crediting reason, and its stderr cross-check reads shutdown "
+               f"drops alone, got {mixed['ledger.egress']}")
+        overflow_only = results("ledger-overflow-stderr-zero", v0_extra=-500, sut_extra=overflow)
+        expect(overflow_only["ledger.egress"].status == checks.PASS
+               and "drain complete's batches_dropped" not in overflow_only["ledger.egress"].detail,
+               f"an overflow drop with stderr's drain complete at 0 doesn't WARN, got "
+               f"{overflow_only['ledger.egress']}")
+        # A rejected batch counts the gap and still FAILs both rows, with or without a gap.
+        for name, v1_short in (("ledger-rejected", 40), ("ledger-rejected-no-gap", 0)):
+            rejected = results(name, v1_short=v1_short, life1_dropped=1,
+                               dropped_reason="rejected")
+            for row in ("ledger.egress", "ledger.summary"):
+                expect(rejected[row].status == checks.FAIL
+                       and "FAIL: 1 batch(es) rejected by the destination" in rejected[row].detail,
+                       f"{row} FAILs a rejected batch drop and names it ({name}), got "
+                       f"{rejected[row]}")
+            expect(v1_short == 0 or "40, counted (batches dropped: rejected 1)"
+                   in rejected["ledger.egress"].detail,
+                   f"a rejected batch still counts the gap, got {rejected['ledger.egress']}")
+        corrupt = results("ledger-disk-corrupt", v1_short=40, life1_dropped=1,
+                          dropped_reason="disk_corrupt")
+        expect(corrupt["ledger.egress"].status == checks.FAIL
+               and "1 batch(es) dropped from a corrupt disk spool" in corrupt["ledger.egress"].detail
+               and corrupt["ledger.summary"].status == checks.FAIL,
+               f"a corrupt-spool drop FAILs egress and the summary, got "
+               f"{corrupt['ledger.egress']} / {corrupt['ledger.summary']}")
         log_counted = results("ledger-counted-stderr-only", v0_extra=-500, life0_dropped=3,
                               shutdown_in=("stderr",))
         expect(log_counted["ledger.egress"].status == checks.FAIL
@@ -2145,7 +2232,7 @@ def _script_ledger():
                          dropped_at="lua")
         expect(not exited["ledger.egress"].detail.startswith("SUT telemetry shows")
                and exited["ledger.egress"].status == checks.PASS
-               and "counted (batches dropped for shutdown 3)" in exited["ledger.egress"].detail,
+               and "counted (batches dropped: shutdown 3)" in exited["ledger.egress"].detail,
                f"an exit-ended life is a stopped earlier life with a counted gap, got "
                f"{exited['ledger.egress']}")
         expect(exited["ledger.script"].status == checks.PASS
@@ -2320,6 +2407,247 @@ def _gauge_lives():
     value, _ = checks.reduce_gauge(tel, "logit.component.retrying", attrs, T0 + 100, T0 + 120,
                                    "last")
     expect(value == 1, f"the value in force inside one life still counts, got {value}")
+
+
+def _service_stdout(end_s, rss, fds, strings, restart_at=None):
+    """A `logit` service's NDJSON every 5 s from +0 to `end_s`: uptime, and `rss(offset)`,
+    `fds(offset)`, and `strings(offset)` as its resident bytes, fds, and interner strings. A
+    `restart_at` offset starts a second life there, its uptime from 1 again."""
+    lines = []
+    for offset in range(0, int(end_s) + 1, 5):
+        stamp = _stamp(T0 + offset)
+        uptime = offset + 1.0 if restart_at is None or offset < restart_at else (
+            offset - restart_at + 1.0)
+        lines.append(_line(stamp, "logit.process.uptime", "gauge", uptime))
+        lines.append(_line(stamp, "logit.component.batches.delivered", "sum", 1,
+                           component="sink"))
+        lines.append(_line(stamp, "logit.process.memory.resident.bytes", "gauge", rss(offset)))
+        lines.append(_line(stamp, "logit.process.fds", "gauge", fds(offset)))
+        lines.append(_line(stamp, "logit.process.interner.strings", "gauge", strings(offset)))
+    return lines
+
+
+def _slope_run(tmp, name, sut=None, gen=None, end_s=3600, **resolved):
+    """A run directory of `end_s` seconds after a 60 s warmup with no faults, `logit` and
+    `generator` NDJSON from `_service_stdout(**sut)` and `(**gen)`, flat by default."""
+    flat = {"rss": lambda o: 50 * 2 ** 20, "fds": lambda o: 10, "strings": lambda o: 100}
+    timeline = [_phase("start", 0, t0=T0), _phase("end_begin", end_s),
+                _phase("end_end", end_s + 50)]
+    run_dir = _run_dir(tmp, name, timeline,
+                       _service_stdout(end_s + 50, **{**flat, **(sut or {})}),
+                       duration=float(end_s), **resolved)
+    (run_dir / "logs" / "generator.stdout").write_text(
+        "\n".join(_service_stdout(end_s + 50, **{**flat, **(gen or {})})) + "\n")
+    return run_dir
+
+
+# 128 MiB an hour, in bytes a second: twice the fixtures' 64 MiB/h limit.
+_FAST_RSS = 128 * 2 ** 20 / 3600
+
+
+def _per_service():
+    """`rss_slope` and `fd_slope` judge each service apart, one detail line each, and an
+    `[expected]` verdict scores a service PASS when it comes out as expected, FAIL when not."""
+    growing = {"rss": lambda o: 50 * 2 ** 20 + _FAST_RSS * o}
+    with tempfile.TemporaryDirectory() as tmp:
+        def row(name, check, **kwargs):
+            return _status(_slope_run(tmp, name, **kwargs), check)
+
+        result = row("rss-plain", checks.check_rss_slope, sut=growing)
+        expect(result.status == checks.FAIL and len(result.detail.split(" | ")) == 2
+               and "generator PASS: MiB/h life 0 +0.0" in result.detail
+               and "logit FAIL: MiB/h life 0 +128.0" in result.detail,
+               f"rss_slope judges each service on its own line, got {result}")
+        result = row("rss-gen-only", checks.check_rss_slope, gen=growing)
+        expect(result.status == checks.FAIL and "generator FAIL" in result.detail
+               and "logit PASS" in result.detail,
+               f"rss_slope names the generator as the service that grew, got {result}")
+        result = row("rss-expected", checks.check_rss_slope, sut=growing,
+                     expected={"rss_slope": {"logit": "FAIL"}})
+        expect(result.status == checks.PASS
+               and "logit FAIL, as expected: MiB/h life 0 +128.0" in result.detail
+               and "generator PASS" in result.detail,
+               f"an expected FAIL scores PASS, got {result}")
+        result = row("rss-expected-missed", checks.check_rss_slope,
+                     expected={"rss_slope": {"logit": "FAIL"}})
+        expect(result.status == checks.FAIL
+               and "logit: expected FAIL, got PASS" in result.detail,
+               f"an expected FAIL that came out PASS FAILs, got {result}")
+        result = row("rss-expected-other", checks.check_rss_slope, sut=growing,
+                     expected={"rss_slope": {"generator": "PASS"}})
+        expect(result.status == checks.FAIL and "logit FAIL" in result.detail
+               and "generator PASS, as expected" in result.detail,
+               f"a service with no expectation is judged normally, got {result}")
+        result = row("rss-expected-warn", checks.check_rss_slope, sut=growing, end_s=1800,
+                     expected={"rss_slope": {"logit": "FAIL"}})
+        expect(result.status == checks.FAIL
+               and "logit: expected FAIL, got WARN" in result.detail,
+               f"growth in a run under an hour WARNs, which an expected FAIL refuses, got "
+               f"{result}")
+        result = row("rss-expected-fd", checks.check_rss_slope, sut=growing,
+                     expected={"fd_slope": {"logit": "FAIL"}})
+        expect(result.status == checks.FAIL,
+               f"an expectation for another row doesn't touch rss_slope, got {result}")
+
+        leaking = {"fds": lambda o: 10 if o < 1800 else 30}
+        result = row("fd-plain", checks.check_fd_slope, gen=leaking)
+        expect(result.status == checks.FAIL and len(result.detail.split(" | ")) == 2
+               and "generator FAIL: warmup median 10 -> end 30" in result.detail
+               and "logit PASS: warmup median 10 -> end 10" in result.detail,
+               f"fd_slope judges each service on its own line, got {result}")
+        result = row("fd-expected", checks.check_fd_slope, gen=leaking,
+                     expected={"fd_slope": {"generator": "FAIL"}})
+        expect(result.status == checks.PASS and "generator FAIL, as expected" in result.detail,
+               f"fd_slope takes an expected FAIL, got {result}")
+        result = row("fd-expected-missed", checks.check_fd_slope,
+                     expected={"fd_slope": {"generator": "FAIL"}})
+        expect(result.status == checks.FAIL
+               and "generator: expected FAIL, got PASS" in result.detail,
+               f"fd_slope FAILs an expected FAIL that came out PASS, got {result}")
+
+
+def _slope_edges():
+    """The slope rows SKIP with no service to judge, WARN on a service with samples but no
+    fittable life, and let an `[expected]` verdict FAIL where they would otherwise SKIP."""
+    with tempfile.TemporaryDirectory() as tmp:
+        start, end = _phase("start", 0, t0=T0), [_phase("end_begin", 3600),
+                                                   _phase("end_end", 3650)]
+        # A run recorded before the role map has no `services`, so no service to judge.
+        none = _run_dir(tmp, "no-services", [start] + end, _sut_stdout(3600), services={},
+                        duration=3600.0)
+        for check in (checks.check_rss_slope, checks.check_fd_slope):
+            result = _status(none, check)
+            expect(result.status == checks.SKIP,
+                   f"{check.__name__} SKIPs with no service to judge, got {result}")
+
+        # The generator's telemetry stops at +80: five samples after warmup, too few to fit.
+        short = _slope_run(tmp, "unfittable")
+        (short / "logs" / "generator.stdout").write_text("\n".join(
+            _service_stdout(80, lambda o: 50 * 2 ** 20, lambda o: 10, lambda o: 100)) + "\n")
+        result = _status(short, checks.check_rss_slope)
+        expect(result.status == checks.WARN
+               and "generator WARN: no life with enough samples" in result.detail
+               and "logit PASS" in result.detail,
+               f"a service with samples but no fittable life WARNs beside a good one, got "
+               f"{result}")
+
+        # Every service sampled, none fittable, and no expectation: nothing to judge.
+        unfit = _slope_run(tmp, "all-unfittable", end_s=80)
+        result = _status(unfit, checks.check_rss_slope)
+        expect(result.status == checks.SKIP,
+               f"rss_slope SKIPs when no service has a fittable life, got {result}")
+
+        expected = {"fd_slope": {"logit": "FAIL"}}
+        untimed = _run_dir(tmp, "fd-no-start", end, _sut_stdout(3600), duration=3600.0,
+                           expected=expected)
+        result = _status(untimed, checks.check_fd_slope)
+        expect(result.status == checks.FAIL and "expected FAIL, got SKIP" in result.detail,
+               f"fd_slope FAILs an expectation it can't judge for want of a start, got {result}")
+        silent = _run_dir(tmp, "fd-no-samples", [start] + end, duration=3600.0,
+                          expected=expected)
+        result = _status(silent, checks.check_fd_slope)
+        expect(result.status == checks.FAIL and "logit" in result.detail,
+               f"fd_slope FAILs an expectation on a service with no fd samples, got {result}")
+
+
+def _expected_rules(root):
+    path, base = _base(root)
+
+    def with_expected(table):
+        raw = copy.deepcopy(base)
+        raw["expected"] = table
+        return raw
+
+    loaded = scenario.from_dict(with_expected({"rss_slope": {"logit": "FAIL"},
+                                               "fd_slope": {"generator": "PASS"}}), path)
+    scenario.check_services(loaded, scenario.base_roles(loaded))
+    expect(loaded.to_json()["expected"] == {"rss_slope": {"logit": "FAIL"},
+                                            "fd_slope": {"generator": "PASS"}},
+           "the resolved scenario carries [expected]")
+    cases = [
+        ({"ledger.egress": {"logit": "FAIL"}}, "only rss_slope, fd_slope take an expected",
+         "an expectation on a row that doesn't judge per service"),
+        ({"rss_slope": {"logit": "fail"}}, "verdict must be one of PASS, WARN, FAIL",
+         "a lowercase verdict"),
+        ({"rss_slope": {"logit": "SKIP"}}, "verdict must be one of", "a SKIP verdict"),
+        ({"rss_slope": {"victoria-metrics": "FAIL"}}, "unknown service `victoria-metrics`",
+         "an expectation on a service that doesn't run logit"),
+        ({"rss_slope": {}}, "must be a table of services", "an empty row table"),
+        ({"rss_slope": "FAIL"}, "must be a table of services", "a bare verdict"),
+        ("FAIL", "`expected` must be a table", "a non-table [expected]"),
+    ]
+    for table, needle, what in cases:
+        _refused(path, with_expected(table), needle, what)
+
+
+def _slope_reducer():
+    """The `slope` reducer: the window's samples fitted per life, per hour; the `run` window
+    from warmup's end to the end sequence."""
+    def exp(**fields):
+        return {"name": "x", "service": "logit", "metric": "logit.process.interner.strings",
+                "attrs": {}, "step": None, "window": "run", "reduce": "slope", "min": None,
+                "max": None, **fields}
+
+    # 100 strings a second after warmup, 360,000 an hour. Warmup holds 0 and the end sequence
+    # drops to 0, so a window reaching into either fits another slope.
+    after_warmup = {"strings": lambda o: 0 if o <= 60 or o > 3600 else 100 * (o - 60)}
+    with tempfile.TemporaryDirectory() as tmp:
+        counter = 0
+
+        def rows(expectations, **kwargs):
+            nonlocal counter
+            counter += 1
+            run_dir = _slope_run(tmp, f"slope-{counter}", expect=expectations, **kwargs)
+            return [r for r in checks.run_all(run_dir) if r.id.startswith("expect")]
+
+        result = rows([exp(min=359999, max=360001)], sut=after_warmup)[0]
+        expect(result.status == checks.PASS and "life 0 360,000/h" in result.detail
+               and "run (+60s, +3600s]" in result.detail,
+               f"slope over the run window is 100/s as 360,000/h, got {result}")
+        result = rows([exp(min=400000)], sut=after_warmup)[0]
+        expect(result.status == checks.FAIL and "FAIL" in result.detail,
+               f"a slope under its min FAILs, got {result}")
+        result = rows([exp(max=-1)], sut=after_warmup)[0]
+        expect(result.status == checks.FAIL, f"a slope over its max FAILs, got {result}")
+
+        result = rows([exp(min=0)], end_s=85)[0]
+        expect(result.status == checks.FAIL and "too few samples" in result.detail,
+               f"a run window under {checks.SLOPE_MIN_SPAN_S}s FAILs, got {result}")
+
+        # Life 0 grows 100/s to +1800; life 1 starts at 0 there and grows 50/s.
+        two = {"strings": lambda o: 100 * o if o < 1800 else 50 * (o - 1800),
+               "restart_at": 1800}
+        result = rows([exp(min=350000)], sut=two)[0]
+        expect(result.status == checks.FAIL and "life 0 360,000/h" in result.detail
+               and "life 1 180,000/h FAIL" in result.detail,
+               f"slope fits each life and judges each, got {result}")
+        result = rows([exp(min=170000)], sut=two)[0]
+        expect(result.status == checks.PASS,
+               f"a restart's drop isn't fitted as a slope, got {result}")
+        result = rows([exp(metric="logit.process.memory.resident.bytes", min=0, max=1)])[0]
+        expect(result.status == checks.PASS and "life 0 0/h" in result.detail,
+               f"a flat gauge's slope is 0, got {result}")
+
+    path, base = _base(Path(__file__).resolve().parent.parent)
+
+    def with_expect(**changes):
+        raw = copy.deepcopy(base)
+        one = {**VALID_EXPECT, "reduce": "slope", "min": 0, **changes}
+        raw["expect"] = [{k: v for k, v in one.items() if v is not None}]
+        return raw
+
+    loaded = scenario.from_dict(with_expect(window="run", step=None), path)
+    expect(loaded.expectations[0].step is None and loaded.to_json()["expect"][0]["step"] is None,
+           "a run window loads with no step")
+    _refused(path, with_expect(window="run"), "window `run` spans the whole run and takes no",
+             "a run window with a step")
+    _refused(path, with_expect(step=None), "missing `step`", "a step window with no step")
+    _refused(path, with_expect(metric="logit.input.kernel.drops"),
+             "reads a gauge, and logit.input.kernel.drops is a sum", "a slope of a counter")
+    _refused(path, with_expect(metric="logit.process.interner.strings", reduce="delta"),
+             "logit.process.interner.strings is a gauge", "a counter reducer on interner.strings")
+    _refused(path, with_expect(metric="logit.process.memory.resident.bytes", reduce="delta"),
+             "logit.process.memory.resident.bytes is a gauge", "a counter reducer on RSS")
 
 
 def _kill_watchdog():
@@ -2662,7 +2990,7 @@ KILL_KILL = (203, 213)
 
 def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=None, drop=(),
               every_window=True, kill_residual=0, silence=None, idle=(), extra_sent=(),
-              late_report=False, no_drains=None):
+              late_report=False, no_drains=None, sut_extra=()):
     """A three-life run for the ledger: life 1 ends by a kill. The generator and the SUT move
     `PER_DRAIN` lines per 5 s drain (200/s), and the export samples every 10 s. Lives 0 and 2
     balance. Life 1's Ab − V is `kill_gap`, the window the kill discarded; its band is
@@ -2678,7 +3006,8 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
     is a `(start, end)` span with no SUT drain, as a pause leaves. `every_window` sets `[ledger]
     vm_every_window`. `kill_residual` lines are read in the drain before life 1's last and never
     absorbed. `silence` is `(service, action)` of a fault over +240..+270 in life 2, or
-    `(service, action, start, end)` of one over those offsets."""
+    `(service, action, start, end)` of one over those offsets. `sut_extra` adds raw SUT
+    telemetry lines."""
     queued = replayed if queued is None else queued
     gen = []
     for offset in range(5, 301, 5):
@@ -2747,7 +3076,7 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
                      _action("revert", "c0s3", action, on, s_end - 0.2, s_end)]
     timeline += [_phase("end_begin", 300), _phase("end_end", 330)]
     ledger = {**LEDGER, "vm_every_window": True} if every_window else LEDGER
-    run_dir = _run_dir(tmp, name, timeline, sut, ledger=ledger,
+    run_dir = _run_dir(tmp, name, timeline, sut + list(sut_extra), ledger=ledger,
                        configs={"sut": "logit-sut.yaml"})
     (run_dir / "configs").mkdir()
     (run_dir / "configs" / "logit-sut.yaml").write_text(KILL_SUT_CONFIG)
@@ -2807,6 +3136,15 @@ def _kill_ledger():
                f"egress reports the killed life's gap inside its band, got {egress}")
         expect("life 2 (final): Ab 18,000 − V[sink] 18,000 = 0, ok" in egress,
                f"the final life stays exact, got {egress}")
+        overflow = [_line(_stamp(T0 + 180), "logit.component.batches.dropped", "sum", 4,
+                          component="sink", attrs={"reason": "overflow_oldest"})]
+        reported = results("kill-overflow", sut_extra=overflow)
+        expect(reported["ledger.egress"].status == checks.PASS
+               and "within band" in reported["ledger.egress"].detail
+               and "batches dropped: overflow_oldest 4, reported, not judged"
+               in reported["ledger.egress"].detail,
+               f"a killed life's overflow drops are reported beside its band, got "
+               f"{reported['ledger.egress']}")
 
         edge_high = results("kill-high-edge", kill_gap=3000)
         expect(edge_high["ledger.egress"].status == checks.PASS,
@@ -3817,6 +4155,385 @@ def _kafka_checks():
                f"ledger.topic SKIPs on the local target, got {local['ledger.topic']}")
 
 
+# The second source the fan-in fixtures add: a generator service and the SUT listener it reaches.
+LINES_SOURCE = {"service": "generator-lines", "generator_input": "load",
+                "generator_sink": "out", "sut_listener": "lines"}
+
+
+def _sources_run(tmp, name, sut_edit=None, gen_edit=None, transforms=(), sut_config=None,
+                 timeline_extra=(), **kwargs):
+    """`_ledger_run`'s two-life run directory with a second source (`LINES_SOURCE`): the
+    generator `generator-lines` repeats `generator`'s telemetry, the SUT listener `lines`
+    repeats `in`'s lines (its stderr shutdown lines included), and `window`'s received and
+    absorbed counts and the export's values double, so every identity holds over the two.
+
+    `sut_edit(record)` may change or drop (return None) each of `lines`' telemetry records, and
+    `gen_edit(record)` each of `generator-lines`'. `transforms` names nodes between `lines` and
+    `window`, each forwarding what `lines` sent, written as that source's `sut_transforms`;
+    `sut_config` is the SUT config text the run's `configs/` holds."""
+    run_dir = _ledger_run(tmp, name, timeline_extra=timeline_extra, **kwargs)
+    out = []
+    for line in (run_dir / "logs" / "logit.stdout").read_text().splitlines():
+        record = json.loads(line)
+        component = record["attributes"]["component"]
+        metric = record["metrics"][0]
+        if component == "window" and metric["name"] in ("logit.component.events.received",
+                                                        "logit.transform.metrics.absorbed"):
+            metric["value"] *= 2
+            out.append(json.dumps(record))
+            continue
+        out.append(line)
+        if component != "in":
+            continue
+        copied = copy.deepcopy(record)
+        copied["attributes"]["component"] = "lines"
+        if metric["name"] == "logit.component.events.sent":
+            for node in transforms:
+                for name_ in ("logit.component.events.received", "logit.component.events.sent"):
+                    hop = copy.deepcopy(copied)
+                    hop["attributes"]["component"] = node
+                    hop["metrics"][0]["name"] = name_
+                    hop = sut_edit(hop) if sut_edit else hop
+                    if hop is not None:
+                        out.append(json.dumps(hop))
+        copied = sut_edit(copied) if sut_edit else copied
+        if copied is not None:
+            out.append(json.dumps(copied))
+    (run_dir / "logs" / "logit.stdout").write_text("\n".join(out) + "\n")
+    stderr = []
+    for line in (run_dir / "logs" / "logit.stderr").read_text().splitlines():
+        stderr.append(line)
+        entry = json.loads(line)
+        if entry.get("component") == "in":
+            stderr.append(json.dumps({**entry, "component": "lines"}))
+    (run_dir / "logs" / "logit.stderr").write_text("\n".join(stderr) + "\n")
+    gen = []
+    for line in (run_dir / "logs" / "generator.stdout").read_text().splitlines():
+        record = json.loads(line)
+        record = gen_edit(record) if gen_edit else record
+        if record is not None:
+            gen.append(json.dumps(record))
+    (run_dir / "logs" / "generator-lines.stdout").write_text("\n".join(gen) + "\n")
+    series = vm.parse_export((run_dir / "vm-export" / "sink.jsonl").read_text())
+    for one in series:
+        one["values"] = [value * 2 for value in one["values"]]
+    _write_export(run_dir, "sink", series)
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    resolved["services"] = {**resolved["services"], "generator-lines": "generator"}
+    second = dict(LINES_SOURCE, **({"sut_transforms": list(transforms)} if transforms else {}))
+    resolved["ledger"]["source"] = list(resolved["ledger"]["source"]) + [second]
+    if sut_config is not None:
+        (run_dir / "configs").mkdir(exist_ok=True)
+        (run_dir / "configs" / "sut.yaml").write_text(sut_config)
+        resolved["configs"] = {"sut": "sut.yaml"}
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    return run_dir
+
+
+def _at(offset, change):
+    """A `sut_edit`/`gen_edit` applying `change(record)` to the records stamped at `offset`
+    seconds and keeping the rest."""
+    def edit(record):
+        if record["timestamp"] == _stamp(T0 + offset):
+            change(record)
+        return record
+    return edit
+
+
+def _sources_ledger():
+    """The ledger with two sources: `ledger.wire` judged per source against the fault windows
+    of its own generator and of everything off the generators, `ledger.intake` per listener,
+    `ledger.edge` over the listeners' summed E and through a source's `sut_transforms`, R
+    summed per listener from each listener's own `receive:`, and `recovery` against the summed
+    rate."""
+
+    def less(metric, by, component="lines"):
+        def change(record):
+            if (record["metrics"][0]["name"] == metric
+                    and record["attributes"]["component"] == component):
+                record["metrics"][0]["value"] -= by
+        return change
+
+    def netem(on):
+        return (_action("apply", "x1", "netem", on, 52, affects_udp_ingress=True),
+                _action("revert", "x1", "netem", on, 62, affects_udp_ingress=True))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            return {r.id: r for r in checks.run_all(_sources_run(tmp, name, **kwargs))}
+
+        clean = results("sources-clean")
+        for row in ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.aggregate",
+                    "ledger.egress", "ledger.summary", "recovery", "identity.sink"):
+            expect(clean[row].status == checks.PASS,
+                   f"{row} PASSes the balanced two-source fixture, got {clean[row]}")
+        wire = clean["ledger.wire"].detail
+        expect("generator -> in: G 60,000" in wire and "generator-lines -> lines: G 60,000" in wire,
+               f"ledger.wire reports one detail per source, got {wire}")
+        intake = clean["ledger.intake"].detail
+        expect("final life 1 in: W − D" in intake and "final life 1 lines: W − D" in intake,
+               f"ledger.intake judges each listener, got {intake}")
+        expect("ΣE 68,000 == A 68,000" in clean["ledger.edge"].detail,
+               f"ledger.edge sums E over the two listeners, got {clean['ledger.edge']}")
+        expect("R 89,000 = 10,000 + 2 x 1,000 (in) + 10,000 + 2 x 1,000 (lines) + 65 x 1,000"
+               in clean["ledger.intake"].detail,
+               f"R holds each listener's queue and batches and aggregate's once, got "
+               f"{clean['ledger.intake'].detail}")
+
+        # Lines lost on the second source's wire at +60: inside a netem on its own generator,
+        # by design; inside a netem on the other generator, steady loss for this source.
+        lost = _at(60, less("logit.input.datagrams", 400))
+        own = results("sources-wire-own", sut_edit=lost, timeline_extra=netem("generator-lines"))
+        expect(own["ledger.wire"].status == checks.PASS,
+               f"wire loss inside the source's own generator's fault window passes, got "
+               f"{own['ledger.wire']}")
+        other = results("sources-wire-other", sut_edit=lost, timeline_extra=netem("generator"))
+        detail = other["ledger.wire"].detail
+        expect(other["ledger.wire"].status == checks.FAIL
+               and re.search(r"generator-lines -> lines: \d+ lost outside UDP-affecting windows",
+                             detail)
+               and "generator -> in: G 60,000" in detail,
+               f"the same loss inside the other generator's fault window FAILs this source "
+               f"alone, got {detail}")
+        sut_fault = results("sources-wire-sut", sut_edit=lost, timeline_extra=netem("logit"))
+        expect(sut_fault["ledger.wire"].status == checks.PASS,
+               f"a UDP-affecting fault on the SUT excuses every source's wire, got "
+               f"{sut_fault['ledger.wire']}")
+        datagrams = results("sources-wire-datagrams", gen_edit=_at(100, less(
+            "logit.output.datagrams", 1, component="out")))
+        expect(datagrams["ledger.wire"].status == checks.FAIL
+               and "generator-lines -> lines: precondition" in datagrams["ledger.wire"].detail
+               and "generator -> in: precondition" not in datagrams["ledger.wire"].detail,
+               f"each source's messages == datagrams precondition is its own, got "
+               f"{datagrams['ledger.wire']}")
+
+        # The second listener sends 5 events fewer than it read in the final life.
+        short = results("sources-intake", sut_edit=_at(200, less(
+            "logit.component.events.sent", 5)))
+        detail = short["ledger.intake"].detail
+        expect(short["ledger.intake"].status == checks.FAIL
+               and detail.startswith("final life 1 lines: W − D 34,000 vs E + B 33,995, off "
+                                     "by 5")
+               and "final life 1 in: W − D 34,000 vs E + B 34,000" in detail,
+               f"an imbalance on one listener FAILs naming it, got {detail}")
+        expect(short["ledger.edge"].status == checks.FAIL
+               and "ΣE 67,995 != A 68,000" in short["ledger.edge"].detail,
+               f"the listeners' summed E short of A FAILs the edge, got {short['ledger.edge']}")
+        oversize = results("sources-intake-oversize", sut_edit=_at(200, less(
+            "logit.component.events.sent", 5)), sut_extra=[_line(
+                _stamp(T0 + 200), "logit.input.frames.dropped", "sum", 5, component="lines",
+                attrs={"reason": "oversize"})])
+        expect(oversize["ledger.intake"].status == checks.PASS,
+               f"lines_in's oversize drops are B, got {oversize['ledger.intake']}")
+
+        # Transforms between `lines` and `window`: each forwards every event, else the edge
+        # FAILs at the hop.
+        chained = results("sources-transforms", transforms=("parse", "count"))
+        expect(chained["ledger.edge"].status == checks.PASS
+               and "T_in[count] 34,000 == T_out[count] 34,000 (count forwards every event)"
+               in chained["ledger.edge"].detail,
+               f"ledger.edge walks a source's transforms, got {chained['ledger.edge']}")
+        expect("10,000 + 132 x 1,000 (lines)" in chained["ledger.intake"].detail,
+               f"each transform adds an inbox and a batch to R, got "
+               f"{chained['ledger.intake'].detail}")
+        dropped = results("sources-transforms-drop", transforms=("parse", "count"),
+                          sut_edit=lambda record: (_at(200, less(
+                              "logit.component.events.sent", 3, component="count"))(record)))
+        detail = dropped["ledger.edge"].detail
+        expect(dropped["ledger.edge"].status == checks.FAIL
+               and "T_in[count] 34,000 != T_out[count] 33,997" in detail,
+               f"a transform that drops events FAILs the edge at its hop, got {detail}")
+
+        # Each listener's own `receive:` sizes its share of R.
+        sized = results("sources-r", sut_config=(
+            "components:\n  in: { type: statsd_in, bind: 0.0.0.0:8125 }\n"
+            "  lines:\n    type: lines_in\n    receive: { max_datagrams: 500, "
+            "batch_max_events: 100 }\n"))
+        expect("R 77,700 = 10,000 + 2 x 1,000 (in) + 500 + 2 x 100 (lines) + 65 x 1,000"
+               in sized["ledger.intake"].detail,
+               f"R reads each listener's receive block, got {sized['ledger.intake'].detail}")
+
+        # Recovery sums the listeners' ingest against the generators' summed rate: one source
+        # at half its rate after the stop is 75% of the whole.
+        def half(record):
+            stamp = record["timestamp"]
+            if (record["metrics"][0]["name"] == "logit.input.datagrams"
+                    and _stamp(T0 + 135) <= stamp <= _stamp(T0 + 180)):
+                record["metrics"][0]["value"] //= 2
+            return record
+        slow = results("sources-recovery", sut_edit=half)
+        expect(slow["recovery"].status == checks.FAIL
+               and "is 75% of the warmup rate" in slow["recovery"].detail,
+               f"recovery judges the summed ingest against the summed rate, got "
+               f"{slow['recovery']}")
+
+
+def _source_rules(root):
+    """`[[ledger.source]]` and `[configs]` per generator: every rule `load()` holds them to, the
+    rules that need the role map, and each generator's compose variable."""
+    path, raw = _base(root)
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    lines = dict(LINES_SOURCE)
+
+    def second(r, **changes):
+        r["ledger"]["source"].append({**lines, **changes})
+        r["configs"]["generator-lines"] = "logit-generator.yaml"
+
+    _refused(path, mutate(lambda r: r["ledger"].pop("source")), "ledger: missing `source`",
+             "no [[ledger.source]]")
+    _refused(path, mutate(lambda r: r["ledger"].update(source=[])),
+             "ledger.source must be one or more tables", "an empty [[ledger.source]] list")
+    for key in ("generator_input", "generator_sink", "sut_listener"):
+        _refused(path, mutate(lambda r, key=key: r["ledger"].update({key: "statsd"})),
+                 f"ledger.{key} is a [[ledger.source]] key", f"the old scalar `{key}`")
+        _refused(path, mutate(lambda r, key=key: r["ledger"]["source"][0].pop(key)),
+                 f"ledger.source 1: missing `{key}`", f"a source without `{key}`")
+    _refused(path, mutate(lambda r: r["ledger"]["source"][0].pop("service")),
+             "ledger.source 1: missing `service`", "a source without `service`")
+    _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(rate=1)),
+             "ledger.source 1: unknown key `rate`", "an unknown source key")
+    _refused(path, mutate(lambda r: second(r, service="generator")),
+             "ledger.source 2: `service` 'generator' repeats another source's",
+             "two sources on one generator")
+    _refused(path, mutate(lambda r: second(r, sut_listener="statsd")),
+             "ledger.source 2: `sut_listener` 'statsd' repeats another source's",
+             "two sources into one listener")
+    _refused(path, mutate(lambda r: second(r, service="Lines!")),
+             "`service` must name a generator service", "a service that isn't a slug")
+    _refused(path, mutate(lambda r: r["ledger"]["source"].append(dict(lines))),
+             "configs: missing `generator-lines`", "a source whose generator has no config")
+    _refused(path, mutate(lambda r: r["configs"].update({"generator-lines": "x.yaml"})),
+             "configs: unknown key `generator-lines`", "a config for no source")
+    _refused(path, mutate(lambda r: second(r, sut_transforms=["parse", "lines"])),
+             "`sut_transforms` repeats a component or names a listener",
+             "a transform that is a listener")
+    _refused(path, mutate(lambda r: (r["ledger"]["source"][0].update(sut_transforms=["parse"]),
+                                     second(r, sut_transforms=["count", "parse"]))),
+             "ledger.source 2: `sut_transforms` names parse, which another source's chain "
+             "lists", "one transform on two sources' chains")
+    _refused(path, mutate(lambda r: (second(r, service="generator_lines"),
+                                     r["ledger"]["source"].append(dict(lines)),
+                                     r["configs"].update(
+                                         {"generator_lines": "logit-generator.yaml"}))),
+             "ledger.source 3: `service` 'generator-lines' would mount its config through "
+             "SOAK_GENERATOR_LINES_CONFIG", "two services sharing one compose variable")
+    _refused(path, mutate(lambda r: (second(r, service="sut"),
+                                     r["configs"].pop("generator-lines"))),
+             "`service` 'sut' would mount its config through SOAK_SUT_CONFIG",
+             "a generator whose variable is the SUT's")
+    _refused(path, mutate(lambda r: second(r, sut_transforms="parse")),
+             "`sut_transforms` must list the component ids", "a transform list that isn't one")
+    _refused(path, mutate(lambda r: (second(r, sut_transforms=["parse"]),
+                                     r["ledger"].update(sut_script="lua"))),
+             "`sut_transforms` and [ledger] sut_script can't be combined",
+             "transforms beside a script")
+    def moved(r, service):
+        r["ledger"]["source"][0]["service"] = service
+        r["configs"][service] = r["configs"].pop("generator")
+
+    _refused(path, mutate(lambda r: moved(r, "logit")),
+             "ledger.source 1: service `logit` isn't a generator service", "a source on the SUT")
+    _refused(path, mutate(lambda r: moved(r, "victoria-metrics")),
+             "service `victoria-metrics` isn't a generator service", "a source on a backend")
+    _refused(path, raw, "generator service generator-lines has no [[ledger.source]]",
+             "a generator with no source",
+             roles={**scenario.BASE_ROLES, "generator-lines": "generator"})
+
+    for service, name in (("generator", "SOAK_GENERATOR_CONFIG"),
+                          ("generator-lines", "SOAK_GENERATOR_LINES_CONFIG")):
+        expect(scenario.config_env(service) == name,
+               f"{service}'s config is in {name}, got {scenario.config_env(service)}")
+
+    fanin = scenario.load(root / "scenarios" / "fanin" / "scenario.toml")
+    roles = _override_roles(fanin)
+    expect(roles == {**scenario.BASE_ROLES, "generator-lines": "generator"}
+           and scenario.service_problems(fanin, roles) == [],
+           f"fanin's override adds a second generator its sources name, got {roles}")
+    expect(fanin.generators == ["generator", "generator-lines"]
+           and fanin.config_path("generator-lines").name == "logit-generator-lines.yaml",
+           f"fanin names each generator's config, got {fanin.generators}")
+    problems = scenario.service_problems(fanin, scenario.BASE_ROLES)
+    expect(any("service `generator-lines` isn't a generator service" in p for p in problems),
+           f"without the override, fanin's second source is refused, got {problems}")
+    base_text = (root / "compose.yaml").read_text()
+    override = fanin.compose_path().read_text()
+    expect("${SOAK_GENERATOR_LINES_CONFIG:?" in override
+           and "${SOAK_GENERATOR_CONFIG:?" in base_text,
+           "each generator's service mounts the config its compose variable names")
+
+    # Fault predicates and per-source windows: a fault on one generator affects that source's
+    # wire alone; one on the SUT affects both.
+    data = type("Data", (), {"services": roles})()
+    for on, generator, lines_ in (("generator", True, False), ("generator-lines", False, True),
+                                  ("logit", True, True)):
+        fault = checks.Fault("x", "netem" if on != "logit" else "stop", on, 0, 1,
+                             affects_udp_ingress=True, affects_egress=False)
+        got = (checks.affects_source(data, fault, "generator"),
+               checks.affects_source(data, fault, "generator-lines"))
+        expect(got == (generator, lines_),
+               f"a fault on {on} affects (generator, generator-lines) wires {got}")
+    step = scenario.Step("c0s1", 0, 0, "netem", "generator-lines", "loss 1%", 0, 1)
+    expect(faults.ACTIONS["netem"].affects_udp_ingress(step, roles),
+           "a netem on a second generator affects UDP ingress")
+    _refused(path, mutate(lambda r: r["step"].append(
+        {"at": "11m10s", "action": "kill", "on": "generator-lines", "for": "20s"})),
+             "kill is for logit only", "a kill on a second generator",
+             roles={**scenario.BASE_ROLES, "generator-lines": "generator"})
+
+
+def _fanin_driver(root):
+    """The driver with two generators: `compose.env` sets each generator's config variable,
+    and the end sequence stops every generator before it waits on the sinks."""
+    fanin = scenario.load(root / "scenarios" / "fanin" / "scenario.toml")
+    roles = _override_roles(fanin)
+    with tempfile.TemporaryDirectory() as tmp:
+        run = driver.Run(root, fanin, fanin.duration, None, False, Path(tmp) / "fanin", [],
+                         "logit:soak", roles=roles)
+        run.prepare()
+        env = (run.run_dir / "compose.env").read_text()
+        expect(f"SOAK_GENERATOR_CONFIG={fanin.config_path('generator')}\n" in env
+               and f"SOAK_GENERATOR_LINES_CONFIG={fanin.config_path('generator-lines')}\n"
+               in env and (run.run_dir / "configs" / "logit-generator-lines.yaml").is_file(),
+               f"compose.env sets each generator's config and the run copies both, got {env}")
+        for jsonl in (run.timeline, run.watchdog, run.stats, run.freshness, run.capture):
+            jsonl.close()
+
+    class Stops:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, args, timeout=None):
+            self.calls.append(args)
+            return docker.Result(0, "", "")
+
+        def inspect(self, container, timeout=None):
+            return {"State": {"ExitCode": 0}}
+
+    run = driver.Run(root, fanin, fanin.duration, None, False, "/nonexistent", [], "logit:soak",
+                     roles=roles)
+    run.docker = Stops()
+    run.ids = {name: f"id-{name}" for name in roles}
+    run.timeline = _Records()
+    run.t0 = 0.0
+    run.has_vm = False
+    run.inspect_all = lambda: None
+    run.wait_sink_drained = lambda: None
+    real_print = driver._print
+    driver._print = lambda text, stream=None: None
+    try:
+        run.end_sequence()
+    finally:
+        driver._print = real_print
+    stopped = [call[-1] for call in run.docker.calls if call[0] == "stop"]
+    expect(stopped == ["id-generator", "id-generator-lines", "id-logit"],
+           f"the end sequence stops each generator, then the SUT, got {stopped}")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -3847,11 +4564,14 @@ def run(root, quiet=False):
                      _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
                      _report, _expected_event_rules, _exit_driver, _ready_words, _exit_watchdog,
-                     _script_ledger, _sink_ledger, _roles, _sink_rules, _driver_roles, _shipped):
+                     _script_ledger, _sink_ledger, _roles, _sink_rules, _driver_roles,
+                     _sources_ledger, _source_rules, _fanin_driver, _per_service, _slope_edges,
+                     _expected_rules, _slope_reducer, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
-                              _shipped, _roles, _sink_rules, _driver_roles)
+                              _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
+                              _fanin_driver, _expected_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")

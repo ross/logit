@@ -50,8 +50,9 @@ class Context:
 class Action:
     apply: object
     revert: object
-    # Whether the fault can lose UDP between the generator and the SUT, which the ledger's wire
-    # row judges only outside such windows.
+    # Whether the fault can lose UDP between a generator and the SUT, which the ledger's wire
+    # row judges only outside such windows. A fault on a generator affects only that generator's
+    # own source; checks.py splits it per `[[ledger.source]]` by the step's `on`.
     affects_udp_ingress: object
     # Whether the fault can delay or fail a SUT sink's delivery to a backend or a broker.
     affects_egress: object

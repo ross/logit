@@ -1,0 +1,10 @@
+# fanin's second generator, merged onto tools/soak/compose.yaml. It is the base `generator`
+# service under another name with its own config, which the driver sets in
+# SOAK_GENERATOR_LINES_CONFIG (`scenario.config_env()`). `extends.file` resolves against the
+# project directory, the base file's, not this file's. Compose merges `volumes` by mount target,
+# so this `/config.yaml` replaces the base service's.
+services:
+  generator-lines:
+    extends: { file: compose.yaml, service: generator }
+    labels: { soak.role: generator }
+    volumes: ["${SOAK_GENERATOR_LINES_CONFIG:?set by script/soak}:/config.yaml:ro,z"]

@@ -18,12 +18,15 @@ sut = "logit-sut.yaml"
 generator = "logit-generator.yaml"
 
 [ledger]
-generator_input = "load"
-generator_sink = "statsd"
-sut_listener = "statsd"
 sut_aggregate = "window"
 wire_loss_outside_faults = 0.0
 split = "route"           # the sinks' V add up to what `window` absorbed
+
+[[ledger.source]]         # one per generator the ledger follows into the SUT
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
 
 [[ledger.sink]]
 id = "vm_a"
