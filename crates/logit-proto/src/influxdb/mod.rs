@@ -125,9 +125,9 @@
 //! 1. Batching: the writes `influxdb_out` sends needn't match the requests `influxdb_in` received.
 //! 2. Duplicate points in one body (same measurement, tag set, and timestamp) merge, last write
 //!    wins per field.
-//! 3. Tag order isn't preserved: tags leave in the order the process interned their keys. influxd
-//!    sorts the series key itself, so what it stores is unaffected; only the bytes on the wire differ
-//!    between processes.
+//! 3. Tag order isn't preserved: tags leave in the order the process interned their keys.
+//!    influxd sorts the series key itself, so what it stores is unaffected; only the bytes on the
+//!    wire differ between processes.
 //! 4. Field order: numeric and boolean fields leave in wire order (a field a later duplicate adds
 //!    goes after the existing ones), and string fields leave after them, in an order the encoder
 //!    doesn't preserve. A field's identity is its key, so order carries no meaning at the
