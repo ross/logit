@@ -397,8 +397,8 @@ sees depends on the leg:
 - **Prometheus behind `aggregate` with `temporality: cumulative`:**
   `logit_process_cpu_seconds_total{mode}`, where `rate()` is cores in use per `mode` (sum over
   `mode` for the total).
-- **`prometheus_out` without a cumulative `aggregate`:** it skips a delta `Sum` and counts it as
-  `logit.output.metrics.skipped{metric_kind="delta_sum"}`.
+- **`prometheus_out` without a cumulative `aggregate`:** it drops a delta `Sum` and counts it as
+  `logit.output.metrics.dropped{reason="unresolved_delta"}`.
 - **InfluxDB behind a delta `aggregate`:** CPU seconds per window per mode, so the value divided by
   the window length is utilization. The first window includes the CPU spent starting up.
 
@@ -1058,27 +1058,28 @@ header that was missing, malformed, cut short, or late, read before any TLS acce
 client, with no socket of its own.
 
 **The codec's counters**, on the decode side of both modes, are
-`logit.input.metrics.skipped{reason=…}` and `logit.input.metrics.degraded{reason=…}`:
+`logit.input.metrics.dropped{reason=…}` and `logit.input.metrics.degraded{reason=…}`. Every
+decode-side reason is loss, so this codec counts no `logit.input.metrics.skipped`:
 
 - **Text assembler reasons**, shared by both modes because remote-write decodes through the same
   `assemble::Assembler`: `malformed_line`, `malformed_metadata`, `duplicate_label`,
   `duplicate_series`, `duplicate_type`, `duplicate_metadata`, `unknown_suffix`,
   `incomplete_series`, `empty_histogram`, `non_monotonic_buckets`, plus
-  `degraded{reason="histogram_count_mismatch"}` and `degraded{reason="exemplar_dropped"}`, the
+  `degraded{reason="histogram_count_mismatch"}` and `degraded{reason="exemplar_omitted"}`, the
   second for an OpenMetrics exemplar on a `_sum`, `_count`, `_created`, or quantile line, where
   the model has nowhere to keep it.
-- **`skipped{reason="invalid_labels"}`** (remote-write): a series with no `__name__`, an empty label
+- **`dropped{reason="invalid_labels"}`** (remote-write): a series with no `__name__`, an empty label
   name or value, or a label set that isn't strictly ascending by byte order. Both specs forbid a
   sender from producing these, and none is worth failing the whole request over.
-- **`skipped{reason="native_histogram"}`** (remote-write): one `histograms[]` entry. See
+- **`dropped{reason="native_histogram"}`** (remote-write): one `histograms[]` entry. See
   `docs/known-gaps/mappings.md`; this is also why a 2.0 response's `Histograms-Written` is always
   `0`.
-- **`degraded{reason="exemplar_dropped"}`** (both modes): in scrape mode, an OpenMetrics exemplar
+- **`degraded{reason="exemplar_omitted"}`** (both modes): in scrape mode, an OpenMetrics exemplar
   on a line other than a value sample or a `_bucket` (the text assembler reason above); in
   remote-write, an exemplar whose series has no sample anywhere in the request, or whose series
-  was itself skipped. This reason is also an encoder reason on the output side. It's not additive with `invalid_labels`: a series with bad labels and
-  three exemplars raises one `invalid_labels` and three `exemplar_dropped`, because they answer
-  different questions.
+  was itself dropped. This reason is also an encoder reason on the output side. It's not additive
+  with `invalid_labels`: a series with bad labels and three exemplars raises one `invalid_labels`
+  and three `exemplar_omitted`, because they answer different questions.
 - **`degraded{reason="seed_mismatch"}`** (metadata cache): a *remembered* type would have made the
   assembler throw a sample away, so it gives way instead and the sample opens an implicit family of
   its own (`crates/logit-proto/src/prometheus/assemble.rs`'s "A seeded type is advisory" table). A
@@ -1723,7 +1724,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 
 | Class | Counts | Counters |
 |---|---|---|
-| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `statsd_out`, `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.dropped`, `labels.normalized`, `spans.degraded`, `stats.skipped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"too_many_tags"\|"needs_agent_processing"\|"not_datadog_origin"}` and its `too_many_tags` diagnostic; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `kafka_out`'s `records.dropped{reason="oversize"}`, `records.unkeyed`, `events.skipped{reason="no_log"}`, its `oversize` diagnostic, and under `format: otlp_proto` the OTLP codec's `metrics.skipped` and `metrics.degraded`; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
+| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `statsd_out`, `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.dropped`, `metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.omitted`, `labels.normalized`, `spans.degraded`, `stats.skipped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"too_many_tags"\|"needs_agent_processing"\|"not_datadog_origin"}` and its `too_many_tags` diagnostic; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `kafka_out`'s `records.dropped{reason="oversize"}`, `records.unkeyed`, `events.skipped{reason="no_log"}`, its `oversize` diagnostic, and under `format: otlp_proto` the OTLP codec's `metrics.skipped` and `metrics.degraded`; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
 | Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
 | Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `otlp_out`'s `records.rejected`; `datadog_out`'s `records.rejected{route="series"}` from a series `202`'s body; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"\|"ambiguous_at_most_once"}` and the Datadog sinks' `records.dropped{route, reason="rejected"\|"ambiguous_at_most_once"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); `kafka_out`'s `records.dropped{reason="rejected"\|"invalid_timestamp"\|"invalid_record"\|"ambiguous_at_most_once"}` for a partition batch; and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `series_rejected`, `ack_unsupported`, `ack_timeout`, `oversize` for Splunk Cloud's answer, and `kafka_out`'s `rejected`, `invalid_timestamp`, and `invalid_record`). `otlp_out`, `datadog_out`, `datadog_trace_out`, and `kafka_out` meet each of their verdicts at most once per batch, because a retry never resends a signal, request, or partition batch the destination settled; only `splunk_hec_out` and the datagram sinks meet one again on a retry |
 
@@ -2226,13 +2227,15 @@ and render, so both total under one component, and counts on every `send` and ev
 sender mode it's a plain field with one direction, and counts once per batch however many attempts
 it takes (the class table above).
 
-- `logit.output.metrics.skipped{metric_kind="delta_sum"|"delta_histogram"|"gauge_delta"|
-  "exponential_histogram"}` and `{reason="no_recorded_value"|"type_conflict"|"name_collision"}`.
-  The latter two reasons are *within* one batch, distinct from the cross-batch `type_conflict`
-  counter above.
+- `logit.output.metrics.dropped{reason="unresolved_delta"|"unresolved_gauge_delta"|
+  "type_conflict"|"name_collision"}`: a delta `Sum` or `Histogram`, or a `GaugeDelta`, with no
+  `aggregate` upstream to resolve it, and two records that can't share one family. The last two
+  reasons are *within* one batch, distinct from the cross-batch `type_conflict` counter above.
+- `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` in registry mode, where
+  neither text dialect has a form for one, and `{reason="no_recorded_value"}`.
 - `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"|"distribution"|"samples"|"set"|
-  "set_members"}` and `{reason="exemplar_dropped"|"unit_not_suffix"}` (render-side).
-- `logit.output.labels.dropped{reason="unrepresentable"|"reserved"|"collision"}`.
+  "set_members"}` and `{reason="exemplar_omitted"|"unit_not_suffix"}` (render-side).
+- `logit.output.labels.omitted{reason="unrepresentable"|"reserved"|"collision"}`.
 - `logit.output.labels.normalized{reason="multi_value"}`: a multi-valued attribute collapsed to its
   last representable element, because a Prometheus label set has no multi-value label. Lossy; see
   above.
@@ -2241,10 +2244,13 @@ Some reasons exist only on one path:
 
 - `skipped{reason="stale"}` is the text writer stepping over a `Point::Stale`, which it sees only on
   a relay that fed it one.
-- `skipped{reason="no_timestamp"}`, `skipped{reason="invalid_labels"}` (a family with an empty
+- `dropped{reason="native_histogram"}` is sender mode's count of an `ExponentialHistogram`.
+  Remote-write has native histograms, which this codec doesn't map yet, so the record is loss
+  rather than the format skip registry mode counts.
+- `dropped{reason="no_timestamp"}`, `dropped{reason="invalid_labels"}` (a family with an empty
   name; `__name__` may not be empty), `degraded{reason="sub_ms_collapsed"}` (two readings of one
   series landing on one millisecond, the later winning; `docs/known-gaps/mappings.md`), and
-  `labels.dropped{reason="empty_value"}` are remote-write encode's, where the wire forbids what the
+  `labels.omitted{reason="empty_value"}` are remote-write encode's, where the wire forbids what the
   exposition grammar merely renders differently.
 - `skipped{reason="no_recorded_value"}` means something narrower in sender mode. The encoder runs
   with `with_stale_markers(true)` there, so a flagged `Gauge`/`Sum`/marker-untyped record is written

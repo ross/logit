@@ -2369,8 +2369,8 @@ value, the mitigation is on the sending side: send an absolute value periodicall
   series was first seen, labeled `Cumulative` and stamped with that first-seen time
   (`start_timestamp`) so a consumer can tell a real restart from a decrease.
 
-A Prometheus scrape carries the cumulative shape, and `prometheus_out` skips delta records instead
-of resolving them itself (`docs/adr/prometheus-scrape-and-exposition.md`), so
+A Prometheus scrape carries the cumulative shape, and `prometheus_out` drops delta records, counted
+`logit.output.metrics.dropped{reason="unresolved_delta"}`, instead of resolving them itself (`docs/adr/prometheus-scrape-and-exposition.md`), so
 `statsd_in -> aggregate(temporality: cumulative) -> prometheus_out` is the intended pipeline.
 
 `cumulative` relies on the `series_retention`/`max_retained_series` pair above to keep running
@@ -3529,7 +3529,7 @@ flow with `keep_signals` (or `has_signal`) so each sink sees only its product's 
 
 **Put `aggregate` with `temporality: cumulative` ahead of metrics bound for VictoriaMetrics.**
 VictoriaMetrics keeps no temporality. A delta `Sum` sent over OTLP is stored as its raw
-per-interval points, so `rate()` and `increase()` over it are wrong, and `prometheus_out` skips a
+per-interval points, so `rate()` and `increase()` over it are wrong, and `prometheus_out` drops a
 delta `Sum` outright. The `aggregate` keeps a running total, as it does ahead of any Prometheus
 receiver ([Counter temporality](#counter-temporality-delta-vs-cumulative)).
 
