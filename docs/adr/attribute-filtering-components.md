@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-11
+updated: 2026-10-13
 ---
 
 # Attribute filtering is two transform components, and a bounded matcher is not a predicate language
@@ -298,3 +298,10 @@ predicate grammar; a list of key names is not a grammar and has nowhere to grow 
 Matching reuses `AttrMap::get_sym` and the resource-match cache, which now also covers
 `resource_present`. Telemetry and the allocation pins are unchanged: a presence probe is the same
 stack-only binary search as a pair's, with no value comparison.
+
+## Amendment: discards are counted by the runtime (2026-10-13)
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `has_attributes` and `drop_attributes` record no counter of their own. Every event
+either removes is `logit.component.events.discarded`, which the runtime counts under the filter's
+id; the shared `logit.transform.events.filtered` counter they registered is removed, because it
+duplicated that count.

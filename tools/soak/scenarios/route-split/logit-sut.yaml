@@ -16,7 +16,10 @@ components:
     type: route
     sources: [window]
     by: { attribute: shard }
-    routes: { "0": tier_a, "1": tier_b }   # nothing is unrouted: the generator sends 0 and 1
+    routes: { "0": tier_a, "1": tier_b }
+  # A router needs a consumer for what no route claims. The generator sends only shards 0 and 1,
+  # so this receives nothing; `nothing-unrouted` in scenario.toml checks that.
+  unrouted: { type: null_out, sources: [split] }
   tier_a: { type: target }
   tier_b: { type: target }
   vm_a:

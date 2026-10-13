@@ -52,7 +52,7 @@ fn tag_element_eq(a: &Value, b: &Value) -> bool {
 }
 
 /// What [`render_tags`] could not represent, for the caller to count
-/// (`logit.output.tags.dropped{reason="unrepresentable"}`).
+/// (`logit.output.tags.omitted{reason="unrepresentable"}`).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Dropped {
     pub unrepresentable: usize,
@@ -60,7 +60,7 @@ pub struct Dropped {
 
 /// Renders attribute pairs as Datadog tags: `Str` → `k:v`, `Bool(true)` → `k`, `Bool(false)` →
 /// nothing, numbers → `k:<display>`, `Timestamp` → `k:<RFC 3339>`, `Array` → one tag per element
-/// under the same rules, `Map`/`Bytes`/`Null` → dropped and counted. Keys in `skip` are the ones a
+/// under the same rules, `Map`/`Bytes`/`Null` → omitted and counted. Keys in `skip` are the ones a
 /// caller already consumed into a wire field of its own (`host.name`, the `datadog.*` carriers)
 /// and are never rendered.
 pub fn render_tags<'a>(

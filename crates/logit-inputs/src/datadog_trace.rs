@@ -134,7 +134,7 @@
 //! [`Fanout::send_with_deadline`], reaching every downstream consumer or none, under a
 //! [`BUSY_AFTER`] deadline, and a request that misses it is answered `503` with
 //! `Retry-After: 1`, counted `logit.input.requests{class="busy"}` and
-//! `logit.input.batches.dropped{reason="busy"}`. `BUSY_AFTER` is shorter than `datadog_in`'s (2 s,
+//! `logit.input.batches.deferred`. `BUSY_AFTER` is shorter than `datadog_in`'s (2 s,
 //! not 5 s), because a tracer's patience is: dd-trace-py retries a `503` a few times and then
 //! drops the payload, where an Agent retries for minutes. A stall shorter than the window
 //! [ADR `datadog-agent-and-intake-relay`](../../../../docs/adr/datadog-agent-and-intake-relay.md)'s
@@ -142,8 +142,9 @@
 //! so treat a sustained rate as loss.
 //!
 //! A batch no consumer takes, because every consumer of the listener has closed, is answered the
-//! same `503` and `Retry-After: 1` with `closed_consumer` in place of `busy`, in the body and both
-//! counters, as `datadog_in` does.
+//! same `503` and `Retry-After: 1` with `closed_consumer` in place of `busy`, in the body and
+//! `logit.input.requests{class}`, and counted
+//! `logit.input.batches.dropped{reason="closed_consumer"}`, as `datadog_in` does.
 //!
 //! # The Unix socket
 //!
@@ -189,9 +190,9 @@
 //! `unknown_route`, `unsupported_route` (also tagged `route`), `method`, `oversize`, `encoding`,
 //! `json_traces`, `malformed_encoding`, `malformed`, `stalled`, or `body_read`.
 //! `logit.input.requests.acknowledged{route}` counts a stub's upload,
-//! `logit.input.batches.dropped{reason}` (`busy` or `closed_consumer`) a batch a `503` left
-//! undelivered,
-//! and `logit.input.spans` the spans delivered. The connection metrics are `otlp_in`'s, with one
+//! `logit.input.batches.deferred` a batch a busy `503` left undelivered,
+//! `logit.input.batches.dropped{reason="closed_consumer"}` one no consumer took, and
+//! `logit.input.spans` the spans delivered. The connection metrics are `otlp_in`'s, with one
 //! difference: the kernel accept-queue gauges (`crate::tcp::AcceptQueueSampler`) cover the TCP
 //! listener only, since they read `TCP_INFO`, which a Unix socket has no counterpart for.
 
@@ -1144,11 +1145,7 @@ async fn respond(
         }
         Err(undelivered) => {
             let reason = undelivered.reason();
-            shared.telemetry.count(
-                "logit.input.batches.dropped",
-                undelivered.count() as f64,
-                &[("reason", reason)],
-            );
+            undelivered.record(&shared.telemetry);
             let mut diag = shared.diag.clone();
             let _ = match undelivered {
                 Undelivered::Busy(_) => diag.warn_throttled(
@@ -2092,7 +2089,8 @@ mod tests {
         assert!(rx.try_recv().is_err(), "the 503'd batch was never delivered");
         let events = Totals::of(registry.drain(0));
         assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 1.0);
-        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 1.0);
+        assert_eq!(events.sum("logit.input.batches.deferred", &[]), 1.0);
+        assert_eq!(events.sum("logit.input.batches.dropped", &[]), 0.0);
         assert_eq!(events.sum("logit.input.spans", &[]), 1.0, "only the first");
     }
 
@@ -2113,7 +2111,7 @@ mod tests {
             events.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]),
             1.0
         );
-        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 0.0);
+        assert_eq!(events.sum("logit.input.batches.deferred", &[]), 0.0);
         assert_eq!(events.sum("logit.input.requests", &[("class", "closed_consumer")]), 1.0);
         assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 0.0);
     }

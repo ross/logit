@@ -97,7 +97,7 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "logit.component.events.{sent,received,dropped}",
+      "title": "logit.component.events.{sent,received,dropped,discarded}",
       "description": "The uniform per-component runtime instrumentation every component gets for free (Fanout::send / run_transform / run_output).",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
       "interval": "1m",
@@ -120,6 +120,12 @@
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "expr": "sum by (component) (rate(logit_component_events_dropped_total[$__rate_interval]))",
           "legendFormat": "dropped {{component}}"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (component) (rate(logit_component_events_discarded_total[$__rate_interval]))",
+          "legendFormat": "discarded {{component}}"
         }
       ]
     },

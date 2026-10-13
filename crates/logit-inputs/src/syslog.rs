@@ -118,11 +118,19 @@ impl SyslogInput {
 
     /// Attaches a telemetry handle for the drivers' layer-3 counters
     /// (`docs/design/internal-telemetry.md`): datagrams and bytes on UDP, connections and frames on
-    /// TCP.
+    /// TCP. The decoder gets it too, for `logit.input.messages.dropped`.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.inner = match self.inner {
-            Inner::Udp(listener) => Inner::Udp(listener.with_telemetry(telemetry)),
-            Inner::Tcp(listener) => Inner::Tcp(listener.with_telemetry(telemetry)),
+            Inner::Udp(listener) => Inner::Udp(
+                listener
+                    .with_telemetry(telemetry.clone())
+                    .map_decoder(|d| d.with_telemetry(telemetry)),
+            ),
+            Inner::Tcp(listener) => Inner::Tcp(
+                listener
+                    .with_telemetry(telemetry.clone())
+                    .map_decoder(|d| d.with_telemetry(telemetry)),
+            ),
         };
         self
     }

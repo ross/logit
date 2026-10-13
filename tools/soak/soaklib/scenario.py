@@ -156,7 +156,7 @@ VERDICTS = ("PASS", "WARN", "FAIL")
 # missing here is checked against the kind its points carry when the run is scored.
 METRIC_KINDS = {
     "logit.input.datagrams": "sum",
-    "logit.input.kernel.drops": "sum",
+    "logit.input.kernel.dropped": "sum",
     "logit.component.datagrams.dropped": "sum",
     "logit.component.batches.dropped": "sum",
     "logit.component.batches.delivered": "sum",
@@ -176,6 +176,7 @@ METRIC_KINDS = {
     "logit.component.diagnostics": "sum",
     "logit.component.errors": "sum",
     "logit.component.events.dropped": "sum",
+    "logit.component.events.discarded": "sum",
     "logit.component.flush.events": "sum",
     "logit.script.events.emitted": "sum",
     "logit.script.vm.memory": "gauge",

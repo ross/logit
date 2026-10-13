@@ -90,13 +90,13 @@ impl DatadogDecoder {
 
     fn decode_log_item(&mut self, item: &Json, received_at: i64) -> Option<Event> {
         let Json::Object(obj) = item else {
-            self.skip_log("not_an_object");
+            self.drop_log("not_an_object");
             self.diagnostics.warn_throttled("malformed_log", "datadog log item is not an object");
             return None;
         };
         let message = match obj.get("message") {
             None | Some(Json::Null) => {
-                self.skip_log("no_message");
+                self.drop_log("no_message");
                 return None;
             }
             Some(Json::String(s)) => Value::str(s.as_str()),
@@ -167,8 +167,8 @@ impl DatadogDecoder {
         }
     }
 
-    fn skip_log(&self, reason: &'static str) {
-        self.telemetry.count("logit.input.logs.skipped", 1.0, &[("reason", reason)]);
+    fn drop_log(&self, reason: &'static str) {
+        self.telemetry.count("logit.input.logs.dropped", 1.0, &[("reason", reason)]);
     }
 }
 
@@ -254,7 +254,7 @@ impl DatadogEncoder {
                 // Would collide with the wire's own `message`/`timestamp`. A decoded Datadog log
                 // never carries either as an attribute.
                 self.telemetry.count(
-                    "logit.output.tags.dropped",
+                    "logit.output.tags.omitted",
                     1.0,
                     &[("reason", "reserved_key")],
                 );
@@ -410,13 +410,13 @@ pub(super) mod tests {
         assert_eq!(batch.events.len(), 2);
         assert_eq!(batch.events[0].timestamp, 1_700_000_000_500_000_000);
         assert_eq!(batch.events[1].timestamp, RECEIVED_AT);
-        assert_eq!(counted(&registry, "logit.input.logs.skipped", ("reason", "no_message")), 2.0);
+        assert_eq!(counted(&registry, "logit.input.logs.dropped", ("reason", "no_message")), 2.0);
     }
 
-    /// An Agent's connectivity check: no log, and nothing counted as skipped. An empty object
+    /// An Agent's connectivity check: no log, and nothing counted dropped. An empty object
     /// inside an array is still a log item with no message.
     #[test]
-    fn a_bare_empty_object_is_no_log_and_not_a_skip() {
+    fn a_bare_empty_object_is_no_log_and_not_a_drop() {
         let registry = Registry::new();
         let mut decoder = DatadogDecoder::new().with_telemetry(registry.telemetry_for(
             "datadog_in",
@@ -424,13 +424,13 @@ pub(super) mod tests {
             "listener",
         ));
         assert!(decoder.decode_logs(b"{}", RECEIVED_AT).unwrap().events.is_empty());
-        assert_eq!(counted(&registry, "logit.input.logs.skipped", ("reason", "no_message")), 0.0);
+        assert_eq!(counted(&registry, "logit.input.logs.dropped", ("reason", "no_message")), 0.0);
         assert!(decoder.decode_logs(b"[{}]", RECEIVED_AT).unwrap().events.is_empty());
-        assert_eq!(counted(&registry, "logit.input.logs.skipped", ("reason", "no_message")), 1.0);
+        assert_eq!(counted(&registry, "logit.input.logs.dropped", ("reason", "no_message")), 1.0);
     }
 
     #[test]
-    fn non_object_items_are_skipped_and_counted() {
+    fn non_object_items_are_dropped_and_counted() {
         let registry = Registry::new();
         let mut decoder = DatadogDecoder::new().with_telemetry(registry.telemetry_for(
             "datadog_in",
@@ -440,7 +440,7 @@ pub(super) mod tests {
         let batch = decoder.decode_logs(br#"[7,{"message":"a"}]"#, RECEIVED_AT).unwrap();
         assert_eq!(batch.events.len(), 1);
         assert_eq!(
-            counted(&registry, "logit.input.logs.skipped", ("reason", "not_an_object")),
+            counted(&registry, "logit.input.logs.dropped", ("reason", "not_an_object")),
             1.0
         );
     }
@@ -524,7 +524,7 @@ pub(super) mod tests {
         let out = String::from_utf8(encoder.encode_logs(&batch).unwrap().to_vec()).unwrap();
         assert_eq!(out, r#"[{"message":"m","timestamp":1000}]"#);
         assert_eq!(
-            counted(&registry, "logit.output.tags.dropped", ("reason", "reserved_key")),
+            counted(&registry, "logit.output.tags.omitted", ("reason", "reserved_key")),
             1.0
         );
     }

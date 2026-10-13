@@ -171,7 +171,7 @@ their own place on the wire don't. To keep a metric, cut its tags upstream with 
 
 The series route also names what it dropped from an accepted request in its `202` body, such as
 a point more than 10 minutes in the future when the sender's clock runs ahead. `datadog_out`
-counts each named series `logit.output.records.rejected{route="series"}`, leaves it out of
+counts each named series `logit.output.records.dropped{route="series", reason="rejected"}`, leaves it out of
 `logit.output.records`, and logs `series_rejected` with the first entry. The batch isn't retried:
 the rest of the request was stored.
 
@@ -222,7 +222,7 @@ tables.
 
 When the pipeline doesn't take a request's batches in time, both listeners answer `503` with
 `Retry-After: 1` rather than holding the connection, and count
-`logit.input.batches.dropped{reason="busy"}`. What that costs depends on the sender:
+`logit.input.batches.deferred`. What that costs depends on the sender:
 
 - **`datadog_in`** waits 5 seconds. An Agent's forwarder keeps the payload in its retry queue and
   retries for minutes, so a `503` defers delivery until that queue fills.
@@ -265,7 +265,7 @@ Three details catch people out:
   value. A decimal trace id fills the low 64 bits; name an attribute holding `_dd.p.tid`'s high
   half in `trace_id_high:` if your logs carry it.
 - **`datadog_out` sends the log body as the Datadog `message`**, and drops an attribute named
-  `message` or `timestamp`, counted `logit.output.tags.dropped{reason="reserved_key"}`. After
+  `message` or `timestamp`, counted `logit.output.tags.omitted{reason="reserved_key"}`. After
   `json`, the body is still the original line. The lifted ids go out as hex `trace_id` and
   `span_id`, which Datadog's log intake correlates on, unless the log already has an attribute of
   either name.

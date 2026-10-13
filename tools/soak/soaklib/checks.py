@@ -1123,19 +1123,23 @@ class Ledger:
         for listener in self.listeners:
             one = self.per[listener] = {}
             one["W"] = sut.counter_by_life("logit.input.datagrams", component=listener)
-            one["K"] = sut.counter_by_life("logit.input.kernel.drops", component=listener)
+            one["K"] = sut.counter_by_life("logit.input.kernel.dropped", component=listener)
             # D, every reason. Every SUT config gives `internal` a dedicated pipeline, so its
             # final drain runs after every data node has exited and carries the shutdown drops.
             one["D_tel"] = sut.counter_by_life("logit.component.datagrams.dropped",
                                                component=listener)
             one["D_shutdown"] = sut.counter_by_life("logit.component.datagrams.dropped",
                                                     component=listener, reason="shutdown")
-            # B: a statsd line the decoder refused, and a line over `lines_in`'s
-            # `max_line_bytes`, which its decoder drops and counts without a decoder error. Each
-            # is 0 on a listener that has no such rule.
+            # B: a line the decoder refused (`messages.dropped{reason="malformed"}`), a datagram
+            # it refused whole (`frames.dropped{reason="undecodable"}`), and a line over
+            # `lines_in`'s `max_line_bytes`, which its decoder drops without a decoder error.
+            # Each is 0 on a listener that has no such rule. A generator line is one datagram, so
+            # a refused datagram is one line.
             one["B"] = _summed({
-                "bad_line": sut.counter_by_life("logit.component.diagnostics",
-                                                component=listener, key="bad_line"),
+                "malformed": sut.counter_by_life("logit.input.messages.dropped",
+                                                 component=listener, reason="malformed"),
+                "undecodable": sut.counter_by_life("logit.input.frames.dropped",
+                                                   component=listener, reason="undecodable"),
                 "oversize": sut.counter_by_life("logit.input.frames.dropped",
                                                 component=listener, reason="oversize")})
             one["E"] = sut.counter_by_life("logit.component.events.sent", component=listener)
@@ -1150,9 +1154,13 @@ class Ledger:
         self.shutdown_batches = sut.counter_by_life("logit.component.batches.dropped",
                                                     reason="shutdown")
         # `{life: {(component, reason): batches}}` under every reason, which `drop_credit` reads.
-        # The reason set is open: a reason this file doesn't name still counts a gap.
+        # The reason set is open: a reason this file doesn't name still counts a gap. Except
+        # `disk_torn`: a spool counts it at open for a batch an earlier life received, so it
+        # can't explain a gap in the life that counts it, as `buffer.disk.replayed` can't.
         self.dropped_batches = {}
         for point in sut.matching("logit.component.batches.dropped"):
+            if point.attributes.get("reason") == "disk_torn":
+                continue
             if isinstance(point.value, (int, float)) and point.value:
                 key = (point.attributes.get("component"), point.attributes.get("reason"))
                 life = self.dropped_batches.setdefault(point.life, {})
@@ -1166,10 +1174,12 @@ class Ledger:
             self.L_in = sut.counter_by_life("logit.component.events.received", component=script)
             # Counts events: an `emit_many` outcome adds one per event it returns.
             self.L_emit = sut.counter_by_life("logit.script.events.emitted", component=script)
-            self.L_drop = sut.counter_by_life("logit.component.events.dropped", component=script,
-                                              reason="script_drop")
-            self.L_err = sut.counter_by_life("logit.component.errors", component=script,
-                                             reason="process")
+            # A `nil` return is an intended discard; an error loses its one input event, which
+            # the runtime counts as loss beside `errors{reason="process"}`.
+            self.L_drop = sut.counter_by_life("logit.component.events.discarded",
+                                              component=script)
+            self.L_err = sut.counter_by_life("logit.component.events.dropped", component=script,
+                                             reason="script_error")
             self.L_flush = sut.counter_by_life("logit.component.flush.events", component=script)
             self.L_sent = sut.counter_by_life("logit.component.events.sent", component=script)
 
@@ -1418,8 +1428,8 @@ class Ledger:
         return self.get("Ab", life) - (self.get("L_flush", life) if self.script else 0)
 
     def script_dropped(self, life):
-        """The events a script dropped (`script_drop`) or failed on (`errors{process}`), both
-        counted, 0 with no script."""
+        """The events a script discarded (`events.discarded`) or lost to an error
+        (`events.dropped{reason="script_error"}`), both counted, 0 with no script."""
         if not self.script:
             return 0
         return self.get("L_drop", life) + self.get("L_err", life)
@@ -1601,7 +1611,7 @@ def _wire_buckets(data, led, source):
         return c1 if t2 == t1 else c1 + (c2 - c1) * (t - t1) / (t2 - t1)
 
     counts = {}
-    for name in ("logit.input.datagrams", "logit.input.kernel.drops"):
+    for name in ("logit.input.datagrams", "logit.input.kernel.dropped"):
         for ts, value, _ in sut.counter_points(name, component=source.get("sut_listener")):
             counts[ts] = counts.get(ts, 0) + value
     drains = sorted(set(sut.drains) | set(counts))
@@ -1849,8 +1859,8 @@ def check_ledger_edge(data):
 
 def check_ledger_script(data):
     """For a `[ledger] sut_script`, else SKIP, the final life's script hop: E == L_in (the
-    listener's edge), L_in == L_emit + L_drop + L_err (every event emitted, dropped, or failed
-    on), and L_sent == L_emit + L_flush (what it sent is what `process()` emitted plus what
+    listener's edge), L_in == L_emit + L_drop + L_err (every event emitted, discarded, or lost
+    to a script error), and L_sent == L_emit + L_flush (what it sent is what `process()` emitted plus what
     `flush()` returned). Earlier lives are reported."""
     if not data.ledger.get("sut_script"):
         return Result("ledger.script", SKIP, "no [ledger] sut_script")
@@ -2072,10 +2082,19 @@ def check_ledger_summary(data):
     return Result("ledger.summary", status, detail, _per_life_lines(led))
 
 
+def _torn_upto(sut, sink, life, at):
+    """`batches.dropped{reason="disk_torn"}` for one sink and life up to `at`. A spool counts it
+    at open for a batch an earlier life received and lost with a torn tail, so like
+    `buffer.disk.replayed` it settles a batch this life never received."""
+    return sum(v for ts, v, point_life in sut.counter_points(
+        "logit.component.batches.dropped", component=sink, reason="disk_torn")
+        if point_life == life and ts <= at)
+
+
 def check_identity_sink(data):
     """For each sink, at the final life's last drain before its shutdown drain:
-    batches.received + buffer.disk.replayed == delivered + dropped (every reason) +
-    buffer.batches, one batch in flight allowed."""
+    batches.received + buffer.disk.replayed + batches.dropped{reason="disk_torn"} ==
+    delivered + dropped (every reason) + buffer.batches, one batch in flight allowed."""
     led = _ledger(data)
     skipped = _skip_without_sut("identity.sink", led)
     if skipped:
@@ -2097,13 +2116,15 @@ def check_identity_sink(data):
         # delivered in this life but were received in another, and `buffer.disk.replayed`
         # counts them.
         replayed = upto("logit.component.buffer.disk.replayed")
+        torn = _torn_upto(sut, sink, life, at)
         delivered = upto("logit.component.batches.delivered")
         dropped = upto("logit.component.batches.dropped")
         queued = next((v for ts, v, point_life in reversed(sut.gauge_series(
             "logit.component.buffer.batches", component=sink))
             if point_life == life and ts <= at), 0)
-        gap = received + replayed - delivered - dropped - queued
-        replay = f" + replayed {_n(replayed)}" if replayed else ""
+        gap = received + replayed + torn - delivered - dropped - queued
+        replay = (f" + replayed {_n(replayed)}" if replayed else "") + (
+            f" + torn {_n(torn)}" if torn else "")
         if not 0 <= gap <= 1:
             status = FAIL
         lines.append(f"{sink}: received {_n(received)}{replay} vs delivered {_n(delivered)} + "
@@ -2353,13 +2374,15 @@ def _sent_one(data, led, sink, flag, lines):
 
         received = upto("logit.component.batches.received")
         replayed = upto("logit.component.buffer.disk.replayed")
+        torn = _torn_upto(sut, sink, life, at)
         delivered = upto("logit.component.batches.delivered")
         dropped = upto("logit.component.batches.dropped")
         queued = next((v for ts, v, point_life in reversed(sut.gauge_series(
             "logit.component.buffer.batches", component=sink))
             if point_life == life and ts <= at), 0)
-        gap = received + replayed - delivered - dropped - queued
-        replay = f" + replayed {_n(replayed)}" if replayed else ""
+        gap = received + replayed + torn - delivered - dropped - queued
+        replay = (f" + replayed {_n(replayed)}" if replayed else "") + (
+            f" + torn {_n(torn)}" if torn else "")
         text = (f"{sink} life {life} at {data.offset(at)}: received {_n(received)}{replay} vs "
                 f"delivered {_n(delivered)} + dropped {_n(dropped)} + buffer.batches "
                 f"{_n(queued)}, gap {_n(gap)}")
@@ -2403,20 +2426,26 @@ def _sent_one(data, led, sink, flag, lines):
         if reason in REJECTED_BATCH_REASONS:
             flag(FAIL, f"{sink}: {_n(value)} batch(es) dropped {reason}, the destination "
                        f"refused them ({quoted('request_rejected')})")
+        elif data.external and reason in FAULT_DROP_REASONS:
+            # On a Kafka target `ledger.egress` FAILs it instead.
+            flag(FAIL, f"{sink}: {_n(value)} batch(es) {FAULT_DROP_REASONS[reason]}")
         else:
             flag(WARN, f"{sink}: {_n(value)} batch(es) dropped {reason}, counted")
     record_drops = _by_attr(sut, "logit.output.records.dropped", "reason", component=sink)
     for reason, value in sorted(record_drops.items()):
         if reason in REJECTED_RECORD_REASONS:
+            # `rejected` counts both a rejected request's entries and the series a 2xx body
+            # names, so it quotes whichever of the two the sink logged.
+            groups = [("request_rejected", "oversize")]
+            if reason == "rejected":
+                groups.append(("series_rejected",))
+            found = [quoted(*keys) for keys in groups
+                     if any(entry.key in keys for entry in diagnostics)]
+            evidence = "; ".join(found) or quoted(*groups[0])
             flag(FAIL, f"{sink}: {_n(value)} record(s) dropped {reason}, refused by the "
-                       "destination or too large to send "
-                       f"({quoted('request_rejected', 'oversize')})")
+                       f"destination or too large to send ({evidence})")
         else:
             flag(WARN, f"{sink}: {_n(value)} record(s) dropped {reason} before sending, counted")
-    named = sum(sut.counter_by_life("logit.output.records.rejected", component=sink).values())
-    if named:
-        flag(FAIL, f"{sink}: {_n(named)} record(s) named dropped in an accepted response's body "
-                   f"({quoted('series_rejected')})")
     skipped_metrics = _by_attr(sut, "logit.output.metrics.skipped", "reason", component=sink)
     skipped_metrics.update({f"metric_kind={k}": v for k, v in _by_attr(
         sut, "logit.output.metrics.skipped", "metric_kind", component=sink).items()
@@ -2427,6 +2456,15 @@ def _sent_one(data, led, sink, flag, lines):
     if total_skipped:
         detail = ", ".join(f"{k} {_n(v)}" for k, v in sorted(skipped_metrics.items()))
         flag(WARN, f"{sink}: {_n(total_skipped)} metric(s) skipped by the encoder, never sent"
+                   + (f" ({detail})" if detail else ""))
+    # An encode fault (a non-finite value, an oversized sketch, an unresolved GaugeDelta).
+    dropped_metrics = _by_attr(sut, "logit.output.metrics.dropped", "reason", component=sink)
+    dropped_metrics.pop("?", None)
+    total_dropped = sum(sut.counter_by_life("logit.output.metrics.dropped",
+                                            component=sink).values())
+    if total_dropped:
+        detail = ", ".join(f"{k} {_n(v)}" for k, v in sorted(dropped_metrics.items()))
+        flag(WARN, f"{sink}: {_n(total_dropped)} metric(s) dropped by the encoder, never sent"
                    + (f" ({detail})" if detail else ""))
 
     for text in off_identity:
@@ -2863,12 +2901,80 @@ def check_expect(data):
     return [_expect_one(data, exp) for exp in expectations]
 
 
+def _balanced_drop(led, name, component, reason, batch_drops):
+    """Whether another row already judges this `*.dropped` term, so `drops` leaves it out."""
+    # Every node's `batches.dropped` is judged by `ledger.egress`, `ledger.summary`, and
+    # `identity.sink` (a torn tail included), and a node's `events.dropped` beside a batch drop
+    # of the same reason counts the same loss. `bytes.dropped` counts `datagrams.dropped`'s
+    # datagrams again. On an external target `ledger.egress` SKIPs and `ledger.summary` reads no
+    # fault drop, so a `FAULT_DROP_REASONS` batch drop at a node other than a sink stays here;
+    # `ledger.sent` FAILs one at a sink.
+    if name == "logit.component.batches.dropped":
+        return not (led.data.external and reason in FAULT_DROP_REASONS
+                    and component not in led.sinks)
+    if name == "logit.component.bytes.dropped":
+        return True
+    if name == "logit.component.events.dropped" and (component, reason) in batch_drops:
+        return True
+    if component in led.listeners:
+        if name in ("logit.component.datagrams.dropped", "logit.input.kernel.dropped",
+                    "logit.component.events.dropped"):
+            return True  # D, K, and X
+        if (name, reason) in (("logit.input.messages.dropped", "malformed"),
+                              ("logit.input.frames.dropped", "undecodable"),
+                              ("logit.input.frames.dropped", "oversize")):
+            return True  # B
+    if (component == led.script and name == "logit.component.events.dropped"
+            and reason == "script_error"):
+        return True  # L_err
+    if component in led.sinks and not led.data.has_vm and name in (
+            "logit.output.records.dropped", "logit.output.metrics.dropped"):
+        return True  # `ledger.sent` judges these on an external or Kafka target
+    return False
+
+
+def check_drops(data):
+    """Every `logit.*.dropped` counter the SUT emitted that no other row judges: loss by the
+    name alone (ADR `telemetry-loss-vocabulary`). A `FAULT_DROP_REASONS` reason FAILs, any
+    other WARNs. Terms the ledger and the sink rows balance stay with them."""
+    led = _ledger(data)
+    skipped = _skip_without_sut("drops", led)
+    if skipped:
+        return skipped
+    batch_drops = {(point.attributes.get("component"), point.attributes.get("reason"))
+                   for point in led.sut.matching("logit.component.batches.dropped")
+                   if isinstance(point.value, (int, float)) and point.value}
+    names = sorted({point.name for point in led.sut.points
+                    if point.name.startswith("logit.") and point.name.endswith(".dropped")})
+    totals = {}
+    for name in names:
+        for point in led.sut.matching(name):
+            if not isinstance(point.value, (int, float)) or not point.value:
+                continue
+            component = point.attributes.get("component", "?")
+            reason = point.attributes.get("reason", "?")
+            if _balanced_drop(led, name, component, reason, batch_drops):
+                continue
+            key = (name, component, reason)
+            totals[key] = totals.get(key, 0) + point.value
+    if not totals:
+        return Result("drops", PASS, "no *.dropped count outside the ledger and the sink rows")
+    status = PASS
+    lines = []
+    for (name, component, reason), value in sorted(totals.items()):
+        verdict = FAIL if reason in FAULT_DROP_REASONS else WARN
+        status = worst([status, verdict])
+        lines.append(f"{component}: {name}{{reason=\"{reason}\"}} {_n(value)}")
+    return Result("drops", status, f"{len(lines)} *.dropped count(s) outside the ledger: "
+                  + "; ".join(lines), lines)
+
+
 CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_intake,
     check_ledger_edge, check_ledger_script, check_ledger_aggregate, check_ledger_egress,
     check_ledger_windows, check_ledger_replay, check_ledger_summary, check_ledger_sent,
-    check_ledger_topic, check_identity_sink, check_recovery, check_expect,
+    check_ledger_topic, check_identity_sink, check_drops, check_recovery, check_expect,
 )
 
 

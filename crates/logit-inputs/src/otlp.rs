@@ -954,11 +954,7 @@ const NO_CONSUMER_TOOK_THE_BATCH: &str = "no consumer took the batch";
 
 /// Counts a request's batches that no consumer took, the refused one included.
 fn count_undelivered(telemetry: &Telemetry, undelivered: crate::http::Undelivered) {
-    telemetry.count(
-        "logit.input.batches.dropped",
-        undelivered.count() as f64,
-        &[("reason", undelivered.reason())],
-    );
+    undelivered.record(telemetry);
 }
 
 /// Matches an OTLP/HTTP path (`/v1/logs`, `/v1/metrics`, `/v1/traces`) to its [`Signal`].

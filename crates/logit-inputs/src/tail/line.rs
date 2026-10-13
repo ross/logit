@@ -188,6 +188,12 @@ impl LineSplitter {
             self.partial.len() as u64
         }
     }
+
+    /// Whether a line that hasn't reached its `\n` is held for emission. An oversized line being
+    /// dropped isn't held: it was counted when its drop began.
+    pub fn holds_partial(&self) -> bool {
+        !self.dropping && !self.partial.is_empty()
+    }
 }
 
 fn strip_cr(b: Bytes) -> Bytes {

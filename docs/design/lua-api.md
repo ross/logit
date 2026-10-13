@@ -166,6 +166,12 @@ shape" below) and is how a stateful script turns accumulated state into emitted 
 contract the native aggregator ([docs/design/data-model.md](data-model.md)'s mergeable metric
 kinds) runs on.
 
+**A `nil` return is a discard; an error is a loss.** The runtime counts each event `process()`
+returns `nil` for as `logit.component.events.discarded`, the config's choice. An error raised in
+`process()` loses the event it was called with, counted as
+`logit.component.events.dropped{reason="script_error"}` beside
+`logit.component.errors{reason="process"}`, so an alert on `*.dropped` sees a failing script.
+
 **`flush()` runs in a root context** ([ADR `lua-flush-root-context`](../adr/lua-flush-root-context.md)).
 A flush is the result of no one event or batch, so `trace`, `provenance`, `resource` and `scope`
 are reset before every call: a fresh trace root, this component as its own provenance, an empty
@@ -266,16 +272,15 @@ was called on, so `return event:to("host_stream")` is the idiomatic one-liner, a
 - **`event:to(nil)` clears the mark.** An event marked earlier in `process()` goes back to being
   unrouted.
 - **An id not in this component's `targets:` is a script error**, counted like every other script
-  error (`logit.component.errors{reason="process"}`) and naming the ids that *are* configured. It
+  error (`logit.component.errors{reason="process"}`, and the event lost as
+  `events.dropped{reason="script_error"}`) and naming the ids that *are* configured. It
   is never a silent forward. The same applies to `event:to("x")` on a component with no
   `targets:`.
 - **An unmarked event goes to the component's own consumers**, the components that list it in
   `sources:`. That ordinary outbound edge is the else-branch; you don't need a chain of
-  complementary filters. A router with targets and **no** ordinary consumers is a legal config,
-  and it drops and counts its unmarked events as
-  `logit.component.events.dropped{reason="unrouted"}` (`docs/design/internal-telemetry.md`). This
-  includes unmarked events from `flush()`: an `interval:`-bearing router with no ordinary
-  consumers loses any unmarked output its `flush()` emits.
+  complementary filters. A component with `targets:` and **no** ordinary consumer fails
+  validation, because its unmarked events, including unmarked output from `flush()`, would have
+  nowhere to go. To discard them on purpose, list the component in a `null_out`'s `sources:`.
 - **`event:clone()` copies the mark**, so a script fanning a routed event out gets two events
   headed the same way; `copy:to(nil)` (or `copy:to("other")`) makes them diverge. The mark is
   per-*event*, not per-call: `return {a:to("x"), b}` sends `a` to `x` and `b` to the component's

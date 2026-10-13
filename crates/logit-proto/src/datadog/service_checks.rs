@@ -8,6 +8,7 @@
 
 use super::events::{non_empty_str, seconds, ATTR_STATSD_TIMESTAMP};
 use super::logs::{new_batch, parse_json};
+use super::outcomes::{MetricIn, MetricOut};
 use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, or_received};
 use super::{is_service_check, DatadogDecoder, DatadogEncoder};
@@ -76,7 +77,7 @@ impl DatadogDecoder {
 
     fn decode_check(&mut self, item: &Json, received_at: i64) -> Option<Event> {
         let Json::Object(obj) = item else {
-            self.skip_check("malformed");
+            self.skip_check(MetricIn::Malformed);
             self.diagnostics.warn_throttled(
                 "malformed_service_check",
                 "datadog service check is not an object",
@@ -84,13 +85,13 @@ impl DatadogDecoder {
             return None;
         };
         let Some(name) = non_empty_str(obj, "check") else {
-            self.skip_check("no_name");
+            self.skip_check(MetricIn::NoName);
             return None;
         };
         let status = match obj.get("status").and_then(Json::as_u64) {
             Some(status) if status <= MAX_STATUS => status,
             _ => {
-                self.skip_check("invalid_status");
+                self.skip_check(MetricIn::InvalidStatus);
                 return None;
             }
         };
@@ -115,8 +116,8 @@ impl DatadogDecoder {
         ))
     }
 
-    fn skip_check(&self, reason: &'static str) {
-        self.telemetry.count("logit.input.metrics.skipped", 1.0, &[("reason", reason)]);
+    fn skip_check(&self, outcome: MetricIn) {
+        self.metric_not_decoded(outcome, 1);
     }
 }
 
@@ -147,11 +148,7 @@ impl DatadogEncoder {
                     .then_some(*gauge as u64),
             };
             let Some(status) = status else {
-                self.telemetry.count(
-                    "logit.output.metrics.skipped",
-                    1.0,
-                    &[("reason", "invalid_status")],
-                );
+                self.metric_not_sent(MetricOut::InvalidStatus);
                 continue;
             };
 
@@ -160,7 +157,7 @@ impl DatadogEncoder {
             let dropped = render_tags(attrs.iter().map(|(k, v)| (*k, *v)), &skip, &mut tags);
             if dropped.unrepresentable > 0 {
                 self.telemetry.count(
-                    "logit.output.tags.dropped",
+                    "logit.output.tags.omitted",
                     dropped.unrepresentable as f64,
                     &[("reason", "unrepresentable")],
                 );
@@ -235,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_statuses_and_nameless_checks_are_skipped_and_counted() {
+    fn invalid_statuses_and_nameless_checks_are_dropped_and_counted() {
         let registry = Registry::new();
         let mut decoder = DatadogDecoder::new().with_telemetry(registry.telemetry_for(
             "datadog_in",
@@ -250,7 +247,7 @@ mod tests {
             .unwrap();
         assert_eq!(batch.events.len(), 1);
         assert_eq!(
-            counted(&registry, "logit.input.metrics.skipped", ("reason", "invalid_status")),
+            counted(&registry, "logit.input.metrics.dropped", ("reason", "invalid_status")),
             3.0
         );
     }
@@ -286,7 +283,7 @@ mod tests {
         ));
         assert!(encoder.encode_service_checks(&batch).is_none());
         assert_eq!(
-            counted(&registry, "logit.output.metrics.skipped", ("reason", "invalid_status")),
+            counted(&registry, "logit.output.metrics.dropped", ("reason", "invalid_status")),
             1.0
         );
     }

@@ -59,8 +59,8 @@ Each JSON file is `json.dump(sort_keys=True, indent=1)`:
   `message` it contains.
 - `divergence`: present if and only if `logit` differs from `carbon`, naming why and the
   `docs/known-gaps/mappings.md` row that records it.
-- `decoder_skips`: the `logit.input.metrics.skipped` reasons the pickle decoder counts, besides
-  `bad_shape`; `decoder_divergence`: present if and only if the reader agrees with carbon and a
+- `decoder_skips`: the `logit.input.metrics.dropped` reasons the pickle decoder counts, besides
+  `bad_shape` (the field name predates the split between `dropped` and `skipped`); `decoder_divergence`: present if and only if the reader agrees with carbon and a
   datapoint's fate in the decoder differs from its carbon `fate`.
 - `exercises` and `opcodes`: the opcodes the case claims, and every opcode it contains.
 

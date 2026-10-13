@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-09
+updated: 2026-10-13
 ---
 
 # RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission
@@ -259,3 +259,10 @@ changes the line's dialect instead of dropping it.
 
 `crates/logit-proto/src/syslog/mod.rs`'s "Dialect disambiguation" holds the rule, and its
 "Leniencies" lists the departures from the grammar that are accepted as RFC 5424.
+
+## Amendment (2026-10-13): `structured_data.omitted`
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the message is still sent when an element or param is left off, so `syslog_out`
+counts it `logit.output.structured_data.omitted{reason}` with the same reasons, and the
+`EncodeStats` fields this record cites are `omitted_invalid_sd_name` and
+`omitted_sd_id_collision`.
