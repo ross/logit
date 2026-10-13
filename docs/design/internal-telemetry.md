@@ -1811,7 +1811,7 @@ many attempts the runtime makes.
 | `logit.output.tags.normalized{reason="multi_value"}` | a multi-valued tag (from a relayed, repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) rendered as its last representable element, once per attribute. Line protocol has no multi-value tag, so this is the fallback. Lossy; see above |
 | `logit.output.tags.dropped{reason="unrepresentable"}` | a tag whose value has no plain-text form: `Null`, `Bytes`, `Timestamp`, `Map`, or an `Array` with no representable element |
 | `logit.output.tags.dropped{reason="empty"}` | a tag with an empty key or value, which `influxd` rejects |
-| `logit.output.tags.dropped{reason="unencodable"}` | a tag key or value with a newline or a trailing backslash, which line protocol can't spell |
+| `logit.output.tags.dropped{reason="unencodable"}` | a tag key or value with a newline, a trailing backslash, or a backslash before a space, which line protocol can't spell |
 | `logit.output.tags.dropped{reason="reserved"}` | a tag key `influxd` reserves: `_measurement`, `_field`, or `time` |
 | `logit.output.metrics.normalized{reason="carrier_mismatch"}` | a record on an `influxdb.measurement` carrier event that doesn't fit the carrier line (its name lacks the `<measurement>.` prefix, or its kind isn't a `Gauge` or `Sum`), written as its own line |
 | `logit.output.metrics.skipped{reason="unencodable_value"}` | a non-finite `Gauge` or `Sum` value, or carrier field |
