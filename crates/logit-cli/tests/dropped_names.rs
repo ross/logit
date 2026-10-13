@@ -41,17 +41,18 @@ fn dropped_literals(text: &str) -> Vec<&str> {
     names
 }
 
-/// `text` up to its first `#[cfg(test)]` attribute on an inline module: a `mod` line that doesn't
-/// end in `;`. A `#[path]` module is a declaration, so it never ends the scan.
+/// `text` up to its first `#[cfg(test)]` attribute on an inline module: a `mod` line, with or
+/// without a visibility, that doesn't end in `;`. A `#[path]` module is a declaration, so it never ends the scan.
 fn shipped_part(text: &str) -> &str {
     let mut offset = 0;
     let mut previous_was_cfg_test = false;
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        if previous_was_cfg_test
-            && trimmed.starts_with("mod ")
-            && !trimmed.trim_end().ends_with(';')
-        {
+        let item = ["pub(crate) ", "pub(super) ", "pub "]
+            .iter()
+            .find_map(|vis| trimmed.strip_prefix(vis))
+            .unwrap_or(trimmed);
+        if previous_was_cfg_test && item.starts_with("mod ") && !item.trim_end().ends_with(';') {
             let cfg_line = text[..offset].trim_end_matches('\n').rfind('\n').map_or(0, |i| i + 1);
             return &text[..cfg_line];
         }
@@ -96,7 +97,7 @@ fn the_scan_reads_literals_and_stops_at_test_code() {
     let text = "let a = \"logit.input.frames.dropped\";\nlet b = \"logit.input.frames\";\n\
                 #[cfg(test)]\nfn helper() { \"logit.input.kernel.dropped\" }\n\
                 #[cfg(test)]\nmod verification;\nlet c = \"logit.input.logs.dropped\";\n\
-                #[cfg(test)]\nmod tests { \"logit.output.tags.dropped\" }\n";
+                #[cfg(test)]\npub(crate) mod tests { \"logit.output.tags.dropped\" }\n";
     assert_eq!(
         dropped_literals(shipped_part(text)),
         ["logit.input.frames.dropped", "logit.input.kernel.dropped", "logit.input.logs.dropped"]
