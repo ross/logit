@@ -8,6 +8,8 @@
 //! | `text` | the log body: a `Str` or `Bytes` as it is, a `Map` or `Array` in `crate::ndjson`'s value form, a timestamp as RFC 3339, another scalar as its `Display` text, `Null` as nothing | those bodies joined by `\n`, with none after the last |
 //! | `msgpack` | `crate::msgpack`'s map | those maps back to back |
 //! | `native` | a `CODEC_BATCH` frame of a one-event batch under the batch's resource and scope | one `CODEC_BATCH` frame of the events |
+//! | `otlp_proto` | takes no `record:`: one signal's OTLP export request in protobuf, below | |
+//! | `otlp_json` | takes no `record:`: the same request as OTLP/JSON, below | |
 //!
 //! `crate::ndjson`'s doc is the grammar of the JSON object and `crate::msgpack`'s the
 //! MessagePack value forms. A native frame is uncompressed: `compression:` compresses the record
@@ -42,18 +44,52 @@
 //! | `Null`, `Array`, `Map`, or no value | no key: the record goes unkeyed, counted in [`EncodeStats::missing_key`] |
 //!
 //! A record's timestamp is the event's, in milliseconds since the Unix epoch, rounded down.
+//!
+//! # OTLP formats
+//!
+//! `otlp_proto` and `otlp_json` write one record per OTLP export request
+//! (`docs/adr/kafka-otlp-formats.md`); they differ only in the serialization of the request, and
+//! the size budget measures that serialization's length.
+//! A batch becomes one request per signal that has records, in the order logs, traces, metrics,
+//! each built by `OtlpEncoder::request` from the batch's own events under its resource and
+//! scope, and tagged with its signal in [`RecordMeta::signal`], which picks its topic. Two
+//! things split a signal's request further, and nothing else does:
+//!
+//! - **The key.** `trace_id` splits logs and spans into one request per trace id, in order of
+//!   first appearance, keyed as the per-event table's first row; each signal reads its own
+//!   field, a log its `TraceRef` and a span its own id, so an event carrying both can key its
+//!   two records differently. The events with none form one unkeyed request, which counts once
+//!   per record in [`EncodeStats::missing_key`]. Metrics stay one unkeyed request and count
+//!   nothing. `{resource: NAME}` keys every request of the batch with that value's text, or
+//!   sends each unkeyed, counted. `{attribute: NAME}` is refused by the sink.
+//! - **The size.** A request's budget is the encoder's less its key's length, the record overhead
+//!   the producer's cap check adds for a key. A request over it is cut by events, each record the
+//!   longest run of the remaining events that fits, found as `native` finds one. A single event
+//!   whose request is over the budget alone is dropped, counted once in
+//!   [`EncodeStats::oversize`] for each signal record it would have formed.
+//!
+//! The first encode of each key group is the one that counts the OTLP mapping's side effects
+//! (`logit.output.metrics.skipped` and `degraded`); every probe of the cut runs with the gate
+//! [`KafkaEncoder::with_counters`] takes muted. A record's timestamp is the time the encoder
+//! wrote it: a request holds many events, and one future-stamped event would otherwise lose the
+//! whole request to Kafka's rule against records stamped more than an hour ahead.
 
+use std::collections::HashMap;
 use std::fmt::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use logit_core::interner::intern;
 use logit_core::time::write_rfc3339_utc;
 use logit_core::trace::push_hex;
-use logit_core::{Event, EventBatch, Resource, Scope, Symbol, Value};
+use logit_core::{
+    CountGate, Diagnostics, Event, EventBatch, Resource, Scope, Symbol, Telemetry, Value,
+};
 use logit_proto::frame::{write_frame, Compression};
 use logit_proto::msgpack::Writer;
 use logit_proto::native::{encode_events, CODEC_BATCH};
-use logit_proto::{FramedEncoder, MessageBuf};
+use logit_proto::otlp::{OtlpEncoder, OtlpRequest};
+use logit_proto::{FramedEncoder, MessageBuf, Signal};
 
 /// What each record's key is. Mirrors `logit_config::KafkaKey`, which `logit-cli` converts.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -75,6 +111,8 @@ pub enum RecordFormat {
     Text,
     Msgpack,
     Native,
+    OtlpProto,
+    OtlpJson,
 }
 
 impl RecordFormat {
@@ -83,7 +121,13 @@ impl RecordFormat {
         match self {
             RecordFormat::Json | RecordFormat::Text | RecordFormat::Msgpack => RecordMode::Event,
             RecordFormat::Native => RecordMode::Batch,
+            RecordFormat::OtlpProto | RecordFormat::OtlpJson => RecordMode::Request,
         }
+    }
+
+    /// Whether each record holds one OTLP export request, a unit `record:` can't change.
+    pub fn is_otlp(self) -> bool {
+        self.default_record() == RecordMode::Request
     }
 }
 
@@ -94,6 +138,9 @@ pub enum RecordMode {
     Event,
     /// As many of a batch's events as fit under `max_request_bytes`.
     Batch,
+    /// One OTLP export request of one signal: the OTLP formats' own unit, which `record:` can't
+    /// select.
+    Request,
 }
 
 /// [`RecordKey`] with its attribute name interned once.
@@ -105,12 +152,15 @@ enum Compiled {
     Resource(Symbol),
 }
 
-/// A record's key and timestamp; its value is the message's bytes.
+/// A record's key, timestamp, and signal; its value is the message's bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordMeta {
     pub key: Option<Bytes>,
     /// `CreateTime`, in milliseconds since the Unix epoch.
     pub timestamp: i64,
+    /// The signal of an OTLP format's request, which picks its topic; `None` for the other
+    /// formats, whose records all go to `topic:`.
+    pub signal: Option<Signal>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -119,7 +169,8 @@ pub struct EncodeStats {
     pub missing_key: usize,
     /// Events `format: text` skipped for having no log record.
     pub no_log: usize,
-    /// Events dropped under `record: batch` because their value alone is over the budget.
+    /// Events dropped under `record: batch` because their value alone is over the budget; under
+    /// an OTLP format, one per signal of an event whose request alone is over it.
     pub oversize: usize,
 }
 
@@ -135,6 +186,11 @@ pub struct KafkaEncoder {
     render: Render,
     /// The `record: batch` value being filled; reused.
     value: Vec<u8>,
+    /// The OTLP mapping, on handles gated by `gate`.
+    otlp: OtlpEncoder,
+    /// Muted around every OTLP encode that repeats an event's mapping, so the mapping's
+    /// side-effect counters count each event once.
+    gate: CountGate,
 }
 
 /// One event's value for the per-event formats, in buffers reused across events and batches.
@@ -184,6 +240,9 @@ impl Render {
                 Some(&self.body)
             }
             RecordFormat::Native => unreachable!("native frames go through `native_frame`"),
+            RecordFormat::OtlpProto | RecordFormat::OtlpJson => {
+                unreachable!("OTLP requests go through `otlp`")
+            }
         }
     }
 }
@@ -238,7 +297,25 @@ impl KafkaEncoder {
             scratch: String::new(),
             render: Render::default(),
             value: Vec::new(),
+            otlp: OtlpEncoder::new(),
+            gate: CountGate::new(),
         }
+    }
+
+    /// Counts the OTLP mapping's side effects (`logit.output.metrics.degraded` and `skipped`,
+    /// and their warnings) through views of `telemetry` and `diag` gated by `gate`, the sink's
+    /// batch accounting gate.
+    pub fn with_counters(
+        mut self,
+        telemetry: &Telemetry,
+        diag: &Diagnostics,
+        gate: &CountGate,
+    ) -> Self {
+        self.otlp = OtlpEncoder::new()
+            .with_telemetry(telemetry.gated(gate))
+            .with_diagnostics(diag.gated(gate));
+        self.gate = gate.clone();
+        self
     }
 
     /// The key bytes for `event`; `Err(())` when a configured key has no value on it.
@@ -273,7 +350,7 @@ impl KafkaEncoder {
             stats.missing_key += 1;
             None
         });
-        RecordMeta { key, timestamp: millis(event.timestamp) }
+        RecordMeta { key, timestamp: millis(event.timestamp), signal: None }
     }
 
     /// `record: event`: one record per event.
@@ -332,7 +409,7 @@ impl KafkaEncoder {
             }
             let separator = usize::from(joined && count > 0);
             if count > 0 && self.value.len() + separator + piece.len() > self.budget {
-                out.push_with(&self.value, RecordMeta { key: None, timestamp });
+                out.push_with(&self.value, RecordMeta { key: None, timestamp, signal: None });
                 self.value.clear();
                 count = 0;
             }
@@ -345,7 +422,7 @@ impl KafkaEncoder {
             count += 1;
         }
         if count > 0 {
-            out.push_with(&self.value, RecordMeta { key: None, timestamp });
+            out.push_with(&self.value, RecordMeta { key: None, timestamp, signal: None });
         }
     }
 
@@ -364,7 +441,8 @@ impl KafkaEncoder {
         let mut rest = &batch.events[..];
         let Some(first) = rest.first() else { return };
         if let Some(frame) = fits(rest) {
-            out.push_with(&frame, RecordMeta { key: None, timestamp: millis(first.timestamp) });
+            let meta = RecordMeta { key: None, timestamp: millis(first.timestamp), signal: None };
+            out.push_with(&frame, meta);
             return;
         }
         // The first pass starts knowing the whole batch doesn't fit. Later passes find their
@@ -372,7 +450,7 @@ impl KafkaEncoder {
         // encode of the remaining batch.
         let mut known_over = Some(rest.len());
         while let Some(first) = rest.first() {
-            let meta = RecordMeta { key: None, timestamp: millis(first.timestamp) };
+            let meta = RecordMeta { key: None, timestamp: millis(first.timestamp), signal: None };
             // A run length that doesn't fit, or one past the end when none is known.
             let over_at_start = known_over.take().unwrap_or(rest.len() + 1);
             let Some(mut best) = fits(&rest[..1]) else {
@@ -406,6 +484,208 @@ impl KafkaEncoder {
     }
 }
 
+/// One OTLP request's worth of a signal's events, before the size cap cuts it.
+struct Group<'e> {
+    key: Option<Bytes>,
+    /// Unkeyed because the configured key has no value here: each record counts in
+    /// [`EncodeStats::missing_key`].
+    missing: bool,
+    events: Vec<&'e Event>,
+}
+
+/// What one candidate encode of a run of events gave.
+enum Fit {
+    /// The request fits the budget.
+    /// The request, and its OTLP/JSON when the format is `otlp_json`, written once to measure it.
+    Fits(OtlpRequest, Option<Vec<u8>>),
+    /// No event of the run yields a record of the signal: a metric the mapping skips.
+    Empty,
+    Over,
+}
+
+/// The order an OTLP format writes a batch's signals in, `SignalEncoder::encode_signals`'s.
+const SIGNALS: [Signal; 3] = [Signal::Logs, Signal::Traces, Signal::Metrics];
+
+fn carries(signal: Signal, event: &Event) -> bool {
+    match signal {
+        Signal::Logs => event.log.is_some(),
+        Signal::Traces => event.span.is_some(),
+        Signal::Metrics => !event.metrics.is_empty(),
+    }
+}
+
+/// The trace id `signal`'s record of `event` carries: a span's own, or the log record's
+/// `TraceRef`. An all-zero id is none.
+fn signal_trace_id(signal: Signal, event: &Event) -> Option<[u8; 16]> {
+    let id = match signal {
+        Signal::Logs => event.log.as_ref()?.trace.as_ref()?.trace_id,
+        Signal::Traces => event.span.as_ref()?.trace_id,
+        Signal::Metrics => return None,
+    };
+    id.iter().any(|&b| b != 0).then_some(id)
+}
+
+impl KafkaEncoder {
+    /// The OTLP formats: one request per signal, split by key and then by the budget
+    /// (`docs/adr/kafka-otlp-formats.md`, items 1, 5, 6, and 7).
+    fn otlp(
+        &mut self,
+        batch: &EventBatch,
+        out: &mut MessageBuf<RecordMeta>,
+        stats: &mut EncodeStats,
+    ) {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let timestamp = millis(i64::try_from(nanos).unwrap_or(i64::MAX));
+        for signal in SIGNALS {
+            let groups = self.groups(signal, batch);
+            for group in groups {
+                self.otlp_group(signal, batch, group, timestamp, out, stats);
+            }
+        }
+    }
+
+    /// `signal`'s events of `batch`, grouped by their key: one group per trace id, in order of
+    /// first appearance, then the events with none; or one group for the batch.
+    fn groups<'e>(&mut self, signal: Signal, batch: &'e EventBatch) -> Vec<Group<'e>> {
+        let events = batch.events.iter().filter(|e| carries(signal, e));
+        let one = |key: Option<Bytes>, missing: bool, events: Vec<&'e Event>| {
+            if events.is_empty() {
+                Vec::new()
+            } else {
+                vec![Group { key, missing, events }]
+            }
+        };
+        match self.key {
+            Compiled::TraceId if signal != Signal::Metrics => {
+                let mut groups: Vec<Group<'e>> = Vec::new();
+                let mut index: HashMap<[u8; 16], usize> = HashMap::new();
+                let mut unkeyed = Vec::new();
+                for event in events {
+                    let Some(id) = signal_trace_id(signal, event) else {
+                        unkeyed.push(event);
+                        continue;
+                    };
+                    let at = *index.entry(id).or_insert_with(|| {
+                        self.scratch.clear();
+                        push_hex(&mut self.scratch, &id);
+                        let key = Some(Bytes::copy_from_slice(self.scratch.as_bytes()));
+                        groups.push(Group { key, missing: false, events: Vec::new() });
+                        groups.len() - 1
+                    });
+                    groups[at].events.push(event);
+                }
+                groups.extend(one(None, true, unkeyed));
+                groups
+            }
+            Compiled::Resource(sym) => {
+                let key = batch
+                    .resource
+                    .attributes
+                    .get_sym(sym)
+                    .and_then(|value| key_bytes(value, &mut self.scratch).ok());
+                one(key.clone(), key.is_none(), events.collect())
+            }
+            // `key: {attribute: ..}` is refused under the OTLP formats.
+            _ => one(None, false, events.collect()),
+        }
+    }
+
+    /// Writes `group` as records of `signal`: the whole request when it fits the budget less
+    /// its key, else each the longest run of the remaining events that fits, found as
+    /// `native_packed` finds one. The whole request's encode is the one that counts the
+    /// mapping's side effects; every probe after it runs with the gate muted.
+    fn otlp_group(
+        &mut self,
+        signal: Signal,
+        batch: &EventBatch,
+        group: Group<'_>,
+        timestamp: i64,
+        out: &mut MessageBuf<RecordMeta>,
+        stats: &mut EncodeStats,
+    ) {
+        let Group { key, missing, events } = group;
+        let budget = self.budget.saturating_sub(key.as_ref().map_or(0, Bytes::len));
+        let (resource, scope) = (&batch.resource, batch.scope.as_deref());
+        let emit = |(request, json): (OtlpRequest, Option<Vec<u8>>),
+                    out: &mut MessageBuf<RecordMeta>,
+                    stats: &mut EncodeStats| {
+            let meta = RecordMeta { key: key.clone(), timestamp, signal: Some(signal) };
+            match json {
+                Some(json) => out.push_with(&json, meta),
+                None => out.push_with(&request.encode_to_vec(), meta),
+            };
+            stats.missing_key += usize::from(missing);
+        };
+        let json = self.format == RecordFormat::OtlpJson;
+        let otlp = &mut self.otlp;
+        let mut fits =
+            |events: &[&Event]| match otlp.request(signal, resource, scope, events.iter().copied())
+            {
+                None => Fit::Empty,
+                Some(request) if json => {
+                    let mut body = Vec::new();
+                    request.write_json(&mut body);
+                    if body.len() <= budget {
+                        Fit::Fits(request, Some(body))
+                    } else {
+                        Fit::Over
+                    }
+                }
+                Some(request) if request.encoded_len() <= budget => Fit::Fits(request, None),
+                Some(_) => Fit::Over,
+            };
+        match fits(&events) {
+            Fit::Fits(request, json) => return emit((request, json), out, stats),
+            Fit::Empty => return,
+            Fit::Over => {}
+        }
+        let gate = self.gate.clone();
+        gate.muted(|| {
+            let mut rest = &events[..];
+            // The first pass starts knowing the whole group doesn't fit.
+            let mut known_over = Some(rest.len());
+            while !rest.is_empty() {
+                let over_at_start = known_over.take().unwrap_or(rest.len() + 1);
+                let mut best = match fits(&rest[..1]) {
+                    Fit::Fits(request, json) => (request, json),
+                    Fit::Empty => {
+                        rest = &rest[1..];
+                        continue;
+                    }
+                    Fit::Over => {
+                        stats.oversize += 1;
+                        rest = &rest[1..];
+                        continue;
+                    }
+                };
+                // `fit` events fit and `over` don't: double, then bisect between them. A run
+                // starting with an event that yields a record never encodes empty.
+                let (mut fit, mut over) = (1, over_at_start);
+                let mut probe = 2;
+                while probe < over && fit < rest.len() {
+                    let n = probe.min(rest.len());
+                    match fits(&rest[..n]) {
+                        Fit::Fits(request, json) => {
+                            (fit, best) = (n, (request, json));
+                            probe *= 2;
+                        }
+                        Fit::Empty | Fit::Over => over = n,
+                    }
+                }
+                while over - fit > 1 {
+                    let mid = fit + (over - fit) / 2;
+                    match fits(&rest[..mid]) {
+                        Fit::Fits(request, json) => (fit, best) = (mid, (request, json)),
+                        Fit::Empty | Fit::Over => over = mid,
+                    }
+                }
+                emit(best, out, stats);
+                rest = &rest[fit..];
+            }
+        });
+    }
+}
+
 /// A value's key bytes, by the module doc's table; `Err(())` for one that can't be a key.
 fn key_bytes(value: &Value, scratch: &mut String) -> Result<Bytes, ()> {
     scratch.clear();
@@ -433,6 +713,7 @@ impl FramedEncoder for KafkaEncoder {
             (RecordMode::Event, _) => self.per_event(batch, out, &mut stats),
             (RecordMode::Batch, RecordFormat::Native) => self.native_packed(batch, out, &mut stats),
             (RecordMode::Batch, _) => self.packed(batch, out, &mut stats),
+            (RecordMode::Request, _) => self.otlp(batch, out, &mut stats),
         }
         stats
     }
@@ -480,7 +761,10 @@ mod tests {
         let mut line = String::new();
         crate::ndjson::render_ndjson(&mut line, &b);
         assert_eq!(format!("{}\n", records[0].0), line);
-        assert_eq!(records[0].1, RecordMeta { key: None, timestamp: 1_700_000_000_123 });
+        assert_eq!(
+            records[0].1,
+            RecordMeta { key: None, timestamp: 1_700_000_000_123, signal: None }
+        );
         assert_eq!(stats.missing_key, 0, "no key configured is not a missing key");
     }
 
@@ -616,6 +900,7 @@ mod tests {
                             assert!(text.ends_with('\n'), "NDJSON lines end with a newline");
                             text.lines().map(str::to_string).collect()
                         }
+                        RecordMode::Request => unreachable!("json writes no request"),
                     }
                 })
                 .inspect(|line| {
@@ -650,7 +935,7 @@ mod tests {
             RecordFormat::Native => {
                 native_events(batch, records).iter().map(|e| ndjson(batch, e)).collect()
             }
-            RecordFormat::Text => unreachable!(),
+            RecordFormat::Text | RecordFormat::OtlpProto | RecordFormat::OtlpJson => unreachable!(),
         }
     }
 
@@ -667,7 +952,7 @@ mod tests {
                 assert_eq!(stats, EncodeStats::default(), "{format:?} {record:?}");
                 let expected_records = match record {
                     RecordMode::Event => batch.events.len(),
-                    RecordMode::Batch => 1,
+                    RecordMode::Batch | RecordMode::Request => 1,
                 };
                 assert_eq!(records.len(), expected_records, "{format:?} {record:?}");
                 assert_eq!(
@@ -733,7 +1018,7 @@ mod tests {
         assert_eq!(stats.no_log, 1);
         assert_eq!(batched.len(), 1);
         assert_eq!(batched[0].0, want.join(&b'\n'));
-        assert_eq!(batched[0].1, RecordMeta { key: None, timestamp: 0 });
+        assert_eq!(batched[0].1, RecordMeta { key: None, timestamp: 0, signal: None });
     }
 
     /// Under `record: batch`, each record takes events until the next would push it over the

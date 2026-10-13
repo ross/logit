@@ -768,6 +768,31 @@ pub enum KafkaFormat {
     /// `logit`'s own binary format, the one `stdio_out`'s `format: native` writes: one frame per
     /// record, which `logit` decodes with no loss. Defaults to `record: batch`.
     Native,
+    /// One OTLP protobuf export request per record, as the OpenTelemetry Collector's Kafka
+    /// exporter writes it and its Kafka receiver reads it: each batch's logs, metrics, and
+    /// spans as separate requests, each to its signal's topic (`topics:`). Takes no `record:`.
+    OtlpProto,
+    /// The same request as `otlp_proto`, as OTLP/JSON, in the form the OpenTelemetry Collector's
+    /// own JSON marshaler writes and its Kafka receiver reads under `encoding: otlp_json`.
+    /// Topics, keys, and splitting are as for `otlp_proto`; a request is split by its JSON
+    /// length. Takes no `record:`.
+    OtlpJson,
+}
+
+/// Each signal's topic under an OTLP `format:`. A key left out takes the OpenTelemetry Collector
+/// Kafka exporter's default.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaTopics {
+    /// The log records' topic. Defaults to `otlp_logs`.
+    #[serde(default)]
+    pub logs: Option<String>,
+    /// The metrics' topic. Defaults to `otlp_metrics`.
+    #[serde(default)]
+    pub metrics: Option<String>,
+    /// The spans' topic. Defaults to `otlp_spans`.
+    #[serde(default)]
+    pub traces: Option<String>,
 }
 
 /// How many events one `kafka_out` record holds.
@@ -2935,26 +2960,42 @@ pub enum ComponentKind {
         /// topic's partitions and leaders, then connects to each leader at the address the
         /// cluster advertises, so every advertised listener must be reachable from `logit`.
         brokers: Vec<String>,
-        /// The topic every record goes to. With the broker's `auto.create.topics.enable` on,
-        /// a missing topic is created on first use; otherwise the sink holds its queue until an
-        /// operator creates it.
-        topic: String,
+        /// The topic every record goes to. Required except under `format: otlp_proto` or `otlp_json`, where
+        /// setting it sends every signal to this one topic in place of `topics:`. With the
+        /// broker's `auto.create.topics.enable` on, a missing topic is created on first use;
+        /// otherwise the sink holds its queue until an operator creates it.
+        #[serde(default)]
+        topic: Option<String>,
+        /// Under `format: otlp_proto` or `otlp_json` only, each signal's topic: `{logs: NAME, metrics: NAME,
+        /// traces: NAME}`, any key left out taking its default, `otlp_logs`, `otlp_metrics`, or
+        /// `otlp_spans`. Can't be set with `topic:`. A signal's topic is first asked about when
+        /// that signal first arrives, so a pipeline that never carries metrics never creates
+        /// the metrics topic, and a missing or misconfigured topic shows only then.
+        #[serde(default)]
+        topics: Option<KafkaTopics>,
         /// What each record's key is: `none` (the default) sends unkeyed records, all of one
         /// batch to one partition; `trace_id` keys by the span's trace id, else the log's, as
         /// 32 lowercase hex characters; `{attribute: NAME}` or `{resource: NAME}` keys by that
         /// event or resource attribute's value as text. A keyed record goes to the partition the
         /// Java client's default partitioner picks for the same key. An event without the value
-        /// (or with a map or array there) is sent unkeyed, counted.
+        /// (or with a map or array there) is sent unkeyed, counted. Under `format: otlp_proto` or
+        /// `otlp_json`, `trace_id` splits the logs and spans of a batch into one request per trace id (a
+        /// log's own trace id, a span's own), metrics stay one unkeyed request, `{resource:
+        /// NAME}` keys every request of a batch alike, and `{attribute: NAME}` is rejected.
         #[serde(default)]
         key: KafkaKey,
         /// What a record's value holds: `json` (the default), the object `stdio_out`'s `format:
         /// json` writes on one line; `text`, the log body alone; `msgpack`, the `json` object as
-        /// MessagePack; or `native`, `logit`'s own lossless binary format.
+        /// MessagePack; `native`, `logit`'s own lossless binary format; or `otlp_proto`, one
+        /// OTLP export request of one signal, which the OpenTelemetry Collector's Kafka
+        /// receiver reads; or `otlp_json`, the same request as OTLP/JSON. An OTLP request too large
+        /// for `max_request_bytes` is split into several, each a valid request, and a record's
+        /// timestamp is the time it was written rather than an event's.
         #[serde(default)]
         format: KafkaFormat,
         /// How many events one record holds: `event`, one each, or `batch`, as many as fit under
         /// `max_request_bytes`. Defaults to `batch` for `format: native` and `event` for the
-        /// others. A `key` other than `none` needs `event`.
+        /// others but `otlp_proto` and `otlp_json`, which take none. A `key` other than `none` needs `event`.
         #[serde(default)]
         record: Option<KafkaRecord>,
         /// How record batches are compressed: `none` (the default), `gzip`, `snappy`, `lz4`, or
@@ -7223,6 +7264,7 @@ mod tests {
             ComponentKind::KafkaOut {
                 brokers,
                 topic,
+                topics,
                 key,
                 format,
                 record,
@@ -7236,7 +7278,8 @@ mod tests {
                 sasl,
             } => {
                 assert_eq!(brokers, vec!["kafka:9092".to_string()]);
-                assert_eq!(topic, "logs");
+                assert_eq!(topic.as_deref(), Some("logs"));
+                assert_eq!(topics, None);
                 assert_eq!(key, KafkaKey::None);
                 assert_eq!(format, KafkaFormat::Json);
                 assert_eq!(record, None, "unset, so the format's own default applies");
@@ -7309,6 +7352,45 @@ mod tests {
             r#"{"type": "kafka_out", "brokers": ["k:9092"], "topic": "t", "linger": "5ms"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn kafka_out_otlp_proto_takes_topics_with_the_three_signal_keys_only() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "kafka_out", "brokers": ["k:9092"], "format": "otlp_proto",
+                "topics": {"logs": "l", "traces": "t"}}"#,
+        )
+        .unwrap();
+        let ComponentKind::KafkaOut { topic, topics, format, .. } = component.kind else {
+            panic!("expected KafkaOut");
+        };
+        assert_eq!(format, KafkaFormat::OtlpProto);
+        assert_eq!(topic, None, "optional in config");
+        assert_eq!(
+            topics,
+            Some(KafkaTopics { logs: Some("l".into()), metrics: None, traces: Some("t".into()) })
+        );
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "kafka_out", "brokers": ["k:9092"], "format": "otlp_proto",
+                "topics": {"spans": "s"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("spans"), "{err}");
+    }
+
+    #[test]
+    fn kafka_out_otlp_json_takes_topics_and_no_topic() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "kafka_out", "brokers": ["k:9092"], "format": "otlp_json",
+                "topics": {"metrics": "m"}}"#,
+        )
+        .unwrap();
+        let ComponentKind::KafkaOut { topic, topics, format, .. } = component.kind else {
+            panic!("expected KafkaOut");
+        };
+        assert_eq!(format, KafkaFormat::OtlpJson);
+        assert_eq!(topic, None);
+        assert_eq!(topics, Some(KafkaTopics { metrics: Some("m".into()), ..Default::default() }));
     }
 
     #[test]

@@ -1,12 +1,15 @@
 //! The producer: cluster metadata, the idempotent producer's identity and sequences, and one
 //! attempt at a set of partition batches with a verdict per partition.
 //!
-//! A sink drives it in two calls per `logit` batch. [`Producer::prepare`] partitions the records
+//! A producer serves one topic, and only the multi-topic facade ([`super::multi`]) constructs
+//! and drives one, in two calls per `logit` batch. [`Producer::prepare`] partitions the records
 //! once and cuts each partition's share into partition batches under `max_request_bytes`, into a
-//! [`Pending`] the sink keeps until the batch is final. [`Producer::attempt`] sends every
-//! unsettled partition batch of a [`Pending`] once and returns the send's verdict
-//! (`docs/adr/kafka-output.md`, item 4). Keeping the [`Pending`] across attempts is what keeps
-//! each unkeyed record on its first partition and each partition batch on its first sequence.
+//! [`Pending`] the facade keeps until the batch is final. [`Producer::send`] sends every
+//! unsettled partition batch of a [`Pending`] once and returns what each settled as, with no
+//! verdict of its own: the facade reads every topic's partition states into one
+//! (`docs/adr/kafka-otlp-formats.md`, item 4). Keeping the [`Pending`] across attempts is what
+//! keeps each unkeyed record on its first partition and each partition batch on its first
+//! sequence.
 //!
 //! What an attempt does, in order:
 //!
@@ -210,15 +213,17 @@ impl Part {
     }
 }
 
-/// One `logit` batch's records, partitioned and cut into partition batches, with what the broker
-/// settled so far. The sink keeps it across attempts at the batch.
+/// One `logit` batch's records for one topic, partitioned and cut into partition batches, with
+/// what the broker settled so far. The facade keeps it across attempts at the batch.
 #[derive(Debug, Default)]
 pub(crate) struct Pending {
     pub(crate) parts: Vec<Part>,
     /// Records over `max_request_bytes` on their own, dropped before any request.
     pub(crate) oversize: usize,
-    accepted: bool,
-    first_rejection: Option<String>,
+    /// Whether any partition batch was accepted, on any attempt.
+    pub(crate) accepted: bool,
+    /// The broker's answer to the first partition batch it rejected.
+    pub(crate) first_rejection: Option<String>,
 }
 
 /// What a partition batch settled as on one attempt.
@@ -241,15 +246,11 @@ pub(crate) struct Settled {
     pub(crate) why: String,
 }
 
-/// One attempt's result: the send's verdict, and each settlement it reached, for the sink to
-/// count.
+/// One topic's attempt: each settlement it reached, and the error that stopped it before any
+/// partition batch was sent, when one did (identity or metadata).
 #[derive(Debug)]
-pub(crate) struct Attempt {
-    /// `Ok` once no partition batch is unsettled and one was accepted, on this attempt or an
-    /// earlier one. Otherwise the strongest unsettled class (`Refused`, `Ambiguous`, `Clean`),
-    /// or, with every partition batch settled and none accepted, the first rejection as
-    /// `Rejected`.
-    pub(crate) result: anyhow::Result<()>,
+pub(crate) struct Sent {
+    pub(crate) error: Option<anyhow::Error>,
     pub(crate) settled: Vec<Settled>,
 }
 
@@ -350,41 +351,41 @@ impl Producer {
 
     /// Partitions `records` and cuts each partition's share into partition batches whose size
     /// estimate stays under `max_request_bytes`. A record whose own estimate is over it is
-    /// dropped and counted in [`Pending::oversize`]. Fails, with nothing partitioned, when
-    /// metadata can't be had (`Clean`), the topic is refused (`Refused`), or unkeyed records have
-    /// no led partition to go to (`Clean`).
+    /// dropped and counted in [`Pending::oversize`]. Takes the records only on success: it
+    /// fails, leaving `records` as they were, when metadata can't be had (`Clean`), the topic is
+    /// refused (`Refused`), or unkeyed records have no led partition to go to (`Clean`).
     pub(crate) async fn prepare(
         &mut self,
-        records: Vec<ProducerRecord>,
+        records: &mut Vec<ProducerRecord>,
     ) -> anyhow::Result<Pending> {
         self.ensure_metadata().await?;
         let meta = self.metadata.as_ref().expect("ensure_metadata leaves metadata");
         let count = meta.leaders.len();
         let cap = self.config.max_request_bytes;
-        let mut sticky = None;
+        let fits = |record: &ProducerRecord| BATCH_OVERHEAD + record.size_upper_bound() <= cap;
+        let sticky = if records.iter().any(|r| r.key.is_none() && fits(r)) {
+            let Some(p) = partitioner::sticky_partition(&meta.led_partitions()) else {
+                self.refresh_due = true;
+                return Err(anyhow!(
+                    "no partition of Kafka topic {:?} has a leader",
+                    self.config.topic
+                ))
+                .context(Fault::Clean);
+            };
+            p
+        } else {
+            0
+        };
         let mut by_partition: BTreeMap<i32, Vec<ProducerRecord>> = BTreeMap::new();
         let mut oversize = 0;
-        for record in records {
-            if BATCH_OVERHEAD + record.size_upper_bound() > cap {
+        for record in std::mem::take(records) {
+            if !fits(&record) {
                 oversize += 1;
                 continue;
             }
             let partition = match &record.key {
                 Some(key) => partitioner::partition_for_key(key, count),
-                None => match sticky {
-                    Some(p) => p,
-                    None => {
-                        let Some(p) = partitioner::sticky_partition(&meta.led_partitions()) else {
-                            self.refresh_due = true;
-                            return Err(anyhow!(
-                                "no partition of Kafka topic {:?} has a leader",
-                                self.config.topic
-                            ))
-                            .context(Fault::Clean);
-                        };
-                        *sticky.insert(p)
-                    }
-                },
+                None => sticky,
             };
             by_partition.entry(partition).or_default().push(record);
         }
@@ -440,13 +441,18 @@ impl Producer {
     }
 
     /// Sends every unsettled partition batch of `pending` once.
-    pub(crate) async fn attempt(&mut self, pending: &mut Pending) -> Attempt {
+    pub(crate) async fn send(&mut self, pending: &mut Pending) -> Sent {
         let mut settled = Vec::new();
-        let result = match self.send_unsettled(pending, &mut settled).await {
-            Ok(()) => pending.verdict(),
-            Err(err) => Err(err),
-        };
-        Attempt { result, settled }
+        let error = self.send_unsettled(pending, &mut settled).await.err();
+        Sent { error, settled }
+    }
+
+    /// [`Producer::send`] with the verdict the facade reaches for this topic alone.
+    #[cfg(test)]
+    pub(crate) async fn attempt(&mut self, pending: &mut Pending) -> super::multi::Attempt {
+        let sent = self.send(pending).await;
+        let result = super::multi::verdict(&mut [(Some(&*pending), sent.error)]);
+        super::multi::Attempt { result, settled: sent.settled, oversize: 0 }
     }
 
     async fn send_unsettled(
@@ -920,39 +926,6 @@ impl Producer {
             }
         }
         Err(last.expect("at least one bootstrap entry"))
-    }
-}
-
-impl Pending {
-    /// The send's verdict once no request is outstanding ([`Attempt::result`]).
-    fn verdict(&self) -> anyhow::Result<()> {
-        let rank = |f: Fault| match f {
-            Fault::Refused => 3,
-            Fault::Ambiguous => 2,
-            _ => 1,
-        };
-        let unsettled: Vec<(Fault, &str)> = self
-            .parts
-            .iter()
-            .filter_map(|p| match &p.state {
-                PartState::Unsettled { fault, why } => Some((*fault, why.as_str())),
-                _ => None,
-            })
-            .collect();
-        if let Some(&(fault, why)) = unsettled.iter().max_by_key(|(f, _)| rank(*f)) {
-            return Err(anyhow!(
-                "{} of {} Kafka partition batches unsettled: {why}",
-                unsettled.len(),
-                self.parts.len()
-            ))
-            .context(fault);
-        }
-        match &self.first_rejection {
-            Some(why) if !self.accepted => {
-                Err(anyhow!("Kafka rejected the batch: {why}")).context(Fault::Rejected)
-            }
-            _ => Ok(()),
-        }
     }
 }
 

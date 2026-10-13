@@ -1,9 +1,13 @@
 //! OTLP/JSON decoding into the same generated `prost` structs the protobuf path uses, so every
-//! mapping rule in `super`'s modules holds for both encodings. It's hand-written over
+//! mapping rule in `super`'s modules holds for both encodings. The decoder is hand-written over
 //! `serde_json::Value` (ADR `otlp-json-decoding`) because `pbjson` applies proto3 JSON's
 //! bytes-as-base64 rule to trace and span ids, which OTLP writes as hex.
 //!
-//! **This module doc is the dialect table.** From the
+//! The encoder, [`write_logs`], [`write_metrics`], and [`write_traces`], writes from the same
+//! structs, as the OTel Collector's pdata marshaler does; `encode.rs`'s module doc is the table of
+//! what it writes, and where that differs from what this decoder accepts.
+//!
+//! **This module doc is the decoding dialect table.** From the
 //! [OTLP spec](https://opentelemetry.io/docs/specs/otlp/):
 //!
 //! - **Field names** are lowerCamelCase (`traceId`, `startTimeUnixNano`); the spec says
@@ -31,10 +35,12 @@
 //! `exponential_histogram_data_point`, ids as hex, feeding the same `decode_exemplar` the
 //! protobuf path does. A `summaryDataPoint` has no `exemplars` key, as in protobuf.
 
+mod encode;
 mod logs;
 mod metrics;
 mod traces;
 
+pub use encode::{write_logs, write_metrics, write_traces};
 pub(crate) use logs::logs_data;
 pub(crate) use metrics::metrics_data;
 pub(crate) use traces::traces_data;
