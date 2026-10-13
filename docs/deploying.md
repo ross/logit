@@ -655,6 +655,26 @@ A dedicated pipeline can have transforms, such as a `keep_signals` or an `aggreg
 and the [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md)'s
 "Amendment: internal drains last" section.
 
+## Alerting on loss
+
+**Alert on any nonzero `logit.*.dropped` count, grouped by its `component` and `reason`
+attributes.** Every `*.dropped` counter is loss: data that should have left `logit` and didn't.
+Its `reason` says where to look, so you don't need a list of reasons to exclude. An outcome your
+config asked for never counts as dropped: a filter, `sample`, `aggregate`, or Lua script removing
+an event counts `logit.component.events.discarded`, and a tag or field removed from a record that's
+still delivered counts `*.omitted`. The full vocabulary is in
+[internal-telemetry.md](design/internal-telemetry.md#loss-vocabulary).
+
+Two signals are back-pressure, not loss. Watch them, because a sustained value means a stage
+isn't keeping up and loss may follow:
+
+- `logit.input.batches.deferred`: an HTTP listener answered `503` and the client kept the data to
+  retry. A client with a short retry window, such as a dd-trace tracer, drops its payload once it
+  gives up, and `logit` can't count that.
+- `logit.component.retrying` (gauge, on a sink): `1` while the sink retries a failing head. A hold
+  drops nothing, so `*.dropped` doesn't move until the queue behind it overflows or shutdown
+  cuts it. Alert on this gauge staying at `1`.
+
 ## Sink delivery buffering
 
 Every sink (`influxdb_out`, `stdio_out`, `file_out`, ...) sits behind its own delivery queue,
@@ -837,8 +857,8 @@ buffering:
 - `logit.component.batches.dropped` (count, tagged `reason`): `overflow_oldest`/`overflow_newest`
   (a `drop_*` policy dropped something), `rejected` (the destination refused the batch for its own
   content), `ambiguous_at_most_once` (a send of unknown outcome under `at_most_once`), or
-  `shutdown` (the queue, or batches still waiting to enter it, held data when the sink stopped). Any sustained nonzero rate is data
-  loss worth alerting on. The `reason` says whether the cause is an overflowing queue, a failing
+  `shutdown` (the queue, or batches still waiting to enter it, held data when the sink stopped). Any nonzero count is data loss
+  worth alerting on ([Alerting on loss](#alerting-on-loss)). The `reason` says whether the cause is an overflowing queue, a failing
   destination, or a slow drain racing shutdown.
 - `logit.component.retrying` (gauge): `1` while a sink holds a failing head. A hold drops nothing,
   so it never shows in `batches.dropped`.
@@ -1118,8 +1138,9 @@ For a UDP listener:
 - `logit.component.datagrams.dropped` / `.bytes.dropped` (count, tagged `reason`:
   `overflow_oldest`/`overflow_newest`): every datagram this listener chose to drop. This is the drop
   you can size your way out of, by raising `receive.max_datagrams`/`max_bytes` or speeding up
-  what's downstream. A sustained nonzero rate means the listener is overloaded relative to how fast
-  downstream decodes and consumes; size `receive:` or the downstream chain against it.
+  what's downstream. Any nonzero count is loss; a sustained rate means the listener is overloaded
+  relative to how fast downstream decodes and consumes, so size `receive:` or the downstream chain
+  against it.
 
   The same counter's `reason="truncated"` (Linux only) is a datagram longer than the 65,507-byte
   read slot, which the kernel cut short, so the listener drops it rather than decode a partial
@@ -1129,8 +1150,8 @@ For a UDP listener:
 - `logit.input.kernel.dropped{reason="socket"}` (count, Linux only): datagrams the *kernel* discarded before
   `recv_from` could return them, read from the listening socket itself. It is the same number
   `/proc/net/udp`'s `drops` column shows for this socket. It is a separate loss from the queue
-  counter above; the two add up. Any sustained nonzero rate means datagrams arrive faster than this
-  process takes them off the socket.
+  counter above; the two add up. Any nonzero count is loss; a sustained rate means datagrams arrive
+  faster than this process takes them off the socket.
 - `logit.input.receive_buffer.utilization` (gauge), with
   `logit.input.receive_buffer.used.bytes` / `.bytes` behind it: how full the kernel's socket buffer
   is, sampled once a second. It is the leading indicator for `kernel.dropped`: the kernel drops at

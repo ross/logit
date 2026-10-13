@@ -53,6 +53,13 @@ exists or a contract other `logit` processes depend on:
   `Rejected` loses data and reading a bad batch as `Refused` wedges the sink. A sink's own
   transport timeout is the only bound on an attempt, so every write and acknowledgment wait a sink
   makes must have one.
+- **Any nonzero `*.dropped` is loss someone should look into**, and it's always tagged `reason`.
+  An outcome the config asked for never uses the word: it's `events.discarded`, `*.omitted`,
+  `*.skipped`, `*.evicted`, or `input.batches.deferred`. A loss reported only by a diagnostic gets
+  a `*.dropped` counter beside it. Operators and the soak harness alert on the name alone, with no
+  list of reasons to exclude
+  ([ADR `telemetry-loss-vocabulary`](docs/adr/telemetry-loss-vocabulary.md),
+  [internal-telemetry.md](docs/design/internal-telemetry.md)'s "Loss vocabulary").
 
 The lossless-relay, Lua-VM, mergeable-sketch, and memory-pin rules are in
 [Design constraints that aren't optional](#design-constraints-that-arent-optional).
