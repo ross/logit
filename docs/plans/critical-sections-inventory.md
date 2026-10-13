@@ -3728,11 +3728,13 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 - **What it does:** Per incoming batch: one child context, one `"process"` span, then a four-pass partition
   (route-borrowing → count → `reserve_exact` per used destination → move) into node-owned scratch buffers that
   `std::mem::take` leaves capacity-0 for the next batch. Sends one batch per non-empty destination under the
-  *same* context. Slot 0 is the router's own outbound edge; an empty slot-0 destination counts
-  `events.dropped{reason="unrouted"}` explicitly, because `Fanout::deliver` returns early and counts nothing.
+  *same* context. Slot 0 is the router's own outbound edge. `Fanout::deliver` returns early and counts nothing on
+  zero consumers, so graph rule 50 (a router needs an ordinary consumer) is what keeps slot 0 from being a
+  silent sink; the `debug_assert!`s in `run_router` and `send_lua_partitions` pin it in debug builds.
 - **Why sensitive:** hot-path (per event); custom (the four-pass partition and the exact allocation contract:
-  `1 + used destinations` per batch, zero per event); accounting (the `unrouted` counter is the *only* thing
-  making unrouted events visible); data-loss (an out-of-range slot falls back to unrouted in release).
+  `1 + used destinations` per batch, zero per event); accounting (unrouted events have no counter of their own;
+  they're visible only as slot 0's consumer's `events.received`, so a slot 0 with no consumer would lose them
+  uncounted); data-loss (an out-of-range slot falls back to slot 0 in release).
 - **Invariants to verify:**
   - The partition is total: every event in appears in exactly one destination out (no `Destination::Drop`).
   - `scratch.dests` entries are always left empty on return (the final `mem::take` loop in `route_batch`), so a stale event can never leak into
@@ -3742,15 +3744,17 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   - The out-of-range guard in pass 1 (the `Destination::To(n) if ..` arm) is `usize::from(n) + 1 >= slots` (`>=`, not `>`) — verify the boundary.
   - `counts.resize(slots, 0)` after `clear()` re-zeroes every slot each batch.
   - One incoming batch = exactly one span and one context, however many destinations it forks into.
-  - `Fanout::deliver`'s zero-consumer early return is compensated by the explicit `unrouted` count in
-    the `slot == 0 && destination.is_empty()` block in `run_router`, and by `send_lua_partitions`' identical
-    block.
+  - `Fanout::deliver`'s zero-consumer early return is never reached for slot 0: graph rule 50 gives every
+    router an ordinary consumer. The `debug_assert!(!destination.is_empty())` in `run_router` and
+    `send_lua_partitions` checks this in debug builds only; release compiles it out, so the graph rule is the
+    guarantee (RT-14).
 - **Observed concerns (unverified):** none spotted. The `None => continue` arm in `run_router` would silently
   discard a partition if a slot had no `Fanout`, but it is genuinely unreachable given the scratch is sized from
   `targets` itself.
 - **Existing coverage:** `a_router_partitions_a_batch_across_two_targets`,
   `unrouted_events_reach_the_routers_ordinary_consumers`,
-  `unrouted_events_are_counted_when_a_router_has_no_ordinary_consumers`,
+  `graph.rs`'s `a_router_with_targets_but_no_consumers_is_rejected` and
+  `a_router_whose_consumer_is_null_out_resolves` (rule 50),
   `one_incoming_batch_forks_into_one_span_however_many_destinations`,
   `route_batch_partitions_into_slot_order_and_leaves_its_scratch_empty_for_reuse`;
   `crates/logit-bench/tests/allocations.rs`
@@ -3925,16 +3929,17 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 
 ### RT-14 — Graph rules the runtime *assumes* (cycle detection, target arity, slot order)
 - **Location:** `crates/logit-pipeline/src/graph.rs` (`topological_order` — Kahn plus cycle recovery),
-  `target_edges`, `targets_of`, `resolve` (its rule 5 cycle check, the rule 50 router exemption inside rule 7's
-  check, and the rule 48/49 target checks).
+  `target_edges`, `targets_of`, `resolve` (its rule 5 cycle check, rule 50's router check inside rule 7's
+  consumer loop, and the rule 48/49 target checks).
   Runtime consumers: `runtime.rs` (`run_with_telemetry`'s `Role::Target` skip in the channel loop, `senders[c]` in
   the target-`Fanout` pre-pass and spawn loop, the `resolve_target_fanouts` calls in the `Router` and `Lua` arms,
   and `resolve_target_fanouts`'s `panic!`).
-- **What it does:** Validation, mostly — but three of its outputs are load-bearing at runtime: (1) **no cycles**,
+- **What it does:** Validation, mostly — but four of its outputs are load-bearing at runtime: (1) **no cycles**,
   including router→target edges, which is what stops a runtime deadlock rather than merely an ugly graph;
   (2) **rule 49** (nothing names a `target` as a source), which is what makes `senders[c]` in `runtime.rs`'s
   target-`Fanout` pre-pass and spawn loop non-panicking; (3) **`targets_of`'s order is the slot order** used identically by `Destination::To(n)`,
-  the runtime's `Vec<Fanout>`, and the Lua name→slot table.
+  the runtime's `Vec<Fanout>`, and the Lua name→slot table; (4) **rule 50** (a router has an ordinary
+  consumer), which is what keeps a router's slot 0 from dropping unrouted events uncounted (RT-10).
 - **Why sensitive:** the runtime *indexes and panics* on these guarantees; a cycle that slipped through is a
   runtime deadlock, not a validation message.
 - **Invariants to verify:**
@@ -3951,7 +3956,8 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   (`target != id`) defers a router naming itself to rule 48 for a better message — verify rule 48 actually runs
   in every path that reaches the runtime.
 - **Existing coverage:** `graph.rs`'s `tests` module (`two_node_cycle_is_rejected`, `longer_cycle_is_rejected`,
-  `a_cycle_is_reported_as_a_concrete_path`), plus the rule-by-rule suite. Governed by
+  `a_cycle_is_reported_as_a_concrete_path`, and for rule 50 `a_router_with_targets_but_no_consumers_is_rejected`
+  and `a_router_whose_consumer_is_null_out_resolves`), plus the rule-by-rule suite. Governed by
   `docs/adr/component-graph-configuration.md`, `docs/adr/target-components.md`,
   `docs/design/pipeline-graph.md`.
 - **Priority:** **P1** — validation, so a gap surfaces as a hang or panic at startup rather than as data loss,

@@ -354,7 +354,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 48. A router target that is unresolved, the router itself, or not a `target`, or a repeated `lua`
     target.
 49. A `target` with `sources`, or one no router directs to.
-50. Not a rejection: a router is exempt from rule 7.
+50. A router (`route`, or `lua`/`lua_file` with `targets:`) with no ordinary consumer. Name a
+    `null_out` as its consumer to discard the events no target claims.
 51. A `route` with no `routes:`, an empty key or value, or an empty `by:` key.
 52. An inconsistent `statsd_out` `tls:`, or one under `transport: udp`.
 53. A `0s` `idle_timeout`, or any `idle_timeout` on a UDP listener.

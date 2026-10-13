@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-10-11
+updated: 2026-10-13
 ---
 
 # Shutdown accounting and cancellation safety: every shutdown loss counted, and one table of cancellation points
@@ -624,6 +624,9 @@ own consumers. `internal`'s **pipeline** is every node reachable from it. The pi
     would otherwise print on every clean exit. It does this on exit 0 and exit 2 alike. That
     covers a mixed pipeline's residual and the final drain's own counts. Spans and captured logs
     aren't repeated, because the logs already went to stderr.
+    [2026-10-13: `unrouted` left the intended list. Graph rule 50 makes a router with no ordinary
+    consumer a config error, so the reason is no longer counted
+    ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)).]
 
 Because a dedicated pipeline exports what a listener counts while it stops, the HTTP listeners
 count each connection their shutdown close sequence ends as
