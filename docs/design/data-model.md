@@ -323,8 +323,8 @@ pub struct MetricRecord {
 
 pub enum MetricKind {
     Sum(Sum),                             // replaces Counter; MetricKind::counter(v) for delta+monotonic
-    Gauge(f64),
-    GaugeDelta(f64),   // unresolved relative adjustment; resolved into Gauge by `aggregate` only
+    Gauge(MetricValue),
+    GaugeDelta(MetricValue),  // unresolved relative adjustment; resolved into Gauge by `aggregate` only
     Samples(Samples),                     // raw observations -- statsd_in's ms/h/d decode straight to this
     Distribution(DdSketch),               // produced only by `aggregate`, merging a run of Samples
     SetMembers(Vec<bytes::Bytes>),        // raw set members -- statsd_in's s decodes straight to this
@@ -335,7 +335,12 @@ pub enum MetricKind {
     Summary(Summary),                     // pre-computed quantiles
 }
 
-pub struct Sum { pub value: f64, pub temporality: Temporality, pub monotonic: bool }
+// Typed as the wire typed it; a decoder with an untyped wire produces F64. PartialEq is
+// strict: F64(1.0) != I64(1). `checked_add` widens a mixed or overflowing sum
+// (docs/adr/typed-metric-scalar.md).
+pub enum MetricValue { F64(f64), I64(i64), U64(u64), Bool(bool) }
+
+pub struct Sum { pub value: MetricValue, pub temporality: Temporality, pub monotonic: bool }
 
 pub struct Samples { pub values: SmallVec<[f64; SAMPLES_INLINE]>, pub sample_rate: f64 }
 

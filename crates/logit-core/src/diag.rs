@@ -163,7 +163,7 @@ impl Diagnostics {
 mod tests {
     use super::*;
     use crate::telemetry::Registry;
-    use crate::MetricKind;
+    use crate::{MetricKind, MetricValue};
     use tracing_subscriber::layer::SubscriberExt;
 
     /// A `tracing` layer recording each event's level, `component`/`key` fields, and message.
@@ -246,7 +246,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].attributes.get("key").and_then(|v| v.as_str()), Some("parse_failure"));
         match &events[0].metrics[0].kind {
-            MetricKind::Sum(s) => assert_eq!(s.value, 10.0),
+            MetricKind::Sum(s) => assert_eq!(s.value, MetricValue::F64(10.0)),
             other => panic!("expected Sum, got {other:?}"),
         }
     }
@@ -329,7 +329,7 @@ mod tests {
             .filter(|e| e.attributes.get("key").and_then(|v| v.as_str()) == Some(key))
             .flat_map(|e| e.metrics.iter())
             .map(|m| match &m.kind {
-                MetricKind::Sum(s) => s.value,
+                MetricKind::Sum(s) => s.value.as_f64(),
                 other => panic!("expected Sum, got {other:?}"),
             })
             .sum()

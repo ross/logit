@@ -77,6 +77,8 @@ with the constituent parts:
 | `AttrMap` | 392 | 8 × 48 inline, + 8 of smallvec overhead (`union` feature, below) |
 | `DdSketch` | 128 | the hand-rolled sketch (`crates/logit-core/src/sketch.rs`, [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)) inlined directly (no `Box`): a `Mapping` (40), two bin `Vec`s (48), five `f64` summary fields (40), the exact-stats flag; it was 176 as a wrapped `sketches_ddsketch::DDSketch` |
 | `Samples` | 168 | `SmallVec<[f64; SAMPLES_INLINE]>` (`SAMPLES_INLINE = 19`) + `sample_rate: f64` -- sized when it had to sit just under the 176-byte `DdSketch`; now the largest variant, see `MetricKind` below |
+| `MetricValue` | 16 | an 8-byte `f64`/`i64`/`u64`/`bool` payload plus a discriminant padded to 8 ([ADR `typed-metric-scalar`](../adr/typed-metric-scalar.md)) |
+| `Sum` | 24 | `value: MetricValue` (16) + `temporality` (1) + `monotonic` (1), padded to 8 |
 | `MetricKind` | 176 | sized by its largest variant, `Samples` at 168, plus a real discriminant -- every other variant (`Distribution`'s 128-byte `DdSketch` included, and `Sum`/`Gauge`/`GaugeDelta`/`SetMembers`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary`) is smaller and pays the same 176 regardless. Shrinking `Samples` to 19 → 13 inline values would take it to 128 and `MetricKind` to 136; that's a sizing decision for the perf VM ([ADR `event-sizing-and-allocation-strategy`](../adr/event-sizing-and-allocation-strategy.md)), not a free change |
 | `MetricRecord` | 224 | `MetricKind` (176) + `name`/`unit`/`description` (4 each, one padded) + `start_timestamp: i64` (8) + `exemplars: Vec<Exemplar>` (24) + `flags: u32` (4, fills former padding) |
 | `MetricList` | 232 | 1 × 224 inline + 8 |
@@ -102,7 +104,7 @@ unconditionally. That is the price of "an event is whatever it carries"
 
 **`MetricKind::Distribution` sets the size of every metric.** A `Sum(Sum { value, temporality,
 monotonic })` ([ADR `metrics-model-v2`](../adr/metrics-model-v2.md)'s replacement for the old
-`Counter(f64)`) needs a fraction of that and still pays 176, because `DDSketch` (two `Store`s and a
+`Counter(f64)`) needs 24 bytes of that and still pays 176, because `DDSketch` (two `Store`s and a
 `Config`) is inlined into the enum. That is deliberate, per
 [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md):
 boxing it would save 144 bytes here but cost an allocation on every distribution metric
