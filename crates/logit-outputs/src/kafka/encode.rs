@@ -17,8 +17,9 @@
 //!
 //! `format: text` skips an event with no log record and counts it in
 //! [`EncodeStats::no_log`]. An event whose body it writes leaves its metrics and span behind,
-//! counted in [`EncodeStats::metrics_omitted`] and [`EncodeStats::spans_omitted`]; an event
-//! dropped as `oversize` under `record: batch` counts only there. A text body that contains `\n`
+//! counted in [`EncodeStats::metrics_omitted`] and [`EncodeStats::spans_omitted`] at encode, so
+//! a record the producer later drops as oversize, or the broker rejects or names, has still
+//! counted them. An event dropped as `oversize` under `record: batch` counts only there. A text body that contains `\n`
 //! can't be told from two bodies in a batch record.
 //!
 //! Under `record: batch`, events go into a record in batch order until the next would push its

@@ -209,12 +209,14 @@ Two entries leave [Loss with no counter](#loss-with-no-counter), which keeps onl
 | `docker_in`'s decoder: a held reassembly discarded at an in-place truncation | `input.frames.dropped{reason="truncated"}`, one per stream that held one |
 
 - **`kafka_out`'s piece is `omitted`, not `skipped`.** The list placed it under `*.skipped`, but
-  the record is still delivered with the log body, and a piece removed from a delivered record is
-  what `*.omitted` means. The `format` reason says the operator chose it. A metrics-only event
+  the encoder writes a record with the log body, and a piece removed from a record that's
+  otherwise sent is what `*.omitted` means. The `format` reason says the operator chose it. A metrics-only event
   still counts `output.events.skipped{reason="no_log"}` and nothing more, because no record is
   written for it. Both counters are encode-side, counted once per batch however many attempts
-  the sink makes. An event whose own value is over the budget under `record: batch` counts
-  `records.dropped{reason="oversize"}` instead.
+  the sink makes, so a record lost after encoding (under `record: event`, one the producer drops
+  as oversize, or one the broker rejects or names) has still counted its omitted pieces, beside
+  its `records.dropped`. An event whose own value is over the budget under `record: batch`
+  counts `records.dropped{reason="oversize"}` instead.
 - **`docker_in`'s counters reuse `tail_in`'s names.** The decoder counts a message, where the
   driver counts a line, and both are a frame the listener lost. A re-read after a restart
   re-drops an oversize message and counts it again, as `tail_in` counts a long line each time it
@@ -223,7 +225,7 @@ Two entries leave [Loss with no counter](#loss-with-no-counter), which keeps onl
 - **A truncation counts a held reassembly and the unterminated line behind it once.** The driver
   counts the line splitter's unterminated line only when the decoder holds no entry, because that
   line most often continues the held one. An unterminated line on the other stream, beside a
-  held reassembly, goes uncounted (`docs/known-gaps/tailing.md`).
+  held reassembly or a drop in progress, goes uncounted (`docs/known-gaps/tailing.md`).
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related

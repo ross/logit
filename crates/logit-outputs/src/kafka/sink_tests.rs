@@ -310,9 +310,10 @@ async fn each_drop_and_an_unkeyed_record_is_counted_by_its_reason() {
     }
 }
 
-/// An encode repeated after a failed `prepare` counts its encode-side points once.
+/// A retry after a failed metadata lookup resends the pending batch the first attempt encoded,
+/// so it encodes nothing again and its encode-side points count once.
 #[tokio::test]
-async fn a_retried_prepare_counts_encode_side_points_once() {
+async fn a_retry_resends_the_kept_encode_and_counts_encode_side_points_once() {
     let cluster = cluster(&[0]).await;
     let mut probe = TelemetryProbe::new();
     let mut out = sink(
@@ -336,20 +337,20 @@ async fn a_retried_prepare_counts_encode_side_points_once() {
     assert_eq!(sum(&sums, "logit.output.batch.bytes", &[]), first);
 }
 
-/// Under `format: text`, the metrics and span a delivered record leaves out are counted
-/// `omitted` once per batch, though a failed `prepare` repeats the encode, and an event with no
-/// log is counted `skipped` and nothing more.
+/// A second encode of a batch already encoded counts no encode-side point again, and the next
+/// batch's first encode counts them all. Calls `prepare` directly: `write_loop` keeps the
+/// encoded batch across retries, so no retry repeats the encode the gate guards.
 #[tokio::test]
-async fn text_counts_omitted_metrics_and_spans_once_across_a_retried_prepare() {
-    let cluster = cluster(&[0]).await;
+async fn a_repeated_encode_of_one_batch_counts_encode_side_points_once() {
     let mut probe = TelemetryProbe::new();
-    let mut out = sink(KafkaSettings { format: RecordFormat::Text, ..settings(&cluster) }, &probe);
-    cluster.script(Step {
-        api: kafka_protocol::messages::ApiKey::Metadata,
-        partition: None,
-        topic: None,
-        action: Action::Error(fault::code::LEADER_NOT_AVAILABLE),
-    });
+    let mut out = sink(
+        KafkaSettings {
+            format: RecordFormat::Text,
+            key: RecordKey::Attribute("absent".into()),
+            ..KafkaSettings::new(vec!["127.0.0.1:9".into()], TOPIC)
+        },
+        &probe,
+    );
     let mut mixed = event("a", "m");
     mixed.metrics.push(logit_core::MetricRecord::new(
         logit_core::interner::intern("m"),
@@ -369,12 +370,23 @@ async fn text_counts_omitted_metrics_and_spans_once_across_a_retried_prepare() {
         ext: None,
     });
     let input = batch(vec![mixed, metric_event()]);
-    let sums = run(&mut out, &mut probe, vec![input], fast_retry()).await;
-    assert_eq!(sum(&sums, "logit.output.requests", &[("class", "clean")]), 1.0, "one retry");
-    assert_eq!(cluster.state().partition(TOPIC, 0).records().len(), 1);
-    assert_eq!(sum(&sums, "logit.output.metrics.omitted", &[("reason", "format")]), 1.0);
-    assert_eq!(sum(&sums, "logit.output.spans.omitted", &[("reason", "format")]), 1.0);
-    assert_eq!(sum(&sums, "logit.output.events.skipped", &[("reason", "no_log")]), 1.0);
+    let seq = |n| SeqId { id: [0; 16], seq: n };
+    let points = [
+        ("logit.output.batch.bytes", &[][..], 1.0), // the one body, `m`
+        ("logit.output.records.unkeyed", &[][..], 1.0),
+        ("logit.output.metrics.omitted", &[("reason", "format")][..], 1.0),
+        ("logit.output.spans.omitted", &[("reason", "format")][..], 1.0),
+        ("logit.output.events.skipped", &[("reason", "no_log")][..], 1.0),
+    ];
+    for (n, batches) in [(1, 1.0), (2, 2.0)] {
+        out.observe_batch(BatchContext::default(), seq(n));
+        assert!(out.prepare(&input).is_some());
+        assert!(out.prepare(&input).is_some(), "a repeat encodes the same records");
+        let totals = probe.poll();
+        for (name, tags, per_batch) in points {
+            assert_eq!(totals.sum(name, tags), per_batch * batches, "{name} after batch {n}");
+        }
+    }
 }
 
 /// A topic the broker won't create is `Refused` once a refresh confirms it, which holds the

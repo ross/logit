@@ -466,7 +466,7 @@ config asked for never uses the word:
 |---|---|---|
 | `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
 | `logit.component.events.discarded` | A filter, `sample`, `aggregate`, or Lua script removed an event because the config asked it to. | None. |
-| `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, or sample value) removed from a record that's still delivered. | `reason` where more than one cause exists. |
+| `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, sample value, or a metric record or span beside a log body) removed from a record that's still delivered. | `reason` where more than one cause exists. |
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
 | `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. | `reason`, `metric_kind`, or `field`. |
 | `*.evicted`, `*.untracked` | An entry left a bounded bookkeeping table. No data was lost. | `reason` where more than one cause exists. |
@@ -2165,7 +2165,7 @@ spans, or metrics it holds.
 | `logit.output.records.dropped{reason="ambiguous_at_most_once"}` | count | records left unsettled when `at_most_once` drops a batch after an `Ambiguous` attempt, or drops an `Ambiguous` partition batch before retrying a `Refused` one |
 | `logit.output.records.unkeyed` | count | records sent without a key because the configured `key:` had no value on their event, or under `format: otlp_proto` or `otlp_json` on their request's events or resource, once per batch |
 | `logit.output.events.skipped{reason="no_log"}` | count | events `format: text` skipped for having no log record, once per batch |
-| `logit.output.metrics.omitted{reason="format"}`, `logit.output.spans.omitted{reason="format"}` | count | under `format: text`, the metric records and spans left out of a record that carries their event's log body, one per metric record and one per span, once per batch |
+| `logit.output.metrics.omitted{reason="format"}`, `logit.output.spans.omitted{reason="format"}` | count | under `format: text`, the metric records and spans left out of a record that carries their event's log body, one per metric record and one per span, once per batch; counted at encode, so a record later dropped (`oversize`, `rejected`, or named by the broker) has still counted them |
 | `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, `logit.output.metrics.degraded{metric_kind}` | count | under `format: otlp_proto` or `otlp_json`, metrics the OTLP codec skips, drops, or degrades, as `otlp_out` counts them, once per batch |
 
 `Diagnostics` keys, each throttled: `oversize`, naming the record count and the

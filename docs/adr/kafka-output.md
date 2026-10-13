@@ -585,8 +585,11 @@ logged that `ERROR` before the change and nothing after it.
 Item 6 of "Amendment: what W3 settled" counts an event with no log record. An event that carries
 a log and also metrics or a span now counts what its record leaves out: one
 `logit.output.metrics.omitted{reason="format"}` per metric record and one
-`logit.output.spans.omitted{reason="format"}` per span, encode-side, once per batch. The record
-is delivered, so the name is `omitted`, not `skipped`
+`logit.output.spans.omitted{reason="format"}` per span, encode-side, once per batch. The pieces
+leave a record that's otherwise sent, so the name is `omitted`, not `skipped`
 ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s amendment of the same date).
+Being encode-side, the counts stand when the record is lost later: under `record: event`, a
+record the producer drops as oversize, or one the broker rejects or names, has still counted its
+omitted pieces beside its `records.dropped`.
 `record: batch` counts the same, except for an event over the budget alone, which is counted
 `records.dropped{reason="oversize"}` and nothing more.

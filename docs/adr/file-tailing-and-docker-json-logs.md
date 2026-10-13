@@ -620,4 +620,4 @@ fragments the drop then discards count nothing more. `reset` counts one
 nothing for a stream mid-drop. At a truncation the driver counts the line splitter's unterminated
 line only when the decoder holds no entry, so a held reassembly and the unterminated line that
 continues it count once. The cost is that an unterminated line on the other stream, beside a held
-reassembly, goes uncounted (`docs/known-gaps/tailing.md`).
+reassembly or a drop in progress, goes uncounted (`docs/known-gaps/tailing.md`).
