@@ -1356,7 +1356,8 @@ fn metric_value_field(t: &Table, path: &str) -> mlua::Result<MetricValue> {
         "u64" => {
             let reject = |got: String| {
                 runtime_error(format!(
-                    "Event.new: {} must be a non-negative integer up to 2^53 or a decimal string                      that fits a u64, got {got}",
+                    "Event.new: {} must be a non-negative integer up to 2^53 or a decimal string \
+                     that fits a u64, got {got}",
                     field()
                 ))
             };
@@ -2404,7 +2405,13 @@ mod tests {
         );
         // A double above 2^53 can't say which integer it was; the decimal string can.
         let err = metric_err(r#"name = "m", kind = "gauge", value = 2^53 + 2, type = "u64""#);
-        assert!(err.contains("got 9007199254740994"), "got: {err}");
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].value must be a non-negative integer up to 2^53 or a \
+                 decimal string that fits a u64, got 9007199254740994"
+            ),
+            "got: {err}"
+        );
         let err = metric_err(r#"name = "m", kind = "gauge", value = -(2^53) - 2, type = "i64""#);
         assert!(err.contains("got -9007199254740994"), "got: {err}");
         let err = metric_err(

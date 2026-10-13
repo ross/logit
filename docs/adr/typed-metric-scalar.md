@@ -156,3 +156,11 @@ replay into a newer one. `docs/design/wire-protocol.md` and the bake-off's wire 
   [ADR `stream-json-format`](stream-json-format.md). `docs/design/internal-telemetry.md` gains the
   `widened`, `inexact_read`, and `bool_value` reasons, and `docs/design/lua-api.md` the `type` key.
 - [`docs/plans/influxdb-relay.md`](../plans/influxdb-relay.md)'s `influx/w1` builds this.
+
+## Amendment: Datadog APM stats counts are a typed wire (2026-10-13)
+
+The Decision's decoder list names OTLP, collectd, and InfluxDB as the typed wires. Datadog's APM
+`StatsPayload` is a fourth: its `hits`, `errors`, `topLevelHits`, and `duration` are `uint64` on
+the wire, so `datadog_in` decodes each as a `Sum` of `U64` and `datadog_out` writes it back as is.
+The `logit.input.stats.degraded{reason="inexact_count"}` degradation that rounded a count above
+2^53 is gone with it. Every other decoder still produces `F64`.
