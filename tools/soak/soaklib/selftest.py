@@ -3805,6 +3805,20 @@ def _external_checks():
         expect(row.status == checks.FAIL and "status 400" in row.detail
                and "dropped rejected" in row.detail and "answered 400 Bad Request" in row.detail,
                f"a rejected batch FAILs with the status and the sink's text, got {row}")
+        expect(rejected["drops"].status == checks.PASS,
+               f"drops leaves a sink's rejected batch to ledger.sent's FAIL, got "
+               f"{rejected['drops']}")
+        corrupt_at = _stamp(T0 + 250)
+        corrupt = results("external-disk-corrupt", sut_extra=_datadog_lines() + [
+            _line(corrupt_at, "logit.component.batches.dropped", "sum", 1, component="sink",
+                  attrs={"reason": "disk_corrupt"}),
+            _line(corrupt_at, "logit.component.events.dropped", "sum", 40, component="sink",
+                  attrs={"reason": "disk_corrupt"})])
+        expect(corrupt["drops"].status == checks.FAIL
+               and corrupt["drops"].lines == [
+                   "sink: logit.component.batches.dropped{reason=\"disk_corrupt\"} 1"],
+               f"on an external target, where no ledger row FAILs it, drops FAILs a "
+               f"disk_corrupt batch once, not again for its events, got {corrupt['drops']}")
         for name, kwargs, needle in (
                 ("external-rejected-records", dict(batch=False), "100 record(s) dropped rejected"),
                 ("external-rejected-batch", dict(records=False), "1 batch(es) dropped rejected")):

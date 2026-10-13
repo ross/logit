@@ -2903,8 +2903,13 @@ def _balanced_drop(led, name, component, reason, batch_drops):
     # Every node's `batches.dropped` is judged by `ledger.egress`, `ledger.summary`, and
     # `identity.sink` (a torn tail included), and a node's `events.dropped` beside a batch drop
     # of the same reason counts the same loss. `bytes.dropped` counts `datagrams.dropped`'s
-    # datagrams again.
-    if name in ("logit.component.batches.dropped", "logit.component.bytes.dropped"):
+    # datagrams again. On an external target `ledger.egress` SKIPs and `ledger.summary` reads no
+    # fault drop, so a `FAULT_DROP_REASONS` batch drop stays here, unless `ledger.sent` already
+    # FAILs it at a sink.
+    if name == "logit.component.batches.dropped":
+        return not (not led.data.has_vm and reason in FAULT_DROP_REASONS
+                    and not (component in led.sinks and reason in REJECTED_BATCH_REASONS))
+    if name == "logit.component.bytes.dropped":
         return True
     if name == "logit.component.events.dropped" and (component, reason) in batch_drops:
         return True

@@ -911,7 +911,8 @@ The rows:
   batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B terms, and the
   script's L_err) and, on an external or Kafka target, the sink's `records.dropped` and
   `metrics.dropped`, which `ledger.sent` judges. A `rejected` or `disk_corrupt` reason FAILs;
-  any other WARNs.
+  any other WARNs. On those targets `ledger.egress` SKIPs, so a `disk_corrupt` batch drop, or a
+  `rejected` one anywhere but a sink (whose `ledger.sent` FAILs it), stays in this row.
 - `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
   window around one step, or over the whole run (W8c); see "The scenario schema".
 
