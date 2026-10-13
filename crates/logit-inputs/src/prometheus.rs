@@ -140,7 +140,7 @@
 //! **The `-Written` headers.** A 2.0 request's response carries
 //! `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written`, on `4xx` as well as `2xx`
 //! as 2.0 requires, reporting what this receiver stored: zeros on a rejection, and always `0`
-//! histograms, since native histograms are skipped and counted rather than stored
+//! histograms, since native histograms are dropped and counted rather than stored
 //! (`docs/known-gaps/prometheus.md`). A 1.0 request gets none: 1.0 defines none.
 //!
 //! *Samples-written is measured on the way out, not on the way in.* The codec's accepted count is
@@ -325,7 +325,7 @@
 //! request also reports `Diagnostics::warn_throttled("write_rejected", ..)` with the peer address
 //! in the message text only, never a tag (a peer address isn't `&'static` and isn't safe to intern
 //! per peer, `logit_core::telemetry::Tag`'s convention). The decoder's own
-//! `logit.input.metrics.skipped{reason}` counts what it stepped over, native histograms included.
+//! `logit.input.metrics.dropped{reason}` counts what it stepped over, native histograms included.
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, drive_connection, Activity, BodyReadError,
@@ -1822,7 +1822,7 @@ fn header_str(headers: &HeaderMap, name: http::header::HeaderName) -> &str {
 
 /// `204 No Content`, plus 2.0's `-Written` report of what this receiver stored: `samples` is the
 /// wire samples of the series that reached the fanout, never the assembler's accepted total.
-/// Native histograms are skipped, so the histogram count is always `0`.
+/// Native histograms are dropped, so the histogram count is always `0`.
 fn no_content(
     version: Option<remote_write::Version>,
     samples: u64,
@@ -2697,7 +2697,7 @@ mod tests {
             lowered.contains(&format!("{}: 1", remote_write::HEADER_SAMPLES_WRITTEN)),
             "got: {response}"
         );
-        // Always 0: native histograms are skipped and counted, never stored.
+        // Always 0: native histograms are dropped and counted, never stored.
         assert!(
             lowered.contains(&format!("{}: 0", remote_write::HEADER_HISTOGRAMS_WRITTEN)),
             "got: {response}"
@@ -3232,9 +3232,9 @@ mod tests {
             Some(0.0),
             "and the counter agrees with the header"
         );
-        // The decoder's skip counter is where the loss is visible.
+        // The decoder's drop counter is where the loss is visible.
         assert_eq!(
-            counter_in(&events, "logit.input.metrics.skipped", ("reason", "non_monotonic_buckets")),
+            counter_in(&events, "logit.input.metrics.dropped", ("reason", "non_monotonic_buckets")),
             Some(1.0)
         );
     }

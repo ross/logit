@@ -1,6 +1,6 @@
 ---
 created: 2026-09-21
-updated: 2026-09-21
+updated: 2026-10-13
 ---
 
 # `flatten`: dotted-key expansion as an opt-in, operator-placed transform
@@ -194,3 +194,16 @@ both of which carry nesting losslessly — flattening them would be pure loss fo
   going forward, not a repair of the existing diagnosability gap — giving `influxdb_out` the
   `logit.output.tags.dropped{reason="unrepresentable"}` counter its four sibling sinks already have
   is tracked as separate follow-up work, not part of this transform.
+
+## Amendment (2026-10-13): `tags.omitted`
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `statsd_out`, `graphite_out`, and `collectd_out` count a nested attribute they
+leave off a delivered record as `logit.output.tags.omitted`, with the same reasons this record
+cites under `tags.dropped`.
+
+## Amendment (2026-10-13): `prometheus_out` omits a label
+
+The sink table's `prometheus_out` row is now
+`logit.output.labels.omitted{reason="unrepresentable"}`: the series is still exposed without the
+label, so the count isn't loss under
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md).

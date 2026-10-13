@@ -120,7 +120,7 @@
 //! assembler at the far end.
 //!
 //! The encoder runs `with_timestamps_always(true)`, since the wire can't omit a timestamp and a
-//! series without one would be skipped, and `with_stale_markers(true)`, so a record flagged
+//! series without one would be dropped, and `with_stale_markers(true)`, so a record flagged
 //! `FLAG_NO_RECORDED_VALUE` is written as Prometheus's stale marker (a NaN with bit pattern
 //! `0x7ff0000000000002`) instead of skipped. That covers `Gauge`, `Sum`, and marker-untyped
 //! records only: a flagged `Histogram`/`Summary`/sketch expands to several series and one flag
@@ -186,7 +186,7 @@
 //!
 //! **Delivery posture.** Both modes keep the default, `at_least_once`
 //! (`docs/adr/delivery-semantics.md`, item 5), which retries an `Ambiguous` attempt such as a
-//! 5xx. This sink skips a delta outright ("Telemetry" below), so nothing it sends adds at a
+//! 5xx. This sink drops a delta outright ("Telemetry" below), so nothing it sends adds at a
 //! receiver: a sample's identity there is `(label set, timestamp)`, and a retry re-encodes the
 //! same events, so a resend overwrites. In registry mode `send` replaces in-memory state, so a
 //! resend changes nothing. `buffer.delivery: at_most_once` would turn every 5xx into a dropped
@@ -218,22 +218,22 @@
 //! | `logit.output.samples` | samples in the request body, counted by the codec ([`remote_write::encode_counted`]) rather than guessed from family counts: one `Series` is one sample for a gauge and several for a histogram. Mirrors `prometheus_in`'s `logit.input.samples`, so the two ends of a relay compare |
 //!
 //! Both modes also get everything the codec counts on the sink's [`PrometheusEncoder`]:
-//! `logit.output.metrics.{skipped,degraded}`, `logit.output.labels.dropped`, and
+//! `logit.output.metrics.{dropped,skipped,degraded}`, `logit.output.labels.omitted`, and
 //! `logit.output.labels.normalized{reason="multi_value"}`. That last one is a `Value::Array`
 //! attribute (a repeated DogStatsD tag key relayed from `statsd_in`) collapsed to its last
 //! representable element, since a Prometheus label set has no multi-value label. Unlike the other
 //! `*.normalized` reasons in `docs/design/internal-telemetry.md`, it's **lossy**: the non-last
-//! elements are discarded. It's `normalized` rather than `dropped` because the label survives.
+//! elements are discarded. It's `normalized` rather than `omitted` because the label survives.
 //!
-//! A delta `Sum` is the common skip in either mode: counted
-//! `logit.output.metrics.skipped{metric_kind="delta_sum"}`, with a throttled
+//! A delta `Sum` is the common drop in either mode: counted
+//! `logit.output.metrics.dropped{reason="unresolved_delta"}`, with a throttled
 //! `delta_temporality_unresolved` diagnostic naming the fix, an `aggregate` with
 //! `temporality: cumulative` in front of the sink. This sink never accumulates a delta itself;
 //! remote-write carries cumulative series too, so it has no spelling for one either.
 //!
 //! **Registry mode counts both directions on one encoder.** `send` and a render share a single
 //! [`PrometheusEncoder`], so `send`'s drops and a render's
-//! `degraded{reason="exemplar_dropped"|"unit_not_suffix"}` from [`text::write_with`] add up as one
+//! `degraded{reason="exemplar_omitted"|"unit_not_suffix"}` from [`text::write_with`] add up as one
 //! component's totals. The lock order that implies (encoder before registry) is on
 //! [`ExposeOutput::encoder`]. Sender mode has one direction and `&mut self`, so its encoder is a
 //! plain field, counting once per batch however many attempts it takes (`crate::accounting`);
@@ -272,7 +272,7 @@ use logit_pipeline::listen::BindOptions;
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::prometheus::compression::{self, Encoding};
 use logit_proto::prometheus::{
-    events_to_families, remote_write, text, Dialect, FamilyType, MetricFamily, Point,
+    events_to_families, remote_write, text, Destination, Dialect, FamilyType, MetricFamily, Point,
     PrometheusEncoder, Series,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -506,9 +506,9 @@ impl Registry {
     }
 
     /// Renders through [`text::write_with`], not [`text::write`], so the writer's drops
-    /// (`degraded{reason="exemplar_dropped"|"unit_not_suffix"}`, and
-    /// `skipped{reason="name_collision"}` for two families with one `# TYPE` name) count on the
-    /// encoder `send` uses. Post-sanitization family-name collisions are that encoder's to skip and
+    /// (`degraded{reason="exemplar_omitted"|"unit_not_suffix"}`, and
+    /// `dropped{reason="name_collision"}` for two families with one `# TYPE` name) count on the
+    /// encoder `send` uses. Post-sanitization family-name collisions are that encoder's to drop and
     /// count too.
     fn render(&self, dialect: Dialect, encoder: &mut PrometheusEncoder) -> Vec<u8> {
         let mut out = Vec::new();
@@ -997,7 +997,8 @@ impl RemoteWriteOutput {
 
 /// The sender's encoder, built in one place so `new` and the builders can't drift (module doc's
 /// "The wire"): `with_timestamps_always` because the wire can't omit a timestamp,
-/// `with_stale_markers` because remote-write, unlike an exposition, can say "this series is gone".
+/// `with_stale_markers` because remote-write, unlike an exposition, can say "this series is gone",
+/// and `with_destination` because an exponential histogram is a drop here, not a format skip.
 /// Its handles are views gated by `gate`, so a retried batch counts its codec's drops once
 /// (`crate::accounting`).
 fn new_sender_encoder(
@@ -1006,6 +1007,7 @@ fn new_sender_encoder(
     gate: &logit_core::CountGate,
 ) -> PrometheusEncoder {
     PrometheusEncoder::new()
+        .with_destination(Destination::RemoteWrite)
         .with_stale_markers(true)
         .with_timestamps_always(true)
         .with_telemetry(telemetry.gated(gate))
@@ -1333,8 +1335,8 @@ fn text_response(status: StatusCode, body: &'static str) -> http::Response<Full<
 mod tests {
     use super::*;
     use logit_core::{
-        interner::intern, AttrMap, Event, Histogram, MetricKind, MetricRecord, Resource, Sum,
-        Summary, Temporality, Value,
+        interner::intern, AttrMap, Event, ExpHistogram, Histogram, MetricKind, MetricRecord,
+        Resource, Sum, Summary, Temporality, Value,
     };
     use logit_pipeline::Fault;
     use logit_proto::prometheus::{ATTR_TIMESTAMP, ATTR_TYPE, LABEL_INSTANCE};
@@ -1819,9 +1821,9 @@ mod tests {
         assert_eq!(counter(&registry, TYPE_CONFLICT, "component", "out"), 1.0);
     }
 
-    /// The sink's encoder is wired to the component's `Telemetry`, so codec skips are counted.
+    /// The sink's encoder is wired to the component's `Telemetry`, so codec drops are counted.
     #[tokio::test]
-    async fn a_delta_sum_is_skipped_and_counted_through_the_sinks_own_telemetry() {
+    async fn a_delta_sum_is_dropped_and_counted_through_the_sinks_own_telemetry() {
         let registry = logit_core::Registry::new();
         let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_expire_after(Duration::ZERO)
@@ -1832,7 +1834,7 @@ mod tests {
             &[],
         )]))
         .await
-        .expect("a skipped record is not a send failure");
+        .expect("a dropped record is not a send failure");
 
         let (_sink, url) = bound(sink).await;
         assert_eq!(
@@ -1841,7 +1843,7 @@ mod tests {
             "a delta Sum never reaches the exposition"
         );
         assert_eq!(
-            counter(&registry, "logit.output.metrics.skipped", "metric_kind", "delta_sum"),
+            counter(&registry, "logit.output.metrics.dropped", "reason", "unresolved_delta"),
             1.0
         );
     }
@@ -1871,7 +1873,7 @@ mod tests {
             "exactly one exemplar reaches the wire: {body}"
         );
         assert_eq!(
-            counter(&registry, "logit.output.metrics.degraded", "reason", "exemplar_dropped"),
+            counter(&registry, "logit.output.metrics.degraded", "reason", "exemplar_omitted"),
             1.0,
             "the one that had no line to sit on is counted"
         );
@@ -2460,9 +2462,9 @@ mod tests {
         );
     }
 
-    /// A delta `Sum` is skipped and counted in sender mode too, with the same named fix.
+    /// A delta `Sum` is dropped and counted in sender mode too, with the same named fix.
     #[tokio::test]
-    async fn a_delta_sum_is_skipped_and_counted_with_no_request_left_to_send() {
+    async fn a_delta_sum_is_dropped_and_counted_with_no_request_left_to_send() {
         let (url, seen) = canned_receiver(StatusCode::OK, "").await;
         let registry = logit_core::Registry::new();
         let mut sink =
@@ -2480,11 +2482,51 @@ mod tests {
             ),
         )]))
         .await
-        .expect("a skipped record is not a failure");
+        .expect("a dropped record is not a failure");
 
         assert_eq!(
-            counter(&registry, "logit.output.metrics.skipped", "metric_kind", "delta_sum"),
+            counter(&registry, "logit.output.metrics.dropped", "reason", "unresolved_delta"),
             1.0
+        );
+        assert!(seen.lock().unwrap().is_empty(), "nothing survived, so nothing was sent");
+    }
+
+    /// An exponential histogram is a remote-write drop, not the format skip an exposition counts:
+    /// the wire has native histograms, and this sender doesn't write them.
+    #[tokio::test]
+    async fn an_exponential_histogram_is_dropped_as_a_native_histogram() {
+        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let registry = logit_core::Registry::new();
+        let mut sink =
+            sender(&url).with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
+        let kind = MetricKind::ExponentialHistogram(ExpHistogram {
+            scale: 1,
+            zero_count: 0,
+            zero_threshold: 0.0,
+            positive: (0, vec![1]),
+            negative: (0, vec![]),
+            temporality: Temporality::Cumulative,
+            count: 1,
+            sum: None,
+            min: None,
+            max: None,
+        });
+        sink.send(&batch(vec![Event::metric(
+            1_000_000_000,
+            AttrMap::new(),
+            MetricRecord::new(intern("latency"), kind),
+        )]))
+        .await
+        .expect("a dropped record is not a failure");
+
+        let events = registry.drain(0);
+        assert_eq!(
+            tagged(&events, "logit.output.metrics.dropped", "reason", "native_histogram"),
+            1.0
+        );
+        assert_eq!(
+            tagged(&events, "logit.output.metrics.skipped", "metric_kind", "exponential_histogram"),
+            0.0
         );
         assert!(seen.lock().unwrap().is_empty(), "nothing survived, so nothing was sent");
     }
@@ -2983,7 +3025,7 @@ mod tests {
         MetricKind::Sum(Sum { value, temporality: Temporality::Delta, monotonic: true })
     }
 
-    /// A delta `Sum` the codec skips with its diagnostic, and nothing else: a batch that sends
+    /// A delta `Sum` the codec drops with its diagnostic, and nothing else: a batch that sends
     /// no request.
     fn nothing_to_send_batch() -> EventBatch {
         batch(vec![Event::metric(
@@ -3005,7 +3047,7 @@ mod tests {
     }
 
     const ENCODE_SIDE: [SumSeries<'static>; 2] = [
-        ("logit.output.metrics.skipped", &[("metric_kind", "delta_sum")]),
+        ("logit.output.metrics.dropped", &[("reason", "unresolved_delta")]),
         ("logit.component.diagnostics", &[("key", "delta_temporality_unresolved")]),
     ];
 
@@ -3229,7 +3271,7 @@ mod tests {
         }
         let events = registry.drain(0);
         assert_eq!(
-            tagged(&events, "logit.output.metrics.skipped", "metric_kind", "delta_sum"),
+            tagged(&events, "logit.output.metrics.dropped", "reason", "unresolved_delta"),
             2.0
         );
         assert_eq!(
@@ -3237,7 +3279,7 @@ mod tests {
             2.0
         );
         assert_eq!(
-            tagged(&events, "logit.output.metrics.degraded", "reason", "exemplar_dropped"),
+            tagged(&events, "logit.output.metrics.degraded", "reason", "exemplar_omitted"),
             2.0
         );
     }

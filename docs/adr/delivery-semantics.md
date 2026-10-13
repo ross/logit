@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-11
+updated: 2026-10-13
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -587,3 +587,10 @@ and it isn't an acknowledgment of delivery: it tells the sender the batch was dr
 sender drops it as `Rejected` (item 2's permitted loss). A frame no consumer took still gets
 `Reject{GOING_AWAY}` and leaves the mark alone. A rejected `Ack` lost before the sender reads it
 lets a mark resume commit the frame as delivered; `docs/known-gaps/native-hop.md` tracks that.
+
+## Amendment (2026-10-13): `prometheus_out` drops a delta
+
+`prometheus_out` counts a delta `Sum` or `Histogram` as loss,
+`logit.output.metrics.dropped{reason="unresolved_delta"}`, where the remedy list above says it
+skips one ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)). The remedy is
+unchanged: an `aggregate` with `temporality: cumulative` upstream.

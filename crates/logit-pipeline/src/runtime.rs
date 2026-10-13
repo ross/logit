@@ -1797,13 +1797,9 @@ pub fn process_batch(
     // cost (`docs/design/internal-telemetry.md`).
     transform.end_batch();
     drop(process_timer);
-    let absorbed = (before - events.len()) as u64;
-    if absorbed > 0 {
-        telemetry.count(
-            "logit.component.events.dropped",
-            absorbed as f64,
-            &[("reason", "absorbed")],
-        );
+    let discarded = (before - events.len()) as u64;
+    if discarded > 0 {
+        telemetry.count("logit.component.events.discarded", discarded as f64, &[]);
     }
     if events.is_empty() {
         None
@@ -1865,17 +1861,12 @@ async fn run_router(
                     None => continue,
                 },
             };
-            // `Fanout::deliver` returns early on zero consumers and counts nothing, so unrouted
-            // events must be counted here. A router with targets and no ordinary consumers is
-            // legal (rule 50); its forward partition is the events no route claimed.
-            if slot == 0 && destination.is_empty() {
-                telemetry.count(
-                    "logit.component.events.dropped",
-                    out.events.len() as f64,
-                    &[("reason", "unrouted")],
-                );
-                continue;
-            }
+            // `Fanout::deliver` returns early on zero consumers and counts nothing. Graph rule 50
+            // gives every router an ordinary consumer, so the forward partition always has one.
+            debug_assert!(
+                !destination.is_empty(),
+                "router destination slot {slot} has no consumer"
+            );
             destination.send_with_own_context(out, ctx).await;
         }
     }
@@ -2606,7 +2597,6 @@ fn run_lua_loop(
                     &resource,
                     &scope,
                     ctx,
-                    &telemetry,
                 );
                 span.events(sent);
             }
@@ -2737,7 +2727,7 @@ fn run_lua_loop(
         // events otherwise. A target slot grows normally: a script returns its verdict with the
         // event, so there's no count to reserve from, unlike `route_batch`.
         scratch.dests[0].reserve_exact(batch.events.len());
-        let mut dropped: u64 = 0;
+        let mut discarded: u64 = 0;
         let mut errors: u64 = 0;
         let slots = scratch.dests.len();
         for event in batch.events {
@@ -2760,7 +2750,7 @@ fn run_lua_loop(
                         scratch.dests[lua_slot_of(mark, slots)].push(event);
                     }
                 }
-                Ok(ProcessOutcome::Drop) => dropped += 1,
+                Ok(ProcessOutcome::Drop) => discarded += 1,
                 Err(err) => {
                     errors += 1;
                     diag.warn_throttled("script_error", format_args!("script error: {err}"));
@@ -2773,15 +2763,18 @@ fn run_lua_loop(
         // Once per batch: how a script leaking VM-side state becomes visible
         // (`docs/design/internal-telemetry.md`).
         telemetry.gauge("logit.script.vm.memory", worker.used_memory() as f64, &[]);
-        if dropped > 0 {
-            telemetry.count(
-                "logit.component.events.dropped",
-                dropped as f64,
-                &[("reason", "script_drop")],
-            );
+        if discarded > 0 {
+            telemetry.count("logit.component.events.discarded", discarded as f64, &[]);
         }
         if errors > 0 {
             telemetry.count("logit.component.errors", errors as f64, &[("reason", "process")]);
+            // `ScriptWorker::process` takes the event by value and returns nothing on `Err`, so
+            // each error loses its one input event.
+            telemetry.count(
+                "logit.component.events.dropped",
+                errors as f64,
+                &[("reason", "script_error")],
+            );
             // Any script error, even mixed with successful emits, marks the span failed at the
             // call site whose error path fired, as `write_loop` does. Without it, a batch whose
             // every event errored would record a successful zero-event span.
@@ -2806,7 +2799,6 @@ fn run_lua_loop(
             &resource,
             &scope,
             ctx,
-            &telemetry,
         );
         drop(guard);
         if sent > 0 {
@@ -2859,8 +2851,8 @@ fn lua_slot_of(mark: Option<u16>, slots: usize) -> usize {
 /// [`BatchContext`], each buffer taken with `std::mem::take` (see [`RouterScratch`]). Returns the
 /// number of events handed over, for the caller's span. Used by both `run_lua` paths.
 ///
-/// Counts an unconsumed forward partition as `events.dropped{reason="unrouted"}`, as
-/// `run_router` does, since `Fanout::deliver` counts nothing on zero consumers.
+/// `Fanout::deliver` counts nothing on zero consumers; graph rule 50 gives a `lua` node with
+/// `targets:` an ordinary consumer, so no partition goes uncounted.
 fn send_lua_partitions(
     dests: &mut [Vec<Event>],
     fanout: &Fanout,
@@ -2868,7 +2860,6 @@ fn send_lua_partitions(
     resource: &Arc<Resource>,
     scope: &Option<Arc<Scope>>,
     ctx: BatchContext,
-    telemetry: &Telemetry,
 ) -> u64 {
     let mut sent = 0u64;
     for (slot, dest) in dests.iter_mut().enumerate() {
@@ -2887,14 +2878,7 @@ fn send_lua_partitions(
                 None => continue,
             },
         };
-        if slot == 0 && destination.is_empty() {
-            telemetry.count(
-                "logit.component.events.dropped",
-                events.len() as f64,
-                &[("reason", "unrouted")],
-            );
-            continue;
-        }
+        debug_assert!(!destination.is_empty(), "lua destination slot {slot} has no consumer");
         destination.send_blocking_with_own_context(
             EventBatch { resource: resource.clone(), scope: scope.clone(), events },
             ctx,
@@ -4554,6 +4538,94 @@ mod tests {
             SpanStatus::Error,
             "a mixed success/error batch must not drain as a successful span"
         );
+    }
+
+    /// A script's `nil` return is `events.discarded`; a script error loses its event, counted as
+    /// `events.dropped{reason="script_error"}` beside `errors{reason="process"}`.
+    #[tokio::test]
+    async fn run_lua_counts_a_nil_return_as_discarded_and_an_error_as_dropped() {
+        let script = "n = 0\n\
+                       function process(event)\n\
+                       \x20 n = n + 1\n\
+                       \x20 if n == 1 then return nil end\n\
+                       \x20 if n == 2 then error('boom') end\n\
+                       \x20 return event\n\
+                       end"
+        .to_string();
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "enrich".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua { script: script.clone(), interval: None, max_memory: None },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![
+                counter_event("hits", 1.0),
+                counter_event("hits", 2.0),
+                counter_event("hits", 3.0),
+            ],
+        };
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua { script, interval: None, runtime: LuaRuntimeConfig::default() },
+        );
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx: result_tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            RECV_TIMEOUT,
+            run_with_telemetry(g, specs, telemetry, Readiness::disabled(), std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        let received = result_rx.recv_timeout(RECV_TIMEOUT).expect("output should receive a batch");
+        assert_eq!(received.events.len(), 1, "only the third event is returned");
+        let totals = Totals::of(registry.drain(0));
+        let enrich = |name, tags: &[(&str, &str)]| {
+            let mut all = vec![("component", "enrich")];
+            all.extend_from_slice(tags);
+            totals.sum(name, &all)
+        };
+        assert_eq!(enrich("logit.component.events.discarded", &[]), 1.0);
+        assert_eq!(
+            enrich("logit.component.events.dropped", &[("reason", "script_error")]),
+            1.0,
+            "the event the script errored on is lost"
+        );
+        assert_eq!(enrich("logit.component.events.dropped", &[]), 1.0, "no other drop reason");
+        assert_eq!(enrich("logit.component.errors", &[("reason", "process")]), 1.0);
     }
 
     /// `flush_now` samples VM memory even when no batch ever arrived.
@@ -11731,99 +11803,6 @@ mod tests {
         );
     }
 
-    /// With no ordinary consumers, unrouted events are counted as dropped and the run terminates.
-    #[tokio::test]
-    async fn unrouted_events_are_counted_when_a_router_has_no_ordinary_consumers() {
-        let g = routed_graph(vec![
-            (
-                "in",
-                vec![],
-                vec![],
-                ComponentKind::StatsdIn {
-                    bind: "127.0.0.1:0".to_string(),
-                    transport: logit_config::StatsdTransport::default(),
-                    tls: None,
-                    handshake_timeout: logit_config::default_handshake_timeout(),
-                    idle_timeout: None,
-                    max_connections: logit_config::default_max_connections(),
-                    peer: false,
-                    reuse_port: false,
-                    proxy_protocol: false,
-                    socket_mode: None,
-                },
-            ),
-            (
-                "split",
-                vec!["in"],
-                vec!["a"],
-                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
-            ),
-            ("a", vec![], vec![], ComponentKind::Target {}),
-            ("sink_a", vec!["a"], vec![], influxdb_out()),
-        ]);
-
-        let (tx_a, rx_a) = std::sync::mpsc::channel();
-        let batch = one_batch(vec![
-            tagged_event("routed", Some("a")),
-            tagged_event("unrouted_one", None),
-            tagged_event("unrouted_two", Some("zzz")),
-        ]);
-
-        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
-        specs.insert(
-            "in".to_string(),
-            NodeSpec::Input(
-                Box::new(FiniteInput { batch: Some(batch) }),
-                InputRuntimeConfig::default(),
-            ),
-        );
-        specs.insert(
-            "split".to_string(),
-            NodeSpec::Router(Box::new(SplitByAttr::new("stream", &[("a", 0)]))),
-        );
-        specs.insert("a".to_string(), NodeSpec::Target);
-        specs.insert("sink_a".to_string(), recording_sink(tx_a));
-
-        let registry = Registry::new();
-        let telemetry: HashMap<String, Telemetry> = ["in", "split", "a", "sink_a"]
-            .into_iter()
-            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
-            .collect();
-
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            run_with_telemetry(g, specs, telemetry, Readiness::disabled(), std::future::pending()),
-        )
-        .await
-        .expect("a router whose forward partition has nowhere to go must not hang the run")
-        .expect("run should complete without error");
-
-        let routed = rx_a.recv_timeout(Duration::from_secs(1)).expect("sink_a gets the routed one");
-        assert_eq!(routed.events.len(), 1);
-
-        let events = registry.drain(0);
-        let dropped = events
-            .iter()
-            .filter(|e| e.attributes.get("component").and_then(|v| v.as_str()) == Some("split"))
-            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("unrouted"))
-            .find_map(|e| {
-                e.metrics.iter().find_map(|m| match &m.kind {
-                    MetricKind::Sum(s)
-                        if logit_core::interner::resolve(m.name)
-                            == "logit.component.events.dropped" =>
-                    {
-                        Some(s.value)
-                    }
-                    _ => None,
-                })
-            });
-        assert_eq!(
-            dropped,
-            Some(2.0),
-            "both unrouted events should be counted under the router, got: {events:?}"
-        );
-    }
-
     /// Downstream of a target, `previous` is the target's id and `origin` is still the listener.
     #[tokio::test]
     async fn previous_downstream_of_a_target_is_the_targets_id_and_origin_is_untouched() {
@@ -12064,9 +12043,11 @@ mod tests {
             ),
             ("shared", vec![], vec![], ComponentKind::Target {}),
             ("sink", vec!["shared"], vec![], influxdb_out()),
+            ("rest", vec!["split_a", "split_b"], vec![], influxdb_out()),
         ]);
 
         let (tx, rx) = std::sync::mpsc::channel();
+        let (tx_rest, _rx_rest) = std::sync::mpsc::channel();
         let batch =
             one_batch(vec![tagged_event("from_a", Some("a")), tagged_event("from_b", Some("b"))]);
 
@@ -12078,7 +12059,7 @@ mod tests {
                 InputRuntimeConfig::default(),
             ),
         );
-        // Each router claims one event for `shared`; the other is dropped as unrouted.
+        // Each router claims one event for `shared`; the other goes to `rest`.
         specs.insert(
             "split_a".to_string(),
             NodeSpec::Router(Box::new(SplitByAttr::new("stream", &[("a", 0)]))),
@@ -12089,6 +12070,7 @@ mod tests {
         );
         specs.insert("shared".to_string(), NodeSpec::Target);
         specs.insert("sink".to_string(), recording_sink(tx));
+        specs.insert("rest".to_string(), recording_sink(tx_rest));
 
         tokio::time::timeout(Duration::from_secs(5), run(g, specs))
             .await

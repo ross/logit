@@ -1067,10 +1067,10 @@ const ABSORBED: &str = "logit.transform.metrics.absorbed";
 const PASSED: &str = "logit.transform.metrics.passed_through";
 const UNSEEDED: &str = "logit.transform.gauge.delta.unseeded";
 const CLAMPED: &str = "logit.transform.samples.weight_clamped";
-const NON_FINITE_DROPPED: &str = "logit.transform.samples.non_finite_dropped";
+const SAMPLES_OMITTED: &str = "logit.transform.samples.omitted";
 const SAMPLES_FALLBACK: &str = "logit.transform.samples.fallback";
 const MEMBERS_FALLBACK: &str = "logit.transform.set_members.fallback";
-const LINKS_DROPPED: &str = "logit.transform.links.dropped";
+const LINKS_OMITTED: &str = "logit.transform.links.omitted";
 const EVICTED: &str = "logit.transform.series.evicted";
 /// Every counter the model predicts, and the tag each is read under ("" for none).
 const MODELED_COUNTERS: [(&str, &str); 8] = [
@@ -1078,10 +1078,10 @@ const MODELED_COUNTERS: [(&str, &str); 8] = [
     (PASSED, "reason"),
     (UNSEEDED, ""),
     (CLAMPED, ""),
-    (NON_FINITE_DROPPED, ""),
+    (SAMPLES_OMITTED, "reason"),
     (SAMPLES_FALLBACK, "reason"),
     (MEMBERS_FALLBACK, "reason"),
-    (LINKS_DROPPED, "reason"),
+    (LINKS_OMITTED, "reason"),
 ];
 
 enum Fate {
@@ -1341,7 +1341,7 @@ fn merge(
         (RefAcc::Dist(obs), MetricKind::Samples(s)) => {
             let (finite, dropped) = observations(&s.values, s.sample_rate);
             obs.extend(finite);
-            counts.add(NON_FINITE_DROPPED, "", dropped);
+            counts.add(SAMPLES_OMITTED, "non_finite", dropped);
             counts.add(CLAMPED, "", u64::from(ref_clamped(&s.values, s.sample_rate)));
         }
         (RefAcc::RawSamples { values, rate }, MetricKind::Samples(s)) => {
@@ -1360,7 +1360,7 @@ fn merge(
                     for (vs, r) in [(&values[..], *rate), (&s.values[..], s.sample_rate)] {
                         let (finite, dropped) = observations(vs, r);
                         obs.extend(finite);
-                        counts.add(NON_FINITE_DROPPED, "", dropped);
+                        counts.add(SAMPLES_OMITTED, "non_finite", dropped);
                         counts.add(CLAMPED, "", u64::from(ref_clamped(vs, r)));
                     }
                     counts.add(SAMPLES_FALLBACK, reason, 1);
@@ -1375,7 +1375,7 @@ fn merge(
         (RefAcc::RawSamples { values, rate }, MetricKind::Distribution(_)) => {
             let KindSpec::Dist(s) = spec else { unreachable!() };
             let (mut obs, dropped) = observations(values, *rate);
-            counts.add(NON_FINITE_DROPPED, "", dropped);
+            counts.add(SAMPLES_OMITTED, "non_finite", dropped);
             counts.add(CLAMPED, "", u64::from(ref_clamped(values, *rate)));
             obs.extend(observations(&s.values, s.sample_rate).0);
             *acc = RefAcc::Dist(obs);
@@ -1673,7 +1673,7 @@ fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> 
                 } = model.flush(now);
                 let mut counts = std::mem::take(&mut model.counts);
                 counts.add(
-                    LINKS_DROPPED,
+                    LINKS_OMITTED,
                     "contexts",
                     expected.iter().map(|(s, _)| s.dropped_contexts).sum(),
                 );
@@ -2281,7 +2281,7 @@ proptest! {
     #![proptest_config(config(256))]
 
     /// XFORM-05: over two windows of random batches, every series' held contexts, emitted links,
-    /// and `links.dropped` count match [`ref_links`] per series, and a flush empties every set.
+    /// and `links.omitted` count match [`ref_links`] per series, and a flush empties every set.
     /// The rules are `ContributingContexts` and `ContributingContexts::observe`.
     #[test]
     fn contributing_contexts_cap_per_series_and_count_only_new_and_full(
@@ -2348,8 +2348,8 @@ proptest! {
             prop_assert_eq!(emitted, expected_links);
             let dropped: u64 = expected.iter().map(|(_, _, d)| d).sum();
             let drained = registry.drain(now);
-            prop_assert_eq!(telemetry_total(&drained, LINKS_DROPPED, "reason", "contexts"), dropped);
-            prop_assert_eq!(telemetry_total(&drained, LINKS_DROPPED, "", ""), dropped);
+            prop_assert_eq!(telemetry_total(&drained, LINKS_OMITTED, "reason", "contexts"), dropped);
+            prop_assert_eq!(telemetry_total(&drained, LINKS_OMITTED, "", ""), dropped);
 
             // After the flush: every retained series starts the next window with an empty set.
             for (series, seen, dropped) in held_contexts(&agg) {

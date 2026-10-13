@@ -1231,6 +1231,11 @@ async fn absorb_frame<D: Decoder + Send>(
             }
         }
         Err(err) => {
+            telemetry.count(
+                crate::udp::FRAMES_DROPPED,
+                1.0,
+                &[("reason", crate::udp::UNDECODABLE)],
+            );
             diag.warn_throttled("bad_frame", err);
         }
     }
