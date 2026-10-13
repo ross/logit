@@ -118,7 +118,7 @@ impl InfluxDecoder {
         let mut parsed: Vec<(Line<'_>, i64)> = Vec::new();
         for (number, raw) in lines(&body) {
             let fail = |reason| {
-                let start = raw.iter().position(|b| !matches!(b, b' ' | b'\t')).unwrap_or(0);
+                let start = raw.iter().position(|b| !matches!(b, b' ' | b'\t' | 0)).unwrap_or(0);
                 LineError { line: number, text: subslice::share(&body, &raw[start..]), reason }
             };
             let Some(line) = parse_line(raw).map_err(fail)? else { continue };

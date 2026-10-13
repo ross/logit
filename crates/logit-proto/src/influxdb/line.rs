@@ -172,10 +172,11 @@ fn line_end(buf: &[u8], start: usize) -> usize {
     i
 }
 
-/// Whether `b` is whitespace influxd skips around a section: a space or a tab. A tab never ends a
-/// section (probe row 4.3); only a run that a space starts may contain one (row 4.5).
+/// Whether `b` is whitespace influxd skips (`skipWhitespace` in `models/points.go`): a space, a
+/// tab, or NUL. A tab or NUL never ends a section (probe row 4.3); only a run that a space starts,
+/// or the line's leading run, may contain one (row 4.5).
 fn is_skippable(b: u8) -> bool {
-    b == b' ' || b == b'\t'
+    b == b' ' || b == b'\t' || b == 0
 }
 
 fn skip_ws(s: &[u8], mut i: usize) -> usize {
@@ -230,12 +231,14 @@ pub fn parse_line(raw: &[u8]) -> Result<Option<Line<'_>>, Reason> {
                 return Err("missing tag value".into());
             }
             let j = k_end + 1;
-            let v_end = scan_until(s, j, b"=, ");
+            // influxd tests a tag value's first byte for `,` and space only, so a value may start
+            // with an unescaped `=`.
+            if j == s.len() || matches!(s[j], b',' | b' ') {
+                return Err("missing tag value".into());
+            }
+            let v_end = scan_until(s, j + 1, b"=, ");
             if v_end < s.len() && s[v_end] == b'=' {
                 return Err("invalid tag format".into());
-            }
-            if v_end == j {
-                return Err("missing tag value".into());
             }
             if v_end == s.len() {
                 return Err("missing fields".into());
@@ -313,12 +316,14 @@ pub fn parse_line(raw: &[u8]) -> Result<Option<Line<'_>>, Reason> {
     if i == s.len() {
         return Ok(Some(Line { measurement, tags, fields: fields.list, timestamp: None }));
     }
+    // The timestamp ends at a space only, and only spaces may follow it (`scanTime` and
+    // `parsePoint` in `models/points.go`): a tab or NUL there is not whitespace.
     let mut t_end = i;
-    while t_end < s.len() && !is_skippable(s[t_end]) {
+    while t_end < s.len() && s[t_end] != b' ' {
         t_end += 1;
     }
     let timestamp = parse_timestamp(&s[i..t_end])?;
-    if skip_ws(s, t_end) != s.len() {
+    if s[t_end..].iter().any(|&b| b != b' ') {
         return Err("point is invalid".into());
     }
     Ok(Some(Line { measurement, tags, fields: fields.list, timestamp: Some(timestamp) }))
@@ -785,6 +790,37 @@ mod tests {
         assert_eq!(err("p04k f=1i,  g=2i"), "invalid field format");
         assert_eq!(err("p04l f=1i,g=2i,"), "invalid field format");
         assert_eq!(err("p04m f=1i #trailing"), "bad timestamp");
+    }
+
+    // influxd's `scanTime` ends a timestamp at a space only, and `parsePoint` allows only spaces
+    // after it (`models/points.go`).
+    #[test]
+    fn only_spaces_may_end_or_follow_a_timestamp() {
+        assert_eq!(err("m f=1i 123\t"), "bad timestamp");
+        assert_eq!(err("m f=1i 123\0"), "bad timestamp");
+        assert_eq!(err("m f=1i 123 \t"), "point is invalid");
+        assert_eq!(ok("m f=1i 123  ").timestamp, Some(123));
+    }
+
+    // influxd's `skipWhitespace` skips NUL as it does a space or a tab (`models/points.go`).
+    #[test]
+    fn nul_is_whitespace_where_whitespace_is_skipped() {
+        assert!(matches!(parse_line(b"\0"), Ok(None)), "a NUL-only line is blank");
+        assert_eq!(ok("\0m f=1i").measurement, "m");
+        assert_eq!(ok("m \0f=1i").fields[0].0, "f");
+        assert_eq!(ok("m f=1i \x00123").timestamp, Some(123));
+        assert_eq!(ok("m f=1i \0").timestamp, None);
+    }
+
+    // influxd's `scanTagsValue` checks a tag value's first byte for `,` and a space only, and
+    // looks for an unescaped `=` from the second byte on.
+    #[test]
+    fn a_tag_value_may_start_with_an_equals_sign() {
+        assert_eq!(tag(&ok("m,t==v f=1i"), "t"), "=v");
+        assert_eq!(tag(&ok("m,t== f=1i"), "t"), "=");
+        assert_eq!(err("m,t=="), "missing fields");
+        assert_eq!(err("m,t=v=w f=1i"), "invalid tag format");
+        assert_eq!(err("m,t= f=1i"), "missing tag value");
     }
 
     // -- 5. empty and comment-only bodies ------------------------------------------------------

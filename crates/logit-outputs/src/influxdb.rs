@@ -433,7 +433,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_400_invalid_parse_error_is_rejected() {
-        // The shape `influxd` 2.9.1 answers (the W2 probe's row 13.1): no `line` field.
+        // The shape `influxd` 2.9.1 answers (`docs/plans/influxdb-relay.md`'s "Settled by probe",
+        // row 13.1): no `line` field.
         let body =
             r#"{"code":"invalid","message":"unable to parse 'x value=': missing field value"}"#;
         let (fault, text) = class_of(influx_error("400 Bad Request", body)).await;

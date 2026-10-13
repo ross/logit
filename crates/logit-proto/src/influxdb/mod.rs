@@ -19,13 +19,14 @@
 //! | escaping in a measurement, tag key, tag value, field key | a backslash before `,`, `=`, or a space is dropped and the character is literal; a field key also unescapes `\"`; any other backslash, `\\` included, is kept as is, so `\\` is two backslashes |
 //! | a delimiter after a backslash | escaped, whatever precedes the backslash, so no name can end in a backslash: `v\\ f=1i` fails |
 //! | `=` in a measurement | literal, unescaped |
+//! | `=` as a tag value's first byte | literal, unescaped: only a later unescaped `=` fails, and a first byte of `,` or a space is a missing value |
 //! | string field value | `"`-quoted; `\"` is a quote, `\\` one backslash, any other `\x` two characters; `,`, `=`, a space, and a raw newline are literal inside |
 //! | float | `-?(digits[.digits] \| .digits)([eE][+-]?digits)?`, finite: `1`, `5.`, `.5`, `1.5e+3`, `-0`; `+1`, `inf`, `NaN`, `0x10`, `1e309` fail |
 //! | integer / unsigned | `-?digitsi` in `i64` / `digitsu` in `u64`; `1.0i`, `-1u`, `1_000i`, an overflow fail |
 //! | boolean | `t T true True TRUE f F false False FALSE`, nothing else |
 //! | timestamp | `-?digits`, scaled by `precision` with overflow checked, then within ±9223372036854775806 ns |
 //! | line splitting | a newline ends a line unless escaped or inside a quoted string value ([`line::lines`]) |
-//! | whitespace | leading and trailing spaces and tabs, and runs of them after a separating space, are skipped; a tab never separates sections |
+//! | whitespace | spaces, tabs, and NULs leading a line, and runs of them after a separating space, are skipped; a tab or NUL never separates sections; only spaces may follow a timestamp |
 //! | comments, blank lines | a whole line starting `#`, after optional whitespace, and a blank line are skipped |
 //! | a repeated tag key; tag key `_measurement`, `_field`, or `time`; field key `time` | a parse error |
 //! | a repeated field key in one line | the last value at the first position; a different type is a parse error |
@@ -110,7 +111,7 @@
 //! | `Array` | its last representable element | `tags.normalized{reason="multi_value"}` (lossy) |
 //! | `Null`, `Bytes`, `Timestamp`, `Map`, a non-UTF-8 `Str`, an `Array` with no representable element | dropped | `tags.dropped{reason="unrepresentable"}` |
 //! | an empty key or value | dropped | `tags.dropped{reason="empty"}` |
-//! | a key or value with a line break, or ending in `\` | dropped | `tags.dropped{reason="unencodable"}` |
+//! | a key or value with a line break, ending in `\`, or with `\` directly before `,`, a space, or `=` | dropped | `tags.dropped{reason="unencodable"}` |
 //! | key `_measurement`, `_field`, or `time` | dropped: influxd rejects the whole write | `tags.dropped{reason="reserved"}` |
 //! | key under `influxdb.` or `statsd.` | not a tag | -- |
 //!
@@ -133,8 +134,9 @@
 //!    integer keeps its `i` or `u` suffix, and a boolean leaves as `true` or `false` whatever
 //!    spelling arrived.
 //! 6. Escaping: the encoder writes only the escapes the grammar requires, so a backslash a sender
-//!    wrote doubled leaves as it was read, and a key the grammar can't spell is dropped, counted
-//!    `skipped{reason="unencodable_key"}`.
+//!    wrote doubled leaves as it was read, and a key the grammar can't spell is dropped, counted:
+//!    a dropped measurement or field key is `skipped{reason="unencodable_key"}`, a dropped tag is
+//!    `tags.dropped{reason="unencodable"}`.
 //! 7. Timestamps: every point leaves with a timestamp in nanoseconds, so `precision` isn't
 //!    carried, and a point that arrived with none leaves with its receipt time (see item 14).
 //! 8. Comments, blank lines, and runs of spaces are dropped. A CRLF line ending, a tab separator,

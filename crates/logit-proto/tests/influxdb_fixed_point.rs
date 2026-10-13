@@ -286,3 +286,36 @@ fn a_field_key_that_desyncs_the_line_splitter_is_never_written() {
         assert!(decoded.contains(&neighbor), "{key:?}: the next point survives");
     }
 }
+
+/// A tag key or value with `\` before `,`, space, or `=` leaves as `\\` and a bare delimiter,
+/// so the line splitter leaves the tag section early: a `"` in a tag value then opens a quote
+/// that merges the next line, and a string field's newline splits the line. The tag is dropped
+/// instead, and the rest of the batch survives.
+#[test]
+fn a_tag_that_desyncs_the_line_splitter_is_never_written() {
+    let neighbor = point("n", &[], &[("value", MetricValue::I64(2))], &[], 6);
+    let cases = [
+        point("m", &[("a\\ b", "c\"d")], &[("value", MetricValue::I64(1))], &[], 5),
+        point("m", &[("t", "x\\ y\\,z")], &[], &[("s", "one\ntwo")], 5),
+    ];
+    for source in cases {
+        let source = batch(vec![source, neighbor.clone()]);
+        let encoded = encode(&source);
+        let decoded = decode(encoded.clone(), &source.resource);
+        assert!(decoded.contains(&neighbor), "the next point survives; wire: {encoded:?}");
+        let round_tripped =
+            EventBatch { resource: source.resource.clone(), scope: None, events: decoded };
+        assert_eq!(encode(&round_tripped), encoded, "encode(decode(encode(b))) == encode(b)");
+    }
+}
+
+#[test]
+fn a_tag_value_starting_with_an_equals_sign_is_a_fixed_point() {
+    assert_fixed_point(batch(vec![point(
+        "m",
+        &[("t", "=v")],
+        &[("f", MetricValue::I64(1))],
+        &[],
+        7,
+    )]));
+}

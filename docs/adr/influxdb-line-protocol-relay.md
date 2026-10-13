@@ -243,9 +243,10 @@ the same list with the same numbers, and the two lists must stay numbered alike:
 5. Number spelling: a float leaves as the shortest string that round-trips its `f64`, an integer
    keeps its `i` or `u` suffix, and a boolean leaves as `true` or `false` whatever spelling
    arrived.
-6. Escaping: the encoder writes only the escapes the grammar requires (see "Escaping"), so a
-   backslash that a sender wrote doubled leaves as it was read, and a key the grammar can't spell
-   is dropped, counted.
+6. Escaping: the encoder writes only the escapes the grammar requires, so a backslash a sender
+   wrote doubled leaves as it was read, and a key the grammar can't spell is dropped, counted:
+   a dropped measurement or field key is `skipped{reason="unencodable_key"}`, a dropped tag is
+   `tags.dropped{reason="unencodable"}`.
 7. Timestamps: every point leaves with a timestamp in nanoseconds, so `precision` isn't carried,
    and a point that arrived with none leaves with its receipt time (see item 14).
 8. Comments, blank lines, and runs of spaces are dropped. A CRLF line ending, a tab separator, and
@@ -276,8 +277,9 @@ tag key, tag value, and field key:
   escapes only `,`, space, and (outside a measurement) `=`, each with one backslash.
 - A key that ends in a backslash, or has one before a delimiter, has no spelling: the backslash
   would escape the delimiter. The encoder drops the point (a measurement, a field key) or the tag
-  (a tag key or value) and counts it `skipped{reason="unencodable_key"}`. The decoder reads a
-  trailing backslash before a delimiter as escaping it, which fails as it does at `influxd`.
+  (a tag key or value), counting a point or field `skipped{reason="unencodable_key"}` and a tag
+  `tags.dropped{reason="unencodable"}`. The decoder reads a trailing backslash before a delimiter
+  as escaping it, which fails as it does at `influxd`.
 - Inside a quoted string field value, `\"` is a quote and `\\` is one backslash, and any other
   `\x` is two literal characters. A raw newline inside the quotes is part of the value, so the
   decoder splits a body into lines with quote tracking.
