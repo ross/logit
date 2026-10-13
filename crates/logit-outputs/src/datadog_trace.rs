@@ -177,7 +177,7 @@
 //! | `logit.output.records.dropped{route, reason}` | `oversize` or `rejected`, as above; `ambiguous_at_most_once`, the records an at-most-once drop loses, which for the stats route behind a stopped trace route is the batch's stats group count, an upper bound that includes a group its encode would have dropped `oversize` |
 //!
 //! Plus everything [`DatadogEncoder`] counts itself (`logit.output.spans.degraded`,
-//! `logit.output.stats.*`, `logit.output.tags.dropped`), which this sink doesn't repeat.
+//! `logit.output.stats.*`, `logit.output.tags.omitted`), which this sink doesn't repeat.
 //!
 //! **Once per batch or per attempt** (ADR `sink-send-path-and-attempt-accounting`, decision 1).
 //! Each route is a unit of the sink's `BatchAccounting`: the encoder's counters, the trace or
@@ -1877,7 +1877,7 @@ mod tests {
         ("logit.output.spans.degraded", &[("reason", "json_text")]),
         ("logit.output.spans.degraded", &[("reason", "no_wire_form")]),
         ("logit.component.diagnostics", &[("key", "bad_header")]),
-        ("logit.output.tags.dropped", &[("reason", "no_wire_form")]),
+        ("logit.output.tags.omitted", &[("reason", "no_wire_form")]),
     ];
 
     /// Beyond `logit.output.requests`, what this sink counts per request sent rather than once per

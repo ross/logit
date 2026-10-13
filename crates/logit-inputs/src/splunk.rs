@@ -1143,7 +1143,9 @@ async fn respond(
                 }
             }
             Err(Undelivered::Busy(_)) => {
-                shared.telemetry.count("logit.input.batches.deferred", total as f64, &[]);
+                // The whole body, not only the batch the deadline refused: a `503` code 9 leaves
+                // every batch with the client.
+                Undelivered::Busy(total).record(&shared.telemetry);
                 shared.diag.clone().warn_throttled(
                     "busy",
                     format_args!(

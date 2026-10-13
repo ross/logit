@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-10-04
+updated: 2026-10-13
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -566,3 +566,23 @@ whose body opens with a receiver's decompression error, as `Refused`, since both
 sink's `version:` or `compression:` rather than the batch. The table, with its evidence, is the
 "Faults, retries and duplicate safety (sender mode)" section of
 `crates/logit-outputs/src/prometheus.rs`'s module doc.
+
+## Amendment (2026-10-13): loss counters follow the telemetry loss vocabulary
+
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md) renames the counters both ends
+report:
+
+- The receiver's `native_histogram` and `invalid_labels` reasons, and every reason it shares with
+  the scrape decoder, are `logit.input.metrics.dropped`, in place of
+  `logit.input.metrics.skipped`. `Decoded::histograms_skipped` is `Decoded::histograms_dropped`.
+- The sender counts an `ExponentialHistogram` as
+  `logit.output.metrics.dropped{reason="native_histogram"}`, not
+  `skipped{metric_kind="exponential_histogram"}`. Remote-write has native histograms, so the record
+  is lost to a gap in `logit`, not to the wire format; the exposition path keeps the skip. The
+  codec tells the two apart with `PrometheusEncoder::with_destination`.
+- The sender's `no_timestamp` and `invalid_labels` reasons move to
+  `logit.output.metrics.dropped`; `logit.output.labels.dropped` is `logit.output.labels.omitted`,
+  every reason; and `exemplar_dropped` is `exemplar_omitted` on both ends.
+
+A flagged multi-series record stays `skipped{reason="no_recorded_value"}`, and
+`degraded{reason="sub_ms_collapsed"}` is unchanged.

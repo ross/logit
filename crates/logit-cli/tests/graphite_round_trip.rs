@@ -674,7 +674,7 @@ async fn a_nan_value_is_skipped_and_counted() {
     let (harness, registry) = diagnostic_harness().await;
     harness.send_raw(&read_fixture("nan-value", "in")).await;
 
-    wait_for_counted(&registry, "logit.input.metrics.skipped", ("reason", "non_finite_value"))
+    wait_for_counted(&registry, "logit.input.metrics.dropped", ("reason", "non_finite_value"))
         .await;
 }
 
@@ -684,7 +684,7 @@ async fn a_malformed_line_is_skipped_and_counted() {
     let (harness, registry) = diagnostic_harness().await;
     harness.send_raw(&read_fixture("bad-line", "in")).await;
 
-    wait_for_counted(&registry, "logit.input.metrics.skipped", ("reason", "bad_line")).await;
+    wait_for_counted(&registry, "logit.input.metrics.dropped", ("reason", "bad_line")).await;
 }
 
 // -- cross-protocol ---------------------------------------------------------------------------

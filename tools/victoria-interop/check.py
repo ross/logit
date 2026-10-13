@@ -281,7 +281,11 @@ def leg_10():
     unsupported = telemetry_sum(telemetry, "logit.input.writes", **{"class": "unsupported"})
     ok = telemetry_sum(telemetry, "logit.input.writes", **{"class": "ok"})
     ok_zstd = telemetry_sum(telemetry, "logit.input.writes", **{"class": "ok", "encoding": "zstd"})
-    skipped = telemetry_sum(telemetry, "logit.input.metrics.skipped")
+    # Every decode loss is `metrics.dropped`; `metrics.skipped` is summed too so that a reason
+    # counted under either name fails the leg. `ok_zstd >= 1` below proves this file was read.
+    lost = telemetry_sum(telemetry, "logit.input.metrics.dropped") + telemetry_sum(
+        telemetry, "logit.input.metrics.skipped"
+    )
     received = read_events(OUT / "vmagent-in-received.log")
     ours = sorted({
         item["name"]
@@ -294,11 +298,11 @@ def leg_10():
     detail = (
         f"writes class=ok,encoding=zstd {ok_zstd} (class=ok total {ok}), class=unsupported "
         f"{unsupported}; vmagent log {'shows' if downgraded else 'does not show'} the downgrade; "
-        f"received {ours or 'no'} vi_expose_* series; {skipped} series skipped"
+        f"received {ours or 'no'} vi_expose_* series; {lost} series dropped or skipped"
     )
     if not (ok_zstd >= 1 and unsupported == 0 and not downgraded):
         return "FAIL", detail
-    if not ours or skipped:
+    if not ours or lost:
         return "GAP", detail
     return "PASS", detail
 

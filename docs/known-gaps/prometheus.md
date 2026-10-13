@@ -128,8 +128,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     sends them, which VictoriaMetrics doesn't.
 - **An `ExponentialHistogram` can't reach VictoriaMetrics's native-histogram ingest over
   remote-write.** VictoriaMetrics accepts a remote-write native histogram and converts it to its
-  `vmrange` buckets, but `prometheus_out` skips and counts every `ExponentialHistogram` on both
-  wires: see the native-histogram row under [Cross-protocol mappings](mappings.md).
+  `vmrange` buckets, but `prometheus_out` writes no `ExponentialHistogram` on either wire, and a
+  remote-write one is dropped and counted `logit.output.metrics.dropped{reason="native_histogram"}`:
+  see the native-histogram row under [Cross-protocol mappings](mappings.md).
   - **Workaround:** send it over OTLP. `otlp_out` to VictoriaMetrics's `/opentelemetry` carries
     it, and VictoriaMetrics stores it as `_bucket` series with a `vmrange` label plus `_count` and
     `_sum` (verified, leg 6).

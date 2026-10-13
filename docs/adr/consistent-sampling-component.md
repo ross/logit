@@ -1,6 +1,6 @@
 ---
 created: 2026-09-22
-updated: 2026-09-22
+updated: 2026-10-13
 ---
 
 # `sample`: consistent, keyed event sampling with an operator override
@@ -176,3 +176,11 @@ exists for the central-collector rates where per-event telemetry calls are the c
   `generate_in` → `trace_context` → `sample` (`key: trace_id`, an `always_keep` flag) →
   `stdio_out`, so "the same traces survive on every run, every span of each" can be seen rather
   than trusted. `demo/` is unchanged: it keeps every trace on purpose.
+
+## Amendment: discarded, not dropped (2026-10-13)
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `sample` no longer emits `logit.transform.events.filtered`; the runtime's
+`logit.component.events.discarded` counts the same events under the component's id. The decision
+counter keeps its tags with the outcome renamed:
+`logit.transform.sample.decisions{outcome="kept"|"discarded", by}`. An event `sample` removes is
+the config's choice, not loss, so it never appears under `*.dropped`.

@@ -119,7 +119,7 @@ fn read_capture(name: &str) -> Capture {
 }
 
 /// What one capture decoded to: its groups flattened into one family list, what the request itself
-/// declared, and every `logit.input.metrics.{skipped,degraded}` reason the decode recorded. A
+/// declared, and every `logit.input.metrics.{dropped,degraded}` reason the decode recorded. A
 /// conforming sender's request should produce none of the last: a reason there means this codec
 /// dropped or downgraded something Prometheus sent.
 struct Replayed {
@@ -149,7 +149,7 @@ fn replay_with(capture: &Capture, seed: &Declarations) -> Replayed {
         .filter(|event| {
             event.metrics.iter().any(|metric| {
                 let name = logit_core::interner::resolve(metric.name);
-                name == "logit.input.metrics.skipped" || name == "logit.input.metrics.degraded"
+                name == "logit.input.metrics.dropped" || name == "logit.input.metrics.degraded"
             })
         })
         .filter_map(|event| {
@@ -220,10 +220,10 @@ const FLAT_SAMPLE_FAMILIES: [&str; 8] = [
     "prometheus_tsdb_wal_page_flushes_total",
 ];
 
-/// Every capture decodes with nothing skipped or degraded, including the unseeded summary's
+/// Every capture decodes with nothing dropped or degraded, including the unseeded summary's
 /// `go_gc_duration_seconds_sum`/`_count` (`assemble.rs`'s "Only a declared base claims a suffix").
 #[test]
-fn every_recorded_request_decodes_with_nothing_skipped_or_degraded() {
+fn every_recorded_request_decodes_with_nothing_dropped_or_degraded() {
     for name in all_captures() {
         let capture = read_capture(name);
         assert_eq!(capture.headers.get("method").map(String::as_str), Some("POST"), "{name}");
@@ -241,7 +241,7 @@ fn every_recorded_request_decodes_with_nothing_skipped_or_degraded() {
         assert_eq!(
             replayed.reasons,
             Vec::<String>::new(),
-            "{name}: a real Prometheus request must decode with nothing skipped or degraded -- \
+            "{name}: a real Prometheus request must decode with nothing dropped or degraded -- \
              see this test's own doc for the bug this corpus found"
         );
         assert!(
@@ -382,7 +382,7 @@ fn recorded_metadata_types_a_recorded_sample_request() {
     let capture = read_capture(V1_SAMPLES[0]);
     let seeded = replay_with(&capture, &seed);
 
-    // Still nothing skipped -- the stateless decode loses nothing either, so a seed that changed
+    // Still nothing dropped -- the stateless decode loses nothing either, so a seed that changed
     // that in *either* direction would be the thing to notice.
     assert_eq!(seeded.reasons, Vec::<String>::new(), "typing a request must not cost it a sample");
 
@@ -532,7 +532,7 @@ fn a_vmagent_zstd_sample_request_decodes_every_series() {
 fn assert_vmagent_samples_decode_every_series(names: [&str; 2]) {
     let (samples, _) = vmagent_split(names);
     let replayed = replay(&samples);
-    assert_eq!(replayed.reasons, Vec::<String>::new(), "{}: nothing skipped", samples.name);
+    assert_eq!(replayed.reasons, Vec::<String>::new(), "{}: nothing dropped", samples.name);
 
     let names: BTreeSet<&str> =
         replayed.families.iter().map(|family| family.name.as_str()).collect();

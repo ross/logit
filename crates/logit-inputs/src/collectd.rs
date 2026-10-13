@@ -97,9 +97,13 @@ impl CollectdInput {
         self
     }
 
-    /// Attaches a telemetry handle for the shared listener's datagram and byte counters.
+    /// Attaches a telemetry handle for the shared listener's datagram and byte counters, and for
+    /// the decoder's own drop counters.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.inner = self.inner.with_telemetry(telemetry);
+        self.inner = self
+            .inner
+            .with_telemetry(telemetry.clone())
+            .map_decoder(|d| d.with_telemetry(telemetry));
         self
     }
 

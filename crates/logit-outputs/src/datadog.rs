@@ -192,8 +192,9 @@
 //! for a clean request, and otherwise a protobuf whose field 1, `repeated string errors`, holds one
 //! entry per series dropped ("Payload validation failed: series <metric> contains 1 data points
 //! too far in the future", "... too many tags in series <metric>: limit=100 tags=101"), recorded
-//! from a trial org on 2026-10-08. Each entry counts one record `records.rejected`, at most the
-//! request's entries, and comes out of `records`, with a throttled `series_rejected` diagnostic
+//! from a trial org on 2026-10-08. Each entry counts one record
+//! `records.dropped{reason="rejected"}`, at most the request's entries, and comes out of
+//! `records`, with a throttled `series_rejected` diagnostic
 //! quoting the first entry. The verdict stays `Ok`: the rest of the request was stored, and a retry
 //! would resend it. The read stops at 4 MiB, and an entry past it isn't counted. The
 //! other routes' `2xx` bodies aren't read: distribution points and sketches answer
@@ -206,7 +207,7 @@
 //!
 //! | Response | Class | Why | Evidence |
 //! |---|---|---|---|
-//! | `2xx` (logs answer `202`) | `Ok` | accepted for processing; on the series route, each `errors` entry in the body counts one record `records.rejected` | [send logs][logs-api]; a trial org's series `202` bodies, 2026-10-08 |
+//! | `2xx` (logs answer `202`) | `Ok` | accepted for processing; on the series route, each `errors` entry in the body counts one record `records.dropped{reason="rejected"}` | [send logs][logs-api]; a trial org's series `202` bodies, 2026-10-08 |
 //! | `400` | `Rejected` | "Bad request (likely an issue in the payload formatting)": this body; the Agent drops it too | [send logs][logs-api], [Agent retry guide][agent-retry] |
 //! | `401` | `Refused` | "Unauthorized (likely a missing API Key)": the key rides on every request | [send logs][logs-api] |
 //! | `403` | `Refused` | "Permission issue (likely using an invalid API Key)", or a key sent to another `site`: one org-wide key on every route, so every request gets it; the Agent retries it after refreshing the key | [send logs][logs-api], the Agent's [`transaction.go`][agent-tx] |
@@ -252,11 +253,10 @@
 //! | `logit.output.request.duration{route}` | one timer per request |
 //! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; not for a refused connection |
 //! | `logit.output.records{route}` | entries in a request Datadog accepted, less those its series `202` body names |
-//! | `logit.output.records.rejected{route}` | series a `202` body names as dropped; the series route only |
-//! | `logit.output.records.dropped{route, reason}` | `stale`, `too_many_tags`, `oversize`, `needs_agent_processing`, `not_datadog_origin`, `rejected`, as above; `ambiguous_at_most_once`, the entries an at-most-once drop loses, which for a route the attempt never reached is the plan's count, an upper bound that includes entries its encode would have skipped or dropped `oversize` |
+//! | `logit.output.records.dropped{route, reason}` | `stale`, `too_many_tags`, `oversize`, `needs_agent_processing`, `not_datadog_origin`, as above; `rejected`, a rejected request's entries or the series a `202` body names; `ambiguous_at_most_once`, the entries an at-most-once drop loses, which for a route the attempt never reached is the plan's count, an upper bound that includes entries its encode would have skipped or dropped `oversize` |
 //!
-//! Plus everything [`DatadogEncoder`] counts itself (`logit.output.metrics.skipped`, including
-//! `unsupported_kind`-style skips by `metric_kind`; `metrics.degraded`; `tags.dropped`;
+//! Plus everything [`DatadogEncoder`] counts itself (`logit.output.metrics.skipped` by
+//! `metric_kind` or `reason`; `metrics.dropped`; `metrics.degraded`; `tags.omitted`;
 //! `spans.degraded`; `stats.*`), which this sink doesn't repeat.
 //!
 //! **Once per batch or per attempt** (ADR `sink-send-path-and-attempt-accounting`, decision 1).
@@ -264,8 +264,8 @@
 //! `needs_agent_processing`, `not_datadog_origin`, an event too large to send alone, and the
 //! encoder's counters and diagnostics, through handles gated by the sink's `BatchAccounting`. The
 //! plan is unit 0 and each route its own unit, so a route an earlier attempt never reached counts
-//! on the attempt that first encodes it. The transport counters, `records.rejected`, a `413`'s
-//! `oversize`, and a rejected request's `rejected` count per request sent: a settled request isn't
+//! on the attempt that first encodes it. The transport counters, a series `202`'s `rejected`,
+//! a `413`'s `oversize`, and a rejected request's `rejected` count per request sent: a settled request isn't
 //! resent, so each counts once per batch for it, and a retry counts only the requests it sends.
 
 use crate::accounting::BatchAccounting;
@@ -308,7 +308,6 @@ const REQUEST_DURATION: &str = "logit.output.request.duration";
 const REQUEST_BYTES: &str = "logit.output.request.bytes";
 const RECORDS: &str = "logit.output.records";
 const RECORDS_DROPPED: &str = "logit.output.records.dropped";
-const RECORDS_REJECTED: &str = "logit.output.records.rejected";
 
 const MINUTE: i64 = 60 * 1_000_000_000;
 /// Datadog's series window: a point more than 1h old or 10 min ahead is rejected.
@@ -1042,7 +1041,7 @@ impl DatadogOutput {
     /// [`Fault::Clean`] one, which never connected. A rejection counts the request's entries
     /// dropped here, `oversize` for a `413` and `rejected` for any other 3xx or 4xx that
     /// [`classify_status`] doesn't read as `Refused`. A series `2xx` counts the entries its body
-    /// names `records.rejected` ([`series_errors`]).
+    /// names `rejected` as well ([`series_errors`]), and takes them out of `records`.
     async fn post(&mut self, route: Route, encoded: Encoded, entries: usize) -> anyhow::Result<()> {
         let url = self.url(route);
         let tags = [("route", route.name())];
@@ -1088,7 +1087,7 @@ impl DatadogOutput {
                 let rejected = errors.len().min(entries);
                 if let Some(first) = errors.first() {
                     let first = redacted_snippet(&String::from_utf8_lossy(first), key);
-                    self.telemetry.count(RECORDS_REJECTED, rejected as f64, &tags);
+                    self.dropped(route, "rejected", rejected);
                     self.diag.warn_throttled(
                         "series_rejected",
                         format_args!(
@@ -1964,8 +1963,8 @@ mod tests {
         \x0a\x6ePayload validation failed: series logit.w0202.1791476884.future15 contains 1 \
         data points too far in the future";
 
-    /// `records` and `records.rejected` on the series route after sending `gauges` gauges against
-    /// an intake answering every series request `202` with `body`.
+    /// `records` and `records.dropped{reason="rejected"}` on the series route after sending
+    /// `gauges` gauges against an intake answering every series request `202` with `body`.
     async fn series_202(gauges: usize, body: &'static [u8]) -> (f64, f64, Vec<Event>) {
         let (addr, _log) = per_path_recorder(move |_, _| Reply::Answer(202, body.to_vec())).await;
         let registry = Registry::new();
@@ -1977,11 +1976,16 @@ mod tests {
         out.send_at(&b, NOW).await.expect("a 202 is accepted whatever its body names");
         let points = registry.drain(0);
         let tags = [("route", "series")];
-        (total(&points, RECORDS, &tags), total(&points, RECORDS_REJECTED, &tags), points)
+        let rejected =
+            total(&points, RECORDS_DROPPED, &[("route", "series"), ("reason", "rejected")]);
+        // Counted once, under `rejected` alone.
+        assert_eq!(total(&points, RECORDS_DROPPED, &[]), rejected);
+        (total(&points, RECORDS, &tags), rejected, points)
     }
 
     /// Each entry of a series `202`'s `errors` is one series Datadog dropped: counted
-    /// `records.rejected` and taken out of `records`, with the first entry quoted once.
+    /// `records.dropped{reason="rejected"}` and taken out of `records`, with the first entry
+    /// quoted once.
     #[tokio::test]
     async fn a_series_202_naming_dropped_series_counts_them_rejected() {
         let (records, rejected, points) = series_202(3, SERIES_202_TWO_ERRORS).await;
@@ -2251,9 +2255,9 @@ mod tests {
         ("logit.component.diagnostics", &[("key", "too_many_tags")]),
         (RECORDS_DROPPED, &[("route", "traces"), ("reason", "not_datadog_origin")]),
         ("logit.output.metrics.skipped", &[("metric_kind", "non_monotonic_delta_sum")]),
-        ("logit.output.metrics.skipped", &[("reason", "oversized_sketch")]),
+        ("logit.output.metrics.dropped", &[("reason", "oversized_sketch")]),
         ("logit.component.diagnostics", &[("key", "oversized_sketch")]),
-        ("logit.output.tags.dropped", &[("reason", "reserved_key")]),
+        ("logit.output.tags.omitted", &[("reason", "reserved_key")]),
     ];
 
     /// Beyond `logit.output.requests`, what a retried batch counts once per attempt here.
@@ -2396,7 +2400,7 @@ mod tests {
         assert_eq!(log.len(), requests + 1, "the first request failed, then all were resent");
         for sums in [&single, &retried] {
             assert_eq!(
-                sum_of(sums, "logit.output.tags.dropped", &[("reason", "reserved_key")]),
+                sum_of(sums, "logit.output.tags.omitted", &[("reason", "reserved_key")]),
                 9.0
             );
             let oversize = [("route", "logs"), ("reason", "oversize")];
@@ -2404,7 +2408,7 @@ mod tests {
             assert_eq!(sum_of(sums, "logit.component.diagnostics", &[("key", "oversize")]), 1.0);
         }
         let encode_side: [SumSeries<'static>; 3] = [
-            ("logit.output.tags.dropped", &[("reason", "reserved_key")]),
+            ("logit.output.tags.omitted", &[("reason", "reserved_key")]),
             (RECORDS_DROPPED, &[("reason", "oversize")]),
             ("logit.component.diagnostics", &[("key", "oversize")]),
         ];

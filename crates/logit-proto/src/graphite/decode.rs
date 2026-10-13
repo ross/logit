@@ -32,6 +32,9 @@ use std::sync::Arc;
 /// Nanoseconds per second -- the scale an ingress timestamp is widened by.
 const NANOS_PER_SECOND: f64 = 1e9;
 
+/// What a malformed line or pickle item counts on, by [`Dropped`] reason.
+const METRICS_DROPPED: &str = "logit.input.metrics.dropped";
+
 /// Carbon's receipt-time sentinel: its `MetricLineReceiver` treats a `-1` timestamp as "now".
 const RECEIPT_TIME_SENTINEL: f64 = -1.0;
 
@@ -157,7 +160,10 @@ fn decode_plaintext(bytes: &Bytes, received_at: i64, out: &mut Vec<Event>, ctx: 
             continue;
         }
         let Ok(line) = std::str::from_utf8(raw) else {
-            ctx.skip("bad_line", format_args!("graphite: line is not valid utf-8; skipping it"));
+            ctx.drop_metric(
+                Dropped::BadLine,
+                format_args!("graphite: line is not valid utf-8; skipping it"),
+            );
             continue;
         };
         decode_line(bytes, line, received_at, out, ctx);
@@ -173,16 +179,16 @@ fn decode_line(bytes: &Bytes, line: &str, received_at: i64, out: &mut Vec<Event>
     let (Some(path_field), Some(value_field), Some(timestamp_field), None) =
         (fields.next(), fields.next(), fields.next(), fields.next())
     else {
-        ctx.skip(
-            "bad_line",
+        ctx.drop_metric(
+            Dropped::BadLine,
             format_args!("graphite: {line:?} is not three whitespace-separated fields; skipping"),
         );
         return;
     };
 
     let Ok(value) = value_field.parse::<f64>() else {
-        ctx.skip(
-            "bad_line",
+        ctx.drop_metric(
+            Dropped::BadLine,
             format_args!("graphite: {value_field:?} is not a number (line {line:?}); skipping"),
         );
         return;
@@ -196,8 +202,9 @@ fn decode_line(bytes: &Bytes, line: &str, received_at: i64, out: &mut Vec<Event>
 /// Decodes one complete, already **unframed** pickle payload.
 ///
 /// A bad payload fails the whole call (a pickle stack machine has no resync point), and the caller
-/// drops the frame. A *wrong-shaped item* in a good payload costs only itself, counted
-/// `logit.input.metrics.skipped{reason="bad_shape"}`.
+/// drops the frame, counting it `logit.input.frames.dropped{reason="undecodable"}`. A
+/// *wrong-shaped item* in a good payload costs only itself, counted
+/// `logit.input.metrics.dropped{reason="bad_shape"}`.
 fn decode_pickle(
     pickle: &mut PickleReader,
     bytes: &Bytes,
@@ -212,7 +219,7 @@ fn decode_pickle(
     match result {
         Ok(skipped) => {
             if skipped > 0 {
-                ctx.count_skipped("bad_shape", skipped);
+                ctx.count_dropped(Dropped::BadShape, skipped);
             }
             Ok(())
         }
@@ -241,8 +248,8 @@ fn push_datapoint(
     ctx: &mut Ctx,
 ) {
     if !value.is_finite() {
-        ctx.skip(
-            "non_finite_value",
+        ctx.drop_metric(
+            Dropped::NonFiniteValue,
             format_args!(
                 "graphite: {path_field:?} carries {value}, which has no carbon wire form \
                  (carbon drops a NaN on receipt too); skipping"
@@ -254,7 +261,10 @@ fn push_datapoint(
     let mut attributes = AttrMap::new();
     let Some(path) = parse_tags(bytes, path_field, &mut attributes, ctx) else { return };
     if path.is_empty() {
-        ctx.skip("bad_line", format_args!("graphite: {path_field:?} has an empty path; skipping"));
+        ctx.drop_metric(
+            Dropped::BadLine,
+            format_args!("graphite: {path_field:?} has an empty path; skipping"),
+        );
         return;
     }
 
@@ -279,15 +289,15 @@ fn parse_tags<'a>(
     let Some((path, tags)) = field.split_once(';') else { return Some(field) };
     for segment in tags.split(';') {
         let Some((name, value)) = segment.split_once('=') else {
-            ctx.skip(
-                "bad_tag",
+            ctx.drop_metric(
+                Dropped::BadTag,
                 format_args!("graphite: tag segment {segment:?} has no '='; skipping the line"),
             );
             return None;
         };
         if name.is_empty() || value.is_empty() {
-            ctx.skip(
-                "bad_tag",
+            ctx.drop_metric(
+                Dropped::BadTag,
                 format_args!(
                     "graphite: tag segment {segment:?} has an empty name or value; skipping \
                      the line"
@@ -308,8 +318,8 @@ fn parse_tags<'a>(
 /// The wire timestamp field, parsed and widened to nanoseconds.
 fn parse_timestamp(field: &str, received_at: i64, ctx: &mut Ctx) -> Option<i64> {
     let Ok(seconds) = field.parse::<f64>() else {
-        ctx.skip(
-            "bad_timestamp",
+        ctx.drop_metric(
+            Dropped::BadTimestamp,
             format_args!("graphite: {field:?} is not a timestamp; skipping the line"),
         );
         return None;
@@ -330,8 +340,8 @@ fn resolve_timestamp(seconds: f64, received_at: i64, ctx: &mut Ctx) -> Option<i6
         return Some(received_at);
     }
     if !seconds.is_finite() || seconds <= 0.0 {
-        ctx.skip(
-            "bad_timestamp",
+        ctx.drop_metric(
+            Dropped::BadTimestamp,
             format_args!(
                 "graphite: {seconds} is not a positive instant and is not carbon's -1 \
                  receipt-time sentinel; skipping the line"
@@ -344,7 +354,40 @@ fn resolve_timestamp(seconds: f64, received_at: i64, ctx: &mut Ctx) -> Option<i6
     Some((whole as i64).saturating_mul(NANOS_PER_SECOND as i64).saturating_add(sub_nanos))
 }
 
-/// The telemetry/diagnostics pair every skip site needs, carried together so a skip is never
+/// Why a line or datapoint was dropped: the `reason` on `logit.input.metrics.dropped` and the
+/// throttled diagnostic's key, one word for both so the counter and the log line grep alike. An
+/// enum so a drop site can't name a reason the module doc's table doesn't list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dropped {
+    BadLine,
+    BadTag,
+    BadTimestamp,
+    NonFiniteValue,
+    BadShape,
+}
+
+impl Dropped {
+    #[cfg(test)]
+    const ALL: [Dropped; 5] = [
+        Dropped::BadLine,
+        Dropped::BadTag,
+        Dropped::BadTimestamp,
+        Dropped::NonFiniteValue,
+        Dropped::BadShape,
+    ];
+
+    fn reason(self) -> &'static str {
+        match self {
+            Dropped::BadLine => "bad_line",
+            Dropped::BadTag => "bad_tag",
+            Dropped::BadTimestamp => "bad_timestamp",
+            Dropped::NonFiniteValue => "non_finite_value",
+            Dropped::BadShape => "bad_shape",
+        }
+    }
+}
+
+/// The telemetry/diagnostics pair every drop site needs, carried together so a drop is never
 /// counted but not reported, or the reverse.
 struct Ctx<'a> {
     telemetry: &'a Telemetry,
@@ -354,19 +397,19 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    /// One skipped line/datapoint: `logit.input.metrics.skipped{reason}` plus a throttled
-    /// diagnostic under the same key, so the counter and the log line grep by one word.
-    fn skip(&mut self, reason: &'static str, message: impl Display) {
-        self.telemetry.count("logit.input.metrics.skipped", 1.0, &[("reason", reason)]);
-        self.diag.warn_throttled(reason, message);
+    /// One dropped line/datapoint: `logit.input.metrics.dropped{reason}` plus a throttled
+    /// diagnostic under the same key.
+    fn drop_metric(&mut self, why: Dropped, message: impl Display) {
+        self.telemetry.count(METRICS_DROPPED, 1.0, &[("reason", why.reason())]);
+        self.diag.warn_throttled(why.reason(), message);
     }
 
-    /// Several skips at once, with one summary diagnostic: the pickle `bad_shape` case, where the
+    /// Several drops at once, with one summary diagnostic: the pickle `bad_shape` case, where the
     /// reader returns only a count.
-    fn count_skipped(&mut self, reason: &'static str, n: usize) {
-        self.telemetry.count("logit.input.metrics.skipped", n as f64, &[("reason", reason)]);
+    fn count_dropped(&mut self, why: Dropped, n: usize) {
+        self.telemetry.count(METRICS_DROPPED, n as f64, &[("reason", why.reason())]);
         self.diag.warn_throttled(
-            reason,
+            why.reason(),
             format_args!(
                 "graphite: {n} pickle item(s) were not (path, (timestamp, value)); skipping them"
             ),
@@ -405,9 +448,20 @@ mod tests {
         (events, registry)
     }
 
-    /// The **total** recorded on `logit.input.metrics.skipped{reason}`. Drains, so call once.
-    fn skipped_total(registry: &Registry, reason: &str) -> f64 {
-        counter_total(registry, "logit.input.metrics.skipped", "reason", reason)
+    /// The **total** recorded on `logit.input.metrics.dropped{reason}`. Drains, so call once.
+    fn dropped_total(registry: &Registry, reason: &str) -> f64 {
+        counter_total(registry, "logit.input.metrics.dropped", "reason", reason)
+    }
+
+    /// Each reason is the one the module doc's decode table names, so renaming a variant's string
+    /// can't go unnoticed.
+    #[test]
+    fn every_dropped_reason_is_named_as_the_module_doc_lists() {
+        let reasons: Vec<&str> = Dropped::ALL.iter().map(|d| d.reason()).collect();
+        assert_eq!(
+            reasons,
+            ["bad_line", "bad_tag", "bad_timestamp", "non_finite_value", "bad_shape"]
+        );
     }
 
     fn counter_total(registry: &Registry, metric: &str, tag: &str, tag_value: &str) -> f64 {
@@ -529,7 +583,7 @@ mod tests {
         for line in ["a.b NaN 1700000000", "a.b inf 1700000000", "a.b -inf 1700000000"] {
             let (events, registry) = decode_counted(&format!("{line}\n"));
             assert!(events.is_empty(), "{line}");
-            assert_eq!(skipped_total(&registry, "non_finite_value"), 1.0, "{line}");
+            assert_eq!(dropped_total(&registry, "non_finite_value"), 1.0, "{line}");
         }
     }
 
@@ -538,7 +592,7 @@ mod tests {
         for line in ["a.b 1 0", "a.b 1 -2", "a.b 1 -0.5"] {
             let (events, registry) = decode_counted(&format!("{line}\n"));
             assert!(events.is_empty(), "{line}");
-            assert_eq!(skipped_total(&registry, "bad_timestamp"), 1.0, "{line}");
+            assert_eq!(dropped_total(&registry, "bad_timestamp"), 1.0, "{line}");
         }
     }
 
@@ -546,7 +600,7 @@ mod tests {
     fn an_unparseable_timestamp_is_rejected_as_a_bad_timestamp() {
         let (events, registry) = decode_counted("a.b 1 yesterday\n");
         assert!(events.is_empty());
-        assert_eq!(skipped_total(&registry, "bad_timestamp"), 1.0);
+        assert_eq!(dropped_total(&registry, "bad_timestamp"), 1.0);
     }
 
     #[test]
@@ -554,7 +608,7 @@ mod tests {
         for line in ["a.b 1", "a.b 1 1700000000 extra", "a.b"] {
             let (events, registry) = decode_counted(&format!("{line}\n"));
             assert!(events.is_empty(), "{line}");
-            assert_eq!(skipped_total(&registry, "bad_line"), 1.0, "{line}");
+            assert_eq!(dropped_total(&registry, "bad_line"), 1.0, "{line}");
         }
     }
 
@@ -562,7 +616,7 @@ mod tests {
     fn an_unparseable_value_is_rejected_as_a_bad_line() {
         let (events, registry) = decode_counted("a.b twelve 1700000000\n");
         assert!(events.is_empty());
-        assert_eq!(skipped_total(&registry, "bad_line"), 1.0);
+        assert_eq!(dropped_total(&registry, "bad_line"), 1.0);
     }
 
     /// Normalization 9: any whitespace run separates fields, and leading/trailing whitespace is
@@ -589,7 +643,7 @@ mod tests {
     fn empty_and_whitespace_only_lines_are_skipped_uncounted() {
         let (events, registry) = decode_counted("\n\n   \n\t\na.b 1 1700000000\n\n");
         assert_eq!(events.len(), 1);
-        assert_eq!(skipped_total(&registry, "bad_line"), 0.0);
+        assert_eq!(dropped_total(&registry, "bad_line"), 0.0);
     }
 
     #[test]
@@ -602,7 +656,7 @@ mod tests {
         ] {
             let (events, registry) = decode_counted(&format!("{line}\n"));
             assert!(events.is_empty(), "{line}");
-            assert_eq!(skipped_total(&registry, "bad_tag"), 1.0, "{line}");
+            assert_eq!(dropped_total(&registry, "bad_tag"), 1.0, "{line}");
         }
     }
 
@@ -622,7 +676,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(name(&events[0]), "good.one");
         assert_eq!(name(&events[1]), "good.two");
-        assert_eq!(skipped_total(&registry, "bad_line"), 1.0);
+        assert_eq!(dropped_total(&registry, "bad_line"), 1.0);
     }
 
     #[test]
@@ -750,7 +804,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(name(&events[0]), "a.b");
         assert_eq!(name(&events[1]), "c.d");
-        assert_eq!(skipped_total(&registry, "bad_shape"), 1.0);
+        assert_eq!(dropped_total(&registry, "bad_shape"), 1.0);
     }
 
     /// A forbidden opcode fails the whole frame, reported under `bad_pickle`.
@@ -784,6 +838,6 @@ mod tests {
         super::super::pickle::write_datapoints(&mut payload, [("a.b", 1_700_000_000i64, f64::NAN)]);
         let (events, registry) = decode_pickle_payload(&payload);
         assert!(events.is_empty());
-        assert_eq!(skipped_total(&registry, "non_finite_value"), 1.0);
+        assert_eq!(dropped_total(&registry, "non_finite_value"), 1.0);
     }
 }

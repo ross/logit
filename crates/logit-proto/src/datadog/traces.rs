@@ -297,9 +297,9 @@ fn put(attrs: &mut AttrMap, collisions: &mut usize, key: &str, value: Value) {
 }
 
 impl DatadogDecoder {
-    pub(super) fn span_skipped(&self, reason: &'static str, n: usize) {
+    pub(super) fn span_dropped(&self, reason: &'static str, n: usize) {
         if n > 0 {
-            self.telemetry.count("logit.input.spans.skipped", n as f64, &[("reason", reason)]);
+            self.telemetry.count("logit.input.spans.dropped", n as f64, &[("reason", reason)]);
         }
     }
 
@@ -312,7 +312,7 @@ impl DatadogDecoder {
     /// Drops one span (or a whole chunk or trace, `n` spans) whose shape is wrong, keeping the
     /// rest of the request.
     pub(super) fn malformed_span(&mut self, n: usize, why: impl std::fmt::Display) {
-        self.span_skipped("malformed", n.max(1));
+        self.span_dropped("malformed", n.max(1));
         self.diagnostics
             .warn_throttled("malformed_span", format!("datadog: malformed span dropped: {why}"));
     }

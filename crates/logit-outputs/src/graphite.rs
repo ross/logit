@@ -825,7 +825,7 @@ mod tests {
             let batch = batch_with(vec![gauge_event("a.long.enough.metric.name", 1.0)]);
             output.send(&batch).await.expect("an all-dropped batch must not attempt any I/O");
             assert!(
-                counted(&registry, "logit.output.metrics.skipped", ("reason", "oversize_line")),
+                counted(&registry, "logit.output.metrics.dropped", ("reason", "oversize_line")),
                 "expected the encoder's own cap to have dropped the line as oversize in this \
                  ordering"
             );
@@ -921,7 +921,7 @@ mod tests {
     }
 
     const ENCODE_SIDE: [(&str, &[(&str, &str)]); 3] = [
-        ("logit.output.metrics.skipped", &[("metric_kind", "gauge_delta")]),
+        ("logit.output.metrics.dropped", &[("reason", "unresolved_gauge_delta")]),
         ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
         ("logit.output.batch.bytes", &[]),
     ];

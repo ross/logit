@@ -15,7 +15,7 @@ use bytes::Bytes;
 use logit_core::interner::{intern, Symbol};
 use logit_core::{
     AttrMap, BodyFormat, Diagnostics, Event, LogRecord, MetricKind, MetricRecord, Resource, Scope,
-    Severity, Sum, Temporality, Value,
+    Severity, Sum, Telemetry, Temporality, Value,
 };
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -27,12 +27,24 @@ use std::sync::Arc;
 /// [`MAX_VALUES_PER_LIST`] times; the `collectd.*` attribute keeps every byte.
 const MAX_NAME_SEGMENT_BYTES: usize = DATA_MAX_NAME_LEN - 1;
 
+/// What a datagram loses past an Encryption part or a malformed part behind decoded lists, by
+/// `reason`. The listener's driver counts a datagram that decodes to nothing under the same name.
+const FRAMES_DROPPED: &str = "logit.input.frames.dropped";
+
+/// A Values part dispatched against an incomplete identity, one per data source.
+const METRICS_DROPPED: &str = "logit.input.metrics.dropped";
+
+/// A notification that fails validation, by `reason`.
+const EVENTS_DROPPED: &str = "logit.input.events.dropped";
+
 /// Decodes collectd binary-protocol datagrams, with no socket, so framing, stickiness, and
 /// malformed-input tests run against it directly.
 pub struct CollectdDecoder {
     /// One shared resource for every batch, **not** one per host (see [`super`]'s module doc).
     resource: Arc<Resource>,
     diag: Diagnostics,
+    /// Where each loss the module doc's decode table names is counted.
+    telemetry: Telemetry,
     /// Scratch for the record name being built (`<plugin>.<type>[.<i>]`), a field so a
     /// 64-data-source list allocates no `String`.
     name: String,
@@ -60,6 +72,7 @@ impl CollectdDecoder {
         Self {
             resource,
             diag: Diagnostics::default(),
+            telemetry: Telemetry::default(),
             name: String::new(),
             keys: AttrKeys {
                 host: intern(super::ATTR_HOST),
@@ -76,6 +89,11 @@ impl CollectdDecoder {
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
+        self
+    }
+
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
         self
     }
 
@@ -99,6 +117,12 @@ impl CollectdDecoder {
     pub fn with_types_db(mut self, types_db: Arc<TypesDb>) -> Self {
         self.types_db = Some(types_db);
         self
+    }
+
+    /// One notification dropped for failing validation (an invalid severity, an empty message, or
+    /// no host); its diagnostic stays `notification_dropped`.
+    fn count_invalid_notification(&self) {
+        self.telemetry.count(EVENTS_DROPPED, 1.0, &[("reason", "invalid_notification")]);
     }
 
     /// This decoder's diagnostics handle.
@@ -180,6 +204,7 @@ impl Decoder for CollectdDecoder {
                 Err(fault) => {
                     let kept = out.len() - pushed_before;
                     if kept > 0 {
+                        self.telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", "malformed_part")]);
                         self.diag.warn_throttled(
                             "bad_part",
                             format_args!(
@@ -246,6 +271,7 @@ impl CollectdDecoder {
             // (`docs/known-gaps/mappings.md`): stop, rather than report each garbage part as
             // malformed.
             part::TYPE_ENCRYPTION => {
+                self.telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", "encrypted")]);
                 self.diag.warn_throttled(
                     "encrypted_packet_dropped",
                     "collectd: encrypted packet (part 0x0210); dropping the rest of the datagram \
@@ -297,9 +323,15 @@ impl CollectdDecoder {
         }
 
         // collectd's `network_dispatch_values` rejects a list with an empty host, plugin, or type
-        // (`-EINVAL`). Skipped, not malformed: the part is well formed, and so are its neighbors.
+        // (`-EINVAL`). Dropped alone, not malformed: the part is well formed, and so are its
+        // neighbors.
         let (Some(host), Some(plugin), Some(type_)) = (&sticky.host, &sticky.plugin, &sticky.type_)
         else {
+            self.telemetry.count(
+                METRICS_DROPPED,
+                count as f64,
+                &[("reason", "incomplete_identity")],
+            );
             self.diag.warn_throttled(
                 "incomplete_identity",
                 "collectd: a value list arrived with an empty host, plugin or type; skipping it \
@@ -435,6 +467,7 @@ impl CollectdDecoder {
             2 => Severity::Warn,
             4 => Severity::Info,
             other => {
+                self.count_invalid_notification();
                 self.diag.warn_throttled(
                     "notification_dropped",
                     format_args!(
@@ -446,6 +479,7 @@ impl CollectdDecoder {
             }
         };
         let Some(message_range) = message_range else {
+            self.count_invalid_notification();
             self.diag.warn_throttled(
                 "notification_dropped",
                 "collectd: notification message is empty; dropping (collectd's own receiver \
@@ -454,6 +488,7 @@ impl CollectdDecoder {
             return;
         };
         let Some(host) = &sticky.host else {
+            self.count_invalid_notification();
             self.diag.warn_throttled(
                 "notification_dropped",
                 "collectd: notification arrived with no host set; dropping",
@@ -717,16 +752,42 @@ pub(crate) mod tests {
         CollectdDecoder::new(Arc::new(Resource::default()))
     }
 
-    /// A decoder whose diagnostics mirror into a drainable registry, for asserting on
-    /// `logit.component.diagnostics{key}`.
+    /// A decoder whose diagnostics and counters land in a drainable registry, for asserting on
+    /// `logit.component.diagnostics{key}` and the decoder's `*.dropped{reason}`.
     fn decoder_with_diag() -> (CollectdDecoder, Arc<Registry>) {
         let registry = Registry::new();
-        let diag = Diagnostics::new("collectd_in").with_telemetry(registry.telemetry_for(
-            "collectd_in",
-            "collectd_in",
-            "listener",
-        ));
-        (decoder().with_diagnostics(diag), registry)
+        let telemetry = registry.telemetry_for("collectd_in", "collectd_in", "listener");
+        let diag = Diagnostics::new("collectd_in").with_telemetry(telemetry.clone());
+        (decoder().with_diagnostics(diag).with_telemetry(telemetry), registry)
+    }
+
+    /// Whether `registry` recorded a diagnostic for `key`, and the total counted on `name` under
+    /// `reason`. Drains, so call it once per test.
+    fn diagnosed_and_counted(
+        registry: &Registry,
+        key: &str,
+        name: &str,
+        reason: &str,
+    ) -> (bool, f64) {
+        let events = registry.drain(0);
+        let tagged = |event: &Event, tag: &str, value: &str| {
+            event.attributes.get(tag).and_then(|v| v.as_str()) == Some(value)
+        };
+        let diagnosed = events.iter().any(|event| {
+            event.metrics.iter().any(|m| resolve(m.name) == "logit.component.diagnostics")
+                && tagged(event, "key", key)
+        });
+        let counted = events
+            .iter()
+            .filter(|event| tagged(event, "reason", reason))
+            .flat_map(|event| &event.metrics)
+            .filter(|m| resolve(m.name) == name)
+            .map(|m| match &m.kind {
+                MetricKind::Sum(sum) => sum.value,
+                other => panic!("{name} must be a counter, got {other:?}"),
+            })
+            .sum();
+        (diagnosed, counted)
     }
 
     /// Whether `registry` recorded a `logit.component.diagnostics` point for `key`. Drains, so call
@@ -1049,7 +1110,15 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         decoder.decode_into(bytes, RECEIVED_AT, &mut out).unwrap();
         assert_eq!(out.len(), 1, "only the list before the Encryption part is decoded");
-        assert!(diagnosed(&registry, "encrypted_packet_dropped"));
+        assert_eq!(
+            diagnosed_and_counted(
+                &registry,
+                "encrypted_packet_dropped",
+                FRAMES_DROPPED,
+                "encrypted"
+            ),
+            (true, 1.0)
+        );
     }
 
     #[test]
@@ -1072,7 +1141,15 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(out.len(), 1, "the notification is dropped, the value list is not");
         assert!(out[0].log.is_none());
-        assert!(diagnosed(&registry, "notification_dropped"));
+        assert_eq!(
+            diagnosed_and_counted(
+                &registry,
+                "notification_dropped",
+                EVENTS_DROPPED,
+                "invalid_notification"
+            ),
+            (true, 1.0)
+        );
     }
 
     // --- notifications (0x0100 Message / 0x0101 Severity) --------------------------------------
@@ -1169,7 +1246,15 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(out.is_empty());
-        assert!(diagnosed(&registry, "notification_dropped"));
+        assert_eq!(
+            diagnosed_and_counted(
+                &registry,
+                "notification_dropped",
+                EVENTS_DROPPED,
+                "invalid_notification"
+            ),
+            (true, 1.0)
+        );
     }
 
     #[test]
@@ -1189,7 +1274,16 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             assert!(out.is_empty(), "severity {wire}");
-            assert!(diagnosed(&registry, "notification_dropped"), "severity {wire}");
+            assert_eq!(
+                diagnosed_and_counted(
+                    &registry,
+                    "notification_dropped",
+                    EVENTS_DROPPED,
+                    "invalid_notification"
+                ),
+                (true, 1.0),
+                "severity {wire}"
+            );
         }
     }
 
@@ -1289,7 +1383,16 @@ pub(crate) mod tests {
             let mut out = Vec::new();
             decoder.decode_into(bytes, RECEIVED_AT, &mut out).expect("a skip is not an error");
             assert!(out.is_empty());
-            assert!(diagnosed(&registry, "incomplete_identity"));
+            assert_eq!(
+                diagnosed_and_counted(
+                    &registry,
+                    "incomplete_identity",
+                    METRICS_DROPPED,
+                    "incomplete_identity"
+                ),
+                (true, 1.0),
+                "one data source, one record dropped"
+            );
         }
     }
 
@@ -1373,7 +1476,10 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         decoder.decode_into(bytes, RECEIVED_AT, &mut out).expect("earlier lists survive");
         assert_eq!(out.len(), 1);
-        assert!(diagnosed(&registry, "bad_part"));
+        assert_eq!(
+            diagnosed_and_counted(&registry, "bad_part", FRAMES_DROPPED, "malformed_part"),
+            (true, 1.0)
+        );
     }
 
     /// A malformed part **abandons the rest of the datagram**; decoding never resumes past it.
@@ -1394,7 +1500,10 @@ pub(crate) mod tests {
         decoder.decode_into(bytes, RECEIVED_AT, &mut out).expect("earlier lists survive");
         assert_eq!(out.len(), 1, "only the list before the malformed part is decoded");
         assert_eq!(out[0].metrics[0].kind, MetricKind::Gauge(1.0));
-        assert!(diagnosed(&registry, "bad_part"));
+        assert_eq!(
+            diagnosed_and_counted(&registry, "bad_part", FRAMES_DROPPED, "malformed_part"),
+            (true, 1.0)
+        );
     }
 
     /// An inflated `count` is rejected on the length check, before anything is sized from it

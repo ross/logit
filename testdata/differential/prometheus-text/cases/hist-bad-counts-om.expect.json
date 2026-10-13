@@ -1,5 +1,5 @@
 {
- "divergence": "a NaN or negative bucket count and an infinite `_count` have no `u64` reading: each line skipped `malformed_line` (docs/known-gaps/mappings.md: A sample value or timestamp the model can't hold)",
+ "divergence": "a NaN or negative bucket count and an infinite `_count` have no `u64` reading: each line dropped `malformed_line` (docs/known-gaps/mappings.md: A sample value or timestamp the model can't hold)",
  "divergent": [
   [
    "h_bucket",
