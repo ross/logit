@@ -173,6 +173,30 @@ count, so no `events.dropped` is counted with it. `component.buffer.disk.truncat
 count of repairs. [ADR `disk-backed-sink-buffer`](disk-backed-sink-buffer.md)'s amendment of the
 same date has the bounds of the count and how it enters the sink identity.
 
+## Amendment (2026-10-13): close-out
+
+- **The operator copy of the vocabulary** is
+  [internal-telemetry.md](../design/internal-telemetry.md#loss-vocabulary)'s "Loss vocabulary",
+  and `docs/deploying.md`'s "Alerting on loss" gives the one alerting rule. This record keeps the
+  decision and the migration record; neither copy repeats the other's tables.
+- **Two classifications stay as the migration record has them**, by the maintainer's call:
+  - `prometheus_out`'s `output.metrics.degraded{reason="sub_ms_collapsed"}` stays `degraded`.
+    Of two readings of one series whose timestamps share a millisecond, the series is delivered
+    with the later one, because the destination holds one sample per millisecond.
+  - `datadog_out`'s cumulative and non-monotonic `Sum` stay
+    `output.metrics.skipped{metric_kind}`, though "missing upstream stage" would make them
+    `dropped`. No `logit` stage converts either to a delta monotonic `Sum` a Datadog `count` can
+    carry, so an operator alerted on them has nothing to change until one exists.
+- **`output.metrics.type_conflict` keeps its name** (a row in the Outputs table). It counts a
+  family `prometheus_out`'s registry replaced because a later batch re-typed it: the new type
+  wins and the old type's series are evicted, because exposition allows one type per family.
+- **The soak harness reads every `*.dropped` as loss.** Its `drops` row surfaces every
+  `logit.*.dropped` counter the system under test emits that no ledger row balances
+  ([ADR `soak-harness`](soak-harness.md), `tools/soak/README.md`).
+- **`influxdb_out` is the one entry left under [Loss with no counter](#loss-with-no-counter).**
+  The `influx` stream, which rewrites `influxdb_out` and adds `influxdb_in`, adopts this vocabulary
+  for both, so its counters land there rather than here.
+
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
 `*.rejected` name and reason that existed on 2026-10-13, verified against the emit sites in
@@ -236,6 +260,7 @@ series route, `prometheus_out`'s exposition dialects, and `splunk_hec_out`'s
 | `collectd_out` | `output.metrics.skipped` (`notification_dropped`) | `output.metrics.dropped` (`invalid_notification`) |
 | every sink that counts them | `output.metrics.degraded` (every `metric_kind`; `set_estimate`, `rebinned`, `fractional_count`, `sample_rate_expanded`, `unit_not_suffix`, `sub_ms_collapsed`) | unchanged |
 | `prometheus_out` | `output.metrics.degraded` (`exemplar_dropped`) | `output.metrics.degraded` (`exemplar_omitted`) |
+| `prometheus_out` registry | `output.metrics.type_conflict` (untagged: a family re-typed across batches, its old series cleared) | unchanged |
 | graphite, splunk | `output.metrics.normalized` (every reason) | unchanged |
 | `statsd_out` | `output.messages.dropped` (`unresolved_gauge_delta`, `unencodable_value`, `empty_name`, `oversize_line`, `invalid_service_check`) | unchanged |
 | `statsd_out` | `output.messages.dropped` (`unencodable_value` for an out-of-range `sample_rate`, where the line is still sent without `@rate`) | `output.fields.omitted` (`invalid_value`) |

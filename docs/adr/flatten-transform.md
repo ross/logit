@@ -195,15 +195,11 @@ both of which carry nesting losslessly — flattening them would be pure loss fo
   `logit.output.tags.dropped{reason="unrepresentable"}` counter its four sibling sinks already have
   is tracked as separate follow-up work, not part of this transform.
 
-## Amendment (2026-10-13): `tags.omitted`
+## Amendment (2026-10-13): `tags.omitted` and `labels.omitted`
 
-Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `statsd_out`, `graphite_out`, and `collectd_out` count a nested attribute they
-leave off a delivered record as `logit.output.tags.omitted`, with the same reasons this record
-cites under `tags.dropped`.
-
-## Amendment (2026-10-13): `prometheus_out` omits a label
-
-The sink table's `prometheus_out` row is now
-`logit.output.labels.omitted{reason="unrepresentable"}`: the series is still exposed without the
-label, so the count isn't loss under
-[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md).
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the sink table's counters
+are renamed: `statsd_out`, `graphite_out`, and `collectd_out` count a nested attribute they leave
+off a delivered record as `logit.output.tags.omitted`, and `prometheus_out` as
+`logit.output.labels.omitted`, each with the reasons this record cites under `tags.dropped` and
+`labels.dropped`. The record is still delivered without the tag or label, so the count isn't loss.
+`influxdb_out` still counts nothing.
