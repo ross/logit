@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-10-11
+updated: 2026-10-13
 ---
 
 # Shutdown accounting and cancellation safety: every shutdown loss counted, and one table of cancellation points
@@ -648,3 +648,12 @@ Alternatives considered:
   dedicated edge. The dedicated case alone is simple and covers the recommended setup.
 - **Require a dedicated pipeline through a validation rule.** Rejected: a mixed pipeline is valid,
   and the loss is limited to shutdown-time telemetry.
+
+## Amendment: the exit summary's exclusions shrink (2026-10-13)
+
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md) renames the counters decision 16 excluded from its `warn` level: a transform's or script's
+removed event is `logit.component.events.discarded`, and `keep`/`remove`'s count is
+`logit.transform.attributes.omitted`. Neither is named `*.dropped`, so decision 16 needs no
+exclusion for them: the summary warns on a nonzero `*.dropped` point unless its `reason` is
+`unrouted`. A Lua event lost to a script error is new loss under
+`events.dropped{reason="script_error"}` and warns.

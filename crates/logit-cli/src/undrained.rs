@@ -29,22 +29,16 @@ pub enum Reading {
 }
 
 impl Leftover {
-    /// A nonzero `*.dropped` count is data the run lost, unless the config asked for the drop:
-    /// its `reason` is in `INTENDED_REASONS`, or its metric is in `INTENDED_METRICS`. Everything
-    /// else is routine. Both are exclusion lists, so a reason or metric added later warns until
-    /// someone decides it is intended.
+    /// A nonzero `*.dropped` count is data the run lost, unless its `reason` is in
+    /// `INTENDED_REASONS`. Everything else is routine
+    /// (`docs/adr/telemetry-loss-vocabulary.md`). The list is an exclusion list, so a reason added
+    /// later warns until someone decides it is intended.
     fn is_loss(&self) -> bool {
-        /// Drops a transform or router makes because the config says to: an aggregate or filter
-        /// absorbing an event, a route with no matching target, and a script returning no event.
-        const INTENDED_REASONS: [&str; 3] = ["absorbed", "unrouted", "script_drop"];
-        /// Config-intended drops counted with no `reason` tag. A component that adds a counter
-        /// named `*.dropped` for something the config asked for and tags no reason must add the
-        /// metric here, or every clean exit logs it at `warn`.
-        const INTENDED_METRICS: [&str; 1] = ["logit.transform.attributes.dropped"];
+        /// A route with no matching target, which the router counts under `*.dropped`.
+        const INTENDED_REASONS: [&str; 1] = ["unrouted"];
         let reason = self.tags.split(',').find_map(|pair| pair.strip_prefix("reason="));
         matches!(self.reading, Reading::Value(v) if v != 0.0)
             && self.metric.ends_with(".dropped")
-            && !INTENDED_METRICS.contains(&self.metric)
             && !reason.is_some_and(|r| INTENDED_REASONS.contains(&r))
     }
 }
@@ -175,23 +169,31 @@ mod tests {
             tags: format!("reason={reason}"),
             reading: Reading::Value(3.0),
         };
-        for intended in ["absorbed", "unrouted", "script_drop"] {
-            assert!(!dropped(intended).is_loss(), "{intended}");
-        }
-        for lost in ["shutdown", "rejected", "ambiguous_at_most_once", "a_new_reason"] {
+        assert!(!dropped("unrouted").is_loss());
+        for lost in [
+            "shutdown",
+            "rejected",
+            "ambiguous_at_most_once",
+            "script_error",
+            "absorbed",
+            "script_drop",
+            "a_new_reason",
+        ] {
             assert!(dropped(lost).is_loss(), "{lost}");
         }
     }
 
     #[test]
-    fn an_intended_metric_with_no_reason_is_not_a_loss() {
-        let attributes = |value| Leftover {
+    fn an_intended_outcome_is_not_named_dropped() {
+        let leftover = |metric| Leftover {
             component: "c".into(),
-            metric: "logit.transform.attributes.dropped",
+            metric,
             tags: String::new(),
-            reading: Reading::Value(value),
+            reading: Reading::Value(4.0),
         };
-        assert!(!attributes(4.0).is_loss());
+        assert!(!leftover("logit.component.events.discarded").is_loss());
+        assert!(!leftover("logit.transform.attributes.omitted").is_loss());
+        assert!(leftover("logit.transform.attributes.dropped").is_loss(), "no metric is exempt");
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //! `Fanout` has touched (a bench or unit test).
 
 use logit_core::interner::{intern, Symbol};
-use logit_core::{Event, Provenance, Resource, Telemetry};
+use logit_core::{Event, Provenance, Resource};
 use logit_pipeline::Transform;
 use std::sync::Arc;
 
@@ -56,19 +56,12 @@ impl Matcher {
 /// Never mutates a forwarded event. See the module doc for the matching rules.
 pub struct HasProvenance {
     matcher: Matcher,
-    telemetry: Telemetry,
 }
 
 impl HasProvenance {
     /// Builds the filter from component-id lists, interned here.
     pub fn new(origin: Vec<String>, previous: Vec<String>) -> Self {
-        Self { matcher: Matcher::new(origin, previous), telemetry: Telemetry::default() }
-    }
-
-    /// Attaches a telemetry handle; matching fixed values can't fail, so no `Diagnostics`.
-    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry;
-        self
+        Self { matcher: Matcher::new(origin, previous) }
     }
 }
 
@@ -78,7 +71,7 @@ impl Transform for HasProvenance {
     }
 
     fn process(&mut self, _resource: &Arc<Resource>, _event: &mut Event) -> bool {
-        forward(self.matcher.matches(), &self.telemetry)
+        self.matcher.matches()
     }
 }
 
@@ -88,18 +81,12 @@ impl Transform for HasProvenance {
 /// The complement of [`HasProvenance`] on the same config, taken at the top level, not per field.
 pub struct DropProvenance {
     matcher: Matcher,
-    telemetry: Telemetry,
 }
 
 impl DropProvenance {
     /// Builds the filter; see [`HasProvenance::new`].
     pub fn new(origin: Vec<String>, previous: Vec<String>) -> Self {
-        Self { matcher: Matcher::new(origin, previous), telemetry: Telemetry::default() }
-    }
-
-    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry;
-        self
+        Self { matcher: Matcher::new(origin, previous) }
     }
 }
 
@@ -111,22 +98,15 @@ impl Transform for DropProvenance {
     fn process(&mut self, _resource: &Arc<Resource>, _event: &mut Event) -> bool {
         // This `!` is the only difference from `HasProvenance`: with both fields configured, an
         // event drops only when both match.
-        forward(!self.matcher.matches(), &self.telemetry)
+        !self.matcher.matches()
     }
-}
-
-/// Records the verdict and returns `keep`.
-///
-/// The `0.0` on the forward path registers `events.filtered` so it reads zero rather than absent.
-fn forward(keep: bool, telemetry: &Telemetry) -> bool {
-    telemetry.count("logit.transform.events.filtered", if keep { 0.0 } else { 1.0 }, &[]);
-    keep
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{AttrMap, BodyFormat, LogRecord, Registry, Value};
+    use logit_core::{AttrMap, BodyFormat, EventBatch, LogRecord, Registry, Value};
+    use logit_pipeline::runtime::process_batch;
 
     fn event() -> Event {
         Event::log(
@@ -309,27 +289,21 @@ mod tests {
     // -- telemetry ------------------------------------------------------------------------------
 
     #[test]
-    fn both_record_filtered_events() {
+    fn a_filtered_event_counts_as_discarded_not_dropped() {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("filter", "has_provenance", "transform");
-        let mut has =
-            HasProvenance::new(vec!["nginx_in".to_string()], vec![]).with_telemetry(telemetry);
+        let mut has = HasProvenance::new(vec!["nginx_in".to_string()], vec![]);
+        let batch =
+            || EventBatch { resource: default_resource(), scope: None, events: vec![event()] };
 
         has.observe_provenance(provenance(Some("nginx_in"), None));
-        has.process(&default_resource(), &mut event());
+        assert!(process_batch(&mut has, batch(), &telemetry).is_some());
         has.observe_provenance(provenance(Some("syslog_in"), None));
-        has.process(&default_resource(), &mut event());
+        assert!(process_batch(&mut has, batch(), &telemetry).is_none());
 
         let events = registry.drain(0);
-        assert_eq!(counter_value(&events, "logit.transform.events.filtered"), Some(1.0));
-    }
-
-    #[test]
-    fn a_disabled_telemetry_handle_is_the_default() {
-        let mut has = HasProvenance::new(vec!["nginx_in".to_string()], vec![]);
-        has.observe_provenance(provenance(Some("nginx_in"), None));
-        let mut ev = event();
-        assert!(has.process(&default_resource(), &mut ev));
+        assert_eq!(counter_value(&events, "logit.component.events.discarded"), Some(1.0));
+        assert_eq!(counter_value(&events, "logit.component.events.dropped"), None);
     }
 
     // -- end-to-end: a real batch through Fanout/run_transform -----------------------------------

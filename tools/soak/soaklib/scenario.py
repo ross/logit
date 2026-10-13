@@ -176,6 +176,7 @@ METRIC_KINDS = {
     "logit.component.diagnostics": "sum",
     "logit.component.errors": "sum",
     "logit.component.events.dropped": "sum",
+    "logit.component.events.discarded": "sum",
     "logit.component.flush.events": "sum",
     "logit.script.events.emitted": "sum",
     "logit.script.vm.memory": "gauge",

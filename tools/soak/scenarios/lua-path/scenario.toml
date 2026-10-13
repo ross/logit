@@ -4,7 +4,7 @@
 # pauses, and partitions. The schema is docs/plans/soak-harness.md's "The scenario schema".
 
 name = "lua-path"
-description = "statsd-vm with lua between statsd_in and aggregate: rewrite, script_drop, script errors, and a flush() rollup"
+description = "statsd-vm with lua between statsd_in and aggregate: rewrite, discards, script errors, and a flush() rollup"
 duration = "16m"          # warmup + one cycle + cooldown; --duration overrides
 warmup = "60s"            # no faults: baseline rate, RSS, fds
 cooldown = "120s"         # no faults at the end; >= recovery_bound
@@ -85,11 +85,10 @@ for = "45s"
 
 # The script's three outcomes besides an emit, each seen in the first fault's window.
 [[expect]]
-name = "script-drops"
+name = "script-discards"
 service = "logit"
-metric = "logit.component.events.dropped"
+metric = "logit.component.events.discarded"
 component = "enrich"
-attrs = { reason = "script_drop" }
 step = "c0s1"
 window = "during"
 reduce = "delta"
@@ -101,6 +100,17 @@ service = "logit"
 metric = "logit.component.errors"
 component = "enrich"
 attrs = { reason = "process" }
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "script-error-loss"
+service = "logit"
+metric = "logit.component.events.dropped"
+component = "enrich"
+attrs = { reason = "script_error" }
 step = "c0s1"
 window = "during"
 reduce = "delta"
