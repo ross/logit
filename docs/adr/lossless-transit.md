@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-05
+updated: 2026-10-13
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
@@ -249,3 +249,24 @@ into one event per line).
 Realized as of 2026-09-25: the pair relays losslessly modulo the normalizations its codec's
 module doc lists; see [`docs/plans/splunk-relay.md`](../plans/splunk-relay.md)'s closing
 assessment.
+
+## Amendment: a tenth like pair (2026-10-13)
+
+`influxdb_in -> influxdb_out` (InfluxDB 2.x line protocol over the v2 write API) is the tenth
+like-protocol pair in scope under this ADR, alongside `statsd`, `otlp`, `syslog`, `prometheus`,
+`collectd`, `graphite`, the two Datadog pairs, and `splunk_hec`. See
+[ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md) for the protocol, the
+`influxdb.*` carrier (the measurement, string fields, and the request's org and bucket), fields as
+typed `Gauge` records on one event, the all-or-nothing write, and the listener's responses, and
+[`docs/plans/influxdb-relay.md`](../plans/influxdb-relay.md) for the workstreams closing it. Its
+permitted normalizations are numbered in that ADR, and
+`crates/logit-proto/src/influxdb/mod.rs`'s module doc will carry the same numbers (batching;
+duplicate points in one body merged, last write wins per field; tag and field order; number
+spelling and escaping; timestamps leaving in nanoseconds, receipt time for none; comments and
+blank lines dropped; the cross-source 1 ns nudge).
+
+The pair needs a typed metric scalar, which the model didn't have:
+[ADR `typed-metric-scalar`](typed-metric-scalar.md) replaces the `f64` in `Gauge`, `GaugeDelta`,
+and `Sum` with `MetricValue { F64, I64, U64, Bool }`. That change also closes two losses this ADR
+already counted as debt: an OTLP `as_int` point leaving `otlp_out` as a double, and a collectd
+`COUNTER`, `DERIVE`, or `ABSOLUTE` above 2^53 decoding to a different number.

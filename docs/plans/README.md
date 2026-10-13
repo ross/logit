@@ -10,6 +10,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: `influxdb_in`/`influxdb_out` — a lossless InfluxDB line-protocol relay](influxdb-relay.md) | 2026-10-13 | 2026-10-13 |
 | [Enabling plan: `kafka_out` — a pure-Rust Kafka producer](kafka-output.md) | 2026-10-11 | 2026-10-11 |
 | [Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger](soak-harness.md) | 2026-10-08 | 2026-10-11 |
 | [Enabling plan: sender addresses on the HTTP listeners — `peer:`, `proxy_protocol:`, and `forwarded:`](http-listener-peer-address.md) | 2026-10-05 | 2026-10-05 |

@@ -149,9 +149,10 @@ exposition/OpenMetrics format already describes.
 
 ### InfluxDB line protocol
 
-Reference: <https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/>.
-`logit` has `influxdb_out` but no `influxdb_in`, so this is a target for egress fidelity, not a
-like-protocol pair under [ADR `lossless-transit`](../adr/lossless-transit.md).
+Reference: <https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/>. See
+[ADR `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md) for `logit`'s
+`influxdb_in`/`influxdb_out` model mapping, the `influxdb.*` carrier, and the permitted
+normalizations.
 
 `<measurement>[,<tag_key>=<tag_value>...] <field_key>=<field_value>[,<field_key>=<field_value>...] [<timestamp>]`.
 
@@ -162,6 +163,22 @@ like-protocol pair under [ADR `lossless-transit`](../adr/lossless-transit.md).
 - Tag values are always strings. A backslash escapes comma, equals sign, and space in measurement
   names, tag keys and values, and field keys, and escapes double quote and backslash in string
   field values. Timestamp precision is set per write; the default is nanoseconds.
+
+The pair's fixture corpus must cover each of these wire features:
+
+- each field type: float, signed integer, unsigned integer, string, and boolean in each spelling;
+- escaping in every position: measurement, tag key, tag value, field key, and string field value,
+  including a backslash;
+- each `precision` value: `ns`, `us`, `ms`, and `s`;
+- a point with no timestamp;
+- comment lines and blank lines;
+- a point with several fields;
+- duplicate points (same measurement, tag set, and timestamp) in one body;
+- a gzip-compressed body.
+
+How `influxd` itself reads the edge cases (a backslash before a non-special character, boolean
+spellings, number forms) is to be verified against a real server; see
+[`docs/plans/influxdb-relay.md`](../plans/influxdb-relay.md)'s "Open risks".
 
 ### collectd binary/network protocol
 
