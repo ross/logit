@@ -1042,12 +1042,12 @@ the other way around (`docs/design/pipeline-graph.md`'s "Crate layout" section) 
 keeps the pipeline runtime from having to know about any concrete protocol or transform. A new
 protocol implements `logit_proto::Decoder` on the listener side and, on the sink side, whichever
 of the three encoder shapes its wire format is: `logit_proto::Encoder` (one opaque blob per
-batch — `influxdb` is the template), `logit_proto::FramedEncoder` (one framed message per
-record into a `logit_proto::MessageBuf`, with per-message drop accounting — `syslog`/`statsd`,
-[ADR `framed-encoder`](docs/adr/framed-encoder.md)), or `logit_proto::SignalEncoder` (one
-payload per signal — `otlp`); plus `logit_pipeline::Input` or `logit_pipeline::Output`, and a
-variant in `logit_config`'s `ComponentKind`. (`prometheus` is the one pair outside all of these,
-by design — its ADR says why.) A new native transform implements `logit_pipeline::Transform`,
-following `logit-transforms::Aggregator`. A new router implements `logit_pipeline::Router`
-(`crates/logit-pipeline/src/router.rs`), following `logit-transforms::Route`
-([ADR `target-components`](docs/adr/target-components.md)).
+batch — `logit_proto::influxdb::encode` is the template), `logit_proto::FramedEncoder` (one
+framed message per record into a `logit_proto::MessageBuf`, with per-message drop accounting —
+`syslog`/`statsd`, [ADR `framed-encoder`](docs/adr/framed-encoder.md)), or
+`logit_proto::SignalEncoder` (one payload per signal — `otlp`); plus `logit_pipeline::Input` or
+`logit_pipeline::Output`, and a variant in `logit_config`'s `ComponentKind`. (`prometheus` is the
+one pair outside all of these, by design — its ADR says why.) A new native transform implements
+`logit_pipeline::Transform`, following `logit-transforms::Aggregator`. A new router implements
+`logit_pipeline::Router` (`crates/logit-pipeline/src/router.rs`), following
+`logit-transforms::Route` ([ADR `target-components`](docs/adr/target-components.md)).

@@ -32,6 +32,11 @@ delete APIs, and InfluxDB 3's own write endpoints are out of scope. The decision
 with Ross on 2026-10-13 and are recorded in full, with the workstreams that build them, in
 [`docs/plans/influxdb-relay.md`](../plans/influxdb-relay.md).
 
+On 2026-10-13 the `influx/w2` probe checked this ADR's wire claims against `influxd` 2.9.1. The
+plan's "Settled by probe" section lists the answers, and this ADR states each as verified: the
+escaping rules, the error JSON without a `line` field, and the listener's responses. "Deviations
+from `influxd`" lists where `influxdb_in` chooses differently.
+
 ## Decision
 
 ### Transport
@@ -42,9 +47,11 @@ writing to the same route. The listener:
 - honors `precision=ns|us|ms|s`, nanoseconds when absent, and stamps a point with no timestamp with
   the request's receipt time;
 - reads `org`, `orgID`, and `bucket` from the query string (see "One request, one batch");
-- accepts `Content-Encoding: gzip` and identity, and answers `415` to any other encoding;
+- accepts `Content-Encoding: gzip` (lowercase, as `influxd` matches it) and identity, and answers
+  `415` to any other encoding;
 - takes an optional `tokens:` allowlist, matched against `Authorization: Token <t>` or
   `Authorization: Bearer <t>`;
+- serves `GET /ping` and `GET /health`, which need no token, as `influxd` does;
 - takes `tls:`, the field every single-mode HTTP listener uses. `bind_tls:` is `prometheus_in`'s
   alone, because only that listener has two modes;
 - takes `peer:`, `proxy_protocol:`, and `forwarded:` as the other HTTP listeners do
@@ -52,8 +59,8 @@ writing to the same route. The listener:
   [ADR `forwarded-header-parsing`](forwarded-header-parsing.md));
 - answers `503` with InfluxDB's error JSON when the pipeline stays busy, as `splunk_hec_in` does.
 
-Whether to serve `GET /ping` and `GET /health`, and the default `max_request_bytes`, wait on the
-probe of a real `influxd` in `influx/w2` (see the plan's "Open risks").
+`influxd` enforces no request-size limit, so `max_request_bytes` and its default are a `logit`
+choice, set in `influx/w3`.
 
 ### Model mapping
 
@@ -140,8 +147,10 @@ the pair, so requests that name the same pair share one resource.
 ### Parse the whole body, then deliver all or nothing
 
 The listener parses the whole body before delivering any of it. One unparseable line answers `400`
-with InfluxDB's error JSON (`code`, `message`, and `line`), and nothing in the body is forwarded.
-That's what InfluxDB does: a parse error rejects the whole write. It also means a producer that
+with InfluxDB's error JSON (`code` and `message`), and nothing in the body is forwarded. The
+message is `unable to parse '<line>': <reason>`, naming the offending line by its text. InfluxDB
+has no `line` field, and the decoder's 1-based line index goes to logs and telemetry only. That's
+what InfluxDB does: a parse error rejects the whole write. It also means a producer that
 retries a body gets the same answer, and never a partial write `logit` can't describe.
 
 ### Duplicate points merge, last write wins
@@ -181,17 +190,21 @@ Each status is chosen so that a producer's retry behaves as it would against Inf
 | Situation | Status | Reaches `influxdb_out` as |
 |---|---|---|
 | written | `204` | `Ok` |
-| a parse error, a missing `bucket` or org, or a bad `precision` | `400` `invalid`, with `line` for a parse error | `Rejected` |
+| a parse error, a missing `org` and `orgID`, or a bad `precision` | `400` `invalid` | `Rejected` |
+| a missing `bucket` | `404` `not found` | `Refused`: a misconfigured URL |
 | `tokens:` set, and the token is missing or unknown | `401` `unauthorized` | `Refused` |
 | over `max_request_bytes`, by `Content-Length` or after decompression | `413` | `Rejected` |
 | busy past the listener's bound, or a closed downstream consumer | `503` `unavailable`, `Retry-After: 1` | `Ambiguous` |
 | an unknown route, `/write` included | `404` | `Refused`: a misconfigured URL |
 | a wrong method | `405` | `Refused`; `influxdb_out` always sends `POST` |
 | a stalled body | `408` | `Rejected` |
-| an unsupported `Content-Encoding` | `415` | `Rejected`; `influxdb_out` sends identity |
+| an unsupported `Content-Encoding` (anything but lowercase `gzip` or identity) | `415` | `Rejected`; `influxdb_out` sends identity |
+| `GET /ping` | `204`, with `X-Influxdb-Version`; no token needed | not sent by `influxdb_out` |
+| `GET /health` | `200` JSON, no token needed | not sent by `influxdb_out` |
 
-The listener never sends `403`, a bucket `404`, `422`, or `429`: it has no permissions per bucket,
-no buckets, no stored schema, and no rate limit. The module doc of
+When a request carries both `org` and `orgID`, `orgID` wins, as at `influxd`. The listener never
+sends `403`, `422`, `429`, or a `404` for an unknown bucket or org: it has no permissions per
+bucket, no buckets, no stored schema, and no rate limit. The module doc of
 `crates/logit-inputs/src/influxdb.rs` is the canonical copy once `influx/w3` lands.
 
 ### The codec lives in `logit-proto`
@@ -225,23 +238,63 @@ numbered alike:
 2. Duplicate points in one body (same measurement, tag set, and timestamp) merge, last write wins
    per field.
 3. Tag order is canonicalized.
-4. Field order is first appearance: a field a later duplicate adds goes after the existing ones.
+4. Field order: numeric and boolean fields leave in wire order (a field a later duplicate adds
+   goes after the existing ones), and string fields leave after them, in an order the encoder
+   doesn't preserve. A field's identity is its key, so order carries no meaning at the receiver.
 5. Number spelling: a float leaves as the shortest string that round-trips its `f64`, an integer
    keeps its `i` or `u` suffix, and a boolean leaves as `true` or `false` whatever spelling
    arrived.
-6. Escaping: the encoder writes only the escapes the grammar requires.
+6. Escaping: the encoder writes only the escapes the grammar requires (see "Escaping"), so a
+   backslash that a sender wrote doubled leaves as it was read, and a key the grammar can't spell
+   is dropped, counted.
 7. Timestamps: every point leaves with a timestamp in nanoseconds, so `precision` isn't carried,
-   and a point that arrived with none leaves with its receipt time.
-8. Comments, blank lines, and runs of whitespace are dropped.
+   and a point that arrived with none leaves with its receipt time (see item 14).
+8. Comments, blank lines, and runs of spaces are dropped. A CRLF line ending, a tab separator, and
+   a trailing comment after the fields are parse errors, not normalized.
 9. A same-series point from another source in one sink batch is nudged forward by 1 ns.
 10. A `Sum`'s temporality and monotonicity are dropped on egress. A point from `influxdb_in` is
     always a `Gauge`, so this applies only to an event from another protocol.
 11. A listener's sender attributes (`network.peer.*`, `client.*`) are added under `peer:`,
     `proxy_protocol:`, or `forwarded:`.
 12. A tag key under the reserved `influxdb.` prefix is dropped, counted.
+13. A duplicate field key within one line: the last value wins.
+14. An absent timestamp: the request's arrival time truncated to `precision`, one instant for every
+    such point in the request.
 
-Which escapes the grammar requires, including whether `influxd` reads `\\` as one backslash in a
-measurement, tag, or field key, is settled by the `influx/w2` probe, not by this ADR.
+### Escaping
+
+The probe settled the grammar `influxdb_in` decodes and `influxdb_out` encodes. In a measurement,
+tag key, tag value, and field key:
+
+- A backslash before `,` or space is dropped and the character is literal. `=` is special in a
+  tag key, tag value, and field key, and a backslash before it is dropped. `=` isn't special in a
+  measurement, so the encoder writes it bare there. `\=` in a measurement is accepted by `influxd`
+  with `204` and the data is unreadable afterward, so the encoder never writes it.
+- A backslash before anything else, another backslash included, stays a literal backslash. `\\`
+  is not an escape: it decodes to two backslashes. The encoder writes a backslash as itself and
+  escapes only `,`, space, and (outside a measurement) `=`, each with one backslash.
+- A key that ends in a backslash, or has one before a delimiter, has no spelling: the backslash
+  would escape the delimiter. The encoder drops the point (a measurement, a field key) or the tag
+  (a tag key or value) and counts it `skipped{reason="unencodable_key"}`. The decoder reads a
+  trailing backslash before a delimiter as escaping it, which fails as it does at `influxd`.
+- Inside a quoted string field value, `\"` is a quote and `\\` is one backslash, and any other
+  `\x` is two literal characters. A raw newline inside the quotes is part of the value, so the
+  decoder splits a body into lines with quote tracking.
+
+### Deviations from `influxd`
+
+`influxdb_in` differs from `influxd` in these places, each a choice:
+
+- A `time` field key and a same-line field type conflict (`f=1i,f=2.5`) answer `400` where `influxd`
+  answers `422`. The listener keeps no per-bucket type table, so it doesn't police types and a
+  later value wins even across types. A same-line duplicate field key takes the last value
+  (normalization 13).
+- The decoder enforces neither the 1 MiB field-value limit nor the 65,535-byte series-key limit.
+  `max_request_bytes` bounds the body; the destination applies its own limits.
+- A `Content-Encoding` other than `gzip` or identity answers `415`, where `influxd` ignores the
+  header and parses the raw bytes.
+- A field type conflict across lines or requests is the destination's `422`, which `influxdb_out`
+  reads as `Rejected` (decision 10), not a response from the listener.
 
 ## Alternatives considered
 

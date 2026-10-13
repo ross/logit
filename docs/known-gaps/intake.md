@@ -94,7 +94,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     can then share a `received_at`: the `(series, timestamp)` collision the `+ i` offset exists to
     prevent (ADR `udp-intake-batching-and-socket-visibility`'s "One `received_at` per syscall
     batch"). The damage is bounded: `decode_loop`'s latency computation clamps with `.max(0)`, and
-    `influxdb_out`'s `allocate_timestamp` disambiguates within an output batch.
+    `influxdb_out`'s `allocate_timestamp` disambiguates within an output batch
+    (the `encode (InfluxDB)` 1 ns nudge row in [mappings](mappings.md)).
   - The listener can't close this, because the fix, a monotonic clock, would be the wrong
     timestamp. `every_datagram_in_a_batch_gets_its_own_received_at`'s doc comment states the same
     distinction next to the assertion.

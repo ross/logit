@@ -380,7 +380,6 @@ use crate::datagram::{
     send_datagrams, DatagramDest, Datagrams, Framing, Report, Sent, UdpDest, UnixDest, UnixSocket,
     UnixTarget,
 };
-use crate::influxdb::{push_float, tag_value};
 use crate::stream::{Dial, PooledStream, Target, TlsTarget};
 use crate::Output;
 use anyhow::Context;
@@ -389,6 +388,7 @@ use logit_core::{
     Temporality, Value,
 };
 use logit_pipeline::{BatchContext, DeliveryPosture, SeqId};
+use logit_proto::influxdb::encode::{push_float, tag_value};
 use logit_proto::multi_value::{expand_dotted, DottedScratch};
 use logit_proto::{FramedEncoder, MessageBuf, MultiValue};
 use std::fmt::Write as _;
@@ -575,7 +575,7 @@ pub struct StatsdEncoder {
     max_packet_bytes: usize,
     diag: Diagnostics,
     /// The current event's `|#k:v,k:v` tag segment, built once and shared across its metrics
-    /// (`influxdb.rs::render_tag_suffix`'s split).
+    /// (`logit_proto::influxdb::encode::render_tag_suffix`'s split).
     tag_suffix: String,
     /// One rendered line, or a negative-gauge pair joined by `\n`. Cleared per metric, never
     /// reallocated (`syslog.rs::SyslogEncoder::line`'s discipline).

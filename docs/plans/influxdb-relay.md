@@ -78,15 +78,10 @@ tag or label unless a `remove` drops it.
 
 ### `influx/w2`: the codec, `crates/logit-proto/src/influxdb/`
 
-**Step 0 probes a real `influxd`** (`compose.yaml`'s `influxdb` service, its image pinned by digest
-in this plan) through `POST /api/v2/write`, reading each result back through `/api/v2/query`. The
-answers land in this plan as "Settled by probe", as [`splunk-relay.md`](splunk-relay.md) records
-its own. The probe covers escaping in every position, comments and blank lines, CRLF and tabs, an
-empty body, a duplicate tag or field key in one line, reserved names (`_measurement`, `_field`,
-`time`), boolean spellings, number forms and overflow, timestamp range and precision overflow, a
-long string field, a type conflict within one body, the error JSON's shape and line numbering,
-`Token` against `Bearer`, missing `bucket`/`org`/`orgID` and a bad `precision`,
-`Content-Encoding: deflate`, `/ping` and `/health`, and the default `max-body-size`.
+**Step 0 probed a real `influxd`** (`compose.yaml`'s `influxdb` service) through
+`POST /api/v2/write`, reading each result back with Flux. ["Settled by probe"](#settled-by-probe-influxd-291)
+records the image and the answers, as [`splunk-relay.md`](splunk-relay.md) records its own. The
+lexer, decoder, and encoder follow those answers.
 
 Files:
 
@@ -102,7 +97,8 @@ Files:
 - `encode.rs`: `InfluxLineEncoder` and its helpers, moved from `crates/logit-outputs/src/influxdb.rs`,
   plus the carrier path and typed suffixes. It counts the two drops that are silent today: a
   non-finite value and a line left with no fields.
-- `response.rs`: InfluxDB's `{"code","message"[,"line"]}` error body and its code constants.
+- `response.rs`: InfluxDB's `{"code","message"}` error body and its code constants. The message
+  carries the offending line's text, not a line number.
 
 `crates/logit-outputs/src/influxdb.rs` keeps only the sink. `statsd_out` and the benches import the
 shared helpers from the proto module.
@@ -111,8 +107,8 @@ shared helpers from the proto module.
 
 - `crates/logit-inputs/src/influxdb.rs`, modeled on `splunk_hec_in` and reusing `crate::http`,
   `crate::listener`, and `crate::peer`. A small, capped cache maps an `(org, bucket)` pair to its
-  `Arc<Resource>`. Routes: `POST /api/v2/write`; `/ping` and `/health` as the probe decides;
-  `404` for everything else, `/write` included. The response table is [ADR
+  `Arc<Resource>`. Routes: `POST /api/v2/write`; `GET /ping` and `GET /health`, which
+  need no token ("Settled by probe"); `404` for everything else, `/write` included. The response table is [ADR
   `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md)'s "Listener responses".
 - `InfluxDbIn` in `crates/logit-config/src/lib.rs`, with `bind`, `tls`, `tokens`,
   `max_request_bytes`, `handshake_timeout`, `idle_timeout`, `max_connections`, `peer`,
@@ -158,8 +154,8 @@ inequality.
   every variant round-trips the native codec. `script/unsafe-check fuzz-seed` and a short
   `fuzz-all`.
 - **W2**: lexer unit tests per probe row, each carrying its provenance; decoder tests for merging,
-  typed fields, the string carrier, precision, receipt time, all-or-nothing with `line`, and zero
-  copy; encoder tests for the carrier path and its fallback;
+  typed fields, the string carrier, precision, receipt time, all-or-nothing with a message that
+  names the offending line, and zero copy; encoder tests for the carrier path and its fallback;
   `crates/logit-proto/tests/influxdb_fixed_point.rs` (`decode(encode(b)) == b` and
   `encode(decode(encode(b))) == encode(b)`, plus a proptest over normalized generators); truncation
   and bit-flip robustness; `script/unsafe-check fuzz influxdb_line` for 600 seconds.
@@ -174,18 +170,97 @@ inequality.
 A wire feature the fixture corpus must cover is listed in
 [`telemetry-landscape.md`](../design/telemetry-landscape.md)'s "InfluxDB line protocol" section.
 
+## Settled by probe (influxd 2.9.1)
+
+The W2 probe wrote each case to `docker.io/library/influxdb:2` (the tag `compose.yaml` uses),
+digest `sha256:f75e48af0598e8aec7986e991a848d19a119101a7d563a2e5db1dfaac9c45daa`, which reports
+`version: v2.9.1` (commit `d4fa1941fd`), and read it back with Flux or InfluxQL. ADR
+`influxdb-line-protocol-relay` records what each answer changed. These facts bind the codec and
+the listener:
+
+1. **Escaping outside a string field value.** In a measurement, tag key, tag value, and field key,
+   a backslash before `,`, space, or `=` is dropped and the character is literal. A backslash
+   before anything else, another backslash included, stays a literal backslash. `\\` is not an
+   escape: `p\\x` is stored with two backslashes. So the encoder writes a backslash as itself and
+   escapes only `,`, space, and (outside a measurement) `=`, each with one backslash.
+2. **`=` in a measurement.** A bare `=` is stored as written (`p=e`). `\=` is accepted with `204`,
+   the name appears in the index, and no row is readable, so the data is lost without an error. The
+   encoder never writes `\=` in a measurement.
+3. **A trailing backslash is unwritable.** A key or tag value that ends in a backslash, or has one
+   before a delimiter, makes that delimiter escaped, and `influxd` answers `400` (`invalid tag
+   format`, `missing fields`, or `invalid value: field-key=...`). The grammar has no spelling for
+   it.
+4. **String field values.** Inside the quotes, `\"` is a quote and `\\` is one backslash. Any other
+   `\x` is two literal characters. A raw newline inside the quotes is part of the value, so a body
+   splits into lines only with quote tracking. `,`, space, and `=` need no escape inside quotes.
+   An unterminated quote is `400` `unbalanced quotes`.
+5. **Numbers and booleans.** A bare number is a float, including `1`, `5.`, `.5`, `1.5e+3`, and
+   `-0`. `Ni` is an `i64` and `Nu` a `u64`; `007i` and `0u` are fine. These are `400`: `+1`, `+1i`,
+   `inf`, `NaN`, `0x10`, `1_000i`, `-1u`, `1.0i`, `1e3i`, `1e`, `1e309`, and an `i64` or `u64`
+   overflow. Booleans are only `t T true True TRUE f F false False FALSE`; `tRUE` and `TrUe`
+   are `400`.
+6. **Whitespace, line endings, and comments.** A line that starts with `#` after optional spaces is
+   a comment, and blank lines, leading spaces, trailing spaces, and runs of spaces between
+   sections are accepted. CRLF is `400`, because the `\r` stays on the last token (`invalid
+   number`). A tab is not a separator (`missing fields`). A `# comment` after the fields is `400`
+   (`bad timestamp`). A space after a field comma, or a trailing comma, is `400`
+   (`invalid field format`). An empty, whitespace-only, or comment-only body is `204`.
+7. **`precision` and an absent timestamp.** `ns`, `us`, `ms`, and `s` are valid and an empty value
+   means `ns`; anything else (`h`, `n`, `NS`, `millisecond`) is `400` with `invalid precision; valid
+   precision units are ns, us, ms, and s`. A point with no timestamp gets the request's arrival
+   time truncated to `precision`, and every such point in one request shares that instant.
+8. **Timestamp range.** After scaling to nanoseconds, a value must lie in -9223372036854775806 to
+   9223372036854775806; outside it is `400` `time outside range ...`. Negative values and `0` are
+   fine. A decimal point, a leading `+`, a non-number, or a second trailing token is `400`
+   (`bad timestamp`, `point is invalid`).
+9. **Duplicates.** Points with the same measurement, tag set, and timestamp merge into one point,
+   and the last write wins per field, within one body and across requests. Tag order doesn't matter
+   because `influxd` sorts the series key. A duplicate tag key in one line is `400`
+   (`duplicate tags`). A duplicate field key in one line (`f=1i,f=2i`) keeps the last value.
+10. **Reserved names.** A tag key of `_measurement`, `_field`, or `time` is `400`. A field key of
+    `time` is `422` (`invalid field name`). A measurement may start with `_`. A tag key of `_time`
+    or `_value` is accepted at write but breaks every Flux read that includes it, and a full-bucket
+    scan panicked, so those arrive from a sender as ordinary tags.
+11. **Error JSON.** The body is `{"code":"invalid","message":"unable to parse '<line>': <reason>"}`
+    for `400` and `{"code":"unprocessable entity","message":"..."}` for `422`. There is **no `line`
+    field**. When several lines fail to parse, one message joins their `unable to parse` clauses
+    with `\n`. The message repeats the whole offending line, including any raw bytes.
+12. **Parse error against type conflict.** A parse error is `400` and rejects the whole request;
+    nothing from the body is stored. A field type conflict (`is type float, already exists as type
+    integer`) is a `422` partial write: the other points are stored, the conflicting point is
+    dropped whole (`dropped=1`), and the message names the first conflict. The check spans lines in
+    one body and spans requests, because the type lives in the bucket.
+13. **Limits.** No body-size limit exists up to the 256 MiB tried, and v2.9.1 has no flag to set
+    one. A string field value over 1,048,576 bytes is a `422` partial write. A series key over
+    65,535 bytes (measurement, tag keys and values, escapes counted) is `400` `max key length
+    exceeded: <n> > 65535`.
+14. **`Content-Encoding`.** Only lowercase `gzip` is decompressed. `deflate`, `zstd`, `br`, and
+    `GZIP` pass through undecoded and the raw bytes are parsed as line protocol, so a compressed
+    body fails as `missing fields` and a plain-text body with `br` succeeds. `influxd` never
+    answers `415`. A body labeled `gzip` that isn't gzip is `500`. `Content-Type` is ignored.
+    `Transfer-Encoding: chunked` with no `Content-Length` is accepted.
+15. **Authentication.** `Authorization: Token <t>` and `Bearer <t>` both work, and the scheme
+    matches case-insensitively. A missing token, a wrong token, HTTP Basic, a `u`/`p` query pair,
+    and a bare token are all `401` `{"code":"unauthorized","message":"unauthorized access"}`.
+16. **Query parameters.** A missing or empty `bucket` is `404` `bucket not found`. A missing `org`
+    and `orgID` is `400` `Please provide either orgID or org`. `orgID` wins when both are given.
+    An unknown bucket or org is `404`. A malformed `orgID` is `400`. `rp` and `consistency` are
+    ignored. A trailing slash on the route is a `308` redirect.
+17. **`/ping`, `/health`, and v1.** `GET /ping` and `HEAD /ping` need no token and answer `204`
+    with `X-Influxdb-Version` and `X-Influxdb-Build` headers. `GET /health` needs no token and
+    answers `200` with a JSON body (`name`, `message`, `status`, `checks`, `version`, `commit`).
+    Every response carries `X-Influxdb-Version`. A wrong method on the write route is `405` with
+    `Allow: OPTIONS, POST`. The v1 `POST /write?db=` route works only when a DBRP mapping for `db`
+    exists; otherwise it is `404` `no dbrp mapping found`. It stays out of scope here.
+
 ## Open risks
 
-Each of these is to be verified by W2's probe or W3's recording, and none is settled here:
-
-- **Backslash escaping.** On a reading of its source, the v1 `models` parser's unescape handles
-  only `\,`, `\ `, `\=`, and `\"`. If `influxd` doesn't read `\\` as one backslash in a
-  measurement, tag, or field key, today's encoder, which writes `\\`, doubles a backslash on every
-  hop. If the probe confirms it, W2 fixes the encoder with a regression test.
-- **Telegraf chunked bodies.** `tools/record-fixtures/raw_capture.py` answers `411` to a request
-  with no `Content-Length`. If Telegraf's `outputs.influxdb_v2` sends chunked bodies, the recorder
-  needs an `--accept-chunked` mode before W3 can record.
-- **`/ping` and `/health`.** Whether Telegraf and the client libraries probe either route before
-  writing, and what a real `influxd` answers, decides whether `influxdb_in` serves them.
-- **The `max-body-size` default.** `influxdb_in`'s `max_request_bytes` default follows what the
-  probe finds `influxd` enforcing by default.
+- **Telegraf chunked bodies.** `influxd` accepts a chunked body, but
+  `tools/record-fixtures/raw_capture.py` answers `411` to a request with no `Content-Length`. If
+  Telegraf's `outputs.influxdb_v2` sends chunked bodies, the recorder needs an `--accept-chunked`
+  mode before W3 can record. W3's recording verifies it.
+- **The `max_request_bytes` default.** `influxd` enforces no limit, so there is no default to
+  follow. The value is a `logit` choice, set in W3 and documented as a protection that `influxd`
+  lacks.
+- **Whether clients probe `/ping` or `/health`.** `influxd` answers both without a token, and the
+  listener serves both. W3's recording shows which of Telegraf and the client libraries call them.
