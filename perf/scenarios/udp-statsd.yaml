@@ -14,7 +14,7 @@
 # something sends to it), which is what `script/validate` and the shipped-config test need.
 #
 # `receive_buffer_bytes` is small relative to the offered load: this family targets the regime
-# where the kernel is close to dropping, so `logit.input.kernel.drops` and
+# where the kernel is close to dropping, so `logit.input.kernel.dropped` and
 # `receive_buffer.utilization` have something to say (perf/load/README.md, "Tuning").
 components:
   statsd:

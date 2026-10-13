@@ -17,12 +17,11 @@
 //! producer, or omit `value:` to match any value.
 //!
 //! **Telemetry** is tallied per event and emitted once per batch from `end_batch`:
-//! `logit.transform.events.filtered` (the dropped count, emitted even when `0` so the series
-//! registers) and `logit.transform.sample.decisions{outcome, by}` for each non-zero cell. `by` is
-//! `override` for an `always_keep` hit, `key` for a hashed verdict, `random` for a keyless draw,
-//! and `missing` for an event whose configured key was absent, whatever `missing:` then did with
-//! it. The node runtime also counts every drop as
-//! `logit.component.events.dropped{reason="absorbed"}`.
+//! `logit.transform.sample.decisions{outcome, by}` for each non-zero cell, `outcome` being `kept`
+//! or `discarded`. `by` is `override` for an `always_keep` hit, `key` for a hashed verdict,
+//! `random` for a keyless draw, and `missing` for an event whose configured key was absent,
+//! whatever `missing:` then did with it. The node runtime counts every discarded event as
+//! `logit.component.events.discarded`.
 //!
 //! Zero allocations per event, pinned by `crates/logit-bench/tests/allocations.rs`: keys and the
 //! override field are interned once at construction, lookups are `AttrMap::get_sym`, and the hash
@@ -147,7 +146,7 @@ impl By {
 #[derive(Default)]
 struct Tally {
     kept: [u64; 4],
-    dropped: [u64; 4],
+    discarded: [u64; 4],
 }
 
 impl Tally {
@@ -155,23 +154,18 @@ impl Tally {
         if kept {
             self.kept[by as usize] += 1;
         } else {
-            self.dropped[by as usize] += 1;
+            self.discarded[by as usize] += 1;
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.kept.iter().chain(&self.dropped).all(|n| *n == 0)
+        self.kept.iter().chain(&self.discarded).all(|n| *n == 0)
     }
 
     fn flush(&mut self, telemetry: &Telemetry) {
-        telemetry.count(
-            "logit.transform.events.filtered",
-            self.dropped.iter().sum::<u64>() as f64,
-            &[],
-        );
         for by in By::ALL {
             for (outcome, n) in
-                [("kept", self.kept[by as usize]), ("dropped", self.dropped[by as usize])]
+                [("kept", self.kept[by as usize]), ("discarded", self.discarded[by as usize])]
             {
                 if n > 0 {
                     telemetry.count(
@@ -592,17 +586,6 @@ mod tests {
         })
     }
 
-    fn filtered(events: &[Event]) -> Option<f64> {
-        events.iter().find_map(|e| {
-            e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Sum(sum) if resolve(m.name) == "logit.transform.events.filtered" => {
-                    Some(sum.value.as_f64())
-                }
-                _ => None,
-            })
-        })
-    }
-
     #[test]
     fn decisions_are_counted_once_per_batch_by_outcome_and_reason() {
         let registry = Registry::new();
@@ -624,24 +607,11 @@ mod tests {
 
         s.end_batch();
         let events = registry.drain(0);
-        assert_eq!(filtered(&events), Some(2.0));
         assert_eq!(decisions(&events, "kept", "override"), Some(1.0));
-        assert_eq!(decisions(&events, "dropped", "key"), Some(2.0));
+        assert_eq!(decisions(&events, "discarded", "key"), Some(2.0));
+        assert_eq!(decisions(&events, "dropped", "key"), None, "the outcome is `discarded`");
         assert_eq!(decisions(&events, "kept", "missing"), Some(1.0));
         assert_eq!(decisions(&events, "kept", "key"), None, "zero cells are not emitted");
-    }
-
-    #[test]
-    fn filtered_is_emitted_at_zero_for_a_batch_that_dropped_nothing() {
-        let registry = Registry::new();
-        let telemetry = registry.telemetry_for("sampled", "sample", "transform");
-        let mut s = Sample::new(0.5, Some(SampleKey::TraceId), SampleMissing::Keep, None)
-            .with_telemetry(telemetry);
-        assert!(s.process(&no_resource(), &mut log_event(&[])));
-        s.end_batch();
-        let events = registry.drain(0);
-        assert_eq!(filtered(&events), Some(0.0));
-        assert_eq!(decisions(&events, "kept", "missing"), Some(1.0));
     }
 
     #[test]
@@ -650,6 +620,6 @@ mod tests {
         let telemetry = registry.telemetry_for("sampled", "sample", "transform");
         let mut s = Sample::new(0.5, None, SampleMissing::Random, None).with_telemetry(telemetry);
         s.end_batch();
-        assert_eq!(filtered(&registry.drain(0)), None);
+        assert!(registry.drain(0).iter().all(|e| e.metrics.is_empty()));
     }
 }

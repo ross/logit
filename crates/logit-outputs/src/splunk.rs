@@ -142,8 +142,9 @@
 //! | `logit.output.acks{result}` | per `/event` request under `ack: true`: `acked`, `timeout`, or `unsupported` |
 //!
 //! Plus everything [`SplunkEncoder`] counts itself (`logit.output.metrics.skipped` and
-//! `metrics.degraded` by `metric_kind` under `multi_value`, `metrics.normalized`, `tags.dropped`,
-//! `events.skipped`, `spans.degraded`), which this sink doesn't repeat.
+//! `metrics.degraded` by `metric_kind` under `multi_value`, `metrics.dropped`,
+//! `metrics.normalized`, `tags.omitted`, `events.skipped`, `events.dropped`, `spans.degraded`),
+//! which this sink doesn't repeat.
 
 use crate::accounting::BatchAccounting;
 use crate::http::{
@@ -1928,8 +1929,8 @@ mod tests {
         Event::metric(TS, AttrMap::new(), MetricRecord::new(intern("latency"), histogram))
     }
 
-    /// A blank log the codec skips with its diagnostic, and a histogram `multi_value: skip`
-    /// drops: a batch that sends no request.
+    /// A blank log the codec drops with its diagnostic, and a histogram `multi_value: skip`
+    /// skips: a batch that sends no request.
     fn nothing_to_send_batch() -> EventBatch {
         batch(vec![log_event(""), histogram_event()])
     }
@@ -1944,7 +1945,7 @@ mod tests {
     }
 
     const ENCODE_SIDE: [SumSeries<'static>; 5] = [
-        ("logit.output.events.skipped", &[("reason", "blank_event")]),
+        ("logit.output.events.dropped", &[("reason", "blank_event")]),
         ("logit.component.diagnostics", &[("key", "blank_event")]),
         ("logit.output.metrics.skipped", &[("metric_kind", "histogram")]),
         (RECORDS_DROPPED, &[("reason", "oversize")]),

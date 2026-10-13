@@ -3,15 +3,15 @@
 //! rest is the body.
 //!
 //! Oracles, each over every input:
-//! - skip or reject: a body fails as a whole only for the two reasons `text.rs`'s "Malformed
+//! - drop or reject: a body fails as a whole only for the two reasons `text.rs`'s "Malformed
 //!   input" section names, an OpenMetrics body with no `# EOF` line and content after one, and
-//!   only for those; every other fault is a counted skip inside an `Ok`;
+//!   only for those; every other fault is a counted drop inside an `Ok`;
 //! - canonical text: `T1 = write(parse(x))` may differ from `x` by the "Permitted
 //!   normalizations" in `crates/logit-proto/src/prometheus/mod.rs`, so the property starts at
-//!   `T1`: it parses with nothing skipped or degraded, and writing that parse gives `T1`'s bytes.
+//!   `T1`: it parses with nothing dropped, skipped, or degraded, and writing that parse gives `T1`'s bytes.
 //!   Comparing text sidesteps `NaN` under `PartialEq`;
 //! - histograms (`mod.rs`'s `Point::Histogram`, `text.rs`'s "Leniencies"): bounds strictly
-//!   ascending and never `NaN`, the last one `+Inf`, its count the total; the model mapping skips a
+//!   ascending and never `NaN`, the last one `+Inf`, its count the total; the model mapping drops a
 //!   series if and only if its cumulative counts decrease, and otherwise keeps every count.
 //!   Summary quantiles are strictly ascending numbers. Their range isn't checked, by the parser or
 //!   here: Prometheus's own parsers keep a quantile outside `[0, 1]` too;
@@ -28,24 +28,19 @@ use logit_core::MetricKind;
 use logit_proto::prometheus::text::{parse_with, write, Dialect};
 use logit_proto::prometheus::{families_to_events_with, MetricFamily, Point};
 use logit_proto::CodecError;
-use prometheus::{counted_decoder, reasons};
+use prometheus::{counted_decoder, reasons, Reasons};
 
 const RECEIVED_AT: i64 = 1_700_000_000_123_456_789;
 
 struct Parsed {
     result: Result<Vec<MetricFamily>, CodecError>,
-    skipped: std::collections::BTreeMap<String, u64>,
-    degraded: std::collections::BTreeMap<String, u64>,
+    reasons: Reasons,
 }
 
 fn parse(body: &[u8], dialect: Dialect) -> Parsed {
     let (registry, mut decoder) = counted_decoder();
     let result = parse_with(body, dialect, &mut decoder);
-    Parsed {
-        result,
-        skipped: reasons(&registry, "skipped"),
-        degraded: reasons(&registry, "degraded"),
-    }
+    Parsed { result, reasons: reasons(&registry) }
 }
 
 fn written(families: &[MetricFamily], dialect: Dialect) -> Vec<u8> {
@@ -200,10 +195,10 @@ fn check_points(families: &[MetricFamily]) {
         }
     }
 
-    let mut skipped = Vec::new();
+    let mut dropped = Vec::new();
     let mut decoder = logit_proto::prometheus::PrometheusDecoder::new();
     let events = families_to_events_with(families, RECEIVED_AT, &mut decoder, &mut |f, s| {
-        skipped.push((f.name.clone(), s.labels.clone()));
+        dropped.push((f.name.clone(), s.labels.clone()));
     });
     let mut kept = events.iter();
     for family in families {
@@ -212,12 +207,12 @@ fn check_points(families: &[MetricFamily]) {
                 Point::Histogram { buckets, .. } => buckets.windows(2).any(|w| w[1].1 < w[0].1),
                 _ => false,
             };
-            let was_skipped = skipped.contains(&(family.name.clone(), series.labels.clone()));
+            let was_dropped = dropped.contains(&(family.name.clone(), series.labels.clone()));
             assert_eq!(
-                was_skipped, decreasing,
-                "histograms: the model skips a series if and only if its counts decrease"
+                was_dropped, decreasing,
+                "histograms: the model drops a series if and only if its counts decrease"
             );
-            if was_skipped {
+            if was_dropped {
                 continue;
             }
             let event = kept.next().expect("model: one event per kept series");
@@ -241,11 +236,11 @@ fuzz_target!(|data: &[u8]| {
     let families = match (parsed.result, expected) {
         (Ok(families), None) => families,
         (Err(CodecError::Malformed(reason)), Some(expected)) => {
-            assert_eq!(reason, expected, "skip or reject: the wrong rejection");
+            assert_eq!(reason, expected, "drop or reject: the wrong rejection");
             return;
         }
         (result, expected) => {
-            panic!("skip or reject: {result:?} where the doc's table says {expected:?}")
+            panic!("drop or reject: {result:?} where the doc's table says {expected:?}")
         }
     };
 
@@ -254,8 +249,10 @@ fuzz_target!(|data: &[u8]| {
     let t1 = written(&families, dialect);
     let again = parse(&t1, dialect);
     let reparsed = again.result.expect("canonical text: T1 fails to parse");
-    assert!(again.skipped.is_empty(), "canonical text: T1 skips {:?}", again.skipped);
-    assert!(again.degraded.is_empty(), "canonical text: T1 degrades {:?}", again.degraded);
+    let reasons = &again.reasons;
+    assert!(reasons.dropped.is_empty(), "canonical text: T1 drops {:?}", reasons.dropped);
+    assert!(reasons.skipped.is_empty(), "canonical text: T1 skips {:?}", reasons.skipped);
+    assert!(reasons.degraded.is_empty(), "canonical text: T1 degrades {:?}", reasons.degraded);
     let t2 = written(&reparsed, dialect);
     assert!(
         t1 == t2,

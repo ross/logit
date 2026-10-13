@@ -66,7 +66,7 @@
 //! - SD-ID and PARAM-NAME must be RFC 5424 section 6.3.2 `SD-NAME`s ([`is_valid_sd_name`]: 1-32
 //!   `PRINTUSASCII` characters excluding `=`, SP, `]`, `"`). An invalid SD-ID skips the whole
 //!   element, an invalid PARAM-NAME skips that param; both count in
-//!   [`EncodeStats::dropped_invalid_sd_name`] and a throttled `invalid_structured_data`
+//!   [`EncodeStats::omitted_invalid_sd_name`] and a throttled `invalid_structured_data`
 //!   diagnostic.
 //! - `syslog.sd` absent, not a `Value::Map`, or producing zero elements renders as `-`.
 //! - A non-`Str`/`Array` PARAM-VALUE (number, bool, nested container) still renders, through
@@ -86,8 +86,8 @@
 //! - `syslog_in` decodes the element back into `syslog.sd` like any other; lifting it back into
 //!   top-level attributes is a transform's job.
 //! - **A duplicate SD-ID is refused, not emitted twice.** When `sd_id` already names a key of the
-//!   event's own `syslog.sd`, the opt-in element is skipped
-//!   ([`EncodeStats::dropped_sd_id_collision`], a throttled `invalid_structured_data` diagnostic
+//!   event's own `syslog.sd`, the opt-in element is omitted
+//!   ([`EncodeStats::omitted_sd_id_collision`], a throttled `invalid_structured_data` diagnostic
 //!   naming the collision). `logit_proto::syslog`'s `parse_structured_data` fails the RFC 5424
 //!   parse on a repeated SD-ID, so emitting both would make the far end of a
 //!   `syslog_in -> syslog_out -> syslog_in` relay read the line as RFC 3164 and lose its structure.
@@ -229,14 +229,14 @@ pub struct EncodeStats {
     pub skipped_no_log: usize,
     pub truncated: usize,
     pub dropped_oversize_header: usize,
-    /// SD-ELEMENTs skipped for an invalid SD-ID, or SD-PARAMs skipped for an invalid PARAM-NAME
+    /// SD-ELEMENTs omitted for an invalid SD-ID, or SD-PARAMs omitted for an invalid PARAM-NAME
     /// (module doc's "STRUCTURED-DATA").
-    pub dropped_invalid_sd_name: usize,
-    /// `syslog.sd` elements skipped because their value isn't a `Value::Map`.
-    pub dropped_sd_not_map: usize,
-    /// Opt-in `structured_data` SD-ELEMENTs skipped because the event's `syslog.sd` already
+    pub omitted_invalid_sd_name: usize,
+    /// `syslog.sd` elements omitted because their value isn't a `Value::Map`.
+    pub omitted_sd_not_map: usize,
+    /// Opt-in `structured_data` SD-ELEMENTs omitted because the event's `syslog.sd` already
     /// carries their SD-ID.
-    pub dropped_sd_id_collision: usize,
+    pub omitted_sd_id_collision: usize,
 }
 
 /// The validated `sd_id` behind [`SyslogEncoder::with_structured_data`].
@@ -844,7 +844,7 @@ fn write_structured_data(
                     );
                 }
                 _ => {
-                    stats.dropped_sd_not_map += 1;
+                    stats.omitted_sd_not_map += 1;
                     diag.warn_throttled(
                         "invalid_structured_data",
                         format_args!(
@@ -870,7 +870,7 @@ fn write_structured_data(
                 Some(Value::Map(sd)) if sd.get(&cfg.sd_id).is_some()
             );
             if collides {
-                stats.dropped_sd_id_collision += 1;
+                stats.omitted_sd_id_collision += 1;
                 diag.warn_throttled(
                     "invalid_structured_data",
                     format_args!(
@@ -901,7 +901,7 @@ fn write_structured_data(
 
 /// One SD-ELEMENT: `[SD-ID PARAM-NAME="value" ...]`. An invalid `sd_id` skips the whole element
 /// and an invalid PARAM-NAME skips that param ([`write_sd_param`]), each counted in
-/// [`EncodeStats::dropped_invalid_sd_name`] with a throttled `invalid_structured_data` diagnostic.
+/// [`EncodeStats::omitted_invalid_sd_name`] with a throttled `invalid_structured_data` diagnostic.
 ///
 /// PARAM-NAMEs are sorted by name bytes. They're already unique (the decoder groups a repeated
 /// one under a `Value::Array`), so sorting makes the element a function of its data; a wire
@@ -915,7 +915,7 @@ fn write_sd_element<'a>(
     diag: &mut Diagnostics,
 ) {
     if !is_valid_sd_name(sd_id) {
-        stats.dropped_invalid_sd_name += 1;
+        stats.omitted_invalid_sd_name += 1;
         diag.warn_throttled(
             "invalid_structured_data",
             format_args!("syslog_out: dropping SD-ELEMENT with invalid SD-ID {sd_id:?}"),
@@ -933,7 +933,7 @@ fn write_sd_element<'a>(
 }
 
 /// One SD-PARAM, or one per item of an `Array` value (the decoder's repeated-PARAM-NAME shape).
-/// Skipped and counted in [`EncodeStats::dropped_invalid_sd_name`], as in [`write_sd_element`],
+/// Skipped and counted in [`EncodeStats::omitted_invalid_sd_name`], as in [`write_sd_element`],
 /// when `name` isn't a valid `SD-NAME`.
 fn write_sd_param(
     out: &mut String,
@@ -944,7 +944,7 @@ fn write_sd_param(
     diag: &mut Diagnostics,
 ) {
     if !is_valid_sd_name(name) {
-        stats.dropped_invalid_sd_name += 1;
+        stats.omitted_invalid_sd_name += 1;
         diag.warn_throttled(
             "invalid_structured_data",
             format_args!("syslog_out: dropping SD-PARAM with invalid name {name:?}"),
@@ -1243,18 +1243,18 @@ fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
         &[("reason", "oversize_header")],
     );
     telemetry.count(
-        "logit.output.structured_data.dropped",
-        stats.dropped_invalid_sd_name as f64,
+        "logit.output.structured_data.omitted",
+        stats.omitted_invalid_sd_name as f64,
         &[("reason", "invalid_sd_name")],
     );
     telemetry.count(
-        "logit.output.structured_data.dropped",
-        stats.dropped_sd_not_map as f64,
+        "logit.output.structured_data.omitted",
+        stats.omitted_sd_not_map as f64,
         &[("reason", "not_a_map")],
     );
     telemetry.count(
-        "logit.output.structured_data.dropped",
-        stats.dropped_sd_id_collision as f64,
+        "logit.output.structured_data.omitted",
+        stats.omitted_sd_id_collision as f64,
         &[("reason", "sd_id_collision")],
     );
 }
@@ -1460,10 +1460,15 @@ mod tests {
 
     /// Asserts each of `EncodeStats`'s three structured-data drop counters landed on the expected
     /// value, so a test naming one cause also proves the other two stayed at zero.
-    fn assert_sd_drops(stats: &EncodeStats, invalid_name: usize, not_map: usize, collision: usize) {
-        assert_eq!(stats.dropped_invalid_sd_name, invalid_name, "dropped_invalid_sd_name");
-        assert_eq!(stats.dropped_sd_not_map, not_map, "dropped_sd_not_map");
-        assert_eq!(stats.dropped_sd_id_collision, collision, "dropped_sd_id_collision");
+    fn assert_sd_omitted(
+        stats: &EncodeStats,
+        invalid_name: usize,
+        not_map: usize,
+        collision: usize,
+    ) {
+        assert_eq!(stats.omitted_invalid_sd_name, invalid_name, "omitted_invalid_sd_name");
+        assert_eq!(stats.omitted_sd_not_map, not_map, "omitted_sd_not_map");
+        assert_eq!(stats.omitted_sd_id_collision, collision, "omitted_sd_id_collision");
     }
 
     // -- Encoder: RFC 5424 --------------------------------------------------------------------
@@ -2836,7 +2841,7 @@ mod tests {
         let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
         let (msgs, stats) = encode(vec![event]);
         assert!(!msgs[0].contains("bad id"), "invalid SD-ID must not reach the wire: {}", msgs[0]);
-        assert_sd_drops(&stats, 1, 0, 0);
+        assert_sd_omitted(&stats, 1, 0, 0);
         // No valid element survived -> NILVALUE, as in the absent case.
         assert!(msgs[0].ends_with("- - x"), "got: {}", msgs[0]);
     }
@@ -2852,7 +2857,7 @@ mod tests {
         let (msgs, stats) = encode(vec![event]);
         assert!(msgs[0].contains(r#"[a@1 good="y"]"#), "got: {}", msgs[0]);
         assert!(!msgs[0].contains("bad name"));
-        assert_sd_drops(&stats, 1, 0, 0);
+        assert_sd_omitted(&stats, 1, 0, 0);
     }
 
     #[test]
@@ -3049,7 +3054,7 @@ mod tests {
         let (msgs, stats) = encode_with(&mut encoder, vec![event]);
         assert!(msgs[0].contains(r#"ok="y""#));
         assert!(!msgs[0].contains(&long_key));
-        assert_sd_drops(&stats, 1, 0, 0);
+        assert_sd_omitted(&stats, 1, 0, 0);
     }
 
     #[test]
@@ -3061,7 +3066,7 @@ mod tests {
         assert!(msgs[0].ends_with("- - x"), "no attributes qualify -> NILVALUE: {}", msgs[0]);
     }
 
-    /// On an SD-ID collision the origin's element wins and the opt-in one is dropped and counted,
+    /// On an SD-ID collision the origin's element wins and the opt-in one is omitted and counted,
     /// since `syslog_in` reads a line with a repeated SD-ID as RFC 3164.
     #[test]
     fn structured_data_skips_the_opt_in_element_when_its_sd_id_collides_with_an_existing_one() {
@@ -3073,14 +3078,14 @@ mod tests {
             SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("myapp@12345").unwrap();
         let (msgs, stats) = encode_with(&mut encoder, vec![event]);
         assert!(msgs[0].contains(r#"[myapp@12345 orig="1"]"#), "got: {}", msgs[0]);
-        assert!(!msgs[0].contains(r#"env="prod""#), "opt-in element must be dropped: {}", msgs[0]);
+        assert!(!msgs[0].contains(r#"env="prod""#), "opt-in element must be omitted: {}", msgs[0]);
         assert_eq!(
             msgs[0].matches("myapp@12345").count(),
             1,
             "the SD-ID must appear exactly once, not twice: {}",
             msgs[0]
         );
-        assert_sd_drops(&stats, 0, 0, 1);
+        assert_sd_omitted(&stats, 0, 0, 1);
     }
 
     /// A collision isn't counted or warned for an event with only `syslog.*` attributes, which
@@ -3099,7 +3104,7 @@ mod tests {
             .with_diagnostics(diag);
         let (msgs, stats) = encode_with(&mut encoder, vec![event]);
         assert!(msgs[0].contains(r#"[myapp@12345 orig="1"]"#), "got: {}", msgs[0]);
-        assert_sd_drops(&stats, 0, 0, 0);
+        assert_sd_omitted(&stats, 0, 0, 0);
         let events = registry.drain(0);
         assert!(
             !events.iter().any(|e| e.attributes.get("key").and_then(|v| v.as_str())
@@ -3127,42 +3132,42 @@ mod tests {
             "the non-map element's value must not reach the wire: {}",
             msgs[0]
         );
-        assert_sd_drops(&stats, 0, 1, 0);
+        assert_sd_omitted(&stats, 0, 1, 0);
     }
 
-    /// `report_encode_stats` maps each of `EncodeStats`'s three structured-data drop counters to
-    /// its own `logit.output.structured_data.dropped{reason}` point, tested directly rather than
-    /// through `SyslogOutput::send`, which needs a live socket.
+    /// `report_encode_stats` maps each of `EncodeStats`'s three structured-data omission counters
+    /// to its own `logit.output.structured_data.omitted{reason}` point, tested directly rather than
+    /// through `SyslogOutput::send`, which needs a live socket. The message itself is still sent,
+    /// so nothing lands on a `*.dropped` name.
     #[test]
-    fn report_encode_stats_tags_each_structured_data_drop_reason_separately() {
+    fn report_encode_stats_tags_each_structured_data_omission_reason_separately() {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("syslog_out", "syslog", "output");
         let stats = EncodeStats {
-            dropped_invalid_sd_name: 1,
-            dropped_sd_not_map: 1,
-            dropped_sd_id_collision: 1,
+            omitted_invalid_sd_name: 1,
+            omitted_sd_not_map: 1,
+            omitted_sd_id_collision: 1,
             ..EncodeStats::default()
         };
         report_encode_stats(&telemetry, &stats);
 
         let events = registry.drain(0);
-        let dropped_for_reason = |reason: &str| -> f64 {
+        let counted = |name: &str, reason: &str| -> f64 {
             events
                 .iter()
                 .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some(reason))
                 .flat_map(|e| &e.metrics)
-                .filter(|m| {
-                    logit_core::interner::resolve(m.name) == "logit.output.structured_data.dropped"
-                })
+                .filter(|m| logit_core::interner::resolve(m.name) == name)
                 .map(|m| match m.kind {
                     MetricKind::Sum(ref s) => s.value.as_f64(),
                     ref other => panic!("expected a counter, got {other:?}"),
                 })
                 .sum()
         };
-        assert_eq!(dropped_for_reason("invalid_sd_name"), 1.0);
-        assert_eq!(dropped_for_reason("not_a_map"), 1.0);
-        assert_eq!(dropped_for_reason("sd_id_collision"), 1.0);
+        for reason in ["invalid_sd_name", "not_a_map", "sd_id_collision"] {
+            assert_eq!(counted("logit.output.structured_data.omitted", reason), 1.0, "{reason}");
+            assert_eq!(counted("logit.output.structured_data.dropped", reason), 0.0, "{reason}");
+        }
     }
 
     #[test]

@@ -70,9 +70,9 @@
 //!      value, repeating a non-`1.0` `sample_rate` on each.
 //!    - A timer's `h`/`d` type letter becomes `ms`.
 //!    - `|c:<container-id>`, `|e:<external-data>`, `|card:<cardinality>` and `|T<timestamp>` are
-//!      dropped, each counted in `EncodeStats::dropped_dialect_fields`.
+//!      dropped, each counted in `EncodeStats::omitted_dialect_fields`.
 //!    - A DogStatsD event or service check has no classic form, so the whole event is dropped and
-//!      counted in `EncodeStats::dropped_dialect_events`.
+//!      counted in `EncodeStats::skipped_dialect_events`.
 //!
 //!    Fixtures: the `statsd-dialect-*` cases, plus
 //!    `events_and_service_checks_produce_no_output_and_are_counted_under_plain_statsd`, which
@@ -555,7 +555,7 @@ async fn statsd_dialect_drops_external_data_and_cardinality() {
         direct_batch(&read_fixture("statsd-dialect-drops-external-data-and-cardinality", "in"));
     let mut out = MessageBuf::default();
     let stats = StatsdEncoder::new(Format::Statsd).encode_into(&batch, &mut out);
-    assert_eq!(stats.dropped_dialect_fields, 4, "|c:, |e:, |card: and |T, one each");
+    assert_eq!(stats.omitted_dialect_fields, 4, "|c:, |e:, |card: and |T, one each");
 }
 
 #[tokio::test]
@@ -577,7 +577,7 @@ async fn events_and_service_checks_produce_no_output_and_are_counted_under_plain
         let stats = encoder.encode_into(&batch, &mut out);
         assert!(out.is_empty(), "{fixture}: format: statsd should emit no lines for this event");
         assert_eq!(
-            stats.dropped_dialect_events, 1,
+            stats.skipped_dialect_events, 1,
             "{fixture}: the drop should be counted, not silent"
         );
     }

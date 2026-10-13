@@ -24,7 +24,7 @@
 //!    The error names one concrete cycle, never a component merely downstream of it.
 //! 6. Wrong arity for the kind's [`Role`]: a listener or `target` with `sources`, a transform or
 //!    sink without, or a sink named as another component's source.
-//! 7. A non-sink component with no consumer: it would run for nothing (50 exempts routers).
+//! 7. A non-sink component with no consumer: it would run for nothing (50 words it for routers).
 //! 8. A kind `is_implemented` doesn't list.
 //! 9. A zero `interval` on a kind that has one (the `interval` fn's table): it would flush
 //!    continuously.
@@ -145,8 +145,10 @@
 //!     onto one target.
 //! 49. A `target` with `sources` (checked in 6), or one no router directs to: its consumers would
 //!     wait forever.
-//! 50. Not a rejection: 7 exempts a router, whose unrouted events are dropped and counted
-//!     (`logit.component.events.dropped{reason="unrouted"}`).
+//! 50. A router (`route`, or `lua`/`lua_file` with `targets:`) with no ordinary consumer: its
+//!     consumers receive every event no target claims, so with none those events would vanish.
+//!     Checked with 7, under its own message naming the `null_out` fix
+//!     (`docs/adr/target-components.md`).
 //! 51. A `route` with no `routes:`, an empty key or value, or an empty `by:` attribute/resource
 //!     key. Runs before 48, so an empty value isn't reported as an unknown target.
 //! 52. A `statsd_out` `tls:` failing 44's three checks, messages verbatim
@@ -879,14 +881,18 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     // Rule 7: every non-sink component, `target`s included, needs at least one consumer.
     //
-    // Rule 50: a router (non-empty `targets_of`) is exempt. Its consumers get only its unrouted
-    // events, and a router with none drops and counts those
-    // (`logit.component.events.dropped{reason="unrouted"}`), so it isn't a silent black hole.
+    // Rule 50: a router (non-empty `targets_of`) is no exception. Its ordinary consumers receive
+    // every event no target claims, and the runtime counts no loss there, so a discard has to be a
+    // `null_out` the graph shows.
     for (id, component) in &components {
-        if role(&component.kind) != Role::Sink
-            && consumers.get(id).is_none_or(Vec::is_empty)
-            && targets_of(component).is_empty()
-        {
+        if role(&component.kind) != Role::Sink && consumers.get(id).is_none_or(Vec::is_empty) {
+            if !targets_of(component).is_empty() {
+                anyhow::bail!(
+                    "component '{id}' is a router with no consumers -- every event no target \
+                     claims goes to its consumers; list '{id}' in another component's sources, or \
+                     in a null_out's sources to discard those events"
+                );
+            }
             anyhow::bail!("component '{id}' has no consumers -- nothing reads what it produces");
         }
     }
@@ -8047,6 +8053,7 @@ mod tests {
             ("t", vec![], vec![], target()),
             ("routed", vec!["t"], vec![], sink()),
             ("direct", vec!["in"], vec![], sink()),
+            ("rest", vec!["r"], vec![], null_out()),
         ]));
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("sinks 'direct', 'routed',"), "{warnings:?}");
@@ -9239,6 +9246,7 @@ mod tests {
             ("r", vec!["in"], vec!["t"], route(by_attribute("stream"), &[("host", "t")])),
             ("t", vec![], vec![], target()),
             ("out", vec!["t"], vec![], sink()),
+            ("rest", vec!["r"], vec![], null_out()),
         ]));
         assert!(
             err.contains("'r'") && err.contains("a route's targets are its routes: values"),
@@ -9287,6 +9295,7 @@ mod tests {
             ("r", vec!["in"], vec!["t", "t"], lua()),
             ("t", vec![], vec![], target()),
             ("out", vec!["t"], vec![], sink()),
+            ("rest", vec!["r"], vec![], null_out()),
         ]));
         assert!(err.contains("lists target 't' more than once"), "got: {err}");
     }
@@ -9336,18 +9345,40 @@ mod tests {
         assert!(err.contains("'t': is a target that no router directs to"), "got: {err}");
     }
 
-    /// Rule 50: a router whose every event is routed needs no ordinary consumer, so rule 7 doesn't
-    /// reject it.
+    /// Rule 50: a router with targets and no ordinary consumer is rejected, `lua` and `route`
+    /// alike, with the router message rather than rule 7's generic one.
     #[test]
-    fn a_router_with_targets_but_no_consumers_resolves() {
+    fn a_router_with_targets_but_no_consumers_is_rejected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t"], vec![], sink()),
+        ]));
+        assert!(err.contains("'r' is a router with no consumers"), "got: {err}");
+        assert!(err.contains("null_out"), "the message names the discard fix, got: {err}");
+
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec![], route(by_attribute("tier"), &[("a", "t")])),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t"], vec![], sink()),
+        ]));
+        assert!(err.contains("'r' is a router with no consumers"), "got: {err}");
+    }
+
+    /// Rule 50: a `null_out` consumer is the explicit discard for unclaimed events.
+    #[test]
+    fn a_router_whose_consumer_is_null_out_resolves() {
         let graph = resolve(cfg_with_targets(vec![
             ("in", vec![], vec![], listener()),
             ("r", vec!["in"], vec!["t"], lua()),
             ("t", vec![], vec![], target()),
             ("out", vec!["t"], vec![], sink()),
+            ("discard", vec!["r"], vec![], null_out()),
         ]))
-        .expect("rule 50 should let a targets-only router resolve");
-        assert!(graph.components["r"].consumers.is_empty(), "r has no ordinary consumers");
+        .expect("a router with a null_out consumer should resolve");
+        assert_eq!(graph.components["r"].consumers, vec!["discard".to_string()]);
         assert_eq!(graph.components["r"].targets, vec!["t".to_string()]);
     }
 
@@ -9512,6 +9543,7 @@ mod tests {
             ("r", vec!["in"], vec![], route(by_attribute("stream"), &[("", "t")])),
             ("t", vec![], vec![], target()),
             ("out", vec!["t"], vec![], sink()),
+            ("rest", vec!["r"], vec![], null_out()),
         ]));
         assert!(err.contains("a route 'routes' key must not be empty"), "got: {err}");
     }
@@ -9535,6 +9567,7 @@ mod tests {
             ("r", vec!["in"], vec![], route(by_attribute(""), &[("host", "t")])),
             ("t", vec![], vec![], target()),
             ("out", vec!["t"], vec![], sink()),
+            ("rest", vec!["r"], vec![], null_out()),
         ]));
         assert!(err.contains("'by: {attribute: ..}' key name must not be empty"), "got: {err}");
     }

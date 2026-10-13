@@ -139,7 +139,7 @@ impl DatadogDecoder {
     /// `/api/v0.2/traces`: one batch per `TracerPayload`, each resource carrying that payload's
     /// `datadog.tracer.*` and the envelope's `datadog.agent.*`. An `AgentPayload` with no tracer
     /// payloads decodes to no batches. `idxTracerPayloads` (the v1.0 string-table form, not
-    /// implemented) are skipped and counted `idx_payload`, one per payload. `received_at` is
+    /// implemented) are dropped and counted `idx_payload`, one per payload. `received_at` is
     /// unused: a span's `start` is its timestamp.
     pub fn decode_agent_payload(
         &mut self,
@@ -150,7 +150,7 @@ impl DatadogDecoder {
         let payload = AgentPayload::decode(body).map_err(|e| {
             CodecError::Malformed(format!("datadog AgentPayload does not decode: {e}"))
         })?;
-        self.span_skipped("idx_payload", payload.idx_tracer_payloads.len());
+        self.span_dropped("idx_payload", payload.idx_tracer_payloads.len());
         let mut agent = WireAgent {
             host_name: payload.host_name,
             env: payload.env,
@@ -394,6 +394,7 @@ mod tests {
         RESOURCE_ATTR_AGENT_TARGET_TPS,
     };
     use crate::datadog::{RESOURCE_ATTR_AGENT_HOSTNAME, RESOURCE_ATTR_TRACER_ENV};
+    use logit_core::interner::resolve;
     use logit_core::{Registry, Value};
 
     fn full_span() -> Span {
@@ -532,13 +533,14 @@ mod tests {
         assert_eq!(attrs.get("d"), Some(&Value::F64(0.25)));
         assert_eq!(attrs.get("a"), Some(&Value::Array(vec![Value::I64(1), Value::str("y")])));
         assert!(matches!(e.attributes.get("appsec"), Some(Value::Bytes(_))));
-        let reasons: Vec<String> = registry
-            .drain(0)
-            .iter()
-            .filter_map(|e| e.attributes.get("reason").and_then(Value::as_str).map(String::from))
-            .collect();
-        assert!(reasons.contains(&"idx_payload".to_string()));
-        assert!(reasons.contains(&"negative_duration".to_string()));
+        let mut counters = Vec::new();
+        for e in registry.drain(0) {
+            let Some(reason) = e.attributes.get("reason").and_then(Value::as_str) else { continue };
+            counters.extend(e.metrics.iter().map(|m| format!("{}{{{reason}}}", resolve(m.name))));
+        }
+        let has = |c: &str| counters.contains(&c.to_string());
+        assert!(has("logit.input.spans.dropped{idx_payload}"), "{counters:?}");
+        assert!(has("logit.input.spans.degraded{negative_duration}"), "{counters:?}");
     }
 
     #[test]

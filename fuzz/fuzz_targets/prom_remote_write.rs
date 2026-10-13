@@ -5,7 +5,7 @@
 //!
 //! Oracles:
 //! - built requests: the verdict `remote_write.rs`'s "Malformed input: what is a `400`, and what
-//!   is a counted skip" section gives. A 2.0 request is `Malformed` if and only if `symbols[0]`
+//!   is a counted drop" section gives. A 2.0 request is `Malformed` if and only if `symbols[0]`
 //!   isn't empty, a `labels_refs` list has an odd length, or a reference is out of range: in any
 //!   series' labels, or in the metadata or an exemplar of a series whose labels are valid, the only
 //!   ones whose metadata and exemplars are read. A 1.0 request is never `Malformed`. Otherwise
@@ -15,7 +15,7 @@
 //!   `version_2_symbol_table_errors_fail_the_whole_request` pins one case of each rule;
 //! - every input that decodes, in both modes and versions: `B1 = encode(decode(x))` may differ
 //!   from `x` by the module doc's "Permitted normalizations", so the property starts at `B1`:
-//!   it decodes with nothing skipped or degraded, and encoding that decode gives `B1`'s bytes.
+//!   it decodes with nothing dropped, skipped, or degraded, and encoding that decode gives `B1`'s bytes.
 #![no_main]
 
 #[path = "shared/prometheus.rs"]
@@ -27,9 +27,8 @@ use logit_proto::prometheus::generated::prometheus as pb1;
 use logit_proto::prometheus::remote_write::{decode, encode, Decoded, Version};
 use logit_proto::prometheus::{PrometheusEncoder, STALE_NAN_BITS};
 use logit_proto::CodecError;
-use prometheus::{counted_decoder, reasons};
+use prometheus::{counted_decoder, reasons, Reasons};
 use prost::Message;
-use std::collections::BTreeMap;
 
 /// The strings a built request draws from: the names the decoder routes on, label names and
 /// values it validates, and an exemplar's trace reference.
@@ -255,18 +254,13 @@ fn v2_verdict(request: &pb2::Request) -> Verdict {
 
 struct Counted {
     result: Result<Decoded, CodecError>,
-    skipped: BTreeMap<String, u64>,
-    degraded: BTreeMap<String, u64>,
+    reasons: Reasons,
 }
 
 fn decode_counted(body: &[u8], version: Version) -> Counted {
     let (registry, mut decoder) = counted_decoder();
     let result = decode(body, version, &mut decoder);
-    Counted {
-        result,
-        skipped: reasons(&registry, "skipped"),
-        degraded: reasons(&registry, "degraded"),
-    }
+    Counted { result, reasons: reasons(&registry) }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -293,10 +287,10 @@ fuzz_target!(|data: &[u8]| {
         match (&first.result, verdict) {
             (Err(CodecError::Malformed(_)), Err(())) => {}
             (Ok(decoded), Ok((invalid, histograms))) => {
-                let count = |reason: &str| first.skipped.get(reason).copied().unwrap_or(0);
+                let count = |reason: &str| first.reasons.dropped.get(reason).copied().unwrap_or(0);
                 assert_eq!(count("invalid_labels"), invalid, "built: invalid_labels");
                 assert_eq!(count("native_histogram"), histograms, "built: native_histogram");
-                assert_eq!(decoded.histograms_skipped, histograms, "built: histograms_skipped");
+                assert_eq!(decoded.histograms_dropped, histograms, "built: histograms_dropped");
             }
             (result, verdict) => {
                 panic!(
@@ -311,8 +305,10 @@ fuzz_target!(|data: &[u8]| {
     let b1 = encode(&decoded.groups, version, &mut PrometheusEncoder::new());
     let second = decode_counted(&b1, version);
     let redecoded = second.result.expect("fixed point: B1 fails to decode");
-    assert!(second.skipped.is_empty(), "fixed point: B1 skips {:?}", second.skipped);
-    assert!(second.degraded.is_empty(), "fixed point: B1 degrades {:?}", second.degraded);
+    let reasons = &second.reasons;
+    assert!(reasons.dropped.is_empty(), "fixed point: B1 drops {:?}", reasons.dropped);
+    assert!(reasons.skipped.is_empty(), "fixed point: B1 skips {:?}", reasons.skipped);
+    assert!(reasons.degraded.is_empty(), "fixed point: B1 degrades {:?}", reasons.degraded);
     let b2 = encode(&redecoded.groups, version, &mut PrometheusEncoder::new());
     assert!(
         b1 == b2,

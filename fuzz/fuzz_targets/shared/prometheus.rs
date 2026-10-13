@@ -1,5 +1,5 @@
-//! What the two Prometheus targets share: a decoder whose skip and degradation counters can be
-//! read back.
+//! What the two Prometheus targets share: a decoder whose drop, skip, and degradation counters can
+//! be read back.
 
 use logit_core::interner::resolve;
 use logit_core::{MetricKind, Registry};
@@ -14,21 +14,34 @@ pub fn counted_decoder() -> (Arc<Registry>, PrometheusDecoder) {
     (registry, PrometheusDecoder::new().with_telemetry(telemetry))
 }
 
-/// Every `logit.input.metrics.<counter>{reason}` the registry holds, with its count.
-pub fn reasons(registry: &Registry, counter: &str) -> BTreeMap<String, u64> {
-    let name = format!("logit.input.metrics.{counter}");
-    let mut out = BTreeMap::new();
+/// Each `logit.input.metrics.*{reason}` counter the decoder writes, by reason, with its count.
+#[derive(Default)]
+pub struct Reasons {
+    pub dropped: BTreeMap<String, u64>,
+    /// The decoder counts nothing here; a target asserts it stays empty.
+    pub skipped: BTreeMap<String, u64>,
+    pub degraded: BTreeMap<String, u64>,
+}
+
+/// Reads every counter in one pass: [`Registry::drain`] empties the registry, so a second read
+/// would see nothing.
+pub fn reasons(registry: &Registry) -> Reasons {
+    let mut out = Reasons::default();
     for event in registry.drain(0) {
-        let Some(count) = event.metrics.iter().find_map(|metric| {
-            (resolve(metric.name) == name).then_some(match &metric.kind {
+        let reason = event.attributes.get("reason").and_then(|value| value.as_str());
+        for metric in &event.metrics {
+            let map = match resolve(metric.name) {
+                "logit.input.metrics.dropped" => &mut out.dropped,
+                "logit.input.metrics.skipped" => &mut out.skipped,
+                "logit.input.metrics.degraded" => &mut out.degraded,
+                _ => continue,
+            };
+            let count = match &metric.kind {
                 MetricKind::Sum(sum) => sum.value.as_f64(),
                 _ => 0.0,
-            })
-        }) else {
-            continue;
-        };
-        let reason = event.attributes.get("reason").and_then(|value| value.as_str());
-        *out.entry(reason.unwrap_or("").to_string()).or_insert(0) += count as u64;
+            };
+            *map.entry(reason.unwrap_or("").to_string()).or_insert(0) += count as u64;
+        }
     }
     out
 }

@@ -29,15 +29,15 @@
 //! - an `le` or `quantile` label compared as the `f64` it parses to: Prometheus rewrites a
 //!   histogram's `le` and a summary's `quantile` to its own float spelling (`1` as `1.0`), and
 //!   logit holds the bound as a number (`prometheus/mod.rs`'s `Point`);
-//! - a series Prometheus reads twice counts once, the first: logit skips the repeat as
-//!   `duplicate_series` (`text.rs`'s skip table), and Prometheus's appender keeps the first sample
+//! - a series Prometheus reads twice counts once, the first: logit drops the repeat as
+//!   `duplicate_series` (`text.rs`'s drop table), and Prometheus's appender keeps the first sample
 //!   for a series and timestamp;
 //! - a `+Inf` bucket only logit has, where Prometheus read none, and a `_count` only logit has, the
 //!   `+Inf` total restated: `text.rs`'s "Leniencies";
 //! - a histogram `_count` that differs from Prometheus's, for a series whose own `_count` line
 //!   Prometheus read as disagreeing with its `+Inf` bucket or, with none, as a count below the
 //!   highest bucket, which is the series `histogram_count_mismatch` counts: the bucket wins
-//!   (`text.rs`'s skip table);
+//!   (`text.rs`'s drop table);
 //! - a bucket, `_count`, or `_gcount` value Prometheus reads as a fraction equals logit's `u64`
 //!   count when it rounds to it (`assemble.rs`'s `count_value`);
 //! - `untyped` equals `unknown`: Prometheus's text parser reads `# TYPE x untyped` as
@@ -218,7 +218,8 @@ fn decode(bytes: &[u8], dialect: Dialect) -> Decoded {
         };
         for metric in &event.metrics {
             let map = match resolve(metric.name) {
-                "logit.input.metrics.skipped" => &mut skips,
+                // A case's `skips` holds the reasons of both counters.
+                "logit.input.metrics.dropped" | "logit.input.metrics.skipped" => &mut skips,
                 "logit.input.metrics.degraded" => &mut degraded,
                 _ => continue,
             };

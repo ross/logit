@@ -397,13 +397,13 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   `mmsghdr`s into `Vec<u64>` word buffers pointed at a single `vlen * 65_507`-byte slab, issues one
   `libc::recvmmsg(fd, hdrs, vlen, MSG_DONTWAIT, NULL)`, and lifts each returned `msg_len` and
   `msg_hdr.msg_flags` into plain integer vectors. Back in async context it copies each datagram out
-  as a right-sized `Bytes`, stamps `received_at = now_nanos() + i`, and counts `MSG_TRUNC`
-  occurrences.
+  as a right-sized `Bytes`, stamps `received_at = now_nanos() + i`, and drops and counts each `MSG_TRUNC`
+  datagram instead of copying it.
 - **Why sensitive:** unsafe/syscall (three `unsafe` blocks: pointer writes of C structs into `u64`
   storage, the raw `recvmmsg`, and the post-call `(*hdrs.add(i))` reads); hot-path (this is the
   per-datagram ingress path for every UDP listener); custom (no crate does the vectored receive —
   `tokio` exposes none); cancellation (the future is dropped by `read_loop`'s shutdown race);
-  accounting (`logit.input.datagrams.truncated`, and the `+ i` timestamp offset feeding downstream
+  accounting (`datagrams.dropped{reason="truncated"}`, and the `+ i` timestamp offset feeding downstream
   (series, timestamp) identity); untrusted-input (lengths and flags come from the kernel but the
   payload boundaries drive the slicing).
 - **Invariants to verify:** *(all nine verified in `libc/w1` — see the Verified paragraph below)*
@@ -526,7 +526,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
 - **Why sensitive:** hot-path; cancellation (both `select!` arms can drop a future mid-flight);
   backpressure (`overflow: block` is the one configuration where this genuinely stops reading);
   data-loss (a cancelled `push_many` discards up to `read_batch` datagrams *uncounted*);
-  accounting (`logit.input.reads`/`.datagrams`/`.datagram.bytes`/`.datagrams.truncated` must
+  accounting (`logit.input.reads`/`.datagrams`/`.datagram.bytes` and `datagrams.dropped{reason="truncated"}` must
   reconcile with what `decode_loop` and the queue's own drop counters report); concurrency
   (`queue.close()` is the sole liveness signal for the decode half).
 - **Invariants to verify:**
@@ -1129,7 +1129,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   kernel's aliased accept-queue depth/backlog. `DropCounter::delta` turns the free-running, wrapping
   `sk_drops` into a per-interval delta, treating the first sample as an absolute from a known zero.
 - **Why sensitive:** unsafe/syscall (two raw `getsockopt` calls with caller-supplied `socklen_t`
-  in/out); accounting (`logit.input.kernel.drops` is the only visibility into loss no other layer
+  in/out); accounting (`logit.input.kernel.dropped` is the only visibility into loss no other layer
   can see, and it is claimed to reconcile byte-for-byte with `/proc/net/udp`'s `drops` column);
   custom (deliberately not procfs); nontrivial-3p-use(libc — `SK_MEMINFO_*` indices and the
   `TCP_LISTEN` constant are copied from kernel UAPI, not from `libc`).
@@ -1185,7 +1185,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   accept-queue block. ADR: `udp-intake-batching-and-socket-visibility`, plus its 2026-09-21
   amendment.
 - **Suggested verification approach:** ~~targeted review against the kernel UAPI headers; a
-  real-socket test that cross-checks `logit.input.kernel.drops` against `/proc/net/udp`'s `drops`
+  real-socket test that cross-checks `logit.input.kernel.dropped` against `/proc/net/udp`'s `drops`
   column under a perf-VM `udp-statsd --verify` run; run the unit tests under an older kernel
   container to exercise the short-reply path.~~ Done, except the older-kernel container — which is
   now unnecessary: the short-reply paths are unit-testable directly, and no kernel that has the
@@ -2295,8 +2295,8 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   - `logit.input.lines` counts lines *offered to the decoder*, so it excludes lines dropped by
     `LineSplitter` for `max_line_bytes` and includes lines the decoder then rejects — confirm the
     doc says exactly that, since `lines` ≠ events emitted in both directions.
-  - Oversized dropped lines have a diagnostic (`read_one`'s `long_line`) but no dedicated counter; `bad_line`
-    likewise only surfaces via `logit.component.diagnostics{key}`. Verify that's sufficient to
+  - Oversized dropped lines have a diagnostic (`read_one`'s `long_line`) and, since 2026-10-13,
+    `logit.input.frames.dropped{reason="oversize"}`; `bad_line` only surfaces via `logit.component.diagnostics{key}`. Verify that's sufficient to
     reconcile input bytes against emitted events.
   - `files.open` (a gauge of `self.files.len()` in `scan`) counts `Draining`/`Deselected` entries too.
   - `watch.watches` reports intended, not live, watches (in `scan`) — verify the doc's claim and
@@ -2418,8 +2418,21 @@ surveyor's.
   test, which passed and failed only with the lock removed. Still open: the startup double read,
   and `open` counting `events.dropped{reason="disk_corrupt"}` as the number of corrupt regions
   rather than events.
+- **Changed 2026-10-13 (`drops/w1b`):** `open` counts the batch lost with a torn tail as
+  `batches.dropped{reason="disk_torn"}` (no `events.dropped`), unless the persisted cursor is past
+  the torn record's start; `disk.truncated` stays the repair count. A new invariant: a torn tail
+  counts at most one `disk_torn` batch, and never when the cursor shows the record committed.
+  Checked by
+  `a_segment_truncated_mid_record_recovers_to_the_last_good_frame_and_counts_the_lost_batch` and
+  `a_torn_tail_behind_the_persisted_cursor_is_repaired_but_not_counted_lost`,
+  `a_torn_tail_at_the_persisted_cursor_was_never_committed_and_counts_lost`, and
+  `a_cursor_in_an_older_segment_never_marks_the_active_segments_torn_record_committed`. Known
+  overcounts: a failed write already counted `disk_full`/`disk_io_error` whose bytes no push
+  repaired before exit, and a record committed after the last cursor persist and then torn by a
+  power loss, each count again ([ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md)'s
+  2026-10-13 amendment).
 - **Existing coverage:** `disk_queue.rs` tests
-  `a_segment_truncated_mid_record_recovers_to_the_last_good_frame_and_counts_truncated`,
+  `a_segment_truncated_mid_record_recovers_to_the_last_good_frame_and_counts_the_lost_batch`,
   `a_crc_corrupted_record_mid_segment_is_skipped_via_resync_and_counted`,
   `a_trace_id_containing_magic_does_not_derail_recovery`, `a_missing_cursor_starts_at_the_oldest_segment`,
   `a_cursor_past_the_end_restarts_at_the_oldest_surviving_segment`,
@@ -3666,7 +3679,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   constant time via a nanosecond remainder, so a process stalled for hours does not replay every missed tick.
 - **Why sensitive:** hot-path; cancellation (`inbox.recv()` inside a `timeout` must be cancel-safe or a batch is
   lost); data-loss (a missed close-time flush silently discards an aggregation window); custom (the cadence math);
-  accounting (`flush.events`, `events.dropped{reason="absorbed"}`).
+  accounting (`flush.events`, `events.discarded`).
 - **Invariants to verify:**
   - `tokio::sync::mpsc::Receiver::recv` is cancel-safe, so a `timeout` elapse never consumes a batch.
   - The close-time flush runs exactly once, only for a transform with an interval (the `if next_flush.is_some()` in the closed-inbox arm).
@@ -3700,7 +3713,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 - **Location:** `runtime.rs` (`process_batch`); trait at `transform.rs` (`Transform`).
 - **What it does:** The per-batch body of `run_transform`: reads `scope` out, offers it to `observe_scope`,
   applies `map_resource`, then `events.retain_mut(|e| transform.process(&resource, e))` in place, calls
-  `end_batch`, and counts `before - after` as `events.dropped{reason="absorbed"}`. Returns `None` for an empty
+  `end_batch`, and counts `before - after` as `events.discarded`. Returns `None` for an empty
   result so no empty batch is ever sent.
 - **Why sensitive:** hot-path (per event, per batch, on every transform node); custom (the in-place
   `retain_mut` shape exists specifically to avoid memcpy'ing an 864-byte `Event`); accounting.
@@ -3728,11 +3741,13 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 - **What it does:** Per incoming batch: one child context, one `"process"` span, then a four-pass partition
   (route-borrowing → count → `reserve_exact` per used destination → move) into node-owned scratch buffers that
   `std::mem::take` leaves capacity-0 for the next batch. Sends one batch per non-empty destination under the
-  *same* context. Slot 0 is the router's own outbound edge; an empty slot-0 destination counts
-  `events.dropped{reason="unrouted"}` explicitly, because `Fanout::deliver` returns early and counts nothing.
+  *same* context. Slot 0 is the router's own outbound edge. `Fanout::deliver` returns early and counts nothing on
+  zero consumers, so graph rule 50 (a router needs an ordinary consumer) is what keeps slot 0 from being a
+  silent sink; the `debug_assert!`s in `run_router` and `send_lua_partitions` pin it in debug builds.
 - **Why sensitive:** hot-path (per event); custom (the four-pass partition and the exact allocation contract:
-  `1 + used destinations` per batch, zero per event); accounting (the `unrouted` counter is the *only* thing
-  making unrouted events visible); data-loss (an out-of-range slot falls back to unrouted in release).
+  `1 + used destinations` per batch, zero per event); accounting (unrouted events have no counter of their own;
+  they're visible only as slot 0's consumer's `events.received`, so a slot 0 with no consumer would lose them
+  uncounted); data-loss (an out-of-range slot falls back to slot 0 in release).
 - **Invariants to verify:**
   - The partition is total: every event in appears in exactly one destination out (no `Destination::Drop`).
   - `scratch.dests` entries are always left empty on return (the final `mem::take` loop in `route_batch`), so a stale event can never leak into
@@ -3742,15 +3757,17 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   - The out-of-range guard in pass 1 (the `Destination::To(n) if ..` arm) is `usize::from(n) + 1 >= slots` (`>=`, not `>`) — verify the boundary.
   - `counts.resize(slots, 0)` after `clear()` re-zeroes every slot each batch.
   - One incoming batch = exactly one span and one context, however many destinations it forks into.
-  - `Fanout::deliver`'s zero-consumer early return is compensated by the explicit `unrouted` count in
-    the `slot == 0 && destination.is_empty()` block in `run_router`, and by `send_lua_partitions`' identical
-    block.
+  - `Fanout::deliver`'s zero-consumer early return is never reached for slot 0: graph rule 50 gives every
+    router an ordinary consumer. The `debug_assert!(!destination.is_empty())` in `run_router` and
+    `send_lua_partitions` checks this in debug builds only; release compiles it out, so the graph rule is the
+    guarantee (RT-14).
 - **Observed concerns (unverified):** none spotted. The `None => continue` arm in `run_router` would silently
   discard a partition if a slot had no `Fanout`, but it is genuinely unreachable given the scratch is sized from
   `targets` itself.
 - **Existing coverage:** `a_router_partitions_a_batch_across_two_targets`,
   `unrouted_events_reach_the_routers_ordinary_consumers`,
-  `unrouted_events_are_counted_when_a_router_has_no_ordinary_consumers`,
+  `graph.rs`'s `a_router_with_targets_but_no_consumers_is_rejected` and
+  `a_router_whose_consumer_is_null_out_resolves` (rule 50),
   `one_incoming_batch_forks_into_one_span_however_many_destinations`,
   `route_batch_partitions_into_slot_order_and_leaves_its_scratch_empty_for_reuse`;
   `crates/logit-bench/tests/allocations.rs`
@@ -3925,16 +3942,17 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 
 ### RT-14 — Graph rules the runtime *assumes* (cycle detection, target arity, slot order)
 - **Location:** `crates/logit-pipeline/src/graph.rs` (`topological_order` — Kahn plus cycle recovery),
-  `target_edges`, `targets_of`, `resolve` (its rule 5 cycle check, the rule 50 router exemption inside rule 7's
-  check, and the rule 48/49 target checks).
+  `target_edges`, `targets_of`, `resolve` (its rule 5 cycle check, rule 50's router check inside rule 7's
+  consumer loop, and the rule 48/49 target checks).
   Runtime consumers: `runtime.rs` (`run_with_telemetry`'s `Role::Target` skip in the channel loop, `senders[c]` in
   the target-`Fanout` pre-pass and spawn loop, the `resolve_target_fanouts` calls in the `Router` and `Lua` arms,
   and `resolve_target_fanouts`'s `panic!`).
-- **What it does:** Validation, mostly — but three of its outputs are load-bearing at runtime: (1) **no cycles**,
+- **What it does:** Validation, mostly — but four of its outputs are load-bearing at runtime: (1) **no cycles**,
   including router→target edges, which is what stops a runtime deadlock rather than merely an ugly graph;
   (2) **rule 49** (nothing names a `target` as a source), which is what makes `senders[c]` in `runtime.rs`'s
   target-`Fanout` pre-pass and spawn loop non-panicking; (3) **`targets_of`'s order is the slot order** used identically by `Destination::To(n)`,
-  the runtime's `Vec<Fanout>`, and the Lua name→slot table.
+  the runtime's `Vec<Fanout>`, and the Lua name→slot table; (4) **rule 50** (a router has an ordinary
+  consumer), which is what keeps a router's slot 0 from dropping unrouted events uncounted (RT-10).
 - **Why sensitive:** the runtime *indexes and panics* on these guarantees; a cycle that slipped through is a
   runtime deadlock, not a validation message.
 - **Invariants to verify:**
@@ -3951,7 +3969,8 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   (`target != id`) defers a router naming itself to rule 48 for a better message — verify rule 48 actually runs
   in every path that reaches the runtime.
 - **Existing coverage:** `graph.rs`'s `tests` module (`two_node_cycle_is_rejected`, `longer_cycle_is_rejected`,
-  `a_cycle_is_reported_as_a_concrete_path`), plus the rule-by-rule suite. Governed by
+  `a_cycle_is_reported_as_a_concrete_path`, and for rule 50 `a_router_with_targets_but_no_consumers_is_rejected`
+  and `a_router_whose_consumer_is_null_out_resolves`), plus the rule-by-rule suite. Governed by
   `docs/adr/component-graph-configuration.md`, `docs/adr/target-components.md`,
   `docs/design/pipeline-graph.md`.
 - **Priority:** **P1** — validation, so a gap surfaces as a hang or panic at startup rather than as data loss,
@@ -4032,8 +4051,8 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   correctness of "every `logit` process reaches the same verdict independently" rests entirely there, not in
   `logit-pipeline`.
 - `logit_core::telemetry`'s `MAX_LINKS_PER_SPAN = 32` (`telemetry.rs`) silently bounds what `run_flush`
-  (`runtime.rs`, its `span.links(links)`) attaches; the drop is counted as
-  `logit.internal.span.links.dropped{reason="cardinality"}`.
+  (`runtime.rs`, its `span.links(links)`) attaches; a link past the cap is counted as
+  `logit.internal.span.links.omitted{reason="cardinality"}`.
 - `InMemoryBuffer::peek` sets `head_reserved` (`crates/logit-proto/src/buffer.rs`, `InMemoryBuffer::peek`) and only `commit`
   clears it — this reservation lifecycle crosses three crates and is the subtlest shared invariant I found.
 - ~~`Output::observe_batch` (`output.rs`) is implemented only by `logit_out`; whoever surveys
@@ -5037,7 +5056,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   and every unrecognized gRPC status defaults to `Permanent`);
   nontrivial-3p-use(hyper-util/hyper-rustls) (`http2_only` + `https_or_http` + the
   "`alpn_protocols` must be empty on the way in or `with_tls_config` panics" contract in `build_grpc_client`'s doc comment);
-  accounting (`logit.output.requests{signal,class}`, `logit.output.records.rejected{signal}`).
+  accounting (`logit.output.requests{signal,class}`, `logit.output.records.dropped{signal, reason="rejected"}`).
 - **Invariants to verify:**
   - `tls.alpn_protocols` is empty for every `ClientConfig` reaching `build_grpc_client` — both
     `default_client_tls_config` and `crate::tls::build_client_config` must never set it, or the
@@ -5073,7 +5092,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     a malformed status therefore causes retries rather than a permanent failure.
     **Medium confidence it's the right call.**
   - `parse_partial_success` failures are silent by design (`(0, "")`), so a receiver reporting
-    rejections in a shape this parser mis-reads under-counts `logit.output.records.rejected`.
+    rejections in a shape this parser mis-reads under-counts `logit.output.records.dropped{reason="rejected"}`.
     **Medium confidence.**
   - A `rejected` value above `i64::MAX` wraps negative at the `rejected = v as i64` cast in
     `parse_partial_success_message` and is then silently ignored by the `rejected > 0` guard in
@@ -6567,7 +6586,7 @@ the telemetry buffers are `std::collections::HashMap`.
   equaled `MAX_WEIGHT`, so `@0.001` (weight 1000, unclamped) and an empty record reported, and a
   clamped record held raw never did. Fixed with `Samples::is_clamped`, which `aggregate` also asks
   of the held records at fallback. `sketch()` drops a non-finite value with no counter;
-  `aggregate` now counts what it drops as `logit.transform.samples.non_finite_dropped`.
+  `aggregate` now counts what it leaves out as `logit.transform.samples.omitted{reason="non_finite"}`.
 
 ---
 
@@ -6614,7 +6633,7 @@ the telemetry buffers are `std::collections::HashMap`.
 ### CORE-10 — Deterministic span sampling and `SpanGuard` span minting
 - **Location:** `crates/logit-core/src/telemetry.rs` (`DEFAULT_SPAN_SAMPLE_RATE = 0.1`, `trace_is_sampled`; `Telemetry::span`; `now_unix_nanos`, with the `#[cfg(test)]` clock override; `PendingSpan`, `started_at` rationale; `SpanGuard`, `link` cap, `finish_inner`'s saturating `start + elapsed`; `ComponentBuffer::span_event`; `Timer`, record-on-`Drop`)
 - **What it does:** Every node visit mints at most one span, kept or dropped by a hash of the `trace_id` alone so every `logit` process in a split topology reaches the same verdict with no propagated bit. The end timestamp is `start + Instant::elapsed()`, never a second wall-clock read, so an NTP correction can't produce `end < start`.
-- **Why sensitive:** numeric (a float comparison against `rate * 2^53`, NaN handling, the 53-bit truncation choice), hot-path (called per node visit per batch), accounting (`logit.internal.spans.dropped`, `span.links.dropped`), concurrency (the sample rate is copied into each buffer at construction to avoid a second lock).
+- **Why sensitive:** numeric (a float comparison against `rate * 2^53`, NaN handling, the 53-bit truncation choice), hot-path (called per node visit per batch), accounting (`logit.internal.spans.dropped`, `span.links.omitted`), concurrency (the sample rate is copied into each buffer at construction to avoid a second lock).
 - **Invariants to verify:**
   - `trace_is_sampled` keeps approximately `rate` of uniformly distributed trace ids, exactly at `rate == 1.0` (the `!(rate < 1.0)` form in `trace_is_sampled` is deliberately NaN-permissive) and none at `rate <= 0.0`.
   - The verdict depends only on `trace_id` — two processes with the same configured rate agree for every id.
@@ -8079,7 +8098,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     (the loop in `runtime.rs`'s `deliver_with_retry`), and every sink here re-encodes and re-emits its full drop/normalization
     counter set at the top of `send`. A `Fault::Clean` retry (connect refused, DNS failure,
     plaintext zero-byte write) therefore **double-counts every encode-side drop** —
-    `logit.output.messages.dropped{reason=…}`, `logit.output.tags.dropped`,
+    `logit.output.messages.dropped{reason=…}`, `logit.output.tags.omitted`,
     `logit.output.batch.bytes`. I found no ADR or known-gaps entry acknowledging this; grepping
     `buffered-sink-delivery.md` and `known-gaps/` for re-encode/double-count turned up nothing.
     High confidence on the mechanism; unverified whether anyone has measured it.

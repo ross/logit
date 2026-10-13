@@ -47,10 +47,10 @@
 //! | `GAUGE` / `3` / `"gauge"`; a v1 series with no `type` | `Gauge(v)` | -- |
 //! | `RATE` / `2` / `"rate"` | `Gauge(v)` + [`ATTR_TYPE`] `rate` | -- |
 //! | `UNSPECIFIED` / `0` / `""`; a v2 JSON series with no `type` | `Gauge(v)` + [`ATTR_TYPE`] `unspecified` | -- |
-//! | an unknown type, no `metric`, no `points` array, or a field of the wrong JSON type | the series is skipped; the rest of the request decodes | `logit.input.metrics.skipped{reason="bad_series"}` + diag `bad_series` |
-//! | a point that isn't `[ts, value]` / `{timestamp, value}` / `[ts, [values]]` | the point is skipped | `skipped{reason="bad_point"}` |
-//! | v1 `[ts, null]` | the point is skipped | `skipped{reason="null_value"}` |
-//! | a non-finite protobuf value | the point is skipped | `skipped{reason="non_finite_value"}` |
+//! | an unknown type, no `metric`, no `points` array, or a field of the wrong JSON type | the series is dropped; the rest of the request decodes | `logit.input.metrics.dropped{reason="bad_series"}` + diag `bad_series` |
+//! | a point that isn't `[ts, value]` / `{timestamp, value}` / `[ts, [values]]` | the point is dropped | `dropped{reason="bad_point"}` |
+//! | v1 `[ts, null]` | the point is skipped | `logit.input.metrics.skipped{reason="null_value"}` |
+//! | a non-finite protobuf value | the point is dropped | `dropped{reason="non_finite_value"}` |
 //! | point timestamp (s) | `Event::timestamp`; a fractional v1 timestamp truncates to its second | -- |
 //! | timestamp absent, zero, or negative | `received_at`, truncated to its second | `logit.input.metrics.degraded{reason="no_timestamp"}` |
 //! | `unit` | `MetricRecord::unit` when non-empty | -- |
@@ -79,9 +79,9 @@
 //! | `k > 0` / `k < 0` / `k == 0` with count `n` | positive bin `key: k` / negative bin `key: -k` / the zero count; repeated keys sum | -- |
 //! | `cnt`, `min`, `max`, `sum` | the sketch's exact summary (`SketchStats`); `avg` is ignored | -- |
 //! | `metric`, `host`, `tags`, `metadata.origin` | as for a series | -- |
-//! | no bins and `cnt == 0` | skipped | `skipped{reason="empty_sketch"}` |
-//! | `k`/`n` lengths differ, a key outside ±32767, `cnt <= 0` with populated bins, a non-finite `min`/`max`/`sum`, or no `metric` | skipped | `skipped{reason="bad_sketch"}` + diag `bad_sketch` |
-//! | legacy `distributions` entries | ignored | `skipped{reason="legacy_distribution"}`, one per entry |
+//! | no bins and `cnt == 0` | skipped | `logit.input.metrics.skipped{reason="empty_sketch"}` |
+//! | `k`/`n` lengths differ, a key outside ±32767, `cnt <= 0` with populated bins, a non-finite `min`/`max`/`sum`, or no `metric` | dropped | `logit.input.metrics.dropped{reason="bad_sketch"}` + diag `bad_sketch` |
+//! | legacy `distributions` entries | dropped: not implemented | `dropped{reason="legacy_distribution"}`, one per entry |
 //! | payload `metadata` (`CommonMetadata`) `agent_version`, `timezone`, `internal_ip`, `public_ip` | batch resource [`RESOURCE_ATTR_AGENT_VERSION`], [`RESOURCE_ATTR_AGENT_TIMEZONE`], [`RESOURCE_ATTR_AGENT_INTERNAL_IP`], [`RESOURCE_ATTR_AGENT_PUBLIC_IP`] (`Str`), each when non-empty | -- |
 //! | payload `metadata.current_epoch` | batch resource [`RESOURCE_ATTR_AGENT_EPOCH`] (`F64`) when nonzero | -- |
 //! | payload `metadata.api_key` | dropped; a credential, never stored | -- |
@@ -91,7 +91,7 @@
 //! One series (or sketch) per `(event, MetricRecord)`, carrying one point. Carriers are read from
 //! the resource merged with the event's attributes (event wins); every other attribute renders as
 //! a tag by [`tags`]'s rule. A `Map`/`Bytes`/`Null` tag value, or a carrier of the wrong `Value`
-//! type, counts `logit.output.tags.dropped{reason="unrepresentable"}`.
+//! type, counts `logit.output.tags.omitted{reason="unrepresentable"}`.
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
@@ -104,20 +104,21 @@
 //! | `Distribution` under a logarithmic mapping | re-binned into `Mapping::agent` at each bin's representative value, summary kept | `degraded{reason="rebinned"}` |
 //! | a sketch bin with a fractional count | rounded; a bin rounding to 0 is omitted | `degraded{reason="fractional_count"}`, once per sketch |
 //! | a `Distribution` with no bins and zero count | skipped | `logit.output.metrics.skipped{reason="empty_sketch"}` |
-//! | a `Distribution` whose counts split into more than [`sketches::MAX_DOGSKETCH_ENTRIES`] `k`/`n` entries | skipped | `skipped{reason="oversized_sketch"}` + diag `oversized_sketch` |
-//! | `Sum{Cumulative}` / `Sum{Delta, !monotonic}` | skipped by the series encoders | `skipped{metric_kind="cumulative_sum"\|"non_monotonic_delta_sum"}` |
-//! | `GaugeDelta`, `SetMembers`, `Histogram`, `ExponentialHistogram`, `Summary` | skipped by the series encoders | `skipped{metric_kind="gauge_delta"\|"set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` |
+//! | a `Distribution` whose counts split into more than [`sketches::MAX_DOGSKETCH_ENTRIES`] `k`/`n` entries | dropped | `logit.output.metrics.dropped{reason="oversized_sketch"}` + diag `oversized_sketch` |
+//! | `Sum{Cumulative}` / `Sum{Delta, !monotonic}` | skipped by the series encoders | `logit.output.metrics.skipped{metric_kind="cumulative_sum"\|"non_monotonic_delta_sum"}` |
+//! | `GaugeDelta` | dropped by the series encoders: nothing upstream resolved it to a gauge | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` |
+//! | `SetMembers`, `Histogram`, `ExponentialHistogram`, `Summary` | skipped by the series encoders | `logit.output.metrics.skipped{metric_kind="set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` |
 //! | a kind another metrics route carries | left for that route, uncounted: only the series encoders count skips, and only of kinds no route carries | -- |
 //! | record 0 of a service check (`statsd.service_check.name` present and a `Gauge` first metric) | left for the service-checks route, uncounted; any later record encodes as usual, without the check's `statsd.service_check.*` carriers as tags | -- |
 //! | every record of an APM stats event ([`stats::ATTR_STATS_NAME`] present; [`is_datadog_stats`]) | left for the stats routes, uncounted: its `Sum`s and summary `Distribution`s are a stats group, not series or sketches | -- |
-//! | a record flagged `NO_RECORDED_VALUE` | skipped; Datadog has no no-value marker | `skipped{reason="no_recorded_value"}` |
-//! | a non-finite value or sample | skipped (JSON has no `NaN`) | `skipped{reason="non_finite_value"}` |
+//! | a record flagged `NO_RECORDED_VALUE` | skipped; Datadog has no no-value marker | `logit.output.metrics.skipped{reason="no_recorded_value"}` |
+//! | a non-finite value or sample | dropped (JSON has no `NaN`) | `logit.output.metrics.dropped{reason="non_finite_value"}` |
 //! | `Event::timestamp` | whole seconds, rounded toward negative infinity | -- |
 //! | [`ATTR_HOST_NAME`] | v2: a `{type: "host"}` resource, first; v1 and distribution: `host`, always (`""` when absent); sketch: `host` | -- |
 //! | [`ATTR_DEVICE`] | v1: `device`; v2: a `{type: "device"}` resource after the host | -- |
 //! | [`ATTR_RESOURCES`] | v2 resources after host and device, in order | -- |
 //! | the `datadog.origin.*` codes | protobuf and sketch `metadata.origin` (no `metric_type`); JSON v2 `metadata.origin` (no `category`) | -- |
-//! | a carrier the route has no field for (v1: resources and origin; distribution points: all but the host; sketches: device, resources, source type, interval, type, `metric_type`; every route but sketches: the `datadog.agent.*` payload metadata) | dropped | `logit.output.tags.dropped{reason="no_wire_form"}`, one per carrier |
+//! | a carrier the route has no field for (v1: resources and origin; distribution points: all but the host; sketches: device, resources, source type, interval, type, `metric_type`; every route but sketches: the `datadog.agent.*` payload metadata) | omitted | `logit.output.tags.omitted{reason="no_wire_form"}`, one per carrier |
 //! | batch resource `datadog.agent.version` / `.timezone` / `.epoch` / `.internal_ip` / `.public_ip` | sketches: payload `metadata` (`CommonMetadata`, `api_key` `""`); omitted when the resource carries none | -- |
 //! | `MetricRecord::unit` | v1 and v2 `unit` when `Some` | -- |
 //!
@@ -138,10 +139,10 @@
 //! 4. a zero `interval` or origin code, an empty `unit`/`source_type_name`/`device`, and a v1 `type`
 //!    of `gauge` or none all encode to the same wire;
 //! 5. a v1 point with a `null` value, a distribution point with no values, and an empty sketch are
-//!    dropped and counted;
+//!    skipped and counted;
 //! 6. a sketch's repeated `k` entries sum on decode and re-split at 65535 on encode, and its `avg`
 //!    is recomputed as `sum / cnt`;
-//! 7. across routes (v1 and v2), a carrier the target has no field for is dropped and counted
+//! 7. across routes (v1 and v2), a carrier the target has no field for is omitted and counted
 //!    `no_wire_form`, per the encode table.
 //! 8. a JSON route (v1, v2 JSON, distribution points) carries a metric value exactly: this
 //!    crate's `serde_json` dependency enables `float_roundtrip` (see `Cargo.toml`). The protobuf
@@ -163,10 +164,10 @@
 //! |---|---|---|
 //! | body: a JSON array of objects, or one bare object | one [`logit_core::Event::log`] per object | anything else (or not JSON): `CodecError::Malformed` |
 //! | body: a bare empty object `{}`, the connectivity check an Agent's logs sender posts before its first batch (`testdata/interop/datadog/agent-api-v2-logs-000.bin`) | no events | -- |
-//! | an array element that isn't an object | skipped | `logit.input.logs.skipped{reason="not_an_object"}` + diag `malformed_log` |
+//! | an array element that isn't an object | dropped | `logit.input.logs.dropped{reason="not_an_object"}` + diag `malformed_log` |
 //! | `message` string | `LogRecord::message` = `Str`, `body_format: Raw` | -- |
 //! | `message` of another JSON type | `Str` of its JSON text | -- |
-//! | `message` absent or `null` | item skipped | `logit.input.logs.skipped{reason="no_message"}` |
+//! | `message` absent or `null` | item dropped | `logit.input.logs.dropped{reason="no_message"}` |
 //! | `status` | attribute `status`, verbatim; `severity` by case-insensitive match: `emergency`/`emerg`/`alert`/`critical`/`crit`/`fatal` → `Fatal`, `error`/`err` → `Error`, `warning`/`warn` → `Warn`, `notice`/`info` → `Info`, `debug` → `Debug`, `trace` → `Trace`, else `None` | -- |
 //! | `timestamp`: integer (or fractional) milliseconds, or an RFC 3339 string | `Event::timestamp` | -- |
 //! | `timestamp` absent, `null`, or `0` | `received_at` | -- |
@@ -187,8 +188,8 @@
 //! | body not a JSON object | -- | `CodecError::Malformed` |
 //! | envelope `internalHostname`, non-empty | resource [`RESOURCE_ATTR_AGENT_HOSTNAME`] | -- |
 //! | envelope `apiKey` | dropped; a credential, never stored | -- |
-//! | envelope group that isn't an array, or an item that isn't an object | skipped | `logit.input.events.skipped{reason="malformed"}` + diag `malformed_event` |
-//! | neither a title nor a text | item skipped | `logit.input.events.skipped{reason="no_title"}` |
+//! | envelope group that isn't an array, or an item that isn't an object | dropped | `logit.input.events.dropped{reason="malformed"}` + diag `malformed_event` |
+//! | neither a title nor a text | item dropped | `logit.input.events.dropped{reason="no_title"}` |
 //! | `msg_title`/`title` | `statsd.event.title` (`""` when only a text arrived) | -- |
 //! | `msg_text`/`text` | `LogRecord::message` = `Str`, `body_format: Raw`, `event_name: None` | -- |
 //! | `timestamp`/`date_happened` seconds | `Event::timestamp`; absent or `0` → `received_at` | -- |
@@ -204,11 +205,11 @@
 //! | Wire | Model | Counter / diag |
 //! |---|---|---|
 //! | body: a JSON array of objects (one bare object is accepted too) | one [`logit_core::Event::metric`] per check | anything else: `CodecError::Malformed` |
-//! | an element that isn't an object | skipped | `logit.input.metrics.skipped{reason="malformed"}` + diag `malformed_service_check` |
-//! | `check`, absent or empty | skipped | `logit.input.metrics.skipped{reason="no_name"}` |
+//! | an element that isn't an object | dropped | `logit.input.metrics.dropped{reason="malformed"}` + diag `malformed_service_check` |
+//! | `check`, absent or empty | dropped | `logit.input.metrics.dropped{reason="no_name"}` |
 //! | `check` | the record's name, and `statsd.service_check.name` | -- |
 //! | `status` 0 to 3 | `MetricKind::Gauge(status)`, and `statsd.service_check.status` = `U64` | -- |
-//! | `status` absent, negative, above 3, or not an integer | skipped | `logit.input.metrics.skipped{reason="invalid_status"}` |
+//! | `status` absent, negative, above 3, or not an integer | dropped | `logit.input.metrics.dropped{reason="invalid_status"}` |
 //! | `message`, `host_name`, non-empty | `statsd.service_check.message`, `.host` | -- |
 //! | `tags`, an array or `null` | attributes, by [`tags`]'s rule | -- |
 //! | `timestamp` seconds | `Event::timestamp`; absent or `0` → `received_at` | -- |
@@ -235,15 +236,15 @@
 //! | `ddsource`, else [`ATTR_SOURCE`], else [`DatadogEncoder::with_default_source`] | `ddsource`, omitted when none | -- |
 //! | `ddtags` | `ddtags`, verbatim | -- |
 //! | every other attribute | a top-level key: `Map`/`Array` nested, `Bytes` → base64, `Timestamp` → RFC 3339, non-finite `F64` → `null` | -- |
-//! | an attribute named `message` or `timestamp` | dropped: it would collide with the wire's own | `logit.output.tags.dropped{reason="reserved_key"}` |
+//! | an attribute named `message` or `timestamp` | omitted: it would collide with the wire's own | `logit.output.tags.omitted{reason="reserved_key"}` |
 //! | `LogRecord::trace`, when no `trace_id` or `span_id` attribute is present | `trace_id` (32 lowercase hex) and, when the ref has one, `span_id` (16 lowercase hex), after the attributes: the OTel form Datadog's log intake detects. An attribute of either name suppresses both, so a relayed intake log re-encodes unchanged | -- |
 //! | **events** ([`DatadogEncoder::encode_events`]): an event with a `log` carrying `statsd.event.title` | [`events::EventFormat::AgentEnvelope`] (the default): one envelope for the batch, `apiKey` `""`, groups keyed by `statsd.event.source_type` (else `api`) in sorted order; [`events::EventFormat::PublicV1`]: one object per event | -- |
 //! | resource [`RESOURCE_ATTR_AGENT_HOSTNAME`] | envelope `internalHostname`, `""` when absent | -- |
 //! | the event fields | Agent item keys in the Agent's order: `msg_title`, `msg_text`, `timestamp` (seconds), `priority`, `host` (always, `""` when absent), `tags`, `alert_type`, `aggregation_key`, `source_type_name`, `event_type`, then `device_name`, `related_event_id`; the public form uses `title`, `text`, `date_happened` and omits an absent `host`. Empty optional fields are omitted | -- |
 //! | no `statsd.event.alert_type` | `alert_type` from `severity`: `Error`/`Fatal` → `error`, `Warn` → `warning`, `Info` → `info`, else omitted | -- |
 //! | **service checks** ([`DatadogEncoder::encode_service_checks`]): an event carrying `statsd.service_check.name` whose first metric is a `Gauge` | one array item with every key: `check`, `host_name` (`""`), `timestamp` (seconds), `status`, `message` (`""`), `tags` (`[]`) | -- |
-//! | `statsd.service_check.status` `U64` 0 to 3, else the gauge when it is an integer 0 to 3 | `status` | otherwise skipped: `logit.output.metrics.skipped{reason="invalid_status"}` |
-//! | every attribute not consumed above (events and checks) | `tags`, by [`tags::render_tags`]; `statsd.timestamp` (DogStatsD's timestamp carrier) is never rendered | `logit.output.tags.dropped{reason="unrepresentable"}` for a `Map`/`Bytes`/`Null` |
+//! | `statsd.service_check.status` `U64` 0 to 3, else the gauge when it is an integer 0 to 3 | `status` | otherwise dropped: `logit.output.metrics.dropped{reason="invalid_status"}` |
+//! | every attribute not consumed above (events and checks) | `tags`, by [`tags::render_tags`]; `statsd.timestamp` (DogStatsD's timestamp carrier) is never rendered | `logit.output.tags.omitted{reason="unrepresentable"}` for a `Map`/`Bytes`/`Null` |
 //!
 //! ## Permitted normalizations (logs, events, service checks)
 //!
@@ -309,8 +310,8 @@
 //! | `Datadog-Client-Computed-Top-Level` (any non-empty value); `Datadog-Client-Computed-Stats` (any non-empty value but a Go `false` spelling) | [`RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL`], [`RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS`] = `Bool(true)`; absent otherwise | -- |
 //! | `Datadog-Client-Dropped-P0-Traces`, `-Spans` | [`RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES`], [`RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS`] (`U64`); a value that isn't an unsigned integer is left out | diag `bad_header` |
 //! | `AgentPayload` fields | every batch's resource: [`RESOURCE_ATTR_AGENT_HOSTNAME`], `datadog.agent.env`, [`RESOURCE_ATTR_AGENT_VERSION`] (`Str`), `.target_tps`, `.error_tps` (`F64`, nonzero), `.rare_sampler_enabled` (`true`), `.tags` (`Map`) | -- |
-//! | `AgentPayload.idxTracerPayloads` (v1.0) | skipped | `logit.input.spans.skipped{reason="idx_payload"}`, one per payload |
-//! | a span (v0.5: wrong arity, a dictionary index out of range), trace array, or chunk that doesn't parse | dropped; the rest decodes | `skipped{reason="malformed"}` + diag `malformed_span` |
+//! | `AgentPayload.idxTracerPayloads` (v1.0) | dropped: not implemented | `logit.input.spans.dropped{reason="idx_payload"}`, one per payload |
+//! | a span (v0.5: wrong arity, a dictionary index out of range), trace array, or chunk that doesn't parse | dropped; the rest decodes | `dropped{reason="malformed"}` + diag `malformed_span` |
 //! | a body whose structure doesn't parse (not the top-level shape, truncated, bad protobuf) | -- | `CodecError::Malformed` |
 //!
 //! ## Encode: events → spans
@@ -397,16 +398,16 @@
 //! | Wire | Model | Counter / diag |
 //! |---|---|---|
 //! | a body that isn't msgpack, a truncated value, a top level that isn't a map, or (v0.6) a `ClientStatsPayload` field of the wrong type | -- | `CodecError::Malformed` |
-//! | an intake `Stats` element that isn't a well-formed `ClientStatsPayload` | dropped; the other payloads decode | `logit.input.stats.skipped{reason="malformed_payload"}` + diag `malformed_stats` |
-//! | a bucket, or a group, with a field of the wrong type (or that isn't a map) | dropped; the rest decodes | `skipped{reason="malformed_bucket"\|"malformed_group"}` + diag `malformed_stats` |
+//! | an intake `Stats` element that isn't a well-formed `ClientStatsPayload` | dropped; the other payloads decode | `logit.input.stats.dropped{reason="malformed_payload"}` + diag `malformed_stats` |
+//! | a bucket, or a group, with a field of the wrong type (or that isn't a map) | dropped; the rest decodes | `dropped{reason="malformed_bucket"\|"malformed_group"}` + diag `malformed_stats` |
 //! | an unknown key; a `nil` value | skipped; the field's zero value (msgp's own rules) | -- |
 //! | one `ClientGroupedStats` of a bucket | one `Event::metric`; `timestamp` = the bucket's `Start` (ns) | a `Start` above `i64::MAX`: clamped, `logit.input.stats.degraded{reason="bucket_start_overflow"}` |
-//! | a bucket with no groups | nothing | `skipped{reason="empty_bucket"}` |
+//! | a bucket with no groups | nothing | `logit.input.stats.skipped{reason="empty_bucket"}` |
 //! | `Hits`, `Errors`, `TopLevelHits` | `datadog.stats.hits`, `.errors`, `.top_level_hits`: delta monotonic `Sum` of the `uint64` as `U64`, exact, always present | -- |
 //! | `Duration` | `datadog.stats.duration`: the same, unit `ns` | the same |
 //! | `OkSummary`, `ErrorSummary` | `datadog.stats.ok_summary`, `.error_summary`: `Distribution` under `Mapping::logarithmic(gamma, indexOffset, 2048)`, sparse `binCounts` and `contiguousBinCounts` both read (a key in both sums), `zeroCount`; the summary (`count`/`min`/`max`/`sum`) derived from the bins; absent when the wire bytes are empty | -- |
-//! | a summary whose `interpolation` isn't `NONE` | that record dropped; its keys aren't the logarithmic mapping's | `skipped{reason="interpolation"}` |
-//! | a summary that isn't a DDSketch, has no mapping, or has a `gamma`/`indexOffset` no mapping can use | that record dropped | `skipped{reason="bad_sketch"}` + diag `bad_stats_sketch` |
+//! | a summary whose `interpolation` isn't `NONE` | that record dropped; its keys aren't the logarithmic mapping's, and decoding them isn't implemented | `logit.input.stats.dropped{reason="interpolation"}` |
+//! | a summary that isn't a DDSketch, has no mapping, or has a `gamma`/`indexOffset` no mapping can use | that record dropped | `dropped{reason="bad_sketch"}` + diag `bad_stats_sketch` |
 //! | `Service`, `Resource`, `Type`, `SpanKind` | `service.name`, `resource.name`, `span.type`, `span.kind` (ADR decision 8), when non-empty | -- |
 //! | `Name` | [`stats::ATTR_STATS_NAME`], always, even empty: it is what marks the event as APM stats | -- |
 //! | `DBType`, `GRPCStatusCode`, `HTTPMethod`, `HTTPEndpoint`, `srv_src` | `datadog.stats.db_type`, `.grpc_status_code`, `.http_method`, `.http_endpoint`, `.service_source`, when non-empty | -- |
@@ -433,12 +434,12 @@
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
-//! | a group attribute (the event's, else the resource's) | its field above; `""`, `0`, `false`, or `[]` when absent | a value of the wrong type: `logit.output.tags.dropped{reason="unrepresentable"}` |
-//! | any other event attribute; a resource attribute that is none of the fields above (`datadog.agent.*` and the two envelope flags count on the v0.6 route, which has no envelope) | dropped | `tags.dropped{reason="no_wire_form"}`, one per attribute (a resource's once per body) |
+//! | a group attribute (the event's, else the resource's) | its field above; `""`, `0`, `false`, or `[]` when absent | a value of the wrong type: `logit.output.tags.omitted{reason="unrepresentable"}` |
+//! | any other event attribute; a resource attribute that is none of the fields above (`datadog.agent.*` and the two envelope flags count on the v0.6 route, which has no envelope) | omitted | `tags.omitted{reason="no_wire_form"}`, one per attribute (a resource's once per body) |
 //! | a delta `Sum` hits/errors/top-level-hits/duration | `uint64`: a `U64` or non-negative `I64` as is, a `Bool` as `1` or `0`, an `F64` rounded to the nearest integer | a `Bool`: `logit.output.metrics.normalized{reason="bool_value"}`; a negative `I64`: `0`, `degraded{reason="bad_count"}`; a fraction: `logit.output.stats.degraded{reason="fractional_count"}`; negative or non-finite: `0`, `degraded{reason="bad_count"}`; above 2^64: `u64::MAX`, `degraded{reason="count_overflow"}` |
 //! | an ok/error summary `Distribution` under a logarithmic mapping | a DDSketch protobuf: its `gamma` and `indexOffset`, `interpolation: NONE`, both stores as sparse `binCounts` in ascending key order, `zeroCount`. Hand-encoded, since prost's `HashMap` would order the bins at random | a bin limit other than 2048 (a receiver collapses at 2048): `degraded{reason="bin_limit"}`; a summary tracked from observations (`stats_exact`), which the protobuf has no field for: `degraded{reason="exact_summary"}` |
 //! | the same under `Mapping::agent` | `gamma = 1.015625`, `indexOffset = bias + 0.5`, keys unchanged: Datadog's own conversion, reading the Agent's round-half-to-even key as the logarithmic floor. Only a value on an exact tie keys differently, and the exact summary is lost | `degraded{reason="agent_mapping"}` |
-//! | a record of another name, or a known name of another kind (a cumulative `Sum`, say) | skipped | `logit.output.stats.skipped{reason="unrecognized_record"}` |
+//! | a record of another name, or a known name of another kind (a cumulative `Sum`, say) | dropped | `logit.output.stats.dropped{reason="unrecognized_record"}` |
 //! | a negative `Event::timestamp` | bucket `Start` `0` | `degraded{reason="negative_timestamp"}`, once per bucket of a body |
 //!
 //! ## Permitted normalizations (APM stats)
@@ -461,6 +462,8 @@
 pub mod generated;
 pub mod tags;
 pub mod time;
+
+mod outcomes;
 
 pub mod series;
 pub mod sketches;

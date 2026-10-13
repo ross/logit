@@ -73,7 +73,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `ScriptWorker::process` timing distribution would isolate one pathological event in a big
     batch (`logit.component.process.duration` is whole-batch), at the cost of a clock read per
     event. Every `process()` error (`ScriptError::MissingProcess`, `ScriptError::Lua`) collapses
-    into one `logit.component.errors{reason="process"}`, and every `flush()` error into
+    into one `logit.component.errors{reason="process"}` (and its event into
+    `events.dropped{reason="script_error"}`), and every `flush()` error into
     `reason="flush"`, so you can't tell a script bug from a runtime error. Each is real; none was
     a default yes.
 - **Internal-log sampling is the existing per-key occurrence throttle, nothing finer.**
