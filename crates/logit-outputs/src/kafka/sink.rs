@@ -35,11 +35,12 @@
 //! | `logit.output.records.dropped{reason}` | `oversize` (one record over `max_request_bytes`; under `record: batch` one event whose value alone is over it; under an OTLP format one per signal record an event too large alone would have formed; never sent), `rejected` (a partition batch the broker rejected), `invalid_timestamp` or `invalid_record` (records the broker named), or `ambiguous_at_most_once` (records left unsettled when `at_most_once` drops an `Ambiguous` batch, or an `Ambiguous` partition batch beside a `Refused` one, on any topic) |
 //! | `logit.output.records.unkeyed` | records sent without a key because the configured key had no value: on their event, or under an OTLP format on the request's events or resource |
 //! | `logit.output.events.skipped{reason="no_log"}` | events `format: text` skipped for having no log record |
+//! | `logit.output.metrics.omitted{reason="format"}`, `logit.output.spans.omitted{reason="format"}` | under `format: text`, the metric records and spans an event carries beside the log body its record holds, one per metric record and one per span |
 //! | `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, `logit.output.metrics.degraded{metric_kind}` | under an OTLP format, metrics the OTLP mapping skips, drops, or degrades (`logit_proto::otlp::metrics`), once per metric |
 //!
-//! `oversize`, `records.unkeyed`, `events.skipped`, and the OTLP mapping's counters are
-//! encode-side, counted once per batch; the others follow the broker's answer, which a retry
-//! never meets twice for one partition batch. Each drop but `ambiguous_at_most_once` raises a
+//! `oversize`, `records.unkeyed`, `events.skipped`, `metrics.omitted`, `spans.omitted`, and the
+//! OTLP mapping's counters are encode-side, counted once per batch; the others follow the
+//! broker's answer, which a retry never meets twice for one partition batch. Each drop but `ambiguous_at_most_once` raises a
 //! throttled diagnostic of the same name: `oversize` names the record count and the
 //! `max_request_bytes` cap, and `rejected`, `invalid_timestamp`, and `invalid_record` carry the
 //! broker's error code and message.
@@ -78,6 +79,8 @@ const RECORDS: &str = "logit.output.records";
 const RECORDS_DROPPED: &str = "logit.output.records.dropped";
 const RECORDS_UNKEYED: &str = "logit.output.records.unkeyed";
 const EVENTS_SKIPPED: &str = "logit.output.events.skipped";
+const METRICS_OMITTED: &str = "logit.output.metrics.omitted";
+const SPANS_OMITTED: &str = "logit.output.spans.omitted";
 
 /// Which replicas must have a batch before the broker answers. Mirrors `logit_config::KafkaAcks`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -321,6 +324,14 @@ impl KafkaOutput {
             }
             if stats.no_log > 0 {
                 self.telemetry.count(EVENTS_SKIPPED, stats.no_log as f64, &[("reason", "no_log")]);
+            }
+            if stats.metrics_omitted > 0 {
+                let n = stats.metrics_omitted as f64;
+                self.telemetry.count(METRICS_OMITTED, n, &[("reason", "format")]);
+            }
+            if stats.spans_omitted > 0 {
+                let n = stats.spans_omitted as f64;
+                self.telemetry.count(SPANS_OMITTED, n, &[("reason", "format")]);
             }
             self.count_oversize(stats.oversize);
         }

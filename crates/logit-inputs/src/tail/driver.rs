@@ -891,7 +891,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             return;
         }
         let prev_offset = tracked.offset;
-        let discarded_partial = tracked.splitter.holds_partial();
+        // A decoder holding an entry (`docker_in`'s reassembly, or a drop in progress) counts
+        // its own loss in `reset`, and the unterminated line most often continues that entry, so
+        // it isn't counted a second time here.
+        let discarded_partial = tracked.splitter.holds_partial() && !tracked.decoder.holds_entry();
         tracked.offset = 0;
         // Discard, not emit, the held partial (or a stale `dropping`): it belongs to content
         // that's gone, and would otherwise be spliced onto, or swallow, the new first line. The

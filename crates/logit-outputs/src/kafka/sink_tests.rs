@@ -336,6 +336,47 @@ async fn a_retried_prepare_counts_encode_side_points_once() {
     assert_eq!(sum(&sums, "logit.output.batch.bytes", &[]), first);
 }
 
+/// Under `format: text`, the metrics and span a delivered record leaves out are counted
+/// `omitted` once per batch, though a failed `prepare` repeats the encode, and an event with no
+/// log is counted `skipped` and nothing more.
+#[tokio::test]
+async fn text_counts_omitted_metrics_and_spans_once_across_a_retried_prepare() {
+    let cluster = cluster(&[0]).await;
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink(KafkaSettings { format: RecordFormat::Text, ..settings(&cluster) }, &probe);
+    cluster.script(Step {
+        api: kafka_protocol::messages::ApiKey::Metadata,
+        partition: None,
+        topic: None,
+        action: Action::Error(fault::code::LEADER_NOT_AVAILABLE),
+    });
+    let mut mixed = event("a", "m");
+    mixed.metrics.push(logit_core::MetricRecord::new(
+        logit_core::interner::intern("m"),
+        logit_core::MetricKind::Gauge(1.0),
+    ));
+    mixed.span = Some(logit_core::SpanRecord {
+        trace_id: [1; 16],
+        span_id: [1; 8],
+        parent_span_id: None,
+        name: Value::str("s"),
+        kind: logit_core::SpanKind::Internal,
+        status: logit_core::SpanStatus::Unset,
+        events: vec![],
+        links: vec![],
+        end_timestamp: TS,
+        flags: 0,
+        ext: None,
+    });
+    let input = batch(vec![mixed, metric_event()]);
+    let sums = run(&mut out, &mut probe, vec![input], fast_retry()).await;
+    assert_eq!(sum(&sums, "logit.output.requests", &[("class", "clean")]), 1.0, "one retry");
+    assert_eq!(cluster.state().partition(TOPIC, 0).records().len(), 1);
+    assert_eq!(sum(&sums, "logit.output.metrics.omitted", &[("reason", "format")]), 1.0);
+    assert_eq!(sum(&sums, "logit.output.spans.omitted", &[("reason", "format")]), 1.0);
+    assert_eq!(sum(&sums, "logit.output.events.skipped", &[("reason", "no_log")]), 1.0);
+}
+
 /// A topic the broker won't create is `Refused` once a refresh confirms it, which holds the
 /// queue; one it creates costs no failure.
 #[tokio::test]
