@@ -110,7 +110,7 @@ Sinks live in `crates/logit-outputs`.
 | `collectd_out` | `crates/logit-outputs/src/collectd.rs` | collectd's binary `network` protocol | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
 | `graphite_out` | `crates/logit-outputs/src/graphite.rs` | carbon plaintext and pickle | [ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md) |
 | `logit_out` | `crates/logit-outputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md), [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md), [ADR `native-hop-send-window`](docs/adr/native-hop-send-window.md), [ADR `native-hop-named-acks`](docs/adr/native-hop-named-acks.md) |
-| `null_out` | `crates/logit-outputs/src/null.rs` | discards everything; a load-test sink | [ADR `load-test-harness`](docs/adr/load-test-harness.md) |
+| `null_out` | `crates/logit-outputs/src/null.rs` | discards everything: the explicit discard an operator names in the graph (a router's unrouted events, say), and the load-test sink | [ADR `load-test-harness`](docs/adr/load-test-harness.md), [ADR `target-components`](docs/adr/target-components.md) |
 
 ### Transforms and routing
 
@@ -226,10 +226,12 @@ Details an agent needs beyond the table:
 - **`route`/`target`**: a `target` is a named, zero-cost destination a router directs events into,
   and `route` is the native equality-only router that fills it. Together they remove two
   structural costs the central-collector split-apart topology had no better answer for: a filter
-  chain paid by every branch, and the deep clone an all-mutating fan-out can't avoid.
+  chain paid by every branch, and the deep clone an all-mutating fan-out can't avoid. A router
+  needs an ordinary consumer for the events no target claims (graph rule 50); `null_out` is how a
+  config discards them on purpose.
 - **`generate_in`**: `event:` templates via `logit_core::template`, with `{seq}`/`{seq%N}`
-  placeholders. `generate_in` and `null_out` ship unconditionally but exist only to drive the
-  load-test harness (see [Harnesses](#harnesses)).
+  placeholders. `generate_in` ships unconditionally but exists only to drive the load-test
+  harness (see [Harnesses](#harnesses)), whose sink end is `null_out`.
 
 ### Lossless like-protocol relays
 
@@ -1005,7 +1007,7 @@ crates/
   logit-proto       codec traits, native wire format, output buffering, framing (the stream `Framer` every TCP listener frames with), statsd (statsd_in's decoder), syslog (syslog_in's decoder), message (the json, csv, logfmt, and kv parse cores the transforms wrap)
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target; the listener), syslog (the listener), graphite, lines (lines_in), collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
-  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), splunk (splunk_hec_out), kafka (kafka_out), logit (logit_out), null_out (load-test discard sink)
+  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), splunk (splunk_hec_out), kafka (kafka_out), logit (logit_out), null_out (discard sink)
                     shared drivers: `stream` (the pooled TCP, TLS, and Unix-stream send of statsd, syslog, and graphite), `datagram` (the packer and UDP/Unix-datagram send of statsd, syslog, graphite, and collectd), `accounting` (`BatchAccounting`, the once-per-batch encode-side counting gate; ADR `sink-send-path-and-attempt-accounting`)
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, timestamp (event.timestamp from an attribute), scale, has_signal, keep_signals, drop_signals, has_attributes, drop_attributes, has_provenance, drop_provenance, keep_values, bucket (numeric range into a named class), logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), sample (consistent, keyed sampling on a frozen XXH64 hash), route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`

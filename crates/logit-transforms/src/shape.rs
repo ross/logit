@@ -39,7 +39,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Batches one flush window records before dropping and counting the rest: a memory guard, not a
+/// Batches one flush window records before leaving the rest unrecorded and counted: a memory guard, not a
 /// tuning knob, like `aggregate`'s `max_retained_series`. Bounds the window at four `Vec<f64>`s of
 /// 4096 across every `source`.
 const MAX_BATCHES_PER_WINDOW: usize = 4096;
@@ -350,7 +350,7 @@ impl Shape {
         self
     }
 
-    /// Attaches a telemetry handle for the drop counters (`logit.transform.batches.dropped`,
+    /// Attaches a telemetry handle for the bookkeeping counters (`logit.transform.batches.untracked`,
     /// `.keys.untracked`, `.keysets.untracked`): counts of what a bounded table didn't record,
     /// naming nothing observed.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
@@ -581,14 +581,14 @@ impl Transform for Shape {
     }
 
     /// Commits the batch into this flush window and resets. Past [`MAX_BATCHES_PER_WINDOW`] a
-    /// batch is dropped and counted.
+    /// batch's measurements go unrecorded and are counted.
     fn end_batch(&mut self) {
         let keysets = self.batch_keysets.len() as f64;
         let tally = std::mem::take(&mut self.batch);
         self.batch_keysets.clear();
 
         if self.window_batches >= MAX_BATCHES_PER_WINDOW {
-            self.telemetry.count("logit.transform.batches.dropped", 1.0, &[]);
+            self.telemetry.count("logit.transform.batches.untracked", 1.0, &[]);
             return;
         }
         self.window_batches += 1;
@@ -1325,7 +1325,8 @@ mod tests {
         );
 
         let points = registry.drain(0);
-        assert_eq!(telemetry_counter(&points, "logit.transform.batches.dropped"), Some(3.0));
+        assert_eq!(telemetry_counter(&points, "logit.transform.batches.untracked"), Some(3.0));
+        assert_eq!(telemetry_counter(&points, "logit.transform.batches.dropped"), None);
     }
 
     // -- the counts-only property --------------------------------------------------------------

@@ -624,6 +624,7 @@ own consumers. `internal`'s **pipeline** is every node reachable from it. The pi
     would otherwise print on every clean exit. It does this on exit 0 and exit 2 alike. That
     covers a mixed pipeline's residual and the final drain's own counts. Spans and captured logs
     aren't repeated, because the logs already went to stderr.
+    See "Amendment: the exit summary's exclusions are gone" below.
 
 Because a dedicated pipeline exports what a listener counts while it stops, the HTTP listeners
 count each connection their shutdown close sequence ends as
@@ -648,6 +649,21 @@ Alternatives considered:
   dedicated edge. The dedicated case alone is simple and covers the recommended setup.
 - **Require a dedicated pipeline through a validation rule.** Rejected: a mixed pipeline is valid,
   and the loss is limited to shutdown-time telemetry.
+
+## Amendment: the exit summary's exclusions are gone (2026-10-13)
+
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md) leaves decision 16 nothing to
+exclude from its `warn` level:
+
+- A transform's or script's removed event is `logit.component.events.discarded`, and
+  `keep`/`remove`'s count is `logit.transform.attributes.omitted`. Neither is named `*.dropped`,
+  so `absorbed`, `script_drop`, and the reason-less `logit.transform.attributes.dropped` need no
+  exclusion.
+- Graph rule 50 makes a router with no ordinary consumer a config error, so `unrouted` is no
+  longer counted.
+
+The summary now warns on every nonzero `*.dropped` point, whatever its `reason`. A Lua event lost
+to a script error is new loss under `events.dropped{reason="script_error"}` and warns.
 
 ## Amendment (2026-10-13): a truncated datagram is a drop
 

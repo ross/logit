@@ -3666,7 +3666,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   constant time via a nanosecond remainder, so a process stalled for hours does not replay every missed tick.
 - **Why sensitive:** hot-path; cancellation (`inbox.recv()` inside a `timeout` must be cancel-safe or a batch is
   lost); data-loss (a missed close-time flush silently discards an aggregation window); custom (the cadence math);
-  accounting (`flush.events`, `events.dropped{reason="absorbed"}`).
+  accounting (`flush.events`, `events.discarded`).
 - **Invariants to verify:**
   - `tokio::sync::mpsc::Receiver::recv` is cancel-safe, so a `timeout` elapse never consumes a batch.
   - The close-time flush runs exactly once, only for a transform with an interval (the `if next_flush.is_some()` in the closed-inbox arm).
@@ -3700,7 +3700,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 - **Location:** `runtime.rs` (`process_batch`); trait at `transform.rs` (`Transform`).
 - **What it does:** The per-batch body of `run_transform`: reads `scope` out, offers it to `observe_scope`,
   applies `map_resource`, then `events.retain_mut(|e| transform.process(&resource, e))` in place, calls
-  `end_batch`, and counts `before - after` as `events.dropped{reason="absorbed"}`. Returns `None` for an empty
+  `end_batch`, and counts `before - after` as `events.discarded`. Returns `None` for an empty
   result so no empty batch is ever sent.
 - **Why sensitive:** hot-path (per event, per batch, on every transform node); custom (the in-place
   `retain_mut` shape exists specifically to avoid memcpy'ing an 864-byte `Event`); accounting.
@@ -3728,11 +3728,13 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 - **What it does:** Per incoming batch: one child context, one `"process"` span, then a four-pass partition
   (route-borrowing → count → `reserve_exact` per used destination → move) into node-owned scratch buffers that
   `std::mem::take` leaves capacity-0 for the next batch. Sends one batch per non-empty destination under the
-  *same* context. Slot 0 is the router's own outbound edge; an empty slot-0 destination counts
-  `events.dropped{reason="unrouted"}` explicitly, because `Fanout::deliver` returns early and counts nothing.
+  *same* context. Slot 0 is the router's own outbound edge. `Fanout::deliver` returns early and counts nothing on
+  zero consumers, so graph rule 50 (a router needs an ordinary consumer) is what keeps slot 0 from being a
+  silent sink; the `debug_assert!`s in `run_router` and `send_lua_partitions` pin it in debug builds.
 - **Why sensitive:** hot-path (per event); custom (the four-pass partition and the exact allocation contract:
-  `1 + used destinations` per batch, zero per event); accounting (the `unrouted` counter is the *only* thing
-  making unrouted events visible); data-loss (an out-of-range slot falls back to unrouted in release).
+  `1 + used destinations` per batch, zero per event); accounting (unrouted events have no counter of their own;
+  they're visible only as slot 0's consumer's `events.received`, so a slot 0 with no consumer would lose them
+  uncounted); data-loss (an out-of-range slot falls back to slot 0 in release).
 - **Invariants to verify:**
   - The partition is total: every event in appears in exactly one destination out (no `Destination::Drop`).
   - `scratch.dests` entries are always left empty on return (the final `mem::take` loop in `route_batch`), so a stale event can never leak into
@@ -3742,15 +3744,17 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   - The out-of-range guard in pass 1 (the `Destination::To(n) if ..` arm) is `usize::from(n) + 1 >= slots` (`>=`, not `>`) — verify the boundary.
   - `counts.resize(slots, 0)` after `clear()` re-zeroes every slot each batch.
   - One incoming batch = exactly one span and one context, however many destinations it forks into.
-  - `Fanout::deliver`'s zero-consumer early return is compensated by the explicit `unrouted` count in
-    the `slot == 0 && destination.is_empty()` block in `run_router`, and by `send_lua_partitions`' identical
-    block.
+  - `Fanout::deliver`'s zero-consumer early return is never reached for slot 0: graph rule 50 gives every
+    router an ordinary consumer. The `debug_assert!(!destination.is_empty())` in `run_router` and
+    `send_lua_partitions` checks this in debug builds only; release compiles it out, so the graph rule is the
+    guarantee (RT-14).
 - **Observed concerns (unverified):** none spotted. The `None => continue` arm in `run_router` would silently
   discard a partition if a slot had no `Fanout`, but it is genuinely unreachable given the scratch is sized from
   `targets` itself.
 - **Existing coverage:** `a_router_partitions_a_batch_across_two_targets`,
   `unrouted_events_reach_the_routers_ordinary_consumers`,
-  `unrouted_events_are_counted_when_a_router_has_no_ordinary_consumers`,
+  `graph.rs`'s `a_router_with_targets_but_no_consumers_is_rejected` and
+  `a_router_whose_consumer_is_null_out_resolves` (rule 50),
   `one_incoming_batch_forks_into_one_span_however_many_destinations`,
   `route_batch_partitions_into_slot_order_and_leaves_its_scratch_empty_for_reuse`;
   `crates/logit-bench/tests/allocations.rs`
@@ -3925,16 +3929,17 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 
 ### RT-14 — Graph rules the runtime *assumes* (cycle detection, target arity, slot order)
 - **Location:** `crates/logit-pipeline/src/graph.rs` (`topological_order` — Kahn plus cycle recovery),
-  `target_edges`, `targets_of`, `resolve` (its rule 5 cycle check, the rule 50 router exemption inside rule 7's
-  check, and the rule 48/49 target checks).
+  `target_edges`, `targets_of`, `resolve` (its rule 5 cycle check, rule 50's router check inside rule 7's
+  consumer loop, and the rule 48/49 target checks).
   Runtime consumers: `runtime.rs` (`run_with_telemetry`'s `Role::Target` skip in the channel loop, `senders[c]` in
   the target-`Fanout` pre-pass and spawn loop, the `resolve_target_fanouts` calls in the `Router` and `Lua` arms,
   and `resolve_target_fanouts`'s `panic!`).
-- **What it does:** Validation, mostly — but three of its outputs are load-bearing at runtime: (1) **no cycles**,
+- **What it does:** Validation, mostly — but four of its outputs are load-bearing at runtime: (1) **no cycles**,
   including router→target edges, which is what stops a runtime deadlock rather than merely an ugly graph;
   (2) **rule 49** (nothing names a `target` as a source), which is what makes `senders[c]` in `runtime.rs`'s
   target-`Fanout` pre-pass and spawn loop non-panicking; (3) **`targets_of`'s order is the slot order** used identically by `Destination::To(n)`,
-  the runtime's `Vec<Fanout>`, and the Lua name→slot table.
+  the runtime's `Vec<Fanout>`, and the Lua name→slot table; (4) **rule 50** (a router has an ordinary
+  consumer), which is what keeps a router's slot 0 from dropping unrouted events uncounted (RT-10).
 - **Why sensitive:** the runtime *indexes and panics* on these guarantees; a cycle that slipped through is a
   runtime deadlock, not a validation message.
 - **Invariants to verify:**
@@ -3951,7 +3956,8 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   (`target != id`) defers a router naming itself to rule 48 for a better message — verify rule 48 actually runs
   in every path that reaches the runtime.
 - **Existing coverage:** `graph.rs`'s `tests` module (`two_node_cycle_is_rejected`, `longer_cycle_is_rejected`,
-  `a_cycle_is_reported_as_a_concrete_path`), plus the rule-by-rule suite. Governed by
+  `a_cycle_is_reported_as_a_concrete_path`, and for rule 50 `a_router_with_targets_but_no_consumers_is_rejected`
+  and `a_router_whose_consumer_is_null_out_resolves`), plus the rule-by-rule suite. Governed by
   `docs/adr/component-graph-configuration.md`, `docs/adr/target-components.md`,
   `docs/design/pipeline-graph.md`.
 - **Priority:** **P1** — validation, so a gap surfaces as a hang or panic at startup rather than as data loss,
@@ -4032,8 +4038,8 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   correctness of "every `logit` process reaches the same verdict independently" rests entirely there, not in
   `logit-pipeline`.
 - `logit_core::telemetry`'s `MAX_LINKS_PER_SPAN = 32` (`telemetry.rs`) silently bounds what `run_flush`
-  (`runtime.rs`, its `span.links(links)`) attaches; the drop is counted as
-  `logit.internal.span.links.dropped{reason="cardinality"}`.
+  (`runtime.rs`, its `span.links(links)`) attaches; a link past the cap is counted as
+  `logit.internal.span.links.omitted{reason="cardinality"}`.
 - `InMemoryBuffer::peek` sets `head_reserved` (`crates/logit-proto/src/buffer.rs`, `InMemoryBuffer::peek`) and only `commit`
   clears it — this reservation lifecycle crosses three crates and is the subtlest shared invariant I found.
 - ~~`Output::observe_batch` (`output.rs`) is implemented only by `logit_out`; whoever surveys
@@ -6567,7 +6573,7 @@ the telemetry buffers are `std::collections::HashMap`.
   equaled `MAX_WEIGHT`, so `@0.001` (weight 1000, unclamped) and an empty record reported, and a
   clamped record held raw never did. Fixed with `Samples::is_clamped`, which `aggregate` also asks
   of the held records at fallback. `sketch()` drops a non-finite value with no counter;
-  `aggregate` now counts what it drops as `logit.transform.samples.non_finite_dropped`.
+  `aggregate` now counts what it leaves out as `logit.transform.samples.omitted{reason="non_finite"}`.
 
 ---
 
@@ -6614,7 +6620,7 @@ the telemetry buffers are `std::collections::HashMap`.
 ### CORE-10 — Deterministic span sampling and `SpanGuard` span minting
 - **Location:** `crates/logit-core/src/telemetry.rs` (`DEFAULT_SPAN_SAMPLE_RATE = 0.1`, `trace_is_sampled`; `Telemetry::span`; `now_unix_nanos`, with the `#[cfg(test)]` clock override; `PendingSpan`, `started_at` rationale; `SpanGuard`, `link` cap, `finish_inner`'s saturating `start + elapsed`; `ComponentBuffer::span_event`; `Timer`, record-on-`Drop`)
 - **What it does:** Every node visit mints at most one span, kept or dropped by a hash of the `trace_id` alone so every `logit` process in a split topology reaches the same verdict with no propagated bit. The end timestamp is `start + Instant::elapsed()`, never a second wall-clock read, so an NTP correction can't produce `end < start`.
-- **Why sensitive:** numeric (a float comparison against `rate * 2^53`, NaN handling, the 53-bit truncation choice), hot-path (called per node visit per batch), accounting (`logit.internal.spans.dropped`, `span.links.dropped`), concurrency (the sample rate is copied into each buffer at construction to avoid a second lock).
+- **Why sensitive:** numeric (a float comparison against `rate * 2^53`, NaN handling, the 53-bit truncation choice), hot-path (called per node visit per batch), accounting (`logit.internal.spans.dropped`, `span.links.omitted`), concurrency (the sample rate is copied into each buffer at construction to avoid a second lock).
 - **Invariants to verify:**
   - `trace_is_sampled` keeps approximately `rate` of uniformly distributed trace ids, exactly at `rate == 1.0` (the `!(rate < 1.0)` form in `trace_is_sampled` is deliberately NaN-permissive) and none at `rate <= 0.0`.
   - The verdict depends only on `trace_id` — two processes with the same configured rate agree for every id.

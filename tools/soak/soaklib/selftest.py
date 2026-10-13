@@ -1118,10 +1118,11 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             for metric, value, attrs in (
                     ("logit.component.events.received", l_in, None),
                     ("logit.script.events.emitted", emit, {"outcome": "emit"}),
-                    ("logit.component.events.dropped", drop, {"reason": "script_drop"}),
-                    ("logit.component.errors", err
+                    ("logit.component.events.discarded", drop, None),
+                    ("logit.component.events.dropped", err
                      - (l_err_unreported if life == 1 and offset == 200 else 0),
-                     {"reason": "process"}),
+                     {"reason": "script_error"}),
+                    ("logit.component.errors", err, {"reason": "process"}),
                     ("logit.component.flush.events", flush, None),
                     ("logit.component.events.sent", l_sent, None)):
                 sut.append(_line(stamp, metric, "sum", value, component="lua", attrs=attrs))

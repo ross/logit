@@ -1026,10 +1026,10 @@ fn build_spec(
         Regex { pattern, field } => NodeSpec::Transform(Box::new(
             RegexParser::new(pattern, field.as_deref())?.with_telemetry(telemetry.clone()),
         )),
-        HasSignal { signals, mode } => NodeSpec::Transform(Box::new(
-            HasSignalTransform::new(to_signal_set(signals), to_match_mode(*mode))
-                .with_telemetry(telemetry.clone()),
-        )),
+        HasSignal { signals, mode } => NodeSpec::Transform(Box::new(HasSignalTransform::new(
+            to_signal_set(signals),
+            to_match_mode(*mode),
+        ))),
         KeepSignals { signals } => NodeSpec::Transform(Box::new(
             KeepSignalsTransform::new(to_signal_set(signals)).with_telemetry(telemetry.clone()),
         )),
@@ -1039,15 +1039,13 @@ fn build_spec(
         HasAttributes { resource, attributes, resource_present, attributes_present } => {
             NodeSpec::Transform(Box::new(
                 HasAttributesTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
-                    .with_present(resource_present.clone(), attributes_present.clone())
-                    .with_telemetry(telemetry.clone()),
+                    .with_present(resource_present.clone(), attributes_present.clone()),
             ))
         }
         DropAttributes { resource, attributes, resource_present, attributes_present } => {
             NodeSpec::Transform(Box::new(
                 DropAttributesTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
-                    .with_present(resource_present.clone(), attributes_present.clone())
-                    .with_telemetry(telemetry.clone()),
+                    .with_present(resource_present.clone(), attributes_present.clone()),
             ))
         }
         KeepValues { resource, attributes } => NodeSpec::Transform(Box::new(
@@ -1111,12 +1109,10 @@ fn build_spec(
         )),
         // The config's `Vec<String>`s pass straight through; the transform interns them.
         HasProvenance { origin, previous } => NodeSpec::Transform(Box::new(
-            HasProvenanceTransform::new(origin.clone(), previous.clone())
-                .with_telemetry(telemetry.clone()),
+            HasProvenanceTransform::new(origin.clone(), previous.clone()),
         )),
         DropProvenance { origin, previous } => NodeSpec::Transform(Box::new(
-            DropProvenanceTransform::new(origin.clone(), previous.clone())
-                .with_telemetry(telemetry.clone()),
+            DropProvenanceTransform::new(origin.clone(), previous.clone()),
         )),
 
         InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(

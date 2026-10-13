@@ -684,7 +684,7 @@ and takes the worst status; `report.py` is unchanged.
 | A_sent | aggregate `logit.component.events.sent` (W7b), counted once per send however many consumers a fan-out reaches |
 | S_in[sink], T_sent[target] | each sink's `logit.component.events.received`, and under `split = "route"` its target's `logit.component.events.sent` (W7b) |
 | Ab | aggregate `logit.transform.metrics.absorbed` |
-| L_in, L_emit, L_drop, L_err, L_flush, L_sent | with `[ledger] sut_script` (W7a), the script's `logit.component.events.received`; `logit.script.events.emitted` summed over its `outcome`s, which counts events, one per event an `emit_many` returns; `logit.component.events.dropped{reason="script_drop"}`; `logit.component.errors{reason="process"}`, one per event a script error drops; `logit.component.flush.events`; and `logit.component.events.sent`, which counts what `process()` and `flush()` send alike |
+| L_in, L_emit, L_drop, L_err, L_flush, L_sent | with `[ledger] sut_script` (W7a), the script's `logit.component.events.received`; `logit.script.events.emitted` summed over its `outcome`s, which counts events, one per event an `emit_many` returns; `logit.component.events.discarded`, one per event `process()` returns `nil` for; `logit.component.events.dropped{reason="script_error"}`, one per event a script error loses, counted beside `logit.component.errors{reason="process"}`; `logit.component.flush.events`; and `logit.component.events.sent`, which counts what `process()` and `flush()` send alike |
 | V[sink] | per sink (W7b), the reset-aware total of `vm-export/<sink>.jsonl`: add each series' first value, then every non-negative step, and on a decrease or at a SUT life start add the new value. V splits per SUT life at each series' decreases and at each life start, placing a sample by its timestamp, which is the SUT's own window time; a restart whose first value isn't below the last one shows no decrease. A series should have one segment per SUT life, else WARN |
 
 The generator sets `max_packet_bytes: "32"`, so one datagram carries one line of about 20 bytes,
@@ -1159,8 +1159,9 @@ where it needs them, and a small check extension.
    exited ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Admin endpoint, readiness,
    and release image"). Three scenarios
    ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)):
-   - `lua-path`: under the `statsd-vm` schedule in §2, the script rewrites each event, drops every
-     53rd (`script_drop`), fails on every 97th (`errors{reason="process"}`), and returns one
+   - `lua-path`: under the `statsd-vm` schedule in §2, the script rewrites each event, discards every
+     53rd (`events.discarded`), fails on every 97th (`events.dropped{reason="script_error"}` beside
+     `errors{reason="process"}`), and returns one
      rollup event from `flush()` each window.
    - `lua-stall`: a busy loop after N events reads `stalled`, then `ok`. The sandbox has no
      clock, so the loop is an iteration count sized past the 10 s `stall_after`, and a `mark`

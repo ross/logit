@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-11
+updated: 2026-10-13
 ---
 
 # `target` components: named destinations a router directs events into, beside `sources:`
@@ -114,7 +114,8 @@ components:
 `sources:` -- which is how the else-branch is spelled: not a chain of complements, but the
 router's own edge. A router with targets and no ordinary consumers is a legal config (rule 50
 below); its unrouted events are dropped and counted,
-`logit.component.events.dropped{reason="unrouted"}`, never silently.
+`logit.component.events.dropped{reason="unrouted"}`, never silently. [2026-10-13: superseded;
+a router now needs an ordinary consumer. See the amendment at the end.]
 
 **`targets:` is a `Component` field, beside `sources:`/`buffer:`/`receive:`, not a field on the
 Lua variants.** A variant field would make `targets:` an unknown key on every other kind, a
@@ -260,3 +261,20 @@ what the component does to an event, the way `set`/`keep`/`scale` do. `event:to(
   `fixtures/fan-out-central.yaml` rewritten onto `route` + targets with `fan-out-edge.yaml`
   untouched -- the same edge config, a central config that no longer clones.
 - **Build-out:** [`docs/plans/target-components.md`](../plans/target-components.md).
+
+## Amendment (2026-10-13): a router needs an ordinary consumer
+
+Rule 50 no longer exempts a router from rule 7. A router (`route`, or `lua`/`lua_file` with
+`targets:`) with no ordinary consumer fails validation, with a message telling the operator to
+list it in another component's `sources:`, or in a `null_out`'s to discard what no target claims.
+`logit.component.events.dropped{reason="unrouted"}` and the runtime branches in `run_router` and
+`send_lua_partitions` that counted it are removed.
+
+The Decision section's "a router with targets and no ordinary consumers is a legal config", and
+the Consequences section's `reason="unrouted"` telemetry line, are superseded. Unrouted events
+still go to the router's ordinary consumers; what changed is that a router must have one.
+
+Why: [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md) makes any nonzero
+`*.dropped` a loss to investigate, and an unrouted drop was a config choice counted as one.
+Requiring a consumer moves that choice into the graph, where `null_out` names it, instead of
+leaving it inferred from a counter.

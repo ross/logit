@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-09-03
+updated: 2026-10-13
 ---
 
 # Signal filtering is two transform components, not a sink field
@@ -127,3 +127,12 @@ permissive, "forward anything with a payload" filter, not a no-op — unlike the
 - `docs/known-gaps/otlp.md`'s `otlp_out` entry loses its "no signal filter" clause; the other listed
   gaps (custom headers, compression, gRPC TLS, hardcoded paths, `observed_time_unix_nano`) are
   unaffected and remain filed.
+
+## Amendment: discards are counted by the runtime (2026-10-13)
+
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md) supersedes the Consequences bullet on `absorbed`. A filter's removed event is now
+`logit.component.events.discarded` (untagged), which `process_batch` counts for every transform
+that returns `false`, so the count is precise for filters as well as `aggregate`.
+`logit.transform.events.filtered` is removed: it duplicated `events.discarded`. `has_signal` records
+nothing of its own. `keep_signals` and `drop_signals` keep
+`logit.transform.payloads.stripped{signal}`, because the event survives a strip.

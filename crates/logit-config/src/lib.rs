@@ -2540,8 +2540,9 @@ pub enum ComponentKind {
     },
     /// Equality-only routing: one key read per event, one target per matching value. There is no
     /// predicate language; use `lua` for a condition. An event whose key is absent, or whose
-    /// value no route names, is unrouted: it goes to this component's ordinary consumers, or is
-    /// dropped and counted (`logit.component.events.dropped{reason="unrouted"}`) if it has none.
+    /// value no route names, is unrouted: it goes to this component's ordinary consumers, the
+    /// components that list it in `sources:`. A `route` must have at least one; to discard
+    /// unrouted events, list it in a `null_out`'s `sources:`.
     Route {
         by: RouteBy,
         /// Value to target id. Several values may name one target. The router's edges derive
@@ -3591,11 +3592,12 @@ pub enum ComponentKind {
         #[serde(default)]
         reuse_port: bool,
     },
-    /// A sink that drops everything, as cheaply as the runtime allows; the sink end of the
-    /// load-test harness. It measures everything upstream of a sink without a real one's
-    /// encoder, socket, or filesystem in the number, while the runtime's own telemetry still
-    /// counts what it received. No fields: a scenario that wants an encoder in the measurement
-    /// uses `file_out` to `/dev/null` instead.
+    /// A sink that discards everything, as cheaply as the runtime allows, while the runtime's
+    /// own telemetry still counts what it received. Name it as a consumer to discard events by
+    /// choice, such as the events a router sends to no target, so the discard shows in the
+    /// config. It's also the sink end of a load test: it measures everything upstream with no
+    /// encoder, socket, or filesystem in the number. No fields: to keep an encoder in the
+    /// measurement, use `file_out` to `/dev/null` instead.
     NullOut {},
     /// A named destination a router directs events into. No fields and no `sources:`: a target
     /// is fed by a router that names it, never by naming anything itself, and must be directed

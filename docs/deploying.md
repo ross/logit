@@ -558,7 +558,7 @@ that recorded the point.
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
 | `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
-| `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for a nonzero `*.dropped` count whose `reason` isn't one the config asked for (`absorbed`, `unrouted`, `script_drop`), other than `keep` and `remove`'s `logit.transform.attributes.dropped`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
+| `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for any nonzero `*.dropped` count, whatever its `reason`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
 `telemetry left undrained at exit` is the last word on counts recorded after `internal`'s final
@@ -2326,6 +2326,26 @@ format: {pattern: "%Y-%m-%d %H:%M:%S.%f UTC"}
 format: {pattern: "%d/%b/%Y:%H:%M:%S %z"}
 ```
 
+## Routing: every router needs a consumer for unrouted events
+
+A router (`route`, or `lua`/`lua_file` with `targets:`) sends each event it doesn't direct into a
+`target` to its ordinary consumers, the components that list it in `sources:`. `logit validate`
+rejects a router with none, because those events would otherwise vanish uncounted. To discard
+them on purpose, name a `null_out` as that consumer, so the discard shows in the config:
+
+```yaml
+split:
+  type: route
+  sources: [in]
+  by: { attribute: stream }
+  routes: { host: host_target, app: app_target }
+unrouted:
+  type: null_out
+  sources: [split]
+```
+
+`null_out` counts what it discards under `logit.component.events.received`, as any sink does.
+
 ## Series retention
 
 `aggregate` normally drains every series on every flush (tumbling). Statsd gauges are the
@@ -2491,8 +2511,8 @@ way); against another transform or a Lua stage, one of the two always clones.
   counted instead of tracked, so `logit.shape.distinct_keys` and `.distinct_keysets` become lower
   bounds and `.keyset_share.top1`/`.top5` under-report. Raise the cap or, better, put a `keep` in
   front of the tap so it measures the key-set you intend to carry.
-- `logit.transform.keys.untracked`/`.keysets.untracked` (count): the matching drop counters.
-- `logit.transform.batches.dropped`: more than 4096 batches arrived in one flush window. Shorten
+- `logit.transform.keys.untracked`/`.keysets.untracked` (count): what those caps turned away.
+- `logit.transform.batches.untracked`: more than 4096 batches arrived in one flush window. Shorten
   `interval`, or accept that the per-batch distribution samples the window instead of covering all
   of it.
 
