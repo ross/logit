@@ -1123,19 +1123,23 @@ class Ledger:
         for listener in self.listeners:
             one = self.per[listener] = {}
             one["W"] = sut.counter_by_life("logit.input.datagrams", component=listener)
-            one["K"] = sut.counter_by_life("logit.input.kernel.drops", component=listener)
+            one["K"] = sut.counter_by_life("logit.input.kernel.dropped", component=listener)
             # D, every reason. Every SUT config gives `internal` a dedicated pipeline, so its
             # final drain runs after every data node has exited and carries the shutdown drops.
             one["D_tel"] = sut.counter_by_life("logit.component.datagrams.dropped",
                                                component=listener)
             one["D_shutdown"] = sut.counter_by_life("logit.component.datagrams.dropped",
                                                     component=listener, reason="shutdown")
-            # B: a statsd line the decoder refused, and a line over `lines_in`'s
-            # `max_line_bytes`, which its decoder drops and counts without a decoder error. Each
-            # is 0 on a listener that has no such rule.
+            # B: a line the decoder refused (`messages.dropped{reason="malformed"}`), a datagram
+            # it refused whole (`frames.dropped{reason="undecodable"}`), and a line over
+            # `lines_in`'s `max_line_bytes`, which its decoder drops without a decoder error.
+            # Each is 0 on a listener that has no such rule. A generator line is one datagram, so
+            # a refused datagram is one line.
             one["B"] = _summed({
-                "bad_line": sut.counter_by_life("logit.component.diagnostics",
-                                                component=listener, key="bad_line"),
+                "malformed": sut.counter_by_life("logit.input.messages.dropped",
+                                                 component=listener, reason="malformed"),
+                "undecodable": sut.counter_by_life("logit.input.frames.dropped",
+                                                   component=listener, reason="undecodable"),
                 "oversize": sut.counter_by_life("logit.input.frames.dropped",
                                                 component=listener, reason="oversize")})
             one["E"] = sut.counter_by_life("logit.component.events.sent", component=listener)
@@ -1601,7 +1605,7 @@ def _wire_buckets(data, led, source):
         return c1 if t2 == t1 else c1 + (c2 - c1) * (t - t1) / (t2 - t1)
 
     counts = {}
-    for name in ("logit.input.datagrams", "logit.input.kernel.drops"):
+    for name in ("logit.input.datagrams", "logit.input.kernel.dropped"):
         for ts, value, _ in sut.counter_points(name, component=source.get("sut_listener")):
             counts[ts] = counts.get(ts, 0) + value
     drains = sorted(set(sut.drains) | set(counts))

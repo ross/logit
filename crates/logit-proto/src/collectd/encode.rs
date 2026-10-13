@@ -39,14 +39,14 @@ pub struct EncodeStats {
     pub dropped_unencodable_value: usize,
     /// A `NO_RECORDED_VALUE`-flagged point of any kind **other than** `Gauge` (which encodes as
     /// NaN).
-    pub dropped_no_recorded_value: usize,
+    pub skipped_no_recorded_value: usize,
     /// A `MetricKind::GaugeDelta`, which means a missing `aggregate` stage, not a bad metric.
     pub dropped_gauge_delta: usize,
     /// An event whose `timestamp` is zero or negative: there is no cdtime before the epoch, and
     /// stamping "now" would invent an instant.
     ///
     /// Counted once per value **list** the event would have produced (1 for like-relay, one per
-    /// record for fallback), so it means what every other sink's `metrics.skipped` means.
+    /// record for fallback), so it means what every other sink's `metrics.dropped` means.
     pub dropped_unencodable_timestamp: usize,
     /// An event with no `collectd.host`, no `host.name`, and no
     /// [`CollectdEncoder::with_hostname`]. Counted per value list, like
@@ -62,11 +62,11 @@ pub struct EncodeStats {
     pub dropped_oversize_list: usize,
     /// An attribute outside the `collectd.` namespace (collectd has no tags), once per attribute
     /// per event, including `host.name`, which host resolution reads but can't carry as itself.
-    pub tags_dropped_no_wire_form: usize,
+    pub tags_omitted_no_wire_form: usize,
     /// A `collectd.*` attribute with no wire form here: an identity field that isn't
     /// `Str`/`Bytes`, an interval that isn't a finite positive `F64`, a `collectd.severity` that
     /// isn't `U64` or rides on a value list, or a `collectd.*` name this codec doesn't know.
-    pub tags_dropped_unrepresentable: usize,
+    pub tags_omitted_unrepresentable: usize,
     /// An identity field that had a NUL or `/` replaced with `_`. Counted once per field.
     pub identity_sanitized_substituted: usize,
     /// An identity field truncated to [`MAX_IDENTITY_BYTES`]. Counted once per field.
@@ -261,7 +261,7 @@ impl FramedEncoder for CollectdEncoder {
                 // A `log`-only event is a notification *attempt* only if it carries
                 // `collectd.severity`; otherwise it is the uncounted no-metrics skip. A plain scan,
                 // not `collect_carriers`, so a non-attempt doesn't count every attribute as
-                // `tags_dropped_no_wire_form`.
+                // `tags_omitted_no_wire_form`.
                 let is_notification_attempt = event.log.is_some()
                     && logit_core::attrs::merged(&batch.resource, event)
                         .any(|(key, _)| logit_core::interner::resolve(key) == ATTR_SEVERITY);
@@ -295,11 +295,11 @@ impl FramedEncoder for CollectdEncoder {
             // counted a wrong-typed one; it leaves the `U64` case for the caller, which knows the
             // path.
             if carriers.severity.is_some() {
-                ctx.tag_dropped_unrepresentable();
+                ctx.tag_omitted_unrepresentable();
             }
 
             // The value lists this event would produce, which the two whole-event drops below
-            // count, so `logit.output.metrics.skipped` stays per-record as at every other sink.
+            // count, so `logit.output.metrics.dropped` stays per-record as at every other sink.
             let lists = if carriers.type_.is_some() { 1 } else { event.metrics.len() };
 
             // 0 is collectd's "no time given", which its receiver rejects: drop, don't send it.
@@ -419,14 +419,14 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    fn tag_dropped_no_wire_form(&mut self) {
-        self.stats.tags_dropped_no_wire_form += 1;
-        self.telemetry.count("logit.output.tags.dropped", 1.0, &[("reason", "no_wire_form")]);
+    fn tag_omitted_no_wire_form(&mut self) {
+        self.stats.tags_omitted_no_wire_form += 1;
+        self.telemetry.count("logit.output.tags.omitted", 1.0, &[("reason", "no_wire_form")]);
     }
 
-    fn tag_dropped_unrepresentable(&mut self) {
-        self.stats.tags_dropped_unrepresentable += 1;
-        self.telemetry.count("logit.output.tags.dropped", 1.0, &[("reason", "unrepresentable")]);
+    fn tag_omitted_unrepresentable(&mut self) {
+        self.stats.tags_omitted_unrepresentable += 1;
+        self.telemetry.count("logit.output.tags.omitted", 1.0, &[("reason", "unrepresentable")]);
     }
 
     fn identity_substituted(&mut self) {
@@ -456,9 +456,9 @@ impl Ctx<'_> {
     fn drop_gauge_delta(&mut self) {
         self.stats.dropped_gauge_delta += 1;
         self.telemetry.count(
-            "logit.output.metrics.skipped",
+            "logit.output.metrics.dropped",
             1.0,
-            &[("metric_kind", "gauge_delta")],
+            &[("reason", "unresolved_gauge_delta")],
         );
         self.diag.warn_throttled(
             "gauge_delta_unresolved",
@@ -470,7 +470,7 @@ impl Ctx<'_> {
     fn drop_unencodable_value(&mut self, name: &str, value: f64) {
         self.stats.dropped_unencodable_value += 1;
         self.telemetry.count(
-            "logit.output.metrics.skipped",
+            "logit.output.metrics.dropped",
             1.0,
             &[("reason", "unencodable_value")],
         );
@@ -484,7 +484,7 @@ impl Ctx<'_> {
     }
 
     fn drop_no_recorded_value(&mut self, name: &str) {
-        self.stats.dropped_no_recorded_value += 1;
+        self.stats.skipped_no_recorded_value += 1;
         self.telemetry.count(
             "logit.output.metrics.skipped",
             1.0,
@@ -504,7 +504,7 @@ impl Ctx<'_> {
     fn drop_unencodable_timestamp(&mut self, timestamp: i64, lists: usize) {
         self.stats.dropped_unencodable_timestamp += lists;
         self.telemetry.count(
-            "logit.output.metrics.skipped",
+            "logit.output.metrics.dropped",
             lists as f64,
             &[("reason", "unencodable_timestamp")],
         );
@@ -521,7 +521,7 @@ impl Ctx<'_> {
     fn drop_no_host(&mut self, lists: usize) {
         self.stats.dropped_no_host += lists;
         self.telemetry.count(
-            "logit.output.metrics.skipped",
+            "logit.output.metrics.dropped",
             lists as f64,
             &[("reason", "no_host")],
         );
@@ -537,7 +537,7 @@ impl Ctx<'_> {
 
     fn drop_too_many_values(&mut self, records: usize) {
         self.stats.dropped_too_many_values += 1;
-        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("reason", "too_many_values")]);
+        self.telemetry.count("logit.output.metrics.dropped", 1.0, &[("reason", "too_many_values")]);
         self.diag.warn_throttled(
             "too_many_values",
             format_args!(
@@ -551,7 +551,7 @@ impl Ctx<'_> {
 
     fn drop_empty_name(&mut self) {
         self.stats.dropped_empty_name += 1;
-        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("reason", "empty_name")]);
+        self.telemetry.count("logit.output.metrics.dropped", 1.0, &[("reason", "empty_name")]);
         self.diag.warn_throttled(
             "empty_metric_name",
             "collectd_out: a value list's plugin or type is empty after sanitizing; dropping it \
@@ -562,7 +562,7 @@ impl Ctx<'_> {
     fn drop_oversize_list(&mut self, max_packet_bytes: usize) {
         self.stats.dropped_oversize_list += 1;
         self.telemetry.count(
-            "logit.output.metrics.skipped",
+            "logit.output.metrics.dropped",
             1.0,
             &[("reason", "oversize_value_list")],
         );
@@ -581,9 +581,9 @@ impl Ctx<'_> {
     fn drop_notification(&mut self, severity: Option<u64>) {
         self.stats.dropped_notification += 1;
         self.telemetry.count(
-            "logit.output.metrics.skipped",
+            "logit.output.metrics.dropped",
             1.0,
-            &[("reason", "notification_dropped")],
+            &[("reason", "invalid_notification")],
         );
         self.diag.warn_throttled(
             "notification_dropped",
@@ -597,7 +597,7 @@ impl Ctx<'_> {
     /// See [`EncodeStats::dropped_empty_message`].
     fn drop_empty_message(&mut self) {
         self.stats.dropped_empty_message += 1;
-        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("reason", "empty_message")]);
+        self.telemetry.count("logit.output.metrics.dropped", 1.0, &[("reason", "empty_message")]);
         self.diag.warn_throttled(
             "empty_message",
             "collectd_out: a notification's message is empty; dropping (collectd's own receiver \
@@ -623,7 +623,7 @@ impl Ctx<'_> {
     fn drop_oversize_notification(&mut self, max_packet_bytes: usize) {
         self.stats.dropped_oversize_notification += 1;
         self.telemetry.count(
-            "logit.output.metrics.skipped",
+            "logit.output.metrics.dropped",
             1.0,
             &[("reason", "oversize_notification")],
         );
@@ -688,10 +688,10 @@ fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx)
                 // skipping as a plain log event.
                 ("severity", _) => {
                     carriers.severity_present = true;
-                    ctx.tag_dropped_unrepresentable();
+                    ctx.tag_omitted_unrepresentable();
                 }
                 // A wrong-typed carrier, a non-positive interval, or an unknown `collectd.*` name.
-                _ => ctx.tag_dropped_unrepresentable(),
+                _ => ctx.tag_omitted_unrepresentable(),
             }
             continue;
         }
@@ -699,7 +699,7 @@ fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx)
             carriers.host_name = Some(value);
         }
         // Counted even for `host.name`: host resolution reads it, but it has no wire form itself.
-        ctx.tag_dropped_no_wire_form();
+        ctx.tag_omitted_no_wire_form();
     }
     carriers
 }
@@ -1231,8 +1231,8 @@ mod tests {
         })
     }
 
-    /// The **total** recorded on `logit.output.metrics.skipped{reason}`. Drains, so call once.
-    fn skipped_total(registry: &Registry, reason: &str) -> f64 {
+    /// The **total** recorded on `logit.output.metrics.dropped{reason}`. Drains, so call once.
+    fn dropped_total(registry: &Registry, reason: &str) -> f64 {
         let events = registry.drain(0);
         let mut total = 0.0;
         for event in &events {
@@ -1240,7 +1240,7 @@ mod tests {
                 continue;
             }
             for metric in &event.metrics {
-                if logit_core::interner::resolve(metric.name) != "logit.output.metrics.skipped" {
+                if logit_core::interner::resolve(metric.name) != "logit.output.metrics.dropped" {
                     continue;
                 }
                 match &metric.kind {
@@ -1423,7 +1423,7 @@ mod tests {
         assert_eq!(stats.dropped_oversize_list, 1);
         assert!(counted(
             &registry,
-            "logit.output.metrics.skipped",
+            "logit.output.metrics.dropped",
             ("reason", "oversize_value_list")
         ));
         assert!(counted(
@@ -1557,7 +1557,7 @@ mod tests {
             assert_eq!(stats.dropped_unencodable_value, 1, "{value}");
             assert!(counted(
                 &registry,
-                "logit.output.metrics.skipped",
+                "logit.output.metrics.dropped",
                 ("reason", "unencodable_value")
             ));
             assert!(counted(
@@ -1618,7 +1618,11 @@ mod tests {
         let (packets, stats, registry, diag_registry) = encode_counted(&batch(vec![event]), 1452);
         assert!(packets.is_empty());
         assert_eq!(stats.dropped_gauge_delta, 1);
-        assert!(counted(&registry, "logit.output.metrics.skipped", ("metric_kind", "gauge_delta")));
+        assert!(counted(
+            &registry,
+            "logit.output.metrics.dropped",
+            ("reason", "unresolved_gauge_delta")
+        ));
         assert!(counted(
             &diag_registry,
             "logit.component.diagnostics",
@@ -1700,7 +1704,7 @@ mod tests {
         let (packets, stats, registry, diag_registry) =
             encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert!(packets.is_empty());
-        assert_eq!(stats.dropped_no_recorded_value, 1);
+        assert_eq!(stats.skipped_no_recorded_value, 1);
         assert!(counted(
             &registry,
             "logit.output.metrics.skipped",
@@ -1754,7 +1758,7 @@ mod tests {
             assert_eq!(stats.dropped_unencodable_timestamp, 1);
             assert!(counted(
                 &registry,
-                "logit.output.metrics.skipped",
+                "logit.output.metrics.dropped",
                 ("reason", "unencodable_timestamp")
             ));
         }
@@ -1776,9 +1780,9 @@ mod tests {
             event.attributes.insert(ATTR_INTERVAL, value.clone());
             let (packets, stats, registry, _) =
                 encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
-            assert_eq!(stats.tags_dropped_unrepresentable, 1, "{value:?}");
+            assert_eq!(stats.tags_omitted_unrepresentable, 1, "{value:?}");
             assert_eq!(attr(&decode_all(&packets)[0], ATTR_INTERVAL), None);
-            assert!(counted(&registry, "logit.output.tags.dropped", ("reason", "unrepresentable")));
+            assert!(counted(&registry, "logit.output.tags.omitted", ("reason", "unrepresentable")));
         }
     }
 
@@ -1796,7 +1800,7 @@ mod tests {
         event.attributes.insert("host.name", Value::from("from-host-name"));
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("from-host-name")));
-        assert_eq!(stats.tags_dropped_no_wire_form, 1, "`host.name` is read but still dropped");
+        assert_eq!(stats.tags_omitted_no_wire_form, 1, "`host.name` is read but still dropped");
 
         // Then the configured hostname.
         let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
@@ -1837,7 +1841,7 @@ mod tests {
             assert!(packets.is_empty(), "{label}");
             assert_eq!(stats.dropped_no_host, expected, "{label}: no_host stat");
             assert_eq!(
-                skipped_total(&registry, "no_host"),
+                dropped_total(&registry, "no_host"),
                 expected as f64,
                 "{label}: no_host counter"
             );
@@ -1850,7 +1854,7 @@ mod tests {
             assert!(packets.is_empty(), "{label}");
             assert_eq!(stats.dropped_unencodable_timestamp, expected, "{label}: timestamp stat");
             assert_eq!(
-                skipped_total(&registry, "unencodable_timestamp"),
+                dropped_total(&registry, "unencodable_timestamp"),
                 expected as f64,
                 "{label}: timestamp counter"
             );
@@ -1867,7 +1871,7 @@ mod tests {
             encode_counted(&batch(vec![relay_event(records)]), DEFAULT_MAX_PACKET_BYTES);
         assert!(packets.is_empty(), "65 data sources must not reach the wire");
         assert_eq!(stats.dropped_too_many_values, 1, "one list dropped, not one per record");
-        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "too_many_values")));
+        assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "too_many_values")));
         assert!(counted(&diag_registry, "logit.component.diagnostics", ("key", "too_many_values")));
     }
 
@@ -1904,7 +1908,7 @@ mod tests {
 
         assert!(packets.is_empty());
         assert_eq!(stats.dropped_no_host, 1);
-        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "no_host")));
+        assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "no_host")));
         assert!(counted(&diag_registry, "logit.component.diagnostics", ("key", "no_host")));
     }
 
@@ -1993,7 +1997,7 @@ mod tests {
                 encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
             assert!(packets.is_empty(), "{key}");
             assert_eq!(stats.dropped_empty_name, 1);
-            assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "empty_name")));
+            assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "empty_name")));
         }
     }
 
@@ -2004,8 +2008,8 @@ mod tests {
         event.attributes.insert("region", Value::from("us-east"));
         let (packets, stats, registry, _) =
             encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
-        assert_eq!(stats.tags_dropped_no_wire_form, 2);
-        assert!(counted(&registry, "logit.output.tags.dropped", ("reason", "no_wire_form")));
+        assert_eq!(stats.tags_omitted_no_wire_form, 2);
+        assert!(counted(&registry, "logit.output.tags.omitted", ("reason", "no_wire_form")));
         let decoded = decode_all(&packets);
         assert_eq!(attr(&decoded[0], "env"), None, "collectd has no tag concept at all");
     }
@@ -2015,7 +2019,7 @@ mod tests {
         let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
         event.attributes.insert(ATTR_PLUGIN_INSTANCE, Value::I64(7));
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
-        assert_eq!(stats.tags_dropped_unrepresentable, 1);
+        assert_eq!(stats.tags_omitted_unrepresentable, 1);
         assert_eq!(attr(&decode_all(&packets)[0], ATTR_PLUGIN_INSTANCE), None);
     }
 
@@ -2048,15 +2052,15 @@ mod tests {
     }
 
     /// Metrics win: `collectd.severity` on an event with metrics is counted
-    /// `tags_dropped_unrepresentable`.
+    /// `tags_omitted_unrepresentable`.
     #[test]
     fn a_severity_attribute_on_a_metrics_bearing_event_is_dropped_and_counted() {
         let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
         event.attributes.insert(ATTR_SEVERITY, Value::U64(2));
         let (packets, stats, registry, _) =
             encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
-        assert_eq!(stats.tags_dropped_unrepresentable, 1);
-        assert!(counted(&registry, "logit.output.tags.dropped", ("reason", "unrepresentable")));
+        assert_eq!(stats.tags_omitted_unrepresentable, 1);
+        assert!(counted(&registry, "logit.output.tags.omitted", ("reason", "unrepresentable")));
 
         let decoded = decode_all(&packets);
         assert_eq!(decoded.len(), 1, "the event still encodes as an ordinary value list");
@@ -2160,7 +2164,7 @@ mod tests {
             encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert!(packets.is_empty());
         assert_eq!(stats.dropped_empty_message, 1);
-        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "empty_message")));
+        assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "empty_message")));
         assert!(counted(&diag_registry, "logit.component.diagnostics", ("key", "empty_message")));
     }
 
@@ -2183,8 +2187,8 @@ mod tests {
             assert_eq!(stats.dropped_notification, 1, "{wire:?}");
             assert!(counted(
                 &registry,
-                "logit.output.metrics.skipped",
-                ("reason", "notification_dropped")
+                "logit.output.metrics.dropped",
+                ("reason", "invalid_notification")
             ));
             assert!(counted(
                 &diag_registry,
@@ -2202,7 +2206,7 @@ mod tests {
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert!(packets.is_empty());
         assert_eq!(stats.dropped_notification, 1);
-        assert_eq!(stats.tags_dropped_unrepresentable, 1);
+        assert_eq!(stats.tags_omitted_unrepresentable, 1);
         assert_eq!(stats.skipped_no_metrics, 0, "a present collectd.severity is an attempt");
     }
 

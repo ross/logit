@@ -103,39 +103,39 @@
 //! |---|---|---|
 //! | event with `collectd.type` present (merged: event attributes, then resource) | **like-relay**: one Values part carrying every record of `event.metrics` in order, identity straight off the `collectd.*` attributes | -- |
 //! | event without `collectd.type` | **fallback**: one single-data-source list per record -- plugin = the record name up to its first `.` (the whole name if it has none), type_instance = the remainder, type = `counter`/`gauge`/`derive`/`absolute` by kind (all single-data-source types in a stock `types.db`), no plugin_instance | -- |
-//! | an event with `event.metrics` non-empty **and** an [`ATTR_SEVERITY`] attribute | metrics win: the event encodes as an ordinary value list (like-relay or fallback, per the two rows above); `collectd.severity` has no wire form on a value list and is dropped like any other unrepresentable `collectd.*` carrier | `logit.output.tags.dropped{reason="unrepresentable"}` |
+//! | an event with `event.metrics` non-empty **and** an [`ATTR_SEVERITY`] attribute | metrics win: the event encodes as an ordinary value list (like-relay or fallback, per the two rows above); `collectd.severity` has no wire form on a value list and is dropped like any other unrepresentable `collectd.*` carrier | `logit.output.tags.omitted{reason="unrepresentable"}` |
 //! | `Sum{Cumulative, monotonic}`, integral, in `u64` range | COUNTER | -- |
 //! | `Sum{Cumulative, !monotonic}`, integral, in `i64` range | DERIVE | -- |
 //! | `Sum{Delta, monotonic}`, integral, in `u64` range | ABSOLUTE | -- |
 //! | `Sum{Delta, !monotonic}` | dropped | `logit.output.metrics.skipped{metric_kind="non_monotonic_delta_sum"}` |
-//! | any `Sum` non-integral, out of range, or non-finite | dropped | `logit.output.metrics.skipped{reason="unencodable_value"}` + diag `unencodable_value`. Rounding would fabricate: statsd's `page.views:2\|c\|@0.3` reaches a sink as `6.666…`, and `6` or `7` is a number nobody sent. |
+//! | any `Sum` non-integral, out of range, or non-finite | dropped | `logit.output.metrics.dropped{reason="unencodable_value"}` + diag `unencodable_value`. Rounding would fabricate: statsd's `page.views:2\|c\|@0.3` reaches a sink as `6.666…`, and `6` or `7` is a number nobody sent. |
 //! | `Gauge(v)`, finite or ±inf | GAUGE | -- |
 //! | `Gauge` flagged `NO_RECORDED_VALUE` | GAUGE NaN -- the inverse of the decode row above | -- |
 //! | any non-`Gauge` flagged `NO_RECORDED_VALUE` | dropped | `logit.output.metrics.skipped{reason="no_recorded_value"}` + diag `no_recorded_value` |
-//! | `GaugeDelta` | dropped | `logit.output.metrics.skipped{metric_kind="gauge_delta"}` + diag `gauge_delta_unresolved` (the same greppable key every other sink uses -- it means a missing `aggregate`, not a malformed metric) |
+//! | `GaugeDelta` | dropped | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` + diag `gauge_delta_unresolved` (the same greppable key every other sink uses -- it means a missing `aggregate`, not a malformed metric) |
 //! | `Samples`, `Distribution`, `SetMembers`, `Set`, `Histogram`, `ExponentialHistogram`, `Summary` | dropped, one exhaustive `match` arm each, no wildcard | `logit.output.metrics.skipped{metric_kind="samples"\|"distribution"\|"set_members"\|"set"\|"histogram"\|"exponential_histogram"\|"summary"}` |
 //! | a **like-relay** list where any one record fails the rows above | the whole list is dropped, counted once for the first failing reason | as above -- collectd's receiver rejects a list whose value count disagrees with its type's `ds_num` anyway, so emitting the survivors would be worse than dropping |
 //! | `Event::timestamp > 0` | TimeHR = [`nanos_to_cdtime`] | -- |
-//! | `Event::timestamp <= 0` | the list is dropped | `logit.output.metrics.skipped{reason="unencodable_timestamp"}` |
+//! | `Event::timestamp <= 0` | the list is dropped | `logit.output.metrics.dropped{reason="unencodable_timestamp"}` |
 //! | `collectd.interval` `F64`, finite, `> 0` | IntervalHR = `round(v * 2³⁰)` | -- |
 //! | `collectd.interval` absent | IntervalHR `0` (collectd's own "unspecified") | -- |
-//! | `collectd.interval` present but not a finite positive `F64` | IntervalHR `0` | `logit.output.tags.dropped{reason="unrepresentable"}` |
+//! | `collectd.interval` present but not a finite positive `F64` | IntervalHR `0` | `logit.output.tags.omitted{reason="unrepresentable"}` |
 //! | host | `collectd.host`, else `host.name`, else the encoder's [`CollectdEncoder::with_hostname`] value -- the first that survives sanitizing non-empty | -- |
-//! | none of those three present | the whole event is dropped | `logit.output.metrics.skipped{reason="no_host"}` + diag `no_host`. collectd's receiver rejects an empty host, and there is no honest substitute: this codec neither reads the OS hostname (deferred work, `docs/known-gaps/mappings.md`) nor invents a placeholder, since one made-up name would silently merge every unlabelled sender into a single host's metrics. |
+//! | none of those three present | the whole event is dropped | `logit.output.metrics.dropped{reason="no_host"}` + diag `no_host`. collectd's receiver rejects an empty host, and there is no honest substitute: this codec neither reads the OS hostname (deferred work, `docs/known-gaps/mappings.md`) nor invents a placeholder, since one made-up name would silently merge every unlabelled sender into a single host's metrics. |
 //! | `collectd.*` identity, `Str` or `Bytes` | verbatim after sanitizing; a `Bytes` is byte-verbatim (collectd's own strings are bytes, not UTF-8) | `logit.output.identity.sanitized{reason="substituted"\|"truncated"}` |
-//! | `collectd.*` identity of any other `Value` type | treated as absent | `logit.output.tags.dropped{reason="unrepresentable"}` |
-//! | every attribute outside the `collectd.` namespace | dropped -- collectd has no tag concept at all, and `host.name` is counted here too even though the host resolution above reads it | `logit.output.tags.dropped{reason="no_wire_form"}`, once per attribute per event |
-//! | plugin or type empty after sanitizing | the list is dropped | `logit.output.metrics.skipped{reason="empty_name"}` |
-//! | a like-relay event carrying more than [`MAX_VALUES_PER_LIST`] records | the list is dropped whole | `logit.output.metrics.skipped{reason="too_many_values"}` + diag `too_many_values`. The cap is pair-wide: a longer list fits comfortably under the byte cap, but the decode side of this very codec rejects it as a malformed part -- and that abandons every unrelated list packed behind it in the same datagram. `aggregate`/`kv_metrics` can both put far more than 64 records on one event. |
-//! | a list that alone exceeds `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.skipped{reason="oversize_value_list"}` + diag `oversize_value_list` |
+//! | `collectd.*` identity of any other `Value` type | treated as absent | `logit.output.tags.omitted{reason="unrepresentable"}` |
+//! | every attribute outside the `collectd.` namespace | dropped -- collectd has no tag concept at all, and `host.name` is counted here too even though the host resolution above reads it | `logit.output.tags.omitted{reason="no_wire_form"}`, once per attribute per event |
+//! | plugin or type empty after sanitizing | the list is dropped | `logit.output.metrics.dropped{reason="empty_name"}` |
+//! | a like-relay event carrying more than [`MAX_VALUES_PER_LIST`] records | the list is dropped whole | `logit.output.metrics.dropped{reason="too_many_values"}` + diag `too_many_values`. The cap is pair-wide: a longer list fits comfortably under the byte cap, but the decode side of this very codec rejects it as a malformed part -- and that abandons every unrelated list packed behind it in the same datagram. `aggregate`/`kv_metrics` can both put far more than 64 records on one event. |
+//! | a list that alone exceeds `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.dropped{reason="oversize_value_list"}` + diag `oversize_value_list` |
 //! | an event with no metrics at all, no [`ATTR_SEVERITY`] attribute (present in any form) either | skipped | [`EncodeStats::skipped_no_metrics`] (no counter of its own -- nothing was lost, there was nothing to send) |
 //! | `MetricRecord`'s `unit`, `description`, `start_timestamp`, `exemplars`; `EventBatch::scope`; `Resource::schema_url` | dropped | none; `docs/known-gaps/mappings.md` rows -- the protocol has no field for any of them |
 //! | an event with no metrics, `Event::log` set, and an [`ATTR_SEVERITY`] attribute present (any `Value` type) | a **notification**, always its own datagram: TimeHR, Severity, Host, Plugin, PluginInstance, Type, TypeInstance (the last four only when non-empty; identity written in full, no elision state read or left behind -- see below), Message | -- |
-//! | that notification's [`ATTR_SEVERITY`] is not `Value::U64` or not one of {1, 2, 4} | dropped whole | `logit.output.metrics.skipped{reason="notification_dropped"}` + diag `notification_dropped` ([`EncodeStats::dropped_notification`]) |
-//! | that notification's `LogRecord::message` is empty, or not a `Str`/`Bytes` `Value` | dropped whole | `logit.output.metrics.skipped{reason="empty_message"}` + diag `empty_message` ([`EncodeStats::dropped_empty_message`]) |
+//! | that notification's [`ATTR_SEVERITY`] is not `Value::U64` or not one of {1, 2, 4} | dropped whole | `logit.output.metrics.dropped{reason="invalid_notification"}` + diag `notification_dropped` ([`EncodeStats::dropped_notification`]) |
+//! | that notification's `LogRecord::message` is empty, or not a `Str`/`Bytes` `Value` | dropped whole | `logit.output.metrics.dropped{reason="empty_message"}` + diag `empty_message` ([`EncodeStats::dropped_empty_message`]) |
 //! | that notification's message, `Str` or `Bytes`, NUL byte | written verbatim, NUL → `_` (uncounted -- collectd's own C strings make this substitution routine, unlike an identity field where it changes what a receiver keys a series on) | -- |
 //! | that notification's message longer than [`NOTIF_MAX_MSG_LEN`] `- 1` (255) bytes | truncated on a character (`Str`) or byte (`Bytes`) boundary | `logit.output.messages.truncated` + diag `message_truncated` ([`EncodeStats::notification_messages_truncated`]) |
-//! | a notification alone exceeding `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.skipped{reason="oversize_notification"}` + diag `oversize_notification` ([`EncodeStats::dropped_oversize_notification`]) |
+//! | a notification alone exceeding `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.dropped{reason="oversize_notification"}` + diag `oversize_notification` ([`EncodeStats::dropped_oversize_notification`]) |
 //!
 //! A notification is **always its own datagram**, carrying its identity in full. That mirrors
 //! collectd's own sender, per the recorded capture
@@ -253,7 +253,7 @@ pub const NOTIF_MAX_MSG_LEN: usize = 256;
 /// The wire allows `(65535 - 6) / 9 = 7281`, but nothing real comes close (`load` has 3,
 /// `if_octets` 2). The cap is **pair-wide**: over it, a Values part is malformed on decode (the
 /// rest of the datagram is abandoned), so the encoder drops such a list whole, counted
-/// `logit.output.metrics.skipped{reason="too_many_values"}`, rather than send one that a receiver
+/// `logit.output.metrics.dropped{reason="too_many_values"}`, rather than send one that a receiver
 /// running this codec would reject along with every list packed behind it.
 ///
 /// It bounds the decoder's per-part work and the record-name suffix fan-out

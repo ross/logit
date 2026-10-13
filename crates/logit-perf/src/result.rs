@@ -190,7 +190,7 @@ pub struct UdpSample {
     /// mean fill of one `recvmmsg(2)` batch, which says whether `receive.read_batch` is the
     /// constraint (`docs/deploying.md`'s "Listener intake"). `0` for a run that received nothing.
     pub reads: u64,
-    /// `logit.input.kernel.drops`: discarded by the kernel before a read returned them. On
+    /// `logit.input.kernel.dropped`: discarded by the kernel before a read returned them. On
     /// loopback `sent == received + this`, which `crate::run`'s self-check asserts.
     pub kernel_dropped: u64,
     /// `logit.component.datagrams.dropped{reason=overflow_*}`: `ReceiveQueue` eviction, loss

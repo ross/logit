@@ -3286,7 +3286,7 @@ pub enum ComponentKind {
         /// Used only when an event carries neither `collectd.host` nor `host.name` (one that
         /// never passed through `collectd_in`, say). No default, so a relayed list's origin is
         /// never silently overwritten. With nothing configured and nothing on the event, the list
-        /// is dropped and counted (`logit.output.metrics.skipped{reason="no_host"}`): collectd's
+        /// is dropped and counted (`logit.output.metrics.dropped{reason="no_host"}`): collectd's
         /// receiver rejects an empty host.
         #[serde(default)]
         hostname: Option<String>,

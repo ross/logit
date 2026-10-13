@@ -397,13 +397,13 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   `mmsghdr`s into `Vec<u64>` word buffers pointed at a single `vlen * 65_507`-byte slab, issues one
   `libc::recvmmsg(fd, hdrs, vlen, MSG_DONTWAIT, NULL)`, and lifts each returned `msg_len` and
   `msg_hdr.msg_flags` into plain integer vectors. Back in async context it copies each datagram out
-  as a right-sized `Bytes`, stamps `received_at = now_nanos() + i`, and counts `MSG_TRUNC`
-  occurrences.
+  as a right-sized `Bytes`, stamps `received_at = now_nanos() + i`, and drops and counts each `MSG_TRUNC`
+  datagram instead of copying it.
 - **Why sensitive:** unsafe/syscall (three `unsafe` blocks: pointer writes of C structs into `u64`
   storage, the raw `recvmmsg`, and the post-call `(*hdrs.add(i))` reads); hot-path (this is the
   per-datagram ingress path for every UDP listener); custom (no crate does the vectored receive —
   `tokio` exposes none); cancellation (the future is dropped by `read_loop`'s shutdown race);
-  accounting (`logit.input.datagrams.truncated`, and the `+ i` timestamp offset feeding downstream
+  accounting (`datagrams.dropped{reason="truncated"}`, and the `+ i` timestamp offset feeding downstream
   (series, timestamp) identity); untrusted-input (lengths and flags come from the kernel but the
   payload boundaries drive the slicing).
 - **Invariants to verify:** *(all nine verified in `libc/w1` — see the Verified paragraph below)*
@@ -526,7 +526,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
 - **Why sensitive:** hot-path; cancellation (both `select!` arms can drop a future mid-flight);
   backpressure (`overflow: block` is the one configuration where this genuinely stops reading);
   data-loss (a cancelled `push_many` discards up to `read_batch` datagrams *uncounted*);
-  accounting (`logit.input.reads`/`.datagrams`/`.datagram.bytes`/`.datagrams.truncated` must
+  accounting (`logit.input.reads`/`.datagrams`/`.datagram.bytes` and `datagrams.dropped{reason="truncated"}` must
   reconcile with what `decode_loop` and the queue's own drop counters report); concurrency
   (`queue.close()` is the sole liveness signal for the decode half).
 - **Invariants to verify:**
@@ -1129,7 +1129,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   kernel's aliased accept-queue depth/backlog. `DropCounter::delta` turns the free-running, wrapping
   `sk_drops` into a per-interval delta, treating the first sample as an absolute from a known zero.
 - **Why sensitive:** unsafe/syscall (two raw `getsockopt` calls with caller-supplied `socklen_t`
-  in/out); accounting (`logit.input.kernel.drops` is the only visibility into loss no other layer
+  in/out); accounting (`logit.input.kernel.dropped` is the only visibility into loss no other layer
   can see, and it is claimed to reconcile byte-for-byte with `/proc/net/udp`'s `drops` column);
   custom (deliberately not procfs); nontrivial-3p-use(libc — `SK_MEMINFO_*` indices and the
   `TCP_LISTEN` constant are copied from kernel UAPI, not from `libc`).
@@ -1185,7 +1185,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   accept-queue block. ADR: `udp-intake-batching-and-socket-visibility`, plus its 2026-09-21
   amendment.
 - **Suggested verification approach:** ~~targeted review against the kernel UAPI headers; a
-  real-socket test that cross-checks `logit.input.kernel.drops` against `/proc/net/udp`'s `drops`
+  real-socket test that cross-checks `logit.input.kernel.dropped` against `/proc/net/udp`'s `drops`
   column under a perf-VM `udp-statsd --verify` run; run the unit tests under an older kernel
   container to exercise the short-reply path.~~ Done, except the older-kernel container — which is
   now unnecessary: the short-reply paths are unit-testable directly, and no kernel that has the

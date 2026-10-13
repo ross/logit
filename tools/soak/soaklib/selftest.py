@@ -347,8 +347,8 @@ def _expect_rules(root):
         (dict(reduce="mean"), "unknown reduce `mean`", "an unknown reducer"),
         (dict(reduce="delta"), "reads a sum, and logit.component.buffer.batches is a gauge",
          "a counter reducer on a gauge"),
-        (dict(metric="logit.input.kernel.drops", reduce="max"),
-         "reads a gauge, and logit.input.kernel.drops is a sum", "a gauge reducer on a counter"),
+        (dict(metric="logit.input.kernel.dropped", reduce="max"),
+         "reads a gauge, and logit.input.kernel.dropped is a sum", "a gauge reducer on a counter"),
         (dict(min=None), "needs `min`, `max`, or both", "an expectation without bounds"),
         (dict(max=1), "`min` 2 is above `max` 1", "min above max"),
         (dict(min="2"), "must be numbers", "a bound that isn't a number"),
@@ -2274,7 +2274,7 @@ def _expect_run(tmp, name, expectations, apply_rc=0, second_cycle=False):
       `reason=overflow_oldest`, and 7 at +140 under `reason=shutdown`.
     - `logit.component.buffer.batches{component=sink}`: set to 5 at +50, 2 at +120, 0 at +200,
       and 3 at +330. Nothing else sets it, as a gauge only drains after it's set.
-    - `logit.input.kernel.drops{component=in}`: 5 at +200, after the revert.
+    - `logit.input.kernel.dropped{component=in}`: 5 at +200, after the revert.
     - `logit.component.inbox.full{component=window}` exported as a gauge, a kind mismatch."""
     stdout = []
     for offset in range(5, 451, 5):
@@ -2293,7 +2293,7 @@ def _expect_run(tmp, name, expectations, apply_rc=0, second_cycle=False):
             stdout.append(_line(stamp, "logit.component.buffer.batches", "gauge", value,
                                 component="sink"))
         if offset == 200:
-            stdout.append(_line(stamp, "logit.input.kernel.drops", "sum", 5, component="in"))
+            stdout.append(_line(stamp, "logit.input.kernel.dropped", "sum", 5, component="in"))
         stdout.append(_line(stamp, "logit.component.inbox.full", "gauge", 1, component="window"))
     timeline = [_phase("start", 0, t0=T0),
                 _action("apply", "c0s1", "stop", "victoria-metrics", 100, rc=apply_rc),
@@ -2346,12 +2346,12 @@ def _expect_checks():
         one("attrs filter on reason", checks.PASS, metric="logit.component.datagrams.dropped",
             attrs={"component": "in", "reason": "overflow_oldest"}, min=130, max=130)
         one("a loss counter never emitted in the window reads 0", checks.PASS,
-            metric="logit.input.kernel.drops", max=0)
+            metric="logit.input.kernel.dropped", max=0)
         # through is (+100, +235]: 27 drains, two missing.
         one("through spans the fault and its recovery_bound", checks.PASS, window="through",
             min=25000, max=25000)
         one("through sees a counter that moves after the revert", checks.FAIL,
-            window="through", metric="logit.input.kernel.drops", max=0)
+            window="through", metric="logit.input.kernel.dropped", max=0)
         one("a counter that should stay 0 FAILs when it moved", checks.FAIL,
             metric="logit.component.datagrams.dropped", max=0)
 
@@ -2642,8 +2642,8 @@ def _slope_reducer():
     _refused(path, with_expect(window="run"), "window `run` spans the whole run and takes no",
              "a run window with a step")
     _refused(path, with_expect(step=None), "missing `step`", "a step window with no step")
-    _refused(path, with_expect(metric="logit.input.kernel.drops"),
-             "reads a gauge, and logit.input.kernel.drops is a sum", "a slope of a counter")
+    _refused(path, with_expect(metric="logit.input.kernel.dropped"),
+             "reads a gauge, and logit.input.kernel.dropped is a sum", "a slope of a counter")
     _refused(path, with_expect(metric="logit.process.interner.strings", reduce="delta"),
              "logit.process.interner.strings is a gauge", "a counter reducer on interner.strings")
     _refused(path, with_expect(metric="logit.process.memory.resident.bytes", reduce="delta"),

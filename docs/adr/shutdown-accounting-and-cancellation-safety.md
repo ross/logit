@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-10-11
+updated: 2026-10-13
 ---
 
 # Shutdown accounting and cancellation safety: every shutdown loss counted, and one table of cancellation points
@@ -648,3 +648,9 @@ Alternatives considered:
   dedicated edge. The dedicated case alone is simple and covers the recommended setup.
 - **Require a dedicated pipeline through a validation rule.** Rejected: a mixed pipeline is valid,
   and the loss is limited to shutdown-time telemetry.
+
+## Amendment (2026-10-13): a truncated datagram is a drop
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `logit.input.datagrams.truncated` is removed. The UDP read side counts a datagram
+the kernel truncated as `logit.component.datagrams.dropped{reason="truncated"}` and never queues
+it, so it now appears in the sum this record describes, as one more reason.

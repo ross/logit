@@ -413,7 +413,7 @@ Per pair:
   the push and pop side. `logit_pipeline::sockstat` reads the kernel's own per-socket counters
   straight off a listener's fd (`getsockopt(SO_MEMINFO)` for a UDP socket's drops/receive-buffer
   fill, `TCP_INFO` for a `LISTEN` socket's accept-queue depth/backlog), once a second and once
-  more after the read loop stops. So `logit.input.kernel.drops` and the
+  more after the read loop stops. So `logit.input.kernel.dropped` and the
   `receive_buffer.*`/`accept_queue.*` gauges attribute to a component a loss no other layer could
   see ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)).
 - **TCP**: `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` can each run `transport: tcp` on a

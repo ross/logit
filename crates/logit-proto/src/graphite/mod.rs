@@ -47,27 +47,29 @@
 //! | `;name=value` | event attribute, `Value::Str` over a zero-copy [`bytes::Bytes`] slice of the input; a copy when the path is a protocol-0 pickle string the reader decoded into its scratch ([`pickle`]'s "Bounds") | -- |
 //! | repeated tag key | last occurrence wins | `logit.input.tags.normalized{reason="duplicate_key"}` + diag `duplicate_tag_key` |
 //! | finite value (`3`, `-1.5`, `1e5`, or a pickle `"3.14"` string) | `Gauge(v)` | -- |
-//! | NaN / ±inf | line skipped | `logit.input.metrics.skipped{reason="non_finite_value"}` + diag `non_finite_value` |
+//! | NaN / ±inf | line dropped | `logit.input.metrics.dropped{reason="non_finite_value"}` + diag `non_finite_value` |
 //! | `timestamp == -1` | `received_at` (carbon's own rule) | -- |
 //! | `timestamp > 0`, integral or fractional | whole seconds and the sub-second part scaled to nanoseconds separately, the part rounded half away from zero, saturating at `i64::MAX`; under half a nanosecond reads as `0` | -- |
-//! | any other `timestamp` (`<= 0`, non-finite, unparseable) | skipped | `logit.input.metrics.skipped{reason="bad_timestamp"}` + diag `bad_timestamp` |
-//! | not exactly 3 whitespace-separated fields; an unparseable value; non-UTF-8 bytes; an empty path | skipped | `logit.input.metrics.skipped{reason="bad_line"}` + diag `bad_line` |
-//! | malformed tag (a `;` segment with no `=`, an empty name, or an empty value) | the **whole line** is skipped -- carbon's own `TaggedSeries.parse` raises rather than dropping the one tag | `logit.input.metrics.skipped{reason="bad_tag"}` + diag `bad_tag` |
+//! | any other `timestamp` (`<= 0`, non-finite, unparseable) | dropped | `logit.input.metrics.dropped{reason="bad_timestamp"}` + diag `bad_timestamp` |
+//! | not exactly 3 whitespace-separated fields; an unparseable value; non-UTF-8 bytes; an empty path | dropped | `logit.input.metrics.dropped{reason="bad_line"}` + diag `bad_line` |
+//! | malformed tag (a `;` segment with no `=`, an empty name, or an empty value) | the **whole line** is dropped -- carbon's own `TaggedSeries.parse` raises rather than dropping the one tag | `logit.input.metrics.dropped{reason="bad_tag"}` + diag `bad_tag` |
 //! | empty / ASCII-whitespace-only line | skipped, **uncounted** (packet padding, a trailing `\n`); a line of Unicode whitespace is a `bad_line` | -- |
 //! | line longer than `max_line_bytes` (TCP) | the framer drops it and resynchronizes at the next `\n`; the line after it still decodes, and the connection stays up | `logit.input.frames.dropped{reason="oversize"}`, or `reason="drained"` when the line crossed the bound before its `\n` arrived, after which the connection discards input until its next `\n` + diag `framing_error` |
 //! | pickle frame longer than `max_frame_bytes` | the connection is closed -- there is no resync point in a length-framed stream | `logit.input.frames.dropped{reason="oversize"}` + diag `framing_error` |
-//! | a disallowed pickle opcode, a declared length past the payload, a protocol-0 argument the reader refuses ([`pickle`]'s "Protocol 0"), a string that isn't UTF-8 once decoded, the depth/item caps, or a non-empty list item in a list grown by `APPEND`/`APPENDS` ([`pickle::PickleReader::read_datapoints`]) | `CodecError::Malformed`, the whole frame is dropped | diag `bad_pickle` |
-//! | any other pickle item that is not `(str, (num, num))` | **that datapoint** is skipped; the rest of the frame still decodes | `logit.input.metrics.skipped{reason="bad_shape"}` + diag `bad_shape` |
+//! | a disallowed pickle opcode, a declared length past the payload, a protocol-0 argument the reader refuses ([`pickle`]'s "Protocol 0"), a string that isn't UTF-8 once decoded, the depth/item caps, or a non-empty list item in a list grown by `APPEND`/`APPENDS` ([`pickle::PickleReader::read_datapoints`]) | `CodecError::Malformed`, the whole frame is dropped | `logit.input.frames.dropped{reason="undecodable"}`, counted by the listener's driver, + diag `bad_pickle` |
+//! | any other pickle item that is not `(str, (num, num))` | **that datapoint** is dropped; the rest of the frame still decodes | `logit.input.metrics.dropped{reason="bad_shape"}` + diag `bad_shape` |
 //! | `Resource` / `Scope` | the decoder's own shared default / `None` | -- |
 //!
 //! Framing is the listener's job: the two oversize rows are counted and diagnosed by the shared TCP
-//! driver's [`Framer`](crate::framing::Framer), not by [`GraphiteDecoder`]. Every other
-//! row is emitted here.
+//! driver's [`Framer`](crate::framing::Framer), not by [`GraphiteDecoder`], and the driver counts
+//! the whole-frame pickle failure's `frames.dropped` when [`GraphiteDecoder`] returns its error.
+//! Every other row is emitted here.
 //!
 //! ## Encode: model → wire
 //!
-//! Counter prefix `logit.output.metrics.skipped{reason=…}` unless noted; a whole-kind drop is
-//! tagged `{metric_kind=…}` instead of `{reason=…}`, the shape every other sink uses.
+//! Counter prefix `logit.output.metrics.dropped{reason=…}` unless noted. A record with nothing to
+//! carry, or a kind the operator chose to skip, is `logit.output.metrics.skipped` instead, tagged
+//! `{metric_kind=…}` for a whole kind, the shape every other sink uses.
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
@@ -76,19 +78,19 @@
 //! | `Sum{Delta\|Cumulative, monotonic\|!monotonic}` | the bare value | -- (normalization 12) |
 //! | `Gauge(v)`, finite | `path v ts` | -- |
 //! | `Gauge` NaN / ±inf, or any non-finite value | dropped | `{reason="unencodable_value"}` + diag `unencodable_value` |
-//! | any kind flagged [`logit_core::MetricRecord::FLAG_NO_RECORDED_VALUE`] | dropped | `{reason="no_recorded_value"}` + diag `no_recorded_value` |
-//! | `GaugeDelta` | dropped | `{metric_kind="gauge_delta"}` + diag `gauge_delta_unresolved` |
-//! | `Samples`/`Distribution`/`Histogram`/`ExponentialHistogram`/`Summary`/`Set`/`SetMembers` under [`MultiValue::Skip`] (the default) | dropped, one exhaustive `match` arm each, no wildcard | `{metric_kind="samples"\|"distribution"\|"histogram"\|"exponential_histogram"\|"summary"\|"set"\|"set_members"}` |
+//! | any kind flagged [`logit_core::MetricRecord::FLAG_NO_RECORDED_VALUE`] | skipped | `logit.output.metrics.skipped{reason="no_recorded_value"}` + diag `no_recorded_value` |
+//! | `GaugeDelta` | dropped | `{reason="unresolved_gauge_delta"}` + diag `gauge_delta_unresolved` |
+//! | `Samples`/`Distribution`/`Histogram`/`ExponentialHistogram`/`Summary`/`Set`/`SetMembers` under [`MultiValue::Skip`] (the default) | skipped, one exhaustive `match` arm each, no wildcard | `logit.output.metrics.skipped{metric_kind="samples"\|"distribution"\|"histogram"\|"exponential_histogram"\|"summary"\|"set"\|"set_members"}` |
 //! | the same seven kinds under [`MultiValue::Expand`] | the sub-path table in [`crate::multi_value`] | `logit.output.metrics.degraded{metric_kind=…}`, **once per record** however many sub-paths it produced |
 //! | `event.timestamp.div_euclid(1_000_000_000) <= 0` | dropped | `{reason="unencodable_timestamp"}` + diag `unencodable_timestamp` |
 //! | attributes under [`Tags::Carbon`] (the default) | `;name=value`, ascending **rendered** name | -- |
-//! | attributes under [`Tags::Drop`] | no tag segment at all | `logit.output.tags.dropped{reason="dialect"}`, once per attribute |
+//! | attributes under [`Tags::Drop`] | no tag segment at all | `logit.output.tags.omitted{reason="dialect"}`, once per attribute |
 //! | `Value::Str/I64/U64/F64/Bool` | stringified | -- |
 //! | `Value::Array` | the **last** representable element | `logit.output.tags.normalized{reason="multi_value"}`, once per attribute |
-//! | `Value::Null/Bytes/Timestamp/Map`, or an `Array` with no representable element | the tag is dropped | `logit.output.tags.dropped{reason="unrepresentable"}` |
+//! | `Value::Null/Bytes/Timestamp/Map`, or an `Array` with no representable element | the tag is omitted | `logit.output.tags.omitted{reason="unrepresentable"}` |
 //! | a forbidden byte in the path / a tag name / a tag value | `_` | `logit.output.metrics.normalized{reason="path_sanitized"\|"tag_sanitized"}`, once per record per reason |
-//! | a tag whose name or value is empty after sanitizing | the tag is dropped | `logit.output.tags.dropped{reason="empty"}` |
-//! | two tags colliding after rendering | the one whose **original** name sorts first is kept | `logit.output.tags.dropped{reason="collision"}` |
+//! | a tag whose name or value is empty after sanitizing | the tag is omitted | `logit.output.tags.omitted{reason="empty"}` |
+//! | two tags colliding after rendering | the one whose **original** name sorts first is kept | `logit.output.tags.omitted{reason="collision"}` |
 //! | a path empty after sanitizing | dropped | `{reason="empty_name"}` |
 //! | a plaintext line longer than `max_packet_bytes` | dropped whole, never split | `{reason="oversize_line"}` + diag `oversize_line` |
 //! | a single pickle datapoint larger than `max_frame_bytes` | dropped whole, never split | `{reason="oversize_datapoint"}` + diag `oversize_datapoint` |
@@ -247,7 +249,7 @@ pub enum Tags {
     #[default]
     Carbon,
     /// Emit no tag segment, for a pre-1.1 Graphite, whose whisper backend would take the `;` into
-    /// a directory name. Each dropped tag is counted `logit.output.tags.dropped{reason="dialect"}`.
+    /// a directory name. Each dropped tag is counted `logit.output.tags.omitted{reason="dialect"}`.
     Drop,
 }
 

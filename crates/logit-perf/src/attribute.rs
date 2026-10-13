@@ -519,7 +519,7 @@ fn render_ids<'a>(ids: impl Iterator<Item = &'a String>) -> String {
 /// unless the graph drops or collapses events, as `aggregate` does.
 ///
 /// A [`Workload::Driven`] scenario gets neither check: it has no generator, loss is expected, and
-/// `run` checks the accounting against `logit.input.kernel.drops`, which this table lacks.
+/// `run` checks the accounting against `logit.input.kernel.dropped`, which this table lacks.
 pub fn check_counts(nodes: &BTreeMap<String, NodeStats>, workload: &Workload) -> Vec<String> {
     let measured: Vec<(&String, &NodeStats)> =
         nodes.iter().filter(|(id, _)| !NodeStats::is_harness(id)).collect();
