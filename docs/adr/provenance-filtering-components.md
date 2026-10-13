@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-10
+updated: 2026-10-13
 ---
 
 # Provenance filtering is two transform components, combining has_attributes' and has_signal's shapes
@@ -183,3 +183,10 @@ global already use, and `origin`/`previous` read naturally as *its* two fields, 
 - If a future config needs an actual operator, or a condition over something other than
   `origin`/`previous`, that is new evidence for `routing-by-condition-is-lua`'s own revisit
   trigger, not a reason to grow this component past two closed fields of component ids.
+
+## Amendment: discards are counted by the runtime (2026-10-13)
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `has_provenance` and `drop_provenance` record no counter of their own, and the
+Consequences bullet on sharing `logit.transform.events.filtered` no longer applies: that counter is
+removed. Every event either removes is `logit.component.events.discarded`, which the runtime
+counts under the filter's id.

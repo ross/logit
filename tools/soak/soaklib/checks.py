@@ -1123,19 +1123,23 @@ class Ledger:
         for listener in self.listeners:
             one = self.per[listener] = {}
             one["W"] = sut.counter_by_life("logit.input.datagrams", component=listener)
-            one["K"] = sut.counter_by_life("logit.input.kernel.drops", component=listener)
+            one["K"] = sut.counter_by_life("logit.input.kernel.dropped", component=listener)
             # D, every reason. Every SUT config gives `internal` a dedicated pipeline, so its
             # final drain runs after every data node has exited and carries the shutdown drops.
             one["D_tel"] = sut.counter_by_life("logit.component.datagrams.dropped",
                                                component=listener)
             one["D_shutdown"] = sut.counter_by_life("logit.component.datagrams.dropped",
                                                     component=listener, reason="shutdown")
-            # B: a statsd line the decoder refused, and a line over `lines_in`'s
-            # `max_line_bytes`, which its decoder drops and counts without a decoder error. Each
-            # is 0 on a listener that has no such rule.
+            # B: a line the decoder refused (`messages.dropped{reason="malformed"}`), a datagram
+            # it refused whole (`frames.dropped{reason="undecodable"}`), and a line over
+            # `lines_in`'s `max_line_bytes`, which its decoder drops without a decoder error.
+            # Each is 0 on a listener that has no such rule. A generator line is one datagram, so
+            # a refused datagram is one line.
             one["B"] = _summed({
-                "bad_line": sut.counter_by_life("logit.component.diagnostics",
-                                                component=listener, key="bad_line"),
+                "malformed": sut.counter_by_life("logit.input.messages.dropped",
+                                                 component=listener, reason="malformed"),
+                "undecodable": sut.counter_by_life("logit.input.frames.dropped",
+                                                   component=listener, reason="undecodable"),
                 "oversize": sut.counter_by_life("logit.input.frames.dropped",
                                                 component=listener, reason="oversize")})
             one["E"] = sut.counter_by_life("logit.component.events.sent", component=listener)
@@ -1166,10 +1170,12 @@ class Ledger:
             self.L_in = sut.counter_by_life("logit.component.events.received", component=script)
             # Counts events: an `emit_many` outcome adds one per event it returns.
             self.L_emit = sut.counter_by_life("logit.script.events.emitted", component=script)
-            self.L_drop = sut.counter_by_life("logit.component.events.dropped", component=script,
-                                              reason="script_drop")
-            self.L_err = sut.counter_by_life("logit.component.errors", component=script,
-                                             reason="process")
+            # A `nil` return is an intended discard; an error loses its one input event, which
+            # the runtime counts as loss beside `errors{reason="process"}`.
+            self.L_drop = sut.counter_by_life("logit.component.events.discarded",
+                                              component=script)
+            self.L_err = sut.counter_by_life("logit.component.events.dropped", component=script,
+                                             reason="script_error")
             self.L_flush = sut.counter_by_life("logit.component.flush.events", component=script)
             self.L_sent = sut.counter_by_life("logit.component.events.sent", component=script)
 
@@ -1418,8 +1424,8 @@ class Ledger:
         return self.get("Ab", life) - (self.get("L_flush", life) if self.script else 0)
 
     def script_dropped(self, life):
-        """The events a script dropped (`script_drop`) or failed on (`errors{process}`), both
-        counted, 0 with no script."""
+        """The events a script discarded (`events.discarded`) or lost to an error
+        (`events.dropped{reason="script_error"}`), both counted, 0 with no script."""
         if not self.script:
             return 0
         return self.get("L_drop", life) + self.get("L_err", life)
@@ -1601,7 +1607,7 @@ def _wire_buckets(data, led, source):
         return c1 if t2 == t1 else c1 + (c2 - c1) * (t - t1) / (t2 - t1)
 
     counts = {}
-    for name in ("logit.input.datagrams", "logit.input.kernel.drops"):
+    for name in ("logit.input.datagrams", "logit.input.kernel.dropped"):
         for ts, value, _ in sut.counter_points(name, component=source.get("sut_listener")):
             counts[ts] = counts.get(ts, 0) + value
     drains = sorted(set(sut.drains) | set(counts))
@@ -1849,8 +1855,8 @@ def check_ledger_edge(data):
 
 def check_ledger_script(data):
     """For a `[ledger] sut_script`, else SKIP, the final life's script hop: E == L_in (the
-    listener's edge), L_in == L_emit + L_drop + L_err (every event emitted, dropped, or failed
-    on), and L_sent == L_emit + L_flush (what it sent is what `process()` emitted plus what
+    listener's edge), L_in == L_emit + L_drop + L_err (every event emitted, discarded, or lost
+    to a script error), and L_sent == L_emit + L_flush (what it sent is what `process()` emitted plus what
     `flush()` returned). Earlier lives are reported."""
     if not data.ledger.get("sut_script"):
         return Result("ledger.script", SKIP, "no [ledger] sut_script")

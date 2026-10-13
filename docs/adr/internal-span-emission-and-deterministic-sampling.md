@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-22
+updated: 2026-10-13
 ---
 
 # Internal span emission, one span per node-visit, and deterministic-on-`trace_id` sampling
@@ -289,3 +289,10 @@ thing to get from a typo rather than a deliberate "sample everything" choice.
   `send_blocking_with_context` are redefined in terms of them, same observable behavior.
 - `docs/known-gaps/telemetry.md`'s internal-spans entry closes items 1 and 2 (emission, sampling);
   the "What this doesn't do" residuals above are recorded there as the new open list.
+
+## Amendment: links past the cap are omitted (2026-10-13)
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), a link past `MAX_LINKS_PER_SPAN` is counted as
+`logit.internal.span.links.omitted{reason="cardinality"}`, not `.dropped`: the span is still
+exported, without that link. `logit.internal.spans.dropped{reason="buffer_full"}` keeps its name,
+because the whole span is lost.

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-10-09
+updated: 2026-10-13
 ---
 
 # collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder
@@ -498,3 +498,16 @@ unchanged.
 - `crates/logit-core/tests/type_sizes.rs` is untouched by this pair: nothing in the core model
   changes shape to support it.
 - No new crate dependency: `bytes`, `socket2`, and `proptest` are already present in the workspace.
+
+## Amendment (2026-10-13): loss vocabulary
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `collectd_out`'s `output.tags.dropped` becomes `output.tags.omitted` with the same
+reasons, an unresolved `GaugeDelta` becomes `output.metrics.dropped{reason="unresolved_gauge_delta"}`,
+a notification that fails validation becomes `output.metrics.dropped{reason="invalid_notification"}`
+(its diagnostic stays `notification_dropped`), and every fault reason moves from `metrics.skipped`
+to `metrics.dropped`. `no_recorded_value` and a kind collectd has no data-source type for stay
+`metrics.skipped`. `collectd_in` gains counters for the losses it only diagnosed:
+`input.frames.dropped{reason="undecodable"|"malformed_part"|"encrypted"}`,
+`input.metrics.dropped{reason="incomplete_identity"}`, and
+`input.events.dropped{reason="invalid_notification"}`. `crates/logit-proto/src/collectd/mod.rs`'s
+module doc is the canonical table.

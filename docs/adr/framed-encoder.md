@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-10-11
+updated: 2026-10-13
 ---
 
 # `FramedEncoder`: a third codec trait for sinks that need per-message framing, over a shared `MessageBuf`
@@ -147,3 +147,10 @@ warm-then-measure call.
   [ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md) each carry an
   amendment pointing here; `docs/known-gaps/`'s entry and `docs/plans/lossless-transit.md`'s
   residual item are closed.
+
+## Amendment (2026-10-13): `statsd_out`'s stats fields
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the `statsd_out` `EncodeStats` field this record cites as `dropped_dialect_events`
+is `skipped_dialect_events`, counted `logit.output.messages.skipped{reason="dialect"}`, and
+`syslog_out`'s `dropped_invalid_sd_name` is `omitted_invalid_sd_name`, counted
+`logit.output.structured_data.omitted`.

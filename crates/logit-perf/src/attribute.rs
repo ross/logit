@@ -39,6 +39,7 @@ const SEND_BLOCKED_DURATION: &str = "logit.component.send.blocked.duration";
 const SEND_DURATION: &str = "logit.component.send.duration";
 const BUFFER_UTILIZATION: &str = "logit.component.buffer.utilization";
 const EVENTS_DROPPED: &str = "logit.component.events.dropped";
+const EVENTS_DISCARDED: &str = "logit.component.events.discarded";
 const BATCHES_DROPPED: &str = "logit.component.batches.dropped";
 
 pub struct AttributeArgs {
@@ -251,6 +252,9 @@ pub struct NodeStats {
     /// bugs.
     pub events_dropped: BTreeMap<String, f64>,
     pub batches_dropped: BTreeMap<String, f64>,
+    /// Events a transform, filter, `aggregate`, or script removed by design: not loss, so kept
+    /// apart from `events_dropped`.
+    pub events_discarded: f64,
 }
 
 impl NodeStats {
@@ -312,6 +316,7 @@ fn fold_metric(node: &mut NodeStats, name: &str, kind: &MetricKind, reason: &str
         BATCHES_DROPPED => {
             *node.batches_dropped.entry(reason.to_string()).or_default() += sum_value(kind);
         }
+        EVENTS_DISCARDED => node.events_discarded += sum_value(kind),
         _ => {}
     }
 }
@@ -364,6 +369,9 @@ fn print_table(nodes: &BTreeMap<String, NodeStats>) {
         );
     }
     for (id, node) in &rows {
+        if node.events_discarded > 0.0 {
+            println!("   discarded {:.0} events at `{id}`", node.events_discarded);
+        }
         for (reason, count) in node.events_dropped.iter().filter(|(_, n)| **n > 0.0) {
             println!("   DROPPED {count:.0} events at `{id}` (reason={reason})");
         }
@@ -447,7 +455,7 @@ pub fn verdict(
 
 /// The largest `events.received` any node under test recorded, excluding the harness's nodes.
 ///
-/// **A summary, not `run`'s denominator.** Where a transform drops events, the peak node is the
+/// **A summary, not `run`'s denominator.** Where a transform discards events, the peak node is the
 /// one before the drop: right for describing where work happened, wrong for events/s, which
 /// `crate::run` takes from [`delivered_at_sink`].
 pub fn peak_received(nodes: &BTreeMap<String, NodeStats>) -> u64 {
@@ -462,7 +470,7 @@ pub fn peak_received(nodes: &BTreeMap<String, NodeStats>) -> u64 {
 /// `events_per_s`/`cpu_us_per_event` and of `--verify`'s exact count.
 ///
 /// Selected by the drain's `role` attribute, not a maximum: the maximum is the shallowest
-/// receiver, which overstates delivery by whatever a filtering transform drops.
+/// receiver, which overstates delivery by whatever a filtering transform discards.
 ///
 /// With several sinks the load spec's `sink:` must name one; with one sink it's omitted.
 pub fn delivered_at_sink(
@@ -519,7 +527,7 @@ fn render_ids<'a>(ids: impl Iterator<Item = &'a String>) -> String {
 /// unless the graph drops or collapses events, as `aggregate` does.
 ///
 /// A [`Workload::Driven`] scenario gets neither check: it has no generator, loss is expected, and
-/// `run` checks the accounting against `logit.input.kernel.drops`, which this table lacks.
+/// `run` checks the accounting against `logit.input.kernel.dropped`, which this table lacks.
 pub fn check_counts(nodes: &BTreeMap<String, NodeStats>, workload: &Workload) -> Vec<String> {
     let measured: Vec<(&String, &NodeStats)> =
         nodes.iter().filter(|(id, _)| !NodeStats::is_harness(id)).collect();
@@ -729,6 +737,25 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_keeps_discarded_apart_from_dropped() {
+        let events = vec![
+            point("windowed", "aggregate", "transform", EVENTS_DISCARDED, MetricKind::counter(7.0)),
+            tagged_point(
+                "windowed",
+                "aggregate",
+                "transform",
+                EVENTS_DROPPED,
+                "shutdown",
+                MetricKind::counter(2.0),
+            ),
+        ];
+        let nodes = aggregate(&events);
+        let windowed = &nodes["windowed"];
+        assert_eq!(windowed.events_discarded, 7.0);
+        assert_eq!(windowed.events_dropped, BTreeMap::from([("shutdown".to_string(), 2.0)]));
+    }
+
+    #[test]
     fn a_cumulative_sum_is_not_mistaken_for_a_counter() {
         // `internal` only ever drains a count as a delta/monotonic `Sum`; a gauge or a cumulative
         // sum arriving under a counter's name is ignored rather than folded in.
@@ -879,7 +906,7 @@ mod tests {
     fn delivered_at_sink_reports_the_sink_not_the_busiest_node() {
         let nodes = BTreeMap::from([
             ("statsd".to_string(), roled("statsd_in", "listener", 0.0)),
-            // A filtering transform: 1,000 in, 400 dropped, 600 out.
+            // A filtering transform: 1,000 in, 400 discarded, 600 out.
             ("keep".to_string(), roled("keep", "transform", 1_000.0)),
             ("out".to_string(), roled("null_out", "sink", 600.0)),
             ("__perf_dump".to_string(), roled("file_out", "sink", 9_999.0)),

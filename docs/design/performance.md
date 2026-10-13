@@ -676,7 +676,10 @@ from 7.7434s on the laptop because the VM is faster per event, not because the c
 
 - **The `DROPPED 20000000 events (reason=absorbed)` line is expected.** Every input event is
   folded into a per-series `DdSketch` and never re-emitted; `Transform::process` returning `None`
-  between flushes is what a stateful aggregator does.
+  between flushes is what a stateful aggregator does. The binary measured here counted those
+  events as `events.dropped{reason="absorbed"}`; the current one counts them as
+  `logit.component.events.discarded` and prints ``discarded 20000000 events at `windowed` `` instead
+  ([ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md)).
 - **Output is 7 flush-tick batches (`batch out`) carrying 7,000 events**: 1000 per tick, one per live series,
   matching `host: h{seq%1000}`'s cardinality. The laptop table showed 12 ticks only because that run
   took longer at the same 1 s interval.

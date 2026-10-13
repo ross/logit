@@ -195,6 +195,12 @@ both of which carry nesting losslessly — flattening them would be pure loss fo
   `logit.output.tags.dropped{reason="unrepresentable"}` counter its four sibling sinks already have
   is tracked as separate follow-up work, not part of this transform.
 
+## Amendment (2026-10-13): `tags.omitted`
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `statsd_out`, `graphite_out`, and `collectd_out` count a nested attribute they
+leave off a delivered record as `logit.output.tags.omitted`, with the same reasons this record
+cites under `tags.dropped`.
+
 ## Amendment (2026-10-13): `prometheus_out` omits a label
 
 The sink table's `prometheus_out` row is now

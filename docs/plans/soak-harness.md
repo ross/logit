@@ -674,9 +674,9 @@ and takes the worst status; `report.py` is unchanged.
 |---|---|
 | G | per source (W8b), its generator's `logit.output.messages{component=<generator_sink>}`; precondition: equals that sink's `logit.output.datagrams` |
 | W | per listener (W8b), SUT `logit.input.datagrams{component=<sut_listener>}` |
-| K | per listener, SUT `logit.input.kernel.drops` |
+| K | per listener, SUT `logit.input.kernel.dropped` |
 | D | per listener, SUT `logit.component.datagrams.dropped` under every reason, from telemetry; the listener's stderr shutdown lines only cross-check its `shutdown` part, and a killed life counts none |
-| B | per listener, SUT `logit.component.diagnostics{key=bad_line}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a statsd line the decoder refused, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule |
+| B | per listener, SUT `logit.input.messages.dropped{reason=malformed}` plus `logit.input.frames.dropped{reason=undecodable}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a line the decoder refused, a datagram it refused whole, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule |
 | E | per listener, SUT `logit.component.events.sent{component=<sut_listener>}` |
 | X | per listener, SUT `logit.component.events.dropped{component=<sut_listener>}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`) |
 | T_in[node], T_out[node] | with a source's `sut_transforms` (W8b), each node's `logit.component.events.received` and `logit.component.events.sent` |
@@ -684,7 +684,7 @@ and takes the worst status; `report.py` is unchanged.
 | A_sent | aggregate `logit.component.events.sent` (W7b), counted once per send however many consumers a fan-out reaches |
 | S_in[sink], T_sent[target] | each sink's `logit.component.events.received`, and under `split = "route"` its target's `logit.component.events.sent` (W7b) |
 | Ab | aggregate `logit.transform.metrics.absorbed` |
-| L_in, L_emit, L_drop, L_err, L_flush, L_sent | with `[ledger] sut_script` (W7a), the script's `logit.component.events.received`; `logit.script.events.emitted` summed over its `outcome`s, which counts events, one per event an `emit_many` returns; `logit.component.events.dropped{reason="script_drop"}`; `logit.component.errors{reason="process"}`, one per event a script error drops; `logit.component.flush.events`; and `logit.component.events.sent`, which counts what `process()` and `flush()` send alike |
+| L_in, L_emit, L_drop, L_err, L_flush, L_sent | with `[ledger] sut_script` (W7a), the script's `logit.component.events.received`; `logit.script.events.emitted` summed over its `outcome`s, which counts events, one per event an `emit_many` returns; `logit.component.events.discarded`, one per event `process()` returns `nil` for; `logit.component.events.dropped{reason="script_error"}`, one per event a script error loses, counted beside `logit.component.errors{reason="process"}`; `logit.component.flush.events`; and `logit.component.events.sent`, which counts what `process()` and `flush()` send alike |
 | V[sink] | per sink (W7b), the reset-aware total of `vm-export/<sink>.jsonl`: add each series' first value, then every non-negative step, and on a decrease or at a SUT life start add the new value. V splits per SUT life at each series' decreases and at each life start, placing a sample by its timestamp, which is the SUT's own window time; a restart whose first value isn't below the last one shows no decrease. A series should have one segment per SUT life, else WARN |
 
 The generator sets `max_packet_bytes: "32"`, so one datagram carries one line of about 20 bytes,
@@ -1159,8 +1159,9 @@ where it needs them, and a small check extension.
    exited ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Admin endpoint, readiness,
    and release image"). Three scenarios
    ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)):
-   - `lua-path`: under the `statsd-vm` schedule in §2, the script rewrites each event, drops every
-     53rd (`script_drop`), fails on every 97th (`errors{reason="process"}`), and returns one
+   - `lua-path`: under the `statsd-vm` schedule in §2, the script rewrites each event, discards every
+     53rd (`events.discarded`), fails on every 97th (`events.dropped{reason="script_error"}` beside
+     `errors{reason="process"}`), and returns one
      rollup event from `flush()` each window.
    - `lua-stall`: a busy loop after N events reads `stalled`, then `ok`. The sandbox has no
      clock, so the loop is an iteration count sized past the 10 s `stall_after`, and a `mark`

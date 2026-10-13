@@ -819,6 +819,15 @@ See `crates/logit-transforms/src/aggregate.rs`'s `SeriesKey`, `value_key_eq`, `s
 `docs/plans/critical-sections-inventory.md`'s XFORM-01 to XFORM-05 and CORE-07 entries for what
 each workstream verifies.
 
+## Amendment: omitted samples and links (2026-10-13)
+
+Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), two `aggregate` counters are renamed, because each counts a piece left out of a
+record that still merges or flushes: `logit.transform.samples.non_finite_dropped` becomes
+`logit.transform.samples.omitted{reason="non_finite"}`, and `logit.transform.links.dropped{reason=
+"contexts"}` becomes `logit.transform.links.omitted{reason="contexts"}`. An event `aggregate`
+absorbs entirely is `logit.component.events.discarded`; `logit.transform.metrics.absorbed` keeps
+its name, so `metrics_in == absorbed + passed_through` is unchanged.
+
 ## Amendment (2026-10-13): `prometheus_out` drops a delta
 
 The cumulative-mode amendment's "Who needs it" says `prometheus_out` skips a delta `Sum` or

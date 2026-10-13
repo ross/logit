@@ -63,8 +63,8 @@ components:
       overflow: drop_oldest
 
   # The else branch: everything `stream: host`/`stream: app` didn't claim, including an absent
-  # `stream`. A router's own `sources:` edge is where its unrouted events go. With no consumer here
-  # they'd be dropped and counted `logit.component.events.dropped{reason="unrouted"}`.
+  # `stream`. A router's own `sources:` edge is where its unrouted events go, and a router must
+  # have one: to discard them instead, make this a `null_out`.
   untagged_out:
     type: stdio_out
     sources: [split]

@@ -927,9 +927,9 @@ impl Aggregator {
                 }
                 if samples_non_finite > 0 {
                     self.telemetry.count(
-                        "logit.transform.samples.non_finite_dropped",
+                        "logit.transform.samples.omitted",
                         f64::from(samples_non_finite),
-                        &[],
+                        &[("reason", "non_finite")],
                     );
                 }
                 if samples_clamped > 0 {
@@ -1201,7 +1201,7 @@ impl Aggregator {
 
         if total_dropped_links > 0 {
             self.telemetry.count(
-                "logit.transform.links.dropped",
+                "logit.transform.links.omitted",
                 total_dropped_links as f64,
                 &[("reason", "contexts")],
             );
@@ -2437,9 +2437,13 @@ mod tests {
 
         let drained = registry.drain(0);
         assert_eq!(
-            counter_with_tag(&drained, "logit.transform.links.dropped", "reason", "contexts"),
+            counter_with_tag(&drained, "logit.transform.links.omitted", "reason", "contexts"),
             Some(1.0),
-            "the 9th distinct context should be dropped and counted under reason=contexts"
+            "the 9th distinct context should be omitted and counted under reason=contexts"
+        );
+        assert_eq!(
+            counter_with_tag(&drained, "logit.transform.links.dropped", "reason", "contexts"),
+            None
         );
     }
 
@@ -4511,7 +4515,11 @@ mod tests {
         let values = [1.0, f64::NAN, f64::INFINITY];
         feed(&mut agg, &resource, metric_event("t", samples_at(1.0, &values), 0));
         let events = registry.drain(0);
-        assert_eq!(counter_total(&events, "logit.transform.samples.non_finite_dropped"), 2.0);
+        assert_eq!(
+            counter_with_tag(&events, "logit.transform.samples.omitted", "reason", "non_finite"),
+            Some(2.0)
+        );
+        assert_eq!(counter_total(&events, "logit.transform.samples.non_finite_dropped"), 0.0);
         match kind_of(&flush_events(&mut agg, 10)[0].1[0]) {
             MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 1),
             other => panic!("expected a Distribution, got {other:?}"),

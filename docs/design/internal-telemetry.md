@@ -232,10 +232,10 @@ A point's `PointKey` map coalesces repeats at the same `(name, tags)` key. Two s
 identity to coalesce on, so `ComponentBuffer` holds spans in a separate, unkeyed `Vec`, capped at
 `MAX_SPANS_PER_COMPONENT` (512). That's a volume bound, not a cardinality one: nothing else bounds
 how many spans accumulate except drain interval × sample rate. `SpanGuard::link`/`links` also cap
-each span's own link list at `MAX_LINKS_PER_SPAN` (32). Both drop and count rather than grow:
-`logit.internal.spans.dropped{reason="buffer_full"}` on the buffer (drained alongside
-`points.dropped`), and `logit.internal.span.links.dropped{reason="cardinality"}`, recorded
-immediately on the guard.
+each span's own link list at `MAX_LINKS_PER_SPAN` (32). Both count rather than grow: a span past
+the buffer cap is lost, as `logit.internal.spans.dropped{reason="buffer_full"}` (drained alongside
+`points.dropped`), and a link past the span's cap is left off a span that's still exported, as
+`logit.internal.span.links.omitted{reason="cardinality"}`, recorded immediately on the guard.
 
 ### Span versus point, side by side
 
@@ -519,9 +519,8 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.batches.received` / `.events.received` | count | `run_transform`, `run_output`, `run_lua`, `run_router`. For `run_output`, this includes every batch its shutdown sweep takes from the inbox |
 | `logit.component.batches.delivered` / `.events.delivered` | count | `write_loop`, once per batch `Output::send` delivered. At shutdown a sink's `batches.received` equals `batches.delivered` plus `batches.dropped` under every reason plus what a disk spool still holds, and the same for events |
 | `logit.component.process.duration` | timing | `run_transform`, `run_lua`, `run_router` (whole batch — for a router this spans `route_batch`'s partition, not any one destination's send) |
-| `logit.component.events.dropped{reason="absorbed"}` | count | `Transform::process` returned `false` |
-| `logit.component.events.dropped{reason="script_drop"}` | count | Lua `ProcessOutcome::Drop` |
-| `logit.component.events.dropped{reason="unrouted"}` | count | `run_router` or `run_lua`: events no route or `event:to(..)` claimed, at a node with targets and no ordinary consumers. See below. |
+| `logit.component.events.discarded` | count | `Transform::process` returned `false`, or a Lua `process()` returned `nil` (`ProcessOutcome::Drop`): an event the config removed by design. Untagged, and recorded only when nonzero |
+| `logit.component.events.dropped{reason="script_error"}` | count | `run_lua`, one per event whose `process()` call raised an error: that event is lost. Counted beside `errors{reason="process"}` |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
 | `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window` |
 | `logit.component.retries` | count | a retried delivery attempt or windowed round, `deliver_with_retry` or `deliver_window` (`write_loop`) |
@@ -558,17 +557,10 @@ a wedge, with an error naming the node. The batch that crossed the cap has alrea
 batches still waiting in its inbox count as `batches.dropped`/`events.dropped{reason="shutdown"}`
 under its own id. A memory failure is not a panic, so it never logs `thread_panicked`.
 
-**`unrouted` is counted explicitly** ([ADR `target-components`](../adr/target-components.md)).
-`Fanout` returns early on zero consumers and counts nothing, and the ADR's rule is that unrouted
-events are dropped and counted, never silently. A router *with* ordinary consumers never emits
-this reason, because its unrouted events go to those consumers. A `lua`/`lua_file` component with
-`targets:` and no ordinary consumers follows the same rule, on both its batch path and its
-`flush()`.
-
-**`absorbed` is imprecise for filters.** `process_batch` records
-`logit.component.events.dropped{reason="absorbed"}` whenever a transform returns `false`, including
-every drop by the signal, attribute, and provenance filters and by `sample`. Those components' own
-layer-3 counters say why.
+**An unrouted event has no counter of its own** ([ADR `target-components`](../adr/target-components.md)).
+Graph rule 50 rejects a router (`route`, or `lua`/`lua_file` with `targets:`) that has no
+ordinary consumer, so every event no target claims reaches one. A config that discards those
+events names a `null_out` as that consumer, whose `events.received` counts them.
 
 **A `target` emits the layer-2 *producer* set and nothing else.** It has no task, no inbox, and no
 receive side: it's one `Fanout` carrying the target's own id and telemetry handle
@@ -652,15 +644,15 @@ datagram passes through.
 | `logit.component.receive.utilization` | gauge | `max(datagram ratio, byte ratio)` against the two configured bounds |
 | `logit.component.receive.push.blocked.duration` | timing | only under `overflow: block`, only when a push actually waited |
 | `logit.component.receive.latency` | timing | arrival (`Datagram::received_at`) → dequeue, per datagram — the number that says whether event timestamps are trustworthy under load |
-| `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction) or `shutdown`: datagrams read but never decoded because the listener stopped (a batch the read half never queued, a popped batch the decode half never decoded, or what the receive queue still held when the grace backstop dropped the listener). With these, `logit.input.datagrams` equals the `receive.latency` sample count plus every reason's drops. `shutdown` counts reach only a dedicated `internal` pipeline (see "With a dedicated pipeline, `internal` drains last"); with a mixed one they land after `internal`'s final drain. The listener also logs each at `warn` (see `docs/known-gaps/intake.md`) |
+| `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction); `truncated`: a datagram longer than the 65,507-byte receive slot, which the kernel cut short (`MSG_TRUNC`), so the read half counts it and never queues it (**IPv6 or `AF_UNIX`, and Linux-only:** 65,507 is IPv4's maximum payload, and a `recv_from` build can't see the cut); or `shutdown`: datagrams read but never decoded because the listener stopped (a batch the read half never queued, a popped batch the decode half never decoded, or what the receive queue still held when the grace backstop dropped the listener). With these, `logit.input.datagrams` equals the `receive.latency` sample count plus every reason's drops. `shutdown` counts reach only a dedicated `internal` pipeline (see "With a dedicated pipeline, `internal` drains last"); with a mixed one they land after `internal`'s final drain. The listener also logs each at `warn` (see `docs/known-gaps/intake.md`) |
 | `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` is **a single tracked file or connection** ending and flushing its own accumulator on the way out: a `tail_in`/`docker_in` file that rotated away or was removed, or a `graphite_in` TCP connection the client closed or reset, or that was dropped for an oversize frame — in every case while the listener itself keeps running. `shutdown` is the whole component stopping. An ordinary client disconnect is `closed`, never `shutdown`. |
-| `logit.input.datagrams.truncated` | count | datagrams that arrived longer than the 65,507-byte receive slot and were delivered only as far as it holds, with the remainder discarded by the kernel. **IPv6-only, and Linux-only:** 65,507 is IPv4's maximum payload, IPv6 permits 65,527, and `MSG_TRUNC` in `recvmmsg`'s returned flags is what makes the loss visible rather than silent — a `recv_from` build has no way to see it and never reports this. Not emitted when it is zero, like every other loss counter here |
+| `logit.input.frames.dropped{reason="undecodable"}` | count | a datagram the decoder rejected whole (the `bad_datagram` diagnostic). It was dequeued, so it has its `receive.latency` sample and sits outside the identity above |
 | `logit.input.reads` | count | read syscalls the listener made — one per `recvmmsg(2)` batch on Linux, one per `recv_from` elsewhere. Exists to be a denominator: `logit.input.datagrams / logit.input.reads` is the **mean fill** of the syscall batch, the only number that says whether `receive.read_batch` is doing anything. A fill pinned at `read_batch` means the knob is the limit and raising it may help; a fill near 1 means datagrams arrive one at a time and the knob is irrelevant at any setting |
 | `logit.input.receive_buffer.bytes` | gauge | granted `SO_RCVBUF` after any kernel clamp — the kernel's `sk_rcvbuf`, which on Linux is double what was requested. Emitted at bind *and* re-emitted on every kernel sample below (see "Why a constant is re-emitted") |
 | `logit.input.receive_buffer.requested.bytes` | gauge | what `receive.receive_buffer_bytes` asked for, absent when unset — sampled once at bind, and genuinely bind-only: it is config, not a kernel reading |
 | `logit.input.receive_buffer.used.bytes` | gauge | `SO_MEMINFO`'s `SK_MEMINFO_RMEM_ALLOC`: bytes the kernel currently charges this socket's receive queue. **Not** queued payload bytes — each packet is charged its `skb->truesize`, several hundred bytes above its own length |
 | `logit.input.receive_buffer.utilization` | gauge | `used.bytes / receive_buffer.bytes`, both from the same `SO_MEMINFO` read. 1.0 is not "nearly full" — it is where the kernel begins dropping. Readings *above* 1.0 are normal under load and must never be clamped: the kernel admits a datagram whenever the already-charged total is at or below the ceiling and then charges its whole `truesize` on top, so a saturated queue settles at up to `rcvbuf + truesize` |
-| `logit.input.kernel.drops` | count | datagrams the kernel discarded before `recv_from` could return them (`SO_MEMINFO`'s `SK_MEMINFO_DROPS`, the same number `/proc/net/udp`'s `drops` column shows for this socket). A delta between samples; not emitted when it is zero |
+| `logit.input.kernel.dropped{reason="socket"}` | count | datagrams the kernel discarded before `recv_from` could return them (`SO_MEMINFO`'s `SK_MEMINFO_DROPS`, the same number `/proc/net/udp`'s `drops` column shows for this socket). None was read, so none is in `logit.input.datagrams` or the identity above. A delta between samples; not emitted when it is zero |
 
 The last three rows are Linux-only (`logit_pipeline::sockstat`, `getsockopt(SO_MEMINFO)`, Linux
 4.12+) and absent elsewhere. The first failed read logs one diagnostic saying so: a `warn` quoting
@@ -710,7 +702,7 @@ says, not a reading of anything.
 
 **Where `kernel` appears in a name, and where it doesn't.** Only on the drops counter, where it
 says *whose loss this was*. `logit.component.datagrams.dropped` is a drop `logit` chose and can be
-sized out of; `logit.input.kernel.drops` is one the kernel took before `logit` had any say. The
+sized out of; `logit.input.kernel.dropped` is one the kernel took before `logit` had any say. The
 remedies differ (see `docs/deploying.md`'s "What to watch for listener intake"), so an operator
 needs to tell them apart at a glance. The gauges need no qualifier: `used.bytes` and
 `utilization` extend the `logit.input.receive_buffer.*` family that
@@ -745,7 +737,7 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 | `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
 | `logit.input.connections.closed{reason="idle"\|"shutdown"}` | count | `idle`: an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. `shutdown`: an HTTP listener (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver) closed an open connection at shutdown, one count per connection whose close sequence finished before `run_input`'s backstop. It lands after the shutdown signal, so only a dedicated `internal` pipeline exports it (see "With a dedicated pipeline, `internal` drains last"). The stream listeners and `logit_in` don't count a shutdown close |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
-| `logit.input.frames.dropped{reason="oversize"\|"drained"\|"malformed"\|"truncated"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses. `drained` is a line-framed listener's line that crossed its bound before its `LF` arrived: counted once, after which the connection discards input until its next `LF` |
+| `logit.input.frames.dropped{reason="oversize"\|"drained"\|"malformed"\|"truncated"\|"undecodable"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses. `drained` is a line-framed listener's line that crossed its bound before its `LF` arrived: counted once, after which the connection discards input until its next `LF`. `undecodable` is a frame the decoder rejected whole (the `bad_frame` diagnostic): the only reason counted *after* `logit.input.frames`, so it is also in that count |
 
 The driver's `Diagnostics` keys: `framing_error` (any `frames.dropped` reason), `bad_frame` (a
 decoder that rejects a whole frame), `connection_error` (I/O, a TLS handshake that failed or
@@ -820,15 +812,18 @@ never reads one.
 
 **Under `transport: unix`:** the `udp` set, from the same driver on a Unix datagram socket. The
 `SO_MEMINFO` sampler reads it as it reads a UDP socket, but `AF_UNIX` makes a full receive queue
-block or refuse the *sender* rather than drop, so `logit.input.kernel.drops` stays at zero there.
+block or refuse the *sender* rather than drop, so `logit.input.kernel.dropped` stays at zero there.
+A datagram past the 65,507-byte slot can arrive on one, and is dropped as `truncated`.
 
 **Under `transport: unix_stream`:** the `tcp` set, less `logit.input.accept_queue.*` (a Unix
 listener has no `TCP_INFO`). One frame is one length-prefixed packet, which may hold several lines,
 and `oversize` is a packet declaring more than 64 KiB, which closes the connection.
 
-**On either transport:** a line that *parses* badly isn't a framing error. It's the decoder's own
-`bad_line`, throttled per listener because every connection's decoder clone shares one set of
-counts. The driver's `bad_frame` key fires only for the single whole-frame failure
+**On either transport:** a line that *parses* badly isn't a framing error. The decoder counts it
+`logit.input.messages.dropped{reason="malformed"}` and reports its own `bad_line`, throttled per
+listener because every connection's decoder clone shares one set of counts; the rest of the
+datagram or packet still decodes. The driver's `bad_datagram`/`bad_frame` key, with
+`frames.dropped{reason="undecodable"}`, fires only for the single whole-frame failure
 `StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. The decoder carries a
 sampled `ms`/`h`/`d` line's `@<rate>` verbatim and clamps nothing; `aggregate` bounds the weight a
 rate implies at `Samples::MAX_WEIGHT` and reports a clamp as
@@ -860,28 +855,28 @@ because syslog has no in-band reject message to spend one on.
   ordinary final message and is emitted.
 
 A frame that *parses* badly isn't a framing error. `SyslogDecoder::decode_into` is infallible, so a
-rejected syslog message reports as the decoder's own `bad_line` on either transport, and the
-driver's `bad_frame` key stays unused here. There's no `ReceiveQueue` on this path, so none of the
+rejected syslog message counts `logit.input.messages.dropped{reason="malformed"}` and reports the
+decoder's own `bad_line` on either transport, and the driver's `bad_frame` key and
+`frames.dropped{reason="undecodable"}` stay unused here. There's no `ReceiveQueue` on this path, so none of the
 `receive_buffer.*` table: the connection's own flow control is the queue (graph rule 17).
 
 ##### `collectd_in`
 
 `crates/logit-inputs/src/collectd.rs`, [ADR `collectd-binary-relay`](../adr/collectd-binary-relay.md).
 
-**No layer-3 counters of its own.** The shared `UdpListener` driver records
-`logit.input.datagrams`/`.datagram.bytes`/`.reads` and the whole `ReceiveQueue`/`receive_buffer.*`
-table, and collectd's binary framing gives this listener nothing further only it can see.
-`Diagnostics` keys:
+The shared `UdpListener` driver records `logit.input.datagrams`/`.datagram.bytes`/`.reads` and
+the whole `ReceiveQueue`/`receive_buffer.*` table. The decoder counts each loss its binary format
+lets it see, beside the diagnostic that names it:
 
-| Key | Meaning |
-|---|---|
-| `bad_datagram` | The driver's own: the datagram's *first* part is malformed, so nothing was salvaged. |
-| `bad_part` | A malformed part behind at least one decoded value list. The earlier lists are kept and the rest of the datagram is abandoned. |
-| `incomplete_identity` | A value list with an empty host, plugin, or type, which collectd's own receiver rejects too. |
-| `encrypted_packet_dropped` | A `SecurityLevel Encrypt` datagram. This codec holds no keys. |
-| `types_db_mismatch` | The configured `types_db` defines the list's type with a different data-source count or kinds than arrived, so its records fall back to index naming. |
-| `notification_dropped` | A `0x0100`/`0x0101` notification with an out-of-set severity, an empty message, or no host set: the notification counterpart of `incomplete_identity`. |
-| `record_name_cut` | A value list whose Plugin or Type is past 127 bytes, cut to 127 in its record name; the `collectd.*` attributes keep every byte. |
+| Key | Counter | Meaning |
+|---|---|---|
+| `bad_datagram` | `logit.input.frames.dropped{reason="undecodable"}` (the driver's) | The datagram's *first* part is malformed, so nothing was salvaged. |
+| `bad_part` | `logit.input.frames.dropped{reason="malformed_part"}` | A malformed part behind at least one decoded value list. The earlier lists are kept and the rest of the datagram is abandoned. |
+| `incomplete_identity` | `logit.input.metrics.dropped{reason="incomplete_identity"}`, one per data source | A value list with an empty host, plugin, or type, which collectd's own receiver rejects too. |
+| `encrypted_packet_dropped` | `logit.input.frames.dropped{reason="encrypted"}` | A `SecurityLevel Encrypt` datagram. This codec holds no keys. |
+| `types_db_mismatch` | -- | The configured `types_db` defines the list's type with a different data-source count or kinds than arrived, so its records fall back to index naming. |
+| `notification_dropped` | `logit.input.events.dropped{reason="invalid_notification"}` | A `0x0100`/`0x0101` notification with an out-of-set severity, an empty message, or no host set: the notification counterpart of `incomplete_identity`. |
+| `record_name_cut` | -- | A value list whose Plugin or Type is past 127 bytes, cut to 127 in its record name; the `collectd.*` attributes keep every byte. |
 
 A type simply *missing* from `types_db` is deliberately not reported, because that's routine, not a
 misconfiguration.
@@ -905,7 +900,7 @@ misconfiguration.
   **both** protocols, where one frame is one plaintext line or one pickle payload, counted at the
   size the decoder was handed (a pickle frame's 4-byte length prefix is stripped first, so the
   count is the payload, not the wire framing).
-  `logit.input.frames.dropped{reason="oversize"|"drained"|"malformed"|"truncated"}` and
+  `logit.input.frames.dropped{reason="oversize"|"drained"|"malformed"|"truncated"|"undecodable"}` and
   `logit.component.receive.flushed{reason}` from the per-connection `BatchAccumulator` (the same
   layer-2 point a datagram listener's shared `decode_loop` records) complete the set. There's no
   receive queue on this transport, because TCP's own flow control is the backpressure, so none of
@@ -916,11 +911,12 @@ connection survives: a plaintext line past `max_line_bytes` is dropped and the r
 resynchronizes at the next newline, while a pickle frame declaring more than `max_frame_bytes`
 closes the connection, because a length-framed stream has no resync point. A plaintext line that
 crossed `max_line_bytes` before its newline arrived counts `reason="drained"` instead, because the
-connection then discards input until its next newline. None is `metrics.skipped`: one vocabulary
-per driver.
+connection then discards input until its next newline. None is `metrics.dropped`: one vocabulary
+per driver. A pickle frame the decoder rejects whole (`bad_pickle`) counts
+`frames.dropped{reason="undecodable"}` from the driver.
 
 The codec adds its own counters under both transports:
-`logit.input.metrics.skipped{reason="bad_line"|"bad_tag"|"bad_timestamp"|"non_finite_value"|
+`logit.input.metrics.dropped{reason="bad_line"|"bad_tag"|"bad_timestamp"|"non_finite_value"|
 "bad_shape"}` and `logit.input.tags.normalized{reason="duplicate_key"}` (a repeated carbon tag key
 collapsing to its last value, which is what carbon's own `TaggedSeries.parse` does). Its
 per-connection accumulator flushes as `receive.flushed{reason="closed"}` when a client hangs up and
@@ -1395,8 +1391,8 @@ those values as *fields*, not as a rendered message.
 **Layer 2 only**, for the same reason as `generate_in`. `run_router`/`route_batch` already record
 `batches.received`/`events.received`/`process.duration`, and every destination's own `Fanout`
 counts what it sent, so a native equality match has nothing further worth a counter. An event
-`route` can't place lands on its router's `Forward` partition, which is what
-`events.dropped{reason="unrouted"}` counts when that router has no ordinary consumers.
+`route` can't place lands on its router's `Forward` partition, and so on its ordinary consumers,
+which every router has.
 
 ##### `aggregate`
 
@@ -1412,14 +1408,14 @@ counts what it sent, so a native equality match has nothing further worth a coun
 | `logit.transform.samples.fallback{reason="rate_mismatch"\|"cap"}` | count | a `samples`-mode series gave up raw retention and became a sketch |
 | `logit.transform.set_members.fallback{reason="cap"}` | count | a `members`-mode series gave up raw retention and became an estimate |
 | `logit.transform.samples.weight_clamped` | count | a record's sample rate implied more than `Samples::MAX_WEIGHT` observations per value (`Samples::is_clamped`), counted when its weight is applied: on absorb into a sketch, or when a raw `distributions: samples` series falls back |
-| `logit.transform.samples.non_finite_dropped` | count | `NaN` or infinite `Samples` values dropped while sketching, since they have no bin |
+| `logit.transform.samples.omitted{reason="non_finite"}` | count | `NaN` or infinite `Samples` values left out of a sketch, since they have no bin; the record's other values still merge |
 | `logit.transform.metrics.absorbed` | count | metric records merged into a series. With `.passed_through` it accounts for every record `process` receives: `metrics_in == absorbed + passed_through` summed over every reason |
 | `logit.transform.metrics.passed_through{reason="no_recorded_value"}` | count | an OTLP `NO_RECORDED_VALUE`-flagged record forwarded unmerged, because it has no reading to fold into a series |
 | `logit.transform.metrics.passed_through{reason="no_merge_rule"}` | count | a record of a kind this stage doesn't merge, forwarded: a cumulative `Sum`, an `ExponentialHistogram`, a `Summary`, and a `Histogram` outside `temporality: cumulative` or already cumulative |
 | `logit.transform.metrics.passed_through{reason="kind_conflict"}` | count | a record forwarded because its series holds another kind |
 | `logit.transform.metrics.passed_through{reason="histogram_bounds_mismatch"}` | count | a histogram forwarded because its bucket bounds differ from its series' |
 | `logit.transform.metrics.passed_through{reason="non_finite"}` | count | a delta `Sum` whose value is `NaN` or infinite, forwarded so a cumulative total stays finite |
-| `logit.transform.links.dropped{reason="contexts"}` | count | contributing span contexts past the fixed per-series cap (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8) that a flushed event's links can't carry, one per merged record whose context the full series doesn't link, so a context seen in two batches counts twice. Unrelated to `max_retained_series`: no series is lost |
+| `logit.transform.links.omitted{reason="contexts"}` | count | contributing span contexts past the fixed per-series cap (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8) that a flushed event's links can't carry, one per merged record whose context the full series doesn't link, so a context seen in two batches counts twice. Unrelated to `max_retained_series`: no series is lost |
 
 Series retention across the window boundary comes from
 `docs/adr/aggregation-window-semantics.md`'s gauge-retention amendment and its cumulative
@@ -1489,7 +1485,7 @@ configured columns).
 
 `crates/logit-transforms/src/keep.rs`.
 
-`logit.transform.attributes.kept` / `.dropped`: the other half of `aggregate`'s cardinality story,
+`logit.transform.attributes.kept` / `.omitted`: the other half of `aggregate`'s cardinality story,
 showing how much `keep` suppresses before events reach `aggregate`. Neither kind has `Diagnostics`,
 because pure attribute filtering has nothing to warn about, so `Telemetry` is attached directly
 rather than through the `Diagnostics` bridge.
@@ -1532,13 +1528,12 @@ minted `SpanRecord`'s id came from the line or from `mint_id`. This is the `kv_m
 [ADR `attribute-filtering-components`](../adr/attribute-filtering-components.md),
 [ADR `provenance-filtering-components`](../adr/provenance-filtering-components.md).
 
-All seven share `logit.transform.events.filtered`, `1.0` per dropped event. `has_signal`,
-`has_attributes`/`drop_attributes`, and `has_provenance`/`drop_provenance` also record `0.0` on the
-forward path, which registers the series rather than leaving it absent; `keep_signals`/
-`drop_signals` record it only when stripping leaves an event with no payload. Those two also
-record `logit.transform.payloads.stripped{signal}` (count), one per payload slot actually cleared;
-no other filter mutates a forwarded event, so none has a `.payloads.stripped`-style counter. None has `Diagnostics`, because matching a fixed set or clearing a fixed signal set can't
-fail.
+None of the seven counts the events it removes: the runtime's `logit.component.events.discarded`
+does, under the filter's own id. `keep_signals`/`drop_signals` record
+`logit.transform.payloads.stripped{signal}` (count), one per payload slot cleared, because
+the event survives a strip; no other filter mutates a forwarded event, so the other five record
+nothing of their own. None has `Diagnostics`, because matching a fixed set or clearing a fixed
+signal set can't fail.
 
 `has_attributes`/`drop_attributes` deliberately have **no cache-miss counter** for their
 resource-match cache (`Matcher`, `Set::map_resource`'s `Arc::ptr_eq` idiom applied to a read).
@@ -1552,7 +1547,7 @@ advertise a cost that isn't there.
 [ADR `value-allowlist-cardinality-clamp`](../adr/value-allowlist-cardinality-clamp.md).
 
 `logit.transform.values.allowed`/`.clamped`, tagged `field`: the value-side counterpart to
-`keep`'s `.attributes.kept`/`.dropped`, read per configured field rather than in aggregate, because
+`keep`'s `.attributes.kept`/`.omitted`, read per configured field rather than in aggregate, because
 two fields on one component can clamp at very different rates. `.values.normalized`, also tagged
 `field`, fires only when a `normalize:` step changed the value; counting the common
 already-conforming case would make the rate unreadable. `field` is safe as a tag because the fields
@@ -1573,8 +1568,8 @@ counts as neither. `field` is safe as a tag because the fields are config-declar
 `crates/logit-transforms/src/shape.rs`,
 [ADR `shape-observer-component`](../adr/shape-observer-component.md).
 
-Three drop counters and nothing else: `logit.transform.batches.dropped` (a flush window's per-batch
-table hit its 4096-batch cap), and `logit.transform.keys.untracked` and
+Three bookkeeping counters and nothing else: `logit.transform.batches.untracked` (a flush window's
+per-batch table hit its 4096-batch cap), and `logit.transform.keys.untracked` and
 `logit.transform.keysets.untracked` (an observation the cumulative table's `max_tracked_*` cap
 turned away, emitted once per flush rather than once per event). All three are **counts of things
 not recorded**, which a bounded table must never drop silently. All three are untagged on purpose:
@@ -1629,15 +1624,14 @@ get counters only.
 `crates/logit-transforms/src/sample.rs`,
 [ADR `consistent-sampling-component`](../adr/consistent-sampling-component.md).
 
-- `logit.transform.events.filtered`, shared with the filters above: the batch's dropped count,
-  emitted even at `0` so the series registers.
-- `logit.transform.sample.decisions{outcome="kept"|"dropped",
+- `logit.transform.sample.decisions{outcome="kept"|"discarded",
   by="key"|"random"|"override"|"missing"}` (count, non-zero cells only). `override` is an
   `always_keep` hit, `key` a hashed verdict, and `random` a keyless sampler's draw. `missing` is an
   event whose configured key was absent, whatever `missing:` then did with it (a random draw
   included), so that cell counts exactly the events the key didn't cover.
 
-Unlike the filters, both are **tallied in plain integers per event and emitted once per batch from
+The runtime's `logit.component.events.discarded` counts the discarded events themselves; this
+counter adds why. It's **tallied in plain integers per event and emitted once per batch from
 `end_batch`** (`kv_metrics`' pattern): a sampler sits on every event of the high-volume streams it
 exists for, where a `Telemetry::count` per event is the cost. No `Diagnostics`: nothing here can
 fail.
@@ -1713,8 +1707,8 @@ The datagram sinks count an oversize drop at one of two points, and in each sink
 |---|---|---|---|
 | `logit.output.messages.dropped` | `oversize_datagram` | the kernel refused a datagram with `EMSGSIZE`, or the packer skipped an entry over the cap | `statsd_out`: entries (lines); `graphite_out`: datapoints; `collectd_out`: value lists (a notification counts one); `syslog_out`: messages |
 | `logit.output.messages.dropped` | `oversize_line` | `statsd_out`'s encoder: one line over `max_packet_bytes` | lines |
-| `logit.output.metrics.skipped` | `oversize_line` | `graphite_out`'s encoder: one plaintext line over `max_packet_bytes` | lines |
-| `logit.output.metrics.skipped` | `oversize_value_list`, `oversize_notification` | `collectd_out`'s encoder: one value list or notification over `max_packet_bytes` | value lists, notifications |
+| `logit.output.metrics.dropped` | `oversize_line` | `graphite_out`'s encoder: one plaintext line over `max_packet_bytes` | lines |
+| `logit.output.metrics.dropped` | `oversize_value_list`, `oversize_notification` | `collectd_out`'s encoder: one value list or notification over `max_packet_bytes` | value lists, notifications |
 
 A sink counter falls in one of three classes
 ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
@@ -1724,7 +1718,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 
 | Class | Counts | Counters |
 |---|---|---|
-| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `statsd_out`, `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.dropped`, `metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.omitted`, `labels.normalized`, `spans.degraded`, `stats.skipped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"too_many_tags"\|"needs_agent_processing"\|"not_datadog_origin"}` and its `too_many_tags` diagnostic; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `kafka_out`'s `records.dropped{reason="oversize"}`, `records.unkeyed`, `events.skipped{reason="no_log"}`, its `oversize` diagnostic, and under `format: otlp_proto` the OTLP codec's `metrics.skipped` and `metrics.degraded`; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
+| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.omitted`, `tags.normalized`, `messages.skipped`, `messages.normalized`, `messages.truncated`, `fields.omitted`, `events.skipped`, `structured_data.omitted`; the codec counters of `statsd_out`, `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.dropped`, `metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.omitted`, `labels.normalized`, `spans.degraded`, `stats.skipped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"too_many_tags"\|"needs_agent_processing"\|"not_datadog_origin"}` and its `too_many_tags` diagnostic; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `kafka_out`'s `records.dropped{reason="oversize"}`, `records.unkeyed`, `events.skipped{reason="no_log"}`, its `oversize` diagnostic, and under `format: otlp_proto` the OTLP codec's `metrics.skipped` and `metrics.degraded`; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
 | Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
 | Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `otlp_out`'s `records.rejected`; `datadog_out`'s `records.rejected{route="series"}` from a series `202`'s body; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"\|"ambiguous_at_most_once"}` and the Datadog sinks' `records.dropped{route, reason="rejected"\|"ambiguous_at_most_once"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); `kafka_out`'s `records.dropped{reason="rejected"\|"invalid_timestamp"\|"invalid_record"\|"ambiguous_at_most_once"}` for a partition batch; and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `series_rejected`, `ack_unsupported`, `ack_timeout`, `oversize` for Splunk Cloud's answer, and `kafka_out`'s `rejected`, `invalid_timestamp`, and `invalid_record`). `otlp_out`, `datadog_out`, `datadog_trace_out`, and `kafka_out` meet each of their verdicts at most once per batch, because a retry never resends a signal, request, or partition batch the destination settled; only `splunk_hec_out` and the datagram sinks meet one again on a retry |
 
@@ -1842,10 +1836,11 @@ sinks tag one count per request with its status class or `network_error`
 - `logit.output.messages.truncated` and
   `logit.output.messages.dropped{reason="oversize_header"|"oversize_datagram"}`: per-message size
   handling (`docs/adr/syslog-output.md`'s "Sizing" section).
-- `logit.output.structured_data.dropped{reason="invalid_sd_name"|"not_a_map"|"sd_id_collision"}`:
-  an SD-ID or PARAM-NAME that isn't a valid RFC 5424 `SD-NAME` (an invalid SD-ID skips the
-  element, an invalid PARAM-NAME that param); a `syslog.sd` element whose value isn't a map of
-  PARAM-NAME to value; the opt-in element colliding with an SD-ID the event already carries.
+- `logit.output.structured_data.omitted{reason="invalid_sd_name"|"not_a_map"|"sd_id_collision"}`:
+  a piece of STRUCTURED-DATA left off a message that is still sent. An SD-ID or PARAM-NAME that
+  isn't a valid RFC 5424 `SD-NAME` (an invalid SD-ID omits the element, an invalid PARAM-NAME that
+  param); a `syslog.sd` element whose value isn't a map of PARAM-NAME to value; the opt-in element
+  colliding with an SD-ID the event already carries.
 - `logit.output.reconnects` (count, TCP only): every connect *after* the first. A climbing count in
   steady state means the peer or the network, not this sink, is unstable. Counted on plaintext and
   TLS (RFC 5425) connections alike, because both go through the pooled-stream driver
@@ -1872,24 +1867,24 @@ sinks tag one count per request with its status class or `network_error`
 - `logit.output.datagrams` (`udp` and `unix`): the packed datagrams a batch of lines was sent as.
   It's the number an operator tuning `max_packet_bytes` needs, because `statsd_out` (unlike
   `syslog_out`, where it equals `messages`) packs several lines per datagram.
-- `logit.output.messages.dropped{reason=...}`, with `reason` one of:
-  `"unresolved_gauge_delta"|"unencodable_value"|"empty_name"|"oversize_line"|
-  "oversize_datagram"|"dialect_field"|"dialect_event"|"invalid_service_check"|
-  "invalid_event_field"`. The less obvious ones:
-  - `dialect_field`: a `|c:`/`|T` field with nowhere to go under `format: statsd`.
-  - `dialect_event`: a whole DogStatsD event or service check dropped under `format: statsd`, which
-    has no `_e`/`_sc` wire form.
-  - `invalid_service_check`: a service check whose first metric isn't a `Gauge` or has no status
-    resolving into `0..=3`.
-  - `invalid_event_field`: an event's `p:`/`t:` field alone omitted for an out-of-set value. It's
-    its own counter, not `unencodable_value`, because the rest of the line still renders.
+- `logit.output.messages.dropped{reason=...}`, a line that should have left and didn't, with
+  `reason` one of `"unresolved_gauge_delta"|"unencodable_value"|"empty_name"|"oversize_line"|
+  "oversize_datagram"|"invalid_service_check"`. `invalid_service_check` is a service check whose
+  first metric isn't a `Gauge` or has no status resolving into `0..=3`.
+- `logit.output.messages.skipped{reason=...}`, a line with nothing to write: `dialect` is a whole
+  DogStatsD event or service check under `format: statsd`, which has no `_e`/`_sc` wire form, and
+  `no_recorded_value` is a `NO_RECORDED_VALUE`-flagged point, which statsd has no way to mark.
+- `logit.output.fields.omitted{reason=...}`, a field left off a line that is still sent: `dialect`
+  is a `|c:`/`|e:`/`|card:`/`|T` field with nowhere to go under `format: statsd`, once per field
+  per line, and `invalid_value` is an event's `p:`/`t:` field with an out-of-set value or a
+  `Samples` `sample_rate` outside `(0, 1]`, written without `@rate`.
 - `logit.output.metrics.degraded{metric_kind=...}` and `logit.output.metrics.skipped{metric_kind=...}`,
   with `metric_kind` one of `"distribution"|"set"|"histogram"|"exponential_histogram"|"summary"|
   "cumulative_sum"|"non_monotonic_delta_sum"`: a summarized kind written as per-component lines
   under `multi_value: expand` (the default), or dropped under `multi_value: skip`. Counted once per
   record, however many lines it writes. `skip` also raises the throttled
   `logit.component.diagnostics{key="unsupported_metric_kind"}`; `expand` raises no diagnostic.
-- `logit.output.tags.dropped{reason="dialect"|"unrepresentable"}`: `format: statsd` dropping the
+- `logit.output.tags.omitted{reason="dialect"|"unrepresentable"}`: `format: statsd` omitting the
   whole tag segment, or an individual unrepresentable tag. Counted **per wire tag**, so a
   multi-valued attribute (an `Array`, from a repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s
   amendment) that expands to several tags on the wire counts once per element, not once per
@@ -1913,8 +1908,11 @@ one grep finds both sinks.
 `crates/logit-outputs/src/collectd.rs`, `docs/adr/collectd-binary-relay.md`.
 
 **The codec emits its own counters and diagnostics directly.** `logit_proto::collectd`'s module
-doc has the full mapping-to-counter table: `logit.output.metrics.skipped{metric_kind|reason}`,
-`logit.output.tags.dropped{reason}`, `logit.output.identity.sanitized{reason}`, and
+doc has the full mapping-to-counter table: `logit.output.metrics.dropped{reason}` (a record that
+should have left and didn't, including an unresolved `GaugeDelta` and a notification that fails
+validation, `invalid_notification`), `logit.output.metrics.skipped{metric_kind|reason}` (a kind
+collectd has no data-source type for, or a `NO_RECORDED_VALUE` point),
+`logit.output.tags.omitted{reason}`, `logit.output.identity.sanitized{reason}`, and
 `logit.output.messages.truncated` (an over-long notification message). Unlike `statsd_out`, whose
 encoder returns an `EncodeStats` for the sink to turn into telemetry, `CollectdEncoder` holds the
 same `Telemetry`/`Diagnostics` handles this sink's `with_telemetry`/`with_diagnostics` receive and
@@ -1946,10 +1944,13 @@ attempted, or outside `{1, 2, 4}`), `empty_message`, `oversize_notification`, an
 rather than `statsd_out`'s. `logit_proto::graphite`'s module doc has the full mapping-to-counter
 table:
 
-- `logit.output.metrics.skipped{reason|metric_kind}`
+- `logit.output.metrics.dropped{reason}` (a record that should have left and didn't, including an
+  unresolved `GaugeDelta`, `unresolved_gauge_delta`)
+- `logit.output.metrics.skipped{reason|metric_kind}` (a `NO_RECORDED_VALUE` point, or a
+  multi-value kind under `multi_value: skip`)
 - `logit.output.metrics.degraded{metric_kind}` (a multi-value kind expanded, once per record)
 - `logit.output.metrics.normalized{reason="path_sanitized"|"tag_sanitized"}`
-- `logit.output.tags.dropped{reason="dialect"|"unrepresentable"|"empty"|"collision"}`
+- `logit.output.tags.omitted{reason="dialect"|"unrepresentable"|"empty"|"collision"}`
 - `logit.output.tags.normalized{reason="multi_value"}` (lossy; see above)
 
 The sink's `with_telemetry`/`with_diagnostics` feed the codec, so both halves of one `send` appear
