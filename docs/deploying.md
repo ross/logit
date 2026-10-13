@@ -2997,7 +2997,8 @@ attributes `host.name`, `com.splunk.source`, `com.splunk.sourcetype`, and `com.s
 `fields` become event attributes. An `event` object in the OTel exporter's span shape decodes to
 a span, `"event":"metric"` (or no `event`, with a measurement in `fields`) to metrics, and
 anything else to a log. An object with no `event` and no measurement, or a blank `event`, is
-skipped and counted, and every valid object in the body is delivered. Splunk Enterprise 10.4.3
+dropped, counted `logit.input.events.dropped{reason="no_event"|"blank_event"}`, and every valid
+object in the body is delivered. Splunk Enterprise 10.4.3
 skips an object with `fields` and no `event` and answers `200`, but answers an object with neither
 `400` code 12 and a blank `event` `400` code 13, indexing the objects before it and none after.
 An object that isn't valid JSON is answered as Splunk answers it: the objects before it are
