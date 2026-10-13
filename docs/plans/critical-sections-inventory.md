@@ -2424,9 +2424,12 @@ surveyor's.
   counts at most one `disk_torn` batch, and never when the cursor shows the record committed.
   Checked by
   `a_segment_truncated_mid_record_recovers_to_the_last_good_frame_and_counts_the_lost_batch` and
-  `a_torn_tail_behind_the_persisted_cursor_is_repaired_but_not_counted_lost`. Known overcount: a
-  failed write already counted `disk_full`/`disk_io_error` whose bytes no push repaired before
-  exit counts again ([ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md)'s
+  `a_torn_tail_behind_the_persisted_cursor_is_repaired_but_not_counted_lost`,
+  `a_torn_tail_at_the_persisted_cursor_was_never_committed_and_counts_lost`, and
+  `a_cursor_in_an_older_segment_never_marks_the_active_segments_torn_record_committed`. Known
+  overcounts: a failed write already counted `disk_full`/`disk_io_error` whose bytes no push
+  repaired before exit, and a record committed after the last cursor persist and then torn by a
+  power loss, each count again ([ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md)'s
   2026-10-13 amendment).
 - **Existing coverage:** `disk_queue.rs` tests
   `a_segment_truncated_mid_record_recovers_to_the_last_good_frame_and_counts_the_lost_batch`,

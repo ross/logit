@@ -1154,9 +1154,13 @@ class Ledger:
         self.shutdown_batches = sut.counter_by_life("logit.component.batches.dropped",
                                                     reason="shutdown")
         # `{life: {(component, reason): batches}}` under every reason, which `drop_credit` reads.
-        # The reason set is open: a reason this file doesn't name still counts a gap.
+        # The reason set is open: a reason this file doesn't name still counts a gap. Except
+        # `disk_torn`: a spool counts it at open for a batch an earlier life received, so it
+        # can't explain a gap in the life that counts it, as `buffer.disk.replayed` can't.
         self.dropped_batches = {}
         for point in sut.matching("logit.component.batches.dropped"):
+            if point.attributes.get("reason") == "disk_torn":
+                continue
             if isinstance(point.value, (int, float)) and point.value:
                 key = (point.attributes.get("component"), point.attributes.get("reason"))
                 life = self.dropped_batches.setdefault(point.life, {})

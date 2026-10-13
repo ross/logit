@@ -531,10 +531,13 @@ repairs.
   drop.
 - **No events are counted.** A partial record holds no readable event count, so `open` emits no
   `events.dropped{reason="disk_torn"}`.
-- **It's a lower bound, with one overcount.** A power loss can lose records whole, and those
-  leave no bytes to count. A write that failed, was counted `disk_full` or `disk_io_error`, and
-  left bytes that no later push repaired before the process exited counts again as `disk_torn`
-  at the next open.
+- **It's a lower bound, with two overcounts.** A power loss can lose records whole, and those
+  leave no bytes to count. Two cases count a batch that was already counted:
+  - A write that failed, was counted `disk_full` or `disk_io_error`, and left bytes that no later
+    push repaired before the process exited counts again as `disk_torn` at the next open.
+  - The cursor persists only every `checkpoint_interval` (1 s by default), and a push flushes
+    without an `fsync`. A record delivered and committed after the last cursor persist, then torn
+    by a power loss, counts delivered and then `disk_torn`.
 - **The sink identity across a restart.** Like `buffer.disk.replayed`, a `disk_torn` drop settles
   a batch an earlier process received, so a per-process identity adds it to the received side:
   `received + replayed + disk_torn = delivered + dropped + queued`.

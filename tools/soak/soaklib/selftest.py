@@ -3302,6 +3302,16 @@ def _kill_ledger():
                in torn["identity.sink"].detail,
                f"identity.sink settles a torn tail's drop against the batch an earlier life "
                f"received, got {torn['identity.sink']}")
+        # The same drop can't explain a gap in life 2: it settles a batch life 1 received.
+        torn_gap = results("kill-torn-tail-gap", sut_extra=(
+            _line(_stamp(T0 + 215), "logit.component.batches.dropped", "sum", 1,
+                  component="sink", attrs={"reason": "disk_torn"}),
+            _line(_stamp(T0 + 220), "logit.transform.metrics.absorbed", "sum", 500,
+                  component="window")))
+        expect(torn_gap["ledger.egress"].status == checks.FAIL
+               and "uncounted" in torn_gap["ledger.egress"].detail,
+               f"egress doesn't credit a torn tail's drop against the life that counts it, got "
+               f"{torn_gap['ledger.egress']}")
         stray = results("kill-stray-drop", stray_drop=True)
         stray_led = checks.Ledger(checks.RunData(Path(tmp) / "kill-stray-drop"))
         expect(1 not in stray_led.D_log and stray["ledger.intake"].status == checks.PASS,

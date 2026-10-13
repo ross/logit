@@ -971,8 +971,8 @@ shutdown, because the spool keeps it. Also watch:
 - `logit.component.buffer.disk.truncated` (count): a torn tail found and truncated at open. Nonzero
   means the previous process ended mid-write, which an ordinary `SIGKILL` does, or a power loss
   tore unsynced bytes. The batch lost with the tail counts `batches.dropped{reason="disk_torn"}`
-  at the same open, unless it was delivered before the crash; it counts no `events.dropped`,
-  because a partial record's event count is unreadable.
+  at the same open, unless the persisted cursor shows it committed; it counts no
+  `events.dropped`, because a partial record's event count is unreadable.
 - `logit.component.buffer.disk.errors{op}` (count): a failed spool filesystem operation, `op` one
   of `cursor`, `flush`, `fsync`, `create`, `truncate`, or `unlink`. Alert on any nonzero value: the
   durability level above no longer holds. A failed `cursor` write means more replay after a

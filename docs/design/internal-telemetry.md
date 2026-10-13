@@ -631,9 +631,10 @@ for it in the process that crashed, before its push either stopped mid-write or 
 power loss tore. It isn't counted when the persisted cursor is past the torn record's start,
 because that record was committed before the crash. It emits no `events.dropped`, since a partial
 record holds no readable event count. It's a lower bound: a power loss can lose records whole,
-which leave no bytes to count. One case counts twice: a write that failed and was counted
-`disk_full` or `disk_io_error`, whose bytes no later push repaired before the process exited.
-Because the batch was received by an earlier process, a per-process sink identity adds it to the
+which leave no bytes to count. Two cases count a batch twice: a write that failed and was counted
+`disk_full` or `disk_io_error`, whose bytes no later push repaired before the process exited; and
+a record delivered and committed after the last cursor persist (every `checkpoint_interval`), then
+torn by a power loss, which counts delivered and then `disk_torn`. Because the batch was received by an earlier process, a per-process sink identity adds it to the
 received side, as it adds `buffer.disk.replayed`.
 
 Two metrics from this document's original design were never built: a per-batch

@@ -742,7 +742,9 @@ impl DiskQueue {
             // received the batch (`drain_inbox` counts receipt before the push), and no process
             // counted it delivered or dropped. Either its push never finished (a kill mid-write),
             // or it was flushed but not yet `fsync`ed when power failed. A cursor past the start
-            // means the record was committed before the crash.
+            // means the record was committed before the crash. The cursor persists only every
+            // `checkpoint_interval`, so a record committed after the last persist and then torn
+            // by a power loss counts delivered and then dropped.
             torn_lost = torn_at.is_some_and(|(seq, good_len)| {
                 !cursor.is_some_and(|(cur_seq, cur_offset)| cur_seq == seq && cur_offset > good_len)
             });
@@ -2264,6 +2266,48 @@ mod tests {
             "a committed record's torn bytes are not loss"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Writes `segments` as segment files 0, 1, ..., persists `cursor`, opens the spool, and
+    /// returns its `batches.dropped{reason="disk_torn"}` count.
+    fn disk_torn_at_open(name: &str, segments: &[Vec<u8>], cursor: (u64, u64)) -> f64 {
+        let dir = scratch_dir(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (seq, bytes) in segments.iter().enumerate() {
+            std::fs::write(segment_path(&dir, seq as u64), bytes).unwrap();
+        }
+        persist_cursor(&dir, cursor.0, cursor.1).unwrap();
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("test", "output", "sink");
+        let q = DiskQueue::open(config(dir.clone()), telemetry, Diagnostics::new("test")).unwrap();
+        let events = registry.drain(0);
+        drop(q);
+        std::fs::remove_dir_all(&dir).ok();
+        metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, Some(("reason", "disk_torn")))
+    }
+
+    #[test]
+    fn a_torn_tail_at_the_persisted_cursor_was_never_committed_and_counts_lost() {
+        let good = raw_record(&batch("good"), ctx());
+        let torn = raw_record(&batch("torn"), ctx());
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&torn[..torn.len() / 2]);
+        // The cursor sits at the torn record's start: the record was never committed.
+        let cursor = (0, good.len() as u64);
+        assert_eq!(disk_torn_at_open("torn-tail-at-cursor", &[bytes], cursor), 1.0);
+    }
+
+    #[test]
+    fn a_cursor_in_an_older_segment_never_marks_the_active_segments_torn_record_committed() {
+        let good = raw_record(&batch("good"), ctx());
+        let torn = raw_record(&batch("torn"), ctx());
+        let older = [good.clone(), good.clone()].concat();
+        let mut active = good.clone();
+        active.extend_from_slice(&torn[..torn.len() / 2]);
+        // An offset past the active segment's recovered length, but in segment 0.
+        let cursor = (0, older.len() as u64);
+        assert!(cursor.1 > good.len() as u64);
+        assert_eq!(disk_torn_at_open("torn-tail-older-cursor", &[older, active], cursor), 1.0);
     }
 
     #[tokio::test]
