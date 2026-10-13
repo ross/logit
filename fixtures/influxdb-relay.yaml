@@ -5,7 +5,7 @@
 # the client changes (docs/adr/influxdb-line-protocol-relay.md).
 #
 # The relay is lossless modulo the normalization list in `crates/logit-proto/src/influxdb/mod.rs`'s
-# module doc: duplicate points in one body merge, tag order is canonicalized, string fields leave
+# module doc: duplicate points in one body merge, tag order isn't preserved (influxd sorts the series key itself), string fields leave
 # after the numeric ones, numbers leave in their shortest spelling, and every point leaves with a
 # nanosecond timestamp (one that arrived with none gets its receipt time). Each write's `org` and
 # `bucket` ride on the batch as the resource attributes `influxdb.org` and `influxdb.bucket`, which

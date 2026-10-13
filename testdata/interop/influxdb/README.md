@@ -7,7 +7,7 @@ from InfluxDB's documentation and probes of an influxd; these captures check tha
 what a real, widely deployed writer puts on the wire. Nothing here came from, or went to, an
 InfluxDB: the capture sink stood where `/api/v2/write` would, answering `204` to every write. The
 sink's `--accept-chunked` removes the chunk framing from a `Transfer-Encoding: chunked` request
-(Telegraf's gzip body is streamed); the payload is untouched and the sidecar keeps
+(Telegraf streams every body chunked, whatever its encoding); the payload is untouched and the sidecar keeps
 `transfer-encoding: chunked`.
 
 Every request carried the dummy token `00000000-0000-0000-0000-000000000000`. It never authorized
@@ -37,10 +37,10 @@ outputs; which output arrives first within a flush varies between recordings.
 
 | Files | Output | Captured | Construct exercised |
 |---|---|---|---|
-| `telegraf-api-v2-write-000.*` (2,161 B) | `fixture-identity`, identity, `Content-Length` | 2026-10-13 | The first flush: `mem` (a `u` field per `influx_uint_support`), `inputs.file`'s points, and `system` as three lines (`n_cpus`/loads, `uptime`, and the string `uptime_format`) at one instant. No `cpu`: it needs a prior sample |
+| `telegraf-api-v2-write-000.*` (2,161 B) | `fixture-identity`, identity, chunked | 2026-10-13 | The first flush: `mem` (a `u` field per `influx_uint_support`), `inputs.file`'s points, and `system` as three lines (`n_cpus`/loads, `uptime`, and the string `uptime_format`) at one instant. No `cpu`: it needs a prior sample |
 | `telegraf-api-v2-write-001.*` (937 B) | `fixture-gzip`, gzip, chunked | 2026-10-13 | The same first flush, gzipped and streamed |
 | `telegraf-api-v2-write-00{2,5}.*` (3,204 B, 3,715 B) | `fixture-gzip`, gzip, chunked | 2026-10-13 | Later flushes: 32 `cpu` series (per-CPU and `cpu-total`) of `F64` usage fields |
-| `telegraf-api-v2-write-00{3,4}.*` (11,866 B, 12,663 B) | `fixture-identity`, identity, `Content-Length` | 2026-10-13 | The same later flushes, uncompressed |
+| `telegraf-api-v2-write-00{3,4}.*` (11,866 B, 12,663 B) | `fixture-identity`, identity, chunked | 2026-10-13 | The same later flushes, uncompressed |
 
 The `inputs.file` points repeat in every body at their fixed 2023 timestamps. They hold: every
 field type (`true`/`false`, `i`, `u` up to `u64::MAX`, floats, a string); two multi-field points

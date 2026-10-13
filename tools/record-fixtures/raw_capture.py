@@ -33,7 +33,7 @@ and `PUT` are captured; a `GET` or `OPTIONS` has an empty `.bin`. It refuses a `
 no `Content-Length`, or with any `Transfer-Encoding`, with `411 Length Required`, not counted:
 de-framing a chunked body is re-encoding. `--accept-chunked` opts out for `chunked` alone: the
 chunk framing is removed, the payload stays byte-for-byte, and the sidecar keeps
-`transfer-encoding: chunked`, for a producer (Telegraf's gzip body) that streams its body. Connections are served on threads, so one idle peer can't park the capture.
+`transfer-encoding: chunked`, for a producer (Telegraf, every body) that streams its body. Connections are served on threads, so one idle peer can't park the capture.
 
 The HTTP reply is `--status` (default `204 No Content`) with an empty body, because an HTTP client
 won't send a second request to a listener that never replied. `--reply PATH=FILE` answers requests

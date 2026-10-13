@@ -20,8 +20,8 @@
 //! [`an_absent_timestamp_leaves_as_the_receipt_time_truncated_to_precision`] covers that.
 //!
 //! `influxdb_out` writes tags in `logit_core::AttrMap`'s order, which is the order the process
-//! first interned each key in, not string order. Normalization 3 promises only a canonical order,
-//! and influxd sorts the series key itself, but the bytes a `.expected` pins depend on it, and a
+//! first interned each key in, not string order. Normalization 3 says tags leave in interning
+//! order, and influxd sorts the series key itself, but the bytes a `.expected` pins depend on it, and a
 //! `cargo test` run shares one interner across every test in this file. So every [`Harness`]
 //! first interns the corpus's tag keys in string order ([`CORPUS_TAG_KEYS`]), which makes the
 //! `.expected` tag order string order under either runner.

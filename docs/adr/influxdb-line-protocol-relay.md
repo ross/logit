@@ -186,31 +186,17 @@ producer's request open across the whole pipeline and every sink, which no `logi
 Each status is chosen so that a producer's retry behaves as it would against InfluxDB, and so that
 `influxdb_out` pointed at `influxdb_in` reads it as the fault class its own response table assigns
 (`crates/logit-outputs/src/influxdb.rs`'s "Response classes"). The module doc of
-`crates/logit-inputs/src/influxdb.rs` is the canonical response table, with the check order; this
-is the summary:
+`crates/logit-inputs/src/influxdb.rs` is the one response table, with every status and the check
+order; this table keeps the rows whose fault class is the decision:
 
 | Situation | Status | Reaches `influxdb_out` as |
 |---|---|---|
 | written, or an empty body | `204` | `Ok` |
-| a parse error, a missing `org` and `orgID`, a bad `precision`, or a gzip body that doesn't decompress | `400` `invalid` | `Rejected` |
+| a line that fails to parse | `400` `invalid` | `Rejected` |
 | a missing `bucket` | `404` `not found` | `Refused`: a misconfigured URL |
 | `tokens:` set, and the token is missing or unknown | `401` `unauthorized` | `Refused` |
-| over `max_request_bytes`, by `Content-Length`, as read, or after decompression | `413` | `Rejected` |
+| over `max_request_bytes` | `413` | `Rejected` |
 | busy past the listener's bound, or a closed downstream consumer | `503` `unavailable`, `Retry-After: 1` | `Ambiguous` |
-| an unknown route, `/write` and a trailing `/` included | `404` | `Refused`: a misconfigured URL |
-| a wrong method | `405` `method not allowed`, with `Allow` | `Refused`; `influxdb_out` always sends `POST` |
-| a stalled body | `408` | `Rejected` |
-| an unsupported `Content-Encoding` (anything but lowercase `gzip` or identity) | `415` | `Rejected`; `influxdb_out` sends identity |
-| `GET` or `HEAD` on `/ping` | `204`, with `X-Influxdb-Version`; no token needed | not sent by `influxdb_out` |
-| `GET` or `HEAD` on `/health` | `200` JSON, no token needed | not sent by `influxdb_out` |
-| `OPTIONS` on a served route | `204`, with `Allow`; no token needed | not sent by `influxdb_out` |
-
-When a request carries both `org` and `orgID`, `orgID` wins, as at `influxd`. The listener checks a
-request in `influxd`'s order, so a request with several faults gets the status `influxd` gives it:
-route and method, then `/ping` and `/health`, the declared size, the token, `Content-Encoding`,
-`precision`, `bucket`, `org`, and last the body. It never sends `403`, `422`, `429`, or a `404`
-for an unknown bucket or org: it has no permissions per bucket, no buckets, no stored schema, and
-no rate limit.
 
 ### The codec lives in `logit-proto`
 

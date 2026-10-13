@@ -15,7 +15,7 @@
 //!
 //! # Responses
 //!
-//! This table is the canonical copy of the ADR's "Listener responses". Every error body is
+//! This table is the canonical response table, with the check order below it. Every error body is
 //! influxd's `{"code","message"}` ([`logit_proto::influxdb::response`]), and every response carries
 //! `X-Influxdb-Version: logit/<version>`. A route matches only as written: a trailing `/` is a
 //! `404`, where influxd answers a `308` redirect.
@@ -64,16 +64,12 @@
 //!
 //! # Telemetry
 //!
-//! Every name and tag is `&'static`. Per request: `logit.input.requests{route, class}` (route
-//! `write`, `ping`, `health`, or `unknown`; class `ok`, `rejected`, `busy`, or `closed_consumer`),
-//! `logit.input.request.duration` (timing, every exit), and `logit.input.request.bytes` (the body
-//! as sent, once read). Rejections: `logit.input.requests.rejected{reason}`, reason
-//! `unknown_route`, `method`, `oversize`, `auth`, `encoding`, `malformed_encoding`, `precision`,
-//! `no_bucket`, `no_org`, `malformed` (a parse error), `stalled`, or `body_read` (a body that
-//! failed for a reason other than its size). `logit.input.batches.dropped{reason}` (`busy` or
-//! `closed_consumer`) counts a decoded batch a `503` left undelivered. The decoder counts
+//! Per request: `logit.input.requests{route, class}`, `logit.input.request.duration`, and
+//! `logit.input.request.bytes`. Rejections: `logit.input.requests.rejected{reason}`. A decoded
+//! batch a `503` left undelivered: `logit.input.batches.dropped{reason}`. The decoder counts
 //! `logit.input.tags.dropped{reason="reserved_prefix"}`. The connection metrics are `otlp_in`'s
-//! verbatim.
+//! verbatim. The reasons, classes, and meanings are in `docs/design/internal-telemetry.md`'s
+//! `influxdb_in` section.
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,

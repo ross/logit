@@ -1020,7 +1020,7 @@ INFLUXDB_TELEGRAF_IMAGE="docker.io/library/telegraf:1.40.2@sha256:aedc74ac64c623
 # Telegraf's `outputs.influxdb_v2`, twice (telegraf-influxdb-v2.conf): the default gzip body and
 # `content_encoding = "identity"`, written to a capture sink standing where InfluxDB 2.x would, on
 # port 8086, answering `204` to every write. The inputs are cpu, mem, system, and an `inputs.file`
-# over telegraf-influxdb-lines.txt. Telegraf streams its gzip body without a Content-Length, so
+# over telegraf-influxdb-lines.txt. Telegraf streams every body chunked, whatever its encoding, so
 # the sink runs with --accept-chunked. Six writes are three 5 s flushes of both outputs.
 record_influxdb() {
     echo "== recording: Telegraf outputs.influxdb_v2 (${INFLUXDB_TELEGRAF_IMAGE}) =="

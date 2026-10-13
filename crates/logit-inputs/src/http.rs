@@ -59,7 +59,7 @@ const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 
 /// The HTTP/1.1-and-h2c builder every `auto` listener serves through, with the h2 settings
 /// above set explicitly. `otlp_in`'s HTTP transport, `prometheus_in`'s receiver, `datadog_in`,
-/// `datadog_trace_in`, and `splunk_hec_in` build here.
+/// `datadog_trace_in`, `splunk_hec_in`, and `influxdb_in` build here.
 pub(crate) fn auto_builder() -> auto::Builder<TokioExecutor> {
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
@@ -383,11 +383,11 @@ pub(crate) fn is_length_limit(err: &(dyn std::error::Error + Send + Sync + 'stat
 }
 
 // -------------------------------------------------------------------------------------------------
-// Request helpers shared by `datadog_in`, `datadog_trace_in`, and `splunk_hec_in`
+// Request helpers shared by `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `influxdb_in`
 // -------------------------------------------------------------------------------------------------
 
 /// A request's declared `Content-Encoding`. Each listener decides which of these it accepts:
-/// `datadog_in` all four, `datadog_trace_in` and `splunk_hec_in` identity and gzip.
+/// `datadog_in` all four, the others identity and gzip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Encoding {
     Identity,
@@ -634,7 +634,7 @@ pub(crate) async fn deliver_with_deadline(
     Ok(())
 }
 
-/// Whether `sent` equals one of `keys`: `datadog_in`'s `api_keys` and `splunk_hec_in`'s `tokens`.
+/// Whether `sent` equals one of `keys`: `datadog_in`'s `api_keys` and the `tokens` of `splunk_hec_in` and `influxdb_in`.
 /// Every key is compared, and each comparison runs over the whole key, so the time taken doesn't
 /// reveal which key matched or how much of a guess did.
 pub(crate) fn matches_any_key(keys: &[Box<[u8]>], sent: &[u8]) -> bool {

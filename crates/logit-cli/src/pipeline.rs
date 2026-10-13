@@ -5478,6 +5478,7 @@ mod tests {
             format!(r#""type": "datadog_in", "bind": "{tcp}""#),
             format!(r#""type": "datadog_trace_in", "bind": "{tcp}""#),
             format!(r#""type": "splunk_hec_in", "bind": "{tcp}""#),
+            format!(r#""type": "influxdb_in", "bind": "{tcp}""#),
             format!(r#""type": "logit_in", "bind": "{tcp}""#),
             format!(r#""type": "prometheus_in", "bind": "{tcp}""#),
             format!(r#""type": "prometheus_out", "bind": "{tcp}""#),
