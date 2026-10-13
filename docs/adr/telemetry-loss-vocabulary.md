@@ -198,6 +198,33 @@ same date has the bounds of the count and how it enters the sink identity.
   `influxdb_out`'s counters land there rather than here. `kafka_out`'s `format: text` and
   `docker_in`'s decoder are follow-ups.
 
+## Amendment (2026-10-13): counters for `kafka_out`'s text format and `docker_in`'s decoder
+
+Two entries leave [Loss with no counter](#loss-with-no-counter), which keeps only `influxdb_out`:
+
+| Loss | Counter |
+|---|---|
+| `kafka_out` under `format: text`: the metric records and span of an event whose log body a record carries | `output.metrics.omitted{reason="format"}`, one per metric record, and `output.spans.omitted{reason="format"}`, one per span |
+| `docker_in`'s decoder: a reassembled message over `max_line_bytes` (diagnostic `long_line`) | `input.frames.dropped{reason="oversize"}`, one per message, when its drop starts |
+| `docker_in`'s decoder: a held reassembly discarded at an in-place truncation | `input.frames.dropped{reason="truncated"}`, one per stream that held one |
+
+- **`kafka_out`'s piece is `omitted`, not `skipped`.** The list placed it under `*.skipped`, but
+  the record is still delivered with the log body, and a piece removed from a delivered record is
+  what `*.omitted` means. The `format` reason says the operator chose it. A metrics-only event
+  still counts `output.events.skipped{reason="no_log"}` and nothing more, because no record is
+  written for it. Both counters are encode-side, counted once per batch however many attempts
+  the sink makes. An event whose own value is over the budget under `record: batch` counts
+  `records.dropped{reason="oversize"}` instead.
+- **`docker_in`'s counters reuse `tail_in`'s names.** The decoder counts a message, where the
+  driver counts a line, and both are a frame the listener lost. A re-read after a restart
+  re-drops an oversize message and counts it again, as `tail_in` counts a long line each time it
+  reads it. A stream already dropping at a truncation counts nothing more: its message was
+  counted when the drop started.
+- **A truncation counts a held reassembly and the unterminated line behind it once.** The driver
+  counts the line splitter's unterminated line only when the decoder holds no entry, because that
+  line most often continues the held one. An unterminated line on the other stream, beside a
+  held reassembly, goes uncounted (`docs/known-gaps/tailing.md`).
+
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
 `*.rejected` name and reason that existed on 2026-10-13, verified against the emit sites in
@@ -321,10 +348,3 @@ belongs under `*.dropped`, or under `*.skipped` where the entry says so; none ha
   under `*.dropped`. A `NO_RECORDED_VALUE` record (`no_recorded_value`: nothing to carry) and
   `SetMembers` and `ExponentialHistogram` (no line-protocol form, though they share the
   `encode_error` key) belong under `*.skipped`.
-- `kafka_out` under `format: text` writes a record from an event's log alone, so a mixed
-  event's metrics and span leave with no count. The operator chose the format, so these belong
-  under `*.skipped`, not `*.dropped`; a metrics-only event already counts
-  `output.events.skipped{reason="no_log"}`.
-- `docker_in`'s decoder drops a message whose reassembled partial entries pass `max_line_bytes`
-  (diagnostic `long_line`), and discards a held partial entry when its file is truncated, with
-  no counter: the decoder has no telemetry handle.
