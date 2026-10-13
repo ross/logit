@@ -458,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reserved_prefix_tag_is_dropped_and_counted() {
+    fn a_reserved_prefix_tag_is_omitted_and_counted() {
         let registry = Registry::new();
         let mut decoder = InfluxDecoder::new().with_telemetry(registry.telemetry_for(
             "influxdb_in",
