@@ -36,6 +36,10 @@
 //! `|card:<cardinality>` and `|T<timestamp>` have no plain-statsd equivalent and are dropped, not
 //! normalized.
 //!
+//! A metric value is the statsd wire's one number: an `F64` prints as a float, an `I64` or `U64`
+//! as its exact integer digits (so `2^53 + 1` survives), and a `Bool` as `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}`
+//! (`docs/adr/typed-metric-scalar.md`).
+//!
 //! ## Sanitization
 //!
 //! A metric name has every `: | @ # , \n \r \0`, ASCII control character, and whitespace character
@@ -381,8 +385,8 @@ use crate::stream::{Dial, PooledStream, Target, TlsTarget};
 use crate::Output;
 use anyhow::Context;
 use logit_core::{
-    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Temporality,
-    Value,
+    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Telemetry,
+    Temporality, Value,
 };
 use logit_pipeline::{BatchContext, DeliveryPosture, SeqId};
 use logit_proto::multi_value::{expand_dotted, DottedScratch};
@@ -457,6 +461,9 @@ pub struct EncodeStats {
     /// A timer's `h`/`d` wire type (`statsd.type`) collapsed to `ms` under `Format::Statsd`.
     /// Counted once per `Samples` record, not per split line.
     pub type_normalized_dialect: usize,
+    /// A `Bool` metric value written as `1` or `0`: the statsd wire has no boolean. Counted
+    /// once per value.
+    pub bool_values: usize,
     /// `statsd.container_id`/`statsd.external_data`/`statsd.cardinality`/`statsd.timestamp`
     /// dropped under `Format::Statsd`
     /// (`append_dialect_extras`). Counted once per field per emitted line, so a negative-gauge pair
@@ -1169,7 +1176,7 @@ fn render_service_check(
         .service_check_name
         .expect("caller only calls this when service_check_name is Some");
     let gauge_value = match &metric.kind {
-        MetricKind::Gauge(v) => *v,
+        MetricKind::Gauge(v) => v.as_f64(),
         other => {
             unreachable!("caller only calls this when the first metric is a Gauge, got {other:?}")
         }
@@ -1291,7 +1298,8 @@ fn render_metric(
     match &metric.kind {
         // Only a delta, monotonic `Sum` means `|c`; any other `Sum` falls to the next arm.
         MetricKind::Sum(s) if s.temporality == Temporality::Delta && s.monotonic => {
-            if !s.value.is_finite() {
+            let value = scalar(s.value, ctx);
+            if !value.is_finite() {
                 ctx.stats.dropped_unencodable_value += 1;
                 ctx.diag.warn_throttled(
                     "unencodable_value",
@@ -1300,11 +1308,12 @@ fn render_metric(
                 return;
             }
             line.clear();
-            write_counter_line(line, name, "", s.value, ctx);
+            write_counter_line(line, name, "", value, ctx);
             push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
         }
         MetricKind::Sum(s) => render_other_sum(line, name, s, ctx),
         MetricKind::Gauge(v) => {
+            let v = scalar(*v, ctx);
             if !v.is_finite() {
                 ctx.stats.dropped_unencodable_value += 1;
                 ctx.diag.warn_throttled(
@@ -1313,9 +1322,10 @@ fn render_metric(
                 );
                 return;
             }
-            render_gauge_entry(line, name, "", *v, ctx);
+            render_gauge_entry(line, name, "", v, ctx);
         }
         MetricKind::GaugeDelta(v) => {
+            let v = scalar(*v, ctx);
             if !relative_gauges {
                 ctx.stats.dropped_gauge_delta += 1;
                 ctx.diag.warn_throttled(
@@ -1336,10 +1346,15 @@ fn render_metric(
             line.clear();
             line.push_str(name);
             line.push(':');
-            if v.is_sign_positive() {
+            let positive = match v {
+                MetricValue::F64(f) => f.is_sign_positive(),
+                MetricValue::I64(n) => n >= 0,
+                MetricValue::U64(_) | MetricValue::Bool(_) => true,
+            };
+            if positive {
                 line.push('+');
             }
-            push_float(line, *v);
+            push_scalar(line, v);
             line.push_str("|g");
             append_tags(line, ctx.tag_suffix);
             append_dialect_extras(line, ctx);
@@ -1373,6 +1388,32 @@ fn render_metric(
     }
 }
 
+/// A metric value as the statsd wire's number. An integer prints as integer text, since an
+/// `f64` that holds a whole number does; a `Bool` is `1` or `0`, counted.
+fn scalar(v: MetricValue, ctx: &mut EncodeCtx) -> MetricValue {
+    match v {
+        MetricValue::Bool(b) => {
+            ctx.stats.bool_values += 1;
+            MetricValue::I64(i64::from(b))
+        }
+        other => other,
+    }
+}
+
+/// Appends a metric value's text: a float through [`push_float`], an integer as its exact digits.
+fn push_scalar(line: &mut String, v: MetricValue) {
+    match v {
+        MetricValue::F64(f) => push_float(line, f),
+        MetricValue::I64(n) => {
+            let _ = write!(line, "{n}");
+        }
+        MetricValue::U64(n) => {
+            let _ = write!(line, "{n}");
+        }
+        MetricValue::Bool(b) => line.push(if b { '1' } else { '0' }),
+    }
+}
+
 /// A `Sum` that isn't delta and monotonic. Under [`MultiValue::Expand`], a cumulative `Sum`
 /// becomes one bare gauge entry of its running total and a non-monotonic delta `Sum` one bare
 /// counter line, the record counted degraded; under [`MultiValue::Skip`], a counted drop.
@@ -1386,7 +1427,8 @@ fn render_other_sum(line: &mut String, name: &str, sum: &logit_core::Sum, ctx: &
         skipped_kind(ctx, name, kind);
         return;
     }
-    if !sum.value.is_finite() {
+    let value = scalar(sum.value, ctx);
+    if !value.is_finite() {
         ctx.stats.dropped_unencodable_value += 1;
         ctx.diag.warn_throttled(
             "unencodable_value",
@@ -1396,10 +1438,10 @@ fn render_other_sum(line: &mut String, name: &str, sum: &logit_core::Sum, ctx: &
     }
     ctx.stats.degraded_kinds.bump(kind);
     match kind {
-        MultiKind::CumulativeSum => render_gauge_entry(line, name, "", sum.value, ctx),
+        MultiKind::CumulativeSum => render_gauge_entry(line, name, "", value, ctx),
         _ => {
             line.clear();
-            write_counter_line(line, name, "", sum.value, ctx);
+            write_counter_line(line, name, "", value, ctx);
             push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
         }
     }
@@ -1471,14 +1513,28 @@ fn skipped_kind(ctx: &mut EncodeCtx, name: &str, kind: MultiKind) {
 
 /// Pushes one gauge entry for `name` + `suffix`: a plain `name:v|g` line, or for a negative
 /// value the indivisible `name:0|g` + `name:-v|g` pair (module doc's "Negative absolute gauges").
-fn render_gauge_entry(line: &mut String, name: &str, suffix: &str, v: f64, ctx: &mut EncodeCtx) {
+fn render_gauge_entry(
+    line: &mut String,
+    name: &str,
+    suffix: &str,
+    v: impl Into<MetricValue>,
+    ctx: &mut EncodeCtx,
+) {
     // `f64`'s `Display` renders `-0.0` as `"-0"`, which the decoder's `"g"` arm reads as a
     // no-op `GaugeDelta` (it checks the leading `-` before parsing). Normalize the sign so
     // `-0.0` is a plain `name:0|g` reset and the pair below is only for real negatives.
     // `stdio_out`'s `gauge_delta_negative_zero_does_not_double_the_sign` is the same trap.
-    let v = if v == 0.0 { 0.0 } else { v };
+    let v = match v.into() {
+        MetricValue::F64(f) => MetricValue::F64(if f == 0.0 { 0.0 } else { f }),
+        other => other,
+    };
+    let negative = match v {
+        MetricValue::F64(f) => f.is_sign_negative(),
+        MetricValue::I64(n) => n < 0,
+        MetricValue::U64(_) | MetricValue::Bool(_) => false,
+    };
     line.clear();
-    if v.is_sign_negative() {
+    if negative {
         write_gauge_line(line, name, suffix, 0.0, ctx);
         line.push('\n');
         write_gauge_line(line, name, suffix, v, ctx);
@@ -1490,11 +1546,17 @@ fn render_gauge_entry(line: &mut String, name: &str, suffix: &str, v: f64, ctx: 
 
 /// Appends one `name<suffix>:v|g` line, tags and dialect extras included; both lines of a
 /// negative pair share it.
-fn write_gauge_line(line: &mut String, name: &str, suffix: &str, v: f64, ctx: &mut EncodeCtx) {
+fn write_gauge_line(
+    line: &mut String,
+    name: &str,
+    suffix: &str,
+    v: impl Into<MetricValue>,
+    ctx: &mut EncodeCtx,
+) {
     line.push_str(name);
     line.push_str(suffix);
     line.push(':');
-    push_float(line, v);
+    push_scalar(line, v.into());
     line.push_str("|g");
     append_tags(line, ctx.tag_suffix);
     append_dialect_extras(line, ctx);
@@ -1503,11 +1565,17 @@ fn write_gauge_line(line: &mut String, name: &str, suffix: &str, v: f64, ctx: &m
 /// Appends one `name<suffix>:v|c` line, tags and dialect extras included. Never `@<rate>`: a
 /// counter's rate is already divided out (module doc's "Sample rate: never for a counter, real
 /// for `Samples`").
-fn write_counter_line(line: &mut String, name: &str, suffix: &str, v: f64, ctx: &mut EncodeCtx) {
+fn write_counter_line(
+    line: &mut String,
+    name: &str,
+    suffix: &str,
+    v: impl Into<MetricValue>,
+    ctx: &mut EncodeCtx,
+) {
     line.push_str(name);
     line.push_str(suffix);
     line.push(':');
-    push_float(line, v);
+    push_scalar(line, v.into());
     line.push_str("|c");
     append_tags(line, ctx.tag_suffix);
     append_dialect_extras(line, ctx);
@@ -2003,6 +2071,11 @@ fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
         stats.members_sanitized as f64,
         &[("reason", "member_sanitized")],
     );
+    telemetry.count(
+        "logit.output.metrics.normalized",
+        stats.bool_values as f64,
+        &[("reason", "bool_value")],
+    );
     for (metric_kind, n) in stats.skipped_kinds.tagged() {
         telemetry.count("logit.output.metrics.skipped", n as f64, &[("metric_kind", metric_kind)]);
     }
@@ -2278,7 +2351,7 @@ mod tests {
 
     #[test]
     fn a_gauge_encodes_as_name_colon_value_pipe_g() {
-        let (msgs, _) = encode(vec![metric_event("load", MetricKind::Gauge(0.75), &[])]);
+        let (msgs, _) = encode(vec![metric_event("load", MetricKind::gauge(0.75), &[])]);
         assert_eq!(msgs, vec!["load:0.75|g"]);
     }
 
@@ -2623,7 +2696,7 @@ mod tests {
     /// `name:0|g`.
     #[test]
     fn a_no_recorded_value_point_is_dropped_and_counted() {
-        let mut flagged = metric_event("conns", MetricKind::Gauge(0.0), &[]);
+        let mut flagged = metric_event("conns", MetricKind::gauge(0.0), &[]);
         flagged.metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         let (msgs, stats) = encode(vec![flagged]);
         assert!(msgs.is_empty(), "a flagged point must not be written at all: {msgs:?}");
@@ -2632,7 +2705,8 @@ mod tests {
 
     #[test]
     fn a_gauge_delta_is_dropped_by_default() {
-        let (msgs, stats) = encode(vec![metric_event("conns", MetricKind::GaugeDelta(5.0), &[])]);
+        let (msgs, stats) =
+            encode(vec![metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(5.0)), &[])]);
         assert!(msgs.is_empty());
         assert_eq!(stats.dropped_gauge_delta, 1);
     }
@@ -2642,7 +2716,7 @@ mod tests {
         let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_relative_gauges(true);
         let (msgs, stats) = encode_with(
             &mut encoder,
-            vec![metric_event("conns", MetricKind::GaugeDelta(5.0), &[])],
+            vec![metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(5.0)), &[])],
         );
         assert_eq!(stats.dropped_gauge_delta, 0);
         assert_eq!(msgs[0], "conns:+5|g");
@@ -2653,7 +2727,7 @@ mod tests {
         let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_relative_gauges(true);
         let (msgs, _) = encode_with(
             &mut encoder,
-            vec![metric_event("conns", MetricKind::GaugeDelta(5.0), &[])],
+            vec![metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(5.0)), &[])],
         );
         assert!(msgs[0].starts_with("conns:+5"));
     }
@@ -2663,21 +2737,21 @@ mod tests {
         let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_relative_gauges(true);
         let (msgs, _) = encode_with(
             &mut encoder,
-            vec![metric_event("conns", MetricKind::GaugeDelta(-5.0), &[])],
+            vec![metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(-5.0)), &[])],
         );
         assert_eq!(msgs[0], "conns:-5|g");
     }
 
     #[test]
     fn a_negative_absolute_gauge_never_renders_as_a_bare_minus() {
-        let (msgs, _) = encode(vec![metric_event("free", MetricKind::Gauge(-5.0), &[])]);
+        let (msgs, _) = encode(vec![metric_event("free", MetricKind::gauge(-5.0), &[])]);
         assert_eq!(msgs.len(), 1, "the pair is one MessageBuf entry");
         assert_eq!(msgs[0], "free:0|g\nfree:-5|g");
     }
 
     #[test]
     fn a_negative_zero_gauge_renders_as_a_plain_zero_not_a_pair() {
-        let (msgs, _) = encode(vec![metric_event("free", MetricKind::Gauge(-0.0), &[])]);
+        let (msgs, _) = encode(vec![metric_event("free", MetricKind::gauge(-0.0), &[])]);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0], "free:0|g");
     }
@@ -2735,7 +2809,7 @@ mod tests {
     }
 
     fn sum_kind(value: f64, temporality: Temporality, monotonic: bool) -> MetricKind {
-        MetricKind::Sum(logit_core::Sum { value, temporality, monotonic })
+        MetricKind::Sum(logit_core::Sum { value: MetricValue::F64(value), temporality, monotonic })
     }
 
     fn hll_of(members: &[&[u8]]) -> logit_core::HyperLogLog {
@@ -2849,6 +2923,27 @@ mod tests {
     }
 
     #[test]
+    fn integers_print_as_integer_text_and_a_bool_as_one_or_zero_counted() {
+        let (msgs, stats) = encode(vec![
+            metric_event("a", MetricKind::Gauge(MetricValue::I64(7)), &[]),
+            metric_event("b", MetricKind::Gauge(MetricValue::U64(8)), &[]),
+            metric_event("c", MetricKind::Gauge(MetricValue::Bool(true)), &[]),
+            metric_event("d", MetricKind::Gauge(MetricValue::Bool(false)), &[]),
+        ]);
+        assert_eq!(msgs, ["a:7|g", "b:8|g", "c:1|g", "d:0|g"]);
+        assert_eq!(stats.bool_values, 2);
+    }
+
+    #[test]
+    fn an_integer_above_2_pow_53_keeps_every_digit() {
+        let (msgs, _) = encode(vec![
+            metric_event("g", MetricKind::Gauge(MetricValue::U64((1 << 53) + 1)), &[]),
+            metric_event("n", MetricKind::Gauge(MetricValue::I64(-((1 << 53) + 1))), &[]),
+        ]);
+        assert_eq!(msgs, ["g:9007199254740993|g", "n:0|g\nn:-9007199254740993|g"]);
+    }
+
+    #[test]
     fn a_non_monotonic_delta_sum_expands_to_a_bare_counter() {
         let (msgs, stats) = encode(vec![
             metric_event("drift", sum_kind(-5.0, Temporality::Delta, false), &[]),
@@ -2870,8 +2965,12 @@ mod tests {
         // The pair decodes to the absolute value, not a relative adjustment.
         let events = decode_one(&msgs[2]);
         assert_eq!(events.len(), 2);
-        assert!(matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == 0.0));
-        assert!(matches!(events[1].metrics[0].kind, MetricKind::GaugeDelta(v) if v == -3.0));
+        assert!(
+            matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == MetricValue::F64(0.0))
+        );
+        assert!(
+            matches!(events[1].metrics[0].kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(-3.0))
+        );
     }
 
     #[test]
@@ -2881,8 +2980,12 @@ mod tests {
         assert_eq!(msgs[..4], ["d.count:2|c", "d.sum:-2|c", "d.min:0|g\nd.min:-4|g", "d.max:2|g"]);
         let events = decode_one(&msgs[2]);
         assert_eq!(events.len(), 2);
-        assert!(matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == 0.0));
-        assert!(matches!(events[1].metrics[0].kind, MetricKind::GaugeDelta(v) if v == -4.0));
+        assert!(
+            matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == MetricValue::F64(0.0))
+        );
+        assert!(
+            matches!(events[1].metrics[0].kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(-4.0))
+        );
     }
 
     #[test]
@@ -3631,7 +3734,7 @@ mod tests {
     fn external_data_and_cardinality_precede_the_message_on_a_service_check_line() {
         let event = service_check_event(
             "check",
-            MetricKind::Gauge(0.0),
+            MetricKind::gauge(0.0),
             &[
                 ("statsd.service_check.status", Value::U64(0)),
                 ("statsd.container_id", Value::str("cid1")),
@@ -3862,7 +3965,7 @@ mod tests {
     fn a_service_check_renders_the_canonical_line() {
         let event = service_check_event(
             "my.check",
-            MetricKind::Gauge(1.0),
+            MetricKind::gauge(1.0),
             &[
                 ("statsd.timestamp", Value::U64(1_700_000_000)),
                 ("statsd.service_check.host", Value::str("web1")),
@@ -3880,7 +3983,7 @@ mod tests {
     fn a_service_check_message_s_pipe_is_substituted() {
         let event = service_check_event(
             "chk",
-            MetricKind::Gauge(0.0),
+            MetricKind::gauge(0.0),
             &[("statsd.service_check.message", Value::str("a|b"))],
         );
         let (msgs, _) = encode(vec![event]);
@@ -3891,7 +3994,7 @@ mod tests {
     fn service_check_status_attribute_wins_over_the_gauge_value() {
         let event = service_check_event(
             "chk",
-            MetricKind::Gauge(3.0),
+            MetricKind::gauge(3.0),
             &[("statsd.service_check.status", Value::U64(1))],
         );
         let (msgs, _) = encode(vec![event]);
@@ -3900,7 +4003,7 @@ mod tests {
 
     #[test]
     fn service_check_status_falls_back_to_the_rounded_gauge_value() {
-        let event = service_check_event("chk", MetricKind::Gauge(1.6), &[]);
+        let event = service_check_event("chk", MetricKind::gauge(1.6), &[]);
         let (msgs, _) = encode(vec![event]);
         assert_eq!(msgs, vec!["_sc|chk|2"]);
     }
@@ -3909,7 +4012,7 @@ mod tests {
     fn an_out_of_range_service_check_status_is_dropped_and_counted() {
         let event = service_check_event(
             "chk",
-            MetricKind::Gauge(9.0),
+            MetricKind::gauge(9.0),
             &[("statsd.service_check.status", Value::U64(5))],
         );
         let (msgs, stats) = encode(vec![event]);
@@ -3920,7 +4023,7 @@ mod tests {
     /// An empty name drops the check rather than rendering `_sc||0`.
     #[test]
     fn a_service_check_with_an_empty_name_is_dropped_and_counted() {
-        let event = service_check_event("", MetricKind::Gauge(0.0), &[]);
+        let event = service_check_event("", MetricKind::gauge(0.0), &[]);
         let (msgs, stats) = encode(vec![event]);
         assert!(msgs.is_empty());
         assert_eq!(stats.dropped_empty_name, 1);
@@ -3945,7 +4048,7 @@ mod tests {
         let mut attributes = AttrMap::new();
         attributes.insert("statsd.service_check.name", Value::str("chk"));
         let mut event =
-            Event::metric(0, attributes, MetricRecord::new(intern("chk"), MetricKind::Gauge(0.0)));
+            Event::metric(0, attributes, MetricRecord::new(intern("chk"), MetricKind::gauge(0.0)));
         event.metrics.push(MetricRecord::new(intern("extra"), MetricKind::counter(1.0)));
         let (msgs, _) = encode(vec![event]);
         assert_eq!(msgs, vec!["_sc|chk|0", "extra:1|c"]);
@@ -3955,7 +4058,7 @@ mod tests {
     fn service_check_carriers_never_appear_as_tags() {
         let event = service_check_event(
             "chk",
-            MetricKind::Gauge(0.0),
+            MetricKind::gauge(0.0),
             &[("statsd.service_check.message", Value::str("m")), ("env", "prod".into())],
         );
         let (msgs, _) = encode(vec![event]);
@@ -3965,7 +4068,7 @@ mod tests {
     #[test]
     fn events_and_service_checks_are_dropped_under_plain_statsd() {
         let ev = event_line_event("t", "x", &[]);
-        let sc = service_check_event("chk", MetricKind::Gauge(0.0), &[]);
+        let sc = service_check_event("chk", MetricKind::gauge(0.0), &[]);
         let (msgs, stats) = encode_with_format(vec![ev, sc], Format::Statsd);
         assert!(msgs.is_empty());
         assert_eq!(stats.dropped_dialect_events, 2);
@@ -4479,7 +4582,7 @@ mod tests {
         let mut encoder = StatsdEncoder::new(Format::DogStatsd);
         let mut out = MessageBuf::default();
         let stats = encoder.encode_into(
-            &batch_with(vec![metric_event("free", MetricKind::Gauge(-5.0), &[])]),
+            &batch_with(vec![metric_event("free", MetricKind::gauge(-5.0), &[])]),
             &mut out,
         );
         assert_eq!(out.len(), 1);
@@ -4878,7 +4981,7 @@ mod tests {
                 MetricKind::Sum(sum)
                     if logit_core::interner::resolve(m.name) == "logit.output.reconnects" =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -5004,7 +5107,11 @@ mod tests {
         let telemetry = registry.telemetry_for("out", "statsd_out", "sink");
         let diag = Diagnostics::new("out").with_telemetry(telemetry);
         let mut output = StatsdOutput::udp("127.0.0.1:1").unwrap().with_diagnostics(diag);
-        let batch = batch_with(vec![metric_event("conns", MetricKind::GaugeDelta(5.0), &[])]);
+        let batch = batch_with(vec![metric_event(
+            "conns",
+            MetricKind::GaugeDelta(MetricValue::F64(5.0)),
+            &[],
+        )]);
         output.send(&batch).await.expect("nothing encodable means no I/O");
 
         let found = registry.drain(0).into_iter().any(|e| {
@@ -5023,14 +5130,14 @@ mod tests {
                 .flat_map(|e| e.metrics)
                 .filter(|m| logit_core::interner::resolve(m.name) == "logit.output.messages")
                 .map(|m| match m.kind {
-                    MetricKind::Sum(s) => s.value,
+                    MetricKind::Sum(s) => s.value.as_f64(),
                     _ => panic!("logit.output.messages must be a counter"),
                 })
                 .sum()
         }
         let batch = || {
             batch_with(vec![
-                metric_event("free", MetricKind::Gauge(-5.0), &[]),
+                metric_event("free", MetricKind::gauge(-5.0), &[]),
                 metric_event("hits", MetricKind::counter(1.0), &[]),
             ])
         };
@@ -5064,7 +5171,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
         let batch = || {
             batch_with(vec![
-                metric_event("free", MetricKind::Gauge(-5.0), &[]),
+                metric_event("free", MetricKind::gauge(-5.0), &[]),
                 metric_event("hits", MetricKind::counter(1.0), &[]),
             ])
         };
@@ -5142,7 +5249,9 @@ mod tests {
             encode(vec![metric_event("hits", MetricKind::counter(3.0), &[("env", "prod".into())])]);
         let events = decode_one(&msgs[0]);
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].metrics[0].kind, MetricKind::Sum(s) if s.value == 3.0));
+        assert!(
+            matches!(events[0].metrics[0].kind, MetricKind::Sum(s) if s.value == MetricValue::F64(3.0))
+        );
         assert_eq!(events[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
     }
 
@@ -5203,29 +5312,37 @@ mod tests {
         let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_relative_gauges(true);
         let (msgs, _) = encode_with(
             &mut encoder,
-            vec![metric_event("conns", MetricKind::GaugeDelta(-5.0), &[])],
+            vec![metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(-5.0)), &[])],
         );
         let events = decode_one(&msgs[0]);
-        assert!(matches!(events[0].metrics[0].kind, MetricKind::GaugeDelta(v) if v == -5.0));
+        assert!(
+            matches!(events[0].metrics[0].kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(-5.0))
+        );
     }
 
     #[test]
     fn a_negative_absolute_gauge_round_trips_to_the_same_effective_value_not_a_delta() {
-        let (msgs, _) = encode(vec![metric_event("free", MetricKind::Gauge(-5.0), &[])]);
+        let (msgs, _) = encode(vec![metric_event("free", MetricKind::gauge(-5.0), &[])]);
         // Reset to 0, then -5: the encoded value.
         let events = decode_one(&msgs[0]);
         assert_eq!(events.len(), 2);
-        assert!(matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == 0.0));
-        assert!(matches!(events[1].metrics[0].kind, MetricKind::GaugeDelta(v) if v == -5.0));
+        assert!(
+            matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == MetricValue::F64(0.0))
+        );
+        assert!(
+            matches!(events[1].metrics[0].kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(-5.0))
+        );
     }
 
     #[test]
     fn a_negative_zero_gauge_does_not_decode_as_a_gauge_delta() {
-        let (msgs, _) = encode(vec![metric_event("free", MetricKind::Gauge(-0.0), &[])]);
+        let (msgs, _) = encode(vec![metric_event("free", MetricKind::gauge(-0.0), &[])]);
         assert!(!msgs[0].contains('-'), "no minus may reach the wire: {}", msgs[0]);
         let events = decode_one(&msgs[0]);
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == 0.0));
+        assert!(
+            matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == MetricValue::F64(0.0))
+        );
     }
 
     #[test]
@@ -5246,7 +5363,9 @@ mod tests {
         let (msgs, _) = encode(original.clone());
         let relayed = decode_one(&msgs[0]);
         assert_eq!(logit_core::interner::resolve(relayed[0].metrics[0].name), name);
-        assert!(matches!(relayed[0].metrics[0].kind, MetricKind::Sum(s) if s.value == 3.0));
+        assert!(
+            matches!(relayed[0].metrics[0].kind, MetricKind::Sum(s) if s.value == MetricValue::F64(3.0))
+        );
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
         assert_eq!(relayed[0].attributes.get("host").and_then(|v| v.as_str()), Some("web1"));
     }
@@ -5338,7 +5457,9 @@ mod tests {
         let (msgs, _) = encode(original);
         assert_eq!(msgs, vec![original_line]);
         let relayed = decode_one(&msgs[0]);
-        assert!(matches!(relayed[0].metrics[0].kind, MetricKind::Gauge(v) if v == 2.0));
+        assert!(
+            matches!(relayed[0].metrics[0].kind, MetricKind::Gauge(v) if v == MetricValue::F64(2.0))
+        );
         assert_eq!(
             relayed[0].attributes.get("statsd.service_check.name").and_then(|v| v.as_str()),
             Some("my.check")
@@ -5829,7 +5950,7 @@ mod tests {
     fn encode_side_batch() -> EventBatch {
         batch_with(vec![
             metric_event("hits", MetricKind::counter(1.0), &[("bad", Value::Null)]),
-            metric_event("conns", MetricKind::GaugeDelta(5.0), &[]),
+            metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(5.0)), &[]),
             metric_event("lat", MetricKind::Distribution(logit_core::DdSketch::new()), &[]),
         ])
     }

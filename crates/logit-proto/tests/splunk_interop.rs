@@ -378,7 +378,7 @@ fn otel_exporter_metrics_decode_in_both_forms() {
             .flat_map(|b| &b.events)
             .flat_map(|e| &e.metrics)
             .map(|m| match &m.kind {
-                MetricKind::Gauge(v) => (resolve(m.name).to_string(), *v),
+                MetricKind::Gauge(v) => (resolve(m.name).to_string(), v.as_f64()),
                 other => panic!("expected a Gauge, got {other:?}"),
             })
             .collect();

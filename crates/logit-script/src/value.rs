@@ -73,7 +73,7 @@ fn u64_is_exact_lua_number(u: u64) -> bool {
     u <= MAX_EXACT_F64_INT as u64
 }
 
-fn exact_i64_to_lua(lua: &Lua, i: i64) -> mlua::Result<LuaValue<'_>> {
+pub(crate) fn exact_i64_to_lua(lua: &Lua, i: i64) -> mlua::Result<LuaValue<'_>> {
     if i64_is_exact_lua_number(i) {
         Ok(LuaValue::Integer(i))
     } else {

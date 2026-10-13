@@ -1424,7 +1424,9 @@ Series retention across the window boundary comes from
 `docs/adr/aggregation-window-semantics.md`'s gauge-retention amendment and its cumulative
 amendment, which reuses the same two bounds and counters for a `temporality: cumulative`
 `Sum`/`Histogram`. Absorbing raw kinds comes from the same ADR's "raw samples and set members"
-amendment.
+amendment. A fold that changes a value's type counts
+`logit.transform.metrics.normalized{reason="widened"}`; see
+[Typed metric values](#typed-metric-values).
 
 `Diagnostics` keys: `series_retention_full` and `gauge_delta_unseeded` (mirroring the eviction and
 unseeded counters); `samples_rate_mismatch`, `samples_cap_exceeded`, `set_members_cap_exceeded`,
@@ -1691,6 +1693,20 @@ A script's `print(...)` is a self-log line, never stdout: `print: <arguments, ta
 `info`, target `logit`, with the component's `component` field (`<unset>` for top-level code that
 runs before the id is known; `crates/logit-script/src/print.rs`). At `info` it sits below the
 lowest `logs:` threshold `internal` accepts, so it reaches the process log but never the pipeline.
+
+#### Typed metric values
+
+A `Gauge`, `GaugeDelta`, or `Sum` value is an `F64`, `I64`, `U64`, or `Bool`
+([ADR `typed-metric-scalar`](../adr/typed-metric-scalar.md)). One counter family on each side of
+the pipeline counts each place a value changes type or loses precision, one per record:
+
+| Name | Where | Meaning |
+|---|---|---|
+| `logit.transform.metrics.normalized{reason="widened"}` | `aggregate` | a fold whose result type differs from an operand's: a mixed-type pair, an integer overflow, or a `Bool` in the sum, with the result usually `F64` (`MetricValue::checked_add`'s table) |
+| `logit.transform.metrics.normalized{reason="inexact_read"}` | `lua`, `lua_file` | a script read an `I64` or `U64` value above 2^53 as a Lua number that isn't the same integer |
+| `logit.output.metrics.normalized{reason="bool_value"}` | every sink whose metric wire is numeric-only | a `Bool` written as `1` or `0`, because the wire has no boolean |
+| `logit.output.metrics.normalized{reason="u64_as_double"}` | `otlp_out`, `kafka_out` under `format: otlp_proto \| otlp_json` | a `U64` above `i64::MAX` written as `as_double`, because OTLP's `as_int` is signed |
+| `logit.output.metrics.normalized{reason="inexact"}` | `collectd_out` | an `I64` or `U64` gauge written as a collectd `GAUGE` double that isn't the same integer |
 
 #### Outputs
 

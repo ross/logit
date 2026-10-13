@@ -760,6 +760,23 @@ is the string `"9007199254740993"`; `tonumber()` it for arithmetic at the precis
 has. The same encoding applies in `to_table()`, and `Event.new` accepts either form, so a count at
 any magnitude round-trips.
 
+**A `value` is always a number, whatever its type.** A `sum`'s, `gauge`'s, or `gauge_delta`'s value
+is a `logit_core::MetricValue`: `f64`, `i64`, `u64`, or `bool` ([ADR
+`typed-metric-scalar`](../adr/typed-metric-scalar.md)). `m.value` reads it as a Lua number, `bool`
+as `0` or `1`, so arithmetic and comparison work the same for every type. Unlike a count, it never
+reads as a string. An integer above 2^53 that a Lua number can't hold reads rounded, and each such
+read is counted `logit.transform.metrics.normalized{reason="inexact_read"}`.
+
+**Writing back the number `m.value` read keeps the type.** A `value` write equal to the current
+value read as a number is a no-op, so `m.value = m.value` leaves an `i64`, a `bool`, or a `u64`
+above 2^53 as it was, the last one exact despite the rounded read. Any other finite number stores
+an `f64`: `m.value = m.value + 1` on an `i64` gauge of `4` stores `f64` `5`.
+
+**`to_table()` names a non-`f64` type.** A metric's table gains `type = "i64"`, `"u64"`, or
+`"bool"` beside its `value`, and no `type` key for an `f64`. There `value` follows the count
+encoding for an `i64` or `u64` (an integer within ±2^53, a decimal string past it), and `bool` is
+`0` or `1`, so `Event.new(e:to_table())` rebuilds every type unchanged.
+
 **A write the metric's kind doesn't allow names the kind.** Writing an always-read-only field
 (`flags`, `kind`, `exemplars`, `values`, `sum`, `count`, ...), or a kind-specific one (`value`,
 `temporality`, `monotonic`) on a kind that doesn't support it, raises
@@ -920,10 +937,12 @@ Per kind (only that kind's keys are accepted):
 
 | `kind` | Key | Type / encoding | Required? |
 |---|---|---|---|
-| `sum` | `value` | finite number (NaN and the infinities are the same error a `value` write raises) | **required** |
+| `sum` | `value` | finite number (NaN and the infinities are the same error a `value` write raises), or what `type` requires | **required** |
+| | `type` | `"f64"`, `"i64"`, `"u64"`, or `"bool"` (see below the table) | optional, default `"f64"` |
 | | `temporality` | `"delta"` or `"cumulative"` | optional, default `"delta"` |
 | | `monotonic` | boolean | optional, default `true` |
-| `gauge` | `value` | finite number | **required** |
+| `gauge` | `value` | finite number, or what `type` requires | **required** |
+| | `type` | as for `sum` | optional, default `"f64"` |
 | `samples` | `values` | array of finite numbers | optional, default empty |
 | | `sample_rate` | finite number | optional, default `1.0` (`Samples::new`'s) |
 | `set_members` | `members` | array of strings (each stored as opaque bytes, UTF-8 or not) | optional, default empty |
@@ -939,6 +958,18 @@ Per kind (only that kind's keys are accepted):
 | `summary` | `quantiles` | array of `{quantile = <number in [0, 1]>, value = <finite number>}` rows; may be empty and need not be sorted | **required** |
 | | `count` | non-negative integer, or a string of decimal digits | **required** |
 | | `sum` | finite number | **required** |
+
+A `sum`'s or `gauge`'s `type` decides what its `value` must be:
+
+- `"f64"`, or no `type`: a finite number.
+- `"i64"`: an integer within ±2^53, or a decimal string, optionally signed, that fits an `i64`.
+- `"u64"`: a non-negative integer up to 2^53, or a decimal string that fits a `u64`.
+- `"bool"`: a boolean, or `0` or `1`.
+
+A number past 2^53 is refused for `"i64"` and `"u64"`, because a Lua number that large can't say
+which integer it was; the decimal string `to_table()` writes there can
+(`Event.new: metrics[1].value must be a non-negative integer up to 2^53 or a decimal string that
+fits a u64, got 9007199254740994`).
 
 A `sum` given only its `value` is `MetricKind::counter` (delta, monotonic), so `{name = "hits",
 kind = "sum", value = 1}` is exactly the counter `statsd_in`'s `c` or a `kv_metrics` `counters:`

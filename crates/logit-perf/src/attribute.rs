@@ -302,8 +302,9 @@ fn fold_metric(node: &mut NodeStats, name: &str, kind: &MetricKind, reason: &str
         SEND_DURATION => add_distribution(&mut node.send, kind),
         BUFFER_UTILIZATION => {
             if let MetricKind::Gauge(v) = kind {
+                let v = v.as_f64();
                 node.buffer_utilization =
-                    Some(node.buffer_utilization.map_or(*v, |seen| seen.max(*v)));
+                    Some(node.buffer_utilization.map_or(v, |seen| seen.max(v)));
             }
         }
         EVENTS_DROPPED => {
@@ -320,7 +321,7 @@ fn fold_metric(node: &mut NodeStats, name: &str, kind: &MetricKind, reason: &str
 /// coerced, since reading a gauge as a count would inflate a total.
 fn sum_value(kind: &MetricKind) -> f64 {
     match kind {
-        MetricKind::Sum(sum) => sum.value,
+        MetricKind::Sum(sum) => sum.value.as_f64(),
         _ => 0.0,
     }
 }
@@ -643,9 +644,9 @@ mod tests {
             point("json", "json", "transform", SEND_BLOCKED_DURATION, timing(&[0.1])),
             point("out", "null_out", "sink", EVENTS_RECEIVED, MetricKind::counter(1_000.0)),
             point("out", "null_out", "sink", SEND_DURATION, timing(&[0.01, 0.02])),
-            point("out", "null_out", "sink", BUFFER_UTILIZATION, MetricKind::Gauge(0.25)),
-            point("out", "null_out", "sink", BUFFER_UTILIZATION, MetricKind::Gauge(0.75)),
-            point("out", "null_out", "sink", BUFFER_UTILIZATION, MetricKind::Gauge(0.10)),
+            point("out", "null_out", "sink", BUFFER_UTILIZATION, MetricKind::gauge(0.25)),
+            point("out", "null_out", "sink", BUFFER_UTILIZATION, MetricKind::gauge(0.75)),
+            point("out", "null_out", "sink", BUFFER_UTILIZATION, MetricKind::gauge(0.10)),
         ];
         let nodes = aggregate(&events);
 
@@ -680,7 +681,7 @@ mod tests {
             "internal",
             "listener",
             "logit.process.uptime",
-            MetricKind::Gauge(5.0),
+            MetricKind::gauge(5.0),
         )];
         let nodes = aggregate(&events);
         assert_eq!(
@@ -733,14 +734,14 @@ mod tests {
         // `internal` only ever drains a count as a delta/monotonic `Sum`; a gauge or a cumulative
         // sum arriving under a counter's name is ignored rather than folded in.
         let events = vec![
-            point("out", "null_out", "sink", EVENTS_RECEIVED, MetricKind::Gauge(99.0)),
+            point("out", "null_out", "sink", EVENTS_RECEIVED, MetricKind::gauge(99.0)),
             point(
                 "out",
                 "null_out",
                 "sink",
                 EVENTS_RECEIVED,
                 MetricKind::Sum(Sum {
-                    value: 7.0,
+                    value: 7.0.into(),
                     temporality: Temporality::Cumulative,
                     monotonic: true,
                 }),

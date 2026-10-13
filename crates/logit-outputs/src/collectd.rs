@@ -244,7 +244,7 @@ mod tests {
         );
         event.metrics.push(MetricRecord::new(
             intern(&format!("{plugin}.{plugin}")),
-            MetricKind::Gauge(value),
+            MetricKind::gauge(value),
         ));
         event
     }
@@ -258,7 +258,7 @@ mod tests {
             MetricRecord::new(
                 intern(name),
                 MetricKind::Sum(Sum {
-                    value,
+                    value: logit_core::MetricValue::F64(value),
                     temporality: Temporality::Cumulative,
                     monotonic: true,
                 }),
@@ -299,7 +299,7 @@ mod tests {
             .flat_map(|e| &e.metrics)
             .filter(|m| logit_core::interner::resolve(m.name) == metric)
             .map(|m| match &m.kind {
-                MetricKind::Sum(s) => s.value,
+                MetricKind::Sum(s) => s.value.as_f64(),
                 other => panic!("{metric} must be a counter, got {other:?}"),
             })
             .sum()

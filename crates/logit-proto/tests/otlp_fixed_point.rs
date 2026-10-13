@@ -16,9 +16,10 @@ use bytes::Bytes;
 use logit_core::interner::intern;
 use logit_core::{
     AttrMap, BodyFormat, Event, EventBatch, Exemplar, ExpHistogram, Histogram, LogRecord,
-    MetricKind, MetricRecord, Resource, Scope, Severity, SpanEvent, SpanExt, SpanKind, SpanLink,
-    SpanRecord, SpanStatus, Sum, Summary, Temporality, TraceRef, Value,
+    MetricKind, MetricRecord, MetricValue, Resource, Scope, Severity, SpanEvent, SpanExt, SpanKind,
+    SpanLink, SpanRecord, SpanStatus, Sum, Summary, Temporality, TraceRef, Value,
 };
+use logit_proto::otlp::generated::opentelemetry::proto::metrics::v1 as otlp_metrics;
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::{Signal, SignalDecoder, SignalEncoder};
 use std::sync::Arc;
@@ -101,10 +102,14 @@ fn metric_batch() -> EventBatch {
 
     let sum = metric_record(
         "fixture_sum",
-        MetricKind::Sum(Sum { value: 12.5, temporality: Temporality::Cumulative, monotonic: true }),
+        MetricKind::Sum(Sum {
+            value: MetricValue::F64(12.5),
+            temporality: Temporality::Cumulative,
+            monotonic: true,
+        }),
         vec![exemplar()],
     );
-    let gauge = metric_record("fixture_gauge", MetricKind::Gauge(-4.5), vec![exemplar()]);
+    let gauge = metric_record("fixture_gauge", MetricKind::gauge(-4.5), vec![exemplar()]);
     let histogram = metric_record(
         "fixture_histogram",
         MetricKind::Histogram(Histogram {
@@ -163,7 +168,7 @@ fn metric_batch() -> EventBatch {
 fn metric_batch_with_new_defaults() -> EventBatch {
     let mut attrs = AttrMap::new();
     attrs.insert("host", "web-1");
-    let record = MetricRecord::new(intern("fixture_default_gauge"), MetricKind::Gauge(1.5));
+    let record = MetricRecord::new(intern("fixture_default_gauge"), MetricKind::gauge(1.5));
     let event = Event::metric(1_700_000_000_000_000_000, attrs, record);
     EventBatch {
         resource: fully_populated_resource(),
@@ -248,6 +253,104 @@ fn assert_fixed_point(signal: Signal, batch: EventBatch) {
         .expect("expected signal payload missing")
         .bytes;
     assert_eq!(re_bytes, bytes, "encode(decode(encode(b))) must equal encode(b) on bytes");
+}
+
+/// `2^53 + 1`, the first integer an `f64` can't hold.
+const ABOVE_F64: i64 = (1 << 53) + 1;
+
+/// An OTLP `asInt` point decodes as `I64` and leaves as `asInt`, with its value intact above 2^53,
+/// for a `Sum` and a `Gauge`.
+#[test]
+fn an_as_int_point_relays_as_as_int() {
+    use otlp_metrics::metric::Data;
+    use otlp_metrics::number_data_point::Value as PbValue;
+    let point = |v: i64| otlp_metrics::NumberDataPoint {
+        time_unix_nano: 1_700_000_000_000_000_000,
+        value: Some(PbValue::AsInt(v)),
+        ..Default::default()
+    };
+    let metrics = vec![
+        otlp_metrics::Metric {
+            name: "int_sum".into(),
+            data: Some(Data::Sum(otlp_metrics::Sum {
+                data_points: vec![point(ABOVE_F64)],
+                aggregation_temporality: 2,
+                is_monotonic: true,
+            })),
+            ..Default::default()
+        },
+        otlp_metrics::Metric {
+            name: "int_gauge".into(),
+            data: Some(Data::Gauge(otlp_metrics::Gauge { data_points: vec![point(-7)] })),
+            ..Default::default()
+        },
+    ];
+    let data = otlp_metrics::MetricsData {
+        resource_metrics: vec![otlp_metrics::ResourceMetrics {
+            scope_metrics: vec![otlp_metrics::ScopeMetrics { metrics, ..Default::default() }],
+            ..Default::default()
+        }],
+    };
+    let wire = Bytes::from(prost::Message::encode_to_vec(&data));
+
+    let decoded = OtlpDecoder::new().decode_signal(Signal::Metrics, wire).expect("decodes");
+    let kinds: Vec<MetricKind> =
+        decoded[0].events.iter().flat_map(|e| e.metrics.iter().map(|m| m.kind.clone())).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            MetricKind::Sum(Sum {
+                value: MetricValue::I64(ABOVE_F64),
+                temporality: Temporality::Cumulative,
+                monotonic: true,
+            }),
+            MetricKind::Gauge(MetricValue::I64(-7)),
+        ]
+    );
+
+    let payload = OtlpEncoder::new()
+        .encode_signals(&decoded[0])
+        .expect("encodes")
+        .into_iter()
+        .find(|p| p.signal == Signal::Metrics)
+        .expect("a metrics payload");
+    let reread: otlp_metrics::MetricsData =
+        prost::Message::decode(payload.bytes).expect("an OTLP metrics body");
+    let values: Vec<Option<PbValue>> = reread.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .map(|m| match &m.data {
+            Some(Data::Sum(sum)) => sum.data_points[0].value,
+            Some(Data::Gauge(gauge)) => gauge.data_points[0].value,
+            other => panic!("unexpected data {other:?}"),
+        })
+        .collect();
+    assert_eq!(values, vec![Some(PbValue::AsInt(ABOVE_F64)), Some(PbValue::AsInt(-7))]);
+}
+
+/// A batch of `I64` scalars is a fixed point; an `F64` decode would fail strict equality.
+#[test]
+fn an_integer_metric_batch_is_a_fixed_point() {
+    let mut attrs = AttrMap::new();
+    attrs.insert("host", "web-1");
+    let sum = MetricRecord::new(
+        intern("fixture_int_sum"),
+        MetricKind::Sum(Sum {
+            value: MetricValue::I64(ABOVE_F64),
+            temporality: Temporality::Delta,
+            monotonic: true,
+        }),
+    );
+    let gauge = MetricRecord::new(intern("fixture_int_gauge"), MetricKind::Gauge(i64::MIN.into()));
+    let ts = 1_700_000_000_000_000_000;
+    assert_fixed_point(
+        Signal::Metrics,
+        EventBatch {
+            resource: fully_populated_resource(),
+            scope: Some(fully_populated_scope()),
+            events: vec![Event::metric(ts, attrs.clone(), sum), Event::metric(ts, attrs, gauge)],
+        },
+    );
 }
 
 #[test]

@@ -42,6 +42,12 @@
 //! | `exponential_histogram` | `scale`, `temporality`, `count`, `zero_count`, `zero_threshold`, `positive`, `negative` (each `{"offset": o, "counts": [..]}`, omitted when its counts are empty), then `sum`, `min`, `max` when present |
 //! | `summary` | `count`, `sum`, `quantiles` (`[{"quantile": q, "value": v}]` in wire order) |
 //!
+//! A `sum`'s `value`, a `gauge`'s `value`, and a `gauge_delta`'s `delta` are a `MetricValue`
+//! (`docs/adr/typed-metric-scalar.md`), written in its own JSON type: a number for `F64` (the
+//! non-finite rule below applies), an integer for `I64` and `U64` (a `U64` above 2^53 keeps every
+//! digit), and a boolean for `Bool`. A whole-number `F64` and an `I64` of the same value both
+//! write the same digits.
+//!
 //! Values: `Null`, `Bool`, `I64`, `U64` are JSON's own; `F64` is a JSON number, except that a
 //! non-finite one, which JSON has no form for, is the string `"NaN"`, `"inf"`, or `"-inf"` (the
 //! rule for every `f64` in the object, bucket bounds included); `Str` is a JSON string; `Timestamp`
@@ -69,7 +75,7 @@ use logit_core::time::write_rfc3339_utc;
 use logit_core::trace::push_hex;
 use logit_core::{
     AttrMap, Event, EventBatch, Exemplar, ExpHistogram, LogRecord, MetricKind, MetricRecord,
-    Resource, Scope, SpanEvent, SpanLink, SpanRecord, Temporality, TraceRef, Value,
+    MetricValue, Resource, Scope, SpanEvent, SpanLink, SpanRecord, Temporality, TraceRef, Value,
 };
 use std::fmt::Write;
 
@@ -419,6 +425,23 @@ fn push_f64<W: TreeWriter>(w: &mut W, obj: &mut W::Map, key: &'static str, v: f6
     w.f64(v);
 }
 
+/// `key: v` for a metric value, in its own JSON type: a number for `F64`, an integer for `I64` and
+/// `U64`, a boolean for `Bool`.
+fn push_metric_value<W: TreeWriter>(
+    w: &mut W,
+    obj: &mut W::Map,
+    key: &'static str,
+    v: MetricValue,
+) {
+    w.key(obj, key);
+    match v {
+        MetricValue::F64(f) => w.f64(f),
+        MetricValue::I64(n) => w.i64(n),
+        MetricValue::U64(n) => w.u64(n),
+        MetricValue::Bool(b) => w.bool(b),
+    }
+}
+
 /// `key: n` for an unsigned integer field.
 fn push_u64<W: TreeWriter>(w: &mut W, obj: &mut W::Map, key: &'static str, n: u64) {
     w.key(obj, key);
@@ -428,13 +451,13 @@ fn push_u64<W: TreeWriter>(w: &mut W, obj: &mut W::Map, key: &'static str, n: u6
 fn walk_kind_fields<W: TreeWriter>(w: &mut W, obj: &mut W::Map, kind: &MetricKind) {
     match kind {
         MetricKind::Sum(s) => {
-            push_f64(w, obj, "value", s.value);
+            push_metric_value(w, obj, "value", s.value);
             push_temporality(w, obj, s.temporality);
             w.key(obj, "monotonic");
             w.bool(s.monotonic);
         }
-        MetricKind::Gauge(v) => push_f64(w, obj, "value", *v),
-        MetricKind::GaugeDelta(v) => push_f64(w, obj, "delta", *v),
+        MetricKind::Gauge(v) => push_metric_value(w, obj, "value", *v),
+        MetricKind::GaugeDelta(v) => push_metric_value(w, obj, "delta", *v),
         MetricKind::Samples(s) => {
             w.key(obj, "values");
             walk_array(w, s.values.iter(), |w, v| w.f64(*v));
@@ -845,7 +868,7 @@ mod tests {
     fn a_sum() {
         assert_eq!(
             metric(MetricKind::Sum(Sum {
-                value: 1.0,
+                value: logit_core::MetricValue::F64(1.0),
                 temporality: Temporality::Cumulative,
                 monotonic: false
             })),
@@ -857,19 +880,40 @@ mod tests {
     #[test]
     fn a_gauge() {
         assert_eq!(
-            metric(MetricKind::Gauge(0.25)),
+            metric(MetricKind::gauge(0.25)),
             "{\"name\":\"m\",\"kind\":\"gauge\",\"value\":0.25}"
+        );
+    }
+
+    #[test]
+    fn a_typed_metric_value_is_a_json_integer_or_boolean() {
+        assert_eq!(
+            metric(MetricKind::Gauge(MetricValue::I64(-5))),
+            "{\"name\":\"m\",\"kind\":\"gauge\",\"value\":-5}"
+        );
+        // 2^53 + 1 has no `f64`; every digit survives.
+        assert_eq!(
+            metric(MetricKind::Gauge(MetricValue::U64((1 << 53) + 1))),
+            "{\"name\":\"m\",\"kind\":\"gauge\",\"value\":9007199254740993}"
+        );
+        assert_eq!(
+            metric(MetricKind::Gauge(MetricValue::Bool(true))),
+            "{\"name\":\"m\",\"kind\":\"gauge\",\"value\":true}"
+        );
+        assert_eq!(
+            metric(MetricKind::GaugeDelta(MetricValue::I64(-2))),
+            "{\"name\":\"m\",\"kind\":\"gauge_delta\",\"delta\":-2}"
         );
     }
 
     #[test]
     fn a_gauge_delta_keeps_its_sign_including_negative_zero() {
         assert_eq!(
-            metric(MetricKind::GaugeDelta(-3.5)),
+            metric(MetricKind::GaugeDelta(logit_core::MetricValue::F64(-3.5))),
             "{\"name\":\"m\",\"kind\":\"gauge_delta\",\"delta\":-3.5}"
         );
         assert_eq!(
-            metric(MetricKind::GaugeDelta(-0.0)),
+            metric(MetricKind::GaugeDelta(logit_core::MetricValue::F64(-0.0))),
             "{\"name\":\"m\",\"kind\":\"gauge_delta\",\"delta\":-0}"
         );
     }
@@ -998,7 +1042,7 @@ mod tests {
 
     #[test]
     fn metric_unit_description_start_and_flags() {
-        let mut record = MetricRecord::new(intern("m"), MetricKind::Gauge(1.0));
+        let mut record = MetricRecord::new(intern("m"), MetricKind::gauge(1.0));
         record.unit = Some(intern("ms"));
         record.description = Some(intern("Latency"));
         record.start_timestamp = 1;
@@ -1017,7 +1061,11 @@ mod tests {
     fn no_recorded_value_suppresses_the_kinds_fields_and_writes_raw_flags() {
         let mut record = MetricRecord::new(
             intern("m"),
-            MetricKind::Sum(Sum { value: 0.0, temporality: Temporality::Delta, monotonic: true }),
+            MetricKind::Sum(Sum {
+                value: logit_core::MetricValue::F64(0.0),
+                temporality: Temporality::Delta,
+                monotonic: true,
+            }),
         );
         record.flags = 3;
         record.unit = Some(intern("1"));
@@ -1033,7 +1081,7 @@ mod tests {
 
     #[test]
     fn exemplars() {
-        let mut record = MetricRecord::new(intern("m"), MetricKind::Gauge(1.0));
+        let mut record = MetricRecord::new(intern("m"), MetricKind::gauge(1.0));
         record.exemplars = vec![
             Exemplar {
                 timestamp: 5,
@@ -1291,7 +1339,7 @@ mod tests {
         assert_eq!(value(Value::F64(f64::INFINITY)), "\"inf\"");
         assert_eq!(value(Value::F64(f64::NEG_INFINITY)), "\"-inf\"");
         assert_eq!(
-            metric(MetricKind::Gauge(f64::NEG_INFINITY)),
+            metric(MetricKind::gauge(f64::NEG_INFINITY)),
             "{\"name\":\"m\",\"kind\":\"gauge\",\"value\":\"-inf\"}"
         );
     }

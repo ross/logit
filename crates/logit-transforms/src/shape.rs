@@ -430,7 +430,7 @@ fn push_counter(metrics: &mut MetricList, name: Symbol, value: f64) {
 }
 
 fn push_gauge(metrics: &mut MetricList, name: Symbol, value: f64) {
-    metrics.push(MetricRecord::new(name, MetricKind::Gauge(value)));
+    metrics.push(MetricRecord::new(name, MetricKind::gauge(value)));
 }
 
 impl Transform for Shape {
@@ -782,14 +782,14 @@ mod tests {
 
     fn counter(event: &Event, name: &str) -> Option<f64> {
         event.metrics.iter().find_map(|m| match &m.kind {
-            MetricKind::Sum(sum) if resolve(m.name) == name => Some(sum.value),
+            MetricKind::Sum(sum) if resolve(m.name) == name => Some(sum.value.as_f64()),
             _ => None,
         })
     }
 
     fn gauge(event: &Event, name: &str) -> Option<f64> {
         event.metrics.iter().find_map(|m| match &m.kind {
-            MetricKind::Gauge(v) if resolve(m.name) == name => Some(*v),
+            MetricKind::Gauge(v) if resolve(m.name) == name => Some(v.as_f64()),
             _ => None,
         })
     }
@@ -1247,7 +1247,7 @@ mod tests {
     fn telemetry_counter(points: &[Event], name: &str) -> Option<f64> {
         points.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Sum(sum) if resolve(m.name) == name => Some(sum.value),
+                MetricKind::Sum(sum) if resolve(m.name) == name => Some(sum.value.as_f64()),
                 _ => None,
             })
         })

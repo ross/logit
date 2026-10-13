@@ -336,12 +336,12 @@ mod tests {
         let mut attrs = AttrMap::new();
         attrs.insert(tag.0, Value::from(tag.1));
         let mut event = Event::empty(TS, attrs);
-        event.metrics.push(MetricRecord::new(intern(name), MetricKind::Gauge(value)));
+        event.metrics.push(MetricRecord::new(intern(name), MetricKind::gauge(value)));
         event
     }
 
     fn gauge_event(name: &str, value: f64) -> Event {
-        Event::metric(TS, AttrMap::new(), MetricRecord::new(intern(name), MetricKind::Gauge(value)))
+        Event::metric(TS, AttrMap::new(), MetricRecord::new(intern(name), MetricKind::gauge(value)))
     }
 
     fn log_event() -> Event {
@@ -375,8 +375,8 @@ mod tests {
             .flat_map(|e| &e.metrics)
             .filter(|m| logit_core::interner::resolve(m.name) == metric)
             .map(|m| match &m.kind {
-                MetricKind::Sum(s) => s.value,
-                MetricKind::Gauge(v) => *v,
+                MetricKind::Sum(s) => s.value.as_f64(),
+                MetricKind::Gauge(v) => v.as_f64(),
                 other => panic!("{metric} must be a counter or gauge, got {other:?}"),
             })
             .sum()
@@ -913,7 +913,10 @@ mod tests {
 
     /// A gauge that encodes, and a gauge delta the codec skips with its diagnostic.
     fn encode_side_batch() -> EventBatch {
-        let delta = MetricRecord::new(intern("conns"), MetricKind::GaugeDelta(5.0));
+        let delta = MetricRecord::new(
+            intern("conns"),
+            MetricKind::GaugeDelta(logit_core::MetricValue::F64(5.0)),
+        );
         batch_with(vec![
             tagged_event("load", 1.0, ("host", "a")),
             Event::metric(TS, AttrMap::new(), delta),

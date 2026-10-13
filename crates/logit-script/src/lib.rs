@@ -242,6 +242,8 @@ impl ScriptWorker {
     /// Safe after `new`, since a function body resolves `telemetry` at call time; a top-level
     /// alias of it captures `nil`. See `crate::telemetry` and `docs/design/lua-api.md`.
     pub fn with_telemetry(self, telemetry: Telemetry) -> Result<Self, ScriptError> {
+        // The proxies count through this copy (`crate::proxy`'s `metric_value_to_lua`).
+        self.lua.set_app_data(telemetry.clone());
         telemetry::install(&self.lua, telemetry)?;
         Ok(self)
     }

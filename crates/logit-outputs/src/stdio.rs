@@ -402,7 +402,7 @@ mod tests {
                     MetricKind::Sum(s)
                         if logit_core::interner::resolve(m.name) == "logit.output.batch.bytes" =>
                     {
-                        Some(s.value)
+                        Some(s.value.as_f64())
                     }
                     _ => None,
                 })
@@ -476,7 +476,7 @@ mod tests {
                         if logit_core::interner::resolve(m.name)
                             == "logit.output.file.rotations" =>
                     {
-                        Some(s.value)
+                        Some(s.value.as_f64())
                     }
                     _ => None,
                 })
@@ -522,7 +522,7 @@ mod tests {
                 MetricKind::Sum(s)
                     if logit_core::interner::resolve(m.name) == "logit.output.file.rotations" =>
                 {
-                    Some(s.value)
+                    Some(s.value.as_f64())
                 }
                 _ => None,
             })
@@ -747,7 +747,7 @@ mod tests {
             .expect("payload should decode");
         assert_eq!(decoded.events.len(), 1);
         match &decoded.events[0].metrics[0].kind {
-            MetricKind::Sum(s) => assert_eq!(s.value, 1.0),
+            MetricKind::Sum(s) => assert_eq!(s.value, logit_core::MetricValue::F64(1.0)),
             other => panic!("expected Sum, got {other:?}"),
         }
     }

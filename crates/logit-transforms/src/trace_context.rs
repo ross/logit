@@ -610,7 +610,7 @@ mod tests {
                             e.attributes.get(k).and_then(|v| v.as_str()) == Some(want)
                         }) =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })

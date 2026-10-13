@@ -2159,7 +2159,7 @@ mod tests {
             .filter_map(|event| {
                 let reason = event.attributes.get("reason")?.as_str()?.to_string();
                 let value = event.metrics.iter().find_map(|m| match &m.kind {
-                    logit_core::MetricKind::Sum(s) => Some(s.value),
+                    logit_core::MetricKind::Sum(s) => Some(s.value.as_f64()),
                     _ => None,
                 })?;
                 Some((reason, value))

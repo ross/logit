@@ -34,7 +34,8 @@
 use bytes::Bytes;
 use logit_core::interner::intern;
 use logit_core::{
-    AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Sum, Temporality, Value,
+    AttrMap, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Sum, Temporality,
+    Value,
 };
 use logit_proto::collectd::types_db::TEST_TYPES_DB;
 use logit_proto::collectd::{
@@ -198,41 +199,66 @@ fn single(kind: MetricKind) -> EventBatch {
     EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] }
 }
 
-fn sum(value: f64, temporality: Temporality, monotonic: bool) -> MetricKind {
-    MetricKind::Sum(Sum { value, temporality, monotonic })
+fn sum(value: impl Into<MetricValue>, temporality: Temporality, monotonic: bool) -> MetricKind {
+    MetricKind::Sum(Sum { value: value.into(), temporality, monotonic })
 }
 
 #[test]
 fn a_gauge_list_is_a_fixed_point() {
-    assert_fixed_point(single(MetricKind::Gauge(0.42)));
+    assert_fixed_point(single(MetricKind::gauge(0.42)));
 }
 
 #[test]
 fn a_counter_list_is_a_fixed_point() {
-    assert_fixed_point(single(sum(1027.0, Temporality::Cumulative, true)));
+    assert_fixed_point(single(sum(1027u64, Temporality::Cumulative, true)));
 }
 
 #[test]
 fn a_derive_list_is_a_fixed_point_including_a_negative_value() {
-    assert_fixed_point(single(sum(-4096.0, Temporality::Cumulative, false)));
+    assert_fixed_point(single(sum(-4096i64, Temporality::Cumulative, false)));
 }
 
 #[test]
 fn an_absolute_list_is_a_fixed_point() {
-    assert_fixed_point(single(sum(5.0, Temporality::Delta, true)));
+    assert_fixed_point(single(sum(5u64, Temporality::Delta, true)));
 }
 
 /// The whole range of collectd's integer types, including `u64::MAX` and `i64::MAX`, which both
 /// round *up* to a power of two as doubles.
 #[test]
 fn integer_values_at_the_edges_of_their_ranges_are_fixed_points() {
-    for value in [0.0, 1.0, 9_007_199_254_740_992.0, u64::MAX as f64] {
+    for value in [0u64, 1, 1 << 53, u64::MAX] {
         assert_fixed_point(single(sum(value, Temporality::Cumulative, true)));
         assert_fixed_point(single(sum(value, Temporality::Delta, true)));
     }
-    for value in [i64::MIN as f64, -1.0, 0.0, i64::MAX as f64] {
+    for value in [i64::MIN, -1, 0, i64::MAX] {
         assert_fixed_point(single(sum(value, Temporality::Cumulative, false)));
     }
+}
+
+/// `2^53 + 1` is the first integer an `f64` can't hold: a COUNTER, ABSOLUTE, or DERIVE carrying
+/// it comes back as the sender's number, not `2^53`.
+#[test]
+fn an_integer_above_2_pow_53_round_trips_exactly() {
+    const ABOVE: u64 = (1 << 53) + 1;
+    assert_fixed_point(single(sum(ABOVE, Temporality::Cumulative, true)));
+    assert_fixed_point(single(sum(ABOVE, Temporality::Delta, true)));
+    assert_fixed_point(single(sum(-(ABOVE as i64), Temporality::Cumulative, false)));
+    let packet = PacketBuilder::new()
+        .string(TYPE_HOST, b"h")
+        .string(TYPE_PLUGIN, b"p")
+        .string(TYPE_TYPE, b"t")
+        .values(&[(DS_COUNTER, ABOVE.to_be_bytes())])
+        .build();
+    let mut events = Vec::new();
+    CollectdDecoder::new(Arc::new(Resource::default()))
+        .decode_into(packet, RECEIVED_AT, &mut events)
+        .expect("decodes");
+    assert_eq!(
+        events[0].metrics[0].kind,
+        sum(ABOVE, Temporality::Cumulative, true),
+        "a wire COUNTER of 2^53 + 1 must decode as that number"
+    );
 }
 
 /// A NaN gauge's *flag* survives the round trip.
@@ -241,7 +267,7 @@ fn a_nan_gauge_round_trips_as_a_flagged_zero_gauge() {
     let mut event = Event::empty(TS, identity(Some("short")));
     event.metrics.push(MetricRecord {
         flags: MetricRecord::FLAG_NO_RECORDED_VALUE,
-        ..MetricRecord::new(intern("load.load"), MetricKind::Gauge(0.0))
+        ..MetricRecord::new(intern("load.load"), MetricKind::gauge(0.0))
     });
     assert_fixed_point(EventBatch {
         resource: Arc::new(Resource::default()),
@@ -252,8 +278,8 @@ fn a_nan_gauge_round_trips_as_a_flagged_zero_gauge() {
 
 #[test]
 fn an_infinite_gauge_is_a_fixed_point() {
-    assert_fixed_point(single(MetricKind::Gauge(f64::INFINITY)));
-    assert_fixed_point(single(MetricKind::Gauge(f64::NEG_INFINITY)));
+    assert_fixed_point(single(MetricKind::gauge(f64::INFINITY)));
+    assert_fixed_point(single(MetricKind::gauge(f64::NEG_INFINITY)));
 }
 
 /// A multi-data-source list is **one** event of N records, re-encoded as one list.
@@ -263,7 +289,7 @@ fn a_multi_value_list_is_a_fixed_point() {
     for (index, value) in [0.1f64, 0.2, 0.3].into_iter().enumerate() {
         event.metrics.push(MetricRecord::new(
             intern(&format!("load.load.{index}")),
-            MetricKind::Gauge(value),
+            MetricKind::gauge(value),
         ));
     }
     assert_fixed_point(EventBatch {
@@ -278,10 +304,10 @@ fn a_multi_value_list_is_a_fixed_point() {
 fn a_mixed_data_source_list_is_a_fixed_point() {
     let mut event = Event::empty(TS, identity(None));
     for (index, kind) in [
-        MetricKind::Gauge(1.5),
-        sum(7.0, Temporality::Cumulative, true),
-        sum(-9.0, Temporality::Cumulative, false),
-        sum(11.0, Temporality::Delta, true),
+        MetricKind::gauge(1.5),
+        sum(7u64, Temporality::Cumulative, true),
+        sum(-9i64, Temporality::Cumulative, false),
+        sum(11u64, Temporality::Delta, true),
     ]
     .into_iter()
     .enumerate()
@@ -301,7 +327,7 @@ fn a_list_with_no_interval_is_a_fixed_point() {
     let mut attrs = identity(Some("short"));
     attrs.remove(ATTR_INTERVAL);
     let mut event = Event::empty(TS, attrs);
-    event.metrics.push(MetricRecord::new(intern("load.load"), MetricKind::Gauge(1.0)));
+    event.metrics.push(MetricRecord::new(intern("load.load"), MetricKind::gauge(1.0)));
     assert_fixed_point(EventBatch {
         resource: Arc::new(Resource::default()),
         scope: None,
@@ -318,7 +344,7 @@ fn many_lists_sharing_an_identity_are_a_fixed_point_across_datagram_boundaries()
             let mut attrs = identity(Some("short"));
             attrs.insert(ATTR_TYPE_INSTANCE, Value::str(format!("instance-{i}")));
             let mut event = Event::empty(TS + i, attrs);
-            event.metrics.push(MetricRecord::new(intern("load.load"), MetricKind::Gauge(i as f64)));
+            event.metrics.push(MetricRecord::new(intern("load.load"), MetricKind::gauge(i as f64)));
             event
         })
         .collect();

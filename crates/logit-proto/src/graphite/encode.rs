@@ -21,7 +21,8 @@ use crate::multi_value::{expand_dotted, DottedScratch};
 use crate::{FramedEncoder, MessageBuf};
 use logit_core::interner::resolve;
 use logit_core::{
-    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
+    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Telemetry,
+    Value,
 };
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -77,6 +78,8 @@ pub struct EncodeStats {
     pub tags_normalized_multi_value: usize,
     /// Records whose path had at least one byte substituted, once per record.
     pub paths_sanitized: usize,
+    /// A `Bool` value, written as `1` or `0`.
+    pub values_normalized_bool: usize,
     /// Records whose tag segment had at least one byte substituted, once per record.
     pub tags_sanitized: usize,
     /// Datapoints written: Σ of every entry's `Meta`, so it matches the sink's
@@ -292,7 +295,7 @@ impl FramedEncoder for GraphiteEncoder {
 /// path sanitization.
 enum Plan {
     /// One datapoint carrying this value.
-    Scalar(f64),
+    Scalar(MetricValue),
     /// Several dotted sub-paths, which [`expand_dotted`] yields.
     Expand,
 }
@@ -341,7 +344,7 @@ fn encode_record(
 
     if let Plan::Scalar(value) = plan {
         if !value.is_finite() {
-            ctx.drop_unencodable_value(name, value);
+            ctx.drop_unencodable_value(name, value.as_f64());
             return;
         }
     }
@@ -359,11 +362,16 @@ fn encode_record(
     }
 
     match plan {
-        Plan::Scalar(value) => sink.emit(path, "", tag_suffix, value, seconds, ctx),
+        Plan::Scalar(value) => {
+            if let MetricValue::Bool(_) = value {
+                ctx.value_bool();
+            }
+            sink.emit(path, "", tag_suffix, value, seconds, ctx)
+        }
         Plan::Expand => {
             ctx.degrade_expanded(metric_kind_tag(&record.kind), name);
             let expanded = expand_dotted(&record.kind, dotted, |suffix, value, _| {
-                sink.emit(path, suffix, tag_suffix, value, seconds, ctx)
+                sink.emit(path, suffix, tag_suffix, MetricValue::F64(value), seconds, ctx)
             });
             debug_assert!(expanded, "only a multi-value kind plans an expansion");
         }
@@ -427,7 +435,7 @@ impl Sink<'_> {
         path: &str,
         suffix: &str,
         tag_suffix: &str,
-        value: f64,
+        value: MetricValue,
         seconds: i64,
         ctx: &mut Ctx,
     ) {
@@ -441,8 +449,15 @@ impl Sink<'_> {
                 self.line.clear();
                 self.line.push_str(self.full_path.as_str());
                 // `f64`'s `{}` is the shortest round-trip rendering (normalization 8): `3.0` writes
-                // as `3`, and re-parsing gives back the same bits.
-                let _ = write!(self.line, " {value} {seconds}");
+                // as `3`, and re-parsing gives back the same bits. An integer writes its own
+                // digits, exact above 2^53 where its `f64` isn't; a `Bool` writes `1` or `0`.
+                let _ = match value {
+                    MetricValue::I64(v) => write!(self.line, " {v} {seconds}"),
+                    MetricValue::U64(v) => write!(self.line, " {v} {seconds}"),
+                    MetricValue::F64(_) | MetricValue::Bool(_) => {
+                        write!(self.line, " {} {seconds}", value.as_f64())
+                    }
+                };
                 if self.line.len() > self.max_packet_bytes {
                     ctx.drop_oversize_line(self.line.len(), self.max_packet_bytes);
                     return;
@@ -452,7 +467,13 @@ impl Sink<'_> {
             }
             Protocol::Pickle => {
                 self.datapoint.clear();
-                pickle::write_datapoint(self.datapoint, self.full_path.as_str(), seconds, value);
+                // A pickled value is a Python float, which carbon stores either way.
+                pickle::write_datapoint(
+                    self.datapoint,
+                    self.full_path.as_str(),
+                    seconds,
+                    value.as_f64(),
+                );
                 // A datapoint that can't fit an *empty* frame never fits; drop it.
                 if pickle::HEADER_BYTES + self.datapoint.len() + pickle::TRAILER_BYTES
                     > self.max_frame_bytes
@@ -881,6 +902,11 @@ impl Ctx<'_> {
         );
     }
 
+    fn value_bool(&mut self) {
+        self.stats.values_normalized_bool += 1;
+        self.telemetry.count("logit.output.metrics.normalized", 1.0, &[("reason", "bool_value")]);
+    }
+
     fn tag_sanitized(&mut self) {
         self.stats.tags_sanitized += 1;
         self.telemetry.count(
@@ -959,7 +985,7 @@ mod tests {
                     continue;
                 }
                 match &m.kind {
-                    MetricKind::Sum(sum) => total += sum.value,
+                    MetricKind::Sum(sum) => total += sum.value.as_f64(),
                     other => panic!("expected a Sum counter, got {other:?}"),
                 }
             }
@@ -972,7 +998,7 @@ mod tests {
     #[test]
     fn a_gauge_becomes_one_line() {
         let (lines, metas, stats, _) =
-            encode_with(&batch(vec![event(MetricKind::Gauge(0.5))]), |e| e);
+            encode_with(&batch(vec![event(MetricKind::gauge(0.5))]), |e| e);
         assert_eq!(lines, vec!["sys.cpu 0.5 1700000000"]);
         assert_eq!(metas, vec![1], "a plaintext entry is always one datapoint");
         assert_eq!(stats.datapoints, 1);
@@ -983,7 +1009,8 @@ mod tests {
     fn every_sum_shape_writes_its_bare_value() {
         for temporality in [Temporality::Delta, Temporality::Cumulative] {
             for monotonic in [true, false] {
-                let kind = MetricKind::Sum(Sum { value: 7.0, temporality, monotonic });
+                let kind =
+                    MetricKind::Sum(Sum { value: MetricValue::F64(7.0), temporality, monotonic });
                 let lines = encode(&batch(vec![event(kind)]));
                 assert_eq!(
                     lines,
@@ -1000,8 +1027,31 @@ mod tests {
         for (value, rendered) in
             [(3.0, "3"), (1.5, "1.5"), (-0.25, "-0.25"), (1e5, "100000"), (1e-7, "0.0000001")]
         {
-            let lines = encode(&batch(vec![event(MetricKind::Gauge(value))]));
+            let lines = encode(&batch(vec![event(MetricKind::gauge(value))]));
             assert_eq!(lines, vec![format!("sys.cpu {rendered} 1700000000")], "{value}");
+        }
+    }
+
+    /// An integer writes its own digits, exact above 2^53; a `Bool` writes `1` or `0`, counted.
+    #[test]
+    fn integer_and_bool_values_render_as_integers() {
+        for (value, rendered) in [
+            (MetricValue::I64(-7), "-7"),
+            (MetricValue::U64(u64::MAX), "18446744073709551615"),
+            (MetricValue::I64((1 << 53) + 1), "9007199254740993"),
+            (MetricValue::Bool(true), "1"),
+            (MetricValue::Bool(false), "0"),
+        ] {
+            let (lines, _, stats, registry) =
+                encode_with(&batch(vec![event(MetricKind::Gauge(value))]), |e| e);
+            assert_eq!(lines, vec![format!("sys.cpu {rendered} 1700000000")], "{value:?}");
+            let is_bool = matches!(value, MetricValue::Bool(_));
+            assert_eq!(stats.values_normalized_bool, usize::from(is_bool), "{value:?}");
+            assert_eq!(
+                counted(&registry, "logit.output.metrics.normalized", ("reason", "bool_value")),
+                if is_bool { 1.0 } else { 0.0 },
+                "{value:?}"
+            );
         }
     }
 
@@ -1009,7 +1059,7 @@ mod tests {
     fn a_non_finite_value_is_dropped_and_counted() {
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let (lines, _, stats, registry) =
-                encode_with(&batch(vec![event(MetricKind::Gauge(value))]), |e| e);
+                encode_with(&batch(vec![event(MetricKind::gauge(value))]), |e| e);
             assert!(lines.is_empty(), "{value}");
             assert_eq!(stats.dropped_unencodable_value, 1, "{value}");
             assert_eq!(
@@ -1021,7 +1071,7 @@ mod tests {
 
     #[test]
     fn a_flagged_record_is_dropped_and_counted() {
-        let mut ev = event(MetricKind::Gauge(0.0));
+        let mut ev = event(MetricKind::gauge(0.0));
         ev.metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         let (lines, _, stats, registry) = encode_with(&batch(vec![ev]), |e| e);
         assert!(lines.is_empty());
@@ -1035,7 +1085,7 @@ mod tests {
     #[test]
     fn a_gauge_delta_is_dropped_under_the_shared_key() {
         let (lines, _, stats, registry) =
-            encode_with(&batch(vec![event(MetricKind::GaugeDelta(1.0))]), |e| e);
+            encode_with(&batch(vec![event(MetricKind::GaugeDelta(MetricValue::F64(1.0)))]), |e| e);
         assert!(lines.is_empty());
         assert_eq!(stats.dropped_gauge_delta, 1);
         assert_eq!(
@@ -1056,8 +1106,8 @@ mod tests {
 
     #[test]
     fn a_non_positive_second_drops_every_record_on_the_event() {
-        let mut ev = event(MetricKind::Gauge(1.0));
-        ev.metrics.push(MetricRecord::new(intern("sys.mem"), MetricKind::Gauge(2.0)));
+        let mut ev = event(MetricKind::gauge(1.0));
+        ev.metrics.push(MetricRecord::new(intern("sys.mem"), MetricKind::gauge(2.0)));
         for timestamp in [0i64, -1, -1_000_000_000] {
             ev.timestamp = timestamp;
             let (lines, _, stats, registry) = encode_with(&batch(vec![ev.clone()]), |e| e);
@@ -1078,7 +1128,7 @@ mod tests {
     /// dropped.
     #[test]
     fn timestamps_floor_to_whole_seconds() {
-        let mut ev = event(MetricKind::Gauge(1.0));
+        let mut ev = event(MetricKind::gauge(1.0));
         ev.timestamp = 1_700_000_000_999_999_999;
         assert_eq!(encode(&batch(vec![ev.clone()])), vec!["sys.cpu 1 1700000000"]);
 
@@ -1095,7 +1145,7 @@ mod tests {
         for (key, value) in attrs {
             attributes.insert(key, value.clone());
         }
-        Event::metric(TS, attributes, MetricRecord::new(intern("sys.cpu"), MetricKind::Gauge(1.0)))
+        Event::metric(TS, attributes, MetricRecord::new(intern("sys.cpu"), MetricKind::gauge(1.0)))
     }
 
     #[test]
@@ -1216,7 +1266,7 @@ mod tests {
             let ev = Event::metric(
                 TS,
                 AttrMap::new(),
-                MetricRecord::new(intern(name), MetricKind::Gauge(1.0)),
+                MetricRecord::new(intern(name), MetricKind::gauge(1.0)),
             );
             let (lines, _, stats, registry) = encode_with(&batch(vec![ev]), |e| e);
             assert_eq!(lines, vec![format!("{rendered} 1 1700000000")], "{name:?}");
@@ -1273,7 +1323,7 @@ mod tests {
         let ev = Event::metric(
             TS,
             AttrMap::new(),
-            MetricRecord::new(intern(""), MetricKind::Gauge(1.0)),
+            MetricRecord::new(intern(""), MetricKind::gauge(1.0)),
         );
         let (lines, _, stats, registry) = encode_with(&batch(vec![ev]), |e| e);
         assert!(lines.is_empty());
@@ -1650,7 +1700,7 @@ mod tests {
         let ev = Event::metric(
             TS,
             AttrMap::new(),
-            MetricRecord::new(intern("a.very.long.metric.name.indeed"), MetricKind::Gauge(1.0)),
+            MetricRecord::new(intern("a.very.long.metric.name.indeed"), MetricKind::gauge(1.0)),
         );
         let (lines, _, stats, registry) =
             encode_with(&batch(vec![ev]), |e| e.with_max_packet_bytes(16));
@@ -1667,7 +1717,7 @@ mod tests {
         let mut encoder = GraphiteEncoder::new();
         let mut out = MessageBuf::default();
         out.push_with(b"stale", 9);
-        encoder.encode_into(&batch(vec![event(MetricKind::Gauge(1.0))]), &mut out);
+        encoder.encode_into(&batch(vec![event(MetricKind::gauge(1.0))]), &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out.iter().next().unwrap(), b"sys.cpu 1 1700000000");
     }
@@ -1700,7 +1750,7 @@ mod tests {
                 Event::metric(
                     TS,
                     AttrMap::new(),
-                    MetricRecord::new(intern("sys.cpu"), MetricKind::Gauge(i as f64)),
+                    MetricRecord::new(intern("sys.cpu"), MetricKind::gauge(i as f64)),
                 )
             })
             .collect();
@@ -1726,7 +1776,7 @@ mod tests {
                 Event::metric(
                     TS,
                     AttrMap::new(),
-                    MetricRecord::new(intern("sys.cpu"), MetricKind::Gauge(i as f64)),
+                    MetricRecord::new(intern("sys.cpu"), MetricKind::gauge(i as f64)),
                 )
             })
             .collect();
@@ -1753,7 +1803,7 @@ mod tests {
         let ev = Event::metric(
             TS,
             AttrMap::new(),
-            MetricRecord::new(intern("a.very.long.metric.name.indeed"), MetricKind::Gauge(1.0)),
+            MetricRecord::new(intern("a.very.long.metric.name.indeed"), MetricKind::gauge(1.0)),
         );
         let (messages, _, stats, registry) = encode_raw_with(&batch(vec![ev]), |e| {
             e.with_protocol(Protocol::Pickle).with_max_frame_bytes(16)
@@ -1812,10 +1862,10 @@ mod tests {
     /// `MetricList` order is wire order within one event.
     #[test]
     fn records_are_written_in_metric_list_order() {
-        let mut ev = event(MetricKind::Gauge(1.0));
+        let mut ev = event(MetricKind::gauge(1.0));
         ev.metrics = MetricList::from_iter([
-            MetricRecord::new(intern("z.last"), MetricKind::Gauge(1.0)),
-            MetricRecord::new(intern("a.first"), MetricKind::Gauge(2.0)),
+            MetricRecord::new(intern("z.last"), MetricKind::gauge(1.0)),
+            MetricRecord::new(intern("a.first"), MetricKind::gauge(2.0)),
         ]);
         assert_eq!(encode(&batch(vec![ev])), vec!["z.last 1 1700000000", "a.first 2 1700000000"]);
     }

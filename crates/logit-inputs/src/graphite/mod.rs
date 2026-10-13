@@ -516,8 +516,8 @@ mod tests {
             .flat_map(|event| &event.metrics)
             .filter(|m| resolve(m.name) == metric)
             .map(|m| match &m.kind {
-                MetricKind::Sum(sum) => sum.value,
-                MetricKind::Gauge(v) => *v,
+                MetricKind::Sum(sum) => sum.value.as_f64(),
+                MetricKind::Gauge(v) => v.as_f64(),
                 other => panic!("{metric} should be a counter or a gauge, got {other:?}"),
             })
             .sum()
@@ -578,7 +578,7 @@ mod tests {
         let names: Vec<&str> = batch.events.iter().map(|e| resolve(e.metrics[0].name)).collect();
         assert_eq!(names, ["a.b", "c.d", "e.f"], "one line is one event, in wire order");
         assert_eq!(batch.events[0].timestamp, TIMESTAMP_NANOS);
-        assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(1.5));
+        assert_eq!(batch.events[0].metrics[0].kind, MetricKind::gauge(1.5));
 
         running.shutdown.send(true).ok();
         running.handle.abort();
@@ -715,7 +715,7 @@ mod tests {
         let batch = running.next_batch("the reassembled line").await;
         assert_eq!(batch.events.len(), 1);
         assert_eq!(resolve(batch.events[0].metrics[0].name), "split.path");
-        assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(1.5));
+        assert_eq!(batch.events[0].metrics[0].kind, MetricKind::gauge(1.5));
 
         running.shutdown.send(true).ok();
         running.handle.abort();
@@ -993,7 +993,7 @@ mod tests {
         let batch = running.next_batch("the reassembled pickle frame").await;
         let names: Vec<&str> = batch.events.iter().map(|e| resolve(e.metrics[0].name)).collect();
         assert_eq!(names, ["pickled.a", "pickled.b", "pickled.c"]);
-        assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(1.5));
+        assert_eq!(batch.events[0].metrics[0].kind, MetricKind::gauge(1.5));
         assert_eq!(batch.events[2].timestamp, 1_700_000_002_000_000_000);
 
         let drained = running.registry.drain(0);
@@ -1110,7 +1110,7 @@ mod tests {
 
         let batch = running.next_batch("the line sent over TLS").await;
         assert_eq!(resolve(batch.events[0].metrics[0].name), "over.tls");
-        assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(1.5));
+        assert_eq!(batch.events[0].metrics[0].kind, MetricKind::gauge(1.5));
 
         running.shutdown.send(true).ok();
         running.handle.abort();
@@ -1361,22 +1361,22 @@ mod tests {
                 (
                     "logit-fixture.pickle.int_value",
                     1_700_000_000_000_000_000,
-                    MetricKind::Gauge(42.0)
+                    MetricKind::gauge(42.0)
                 ),
                 (
                     "logit-fixture.pickle.float_value",
                     1_700_000_001_500_000_000,
-                    MetricKind::Gauge(12.75)
+                    MetricKind::gauge(12.75)
                 ),
                 (
                     "logit-fixture.pickle.negative_value",
                     1_700_000_002_000_000_000,
-                    MetricKind::Gauge(-17.5)
+                    MetricKind::gauge(-17.5)
                 ),
                 (
                     "logit-fixture.pickle.large_value",
                     1_700_000_003_000_000_000,
-                    MetricKind::Gauge(1_234_567.0)
+                    MetricKind::gauge(1_234_567.0)
                 ),
             ],
             "{name}: must decode to exactly python_graphite_pickle_producer.py's DATAPOINTS"
@@ -1408,7 +1408,7 @@ mod tests {
                 let MetricKind::Gauge(value) = e.metrics[0].kind else {
                     panic!("carbon's wire has no type, got {:?}", e.metrics[0].kind)
                 };
-                (resolve(e.metrics[0].name), e.timestamp, value)
+                (resolve(e.metrics[0].name), e.timestamp, value.as_f64())
             })
             .collect()
     }

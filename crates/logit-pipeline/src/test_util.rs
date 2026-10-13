@@ -100,9 +100,11 @@ impl Totals {
             for metric in event.metrics.iter() {
                 let key = (interner::resolve(metric.name).to_string(), tags.clone());
                 match &metric.kind {
-                    MetricKind::Sum(sum) => *self.sums.entry(key.clone()).or_default() += sum.value,
+                    MetricKind::Sum(sum) => {
+                        *self.sums.entry(key.clone()).or_default() += sum.value.as_f64()
+                    }
                     MetricKind::Gauge(v) => {
-                        self.gauges.insert(key.clone(), *v);
+                        self.gauges.insert(key.clone(), v.as_f64());
                     }
                     _ => {}
                 }

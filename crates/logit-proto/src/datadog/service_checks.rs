@@ -111,7 +111,7 @@ impl DatadogDecoder {
         Some(Event::metric(
             or_received(timestamp, received_at),
             attributes,
-            MetricRecord::new(intern(name), MetricKind::Gauge(status as f64)),
+            MetricRecord::new(intern(name), MetricKind::gauge(status as f64)),
         ))
     }
 
@@ -137,6 +137,7 @@ impl DatadogEncoder {
             let Some(MetricKind::Gauge(gauge)) = event.metrics.first().map(|m| &m.kind) else {
                 continue;
             };
+            let gauge = &gauge.as_f64();
             let attrs: Vec<(Symbol, &Value)> = merged(&batch.resource, event).collect();
             let find = |key: Symbol| attrs.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
             let Some(name) = find(keys.name) else { continue };
@@ -216,7 +217,7 @@ mod tests {
         let event = &batch.events[0];
         assert_eq!(event.timestamp, 1_700_000_000_000_000_000);
         assert_eq!(resolve(event.metrics[0].name), "app.ok");
-        assert_eq!(event.metrics[0].kind, MetricKind::Gauge(2.0));
+        assert_eq!(event.metrics[0].kind, MetricKind::gauge(2.0));
         assert_eq!(event.attributes.get(ATTR_SERVICE_CHECK_NAME), Some(&Value::str("app.ok")));
         assert_eq!(event.attributes.get(ATTR_SERVICE_CHECK_STATUS), Some(&Value::U64(2)));
         assert_eq!(event.attributes.get(ATTR_SERVICE_CHECK_MESSAGE), Some(&Value::str("down")));
@@ -271,11 +272,11 @@ mod tests {
     fn encode_skips_non_checks_and_counts_invalid_statuses() {
         let mut attrs = AttrMap::new();
         attrs.insert(ATTR_SERVICE_CHECK_NAME, Value::str("x"));
-        let bad = Event::metric(0, attrs, MetricRecord::new(intern("x"), MetricKind::Gauge(7.0)));
+        let bad = Event::metric(0, attrs, MetricRecord::new(intern("x"), MetricKind::gauge(7.0)));
         let plain = Event::metric(
             0,
             AttrMap::new(),
-            MetricRecord::new(intern("y"), MetricKind::Gauge(1.0)),
+            MetricRecord::new(intern("y"), MetricKind::gauge(1.0)),
         );
         let batch = new_batch(Resource::default(), vec![bad, plain]);
         let registry = Registry::new();

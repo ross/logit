@@ -3935,7 +3935,7 @@ mod tests {
                 }
                 e.metrics.iter().find_map(|m| match &m.kind {
                     MetricKind::Sum(s) if logit_core::interner::resolve(m.name) == name => {
-                        Some(s.value)
+                        Some(s.value.as_f64())
                     }
                     _ => None,
                 })
@@ -4069,7 +4069,7 @@ mod tests {
                 }
                 e.metrics.iter().find_map(|m| match &m.kind {
                     MetricKind::Sum(s) if logit_core::interner::resolve(m.name) == name => {
-                        Some(s.value)
+                        Some(s.value.as_f64())
                     }
                     _ => None,
                 })
@@ -4086,7 +4086,7 @@ mod tests {
                 MetricKind::Gauge(v)
                     if logit_core::interner::resolve(m.name) == "logit.script.vm.memory" =>
                 {
-                    Some(*v)
+                    Some(v.as_f64())
                 }
                 _ => None,
             })
@@ -4654,7 +4654,7 @@ mod tests {
                 MetricKind::Gauge(v)
                     if logit_core::interner::resolve(m.name) == "logit.script.vm.memory" =>
                 {
-                    Some(*v)
+                    Some(v.as_f64())
                 }
                 _ => None,
             })
@@ -4766,7 +4766,9 @@ mod tests {
                 return None;
             }
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Gauge(v) if logit_core::interner::resolve(m.name) == name => Some(*v),
+                MetricKind::Gauge(v) if logit_core::interner::resolve(m.name) == name => {
+                    Some(v.as_f64())
+                }
                 _ => None,
             })
         })
@@ -4873,7 +4875,11 @@ mod tests {
                 .expect("the channel should not have closed");
             match &received.events[0].metrics[0].kind {
                 MetricKind::Sum(s) => {
-                    assert_eq!(s.value, i as f64, "batches should still be delivered in order")
+                    assert_eq!(
+                        s.value,
+                        logit_core::MetricValue::F64(i as f64),
+                        "batches should still be delivered in order"
+                    )
                 }
                 other => panic!("expected Sum, got {other:?}"),
             }
@@ -6250,7 +6256,7 @@ mod tests {
 
     fn counter_value_of(batch: &EventBatch) -> f64 {
         match batch.events[0].metrics.iter().next().map(|m| &m.kind) {
-            Some(MetricKind::Sum(s)) => s.value,
+            Some(MetricKind::Sum(s)) => s.value.as_f64(),
             other => panic!("expected exactly one counter metric, got {other:?}"),
         }
     }
@@ -8595,7 +8601,11 @@ mod tests {
                 .expect("the channel should not have closed");
             match &received.events[0].metrics[0].kind {
                 MetricKind::Sum(s) => {
-                    assert_eq!(s.value, i as f64, "batches should still be delivered in order")
+                    assert_eq!(
+                        s.value,
+                        logit_core::MetricValue::F64(i as f64),
+                        "batches should still be delivered in order"
+                    )
                 }
                 other => panic!("expected Sum, got {other:?}"),
             }
@@ -11812,7 +11822,7 @@ mod tests {
                         if logit_core::interner::resolve(m.name)
                             == "logit.component.events.dropped" =>
                     {
-                        Some(s.value)
+                        Some(s.value.as_f64())
                     }
                     _ => None,
                 })
@@ -12485,7 +12495,7 @@ mod tests {
                     MetricKind::Sum(s)
                         if logit_core::interner::resolve(m.name) == "logit.component.errors" =>
                     {
-                        Some(s.value)
+                        Some(s.value.as_f64())
                     }
                     _ => None,
                 })

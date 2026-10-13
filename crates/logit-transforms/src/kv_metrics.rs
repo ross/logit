@@ -5,10 +5,11 @@
 //!
 //! No flush state; its only state is a per-batch telemetry [`Tally`].
 
-use crate::numeric;
+use crate::{numeric, numeric_typed};
 use logit_core::interner::{intern, resolve};
 use logit_core::{
-    AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, Samples, Symbol, Telemetry,
+    AttrMap, Diagnostics, Event, MetricKind, MetricRecord, MetricValue, Resource, Samples, Sum,
+    Symbol, Telemetry, Temporality,
 };
 use logit_pipeline::Transform;
 use std::sync::Arc;
@@ -169,7 +170,12 @@ impl Transform for KvMetrics {
         for m in &self.counters {
             let derived = match metric_value(m, &event.attributes) {
                 Some(value) => {
-                    let mut record = MetricRecord::new(m.name, MetricKind::counter(value));
+                    let kind = MetricKind::Sum(Sum {
+                        value,
+                        temporality: Temporality::Delta,
+                        monotonic: true,
+                    });
+                    let mut record = MetricRecord::new(m.name, kind);
                     record.unit = m.unit;
                     event.metrics.push(record);
                     true
@@ -228,16 +234,16 @@ impl Transform for KvMetrics {
     }
 }
 
-/// A counter/gauge entry's value for this event: `1.0` with no `field`, else the attribute's
-/// coerced numeric value.
+/// A counter/gauge entry's value for this event: `F64(1.0)` with no `field`, else the attribute's
+/// coerced numeric value, keeping an `I64` or `U64` attribute's type ([`numeric_typed`]).
 ///
 /// `None` (missing, non-numeric, or non-finite) skips this metric for this event, never an error.
 /// That's a common path: nginx's `$upstream_response_time` is `-` on a non-proxied request and a
 /// comma-separated list on a retried one.
-fn metric_value(m: &CompiledMetric, attrs: &AttrMap) -> Option<f64> {
+fn metric_value(m: &CompiledMetric, attrs: &AttrMap) -> Option<MetricValue> {
     match m.field {
-        None => Some(1.0),
-        Some(field) => attrs.get_sym(field).and_then(numeric),
+        None => Some(MetricValue::F64(1.0)),
+        Some(field) => attrs.get_sym(field).and_then(numeric_typed),
     }
 }
 
@@ -286,14 +292,14 @@ mod tests {
         event.metrics.iter().find(|m| resolve(m.name) == name)
     }
 
-    fn counter_value(record: &MetricRecord) -> f64 {
+    fn counter_value(record: &MetricRecord) -> MetricValue {
         match record.kind {
             MetricKind::Sum(sum) => sum.value,
             _ => panic!("expected Sum"),
         }
     }
 
-    fn gauge_value(record: &MetricRecord) -> f64 {
+    fn gauge_value(record: &MetricRecord) -> MetricValue {
         match record.kind {
             MetricKind::Gauge(v) => v,
             _ => panic!("expected Gauge"),
@@ -307,7 +313,7 @@ mod tests {
         let mut event = event_with_attrs(&[]);
         assert!(kv.process(&resource, &mut event), "always forwards");
         let m = metric_named(&event, "hits").expect("counter should be present");
-        assert_eq!(counter_value(m), 1.0);
+        assert_eq!(counter_value(m), MetricValue::F64(1.0));
     }
 
     #[test]
@@ -325,8 +331,8 @@ mod tests {
         ]);
         assert!(kv.process(&resource, &mut event), "always forwards");
 
-        assert_eq!(counter_value(metric_named(&event, "bytes").unwrap()), 512.0);
-        assert_eq!(gauge_value(metric_named(&event, "conns").unwrap()), 3.0);
+        assert_eq!(counter_value(metric_named(&event, "bytes").unwrap()), MetricValue::U64(512));
+        assert_eq!(gauge_value(metric_named(&event, "conns").unwrap()), MetricValue::I64(3));
         match &metric_named(&event, "request_time").unwrap().kind {
             // Raw, unsampled, exactly one observation -- summarizing is `aggregate`'s job.
             MetricKind::Samples(samples) => {
@@ -405,7 +411,24 @@ mod tests {
         let resource = default_resource();
         let mut event = event_with_attrs(&[("status", Value::str("200"))]);
         assert!(kv.process(&resource, &mut event), "always forwards");
-        assert_eq!(counter_value(metric_named(&event, "status").unwrap()), 200.0);
+        assert_eq!(counter_value(metric_named(&event, "status").unwrap()), MetricValue::F64(200.0));
+    }
+
+    /// An integer attribute keeps its type and its exact value: 2^53 + 1 has no `f64`.
+    #[test]
+    fn an_integer_field_keeps_its_type_and_exact_value() {
+        let big = (1_i64 << 53) + 1;
+        let mut kv =
+            KvMetrics::new(vec![spec("total", Some("u"))], vec![spec("depth", Some("i"))], vec![]);
+        let resource = default_resource();
+        let mut event =
+            event_with_attrs(&[("i", Value::I64(big)), ("u", Value::U64(big as u64 + 1))]);
+        assert!(kv.process(&resource, &mut event), "always forwards");
+        assert_eq!(gauge_value(metric_named(&event, "depth").unwrap()), MetricValue::I64(big));
+        assert_eq!(
+            counter_value(metric_named(&event, "total").unwrap()),
+            MetricValue::U64(big as u64 + 1)
+        );
     }
 
     #[test]
@@ -504,7 +527,7 @@ mod tests {
                 return None;
             }
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Sum(sum) if resolve(m.name) == name => Some(sum.value),
+                MetricKind::Sum(sum) if resolve(m.name) == name => Some(sum.value.as_f64()),
                 _ => None,
             })
         })

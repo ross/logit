@@ -585,7 +585,7 @@ mod tests {
             }
             e.metrics.iter().find_map(|m| match &m.kind {
                 MetricKind::Sum(sum) if resolve(m.name) == "logit.transform.sample.decisions" => {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -596,7 +596,7 @@ mod tests {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
                 MetricKind::Sum(sum) if resolve(m.name) == "logit.transform.events.filtered" => {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })

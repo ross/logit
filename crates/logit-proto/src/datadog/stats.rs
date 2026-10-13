@@ -32,7 +32,7 @@ use bytes::Bytes;
 use logit_core::interner::{intern, resolve};
 use logit_core::{
     AttrMap, Bin, DdSketch, Event, EventBatch, Mapping, MappingKind, MetricKind, MetricRecord,
-    Resource, Sum, Temporality, Value,
+    MetricValue, Resource, Sum, Temporality, Value,
 };
 use prost::Message;
 use std::collections::HashMap;
@@ -906,7 +906,25 @@ impl DatadogEncoder {
 
     /// A weighted count back to the wire's `uint64`: rounded to the nearest integer, which is
     /// what the Agent's own stochastic rounding lands on on average.
-    fn count(&self, v: f64) -> u64 {
+    fn count(&self, value: MetricValue) -> u64 {
+        let v = match value {
+            MetricValue::U64(v) => return v,
+            MetricValue::I64(v) => {
+                return u64::try_from(v).unwrap_or_else(|_| {
+                    self.stats_out_degraded("bad_count");
+                    0
+                });
+            }
+            MetricValue::Bool(b) => {
+                self.telemetry.count(
+                    "logit.output.metrics.normalized",
+                    1.0,
+                    &[("reason", "bool_value")],
+                );
+                return u64::from(b);
+            }
+            MetricValue::F64(v) => v,
+        };
         if !(v.is_finite() && v >= 0.0) {
             self.stats_out_degraded("bad_count");
             return 0;
@@ -1129,7 +1147,7 @@ mod tests {
             }
             for m in &event.metrics {
                 if let (true, MetricKind::Sum(s)) = (resolve(m.name) == metric, &m.kind) {
-                    total += s.value;
+                    total += s.value.as_f64();
                 }
             }
         }
@@ -1668,7 +1686,7 @@ mod tests {
                 MetricRecord::new(intern(METRIC_TOP_LEVEL_HITS), MetricKind::counter(2e19)),
                 // Exactly 2^64, what a wire `u64::MAX` decodes to: saturates without a count.
                 MetricRecord::new(intern(METRIC_DURATION), MetricKind::counter(u64::MAX as f64)),
-                MetricRecord::new(intern("other"), MetricKind::Gauge(1.0)),
+                MetricRecord::new(intern("other"), MetricKind::gauge(1.0)),
                 MetricRecord::new(intern(METRIC_OK_SUMMARY), MetricKind::Distribution(agent)),
             ],
             &[("env", Value::str("prod")), (ATTR_HTTP_STATUS_CODE, Value::str("200"))],
@@ -1682,7 +1700,7 @@ mod tests {
                 .flat_map(|ev| ev.metrics.iter())
                 .filter(|m| resolve(m.name) == metric)
                 .map(|m| match m.kind {
-                    MetricKind::Sum(s) => s.value,
+                    MetricKind::Sum(s) => s.value.as_f64(),
                     _ => 0.0,
                 })
                 .sum::<f64>()
@@ -1727,7 +1745,7 @@ mod tests {
         let plain = Event::metric(
             1,
             AttrMap::new(),
-            MetricRecord::new(intern("m"), MetricKind::Gauge(1.0)),
+            MetricRecord::new(intern("m"), MetricKind::gauge(1.0)),
         );
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),

@@ -53,7 +53,8 @@ use anyhow::Context;
 use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::{
-    DdSketch, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
+    DdSketch, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource,
+    Telemetry, Value,
 };
 use logit_pipeline::{BatchContext, DeliveryPosture, SeqId};
 use logit_proto::{CodecError, Encoder};
@@ -558,8 +559,10 @@ fn render_sketch_fields(out: &mut String, sketch: &DdSketch) {
 /// Renders one metric's `k=v,k=v` field set into `out` (cleared first). Returns `false` when
 /// every field was unrepresentable: an empty field set is invalid line protocol.
 ///
-/// - `Sum`/`Gauge`: one `value` field. Line protocol has no temporality or monotonicity, so a
-///   cumulative or non-monotonic `Sum` writes its current `value` too.
+/// - `Sum`/`Gauge`: one `value` field in the value's own type: a bare float for `F64`, `<n>i` for
+///   `I64`, `<n>u` for `U64`, `true`/`false` for `Bool` (`docs/adr/typed-metric-scalar.md`).
+///   Line protocol has no temporality or monotonicity, so a cumulative or non-monotonic `Sum`
+///   writes its current `value` too.
 /// - `Distribution`, and `Samples` re-sketched with each value weighted by its inverse sample rate:
 ///   [`render_sketch_fields`].
 /// - `Histogram`: a `bucket_<bound>` field per finite bound.
@@ -577,18 +580,8 @@ fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError
     out.clear();
 
     match kind {
-        MetricKind::Sum(s) => {
-            if s.value.is_finite() {
-                out.push_str("value=");
-                push_float(out, s.value);
-            }
-        }
-        MetricKind::Gauge(v) => {
-            if v.is_finite() {
-                out.push_str("value=");
-                push_float(out, *v);
-            }
-        }
+        MetricKind::Sum(s) => push_value_field(out, s.value),
+        MetricKind::Gauge(v) => push_value_field(out, *v),
         MetricKind::Distribution(sketch) => {
             render_sketch_fields(out, sketch);
         }
@@ -643,6 +636,31 @@ fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError
         }
     }
     Ok(!out.is_empty())
+}
+
+/// Writes the `value` field of a `Sum` or `Gauge` in its own line-protocol type: bare float,
+/// `<n>i`, `<n>u`, or `true`/`false`. A non-finite float writes nothing.
+fn push_value_field(out: &mut String, v: MetricValue) {
+    match v {
+        MetricValue::F64(f) if f.is_finite() => {
+            out.push_str("value=");
+            push_float(out, f);
+        }
+        MetricValue::F64(_) => {}
+        MetricValue::I64(n) => {
+            out.push_str("value=");
+            push_i64(out, n);
+            out.push('i');
+        }
+        MetricValue::U64(n) => {
+            out.push_str("value=");
+            push_uint(out, n);
+        }
+        MetricValue::Bool(b) => {
+            out.push_str("value=");
+            out.push_str(if b { "true" } else { "false" });
+        }
+    }
 }
 
 /// Comma between field entries. Keyed off "anything written yet", not a loop index: non-finite
@@ -770,13 +788,41 @@ mod tests {
         assert_eq!(out, "page.views,env=prod value=3 1700000000000000000\n");
     }
 
+    /// A typed value keeps its line-protocol type: InfluxDB rejects a write whose field type
+    /// conflicts with what the series already stores.
+    #[test]
+    fn a_typed_value_renders_in_its_own_line_protocol_type() {
+        let sum = |value| {
+            MetricKind::Sum(logit_core::Sum {
+                value,
+                temporality: logit_core::Temporality::Delta,
+                monotonic: true,
+            })
+        };
+        let cases = [
+            (sum(MetricValue::I64(5)), "m value=5i 1700000000000000000\n"),
+            (sum(MetricValue::I64(-5)), "m value=-5i 1700000000000000000\n"),
+            (
+                sum(MetricValue::U64(u64::MAX)),
+                "m value=18446744073709551615u 1700000000000000000\n",
+            ),
+            (MetricKind::Gauge(MetricValue::U64(5)), "m value=5u 1700000000000000000\n"),
+            (MetricKind::Gauge(MetricValue::Bool(true)), "m value=true 1700000000000000000\n"),
+            (MetricKind::Gauge(MetricValue::Bool(false)), "m value=false 1700000000000000000\n"),
+            (MetricKind::Gauge(MetricValue::F64(5.0)), "m value=5 1700000000000000000\n"),
+        ];
+        for (kind, want) in cases {
+            assert_eq!(encode(vec![metric_event("m", kind, &[])]), want);
+        }
+    }
+
     /// A cumulative, non-monotonic `Sum` renders the same as a delta-monotonic one.
     #[test]
     fn a_cumulative_sum_renders_the_same_as_a_counter() {
         let out = encode(vec![metric_event(
             "page.views",
             MetricKind::Sum(logit_core::Sum {
-                value: 3.0,
+                value: logit_core::MetricValue::F64(3.0),
                 temporality: logit_core::Temporality::Cumulative,
                 monotonic: false,
             }),
@@ -787,7 +833,7 @@ mod tests {
 
     #[test]
     fn gauge_line_with_no_tags() {
-        let out = encode(vec![metric_event("cpu.load", MetricKind::Gauge(0.5), &[])]);
+        let out = encode(vec![metric_event("cpu.load", MetricKind::gauge(0.5), &[])]);
         assert_eq!(out, "cpu.load value=0.5 1700000000000000000\n");
     }
 
@@ -1060,7 +1106,7 @@ mod tests {
     /// A `NO_RECORDED_VALUE` point is skipped, not written as `value=0`; a sibling still lands.
     #[test]
     fn a_no_recorded_value_point_is_skipped_not_written_as_a_fabricated_zero() {
-        let mut flagged = metric_event("conns", MetricKind::Gauge(0.0), &[]);
+        let mut flagged = metric_event("conns", MetricKind::gauge(0.0), &[]);
         flagged.metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         let out = encode(vec![flagged, metric_event("page.views", MetricKind::counter(1.0), &[])]);
         assert!(!out.contains("conns"), "a flagged point must not be written at all: {out}");
@@ -1085,7 +1131,7 @@ mod tests {
     #[test]
     fn gauge_delta_is_skipped_not_fatal() {
         let out = encode(vec![
-            metric_event("conns", MetricKind::GaugeDelta(5.0), &[]),
+            metric_event("conns", MetricKind::GaugeDelta(logit_core::MetricValue::F64(5.0)), &[]),
             metric_event("page.views", MetricKind::counter(1.0), &[]),
         ]);
         assert!(!out.contains("conns"), "got: {out}");
@@ -1099,7 +1145,11 @@ mod tests {
         let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
         let mut encoder = InfluxLineEncoder::default()
             .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry));
-        let batch = batch_with(vec![metric_event("conns", MetricKind::GaugeDelta(5.0), &[])]);
+        let batch = batch_with(vec![metric_event(
+            "conns",
+            MetricKind::GaugeDelta(logit_core::MetricValue::F64(5.0)),
+            &[],
+        )]);
         let _ = encoder.encode(&batch);
 
         let events = registry.drain(0);
@@ -1248,7 +1298,7 @@ mod tests {
         let mut event = metric_event("requests", MetricKind::counter(1.0), &[("env", "prod")]);
         event.metrics.push(MetricRecord::new(
             logit_core::interner::intern("latency"),
-            MetricKind::Gauge(5.0),
+            MetricKind::gauge(5.0),
         ));
         event.metrics.push(MetricRecord::new(
             logit_core::interner::intern("bytes"),
@@ -1650,7 +1700,7 @@ mod tests {
                         if logit_core::interner::resolve(m.name)
                             == "logit.output.tags.normalized" =>
                     {
-                        Some(s.value)
+                        Some(s.value.as_f64())
                     }
                     _ => None,
                 })
@@ -1681,7 +1731,7 @@ mod tests {
                     }
                     e.metrics.iter().find_map(|m| match &m.kind {
                         MetricKind::Sum(s) if logit_core::interner::resolve(m.name) == name => {
-                            Some(s.value)
+                            Some(s.value.as_f64())
                         }
                         _ => None,
                     })
@@ -1708,7 +1758,14 @@ mod tests {
         let batch = || {
             let mut tagged = metric_event("hits", MetricKind::counter(1.0), &[]);
             tagged.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
-            batch_with(vec![tagged, metric_event("conns", MetricKind::GaugeDelta(5.0), &[])])
+            batch_with(vec![
+                tagged,
+                metric_event(
+                    "conns",
+                    MetricKind::GaugeDelta(logit_core::MetricValue::F64(5.0)),
+                    &[],
+                ),
+            ])
         };
         const ENCODE_SIDE: [(&str, &[(&str, &str)]); 3] = [
             ("logit.output.tags.normalized", &[("reason", "multi_value")]),
@@ -1772,7 +1829,14 @@ mod tests {
         let batch = || {
             let mut tagged = metric_event("hits", MetricKind::counter(1.0), &[]);
             tagged.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
-            batch_with(vec![tagged, metric_event("conns", MetricKind::GaugeDelta(5.0), &[])])
+            batch_with(vec![
+                tagged,
+                metric_event(
+                    "conns",
+                    MetricKind::GaugeDelta(logit_core::MetricValue::F64(5.0)),
+                    &[],
+                ),
+            ])
         };
         assert_direct_sends_count_after_an_empty_batch(
             &mut output,

@@ -5,7 +5,9 @@
 
 use bytes::Bytes;
 use logit_core::interner::{intern, resolve};
-use logit_core::{subslice, AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Value};
+use logit_core::{
+    subslice, AttrMap, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Value,
+};
 use logit_proto::graphite::{GraphiteDecoder, GraphiteEncoder, Protocol};
 use logit_proto::{Decoder, FramedEncoder, MessageBuf};
 use std::sync::Arc;
@@ -80,7 +82,7 @@ pub fn expected_event(path_field: &str, value: f64, seconds: f64) -> Option<(Eve
     if path.is_empty() {
         return None;
     }
-    let record = MetricRecord::new(intern(path), MetricKind::Gauge(value));
+    let record = MetricRecord::new(intern(path), MetricKind::gauge(value));
     Some((Event::metric(timestamp, attributes, record), approximate))
 }
 
@@ -96,10 +98,10 @@ pub fn assert_matches(decoded: &Event, expected: &(Event, bool), what: &str) {
     } else {
         assert_eq!(decoded, expected, "{what}: the event isn't the doc's");
     }
-    let (MetricKind::Gauge(got), MetricKind::Gauge(want)) =
+    let (MetricKind::Gauge(MetricValue::F64(got)), MetricKind::Gauge(MetricValue::F64(want))) =
         (&decoded.metrics[0].kind, &expected.metrics[0].kind)
     else {
-        unreachable!("both are a Gauge, or the comparison above failed")
+        unreachable!("both are an F64 Gauge, or the comparison above failed")
     };
     assert_eq!(got.to_bits(), want.to_bits(), "{what}: the value's bits changed");
 }
@@ -112,8 +114,8 @@ pub fn check_event(input: &Bytes, event: &Event, zero_copy: bool) {
     assert!(event.log.is_none() && event.span.is_none(), "model: graphite decodes a metric only");
     assert_eq!(event.metrics.len(), 1, "model: one record per datapoint");
     let record = &event.metrics[0];
-    let MetricKind::Gauge(value) = record.kind else {
-        panic!("model: a carbon datapoint is a Gauge")
+    let MetricKind::Gauge(MetricValue::F64(value)) = record.kind else {
+        panic!("model: a carbon datapoint is an F64 Gauge")
     };
     assert!(value.is_finite(), "model: a Gauge is finite");
     assert_eq!(record.flags, 0, "model: carbon has no flagged datapoint");

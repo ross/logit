@@ -14,8 +14,8 @@ use crate::{CodecError, Decoder};
 use bytes::Bytes;
 use logit_core::interner::{intern, Symbol};
 use logit_core::{
-    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, MetricKind, MetricRecord, Resource, Scope,
-    Severity, Sum, Temporality, Value,
+    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, MetricKind, MetricRecord, MetricValue,
+    Resource, Scope, Severity, Sum, Temporality, Value,
 };
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -381,7 +381,7 @@ impl CollectdDecoder {
             let (kind, flags) = match value {
                 DsValue::Counter(v) => (
                     MetricKind::Sum(Sum {
-                        value: v as f64,
+                        value: MetricValue::U64(v),
                         temporality: Temporality::Cumulative,
                         monotonic: true,
                     }),
@@ -389,7 +389,7 @@ impl CollectdDecoder {
                 ),
                 DsValue::Derive(v) => (
                     MetricKind::Sum(Sum {
-                        value: v as f64,
+                        value: MetricValue::I64(v),
                         temporality: Temporality::Cumulative,
                         monotonic: false,
                     }),
@@ -397,7 +397,7 @@ impl CollectdDecoder {
                 ),
                 DsValue::Absolute(v) => (
                     MetricKind::Sum(Sum {
-                        value: v as f64,
+                        value: MetricValue::U64(v),
                         temporality: Temporality::Delta,
                         monotonic: true,
                     }),
@@ -406,9 +406,9 @@ impl CollectdDecoder {
                 // NaN is collectd's "no value for this interval": a flagged point, not a
                 // `Gauge(NaN)` that never compares equal ([`super`]'s decode table).
                 DsValue::Gauge(v) if v.is_nan() => {
-                    (MetricKind::Gauge(0.0), MetricRecord::FLAG_NO_RECORDED_VALUE)
+                    (MetricKind::gauge(0.0), MetricRecord::FLAG_NO_RECORDED_VALUE)
                 }
-                DsValue::Gauge(v) => (MetricKind::Gauge(v), 0),
+                DsValue::Gauge(v) => (MetricKind::gauge(v), 0),
             };
             event.metrics.push(MetricRecord { flags, ..MetricRecord::new(name, kind) });
         }
@@ -758,7 +758,7 @@ pub(crate) mod tests {
         assert_eq!(event.timestamp, RECEIVED_AT);
         assert_eq!(event.metrics.len(), 1);
         assert_eq!(resolve(event.metrics[0].name), "memory.memory");
-        assert_eq!(event.metrics[0].kind, MetricKind::Gauge(1.5));
+        assert_eq!(event.metrics[0].kind, MetricKind::gauge(1.5));
         assert_eq!(attr(event, ATTR_HOST), Some(Value::from("web-1")));
         assert_eq!(attr(event, ATTR_PLUGIN), Some(Value::from("memory")));
         assert_eq!(attr(event, ATTR_TYPE), Some(Value::from("memory")));
@@ -788,19 +788,19 @@ pub(crate) mod tests {
         assert_eq!(
             kinds,
             vec![
-                MetricKind::Gauge(1.5),
+                MetricKind::gauge(1.5),
                 MetricKind::Sum(Sum {
-                    value: 7.0,
+                    value: MetricValue::U64(7),
                     temporality: Temporality::Cumulative,
                     monotonic: true
                 }),
                 MetricKind::Sum(Sum {
-                    value: -1.0,
+                    value: MetricValue::I64(-1),
                     temporality: Temporality::Cumulative,
                     monotonic: false
                 }),
                 MetricKind::Sum(Sum {
-                    value: 9.0,
+                    value: MetricValue::U64(9),
                     temporality: Temporality::Delta,
                     monotonic: true
                 }),
@@ -989,7 +989,7 @@ pub(crate) mod tests {
                 .values(&[gauge(f64::NAN)])
                 .build(),
         );
-        assert_eq!(events[0].metrics[0].kind, MetricKind::Gauge(0.0));
+        assert_eq!(events[0].metrics[0].kind, MetricKind::gauge(0.0));
         assert!(events[0].metrics[0].is_no_recorded_value());
     }
 
@@ -1003,8 +1003,8 @@ pub(crate) mod tests {
                 .values(&[gauge(f64::INFINITY), gauge(f64::NEG_INFINITY)])
                 .build(),
         );
-        assert_eq!(events[0].metrics[0].kind, MetricKind::Gauge(f64::INFINITY));
-        assert_eq!(events[0].metrics[1].kind, MetricKind::Gauge(f64::NEG_INFINITY));
+        assert_eq!(events[0].metrics[0].kind, MetricKind::gauge(f64::INFINITY));
+        assert_eq!(events[0].metrics[1].kind, MetricKind::gauge(f64::NEG_INFINITY));
         assert!(!events[0].metrics[0].is_no_recorded_value());
     }
 
@@ -1393,7 +1393,7 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         decoder.decode_into(bytes, RECEIVED_AT, &mut out).expect("earlier lists survive");
         assert_eq!(out.len(), 1, "only the list before the malformed part is decoded");
-        assert_eq!(out[0].metrics[0].kind, MetricKind::Gauge(1.0));
+        assert_eq!(out[0].metrics[0].kind, MetricKind::gauge(1.0));
         assert!(diagnosed(&registry, "bad_part"));
     }
 
@@ -1529,7 +1529,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_counter_at_the_top_of_the_u64_range_decodes_as_a_lossy_but_finite_f64() {
+    fn a_counter_at_the_top_of_the_u64_range_decodes_exactly() {
         let events = decode(
             PacketBuilder::new()
                 .string(part::TYPE_HOST, b"h")
@@ -1538,11 +1538,11 @@ pub(crate) mod tests {
                 .values(&[counter(u64::MAX), absolute(u64::MAX)])
                 .build(),
         );
-        // Precision loss above 2^53 is a known gap (`docs/known-gaps/mappings.md`), not a failure.
+        // COUNTER and ABSOLUTE decode as `U64`, so the sender's number survives above 2^53.
         assert_eq!(
             events[0].metrics[0].kind,
             MetricKind::Sum(Sum {
-                value: u64::MAX as f64,
+                value: MetricValue::U64(u64::MAX),
                 temporality: Temporality::Cumulative,
                 monotonic: true
             })
@@ -1550,7 +1550,7 @@ pub(crate) mod tests {
         assert_eq!(
             events[0].metrics[1].kind,
             MetricKind::Sum(Sum {
-                value: u64::MAX as f64,
+                value: MetricValue::U64(u64::MAX),
                 temporality: Temporality::Delta,
                 monotonic: true
             })

@@ -123,7 +123,7 @@ fn batch(events: Vec<Event>) -> EventBatch {
 }
 
 fn mixed() -> EventBatch {
-    batch(vec![log("a", None), metric(MetricKind::Gauge(1.0)), span([7; 16], 1), log("b", None)])
+    batch(vec![log("a", None), metric(MetricKind::gauge(1.0)), span([7; 16], 1), log("b", None)])
 }
 
 fn hex(id: [u8; 16]) -> Vec<u8> {
@@ -283,7 +283,7 @@ async fn a_topic_that_failed_to_prepare_holds_the_send() {
     cluster.script(Step::metadata(METRICS, Action::Error(fault::code::TOPIC_AUTHORIZATION_FAILED)));
     let probe = TelemetryProbe::new();
     let mut out = sink(settings(&cluster), &probe);
-    let input = batch(vec![log("a", None), metric(MetricKind::Gauge(1.0))]);
+    let input = batch(vec![log("a", None), metric(MetricKind::gauge(1.0))]);
     out.observe_batch(BatchContext::default(), SeqId { id: [0; 16], seq: 1 });
     let err = out.send(&input).await.expect_err("the metrics topic didn't prepare");
     assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
@@ -306,7 +306,7 @@ async fn a_rejected_topic_beside_an_unsettled_one_is_retried() {
     );
     let probe = TelemetryProbe::new();
     let mut out = sink(settings(&cluster), &probe);
-    let input = batch(vec![log("a", None), metric(MetricKind::Gauge(1.0))]);
+    let input = batch(vec![log("a", None), metric(MetricKind::gauge(1.0))]);
     out.observe_batch(BatchContext::default(), SeqId { id: [0; 16], seq: 1 });
     let err = out.send(&input).await.expect_err("the metrics topic is unsettled");
     assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
@@ -332,7 +332,7 @@ async fn at_most_once_drops_an_ambiguous_topic_beside_a_refused_one() {
         KafkaSettings { acks: KafkaAcks::Leader, idempotent: false, ..settings(&cluster) },
         &probe,
     );
-    let input = batch(vec![log("a", None), log("b", None), metric(MetricKind::Gauge(1.0))]);
+    let input = batch(vec![log("a", None), log("b", None), metric(MetricKind::gauge(1.0))]);
     let sums =
         sums_through_write_loop(&mut out, &mut probe, "kafka_out", vec![input], at_most_once())
             .await;
@@ -385,7 +385,7 @@ async fn trace_id_keys_each_signals_request_by_its_own_trace_id() {
         log("a2", Some(a)),
         span(a, 1),
         both,
-        metric(MetricKind::Gauge(1.0)),
+        metric(MetricKind::gauge(1.0)),
     ]);
     let sums = run(&mut out, &mut probe, vec![input]).await;
 
@@ -517,8 +517,8 @@ async fn an_oversize_request_is_split_and_an_event_too_large_alone_is_dropped() 
 async fn the_mappings_counters_count_once_across_probes_and_a_retried_prepare() {
     let mut events = Vec::new();
     for i in 0..12 {
-        events.push(metric(MetricKind::Gauge(f64::from(i))));
-        events.push(metric(MetricKind::GaugeDelta(1.0)));
+        events.push(metric(MetricKind::gauge(f64::from(i))));
+        events.push(metric(MetricKind::GaugeDelta(logit_core::MetricValue::F64(1.0))));
     }
     let input = batch(events);
     let one = OtlpEncoder::new()

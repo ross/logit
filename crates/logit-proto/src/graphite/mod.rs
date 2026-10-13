@@ -43,10 +43,10 @@
 //! | Wire | Model | Counter / diag |
 //! |---|---|---|
 //! | one line / one pickle datapoint | one `Event`, one `MetricRecord` | -- |
-//! | `path` (everything before the first `;`) | `name = intern(path)`, `Gauge(v)` | -- |
+//! | `path` (everything before the first `;`) | `name = intern(path)`, `Gauge(F64(v))` | -- |
 //! | `;name=value` | event attribute, `Value::Str` over a zero-copy [`bytes::Bytes`] slice of the input; a copy when the path is a protocol-0 pickle string the reader decoded into its scratch ([`pickle`]'s "Bounds") | -- |
 //! | repeated tag key | last occurrence wins | `logit.input.tags.normalized{reason="duplicate_key"}` + diag `duplicate_tag_key` |
-//! | finite value (`3`, `-1.5`, `1e5`, or a pickle `"3.14"` string) | `Gauge(v)` | -- |
+//! | finite value (`3`, `-1.5`, `1e5`, or a pickle `"3.14"` string) | `Gauge(F64(v))`: carbon's value is a double, so an integer reads as `F64` too | -- |
 //! | NaN / ±inf | line skipped | `logit.input.metrics.skipped{reason="non_finite_value"}` + diag `non_finite_value` |
 //! | `timestamp == -1` | `received_at` (carbon's own rule) | -- |
 //! | `timestamp > 0`, integral or fractional | whole seconds and the sub-second part scaled to nanoseconds separately, the part rounded half away from zero, saturating at `i64::MAX`; under half a nanosecond reads as `0` | -- |
@@ -75,6 +75,8 @@
 //! | `MetricRecord::name`, sanitized | the path, verbatim | -- |
 //! | `Sum{Delta\|Cumulative, monotonic\|!monotonic}` | the bare value | -- (normalization 12) |
 //! | `Gauge(v)`, finite | `path v ts` | -- |
+//! | an `I64`/`U64` value | plaintext: the integer's own digits, exact above 2⁵³; pickle: its nearest `f64`, as a pickled value is a Python float | -- |
+//! | a `Bool` value | `1` or `0` | `logit.output.metrics.normalized{reason="bool_value"}` |
 //! | `Gauge` NaN / ±inf, or any non-finite value | dropped | `{reason="unencodable_value"}` + diag `unencodable_value` |
 //! | any kind flagged [`logit_core::MetricRecord::FLAG_NO_RECORDED_VALUE`] | dropped | `{reason="no_recorded_value"}` + diag `no_recorded_value` |
 //! | `GaugeDelta` | dropped | `{metric_kind="gauge_delta"}` + diag `gauge_delta_unresolved` |

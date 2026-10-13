@@ -823,9 +823,9 @@ fn collectd_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
         event
     };
     let sum = |value: f64, temporality: Temporality, monotonic: bool| {
-        MetricKind::Sum(Sum { value, temporality, monotonic })
+        MetricKind::Sum(Sum { value: value.into(), temporality, monotonic })
     };
-    let mut nan = MetricRecord::new(intern("seed.nan"), MetricKind::Gauge(0.0));
+    let mut nan = MetricRecord::new(intern("seed.nan"), MetricKind::gauge(0.0));
     nan.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
     let mut nan_list = list(identity("memory", None, "memory", Some("free")), vec![]);
     nan_list.metrics.push(nan);
@@ -851,7 +851,7 @@ fn collectd_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
         (
             "lists",
             vec![
-                list(identity("load", None, "load", None), vec![MetricKind::Gauge(0.5); 3]),
+                list(identity("load", None, "load", None), vec![MetricKind::gauge(0.5); 3]),
                 list(
                     identity("interface", Some("eth0"), "if_octets", None),
                     vec![
@@ -879,7 +879,7 @@ fn collectd_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
             "max-values",
             vec![list(
                 identity("wide", None, "wide", None),
-                vec![MetricKind::Gauge(1.0); MAX_VALUES_PER_LIST],
+                vec![MetricKind::gauge(1.0); MAX_VALUES_PER_LIST],
             )],
         ),
     ];

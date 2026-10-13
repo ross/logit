@@ -1064,7 +1064,9 @@ fn graphite_pickle_decodes_cpythons_batched_appends_in_full() {
     for (event, (path, seconds, value)) in events.iter().zip(&points) {
         assert_eq!(logit_core::interner::resolve(event.metrics[0].name), path);
         assert_eq!(event.timestamp, i64::from(*seconds) * 1_000_000_000);
-        assert!(matches!(event.metrics[0].kind, logit_core::MetricKind::Gauge(v) if v == *value));
+        assert!(
+            matches!(event.metrics[0].kind, logit_core::MetricKind::Gauge(v) if v.as_f64() == *value)
+        );
     }
 }
 
@@ -2591,7 +2593,9 @@ fn a_ten_byte_varint_with_bits_above_the_low_bit_is_malformed() {
 #[test]
 fn every_metric_kind_rejects_trailing_bytes_in_its_body() {
     let f64_bytes = 1.5f64.to_le_bytes();
-    let mut sum = f64_bytes.to_vec();
+    let mut scalar = vec![0u8]; // type F64
+    scalar.extend_from_slice(&f64_bytes);
+    let mut sum = scalar.clone();
     sum.extend_from_slice(&[0, 1]); // temporality Delta, monotonic
     let mut samples = vec![1u8]; // one sample
     samples.extend_from_slice(&f64_bytes);
@@ -2615,8 +2619,8 @@ fn every_metric_kind_rejects_trailing_bytes_in_its_body() {
 
     let kinds: [(&str, u8, Vec<u8>); 9] = [
         ("Sum", 0, sum),
-        ("Gauge", 1, f64_bytes.to_vec()),
-        ("GaugeDelta", 2, f64_bytes.to_vec()),
+        ("Gauge", 1, scalar.clone()),
+        ("GaugeDelta", 2, scalar),
         ("Samples", 3, samples),
         ("Distribution", 4, sketch.to_bytes()),
         ("SetMembers", 5, set_members),
@@ -2646,7 +2650,7 @@ fn a_record_field_with_trailing_bytes_is_malformed() {
     let null = tlv(0, &[]);
     let mut trace = vec![0u8; 16];
     trace.extend_from_slice(&[0, 0]); // no span id, flags 0
-    let gauge = tlv(1, &[0; 8]);
+    let gauge = tlv(1, &[0; 9]);
 
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("FIELD_TIMESTAMP", tlv(1, &with_junk(&[0x02]))),
@@ -2798,7 +2802,7 @@ fn a_frame_of_empty_exemplars_is_rejected_past_the_decode_budget() {
     let exemplars = tlv(5, &counted_list(&vec![Vec::new(); n])); // MR_EXEMPLARS
     let payload = Bytes::from(wire_batch(
         &["m"],
-        &[wire_metric_event(wire_metric_record(&tlv(1, &[0; 8]), &exemplars))],
+        &[wire_metric_event(wire_metric_record(&tlv(1, &[0; 9]), &exemplars))],
     ));
     // The dictionary's one string and its `Symbol`, the event, the metric record, the exemplars.
     let cost = (1
@@ -2850,12 +2854,12 @@ fn peak_allocation_per_wire_byte_matches_the_documented_ratio() {
         wire_batch(&[], &vec![Vec::new(); n])
     }
     fn metric_records(n: usize) -> Vec<u8> {
-        let record = wire_metric_record(&tlv(1, &[0; 8]), &[]);
+        let record = wire_metric_record(&tlv(1, &[0; 9]), &[]);
         wire_batch(&["m"], &[tlv(4, &counted_list(&vec![record; n]))])
     }
     fn exemplars(n: usize) -> Vec<u8> {
         let field = tlv(5, &counted_list(&vec![Vec::new(); n]));
-        wire_batch(&["m"], &[wire_metric_event(wire_metric_record(&tlv(1, &[0; 8]), &field))])
+        wire_batch(&["m"], &[wire_metric_event(wire_metric_record(&tlv(1, &[0; 9]), &field))])
     }
     fn span_events(n: usize) -> Vec<u8> {
         let event = tlv(2, &tlv(0, &[])); // SE_NAME: Null
@@ -2955,7 +2959,7 @@ const RATIO_SPAN_EVENT: f64 = 89.6;
 const RATIO_SET_MEMBER: f64 = 32.0;
 const RATIO_ARRAY_ITEM: f64 = 20.0;
 const RATIO_SPAN_LINK: f64 = 15.7;
-const RATIO_METRIC_RECORD: f64 = 11.8;
+const RATIO_METRIC_RECORD: f64 = 11.2;
 const RATIO_EXPONENTIAL_BUCKET: f64 = 8.0;
 const RATIO_SAMPLE: f64 = 2.0;
 const RATIO_HISTOGRAM_BUCKET: f64 = 1.8;
@@ -3008,7 +3012,8 @@ fn telemetry_reasons(registry: &logit_core::Registry, prefix: &str) -> Reasons {
             let name = logit_core::interner::resolve(metric.name);
             let logit_core::MetricKind::Sum(sum) = &metric.kind else { return None };
             let reason = event.attributes.get("reason").and_then(Value::as_str)?;
-            name.starts_with(prefix).then(|| (format!("{name}{{{reason}}}"), sum.value as u64))
+            name.starts_with(prefix)
+                .then(|| (format!("{name}{{{reason}}}"), sum.value.as_f64() as u64))
         })
         .collect();
     reasons.sort();

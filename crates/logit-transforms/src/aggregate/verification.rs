@@ -413,7 +413,7 @@ proptest! {
         // Each class is its first record's key and the index of its latest record.
         let mut classes: Vec<(RefKey, usize)> = Vec::new();
         for (i, spec) in specs.iter().enumerate() {
-            let mut record = MetricRecord::new(intern(spec.name), MetricKind::Gauge(i as f64));
+            let mut record = MetricRecord::new(intern(spec.name), MetricKind::gauge(i as f64));
             record.unit = spec.unit.map(intern);
             let mut event = Event::metric(i as i64, attr_map(&spec.attrs, &pool), record);
             prop_assert!(!agg.process(&resource, &mut event), "a gauge-only event is absorbed");
@@ -443,7 +443,9 @@ proptest! {
             prop_assert!(!matched[class], "two emitted series for class {:?}", emitted);
             matched[class] = true;
             match record.kind {
-                MetricKind::Gauge(v) => prop_assert_eq!(v, classes[class].1 as f64),
+                MetricKind::Gauge(v) => {
+                    prop_assert_eq!(v, MetricValue::F64(classes[class].1 as f64))
+                }
                 ref other => prop_assert!(false, "expected a Gauge, got {:?}", other),
             }
         }
@@ -784,11 +786,11 @@ fn kind_spec() -> impl Strategy<Value = KindSpec> {
     prop_oneof![
         3 => plain((scalar(), temporality(), any::<bool>())
             .prop_map(|(value, temporality, monotonic)| {
-                MetricKind::Sum(Sum { value, temporality, monotonic })
+                MetricKind::Sum(Sum { value: MetricValue::F64(value), temporality, monotonic })
             })
             .boxed()),
-        2 => plain(scalar().prop_map(MetricKind::Gauge).boxed()),
-        2 => plain(scalar().prop_map(MetricKind::GaugeDelta).boxed()),
+        2 => plain(scalar().prop_map(MetricKind::gauge).boxed()),
+        2 => plain(scalar().prop_map(|v| MetricKind::GaugeDelta(MetricValue::F64(v))).boxed()),
         3 => plain(samples().prop_map(MetricKind::Samples).boxed()),
         1 => samples().prop_map(KindSpec::Dist),
         1 => members().prop_map(KindSpec::Set),
@@ -1215,12 +1217,14 @@ impl Model {
         fate
     }
 
-    /// The empty accumulator a series of this kind opens with under this config.
+    /// The empty accumulator a series of this kind opens with under this config. A `Sum` or
+    /// gauge opens at `-0.0`, the `f64` additive identity (`-0.0 + x` is `x` bitwise, `-0.0`
+    /// included), which models `Aggregator` seeding the series with its first record's value.
     fn open(&self, spec: &KindSpec) -> RefAcc {
         match spec.build() {
-            MetricKind::Sum(s) => RefAcc::Sum { total: 0.0, monotonic: s.monotonic },
+            MetricKind::Sum(s) => RefAcc::Sum { total: -0.0, monotonic: s.monotonic },
             MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => {
-                RefAcc::Gauge { value: 0.0, at: i64::MIN }
+                RefAcc::Gauge { value: -0.0, at: i64::MIN }
             }
             MetricKind::Samples(s) => match self.config.samples_cap {
                 None => RefAcc::Dist(Vec::new()),
@@ -1330,14 +1334,14 @@ fn merge(
 ) -> Fate {
     let kind = spec.build();
     match (&mut *acc, &kind) {
-        (RefAcc::Sum { total, .. }, MetricKind::Sum(s)) => *total += s.value,
+        (RefAcc::Sum { total, .. }, MetricKind::Sum(s)) => *total += s.value.as_f64(),
         (RefAcc::Gauge { value, at }, MetricKind::Gauge(v)) => {
             if timestamp >= *at {
-                *value = *v;
+                *value = v.as_f64();
                 *at = timestamp;
             }
         }
-        (RefAcc::Gauge { value, .. }, MetricKind::GaugeDelta(d)) => *value += d,
+        (RefAcc::Gauge { value, .. }, MetricKind::GaugeDelta(d)) => *value += d.as_f64(),
         (RefAcc::Dist(obs), MetricKind::Samples(s)) => {
             let (finite, dropped) = observations(&s.values, s.sample_rate);
             obs.extend(finite);
@@ -1511,12 +1515,15 @@ fn check_emitted(
     let mode = record_temporality(config.temporality);
     match (kind, acc) {
         (MetricKind::Sum(s), RefAcc::Sum { total, monotonic }) => {
-            prop_assert!(same_f64(s.value, *total), "sum {} against {}", s.value, total);
+            // Every generated input is `F64`, so the fold never widens and stays `F64`.
+            prop_assert!(matches!(s.value, MetricValue::F64(_)), "sum {:?} isn't F64", s.value);
+            prop_assert!(same_f64(s.value.as_f64(), *total), "sum {:?} against {}", s.value, total);
             prop_assert_eq!(s.temporality, mode);
             prop_assert_eq!(s.monotonic, *monotonic);
         }
         (MetricKind::Gauge(v), RefAcc::Gauge { value, .. }) => {
-            prop_assert!(same_f64(*v, *value), "gauge {} against {}", v, value);
+            prop_assert!(matches!(v, MetricValue::F64(_)), "gauge {:?} isn't F64", v);
+            prop_assert!(same_f64(v.as_f64(), *value), "gauge {:?} against {}", v, value);
         }
         (MetricKind::Distribution(sketch), RefAcc::Dist(obs)) => {
             prop_assert_eq!(sketch.mapping().kind(), logit_core::MappingKind::Agent);
@@ -1566,7 +1573,7 @@ fn telemetry_total(events: &[Event], name: &str, tag: &str, tag_value: &str) -> 
         .flat_map(|e| &e.metrics)
         .filter(|m| resolve(m.name) == name)
         .map(|m| match &m.kind {
-            MetricKind::Sum(s) => s.value as u64,
+            MetricKind::Sum(s) => s.value.as_f64() as u64,
             _ => 0,
         })
         .sum()
@@ -1574,7 +1581,7 @@ fn telemetry_total(events: &[Event], name: &str, tag: &str, tag_value: &str) -> 
 
 fn telemetry_gauge(events: &[Event], name: &str) -> Option<f64> {
     events.iter().flat_map(|e| &e.metrics).find_map(|m| match &m.kind {
-        MetricKind::Gauge(v) if resolve(m.name) == name => Some(*v),
+        MetricKind::Gauge(v) if resolve(m.name) == name => Some(v.as_f64()),
         _ => None,
     })
 }
@@ -1828,7 +1835,7 @@ fn family_kind(family: usize) -> BoxedStrategy<KindSpec> {
         0 => (-1e12..1e12f64, any::<bool>())
             .prop_map(|(value, monotonic)| {
                 KindSpec::Plain(MetricKind::Sum(Sum {
-                    value,
+                    value: MetricValue::F64(value),
                     temporality: Temporality::Delta,
                     monotonic,
                 }))
@@ -1885,7 +1892,7 @@ fn magnitude(specs: &[KindSpec]) -> f64 {
     specs
         .iter()
         .map(|spec| match spec {
-            KindSpec::Plain(MetricKind::Sum(s)) => s.value.abs(),
+            KindSpec::Plain(MetricKind::Sum(s)) => s.value.as_f64().abs(),
             KindSpec::Plain(MetricKind::Histogram(h)) => h.sum.map_or(0.0, f64::abs),
             KindSpec::Plain(MetricKind::Samples(s)) | KindSpec::Dist(s) => weighted(s),
             _ => 0.0,
@@ -1906,7 +1913,12 @@ fn law_eq(x: &MetricKind, y: &MetricKind, n: usize, scale: f64) -> Result<(), Te
     };
     match (x, y) {
         (MetricKind::Sum(a), MetricKind::Sum(b)) => {
-            prop_assert!(close(a.value, b.value), "{} against {}", a.value, b.value);
+            prop_assert!(
+                close(a.value.as_f64(), b.value.as_f64()),
+                "{:?} against {:?}",
+                a.value,
+                b.value
+            );
         }
         (MetricKind::Distribution(a), MetricKind::Distribution(b)) => {
             prop_assert_eq!(a.mapping(), b.mapping());
@@ -1995,7 +2007,7 @@ fn the_model_caps_links_per_series() {
         name: "m0",
         unit: None,
         description: None,
-        kind: KindSpec::Plain(MetricKind::Gauge(1.0)),
+        kind: KindSpec::Plain(MetricKind::gauge(1.0)),
         no_recorded_value: false,
     };
     let event = EventSpec { timestamp: 0, attributes: 0, records: vec![gauge], log: false };
@@ -2071,7 +2083,7 @@ proptest! {
     ) {
         let resource = Arc::new(Resource::default());
         let gauge = |v: f64, ts: i64| {
-            Event::metric(ts, AttrMap::new(), MetricRecord::new(intern("g"), MetricKind::Gauge(v)))
+            Event::metric(ts, AttrMap::new(), MetricRecord::new(intern("g"), MetricKind::gauge(v)))
         };
         let emitted = |agg: &mut Aggregator, now: i64| {
             let (_, _, mut events) = agg.flush(now).remove(0);
@@ -2092,12 +2104,13 @@ proptest! {
         let (now1, relayed) = emitted(&mut first, 10);
         let MetricKind::Gauge(relayed) = relayed else { unreachable!() };
         let mut second = Aggregator::new(Duration::from_secs(10));
-        for mut event in [gauge(relayed, now1), gauge(c, tc)] {
+        for mut event in [gauge(relayed.as_f64(), now1), gauge(c, tc)] {
             second.process(&resource, &mut event);
         }
         let (_, relayed) = emitted(&mut second, 20);
         match (direct, relayed) {
             (MetricKind::Gauge(x), MetricKind::Gauge(y)) => {
+                let (x, y) = (x.as_f64(), y.as_f64());
                 prop_assert!(same_f64(x, y) && same_f64(x, c), "{} and {} against {}", x, y, c);
             }
             other => prop_assert!(false, "{:?}", other),
@@ -2136,15 +2149,15 @@ fn run_order(agg: Aggregator, records: &[(MetricKind, i64)]) -> (Vec<MetricKind>
 #[test]
 fn a_gauge_tie_goes_to_the_later_arrival() {
     for (first, second) in [(1.0, 2.0), (2.0, 1.0)] {
-        let records = [(MetricKind::Gauge(first), 3), (MetricKind::Gauge(second), 3)];
+        let records = [(MetricKind::gauge(first), 3), (MetricKind::gauge(second), 3)];
         let (emitted, _) = run_order(Aggregator::new(Duration::from_secs(10)), &records);
-        assert_eq!(emitted, vec![MetricKind::Gauge(second)]);
+        assert_eq!(emitted, vec![MetricKind::gauge(second)]);
     }
 }
 
 #[test]
 fn a_kind_conflict_keeps_the_first_arrival() {
-    let (gauge, counter) = (MetricKind::Gauge(1.0), MetricKind::counter(2.0));
+    let (gauge, counter) = (MetricKind::gauge(1.0), MetricKind::counter(2.0));
     for (first, second) in [(gauge.clone(), counter.clone()), (counter, gauge)] {
         let records = [(first.clone(), 0), (second.clone(), 0)];
         let (emitted, forwarded) = run_order(Aggregator::new(Duration::from_secs(10)), &records);
@@ -2299,7 +2312,7 @@ proptest! {
             let mut accepted: [Vec<usize>; CAP_SERIES.len()] = Default::default();
             for op in ops {
                 let conflict = op.conflict && exists[op.series];
-                let kind = if conflict { MetricKind::counter(1.0) } else { MetricKind::Gauge(1.0) };
+                let kind = if conflict { MetricKind::counter(1.0) } else { MetricKind::gauge(1.0) };
                 let record = MetricRecord::new(intern(CAP_SERIES[op.series]), kind);
                 let mut event = Event::metric(now, AttrMap::new(), record);
                 agg.observe_batch_context(context(op.context));

@@ -74,6 +74,7 @@
 //! |---|---|
 //! | `Sum{Cumulative, monotonic}` | `counter` |
 //! | `Sum{Cumulative, !monotonic}` | `gauge` -- Prometheus has no non-monotonic counter; `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}` |
+//! | a `Sum` or `Gauge` value of `I64`/`U64`/`Bool` | the sample's double, on both wires: an integer's nearest `f64`, a `Bool` `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}` |
 //! | `Sum{Delta}` / `Histogram{Delta}` | **skipped**, `logit.output.metrics.skipped{metric_kind="delta_sum"\|"delta_histogram"}` + `warn_throttled("delta_temporality_unresolved")` -- put an `aggregate` with `temporality: cumulative` in front of the sink |
 //! | `Gauge` | `gauge`, or whatever `prometheus.type` says (consumed): `untyped`/`unknown`/`info`/`stateset` |
 //! | `GaugeDelta` | **skipped**, `logit.output.metrics.skipped{metric_kind="gauge_delta"}` + `warn_throttled("gauge_delta_unresolved")` (the same greppable key every other sink uses) |
@@ -168,8 +169,8 @@ pub use text::Dialect;
 use crate::otlp::metrics::DISTRIBUTION_QUANTILES;
 use logit_core::interner::{intern, resolve};
 use logit_core::{
-    AttrMap, DdSketch, Diagnostics, Event, Exemplar, Histogram, MetricKind, MetricRecord, Resource,
-    Sum, Summary, Telemetry, Temporality, Value,
+    AttrMap, DdSketch, Diagnostics, Event, Exemplar, Histogram, MetricKind, MetricRecord,
+    MetricValue, Resource, Sum, Summary, Telemetry, Temporality, Value,
 };
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -499,6 +500,19 @@ impl PrometheusEncoder {
         self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("metric_kind", metric_kind)]);
     }
 
+    /// A scalar's sample value. A sample is a double on both wires, so an integer leaves as its
+    /// nearest `f64` and a `Bool` as `1` or `0`, counted.
+    fn scalar(&self, value: MetricValue) -> f64 {
+        if let MetricValue::Bool(_) = value {
+            self.telemetry.count(
+                "logit.output.metrics.normalized",
+                1.0,
+                &[("reason", "bool_value")],
+            );
+        }
+        value.as_f64()
+    }
+
     /// `logit.output.metrics.degraded{reason}` -- the same counter keyed by *why* rather than by
     /// which model kind, for a degradation the wire format forces on a metric of any kind (a
     /// `# UNIT` the format won't accept, an exemplar with nowhere to sit).
@@ -614,13 +628,13 @@ fn point_to_kind(
     Some((
         match point {
             Point::Counter(v) => MetricKind::Sum(Sum {
-                value: *v,
+                value: MetricValue::F64(*v),
                 temporality: Temporality::Cumulative,
                 monotonic: true,
             }),
-            Point::Gauge(v) | Point::Unknown(v) => MetricKind::Gauge(*v),
-            Point::Info => MetricKind::Gauge(1.0),
-            Point::StateSet(on) => MetricKind::Gauge(if *on { 1.0 } else { 0.0 }),
+            Point::Gauge(v) | Point::Unknown(v) => MetricKind::gauge(*v),
+            Point::Info => MetricKind::gauge(1.0),
+            Point::StateSet(on) => MetricKind::gauge(if *on { 1.0 } else { 0.0 }),
             Point::Histogram { buckets, sum, .. } => {
                 let buckets = per_bucket_counts(buckets, decoder)?;
                 MetricKind::Histogram(Histogram {
@@ -655,7 +669,7 @@ fn point_to_kind(
 fn stale_kind(family: FamilyType) -> MetricKind {
     match family {
         FamilyType::Counter => MetricKind::Sum(Sum {
-            value: f64::NAN,
+            value: MetricValue::F64(f64::NAN),
             temporality: Temporality::Cumulative,
             monotonic: true,
         }),
@@ -673,7 +687,7 @@ fn stale_kind(family: FamilyType) -> MetricKind {
         | FamilyType::Info
         | FamilyType::StateSet
         | FamilyType::Unknown
-        | FamilyType::Untyped => MetricKind::Gauge(f64::NAN),
+        | FamilyType::Untyped => MetricKind::gauge(f64::NAN),
     }
 }
 
@@ -850,10 +864,12 @@ fn record_to_point(
     let declared = declared_type(event);
     Some(match &record.kind {
         MetricKind::Sum(s) => match (s.temporality, s.monotonic) {
-            (Temporality::Cumulative, true) => (FamilyType::Counter, Point::Counter(s.value)),
+            (Temporality::Cumulative, true) => {
+                (FamilyType::Counter, Point::Counter(encoder.scalar(s.value)))
+            }
             (Temporality::Cumulative, false) => {
                 encoder.degraded("non_monotonic_sum");
-                (FamilyType::Gauge, Point::Gauge(s.value))
+                (FamilyType::Gauge, Point::Gauge(encoder.scalar(s.value)))
             }
             (Temporality::Delta, _) => {
                 encoder.skipped_kind("delta_sum");
@@ -862,11 +878,13 @@ fn record_to_point(
             }
         },
         MetricKind::Gauge(v) => match declared {
-            Some(FamilyType::Untyped) => (FamilyType::Untyped, Point::Unknown(*v)),
-            Some(FamilyType::Unknown) => (FamilyType::Unknown, Point::Unknown(*v)),
+            Some(FamilyType::Untyped) => (FamilyType::Untyped, Point::Unknown(encoder.scalar(*v))),
+            Some(FamilyType::Unknown) => (FamilyType::Unknown, Point::Unknown(encoder.scalar(*v))),
             Some(FamilyType::Info) => (FamilyType::Info, Point::Info),
-            Some(FamilyType::StateSet) => (FamilyType::StateSet, Point::StateSet(*v != 0.0)),
-            _ => (FamilyType::Gauge, Point::Gauge(*v)),
+            Some(FamilyType::StateSet) => {
+                (FamilyType::StateSet, Point::StateSet(v.as_f64() != 0.0))
+            }
+            _ => (FamilyType::Gauge, Point::Gauge(encoder.scalar(*v))),
         },
         MetricKind::GaugeDelta(_) => {
             encoder.skipped_kind("gauge_delta");
@@ -1245,7 +1263,7 @@ mod tests {
         assert_eq!(
             events[0].metrics[0].kind,
             MetricKind::Sum(Sum {
-                value: 1027.0,
+                value: MetricValue::F64(1027.0),
                 temporality: Temporality::Cumulative,
                 monotonic: true
             })
@@ -1261,7 +1279,7 @@ mod tests {
             vec![Series::new(vec![], Point::Gauge(69.0))],
         )];
         let events = decode(&families);
-        assert_eq!(events[0].metrics[0].kind, MetricKind::Gauge(69.0));
+        assert_eq!(events[0].metrics[0].kind, MetricKind::gauge(69.0));
         assert_eq!(events[0].attributes.get(ATTR_TYPE), None, "a plain gauge needs no marker");
     }
 
@@ -1338,7 +1356,7 @@ mod tests {
             let families =
                 vec![family("m", kind, vec![Series::new(vec![], Point::Unknown(12.47))])];
             let events = decode(&families);
-            assert_eq!(events[0].metrics[0].kind, MetricKind::Gauge(12.47));
+            assert_eq!(events[0].metrics[0].kind, MetricKind::gauge(12.47));
             assert_eq!(events[0].attributes.get(ATTR_TYPE), Some(&Value::from(expected)));
         }
     }
@@ -1352,7 +1370,7 @@ mod tests {
         )];
         let events = decode(&families);
         assert_eq!(resolve(events[0].metrics[0].name), "target");
-        assert_eq!(events[0].metrics[0].kind, MetricKind::Gauge(1.0));
+        assert_eq!(events[0].metrics[0].kind, MetricKind::gauge(1.0));
         assert_eq!(events[0].attributes.get(ATTR_TYPE), Some(&Value::from("info")));
         assert_eq!(events[0].attributes.get("env"), Some(&Value::from("prod")));
     }
@@ -1369,8 +1387,8 @@ mod tests {
         )];
         let events = decode(&families);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].metrics[0].kind, MetricKind::Gauge(0.0));
-        assert_eq!(events[1].metrics[0].kind, MetricKind::Gauge(1.0));
+        assert_eq!(events[0].metrics[0].kind, MetricKind::gauge(0.0));
+        assert_eq!(events[1].metrics[0].kind, MetricKind::gauge(1.0));
         assert_eq!(events[1].attributes.get(ATTR_TYPE), Some(&Value::from("stateset")));
     }
 
@@ -1462,7 +1480,7 @@ mod tests {
     #[test]
     fn a_cumulative_monotonic_sum_encodes_as_a_counter() {
         let kind = MetricKind::Sum(Sum {
-            value: 5.0,
+            value: MetricValue::F64(5.0),
             temporality: Temporality::Cumulative,
             monotonic: true,
         });
@@ -1474,7 +1492,7 @@ mod tests {
     #[test]
     fn a_non_monotonic_cumulative_sum_encodes_as_a_gauge_and_is_counted_degraded() {
         let kind = MetricKind::Sum(Sum {
-            value: 5.0,
+            value: MetricValue::F64(5.0),
             temporality: Temporality::Cumulative,
             monotonic: false,
         });
@@ -1532,7 +1550,7 @@ mod tests {
         ] {
             let event = event_with(
                 &[(ATTR_TYPE, Value::from(marker))],
-                record("m", MetricKind::Gauge(2.0)),
+                record("m", MetricKind::gauge(2.0)),
             );
             let families = encode(&Resource::default(), &event);
             assert_eq!(families[0].kind, expected_kind, "marker {marker}");
@@ -1548,7 +1566,7 @@ mod tests {
     fn a_gauge_delta_is_skipped_under_the_shared_diagnostic_key() {
         let (families, registry, diag) = encode_counted(
             &Resource::default(),
-            &event_with(&[], record("m", MetricKind::GaugeDelta(1.0))),
+            &event_with(&[], record("m", MetricKind::GaugeDelta(MetricValue::F64(1.0)))),
         );
         assert!(families.is_empty());
         assert!(counted(&registry, "logit.output.metrics.skipped", ("metric_kind", "gauge_delta")));
@@ -1742,7 +1760,7 @@ mod tests {
 
     #[test]
     fn a_no_recorded_value_point_is_skipped_and_counted() {
-        let mut rec = record("m", MetricKind::Gauge(0.0));
+        let mut rec = record("m", MetricKind::gauge(0.0));
         rec.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         let (families, registry, _) = encode_counted(&Resource::default(), &event_with(&[], rec));
         assert!(families.is_empty());
@@ -1756,10 +1774,10 @@ mod tests {
     #[test]
     fn a_timestamp_is_emitted_only_when_the_marker_attribute_is_present() {
         let marked =
-            event_with(&[(ATTR_TIMESTAMP, Value::Bool(true))], record("m", MetricKind::Gauge(1.0)));
+            event_with(&[(ATTR_TIMESTAMP, Value::Bool(true))], record("m", MetricKind::gauge(1.0)));
         assert_eq!(encode(&Resource::default(), &marked)[0].series[0].timestamp, Some(RECEIVED_AT));
 
-        let plain = event_with(&[], record("m", MetricKind::Gauge(1.0)));
+        let plain = event_with(&[], record("m", MetricKind::gauge(1.0)));
         assert_eq!(encode(&Resource::default(), &plain)[0].series[0].timestamp, None);
     }
 
@@ -1768,7 +1786,7 @@ mod tests {
         let mut counter = record(
             "m",
             MetricKind::Sum(Sum {
-                value: 1.0,
+                value: MetricValue::F64(1.0),
                 temporality: Temporality::Cumulative,
                 monotonic: true,
             }),
@@ -1782,7 +1800,7 @@ mod tests {
 
         // A gauge has no `_created` sample in either format, so a `start_timestamp` on one has
         // nowhere to go.
-        let mut gauge = record("m", MetricKind::Gauge(1.0));
+        let mut gauge = record("m", MetricKind::gauge(1.0));
         gauge.start_timestamp = 1_605_281_325_000_000_000;
         let event = event_with(&[], gauge);
         assert_eq!(encode(&Resource::default(), &event)[0].series[0].created, None);
@@ -1793,7 +1811,7 @@ mod tests {
         let resource =
             resource_with(&[("instance", Value::from("host:9100")), ("env", Value::from("dev"))]);
         let event =
-            event_with(&[("env", Value::from("prod"))], record("m", MetricKind::Gauge(1.0)));
+            event_with(&[("env", Value::from("prod"))], record("m", MetricKind::gauge(1.0)));
         assert_eq!(
             encode(&resource, &event)[0].series[0].labels,
             labels(&[("env", "prod"), ("instance", "host:9100")])
@@ -1808,7 +1826,7 @@ mod tests {
             (LABEL_INSTANCE, Value::from("node-exporter:9100")),
             (ATTR_TARGET, Value::from("http://node-exporter:9100/metrics")),
         ]);
-        let event = event_with(&[], record("m", MetricKind::Gauge(1.0)));
+        let event = event_with(&[], record("m", MetricKind::gauge(1.0)));
         assert_eq!(
             encode(&resource, &event)[0].series[0].labels,
             labels(&[("instance", "node-exporter:9100")])
@@ -1832,7 +1850,7 @@ mod tests {
                 ("arr", Value::Array(Vec::new())),
                 ("map", Value::Map(Box::new(AttrMap::new()))),
             ],
-            record("m", MetricKind::Gauge(1.0)),
+            record("m", MetricKind::gauge(1.0)),
         );
         let (families, registry, _) = encode_counted(&Resource::default(), &event);
         assert_eq!(
@@ -1874,7 +1892,7 @@ mod tests {
     fn a_multi_value_label_renders_its_last_element_and_is_counted() {
         let event = event_with(
             &[("team", Value::Array(vec![Value::from("a"), Value::from("b")]))],
-            record("m", MetricKind::Gauge(1.0)),
+            record("m", MetricKind::gauge(1.0)),
         );
         let (families, registry, _) = encode_counted(&Resource::default(), &event);
         assert_eq!(families[0].series[0].labels, labels(&[("team", "b")]));
@@ -1898,7 +1916,7 @@ mod tests {
                     Value::Map(Box::new(AttrMap::new())),
                 ]),
             )],
-            record("m", MetricKind::Gauge(1.0)),
+            record("m", MetricKind::gauge(1.0)),
         );
         let (families, registry, _) = encode_counted(&Resource::default(), &event);
         assert_eq!(families[0].series[0].labels, labels(&[("team", "b")]));
@@ -1912,7 +1930,7 @@ mod tests {
         for elements in [Vec::new(), vec![Value::Null, Value::Timestamp(1)]] {
             let event = event_with(
                 &[("team", Value::Array(elements))],
-                record("m", MetricKind::Gauge(1.0)),
+                record("m", MetricKind::gauge(1.0)),
             );
             let (families, registry, _) = encode_counted(&Resource::default(), &event);
             assert!(families[0].series[0].labels.is_empty());
@@ -1934,7 +1952,7 @@ mod tests {
     fn a_post_sanitization_label_collision_keeps_the_first_original_name_and_is_counted() {
         let event = event_with(
             &[("a.b", Value::from("first")), ("a-b", Value::from("second"))],
-            record("m", MetricKind::Gauge(1.0)),
+            record("m", MetricKind::gauge(1.0)),
         );
         let (families, registry, _) = encode_counted(&Resource::default(), &event);
         assert_eq!(families[0].series[0].labels, labels(&[("a_b", "second")]), "`a-b` < `a.b`");
@@ -1965,7 +1983,7 @@ mod tests {
 
     #[test]
     fn description_and_unit_become_help_and_unit() {
-        let mut rec = record("m", MetricKind::Gauge(1.0));
+        let mut rec = record("m", MetricKind::gauge(1.0));
         rec.description = Some(intern("what it measures"));
         rec.unit = Some(intern("seconds"));
         let families = encode(&Resource::default(), &event_with(&[], rec));
@@ -1978,13 +1996,13 @@ mod tests {
         let (registry, telemetry) = telemetry();
         let mut encoder = PrometheusEncoder::new().with_telemetry(telemetry);
         let resource = Resource::default();
-        let gauge = event_with(&[], record("m", MetricKind::Gauge(1.0)));
+        let gauge = event_with(&[], record("m", MetricKind::gauge(1.0)));
         let counter = event_with(
             &[],
             record(
                 "m",
                 MetricKind::Sum(Sum {
-                    value: 2.0,
+                    value: MetricValue::F64(2.0),
                     temporality: Temporality::Cumulative,
                     monotonic: true,
                 }),
@@ -2002,8 +2020,8 @@ mod tests {
     #[test]
     fn one_name_and_one_label_set_twice_keeps_the_later_series() {
         let resource = Resource::default();
-        let first = event_with(&[("k", Value::from("v"))], record("m", MetricKind::Gauge(1.0)));
-        let second = event_with(&[("k", Value::from("v"))], record("m", MetricKind::Gauge(2.0)));
+        let first = event_with(&[("k", Value::from("v"))], record("m", MetricKind::gauge(1.0)));
+        let second = event_with(&[("k", Value::from("v"))], record("m", MetricKind::gauge(2.0)));
         let families = events_to_families(
             [(&resource, &first), (&resource, &second)].into_iter(),
             &mut PrometheusEncoder::new(),
@@ -2015,9 +2033,9 @@ mod tests {
     #[test]
     fn families_come_back_sorted_by_name_and_series_by_label_set() {
         let resource = Resource::default();
-        let z = event_with(&[("k", Value::from("z"))], record("z_metric", MetricKind::Gauge(1.0)));
-        let a2 = event_with(&[("k", Value::from("b"))], record("a_metric", MetricKind::Gauge(1.0)));
-        let a1 = event_with(&[("k", Value::from("a"))], record("a_metric", MetricKind::Gauge(1.0)));
+        let z = event_with(&[("k", Value::from("z"))], record("z_metric", MetricKind::gauge(1.0)));
+        let a2 = event_with(&[("k", Value::from("b"))], record("a_metric", MetricKind::gauge(1.0)));
+        let a1 = event_with(&[("k", Value::from("a"))], record("a_metric", MetricKind::gauge(1.0)));
         let families = events_to_families(
             [(&resource, &z), (&resource, &a2), (&resource, &a1)].into_iter(),
             &mut PrometheusEncoder::new(),
@@ -2036,7 +2054,7 @@ mod tests {
     fn an_unsanitary_metric_name_is_substituted_not_deleted() {
         let families = encode(
             &Resource::default(),
-            &event_with(&[], record("some.metric-name", MetricKind::Gauge(1.0))),
+            &event_with(&[], record("some.metric-name", MetricKind::gauge(1.0))),
         );
         assert_eq!(families[0].name, "some_metric_name");
     }
@@ -2076,8 +2094,8 @@ mod tests {
         let (registry, telemetry) = telemetry();
         let mut encoder = PrometheusEncoder::new().with_telemetry(telemetry);
         let resource = Resource::default();
-        let dotted = event_with(&[], record("a.b", MetricKind::Gauge(1.0)));
-        let dashed = event_with(&[], record("a-b", MetricKind::Gauge(2.0)));
+        let dotted = event_with(&[], record("a.b", MetricKind::gauge(1.0)));
+        let dashed = event_with(&[], record("a-b", MetricKind::gauge(2.0)));
         let families = events_to_families(
             [(&resource, &dotted), (&resource, &dashed)].into_iter(),
             &mut encoder,
@@ -2095,8 +2113,8 @@ mod tests {
         let (registry, telemetry) = telemetry();
         let mut encoder = PrometheusEncoder::new().with_telemetry(telemetry);
         let resource = Resource::default();
-        let dotted = event_with(&[], record("a.b", MetricKind::Gauge(1.0)));
-        let dashed = event_with(&[], record("a-b", MetricKind::Gauge(2.0)));
+        let dotted = event_with(&[], record("a.b", MetricKind::gauge(1.0)));
+        let dashed = event_with(&[], record("a-b", MetricKind::gauge(2.0)));
         // Reverse arrival order from the test above; the result must be identical.
         let families = events_to_families(
             [(&resource, &dashed), (&resource, &dotted)].into_iter(),
@@ -2113,7 +2131,7 @@ mod tests {
         let (registry, telemetry) = telemetry();
         let mut encoder = PrometheusEncoder::new().with_telemetry(telemetry);
         let resource = Resource::default();
-        let event = event_with(&[], record("a.b", MetricKind::Gauge(1.0)));
+        let event = event_with(&[], record("a.b", MetricKind::gauge(1.0)));
         let families = events_to_families(std::iter::once((&resource, &event)), &mut encoder);
         assert_eq!(families[0].name, "a_b");
         assert!(!counted(&registry, "logit.output.metrics.skipped", ("reason", "name_collision")));
@@ -2142,7 +2160,7 @@ mod tests {
             assert!(record.is_no_recorded_value(), "{kind:?} must set the flag");
             let shaped = match (kind, &record.kind) {
                 (FamilyType::Counter, MetricKind::Sum(sum)) => {
-                    sum.value.is_nan()
+                    sum.value.as_f64().is_nan()
                         && sum.monotonic
                         && sum.temporality == Temporality::Cumulative
                 }
@@ -2153,7 +2171,7 @@ mod tests {
                     | FamilyType::Info
                     | FamilyType::StateSet,
                     MetricKind::Gauge(v),
-                ) => v.is_nan(),
+                ) => v.as_f64().is_nan(),
                 (
                     FamilyType::Histogram | FamilyType::GaugeHistogram,
                     MetricKind::Histogram(histogram),
@@ -2214,7 +2232,7 @@ mod tests {
     /// `with_timestamps_always(true)`: every series gets one, marker or not.
     #[test]
     fn timestamps_always_fills_a_timestamp_the_marker_did_not_ask_for() {
-        let event = event_with(&[], record("m", MetricKind::Gauge(1.0)));
+        let event = event_with(&[], record("m", MetricKind::gauge(1.0)));
         assert_eq!(encode(&Resource::default(), &event)[0].series[0].timestamp, None);
 
         let mut encoder = PrometheusEncoder::new().with_timestamps_always(true);
@@ -2235,17 +2253,19 @@ mod tests {
     /// `with_stale_markers(true)`: single-series kinds convert, on the family type they'd have had.
     #[test]
     fn stale_markers_convert_the_single_series_kinds() {
-        let sum = |temporality| MetricKind::Sum(Sum { value: 0.0, temporality, monotonic: true });
+        let sum = |temporality| {
+            MetricKind::Sum(Sum { value: MetricValue::F64(0.0), temporality, monotonic: true })
+        };
         let cases = [
             (None, sum(Temporality::Cumulative), FamilyType::Counter),
             // Temporality is not consulted: a stale marker has no reading to be delta about, so
             // the `delta_sum` skip that would apply to a *valued* record does not apply here.
             (None, sum(Temporality::Delta), FamilyType::Counter),
-            (None, MetricKind::Gauge(0.0), FamilyType::Gauge),
-            (Some("unknown"), MetricKind::Gauge(0.0), FamilyType::Unknown),
-            (Some("untyped"), MetricKind::Gauge(0.0), FamilyType::Untyped),
-            (Some("info"), MetricKind::Gauge(0.0), FamilyType::Info),
-            (Some("stateset"), MetricKind::Gauge(0.0), FamilyType::StateSet),
+            (None, MetricKind::gauge(0.0), FamilyType::Gauge),
+            (Some("unknown"), MetricKind::gauge(0.0), FamilyType::Unknown),
+            (Some("untyped"), MetricKind::gauge(0.0), FamilyType::Untyped),
+            (Some("info"), MetricKind::gauge(0.0), FamilyType::Info),
+            (Some("stateset"), MetricKind::gauge(0.0), FamilyType::StateSet),
         ];
         for (declared, kind, expected) in cases {
             let mut rec = record("m", kind.clone());
@@ -2265,7 +2285,7 @@ mod tests {
         let mut rec = record(
             "m",
             MetricKind::Sum(Sum {
-                value: 0.0,
+                value: MetricValue::F64(0.0),
                 temporality: Temporality::Cumulative,
                 monotonic: false,
             }),
@@ -2309,7 +2329,7 @@ mod tests {
     /// Without `with_stale_markers(true)`, a flagged record is skipped.
     #[test]
     fn stale_markers_are_off_by_default() {
-        let mut rec = record("m", MetricKind::Gauge(0.0));
+        let mut rec = record("m", MetricKind::gauge(0.0));
         rec.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         assert!(encode(&Resource::default(), &event_with(&[], rec)).is_empty());
     }

@@ -223,7 +223,7 @@ fn decode(bytes: &[u8], dialect: Dialect) -> Decoded {
                 _ => continue,
             };
             let MetricKind::Sum(sum) = &metric.kind else { panic!("not a counter") };
-            *map.entry(reason.to_string()).or_default() += sum.value as u64;
+            *map.entry(reason.to_string()).or_default() += sum.value.as_f64() as u64;
         }
     }
     Decoded { result, skips, degraded }

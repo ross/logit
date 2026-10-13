@@ -293,7 +293,7 @@ fn event_fate(event: &Event) -> Fate {
         name: logit_core::interner::resolve(event.metrics[0].name).to_string(),
         tags,
         timestamp: event.timestamp,
-        value: value.to_bits(),
+        value: value.as_f64().to_bits(),
     }
 }
 
@@ -307,7 +307,7 @@ fn skipped(registry: &Registry) -> BTreeMap<String, u64> {
         for m in &event.metrics {
             if logit_core::interner::resolve(m.name) == "logit.input.metrics.skipped" {
                 let MetricKind::Sum(sum) = &m.kind else { panic!("not a counter") };
-                *out.entry(reason.to_string()).or_default() += sum.value as u64;
+                *out.entry(reason.to_string()).or_default() += sum.value.as_f64() as u64;
             }
         }
     }

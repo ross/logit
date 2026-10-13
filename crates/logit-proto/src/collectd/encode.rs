@@ -13,8 +13,8 @@ use super::{
 use crate::{FramedEncoder, MessageBuf};
 use bytes::Bytes;
 use logit_core::{
-    Diagnostics, Event, EventBatch, LogRecord, MetricKind, MetricRecord, Resource, Telemetry,
-    Temporality, Value,
+    Diagnostics, Event, EventBatch, LogRecord, MetricKind, MetricRecord, MetricValue, Resource,
+    Telemetry, Temporality, Value,
 };
 
 /// Usable bytes in an identity field: [`DATA_MAX_NAME_LEN`] minus the NUL. A longer field makes
@@ -40,6 +40,11 @@ pub struct EncodeStats {
     /// A `NO_RECORDED_VALUE`-flagged point of any kind **other than** `Gauge` (which encodes as
     /// NaN).
     pub dropped_no_recorded_value: usize,
+    /// An `I64` or `U64` `Gauge` whose magnitude has no exact `f64`: GAUGE is a double, so the
+    /// value leaves rounded.
+    pub values_normalized_inexact: usize,
+    /// A `Bool` value, written as `1` or `0`.
+    pub values_normalized_bool: usize,
     /// A `MetricKind::GaugeDelta`, which means a missing `aggregate` stage, not a bad metric.
     pub dropped_gauge_delta: usize,
     /// An event whose `timestamp` is zero or negative: there is no cdtime before the epoch, and
@@ -483,6 +488,16 @@ impl Ctx<'_> {
         );
     }
 
+    fn value_inexact(&mut self) {
+        self.stats.values_normalized_inexact += 1;
+        self.telemetry.count("logit.output.metrics.normalized", 1.0, &[("reason", "inexact")]);
+    }
+
+    fn value_bool(&mut self) {
+        self.stats.values_normalized_bool += 1;
+        self.telemetry.count("logit.output.metrics.normalized", 1.0, &[("reason", "bool_value")]);
+    }
+
     fn drop_no_recorded_value(&mut self, name: &str) {
         self.stats.dropped_no_recorded_value += 1;
         self.telemetry.count(
@@ -831,9 +846,8 @@ fn resolve_value(record: &MetricRecord, ctx: &mut Ctx) -> Option<DsValue> {
             }
         },
         // A flagged gauge leaves as NaN, the inverse of the decode side's flagged zero.
-        MetricKind::Gauge(value) => {
-            Some(DsValue::Gauge(if record.is_no_recorded_value() { f64::NAN } else { *value }))
-        }
+        MetricKind::Gauge(_) if record.is_no_recorded_value() => Some(DsValue::Gauge(f64::NAN)),
+        MetricKind::Gauge(value) => Some(DsValue::Gauge(gauge_f64(*value, ctx))),
         MetricKind::GaugeDelta(_) => {
             ctx.drop_gauge_delta();
             None
@@ -869,33 +883,76 @@ fn resolve_value(record: &MetricRecord, ctx: &mut Ctx) -> Option<DsValue> {
     }
 }
 
-/// A `Sum`'s `f64` as a `u64`, or `None` (counted) when it is non-finite, fractional, or out of
-/// range. Never rounds: statsd's `page.views:2|c|@0.3` reaches a sink as `6.666…`, and neither `6`
-/// nor `7` was sent.
-///
-/// The bounds are inclusive and the `as` cast saturates: a wire COUNTER of `u64::MAX` decodes to
-/// the `f64` `2^64`, so an exclusive bound would drop the value it round-tripped from. Above `2^53`
-/// the value is already imprecise (`docs/known-gaps/mappings.md`), and `decode(encode(b)) == b`
-/// holds across the whole range.
-fn as_u64(value: f64, name: &str, ctx: &mut Ctx) -> Option<u64> {
-    if value.is_finite() && value.fract() == 0.0 && value >= 0.0 && value <= u64::MAX as f64 {
-        return Some(value as u64);
+/// A GAUGE's double. An integer leaves as its nearest `f64`, counted when that isn't the same
+/// number; a `Bool` leaves as `1` or `0`, counted.
+fn gauge_f64(value: MetricValue, ctx: &mut Ctx) -> f64 {
+    match value {
+        MetricValue::F64(v) => v,
+        MetricValue::Bool(b) => {
+            ctx.value_bool();
+            f64::from(u8::from(b))
+        }
+        MetricValue::I64(_) | MetricValue::U64(_) => {
+            let (v, exact) = value.as_f64_exact();
+            if !exact {
+                ctx.value_inexact();
+            }
+            v
+        }
     }
-    ctx.drop_unencodable_value(name, value);
+}
+
+/// A `Sum` as a `u64` for COUNTER or ABSOLUTE, or `None` (counted) when it is negative, out of
+/// range, or an `F64` that is non-finite or fractional. Never rounds: statsd's
+/// `page.views:2|c|@0.3` reaches a sink as `6.666…`, and neither `6` nor `7` was sent. A `Bool`
+/// leaves as `1` or `0`, counted.
+///
+/// An `F64`'s bounds are inclusive and the `as` cast saturates, so the `f64` `2^64` leaves as
+/// `u64::MAX`. That value decodes back as `U64`, not `F64`: a relay through collectd types an
+/// untyped sum.
+fn as_u64(value: MetricValue, name: &str, ctx: &mut Ctx) -> Option<u64> {
+    match value {
+        MetricValue::U64(v) => return Some(v),
+        MetricValue::I64(v) => {
+            if let Ok(v) = u64::try_from(v) {
+                return Some(v);
+            }
+        }
+        MetricValue::Bool(b) => {
+            ctx.value_bool();
+            return Some(u64::from(b));
+        }
+        MetricValue::F64(v) => {
+            if v.is_finite() && v.fract() == 0.0 && v >= 0.0 && v <= u64::MAX as f64 {
+                return Some(v as u64);
+            }
+        }
+    }
+    ctx.drop_unencodable_value(name, value.as_f64());
     None
 }
 
-/// [`as_u64`]'s signed sibling, for DERIVE, with the same inclusive bounds (`i64::MAX as f64` is
-/// `2^63`; `i64::MIN as f64` is exactly `-2^63`).
-fn as_i64(value: f64, name: &str, ctx: &mut Ctx) -> Option<i64> {
-    if value.is_finite()
-        && value.fract() == 0.0
-        && value >= i64::MIN as f64
-        && value <= i64::MAX as f64
-    {
-        return Some(value as i64);
+/// [`as_u64`]'s signed sibling, for DERIVE, with the same inclusive `F64` bounds
+/// (`i64::MAX as f64` is `2^63`; `i64::MIN as f64` is `-2^63`).
+fn as_i64(value: MetricValue, name: &str, ctx: &mut Ctx) -> Option<i64> {
+    match value {
+        MetricValue::I64(v) => return Some(v),
+        MetricValue::U64(v) => {
+            if let Ok(v) = i64::try_from(v) {
+                return Some(v);
+            }
+        }
+        MetricValue::Bool(b) => {
+            ctx.value_bool();
+            return Some(i64::from(b));
+        }
+        MetricValue::F64(v) => {
+            if v.is_finite() && v.fract() == 0.0 && v >= i64::MIN as f64 && v <= i64::MAX as f64 {
+                return Some(v as i64);
+            }
+        }
     }
-    ctx.drop_unencodable_value(name, value);
+    ctx.drop_unencodable_value(name, value.as_f64());
     None
 }
 
@@ -1157,7 +1214,8 @@ mod tests {
         MetricRecord::new(intern(name), kind)
     }
 
-    fn counter_record(name: &str, value: f64) -> MetricRecord {
+    fn counter_record(name: &str, value: impl Into<MetricValue>) -> MetricRecord {
+        let value = value.into();
         record(
             name,
             MetricKind::Sum(Sum { value, temporality: Temporality::Cumulative, monotonic: true }),
@@ -1244,7 +1302,7 @@ mod tests {
                     continue;
                 }
                 match &metric.kind {
-                    MetricKind::Sum(sum) => total += sum.value,
+                    MetricKind::Sum(sum) => total += sum.value.as_f64(),
                     other => panic!("expected a Sum counter, got {other:?}"),
                 }
             }
@@ -1286,7 +1344,7 @@ mod tests {
 
     #[test]
     fn a_like_relay_event_re_emits_its_identity_verbatim() {
-        let event = relay_event(vec![record("load.load.0", MetricKind::Gauge(0.5))]);
+        let event = relay_event(vec![record("load.load.0", MetricKind::gauge(0.5))]);
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(packets.len(), 1);
         assert_eq!(stats, EncodeStats::default());
@@ -1298,7 +1356,7 @@ mod tests {
         assert_eq!(attr(&events[0], ATTR_TYPE), Some(Value::from("load")));
         assert_eq!(attr(&events[0], ATTR_INTERVAL), Some(Value::F64(10.0)));
         assert_eq!(events[0].timestamp, TS);
-        assert_eq!(events[0].metrics[0].kind, MetricKind::Gauge(0.5));
+        assert_eq!(events[0].metrics[0].kind, MetricKind::gauge(0.5));
     }
 
     /// A decoded packet, re-encoded, decodes to the same events (`tests/collectd_fixed_point.rs` is
@@ -1317,7 +1375,7 @@ mod tests {
     /// A gauge is written little-endian.
     #[test]
     fn a_gauge_is_written_little_endian() {
-        let event = relay_event(vec![record("load.load", MetricKind::Gauge(1.5))]);
+        let event = relay_event(vec![record("load.load", MetricKind::gauge(1.5))]);
         let (packets, _) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         let bytes = packets.iter().next().unwrap();
         assert!(
@@ -1333,7 +1391,7 @@ mod tests {
             record(
                 "a.c",
                 MetricKind::Sum(Sum {
-                    value: -1.0,
+                    value: MetricValue::F64(-1.0),
                     temporality: Temporality::Cumulative,
                     monotonic: false,
                 }),
@@ -1341,7 +1399,7 @@ mod tests {
             record(
                 "a.d",
                 MetricKind::Sum(Sum {
-                    value: 9.0,
+                    value: MetricValue::F64(9.0),
                     temporality: Temporality::Delta,
                     monotonic: true,
                 }),
@@ -1365,7 +1423,7 @@ mod tests {
 
     #[test]
     fn identity_parts_are_elided_after_the_first_list_in_a_packet() {
-        let first = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let first = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         let mut second = first.clone();
         second.attributes.insert(ATTR_TYPE_INSTANCE, Value::from("short"));
         let (packets, _) = encode(&batch(vec![first, second]), DEFAULT_MAX_PACKET_BYTES);
@@ -1387,13 +1445,13 @@ mod tests {
     #[test]
     fn the_first_list_of_every_datagram_carries_its_full_identity() {
         // Two lists that cannot share a datagram: a cap just above one list's size.
-        let one = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let one = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         let (single, _) = encode(&batch(vec![one.clone()]), DEFAULT_MAX_PACKET_BYTES);
         let list_bytes = single.total_bytes();
 
         let mut second = one.clone();
         second.attributes.insert(ATTR_HOST, Value::from("web-1"));
-        second.metrics[0] = record("load.load", MetricKind::Gauge(0.75));
+        second.metrics[0] = record("load.load", MetricKind::gauge(0.75));
         let (packets, stats) = encode(&batch(vec![one, second]), list_bytes);
 
         assert_eq!(packets.len(), 2, "the cap fits exactly one list per datagram");
@@ -1411,13 +1469,13 @@ mod tests {
         // Without the re-encode, the second datagram would have no plugin.
         let events = decode_all(&packets);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[1].metrics[0].kind, MetricKind::Gauge(0.75));
+        assert_eq!(events[1].metrics[0].kind, MetricKind::gauge(0.75));
         assert_eq!(attr(&events[1], ATTR_PLUGIN), Some(Value::from("load")));
     }
 
     #[test]
     fn a_list_larger_than_the_cap_on_its_own_is_dropped_whole() {
-        let event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         let (packets, stats, registry, diag_registry) = encode_counted(&batch(vec![event]), 8);
         assert!(packets.is_empty());
         assert_eq!(stats.dropped_oversize_list, 1);
@@ -1437,7 +1495,7 @@ mod tests {
     fn many_lists_pack_into_several_datagrams_under_the_cap() {
         let events: Vec<Event> = (0..40)
             .map(|i| {
-                let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(i as f64))]);
+                let mut event = relay_event(vec![record("load.load", MetricKind::gauge(i as f64))]);
                 event.attributes.insert(ATTR_TYPE_INSTANCE, Value::str(format!("i{i}")));
                 event
             })
@@ -1463,7 +1521,7 @@ mod tests {
 
     #[test]
     fn encode_into_clears_its_output_rather_than_appending_to_it() {
-        let event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         let batch = batch(vec![event]);
         let mut encoder = CollectdEncoder::new().with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES);
         let mut packets = MessageBuf::default();
@@ -1480,7 +1538,7 @@ mod tests {
     fn a_fallback_event_derives_plugin_type_and_type_instance_from_the_record_name() {
         let mut event = Event::empty(TS, AttrMap::new());
         event.metrics.push(counter_record("nginx.requests.total", 42.0));
-        event.metrics.push(record("uptime", MetricKind::Gauge(3.5)));
+        event.metrics.push(record("uptime", MetricKind::gauge(3.5)));
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(stats, EncodeStats::default());
 
@@ -1500,18 +1558,22 @@ mod tests {
     fn every_fallback_type_name_matches_its_data_source_kind() {
         let mut event = Event::empty(TS, AttrMap::new());
         event.metrics.push(counter_record("a", 1.0));
-        event.metrics.push(record("b", MetricKind::Gauge(1.0)));
+        event.metrics.push(record("b", MetricKind::gauge(1.0)));
         event.metrics.push(record(
             "c",
             MetricKind::Sum(Sum {
-                value: 1.0,
+                value: MetricValue::F64(1.0),
                 temporality: Temporality::Cumulative,
                 monotonic: false,
             }),
         ));
         event.metrics.push(record(
             "d",
-            MetricKind::Sum(Sum { value: 1.0, temporality: Temporality::Delta, monotonic: true }),
+            MetricKind::Sum(Sum {
+                value: MetricValue::F64(1.0),
+                temporality: Temporality::Delta,
+                monotonic: true,
+            }),
         ));
         let (packets, _) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         let types: Vec<Option<Value>> =
@@ -1534,7 +1596,11 @@ mod tests {
         let mut event = Event::empty(TS, AttrMap::new());
         event.metrics.push(record(
             "a.b",
-            MetricKind::Sum(Sum { value: 1.0, temporality: Temporality::Delta, monotonic: false }),
+            MetricKind::Sum(Sum {
+                value: MetricValue::F64(1.0),
+                temporality: Temporality::Delta,
+                monotonic: false,
+            }),
         ));
         let (packets, stats, registry, _) = encode_counted(&batch(vec![event]), 1452);
         assert!(packets.is_empty());
@@ -1568,6 +1634,50 @@ mod tests {
         }
     }
 
+    /// An integer `Gauge` leaves as a GAUGE double, counted only when the double isn't the same
+    /// number; a `Bool` leaves as `1`, counted.
+    #[test]
+    fn an_integer_or_bool_gauge_leaves_as_a_double_counted_when_inexact() {
+        let cases = [
+            (MetricKind::Gauge(MetricValue::I64(-5)), MetricKind::gauge(-5.0), None),
+            (
+                MetricKind::Gauge(MetricValue::U64((1 << 53) + 1)),
+                MetricKind::gauge(9_007_199_254_740_992.0),
+                Some("inexact"),
+            ),
+            (
+                MetricKind::Gauge(MetricValue::Bool(true)),
+                MetricKind::gauge(1.0),
+                Some("bool_value"),
+            ),
+            (
+                MetricKind::Sum(Sum {
+                    value: MetricValue::Bool(true),
+                    temporality: Temporality::Cumulative,
+                    monotonic: true,
+                }),
+                MetricKind::Sum(Sum {
+                    value: MetricValue::U64(1),
+                    temporality: Temporality::Cumulative,
+                    monotonic: true,
+                }),
+                Some("bool_value"),
+            ),
+        ];
+        for (kind, decoded, reason) in cases {
+            let mut event = Event::empty(TS, AttrMap::new());
+            event.metrics.push(record("load", kind.clone()));
+            let (packets, stats, registry, _) =
+                encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+            assert_eq!(decode_all(&packets)[0].metrics[0].kind, decoded, "{kind:?}");
+            assert_eq!(stats.values_normalized_inexact, usize::from(reason == Some("inexact")));
+            assert_eq!(stats.values_normalized_bool, usize::from(reason == Some("bool_value")));
+            if let Some(reason) = reason {
+                assert!(counted(&registry, "logit.output.metrics.normalized", ("reason", reason)));
+            }
+        }
+    }
+
     /// A negative DERIVE is legal (a signed type); an out-of-range counter is not.
     #[test]
     fn a_negative_derive_encodes_where_a_negative_counter_does_not() {
@@ -1575,32 +1685,33 @@ mod tests {
         event.metrics.push(record(
             "if.octets",
             MetricKind::Sum(Sum {
-                value: -4096.0,
+                value: MetricValue::F64(-4096.0),
                 temporality: Temporality::Cumulative,
                 monotonic: false,
             }),
         ));
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(stats, EncodeStats::default());
+        // DERIVE is an `i64` on the wire, so the `F64` comes back typed.
         assert_eq!(
             decode_all(&packets)[0].metrics[0].kind,
             MetricKind::Sum(Sum {
-                value: -4096.0,
+                value: MetricValue::I64(-4096),
                 temporality: Temporality::Cumulative,
                 monotonic: false
             })
         );
     }
 
-    /// A wire `u64::MAX` COUNTER decodes to the `f64` 2^64, which the *inclusive* bound re-encodes.
+    /// COUNTER and DERIVE carry `U64` and `I64` at the tops of their ranges without loss.
     #[test]
     fn a_counter_at_the_top_of_the_u64_range_survives_a_round_trip() {
         let event = relay_event(vec![
-            counter_record("load.load.0", u64::MAX as f64),
+            counter_record("load.load.0", u64::MAX),
             record(
                 "load.load.1",
                 MetricKind::Sum(Sum {
-                    value: i64::MAX as f64,
+                    value: MetricValue::I64(i64::MAX),
                     temporality: Temporality::Cumulative,
                     monotonic: false,
                 }),
@@ -1614,7 +1725,7 @@ mod tests {
     #[test]
     fn a_gauge_delta_is_dropped_under_the_shared_diagnostic_key() {
         let mut event = Event::empty(TS, AttrMap::new());
-        event.metrics.push(record("a.b", MetricKind::GaugeDelta(5.0)));
+        event.metrics.push(record("a.b", MetricKind::GaugeDelta(MetricValue::F64(5.0))));
         let (packets, stats, registry, diag_registry) = encode_counted(&batch(vec![event]), 1452);
         assert!(packets.is_empty());
         assert_eq!(stats.dropped_gauge_delta, 1);
@@ -1685,12 +1796,12 @@ mod tests {
     fn a_flagged_gauge_round_trips_through_a_nan_and_a_flagged_non_gauge_is_dropped() {
         let mut event = relay_event(vec![MetricRecord {
             flags: MetricRecord::FLAG_NO_RECORDED_VALUE,
-            ..record("load.load", MetricKind::Gauge(0.0))
+            ..record("load.load", MetricKind::gauge(0.0))
         }]);
         let (packets, stats) = encode(&batch(vec![event.clone()]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(stats, EncodeStats::default());
         let decoded = decode_all(&packets);
-        assert_eq!(decoded[0].metrics[0].kind, MetricKind::Gauge(0.0));
+        assert_eq!(decoded[0].metrics[0].kind, MetricKind::gauge(0.0));
         assert!(decoded[0].metrics[0].is_no_recorded_value());
 
         event.metrics[0] = MetricRecord {
@@ -1717,9 +1828,9 @@ mod tests {
     #[test]
     fn a_like_relay_list_with_one_failing_record_is_dropped_whole_and_counted_once() {
         let event = relay_event(vec![
-            record("load.load.0", MetricKind::Gauge(0.5)),
+            record("load.load.0", MetricKind::gauge(0.5)),
             counter_record("load.load.1", 6.666),
-            record("load.load.2", MetricKind::Gauge(0.7)),
+            record("load.load.2", MetricKind::gauge(0.7)),
         ]);
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert!(
@@ -1746,7 +1857,7 @@ mod tests {
     #[test]
     fn a_non_positive_timestamp_drops_the_whole_event() {
         for timestamp in [0i64, -1] {
-            let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+            let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
             event.timestamp = timestamp;
             let (packets, stats, registry, _) =
                 encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
@@ -1762,7 +1873,7 @@ mod tests {
 
     #[test]
     fn an_absent_interval_is_written_as_zero_and_decodes_back_absent() {
-        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         event.attributes.remove(ATTR_INTERVAL);
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(stats, EncodeStats::default());
@@ -1772,7 +1883,7 @@ mod tests {
     #[test]
     fn a_non_f64_or_non_positive_interval_is_counted_unrepresentable_and_written_as_zero() {
         for value in [Value::from("10"), Value::F64(0.0), Value::F64(f64::NAN), Value::I64(10)] {
-            let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+            let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
             event.attributes.insert(ATTR_INTERVAL, value.clone());
             let (packets, stats, registry, _) =
                 encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
@@ -1785,13 +1896,13 @@ mod tests {
     #[test]
     fn the_host_falls_back_from_collectd_host_to_host_name_to_the_configured_hostname() {
         // `collectd.host` wins.
-        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         event.attributes.insert("host.name", Value::from("ignored"));
         let (packets, _) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("web-1")));
 
         // `host.name` next.
-        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         event.attributes.remove(ATTR_HOST);
         event.attributes.insert("host.name", Value::from("from-host-name"));
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
@@ -1799,7 +1910,7 @@ mod tests {
         assert_eq!(stats.tags_dropped_no_wire_form, 1, "`host.name` is read but still dropped");
 
         // Then the configured hostname.
-        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         event.attributes.remove(ATTR_HOST);
         let (packets, _) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("fixture-host")));
@@ -1819,9 +1930,9 @@ mod tests {
             (
                 "like-relay, 3 records",
                 relay_event(vec![
-                    record("load.load.0", MetricKind::Gauge(0.1)),
-                    record("load.load.1", MetricKind::Gauge(0.2)),
-                    record("load.load.2", MetricKind::Gauge(0.3)),
+                    record("load.load.0", MetricKind::gauge(0.1)),
+                    record("load.load.1", MetricKind::gauge(0.2)),
+                    record("load.load.2", MetricKind::gauge(0.3)),
                 ]),
                 1,
             ),
@@ -1861,7 +1972,7 @@ mod tests {
     #[test]
     fn a_like_relay_list_over_the_value_cap_is_dropped_whole_and_counted() {
         let records: Vec<MetricRecord> = (0..MAX_VALUES_PER_LIST + 1)
-            .map(|i| record("load.load", MetricKind::Gauge(i as f64)))
+            .map(|i| record("load.load", MetricKind::gauge(i as f64)))
             .collect();
         let (packets, stats, registry, diag_registry) =
             encode_counted(&batch(vec![relay_event(records)]), DEFAULT_MAX_PACKET_BYTES);
@@ -1875,7 +1986,7 @@ mod tests {
     #[test]
     fn a_like_relay_list_exactly_at_the_value_cap_still_round_trips() {
         let records: Vec<MetricRecord> = (0..MAX_VALUES_PER_LIST)
-            .map(|i| record(&format!("load.load.{i}"), MetricKind::Gauge(i as f64)))
+            .map(|i| record(&format!("load.load.{i}"), MetricKind::gauge(i as f64)))
             .collect();
         let event = relay_event(records);
         let (packets, stats) = encode(&batch(vec![event.clone()]), DEFAULT_MAX_PACKET_BYTES);
@@ -1888,7 +1999,7 @@ mod tests {
     /// With no host anywhere, the event is dropped, counted, and diagnosed; no host is invented.
     #[test]
     fn an_event_with_no_host_and_no_configured_hostname_is_dropped_and_counted() {
-        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         event.attributes.remove(ATTR_HOST);
 
         let registry = Registry::new();
@@ -1912,7 +2023,7 @@ mod tests {
     #[test]
     fn an_empty_or_substituted_away_hostname_counts_as_unconfigured() {
         for hostname in ["", "\0"] {
-            let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+            let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
             event.attributes.insert(ATTR_HOST, Value::from(""));
             let mut encoder = CollectdEncoder::new()
                 .with_hostname(hostname)
@@ -1934,7 +2045,7 @@ mod tests {
     #[test]
     fn a_slash_or_nul_in_an_identity_field_becomes_an_underscore_and_is_counted() {
         for (raw, expected) in [("a/b", "a_b"), ("sda/1\0x", "sda_1_x")] {
-            let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+            let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
             event.attributes.insert(ATTR_TYPE_INSTANCE, Value::from(raw));
             let (packets, stats, registry, _) =
                 encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
@@ -1959,7 +2070,7 @@ mod tests {
     fn an_over_long_identity_field_is_truncated_on_a_character_boundary() {
         // 64 two-byte characters = 128 bytes, so the 127-byte limit falls mid-character.
         let long: String = "é".repeat(64);
-        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         event.attributes.insert(ATTR_TYPE_INSTANCE, Value::str(long));
         let (packets, stats, registry, _) =
             encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
@@ -1973,7 +2084,7 @@ mod tests {
     #[test]
     fn a_non_utf8_identity_field_truncates_on_a_byte_boundary_and_stays_bytes() {
         let raw = Bytes::from(vec![0xFFu8; 200]);
-        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         event.attributes.insert(ATTR_TYPE_INSTANCE, Value::Bytes(raw));
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(stats.identity_sanitized_truncated, 1);
@@ -1987,7 +2098,7 @@ mod tests {
     fn an_empty_plugin_or_type_drops_the_list() {
         for key in [ATTR_PLUGIN, ATTR_TYPE] {
             // Empty, not `/`: substitution never deletes, so `/` would sanitize to a usable `_`.
-            let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+            let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
             event.attributes.insert(key, Value::from(""));
             let (packets, stats, registry, _) =
                 encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
@@ -1999,7 +2110,7 @@ mod tests {
 
     #[test]
     fn a_non_collectd_attribute_is_dropped_and_counted_once_per_attribute() {
-        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         event.attributes.insert("env", Value::from("prod"));
         event.attributes.insert("region", Value::from("us-east"));
         let (packets, stats, registry, _) =
@@ -2012,7 +2123,7 @@ mod tests {
 
     #[test]
     fn a_collectd_identity_carrier_of_the_wrong_value_type_is_counted_unrepresentable() {
-        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         event.attributes.insert(ATTR_PLUGIN_INSTANCE, Value::I64(7));
         let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(stats.tags_dropped_unrepresentable, 1);
@@ -2039,7 +2150,7 @@ mod tests {
             TS,
             attrs(&[(ATTR_PLUGIN, Value::from("from-event")), (ATTR_TYPE, Value::from("gauge"))]),
         );
-        event.metrics.push(record("x", MetricKind::Gauge(1.0)));
+        event.metrics.push(record("x", MetricKind::gauge(1.0)));
         let batch = EventBatch { resource, scope: None, events: vec![event] };
         let (packets, _) = encode(&batch, DEFAULT_MAX_PACKET_BYTES);
         let decoded = decode_all(&packets);
@@ -2051,7 +2162,7 @@ mod tests {
     /// `tags_dropped_unrepresentable`.
     #[test]
     fn a_severity_attribute_on_a_metrics_bearing_event_is_dropped_and_counted() {
-        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         event.attributes.insert(ATTR_SEVERITY, Value::U64(2));
         let (packets, stats, registry, _) =
             encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
@@ -2060,7 +2171,7 @@ mod tests {
 
         let decoded = decode_all(&packets);
         assert_eq!(decoded.len(), 1, "the event still encodes as an ordinary value list");
-        assert_eq!(decoded[0].metrics[0].kind, MetricKind::Gauge(0.5));
+        assert_eq!(decoded[0].metrics[0].kind, MetricKind::gauge(0.5));
         assert_eq!(
             decoded[0].attributes.get(ATTR_SEVERITY),
             None,
@@ -2304,7 +2415,7 @@ mod tests {
     /// its host/plugin/type.
     #[test]
     fn a_notification_is_always_its_own_datagram_never_packed_with_a_preceding_list() {
-        let list_event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let list_event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         let notif_event = notification_event(Value::U64(2), Severity::Warn, "load high");
         let (packets, stats) =
             encode(&batch(vec![list_event, notif_event]), DEFAULT_MAX_PACKET_BYTES);
@@ -2336,7 +2447,7 @@ mod tests {
     #[test]
     fn a_value_list_after_a_notification_does_not_elide_against_it() {
         let notif_event = notification_event(Value::U64(2), Severity::Warn, "load high");
-        let list_event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let list_event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         let (packets, stats) =
             encode(&batch(vec![notif_event, list_event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(stats, EncodeStats::default());
@@ -2358,8 +2469,8 @@ mod tests {
     #[test]
     fn a_batch_mixing_a_value_list_and_a_notification_round_trips() {
         let list_event = relay_event(vec![
-            record("load.load.0", MetricKind::Gauge(0.1)),
-            record("load.load.1", MetricKind::Gauge(0.2)),
+            record("load.load.0", MetricKind::gauge(0.1)),
+            record("load.load.1", MetricKind::gauge(0.2)),
         ]);
         let notif_event = notification_event(Value::U64(1), Severity::Error, "load spiked");
         let (packets, stats) =
@@ -2377,10 +2488,10 @@ mod tests {
     /// empty `type_instance` would leave a receiver reading `"free"`, relabeling the series.
     #[test]
     fn a_notification_between_two_value_lists_does_not_poison_elision() {
-        let mut first = relay_event(vec![record("load.load", MetricKind::Gauge(512.0))]);
+        let mut first = relay_event(vec![record("load.load", MetricKind::gauge(512.0))]);
         first.attributes.insert(ATTR_TYPE_INSTANCE, Value::from("free"));
         let notif = notification_event(Value::U64(2), Severity::Warn, "low memory");
-        let mut third = relay_event(vec![record("load.load", MetricKind::Gauge(256.0))]);
+        let mut third = relay_event(vec![record("load.load", MetricKind::gauge(256.0))]);
         third.attributes.remove(ATTR_TYPE_INSTANCE);
 
         let (packets, stats) = encode(&batch(vec![first, notif, third]), DEFAULT_MAX_PACKET_BYTES);

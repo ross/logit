@@ -261,7 +261,7 @@ fn push_datapoint(
     out.push(Event::metric(
         timestamp,
         attributes,
-        MetricRecord::new(intern(path), MetricKind::Gauge(value)),
+        MetricRecord::new(intern(path), MetricKind::gauge(value)),
     ));
 }
 
@@ -421,7 +421,7 @@ mod tests {
                     continue;
                 }
                 match &m.kind {
-                    MetricKind::Sum(sum) => total += sum.value,
+                    MetricKind::Sum(sum) => total += sum.value.as_f64(),
                     other => panic!("expected a Sum counter, got {other:?}"),
                 }
             }
@@ -431,7 +431,7 @@ mod tests {
 
     fn gauge(event: &Event) -> f64 {
         match &event.metrics[0].kind {
-            MetricKind::Gauge(v) => *v,
+            MetricKind::Gauge(v) => v.as_f64(),
             other => panic!("expected a Gauge, got {other:?}"),
         }
     }

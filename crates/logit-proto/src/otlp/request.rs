@@ -219,7 +219,7 @@ mod tests {
             metric(3, MetricKind::counter(1.0)),
             log(4),
             span(5),
-            metric(6, MetricKind::Gauge(2.0)),
+            metric(6, MetricKind::gauge(2.0)),
         ]);
         let picked: Vec<&Event> = [0, 1, 2, 4].iter().map(|&i| &all.events[i]).collect();
         let sub = EventBatch {

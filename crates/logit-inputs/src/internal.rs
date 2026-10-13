@@ -642,7 +642,7 @@ mod tests {
                     {
                         found = true;
                         if let MetricKind::Sum(sum) = metric.kind {
-                            assert!(sum.value >= 1.0);
+                            assert!(sum.value.as_f64() >= 1.0);
                         }
                     }
                 }

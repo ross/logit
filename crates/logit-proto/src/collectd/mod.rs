@@ -39,11 +39,11 @@
 //! | Wire | Model | Counter / diag |
 //! |---|---|---|
 //! | Values part, N values | one `Event`, `metrics` = N records in wire order | -- |
-//! | COUNTER `u64` | `Sum { value: v as f64, Cumulative, monotonic: true }` | none (above 2⁵³ the `f64` loses precision -- `docs/known-gaps/mappings.md`, shared with OTLP's int/double collapse) |
-//! | DERIVE `i64` | `Sum { Cumulative, monotonic: false }` | none |
-//! | ABSOLUTE `u64` | `Sum { Delta, monotonic: true }` | none |
-//! | GAUGE finite/±inf | `Gauge(v)` | none |
-//! | GAUGE NaN | `Gauge(0.0)` + [`logit_core::MetricRecord::FLAG_NO_RECORDED_VALUE`] | none -- NaN *is* collectd's "no value for this interval," and a flagged point is exactly the model's word for that. Carrying the NaN through instead would make every `PartialEq` fixed-point test a lie (`NaN != NaN`). |
+//! | COUNTER `u64` | `Sum { value: U64(v), Cumulative, monotonic: true }`, exact across the whole range | none |
+//! | DERIVE `i64` | `Sum { value: I64(v), Cumulative, monotonic: false }` | none |
+//! | ABSOLUTE `u64` | `Sum { value: U64(v), Delta, monotonic: true }` | none |
+//! | GAUGE finite/±inf | `Gauge(F64(v))` | none |
+//! | GAUGE NaN | `Gauge(F64(0.0))` + [`logit_core::MetricRecord::FLAG_NO_RECORDED_VALUE`] | none -- NaN *is* collectd's "no value for this interval," and a flagged point is the model's word for that. Carrying the NaN through instead would make every `PartialEq` fixed-point test a lie (`NaN != NaN`). |
 //! | Host/Plugin/PluginInstance/Type/TypeInstance | sticky → the `collectd.*` attributes below; an **empty** string part clears the field, so the attribute is absent | -- |
 //! | Values with an empty host, plugin or type | list skipped, nothing pushed | `incomplete_identity` (collectd's own receiver rejects the same list with `-EINVAL`) |
 //! | TimeHR (2⁻³⁰ s) / Time (s) / neither | `Event::timestamp` = [`cdtime_to_nanos`] / `s * 1e9` / `received_at` | -- (collectd rejects a `time == 0` list; this codec observes rather than rejects, so a timeless list is stamped with receipt time like every other `logit` input) |
@@ -104,12 +104,15 @@
 //! | event with `collectd.type` present (merged: event attributes, then resource) | **like-relay**: one Values part carrying every record of `event.metrics` in order, identity straight off the `collectd.*` attributes | -- |
 //! | event without `collectd.type` | **fallback**: one single-data-source list per record -- plugin = the record name up to its first `.` (the whole name if it has none), type_instance = the remainder, type = `counter`/`gauge`/`derive`/`absolute` by kind (all single-data-source types in a stock `types.db`), no plugin_instance | -- |
 //! | an event with `event.metrics` non-empty **and** an [`ATTR_SEVERITY`] attribute | metrics win: the event encodes as an ordinary value list (like-relay or fallback, per the two rows above); `collectd.severity` has no wire form on a value list and is dropped like any other unrepresentable `collectd.*` carrier | `logit.output.tags.dropped{reason="unrepresentable"}` |
-//! | `Sum{Cumulative, monotonic}`, integral, in `u64` range | COUNTER | -- |
-//! | `Sum{Cumulative, !monotonic}`, integral, in `i64` range | DERIVE | -- |
-//! | `Sum{Delta, monotonic}`, integral, in `u64` range | ABSOLUTE | -- |
+//! | `Sum{Cumulative, monotonic}`, an `I64`/`U64` or integral `F64` in `u64` range | COUNTER | -- |
+//! | `Sum{Cumulative, !monotonic}`, an `I64`/`U64` or integral `F64` in `i64` range | DERIVE | -- |
+//! | `Sum{Delta, monotonic}`, an `I64`/`U64` or integral `F64` in `u64` range | ABSOLUTE | -- |
+//! | `Sum` of `Bool` | COUNTER/DERIVE/ABSOLUTE `1` or `0`, per the rows above | `logit.output.metrics.normalized{reason="bool_value"}` |
 //! | `Sum{Delta, !monotonic}` | dropped | `logit.output.metrics.skipped{metric_kind="non_monotonic_delta_sum"}` |
 //! | any `Sum` non-integral, out of range, or non-finite | dropped | `logit.output.metrics.skipped{reason="unencodable_value"}` + diag `unencodable_value`. Rounding would fabricate: statsd's `page.views:2\|c\|@0.3` reaches a sink as `6.666…`, and `6` or `7` is a number nobody sent. |
-//! | `Gauge(v)`, finite or ±inf | GAUGE | -- |
+//! | `Gauge(F64(v))`, finite or ±inf | GAUGE | -- |
+//! | `Gauge(I64)`/`Gauge(U64)` | GAUGE, the integer's nearest `f64` | `logit.output.metrics.normalized{reason="inexact"}` when that `f64` isn't the same number (a magnitude above 2⁵³) |
+//! | `Gauge(Bool)` | GAUGE `1` or `0` | `logit.output.metrics.normalized{reason="bool_value"}` |
 //! | `Gauge` flagged `NO_RECORDED_VALUE` | GAUGE NaN -- the inverse of the decode row above | -- |
 //! | any non-`Gauge` flagged `NO_RECORDED_VALUE` | dropped | `logit.output.metrics.skipped{reason="no_recorded_value"}` + diag `no_recorded_value` |
 //! | `GaugeDelta` | dropped | `logit.output.metrics.skipped{metric_kind="gauge_delta"}` + diag `gauge_delta_unresolved` (the same greppable key every other sink uses -- it means a missing `aggregate`, not a malformed metric) |

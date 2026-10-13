@@ -97,6 +97,7 @@
 //! |---|---|---|
 //! | `Sum{Delta, monotonic}` | series `count`, `interval` from [`ATTR_INTERVAL`], else `0` | -- |
 //! | `Gauge` | series `gauge`; `rate` or unspecified when [`ATTR_TYPE`] says so | -- |
+//! | a `Sum` or `Gauge` value of `I64`/`U64`/`Bool` | the point's double: an integer's nearest `f64`, a `Bool` `1` or `0` | `logit.output.metrics.normalized{reason="bool_value"}` for a `Bool` |
 //! | `Set` | series `gauge` of `estimate()`, the Agent's `s` | `logit.output.metrics.degraded{reason="set_estimate"}` |
 //! | `Samples` | a distribution point only; with `sample_rate < 1`, each value repeated `weight()` times, because the route has no rate | `degraded{reason="sample_rate_expanded"}` |
 //! | `Distribution` under `Mapping::agent` | a sketch only: `Dogsketch{ts, cnt, min, max, avg: sum/cnt, sum, k, n}`, `k` ascending (negative bins from the largest magnitude as `-key`, then `0`, then positive), a count above 65535 split into repeated entries | -- |
@@ -434,7 +435,7 @@
 //! |---|---|---|
 //! | a group attribute (the event's, else the resource's) | its field above; `""`, `0`, `false`, or `[]` when absent | a value of the wrong type: `logit.output.tags.dropped{reason="unrepresentable"}` |
 //! | any other event attribute; a resource attribute that is none of the fields above (`datadog.agent.*` and the two envelope flags count on the v0.6 route, which has no envelope) | dropped | `tags.dropped{reason="no_wire_form"}`, one per attribute (a resource's once per body) |
-//! | a delta `Sum` hits/errors/top-level-hits/duration | `uint64`, rounded to the nearest integer | a fraction: `logit.output.stats.degraded{reason="fractional_count"}`; negative or non-finite: `0`, `degraded{reason="bad_count"}`; above 2^64: `u64::MAX`, `degraded{reason="count_overflow"}` |
+//! | a delta `Sum` hits/errors/top-level-hits/duration | `uint64`: a `U64` or non-negative `I64` as is, a `Bool` as `1` or `0`, an `F64` rounded to the nearest integer | a `Bool`: `logit.output.metrics.normalized{reason="bool_value"}`; a negative `I64`: `0`, `degraded{reason="bad_count"}`; a fraction: `logit.output.stats.degraded{reason="fractional_count"}`; negative or non-finite: `0`, `degraded{reason="bad_count"}`; above 2^64: `u64::MAX`, `degraded{reason="count_overflow"}` |
 //! | an ok/error summary `Distribution` under a logarithmic mapping | a DDSketch protobuf: its `gamma` and `indexOffset`, `interpolation: NONE`, both stores as sparse `binCounts` in ascending key order, `zeroCount`. Hand-encoded, since prost's `HashMap` would order the bins at random | a bin limit other than 2048 (a receiver collapses at 2048): `degraded{reason="bin_limit"}`; a summary tracked from observations (`stats_exact`), which the protobuf has no field for: `degraded{reason="exact_summary"}` |
 //! | the same under `Mapping::agent` | `gamma = 1.015625`, `indexOffset = bias + 0.5`, keys unchanged: Datadog's own conversion, reading the Agent's round-half-to-even key as the logarithmic floor. Only a value on an exact tie keys differently, and the exact summary is lost | `degraded{reason="agent_mapping"}` |
 //! | a record of another name, or a known name of another kind (a cumulative `Sum`, say) | skipped | `logit.output.stats.skipped{reason="unrecognized_record"}` |
@@ -884,7 +885,7 @@ mod tests {
                 AttrMap::new(),
                 logit_core::MetricRecord::new(
                     logit_core::interner::intern("m"),
-                    MetricKind::Gauge(1.0),
+                    MetricKind::gauge(1.0),
                 ),
             ),
         ]);

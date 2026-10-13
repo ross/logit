@@ -1,6 +1,6 @@
 ---
 created: 2026-09-15
-updated: 2026-10-03
+updated: 2026-10-13
 ---
 
 # `Event.new(t)`: Lua constructs events from the table shape `event:to_table()` already emits
@@ -219,3 +219,22 @@ message gains the calling line (`script:12: Event.new: timestamp is required`); 
 `pcall(Event.new, t)` it's the bare message. The constructor's rules and messages are unchanged.
 Only a call that constructs an event ticks the stall heartbeat; a refused call is not progress.
 [ADR `lua-refusals-raised-from-lua`](lua-refusals-raised-from-lua.md) has the decision and why.
+
+## Amendment: typed metric values (2026-10-13)
+
+A `sum`'s or `gauge`'s value is a `logit_core::MetricValue` (`f64`, `i64`, `u64`, or `bool`) under
+[ADR `typed-metric-scalar`](typed-metric-scalar.md). `to_table()` writes `type = "i64"`, `"u64"`,
+or `"bool"` beside a non-`f64` value and no `type` key for an `f64`, so a float-only event's table
+is unchanged. `Event.new` takes the same optional `type`, defaulting to `"f64"`:
+
+- `"i64"` and `"u64"` take an integer within 2^53 in magnitude, or a decimal string that fits the
+  type, the form `to_table()` writes past 2^53 (`crate::value`'s `exact_i64_to_lua` and
+  `exact_u64_to_lua`). A number past 2^53 is refused, since it can't say which integer it was.
+  `u64` refuses a negative value, and both refuse a fraction.
+- `"bool"` takes a boolean, or `0` or `1`, the number `to_table()` writes.
+- Any other `type` is refused with the message an unknown enum name gets.
+
+Every `MetricValue` variant round-trips through `Event.new(e:to_table())` at its full range, so
+this ADR's shape symmetry holds; `crates/logit-script/tests/event_new_fixed_point.rs` generates
+values of every variant. The flattening the Decision describes still applies to attribute values,
+not to a metric's value.

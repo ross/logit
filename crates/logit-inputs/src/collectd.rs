@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(event.timestamp, 1_700_000_000_000_000_000);
         assert_eq!(event.metrics.len(), 1);
         assert_eq!(resolve(event.metrics[0].name), "memory.memory");
-        assert_eq!(event.metrics[0].kind, MetricKind::Gauge(1.5));
+        assert_eq!(event.metrics[0].kind, MetricKind::gauge(1.5));
         assert_eq!(event.attributes.get("collectd.host"), Some(&Value::from("web-1")));
         assert_eq!(event.attributes.get("collectd.type_instance"), Some(&Value::from("used")));
 
@@ -533,7 +533,7 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
         assert_eq!(names, ["load.load.0", "load.load.1", "load.load.2"]);
         for record in &load.metrics {
             assert!(
-                matches!(record.kind, MetricKind::Gauge(v) if v >= 0.0),
+                matches!(record.kind, MetricKind::Gauge(v) if v.as_f64() >= 0.0),
                 "the load average is a GAUGE, got {:?}",
                 record.kind
             );

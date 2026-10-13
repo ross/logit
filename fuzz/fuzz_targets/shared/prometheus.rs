@@ -21,7 +21,7 @@ pub fn reasons(registry: &Registry, counter: &str) -> BTreeMap<String, u64> {
     for event in registry.drain(0) {
         let Some(count) = event.metrics.iter().find_map(|metric| {
             (resolve(metric.name) == name).then_some(match &metric.kind {
-                MetricKind::Sum(sum) => sum.value,
+                MetricKind::Sum(sum) => sum.value.as_f64(),
                 _ => 0.0,
             })
         }) else {
