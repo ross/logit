@@ -660,9 +660,11 @@ and the [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-account
 **Alert on any nonzero `logit.*.dropped` count, grouped by its `component` and `reason`
 attributes.** Every `*.dropped` counter is loss: data that should have left `logit` and didn't.
 Its `reason` says where to look, so you don't need a list of reasons to exclude.
-`influxdb_out` is the exception: it drops a metric it can't encode with only a
-`logit.component.diagnostics` count (`key="gauge_delta_unresolved"` for an unresolved relative
-gauge, `key="encode_error"` for the rest), so alert on those two keys for it as well. An outcome your
+`influxdb_out` is the exception: it counts its loss only as `logit.component.diagnostics`, so
+alert on `key="gauge_delta_unresolved"` (an unresolved relative gauge) and `key="encode_error"`
+(a metric it failed to encode) for it as well. `encode_error` also counts a `SetMembers` or
+`ExponentialHistogram` metric, which line protocol has no form for, so read its message before
+treating it as loss. Its `no_recorded_value` key isn't loss: the record had no value to send. An outcome your
 config asked for never counts as dropped: a filter, `sample`, `aggregate`, or Lua script removing
 an event counts `logit.component.events.discarded`, and a tag or field removed from a record that's
 still delivered counts `*.omitted`. The full vocabulary is in
@@ -2304,13 +2306,16 @@ see [ADR
   throttled `logit.component.diagnostics{key="scan_error"}` naming the first failing path and its
   errno. A sustained nonzero rate is a permissions or descriptor-limit problem to fix; until it's
   fixed, a file renamed out of that directory stays open.
-- `logit.component.diagnostics{key="long_line"|"truncated"}` (count, via the `Diagnostics` bridge):
-  a line dropped whole for exceeding `max_line_bytes`, also counted
-  `logit.input.frames.dropped{reason="oversize"}`, or a tracked file's length shrinking under
-  it (`logit.input.files.truncated`; an unterminated line held from before it is discarded and
-  counted `logit.input.frames.dropped{reason="truncated"}`) (rare, but real for a tool that recreates a log file in place instead of renaming it away
-  first). A long line is never truncated and passed through, because a truncated line would hand a
-  downstream JSON parser something that looks well-formed but isn't the real line.
+- `logit.component.diagnostics{key="long_line"}` (count, via the `Diagnostics` bridge): a line
+  dropped whole for exceeding `max_line_bytes`, also counted
+  `logit.input.frames.dropped{reason="oversize"}`. A long line is never truncated and passed
+  through, because a truncated line would hand a downstream JSON parser something that looks
+  well-formed but isn't the real line.
+- `logit.component.diagnostics{key="truncated"}` and `logit.input.files.truncated` (counts): a
+  tracked file's length shrinking under it. That's rare, but real for a tool that recreates a log
+  file in place instead of renaming it away first. The file is reread from its start, and an
+  unterminated line held from before the truncation is discarded and counted
+  `logit.input.frames.dropped{reason="truncated"}`.
 - `logit.component.diagnostics{key="metadata_error"}` (`docker_in` only): a container's
   `config.v2.json` couldn't be read or parsed. That container's lines still flow, with a
   `container.id`-only resource instead of the full identity. A missing file is retried on every poll

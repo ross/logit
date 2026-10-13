@@ -316,8 +316,11 @@ series route, `prometheus_out`'s exposition dialects, and `splunk_hec_out`'s
 These lose data and report it only through a diagnostic, or not at all. Under this rule each
 belongs under `*.dropped`, or under `*.skipped` where the entry says so; none has a counter yet:
 
-- `influxdb_out` skips an unresolved relative gauge (diagnostic `gauge_delta_unresolved`), a
-  `NO_RECORDED_VALUE` record, `SetMembers`, and `ExponentialHistogram` with diagnostics only.
+- `influxdb_out` reports what it doesn't write with diagnostics only. An unresolved relative
+  gauge (`gauge_delta_unresolved`) and a metric that fails to encode (`encode_error`) belong
+  under `*.dropped`. A `NO_RECORDED_VALUE` record (`no_recorded_value`: nothing to carry) and
+  `SetMembers` and `ExponentialHistogram` (no line-protocol form, though they share the
+  `encode_error` key) belong under `*.skipped`.
 - `kafka_out` under `format: text` writes a record from an event's log alone, so a mixed
   event's metrics and span leave with no count. The operator chose the format, so these belong
   under `*.skipped`, not `*.dropped`; a metrics-only event already counts
