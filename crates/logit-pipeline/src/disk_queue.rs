@@ -656,9 +656,9 @@ pub struct DiskQueue {
 
 impl DiskQueue {
     /// Opens or creates the spool at `config.dir`, recovering whatever a previous process left:
-    /// truncates a torn active segment, clamps a stale cursor, and counts replayed and corrupt
-    /// records. Fails if another process holds the lock. Blocking (`std::fs`): it runs once,
-    /// before delivery starts.
+    /// truncates a torn active segment and counts the batch lost with it, clamps a stale cursor,
+    /// and counts replayed and corrupt records. Fails if another process holds the lock.
+    /// Blocking (`std::fs`): it runs once, before delivery starts.
     pub fn open(
         config: DiskQueueConfig,
         telemetry: Telemetry,
@@ -693,8 +693,10 @@ impl DiskQueue {
             .with_context(|| format!("listing segments in {}", config.dir.display()))?;
 
         let mut replayed = 0u64;
+        let mut torn_lost = false;
         let mut corrupt_skipped_total = 0u64;
-        let mut truncated = false;
+        // The active segment's recovered length, when `open` cut a torn tail from it.
+        let mut torn_at: Option<(u64, u64)> = None;
 
         let (mut segments, read_seq, read_offset): (VecDeque<Segment>, u64, u64) = if seqs
             .is_empty()
@@ -726,7 +728,7 @@ impl DiskQueue {
                                 .and_then(|f| f.set_len(outcome.good_len))
                         )
                         .with_context(|| format!("truncating torn segment {}", path.display()))?;
-                        truncated = true;
+                        torn_at = Some((seq, outcome.good_len));
                     }
                     segments.push_back(Segment { seq, len: outcome.good_len });
                 } else {
@@ -736,6 +738,14 @@ impl DiskQueue {
             let oldest_seq = seqs[0];
 
             let cursor = load_cursor(&config.dir, &mut diag);
+            // A torn tail is loss unless the persisted cursor is past its start: the sink
+            // received the batch (`drain_inbox` counts receipt before the push), and no process
+            // counted it delivered or dropped. Either its push never finished (a kill mid-write),
+            // or it was flushed but not yet `fsync`ed when power failed. A cursor past the start
+            // means the record was committed before the crash.
+            torn_lost = torn_at.is_some_and(|(seq, good_len)| {
+                !cursor.is_some_and(|(cur_seq, cur_offset)| cur_seq == seq && cur_offset > good_len)
+            });
             let (mut cur_seq, mut cur_offset) = cursor.unwrap_or((oldest_seq, 0));
             if !seqs.contains(&cur_seq) || cur_seq < oldest_seq {
                 if cursor.is_some() {
@@ -793,8 +803,13 @@ impl DiskQueue {
             }
         }
 
-        if truncated {
+        if torn_at.is_some() {
             telemetry.count(DISK_TRUNCATED, 1.0, &[]);
+        }
+        if torn_lost {
+            // One batch: a partial record holds no readable event count, so `events.dropped` isn't
+            // counted. Records lost whole with the page cache leave no bytes and aren't counted.
+            telemetry.count(SINK_QUEUE_METRICS.items_dropped, 1.0, &[("reason", "disk_torn")]);
         }
         if corrupt_skipped_total > 0 {
             telemetry.count(
@@ -2178,7 +2193,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_segment_truncated_mid_record_recovers_to_the_last_good_frame_and_counts_truncated() {
+    async fn a_segment_truncated_mid_record_recovers_to_the_last_good_frame_and_counts_the_lost_batch(
+    ) {
         let dir = scratch_dir("torn-tail");
         let path = segment_path(&dir, 0);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2205,6 +2221,47 @@ mod tests {
             metric_sum(&events, DISK_TRUNCATED, None),
             1.0,
             "the torn tail should have counted exactly one truncation"
+        );
+        assert_eq!(
+            metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, Some(("reason", "disk_torn"))),
+            1.0,
+            "the batch lost with the torn tail is counted dropped"
+        );
+        assert_eq!(
+            metric_sum(&events, SINK_QUEUE_METRICS.units_dropped, None),
+            0.0,
+            "a partial record's event count is unknown, so no events are counted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_torn_tail_behind_the_persisted_cursor_is_repaired_but_not_counted_lost() {
+        let dir = scratch_dir("torn-tail-committed");
+        let path = segment_path(&dir, 0);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = raw_record(&batch("good"), ctx());
+        let torn = raw_record(&batch("torn"), ctx());
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&torn[..torn.len() / 2]);
+        std::fs::write(&path, &bytes).unwrap();
+        // The cursor was persisted past the torn record: it was committed before the crash, and
+        // a power loss tore its bytes afterward.
+        persist_cursor(&dir, 0, (good.len() + torn.len()) as u64).unwrap();
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("test", "output", "sink");
+        let q = DiskQueue::open(config(dir.clone()), telemetry, Diagnostics::new("test")).unwrap();
+        // Closed, so `peek` returns `None` on an empty spool instead of waiting for a push.
+        q.close();
+        assert!(q.peek().await.is_none(), "every record was committed");
+
+        let events = registry.drain(0);
+        assert_eq!(metric_sum(&events, DISK_TRUNCATED, None), 1.0, "the repair is still counted");
+        assert_eq!(
+            metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, None),
+            0.0,
+            "a committed record's torn bytes are not loss"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

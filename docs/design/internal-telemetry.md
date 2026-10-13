@@ -595,7 +595,7 @@ disk-backed sink:
 | `logit.component.buffer.utilization` | gauge | `max(batches ratio, bytes ratio)` against the two configured bounds |
 | `logit.component.buffer.push.blocked.duration` | timing | how long a `Block`-policy push waited for room; only recorded when a push actually had to wait |
 | `logit.component.retrying` | gauge | `1` from the held head's first retryable failure while a retry is pending or in flight, `0` once that head is delivered or dropped and when the write loop exits. A hold drops nothing, so `batches.dropped` stays flat while this reads `1` |
-| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `rejected` (`write_loop`: the destination refused this batch for its own content, or the sink attached no fault), `ambiguous_at_most_once` (`write_loop`: a send of unknown outcome under `delivery: at_most_once`), `shutdown` (`run_output` stopped with an in-memory queue still non-empty, or with batches that never reached the queue: left in the inbox, or held by a push abandoned at shutdown. A disk-backed sink spools those, so it emits `shutdown` only under `delivery: at_most_once`, for a send the shutdown grace cut off mid-flight, which the destination may have taken and which isn't replayed; its sink span carries `fault=ambiguous`), `frame_too_large`/`disk_corrupt`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
+| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `rejected` (`write_loop`: the destination refused this batch for its own content, or the sink attached no fault), `ambiguous_at_most_once` (`write_loop`: a send of unknown outcome under `delivery: at_most_once`), `shutdown` (`run_output` stopped with an in-memory queue still non-empty, or with batches that never reached the queue: left in the inbox, or held by a push abandoned at shutdown. A disk-backed sink spools those, so it emits `shutdown` only under `delivery: at_most_once`, for a send the shutdown grace cut off mid-flight, which the destination may have taken and which isn't replayed; its sink span carries `fault=ambiguous`), `frame_too_large`/`disk_corrupt`/`disk_torn`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
 
 `write_loop` also writes four `Diagnostics` keys. `retrying` and `send_failed` carry the fault
 class and the destination's error text:
@@ -617,7 +617,7 @@ Disk-backed sinks (`DiskQueue`) also emit:
 |---|---|---|
 | `logit.component.buffer.disk.segments` | gauge | segment files currently on disk |
 | `logit.component.buffer.disk.replayed` | count | records found between the resume point and the end of all segments, at `DiskQueue::open` |
-| `logit.component.buffer.disk.truncated` | count | a torn tail found and truncated at `DiskQueue::open` |
+| `logit.component.buffer.disk.truncated` | count | a torn tail found and truncated at `DiskQueue::open`: a repair, counted once per open. The batch lost with it is `batches.dropped{reason="disk_torn"}` |
 | `logit.component.buffer.disk.errors{op=...}` | count | a failed spool filesystem operation, `op` one of `cursor` (a `cursor.json` write), `flush`, `fsync` (a segment or the spool directory), `create` (a rotation's new segment), `truncate` (the torn-tail repair), `unlink` (a consumed segment). Only `truncate` drops a batch: the push that attempted the repair, also counted `batches.dropped{reason="disk_full"\|"disk_io_error"}` |
 
 Each `disk.errors` point is also diagnosed: `op="cursor"` under
@@ -632,6 +632,17 @@ corrupt region to the next record, or skips a corrupt region that runs to the en
 delivery reaches it. A region counts once however many records it spanned, so the count is a lower
 bound, and a skipped region to the end of a segment counts zero `events.dropped`: how many events
 undecodable bytes held is unknowable.
+
+`batches.dropped{reason="disk_torn"}` counts the batch lost with a torn tail: one per tail
+`DiskQueue::open` truncates, beside `buffer.disk.truncated`. The sink counted `batches.received`
+for it in the process that crashed, before its push either stopped mid-write or wrote bytes a
+power loss tore. It isn't counted when the persisted cursor is past the torn record's start,
+because that record was committed before the crash. It emits no `events.dropped`, since a partial
+record holds no readable event count. It's a lower bound: a power loss can lose records whole,
+which leave no bytes to count. One case counts twice: a write that failed and was counted
+`disk_full` or `disk_io_error`, whose bytes no later push repaired before the process exited.
+Because the batch was received by an earlier process, a per-process sink identity adds it to the
+received side, as it adds `buffer.disk.replayed`.
 
 Two metrics from this document's original design were never built: a per-batch
 `buffer.wait.duration` (push-to-commit latency) and an `outcome`-tagged `send.attempts`

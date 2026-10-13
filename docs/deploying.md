@@ -958,8 +958,8 @@ rotation renames each retained file; `logit validate` rejects a larger value.
 
 **What to watch.** The metrics above still apply, with these differences:
 `buffer.utilization`/`.bytes` are sized against `buffer.disk.max_bytes`; `batches.dropped` gains
-the `reason`s `frame_too_large`, `disk_corrupt`, `disk_full`, and `disk_io_error`; and a
-disk-backed sink emits `reason="shutdown"` only under `at_most_once`, when the shutdown grace cuts
+the `reason`s `frame_too_large`, `disk_corrupt`, `disk_torn`, `disk_full`, and `disk_io_error`;
+and a disk-backed sink emits `reason="shutdown"` only under `at_most_once`, when the shutdown grace cuts
 off the batches in flight (an ambiguous outcome that posture drops). Nothing else is dropped at
 shutdown, because the spool keeps it. Also watch:
 
@@ -969,8 +969,10 @@ shutdown, because the spool keeps it. Also watch:
   from the first tick on. A nonzero value on every restart under normal operation means something
   keeps the queue from ever fully draining.
 - `logit.component.buffer.disk.truncated` (count): a torn tail found and truncated at open. Nonzero
-  means the previous process ended mid-write, which an ordinary `SIGKILL` does. Note it; don't
-  alert on it alone.
+  means the previous process ended mid-write, which an ordinary `SIGKILL` does, or a power loss
+  tore unsynced bytes. The batch lost with the tail counts `batches.dropped{reason="disk_torn"}`
+  at the same open, unless it was delivered before the crash; it counts no `events.dropped`,
+  because a partial record's event count is unreadable.
 - `logit.component.buffer.disk.errors{op}` (count): a failed spool filesystem operation, `op` one
   of `cursor`, `flush`, `fsync`, `create`, `truncate`, or `unlink`. Alert on any nonzero value: the
   durability level above no longer holds. A failed `cursor` write means more replay after a

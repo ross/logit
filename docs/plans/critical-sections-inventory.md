@@ -2418,8 +2418,18 @@ surveyor's.
   test, which passed and failed only with the lock removed. Still open: the startup double read,
   and `open` counting `events.dropped{reason="disk_corrupt"}` as the number of corrupt regions
   rather than events.
+- **Changed 2026-10-13 (`drops/w1b`):** `open` counts the batch lost with a torn tail as
+  `batches.dropped{reason="disk_torn"}` (no `events.dropped`), unless the persisted cursor is past
+  the torn record's start; `disk.truncated` stays the repair count. A new invariant: a torn tail
+  counts at most one `disk_torn` batch, and never when the cursor shows the record committed.
+  Checked by
+  `a_segment_truncated_mid_record_recovers_to_the_last_good_frame_and_counts_the_lost_batch` and
+  `a_torn_tail_behind_the_persisted_cursor_is_repaired_but_not_counted_lost`. Known overcount: a
+  failed write already counted `disk_full`/`disk_io_error` whose bytes no push repaired before
+  exit counts again ([ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md)'s
+  2026-10-13 amendment).
 - **Existing coverage:** `disk_queue.rs` tests
-  `a_segment_truncated_mid_record_recovers_to_the_last_good_frame_and_counts_truncated`,
+  `a_segment_truncated_mid_record_recovers_to_the_last_good_frame_and_counts_the_lost_batch`,
   `a_crc_corrupted_record_mid_segment_is_skipped_via_resync_and_counted`,
   `a_trace_id_containing_magic_does_not_derail_recovery`, `a_missing_cursor_starts_at_the_oldest_segment`,
   `a_cursor_past_the_end_restarts_at_the_oldest_surviving_segment`,

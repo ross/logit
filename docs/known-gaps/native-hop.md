@@ -85,7 +85,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **The disk-backed sink spool has an accepted power-loss window.** Every cursor write is
   `fsync`ed (tmp file, then directory); a segment is `fsync`ed only when it rotates away and at
   shutdown, not per push (the ADR's "Durability" section and its amendment). A power loss, though
-  not a process crash, can lose the active segment's most recent un-`fsync`ed writes. A
+  not a process crash, can lose the active segment's most recent un-`fsync`ed writes. Of those,
+  the next open counts only a torn final record, as `batches.dropped{reason="disk_torn"}`; records
+  lost whole leave no bytes and aren't counted. The same count can also include a write that
+  failed and was already counted `disk_full` or `disk_io_error`, if no later push repaired its
+  bytes before the process exited. A
   `disk.sync: every_push` knob that closes the window at a throughput cost is a plausible
   follow-up, not built.
 - **No spool sharing, compaction, or encryption for the disk-backed sink buffer.** Each sink gets

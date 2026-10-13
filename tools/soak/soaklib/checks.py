@@ -2072,10 +2072,19 @@ def check_ledger_summary(data):
     return Result("ledger.summary", status, detail, _per_life_lines(led))
 
 
+def _torn_upto(sut, sink, life, at):
+    """`batches.dropped{reason="disk_torn"}` for one sink and life up to `at`. A spool counts it
+    at open for a batch an earlier life received and lost with a torn tail, so like
+    `buffer.disk.replayed` it settles a batch this life never received."""
+    return sum(v for ts, v, point_life in sut.counter_points(
+        "logit.component.batches.dropped", component=sink, reason="disk_torn")
+        if point_life == life and ts <= at)
+
+
 def check_identity_sink(data):
     """For each sink, at the final life's last drain before its shutdown drain:
-    batches.received + buffer.disk.replayed == delivered + dropped (every reason) +
-    buffer.batches, one batch in flight allowed."""
+    batches.received + buffer.disk.replayed + batches.dropped{reason="disk_torn"} ==
+    delivered + dropped (every reason) + buffer.batches, one batch in flight allowed."""
     led = _ledger(data)
     skipped = _skip_without_sut("identity.sink", led)
     if skipped:
@@ -2097,13 +2106,15 @@ def check_identity_sink(data):
         # delivered in this life but were received in another, and `buffer.disk.replayed`
         # counts them.
         replayed = upto("logit.component.buffer.disk.replayed")
+        torn = _torn_upto(sut, sink, life, at)
         delivered = upto("logit.component.batches.delivered")
         dropped = upto("logit.component.batches.dropped")
         queued = next((v for ts, v, point_life in reversed(sut.gauge_series(
             "logit.component.buffer.batches", component=sink))
             if point_life == life and ts <= at), 0)
-        gap = received + replayed - delivered - dropped - queued
-        replay = f" + replayed {_n(replayed)}" if replayed else ""
+        gap = received + replayed + torn - delivered - dropped - queued
+        replay = (f" + replayed {_n(replayed)}" if replayed else "") + (
+            f" + torn {_n(torn)}" if torn else "")
         if not 0 <= gap <= 1:
             status = FAIL
         lines.append(f"{sink}: received {_n(received)}{replay} vs delivered {_n(delivered)} + "
@@ -2353,13 +2364,15 @@ def _sent_one(data, led, sink, flag, lines):
 
         received = upto("logit.component.batches.received")
         replayed = upto("logit.component.buffer.disk.replayed")
+        torn = _torn_upto(sut, sink, life, at)
         delivered = upto("logit.component.batches.delivered")
         dropped = upto("logit.component.batches.dropped")
         queued = next((v for ts, v, point_life in reversed(sut.gauge_series(
             "logit.component.buffer.batches", component=sink))
             if point_life == life and ts <= at), 0)
-        gap = received + replayed - delivered - dropped - queued
-        replay = f" + replayed {_n(replayed)}" if replayed else ""
+        gap = received + replayed + torn - delivered - dropped - queued
+        replay = (f" + replayed {_n(replayed)}" if replayed else "") + (
+            f" + torn {_n(torn)}" if torn else "")
         text = (f"{sink} life {life} at {data.offset(at)}: received {_n(received)}{replay} vs "
                 f"delivered {_n(delivered)} + dropped {_n(dropped)} + buffer.batches "
                 f"{_n(queued)}, gap {_n(gap)}")

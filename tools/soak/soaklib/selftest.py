@@ -3291,6 +3291,16 @@ def _kill_ledger():
         expect("received 21 + replayed 3 vs delivered 24" in clean["identity.sink"].detail,
                f"identity.sink counts a spool's replayed batches as received, got "
                f"{clean['identity.sink']}")
+        # Life 2's spool opens on a torn tail: the batch life 1 lost with it is counted dropped
+        # in life 2, which never received it.
+        torn = results("kill-torn-tail", sut_extra=(
+            _line(_stamp(T0 + 215), "logit.component.batches.dropped", "sum", 1,
+                  component="sink", attrs={"reason": "disk_torn"}),))
+        expect(torn["identity.sink"].status == checks.PASS
+               and "received 21 + replayed 3 + torn 1 vs delivered 24 + dropped 1"
+               in torn["identity.sink"].detail,
+               f"identity.sink settles a torn tail's drop against the batch an earlier life "
+               f"received, got {torn['identity.sink']}")
         stray = results("kill-stray-drop", stray_drop=True)
         stray_led = checks.Ledger(checks.RunData(Path(tmp) / "kill-stray-drop"))
         expect(1 not in stray_led.D_log and stray["ledger.intake"].status == checks.PASS,
