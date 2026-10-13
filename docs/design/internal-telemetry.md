@@ -1299,8 +1299,8 @@ connection refused for its PROXY header.
 
 **A busy request is not a lost one**, as on `splunk_hec_in`: after 5 seconds without the pipeline
 taking the request's batch, the request gets `503` with `Retry-After: 1`, counted `class="busy"`
-and `batches.deferred`, and nothing of it is delivered, so the client resends it whole. A request's body decodes to one
-batch, delivered all or nothing under one deadline.
+and `batches.deferred`, and nothing of it is delivered, so the client resends it whole. A
+request's body decodes to one batch, delivered all or nothing under one deadline.
 
 `Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a plaintext peer that
 closes cleanly or resets before sending a request byte, after a complete PROXY header under

@@ -66,11 +66,12 @@
 //!
 //! Per request: `logit.input.requests{route, class}`, `logit.input.request.duration`, and
 //! `logit.input.request.bytes`. Rejections: `logit.input.requests.rejected{reason}`. A decoded
-//! batch a `503` left undelivered: `logit.input.batches.deferred` when the pipeline was busy, since
-//! the client still holds the body, and `logit.input.batches.dropped{reason="closed_consumer"}` when
-//! no consumer is open. The decoder counts `logit.input.tags.omitted{reason="reserved_prefix"}`. The connection metrics are `otlp_in`'s
-//! verbatim. The reasons, classes, and meanings are in `docs/design/internal-telemetry.md`'s
-//! `influxdb_in` section.
+//! batch a `503` left undelivered: `logit.input.batches.deferred` when the pipeline was busy,
+//! since the client still holds the body, and
+//! `logit.input.batches.dropped{reason="closed_consumer"}` when no consumer is open. The decoder
+//! counts `logit.input.tags.omitted{reason="reserved_prefix"}`. The connection metrics are
+//! `otlp_in`'s verbatim. The reasons, classes, and meanings are in
+//! `docs/design/internal-telemetry.md`'s `influxdb_in` section.
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
