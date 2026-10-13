@@ -1,6 +1,7 @@
 # The stack `script/kafka-interop` drives: Apache Kafka (KRaft) and Redpanda, each with a plain,
 # a TLS, a mutual-TLS, a SASL_PLAINTEXT, and a SASL_SSL listener (and on Kafka an OAUTHBEARER
-# one), an OAuth 2.0 token server, and one `logit` per leg per broker from the release image. See README.md here, and docs/plans/kafka-output.md's "Interop plan (W4)" for what each leg proves.
+# one), an OAuth 2.0 token server, one `logit` per leg per broker from the release image, and
+# one OpenTelemetry Collector per broker that reads the OTLP legs' topics. See README.md here, and docs/plans/kafka-output.md's "Interop plan (W4)" for what each leg proves.
 #
 # `script/kafka-interop` runs this under the compose project `kafka-interop` with an
 # `--env-file` it writes, which sets:
@@ -213,3 +214,46 @@ services:
     volumes:
       - ./logit-oauth-redpanda.yaml:/config.yaml:ro,z
       - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+
+  logit-otlp-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-otlp-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-otlp-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-otlp-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+
+  # One Collector per broker, reading the topics `logit-otlp-*` writes. It writes what it decoded
+  # to the run directory's `collector/<broker>/` and, for the `keyed` traces, re-keys them into
+  # `exporter-*` topics with its own `kafka` exporter. The image has no shell, so there's no
+  # healthcheck; the script stops it with the legs.
+  collector-kafka:
+    image: otel/opentelemetry-collector-contrib:0.162.0@sha256:39923a8e431bd1f57be82411999d389fcfe40857492e4365456d97a4c1f74be6
+    restart: "no"
+    depends_on:
+      kafka: { condition: service_healthy }
+    environment:
+      BROKER: kafka
+    command: ["--config=/etc/collector.yaml"]
+    volumes:
+      - ./collector.yaml:/etc/collector.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/collector/kafka:/out:z
+
+  collector-redpanda:
+    image: otel/opentelemetry-collector-contrib:0.162.0@sha256:39923a8e431bd1f57be82411999d389fcfe40857492e4365456d97a4c1f74be6
+    restart: "no"
+    depends_on:
+      redpanda: { condition: service_healthy }
+    environment:
+      BROKER: redpanda
+    command: ["--config=/etc/collector.yaml"]
+    volumes:
+      - ./collector.yaml:/etc/collector.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/collector/redpanda:/out:z

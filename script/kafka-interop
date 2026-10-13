@@ -25,13 +25,23 @@ NETEM_IMAGE="logit-soak-netem:local"
 KAFKA_IMAGE="apache/kafka:4.2.0"
 KCAT_IMAGE="edenhill/kcat:1.7.1"
 PYTHON_IMAGE="python:3.12-slim"
+COLLECTOR_IMAGE="otel/opentelemetry-collector-contrib:0.162.0@sha256:39923a8e431bd1f57be82411999d389fcfe40857492e4365456d97a4c1f74be6"
 OAUTH_IMAGE="ghcr.io/navikt/mock-oauth2-server:6.0.2"
 BROKERS=(kafka redpanda)
 # Each topic and its partition count, created on both brokers before any leg starts.
 TOPICS=(parity-logit:6 parity-java:6 codec-none:1 codec-gzip:1 codec-snappy:1 codec-lz4:1
     codec-zstd:1 dedup:3 dedup-control:3 tls:1 mtls:1 mtls-nocert:1 sasl-plain:1
     sasl-scram512:1 sasl-scram256:1 sasl-wrong:1 timestamp:1 oauth-cc:1 oauth-static:1
-    oauth-refused:1)
+    oauth-refused:1
+    otlp_logs:1 otlp_metrics:1 otlp_spans:1 keyed-logs:6 keyed-metrics:1 keyed-spans:6
+    big-logs:1 big-metrics:1 big-spans:1 exporter-default:6 exporter-murmur2:6
+    otlpjson-logs:1 otlpjson-metrics:1 otlpjson-spans:1 jsonbig-logs:6 jsonbig-metrics:1
+    jsonbig-spans:6)
+# The topics that hold OTLP requests, protobuf bytes a tab-separated reader can't carry. Their
+# read-back prints each record's partition, offset, timestamp, key, and value size, and no value.
+BINARY_TOPICS=(otlp_logs otlp_metrics otlp_spans keyed-logs keyed-metrics keyed-spans big-logs
+    big-metrics big-spans exporter-default exporter-murmur2 otlpjson-logs otlpjson-metrics
+    otlpjson-spans jsonbig-logs jsonbig-metrics jsonbig-spans)
 # The dedup leg's fault: the broker's packets to the leg's container dropped from this many
 # seconds after the legs start, for this long. The leg sends for 40 s.
 NETEM_AT=10
@@ -41,10 +51,12 @@ NETEM_FOR=8
 LEGS_WINDOW=75
 
 RUN_DIR="${KAFKA_INTEROP_OUT:-${ROOT}/perf/results/kafka-interop}/$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "${RUN_DIR}/logs" "${RUN_DIR}/tls" "${RUN_DIR}/redpanda" "${RUN_DIR}/readback"
+mkdir -p "${RUN_DIR}/logs" "${RUN_DIR}/tls" "${RUN_DIR}/redpanda" "${RUN_DIR}/readback" \
+    "${RUN_DIR}/collector/kafka" "${RUN_DIR}/collector/redpanda"
 # The image's unprivileged `logit` user, the Kafka image's `appuser`, and Redpanda's `redpanda`
-# each have an unrelated uid; world-writable lets each write here.
-chmod 777 "${RUN_DIR}" "${RUN_DIR}/tls" "${RUN_DIR}/redpanda" "${RUN_DIR}/readback"
+# each have an unrelated uid, and so does the Collector's; world-writable lets each write here.
+chmod 777 "${RUN_DIR}" "${RUN_DIR}/tls" "${RUN_DIR}/redpanda" "${RUN_DIR}/readback" \
+    "${RUN_DIR}/collector" "${RUN_DIR}/collector/kafka" "${RUN_DIR}/collector/redpanda"
 
 # `--env-file` rather than the environment: `sudo` resets the environment, and `$DOCKER` is
 # `sudo docker` by default.
@@ -167,6 +179,12 @@ for config in "${TOOLS_DIR}"/logit-*.yaml; do
     }
 done
 
+${DOCKER} run --rm -e BROKER=kafka -v "${TOOLS_DIR}/collector.yaml:/collector.yaml:ro,z" \
+    "${COLLECTOR_IMAGE}" validate --config /collector.yaml || {
+    echo "kafka-interop: collector.yaml failed the Collector's validate" >&2
+    exit 1
+}
+
 say "generating a private CA and certificates into ${RUN_DIR}/tls"
 make_tls
 # `rpk redpanda start` rewrites its config file, so Redpanda gets a writable copy.
@@ -204,7 +222,7 @@ ki_compose up -d --wait --wait-timeout 180 kafka redpanda >/dev/null
     echo "repo: $(git -C "${ROOT}" rev-parse HEAD) ($(git -C "${ROOT}" status --porcelain | wc -l) modified path(s))"
     echo "docker: $(${DOCKER} version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
     echo "logit image: $(${DOCKER} image inspect -f '{{.Id}}' "${IMAGE}")"
-    for image in "${KAFKA_IMAGE}" "redpandadata/redpanda:v26.2.3" "${KCAT_IMAGE}" "${OAUTH_IMAGE}"; do
+    for image in "${KAFKA_IMAGE}" "redpandadata/redpanda:v26.2.3" "${KCAT_IMAGE}" "${OAUTH_IMAGE}" "${COLLECTOR_IMAGE%%@*}"; do
         echo "${image}: $(${DOCKER} image inspect -f '{{index .RepoDigests 0}}' "${image}" 2>/dev/null || echo unknown)"
     done
     echo "redpanda version: $(ki_compose exec -T redpanda rpk version 2>/dev/null | head -1)"
@@ -287,8 +305,9 @@ for config in "${TOOLS_DIR}"/logit-*.yaml; do
     name="$(basename "${config}" .yaml)"
     LEGS+=("${name}")
 done
-say "starting ${#LEGS[@]} legs"
-ki_compose up -d --no-deps "${LEGS[@]}" >/dev/null
+COLLECTORS=(collector-kafka collector-redpanda)
+say "starting ${#LEGS[@]} legs and ${#COLLECTORS[@]} Collectors"
+ki_compose up -d --no-deps "${LEGS[@]}" "${COLLECTORS[@]}" >/dev/null
 
 sleep "${NETEM_AT}"
 for broker in "${BROKERS[@]}"; do
@@ -314,6 +333,13 @@ for leg in "${LEGS[@]}"; do
     ${DOCKER} stop -t 30 "${id}" >/dev/null
     echo "${leg} $(${DOCKER} inspect -f '{{.State.ExitCode}}' "${id}")" >>"${RUN_DIR}/exits.txt"
 done
+# The legs have finished, so the Collectors have read every record. A SIGTERM flushes their file
+# exporters and the `kafka` exporters' queues before the topics are read back.
+for collector in "${COLLECTORS[@]}"; do
+    id="$(container "${collector}")"
+    ${DOCKER} stop -t 30 "${id}" >/dev/null
+    echo "${collector} $(${DOCKER} inspect -f '{{.State.ExitCode}}' "${id}")" >>"${RUN_DIR}/exits.txt"
+done
 
 say "reading every topic back with kafka-console-consumer.sh and kcat"
 for broker in "${BROKERS[@]}"; do
@@ -327,16 +353,27 @@ for broker in "${BROKERS[@]}"; do
         # The end offsets bound the read, so the consumer stops at the last record instead of
         # waiting out its idle timeout; the timeout only bounds a short topic.
         held="$(awk -F: '{ n += $3 } END { print n + 0 }' "${out}/${topic}.offsets")"
+        binary=false
+        for candidate in "${BINARY_TOPICS[@]}"; do
+            [ "${candidate}" = "${topic}" ] && binary=true
+        done
+        print_value=true
+        kcat_format='%p\t%o\t%T\t%k\t%s\n'
+        if [ "${binary}" = true ]; then
+            print_value=false
+            kcat_format='%p\t%o\t%T\t%k\t%S\t%K\n'
+        fi
         : >"${out}/${topic}.java.tsv"
         if [ "${held}" -gt 0 ]; then
             kafka_tool kafka-console-consumer.sh --bootstrap-server "${broker}:9092" \
                 --topic "${topic}" --from-beginning --max-messages "${held}" --timeout-ms 20000 \
                 --formatter-property print.timestamp=true --formatter-property print.partition=true \
                 --formatter-property print.offset=true --formatter-property print.key=true \
+                --formatter-property print.value="${print_value}" \
                 >"${out}/${topic}.java.tsv" 2>>"${RUN_DIR}/logs/readback.log" || true
         fi
         ${DOCKER} run --rm --network "${NETWORK}" "${KCAT_IMAGE}" -b "${broker}:9092" -C \
-            -t "${topic}" -o beginning -e -q -f '%p\t%o\t%T\t%k\t%s\n' \
+            -t "${topic}" -o beginning -e -q -f "${kcat_format}" \
             >"${out}/${topic}.kcat.tsv" 2>>"${RUN_DIR}/logs/readback.log" || true
     done
 done
