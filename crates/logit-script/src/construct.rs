@@ -59,6 +59,7 @@ use logit_core::{
     SpanLink, SpanRecord, SpanStatus, Sum, Summary, Temporality, Value,
 };
 use mlua::{IntoLua, Lua, Table, Value as LuaValue};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1308,9 +1309,12 @@ fn symbol_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Option<S
 /// `exact_i64_to_lua`/`exact_u64_to_lua`), so `Event.new(e:to_table())` rebuilds the same integer.
 fn metric_value_field(t: &Table, path: &str) -> mlua::Result<MetricValue> {
     let value: LuaValue = t.raw_get("value")?;
-    let type_name = match t.raw_get::<_, LuaValue>("type")? {
-        LuaValue::Nil => "f64".to_owned(),
-        LuaValue::String(s) => s.to_str()?.to_owned(),
+    // Borrowed, not owned: `Event.new` runs per event, and the common `type`-less path must not
+    // allocate (`docs/design/memory.md`'s `Event.new` rows).
+    let type_value: LuaValue = t.raw_get("type")?;
+    let type_name: Cow<'_, str> = match &type_value {
+        LuaValue::Nil => Cow::Borrowed("f64"),
+        LuaValue::String(s) => Cow::Owned(s.to_str()?.to_owned()),
         other => {
             return Err(runtime_error(format!(
                 "Event.new: {} must be a string or nil, got {}",
@@ -1323,12 +1327,13 @@ fn metric_value_field(t: &Table, path: &str) -> mlua::Result<MetricValue> {
         return Err(required(path, "value"));
     }
     let field = || dotted(path, "value");
-    match type_name.as_str() {
+    match &*type_name {
         "f64" => finite(value, field).map(MetricValue::F64),
         "i64" => {
             let reject = |got: String| {
                 runtime_error(format!(
-                    "Event.new: {} must be an integer within ±2^53 or a decimal string that fits                      an i64, got {got}",
+                    "Event.new: {} must be an integer within ±2^53 or a decimal string that fits \
+                     an i64, got {got}",
                     field()
                 ))
             };

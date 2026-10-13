@@ -730,7 +730,7 @@ fn counter_value(kind: &logit_core::MetricKind) -> Option<f64> {
         logit_core::MetricKind::Sum(s)
             if s.temporality == logit_core::Temporality::Delta && s.monotonic =>
         {
-            Some(s.value)
+            Some(s.value.as_f64())
         }
         _ => None,
     }
@@ -738,7 +738,7 @@ fn counter_value(kind: &logit_core::MetricKind) -> Option<f64> {
 
 fn gauge_value(kind: &logit_core::MetricKind) -> Option<f64> {
     match kind {
-        logit_core::MetricKind::Gauge(v) => Some(*v),
+        logit_core::MetricKind::Gauge(v) => Some(v.as_f64()),
         _ => None,
     }
 }

@@ -822,7 +822,7 @@ pub fn gauge_event_after_keep() -> Event {
     event.metrics.clear();
     event.metrics.push(MetricRecord::new(
         logit_core::interner::intern("nginx.connections.active"),
-        MetricKind::Gauge(3.0),
+        MetricKind::gauge(3.0),
     ));
     event
 }
@@ -963,7 +963,7 @@ pub fn wide_gauge_event(name: &str, value: f64) -> Event {
     Event::metric(
         0,
         attributes,
-        MetricRecord::new(logit_core::interner::intern(name), MetricKind::Gauge(value)),
+        MetricRecord::new(logit_core::interner::intern(name), MetricKind::gauge(value)),
     )
 }
 
@@ -1505,7 +1505,7 @@ pub fn prometheus_gauge_events(count: usize) -> Vec<Event> {
                 attributes,
                 MetricRecord::new(
                     logit_core::interner::intern("prom_bench_gauge"),
-                    MetricKind::Gauge(i as f64),
+                    MetricKind::gauge(i as f64),
                 ),
             )
         })
@@ -1621,7 +1621,7 @@ pub fn collectd_event() -> Event {
     let mut event = Event::empty(1_700_000_000_000_000_000, attributes);
     event
         .metrics
-        .push(MetricRecord::new(logit_core::interner::intern("load.load"), MetricKind::Gauge(0.5)));
+        .push(MetricRecord::new(logit_core::interner::intern("load.load"), MetricKind::gauge(0.5)));
     event
 }
 
@@ -1647,7 +1647,7 @@ pub fn graphite_event() -> Event {
     Event::metric(
         1_700_000_000_000_000_000,
         AttrMap::new(),
-        MetricRecord::new(logit_core::interner::intern("app.requests"), MetricKind::Gauge(42.0)),
+        MetricRecord::new(logit_core::interner::intern("app.requests"), MetricKind::gauge(42.0)),
     )
 }
 
@@ -2016,7 +2016,7 @@ pub fn collectd_three_record_event() -> Event {
     {
         event
             .metrics
-            .push(MetricRecord::new(logit_core::interner::intern(name), MetricKind::Gauge(value)));
+            .push(MetricRecord::new(logit_core::interner::intern(name), MetricKind::gauge(value)));
     }
     event
 }

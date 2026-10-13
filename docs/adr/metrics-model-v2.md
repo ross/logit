@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-11
+updated: 2026-10-13
 ---
 
 # Metrics model v2: `Sum` replaces `Counter`, raw/summarized pairs, boxed span fidelity, batch-level `Scope`
@@ -131,6 +131,11 @@ spare bit patterns already present inside `DDSketch`'s own layout. That trick is
 `SAMPLES_INLINE = 19` is the largest value that avoids this — `size_of::<Samples>() == 168`, leaving
 just enough room inside the existing 176-byte envelope for `MetricKind`'s discriminant, so
 `MetricKind` stays exactly 176. Both are asserted exactly in `crates/logit-core/tests/type_sizes.rs`.
+
+**Amendment (2026-10-13): the scalar is `MetricValue`.** `Gauge`, `GaugeDelta`, and `Sum.value`
+hold a `MetricValue` (`F64`, `I64`, `U64`, or `Bool`), not an `f64`, so a decoder keeps the integer
+type its wire carried. The kind set, the raw/summarized pairs, and everything else this ADR decides
+are unchanged. See [ADR `typed-metric-scalar`](typed-metric-scalar.md).
 
 ## Alternatives considered
 

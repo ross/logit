@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-10-09
+updated: 2026-10-13
 ---
 
 # collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder
@@ -71,11 +71,11 @@ value, in wire order.
 | Wire | Model | Counter / diag |
 |---|---|---|
 | Values part, N values | one `Event`, `metrics` = N records in wire order | — |
-| COUNTER u64 | `Sum{v as f64, Cumulative, monotonic:true}` | none (>2⁵³ precision loss: known-gaps row, shared with OTLP int/double) |
-| DERIVE i64 | `Sum{Cumulative, monotonic:false}` | none |
-| ABSOLUTE u64 | `Sum{Delta, monotonic:true}` | none |
-| GAUGE finite/±inf | `Gauge(v)` | none |
-| GAUGE NaN | `Gauge(0.0)` + `FLAG_NO_RECORDED_VALUE` (NaN *is* collectd's "no value"; keeps `PartialEq` fixed points honest) | none |
+| COUNTER u64 | `Sum{U64(v), Cumulative, monotonic:true}` | none |
+| DERIVE i64 | `Sum{I64(v), Cumulative, monotonic:false}` | none |
+| ABSOLUTE u64 | `Sum{U64(v), Delta, monotonic:true}` | none |
+| GAUGE finite/±inf | `Gauge(F64(v))` | none |
+| GAUGE NaN | `Gauge(F64(0.0))` + `FLAG_NO_RECORDED_VALUE` (NaN *is* collectd's "no value"; keeps `PartialEq` fixed points honest) | none |
 | unknown DS type; `count==0`/`>64`; `len != 6+9*count` | packet tail rejected | `bad_part` / `bad_datagram` |
 | Host/Plugin/PluginInstance/Type/TypeInstance | sticky → `collectd.*` attrs; empty string → attribute absent | — |
 | Values with empty host/plugin/type | list skipped | `incomplete_identity` |
@@ -114,6 +114,17 @@ natively:
 | empty plugin after sanitizing | dropped | `empty_name` |
 | list alone > `max_packet_bytes` | dropped whole | `{reason="oversize_value_list"}` + diag |
 | datagram `EMSGSIZE` at send (sink) | its lists dropped, no `Fault` | `logit.output.messages.dropped{reason="oversize_datagram"}` |
+
+**Amendment (2026-10-13): typed values.** The model's scalar is a `MetricValue`
+([ADR `typed-metric-scalar`](typed-metric-scalar.md)), so decode keeps each data source's wire
+type: COUNTER and ABSOLUTE decode to `U64`, DERIVE to `I64`, and GAUGE to `F64`. Encode writes a
+typed `Sum` straight to its wire type when the value is in range: a `U64` or `I64` `Sum` needs no
+integral check, and an `F64` `Sum` still must be integral and in range. The precision loss above
+2⁵³ that the decode table recorded is closed, and `collectd_in -> collectd_out` is exact over the
+whole `u64`/`i64` range. A `Gauge` or `GaugeDelta` holding an `I64` or `U64` is written as GAUGE
+(an `f64`), counted `logit.output.metrics.normalized{reason="inexact"}` when the conversion loses
+bits; a `Bool` value is written as `1` or `0`, counted `{reason="bool_value"}`. None of the ten
+permitted normalizations below says an integer becomes a double, and none changes.
 
 ### Attribute conventions
 
@@ -480,8 +491,7 @@ unchanged.
   [ADR `lossless-transit`](lossless-transit.md), alongside `statsd`, `otlp`, `syslog`, and
   `prometheus` — see [`docs/plans/collectd-binary-relay.md`](../plans/collectd-binary-relay.md) for
   the workstreams that build it.
-- Known-gaps rows, added by W1 (`docs/known-gaps/mappings.md`): `>2⁵³`-magnitude counters losing
-  precision in `Sum.value: f64` (shared with OTLP's int/double collapse); non-integral or
+- Known-gaps rows, added by W1 (`docs/known-gaps/mappings.md`): non-integral or
   out-of-range `Sum` values dropped rather than rounded on encode;
   `Samples`/`Distribution`/`SetMembers`/`Set`/ `Histogram`/`ExponentialHistogram`/`Summary`
   unsupported on collectd egress; `unit`/`description`/

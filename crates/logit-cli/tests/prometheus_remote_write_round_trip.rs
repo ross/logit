@@ -483,7 +483,7 @@ async fn a_stale_marker_crosses_the_wire_as_no_recorded_value() {
         attributes.insert("room", "attic");
         let record = MetricRecord {
             flags: MetricRecord::FLAG_NO_RECORDED_VALUE,
-            ..MetricRecord::new(intern("temperature_celsius"), MetricKind::Gauge(0.0))
+            ..MetricRecord::new(intern("temperature_celsius"), MetricKind::gauge(0.0))
         };
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
@@ -675,7 +675,7 @@ async fn a_stalled_downstream_delays_the_204_without_duplicating_a_write() {
         events: vec![Event::metric(
             1_700_000_000_000_000_000,
             AttrMap::new(),
-            MetricRecord::new(intern(name), MetricKind::Gauge(value)),
+            MetricRecord::new(intern(name), MetricKind::gauge(value)),
         )],
     };
     let first = batch_of("first", 1.0);
