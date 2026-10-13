@@ -911,8 +911,9 @@ The rows:
   batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B terms, and the
   script's L_err) and, on an external or Kafka target, the sink's `records.dropped` and
   `metrics.dropped`, which `ledger.sent` judges. A `rejected` or `disk_corrupt` reason FAILs;
-  any other WARNs. On those targets `ledger.egress` SKIPs, so a `disk_corrupt` batch drop, or a
-  `rejected` one anywhere but a sink (whose `ledger.sent` FAILs it), stays in this row.
+  any other WARNs. On an external target `ledger.egress` SKIPs, so `ledger.sent` FAILs a
+  `rejected` or `disk_corrupt` batch drop at a sink, and one at any other node stays in this
+  row.
 - `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
   window around one step, or over the whole run (W8c); see "The scenario schema".
 
@@ -1046,6 +1047,8 @@ and a diagnostic, and "Telemetry"). This list is the canonical copy of its verdi
   `request_rejected`, `series_rejected`, or both, whichever the sink logged. Under per-request
   verdicts a rejected request drops its records and the batch survives when another request
   was accepted, so both the batch and the record counter are read.
+- On an external target, a batch dropped `disk_corrupt` (2026-10-13): FAIL, because
+  `ledger.egress`, which FAILs it on a local or Kafka target, SKIPs there.
 - An `api_key_rejected` or `request_refused` line from the sink on stderr: FAIL, quoting the
   first. The sink reads that answer as `Refused` and holds its queue with no exit, so the run
   can't deliver until the key or the endpoint is fixed.

@@ -3814,11 +3814,19 @@ def _external_checks():
                   attrs={"reason": "disk_corrupt"}),
             _line(corrupt_at, "logit.component.events.dropped", "sum", 40, component="sink",
                   attrs={"reason": "disk_corrupt"})])
-        expect(corrupt["drops"].status == checks.FAIL
-               and corrupt["drops"].lines == [
-                   "sink: logit.component.batches.dropped{reason=\"disk_corrupt\"} 1"],
-               f"on an external target, where no ledger row FAILs it, drops FAILs a "
-               f"disk_corrupt batch once, not again for its events, got {corrupt['drops']}")
+        expect(corrupt["ledger.sent"].status == checks.FAIL
+               and "1 batch(es) dropped from a corrupt disk spool" in corrupt["ledger.sent"].detail
+               and corrupt["drops"].status == checks.PASS,
+               f"on an external target ledger.sent FAILs a sink's disk_corrupt batch, and drops "
+               f"leaves it and its events there, got {corrupt['ledger.sent']} {corrupt['drops']}")
+        upstream = results("external-rejected-upstream", sut_extra=_datadog_lines() + [
+            _line(corrupt_at, "logit.component.batches.dropped", "sum", 1, component="window",
+                  attrs={"reason": "rejected"})])
+        expect(upstream["drops"].status == checks.FAIL
+               and upstream["drops"].lines == [
+                   "window: logit.component.batches.dropped{reason=\"rejected\"} 1"],
+               f"on an external target, where no ledger row FAILs it, drops FAILs a fault "
+               f"drop at a node other than a sink, got {upstream['drops']}")
         for name, kwargs, needle in (
                 ("external-rejected-records", dict(batch=False), "100 record(s) dropped rejected"),
                 ("external-rejected-batch", dict(records=False), "1 batch(es) dropped rejected")):
@@ -4134,6 +4142,14 @@ def _kafka_checks():
                and "read the topic back" in sent.detail and "ok 58" in sent.detail,
                f"ledger.sent judges kafka_out's ok class and doesn't end the evidence, got "
                f"{sent}")
+        expect(clean["drops"].status == checks.PASS,
+               f"drops PASSes a balanced Kafka run, got {clean['drops']}")
+        faulted = results("kafka-fault-drops", life1_dropped=1, dropped_at="window",
+                          dropped_reason="disk_corrupt")
+        expect(faulted["ledger.egress"].status == checks.FAIL
+               and faulted["drops"].status == checks.PASS,
+               f"on a Kafka target ledger.egress FAILs a disk_corrupt batch drop and drops "
+               f"leaves it there, got {faulted['ledger.egress']} {faulted['drops']}")
         expect(clean["ledger.windows"].status == checks.SKIP
                and checks.NO_VM_KAFKA in clean["ledger.windows"].detail,
                f"ledger.windows SKIPs on a Kafka target, got {clean['ledger.windows']}")

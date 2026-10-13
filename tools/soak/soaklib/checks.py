@@ -2426,6 +2426,9 @@ def _sent_one(data, led, sink, flag, lines):
         if reason in REJECTED_BATCH_REASONS:
             flag(FAIL, f"{sink}: {_n(value)} batch(es) dropped {reason}, the destination "
                        f"refused them ({quoted('request_rejected')})")
+        elif data.external and reason in FAULT_DROP_REASONS:
+            # On a Kafka target `ledger.egress` FAILs it instead.
+            flag(FAIL, f"{sink}: {_n(value)} batch(es) {FAULT_DROP_REASONS[reason]}")
         else:
             flag(WARN, f"{sink}: {_n(value)} batch(es) dropped {reason}, counted")
     record_drops = _by_attr(sut, "logit.output.records.dropped", "reason", component=sink)
@@ -2904,11 +2907,11 @@ def _balanced_drop(led, name, component, reason, batch_drops):
     # `identity.sink` (a torn tail included), and a node's `events.dropped` beside a batch drop
     # of the same reason counts the same loss. `bytes.dropped` counts `datagrams.dropped`'s
     # datagrams again. On an external target `ledger.egress` SKIPs and `ledger.summary` reads no
-    # fault drop, so a `FAULT_DROP_REASONS` batch drop stays here, unless `ledger.sent` already
-    # FAILs it at a sink.
+    # fault drop, so a `FAULT_DROP_REASONS` batch drop at a node other than a sink stays here;
+    # `ledger.sent` FAILs one at a sink.
     if name == "logit.component.batches.dropped":
-        return not (not led.data.has_vm and reason in FAULT_DROP_REASONS
-                    and not (component in led.sinks and reason in REJECTED_BATCH_REASONS))
+        return not (led.data.external and reason in FAULT_DROP_REASONS
+                    and component not in led.sinks)
     if name == "logit.component.bytes.dropped":
         return True
     if name == "logit.component.events.dropped" and (component, reason) in batch_drops:
