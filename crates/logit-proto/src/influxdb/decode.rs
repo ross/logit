@@ -39,9 +39,9 @@ pub struct DecodeStats {
     pub points: usize,
     /// Points merged into an earlier event of the same series and timestamp.
     pub merged: usize,
-    /// Tags dropped for a key under the reserved `influxdb.` prefix, counted
-    /// `logit.input.tags.dropped{reason="reserved_prefix"}`.
-    pub tags_dropped_reserved_prefix: usize,
+    /// Tags omitted for a key under the reserved `influxdb.` prefix, counted
+    /// `logit.input.tags.omitted{reason="reserved_prefix"}`.
+    pub tags_omitted_reserved_prefix: usize,
 }
 
 /// Decodes line-protocol write bodies, with no socket, so grammar and model tests run against it
@@ -167,10 +167,10 @@ impl InfluxDecoder {
             }
         }
 
-        if self.stats.tags_dropped_reserved_prefix > 0 {
+        if self.stats.tags_omitted_reserved_prefix > 0 {
             self.telemetry.count(
-                "logit.input.tags.dropped",
-                self.stats.tags_dropped_reserved_prefix as f64,
+                "logit.input.tags.omitted",
+                self.stats.tags_omitted_reserved_prefix as f64,
                 &[("reason", "reserved_prefix")],
             );
         }
@@ -184,7 +184,7 @@ impl InfluxDecoder {
         let mut attributes = AttrMap::new();
         for (key, value) in &line.tags {
             if key.starts_with(CARRIER_PREFIX) {
-                self.stats.tags_dropped_reserved_prefix += 1;
+                self.stats.tags_omitted_reserved_prefix += 1;
                 continue;
             }
             attributes.insert_sym(self.keys.get_or_intern(key), Value::Str(share(body, value)));
@@ -473,15 +473,19 @@ mod tests {
         assert_eq!(str_attr(&batch.events[0], ATTR_MEASUREMENT), Some("m"));
         assert_eq!(batch.events[0].attributes.get("influxdb.field.f"), None);
         assert_eq!(str_attr(&batch.events[0], "host"), Some("a"));
-        assert_eq!(decoder.stats().tags_dropped_reserved_prefix, 3);
+        assert_eq!(decoder.stats().tags_omitted_reserved_prefix, 3);
 
         let mut total = 0.0;
         for event in registry.drain(0) {
+            assert!(
+                event.metrics.iter().all(|m| resolve(m.name) != "logit.input.tags.dropped"),
+                "a tag left off a delivered point is omitted, not dropped"
+            );
             if event.attributes.get("reason").and_then(Value::as_str) != Some("reserved_prefix") {
                 continue;
             }
             for m in &event.metrics {
-                if resolve(m.name) == "logit.input.tags.dropped" {
+                if resolve(m.name) == "logit.input.tags.omitted" {
                     total += match m.kind {
                         MetricKind::Sum(s) => s.value.as_f64(),
                         MetricKind::Gauge(v) => v.as_f64(),
@@ -548,7 +552,7 @@ mod tests {
         assert_eq!(metrics(&second.events[0]), [("m.g", g(MetricValue::I64(2)))]);
         assert_eq!(
             decoder.stats(),
-            DecodeStats { points: 1, merged: 0, tags_dropped_reserved_prefix: 0 }
+            DecodeStats { points: 1, merged: 0, tags_omitted_reserved_prefix: 0 }
         );
     }
 
@@ -565,7 +569,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             decoder.stats(),
-            DecodeStats { points: 3, merged: 1, tags_dropped_reserved_prefix: 0 }
+            DecodeStats { points: 3, merged: 1, tags_omitted_reserved_prefix: 0 }
         );
     }
 }

@@ -121,14 +121,15 @@ impl InfluxDbOutput {
     async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let (first, body) = self.accounting.encode(0, || self.encoder.encode(batch));
         let body = body?;
-        // Before the empty-body return: a batch whose every line was unencodable still dropped
-        // or normalized what it dropped, and an operator chasing a missing point needs to see it.
+        // Before the empty-body return: a batch whose every line was unencodable still counts
+        // what it dropped, omitted, or normalized, and an operator chasing a missing point needs
+        // to see it.
         if first {
             emit_encode_stats(&self.telemetry, self.encoder.stats());
         }
         if body.is_empty() {
             // Nothing had a line-protocol encoding (e.g. log- or span-only events, or every
-            // metric was skipped). Not an error; nothing to write.
+            // metric was dropped or skipped). Not an error; nothing to write.
             return Ok(());
         }
 
@@ -212,27 +213,28 @@ impl Output for InfluxDbOutput {
 /// ordinary batch doesn't upsert a permanent zero series.
 fn emit_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     const TAGS_NORMALIZED: &str = "logit.output.tags.normalized";
-    const TAGS_DROPPED: &str = "logit.output.tags.dropped";
+    const TAGS_OMITTED: &str = "logit.output.tags.omitted";
     const NORMALIZED: &str = "logit.output.metrics.normalized";
+    const DROPPED: &str = "logit.output.metrics.dropped";
     const SKIPPED: &str = "logit.output.metrics.skipped";
     let rows: [(usize, &str, (&str, &str)); 17] = [
         (stats.tags_normalized_multi_value, TAGS_NORMALIZED, ("reason", "multi_value")),
-        (stats.tags_dropped_unrepresentable, TAGS_DROPPED, ("reason", "unrepresentable")),
-        (stats.tags_dropped_empty, TAGS_DROPPED, ("reason", "empty")),
-        (stats.tags_dropped_unencodable, TAGS_DROPPED, ("reason", "unencodable")),
-        (stats.tags_dropped_reserved, TAGS_DROPPED, ("reason", "reserved")),
+        (stats.tags_omitted_unrepresentable, TAGS_OMITTED, ("reason", "unrepresentable")),
+        (stats.tags_omitted_empty, TAGS_OMITTED, ("reason", "empty")),
+        (stats.tags_omitted_unencodable, TAGS_OMITTED, ("reason", "unencodable")),
+        (stats.tags_omitted_reserved, TAGS_OMITTED, ("reason", "reserved")),
         (stats.metrics_normalized_carrier_mismatch, NORMALIZED, ("reason", "carrier_mismatch")),
-        (stats.skipped_unencodable_value, SKIPPED, ("reason", "unencodable_value")),
-        (stats.skipped_unencodable_key, SKIPPED, ("reason", "unencodable_key")),
-        (stats.skipped_reserved_key, SKIPPED, ("reason", "reserved_key")),
-        (stats.skipped_oversize_value, SKIPPED, ("reason", "oversize_value")),
-        (stats.skipped_no_fields, SKIPPED, ("reason", "no_fields")),
+        (stats.dropped_unencodable_value, DROPPED, ("reason", "unencodable_value")),
+        (stats.dropped_unencodable_key, DROPPED, ("reason", "unencodable_key")),
+        (stats.dropped_reserved_key, DROPPED, ("reason", "reserved_key")),
+        (stats.dropped_oversize_value, DROPPED, ("reason", "oversize_value")),
+        (stats.dropped_no_fields, DROPPED, ("reason", "no_fields")),
         (stats.skipped_no_recorded_value, SKIPPED, ("reason", "no_recorded_value")),
         (stats.skipped_set_members, SKIPPED, ("metric_kind", "set_members")),
         (stats.skipped_exponential_histogram, SKIPPED, ("metric_kind", "exponential_histogram")),
-        (stats.skipped_gauge_delta, SKIPPED, ("metric_kind", "gauge_delta")),
-        (stats.skipped_comment_measurement, SKIPPED, ("reason", "comment_measurement")),
-        (stats.skipped_timestamp_overflow, SKIPPED, ("reason", "timestamp_overflow")),
+        (stats.dropped_unresolved_gauge_delta, DROPPED, ("reason", "unresolved_gauge_delta")),
+        (stats.dropped_comment_measurement, DROPPED, ("reason", "comment_measurement")),
+        (stats.dropped_timestamp_overflow, DROPPED, ("reason", "timestamp_overflow")),
     ];
     for (count, name, label) in rows {
         if count > 0 {
@@ -670,14 +672,16 @@ mod tests {
             .expect("an all-unencodable batch is not an error");
 
         for (name, label) in [
-            ("logit.output.metrics.skipped", ("reason", "unencodable_value")),
-            ("logit.output.metrics.skipped", ("reason", "unencodable_key")),
+            ("logit.output.metrics.dropped", ("reason", "unencodable_value")),
+            ("logit.output.metrics.dropped", ("reason", "unencodable_key")),
             ("logit.output.metrics.normalized", ("reason", "carrier_mismatch")),
-            ("logit.output.tags.dropped", ("reason", "unrepresentable")),
-            ("logit.output.tags.dropped", ("reason", "unencodable")),
+            ("logit.output.tags.omitted", ("reason", "unrepresentable")),
+            ("logit.output.tags.omitted", ("reason", "unencodable")),
         ] {
             assert_eq!(probe.sum(name, &[label]), 1.0, "{name} {label:?}");
         }
+        assert_eq!(probe.sum("logit.output.metrics.skipped", &[]), 0.0, "a lost metric is dropped");
+        assert_eq!(probe.sum("logit.output.tags.dropped", &[]), 0.0, "a tag left off is omitted");
     }
 
     /// `send` records one `logit.output.requests` per call, tagged by status class.
@@ -725,7 +729,7 @@ mod tests {
         };
         use logit_pipeline::test_util::TelemetryProbe;
 
-        // A collapsed multi-value tag, and a gauge delta skipped with its diagnostic.
+        // A collapsed multi-value tag, and a gauge delta dropped with its diagnostic.
         let batch = || {
             let mut tagged = metric_event("hits", MetricKind::counter(1.0), &[]);
             tagged.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
@@ -741,7 +745,7 @@ mod tests {
         const ENCODE_SIDE: [(&str, &[(&str, &str)]); 4] = [
             ("logit.output.tags.normalized", &[("reason", "multi_value")]),
             ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
-            ("logit.output.metrics.skipped", &[("metric_kind", "gauge_delta")]),
+            ("logit.output.metrics.dropped", &[("reason", "unresolved_gauge_delta")]),
             ("logit.output.batch.bytes", &[]),
         ];
         let mut runs = Vec::new();
@@ -819,7 +823,7 @@ mod tests {
             &[
                 ("logit.output.tags.normalized", &[("reason", "multi_value")]),
                 ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
-                ("logit.output.metrics.skipped", &[("metric_kind", "gauge_delta")]),
+                ("logit.output.metrics.dropped", &[("reason", "unresolved_gauge_delta")]),
                 ("logit.output.batch.bytes", &[]),
             ],
         )

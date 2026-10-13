@@ -659,12 +659,7 @@ and the [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-account
 
 **Alert on any nonzero `logit.*.dropped` count, grouped by its `component` and `reason`
 attributes.** Every `*.dropped` counter is loss: data that should have left `logit` and didn't.
-Its `reason` says where to look, so you don't need a list of reasons to exclude.
-`influxdb_out` is the exception: it counts its loss only as `logit.component.diagnostics`, so
-alert on `key="gauge_delta_unresolved"` (an unresolved relative gauge) and `key="encode_error"`
-(a metric it failed to encode) for it as well. `encode_error` also counts a `SetMembers` or
-`ExponentialHistogram` metric, which line protocol has no form for, so read its message before
-treating it as loss. Its `no_recorded_value` key isn't loss: the record had no value to send. An outcome your
+Its `reason` says where to look, so you don't need a list of reasons to exclude. An outcome your
 config asked for never counts as dropped: a filter, `sample`, `aggregate`, or Lua script removing
 an event counts `logit.component.events.discarded`, and a tag or field removed from a record that's
 still delivered counts `*.omitted`. The full vocabulary is in

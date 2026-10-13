@@ -42,7 +42,7 @@
 //! |---|---|---|
 //! | measurement | event attribute [`ATTR_MEASUREMENT`], `Value::Str` | -- |
 //! | tag `k=v` | event attribute `k`, `Value::Str`, never a resource attribute | -- |
-//! | tag key under [`CARRIER_PREFIX`] | dropped (normalization 12) | `logit.input.tags.dropped{reason="reserved_prefix"}` |
+//! | tag key under [`CARRIER_PREFIX`] | omitted (normalization 12) | `logit.input.tags.omitted{reason="reserved_prefix"}` |
 //! | float / integer / unsigned / boolean field `f` | a [`logit_core::MetricRecord`] named `<measurement>.f`, `Gauge(F64 \| I64 \| U64 \| Bool)` | -- |
 //! | N numeric or boolean fields | N records on the one event, in wire order | -- |
 //! | string field `f="x"` | event attribute `influxdb.field.f` ([`FIELD_ATTR_PREFIX`]), `Value::Str` | -- |
@@ -84,23 +84,23 @@
 //! |---|---|---|
 //! | `Gauge`/`Sum` `F64` | `value=` (or `<key>=`) and the shortest string that round-trips | -- |
 //! | `Gauge`/`Sum` `I64` / `U64` / `Bool` | `<n>i` / `<n>u` / `true` or `false` | -- |
-//! | `Gauge`/`Sum` non-finite `F64` | skipped | `metrics.skipped{reason="unencodable_value"}` |
+//! | `Gauge`/`Sum` non-finite `F64` | dropped | `metrics.dropped{reason="unencodable_value"}` |
 //! | `Sum` temporality and monotonicity | dropped (normalization 10) | -- |
-//! | `GaugeDelta` | skipped: the pipeline lacks an `aggregate` | `metrics.skipped{metric_kind="gauge_delta"}`, diagnostic `gauge_delta_unresolved` |
+//! | `GaugeDelta` | dropped: the pipeline lacks an `aggregate` | `metrics.dropped{reason="unresolved_gauge_delta"}`, diagnostic `gauge_delta_unresolved` |
 //! | `Distribution` | `count=<n>u,sum=,p50=,p90=,p99=`, a non-finite component omitted | -- |
 //! | `Samples` | sketched with each value weighted by its inverse sample rate, then as `Distribution` | -- |
-//! | `Histogram` | `bucket_<bound>=<n>u` per finite bound; `sum`, `min`, `max`, and the `+Inf` bucket dropped | `metrics.skipped{reason="no_fields"}` when no bound is finite |
-//! | `Summary` | `q<quantile>=<v>` per finite quantile; `count` and `sum` dropped | `metrics.skipped{reason="no_fields"}` when none is finite |
+//! | `Histogram` | `bucket_<bound>=<n>u` per finite bound; `sum`, `min`, `max`, and the `+Inf` bucket dropped | `metrics.dropped{reason="no_fields"}` when no bound is finite |
+//! | `Summary` | `q<quantile>=<v>` per finite quantile; `count` and `sum` dropped | `metrics.dropped{reason="no_fields"}` when none is finite |
 //! | `Set` | `value=<estimate>u` | -- |
 //! | `SetMembers`, `ExponentialHistogram` | skipped | `metrics.skipped{metric_kind="set_members" \| "exponential_histogram"}`, diagnostic `encode_error` |
 //! | a record flagged `NO_RECORDED_VALUE` | skipped | `metrics.skipped{reason="no_recorded_value"}`, diagnostic `no_recorded_value` |
 //! | `unit`, `description`, `start_timestamp`, exemplars; `EventBatch::scope`; `Resource::schema_url` | dropped | -- |
 //! | a log or span payload | skipped | -- |
-//! | a measurement starting `#` | skipped: influxd reads the line as a comment | `metrics.skipped{reason="comment_measurement"}`, diagnostic `encode_error` |
-//! | a measurement or carrier field key with no spelling | skipped, once per field | `metrics.skipped{reason="unencodable_key"}` |
-//! | carrier field key `time` | skipped: influxd answers `422` | `metrics.skipped{reason="reserved_key"}` |
-//! | carrier string field over 1 MiB | skipped: influxd answers `422` | `metrics.skipped{reason="oversize_value"}` |
-//! | `event.timestamp` | the line's timestamp in nanoseconds; a same-series point already in the batch takes the next free nanosecond (normalization 9) | `metrics.skipped{reason="timestamp_overflow"}` when none is free below `i64::MAX` |
+//! | a measurement starting `#` | dropped: influxd reads the line as a comment | `metrics.dropped{reason="comment_measurement"}`, diagnostic `encode_error` |
+//! | a measurement or carrier field key with no spelling | dropped, once per field | `metrics.dropped{reason="unencodable_key"}` |
+//! | carrier field key `time` | dropped: influxd answers `422` | `metrics.dropped{reason="reserved_key"}` |
+//! | carrier string field over 1 MiB | dropped: influxd answers `422` | `metrics.dropped{reason="oversize_value"}` |
+//! | `event.timestamp` | the line's timestamp in nanoseconds; a same-series point already in the batch takes the next free nanosecond (normalization 9) | `metrics.dropped{reason="timestamp_overflow"}` when none is free below `i64::MAX` |
 //!
 //! Tags are the resource's attributes merged with the event's, the event's value winning:
 //!
@@ -109,10 +109,10 @@
 //! | `Str` (UTF-8) | as is, escaped | -- |
 //! | `Bool`, `I64`, `U64`, `F64` | its decimal text | -- |
 //! | `Array` | its last representable element | `tags.normalized{reason="multi_value"}` (lossy) |
-//! | `Null`, `Bytes`, `Timestamp`, `Map`, a non-UTF-8 `Str`, an `Array` with no representable element | dropped | `tags.dropped{reason="unrepresentable"}` |
-//! | an empty key or value | dropped | `tags.dropped{reason="empty"}` |
-//! | a key or value with a line break, ending in `\`, or with `\` directly before a space | dropped | `tags.dropped{reason="unencodable"}` |
-//! | key `_measurement`, `_field`, or `time` | dropped: influxd rejects the whole write | `tags.dropped{reason="reserved"}` |
+//! | `Null`, `Bytes`, `Timestamp`, `Map`, a non-UTF-8 `Str`, an `Array` with no representable element | omitted | `tags.omitted{reason="unrepresentable"}` |
+//! | an empty key or value | omitted | `tags.omitted{reason="empty"}` |
+//! | a key or value with a line break, ending in `\`, or with `\` directly before a space | omitted | `tags.omitted{reason="unencodable"}` |
+//! | key `_measurement`, `_field`, or `time` | omitted: influxd rejects the whole write | `tags.omitted{reason="reserved"}` |
 //! | key under `influxdb.` or `statsd.` | not a tag | -- |
 //!
 //! <!-- encode-table:end -->
@@ -134,10 +134,10 @@
 //!    integer keeps its `i` or `u` suffix, and a boolean leaves as `true` or `false` whatever
 //!    spelling arrived.
 //! 6. Escaping: the encoder writes only the escapes the grammar requires, so a backslash a sender
-//!    wrote doubled leaves as it was read, and a key the grammar can't spell is dropped, counted:
+//!    wrote doubled leaves as it was read, and a key the grammar can't spell is left out, counted:
 //!    a measurement or field key ending in `\` or with `\` before a delimiter is
-//!    `skipped{reason="unencodable_key"}`, and a tag key or value ending in `\` or with `\` before
-//!    a space is `tags.dropped{reason="unencodable"}`.
+//!    `metrics.dropped{reason="unencodable_key"}`, and a tag key or value ending in `\` or with `\` before
+//!    a space is `tags.omitted{reason="unencodable"}`.
 //! 7. Timestamps: every point leaves with a timestamp in nanoseconds, so `precision` isn't
 //!    carried, and a point that arrived with none leaves with its receipt time (see item 14).
 //! 8. Comments, blank lines, and runs of spaces are dropped. A CRLF line ending, a tab separator,
@@ -147,7 +147,7 @@
 //!     always a `Gauge`, so this applies only to an event from another protocol.
 //! 11. A listener's sender attributes (`network.peer.*`, `client.*`) are added under `peer:`,
 //!     `proxy_protocol:`, or `forwarded:`.
-//! 12. A tag key under the reserved `influxdb.` prefix is dropped, counted.
+//! 12. A tag key under the reserved `influxdb.` prefix is omitted, counted.
 //! 13. A duplicate field key within one line: the last value wins.
 //! 14. An absent timestamp: the request's arrival time truncated to `precision`, one instant for
 //!     every such point in the request.

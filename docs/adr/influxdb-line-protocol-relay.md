@@ -104,8 +104,8 @@ attributes.
 | `influxdb.org_id` | resource | `Str` | the request's `orgID` query parameter |
 | `influxdb.bucket` | resource | `Str` | the request's `bucket` query parameter |
 
-A tag key that starts with `influxdb.` would collide with the carrier, so the decoder drops it,
-counted `logit.input.tags.dropped{reason="reserved_prefix"}` (normalization 12).
+A tag key that starts with `influxdb.` would collide with the carrier, so the decoder omits it,
+counted `logit.input.tags.omitted{reason="reserved_prefix"}` (normalization 12).
 
 ### Egress, with and without the carrier
 
@@ -244,10 +244,10 @@ the same list with the same numbers, and the two lists must stay numbered alike:
    keeps its `i` or `u` suffix, and a boolean leaves as `true` or `false` whatever spelling
    arrived.
 6. Escaping: the encoder writes only the escapes the grammar requires, so a backslash a sender
-   wrote doubled leaves as it was read, and a key the grammar can't spell is dropped, counted:
+   wrote doubled leaves as it was read, and a key the grammar can't spell is left out, counted:
    a measurement or field key ending in `\` or with `\` before a delimiter is
-   `skipped{reason="unencodable_key"}`, and a tag key or value ending in `\` or with `\` before a
-   space is `tags.dropped{reason="unencodable"}`.
+   `metrics.dropped{reason="unencodable_key"}`, and a tag key or value ending in `\` or with `\`
+   before a space is `tags.omitted{reason="unencodable"}`.
 7. Timestamps: every point leaves with a timestamp in nanoseconds, so `precision` isn't carried,
    and a point that arrived with none leaves with its receipt time (see item 14).
 8. Comments, blank lines, and runs of spaces are dropped. A CRLF line ending, a tab separator, and
@@ -257,7 +257,7 @@ the same list with the same numbers, and the two lists must stay numbered alike:
     always a `Gauge`, so this applies only to an event from another protocol.
 11. A listener's sender attributes (`network.peer.*`, `client.*`) are added under `peer:`,
     `proxy_protocol:`, or `forwarded:`.
-12. A tag key under the reserved `influxdb.` prefix is dropped, counted.
+12. A tag key under the reserved `influxdb.` prefix is omitted, counted.
 13. A duplicate field key within one line: the last value wins.
 14. An absent timestamp: the request's arrival time truncated to `precision`, one instant for every
     such point in the request.
@@ -282,8 +282,8 @@ tag key, tag value, and field key:
   ends the tag section early. A backslash before `,` or `=` in a tag is written as `\\,` or `\\=`
   and reads back as written, because `influxd`'s line splitter counts `,` and `=` only after a bare
   space has ended the tag section (probe row 2.13). The encoder drops the point (a measurement, a
-  field key) or the tag (a tag key or value), counting a point or field
-  `skipped{reason="unencodable_key"}` and a tag `tags.dropped{reason="unencodable"}`. The decoder reads a trailing backslash before a delimiter
+  field key) or omits the tag (a tag key or value), counting a point or field
+  `metrics.dropped{reason="unencodable_key"}` and a tag `tags.omitted{reason="unencodable"}`. The decoder reads a trailing backslash before a delimiter
   as escaping it, which fails as it does at `influxd`.
 - Inside a quoted string field value, `\"` is a quote and `\\` is one backslash, and any other
   `\x` is two literal characters. A raw newline inside the quotes is part of the value, so the
@@ -312,7 +312,7 @@ list; this section summarizes it. Each deviation is a choice or a consequence of
 - A field type conflict across lines or requests is the destination's `422`, which `influxdb_out`
   reads as `Rejected` (decision 10), not a response from the listener.
 - The encoder's 1 ns nudge (normalization 9) can push a point at the timestamp ceiling out of
-  range. The encoder then skips it, counted `skipped{reason="timestamp_overflow"}`.
+  range. The encoder then drops it, counted `metrics.dropped{reason="timestamp_overflow"}`.
 
 ## Alternatives considered
 
@@ -347,7 +347,11 @@ list; this section summarizes it. Each deviation is a choice or a consequence of
   `logit_proto::influxdb` holding the lexer, decoder, encoder, and error-body writer. A fuzz target
   joins `fuzz/`.
 - `influxdb_out` gains the carrier path and typed suffixes, and counts what it drops silently today:
-  a non-finite value and a line with no fields.
+  a non-finite value and a line with no fields. Its counters, and `influxdb_in`'s, follow
+  [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md): a point or field lost is
+  `metrics.dropped`, an unresolved `GaugeDelta` among them, a tag left off a delivered point is
+  `tags.omitted`, and only a record with no value and a kind line protocol has no form for are
+  `metrics.skipped`.
 - AGENTS.md's "Nine like-protocol pairs" becomes ten, and "the five HTTP listeners" becomes six,
   when `influx/w3` lands.
 - Known-gaps rows, added with the codec and the listener: what `influxdb_out` drops or reshapes
