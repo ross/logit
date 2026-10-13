@@ -18,8 +18,8 @@
 //! no query can read. Inside a quoted string field value the rules differ: `\` is written `\\`
 //! and `"` is written `\"`.
 //!
-//! That grammar has no spelling for some keys, and the encoder skips them rather than write a line
-//! `influxd` would read differently or reject with the whole batch:
+//! That grammar has no spelling for some keys, and the encoder drops or omits them rather than
+//! write a line `influxd` would read differently or reject with the whole batch:
 //!
 //! - any key ending in `\`, since that backslash would escape the delimiter after it;
 //! - a measurement with a `\` directly before `,`, space, or `=`: `influxd` stores the series but
@@ -1174,7 +1174,7 @@ mod tests {
     /// `\` before `,` or `=` in a tag reads back as written. The tag drops alone; the measurement
     /// or field key drops its point or field.
     #[test]
-    fn a_key_that_ends_in_a_backslash_is_skipped_and_counted() {
+    fn a_key_that_ends_in_a_backslash_is_dropped_and_counted() {
         let (out, stats) = encode_stats(vec![metric_event(
             "page.views",
             MetricKind::counter(1.0),
@@ -1262,7 +1262,7 @@ mod tests {
     /// `influxd` rejects the whole write for a reserved tag key (probe rows 7.1 to 7.3), and a
     /// `time` field is a `422` (row 7.4), which `influxdb_out` reads as a rejected batch.
     #[test]
-    fn reserved_tag_and_field_keys_are_skipped_and_counted() {
+    fn reserved_tag_and_field_keys_are_omitted_or_dropped_and_counted() {
         let (out, stats) = encode_stats(vec![metric_event(
             "m",
             MetricKind::counter(1.0),
@@ -1335,7 +1335,7 @@ mod tests {
     /// An empty or wholly unrepresentable `Array` drops the tag, counted `unrepresentable`, not
     /// `multi_value`.
     #[test]
-    fn an_empty_or_all_unrepresentable_array_tag_drops_the_tag() {
+    fn an_empty_or_all_unrepresentable_array_tag_omits_the_tag() {
         let (out, stats) = encode_stats(vec![event_with_array_tag("team", Vec::new())]);
         assert_eq!(out, "page.views value=1 1700000000000000000\n");
         assert_eq!(stats.tags_normalized_multi_value, 0);
@@ -1392,7 +1392,7 @@ mod tests {
 
     /// An unresolved `GaugeDelta` is dropped, not written as absolute; a sibling still lands.
     #[test]
-    fn gauge_delta_is_skipped_not_fatal() {
+    fn gauge_delta_is_dropped_not_fatal() {
         let (out, stats) = encode_stats(vec![
             metric_event("conns", MetricKind::GaugeDelta(logit_core::MetricValue::F64(5.0)), &[]),
             metric_event("page.views", MetricKind::counter(1.0), &[]),
@@ -1427,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_values_are_skipped_and_counted_not_written_as_invalid_line_protocol() {
+    fn non_finite_values_are_dropped_and_counted_not_written_as_invalid_line_protocol() {
         let (out, stats) =
             encode_stats(vec![metric_event("bad", MetricKind::counter(f64::NAN), &[])]);
         assert_eq!(out, "", "a NaN-only line should produce no output, not `value=NaN`");
@@ -1437,7 +1437,7 @@ mod tests {
 
     /// A `Histogram` with no finite bound has no field to write, and says so.
     #[test]
-    fn a_line_with_no_fields_is_skipped_and_counted() {
+    fn a_line_with_no_fields_is_dropped_and_counted() {
         let (out, stats) = encode_stats(vec![metric_event(
             "resp.size",
             MetricKind::Histogram(Histogram {
@@ -1499,7 +1499,7 @@ mod tests {
 
     /// A record name with a line break can't lead a line.
     #[test]
-    fn a_measurement_with_a_newline_is_skipped_not_split_across_lines() {
+    fn a_measurement_with_a_newline_is_dropped_not_split_across_lines() {
         let (out, stats) = encode_stats(vec![
             metric_event("bad\ninjected", MetricKind::counter(1.0), &[]),
             metric_event("ok", MetricKind::counter(1.0), &[]),
@@ -1741,7 +1741,7 @@ mod tests {
 
     /// A non-finite carrier field drops alone, counted; a line left with no field writes nothing.
     #[test]
-    fn a_non_finite_carrier_field_is_skipped_and_counted() {
+    fn a_non_finite_carrier_field_is_dropped_and_counted() {
         let event =
             carrier_event("m", &[("a", MetricValue::F64(f64::NAN)), ("b", MetricValue::F64(2.0))]);
         let (out, stats) = encode_stats(vec![event]);
@@ -1788,7 +1788,7 @@ mod tests {
     /// A string field over `influxd`'s 1 MiB cap is a `422` (probe row 11.4), which would cost
     /// the whole batch at `influxdb_out`; it drops alone.
     #[test]
-    fn an_oversize_string_field_is_skipped_and_counted() {
+    fn an_oversize_string_field_is_dropped_and_counted() {
         let mut event = carrier_event("m", &[("f", MetricValue::I64(1))]);
         event
             .attributes
