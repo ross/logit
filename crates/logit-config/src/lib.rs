@@ -3506,7 +3506,7 @@ pub enum ComponentKind {
     /// dialect the scraping client's `Accept` negotiates. `endpoint:` sends remote-write: each
     /// batch is POSTed to a remote-write receiver, with no retry in the sink. Set exactly one of
     /// the two; a non-default field belonging to the other mode is rejected rather than ignored.
-    /// Delta metrics are skipped and counted; put an `aggregate` with `temporality: cumulative`
+    /// Delta metrics are dropped and counted; put an `aggregate` with `temporality: cumulative`
     /// upstream.
     PrometheusOut {
         /// `host:port` to serve the exposition on: registry mode. Bound when the pipeline starts,
