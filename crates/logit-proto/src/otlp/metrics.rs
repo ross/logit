@@ -242,7 +242,8 @@ pub(crate) fn encode_metric(
     let attributes = common::attrs_to_key_values(&event.attributes);
     let ts = event.timestamp.max(0) as u64;
     let start = start_time(record.start_timestamp);
-    let exemplars = encode_exemplars(&record.exemplars, telemetry);
+    // Only the four kinds below carry exemplars on the wire, so only they count a normalization.
+    let exemplars = || encode_exemplars(&record.exemplars, telemetry);
 
     let data = match &record.kind {
         MetricKind::Sum(s) => pb::metric::Data::Sum(pb::Sum {
@@ -251,7 +252,7 @@ pub(crate) fn encode_metric(
                 start,
                 ts,
                 record.flags,
-                exemplars,
+                exemplars(),
                 s.value,
                 telemetry,
             )],
@@ -264,7 +265,7 @@ pub(crate) fn encode_metric(
                 start,
                 ts,
                 record.flags,
-                exemplars,
+                exemplars(),
                 *v,
                 telemetry,
             )],
@@ -283,7 +284,7 @@ pub(crate) fn encode_metric(
                     sum: h.sum,
                     bucket_counts,
                     explicit_bounds,
-                    exemplars,
+                    exemplars: exemplars(),
                     flags: record.flags,
                     min: h.min,
                     max: h.max,
@@ -310,7 +311,7 @@ pub(crate) fn encode_metric(
                         bucket_counts: e.negative.1.clone(),
                     }),
                     flags: record.flags,
-                    exemplars,
+                    exemplars: exemplars(),
                     min: e.min,
                     max: e.max,
                     zero_threshold: e.zero_threshold,
@@ -1259,6 +1260,35 @@ mod tests {
             events[0].metrics[0].exemplars.is_empty(),
             "a Summary must not carry exemplars back -- the wire type has no field for them"
         );
+    }
+
+    /// An exemplar on a kind whose wire type has no exemplars field is dropped without counting
+    /// a value normalization it never performed.
+    #[test]
+    fn an_exemplar_on_a_kind_without_exemplars_counts_no_normalization() {
+        let kinds = [
+            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 }),
+            MetricKind::GaugeDelta(MetricValue::F64(1.0)),
+        ];
+        for kind in kinds {
+            for value in [MetricValue::Bool(true), MetricValue::U64(u64::MAX)] {
+                let registry = Registry::new();
+                let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
+                let rec = MetricRecord {
+                    exemplars: vec![Exemplar { value, ..exemplar() }],
+                    ..MetricRecord::new(intern("m"), kind.clone())
+                };
+                let mut diag = Diagnostics::default();
+                let _ = encode_metric(&event(), &rec, &telemetry, &mut diag);
+                let normalized = registry
+                    .drain(0)
+                    .iter()
+                    .filter_map(|e| e.attributes.get("reason")?.as_str().map(str::to_string))
+                    .filter(|r| r == "bool_value" || r == "u64_as_double")
+                    .count();
+                assert_eq!(normalized, 0, "{kind:?} {value:?}");
+            }
+        }
     }
 
     // -- proptest: decode(encode(x)) == x over a generator of MetricRecords -----------------
