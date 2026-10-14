@@ -70,8 +70,9 @@ pub struct Dropped {
 /// Renders attribute pairs as Datadog tags: `Str` → `k:v`, `Bool(true)` → `k`, `Bool(false)` →
 /// nothing, numbers → `k:<display>`, `Timestamp` → `k:<RFC 3339>`, `Array` → one tag per element
 /// under the same rules, `Map`/`Bytes`/`Null` → omitted and counted. Keys in `skip` are the ones a
-/// caller already consumed into a wire field of its own (`host.name`, the `datadog.*` carriers)
-/// and are never rendered, and neither is a private `_logit.` key, which is never counted.
+/// caller already consumed into a wire field of its own (`host.name`, the `_logit.datadog.*`
+/// carriers) and are never rendered, and neither is any other private `_logit.` key, which is
+/// never counted.
 pub fn render_tags<'a>(
     pairs: impl IntoIterator<Item = (Symbol, &'a Value)>,
     skip: &[Symbol],

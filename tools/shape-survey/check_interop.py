@@ -18,13 +18,14 @@ The mapping from wire to measurement is not 1:1:
                                 `receive.batch_max_events: 1` the accumulator never splits or
                                 merges a datagram's decode output, so one datagram is one batch.
 
-  logit.shape.attributes    <-> tags per line, plus the `statsd.*` carriers the decoder stamps:
-  (at tap_input)                `statsd.container_id` for a `|c:<id>` segment (the DogStatsD client
-                                emits one unprompted, having detected its own container),
-                                `statsd.timestamp` for a `|T<secs>` segment, and `statsd.type` on
-                                `ms`/`h`/`d` lines only -- the wire type letter, which those three
-                                share one `Samples` shape for. Repeated tag keys merge into one
-                                attribute holding an array, so a tag count is distinct keys, not
+  logit.shape.attributes    <-> tags per line, plus the `_logit.statsd.*` carriers the decoder
+  (at tap_input)                stamps: `_logit.statsd.container_id` for a `|c:<id>` segment (the
+                                DogStatsD client emits one unprompted, having detected its own
+                                container), `_logit.statsd.timestamp` for a `|T<secs>` segment, and
+                                `_logit.statsd.type` on `ms`/`h`/`d` lines only -- the wire type
+                                letter, which those three share one `Samples` shape for. Repeated
+                                tag keys merge into one attribute holding an array, so a tag count
+                                is distinct keys, not
                                 tokens.
 
 Both comparisons are over multisets, since UDP promises no order. Stdlib only. Exits non-zero on
@@ -76,16 +77,16 @@ def parse_line(line: str) -> tuple[int, int] | None:
                 if token:
                     tag_keys.add(token.split(":", 1)[0])
         elif extra.startswith("c:"):
-            carriers += 1  # statsd.container_id
+            carriers += 1  # _logit.statsd.container_id
         elif extra.startswith("T"):
-            carriers += 1  # statsd.timestamp
+            carriers += 1  # _logit.statsd.timestamp
 
     if type_part in ("c", "g"):
         events = len(values.split(":"))
         attributes = len(tag_keys) + carriers
     elif type_part in ("ms", "h", "d"):
         events = 1
-        attributes = len(tag_keys) + carriers + 1  # + statsd.type
+        attributes = len(tag_keys) + carriers + 1  # + _logit.statsd.type
     elif type_part == "s":
         events = 1
         attributes = len(tag_keys) + carriers
@@ -118,7 +119,7 @@ def derive(corpus: pathlib.Path) -> dict:
             events_here += events
             attributes[attrs] += events
             # Tags per line, kept apart from the attribute count so the report can show both: the
-            # difference is the `statsd.*` carriers.
+            # difference is the `_logit.statsd.*` carriers.
             tag_part = next((p[1:] for p in line.split("|")[2:] if p.startswith("#")), "")
             tags_per_line[len({t.split(":", 1)[0] for t in tag_part.split(",") if t})] += 1
         batch_events[events_here] += 1
@@ -198,7 +199,7 @@ def check(corpus: pathlib.Path, shape_log: pathlib.Path) -> int:
     print(f"  lines per datagram (derived):  {histogram(expected['lines_per_datagram'])}")
     print(f"  tags per line      (derived):  {histogram(expected['tags_per_line'])}")
     print("  (tags per line is the wire figure testdata/interop/statsd/README.md tabulates;")
-    print("   the attribute counts below add statsd_in's own statsd.* carriers -- see the docstring)")
+    print("   the attribute counts below add statsd_in's own _logit.statsd.* carriers -- see the docstring)")
 
     if expected["unmodelled"]:
         print(
@@ -221,7 +222,7 @@ def check(corpus: pathlib.Path, shape_log: pathlib.Path) -> int:
         reported["batch_events"],
     )
     ok &= compare(
-        "logit.shape.attributes <-> tags + statsd.* carriers per event",
+        "logit.shape.attributes <-> tags + _logit.statsd.* carriers per event",
         expected["attributes"],
         reported["attributes"],
     )
@@ -243,14 +244,14 @@ def check(corpus: pathlib.Path, shape_log: pathlib.Path) -> int:
 
 
 def self_test() -> None:
-    # A tagged DogStatsD counter with a container id: 6 tag keys + statsd.container_id = 7.
+    # A tagged DogStatsD counter with a container id: 6 tag keys + _logit.statsd.container_id = 7.
     assert parse_line(
         "app.http.requests.count:1|c|#env:prod,svc:api,endpoint:/,method:GET,status:200,"
         "region:eu|c:in-deadbeef"
     ) == (1, 7)
     # The same line with no tags and no carriers at all: the plain-statsd shape.
     assert parse_line("app.http.requests.count:1|c") == (1, 0)
-    # A timer carries statsd.type on top of its tags.
+    # A timer carries _logit.statsd.type on top of its tags.
     assert parse_line("app.db.query.duration_ms:12.5|ms|#env:prod") == (1, 2)
     # Several values on one timer line stay ONE event (one Samples record); on a counter line they
     # are one event each.
@@ -260,7 +261,7 @@ def self_test() -> None:
     assert parse_line("app.x:1|c|#k:a,k:b") == (1, 1)
     # A sample rate is not an attribute.
     assert parse_line("app.x:1|c|@0.1") == (1, 0)
-    # A set line carries no statsd.type.
+    # A set line carries no _logit.statsd.type.
     assert parse_line("app.users.active:u1:u2|s|#env:prod") == (1, 1)
     # Events and service checks are refused rather than guessed at.
     assert parse_line("_e{5,4}:title|text") is None

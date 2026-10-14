@@ -322,8 +322,9 @@ a number copied from a document would only prove the document and the checker ag
 
 The mapping is deliberately not 1:1, and that's the interesting part. `statsd_in` emits one event
 per *value* on a `c`/`g` line and one per *line* for `ms`/`h`/`d`/`s`. On top of the wire tags, it
-stamps `statsd.container_id` and `statsd.timestamp` when the line carries those segments, and
-`statsd.type` on `ms`/`h`/`d` lines only. The script's docstring spells out all of it.
+stamps `_logit.statsd.container_id` and `_logit.statsd.timestamp` when the line carries those
+segments, and `_logit.statsd.type` on `ms`/`h`/`d` lines only. The script's docstring
+spells out all of it.
 
 **If this check ever fails, stop.** Don't adjust the check to pass. The instrument, the decoder, or
 the derivation is wrong, and you have to establish which before any survey result built on `shape`

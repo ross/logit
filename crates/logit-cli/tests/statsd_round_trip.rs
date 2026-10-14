@@ -156,12 +156,13 @@ fn expected_bytes(name: &str, input: &[u8]) -> Vec<u8> {
 }
 
 /// Zeroes each event's receipt-time `timestamp`, the one field two independent decodes of the
-/// same bytes legitimately disagree on. An event with a `statsd.timestamp` `Value::U64` carrier
-/// keeps its timestamp: that came from a wire `|T<secs>` segment, so both decodes agree on it.
+/// same bytes legitimately disagree on. An event with a `_logit.statsd.timestamp` `Value::U64`
+/// carrier keeps its timestamp: that came from a wire `|T<secs>` segment, so both decodes agree on
+/// it.
 fn normalize_receipt_time(batch: &mut EventBatch) {
     for event in &mut batch.events {
         let has_wire_timestamp =
-            matches!(event.attributes.get("statsd.timestamp"), Some(Value::U64(_)));
+            matches!(event.attributes.get("_logit.statsd.timestamp"), Some(Value::U64(_)));
         if !has_wire_timestamp {
             event.timestamp = 0;
         }
@@ -819,8 +820,8 @@ async fn statsd_in_default_aggregate_statsd_out_under_skip_drops_timers_and_sets
 // ---- `|T` carrier survives `aggregate`'s flush-time rebuild -------------------------------------
 
 /// The `|T` value survives `aggregate`, which sets `Event::timestamp` to the flush clock: the
-/// sink must read the `statsd.timestamp` carrier's `Value::U64`, which rides on the series key,
-/// never `Event::timestamp`.
+/// sink must read the `_logit.statsd.timestamp` carrier's `Value::U64`, which rides on the series
+/// key, never `Event::timestamp`.
 #[tokio::test]
 async fn statsd_in_aggregate_statsd_out_relay_preserves_the_wire_timestamp() {
     let mut harness = Harness::new().await;
@@ -895,7 +896,7 @@ async fn statsd_in_aggregate_statsd_out_relay_keeps_distinct_timestamps_as_disti
 // ---- `statsd_in -> aggregate -> statsd_out`, a service check ------------------------------------
 
 /// A service check is a `MetricKind::Gauge`, so `aggregate` absorbs it. Its
-/// `statsd.service_check.*` carriers ride on the series key, so `_sc|name|status` and its
+/// `_logit.statsd.service_check.*` carriers ride on the series key, so `_sc|name|status` and its
 /// `d:`/`m:` fields survive the window unchanged.
 #[tokio::test]
 async fn statsd_in_aggregate_statsd_out_relay_is_exact_for_a_service_check() {
