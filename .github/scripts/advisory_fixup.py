@@ -206,7 +206,8 @@ def main():
             "",
         ]
         issue_lines += [f"- {advisory_link(f)}: `{f['crate']}` {f['version']} → {f['new']}" for f in fixed]
-        issue_lines += ["", "To apply it: " + "; ".join(f"`cargo update -p {c}`" for c, _ in bumps) + "."]
+        specs = sorted({f"{f['crate']}@{f['version']}" for f in fixed})
+        issue_lines += ["", "To apply it: " + "; ".join(f"`cargo update -p {s}`" for s in specs) + "."]
 
     pr_body = os.path.join(out_dir, "pr-body.md")
     issue_body = os.path.join(out_dir, "issue-body.md")
