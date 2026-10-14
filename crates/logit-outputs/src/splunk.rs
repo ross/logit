@@ -23,7 +23,9 @@
 //! ```
 //!
 //! There are no per-sink `index`, `source`, `sourcetype`, or `host` fields (ADR decision 2): the
-//! encoder reads them from the batch resource, so an upstream `set` stamps them. Graph rule 70
+//! encoder reads them from the batch resource, so an upstream `set` stamps them. A batch whose
+//! resource has no `host.name` gets the process hostname as its `host`
+//! ([`SplunkHecOutput::with_default_host`]), never replacing one it carries. Graph rule 70
 //! validates the block.
 //!
 //! ## Requests
@@ -165,6 +167,7 @@ use logit_proto::{MessageBuf, MultiValue};
 use std::io::Write;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The default `timeout:` for one request.
@@ -372,6 +375,7 @@ pub struct SplunkHecOutput {
     /// Built by [`SplunkHecOutput::with_tls`]; `None` keeps `reqwest`'s default trust.
     tls: Option<rustls::ClientConfig>,
     multi_value: MultiValue,
+    default_host: Option<Arc<str>>,
     /// Counts through views of `telemetry`/`diag` gated by `accounting`
     /// ([`SplunkHecOutput::new_encoder`]).
     encoder: SplunkEncoder,
@@ -411,6 +415,7 @@ impl SplunkHecOutput {
             client: None,
             tls: None,
             multi_value: MultiValue::default(),
+            default_host: None,
             encoder: SplunkEncoder::new(),
             objects: MessageBuf::default(),
             diag: Diagnostics::default(),
@@ -429,6 +434,14 @@ impl SplunkHecOutput {
     /// What a metric kind with more than one number does (`multi_value:`).
     pub fn with_multi_value(mut self, multi_value: MultiValue) -> Self {
         self.multi_value = multi_value;
+        self.encoder = self.new_encoder();
+        self
+    }
+
+    /// The envelope `host` of a batch whose resource has no `host.name`: `logit run` passes the
+    /// process hostname.
+    pub fn with_default_host(mut self, host: impl Into<Arc<str>>) -> Self {
+        self.default_host = Some(host.into());
         self.encoder = self.new_encoder();
         self
     }
@@ -506,6 +519,7 @@ impl SplunkHecOutput {
             .with_telemetry(self.telemetry.gated(gate))
             .with_diagnostics(self.diag.gated(gate))
             .with_multi_value(self.multi_value)
+            .with_default_host(self.default_host.clone())
     }
 
     /// The client, built on first use when [`Output::bind`] wasn't called.
@@ -949,7 +963,7 @@ mod tests {
     use std::io::Read;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     const TOKEN: &str = "11111111-2222-3333-4444-555555555555";
     const TS: i64 = 1_700_000_000_000_000_000;
@@ -1137,6 +1151,35 @@ mod tests {
         let captured = log.lock().unwrap()[0].clone();
         assert_eq!(captured.header("content-encoding"), None);
         assert_eq!(messages(&captured.decode()), ["line 0"]);
+    }
+
+    /// The default host fills a hostless batch's envelope and survives a later builder, which
+    /// rebuilds the encoder; a batch's own `host.name` wins.
+    #[tokio::test]
+    async fn the_default_host_fills_only_a_hostless_batch() {
+        let (addr, log) = accepting().await;
+        let mut out = sink(addr)
+            .with_default_host("relay")
+            .with_telemetry(Telemetry::default())
+            .with_compression(SplunkCompression::None);
+        let hostless = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![log_event("a")],
+        };
+        out.send(&hostless).await.unwrap();
+        out.send(&batch(vec![log_event("b")])).await.unwrap();
+        let captured = log.lock().unwrap().clone();
+        let host = |c: &Captured| {
+            c.decode()[0]
+                .resource
+                .attributes
+                .get("host.name")
+                .and_then(Value::as_str)
+                .map(String::from)
+        };
+        assert_eq!(host(&captured[0]).as_deref(), Some("relay"));
+        assert_eq!(host(&captured[1]).as_deref(), Some("web-1"));
     }
 
     /// The channel is a lowercase version-4 GUID, and differs per sink.

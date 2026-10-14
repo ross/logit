@@ -214,7 +214,7 @@ impl SplunkEncoder {
         }
 
         self.scratch.clear();
-        let mut obj = begin_object(&mut self.scratch, event.timestamp, &ctx.envelope);
+        let mut obj = begin_object(&mut self.scratch, event.timestamp, ctx);
         let slot = obj.key("event");
         match &log.message {
             Value::Str(_) | Value::Bytes(_) => write_str(slot, &value_text(&log.message)),

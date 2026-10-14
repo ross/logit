@@ -39,6 +39,8 @@
 //!
 //! Per event, per field, first hit wins: the `syslog.*` attribute, then the configured default,
 //! then a format-appropriate absence (`-` for RFC 5424's NILVALUE, an omitted token for RFC 3164).
+//! `logit run` always sets a hostname default: the sink's `hostname:`, else the process hostname
+//! (`logit_pipeline::host`), so HOSTNAME is absent only when sanitizing empties it.
 //! `syslog.severity` outranks `log.severity` because `logit_proto::syslog`'s `map_severity` is lossy: it
 //! collapses syslog's eight severities onto five `Severity` variants (0-2 all become `Fatal`, 5 and
 //! 6 both become `Info`). Preferring the raw attribute keeps a relay byte-faithful;

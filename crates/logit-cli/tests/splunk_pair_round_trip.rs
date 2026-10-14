@@ -1,5 +1,6 @@
 //! `splunk_hec_out -> splunk_hec_in` over a real socket: the sink's `endpoint` points at a
-//! listener on `127.0.0.1:0`, and each batch arrives as sent.
+//! listener on `127.0.0.1:0`, and each batch arrives as sent, or with the sink's default host when
+//! it carries none.
 //!
 //! Each batch is one decode of a hand-written HEC body, so it sits on the codec's fixed point
 //! (`crates/logit-proto/tests/splunk_fixed_point.rs`), and `splunk_hec_out` re-encoding it gives
@@ -42,10 +43,16 @@ async fn listener() -> (SocketAddr, mpsc::Receiver<logit_pipeline::Delivered>) {
     (addr, rx)
 }
 
-/// A `splunk_hec_out` pointed at `addr`, reporting into `registry`.
+/// The process hostname `logit run` would hand the sink.
+const RELAY_HOST: &str = "relay";
+
+/// A `splunk_hec_out` pointed at `addr`, with [`RELAY_HOST`] as its default host, reporting into
+/// `registry`. Every seed but [`a_hostless_batch_arrives_with_the_relay_host`]'s carries a `host`,
+/// so it arrives unchanged.
 fn sink(addr: SocketAddr, registry: &Registry) -> SplunkHecOutput {
     SplunkHecOutput::new(format!("http://{addr}/services/collector"), TOKEN)
         .unwrap()
+        .with_default_host(RELAY_HOST)
         .with_telemetry(registry.telemetry_for("out", "splunk_hec_out", "sink"))
 }
 
@@ -104,6 +111,23 @@ async fn every_signal_relays_its_batch_unchanged() {
             assert_eq!(recv_batch(&mut rx).await, batch, "{name} {compression:?}");
         }
     }
+    assert_nothing_delivered(&mut rx).await;
+}
+
+/// The codec's permitted normalization: an object with no `host` leaves with the sink's default
+/// host, and `splunk_hec_in` reads it back as the batch's `host.name`. Nothing else changes.
+#[tokio::test]
+async fn a_hostless_batch_arrives_with_the_relay_host() {
+    let (addr, mut rx) = listener().await;
+    let registry = Registry::new();
+    let batch = seed(r#"{"time":1700000000,"index":"main","event":"no host"}"#);
+    assert!(batch.resource.attributes.get("host.name").is_none());
+    sink(addr, &registry).send(&batch).await.unwrap();
+    let mut expected = batch.clone();
+    let mut resource = (*batch.resource).clone();
+    resource.attributes.insert("host.name", Value::str(RELAY_HOST));
+    expected.resource = Arc::new(resource);
+    assert_eq!(recv_batch(&mut rx).await, expected);
     assert_nothing_delivered(&mut rx).await;
 }
 

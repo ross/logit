@@ -321,7 +321,7 @@ impl SplunkEncoder {
         }
 
         self.scratch.clear();
-        let mut obj = begin_object(&mut self.scratch, event.timestamp, &ctx.envelope);
+        let mut obj = begin_object(&mut self.scratch, event.timestamp, ctx);
         {
             let mut hec = JsonObject::begin(obj.key("event"));
             write_str(hec.key("trace_id"), &to_hex(&span.trace_id));

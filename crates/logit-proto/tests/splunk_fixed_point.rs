@@ -72,6 +72,20 @@ fn every_envelope_key() {
     assert_eq!(batches[0].events[0].attributes.len(), 6);
 }
 
+/// Permitted normalization 10: a hostless object leaves a relay with its process hostname, and
+/// from the second hop on that `host` is the object's own.
+#[test]
+fn a_hostless_object_leaves_with_the_relay_hostname() {
+    let mut relay = SplunkEncoder::new().with_default_host(Some("relay".into()));
+    let d1 = decode(br#"{"time":1,"event":"a"}"#);
+    let e1 = relay.encode(&d1[0]).unwrap();
+    assert_eq!(&e1[..], br#"{"time":1,"host":"relay","event":"a"}"#);
+    let d2 = decode(&e1);
+    assert_eq!(d2[0].resource.attributes.get("host.name"), Some(&Value::str("relay")));
+    let mut next_hop = SplunkEncoder::new().with_default_host(Some("next-hop".into()));
+    assert_eq!(next_hop.encode(&d2[0]).unwrap(), e1);
+}
+
 #[test]
 fn array_and_concatenated_framing_and_whitespace() {
     let array = assert_fixed_point(

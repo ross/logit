@@ -821,12 +821,19 @@ impl DatadogEncoder {
         let mut c = Carriers::default();
         let dropped = render_tags(merged(resource, event), skip, &mut c.tags);
         let mut unrepresentable = dropped.unrepresentable;
+        // A `host.name` that isn't a `Str` is the event's own host, unwritable: counted, and
+        // never replaced by the default host.
+        let mut own_host_unwritable = false;
         for (key, value) in merged(resource, event) {
             if !consumed.contains(&key) {
                 continue;
             }
             let ok = match resolve(key) {
-                ATTR_HOST_NAME => non_empty_str(value).map(|s| c.host = s).is_some(),
+                ATTR_HOST_NAME => {
+                    let ok = non_empty_str(value).map(|s| c.host = s).is_some();
+                    own_host_unwritable |= !ok;
+                    ok
+                }
                 ATTR_DEVICE => non_empty_str(value).map(|s| c.device = s).is_some(),
                 ATTR_SOURCE_TYPE_NAME => {
                     non_empty_str(value).map(|s| c.source_type_name = s).is_some()
@@ -884,6 +891,9 @@ impl DatadogEncoder {
         }
         self.tags_omitted("unrepresentable", unrepresentable);
         self.tags_omitted("no_wire_form", c.unwritable(route));
+        if c.host.is_none() && !own_host_unwritable {
+            c.host = self.default_host.as_deref().map(str::to_string);
+        }
         c
     }
 
@@ -1463,6 +1473,62 @@ mod tests {
         assert!(has("logit.output.metrics.dropped", "reason", "non_finite_value"));
         assert!(!has("logit.output.metrics.skipped", "reason", "non_finite_value"));
         assert!(!has("logit.output.metrics.skipped", "metric_kind", "samples"));
+    }
+
+    /// Every series route writes the default host for a hostless event, and an event's own
+    /// `host.name` wins over it.
+    #[test]
+    fn every_series_route_fills_only_a_missing_host() {
+        let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let mut own = AttrMap::new();
+        own.insert(ATTR_HOST_NAME, Value::str("h"));
+        for (attrs, want) in [(AttrMap::new(), "relay"), (own, "h")] {
+            let gauge = one_event_batch(attrs.clone(), MetricKind::gauge(1.0));
+            let v1: JsonValue =
+                serde_json::from_slice(&e.encode_series_v1(&gauge).unwrap()).unwrap();
+            assert_eq!(v1["series"][0]["host"], want);
+            let v2: JsonValue =
+                serde_json::from_slice(&e.encode_series_v2_json(&gauge).unwrap()).unwrap();
+            assert_eq!(v2["series"][0]["resources"], json!([{ "type": "host", "name": want }]));
+            let proto =
+                MetricPayload::decode(e.encode_series_v2_protobuf(&gauge).unwrap()).unwrap();
+            assert_eq!(
+                proto.series[0].resources,
+                vec![metric_payload::Resource { r#type: "host".into(), name: want.into() }]
+            );
+            let samples = one_event_batch(attrs, MetricKind::Samples(Samples::new([1.0])));
+            let points: JsonValue =
+                serde_json::from_slice(&e.encode_distribution_points(&samples).unwrap()).unwrap();
+            assert_eq!(points["series"][0]["host"], want);
+        }
+    }
+
+    /// With no default host, a hostless v1 series keeps the Agent's `""`.
+    #[test]
+    fn with_no_default_host_a_hostless_v1_series_sends_an_empty_host() {
+        let (mut e, _) = encoder();
+        let b = one_event_batch(AttrMap::new(), MetricKind::gauge(1.0));
+        let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
+        assert_eq!(v1["series"][0]["host"], "");
+    }
+
+    /// A `host.name` that isn't a string is the event's own host: omitted and counted, never
+    /// replaced by the default host.
+    #[test]
+    fn an_unrepresentable_host_is_not_replaced_by_the_default_host() {
+        let registry = Registry::new();
+        let mut e = DatadogEncoder::new()
+            .with_telemetry(registry.telemetry_for("datadog_out", "datadog_out", "sink"))
+            .with_default_host(Some(Arc::from("relay")));
+        let mut attrs = AttrMap::new();
+        attrs.insert(ATTR_HOST_NAME, Value::I64(7));
+        let b = one_event_batch(attrs, MetricKind::gauge(1.0));
+        let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
+        assert_eq!(v1["series"][0]["host"], "");
+        assert_eq!(
+            counted(&registry, "logit.output.tags.omitted", ("reason", "unrepresentable")),
+            1.0
+        );
     }
 
     #[test]

@@ -42,7 +42,9 @@ pub struct Config {
     pub tls_reload_interval: Duration,
     /// The name of the host this process runs on. `logit` stamps it as `host.name` on its own
     /// `internal` telemetry, so several instances writing to one metrics backend stay
-    /// distinguishable. Defaults to the kernel hostname:
+    /// distinguishable. `syslog_out`, `splunk_hec_out`, and `datadog_out` also send it as the
+    /// host of an event that carries none of its own, never replacing one it carries. Defaults
+    /// to the kernel hostname:
     /// the pod name in Kubernetes, the node name under `hostNetwork`, the container's hostname in
     /// Docker, and the machine's hostname on a host. To use another value, set it here. In
     /// Kubernetes, expose the node name or pod name to the container through the downward API
@@ -2965,7 +2967,9 @@ pub enum ComponentKind {
     },
     /// Sends logs, metrics, events, service checks, APM traces, and APM stats straight to
     /// Datadog's intake API, one request per route a batch needs. Host, service, source, and tags
-    /// come from each event's attributes and resource, so stamp them upstream with `set`. Points
+    /// come from each event's attributes and resource, so stamp them upstream with `set`. A
+    /// metric, log, event, or service check with no host goes out with the process hostname, so
+    /// hostless senders relayed through one `logit` report as one Datadog host. Points
     /// older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service
     /// checks) are dropped and counted before sending. Traces go out only once a Datadog Agent
     /// has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.
@@ -3055,8 +3059,9 @@ pub enum ComponentKind {
     /// by both sees one schema. Spans go out as ordinary events: Splunk has no trace store. Each
     /// event's `index`, `source`, `sourcetype`, and `host` come from the batch's resource
     /// attributes `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and
-    /// `host.name`: set them upstream with `set`. Every other attribute goes out as an indexed
-    /// field. A failure Splunk may have partly applied (a `5xx`, a timeout) resends the batch,
+    /// `host.name`: set them upstream with `set`. A batch with no `host.name` goes out with the
+    /// process hostname as its `host`. Every other attribute goes out as an indexed field. A
+    /// failure Splunk may have partly applied (a `5xx`, a timeout) resends the batch,
     /// which Splunk may index twice; `buffer.delivery: at_most_once` drops it instead.
     SplunkHecOut {
         /// The collector's base URL, ending in `/services/collector`:
@@ -3318,8 +3323,9 @@ pub enum ComponentKind {
         #[serde(default)]
         facility: SyslogFacility,
         /// HOSTNAME fallback, used only when the event carries no `syslog.hostname` attribute
-        /// (one that never passed through `syslog_in`, say). No default, so a relayed line's
-        /// origin is never silently overwritten.
+        /// (one that never passed through `syslog_in`, say), so a relayed line's origin is never
+        /// silently overwritten. Defaults to the top-level `hostname:`, else the kernel
+        /// hostname.
         #[serde(default)]
         hostname: Option<String>,
         /// APP-NAME fallback, used only when the event carries no `syslog.tag` attribute. No

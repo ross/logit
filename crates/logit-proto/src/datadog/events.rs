@@ -14,7 +14,7 @@ use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, or_received, seconds_f64_to_nanos, seconds_to_nanos};
 use super::{
     is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_EVENT_DEVICE_NAME,
-    ATTR_EVENT_RELATED_EVENT_ID, ATTR_EVENT_TYPE, RESOURCE_ATTR_AGENT_HOSTNAME,
+    ATTR_EVENT_RELATED_EVENT_ID, ATTR_EVENT_TYPE, ATTR_HOST_NAME, RESOURCE_ATTR_AGENT_HOSTNAME,
 };
 use crate::json::{json_to_value, value_text, write_i64, write_str, write_value, JsonObject};
 use crate::CodecError;
@@ -66,6 +66,7 @@ struct EventKeys {
     related_event_id: Symbol,
     agent_hostname: Symbol,
     statsd_timestamp: Symbol,
+    host_name: Symbol,
 }
 
 impl EventKeys {
@@ -99,6 +100,7 @@ static KEYS: LazyLock<EventKeys> = LazyLock::new(|| EventKeys {
     related_event_id: intern(ATTR_EVENT_RELATED_EVENT_ID),
     agent_hostname: intern(RESOURCE_ATTR_AGENT_HOSTNAME),
     statsd_timestamp: intern(ATTR_STATSD_TIMESTAMP),
+    host_name: intern(ATTR_HOST_NAME),
 });
 
 impl DatadogDecoder {
@@ -319,9 +321,14 @@ impl DatadogEncoder {
         // An optional field: written only when present and not an empty string.
         let optional = |key: Symbol| find(key).filter(|v| v.as_str() != Some(""));
         let agent = format == EventFormat::AgentEnvelope;
+        // `statsd.event.host`, else `host.name`, which then leaves as the host and not a tag.
+        let own_host = optional(keys.host);
+        let host_name = if own_host.is_none() { optional(keys.host_name) } else { None };
+        let mut skip = keys.consumed().to_vec();
+        skip.extend(host_name.map(|_| keys.host_name));
 
         let mut tags = Vec::new();
-        let dropped = render_tags(attrs.iter().map(|(k, v)| (*k, *v)), &keys.consumed(), &mut tags);
+        let dropped = render_tags(attrs.iter().map(|(k, v)| (*k, *v)), &skip, &mut tags);
         if dropped.unrepresentable > 0 {
             self.telemetry.count(
                 "logit.output.tags.omitted",
@@ -343,10 +350,11 @@ impl DatadogEncoder {
             write_str(obj.key("priority"), &value_text(priority));
         }
         // The Agent always writes `host`, empty or not; the public form only when set.
-        match optional(keys.host) {
-            Some(host) => write_str(obj.key("host"), &value_text(host)),
-            None if agent => write_str(obj.key("host"), ""),
-            None => {}
+        match (own_host.or(host_name), &self.default_host) {
+            (Some(host), _) => write_str(obj.key("host"), &value_text(host)),
+            (None, Some(host)) => write_str(obj.key("host"), host),
+            (None, None) if agent => write_str(obj.key("host"), ""),
+            (None, None) => {}
         }
         if !tags.is_empty() {
             let buf = obj.key("tags");
@@ -541,5 +549,44 @@ mod tests {
         assert!(DatadogEncoder::new()
             .encode_events(&untitled, EventFormat::AgentEnvelope)
             .is_empty());
+    }
+
+    /// `statsd.event.host`, then `host.name` (then no tag of that name), then the default host,
+    /// in both forms.
+    #[test]
+    fn encode_fills_a_missing_host_with_host_name_then_the_default_host() {
+        let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let encode_with = |batch: &EventBatch, format| -> Vec<String> {
+            let out = encoder.encode_events(batch, format);
+            out.iter().map(|b| String::from_utf8(b.to_vec()).unwrap()).collect()
+        };
+        let hostless = decode(r#"{"title":"t","text":"x","date_happened":5}"#);
+        assert_eq!(
+            encode_with(&hostless, EventFormat::AgentEnvelope),
+            [
+                r#"{"apiKey":"","events":{"api":[{"msg_title":"t","msg_text":"x","timestamp":5,"host":"relay"}]},"internalHostname":""}"#
+            ]
+        );
+        assert_eq!(
+            encode_with(&hostless, EventFormat::PublicV1),
+            [r#"{"title":"t","text":"x","date_happened":5,"host":"relay"}"#]
+        );
+
+        let mut stamped = hostless.clone();
+        let mut resource = Resource::default();
+        resource.attributes.insert(ATTR_HOST_NAME, Value::str("web-1"));
+        stamped.resource = Arc::new(resource);
+        assert_eq!(
+            encode_with(&stamped, EventFormat::PublicV1),
+            [r#"{"title":"t","text":"x","date_happened":5,"host":"web-1"}"#]
+        );
+
+        let own = decode(r#"{"title":"t","text":"x","date_happened":5,"host":"h"}"#);
+        let mut own_and_stamped = own.clone();
+        own_and_stamped.resource = stamped.resource.clone();
+        assert_eq!(
+            encode_with(&own_and_stamped, EventFormat::PublicV1),
+            [r#"{"title":"t","text":"x","date_happened":5,"host":"h","tags":["host.name:web-1"]}"#]
+        );
     }
 }

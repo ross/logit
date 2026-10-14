@@ -3,7 +3,8 @@
 //!
 //! Each batch is one decode of a hand-written wire payload, so it sits on the codec's fixed point
 //! (`crates/logit-proto/tests/datadog_*_fixed_point.rs`), and `datadog_out` re-encoding it gives
-//! the same batch back through `datadog_in`. Timestamps are relative to now, since `datadog_out`
+//! the same batch back through `datadog_in`, except that a series or log with no host arrives with
+//! the sink's default host, as `logit run` configures it ([`relayed`]). Timestamps are relative to now, since `datadog_out`
 //! drops points outside Datadog's windows before sending. What this file adds over the codec
 //! tests is both HTTP hops: routing, `Content-Type`, gzip and deflate, the `DD-API-KEY` check,
 //! and the two things `datadog_out` doesn't send.
@@ -28,7 +29,8 @@ use logit_proto::datadog::stats::{
     METRIC_TOP_LEVEL_HITS,
 };
 use logit_proto::datadog::{
-    DatadogDecoder, DatadogEncoder, ATTR_SERVICE_NAME, RESOURCE_ATTR_TRACER_HOSTNAME,
+    DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_SERVICE_NAME,
+    RESOURCE_ATTR_TRACER_HOSTNAME,
 };
 use prost::Message;
 use std::collections::HashMap;
@@ -55,11 +57,16 @@ async fn listener() -> (SocketAddr, mpsc::Receiver<logit_pipeline::Delivered>) {
     (addr, rx)
 }
 
-/// A `datadog_out` with all three intakes on `addr`, reporting into `registry`.
+/// The process hostname `logit run` would hand the sink.
+const RELAY_HOST: &str = "relay";
+
+/// A `datadog_out` with all three intakes on `addr` and [`RELAY_HOST`] as its default host,
+/// reporting into `registry`.
 fn sink(addr: SocketAddr, registry: &Registry) -> DatadogOutput {
     let base = format!("http://{addr}");
     DatadogOutput::new(KEY)
         .unwrap()
+        .with_default_host(RELAY_HOST)
         .with_endpoints(DatadogEndpoints {
             api: Some(base.clone()),
             logs: Some(base.clone()),
@@ -87,6 +94,20 @@ fn dropped(points: &[Event], reason: &str) -> f64 {
             _ => 0.0,
         })
         .sum()
+}
+
+/// `batch` as `datadog_in` receives it from [`sink`]: the codec's permitted normalization that
+/// gives a hostless metric its `host.name`, and a hostless log its `hostname`, from the default
+/// host. Every other route's fixture carries a host of its own.
+fn relayed(batch: &EventBatch) -> EventBatch {
+    let mut batch = batch.clone();
+    for event in &mut batch.events {
+        let key = if event.log.is_some() { "hostname" } else { ATTR_HOST_NAME };
+        if event.attributes.get(key).is_none() {
+            event.attributes.insert(key, Value::str(RELAY_HOST));
+        }
+    }
+    batch
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -279,7 +300,11 @@ async fn every_route_relays_its_batch_unchanged() {
     for (name, batch) in cases {
         assert!(!batch.events.is_empty(), "{name}: the case carries events");
         out.send(&batch).await.unwrap_or_else(|err| panic!("{name}: {err:#}"));
-        assert_eq!(recv_batch(&mut rx).await, batch, "{name}");
+        let expected = match name {
+            "series" | "logs" => relayed(&batch),
+            _ => batch,
+        };
+        assert_eq!(recv_batch(&mut rx).await, expected, "{name}");
     }
     assert_nothing_delivered(&mut rx).await;
 }
@@ -363,8 +388,9 @@ async fn a_stale_point_is_counted_and_not_delivered() {
 }
 
 /// A real Agent 7.83's series request (`testdata/interop/datadog/agent-api-v2-series-004.bin`),
-/// decoded, relays unchanged. Its points are restamped to now first, since `datadog_out` drops a
-/// point older than an hour; nothing else is touched.
+/// decoded, relays unchanged but for a hostless series gaining the default host. Its points are
+/// restamped to now first, since `datadog_out` drops a point older than an hour; nothing else is
+/// touched.
 #[tokio::test]
 async fn a_recorded_agent_series_request_relays_unchanged() {
     use std::io::Read;
@@ -387,6 +413,6 @@ async fn a_recorded_agent_series_request_relays_unchanged() {
     let registry = Registry::new();
     let mut out = sink(addr, &registry);
     out.send(&batch).await.expect("datadog_in accepts");
-    assert_eq!(recv_batch(&mut rx).await, batch);
+    assert_eq!(recv_batch(&mut rx).await, relayed(&batch));
     assert_nothing_delivered(&mut rx).await;
 }

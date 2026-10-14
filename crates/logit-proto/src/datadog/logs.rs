@@ -244,6 +244,10 @@ impl DatadogEncoder {
                 if let Some(source) = &self.default_source {
                     write_str(obj.key(key), source);
                 }
+            } else if primary == keys.hostname {
+                if let Some(host) = &self.default_host {
+                    write_str(obj.key(key), host);
+                }
             }
         }
         for (key, value) in &attrs {
@@ -502,6 +506,26 @@ pub(super) mod tests {
         assert_eq!(item["at"], "1970-01-01T00:00:00.000000000Z");
         assert!(item.get("host.name").is_none());
         assert!(item.get("service.name").is_none());
+    }
+
+    /// `hostname`, then `host.name`, then the default host.
+    #[test]
+    fn encode_fills_a_missing_hostname_with_the_default_host() {
+        let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let encode_with = |body: &str| {
+            let out = encoder.encode_logs(&decode(body)).unwrap();
+            serde_json::from_slice::<Json>(&out).unwrap()[0]["hostname"].clone()
+        };
+        assert_eq!(encode_with(r#"[{"message":"a"}]"#), "relay");
+        assert_eq!(encode_with(r#"[{"message":"a","hostname":"h"}]"#), "h");
+        assert_eq!(encode_with(r#"[{"message":"a","host.name":"m"}]"#), "m");
+        assert_eq!(
+            std::str::from_utf8(
+                &DatadogEncoder::new().encode_logs(&decode(r#"[{"message":"a"}]"#)).unwrap()
+            )
+            .unwrap(),
+            r#"[{"message":"a","timestamp":1690000000000}]"#
+        );
     }
 
     #[test]
