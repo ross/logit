@@ -24,9 +24,9 @@ components:
     # bind: 239.192.74.66:25826
     #
     # Optional, and it changes nothing on the wire: `types_db:` names data sources, and
-    # `collectd_out` re-encodes from the `_logit.collectd.*` attributes, never from the record
-    # name. Set it only if something else in the pipeline reads the names. collectd's own types.db
-    # is GPL-licensed and not shipped with logit; point this at the sending hosts' copy.
+    # `collectd_out` re-encodes from the `collectd.*` and `_logit.collectd.*` attributes, never from
+    # the record name. Set it only if something else in the pipeline reads the names. collectd's own
+    # types.db is GPL-licensed and not shipped with logit; point this at the sending hosts' copy.
     # types_db:
     #   - /usr/share/collectd/types.db
     #
@@ -55,7 +55,7 @@ components:
     #                            # to match a path MTU. A list that alone exceeds it is dropped
     #                            # whole and counted, not split.
     # hostname:                  # unset: used only for an event carrying neither
-    #                            # `_logit.collectd.host` nor `host.name`, which a pure relay never
+    #                            # `collectd.host` nor `host.name`, which a pure relay never
     # produces. Set it if
     #                            # this pipeline also carries metrics from another source; without
     #                            # it such an event is dropped and counted (reason="no_host").

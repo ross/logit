@@ -77,7 +77,7 @@ value, in wire order.
 | GAUGE finite/±inf | `Gauge(F64(v))` | none |
 | GAUGE NaN | `Gauge(F64(0.0))` + `FLAG_NO_RECORDED_VALUE` (NaN *is* collectd's "no value"; keeps `PartialEq` fixed points honest) | none |
 | unknown DS type; `count==0`/`>64`; `len != 6+9*count` | packet tail rejected | `bad_part` / `bad_datagram` |
-| Host/Plugin/PluginInstance/Type/TypeInstance | sticky → `_logit.collectd.*` attrs; empty string → attribute absent | — |
+| Host/Plugin/PluginInstance/Type/TypeInstance | sticky → identity attrs (Attribute conventions below); empty string → attribute absent | — |
 | Values with empty host/plugin/type | list skipped | `incomplete_identity` |
 | TimeHR / Time / none | `timestamp` = cdtime→ns / s·1e9 / `received_at` | — |
 | IntervalHR / Interval | `_logit.collectd.interval: F64` = cdtime/2³⁰ s (exact); 0 → absent | — |
@@ -92,7 +92,7 @@ natively:
 
 | Model | Wire | Counter (`logit.output.metrics.skipped{reason=…}` unless noted; kind drops use `{metric_kind=…}` — the Prometheus codec's convention) |
 |---|---|---|
-| event with `_logit.collectd.type` | one Values part, `event.metrics` in order, identity from `_logit.collectd.*` | — |
+| event with `_logit.collectd.type` | one Values part, `event.metrics` in order, identity from its identity attrs | — |
 | event without `_logit.collectd.type` | one 1-DS list per record: plugin = name up to first `.` (whole if none); type = `gauge`/`counter`/`derive`/`absolute` by kind (all 1-DS in stock types.db); type_instance = remainder after first `.`; no plugin_instance | — |
 | `Sum{Cumulative, mono}` integral, u64 range | COUNTER | — |
 | `Sum{Cumulative, !mono}` integral, i64 range | DERIVE | — |
@@ -106,10 +106,10 @@ natively:
 | like-relay list where any record fails | whole list dropped (receiver's `ds_num` check would reject a partial one anyway) | the failing reason, once |
 | `timestamp > 0` / `<= 0` | TimeHR / dropped | `unencodable_timestamp` |
 | `_logit.collectd.interval` finite >0 / absent or bad | IntervalHR round(v·2³⁰) / IntervalHR 0 | bad non-absent: `logit.output.tags.dropped{reason="unrepresentable"}` |
-| host | `_logit.collectd.host` → `host.name` (event, then resource) → configured `hostname:`; none resolved → **list dropped** | `{reason="no_host"}` |
-| `_logit.collectd.*` `Str`/`Bytes` | verbatim after sanitizing (`Bytes` byte-verbatim) | `logit.output.identity.sanitized{reason="substituted"\|"truncated"}` |
-| `_logit.collectd.*` other `Value` types | treated as absent | `tags.dropped{unrepresentable}` |
-| every non-`_logit.collectd.*` attribute | dropped (collectd has no tags) | `tags.dropped{reason="no_wire_form"}` |
+| host | `collectd.host` → `host.name` (event, then resource) → configured `hostname:`; none resolved → **list dropped** | `{reason="no_host"}` |
+| identity attr `Str`/`Bytes` | verbatim after sanitizing (`Bytes` byte-verbatim) | `logit.output.identity.sanitized{reason="substituted"\|"truncated"}` |
+| identity attr of another `Value` type | treated as absent | `tags.dropped{unrepresentable}` |
+| every other attribute | dropped (collectd has no tags) | `tags.dropped{reason="no_wire_form"}` |
 | `unit`/`description`/`start_timestamp`/`exemplars`/`Scope`/`schema_url` | dropped | none; known-gaps rows |
 | empty plugin after sanitizing | dropped | `empty_name` |
 | list alone > `max_packet_bytes` | dropped whole | `{reason="oversize_value_list"}` + diag |
@@ -129,16 +129,17 @@ permitted normalizations below says an integer becomes a double, and none change
 ### Attribute conventions
 
 Rule (b) of [ADR `lossless-transit`](lossless-transit.md): the raw five-tuple identity rides on
-`_logit.collectd.*` attributes and wins on collectd egress. Consumed by `collectd_out`; every other
-sink ignores them (see the private-namespace amendment at the end of this record).
+event attributes and wins on collectd egress. Consumed by `collectd_out`. The host and the two
+instances are public, and every other sink renders them as tags; the rest are private, and every
+other sink ignores them (see the private-namespace amendment at the end of this record).
 
 | Attribute | Value | Meaning |
 |---|---|---|
-| `_logit.collectd.host` | `Str` (`Bytes` if not UTF-8) | Host; absent when empty on the wire; outranks `host.name` on `collectd_out` |
+| `collectd.host` | `Str` (`Bytes` if not UTF-8) | Host; absent when empty on the wire; outranks `host.name` on `collectd_out` |
 | `_logit.collectd.plugin` | `Str`/`Bytes` | required for like-relay |
-| `_logit.collectd.plugin_instance` | `Str`/`Bytes`, only when non-empty | |
+| `collectd.plugin_instance` | `Str`/`Bytes`, only when non-empty | |
 | `_logit.collectd.type` | `Str`/`Bytes` | its presence selects like-relay encoding |
-| `_logit.collectd.type_instance` | `Str`/`Bytes`, only when non-empty | |
+| `collectd.type_instance` | `Str`/`Bytes`, only when non-empty | |
 | `_logit.collectd.interval` | `F64` seconds (cdtime/2³⁰, exact) | absent when 0 / no part |
 | `_logit.collectd.severity` (W5) | `U64` ∈ {1,2,4} | raw severity; marks a notification; outranks `log.severity` on egress |
 
@@ -167,17 +168,17 @@ Identity — host, plugin, plugin instance, type, type instance — lives on the
   identical situation.
 
 `collectd_in` therefore always returns the same shared `Resource::default()` for the life of the
-component (never a per-host one), and `collectd_out` reads identity from `_logit.collectd.*` event
-attributes, falling back to `host.name` (event, then resource) only for host, per the encode table
+component (never a per-host one), and `collectd_out` reads identity from the event attributes
+above, falling back to `host.name` (event, then resource) only for host, per the encode table
 above.
 
 ### Record naming and types.db
 
 A decoded record's name is chosen without ever needing collectd's own `types.db` for fidelity — the
-encoder rebuilds the wire shape from `_logit.collectd.*` attributes, `MetricList` order, and each
-record's kind, so like-relay round-tripping never depends on how a name was chosen. Naming exists
-purely for display and for cross-protocol legibility (what a non-collectd sink downstream sees as
-the metric name):
+encoder rebuilds the wire shape from the `collectd.*` and `_logit.collectd.*` attributes,
+`MetricList` order, and each record's kind, so like-relay round-tripping never depends on how a name
+was chosen. Naming exists purely for display and for cross-protocol legibility (what a non-collectd
+sink downstream sees as the metric name):
 
 - **Single-DS list**: `<plugin>.<type>` — the lone data source (conventionally named `value` in
   collectd's own types) is omitted from the name, matching `collectd`'s own `write_graphite` plugin's
@@ -202,17 +203,18 @@ a short, hand-written file in the same line format, never a copy of the real one
 
 **Amendment (2026-10-09): a record name carries at most 127 bytes of its plugin and its type.**
 Decode cuts each of a record name's `<plugin>` and `<type>` segments to its first
-`DATA_MAX_NAME_LEN` − 1 (127) wire bytes, in every naming rule above. The `_logit.collectd.*`
-attributes keep every byte, and `collectd_out` never reads the name, so the like-protocol relay is
-unchanged.
+`DATA_MAX_NAME_LEN` − 1 (127) wire bytes, in every naming rule above. The `_logit.collectd.plugin`
+and `_logit.collectd.type` attributes keep every byte, and `collectd_out` never reads the name, so
+the like-protocol relay is unchanged.
 
 - **Why.** A Values part interns one name per data source, and the interner never evicts. Uncut,
   a 60 KB Plugin part ahead of a 64-value list put 64 times its length into the interner for one
   datagram. collectd's own receiver rejects a string past 127 bytes, so only a misconfigured
   sender that isn't collectd reaches the cut.
 - **Consequence.** Two Plugins or two Types that share their first 127 bytes get the same record
-  name. Every sink but `collectd_out` ignores the private `_logit.collectd.*` attributes, so each
-  writes the two as one series. `docs/known-gaps/mappings.md` has the `decode (collectd)` row.
+  name. Every sink but `collectd_out` ignores the private `_logit.collectd.plugin` and
+  `_logit.collectd.type`, so each writes the two as one series. `docs/known-gaps/mappings.md` has
+  the `decode (collectd)` row.
 - **Observable.** A list whose name is cut reports a throttled `record_name_cut` diagnostic. It
   costs one length comparison per list, and the merge it can cause is otherwise silent. There is no
   counter, because the decoder holds no `Telemetry`, and nothing is dropped.
@@ -254,7 +256,7 @@ and re-emits `TimeHR = received_at`, since there is no better time to hand back.
 
 collectd's own receiver (`network_dispatch_values`) rejects any `Values` list with an empty host (or
 plugin, or type) with `-EINVAL`. `collectd_out` treats that as a hard invariant on its own egress,
-but resolves it by **omission, not fabrication**: a `_logit.collectd.host` attribute wins when
+but resolves it by **omission, not fabrication**: a `collectd.host` attribute wins when
 present and non-empty, falling back to `host.name` (event, then resource attribute) next, and
 finally to the sink's own optional `hostname:` config field — config-supplied only, exactly like
 `syslog_out`'s own `hostname:` field (`crates/logit-config/src/lib.rs`'s `SyslogOut::hostname` doc:
@@ -266,12 +268,12 @@ resource-identity entry — "there is no OS-hostname source anywhere in the work
 leaves that deferral untouched rather than working around it with a Linux-only
 `/proc/sys/kernel/hostname` read of its own.
 
-When none of the three resolves — no `_logit.collectd.host`, no `host.name` anywhere on event or
+When none of the three resolves — no `collectd.host`, no `host.name` anywhere on event or
 resource, and no configured `hostname:` — the value list is **dropped whole**, counted
 `logit.output.metrics.skipped{reason="no_host"}`, with a throttled `no_host` diagnostic telling the
 operator to set `hostname:` or stamp `host.name` with a `set` transform. This is the one case in the
 encode table above where host resolution doesn't always succeed — but every like-relay list (one
-whose event carries `_logit.collectd.type`) already carries `_logit.collectd.host` as part of the
+whose event carries `_logit.collectd.type`) already carries `collectd.host` as part of the
 same attribute set the like-relay encoding requires, so `no_host` only ever bites cross-protocol
 ingress (an event from some other input with no host anywhere on it), never a genuine
 `collectd_in -> collectd_out` relay.
@@ -301,7 +303,7 @@ rule once restated. See Consequences for where those two edits land.
 
 ### Sanitization
 
-Applies only on encode, over `_logit.collectd.*` string/byte attributes and over the
+Applies only on encode, over the identity string/byte attributes and over the
 plugin/type_instance names the fallback path derives from a non-collectd event's own name: NUL and
 `/` both become `_` (the second matching collectd's own `escape_slashes`, since a bare `/` inside an
 identity field would otherwise be indistinguishable from a path separator to tooling that treats
@@ -389,10 +391,10 @@ trailing workstream after the metrics path is solid. The shape decided now, buil
 notification decodes to an `Event::log` — a `LogRecord` whose `message` and `severity` (1 FAILURE →
 `Error`, 2 WARNING → `Warn`, 4 OKAY → `Info`) come from the wire, plus a `_logit.collectd.severity:
 U64` attribute carrying the raw value, which outranks the normalized `LogRecord.severity` on
-`collectd_out` egress — the identical raw-encoding-outranks-normalized-field shape rule (b) of
-`lossless-transit` already gives `syslog.severity`/`otel.severity_number`. Until W5 lands, both
-parts are simply skipped on decode (a routine, uncounted skip — not every collectd deployment sends
-notifications) and never emitted on encode.
+`collectd_out` egress — the raw-encoding-outranks-normalized-field shape rule (b) of
+`lossless-transit` already gives `_logit.syslog.severity`/`_logit.otel.severity_number`. Until W5
+lands, both parts are simply skipped on decode (a routine, uncounted skip — not every collectd
+deployment sends notifications) and never emitted on encode.
 
 **Amendment (2026-09-12): notifications landed.** W5 built exactly this shape. Decode: `0x0101`
 Severity sets sticky state (reset per datagram, like every other sticky field); `0x0100` Message
@@ -403,8 +405,8 @@ Dropped (`notification_dropped`) when severity is outside `{1, 2, 4}`, the messa
 host is set; time `0` is lenient, exactly as for a value list (`received_at`). Encode: a `log`-only
 event (no metrics) carrying a `_logit.collectd.severity` attribute is a notification; **metrics
 win** on an event carrying both, which drops and counts the attribute
-(`tags.dropped{reason="unrepresentable"}`) exactly as any other unrepresentable `_logit.collectd.*`
-carrier is. A notification is **always its own datagram** — confirmed by the recorded capture below,
+(`tags.dropped{reason="unrepresentable"}`) exactly as any other unrepresentable carrier
+is. A notification is **always its own datagram** — confirmed by the recorded capture below,
 not merely assumed: real collectd flushes whatever value-list packet is in progress, writes the
 notification alone, and the next value list restates its identity in full. `CollectdEncoder` does
 the same and shares no elision state with a notification in either direction — it neither elides
@@ -459,7 +461,7 @@ unchanged.
   of. `syslog_in`'s `syslog.hostname` precedent already answers this the same way for a structurally
   identical situation.
 - **A raw `_logit.collectd.time` cdtime attribute**, carrying the original bits alongside the
-  normalized `Event::timestamp`, the way `_logit.collectd.host`/`_logit.collectd.plugin`/etc. carry
+  normalized `Event::timestamp`, the way `collectd.host`/`_logit.collectd.plugin`/etc. carry
   the raw identity. Rejected: identity fields have a genuine two-sided split (a raw wire spelling
   *and* a normalized field that can each independently be right or wrong — e.g. sanitization changes
   the raw spelling but not what it means). Time has exactly one normalized field and the only
@@ -474,7 +476,7 @@ unchanged.
   primitive for (unlike TLS, which every other encrypted transport in this repo already uses), and no
   workstream in this plan needs it to ship a lossless, useful relay for the overwhelmingly common
   unauthenticated-UDP collectd deployment. Tracked as a known gap instead of built speculatively.
-- **Encoder-side use of `types_db` to regroup fallback (non-`_logit.collectd.*`) records back into
+- **Encoder-side use of `types_db` to regroup fallback (non-collectd) records back into
   multi-DS lists**, the inverse of the decoder's naming lookup. Rejected: the fallback path (events
   with no `_logit.collectd.type`) only ever emits stock single-DS types (`gauge`/`counter`/`derive`/
   `absolute`), so there is never a multi-DS type to regroup into — building the lookup would add
@@ -521,21 +523,25 @@ to `metrics.dropped`. `no_recorded_value` and a kind collectd has no data-source
 `input.events.dropped{reason="invalid_notification"}`. `crates/logit-proto/src/collectd/mod.rs`'s
 module doc is the canonical table.
 
-## Amendment (2026-10-13): the identity attributes are private
+## Amendment (2026-10-13): the carriers are private, the identity is public
 
-Under [ADR `private-attribute-namespace`](private-attribute-namespace.md), every attribute this
-pair carries moves under the private prefix: `collectd.host`, `plugin`, `plugin_instance`, `type`,
-`type_instance`, `interval`, and `severity` become `_logit.collectd.<name>`, and
-`crates/logit-proto/src/collectd/mod.rs`'s `ATTR_PREFIX` becomes `_logit.collectd.`. There are no
-aliases and no decode path for the old names.
+Under [ADR `private-attribute-namespace`](private-attribute-namespace.md), the attributes this pair
+carries split in two:
 
-- **The relay is unchanged.** `collectd_out` reads its own `_logit.collectd.*` keys by exact name,
-  as before, so `collectd_in -> collectd_out` stays a fixed point.
-- **Every other sink ignores them.** `influxdb_out`, `prometheus_out`, `statsd_out`, and the rest
-  no longer render the host or the five-tuple as tags or labels. The record name,
-  `<plugin>.<type>[.<ds>]`, is the only identity a cross-protocol sink sees, so lists from
-  different hosts, or with different plugin or type instances, of the same plugin and type share a
-  series there. A pipeline that needs them as tags copies them to public names upstream of that
-  sink, in a `lua` stage.
+| Private, renamed | Public, unchanged |
+|---|---|
+| `_logit.collectd.plugin`, `_logit.collectd.type`, `_logit.collectd.interval`, `_logit.collectd.severity` | `collectd.host`, `collectd.plugin_instance`, `collectd.type_instance` |
+
+`crates/logit-proto/src/collectd/mod.rs`'s `ATTR_PREFIX` becomes `_logit.collectd.` and covers
+the private four. There are no aliases and no decode path for the old private names.
+
+- **Why the split.** The plugin and type are already in the record name, `<plugin>.<type>[.<ds>]`,
+  modulo the 127-byte cut the carriers undo; the interval and severity restate the wire form of
+  something the model holds. The host and the two instances are identity nothing else carries:
+  the record name leaves them out, and the host stays off the resource by design. Hiding them
+  would merge different hosts' and instances' lists into one series at every other sink.
+- **The relay is unchanged.** `collectd_out` reads the private four under its own prefix and the
+  public three by exact name, so `collectd_in -> collectd_out` stays a fixed point.
+- **Every other sink renders the public three as tags and ignores the private four.**
 - **`collectd_out` skips other protocols' carriers uncounted.** Any other `_logit.` key reaching it
   is skipped without counting `tags.omitted{reason="no_wire_form"}`.

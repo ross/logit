@@ -24,7 +24,8 @@ use std::sync::Arc;
 /// The most bytes of a Plugin or Type a record name carries: [`DATA_MAX_NAME_LEN`] minus the
 /// NUL, the longest string collectd's own receiver takes. A list interns one name per data
 /// source in the never-evicting interner, so a longer part would be copied there up to
-/// [`MAX_VALUES_PER_LIST`] times; the `_logit.collectd.*` attribute keeps every byte.
+/// [`MAX_VALUES_PER_LIST`] times; the `_logit.collectd.plugin`/`_logit.collectd.type` attribute
+/// keeps every byte.
 const MAX_NAME_SEGMENT_BYTES: usize = DATA_MAX_NAME_LEN - 1;
 
 /// What a datagram loses past an Encryption part or a malformed part behind decoded lists, by
@@ -48,7 +49,7 @@ pub struct CollectdDecoder {
     /// Scratch for the record name being built (`<plugin>.<type>[.<i>]`), a field so a
     /// 64-data-source list allocates no `String`.
     name: String,
-    /// The `_logit.collectd.*` attribute keys, interned once so the per-list path uses
+    /// The collectd attribute keys, interned once so the per-list path uses
     /// [`AttrMap::insert_sym`] instead of re-hashing them.
     keys: AttrKeys,
     /// The operator-supplied `types.db`, loaded once per component; `None` means index naming.
@@ -56,7 +57,7 @@ pub struct CollectdDecoder {
     types_db: Option<Arc<TypesDb>>,
 }
 
-/// The interned `_logit.collectd.*` attribute keys; see [`CollectdDecoder::keys`].
+/// The interned collectd attribute keys; see [`CollectdDecoder::keys`].
 struct AttrKeys {
     host: Symbol,
     plugin: Symbol,
@@ -367,12 +368,13 @@ impl CollectdDecoder {
         let type_name = &type_bytes[..type_bytes.len().min(MAX_NAME_SEGMENT_BYTES)];
         if plugin_name.len() < plugin_bytes.len() || type_name.len() < type_bytes.len() {
             // Two Plugins or Types sharing their first 127 bytes now share a name, and every sink
-            // but `collectd_out` ignores `_logit.collectd.*`, so it writes them as one series.
+            // but `collectd_out` ignores the private plugin and type, so it writes them as one
+            // series.
             self.diag.warn_throttled(
                 "record_name_cut",
                 format_args!(
                     "collectd: a {}-byte plugin or {}-byte type is past collectd's 127-byte \
-                     limit; cutting it to 127 bytes in the record name, the _logit.collectd.* \
+                     limit; cutting it to 127 bytes in the record name, the plugin and type \
                      attributes keep it whole",
                     plugin_bytes.len(),
                     type_bytes.len()

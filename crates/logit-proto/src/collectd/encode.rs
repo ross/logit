@@ -7,8 +7,9 @@
 
 use super::part::{self, DsValue};
 use super::{
-    nanos_to_cdtime, ATTR_PREFIX, ATTR_SEVERITY, CDTIME_ONE_SECOND, DATA_MAX_NAME_LEN,
-    MAX_VALUES_PER_LIST, NOTIF_MAX_MSG_LEN,
+    nanos_to_cdtime, ATTR_HOST, ATTR_PLUGIN_INSTANCE, ATTR_PREFIX, ATTR_SEVERITY,
+    ATTR_TYPE_INSTANCE, CDTIME_ONE_SECOND, DATA_MAX_NAME_LEN, MAX_VALUES_PER_LIST,
+    NOTIF_MAX_MSG_LEN,
 };
 use crate::{FramedEncoder, MessageBuf};
 use bytes::Bytes;
@@ -53,7 +54,7 @@ pub struct EncodeStats {
     /// Counted once per value **list** the event would have produced (1 for like-relay, one per
     /// record for fallback), so it means what every other sink's `metrics.dropped` means.
     pub dropped_unencodable_timestamp: usize,
-    /// An event with no `_logit.collectd.host`, no `host.name`, and no
+    /// An event with no `collectd.host`, no `host.name`, and no
     /// [`CollectdEncoder::with_hostname`]. Counted per value list, like
     /// [`Self::dropped_unencodable_timestamp`].
     pub dropped_no_host: usize,
@@ -65,14 +66,13 @@ pub struct EncodeStats {
     /// A single value list larger than `max_packet_bytes`: dropped whole, never split across
     /// datagrams (a split list would be dispatched against the wrong identity).
     pub dropped_oversize_list: usize,
-    /// An attribute outside the private `_logit.` prefix (collectd has no tags), once per
-    /// attribute per event, including `host.name`, which host resolution reads but can't carry as
-    /// itself.
+    /// An attribute that is neither a collectd carrier nor under the private `_logit.` prefix
+    /// (collectd has no tags), once per attribute per event, including `host.name`, which host
+    /// resolution reads but can't carry as itself.
     pub tags_omitted_no_wire_form: usize,
-    /// A `_logit.collectd.*` attribute with no wire form here: an identity field that isn't
-    /// `Str`/`Bytes`, an interval that isn't a finite positive `F64`, a `_logit.collectd.severity`
-    /// that isn't `U64` or rides on a value list, or a `_logit.collectd.*` name this codec doesn't
-    /// know.
+    /// A collectd carrier with no wire form here: an identity field that isn't `Str`/`Bytes`, an
+    /// interval that isn't a finite positive `F64`, a `_logit.collectd.severity` that isn't `U64`
+    /// or rides on a value list, or a `_logit.collectd.*` name this codec doesn't know.
     pub tags_omitted_unrepresentable: usize,
     /// An identity field that had a NUL or `/` replaced with `_`. Counted once per field.
     pub identity_sanitized_substituted: usize,
@@ -222,7 +222,7 @@ impl CollectdEncoder {
         self
     }
 
-    /// The host written when neither `_logit.collectd.host` nor `host.name` is present
+    /// The host written when neither `collectd.host` nor `host.name` is present
     /// (`collectd_out`'s `hostname:`).
     ///
     /// **Operator-supplied, with no default.** The encoder neither reads the OS hostname (deferred,
@@ -544,7 +544,7 @@ impl Ctx<'_> {
         );
         self.diag.warn_throttled(
             "no_host",
-            "collectd_out: no host to write -- the event carries neither `_logit.collectd.host` \
+            "collectd_out: no host to write -- the event carries neither `collectd.host` \
              nor `host.name`, and this sink has no `hostname:` configured; dropping. Set \
              `hostname:` on the sink, or stamp `host.name` with a `set` transform: collectd's \
              receiver rejects an empty host, and inventing one would merge every unlabelled sender \
@@ -655,7 +655,7 @@ impl Ctx<'_> {
     }
 }
 
-/// The `_logit.collectd.*` carriers (plus `host.name`) read off one event's merged attributes.
+/// The collectd carriers (plus `host.name`) read off one event's merged attributes.
 #[derive(Default, Clone, Copy)]
 struct Carriers<'a> {
     host: Option<&'a Value>,
@@ -665,7 +665,7 @@ struct Carriers<'a> {
     type_instance: Option<&'a Value>,
     /// In ticks; `0` means absent, collectd's "unspecified".
     interval_cdtime: u64,
-    /// The normalized host attribute, used only when `_logit.collectd.host` is absent.
+    /// The normalized host attribute, used only when `collectd.host` is absent.
     host_name: Option<&'a Value>,
     /// Whether a [`super::ATTR_SEVERITY`] attribute was present in **any** `Value` type, which
     /// makes a `log`-only event an *attempted* notification.
@@ -676,23 +676,30 @@ struct Carriers<'a> {
 }
 
 /// Walks one event's attributes merged over its resource ([`logit_core::attrs::merged`]; the
-/// event wins), capturing the `_logit.collectd.*` carriers and counting everything with no wire
+/// event wins), capturing the collectd carriers and counting everything with no wire
 /// form.
 fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx) -> Carriers<'a> {
     let mut carriers = Carriers::default();
     for (key, value) in logit_core::attrs::merged(resource, event) {
         let key = logit_core::interner::resolve(key);
+        // The three public identity fields, read by exact name.
+        let public = match key {
+            ATTR_HOST => Some(&mut carriers.host),
+            ATTR_PLUGIN_INSTANCE => Some(&mut carriers.plugin_instance),
+            ATTR_TYPE_INSTANCE => Some(&mut carriers.type_instance),
+            _ => None,
+        };
+        if let Some(slot) = public {
+            match value {
+                Value::Str(_) | Value::Bytes(_) => *slot = Some(value),
+                _ => ctx.tag_omitted_unrepresentable(),
+            }
+            continue;
+        }
         if let Some(field) = key.strip_prefix(ATTR_PREFIX) {
             match (field, value) {
-                ("host", Value::Str(_) | Value::Bytes(_)) => carriers.host = Some(value),
                 ("plugin", Value::Str(_) | Value::Bytes(_)) => carriers.plugin = Some(value),
-                ("plugin_instance", Value::Str(_) | Value::Bytes(_)) => {
-                    carriers.plugin_instance = Some(value)
-                }
                 ("type", Value::Str(_) | Value::Bytes(_)) => carriers.type_ = Some(value),
-                ("type_instance", Value::Str(_) | Value::Bytes(_)) => {
-                    carriers.type_instance = Some(value)
-                }
                 ("interval", Value::F64(seconds)) if seconds.is_finite() && *seconds > 0.0 => {
                     // Exact for every interval a decoded list carries: `10.0` is `10 << 30` ticks.
                     carriers.interval_cdtime = (seconds * CDTIME_ONE_SECOND as f64).round() as u64;
@@ -726,7 +733,7 @@ fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx)
     carriers
 }
 
-/// This event's host: `_logit.collectd.host`, else `host.name`, else
+/// This event's host: `collectd.host`, else `host.name`, else
 /// [`CollectdEncoder::with_hostname`], the first that sanitizes non-empty. `false` means none, and
 /// the event is dropped (counted `no_host`).
 fn resolve_host(
@@ -1233,7 +1240,7 @@ mod tests {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
-    /// A like-relay event: `_logit.collectd.*` identity present, so the encoder re-emits it
+    /// A like-relay event: collectd identity attributes present, so the encoder re-emits it
     /// verbatim.
     fn relay_event(records: Vec<MetricRecord>) -> Event {
         let mut event = Event::empty(
@@ -1907,7 +1914,7 @@ mod tests {
 
     #[test]
     fn the_host_falls_back_from_collectd_host_to_host_name_to_the_configured_hostname() {
-        // `_logit.collectd.host` wins.
+        // `collectd.host` wins.
         let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
         event.attributes.insert("host.name", Value::from("ignored"));
         let (packets, _) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
@@ -2166,7 +2173,7 @@ mod tests {
         assert_eq!(stats, EncodeStats { skipped_no_metrics: 1, ..EncodeStats::default() });
     }
 
-    /// A resource-level `_logit.collectd.*` carrier works, and an event-level one wins over it.
+    /// A resource-level collectd carrier works, and an event-level one wins over it.
     #[test]
     fn resource_carriers_apply_and_event_carriers_win() {
         let mut resource_attrs = AttrMap::new();

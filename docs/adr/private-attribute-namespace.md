@@ -65,7 +65,7 @@ By protocol, these move under `_logit.`:
 |---|---|
 | statsd | every `statsd.*` attribute: `type`, `container_id`, `external_data`, `cardinality`, `timestamp`, `event.*`, `service_check.*` |
 | Prometheus | every `prometheus.*` attribute: `type`, `timestamp`, and the resource attribute `target` |
-| collectd | every `collectd.*` attribute: the five-tuple, `interval`, and `severity` |
+| collectd | `plugin`, `type`, `interval`, and `severity` |
 | Datadog | every `datadog.*` attribute: series, events, service checks, Agent fields, trace chunk, stats, tracer headers, `span.error`, and `source` |
 | InfluxDB | `influxdb.measurement`, and the resource attributes `influxdb.org`, `influxdb.org_id`, and `influxdb.bucket` |
 | syslog | `syslog.severity` |
@@ -74,6 +74,9 @@ By protocol, these move under `_logit.`:
 These stay public:
 
 - `influxdb.field.<key>`: a string field's content, which is data, not a carrier.
+- `collectd.host`, `collectd.plugin_instance`, and `collectd.type_instance`: identity with no
+  other home. The record name holds only the plugin and type, and the host stays off the
+  resource, so hiding them would merge different hosts' and instances' lists into one series.
 - `syslog.timestamp`: the sender's own stamp. `Event.timestamp` is receipt time until a
   `timestamp` component resolves it, so the attribute duplicates nothing, and an operator names it
   in that component's config.

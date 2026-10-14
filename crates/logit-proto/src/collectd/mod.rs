@@ -44,7 +44,7 @@
 //! | ABSOLUTE `u64` | `Sum { value: U64(v), Delta, monotonic: true }` | none |
 //! | GAUGE finite/±inf | `Gauge(F64(v))` | none |
 //! | GAUGE NaN | `Gauge(F64(0.0))` + [`logit_core::MetricRecord::FLAG_NO_RECORDED_VALUE`] | none -- NaN *is* collectd's "no value for this interval," and a flagged point is the model's word for that. Carrying the NaN through instead would make every `PartialEq` fixed-point test a lie (`NaN != NaN`). |
-//! | Host/Plugin/PluginInstance/Type/TypeInstance | sticky → the `_logit.collectd.*` attributes below; an **empty** string part clears the field, so the attribute is absent | -- |
+//! | Host/Plugin/PluginInstance/Type/TypeInstance | sticky → the `collectd.*` and `_logit.collectd.*` attributes below; an **empty** string part clears the field, so the attribute is absent | -- |
 //! | Values with an empty host, plugin or type | list skipped, nothing pushed | `incomplete_identity` (collectd's own receiver rejects the same list with `-EINVAL`) |
 //! | TimeHR (2⁻³⁰ s) / Time (s) / neither | `Event::timestamp` = [`cdtime_to_nanos`] / `s * 1e9` / `received_at` | -- (collectd rejects a `time == 0` list; this codec observes rather than rejects, so a timeless list is stamped with receipt time like every other `logit` input) |
 //! | IntervalHR / Interval | `_logit.collectd.interval` = `F64` seconds (`cdtime / 2³⁰`, exact); `0` → absent | -- |
@@ -60,10 +60,10 @@
 //!
 //! In every record name, `<plugin>` and `<type>` are each cut to their first 127 bytes, the
 //! longest string collectd's own receiver takes, and a UTF-8 sequence the cut splits becomes
-//! U+FFFD; the `_logit.collectd.*` attributes keep every byte. A list whose name is cut reports
-//! `record_name_cut`. Every sink but `collectd_out` ignores the private `_logit.collectd.*`
-//! attributes, so it writes two Plugins or Types that share their first 127 bytes as one series
-//! (ADR `collectd-binary-relay`'s record-name amendment).
+//! U+FFFD; the `_logit.collectd.plugin` and `_logit.collectd.type` attributes keep every byte. A
+//! list whose name is cut reports `record_name_cut`. Every sink but `collectd_out` ignores those
+//! two private attributes, so it writes two Plugins or Types that share their first 127 bytes as
+//! one series (ADR `collectd-binary-relay`'s record-name amendment).
 //!
 //! ## Notifications: `0x0100`/`0x0101`
 //!
@@ -89,10 +89,10 @@
 //! The decoded [`logit_core::Resource`] is always the decoder's own shared one and the
 //! [`logit_core::Scope`] is always `None`: `logit_pipeline::BatchAccumulator::absorb` keys
 //! accumulation on `Arc::ptr_eq`, so a per-host resource would split every batch by sender. The
-//! host rides on `_logit.collectd.host` instead.
+//! host rides on `collectd.host` instead.
 //!
 //! **Record names are display/cross-protocol only.** `collectd_out` re-encodes a list from the
-//! `_logit.collectd.*` attributes, the `MetricList`'s order, and each record's kind, and never
+//! attributes below, the `MetricList`'s order, and each record's kind, and never
 //! reads the name, so a pipeline with no `types_db:`, a stale one, or the sender's own relays the
 //! same bytes. The names change only what an InfluxDB/Prometheus/statsd sink calls the series,
 //! which is the reason to configure [`types_db`].
@@ -101,9 +101,9 @@
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
-//! | event with `_logit.collectd.type` present (merged: event attributes, then resource) | **like-relay**: one Values part carrying every record of `event.metrics` in order, identity straight off the `_logit.collectd.*` attributes | -- |
+//! | event with `_logit.collectd.type` present (merged: event attributes, then resource) | **like-relay**: one Values part carrying every record of `event.metrics` in order, identity straight off the `collectd.*` and `_logit.collectd.*` attributes | -- |
 //! | event without `_logit.collectd.type` | **fallback**: one single-data-source list per record -- plugin = the record name up to its first `.` (the whole name if it has none), type_instance = the remainder, type = `counter`/`gauge`/`derive`/`absolute` by kind (all single-data-source types in a stock `types.db`), no plugin_instance | -- |
-//! | an event with `event.metrics` non-empty **and** an [`ATTR_SEVERITY`] attribute | metrics win: the event encodes as an ordinary value list (like-relay or fallback, per the two rows above); `_logit.collectd.severity` has no wire form on a value list and is dropped like any other unrepresentable `_logit.collectd.*` carrier | `logit.output.tags.omitted{reason="unrepresentable"}` |
+//! | an event with `event.metrics` non-empty **and** an [`ATTR_SEVERITY`] attribute | metrics win: the event encodes as an ordinary value list (like-relay or fallback, per the two rows above); `_logit.collectd.severity` has no wire form on a value list and is dropped like any other unrepresentable carrier | `logit.output.tags.omitted{reason="unrepresentable"}` |
 //! | `Sum{Cumulative, monotonic}`, an `I64`/`U64` or integral `F64` in `u64` range | COUNTER | -- |
 //! | `Sum{Cumulative, !monotonic}`, an `I64`/`U64` or integral `F64` in `i64` range | DERIVE | -- |
 //! | `Sum{Delta, monotonic}`, an `I64`/`U64` or integral `F64` in `u64` range | ABSOLUTE | -- |
@@ -123,11 +123,11 @@
 //! | `_logit.collectd.interval` `F64`, finite, `> 0` | IntervalHR = `round(v * 2³⁰)` | -- |
 //! | `_logit.collectd.interval` absent | IntervalHR `0` (collectd's own "unspecified") | -- |
 //! | `_logit.collectd.interval` present but not a finite positive `F64` | IntervalHR `0` | `logit.output.tags.omitted{reason="unrepresentable"}` |
-//! | host | `_logit.collectd.host`, else `host.name`, else the encoder's [`CollectdEncoder::with_hostname`] value -- the first that survives sanitizing non-empty | -- |
+//! | host | `collectd.host`, else `host.name`, else the encoder's [`CollectdEncoder::with_hostname`] value -- the first that survives sanitizing non-empty | -- |
 //! | none of those three present | the whole event is dropped | `logit.output.metrics.dropped{reason="no_host"}` + diag `no_host`. collectd's receiver rejects an empty host, and there is no honest substitute: this codec neither reads the OS hostname (deferred work, `docs/known-gaps/mappings.md`) nor invents a placeholder, since one made-up name would silently merge every unlabelled sender into a single host's metrics. |
-//! | `_logit.collectd.*` identity, `Str` or `Bytes` | verbatim after sanitizing; a `Bytes` is byte-verbatim (collectd's own strings are bytes, not UTF-8) | `logit.output.identity.sanitized{reason="substituted"\|"truncated"}` |
-//! | `_logit.collectd.*` identity of any other `Value` type | treated as absent | `logit.output.tags.omitted{reason="unrepresentable"}` |
-//! | every attribute outside the private `_logit.` prefix (a `_logit.` key outside `_logit.collectd.` is skipped uncounted) | dropped -- collectd has no tag concept at all, and `host.name` is counted here too even though the host resolution above reads it | `logit.output.tags.omitted{reason="no_wire_form"}`, once per attribute per event |
+//! | collectd identity attributes, `Str` or `Bytes` | verbatim after sanitizing; a `Bytes` is byte-verbatim (collectd's own strings are bytes, not UTF-8) | `logit.output.identity.sanitized{reason="substituted"\|"truncated"}` |
+//! | collectd identity attributes of any other `Value` type | treated as absent | `logit.output.tags.omitted{reason="unrepresentable"}` |
+//! | every attribute that is neither a carrier below nor under the private `_logit.` prefix (a `_logit.` key outside `_logit.collectd.` is skipped uncounted) | dropped -- collectd has no tag concept at all, and `host.name` is counted here too even though the host resolution above reads it | `logit.output.tags.omitted{reason="no_wire_form"}`, once per attribute per event |
 //! | plugin or type empty after sanitizing | the list is dropped | `logit.output.metrics.dropped{reason="empty_name"}` |
 //! | a like-relay event carrying more than [`MAX_VALUES_PER_LIST`] records | the list is dropped whole | `logit.output.metrics.dropped{reason="too_many_values"}` + diag `too_many_values`. The cap is pair-wide: a longer list fits comfortably under the byte cap, but the decode side of this very codec rejects it as a malformed part -- and that abandons every unrelated list packed behind it in the same datagram. `aggregate`/`kv_metrics` can both put far more than 64 records on one event. |
 //! | a list that alone exceeds `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.dropped{reason="oversize_value_list"}` + diag `oversize_value_list` |
@@ -151,15 +151,17 @@
 //! one. Plugin/PluginInstance/Type/TypeInstance parts are still written only when non-empty: "in
 //! full" means "not elided", not "every field present".
 //!
-//! ## Well-known attributes (`_logit.collectd.*`)
+//! ## Well-known attributes
 //!
 //! Rule (b) of [ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md): the raw,
 //! protocol-native fact rides alongside the normalized model field and wins on the way back out.
 //! These are **event** attributes, never resource ones (the `Arc::ptr_eq` accumulator keying
 //! above). `collectd_out` *consumes* each one (reads it for its own purpose, never re-emits it as
-//! something else); every other sink ignores it, as it ignores every key under the private
-//! `_logit.` prefix
-//! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
+//! something else). The four under `_logit.collectd.` are private
+//! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)):
+//! every other sink ignores them, because the record name or a typed field already carries what
+//! they say. `collectd.host`, `collectd.plugin_instance`, and `collectd.type_instance` are public
+//! identity with no other home, so every other sink renders them as ordinary tags.
 //! `docs/design/data-model.md`'s well-known-attribute table is the canonical list.
 //!
 //! | Attribute | Value | Meaning |
@@ -170,7 +172,7 @@
 //! | [`ATTR_TYPE`] | `Str`/`Bytes` | the wire Type; **its presence is what selects like-relay encoding** |
 //! | [`ATTR_TYPE_INSTANCE`] | `Str`/`Bytes` | the wire TypeInstance, only when non-empty |
 //! | [`ATTR_INTERVAL`] | `F64` seconds | `cdtime / 2³⁰`, exact; absent when the wire carried no interval or a zero one |
-//! | [`ATTR_SEVERITY`] | `U64` ∈ {1, 2, 4} | the raw wire severity of a *notification* (1 FAILURE, 2 WARNING, 4 OKAY); its presence on a **metrics-empty** event is what makes `collectd_out` encode it as a notification rather than skip it, and its value -- not the normalized [`logit_core::LogRecord::severity`] -- is what reaches the wire, outranking it exactly as `syslog.severity`/`otel.severity_number` outrank their own normalized field (rule (b) of [ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)). **Metrics win**: on an event that also carries `event.metrics`, this attribute has no wire form -- a value list has no severity concept -- and is dropped and counted like any other unrepresentable `_logit.collectd.*` carrier. |
+//! | [`ATTR_SEVERITY`] | `U64` ∈ {1, 2, 4} | the raw wire severity of a *notification* (1 FAILURE, 2 WARNING, 4 OKAY); its presence on a **metrics-empty** event is what makes `collectd_out` encode it as a notification rather than skip it, and its value -- not the normalized [`logit_core::LogRecord::severity`] -- is what reaches the wire, outranking it as `_logit.syslog.severity`/`_logit.otel.severity_number` outrank their own normalized field (rule (b) of [ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)). **Metrics win**: on an event that also carries `event.metrics`, this attribute has no wire form -- a value list has no severity concept -- and is dropped and counted like any other unrepresentable carrier. |
 //!
 //! ## Sanitization
 //!
@@ -272,16 +274,16 @@ pub const NOTIF_MAX_MSG_LEN: usize = 256;
 pub const MAX_VALUES_PER_LIST: usize = 64;
 
 /// The wire Host. See this module doc's well-known-attribute table.
-pub const ATTR_HOST: &str = "_logit.collectd.host";
+pub const ATTR_HOST: &str = "collectd.host";
 /// The wire Plugin.
 pub const ATTR_PLUGIN: &str = "_logit.collectd.plugin";
 /// The wire PluginInstance, present only when non-empty.
-pub const ATTR_PLUGIN_INSTANCE: &str = "_logit.collectd.plugin_instance";
+pub const ATTR_PLUGIN_INSTANCE: &str = "collectd.plugin_instance";
 /// The wire Type. Its **presence** is what makes `collectd_out` re-emit an event as a like-relay
 /// value list rather than through the fallback naming path.
 pub const ATTR_TYPE: &str = "_logit.collectd.type";
 /// The wire TypeInstance, present only when non-empty.
-pub const ATTR_TYPE_INSTANCE: &str = "_logit.collectd.type_instance";
+pub const ATTR_TYPE_INSTANCE: &str = "collectd.type_instance";
 /// The wire Interval, as `Value::F64` seconds (`cdtime / 2³⁰`, exact).
 pub const ATTR_INTERVAL: &str = "_logit.collectd.interval";
 /// The raw wire severity of a *notification* (`1` FAILURE, `2` WARNING, `4` OKAY), as
@@ -292,8 +294,9 @@ pub const ATTR_INTERVAL: &str = "_logit.collectd.interval";
 /// [`logit_core::LogRecord::severity`], is what reaches the wire.
 pub const ATTR_SEVERITY: &str = "_logit.collectd.severity";
 
-/// The prefix every attribute above shares. The encoder excludes the whole namespace when it
-/// decides what has no wire form, so a later addition can't leak onto the wire as something else.
+/// The prefix of the private attributes above: plugin, type, interval, and severity. The encoder
+/// excludes the whole namespace when it decides what has no wire form, so a later addition can't
+/// leak onto the wire as something else.
 pub const ATTR_PREFIX: &str = "_logit.collectd.";
 
 /// One second in collectd's `cdtime_t` units (2⁻³⁰ s ticks).

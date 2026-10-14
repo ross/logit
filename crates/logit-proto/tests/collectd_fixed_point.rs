@@ -5,9 +5,9 @@
 //! Two properties, per fixture:
 //!
 //! 1. **`decode(encode(b)) == b`**, whole-event `PartialEq`. Every fixture has the shape a real
-//!    decode produces (identity on `_logit.collectd.*` attributes, a positive timestamp, integral
-//!    values for COUNTER/DERIVE/ABSOLUTE, names `<plugin>.<type>[.<i>]`), so the check isn't a
-//!    tautology.
+//!    decode produces (identity on the `collectd.*` and `_logit.collectd.*` attributes, a positive
+//!    timestamp, integral values for COUNTER/DERIVE/ABSOLUTE, names `<plugin>.<type>[.<i>]`), so
+//!    the check isn't a tautology.
 //! 2. **`encode(decode(encode(b))) == encode(b)` on bytes**, which catches a codec that writes two
 //!    byte strings for one batch (a non-deterministic elision decision, a sometimes-written part).
 //!

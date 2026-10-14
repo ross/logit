@@ -1672,7 +1672,7 @@ deployment conventions:
   `load.load.shortterm` instead of `load.load.0`. List several files to merge them in order, a later
   file overriding an earlier one. A file that can't be read or parsed fails startup, naming the
   path and line. It changes only what a cross-protocol sink (InfluxDB, Prometheus, statsd) calls the
-  series: `collectd_out` re-encodes from the `_logit.collectd.*` attributes, so a
+  series: `collectd_out` re-encodes from the `collectd.*` and `_logit.collectd.*` attributes, so a
   `collectd_in -> collectd_out` relay puts the same bytes on the wire either way.
 
 [`fixtures/collectd-to-influxdb.yaml`](../fixtures/collectd-to-influxdb.yaml) is a complete,
@@ -1681,12 +1681,11 @@ above as commented alternatives. **Don't put an `aggregate` between them.** Unli
 [`fixtures/statsd-to-influxdb.yaml`](../fixtures/statsd-to-influxdb.yaml), it has none, because a
 collectd value list is already one pre-aggregated reading per `Interval` with its own timestamp;
 re-windowing it would average averages and re-stamp them with the flush time. The file's header
-comment lists what the cross-protocol hop costs. The host and the rest of a list's identity ride
-on private `_logit.collectd.*` attributes, which no sink but `collectd_out` writes, so InfluxDB sees
-only the measurement name: lists from different hosts, or with different plugin or type instances,
-of the same plugin and type share a series. To keep one as a tag, copy it to a public attribute
-name in a `lua` stage ahead of `influxdb_out`. One N-data-source list also becomes N measurements
-named `plugin.type.ds` sharing a timestamp.
+comment lists what the cross-protocol hop costs. `collectd.host`, `collectd.plugin_instance`, and
+`collectd.type_instance` become InfluxDB tags, so lists from different hosts or instances stay
+apart. The plugin, type, interval, and severity ride on private `_logit.collectd.*` attributes that
+only `collectd_out` writes; the plugin and type already make up the measurement name. One
+N-data-source list becomes N measurements named `plugin.type.ds` sharing a tag set and a timestamp.
 
 ### `graphite_in`: carbon plaintext and pickle, TCP or UDP
 
@@ -1963,8 +1962,8 @@ reference. Before deploying one:
   list too large to fit alone is dropped whole and counted
   `logit.output.metrics.dropped{reason="oversize_value_list"}`, not split.
 - **Set `hostname:` if the pipeline carries metrics that didn't come from `collectd_in`.** A relayed
-  list already carries its origin's host on `_logit.collectd.host`, so a pure relay never needs it.
-  Metrics from a `statsd_in`/`internal` with no `_logit.collectd.host` or `host.name`, and no
+  list already carries its origin's host on `collectd.host`, so a pure relay never needs it.
+  Metrics from a `statsd_in`/`internal` with no `collectd.host` or `host.name`, and no
   `hostname:` set, are dropped and counted `logit.output.metrics.dropped{reason="no_host"}` with a
   `no_host` diagnostic. That is deliberate: collectd's receiver rejects an empty host, and inventing
   one would merge every unlabeled sender into one host's metrics.

@@ -17,7 +17,7 @@
 //! - `max_packet_bytes`: default `1452` (collectd's `MaxPacketSize`,
 //!   [`logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES`]), bounded to `1024..=65507` by graph
 //!   rule 38: collectd's own floor, and the largest UDP payload.
-//! - `hostname:`: optional, used only when an event carries neither `_logit.collectd.host` nor
+//! - `hostname:`: optional, used only when an event carries neither `collectd.host` nor
 //!   `host.name`. With neither, the list is dropped and counted (`no_host`); the sink never reads
 //!   the OS hostname or invents one (`CollectdEncoder::with_hostname`).
 //!
@@ -229,7 +229,7 @@ mod tests {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
-    /// A like-relay event: `_logit.collectd.*` identity and one gauge. Decode-shaped so
+    /// A like-relay event: collectd identity attributes and one gauge. Decode-shaped so
     /// whole-`Event` equality against a real decode is meaningful: the record name is
     /// `<plugin>.<type>`, the decoder's naming rule for a single-data-source list.
     fn relay_event(host: &str, plugin: &str, value: f64) -> Event {
@@ -249,7 +249,7 @@ mod tests {
         event
     }
 
-    /// A fallback-shaped event: no `_logit.collectd.*` identity, so it encodes only with a
+    /// A fallback-shaped event: no collectd identity attributes, so it encodes only with a
     /// configured `hostname:`, via the fallback naming path.
     fn counter_event(name: &str, value: f64) -> Event {
         Event::metric(

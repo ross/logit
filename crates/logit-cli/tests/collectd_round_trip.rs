@@ -96,12 +96,13 @@
 //!
 //! ## Cross-protocol
 //!
-//! `statsd_in -> collectd_out` exercises the encoder's fallback path (no `_logit.collectd.*`
-//! identity), including its two likeliest drops: a sampled counter's non-integral extrapolation,
-//! and a DogStatsD tag, which collectd has no wire form for. `collectd_in -> aggregate ->
-//! collectd_out` pins that a cumulative `Sum` (what COUNTER and DERIVE decode to) passes through
-//! `aggregate` untouched, so the relay stays byte-identical with a window in the middle.
-//! `collectd_in -> prometheus_out` pins that the private identity attributes never become labels.
+//! `statsd_in -> collectd_out` exercises the encoder's fallback path (no collectd identity),
+//! including its two likeliest drops: a sampled counter's non-integral extrapolation, and a
+//! DogStatsD tag, which collectd has no wire form for. `collectd_in -> aggregate -> collectd_out`
+//! pins that a cumulative `Sum` (what COUNTER and DERIVE decode to) passes through `aggregate`
+//! untouched, so the relay stays byte-identical with a window in the middle. `collectd_in ->
+//! prometheus_out` pins that the private carriers never become labels while the public identity
+//! fields do.
 
 use bytes::Bytes;
 use logit_core::{Diagnostics, EventBatch, MetricKind, Registry, Resource, Value};
@@ -1447,11 +1448,11 @@ async fn collectd_in_aggregate_collectd_out_relay_is_exact_for_cumulative_sums()
     );
 }
 
-/// `collectd_in -> prometheus_out`: a value list's identity rides on private `_logit.collectd.*`
-/// attributes, which a Prometheus exposition never renders as labels, so nothing named after a
-/// collectd field reaches the scrape body.
+/// `collectd_in -> prometheus_out`: the private `_logit.collectd.*` carriers (plugin, type,
+/// interval) never become labels, while the public `collectd.host` and `collectd.type_instance`
+/// do, since no other part of the series carries them.
 #[test]
-fn a_value_list_relayed_to_prometheus_carries_no_collectd_labels() {
+fn a_value_list_relayed_to_prometheus_labels_only_public_collectd_identity() {
     let batch = direct_batch(&read_fixture("single-gauge", "in"));
     assert_eq!(attr(&batch.events[0], ATTR_PLUGIN), Some(Value::from("memory")));
 
@@ -1467,7 +1468,12 @@ fn a_value_list_relayed_to_prometheus_carries_no_collectd_labels() {
         .flat_map(|family| &family.series)
         .flat_map(|series| series.labels.iter().map(|(name, _)| name.as_str()))
         .collect();
-    assert!(labels.is_empty(), "no collectd carrier may become a label: {labels:?}");
+    assert!(!labels.contains(&"collectd_plugin"), "a private carrier became a label: {labels:?}");
+    assert_eq!(
+        labels,
+        vec!["collectd_host", "collectd_type_instance"],
+        "the public identity fields, and nothing else, are labels"
+    );
 
     let mut body = Vec::new();
     logit_proto::prometheus::text::write(
@@ -1476,5 +1482,5 @@ fn a_value_list_relayed_to_prometheus_carries_no_collectd_labels() {
         &mut body,
     );
     let body = String::from_utf8(body).expect("exposition must be utf-8");
-    assert!(!body.contains("collectd"), "exposition:\n{body}");
+    assert!(!body.contains("logit_collectd"), "exposition:\n{body}");
 }

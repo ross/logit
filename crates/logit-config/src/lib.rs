@@ -3449,9 +3449,8 @@ pub enum ComponentKind {
         #[serde(default = "default_collectd_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
-        /// Used only when an event carries neither the origin host `collectd_in` records
-        /// (`_logit.collectd.host`) nor `host.name` (one that never passed through `collectd_in`,
-        /// say). No default, so a relayed list's origin is
+        /// Used only when an event carries neither `collectd.host` nor `host.name` (one that
+        /// never passed through `collectd_in`, say). No default, so a relayed list's origin is
         /// never silently overwritten. With nothing configured and nothing on the event, the list
         /// is dropped and counted (`logit.output.metrics.dropped{reason="no_host"}`): collectd's
         /// receiver rejects an empty host.
