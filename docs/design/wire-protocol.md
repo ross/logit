@@ -162,7 +162,7 @@ at a power-of-two count (`tests/robustness.rs`'s
 | `METRIC_SET_MEMBERS` member | 1 B | 32 B `Bytes` | 32 | `size_of::<Bytes>()` |
 | `TAG_ARRAY` item | 2 B | 40 B `Value` | 20 | `size_of::<Value>()` |
 | `SR_LINKS` entry | 29 B | 456 B `SpanLink` | 15.7 | `size_of::<SpanLink>()` |
-| `FIELD_METRICS` record | 19 B | 224 B `MetricRecord` | 11.8 | `size_of::<MetricRecord>()` |
+| `FIELD_METRICS` record | 20 B | 224 B `MetricRecord` | 11.2 | `size_of::<MetricRecord>()` |
 | Exponential-histogram bucket | 1 B | 8 B `u64` | 8 | 8 B |
 | `METRIC_SAMPLES` value | 8 B | 8 B `f64` | 2 | 8 B |
 | `METRIC_HISTOGRAM` bucket | 9 B | 16 B `(f64, u64)` | 1.8 | 16 B |
@@ -333,11 +333,17 @@ then the kind's *fixed, sequential* body. A kind's shape is locked to its tag, s
 skip inside one. `read_metric_kind` rejects an unrecognized kind tag as `Malformed` instead of
 skipping it, because a metric with no interpretable value can't be carried forward.
 
+A *scalar* is a `MetricValue`: a type byte, then eight little-endian value bytes, nine bytes in
+all. The type byte is `0` for `F64` (the `f64`'s bits), `1` for `I64`, `2` for `U64`, and `3` for
+`Bool`, whose eight bytes hold the `u64` `0` or `1`. A reader rejects any other type byte, or a
+`Bool` holding anything but `0` or `1`, as `Malformed`
+([ADR `typed-metric-scalar`](../adr/typed-metric-scalar.md)).
+
 | Tag | Kind | Payload |
 |---|---|---|
-| 0 | `Sum` | `value: f64` LE + `temporality: u8` (`0`=Delta, `1`=Cumulative) + `monotonic: u8` |
-| 1 | `Gauge` | `f64` LE |
-| 2 | `GaugeDelta` | `f64` LE |
+| 0 | `Sum` | `value`: scalar + `temporality: u8` (`0`=Delta, `1`=Cumulative) + `monotonic: u8` |
+| 1 | `Gauge` | scalar |
+| 2 | `GaugeDelta` | scalar |
 | 3 | `Samples` | `uvarint(n)` + `n` × `f64` LE values + `sample_rate: f64` LE |
 | 4 | `Distribution` | `DdSketch::to_bytes()`'s blob, verbatim: a version byte, the mapping (the Agent mapping as one byte, a logarithmic one as `gamma`/`index_offset`/`bin_limit`), the exact-stats flag, `count`/`min`/`max`/`sum`/`zero_count` as `f64` LE, then the positive and negative stores, each `uvarint(n)` + `n` × (zigzag-varint key delta + `count: f64` LE). This process's own form, not a Datadog wire format; `logit_proto`'s Datadog codecs build those from the sketch's bins |
 | 5 | `SetMembers` | `uvarint(n)` + `n` × (`uvarint(len)` + member bytes) |

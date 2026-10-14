@@ -37,7 +37,7 @@ pub fn reasons(registry: &Registry) -> Reasons {
                 _ => continue,
             };
             let count = match &metric.kind {
-                MetricKind::Sum(sum) => sum.value,
+                MetricKind::Sum(sum) => sum.value.as_f64(),
                 _ => 0.0,
             };
             *map.entry(reason.unwrap_or("").to_string()).or_insert(0) += count as u64;

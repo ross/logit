@@ -30,7 +30,7 @@ mod signals;
 mod timestamp;
 mod trace_context;
 
-use logit_core::{AttrMap, Value};
+use logit_core::{AttrMap, MetricValue, Value};
 
 pub use aggregate::{AggregateTemporality, Aggregator, Distributions, Sets};
 pub use attributes::{DropAttributes, HasAttributes};
@@ -70,6 +70,18 @@ pub(crate) fn numeric(value: &Value) -> Option<f64> {
         _ => return None,
     };
     v.is_finite().then_some(v)
+}
+
+/// [`numeric`], keeping an integer attribute's type: `I64` and `U64` become the matching
+/// `MetricValue` variant with no `f64` round trip, so a value above 2^53 stays exact. `F64` and a
+/// parsed `Str` become `F64`. Used by `kv_metrics`, which does no arithmetic on the value
+/// (`docs/adr/typed-metric-scalar.md`'s "Arithmetic widens, counted").
+pub(crate) fn numeric_typed(value: &Value) -> Option<MetricValue> {
+    match value {
+        Value::I64(n) => Some(MetricValue::I64(*n)),
+        Value::U64(n) => Some(MetricValue::U64(*n)),
+        _ => numeric(value).map(MetricValue::F64),
+    }
 }
 
 /// An attribute is present only if it carries a value. `Null`, `""`, and `"-"` are how nginx
@@ -400,12 +412,12 @@ mod chained_pipeline_test {
             match resolve(record.name) {
                 "nginx.requests" => {
                     assert!(
-                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 1.0)
+                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == MetricValue::F64(1.0))
                     );
                 }
                 "nginx.bytes_sent" => {
                     assert!(
-                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 512.0)
+                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == MetricValue::U64(512))
                     );
                 }
                 "nginx.request_time" => match &record.kind {
@@ -617,10 +629,10 @@ mod chained_pipeline_test {
             };
             match resolve(record.name) {
                 "web.requests" => assert!(
-                    matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 1.0)
+                    matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == MetricValue::F64(1.0))
                 ),
                 "web.bytes_sent" => assert!(
-                    matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 612.0)
+                    matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == MetricValue::I64(612))
                 ),
                 "web.request_time" => {
                     let q = median(&record.kind);
@@ -716,7 +728,7 @@ mod chained_pipeline_test {
         assert_eq!(series_event.attributes.get("req.method"), Some(&Value::str("GET")));
         assert_eq!(series_event.attributes.get("res.statusCode"), Some(&Value::U64(200)));
         assert!(
-            matches!(series_event.metrics[0].kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 1.0)
+            matches!(series_event.metrics[0].kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == MetricValue::F64(1.0))
         );
     }
 
@@ -798,12 +810,12 @@ mod chained_pipeline_test {
             match resolve(record.name) {
                 "nginx.requests" => {
                     assert!(
-                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 1.0)
+                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == MetricValue::F64(1.0))
                     );
                 }
                 "nginx.bytes_sent" => {
                     assert!(
-                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 512.0)
+                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == MetricValue::F64(512.0))
                     );
                 }
                 "nginx.request_time" => match &record.kind {
@@ -955,7 +967,7 @@ mod chained_pipeline_test {
             match resolve(record.name) {
                 "nginx.bytes_sent" => {
                     assert!(
-                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 612.0)
+                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == MetricValue::F64(612.0))
                     );
                 }
                 "nginx.request_time" => match &record.kind {

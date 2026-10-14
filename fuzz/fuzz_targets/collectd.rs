@@ -29,8 +29,8 @@ use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use logit_core::interner::resolve;
 use logit_core::{
-    subslice, AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Severity,
-    Temporality, Value,
+    subslice, AttrMap, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource,
+    Severity, Temporality, Value,
 };
 use logit_proto::collectd::part::{self, TYPE_ENCRYPTION, TYPE_SIGNATURE};
 use logit_proto::collectd::{
@@ -151,14 +151,17 @@ fn check_event(datagram: &Bytes, event: &Event) {
         match &record.kind {
             MetricKind::Sum(sum) => {
                 assert_eq!(record.flags, 0, "model: only a GAUGE is flagged");
-                assert!(sum.value.is_finite(), "model: an integer is finite");
                 if sum.temporality == Temporality::Delta {
-                    assert!(sum.monotonic && sum.value >= 0.0, "model: ABSOLUTE is a u64");
+                    assert!(sum.monotonic, "model: ABSOLUTE is monotonic");
+                    assert!(matches!(sum.value, MetricValue::U64(_)), "model: ABSOLUTE is a u64");
                 } else if sum.monotonic {
-                    assert!(sum.value >= 0.0, "model: COUNTER is a u64");
+                    assert!(matches!(sum.value, MetricValue::U64(_)), "model: COUNTER is a u64");
+                } else {
+                    assert!(matches!(sum.value, MetricValue::I64(_)), "model: DERIVE is an i64");
                 }
             }
             MetricKind::Gauge(v) => {
+                let MetricValue::F64(v) = v else { panic!("model: a GAUGE is an f64") };
                 assert!(!v.is_nan(), "model: a NaN GAUGE is flagged, never carried");
                 if record.flags != 0 {
                     assert_eq!(record.flags, MetricRecord::FLAG_NO_RECORDED_VALUE);

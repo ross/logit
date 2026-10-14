@@ -38,6 +38,8 @@
 //! | `Sum{Cumulative, monotonic}` | `metric_name:<n>: v`, `metric_type` `"Sum"` | -- |
 //! | a delta or non-monotonic `Sum` | as above: `metric_type` `"Sum"` has no temporality or monotonicity carrier | `logit.output.metrics.degraded{metric_kind="delta_sum"\|"non_monotonic_sum"}` |
 //! | a non-finite value | the string `"+Inf"`, `"-Inf"`, or `"NaN"` | -- |
+//! | an `I64` or `U64` value | a JSON integer, in its own digits | -- |
+//! | a `Bool` value | `1` or `0` | `logit.output.metrics.normalized{reason="bool_value"}` |
 //! | `GaugeDelta` | dropped: not a Splunk concept, and an `aggregate` resolves it upstream | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` |
 //! | `ExponentialHistogram` | skipped under both `MultiValue` settings, as the exporter does | `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` |
 //! | a record flagged `NO_RECORDED_VALUE` | skipped | `skipped{reason="no_recorded_value"}` |
@@ -76,8 +78,8 @@ use crate::prometheus::cumulative_counts;
 use crate::{MessageBuf, MultiValue, Signal};
 use logit_core::interner::{intern, resolve};
 use logit_core::{
-    AttrMap, DdSketch, Event, Histogram, MetricKind, MetricList, MetricRecord, Samples, Sum,
-    Summary, Symbol, Temporality, Value,
+    AttrMap, DdSketch, Event, Histogram, MetricKind, MetricList, MetricRecord, MetricValue,
+    Samples, Sum, Summary, Symbol, Temporality, Value,
 };
 use serde_json::{Map, Value as Json};
 use std::borrow::Cow;
@@ -171,12 +173,12 @@ impl SplunkDecoder {
         let kind = |v: f64| {
             if is_sum {
                 MetricKind::Sum(Sum {
-                    value: v,
+                    value: MetricValue::F64(v),
                     temporality: Temporality::Cumulative,
                     monotonic: true,
                 })
             } else {
-                MetricKind::Gauge(v)
+                MetricKind::gauge(v)
             }
         };
         let metrics: MetricList =
@@ -212,7 +214,7 @@ pub fn sanitize_metric_name(name: &str) -> Cow<'_, str> {
 struct MetricObject {
     metric_type: Value,
     extra: Option<(&'static str, String)>,
-    values: Vec<(String, f64)>,
+    values: Vec<(String, MetricValue)>,
 }
 
 /// An event's metric objects, in first-use order.
@@ -224,7 +226,8 @@ struct Objects {
 
 impl Objects {
     /// Adds `name = value` to the scalar object for `metric_type`, opening it on first use.
-    fn scalar(&mut self, metric_type: &Value, name: String, value: f64) {
+    fn scalar(&mut self, metric_type: &Value, name: String, value: impl Into<MetricValue>) {
+        let value = value.into();
         let at = match self
             .objects
             .iter()
@@ -260,7 +263,7 @@ impl Objects {
         self.objects.push(MetricObject {
             metric_type: Value::str(metric_type),
             extra: Some((dim, dim_value)),
-            values: vec![(name, value)],
+            values: vec![(name, MetricValue::F64(value))],
         });
     }
 }
@@ -300,13 +303,17 @@ impl SplunkEncoder {
             }
             let name = self.sanitized(resolve(record.name));
             match &record.kind {
-                MetricKind::Gauge(v) => objects.scalar(&gauge_type, name, *v),
+                MetricKind::Gauge(v) => {
+                    self.count_bool(*v);
+                    objects.scalar(&gauge_type, name, *v);
+                }
                 MetricKind::Sum(sum) => {
                     if sum.temporality == Temporality::Delta {
                         self.degrade_kind("delta_sum");
                     } else if !sum.monotonic {
                         self.degrade_kind("non_monotonic_sum");
                     }
+                    self.count_bool(sum.value);
                     objects.scalar(&sum_type, name, sum.value);
                 }
                 MetricKind::GaugeDelta(_) => self.unencoded(Unencoded::UnresolvedGaugeDelta, 1),
@@ -374,10 +381,28 @@ impl SplunkEncoder {
     fn degrade_kind(&self, kind: &'static str) {
         self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("metric_kind", kind)]);
     }
+
+    /// A `Bool` measurement leaves as `1` or `0` ([`write_measurement`]), counted.
+    fn count_bool(&self, value: MetricValue) {
+        if let MetricValue::Bool(_) = value {
+            self.telemetry.count(
+                "logit.output.metrics.normalized",
+                1.0,
+                &[("reason", "bool_value")],
+            );
+        }
+    }
 }
 
-/// A measurement: a finite value as a JSON number, a non-finite one as the exporter's string.
-fn write_measurement(out: &mut Vec<u8>, value: f64) {
+/// A measurement as a JSON number: an integer in its own digits, a `Bool` as `1` or `0`, and a
+/// non-finite `f64` as the exporter's string.
+fn write_measurement(out: &mut Vec<u8>, value: MetricValue) {
+    let value = match value {
+        MetricValue::I64(v) => return write_value(out, &Value::I64(v)),
+        MetricValue::U64(v) => return write_value(out, &Value::U64(v)),
+        MetricValue::Bool(b) => return write_value(out, &Value::I64(i64::from(b))),
+        MetricValue::F64(v) => v,
+    };
     if value.is_finite() {
         write_value(out, &Value::F64(value));
     } else if value.is_nan() {
@@ -511,7 +536,11 @@ mod tests {
     }
 
     fn cumulative(v: f64) -> MetricKind {
-        MetricKind::Sum(Sum { value: v, temporality: Temporality::Cumulative, monotonic: true })
+        MetricKind::Sum(Sum {
+            value: MetricValue::F64(v),
+            temporality: Temporality::Cumulative,
+            monotonic: true,
+        })
     }
 
     fn metric_batch(kinds: Vec<(&str, MetricKind)>, attrs: &[(&'static str, Value)]) -> EventBatch {
@@ -540,9 +569,9 @@ mod tests {
         assert_eq!(
             record_values(&events[0]),
             vec![
-                ("a".into(), MetricKind::Gauge(1.5)),
-                ("b".into(), MetricKind::Gauge(2.0)),
-                ("c".into(), MetricKind::Gauge(3.0)),
+                ("a".into(), MetricKind::gauge(1.5)),
+                ("b".into(), MetricKind::gauge(2.0)),
+                ("c".into(), MetricKind::gauge(3.0)),
             ]
         );
         assert_eq!(events[0].attributes.get("region"), Some(&Value::str("us")));
@@ -550,7 +579,7 @@ mod tests {
         assert_eq!(record_values(&events[1]), vec![("n".into(), cumulative(f64::INFINITY))]);
         assert!(events[1].attributes.is_empty(), "metric_type Sum is consumed");
         assert_eq!(events[2].attributes.get(ATTR_METRIC_TYPE), Some(&Value::str("Histogram")));
-        assert_eq!(record_values(&events[2]), vec![("h_bucket".into(), MetricKind::Gauge(4.0))]);
+        assert_eq!(record_values(&events[2]), vec![("h_bucket".into(), MetricKind::gauge(4.0))]);
     }
 
     #[test]
@@ -564,7 +593,7 @@ mod tests {
             .unwrap();
         let events = &batches[0].events;
         assert_eq!(events.len(), 2);
-        assert_eq!(record_values(&events[0]), vec![("y".into(), MetricKind::Gauge(2.0))]);
+        assert_eq!(record_values(&events[0]), vec![("y".into(), MetricKind::gauge(2.0))]);
         for (reason, n) in [
             ("bad_name", 1.0),
             ("bad_value", 2.0),
@@ -597,8 +626,8 @@ mod tests {
         assert_eq!(
             record_values(event),
             vec![
-                ("spl.sc4syslog.parser.discarded".into(), MetricKind::Gauge(3.0)),
-                ("spl.sc4syslog.parser.processed".into(), MetricKind::Gauge(0.0)),
+                ("spl.sc4syslog.parser.discarded".into(), MetricKind::gauge(3.0)),
+                ("spl.sc4syslog.parser.processed".into(), MetricKind::gauge(0.0)),
             ]
         );
         assert_eq!(event.attributes.get("module"), Some(&Value::str("parser")));
@@ -619,9 +648,9 @@ mod tests {
     fn scalar_records_group_by_metric_type() {
         let batch = metric_batch(
             vec![
-                ("g", MetricKind::Gauge(1.0)),
+                ("g", MetricKind::gauge(1.0)),
                 ("s", cumulative(2.0)),
-                ("inf", MetricKind::Gauge(f64::NEG_INFINITY)),
+                ("inf", MetricKind::gauge(f64::NEG_INFINITY)),
             ],
             &[("region", Value::str("us"))],
         );
@@ -637,7 +666,7 @@ mod tests {
     #[test]
     fn a_verbatim_metric_type_attribute_rides_on_gauges() {
         let batch = metric_batch(
-            vec![("h_bucket", MetricKind::Gauge(4.0))],
+            vec![("h_bucket", MetricKind::gauge(4.0))],
             &[("metric_type", Value::str("Histogram")), ("le", Value::str("0.5"))],
         );
         let body = encode(&[batch]);
@@ -653,12 +682,12 @@ mod tests {
                 (
                     "n",
                     MetricKind::Sum(Sum {
-                        value: 1.0,
+                        value: MetricValue::F64(1.0),
                         temporality: Temporality::Cumulative,
                         monotonic: false,
                     }),
                 ),
-                ("gd", MetricKind::GaugeDelta(1.0)),
+                ("gd", MetricKind::GaugeDelta(MetricValue::F64(1.0))),
             ],
             &[],
         );
@@ -814,7 +843,7 @@ mod tests {
             .find(|e| e.attributes.get("le") == Some(&Value::str("+Inf")))
             .unwrap();
         assert_eq!(bucket.attributes.get(ATTR_METRIC_TYPE), Some(&Value::str("Histogram")));
-        assert_eq!(record_values(bucket), vec![("hist_bucket".into(), MetricKind::Gauge(3.0))]);
+        assert_eq!(record_values(bucket), vec![("hist_bucket".into(), MetricKind::gauge(3.0))]);
         let e1 = encode(&batches);
         assert_eq!(decode(&e1), batches, "the expanded form decodes to a fixed point");
         assert_eq!(encode(&decode(&e1)), e1);
@@ -841,7 +870,7 @@ mod tests {
     fn sanitizing_is_counted_and_duplicate_names_are_skipped() {
         let registry = Registry::new();
         let batch = metric_batch(
-            vec![("a-b", MetricKind::Gauge(1.0)), ("a_b", MetricKind::Gauge(2.0))],
+            vec![("a-b", MetricKind::gauge(1.0)), ("a_b", MetricKind::gauge(2.0))],
             &[("metric_name:x", Value::F64(1.0)), ("_value", Value::I64(1))],
         );
         let objects = objects_of(&mut encoder(&registry), &batch);
@@ -868,7 +897,7 @@ mod tests {
     #[test]
     fn a_no_recorded_value_record_is_skipped() {
         let registry = Registry::new();
-        let mut batch = metric_batch(vec![("g", MetricKind::Gauge(1.0))], &[]);
+        let mut batch = metric_batch(vec![("g", MetricKind::gauge(1.0))], &[]);
         batch.events[0].metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         assert!(objects_of(&mut encoder(&registry), &batch).is_empty());
         assert_eq!(

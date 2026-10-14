@@ -55,10 +55,11 @@ use logit_core::interner::{intern, Symbol};
 use logit_core::trace::{parse_span_id, parse_trace_id, TraceRef};
 use logit_core::{
     AttrMap, BodyFormat, Event, Exemplar, ExpHistogram, Histogram, LogRecord, MetricKind,
-    MetricList, MetricRecord, Samples, Severity, SpanEvent, SpanExt, SpanKind, SpanLink,
-    SpanRecord, SpanStatus, Sum, Summary, Temporality, Value,
+    MetricList, MetricRecord, MetricValue, Samples, Severity, SpanEvent, SpanExt, SpanKind,
+    SpanLink, SpanRecord, SpanStatus, Sum, Summary, Temporality, Value,
 };
 use mlua::{IntoLua, Lua, Table, Value as LuaValue};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -423,7 +424,7 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
         Kind::Sum => {
             // `MetricKind::counter`'s defaults (delta, monotonic), so `{kind = "sum", value = 1}`
             // is the counter `kv_metrics`/`statsd_in` emit.
-            let value = finite_field(t.raw_get("value")?, path, "value")?;
+            let value = metric_value_field(&t, path)?;
             let temporality = enum_field(
                 t.raw_get("temporality")?,
                 path,
@@ -446,7 +447,7 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
             };
             MetricKind::Sum(Sum { value, temporality, monotonic })
         }
-        Kind::Gauge => MetricKind::Gauge(finite_field(t.raw_get("value")?, path, "value")?),
+        Kind::Gauge => MetricKind::Gauge(metric_value_field(&t, path)?),
         Kind::Samples => {
             // `values` go straight onto the record's `SmallVec`, so up to `SAMPLES_INLINE` of
             // them allocate nothing beyond the record.
@@ -601,8 +602,8 @@ impl Kind {
 
     fn keys(self) -> &'static [&'static str] {
         match self {
-            Kind::Sum => &["value", "temporality", "monotonic"],
-            Kind::Gauge => &["value"],
+            Kind::Sum => &["value", "type", "temporality", "monotonic"],
+            Kind::Gauge => &["value", "type"],
             Kind::Samples => &["values", "sample_rate"],
             Kind::SetMembers => &["members"],
             Kind::Histogram => &["buckets", "temporality", "sum", "min", "max"],
@@ -1295,6 +1296,130 @@ fn symbol_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Option<S
     }
 }
 
+/// A `sum`'s or `gauge`'s `value`, typed by its optional `type` (`docs/adr/typed-metric-scalar.md`).
+///
+/// - absent or `"f64"`: a finite number, [`finite_field`]'s rule.
+/// - `"i64"`: an integer within ±2^53, an integral float in that range, or a decimal string
+///   (optional `-`) that fits an `i64`.
+/// - `"u64"`: the same, non-negative, with a string that fits a `u64`.
+/// - `"bool"`: a boolean, or `0`/`1`.
+///
+/// A number above 2^53 is refused for an integer type: the double can't say which integer it
+/// was. `to_table()` writes such a value as a decimal string (`crate::value`'s
+/// `exact_i64_to_lua`/`exact_u64_to_lua`), so `Event.new(e:to_table())` rebuilds the same integer.
+fn metric_value_field(t: &Table, path: &str) -> mlua::Result<MetricValue> {
+    let value: LuaValue = t.raw_get("value")?;
+    // Borrowed, not owned: `Event.new` runs per event, and the common `type`-less path must not
+    // allocate (`docs/design/memory.md`'s `Event.new` rows).
+    let type_value: LuaValue = t.raw_get("type")?;
+    let type_name: Cow<'_, str> = match &type_value {
+        LuaValue::Nil => Cow::Borrowed("f64"),
+        LuaValue::String(s) => Cow::Owned(s.to_str()?.to_owned()),
+        other => {
+            return Err(runtime_error(format!(
+                "Event.new: {} must be a string or nil, got {}",
+                dotted(path, "type"),
+                other.type_name()
+            )))
+        }
+    };
+    if matches!(value, LuaValue::Nil) {
+        return Err(required(path, "value"));
+    }
+    let field = || dotted(path, "value");
+    match &*type_name {
+        "f64" => finite(value, field).map(MetricValue::F64),
+        "i64" => {
+            let reject = |got: String| {
+                runtime_error(format!(
+                    "Event.new: {} must be an integer within ±2^53 or a decimal string that fits \
+                     an i64, got {got}",
+                    field()
+                ))
+            };
+            match value {
+                LuaValue::String(s) => decimal_string(&s, true)
+                    .and_then(|d| d.parse().ok())
+                    .map(MetricValue::I64)
+                    .ok_or_else(|| reject(format!("{:?}", s.to_string_lossy()))),
+                LuaValue::Integer(n) if (-MAX_EXACT_INT..=MAX_EXACT_INT).contains(&n) => {
+                    Ok(MetricValue::I64(n))
+                }
+                LuaValue::Number(n) if n.fract() == 0.0 && n.abs() <= MAX_EXACT_INT as f64 => {
+                    Ok(MetricValue::I64(n as i64))
+                }
+                LuaValue::Integer(n) => Err(reject(n.to_string())),
+                LuaValue::Number(n) => Err(reject(n.to_string())),
+                other => Err(reject(other.type_name().to_string())),
+            }
+        }
+        "u64" => {
+            let reject = |got: String| {
+                runtime_error(format!(
+                    "Event.new: {} must be a non-negative integer up to 2^53 or a decimal string \
+                     that fits a u64, got {got}",
+                    field()
+                ))
+            };
+            match value {
+                LuaValue::String(s) => decimal_string(&s, false)
+                    .and_then(|d| d.parse().ok())
+                    .map(MetricValue::U64)
+                    .ok_or_else(|| reject(format!("{:?}", s.to_string_lossy()))),
+                LuaValue::Integer(n) if (0..=MAX_EXACT_INT).contains(&n) => {
+                    Ok(MetricValue::U64(n as u64))
+                }
+                LuaValue::Number(n)
+                    if n.fract() == 0.0 && (0.0..=MAX_EXACT_INT as f64).contains(&n) =>
+                {
+                    Ok(MetricValue::U64(n as u64))
+                }
+                LuaValue::Integer(n) => Err(reject(n.to_string())),
+                LuaValue::Number(n) => Err(reject(n.to_string())),
+                other => Err(reject(other.type_name().to_string())),
+            }
+        }
+        "bool" => match value {
+            LuaValue::Boolean(b) => Ok(MetricValue::Bool(b)),
+            LuaValue::Integer(n @ (0 | 1)) => Ok(MetricValue::Bool(n == 1)),
+            LuaValue::Number(n) if n == 0.0 || n == 1.0 => Ok(MetricValue::Bool(n == 1.0)),
+            LuaValue::Integer(n) => Err(runtime_error(format!(
+                "Event.new: {} must be a boolean or 0 or 1, got {n}",
+                field()
+            ))),
+            LuaValue::Number(n) => Err(runtime_error(format!(
+                "Event.new: {} must be a boolean or 0 or 1, got {n}",
+                field()
+            ))),
+            other => Err(runtime_error(format!(
+                "Event.new: {} must be a boolean or 0 or 1, got {}",
+                field(),
+                other.type_name()
+            ))),
+        },
+        other => Err(runtime_error(format!(
+            "Event.new: {} must be one of f64, i64, u64, bool (or nil), got \"{other}\"",
+            dotted(path, "type")
+        ))),
+    }
+}
+
+/// 2^53, the largest magnitude below which every integer is a distinct double.
+const MAX_EXACT_INT: i64 = 1 << 53;
+
+/// `s` as UTF-8 when it is all ASCII digits, after one leading `-` if `signed`; else `None`.
+fn decimal_string<'a>(s: &'a mlua::String, signed: bool) -> Option<&'a str> {
+    let bytes = s.as_bytes();
+    let digits = match (signed, bytes.first()) {
+        (true, Some(b'-')) => &bytes[1..],
+        _ => bytes,
+    };
+    match !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
+        true => std::str::from_utf8(bytes).ok(),
+        false => None,
+    }
+}
+
 /// A required finite number (a `value`, a summary's `sum`, `zero_threshold`).
 fn finite_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<f64> {
     match value {
@@ -1539,11 +1664,15 @@ mod tests {
     }
 
     fn sum_kind() -> MetricKind {
-        MetricKind::Sum(Sum { value: 12.5, temporality: Temporality::Cumulative, monotonic: false })
+        MetricKind::Sum(Sum {
+            value: MetricValue::F64(12.5),
+            temporality: Temporality::Cumulative,
+            monotonic: false,
+        })
     }
 
     fn gauge_kind() -> MetricKind {
-        MetricKind::Gauge(3.25)
+        MetricKind::gauge(3.25)
     }
 
     fn samples_kind() -> MetricKind {
@@ -2067,7 +2196,7 @@ mod tests {
     #[test]
     fn new_of_to_table_rejects_a_non_finite_gauge_value() {
         let w = worker(REBUILD);
-        let err = process_err(&w, metric_event(MetricKind::Gauge(f64::NAN)));
+        let err = process_err(&w, metric_event(MetricKind::gauge(f64::NAN)));
         assert!(
             err.contains("Event.new: metrics[1].value must be a finite number, got NaN"),
             "got: {err}"
@@ -2105,7 +2234,7 @@ mod tests {
         let out = mint_metric(
             r#"kind = "gauge", value = 1, exemplars = {{timestamp = "5", value = 2, trace_id = string.rep("33", 16), span_id = string.rep("44", 8), trace_flags = 1}}"#,
         );
-        let mut record = MetricRecord::new(intern("m"), MetricKind::Gauge(1.0));
+        let mut record = MetricRecord::new(intern("m"), MetricKind::gauge(1.0));
         record.exemplars = vec![Exemplar {
             timestamp: 5,
             value: 2.0,
@@ -2130,7 +2259,7 @@ mod tests {
         assert_eq!(
             out.metrics[0].kind,
             MetricKind::Sum(Sum {
-                value: 1.0,
+                value: MetricValue::F64(1.0),
                 temporality: Temporality::Cumulative,
                 monotonic: false
             })
@@ -2230,6 +2359,118 @@ mod tests {
     fn a_missing_value_is_required() {
         let err = metric_err(r#"name = "m", kind = "sum""#);
         assert!(err.contains("Event.new: metrics[1].value is required"), "got: {err}");
+    }
+
+    #[test]
+    fn a_typed_value_builds_its_variant() {
+        let value = |fields: &str| match mint_metric(fields).metrics[0].kind {
+            MetricKind::Gauge(v) => v,
+            MetricKind::Sum(s) => s.value,
+            ref other => panic!("expected a sum or gauge, got {other:?}"),
+        };
+        assert_eq!(value(r#"kind = "gauge", value = 7, type = "u64""#), MetricValue::U64(7));
+        assert_eq!(value(r#"kind = "sum", value = -7, type = "i64""#), MetricValue::I64(-7));
+        assert_eq!(value(r#"kind = "gauge", value = 7, type = "f64""#), MetricValue::F64(7.0));
+        assert_eq!(value(r#"kind = "gauge", value = 7"#), MetricValue::F64(7.0));
+        assert_eq!(
+            value(r#"kind = "gauge", value = true, type = "bool""#),
+            MetricValue::Bool(true)
+        );
+        assert_eq!(value(r#"kind = "gauge", value = 0, type = "bool""#), MetricValue::Bool(false));
+        assert_eq!(
+            value(r#"kind = "gauge", value = "18446744073709551615", type = "u64""#),
+            MetricValue::U64(u64::MAX)
+        );
+        assert_eq!(
+            value(r#"kind = "gauge", value = "-9223372036854775808", type = "i64""#),
+            MetricValue::I64(i64::MIN)
+        );
+        assert_eq!(
+            value(r#"kind = "gauge", value = 2^53, type = "u64""#),
+            MetricValue::U64(1 << 53)
+        );
+    }
+
+    #[test]
+    fn a_typed_value_that_its_type_cannot_hold_is_rejected() {
+        let err = metric_err(r#"name = "m", kind = "gauge", value = 1.5, type = "i64""#);
+        assert!(
+            err.contains("Event.new: metrics[1].value must be an integer within ±2^53"),
+            "got: {err}"
+        );
+        let err = metric_err(r#"name = "m", kind = "gauge", value = -1, type = "u64""#);
+        assert!(
+            err.contains("Event.new: metrics[1].value must be a non-negative integer up to 2^53"),
+            "got: {err}"
+        );
+        // A double above 2^53 can't say which integer it was; the decimal string can.
+        let err = metric_err(r#"name = "m", kind = "gauge", value = 2^53 + 2, type = "u64""#);
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].value must be a non-negative integer up to 2^53 or a \
+                 decimal string that fits a u64, got 9007199254740994"
+            ),
+            "got: {err}"
+        );
+        let err = metric_err(r#"name = "m", kind = "gauge", value = -(2^53) - 2, type = "i64""#);
+        assert!(err.contains("got -9007199254740994"), "got: {err}");
+        let err = metric_err(
+            r#"name = "m", kind = "gauge", value = "18446744073709551616", type = "u64""#,
+        );
+        assert!(err.contains(r#"got "18446744073709551616""#), "got: {err}");
+        let err = metric_err(r#"name = "m", kind = "gauge", value = "-1", type = "u64""#);
+        assert!(err.contains(r#"got "-1""#), "got: {err}");
+        let err = metric_err(r#"name = "m", kind = "gauge", value = 2, type = "bool""#);
+        assert!(
+            err.contains("Event.new: metrics[1].value must be a boolean or 0 or 1, got 2"),
+            "got: {err}"
+        );
+        let err = metric_err(r#"name = "m", kind = "gauge", value = true"#);
+        assert!(
+            err.contains("Event.new: metrics[1].value must be a number, got boolean"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_value_type_is_rejected() {
+        let err = metric_err(r#"name = "m", kind = "gauge", value = 1, type = "int""#);
+        assert!(
+            err.contains(
+                r#"Event.new: metrics[1].type must be one of f64, i64, u64, bool (or nil), got "int""#
+            ),
+            "got: {err}"
+        );
+        let err = metric_err(r#"name = "m", kind = "gauge", value = 1, type = 3"#);
+        assert!(
+            err.contains("Event.new: metrics[1].type must be a string or nil, got integer"),
+            "got: {err}"
+        );
+        let err = metric_err(r#"name = "m", kind = "samples", type = "i64""#);
+        assert!(err.contains("metrics[1].type is not a field"), "got: {err}");
+    }
+
+    #[test]
+    fn every_value_variant_survives_a_rebuild() {
+        let w = worker(REBUILD);
+        for value in [
+            MetricValue::F64(2.5),
+            MetricValue::I64(-3),
+            MetricValue::I64(i64::MIN),
+            MetricValue::U64((1 << 53) + 1),
+            MetricValue::U64(u64::MAX),
+            MetricValue::Bool(true),
+            MetricValue::Bool(false),
+        ] {
+            for kind in [
+                MetricKind::Gauge(value),
+                MetricKind::Sum(Sum { value, temporality: Temporality::Delta, monotonic: true }),
+            ] {
+                let event = metric_event(kind);
+                let out = emitted(w.process(event.clone()).unwrap());
+                assert_eq!(out, event, "{value:?}");
+            }
+        }
     }
 
     #[test]

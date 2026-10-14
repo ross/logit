@@ -31,7 +31,9 @@ sidecar with `method:`, `path:`, and every header (name lowercased, in received 
 replay test can read the content type, encoding, and version headers. `GET`, `OPTIONS`, `POST`,
 and `PUT` are captured; a `GET` or `OPTIONS` has an empty `.bin`. It refuses a `POST` or `PUT` with
 no `Content-Length`, or with any `Transfer-Encoding`, with `411 Length Required`, not counted:
-de-framing a chunked body is re-encoding. Connections are served on threads, so one idle peer can't park the capture.
+de-framing a chunked body is re-encoding. `--accept-chunked` opts out for `chunked` alone: the
+chunk framing is removed, the payload stays byte-for-byte, and the sidecar keeps
+`transfer-encoding: chunked`, for a producer (Telegraf, every body) that streams its body. Connections are served on threads, so one idle peer can't park the capture.
 
 The HTTP reply is `--status` (default `204 No Content`) with an empty body, because an HTTP client
 won't send a second request to a listener that never replied. `--reply PATH=FILE` answers requests
@@ -261,6 +263,18 @@ def capture_http(args, out_dir: pathlib.Path) -> int:
                 self.wfile.write(body)
             self.wfile.flush()
 
+        def read_chunked(self) -> bytes:
+            """The payload of a `Transfer-Encoding: chunked` body, its framing removed. Trailers are read and dropped."""
+            parts = []
+            while True:
+                size = int(self.rfile.readline().split(b";", 1)[0].strip(), 16)
+                if size == 0:
+                    while self.rfile.readline().strip():
+                        pass
+                    return b"".join(parts)
+                parts.append(self.rfile.read(size))
+                self.rfile.readline()
+
         def capture(self, has_body: bool) -> None:
             # Refuse a body this mode can't capture verbatim rather than record it empty: chunked
             # transfer needs de-framing, which is re-encoding, and without a valid Content-Length
@@ -271,9 +285,14 @@ def capture_http(args, out_dir: pathlib.Path) -> int:
             why = None
             length = 0
             encoding = self.headers.get("Transfer-Encoding")
+            chunked = args.accept_chunked and (encoding or "").strip().lower() == "chunked"
+            if chunked:
+                encoding = None
             length_header = self.headers.get("Content-Length")
             if encoding:
                 why = f"Transfer-Encoding: {encoding}"
+            elif chunked:
+                pass
             elif length_header is None:
                 if has_body:
                     why = "no Content-Length"
@@ -300,7 +319,7 @@ def capture_http(args, out_dir: pathlib.Path) -> int:
                 self.close_connection = True
                 return
             # Content-Length bytes, written with no decoding or decompression.
-            body = self.rfile.read(length) if length else b""
+            body = self.read_chunked() if chunked else (self.rfile.read(length) if length else b"")
             path = self.path.split("?", 1)[0]
 
             # Claim the file name under the lock, so two concurrent senders can't both be `-000`.
@@ -423,6 +442,7 @@ def main() -> None:
     ap.add_argument("--name-by-path", action="store_true", help="http: name and number files per request path")
     ap.add_argument("--max-per-path", type=int, default=1, help="http, with --name-by-path: requests written per path")
     ap.add_argument("--discard", action="append", default=[], metavar="PATH", help="http: answer PATH but never write it")
+    ap.add_argument("--accept-chunked", action="store_true", help="http: de-chunk a Transfer-Encoding: chunked body (the sidecar keeps the header); the payload is still verbatim")
     ap.add_argument("--require", action="append", default=[], metavar="PATH[=N]", help="http, with --name-by-path: complete once N requests to PATH are written")
     args = ap.parse_args()
 

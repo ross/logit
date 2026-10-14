@@ -30,7 +30,8 @@
 use bytes::Bytes;
 use logit_core::interner::intern;
 use logit_core::{
-    AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Sum, Temporality, Value,
+    AttrMap, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Sum, Temporality,
+    Value,
 };
 use logit_proto::graphite::{GraphiteDecoder, GraphiteEncoder, Protocol};
 use logit_proto::{Decoder, FramedEncoder, MessageBuf};
@@ -111,7 +112,7 @@ fn datapoint(path: &str, value: f64, seconds: i64, tags: &[(&str, &str)]) -> Eve
     Event::metric(
         seconds * 1_000_000_000,
         attributes,
-        MetricRecord::new(intern(path), MetricKind::Gauge(value)),
+        MetricRecord::new(intern(path), MetricKind::gauge(value)),
     )
 }
 
@@ -187,7 +188,7 @@ fn many_datapoints_are_a_fixed_point() {
 #[test]
 fn one_event_with_several_records_comes_back_as_several_events() {
     let mut event = datapoint("sys.cpu", 1.0, 1_700_000_000, &[("host", "web-1")]);
-    event.metrics.push(MetricRecord::new(intern("sys.mem"), MetricKind::Gauge(2.0)));
+    event.metrics.push(MetricRecord::new(intern("sys.mem"), MetricKind::gauge(2.0)));
     let source = batch(vec![event]);
 
     let decoded =
@@ -203,14 +204,15 @@ fn a_sum_becomes_a_gauge_on_the_first_hop_and_is_then_a_fixed_point() {
     for temporality in [Temporality::Delta, Temporality::Cumulative] {
         for monotonic in [true, false] {
             let mut event = datapoint("page.views", 42.0, 1_700_000_000, &[]);
-            event.metrics[0].kind = MetricKind::Sum(Sum { value: 42.0, temporality, monotonic });
+            event.metrics[0].kind =
+                MetricKind::Sum(Sum { value: MetricValue::F64(42.0), temporality, monotonic });
             let source = batch(vec![event]);
             let decoded = decode_all(
                 &encode_at(&source, Protocol::Plaintext),
                 Protocol::Plaintext,
                 &source.resource,
             );
-            assert_eq!(decoded[0].metrics[0].kind, MetricKind::Gauge(42.0));
+            assert_eq!(decoded[0].metrics[0].kind, MetricKind::gauge(42.0));
             assert_fixed_point(batch(decoded));
         }
     }

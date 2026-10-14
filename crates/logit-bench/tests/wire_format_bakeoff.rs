@@ -83,7 +83,7 @@ fn flagged_metric_batch() -> EventBatch {
         flags: MetricRecord::FLAG_NO_RECORDED_VALUE,
         ..MetricRecord::new(
             logit_core::interner::intern("bakeoff_flagged_metric"),
-            MetricKind::Gauge(0.0),
+            MetricKind::gauge(0.0),
         )
     };
     single_event_batch(Event::metric(0, AttrMap::new(), record))
@@ -110,7 +110,7 @@ fn metric_with_description_and_exemplars_batch() -> EventBatch {
         ..MetricRecord::new(
             logit_core::interner::intern("bakeoff_described_metric"),
             MetricKind::Sum(Sum {
-                value: 12.5,
+                value: logit_core::MetricValue::F64(12.5),
                 temporality: Temporality::Cumulative,
                 monotonic: true,
             }),
@@ -153,7 +153,7 @@ fn representative_batches() -> Vec<EventBatch> {
         single_event_batch(fixtures::distribution_heavy_event()),
         single_event_batch(fixtures::span_event()),
         metric_batch(MetricKind::Sum(Sum {
-            value: 5.0,
+            value: logit_core::MetricValue::F64(5.0),
             temporality: Temporality::Cumulative,
             monotonic: false,
         })),
@@ -327,7 +327,7 @@ fn otlp_preserves_metric_description_start_timestamp_exemplars_and_flags() {
         ..MetricRecord::new(
             logit_core::interner::intern("bakeoff_otlp_metric_fidelity"),
             MetricKind::Sum(Sum {
-                value: 3.0,
+                value: logit_core::MetricValue::F64(3.0),
                 temporality: Temporality::Cumulative,
                 monotonic: true,
             }),
@@ -497,7 +497,10 @@ fn otlp_shatters_a_multi_payload_event_across_separate_batches() {
 /// `a_set_metric_is_skipped_and_counted_rather_than_encoded_wrongly`).
 #[test]
 fn native_postcard_and_rkyv_preserve_gauge_delta_and_set_identity_that_otlp_drops() {
-    for kind in [MetricKind::GaugeDelta(2.5), MetricKind::Set(logit_core::HyperLogLog::default())] {
+    for kind in [
+        MetricKind::GaugeDelta(logit_core::MetricValue::F64(2.5)),
+        MetricKind::Set(logit_core::HyperLogLog::default()),
+    ] {
         let batch = metric_batch(kind);
 
         for (arm, decoded) in [

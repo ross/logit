@@ -948,7 +948,7 @@ pub(crate) mod tests {
                 for m in &event.metrics {
                     if resolve(m.name) == metric {
                         if let MetricKind::Sum(sum) = &m.kind {
-                            total += sum.value;
+                            total += sum.value.as_f64();
                         }
                     }
                 }

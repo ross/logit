@@ -703,7 +703,7 @@ fn depth_gauge(events: &[logit_core::Event]) -> Option<f64> {
     let name = logit_core::interner::intern(SINK_QUEUE_METRICS.depth);
     events.iter().flat_map(|e| e.metrics.iter()).filter(|m| m.name == name).last().and_then(|m| {
         match m.kind {
-            logit_core::MetricKind::Gauge(v) => Some(v),
+            logit_core::MetricKind::Gauge(v) => Some(v.as_f64()),
             _ => None,
         }
     })

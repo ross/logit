@@ -380,7 +380,7 @@ fn metric_event() -> Event {
         AttrMap::new(),
         logit_core::MetricRecord::new(
             logit_core::interner::intern("m"),
-            logit_core::MetricKind::Gauge(1.0),
+            logit_core::MetricKind::gauge(1.0),
         ),
     )
 }

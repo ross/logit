@@ -147,7 +147,7 @@ mod tests {
         let events = registry.drain(0);
         assert_eq!(events.len(), 1);
         match &events[0].metrics[0].kind {
-            MetricKind::Sum(sum) => assert_eq!(sum.value, 3.0),
+            MetricKind::Sum(sum) => assert_eq!(sum.value, logit_core::MetricValue::F64(3.0)),
             other => panic!("expected Sum, got {other:?}"),
         }
         assert_eq!(interner::resolve(events[0].metrics[0].name), "orders.total");
@@ -165,7 +165,7 @@ mod tests {
         let events = registry.drain(0);
         assert_eq!(events.len(), 1);
         match &events[0].metrics[0].kind {
-            MetricKind::Gauge(v) => assert_eq!(*v, 42.0),
+            MetricKind::Gauge(v) => assert_eq!(*v, logit_core::MetricValue::F64(42.0)),
             other => panic!("expected Gauge, got {other:?}"),
         }
         assert_eq!(events[0].attributes.get("status").and_then(|v| v.as_str()), Some("completed"));

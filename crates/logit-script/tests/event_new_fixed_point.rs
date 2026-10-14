@@ -4,14 +4,15 @@
 //! with exemplars, and spans with events and links. It leaves out the kinds the constructor
 //! refuses (the two sketches and `gauge_delta`) and every shape `docs/adr/lua-event-constructor.md`
 //! lists as not round-tripping: the "Residual, recorded rather than fixed" consequence and the
-//! count amendment. Counts draw from the full `u64` range, boundary values first.
+//! count amendment. Counts draw from the full `u64` range, boundary values first, and a `sum`'s or
+//! `gauge`'s value from every `MetricValue` variant at its full range.
 
 use bytes::Bytes;
 use logit_core::interner::intern;
 use logit_core::{
     AttrMap, BodyFormat, Event, Exemplar, ExpHistogram, Histogram, LogRecord, MetricKind,
-    MetricList, MetricRecord, Samples, Severity, SpanEvent, SpanExt, SpanKind, SpanLink,
-    SpanRecord, SpanStatus, Sum, Summary, Temporality, TraceRef, Value,
+    MetricList, MetricRecord, MetricValue, Samples, Severity, SpanEvent, SpanExt, SpanKind,
+    SpanLink, SpanRecord, SpanStatus, Sum, Summary, Temporality, TraceRef, Value,
 };
 use logit_script::{ProcessOutcome, ScriptWorker};
 use proptest::prelude::*;
@@ -55,6 +56,27 @@ fn count() -> impl Strategy<Value = u64> {
         Just(u64::MAX),
         any::<u64>(),
         0u64..1000,
+    ]
+}
+
+/// A `sum`/`gauge` value of every variant, integers boundary values first: ±2^53 are the last a
+/// Lua number holds, so `to_table()` writes the next ones as decimal strings beside their `type`.
+fn metric_value() -> impl Strategy<Value = MetricValue> {
+    prop_oneof![
+        finite().prop_map(MetricValue::F64),
+        prop_oneof![
+            Just(0i64),
+            Just(MAX_EXACT),
+            Just(-MAX_EXACT),
+            Just(MAX_EXACT + 1),
+            Just(-MAX_EXACT - 1),
+            Just(i64::MIN),
+            Just(i64::MAX),
+            any::<i64>(),
+        ]
+        .prop_map(MetricValue::I64),
+        count().prop_map(MetricValue::U64),
+        any::<bool>().prop_map(MetricValue::Bool),
     ]
 }
 
@@ -235,10 +257,14 @@ fn exp_histogram() -> impl Strategy<Value = ExpHistogram> {
 
 fn metric_kind() -> impl Strategy<Value = MetricKind> {
     prop_oneof![
-        (finite(), temporality(), any::<bool>()).prop_map(|(value, temporality, monotonic)| {
-            MetricKind::Sum(Sum { value, temporality, monotonic })
-        }),
-        finite().prop_map(MetricKind::Gauge),
+        (metric_value(), temporality(), any::<bool>()).prop_map(
+            |(value, temporality, monotonic)| MetricKind::Sum(Sum {
+                value,
+                temporality,
+                monotonic
+            })
+        ),
+        metric_value().prop_map(MetricKind::Gauge),
         (prop::collection::vec(finite(), 0..5), finite()).prop_map(|(values, sample_rate)| {
             let mut samples = Samples::new(values);
             samples.sample_rate = sample_rate;

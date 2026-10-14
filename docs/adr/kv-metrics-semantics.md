@@ -60,7 +60,7 @@ keeping it local also keeps this workstream's footprint out of `logit-core` enti
 
 **No `tags:` field on `kv_metrics`, deliberately.** A metric this component derives rides on the same
 event it read attributes from, and every metrics sink already reads that event's attributes for tags
-(`render_tag_suffix`, `crates/logit-outputs/src/influxdb.rs`) — there is nothing for `kv_metrics`
+(`render_tag_suffix`, `crates/logit-proto/src/influxdb/encode.rs`) — there is nothing for `kv_metrics`
 itself to select. Tag selection is `keep`'s job: an operator names the attributes that should survive
 as tags once, in one place in the pipeline, rather than restating a tag allowlist on every metrics
 producer that happens to run before a sink. This also keeps `kv_metrics` genuinely single-purpose:

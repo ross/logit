@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn non_distributions_are_left_alone() {
         let (_, mut e, registry) = with_registry();
-        let record = MetricRecord::new(intern("g"), MetricKind::Gauge(1.0));
+        let record = MetricRecord::new(intern("g"), MetricKind::gauge(1.0));
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
             scope: None,

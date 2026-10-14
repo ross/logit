@@ -1,7 +1,7 @@
 # victoria-interop
 
 `script/victoria-interop` checks `logit` against real VictoriaMetrics, VictoriaLogs,
-VictoriaTraces, and vmagent. It runs the ten legs in
+VictoriaTraces, and vmagent. It runs the eleven legs in
 [`docs/plans/victoriametrics-interop.md`](../../docs/plans/victoriametrics-interop.md)'s "W1's
 legs", queries each backend for what arrived, and prints one row per leg. The plan's "Findings"
 section records what a run showed.
@@ -22,6 +22,7 @@ depends on it running.
 | `victoria-traces` | `victoriametrics/victoria-traces:v0.11.1` | `-otlpGRPCListenAddr=:4317`, `-otlpGRPC.tls=false` |
 | `vmagent` | `victoriametrics/vmagent:v1.152.0` | scrapes `logit-expose` (`vmagent-scrape.yaml`), remote-writes to VictoriaMetrics and to `logit-vmagent-in` |
 | `logit-<leg>` | `logit:victoria-interop`, built from the current tree | one per `logit-<leg>.yaml` |
+| `logit-influx-relay` | same image | leg 11: `influxdb_in` on `:8087` relayed by `influxdb_out` to VictoriaMetrics; `check.py` posts one line-protocol body to it and the same body directly to VictoriaMetrics, and compares the two stored series sets |
 
 Each `logit-<leg>.yaml` says at its top which leg it is. The legs that need synthetic traffic use
 `generate_in`, and the OTLP legs build their metrics, logs, and spans with a `lua` stage's

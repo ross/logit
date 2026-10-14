@@ -1482,7 +1482,7 @@ mod tests {
                     })
             })
             .map(|(_, m)| match &m.kind {
-                MetricKind::Sum(sum) => sum.value,
+                MetricKind::Sum(sum) => sum.value.as_f64(),
                 other => panic!("{name} is not a counter: {other:?}"),
             })
             .sum()

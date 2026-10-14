@@ -532,8 +532,8 @@ mod tests {
             .flat_map(|event| &event.metrics)
             .filter(|m| m.name == intern(metric))
             .map(|m| match &m.kind {
-                MetricKind::Sum(sum) => sum.value,
-                MetricKind::Gauge(v) => *v,
+                MetricKind::Sum(sum) => sum.value.as_f64(),
+                MetricKind::Gauge(v) => v.as_f64(),
                 other => panic!("{metric} should be a counter or a gauge, got {other:?}"),
             })
             .sum()
@@ -545,7 +545,7 @@ mod tests {
 
     fn counter_value(event: &Event) -> f64 {
         match &event.metrics[0].kind {
-            MetricKind::Sum(sum) => sum.value,
+            MetricKind::Sum(sum) => sum.value.as_f64(),
             other => panic!("expected a counter, got {other:?}"),
         }
     }

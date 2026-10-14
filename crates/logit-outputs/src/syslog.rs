@@ -2070,7 +2070,7 @@ mod tests {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
                 MetricKind::Sum(sum) if interner::resolve(m.name) == "logit.output.reconnects" => {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -3159,7 +3159,7 @@ mod tests {
                 .flat_map(|e| &e.metrics)
                 .filter(|m| logit_core::interner::resolve(m.name) == name)
                 .map(|m| match m.kind {
-                    MetricKind::Sum(ref s) => s.value,
+                    MetricKind::Sum(ref s) => s.value.as_f64(),
                     ref other => panic!("expected a counter, got {other:?}"),
                 })
                 .sum()

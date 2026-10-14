@@ -409,8 +409,8 @@ pub fn tail_stats(events: &[Event], component: &str) -> TailStats {
         for metric in &event.metrics {
             let MetricKind::Sum(sum) = &metric.kind else { continue };
             match interner::resolve(metric.name) {
-                LINES => stats.lines += sum.value as u64,
-                ROTATED => stats.rotated += sum.value as u64,
+                LINES => stats.lines += sum.value.as_f64() as u64,
+                ROTATED => stats.rotated += sum.value.as_f64() as u64,
                 DIAGNOSTICS => {
                     let key = event
                         .attributes
@@ -418,7 +418,7 @@ pub fn tail_stats(events: &[Event], component: &str) -> TailStats {
                         .and_then(Value::as_str)
                         .unwrap_or("unknown")
                         .to_string();
-                    *stats.diagnostics.entry(key).or_default() += sum.value as u64;
+                    *stats.diagnostics.entry(key).or_default() += sum.value.as_f64() as u64;
                 }
                 _ => {}
             }

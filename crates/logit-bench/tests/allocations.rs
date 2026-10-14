@@ -486,6 +486,29 @@ fn graphite_decode_a_100_datapoint_protocol_0_pickle_frame() {
     expect_allocs("graphite_in: decode a 100-datapoint protocol-0 pickle frame", stats, 1);
 }
 
+// -- influxdb_in (docs/adr/influxdb-line-protocol-relay.md) -------------------------------------
+
+/// One Telegraf write body, `fixtures::INFLUX_LINES`: 20 lines into 18 events, warm, so names
+/// are interned and the merge index has its table. 67: 40 for each line's parsed tag and field
+/// `Vec`s, 3 per body (the parsed lines, the events, the event-to-line index), 18 for each event's
+/// `MetricList` spilling past one record, and 6 for the three escaped tag values, each unescaped
+/// into a `String` and then copied into the attribute. Every other string is a body slice.
+#[test]
+fn influx_decode_a_telegraf_body() {
+    use logit_proto::influxdb::{InfluxDecoder, Precision};
+
+    let mut decoder = InfluxDecoder::new();
+    let body = bytes::Bytes::from_static(fixtures::INFLUX_LINES.as_bytes());
+    let resource = Arc::new(Resource::default());
+    drop(decoder.decode_body(body.clone(), Precision::Ns, 0, resource.clone()));
+
+    let (batch, stats) = measure(|| {
+        decoder.decode_body(body.clone(), Precision::Ns, 0, resource.clone()).expect("decodes")
+    });
+    assert_eq!(batch.events.len(), 18, "or this measures the wrong thing");
+    expect_allocs("influxdb_in: decode a 20-line Telegraf body", stats, 67);
+}
+
 /// One scrape through the two functions a scrape tick calls (`prometheus_in` has no `Decoder`;
 /// `docs/adr/prometheus-scrape-and-exposition.md`'s "No `logit_proto::Encoder`" section):
 /// `text::parse_with` (bytes -> families), then `families_to_events`. The fixture is

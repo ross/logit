@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(event.metrics.len(), 1, "the metric should ride through unaffected");
         assert!(matches!(
             event.metrics[0].kind,
-            MetricKind::Sum(logit_core::Sum { value, .. }) if value == 1.0
+            MetricKind::Sum(logit_core::Sum { value, .. }) if value == logit_core::MetricValue::F64(1.0)
         ));
     }
 

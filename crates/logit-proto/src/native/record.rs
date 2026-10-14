@@ -30,8 +30,8 @@ use crate::CodecError;
 use bytes::{Buf, Bytes, BytesMut};
 use logit_core::{
     BodyFormat, DdSketch, Event, Exemplar, ExpHistogram, Histogram, HyperLogLog, LogRecord,
-    MetricKind, MetricList, MetricRecord, Samples, Severity, SpanEvent, SpanExt, SpanKind,
-    SpanLink, SpanRecord, SpanStatus, Sum, Summary, Symbol, Temporality, TraceRef,
+    MetricKind, MetricList, MetricRecord, MetricValue, Samples, Severity, SpanEvent, SpanExt,
+    SpanKind, SpanLink, SpanRecord, SpanStatus, Sum, Summary, Symbol, Temporality, TraceRef,
 };
 
 // -- Shared TLV framing helpers ----------------------------------------------------------------
@@ -258,10 +258,52 @@ fn temporality_from_tag(tag: u8) -> Result<Temporality, CodecError> {
     }
 }
 
-fn write_f64_kind(out: &mut BytesMut, tag: u8, v: f64) {
+/// A scalar's type byte, then its eight little-endian bytes (`docs/design/wire-protocol.md`'s
+/// "Record layout"): an `f64`'s bits, an `i64`, a `u64`, or a `Bool` as the `u64` `0` or `1`.
+const SCALAR_F64: u8 = 0;
+const SCALAR_I64: u8 = 1;
+const SCALAR_U64: u8 = 2;
+const SCALAR_BOOL: u8 = 3;
+/// A scalar's encoded length: the type byte and the eight value bytes.
+const SCALAR_LEN: u64 = 9;
+
+fn write_scalar(out: &mut BytesMut, v: MetricValue) {
+    let (tag, bytes) = match v {
+        MetricValue::F64(v) => (SCALAR_F64, v.to_le_bytes()),
+        MetricValue::I64(v) => (SCALAR_I64, v.to_le_bytes()),
+        MetricValue::U64(v) => (SCALAR_U64, v.to_le_bytes()),
+        MetricValue::Bool(b) => (SCALAR_BOOL, u64::from(b).to_le_bytes()),
+    };
     out.extend_from_slice(&[tag]);
-    write_uvarint(out, 8);
-    out.extend_from_slice(&v.to_le_bytes());
+    out.extend_from_slice(&bytes);
+}
+
+/// [`write_scalar`]'s inverse. An unknown type byte, or a `Bool` whose bytes aren't `0` or `1`,
+/// is [`CodecError::Malformed`].
+fn read_scalar(bytes: &mut Bytes) -> Result<MetricValue, CodecError> {
+    let tag = read_u8(bytes)?;
+    if bytes.len() < 8 {
+        return Err(CodecError::Malformed("expected 8 bytes for a metric value".to_string()));
+    }
+    let mut buf = [0u8; 8];
+    bytes.copy_to_slice(&mut buf);
+    match tag {
+        SCALAR_F64 => Ok(MetricValue::F64(f64::from_le_bytes(buf))),
+        SCALAR_I64 => Ok(MetricValue::I64(i64::from_le_bytes(buf))),
+        SCALAR_U64 => Ok(MetricValue::U64(u64::from_le_bytes(buf))),
+        SCALAR_BOOL => match u64::from_le_bytes(buf) {
+            0 => Ok(MetricValue::Bool(false)),
+            1 => Ok(MetricValue::Bool(true)),
+            other => Err(CodecError::Malformed(format!("metric value bool holds {other}"))),
+        },
+        other => Err(CodecError::Malformed(format!("unknown metric value type {other}"))),
+    }
+}
+
+fn write_scalar_kind(out: &mut BytesMut, tag: u8, v: MetricValue) {
+    out.extend_from_slice(&[tag]);
+    write_uvarint(out, SCALAR_LEN);
+    write_scalar(out, v);
 }
 
 fn read_f64(bytes: &mut Bytes) -> Result<f64, CodecError> {
@@ -321,12 +363,12 @@ fn write_metric_kind(out: &mut BytesMut, kind: &MetricKind) {
     match kind {
         MetricKind::Sum(s) => {
             out.extend_from_slice(&[METRIC_SUM]);
-            write_uvarint(out, 10);
-            out.extend_from_slice(&s.value.to_le_bytes());
+            write_uvarint(out, SCALAR_LEN + 2);
+            write_scalar(out, s.value);
             out.extend_from_slice(&[temporality_tag(s.temporality), s.monotonic as u8]);
         }
-        MetricKind::Gauge(v) => write_f64_kind(out, METRIC_GAUGE, *v),
-        MetricKind::GaugeDelta(v) => write_f64_kind(out, METRIC_GAUGE_DELTA, *v),
+        MetricKind::Gauge(v) => write_scalar_kind(out, METRIC_GAUGE, *v),
+        MetricKind::GaugeDelta(v) => write_scalar_kind(out, METRIC_GAUGE_DELTA, *v),
         MetricKind::Samples(s) => {
             let mut tmp = BytesMut::new();
             write_uvarint(&mut tmp, s.values.len() as u64);
@@ -426,13 +468,13 @@ fn read_metric_kind(bytes: &mut Bytes, budget: &DecodeBudget) -> Result<MetricKi
     let mut body = bytes.split_to(len);
     let kind = match kind_tag {
         METRIC_SUM => {
-            let value = read_f64(&mut body)?;
+            let value = read_scalar(&mut body)?;
             let temporality = temporality_from_tag(read_u8(&mut body)?)?;
             let monotonic = read_u8(&mut body)? != 0;
             MetricKind::Sum(Sum { value, temporality, monotonic })
         }
-        METRIC_GAUGE => MetricKind::Gauge(read_f64(&mut body)?),
-        METRIC_GAUGE_DELTA => MetricKind::GaugeDelta(read_f64(&mut body)?),
+        METRIC_GAUGE => MetricKind::Gauge(read_scalar(&mut body)?),
+        METRIC_GAUGE_DELTA => MetricKind::GaugeDelta(read_scalar(&mut body)?),
         METRIC_SAMPLES => {
             let count = read_uvarint(&mut body)? as usize;
             budget.charge_list("samples", count, 8, body.len(), std::mem::size_of::<f64>())?;
@@ -1300,12 +1342,12 @@ mod tests {
 
         let kinds = vec![
             MetricKind::Sum(Sum {
-                value: 3.0,
+                value: MetricValue::F64(3.0),
                 temporality: Temporality::Cumulative,
                 monotonic: false,
             }),
-            MetricKind::Gauge(-1.5),
-            MetricKind::GaugeDelta(0.5),
+            MetricKind::gauge(-1.5),
+            MetricKind::GaugeDelta(MetricValue::F64(0.5)),
             MetricKind::Samples(sample()),
             MetricKind::Distribution(sketch.clone()),
             MetricKind::SetMembers(vec![
@@ -1360,6 +1402,73 @@ mod tests {
             }
             assert_eq!(out, record);
         }
+    }
+
+    /// Every `MetricValue` variant, at the edges of its range, through each scalar kind.
+    #[test]
+    fn round_trips_every_metric_value_through_every_scalar_kind() {
+        let name = logit_core::interner::intern("record_test_scalar");
+        let values = [
+            MetricValue::F64(-0.5),
+            MetricValue::F64(f64::INFINITY),
+            MetricValue::I64(i64::MIN),
+            MetricValue::I64((1 << 53) + 1),
+            MetricValue::U64(u64::MAX),
+            MetricValue::U64(0),
+            MetricValue::Bool(true),
+            MetricValue::Bool(false),
+        ];
+        for value in values {
+            for kind in [
+                MetricKind::Sum(Sum {
+                    value,
+                    temporality: Temporality::Cumulative,
+                    monotonic: false,
+                }),
+                MetricKind::Gauge(value),
+                MetricKind::GaugeDelta(value),
+            ] {
+                let record = MetricRecord::new(name, kind);
+                assert_eq!(dict_round_trip_metric(&record), record);
+            }
+        }
+    }
+
+    /// A scalar body with a given type byte and eight value bytes.
+    fn scalar_kind_body(kind_tag: u8, type_byte: u8, value: u64) -> Bytes {
+        let mut out = BytesMut::new();
+        out.extend_from_slice(&[kind_tag]);
+        write_uvarint(&mut out, SCALAR_LEN);
+        out.extend_from_slice(&[type_byte]);
+        out.extend_from_slice(&value.to_le_bytes());
+        out.freeze()
+    }
+
+    #[test]
+    fn an_unknown_metric_value_type_byte_is_malformed() {
+        let budget = DecodeBudget::unlimited();
+        for kind_tag in [METRIC_GAUGE, METRIC_GAUGE_DELTA] {
+            let result = read_metric_kind(&mut scalar_kind_body(kind_tag, 4, 0), &budget);
+            assert!(
+                matches!(&result, Err(CodecError::Malformed(m)) if m.contains("metric value type 4")),
+                "{result:?}"
+            );
+        }
+        let mut sum = BytesMut::new();
+        sum.extend_from_slice(&[METRIC_SUM]);
+        write_uvarint(&mut sum, SCALAR_LEN + 2);
+        sum.extend_from_slice(&[0xff]);
+        sum.extend_from_slice(&[0; 8]);
+        sum.extend_from_slice(&[0, 1]);
+        let result = read_metric_kind(&mut sum.freeze(), &budget);
+        assert!(matches!(result, Err(CodecError::Malformed(_))), "{result:?}");
+    }
+
+    #[test]
+    fn a_bool_metric_value_holding_neither_0_nor_1_is_malformed() {
+        let budget = DecodeBudget::unlimited();
+        let result = read_metric_kind(&mut scalar_kind_body(METRIC_GAUGE, SCALAR_BOOL, 2), &budget);
+        assert!(matches!(result, Err(CodecError::Malformed(_))), "{result:?}");
     }
 
     #[test]

@@ -227,7 +227,7 @@ impl MetricSpec {
     fn metric_kind(&self) -> MetricKind {
         match self.kind {
             GenerateMetricKind::Sum => MetricKind::counter(self.value),
-            GenerateMetricKind::Gauge => MetricKind::Gauge(self.value),
+            GenerateMetricKind::Gauge => MetricKind::gauge(self.value),
             GenerateMetricKind::Distribution => MetricKind::Samples(Samples::new([self.value])),
         }
     }
@@ -555,7 +555,7 @@ fn now_nanos() -> i64 {
 mod tests {
     use super::*;
     use logit_core::template::parse;
-    use logit_core::{interner, Sum, Temporality};
+    use logit_core::{interner, MetricValue, Sum, Temporality};
     use logit_pipeline::Delivered;
     use tokio::sync::mpsc;
 
@@ -703,7 +703,11 @@ mod tests {
         assert_eq!(interner::resolve(record.name), "requests");
         assert_eq!(
             record.kind,
-            MetricKind::Sum(Sum { value: 2.0, temporality: Temporality::Delta, monotonic: true })
+            MetricKind::Sum(Sum {
+                value: MetricValue::F64(2.0),
+                temporality: Temporality::Delta,
+                monotonic: true
+            })
         );
     }
 
@@ -713,7 +717,7 @@ mod tests {
             .with_metric(parse("queue.depth").unwrap(), GenerateMetricKind::Gauge, 7.5)
             .unwrap();
         let batches = run_to_completion(input).await;
-        assert_eq!(batches[0].events[0].metrics[0].kind, MetricKind::Gauge(7.5));
+        assert_eq!(batches[0].events[0].metrics[0].kind, MetricKind::gauge(7.5));
     }
 
     /// A distribution generates raw `Samples`, never a `DdSketch`.

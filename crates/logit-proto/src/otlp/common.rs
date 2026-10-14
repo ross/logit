@@ -16,7 +16,7 @@
 //! `Resource*` message's field, not the inner `Resource`'s. Its scope becomes one `Scope*` message
 //! ([`scope_to_pb`]/[`pb_to_scope`]) the same way. Resource and scope attributes stay on the batch
 //! and are never copied into `Event::attributes`; a sink that wants resource → scope → point
-//! precedence merges them at render time, as `crates/logit-outputs/src/influxdb.rs`'s
+//! precedence merges them at render time, as `crates/logit-proto/src/influxdb/encode.rs`'s
 //! `render_tag_suffix` does.
 //!
 //! **`AnyValue` nesting has no local depth cap.** Neither [`any_value_to_value`] nor the OTLP/JSON

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-26
+updated: 2026-10-13
 ---
 
 # Relative gauge adjustments (`+`/`-` in statsd)
@@ -151,3 +151,19 @@ rather than the generic `encode_error`) once this lands. See Consequences.
   codebase, now six call sites, not four: `event::metric_record_heap_bytes`, `native/record.rs`,
   `otlp/metrics.rs`, `outputs/{influxdb,stdio,statsd}.rs`, `transforms/aggregate.rs`, and
   `bench/bakeoff/wire_mirror.rs`.
+
+## Amendment: typed values (2026-10-13)
+
+[ADR `typed-metric-scalar`](typed-metric-scalar.md) changes the variant to
+`MetricKind::GaugeDelta(MetricValue)`, beside `MetricKind::Gauge(MetricValue)`. The resolution
+rules above are unchanged; `aggregate` applies a delta with `MetricValue::checked_add`, so the
+result's type follows that ADR's widening table:
+
+- an `I64` delta on an `I64` gauge stays `I64`, and so does a negative one: `statsd_in` decodes
+  every delta as `F64`, but a delta from another source can be an integer;
+- an `F64` delta on an integer gauge, or an integer overflow, widens the gauge to `F64` and counts
+  `logit.transform.metrics.normalized{reason="widened"}`;
+- an unseeded delta resolves against zero in its own type, so the new series holds the delta's
+  value and type, and `logit.transform.gauge.delta.unseeded` still counts it.
+
+A `GaugeDelta` that reaches a sink is still unresolved and still dropped there, whatever its type.

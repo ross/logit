@@ -1,6 +1,6 @@
 ---
 created: 2026-09-28
-updated: 2026-10-02
+updated: 2026-10-13
 ---
 
 # `stdio_out`/`file_out` gain `format: json`, and every machine reader of the text render moves to it
@@ -83,3 +83,14 @@ module doc is the canonical grammar. The rules it follows:
   `tools/shape-survey/configs/`, `tools/splunk-interop/`, and `tools/victoria-interop/` are on
   `format: json`. A change to `ndjson.rs`'s grammar is mirrored there; the module doc names them.
 - The human render is free to change. Its redesign is the next record.
+
+## Amendment: typed metric values (2026-10-13)
+
+A `Sum`'s or `Gauge`'s `value` and a `GaugeDelta`'s `delta` are a `MetricValue`
+([ADR `typed-metric-scalar`](typed-metric-scalar.md)). `format: json` writes `I64` and `U64` as JSON
+integers, so a `U64` above 2^53 keeps every digit, and `Bool` as a JSON boolean. `F64` is unchanged,
+including the non-finite spellings, and a whole-number `F64` still writes the same digits as an
+`I64` of that value. A reader that did `float(item["value"])` on a number still works; one that
+treats the value as a float must now accept a boolean. `kafka_out`'s `format: msgpack` follows
+the same walker and writes MessagePack integers and booleans. `ndjson.rs`'s module doc is the
+grammar.

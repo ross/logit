@@ -117,6 +117,11 @@
 //! | `exponential_histogram` | `scale`, `temporality`, `count`, `zero_count`, `zero_threshold`, `positive:`/`negative:` each a block of `offset` and `counts: [..]` (omitted when its counts are empty), then `sum`, `min`, `max` when present |
 //! | `summary` | `count`, `sum`, `quantiles:` a block of `<q>: <value>` in wire order |
 //!
+//! A `sum`'s `value`, a `gauge`'s `value`, and a `gauge_delta`'s `delta` print as the number, then
+//! its type in parentheses (`value: 5 (i64)`, `value: true (bool)`) unless it is an `f64`, so a
+//! float reads as it always has and an integer or boolean can't pass for one
+//! (`docs/adr/typed-metric-scalar.md`).
+//!
 //! A metric flagged `no_recorded_value` (OTLP's `NO_RECORDED_VALUE`) omits every field of its
 //! kind: the kind's default payload is not a reading (`MetricRecord::flags`). `flags` shows the
 //! raw bitmask whenever it's non-zero. An empty `buckets`/`quantiles` renders as `{}`.
@@ -158,8 +163,8 @@ use logit_core::interner::resolve;
 use logit_core::time::write_rfc3339_utc;
 use logit_core::trace::push_hex;
 use logit_core::{
-    AttrMap, Event, EventBatch, Exemplar, MetricKind, MetricRecord, Resource, Scope, SpanRecord,
-    TraceRef, Value,
+    AttrMap, Event, EventBatch, Exemplar, MetricKind, MetricRecord, MetricValue, Resource, Scope,
+    SpanRecord, TraceRef, Value,
 };
 use logit_proto::{CodecError, Encoder};
 use std::fmt::Display;
@@ -355,20 +360,31 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
 fn render_metric_kind(out: &mut String, col: usize, kind: &MetricKind) {
     match kind {
         MetricKind::Sum(s) => {
-            display_field(out, col, "value", s.value);
+            field(out, col, "value");
+            push_metric_value(out, s.value);
+            out.push('\n');
             str_field(out, col, "temporality", s.temporality.as_str());
             display_field(out, col, "monotonic", s.monotonic);
         }
-        MetricKind::Gauge(v) => display_field(out, col, "value", v),
+        MetricKind::Gauge(v) => {
+            field(out, col, "value");
+            push_metric_value(out, *v);
+            out.push('\n');
+        }
         MetricKind::GaugeDelta(v) => {
             // An explicit sign, so an unresolved relative adjustment never reads as an absolute
             // value (`docs/adr/relative-gauge-adjustments.md`). `is_sign_positive`, not
             // `*v >= 0.0`: `-0.0 >= 0.0` is true, but `Display` prints `-0`, giving `+-0`.
             field(out, col, "delta");
-            if v.is_sign_positive() {
+            let positive = match v {
+                MetricValue::F64(f) => f.is_sign_positive(),
+                MetricValue::I64(n) => *n >= 0,
+                MetricValue::U64(_) | MetricValue::Bool(_) => true,
+            };
+            if positive {
                 out.push('+');
             }
-            let _ = write!(out, "{v}");
+            push_metric_value(out, *v);
             out.push('\n');
         }
         MetricKind::Samples(s) => {
@@ -628,6 +644,16 @@ fn header(out: &mut String, col: usize, name: &str) {
 fn display_field(out: &mut String, col: usize, name: &str, value: impl Display) {
     field(out, col, name);
     let _ = writeln!(out, "{value}");
+}
+
+/// A metric value's number, then its type name in parentheses unless it is an `f64`.
+fn push_metric_value(out: &mut String, v: MetricValue) {
+    let _ = match v {
+        MetricValue::F64(f) => write!(out, "{f}"),
+        MetricValue::I64(n) => write!(out, "{n} (i64)"),
+        MetricValue::U64(n) => write!(out, "{n} (u64)"),
+        MetricValue::Bool(b) => write!(out, "{b} (bool)"),
+    };
 }
 
 fn nonzero_field(out: &mut String, col: usize, name: &str, value: u32) {
@@ -1175,8 +1201,8 @@ mod tests {
     #[test]
     fn a_multi_event_batch_renders_one_block_per_event_in_batch_order() {
         let out = render(vec![
-            metric_event("first", MetricKind::Gauge(1.0)),
-            metric_event("second", MetricKind::Gauge(2.0)),
+            metric_event("first", MetricKind::gauge(1.0)),
+            metric_event("second", MetricKind::gauge(2.0)),
         ]);
         assert_eq!(
             out,
@@ -1199,8 +1225,8 @@ mod tests {
 
     #[test]
     fn several_metrics_on_one_event_each_get_an_item() {
-        let mut event = metric_event("m.one", MetricKind::Gauge(1.0));
-        event.metrics.push(metric("m.two", MetricKind::Gauge(2.0)));
+        let mut event = metric_event("m.one", MetricKind::gauge(1.0));
+        event.metrics.push(metric("m.two", MetricKind::gauge(2.0)));
         assert_eq!(
             render(vec![event]),
             metric_block(&[
@@ -1219,7 +1245,7 @@ mod tests {
     #[test]
     fn sum_renders_value_temporality_and_monotonic() {
         let kind = MetricKind::Sum(logit_core::Sum {
-            value: 2.5,
+            value: logit_core::MetricValue::F64(2.5),
             temporality: Temporality::Cumulative,
             monotonic: false,
         });
@@ -1238,8 +1264,32 @@ mod tests {
     #[test]
     fn gauge_renders_its_value() {
         assert_eq!(
-            render(vec![metric_event("cpu.load", MetricKind::Gauge(0.5))]),
+            render(vec![metric_event("cpu.load", MetricKind::gauge(0.5))]),
             metric_block(&["  - name: cpu.load", "    kind: gauge", "    value: 0.5"])
+        );
+    }
+
+    #[test]
+    fn a_typed_metric_value_shows_its_type() {
+        let cases = [
+            (MetricKind::Gauge(MetricValue::I64(5)), "    value: 5 (i64)"),
+            (
+                MetricKind::Gauge(MetricValue::U64(u64::MAX)),
+                "    value: 18446744073709551615 (u64)",
+            ),
+            (MetricKind::Gauge(MetricValue::Bool(true)), "    value: true (bool)"),
+            (MetricKind::Gauge(MetricValue::F64(5.0)), "    value: 5"),
+        ];
+        for (kind, line) in cases {
+            let kind_line = "    kind: gauge";
+            assert_eq!(
+                render(vec![metric_event("g", kind)]),
+                metric_block(&["  - name: g", kind_line, line])
+            );
+        }
+        assert_eq!(
+            render(vec![metric_event("g", MetricKind::GaugeDelta(MetricValue::I64(-2)))]),
+            metric_block(&["  - name: g", "    kind: gauge_delta", "    delta: -2 (i64)"])
         );
     }
 
@@ -1248,7 +1298,10 @@ mod tests {
         for (v, expected) in [(5.0, "+5"), (-2.0, "-2"), (0.0, "+0"), (-0.0, "-0")] {
             let delta = format!("    delta: {expected}");
             assert_eq!(
-                render(vec![metric_event("g", MetricKind::GaugeDelta(v))]),
+                render(vec![metric_event(
+                    "g",
+                    MetricKind::GaugeDelta(logit_core::MetricValue::F64(v))
+                )]),
                 metric_block(&["  - name: g", "    kind: gauge_delta", &delta]),
                 "for {v:?}"
             );
@@ -1473,7 +1526,7 @@ mod tests {
 
     #[test]
     fn unit_description_and_start_timestamp_render_after_the_kind_fields() {
-        let mut record = metric("req.time", MetricKind::Gauge(0.5));
+        let mut record = metric("req.time", MetricKind::gauge(0.5));
         record.unit = Some(logit_core::interner::intern("ms"));
         record.description = Some(logit_core::interner::intern("Time \"served\""));
         record.start_timestamp = 1_000_000_000;
@@ -1492,7 +1545,7 @@ mod tests {
 
     #[test]
     fn a_unit_that_is_not_identifier_shaped_is_quoted() {
-        let mut record = metric("reqs", MetricKind::Gauge(1.0));
+        let mut record = metric("reqs", MetricKind::gauge(1.0));
         record.unit = Some(logit_core::interner::intern("{request}/s"));
         assert_eq!(
             render(vec![Event::metric(0, AttrMap::new(), record)]),
@@ -1511,7 +1564,7 @@ mod tests {
         let mut record = metric(
             "up",
             MetricKind::Sum(logit_core::Sum {
-                value: 0.0,
+                value: logit_core::MetricValue::F64(0.0),
                 temporality: Temporality::Cumulative,
                 monotonic: true,
             }),
@@ -1532,7 +1585,7 @@ mod tests {
 
     #[test]
     fn a_flag_other_than_no_recorded_value_keeps_the_kind_fields() {
-        let mut record = metric("up", MetricKind::Gauge(1.0));
+        let mut record = metric("up", MetricKind::gauge(1.0));
         record.flags = 0b10;
         assert_eq!(
             render(vec![Event::metric(0, AttrMap::new(), record)]),
@@ -1544,7 +1597,7 @@ mod tests {
     fn exemplars_render_with_their_trace_and_filtered_attributes() {
         let mut filtered = AttrMap::new();
         filtered.insert("exemplar.user", "u-1");
-        let mut record = metric("latency", MetricKind::Gauge(0.3));
+        let mut record = metric("latency", MetricKind::gauge(0.3));
         record.exemplars = vec![
             Exemplar {
                 timestamp: 1_000_000_000,

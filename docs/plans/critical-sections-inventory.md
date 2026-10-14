@@ -272,7 +272,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/stream.rs` (`PooledStream::send`) | findings → #451 |
 | [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/datagram.rs` (`send_datagrams`) | findings → #453 |
 | [SINK-05](#sink-05--the-output-trait-contract-each-sink-relies-on-retry-posture-cancellation-shutdown) | P0 | The `Output` trait contract each sink relies on (retry, posture, cancellation, shutdown) | `crates/logit-pipeline/src/output.rs` (`Output`, `Fault`, `classify`) | findings → #454 |
-| [SINK-09](#sink-09--allocate_timestamp--the-per-series-union-find-collision-allocator-behind-duplicate_safe--true) | P0 | `allocate_timestamp` — the per-series union-find collision allocator behind `duplicate_safe() == true` | `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp`, `encode_metric_line`) | unreviewed |
+| [SINK-09](#sink-09--allocate_timestamp--the-per-series-union-find-collision-allocator-behind-duplicate_safe--true) | P0 | `allocate_timestamp` — the per-series union-find collision allocator behind `duplicate_safe() == true` | `crates/logit-proto/src/influxdb/encode.rs` (`allocate_timestamp`, `encode_metric_line`) | unreviewed |
 | [NET-04](#net-04--udplistenerrun_until_shutdown-the-readdecode-two-future-select-and-double-poll-guard) | P1 | `UdpListener::run_until_shutdown`: the read/decode two-future select and double-poll guard | `crates/logit-inputs/src/udp.rs` (`UdpListener`'s `Input::run_until_shutdown`) | unreviewed |
 | [NET-09](#net-09--tcp-serve_connection-the-shared-next-byte-deadline-idle-close-policy-and-end-of-connection-flushes) | P1 | TCP `serve_connection`: the shared next-byte deadline, idle-close policy, and end-of-connection flushes | `crates/logit-inputs/src/tcp.rs` (`serve_connection`) | unreviewed |
 | [NET-10](#net-10--tcp-accept-loop-connection-cap-permit-lifetime-per-connection-spawn-and-the-live-connections-gauge) | P1 | TCP accept loop: connection cap, permit lifetime, per-connection spawn, and the live-connections gauge | `crates/logit-inputs/src/tcp.rs` (`TcpListener`'s `Input::run_until_shutdown`) | findings → #377 |
@@ -313,7 +313,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CODEC-10](#codec-10--collectd-binary-decoder--tlv-part-framing-and-the-values-part-lengthcount-gate) | P1 | collectd binary decoder — TLV part framing and the Values-part length/count gate | `crates/logit-proto/src/collectd/part.rs` (`read_part`) | findings → #612 |
 | [CODEC-12](#codec-12--prometheus-textopenmetrics-decoder--line-grammar-family-assembler-and-cumulative-bucket-reconstruction) | P1 | Prometheus text/OpenMetrics decoder — line grammar, family assembler, and cumulative-bucket reconstruction | `crates/logit-proto/src/prometheus/text.rs` (`parse_with`, `Parser`, `parse_sample`) | findings → #616, #621 |
 | [CODEC-13](#codec-13--prometheus-remote-write-decoder--snappy-decompression-bomb-guard-and-the-20-symbol-table-indirection) | P1 | Prometheus remote-write decoder — Snappy decompression-bomb guard and the 2.0 symbol-table indirection | `crates/logit-proto/src/prometheus/compression.rs` (`decompress_bounded`, the Snappy `decompress_len` gate), `crates/logit-proto/src/prometheus/remote_write.rs` | findings → #616 |
-| [CODEC-14](#codec-14--influxdb-line-protocol-encoder--collision-avoiding-timestamp-allocator-and-fieldtag-escaping) | P1 | InfluxDB line-protocol encoder — collision-avoiding timestamp allocator and field/tag escaping | `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp`) | unreviewed |
+| [CODEC-14](#codec-14--influxdb-line-protocol-encoder--collision-avoiding-timestamp-allocator-and-fieldtag-escaping) | P1 | InfluxDB line-protocol encoder — collision-avoiding timestamp allocator and field/tag escaping | `crates/logit-proto/src/influxdb/encode.rs` (`allocate_timestamp`) | unreviewed |
 | [CODEC-17](#codec-17--otlp-decode--unguarded-u64-as-i64-timestamp-cast-on-every-wire-timestamp-field-logstracesmetrics) | P1 | OTLP decode — unguarded `u64 as i64` timestamp cast on every wire timestamp field (logs/traces/metrics) | `crates/logit-proto/src/otlp/logs.rs` (`decode_log_record`) | findings → #366 |
 | [CORE-01](#core-01--process-wide-symbol-interner-unbounded-growth-and-per-call-shard-contention) | P1 | Process-wide symbol interner: unbounded growth and per-call shard contention | `crates/logit-core/src/interner.rs` (`INTERNER`, `intern`, `resolve`, `lookup`) | unreviewed |
 | [CORE-02](#core-02--keycache-hand-rolled-cursor-scan-memo-in-front-of-the-interner) | P1 | `KeyCache`: hand-rolled cursor-scan memo in front of the interner | `crates/logit-core/src/interner.rs` (`KeyCache::get_or_intern`) | unreviewed |
@@ -6311,7 +6311,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 ---
 
 ### CODEC-14 — InfluxDB line-protocol encoder — collision-avoiding timestamp allocator and field/tag escaping
-- **Location:** `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp` — a union-find-style "smallest free slot ≥ requested" allocator with path compression), `influxdb.rs` (call site in `encode_metric_line`: per-batch `series_allocated_timestamps` map, series-key computation), `influxdb.rs` (`push_escaped_measurement`/`push_escaped_tag`/`push_escaped` — line-protocol special-character escaping), `influxdb.rs` (`render_fields`, non-finite-value guards per metric kind)
+- **Location:** `crates/logit-proto/src/influxdb/encode.rs` (`allocate_timestamp` — a union-find-style "smallest free slot ≥ requested" allocator with path compression), `encode.rs` (call site in `encode_metric_line`: per-batch `series_allocated_timestamps` map, series-key computation), `encode.rs` (`push_escaped_measurement`/`push_escaped_key`/`push_escaped` — line-protocol special-character escaping), `encode.rs` (`render_fields`, non-finite-value guards per metric kind)
 - **What it does:** Because an InfluxDB point's identity is `(series key, timestamp)`, two events in the same output batch that reduce to the same measurement+tag-set+timestamp would otherwise silently overwrite each other at the database (the second write wins, the first is gone with no error). `allocate_timestamp` prevents this by finding the smallest free timestamp `>= requested` for that series within the batch, using a per-series `HashMap<i64,i64>` "next free slot" chain with path compression (a union-find pattern) so that repeated collisions on one series cost amortized-constant time rather than the O(k²) a naive linear re-probe would cost — the comment documents two earlier, rejected designs and exactly why each was wrong (arrival-order-dependent, or over-corrective). `push_escaped` implements line protocol's backslash-escaping for measurements/tags in one allocation-free pass over the common (nothing-to-escape) case.
 - **Why sensitive:** custom (a hand-rolled union-find variant, not from a crate — this is genuinely novel algorithmic code, not a wrapper), hot-path (every metric line in every batch to `influxdb_out`, v0.1's target sink), data-loss-if-wrong (the entire point of this function is preventing a specific silent-overwrite data-loss mode; a bug in the allocator could itself reintroduce the same silent loss it exists to prevent, or worse, non-deterministically allocate colliding timestamps), accounting (`i64::MAX` reachable only via `checked_add(1)?` returning `None`, which the caller turns into a hard `CodecError::Malformed` rather than a silent collision).
 - **Invariants to verify:**
@@ -8018,7 +8018,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     `graphite_out`'s `true` rests on whisper being last-write-wins per `(path, second)` and is
     explicitly **not** a property of the carbon wire (`graphite.rs`'s module doc, "Duplicate safety"); `influxdb_out`'s
     `true` rests on the encoder being byte-deterministic for a re-encoded batch
-    (`InfluxDbOutput::duplicate_safe`'s doc comment) — which in turn rests on `allocate_timestamp` (own entry below).
+    (the "Delivery posture" paragraph of `crates/logit-outputs/src/influxdb.rs`'s module doc) — which in turn rests on `allocate_timestamp` (own entry below).
   - `send` is safe to drop at every `.await`: connect, probe, write, write_all, flush, `send_to`.
   - `flush()` is a no-op-or-better on every state a connection can be in at shutdown
     (`flush` in `statsd.rs`, `syslog.rs`, `graphite.rs`).
@@ -8077,7 +8077,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `crates/logit-outputs/src/graphite.rs` (`GraphiteOutput::send`) and
   `crates/logit-outputs/src/collectd.rs` (`CollectdOutput::send`)
   (where the *codec* emits its own counters inside `encode_into`);
-  `crates/logit-outputs/src/influxdb.rs` (`InfluxDbOutput::send`, `multi_value_tags`).
+  `crates/logit-outputs/src/influxdb.rs` (`InfluxDbOutput::send`, `emit_encode_stats`) and `crates/logit-proto/src/influxdb/encode.rs` (`EncodeStats`).
   Retry driver: `crates/logit-pipeline/src/runtime.rs` (`deliver_with_retry`).
 - **What it does:** Each `send` re-encodes the batch from scratch and emits every encode-side drop
   / normalization counter, then does the I/O and emits the transport counters.
@@ -8088,7 +8088,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   - A batch delivered on attempt *k* must report each encode-side drop exactly once, not *k* times.
   - A `send` future cancelled by the budget timeout must not leave the encode counters incremented
     with no matching `logit.output.requests` — or, if it does, that asymmetry must be intended.
-  - `InfluxLineEncoder::encode` zeroes `multi_value_tags` per call, and `statsd`/`syslog`'s `EncodeStats`
+  - `InfluxLineEncoder::encode` zeroes `EncodeStats` per call, and `statsd`/`syslog`'s `EncodeStats`
     is `Default`-constructed per call — so the *encoder* does not accumulate; the inflation, if
     real, is purely at the telemetry sink.
   - `graphite`/`collectd` push their counters from inside the codec, so they inflate identically
@@ -8261,7 +8261,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
 - **Invariants to verify:**
   - `duplicate_safe() == true` holds: re-encoding the same `EventBatch` must be byte-identical, so
     InfluxDB's `(measurement, tag set, timestamp)` identity makes the rewrite an overwrite. That
-    requires `series` and `multi_value_tags` to be cleared per `encode` (`InfluxLineEncoder::encode`) and
+    requires `series` and `EncodeStats` to be cleared per `encode` (`InfluxLineEncoder::encode`) and
     `allocate_timestamp` to be order-deterministic (next entry).
   - `is_connect()` is genuinely true only for pre-request failures on the pinned `reqwest` version
     (`classify_transport_error`'s doc comment claims this is confirmed by a live test rather than assumed).
@@ -8302,7 +8302,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
 ---
 
 ### SINK-09 — `allocate_timestamp` — the per-series union-find collision allocator behind `duplicate_safe() == true`
-- **Location:** `crates/logit-outputs/src/influxdb.rs` (`encode_metric_line`, including the
+- **Location:** `crates/logit-proto/src/influxdb/encode.rs` (`encode_metric_line`, including the
   series-key construction and the three rejected schemes, and `allocate_timestamp`);
   state in `InfluxLineEncoder` (`visited`, `series`), cleared at the top of
   `InfluxLineEncoder::encode`.

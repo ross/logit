@@ -83,7 +83,7 @@ fn dropped(points: &[Event], reason: &str) -> f64 {
         .flat_map(|e| e.metrics.iter())
         .filter(|m| resolve(m.name) == "logit.output.records.dropped")
         .map(|m| match &m.kind {
-            MetricKind::Sum(s) => s.value,
+            MetricKind::Sum(s) => s.value.as_f64(),
             _ => 0.0,
         })
         .sum()
@@ -328,7 +328,7 @@ async fn a_set_arrives_as_a_gauge_of_its_estimate() {
     assert_eq!(delivered.events.len(), 1);
     let record = &delivered.events[0].metrics[0];
     assert_eq!(resolve(record.name), "users");
-    assert_eq!(record.kind, MetricKind::Gauge(estimate));
+    assert_eq!(record.kind, MetricKind::gauge(estimate));
 }
 
 /// A chunk an Agent hasn't processed (no `_top_level`) is counted and never sent.
@@ -354,7 +354,7 @@ async fn a_stale_point_is_counted_and_not_delivered() {
         events: vec![Event::metric(
             two_hours_ago,
             AttrMap::new(),
-            MetricRecord::new(intern("load"), MetricKind::Gauge(1.0)),
+            MetricRecord::new(intern("load"), MetricKind::gauge(1.0)),
         )],
     };
     sink(addr, &registry).send(&batch).await.unwrap();

@@ -2,8 +2,8 @@
 
 This directory holds real wire traffic, captured once from real third-party producers and
 committed. The producers are syslog senders, collectd, OTel SDKs, carbon senders, Prometheus,
-node_exporter, a `prometheus_client` app, vmagent, statsd/DogStatsD clients, a Datadog Agent, a dd-trace tracer, and four Splunk HEC
-clients. The fixtures check `logit`'s decoders against what those producers put on the wire:
+node_exporter, a `prometheus_client` app, vmagent, statsd/DogStatsD clients, a Datadog Agent, a dd-trace tracer, four Splunk HEC
+clients, and Telegraf's InfluxDB v2 output. The fixtures check `logit`'s decoders against what those producers put on the wire:
 
 - `crates/logit-proto/src/syslog/`
 - `crates/logit-proto/src/statsd/`
@@ -16,6 +16,7 @@ clients. The fixtures check `logit`'s decoders against what those producers put 
 - `crates/logit-proto/src/datadog/`, `crates/logit-inputs/src/datadog.rs`, and
   `crates/logit-inputs/src/datadog_trace.rs`
 - `crates/logit-proto/src/splunk/` and `crates/logit-inputs/src/splunk.rs`
+- `crates/logit-proto/src/influxdb/`
 
 Without them, a decoder is checked only against this team's reading of RFC 3164/5424, collectd's
 `network.c`, the OTLP spec, or the remote-write spec, and against `logit`'s own encoder. An encoder
@@ -83,6 +84,11 @@ testdata/interop/
                           compressed as sent, one file per request
   splunk/*.headers     -- one sidecar per body: the method, the route with its query string (the
                           `/raw` envelope), and the compression
+  influxdb/README.md   -- provenance table for influxdb/*, and what each capture settled
+  influxdb/*.bin       -- `/api/v2/write` bodies from Telegraf's `outputs.influxdb_v2`, gzip or
+                          identity as sent, one file per request
+  influxdb/*.headers   -- one sidecar per body: the route with its query string, and the
+                          compression
   kafka/README.md      -- provenance for kafka/*: Java-client murmur2 partition vectors, record
                           batches as a broker stored them (Java and kcat, five codecs), and the
                           broker's ApiVersions ranges; not wire captures

@@ -819,6 +819,28 @@ See `crates/logit-transforms/src/aggregate.rs`'s `SeriesKey`, `value_key_eq`, `s
 `docs/plans/critical-sections-inventory.md`'s XFORM-01 to XFORM-05 and CORE-07 entries for what
 each workstream verifies.
 
+## Amendment: typed values (2026-10-13)
+
+[ADR `typed-metric-scalar`](typed-metric-scalar.md) makes a `Sum`'s and a gauge's value a
+`MetricValue` (`F64`, `I64`, `U64`, or `Bool`) instead of an `f64`. The merge laws above hold per
+type; what changes is the type a series emits.
+
+- **The first record seeds the series with its own type.** A series opened by an `I64` sum holds an
+  `I64`, and one opened by a `Bool` gauge delta holds a `Bool`, rather than widening against an
+  `F64` zero. An unseeded delta still resolves against zero, in the delta's own type.
+- **Every later record folds in with `MetricValue::checked_add`.** A delta `Sum` and a `GaugeDelta`
+  applied to a running gauge both use it: an `I64` or `U64` series stays an integer while the sum
+  fits, and a mixed-type pair or an overflow widens, usually to `F64`. Each widening fold counts
+  `logit.transform.metrics.normalized{reason="widened"}`. An absolute `Gauge` replaces the value,
+  type included, by the last-write-wins rule.
+- **`temporality: cumulative` carries the typed total.** A cumulative `I64` counter stays `I64`
+  across flushes, so `prometheus_out` and `otlp_out` see the integer the source sent.
+- **Equality in the merge laws is strict.** `F64(1.0)` and `I64(1)` are different values, so
+  `crates/logit-transforms/src/aggregate/verification.rs`'s reference model, whose generated values
+  are all `F64`, also checks that the emitted value stays `F64`.
+
+A widened series doesn't narrow back: once its total is `F64`, every later fold is `F64`. A
+consumer that needs a fixed type per series feeds `aggregate` one type per series.
 ## Amendment: omitted samples and links (2026-10-13)
 
 Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), two `aggregate` counters are renamed, because each counts a piece left out of a

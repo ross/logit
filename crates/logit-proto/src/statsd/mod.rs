@@ -149,7 +149,7 @@
 //! `m:` included, ends at the next `|`: the DogStatsD reference puts `m:` last, but the `datadog`
 //! Python client writes `c:` and `card:` after it, and the Agent reads `m:` up to the next `|`
 //! (both recorded, `testdata/interop/datadog/README.md`). So a message can't contain `|`. It
-//! decodes to one [`Event::metric`](logit_core::Event::metric), `MetricKind::Gauge(status as f64)`
+//! decodes to one [`Event::metric`](logit_core::Event::metric), `MetricKind::gauge(status as f64)`
 //! under the check's name (interned, like a metric name), with attributes
 //! `statsd.service_check.name` (always, `Value::Str`: `MetricRecord` has nowhere else to carry it),
 //! `statsd.service_check.status` (always, `Value::U64`), `statsd.service_check.message` (`m:`,

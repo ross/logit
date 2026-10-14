@@ -202,7 +202,7 @@ fn an_otel_exporter_body_decodes_into_typed_fields_and_is_a_fixed_point() {
     let metrics = &batches[1].events;
     assert_eq!(metrics.len(), 7);
     let kind = |i: usize| metrics[i].metrics[0].kind.clone();
-    assert_eq!(kind(0), MetricKind::Gauge(123_456_789.0));
+    assert_eq!(kind(0), MetricKind::gauge(123_456_789.0));
     assert!(matches!(
         kind(1),
         MetricKind::Sum(logit_core::Sum {

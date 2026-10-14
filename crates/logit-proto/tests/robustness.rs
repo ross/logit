@@ -27,7 +27,9 @@
 //! encoder's fixed point. The log-message section covers `message::{json,csv,logfmt}`: the JSON
 //! nesting limit the parse inherits from serde_json, truncation and bit flips of an nginx line,
 //! the logfmt and csv quote scanners at a line's end, and the largest allocation each
-//! `message_*` fuzz target's worst 64 KiB message makes.
+//! `message_*` fuzz target's worst 64 KiB message makes. The influxdb section runs
+//! `influxdb::InfluxDecoder` over truncations and bit flips of a Telegraf-shaped body and pins the
+//! largest allocation the worst 64 KiB body makes.
 //!
 //! For each decoder: every single-byte truncation of a valid input, thousands of seeded bit flips,
 //! length fields inflated past the input, and, for `decode_batch`, `Value` nesting past the depth
@@ -46,6 +48,7 @@ use logit_core::{
 use logit_proto::frame::{self, Compression};
 use logit_proto::framing::{FrameError, Framer, FramingMode, Oversize, MAX_FRAME_BYTES};
 use logit_proto::graphite::{GraphiteDecoder, Protocol};
+use logit_proto::influxdb::{InfluxDecoder, Precision};
 use logit_proto::native::control::{self, Ack, AckStatus, Hello, HelloAck, Reject};
 use logit_proto::native::varint::{read_uvarint, write_uvarint};
 use logit_proto::native::{self, DecodeBudget, NativeDecoder};
@@ -76,6 +79,11 @@ use std::sync::Arc;
 
 #[path = "support/prometheus_text.rs"]
 mod prometheus_fixtures;
+
+#[path = "support/influxdb_lines.rs"]
+mod influxdb_lines;
+
+use influxdb_lines::INFLUX_LINES;
 
 use prometheus_fixtures::{OPENMETRICS_FIXTURE, TEXT_FIXTURE};
 
@@ -1064,7 +1072,9 @@ fn graphite_pickle_decodes_cpythons_batched_appends_in_full() {
     for (event, (path, seconds, value)) in events.iter().zip(&points) {
         assert_eq!(logit_core::interner::resolve(event.metrics[0].name), path);
         assert_eq!(event.timestamp, i64::from(*seconds) * 1_000_000_000);
-        assert!(matches!(event.metrics[0].kind, logit_core::MetricKind::Gauge(v) if v == *value));
+        assert!(
+            matches!(event.metrics[0].kind, logit_core::MetricKind::Gauge(v) if v.as_f64() == *value)
+        );
     }
 }
 
@@ -2591,7 +2601,9 @@ fn a_ten_byte_varint_with_bits_above_the_low_bit_is_malformed() {
 #[test]
 fn every_metric_kind_rejects_trailing_bytes_in_its_body() {
     let f64_bytes = 1.5f64.to_le_bytes();
-    let mut sum = f64_bytes.to_vec();
+    let mut scalar = vec![0u8]; // type F64
+    scalar.extend_from_slice(&f64_bytes);
+    let mut sum = scalar.clone();
     sum.extend_from_slice(&[0, 1]); // temporality Delta, monotonic
     let mut samples = vec![1u8]; // one sample
     samples.extend_from_slice(&f64_bytes);
@@ -2615,8 +2627,8 @@ fn every_metric_kind_rejects_trailing_bytes_in_its_body() {
 
     let kinds: [(&str, u8, Vec<u8>); 9] = [
         ("Sum", 0, sum),
-        ("Gauge", 1, f64_bytes.to_vec()),
-        ("GaugeDelta", 2, f64_bytes.to_vec()),
+        ("Gauge", 1, scalar.clone()),
+        ("GaugeDelta", 2, scalar),
         ("Samples", 3, samples),
         ("Distribution", 4, sketch.to_bytes()),
         ("SetMembers", 5, set_members),
@@ -2646,7 +2658,7 @@ fn a_record_field_with_trailing_bytes_is_malformed() {
     let null = tlv(0, &[]);
     let mut trace = vec![0u8; 16];
     trace.extend_from_slice(&[0, 0]); // no span id, flags 0
-    let gauge = tlv(1, &[0; 8]);
+    let gauge = tlv(1, &[0; 9]);
 
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("FIELD_TIMESTAMP", tlv(1, &with_junk(&[0x02]))),
@@ -2798,7 +2810,7 @@ fn a_frame_of_empty_exemplars_is_rejected_past_the_decode_budget() {
     let exemplars = tlv(5, &counted_list(&vec![Vec::new(); n])); // MR_EXEMPLARS
     let payload = Bytes::from(wire_batch(
         &["m"],
-        &[wire_metric_event(wire_metric_record(&tlv(1, &[0; 8]), &exemplars))],
+        &[wire_metric_event(wire_metric_record(&tlv(1, &[0; 9]), &exemplars))],
     ));
     // The dictionary's one string and its `Symbol`, the event, the metric record, the exemplars.
     let cost = (1
@@ -2850,12 +2862,12 @@ fn peak_allocation_per_wire_byte_matches_the_documented_ratio() {
         wire_batch(&[], &vec![Vec::new(); n])
     }
     fn metric_records(n: usize) -> Vec<u8> {
-        let record = wire_metric_record(&tlv(1, &[0; 8]), &[]);
+        let record = wire_metric_record(&tlv(1, &[0; 9]), &[]);
         wire_batch(&["m"], &[tlv(4, &counted_list(&vec![record; n]))])
     }
     fn exemplars(n: usize) -> Vec<u8> {
         let field = tlv(5, &counted_list(&vec![Vec::new(); n]));
-        wire_batch(&["m"], &[wire_metric_event(wire_metric_record(&tlv(1, &[0; 8]), &field))])
+        wire_batch(&["m"], &[wire_metric_event(wire_metric_record(&tlv(1, &[0; 9]), &field))])
     }
     fn span_events(n: usize) -> Vec<u8> {
         let event = tlv(2, &tlv(0, &[])); // SE_NAME: Null
@@ -2955,7 +2967,7 @@ const RATIO_SPAN_EVENT: f64 = 89.6;
 const RATIO_SET_MEMBER: f64 = 32.0;
 const RATIO_ARRAY_ITEM: f64 = 20.0;
 const RATIO_SPAN_LINK: f64 = 15.7;
-const RATIO_METRIC_RECORD: f64 = 11.8;
+const RATIO_METRIC_RECORD: f64 = 11.2;
 const RATIO_EXPONENTIAL_BUCKET: f64 = 8.0;
 const RATIO_SAMPLE: f64 = 2.0;
 const RATIO_HISTOGRAM_BUCKET: f64 = 1.8;
@@ -3008,7 +3020,8 @@ fn telemetry_reasons(registry: &logit_core::Registry, prefix: &str) -> Reasons {
             let name = logit_core::interner::resolve(metric.name);
             let logit_core::MetricKind::Sum(sum) = &metric.kind else { return None };
             let reason = event.attributes.get("reason").and_then(Value::as_str)?;
-            name.starts_with(prefix).then(|| (format!("{name}{{{reason}}}"), sum.value as u64))
+            name.starts_with(prefix)
+                .then(|| (format!("{name}{{{reason}}}"), sum.value.as_f64() as u64))
         })
         .collect();
     reasons.sort();
@@ -3816,4 +3829,86 @@ fn logfmt_and_kv_worst_case_messages_stay_under_the_fuzz_malloc_limit() {
         let reference: Vec<(&str, &str)> = text.split('&').map(|s| (s, s)).collect();
         assert_eq!(reference.len(), out.len() + 1);
     });
+}
+
+// -- influxdb line protocol ----------------------------------------------------------------------
+
+/// Runs `InfluxDecoder::decode_body` over `bytes` with a fresh decoder, returning whether it
+/// failed.
+fn decode_influx(bytes: &Bytes) -> bool {
+    InfluxDecoder::new()
+        .decode_body(bytes.clone(), Precision::Ns, 0, Arc::new(Resource::default()))
+        .is_err()
+}
+
+/// The **weaker** helper: a prefix ending on a line boundary is a shorter valid body.
+#[test]
+fn influx_survives_every_single_byte_truncation() {
+    assert_every_truncation_never_panics(INFLUX_LINES.as_bytes(), |bytes| decode_influx(bytes));
+}
+
+#[test]
+fn influx_survives_seeded_bit_flips() {
+    assert_bit_flips_never_panic(INFLUX_LINES.as_bytes(), 4000, |bytes| decode_influx(bytes));
+}
+
+/// Every prefix of the fixture decodes or fails naming a 1-based line, and no prefix's decode
+/// grows past a small multiple of the body.
+#[test]
+fn influx_every_prefix_decodes_or_names_a_line() {
+    let body = INFLUX_LINES.as_bytes();
+    let peak = peak_live_bytes(|| {
+        for len in 0..body.len() {
+            let mut decoder = InfluxDecoder::new();
+            let result = decoder.decode_body(
+                Bytes::copy_from_slice(&body[..len]),
+                Precision::Ns,
+                0,
+                Arc::new(Resource::default()),
+            );
+            if let Err(err) = result {
+                assert!(err.line >= 1, "a 1-based line index");
+            }
+        }
+    });
+    assert!(peak < 1 << 20, "decoding the fixture's prefixes peaked at {peak} bytes");
+}
+
+/// The worst 64 KiB bodies for `fuzz/fuzz_targets/influxdb_line.rs`'s malloc limit: a point per
+/// line of about ten bytes with distinct timestamps, so nothing merges, and one line of distinct
+/// fields. Measured: the first is 6,058 events whose `Vec` is the largest allocation, 5.2 MiB;
+/// the second's is its records' `MetricList`, 3.5 MiB.
+#[test]
+fn influx_worst_case_body_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 16 << 20;
+    const BODY_BYTES: usize = 65_536;
+    let mut points = Vec::new();
+    let mut ts = 0u32;
+    while points.len() + 12 <= BODY_BYTES {
+        points.extend_from_slice(format!("a f=1 {ts}\n").as_bytes());
+        ts += 1;
+    }
+    let mut fields = b"m ".to_vec();
+    let mut n = 0u32;
+    while fields.len() + 8 <= BODY_BYTES {
+        fields.extend_from_slice(format!("{n:x}=1,").as_bytes());
+        n += 1;
+    }
+    fields.extend_from_slice(b"z=1");
+    for (name, body) in [("points", points), ("fields", fields)] {
+        let mut events = 0;
+        let (peak, largest) = peak_and_largest_allocation(|| {
+            let batch = InfluxDecoder::new()
+                .decode_body(
+                    Bytes::from(body.clone()),
+                    Precision::Ns,
+                    0,
+                    Arc::new(Resource::default()),
+                )
+                .unwrap();
+            events = batch.events.len();
+        });
+        eprintln!("{name}: {} bytes, {events} events, peak {peak}, largest {largest}", body.len());
+        assert!(largest < MALLOC_LIMIT, "{name}: largest allocation {largest}");
+    }
 }

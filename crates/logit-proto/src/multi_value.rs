@@ -46,7 +46,7 @@
 //! and every `.` substituted with `_`: `0.99 → q0_99`, `1.5 → bucket_1_5`,
 //! `-0.5 → bucket_-0_5`, `f64::INFINITY → bucket_inf`. `Display` emits only `-`, digits, at most
 //! one `.`, and `inf`/`-inf`/`NaN`, so two distinct bounds never render to one token (the
-//! collision argument in `crates/logit-outputs/src/influxdb.rs`'s `render_fields`, which rejects
+//! collision argument in `crates/logit-proto/src/influxdb/encode.rs`'s `render_fields`, which rejects
 //! a *rounded* percentile). Graphite needs the substitution because `.` is its hierarchy
 //! separator.
 
@@ -257,7 +257,7 @@ fn push_number_token(out: &mut String, scratch: &mut String, v: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{HyperLogLog, Samples, Sum, Temporality};
+    use logit_core::{HyperLogLog, MetricValue, Samples, Sum, Temporality};
 
     fn sketch(values: &[f64]) -> DdSketch {
         let mut sketch = DdSketch::new();
@@ -446,9 +446,13 @@ mod tests {
     #[test]
     fn scalar_kinds_yield_nothing_and_return_false() {
         for kind in [
-            MetricKind::Sum(Sum { value: 1.0, temporality: Temporality::Delta, monotonic: true }),
-            MetricKind::Gauge(1.0),
-            MetricKind::GaugeDelta(1.0),
+            MetricKind::Sum(Sum {
+                value: MetricValue::F64(1.0),
+                temporality: Temporality::Delta,
+                monotonic: true,
+            }),
+            MetricKind::gauge(1.0),
+            MetricKind::GaugeDelta(MetricValue::F64(1.0)),
         ] {
             let (parts, expanded) = expand(&kind);
             assert!(parts.is_empty(), "{kind:?}");

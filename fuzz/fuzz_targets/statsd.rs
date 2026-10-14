@@ -21,7 +21,7 @@
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use logit_core::interner::resolve;
-use logit_core::{subslice, AttrMap, Event, MetricKind, Resource, Value};
+use logit_core::{subslice, AttrMap, Event, MetricKind, MetricValue, Resource, Value};
 use logit_proto::statsd::StatsdDecoder;
 use logit_proto::{CodecError, Decoder};
 use std::sync::Arc;
@@ -91,9 +91,17 @@ fn check_event(datagram: &Bytes, event: &Event) {
     let metric = &event.metrics[0];
     assert!(!resolve(metric.name).is_empty(), "model: a metric name is non-empty");
     match &metric.kind {
-        MetricKind::Sum(sum) => assert!(sum.value.is_finite(), "model: a Sum is finite"),
+        MetricKind::Sum(sum) => {
+            assert!(
+                matches!(sum.value, MetricValue::F64(f) if f.is_finite()),
+                "model: a Sum is a finite f64"
+            )
+        }
         MetricKind::Gauge(v) | MetricKind::GaugeDelta(v) => {
-            assert!(v.is_finite(), "model: a gauge is finite")
+            assert!(
+                matches!(v, MetricValue::F64(f) if f.is_finite()),
+                "model: a gauge is a finite f64"
+            )
         }
         MetricKind::Samples(samples) => {
             assert!(!samples.values.is_empty(), "model: Samples is non-empty");

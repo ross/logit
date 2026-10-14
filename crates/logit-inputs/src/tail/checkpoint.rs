@@ -339,7 +339,7 @@ mod tests {
                 .flat_map(|e| &e.metrics)
                 .filter(|m| logit_core::interner::resolve(m.name) == name)
                 .map(|m| match &m.kind {
-                    MetricKind::Sum(sum) => sum.value,
+                    MetricKind::Sum(sum) => sum.value.as_f64(),
                     other => panic!("{name} must be a counter, got {other:?}"),
                 })
                 .sum()

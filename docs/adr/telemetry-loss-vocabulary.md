@@ -193,10 +193,10 @@ same date has the bounds of the count and how it enters the sink identity.
 - **The soak harness reads every `*.dropped` as loss.** Its `drops` row surfaces every
   `logit.*.dropped` counter the system under test emits that no ledger row balances
   ([ADR `soak-harness`](soak-harness.md), `tools/soak/README.md`).
-- **[Loss with no counter](#loss-with-no-counter) keeps three entries.** The `influx` stream,
-  which rewrites `influxdb_out` and adds `influxdb_in`, adopts this vocabulary for both, so
-  `influxdb_out`'s counters land there rather than here. `kafka_out`'s `format: text` and
-  `docker_in`'s decoder are follow-ups.
+- **[Loss with no counter](#loss-with-no-counter) keeps two entries,** `kafka_out`'s
+  `format: text` and `docker_in`'s decoder, both follow-ups. `influxdb_out` and `influxdb_in`
+  count under this vocabulary
+  ([ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)).
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
@@ -316,11 +316,6 @@ series route, `prometheus_out`'s exposition dialects, and `splunk_hec_out`'s
 These lose data and report it only through a diagnostic, or not at all. Under this rule each
 belongs under `*.dropped`, or under `*.skipped` where the entry says so; none has a counter yet:
 
-- `influxdb_out` reports what it doesn't write with diagnostics only. An unresolved relative
-  gauge (`gauge_delta_unresolved`) and a metric that fails to encode (`encode_error`) belong
-  under `*.dropped`. A `NO_RECORDED_VALUE` record (`no_recorded_value`: nothing to carry) and
-  `SetMembers` and `ExponentialHistogram` (no line-protocol form, though they share the
-  `encode_error` key) belong under `*.skipped`.
 - `kafka_out` under `format: text` writes a record from an event's log alone, so a mixed
   event's metrics and span leave with no count. The operator chose the format, so these belong
   under `*.skipped`, not `*.dropped`; a metrics-only event already counts

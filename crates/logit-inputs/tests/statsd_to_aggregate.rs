@@ -5,7 +5,7 @@
 //! (`docs/adr/relative-gauge-adjustments.md`).
 
 use bytes::Bytes;
-use logit_core::{MetricKind, Resource};
+use logit_core::{MetricKind, MetricValue, Resource};
 use logit_proto::statsd::StatsdDecoder;
 use logit_proto::Decoder;
 use logit_transforms::Aggregator;
@@ -27,7 +27,9 @@ fn statsd_gauge_then_delta_resolves_through_aggregate() {
     let batch = decoder.decode(Bytes::from_static(b"conns:+5|g")).expect("should decode");
     assert_eq!(batch.events.len(), 1);
     // The wire produced a `GaugeDelta`, not a `Gauge`, before `aggregate` sees it.
-    assert!(matches!(batch.events[0].metrics[0].kind, MetricKind::GaugeDelta(v) if v == 5.0));
+    assert!(
+        matches!(batch.events[0].metrics[0].kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(5.0))
+    );
     for mut event in batch.events {
         assert!(!agg.process(&resource, &mut event), "a pure gauge delta event should absorb");
     }
@@ -39,7 +41,11 @@ fn statsd_gauge_then_delta_resolves_through_aggregate() {
     let (event, _links) = &events[0];
     match event.metrics[0].kind {
         MetricKind::Gauge(v) => {
-            assert_eq!(v, 15.0, "10|g then +5|g should resolve to 15.0 within one window")
+            assert_eq!(
+                v,
+                MetricValue::F64(15.0),
+                "10|g then +5|g should resolve to 15.0 within one window"
+            )
         }
         ref other => panic!("expected Gauge, got {other:?}"),
     }

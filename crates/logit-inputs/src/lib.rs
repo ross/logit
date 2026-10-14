@@ -22,6 +22,7 @@ mod docker_verification;
 pub mod generate;
 pub mod graphite;
 mod http;
+pub mod influxdb;
 pub mod internal;
 pub mod lines;
 mod listener;
