@@ -2776,8 +2776,8 @@ trace rather than dropping priority-0 ones, which would leave them out of the re
 
 **Tracer headers become resource attributes.** `Datadog-Meta-Lang`, `-Lang-Version`,
 `-Tracer-Version`, `Datadog-Container-ID`, and the tracer's other identity and client-computation
-headers land on the batch resource as `datadog.tracer.*`, which `datadog_trace_out` writes back as
-headers. For `/v0.7/traces`, the payload's own fields win over a header.
+headers land on the batch resource as `_logit.datadog.tracer.*`, which `datadog_trace_out` writes
+back as headers. For `/v0.7/traces`, the payload's own fields win over a header.
 
 **The Unix socket.** `socket:` binds a Unix stream socket, as the Agent's `receiver_socket` does.
 The directory must already exist. A stale socket file from an earlier run is replaced, but a path
