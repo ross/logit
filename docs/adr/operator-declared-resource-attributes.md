@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-09-15
+updated: 2026-10-14
 ---
 
 # Operator-declared resource attributes: a `set` transform, not a per-input config field
@@ -113,3 +113,10 @@ never touches it costs nothing. `docs/design/lua-api.md` has the full contract.
   labels with no `demo/loki/loki.yaml` change (both are already in Loki's default index-label set).
 - `otlp_in` gets no special treatment and needs none: an operator simply doesn't put a `set` after
   it, since it already carries a real resource off the wire.
+
+## Amendment: the process hostname (2026-10-14)
+
+The rule that `logit`'s own code may not invent an identity covers a guessed `service.name`. It
+doesn't cover a discovered fact about where the process runs. `internal` stamps the process
+hostname as `host.name` for that reason, with the same standing as `docker_in`'s `container.*`.
+See [ADR `process-hostname`](process-hostname.md).

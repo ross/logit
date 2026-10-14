@@ -571,6 +571,12 @@ Per pair:
 [docs/deploying.md](docs/deploying.md)'s "Probes and exit codes" and "Self-logging" sections are
 the operator-facing account of all of this.
 
+- **Hostname**: `logit run` resolves one process hostname at startup (`logit_pipeline::host`):
+  the top-level `hostname:`, else the kernel hostname through `rustix`'s `uname`, never `$HOSTNAME`
+  or DNS. `prepare` passes it to `build_spec`, and `internal` stamps it as `host.name` beside
+  `service.name`. `logit validate` doesn't resolve it. `collectd_out` doesn't fall back to it
+  ([ADR `process-hostname`](docs/adr/process-hostname.md),
+  [docs/deploying.md](docs/deploying.md)'s "Hostname").
 - **Self-logging**: leveled, structured, through `tracing` (`--log-level`/`LOGIT_LOG`,
   `--log-format text|json`; [ADR `tracing-for-self-logging`](docs/adr/tracing-for-self-logging.md)).
   `internal`'s own `logs:` setting (`warn` by default, `error`, or `off`) captures `logit`'s own

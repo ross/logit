@@ -4,7 +4,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## Internal telemetry and self-logging
 
-- **Internal spans have six open residuals.** Emission, sampling, and OTLP export are built
+- **Internal spans have five open residuals.** Emission, sampling, and OTLP export are built
   ([internal-telemetry.md](../design/internal-telemetry.md)'s "Spans",
   [ADR `trace-context-propagation-on-delivered`](../adr/trace-context-propagation-on-delivered.md),
   [ADR `internal-span-emission-and-deterministic-sampling`](../adr/internal-span-emission-and-deterministic-sampling.md)).
@@ -24,14 +24,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
      `BatchContext`), so `write_loop` can parent its sink span on the context the batch arrived
      under. It's the same size-for-a-span trade `Delivered` made and measured
      ([memory.md](../design/memory.md)'s "Costing internal spans").
-  5. **`service.name` is the only resource identity `internal` sets**
-     ([internal-telemetry.md](../design/internal-telemetry.md)'s "Resource identity"). Its
-     `Resource` has no `host.name`/`service.instance.id`, the semconv way to tell `logit`
-     instances apart in Tempo, because nothing in the running service reads the OS hostname.
-     `SyslogEncoder::default_hostname` in `crates/logit-outputs/src/syslog.rs` is
-     config-supplied, and only the `logit-perf` harness calls `gethostname`. Deferred until the
-     service has that dependency for another reason.
-  6. **The demo's Tempo service graph panel is empty.** It needs three things, and
+  5. **The demo's Tempo service graph panel is empty.** It needs three things, and
      `demo/compose.yaml` and `demo/tempo/tempo.yaml` have none of them: Tempo's
      `metrics_generator` (`service-graphs`/`span-metrics` processors) with `remote_write` to a
      Prometheus-compatible store, that store as a Grafana datasource, and

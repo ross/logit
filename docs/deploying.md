@@ -519,6 +519,39 @@ new process, so one unit could upgrade in place, isn't built; the
 [live reload and socket handover research note](plans/live-reload-and-socket-handover.md) has what
 was considered.
 
+## Hostname
+
+`logit` resolves one hostname at startup. It stamps the name as `host.name` on the resource of its
+own `internal` telemetry, so several instances writing to one metrics backend stay
+distinguishable. The startup log records it as `hostname resolved`.
+
+The hostname is, in order:
+
+1. The top-level `hostname:`, if set. `!env` works here, as in any field.
+2. The kernel hostname. It is the pod name in Kubernetes, the node name under `hostNetwork`, the
+   container ID or `--hostname` value in Docker, and the machine's hostname on a host.
+
+`$HOSTNAME` is not read, and no DNS lookup is made. If the kernel hostname is empty and `hostname:`
+is unset, `logit run` exits `1` and tells you to set it. `logit validate` doesn't resolve a
+hostname, but it rejects an empty `hostname:`.
+
+Each pod gets a new name on every rollout, so the `logit.*` series re-key per pod. To label by
+node instead, or to give a pod a stable name, set `hostname:` from the downward API:
+
+```yaml
+# Pod spec: env
+#   - name: NODE_NAME
+#     valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+#   - name: POD_NAME
+#     valueFrom: {fieldRef: {fieldPath: metadata.name}}
+hostname: !env NODE_NAME   # or POD_NAME
+components:
+  # ...
+```
+
+In Docker, pass `--hostname NAME` (or `hostname:` in Compose) to name the container, or set
+`hostname:` in the config.
+
 ## Self-logging
 
 `logit run` emits leveled, structured self-diagnostics through `tracing`
@@ -1958,10 +1991,11 @@ reference. Before deploying one:
   `logit.output.metrics.dropped{reason="oversize_value_list"}`, not split.
 - **Set `hostname:` if the pipeline carries metrics that didn't come from `collectd_in`.** A relayed
   list already carries its origin's host on `collectd.host`, so a pure relay never needs it. Metrics
-  from a `statsd_in`/`internal` with no `collectd.host` or `host.name`, and no `hostname:` set, are
+  from a `statsd_in` with no `collectd.host` or `host.name`, and no `hostname:` set, are
   dropped and counted `logit.output.metrics.dropped{reason="no_host"}` with a `no_host` diagnostic.
   That is deliberate: collectd's receiver rejects an empty host, and inventing one would merge every
-  unlabeled sender into one host's metrics.
+  unlabeled sender into one host's metrics. `internal` is the exception: it stamps the process
+  hostname as `host.name` (see [Hostname](#hostname)), so its metrics resolve a host.
 
 ### `graphite_out`: relaying to Carbon
 

@@ -652,8 +652,9 @@ components:
   # the dashboard's `logit.*` panels come from here. `span_sample_rate` is `1.0` rather than its
   # `0.1` default (docs/adr/internal-span-emission-and-deterministic-sampling.md), because this
   # demo is meant to show every span it can, not weigh span volume against storage cost. Its
-  # batches carry `service.name = logit` on their resource (see internal-telemetry.md's "Resource
-  # identity" section), which is what lets Tempo resolve a root service for these traces at all.
+  # batches carry `service.name = logit` and `host.name` on their resource (see
+  # internal-telemetry.md's "Resource identity" section); `service.name` is what lets Tempo resolve
+  # a root service for these traces at all.
   self:
     type: internal
     interval: 10s
