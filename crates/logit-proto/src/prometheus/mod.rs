@@ -47,7 +47,12 @@
 //!
 //! One [`Event`] per [`Series`], each carrying exactly one [`logit_core::MetricRecord`]; the
 //! series' labels become `Value::Str` event attributes verbatim (no sanitization -- they arrived
-//! valid).
+//! valid). A label whose name is under the private `_logit.` prefix is omitted, counted
+//! `logit.input.tags.omitted{reason="reserved_prefix"}` once per event, so a sender's label never
+//! reads back as a carrier
+//! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
+//! Only remote-write can carry one: the exposition grammar [`text`] reads has no `.` in a label
+//! name.
 //!
 //! | Wire | Model |
 //! |---|---|
@@ -146,7 +151,8 @@
 //!   directly, with the sketch's own sum and count.)
 //! - under the remote-write receiver's `peer:`, `proxy_protocol:`, or `forwarded:`,
 //!   `network.peer.*` or `client.*` added to every event after decode, an opt-in addition the
-//!   sender never sent, and one of ADR `lossless-transit`'s "Permitted normalizations".
+//!   sender never sent, and one of ADR `lossless-transit`'s "Permitted normalizations";
+//! - a label whose name is under the private `_logit.` prefix omitted, counted.
 //!
 //! Everything else is an error or a counted drop or skip, never a silent reinterpretation.
 
@@ -167,6 +173,7 @@ pub mod text;
 pub use text::Dialect;
 
 use crate::otlp::metrics::DISTRIBUTION_QUANTILES;
+use logit_core::attrs::is_private;
 use logit_core::interner::{intern, resolve};
 use logit_core::{
     AttrMap, DdSketch, Diagnostics, Event, Exemplar, Histogram, MetricKind, MetricRecord,
@@ -701,6 +708,7 @@ pub fn families_to_events_with(
     on_dropped: &mut dyn FnMut(&MetricFamily, &Series),
 ) -> Vec<Event> {
     let mut out = Vec::new();
+    let mut reserved = 0usize;
     for family in families {
         let name = intern(&family.name);
         let unit = family.unit.as_deref().map(intern);
@@ -712,6 +720,10 @@ pub fn families_to_events_with(
             };
             let mut attributes = AttrMap::new();
             for (label, value) in &series.labels {
+                if is_private(label) {
+                    reserved += 1;
+                    continue;
+                }
                 attributes.insert(label, Value::str(value.as_str()));
             }
             if family.kind.needs_marker() {
@@ -737,6 +749,13 @@ pub fn families_to_events_with(
             };
             out.push(Event::metric(timestamp, attributes, record));
         }
+    }
+    if reserved > 0 {
+        decoder.telemetry.count(
+            "logit.input.tags.omitted",
+            reserved as f64,
+            &[("reason", "reserved_prefix")],
+        );
     }
     out
 }
@@ -1413,6 +1432,53 @@ mod tests {
             })
         );
         assert_eq!(events[0].attributes.get("code"), Some(&Value::from("200")));
+    }
+
+    /// A private label is left off the event and counted once per event; `logit.x` and `_logitx`
+    /// aren't private.
+    #[test]
+    fn a_private_label_is_omitted_and_counted_and_lookalikes_are_not() {
+        let registry = Registry::new();
+        let mut decoder = PrometheusDecoder::new().with_telemetry(registry.telemetry_for(
+            "prometheus_in",
+            "prometheus_in",
+            "listener",
+        ));
+        let pairs = [
+            ("code", "200"),
+            ("_logit.prometheus.type", "gauge"),
+            ("logit.x", "1"),
+            ("_logitx", "2"),
+        ];
+        let families = vec![family(
+            "up",
+            FamilyType::Gauge,
+            vec![
+                Series::new(labels(&pairs), Point::Gauge(1.0)),
+                Series::new(labels(&[("_logit.y", "1"), ("code", "200")]), Point::Gauge(2.0)),
+            ],
+        )];
+        let events = families_to_events(&families, RECEIVED_AT, &mut decoder);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].attributes.get("code"), Some(&Value::from("200")));
+        assert_eq!(events[0].attributes.get("logit.x"), Some(&Value::from("1")));
+        assert_eq!(events[0].attributes.get("_logitx"), Some(&Value::from("2")));
+        assert_eq!(events[0].attributes.len(), 3, "{:?}", events[0].attributes);
+        assert_eq!(events[1].attributes.len(), 1, "{:?}", events[1].attributes);
+        let total: f64 = registry
+            .drain(0)
+            .iter()
+            .filter(|e| {
+                e.attributes.get("reason").and_then(|v| v.as_str()) == Some("reserved_prefix")
+            })
+            .flat_map(|e| &e.metrics)
+            .filter(|m| resolve(m.name) == "logit.input.tags.omitted")
+            .map(|m| match &m.kind {
+                MetricKind::Sum(sum) => sum.value.as_f64(),
+                other => panic!("expected a counter, got {other:?}"),
+            })
+            .sum();
+        assert_eq!(total, 2.0);
     }
 
     #[test]

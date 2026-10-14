@@ -105,7 +105,9 @@ attributes.
 | `influxdb.bucket` | resource | `Str` | the request's `bucket` query parameter |
 
 A tag key that starts with `influxdb.` would collide with the carrier, so the decoder omits it,
-counted `logit.input.tags.omitted{reason="reserved_prefix"}` (normalization 12).
+counted `logit.input.tags.omitted{reason="reserved_prefix"}` (normalization 12). A tag key under
+the private `_logit.` prefix is omitted and counted the same way, as on every metric-wire decoder
+([ADR `private-attribute-namespace`](private-attribute-namespace.md)'s inbound guard).
 
 ### Egress, with and without the carrier
 
@@ -252,7 +254,8 @@ the same list with the same numbers, and the two lists must stay numbered alike:
     always a `Gauge`, so this applies only to an event from another protocol.
 11. A listener's sender attributes (`network.peer.*`, `client.*`) are added under `peer:`,
     `proxy_protocol:`, or `forwarded:`.
-12. A tag key under the reserved `influxdb.` prefix is omitted, counted.
+12. A tag key under the reserved `influxdb.` prefix or the private `_logit.` prefix is omitted,
+    counted.
 13. A duplicate field key within one line: the last value wins.
 14. An absent timestamp: the request's arrival time truncated to `precision`, one instant for every
     such point in the request.

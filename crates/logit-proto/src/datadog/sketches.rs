@@ -56,13 +56,14 @@ impl DatadogDecoder {
                 continue;
             }
             let name = intern(&s.metric);
-            let attrs = WireSeries {
+            let (attrs, reserved) = WireSeries {
                 tags: s.tags.iter().map(String::as_str).collect(),
                 host: Some(&s.host),
                 origin: OriginCodes::from_proto(s.metadata.as_ref()),
                 ..WireSeries::default()
             }
             .attributes();
+            let first = out.len();
             for dog in &s.dogsketches {
                 let sketch = match dogsketch_to_sketch(dog) {
                     Ok(Some(sketch)) => sketch,
@@ -87,6 +88,9 @@ impl DatadogDecoder {
                 };
                 let record = MetricRecord::new(name, MetricKind::Distribution(sketch));
                 out.push(Event::metric(timestamp, attrs.clone(), record));
+            }
+            if out.len() > first {
+                self.reserved_tags(reserved);
             }
         }
         let resource = common_metadata_resource(payload.metadata.as_ref());

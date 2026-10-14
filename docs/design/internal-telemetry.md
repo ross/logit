@@ -859,7 +859,10 @@ and `oversize` is a packet declaring more than 64 KiB, which closes the connecti
 listener because every connection's decoder clone shares one set of counts; the rest of the
 datagram or packet still decodes. The driver's `bad_datagram`/`bad_frame` key, with
 `frames.dropped{reason="undecodable"}`, fires only for the single whole-frame failure
-`StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. The decoder carries a
+`StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. A `|#` tag whose key
+starts with `_logit.`, the private carrier prefix, is left off its metric, event, or service check
+and counted `logit.input.tags.omitted{reason="reserved_prefix"}`; the line is delivered, and a
+line rejected for another reason counts none. The decoder carries a
 sampled `ms`/`h`/`d` line's `@<rate>` verbatim and clamps nothing; `aggregate` bounds the weight a
 rate implies at `Samples::MAX_WEIGHT` and reports a clamp as
 `logit.transform.samples.weight_clamped` and a `sample_rate_clamped` diagnostic under its own
@@ -953,7 +956,9 @@ per driver. A pickle frame the decoder rejects whole (`bad_pickle`) counts
 The codec adds its own counters under both transports:
 `logit.input.metrics.dropped{reason="bad_line"|"bad_tag"|"bad_timestamp"|"non_finite_value"|
 "bad_shape"}` and `logit.input.tags.normalized{reason="duplicate_key"}` (a repeated carbon tag key
-collapsing to its last value, which is what carbon's own `TaggedSeries.parse` does). Its
+collapsing to its last value, which is what carbon's own `TaggedSeries.parse` does), and
+`logit.input.tags.omitted{reason="reserved_prefix"}` (a tag whose name starts with `_logit.`, the
+private carrier prefix, left off a delivered datapoint). Its
 per-connection accumulator flushes as `receive.flushed{reason="closed"}` when a client hangs up and
 `{reason="shutdown"}` only when the component itself is stopping.
 
@@ -1117,6 +1122,11 @@ decode-side reason is loss, so this codec counts no `logit.input.metrics.skipped
   declaration the request itself carried is a statement about the samples in front of it; one from
   the cache is a memory of what some other message said. It never appears with an empty cache, and
   a steady stream of it means the table and the senders disagree about a family's shape.
+
+One more codec counter isn't a sample at all: `logit.input.tags.omitted{reason="reserved_prefix"}`
+counts a label whose name starts with `_logit.`, the private carrier prefix, left off a delivered
+series, once per event. Only remote-write can carry such a name; the exposition grammar has no `.`
+in a label name.
 
 `Diagnostics` keys: `bound` (bind mode's listener), `scrape_failed` (scrape mode; the failing
 target's redacted URL appears in the message text only, never a tag), `write_rejected` (bind mode,
@@ -1295,7 +1305,7 @@ connection refused for its PROXY header.
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `oversize` (`413`, as sent or decompressed), `auth` (`401`), `encoding` (`415`, anything but identity or lowercase gzip), `malformed_encoding` (`400`, a gzip stream that doesn't decompress), `precision` (`400`), `no_bucket` (`404`), `no_org` (`400`), `malformed` (`400`, a line that fails to parse), `stalled` (`408`, only with `idle_timeout:` set), or `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload) |
 | `logit.input.batches.deferred` | count | batches a busy `503` left with the client to resend, disjoint from `logit.component.batches.sent` |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | batches no consumer took, answered `503`. The refused batch is also counted in `logit.component.batches.sent` and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}` |
-| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | tags the decoder left off a point because their key starts with `influxdb.`, which would collide with the carrier attributes. The point is delivered. Counted by the codec, under this component's id |
+| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | tags the decoder left off a point because their key starts with `_logit.`, the private carrier prefix, or `influxdb.`, which would collide with this codec's carrier attributes. The point is delivered. Counted by the codec, under this component's id |
 
 **A busy request is not a lost one**, as on `splunk_hec_in`: after 5 seconds without the pipeline
 taking the request's batch, the request gets `503` with `Retry-After: 1`, counted `class="busy"`
@@ -2415,6 +2425,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.input.metrics.dropped{reason="bad_sketch"\|"legacy_distribution"}` | count | a malformed `Dogsketch`, or a legacy `distributions` entry, which isn't implemented |
 | `logit.input.metrics.skipped{reason="empty_sketch"}` | count | a `Dogsketch` with no bins and zero count |
 | `logit.input.metrics.degraded{reason="no_timestamp"}` | count | a point or sketch with no timestamp, stamped with `received_at` |
+| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | a tag whose key starts with `_logit.`, the private carrier prefix, left off a delivered series, sketch, event, or service check, counted per tag: once per series or sketch however many points it delivers |
 | `logit.output.metrics.skipped{metric_kind="cumulative_sum"\|"non_monotonic_delta_sum"\|"set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` | count | a metric kind no Datadog route carries; counted by the series encoders only |
 | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | count | a `GaugeDelta` nothing upstream resolved to a gauge; counted by the series encoders only |
 | `logit.output.metrics.skipped{reason="no_recorded_value"\|"empty_sketch"}` | count | a flagged record, or a sketch with nothing in it |

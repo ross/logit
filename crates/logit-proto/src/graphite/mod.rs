@@ -46,6 +46,7 @@
 //! | `path` (everything before the first `;`) | `name = intern(path)`, `Gauge(F64(v))` | -- |
 //! | `;name=value` | event attribute, `Value::Str` over a zero-copy [`bytes::Bytes`] slice of the input; a copy when the path is a protocol-0 pickle string the reader decoded into its scratch ([`pickle`]'s "Bounds") | -- |
 //! | repeated tag key | last occurrence wins | `logit.input.tags.normalized{reason="duplicate_key"}` + diag `duplicate_tag_key` |
+//! | tag name under the private `_logit.` prefix | omitted, so a sender's tag never reads back as a carrier ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)); the line still decodes | `logit.input.tags.omitted{reason="reserved_prefix"}` |
 //! | finite value (`3`, `-1.5`, `1e5`, or a pickle `"3.14"` string) | `Gauge(F64(v))`: carbon's value is a double, so an integer reads as `F64` too | -- |
 //! | NaN / ±inf | line dropped | `logit.input.metrics.dropped{reason="non_finite_value"}` + diag `non_finite_value` |
 //! | `timestamp == -1` | `received_at` (carbon's own rule) | -- |
@@ -182,6 +183,7 @@
 //! 13. A pickle sender's spelling (protocol version, opcode choice, memo use) leaves as
 //!     `graphite_out`'s protocol-2 writer spelling. A protocol-0, protocol-1, or protocol-5 sender
 //!     is re-spelled, and no decoded field changes.
+//! 14. A tag whose name is under the private `_logit.` prefix is omitted at decode, counted.
 //!
 //! One more sits outside the numbering the ADR and plan share, because the listener adds it after
 //! decode rather than the codec: under `graphite_in`'s `peer:` or `proxy_protocol:`,

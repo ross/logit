@@ -21,6 +21,7 @@ use super::pickle::PickleReader;
 use super::Protocol;
 use crate::{CodecError, Decoder};
 use bytes::Bytes;
+use logit_core::attrs::is_private;
 use logit_core::interner::{intern, KeyCache};
 use logit_core::subslice;
 use logit_core::{
@@ -259,7 +260,10 @@ fn push_datapoint(
     }
 
     let mut attributes = AttrMap::new();
-    let Some(path) = parse_tags(bytes, path_field, &mut attributes, ctx) else { return };
+    let mut reserved = 0;
+    let Some(path) = parse_tags(bytes, path_field, &mut attributes, &mut reserved, ctx) else {
+        return;
+    };
     if path.is_empty() {
         ctx.drop_metric(
             Dropped::BadLine,
@@ -267,6 +271,7 @@ fn push_datapoint(
         );
         return;
     }
+    ctx.tags_omitted_reserved(reserved);
 
     out.push(Event::metric(
         timestamp,
@@ -279,11 +284,14 @@ fn push_datapoint(
 /// `;`, or `None` when a segment is malformed (which skips the whole line).
 ///
 /// A repeated key collapses to its **last** value, counted
-/// `logit.input.tags.normalized{reason="duplicate_key"}` (normalization 5).
+/// `logit.input.tags.normalized{reason="duplicate_key"}` (normalization 5). A key under the private
+/// `_logit.` prefix is skipped and added to `reserved`, for the caller to count once the line is
+/// delivered (normalization 14).
 fn parse_tags<'a>(
     bytes: &Bytes,
     field: &'a str,
     attributes: &mut AttrMap,
+    reserved: &mut usize,
     ctx: &mut Ctx,
 ) -> Option<&'a str> {
     let Some((path, tags)) = field.split_once(';') else { return Some(field) };
@@ -304,6 +312,10 @@ fn parse_tags<'a>(
                 ),
             );
             return None;
+        }
+        if is_private(name) {
+            *reserved += 1;
+            continue;
         }
         let key = ctx.keys.get_or_intern(name);
         if attributes.get_sym(key).is_some() {
@@ -414,6 +426,18 @@ impl Ctx<'_> {
                 "graphite: {n} pickle item(s) were not (path, (timestamp, value)); skipping them"
             ),
         );
+    }
+
+    /// `logit.input.tags.omitted{reason="reserved_prefix"}` for `n` private tags on a delivered
+    /// datapoint.
+    fn tags_omitted_reserved(&mut self, n: usize) {
+        if n > 0 {
+            self.telemetry.count(
+                "logit.input.tags.omitted",
+                n as f64,
+                &[("reason", "reserved_prefix")],
+            );
+        }
     }
 
     fn tag_normalized_duplicate(&mut self, name: &str) {
@@ -561,6 +585,25 @@ mod tests {
         assert_eq!(attr(&events[0], "team").as_deref(), Some("b"));
         assert_eq!(
             counter_total(&registry, "logit.input.tags.normalized", "reason", "duplicate_key"),
+            1.0
+        );
+    }
+
+    /// Normalization 14: a private tag is left off the event and counted, a line dropped for
+    /// another reason counts nothing, and `logit.x` and `_logitx` aren't private.
+    #[test]
+    fn a_private_tag_is_omitted_and_counted_and_lookalikes_are_not() {
+        let (events, registry) = decode_counted(
+            "a.b;team=a;_logit.statsd.type=c;logit.x=1;_logitx=2 1 1700000000\n\
+             a.b;_logit.y=1;bad 1 1700000000\n",
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(attr(&events[0], "team").as_deref(), Some("a"));
+        assert_eq!(attr(&events[0], "logit.x").as_deref(), Some("1"));
+        assert_eq!(attr(&events[0], "_logitx").as_deref(), Some("2"));
+        assert_eq!(events[0].attributes.len(), 3, "{:?}", events[0].attributes);
+        assert_eq!(
+            counter_total(&registry, "logit.input.tags.omitted", "reason", "reserved_prefix"),
             1.0
         );
     }

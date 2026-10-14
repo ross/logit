@@ -55,6 +55,7 @@
 //! | timestamp absent, zero, or negative | `received_at`, truncated to its second | `logit.input.metrics.degraded{reason="no_timestamp"}` |
 //! | `unit` | `MetricRecord::unit` when non-empty | -- |
 //! | `tags` | attributes by [`tags`]'s rule | -- |
+//! | a tag whose key is under the private `_logit.` prefix | omitted; counted once per series that delivers a point | `logit.input.tags.omitted{reason="reserved_prefix"}` |
 //! | the first named `host` resource; v1 and distribution `host` | [`ATTR_HOST_NAME`] | -- |
 //! | the first named `device` resource; v1 `device` | [`ATTR_DEVICE`] (the Agent's v2 serializer sends a v1 `device` as that resource, UNVERIFIED: the recorded Agent ran no check that sets one) | -- |
 //! | every other resource, including an empty-named or second `host` | [`ATTR_RESOURCES`]: `Array` of `Map{type, name}`, in wire order | -- |
@@ -148,6 +149,7 @@
 //!    crate's `serde_json` dependency enables `float_roundtrip` (see `Cargo.toml`). The protobuf
 //!    routes (v2 protobuf, sketches) never go through that parser and carry values bit-exact
 //!    either way.
+//! 9. a tag whose key is under the private `_logit.` prefix is omitted and counted.
 //!
 //! # Logs, events, service checks (`logs`, `events`, `service_checks`)
 //!
@@ -194,7 +196,7 @@
 //! | `msg_text`/`text` | `LogRecord::message` = `Str`, `body_format: Raw`, `event_name: None` | -- |
 //! | `timestamp`/`date_happened` seconds | `Event::timestamp`; absent or `0` → `received_at` | -- |
 //! | `priority`, `host`, `aggregation_key` | `statsd.event.priority`, `.host`, `.aggregation_key` | -- |
-//! | `tags` | attributes, by [`tags`]'s rule | -- |
+//! | `tags` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for an omitted tag |
 //! | `alert_type` | `statsd.event.alert_type`, verbatim; `severity`: `error` → `Error`, `warning` → `Warn`, `success`/`info` → `Info`, else `None` | -- |
 //! | `source_type_name`, else the envelope group key unless it is `api` | `statsd.event.source_type` | -- |
 //! | `event_type` (Agent) | [`ATTR_EVENT_TYPE`] | -- |
@@ -211,7 +213,7 @@
 //! | `status` 0 to 3 | `MetricKind::Gauge(status)`, and `statsd.service_check.status` = `U64` | -- |
 //! | `status` absent, negative, above 3, or not an integer | dropped | `logit.input.metrics.dropped{reason="invalid_status"}` |
 //! | `message`, `host_name`, non-empty | `statsd.service_check.message`, `.host` | -- |
-//! | `tags`, an array or `null` | attributes, by [`tags`]'s rule | -- |
+//! | `tags`, an array or `null` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for an omitted tag |
 //! | `timestamp` seconds | `Event::timestamp`; absent or `0` → `received_at` | -- |
 //!
 //! ## Encode: events → logs, events, service checks
@@ -261,6 +263,8 @@
 //! 5. a log with `host.name`, `service.name`, or `datadog.source` but no `hostname`, `service`, or
 //!    `ddsource` leaves under the Datadog name;
 //! 6. tags reorder by attribute order, and an exact duplicate tag is dropped.
+//! 7. an event's or check's tag whose key is under the private `_logit.` prefix is omitted and
+//!    counted.
 //!
 //! # Traces (`traces`, `traces_msgpack`, `traces_proto`)
 //!
@@ -799,6 +803,18 @@ impl DatadogDecoder {
     pub fn with_diagnostics(mut self, diagnostics: Diagnostics) -> Self {
         self.diagnostics = diagnostics;
         self
+    }
+
+    /// `logit.input.tags.omitted{reason="reserved_prefix"}`: `n` tags [`tags::insert_tags`]
+    /// skipped for a private key, on a series, sketch, event, or check that was delivered.
+    pub(super) fn reserved_tags(&self, n: usize) {
+        if n > 0 {
+            self.telemetry.count(
+                "logit.input.tags.omitted",
+                n as f64,
+                &[("reason", "reserved_prefix")],
+            );
+        }
     }
 }
 
