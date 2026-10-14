@@ -24,6 +24,14 @@
         "$ref": "#/definitions/Component"
       }
     },
+    "hostname": {
+      "description": "The name of the host this process runs on. `logit` stamps it as `host.name` on its own telemetry, so several instances writing to one metrics backend stay distinguishable, and uses it wherever a component needs a hostname of its own. Defaults to the kernel hostname: the pod name in Kubernetes, the node name under `hostNetwork`, the container's hostname in Docker, and the machine's hostname on a host. To use another value, set it here. In Kubernetes, expose the node name or pod name to the container through the downward API and read it with `hostname: !env NODE_NAME`. Must not be empty. The process fails to start if the default is empty and this is unset.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "shutdown": {
       "description": "How the process stops on SIGTERM or SIGINT. Process-level, not per component. Omitting the block keeps the default: the drain starts as soon as the signal arrives.",
       "default": {

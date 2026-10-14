@@ -332,7 +332,11 @@ fn prepare(
     reopen: Option<watch::Receiver<u64>>,
     tls_reloader: &TlsReloader,
 ) -> anyhow::Result<PrepareResult> {
+    let configured_hostname = config.hostname.clone();
     let graph = graph::resolve(config)?;
+    // After `graph::resolve`, so rule 88's message wins over an empty `hostname:`.
+    let hostname = logit_pipeline::host::resolve(configured_hostname.as_deref())?;
+    tracing::info!(target: "logit", hostname = %hostname, "hostname resolved");
 
     // Graph rule 13 allows at most one `internal`; its `span_sample_rate` configures the registry.
     let internal_component = graph.components.iter().find_map(|(id, c)| match &c.kind {
@@ -353,9 +357,16 @@ fn prepare(
     let mut telemetry: HashMap<String, Telemetry> = HashMap::with_capacity(graph.components.len());
     for id in ids {
         let component = &graph.components[id];
-        let (spec, component_telemetry) =
-            build_spec(id, component, &base_dir, registry.as_ref(), reopen.as_ref(), tls_reloader)
-                .with_context(|| format!("component '{id}'"))?;
+        let (spec, component_telemetry) = build_spec(
+            id,
+            component,
+            &base_dir,
+            registry.as_ref(),
+            reopen.as_ref(),
+            tls_reloader,
+            &hostname,
+        )
+        .with_context(|| format!("component '{id}'"))?;
         specs.insert(id.clone(), spec);
         telemetry.insert(id.clone(), component_telemetry);
     }
@@ -422,6 +433,9 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<Vec<String>> {
 ///
 /// Every TLS component (a listener, a sink, or `prometheus_in`'s scrape client) registers its
 /// certificate files with `tls_reloader`, under the component's own `Diagnostics` and `Telemetry`.
+///
+/// `hostname` is the process hostname (`logit_pipeline::host`); `internal` stamps it as
+/// `host.name`.
 fn build_spec(
     id: &str,
     component: &ResolvedComponent,
@@ -429,6 +443,7 @@ fn build_spec(
     registry: Option<&Arc<Registry>>,
     reopen: Option<&watch::Receiver<u64>>,
     tls_reloader: &TlsReloader,
+    hostname: &Arc<str>,
 ) -> anyhow::Result<(NodeSpec, Telemetry)> {
     use logit_config::ComponentKind::*;
     // Every arm clones this rather than moving it: it's returned too, so the node runtime's layer 2
@@ -908,7 +923,7 @@ fn build_spec(
                 .cloned()
                 .expect("graph::resolve's rule 13 guarantees a Registry whenever an 'internal' component does");
             #[allow(unused_mut)]
-            let mut input = InternalInput::new(*interval, registry)
+            let mut input = InternalInput::new(*interval, registry, hostname)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
             #[cfg(feature = "jemalloc")]
@@ -2333,7 +2348,7 @@ mod tests {
         }
     }
 
-    /// [`super::build_spec`] with no reopen generation and a throwaway TLS reloader, shadowing
+    /// [`super::build_spec`] with no reopen generation, a throwaway TLS reloader, and a fixed hostname, shadowing
     /// it for every test below.
     fn build_spec(
         id: &str,
@@ -2341,7 +2356,15 @@ mod tests {
         base_dir: &Path,
         registry: Option<&Arc<Registry>>,
     ) -> anyhow::Result<(NodeSpec, Telemetry)> {
-        super::build_spec(id, component, base_dir, registry, None, &TlsReloader::new())
+        super::build_spec(
+            id,
+            component,
+            base_dir,
+            registry,
+            None,
+            &TlsReloader::new(),
+            &Arc::from("test-host"),
+        )
     }
     use logit_config::{Component, ComponentKind, InternalLogs};
     use std::collections::HashMap as Map;

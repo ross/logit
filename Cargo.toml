@@ -32,6 +32,10 @@ logit-transforms = { path = "crates/logit-transforms" }
 logit-bench = { path = "crates/logit-bench" }
 
 bytes = "1"
+# The process hostname (`logit_pipeline::host`): `uname(2)`'s nodename through a safe wrapper, so
+# the lookup adds no raw-`libc` `unsafe` site (docs/adr/out-of-ci-unsafe-verification.md). Already
+# in the graph transitively.
+rustix = { version = "1", default-features = false, features = ["std", "system"] }
 # OTLP codec only (crates/logit-proto/src/otlp) -- messages generated once, offline, and committed
 # (docs/adr/committed-pregenerated-otlp-protobuf.md); no `prost-build`/`protoc` at build time.
 prost = "0.14"

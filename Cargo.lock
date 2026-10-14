@@ -1216,6 +1216,7 @@ dependencies = [
  "logit-script",
  "proptest",
  "regex",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "serde",

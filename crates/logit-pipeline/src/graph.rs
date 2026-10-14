@@ -301,6 +301,8 @@
 //!     (`docs/adr/influxdb-line-protocol-relay.md`).
 //! 87. A `has_stale` or `drop_stale` with a `max_age` of `0s`, or a `max_ahead` of `0s` when set:
 //!     a zero bound would call nearly every event stale (`docs/adr/stale-event-filtering.md`).
+//! 88. A top-level `hostname` that is empty or only whitespace: it would stamp a blank `host.name`
+//!     (`docs/adr/process-hostname.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -824,8 +826,15 @@ fn is_absolute_http_url(url: &str) -> bool {
 }
 
 pub fn resolve(config: Config) -> anyhow::Result<Graph> {
-    let Config { components, admin, .. } = config;
+    let Config { components, admin, hostname, .. } = config;
     let mut warnings = Vec::new();
+
+    // Rule 88: the top-level `hostname` (`docs/adr/process-hostname.md`).
+    if hostname.as_deref().is_some_and(|h| h.trim().is_empty()) {
+        anyhow::bail!(
+            "'hostname' is empty -- give the host's name, or omit it to use the kernel hostname"
+        );
+    }
 
     // Rule 1: at least one component.
     if components.is_empty() {
@@ -14686,6 +14695,31 @@ mod tests {
         let err = expect_err(cfg_with_admin(r#"{"bind": "/run/logit/admin.sock"}"#));
         assert!(err.contains("admin: 'bind' is a path"), "got: {err}");
         assert!(err.contains("'socket:'"), "got: {err}");
+    }
+
+    // ---- rule 88: the top-level hostname --------------------------------------------------
+
+    fn cfg_with_hostname(hostname: Option<&str>) -> Config {
+        Config {
+            hostname: hostname.map(str::to_string),
+            ..cfg(vec![("in", vec![], listener()), ("out", vec!["in"], sink())])
+        }
+    }
+
+    #[test]
+    fn rule_88_accepts_a_hostname_or_none() {
+        for hostname in [None, Some("node-1")] {
+            resolve(cfg_with_hostname(hostname))
+                .unwrap_or_else(|err| panic!("{hostname:?} should resolve: {err}"));
+        }
+    }
+
+    #[test]
+    fn rule_88_rejects_an_empty_or_blank_hostname() {
+        for hostname in ["", "  \t"] {
+            let err = expect_err(cfg_with_hostname(Some(hostname)));
+            assert!(err.contains("'hostname' is empty"), "got: {err}");
+        }
     }
 
     // ---- rule 71: lua / lua_file max_memory ------------------------------------------------

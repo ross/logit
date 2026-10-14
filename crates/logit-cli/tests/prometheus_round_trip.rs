@@ -356,7 +356,7 @@ async fn internal_telemetry_through_cumulative_aggregate_renders_a_logit_compone
     let telemetry = registry.telemetry_for("probe", "statsd_in", "listener");
     telemetry.count("logit.component.batches.sent", 3.0, &[]);
 
-    let input = InternalInput::new(Duration::from_millis(20), registry);
+    let input = InternalInput::new(Duration::from_millis(20), registry, "test-host");
     let body = first_drain_through_cumulative_aggregate(input).await;
     assert!(
         body.contains("logit_component_batches_sent_total"),
@@ -370,7 +370,8 @@ async fn internal_telemetry_through_cumulative_aggregate_renders_a_logit_compone
 async fn internal_process_metrics_through_cumulative_aggregate_render_in_the_exposition() {
     let registry = Registry::new();
     let own = registry.telemetry_for("self", "internal", "listener");
-    let input = InternalInput::new(Duration::from_millis(20), registry).with_telemetry(own);
+    let input =
+        InternalInput::new(Duration::from_millis(20), registry, "test-host").with_telemetry(own);
     let body = first_drain_through_cumulative_aggregate(input).await;
     assert!(body.contains("logit_process_uptime"), "got:\n{body}");
     #[cfg(target_os = "linux")]

@@ -40,6 +40,16 @@ pub struct Config {
     #[serde(with = "humantime_serde_duration", default = "default_tls_reload_interval")]
     #[schemars(with = "String")]
     pub tls_reload_interval: Duration,
+    /// The name of the host this process runs on. `logit` stamps it as `host.name` on its own
+    /// telemetry, so several instances writing to one metrics backend stay distinguishable, and
+    /// uses it wherever a component needs a hostname of its own. Defaults to the kernel hostname:
+    /// the pod name in Kubernetes, the node name under `hostNetwork`, the container's hostname in
+    /// Docker, and the machine's hostname on a host. To use another value, set it here. In
+    /// Kubernetes, expose the node name or pod name to the container through the downward API
+    /// and read it with `hostname: !env NODE_NAME`. Must not be empty. The process fails to start
+    /// if the default is empty and this is unset.
+    #[serde(default)]
+    pub hostname: Option<String>,
 }
 
 /// Not derived: a derived default would give `tls_reload_interval` zero, which turns polling off.
@@ -50,6 +60,7 @@ impl Default for Config {
             admin: AdminConfig::default(),
             shutdown: ShutdownConfig::default(),
             tls_reload_interval: default_tls_reload_interval(),
+            hostname: None,
         }
     }
 }
