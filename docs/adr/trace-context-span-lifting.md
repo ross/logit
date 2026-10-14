@@ -1,6 +1,6 @@
 ---
 created: 2026-09-04
-updated: 2026-10-11
+updated: 2026-10-13
 ---
 
 # `trace_context` grows a `span:` block, and a native `traceparent` parser
@@ -38,8 +38,9 @@ config-and-server-side plumbing standing in for four lines for a parser inside `
 the core model doesn't carry) — the OTLP codec's `otel.status_message` was too, at the time this
 ADR was written; W4 later retired it in favor of a real `SpanExt.status_message` field
 ([ADR `metrics-model-v2`](metrics-model-v2.md)), leaving `otel.severity_number`/`otel.severity_text`
-as the OTLP-side example of the same pattern today. Nothing wrote down a convention an operator —
-or another `logit` component — could target on purpose. A span
+as the OTLP-side example of the same pattern, until both moved under the private `_logit.` prefix
+([ADR `private-attribute-namespace`](private-attribute-namespace.md)). Nothing wrote down a
+convention an operator — or another `logit` component — could target on purpose. A span
 needs several such names (id, parent, kind, status, timing) at once, which is reason enough to
 name them together rather than growing them one at a time as separate, uncoordinated config
 fields the way `trace_context`'s original `trace_id`/`span_id`/`flags` did.
