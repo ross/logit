@@ -315,7 +315,7 @@ fn flatten(family: &MetricFamily, out: &mut Vec<(Identity, Line)>) {
                     let role = if bound.is_infinite() { Role::Inf } else { Role::Count };
                     let mut l = line(role, *cumulative as f64);
                     let (here, rest): (Vec<_>, Vec<_>) =
-                        exemplars.into_iter().partition(|e| e.value <= *bound);
+                        exemplars.into_iter().partition(|e| e.value.as_f64() <= *bound);
                     l.exemplars = here;
                     exemplars = rest;
                     push(format!("{name}_bucket"), Some(("le", *bound)), l);
@@ -480,7 +480,7 @@ fn compare(go: &Json, logit: &Line, dialect: Dialect, count_mismatch: bool) -> R
                 })
                 .collect();
             if theirs != exemplar_labels(ours)
-                || !same_float(bits(&e["value"]), ours.value)
+                || !same_float(bits(&e["value"]), ours.value.as_f64())
                 || ts != ours_ts
             {
                 return Err(format!("exemplar: Prometheus {e}, logit {ours:?}"));

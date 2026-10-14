@@ -262,7 +262,7 @@ pub(crate) mod tests {
             record.flags = 4;
             record.exemplars = vec![Exemplar {
                 timestamp: 6,
-                value: 0.25,
+                value: logit_core::MetricValue::F64(0.25),
                 trace: Some(trace),
                 filtered_attributes: attrs(&[("ex.k", Value::str("v"))]),
             }];

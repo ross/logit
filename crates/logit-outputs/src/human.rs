@@ -117,7 +117,8 @@
 //! | `exponential_histogram` | `scale`, `temporality`, `count`, `zero_count`, `zero_threshold`, `positive:`/`negative:` each a block of `offset` and `counts: [..]` (omitted when its counts are empty), then `sum`, `min`, `max` when present |
 //! | `summary` | `count`, `sum`, `quantiles:` a block of `<q>: <value>` in wire order |
 //!
-//! A `sum`'s `value`, a `gauge`'s `value`, and a `gauge_delta`'s `delta` print as the number, then
+//! A `sum`'s `value`, a `gauge`'s `value`, a `gauge_delta`'s `delta`, and an exemplar's `value`
+//! print as the number, then
 //! its type in parentheses (`value: 5 (i64)`, `value: true (bool)`) unless it is an `f64`, so a
 //! float reads as it always has and an integer or boolean can't pass for one
 //! (`docs/adr/typed-metric-scalar.md`).
@@ -508,7 +509,9 @@ fn render_exemplar(out: &mut String, col: usize, exemplar: &Exemplar) {
     write_rfc3339_utc(out, exemplar.timestamp);
     out.push('\n');
     let col = col + 2;
-    display_field(out, col, "value", exemplar.value);
+    field(out, col, "value");
+    push_metric_value(out, exemplar.value);
+    out.push('\n');
     if let Some(trace) = &exemplar.trace {
         trace_fields(out, col, trace);
     }
@@ -1601,7 +1604,7 @@ mod tests {
         record.exemplars = vec![
             Exemplar {
                 timestamp: 1_000_000_000,
-                value: 0.25,
+                value: MetricValue::F64(0.25),
                 trace: Some(logit_core::TraceRef {
                     trace_id: [0xab; 16],
                     span_id: Some([0xcd; 8]),
@@ -1609,7 +1612,18 @@ mod tests {
                 }),
                 filtered_attributes: filtered,
             },
-            Exemplar { timestamp: 0, value: 1.0, trace: None, filtered_attributes: AttrMap::new() },
+            Exemplar {
+                timestamp: 0,
+                value: MetricValue::F64(1.0),
+                trace: None,
+                filtered_attributes: AttrMap::new(),
+            },
+            Exemplar {
+                timestamp: 0,
+                value: MetricValue::I64(7),
+                trace: None,
+                filtered_attributes: AttrMap::new(),
+            },
         ];
         assert_eq!(
             render(vec![Event::metric(0, AttrMap::new(), record)]),
@@ -1627,6 +1641,8 @@ mod tests {
                 "          exemplar.user: \"u-1\"",
                 "      - timestamp: 1970-01-01T00:00:00.000000000Z",
                 "        value: 1",
+                "      - timestamp: 1970-01-01T00:00:00.000000000Z",
+                "        value: 7 (i64)",
             ])
         );
     }

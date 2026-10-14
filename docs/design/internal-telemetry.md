@@ -1781,8 +1781,8 @@ the pipeline counts each place a value changes type or loses precision, one per 
 |---|---|---|
 | `logit.transform.metrics.normalized{reason="widened"}` | `aggregate` | a fold whose result type differs from an operand's: a mixed-type pair, an integer overflow, or a `Bool` in the sum, with the result usually `F64` (`MetricValue::checked_add`'s table) |
 | `logit.transform.metrics.normalized{reason="inexact_read"}` | `lua`, `lua_file` | a script read an `I64` or `U64` value above 2^53 as a Lua number that isn't the same integer |
-| `logit.output.metrics.normalized{reason="bool_value"}` | every sink whose metric wire is numeric-only | a `Bool` written as `1` or `0`, because the wire has no boolean |
-| `logit.output.metrics.normalized{reason="u64_as_double"}` | `otlp_out`, `kafka_out` under `format: otlp_proto \| otlp_json` | a `U64` above `i64::MAX` written as `as_double`, because OTLP's `as_int` is signed |
+| `logit.output.metrics.normalized{reason="bool_value"}` | every sink whose metric wire is numeric-only | a `Bool` metric or exemplar value written as `1` or `0`, because the wire has no boolean |
+| `logit.output.metrics.normalized{reason="u64_as_double"}` | `otlp_out`, `kafka_out` under `format: otlp_proto \| otlp_json` | a `U64` metric or exemplar value above `i64::MAX` written as `as_double`, because OTLP's `as_int` is signed |
 | `logit.output.metrics.normalized{reason="inexact"}` | `collectd_out` | an `I64` or `U64` gauge written as a collectd `GAUGE` double that isn't the same integer |
 
 #### Outputs

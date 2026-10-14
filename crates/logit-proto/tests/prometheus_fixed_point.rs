@@ -37,7 +37,7 @@
 //!
 //! [ADR `lossless-transit`]: ../../../docs/adr/lossless-transit.md
 
-use logit_core::{AttrMap, Exemplar, Resource, TraceRef, Value};
+use logit_core::{AttrMap, Exemplar, MetricValue, Resource, TraceRef, Value};
 use logit_proto::prometheus::text::{parse, write, Dialect};
 use logit_proto::prometheus::{
     events_to_families, families_to_events, FamilyType, MetricFamily, Point, PrometheusDecoder,
@@ -169,7 +169,7 @@ fn a_hand_built_family_list_is_a_model_fixed_point() {
     filtered_attributes.insert("detail", Value::str("kept"));
     let exemplar = Exemplar {
         timestamp: 1_605_281_325_500_000_000,
-        value: 0.5,
+        value: MetricValue::F64(0.5),
         trace: Some(TraceRef { trace_id: [7; 16], span_id: Some([6; 8]), flags: 0 }),
         filtered_attributes,
     };
@@ -397,7 +397,7 @@ fn exemplars(dialect: Dialect, kind: FamilyType) -> BoxedStrategy<Vec<Exemplar>>
                     filtered_attributes.insert(&key, Value::str(value));
                 }
             }
-            vec![Exemplar { timestamp, value, trace, filtered_attributes }]
+            vec![Exemplar { timestamp, value: MetricValue::F64(value), trace, filtered_attributes }]
         }
     })
     .boxed()

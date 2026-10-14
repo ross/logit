@@ -97,7 +97,7 @@ const METRIC_KEYS: &[&str] = &[
 
 /// The keys `exemplar_to_table` emits.
 const EXEMPLAR_KEYS: &[&str] =
-    &["timestamp", "value", "trace_id", "span_id", "trace_flags", "attributes"];
+    &["timestamp", "value", "type", "trace_id", "span_id", "trace_flags", "attributes"];
 
 /// The keys of one row of a `histogram`'s `buckets`, as `metric_to_table` emits them.
 const BUCKET_KEYS: &[&str] = &["bound", "count"];
@@ -763,7 +763,7 @@ fn exemplar_from_table(t: Table, path: &str) -> mlua::Result<Exemplar> {
         LuaValue::Nil => return Err(required(path, "timestamp")),
         value => nanos_string(value, path, "timestamp")?,
     };
-    let value = finite_field(t.raw_get("value")?, path, "value")?;
+    let value = metric_value_field(&t, path)?;
     let trace = trace_ref_from_fields(
         t.raw_get("trace_id")?,
         t.raw_get("span_id")?,
@@ -1648,7 +1648,7 @@ mod tests {
         record.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         record.exemplars = vec![Exemplar {
             timestamp: 1_700_000_000_500_000_000,
-            value: 42.0,
+            value: MetricValue::F64(42.0),
             trace: Some(TraceRef { trace_id: [0x33; 16], span_id: Some([0x44; 8]), flags: 1 }),
             filtered_attributes: {
                 let mut m = AttrMap::new();
@@ -2237,10 +2237,35 @@ mod tests {
         let mut record = MetricRecord::new(intern("m"), MetricKind::gauge(1.0));
         record.exemplars = vec![Exemplar {
             timestamp: 5,
-            value: 2.0,
+            value: MetricValue::F64(2.0),
             trace: Some(TraceRef { trace_id: [0x33; 16], span_id: Some([0x44; 8]), flags: 1 }),
             filtered_attributes: AttrMap::new(),
         }];
+        assert_eq!(out, minted_metric(record));
+    }
+
+    /// An exemplar's `value` takes the optional `type` a metric's does, and `to_table()` writes it
+    /// back, so `Event.new(e:to_table())` rebuilds the same typed exemplar.
+    #[test]
+    fn a_typed_exemplar_value_round_trips() {
+        let out = mint_metric(
+            r#"kind = "gauge", value = 1, exemplars = {{timestamp = "5", value = "9223372036854775807", type = "i64"}, {timestamp = "6", value = true, type = "bool"}}"#,
+        );
+        let mut record = MetricRecord::new(intern("m"), MetricKind::gauge(1.0));
+        record.exemplars = vec![
+            Exemplar {
+                timestamp: 5,
+                value: MetricValue::I64(i64::MAX),
+                trace: None,
+                filtered_attributes: AttrMap::new(),
+            },
+            Exemplar {
+                timestamp: 6,
+                value: MetricValue::Bool(true),
+                trace: None,
+                filtered_attributes: AttrMap::new(),
+            },
+        ];
         assert_eq!(out, minted_metric(record));
     }
 

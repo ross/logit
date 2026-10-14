@@ -905,7 +905,7 @@ fn parse_temporality(value: &LuaValue, index: usize) -> mlua::Result<Temporality
 fn exemplar_to_table<'lua>(lua: &'lua Lua, exemplar: &Exemplar) -> mlua::Result<Table<'lua>> {
     let table = lua.create_table()?;
     table.set("timestamp", exemplar.timestamp.to_string())?;
-    table.set("value", exemplar.value)?;
+    set_metric_value(lua, &table, exemplar.value)?;
     table.set(
         "trace_id",
         match exemplar.trace {
@@ -1614,7 +1614,7 @@ pub(crate) mod tests {
         record.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         record.exemplars = vec![Exemplar {
             timestamp: 1_700_000_000_500_000_000,
-            value: 42.0,
+            value: MetricValue::F64(42.0),
             trace: Some(TraceRef { trace_id: [0x33; 16], span_id: Some([0x44; 8]), flags: 1 }),
             filtered_attributes: {
                 let mut m = AttrMap::new();

@@ -74,7 +74,7 @@
 //! |---|---|
 //! | `Sum{Cumulative, monotonic}` | `counter` |
 //! | `Sum{Cumulative, !monotonic}` | `gauge` -- Prometheus has no non-monotonic counter; `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}` |
-//! | a `Sum` or `Gauge` value of `I64`/`U64`/`Bool` | the sample's double, on both wires: an integer's nearest `f64`, a `Bool` `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}` |
+//! | a `Sum` or `Gauge` value, or an exemplar's value, of `I64`/`U64`/`Bool` | the sample's double, on both wires: an integer's nearest `f64`, a `Bool` `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}` |
 //! | `Sum{Delta}` / `Histogram{Delta}` | **dropped**, `logit.output.metrics.dropped{reason="unresolved_delta"}` + `warn_throttled("delta_temporality_unresolved")` -- put an `aggregate` with `temporality: cumulative` in front of the sink |
 //! | `Gauge` | `gauge`, or whatever `prometheus.type` says (consumed): `untyped`/`unknown`/`info`/`stateset` |
 //! | `GaugeDelta` | **dropped**, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` + `warn_throttled("gauge_delta_unresolved")` (the same counter and greppable key every other sink uses) |
@@ -1580,7 +1580,7 @@ mod tests {
     fn exemplars_ride_onto_the_metric_record() {
         let exemplar = Exemplar {
             timestamp: 1_520_879_607_789_000_000,
-            value: 0.67,
+            value: MetricValue::F64(0.67),
             trace: Some(TraceRef { trace_id: [7; 16], span_id: Some([6; 8]), flags: 0 }),
             filtered_attributes: AttrMap::new(),
         };

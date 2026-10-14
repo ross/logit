@@ -156,7 +156,7 @@ at a power-of-two count (`tests/robustness.rs`'s
 | Element | Smallest wire cost | Heap cost | Peak / wire byte | Charged |
 |---|--:|--:|--:|---|
 | Event | 1 B | 864 B `Event` | 864 | `size_of::<Event>()` |
-| `MR_EXEMPLARS` entry | 1 B | 440 B `Exemplar` | 440 | `size_of::<Exemplar>()` |
+| `MR_EXEMPLARS` entry | 1 B | 448 B `Exemplar` | 448 | `size_of::<Exemplar>()` |
 | `TAG_ARRAY` item holding an empty `Map` | 3 B | 40 B `Value` + 392 B boxed `AttrMap` | 144 | both |
 | `SR_EVENTS` entry | 5 B | 448 B `SpanEvent` | 89.6 | `size_of::<SpanEvent>()` |
 | `METRIC_SET_MEMBERS` member | 1 B | 32 B `Bytes` | 32 | `size_of::<Bytes>()` |
@@ -248,7 +248,7 @@ version-negotiated path; skip-unknown framing guards against a torn write, not m
 | Tag | Field | Payload |
 |---|---|---|
 | 1 | `timestamp` | `i64` LE |
-| 2 | `value` | `f64` LE |
+| 2 | `value` | scalar, as `Gauge` and `Sum` carry (see "`MetricKind`" below); skipped only when `F64(0.0)`, so `I64(0)` is written |
 | 3 | `trace` | nested `TraceRef`: 16-byte trace id + span-id presence byte (`0`, or `1` + 8 bytes) + a flags byte |
 | 4 | `filtered_attributes` | attribute map |
 

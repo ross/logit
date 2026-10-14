@@ -4,8 +4,8 @@
 //! with exemplars, and spans with events and links. It leaves out the kinds the constructor
 //! refuses (the two sketches and `gauge_delta`) and every shape `docs/adr/lua-event-constructor.md`
 //! lists as not round-tripping: the "Residual, recorded rather than fixed" consequence and the
-//! count amendment. Counts draw from the full `u64` range, boundary values first, and a `sum`'s or
-//! `gauge`'s value from every `MetricValue` variant at its full range.
+//! count amendment. Counts draw from the full `u64` range, boundary values first, and a `sum`'s,
+//! `gauge`'s, or exemplar's value from every `MetricValue` variant at its full range.
 
 use bytes::Bytes;
 use logit_core::interner::intern;
@@ -282,7 +282,7 @@ fn metric_kind() -> impl Strategy<Value = MetricKind> {
 }
 
 fn exemplar() -> impl Strategy<Value = Exemplar> {
-    (any::<i64>(), finite(), prop::option::of(trace_ref()), attributes()).prop_map(
+    (any::<i64>(), metric_value(), prop::option::of(trace_ref()), attributes()).prop_map(
         |(timestamp, value, trace, filtered_attributes)| Exemplar {
             timestamp,
             value,
