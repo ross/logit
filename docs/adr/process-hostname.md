@@ -41,8 +41,8 @@ its resource beside `service.name`.
   parameter to `build_spec`, so tests choose their own hostname.
 
 `logit` claims `host.name` only for its own telemetry (`internal`). The follow-up workstream makes
-`syslog_out`, `splunk_hec_out`, and `datadog_out` fall back to the process hostname when an event
-carries no host of its own. That fallback fills a missing value and never overwrites a host an
+`syslog_out`, `splunk_hec_out`, and `datadog_out` fall back to the process hostname for events that
+carry no host of their own. That fallback fills a missing value and never overwrites a host an
 event carries. `collectd_out` keeps its `no_host` drop: its ADR's stance that inventing a host
 merges every unlabeled sender into one host's metrics stands. A relay's events reach `collectd_out`
 with the origin's `collectd.host`, and only `internal`'s events, which now carry `host.name`, gain a
@@ -65,7 +65,18 @@ host.
   `influxdb_out`, because both fold resource attributes into labels and tags.
 - In Kubernetes a pod name changes on each rollout, so series re-key per pod. That's inherent to
   telling instances apart; set `hostname: !env NODE_NAME` to use the node name instead.
-- A config that relied on `internal` events having no `host.name` changes behavior in one place:
-  `internal -> collectd_out` now sends the process hostname instead of dropping with `no_host`.
+- A config that relied on `internal` events having no `host.name` changes behavior at three sinks,
+  because each reads `host.name` from the event or its resource:
+  - `collectd_out` tries `collectd.host`, then `host.name`, before its configured `hostname:`. So
+    `internal -> collectd_out` sends the process hostname even when the sink sets
+    `hostname: logit-relay`, and a sink with no `hostname:` sends instead of dropping with
+    `no_host`.
+  - `datadog_out` maps `host.name` to the series and sketch `host`, so `internal`'s metrics now
+    carry a host, which can register a new host in Datadog.
+  - `splunk_hec_out` sets the envelope `host` from the resource's `host.name`, where it used to
+    leave Splunk's default.
+
+  To get a different name, set the top-level `hostname:`. To keep `internal`'s events host-less,
+  place a `remove` of `host.name` after `internal`.
 - `rustix` joins `logit-pipeline`'s direct dependencies (the `system` feature). It was already
   transitive.

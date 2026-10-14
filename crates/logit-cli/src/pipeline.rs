@@ -2348,8 +2348,8 @@ mod tests {
         }
     }
 
-    /// [`super::build_spec`] with no reopen generation, a throwaway TLS reloader, and a fixed hostname, shadowing
-    /// it for every test below.
+    /// [`super::build_spec`] with no reopen generation, a throwaway TLS reloader, and a fixed
+    /// hostname, shadowing it for every test below.
     fn build_spec(
         id: &str,
         component: &ResolvedComponent,

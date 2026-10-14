@@ -1,6 +1,6 @@
 //! The process hostname: one value, resolved once at `logit run` startup, that `logit` stamps as
-//! `host.name` on its own telemetry and hands to any component that needs a hostname of its own
-//! (`docs/adr/process-hostname.md`).
+//! `host.name` on its own `internal` telemetry (`docs/adr/process-hostname.md`). `build_spec` takes
+//! it as a parameter, so other components can use it.
 //!
 //! The order is the top-level `hostname:` if set, then the kernel hostname (`uname(2)`'s
 //! nodename, the value `gethostname(2)` returns). `$HOSTNAME` is not read and no DNS lookup is

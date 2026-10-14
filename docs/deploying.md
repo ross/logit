@@ -525,6 +525,11 @@ was considered.
 own `internal` telemetry, so several instances writing to one metrics backend stay
 distinguishable. The startup log records it as `hostname resolved`.
 
+`host.name` also changes what `internal`'s events do at sinks that read it: `collectd_out` sends it
+as the host, `datadog_out` sets the series `host` (which can register a new Datadog host), and
+`splunk_hec_out` sets the envelope `host`. To send another name, set `hostname:`. To send none,
+place a `remove` of `host.name` after `internal`.
+
 The hostname is, in order:
 
 1. The top-level `hostname:`, if set. `!env` works here, as in any field.
@@ -1995,7 +2000,9 @@ reference. Before deploying one:
   dropped and counted `logit.output.metrics.dropped{reason="no_host"}` with a `no_host` diagnostic.
   That is deliberate: collectd's receiver rejects an empty host, and inventing one would merge every
   unlabeled sender into one host's metrics. `internal` is the exception: it stamps the process
-  hostname as `host.name` (see [Hostname](#hostname)), so its metrics resolve a host.
+  hostname as `host.name` (see [Hostname](#hostname)), and `collectd_out` prefers `host.name` over
+  its own `hostname:`, so `internal`'s metrics always carry the process hostname. Set the top-level
+  `hostname:` to change that name, or place a `remove` of `host.name` after `internal`.
 
 ### `graphite_out`: relaying to Carbon
 

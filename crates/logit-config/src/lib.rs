@@ -41,8 +41,8 @@ pub struct Config {
     #[schemars(with = "String")]
     pub tls_reload_interval: Duration,
     /// The name of the host this process runs on. `logit` stamps it as `host.name` on its own
-    /// telemetry, so several instances writing to one metrics backend stay distinguishable, and
-    /// uses it wherever a component needs a hostname of its own. Defaults to the kernel hostname:
+    /// `internal` telemetry, so several instances writing to one metrics backend stay
+    /// distinguishable. Defaults to the kernel hostname:
     /// the pod name in Kubernetes, the node name under `hostNetwork`, the container's hostname in
     /// Docker, and the machine's hostname on a host. To use another value, set it here. In
     /// Kubernetes, expose the node name or pod name to the container through the downward API
