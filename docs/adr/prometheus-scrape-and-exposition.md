@@ -195,8 +195,8 @@ an ordinary label there:
 - `_logit.prometheus.type` (`Value::Str`): the wire family type when the model has no distinct kind
   for it (`untyped`, `unknown`, `info`, `stateset`, `gaugehistogram`).
 - `_logit.prometheus.timestamp` (`Value::Bool(true)`): the sample carried its own timestamp on the
-  wire; `prometheus_out` re-emits one on that line only. Same shape as the planned
-  `statsd.timestamp`.
+  wire; `prometheus_out` re-emits one on that line only. Same shape as
+  `_logit.statsd.timestamp`.
 
 Plus the resource-level `_logit.prometheus.target` above, consumed the same way.
 `_logit.prometheus.target` is factual, like `docker_in`'s `container.*` attributes and `instance`

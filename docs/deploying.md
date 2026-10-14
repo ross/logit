@@ -3187,8 +3187,8 @@ answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened. A no
 `logit.input.tags.omitted{reason="reserved_prefix"}` means a producer sends a tag key starting
 with `_logit.` or `influxdb.field.`, which the decoder leaves off the point because it would
 collide with a carrier or a string field. `statsd_in`, `graphite_in`, `datadog_in`, and
-`prometheus_in`'s remote-write
-receiver emit the same counter for a `_logit.` key. A sustained `logit.input.batches.deferred` means the pipeline isn't keeping up. A nonzero
+`prometheus_in`'s remote-write receiver emit the same counter for a `_logit.` key. A sustained
+`logit.input.batches.deferred` means the pipeline isn't keeping up. A nonzero
 `logit.input.connections.rejected{reason="limit"}` means the `max_connections` cap is binding.
 `docs/design/internal-telemetry.md`'s `influxdb_in` section has every counter.
 

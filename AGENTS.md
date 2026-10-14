@@ -252,6 +252,12 @@ the first three pairs, [docs/plans/datadog-relay.md](docs/plans/datadog-relay.md
 Datadog pairs, and [docs/plans/splunk-relay.md](docs/plans/splunk-relay.md) for the Splunk pair, and
 [docs/plans/influxdb-relay.md](docs/plans/influxdb-relay.md) for the InfluxDB pair. What the model and codecs carry for them:
 
+- **Carriers**: a protocol's raw wire facts with no typed home ride as attributes under the
+  private `_logit.<protocol>.` prefix (`_logit.statsd.type`), which only that protocol's own sink
+  reads and every other protocol sink ignores, uncounted
+  ([ADR `private-attribute-namespace`](docs/adr/private-attribute-namespace.md);
+  [docs/design/data-model.md](docs/design/data-model.md)'s "Well-known attribute names" is the
+  canonical statement).
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
 - **OTLP**: scope grouping, start time, description, exemplars, a `NO_RECORDED_VALUE` point
@@ -260,9 +266,9 @@ Datadog pairs, and [docs/plans/splunk-relay.md](docs/plans/splunk-relay.md) for 
 - **syslog**: structured data as `syslog.sd`, timestamp precedence, bytes MSG, and opt-in
   structured-data emission.
 - **statsd**: raw timers/sets, `|c:`/`|e:`/`|card:`/`|T`, and events/service checks.
-- **Datadog**: `datadog.*` carriers for every raw field without a typed home (a `rate`'s type, a
-  count's interval, resources, origin, trace chunk, tracer, and Agent fields), `DdSketch` under
-  `Mapping::agent` for the Agent's metrics sketches and `Mapping::logarithmic` for APM stats
+- **Datadog**: `_logit.datadog.*` carriers for every raw field without a typed home (a `rate`'s
+  type, a count's interval, resources, origin, trace chunk, tracer, and Agent fields), `DdSketch`
+  under `Mapping::agent` for the Agent's metrics sketches and `Mapping::logarithmic` for APM stats
   sketches, 128-bit trace ids through `_dd.p.tid`, and APM stats as metric events.
 - **Splunk**: the OTel `splunk_hec` exporter's vocabulary (`com.splunk.*` and `host.name` on the
   resource, `otel.log.*` into typed log fields), `time` parsed without an `f64`, and the
@@ -340,7 +346,7 @@ Per pair:
 - **`collectd_in -> collectd_out`**: `crates/logit-proto`'s `collectd` codec holds both
   directions in one module whose doc is the mapping table. It covers both kinds collectd's binary
   `network` protocol carries: value lists, and notifications as a log event with a
-  `collectd.severity` attribute. A sticky-identity
+  `_logit.collectd.severity` attribute. A sticky-identity
   decoder turns one datagram into one event per Values part, with its N data sources as N
   `MetricRecord`s in wire order. A multicast `bind:` is detected from the address and joined with
   no extra field. An optional `types_db:` names those data sources without ever changing what
@@ -374,8 +380,8 @@ Per pair:
   [fixtures/datadog-direct.yaml](fixtures/datadog-direct.yaml)).
 - **`datadog_trace_in -> datadog_trace_out`** (a Datadog Agent's APM API): v0.3, v0.4, v0.5,
   and v0.7 msgpack traces and `/v0.6/stats` over TCP or the Agent's Unix socket, the tracer's
-  request headers carried as `datadog.tracer.*` resource attributes and restored as headers. v0.4
-  egress, the default, relays a v0.4 tracer losslessly; a v0.7 tracer's chunk fields need
+  request headers carried as `_logit.datadog.tracer.*` resource attributes and restored as
+  headers. v0.4 egress, the default, relays a v0.4 tracer losslessly; a v0.7 tracer's chunk fields need
   `version: v0.7`. A `503` from `datadog_trace_in` defers a payload only for the tracer's short
   retry window
   ([fixtures/datadog-agent-standin.yaml](fixtures/datadog-agent-standin.yaml),
@@ -415,15 +421,16 @@ Per pair:
 - **`influxdb_in -> influxdb_out`** (InfluxDB 2.x line protocol over the v2 write API):
   `crates/logit-proto/src/influxdb/` is one codec whose `mod.rs` doc is the mapping table, the
   permitted-normalization list, and "Deviations from influxd". A point decodes to one `Event`: the
-  measurement as the attribute `influxdb.measurement`, tags as event attributes, each numeric or
-  boolean field as a typed `Gauge` named `<measurement>.<field>` ([ADR
-  `typed-metric-scalar`](docs/adr/typed-metric-scalar.md)), and each string field as
-  `influxdb.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as `influxdb.org`,
-  `influxdb.org_id`, and `influxdb.bucket`, and `influxdb_out` writes to its own configured org
-  and bucket, so a `route` on the bucket picks a destination. The presence of
-  `influxdb.measurement` selects the carrier path on `influxdb_out`; those attributes are ordinary
-  labels at every other sink, so a `remove` belongs ahead of one. A tag key under the
-  `influxdb.` prefix is dropped, counted. `influxdb_in` parses the whole body before building any
+  measurement as the private attribute `_logit.influxdb.measurement`, tags as event attributes,
+  each numeric or boolean field as a typed `Gauge` named `<measurement>.<field>` ([ADR
+  `typed-metric-scalar`](docs/adr/typed-metric-scalar.md)), and each string field as the public
+  `influxdb.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as
+  `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`, and
+  `influxdb_out` writes to its own configured org and bucket, so a `route` on the bucket picks a
+  destination. The presence of `_logit.influxdb.measurement` selects the carrier path on
+  `influxdb_out`. Every other sink ignores the private carriers and renders `influxdb.field.*` as
+  ordinary labels, so a `remove` of those belongs ahead of one. A tag key under `_logit.` or
+  `influxdb.field.` is dropped, counted. `influxdb_in` parses the whole body before building any
   event, so a bad line delivers nothing and the whole request is one batch, delivered all or
   nothing. It acknowledges with `204` once the batch is in every downstream inbox, so a
   destination's `422`, `404`, or `401` reaches `influxdb_out`'s fault classes and never the
