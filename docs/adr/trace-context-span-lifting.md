@@ -187,8 +187,8 @@ breakdown haproxy's finer timers do, for the same not-built-here reason.
   sync.
 - **Underscore names (`trace_id`, `span_id`, `parent_span_id`, ...) instead of dotted
   (`trace.id`, `span.id`, `span.parent_id`).** Rejected: the repo's own convention is dotted
-  (`service.name`, `syslog.facility`, `otel.severity_number` — `otel.status_message` was this
-  list's OTLP example at the time, retired in W4 to a real `SpanExt.status_message` field,
+  (`service.name`, `syslog.facility`, `_logit.otel.severity_number` — `otel.status_message` was
+  this list's OTLP example at the time, retired in W4 to a real `SpanExt.status_message` field,
   [ADR `metrics-model-v2`](metrics-model-v2.md)); underscore was only ever
   `trace_context`'s own original, one-off field-name choice, matching the JSON body example in
   [ADR `log-record-trace-context`](log-record-trace-context.md), not a house style to preserve.

@@ -395,7 +395,7 @@ fn otlp_preserves_log_event_name_observed_timestamp_dropped_count_and_severity_a
     assert_eq!(event.log, expected_log, "LogRecord should round-trip through OTLP exactly");
     assert_eq!(
         event.attributes, expected_attrs,
-        "the otel.severity_* attributes should round-trip alongside the normalized Severity"
+        "the _logit.otel.severity_* attributes should round-trip alongside the normalized Severity"
     );
 }
 

@@ -5,9 +5,10 @@
 //! payload per signal, so mixing signals adds nothing), checked for two properties:
 //!
 //! 1. **`decode_signal(encode_signals(b)) == vec![b]`**, whole-batch `PartialEq`. A fixture is
-//!    built in the shape a real decode produces (a log's `otel.severity_*` attributes already
-//!    match its `Severity`), since decode stamps those attributes. Logs set `observed_timestamp`
-//!    so encode never falls back to the wall clock (`otlp/logs.rs`'s module doc).
+//!    built in the shape a real decode produces (a log's `_logit.otel.severity_*` attributes
+//!    already match its `Severity`), since decode stamps those attributes. Logs set
+//!    `observed_timestamp` so encode never falls back to the wall clock (`otlp/logs.rs`'s module
+//!    doc).
 //! 2. **`encode_signals(decode_signal(encode_signals(b))[0]) == encode_signals(b)` on bytes**,
 //!    catching an encoder that writes two byte strings for one batch (unstable field order, a
 //!    default it sometimes omits).

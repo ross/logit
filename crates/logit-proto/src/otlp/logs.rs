@@ -702,7 +702,8 @@ mod tests {
         );
     }
 
-    /// A log with no `otel.severity_*` attributes encodes the band base and the variant name.
+    /// A log with no `_logit.otel.severity_*` attributes encodes the band base and the variant
+    /// name.
     #[test]
     fn a_non_otlp_sourced_log_still_encodes_the_band_base() {
         let record = plain_log(LogRecord {

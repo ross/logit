@@ -57,10 +57,10 @@ fn fixture_scope() -> Arc<Scope> {
 }
 
 /// In the shape a real OTLP decode produces: `_logit.otel.severity_number` and
-/// `_logit.otel.severity_text` match `Severity::Info`'s `INFO2` (10) band member. Encode consumes these two attributes and decode
-/// re-stamps them from the wire's severity fields, so attributes that disagree with the `Severity`
-/// wouldn't round-trip to themselves (the rule `crates/logit-proto/tests/otlp_fixed_point.rs`'s
-/// module doc states).
+/// `_logit.otel.severity_text` match `Severity::Info`'s `INFO2` (10) band member. Encode consumes
+/// these two attributes and decode re-stamps them from the wire's severity fields, so attributes
+/// that disagree with the `Severity` wouldn't round-trip to themselves (the rule
+/// `crates/logit-proto/tests/otlp_fixed_point.rs`'s module doc states).
 fn fixture_log_attrs() -> AttrMap {
     let mut attrs = AttrMap::new();
     attrs.insert("_logit.otel.severity_number", Value::I64(10));
@@ -227,7 +227,7 @@ fn assert_round_tripped(received: &[EventBatch]) {
     assert_eq!(
         logs_batch.events[0].attributes,
         fixture_log_attrs(),
-        "the otel.severity_* attributes should round-trip alongside the normalized Severity"
+        "the _logit.otel.severity_* attributes should round-trip alongside the normalized Severity"
     );
     assert_eq!(logs_batch.events[0].timestamp, 1_000);
     assert_eq!(logs_batch.resource, fixture_resource(), "the log batch's resource should match");
