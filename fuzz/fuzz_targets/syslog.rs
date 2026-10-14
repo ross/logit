@@ -151,7 +151,7 @@ fn check_event(input: &Bytes, event: &Event) {
             "syslog.facility" => {
                 assert!(matches!(value, Value::U64(0..=23)), "model: facility {value:?}")
             }
-            "syslog.severity" => {
+            "_logit.syslog.severity" => {
                 let Value::U64(n) = value else { panic!("model: severity is a U64") };
                 severity = Some(expected_severity(*n));
             }
@@ -179,7 +179,7 @@ fn check_event(input: &Bytes, event: &Event) {
             other => panic!("model: an attribute syslog never writes: {other}"),
         }
     }
-    assert_eq!(log.severity, Some(severity.expect("model: syslog.severity is stamped")));
+    assert_eq!(log.severity, Some(severity.expect("model: _logit.syslog.severity is stamped")));
     match &log.message {
         Value::Str(bytes) => {
             assert!(std::str::from_utf8(bytes).is_ok(), "model: a Str message is UTF-8");

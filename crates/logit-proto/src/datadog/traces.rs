@@ -29,30 +29,33 @@ use std::collections::HashMap;
 
 /// `_dd.p.tid`: the `meta` key holding a 128-bit trace id's high 64 bits as hex.
 pub const META_TRACE_ID_HIGH: &str = "_dd.p.tid";
-/// `datadog.span.error`: a span's `error` when it is neither 0 nor 1 (`I64`), so it re-encodes
-/// exactly; 0 and 1 are carried by [`SpanRecord::status`] alone.
-pub const ATTR_SPAN_ERROR: &str = "datadog.span.error";
-/// `datadog.chunk.priority` / `.origin` / `.dropped_trace` / `.tags`: a v0.7 or `AgentPayload`
-/// `TraceChunk`'s fields, on every span of the chunk (`I64`, `Str`, `Bool`, `Map` of `Str`).
-pub const ATTR_CHUNK_PRIORITY: &str = "datadog.chunk.priority";
-pub const ATTR_CHUNK_ORIGIN: &str = "datadog.chunk.origin";
-pub const ATTR_CHUNK_DROPPED_TRACE: &str = "datadog.chunk.dropped_trace";
-pub const ATTR_CHUNK_TAGS: &str = "datadog.chunk.tags";
-/// `datadog.tracer.language_version` / `.tags` / `.container_debug`: `TracerPayload` fields with
-/// no APM-stats counterpart, as batch resource attributes; the carriers shared with
+/// `_logit.datadog.span.error`: a span's `error` when it is neither 0 nor 1 (`I64`), so it
+/// re-encodes unchanged; 0 and 1 are carried by [`SpanRecord::status`] alone.
+pub const ATTR_SPAN_ERROR: &str = "_logit.datadog.span.error";
+/// `_logit.datadog.chunk.priority` / `.origin` / `.dropped_trace` / `.tags`: a v0.7 or
+/// `AgentPayload` `TraceChunk`'s fields, on every span of the chunk (`I64`, `Str`, `Bool`, `Map` of
+/// `Str`).
+pub const ATTR_CHUNK_PRIORITY: &str = "_logit.datadog.chunk.priority";
+pub const ATTR_CHUNK_ORIGIN: &str = "_logit.datadog.chunk.origin";
+pub const ATTR_CHUNK_DROPPED_TRACE: &str = "_logit.datadog.chunk.dropped_trace";
+pub const ATTR_CHUNK_TAGS: &str = "_logit.datadog.chunk.tags";
+/// `_logit.datadog.tracer.language_version` / `.tags` / `.container_debug`: `TracerPayload` fields
+/// with no APM-stats counterpart, as batch resource attributes; the carriers shared with
 /// [`super::stats`] (`container_id`, `language_name`, `tracer_version`, `runtime_id`, `env`,
 /// `hostname`, `app_version`) live in [`super`].
-pub const RESOURCE_ATTR_TRACER_LANGUAGE_VERSION: &str = "datadog.tracer.language_version";
-pub const RESOURCE_ATTR_TRACER_TAGS: &str = "datadog.tracer.tags";
-pub const RESOURCE_ATTR_TRACER_CONTAINER_DEBUG: &str = "datadog.tracer.container_debug";
-/// `datadog.agent.target_tps` / `.error_tps` / `.rare_sampler_enabled` / `.tags`: `AgentPayload`
-/// fields with no APM-stats counterpart, as batch resource attributes; `hostname`, `env`, and
-/// `version` live in [`super`] ([`RESOURCE_ATTR_AGENT_HOSTNAME`], [`RESOURCE_ATTR_AGENT_ENV`],
+pub const RESOURCE_ATTR_TRACER_LANGUAGE_VERSION: &str = "_logit.datadog.tracer.language_version";
+pub const RESOURCE_ATTR_TRACER_TAGS: &str = "_logit.datadog.tracer.tags";
+pub const RESOURCE_ATTR_TRACER_CONTAINER_DEBUG: &str = "_logit.datadog.tracer.container_debug";
+/// `_logit.datadog.agent.target_tps` / `.error_tps` / `.rare_sampler_enabled` / `.tags`:
+/// `AgentPayload` fields with no APM-stats counterpart, as batch resource attributes; `hostname`,
+/// `env`, and `version` live in [`super`] ([`RESOURCE_ATTR_AGENT_HOSTNAME`],
+/// [`RESOURCE_ATTR_AGENT_ENV`],
 /// [`RESOURCE_ATTR_AGENT_VERSION`]).
-pub const RESOURCE_ATTR_AGENT_TARGET_TPS: &str = "datadog.agent.target_tps";
-pub const RESOURCE_ATTR_AGENT_ERROR_TPS: &str = "datadog.agent.error_tps";
-pub const RESOURCE_ATTR_AGENT_RARE_SAMPLER_ENABLED: &str = "datadog.agent.rare_sampler_enabled";
-pub const RESOURCE_ATTR_AGENT_TAGS: &str = "datadog.agent.tags";
+pub const RESOURCE_ATTR_AGENT_TARGET_TPS: &str = "_logit.datadog.agent.target_tps";
+pub const RESOURCE_ATTR_AGENT_ERROR_TPS: &str = "_logit.datadog.agent.error_tps";
+pub const RESOURCE_ATTR_AGENT_RARE_SAMPLER_ENABLED: &str =
+    "_logit.datadog.agent.rare_sampler_enabled";
+pub const RESOURCE_ATTR_AGENT_TAGS: &str = "_logit.datadog.agent.tags";
 
 /// `sampler.PriorityNone`: the chunk priority the Agent's own v0.4/v0.5 decoders stamp, meaning
 /// "not decided yet". Decodes to no [`ATTR_CHUNK_PRIORITY`] and is what a span without one
@@ -269,7 +272,7 @@ pub(super) enum Form {
 }
 
 impl Form {
-    /// v0.4 and v0.5 have no chunk envelope: `datadog.chunk.*` has nowhere to go.
+    /// v0.4 and v0.5 have no chunk envelope: `_logit.datadog.chunk.*` has nowhere to go.
     fn has_chunks(self) -> bool {
         matches!(self, Form::V07 | Form::Agent)
     }
@@ -580,9 +583,10 @@ fn sort_map<V>(map: &mut [(String, V)]) {
 }
 
 /// Whether `key` is a carrier [`DatadogEncoder::wire_span`] consumes rather than sends as a
-/// `meta`/`metrics`/`meta_struct` entry. A carrier of the wrong `Value` type isn't one: it goes
-/// out by its type like any attribute, so a Datadog span whose own `meta` happens to use a
-/// carrier's name still relays. A payload carrier, or a tracer header's
+/// `meta`/`metrics`/`meta_struct` entry. A carrier of the wrong `Value` type isn't one. A public
+/// one (`service.name`, `resource.name`, `span.type`) goes out by its type like any attribute, so
+/// a Datadog span whose own `meta` uses one of those names still relays; a `_logit.datadog.*` one
+/// is skipped uncounted, like any private key. A payload carrier, or a tracer header's
 /// ([`super::is_tracer_header_attr`]), counts only on the resource.
 fn is_carrier(key: &str, value: &Value, event: &Event) -> bool {
     match (key, value) {
@@ -697,8 +701,8 @@ impl DatadogEncoder {
     }
 
     /// One span, and the chunk fields it carries. Attributes are the resource merged with the
-    /// event's; the carriers are consumed, everything else lands in `meta`/`metrics`/`meta_struct`
-    /// by its type.
+    /// event's; the carriers are consumed, a private key is skipped, and everything else lands in
+    /// `meta`/`metrics`/`meta_struct` by its type.
     fn wire_span(
         &self,
         resource: &Resource,
@@ -730,6 +734,9 @@ impl DatadogEncoder {
         for (sym, value) in logit_core::attrs::merged(resource, event) {
             let key = resolve(sym);
             if !is_carrier(key, value, event) {
+                if logit_core::attrs::is_private(key) {
+                    continue;
+                }
                 match self.slot(value) {
                     Slot::Meta(s) => wire.meta.push((key.to_string(), s)),
                     Slot::Metric(f) => wire.metrics.push((key.to_string(), f)),
@@ -795,6 +802,7 @@ impl DatadogEncoder {
                 let mut attributes: StrMap = link
                     .attributes
                     .iter()
+                    .filter(|(k, _)| !logit_core::attrs::is_private(resolve(*k)))
                     .map(|(k, v)| (resolve(k).to_string(), self.text(v)))
                     .collect();
                 sort_map(&mut attributes);
@@ -825,6 +833,7 @@ impl DatadogEncoder {
                 let mut attributes: Vec<(String, WireAny)> = e
                     .attributes
                     .iter()
+                    .filter(|(k, _)| !logit_core::attrs::is_private(resolve(*k)))
                     .map(|(k, v)| (resolve(k).to_string(), self.any(v, true)))
                     .collect();
                 sort_map(&mut attributes);
@@ -870,11 +879,12 @@ impl DatadogEncoder {
         }
     }
 
-    /// Counts, once per call, so once per request body, every batch-resource carrier `form` has
-    /// no field for: the `datadog.agent.*` ones below `AgentPayload`, the `datadog.tracer.*` ones
-    /// below v0.7, and the tracer headers' carriers no payload has a field for. A sender that cuts
-    /// a batch into several requests counts them once per request. With `headers`, the caller
-    /// sends every tracer header as a request header, so no header's carrier is lost.
+    /// Counts, once per call, so once per request body, every batch-resource carrier `form` has no
+    /// field for: the `_logit.datadog.agent.*` ones below `AgentPayload`, the
+    /// `_logit.datadog.tracer.*` ones below v0.7, and the tracer headers' carriers no payload has a
+    /// field for. A sender that cuts a batch into several requests counts them once per request.
+    /// With `headers`, the caller sends every tracer header as a request header, so no header's
+    /// carrier is lost.
     pub(super) fn resource_carriers_lost(&self, resource: &Resource, form: Form, headers: bool) {
         let attrs = &resource.attributes;
         let lost_here =
@@ -896,7 +906,8 @@ impl DatadogEncoder {
         self.span_out_degraded("no_wire_form", lost);
     }
 
-    /// The batch resource's `datadog.tracer.*` carriers as a `TracerPayload` around `chunks`.
+    /// The batch resource's `_logit.datadog.tracer.*` carriers as a `TracerPayload` around
+    /// `chunks`.
     pub(super) fn wire_tracer(&self, resource: &Resource, chunks: Vec<WireChunk>) -> WireTracer {
         let attrs = &resource.attributes;
         let text = |key: &str| attrs.get(key).map(|v| self.text(v)).unwrap_or_default();
@@ -934,8 +945,8 @@ impl DatadogEncoder {
         }
     }
 
-    /// The batch resource's `datadog.agent.*` carriers as an `AgentPayload` around one tracer
-    /// payload.
+    /// The batch resource's `_logit.datadog.agent.*` carriers as an `AgentPayload` around one
+    /// tracer payload.
     pub(super) fn wire_agent(&self, resource: &Resource, tracer: WireTracer) -> WireAgent {
         let attrs = &resource.attributes;
         let text = |key: &str| attrs.get(key).map(|v| self.text(v)).unwrap_or_default();
@@ -1044,6 +1055,52 @@ mod tests {
         assert_eq!(keys, sorted, "maps are key-sorted");
         let deg = |r| counted(&registry, "logit.output.spans.degraded", ("reason", r));
         assert_eq!(deg("int_as_f64"), 2.0, "i64::MAX and u64::MAX");
+    }
+
+    /// A private attribute, on the event, the resource, a link, or a span event, never reaches
+    /// `meta`, `metrics`, `meta_struct`, or a link's or span event's attributes, and is never
+    /// counted, even a `Bytes` one a v0.5 body has no `meta_struct` for.
+    #[test]
+    fn a_private_attribute_never_reaches_the_span_and_is_never_counted() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("_logit.x", Value::str("e"));
+        attrs.insert("_logit.f", Value::F64(0.5));
+        attrs.insert("_logit.b", Value::Bytes(Bytes::from_static(b"\x01")));
+        attrs.insert("env", Value::str("prod"));
+        let mut resource = Resource::default();
+        resource.attributes.insert("_logit.y", Value::str("r"));
+
+        let (e, registry) = encoder();
+        let b = batch(resource.clone(), vec![Event::span(0, attrs.clone(), otel_span([0; 16]))]);
+        let s = &only_chunk(&e, &b, Form::V05).spans[0];
+        assert!(s.meta.iter().any(|(k, _)| k == "env"));
+        assert!(s.meta.iter().all(|(k, _)| !k.starts_with("_logit")), "{:?}", s.meta);
+        assert!(s.metrics.is_empty(), "{:?}", s.metrics);
+        assert!(s.meta_struct.is_empty());
+        assert!(registry.drain(0).is_empty(), "a private key is never counted");
+
+        let mut span = otel_span([0; 16]);
+        let mut private = AttrMap::new();
+        private.insert("_logit.z", Value::str("p"));
+        private.insert("n", Value::I64(4));
+        span.links.push(SpanLink {
+            trace_id: [1; 16],
+            span_id: [2; 8],
+            attributes: private.clone(),
+            flags: 0,
+            trace_state: None,
+            dropped_attributes_count: 0,
+        });
+        span.events.push(SpanEvent {
+            timestamp: 7,
+            name: Value::str("boom"),
+            attributes: private,
+            dropped_attributes_count: 0,
+        });
+        let b = batch(resource, vec![Event::span(0, attrs, span)]);
+        let s = &only_chunk(&e, &b, Form::Agent).spans[0];
+        assert_eq!(s.span_links[0].attributes, vec![("n".to_string(), "4".to_string())]);
+        assert_eq!(s.span_events[0].attributes, vec![("n".to_string(), WireAny::Int(4))]);
     }
 
     #[test]

@@ -1055,8 +1055,12 @@ fn exemplar_fits(exemplar: &Exemplar) -> bool {
         }
     }
     for (key, value) in exemplar.filtered_attributes.iter() {
+        let key = resolve(key);
+        if logit_core::attrs::is_private(key) {
+            continue;
+        }
         if let Some(rendered) = super::label_value(value) {
-            total += resolve(key).chars().count() + rendered.chars().count();
+            total += key.chars().count() + rendered.chars().count();
         }
     }
     total <= 128
@@ -1064,7 +1068,7 @@ fn exemplar_fits(exemplar: &Exemplar) -> bool {
 
 /// An [`Exemplar`]'s labels, sorted by name: a [`logit_core::TraceRef`] becomes the two id labels
 /// it arrived as, and every other exemplar attribute renders like any label (an unrepresentable one
-/// is dropped, the way the encode side's own labels are). The inverse of
+/// is dropped, the way the encode side's own labels are, and a private `_logit.` one is skipped). The inverse of
 /// [`super::assemble::exemplar_from_labels`].
 ///
 /// Shared with [`super::remote_write`], which puts the same pairs in a protobuf field rather than
@@ -1079,8 +1083,12 @@ pub(super) fn exemplar_labels(exemplar: &Exemplar) -> Vec<(String, String)> {
         }
     }
     for (key, value) in exemplar.filtered_attributes.iter() {
+        let key = resolve(key);
+        if logit_core::attrs::is_private(key) {
+            continue;
+        }
         if let Some(rendered) = super::label_value(value) {
-            labels.push((resolve(key).to_string(), rendered));
+            labels.push((key.to_string(), rendered));
         }
     }
     labels.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2340,6 +2348,29 @@ mod tests {
         let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
         assert_eq!(body, "# TYPE requests counter\nrequests_total 17\n# EOF\n");
         assert_eq!(counts, vec![("exemplar_omitted".to_string(), 1.0)]);
+    }
+
+    /// A private exemplar attribute never becomes a label and never counts toward the 128-code-point
+    /// budget, so an exemplar over budget only because of one still renders its trace id.
+    #[test]
+    fn a_private_exemplar_attribute_is_skipped_and_outside_the_budget() {
+        let long = "x".repeat(200);
+        // A short private value isolates the label filter; a long one, the budget.
+        for value in ["r", long.as_str()] {
+            let ex = Exemplar {
+                trace: Some(logit_core::TraceRef { trace_id: [0xab; 16], span_id: None, flags: 0 }),
+                ..exemplar(0.1, &[("_logit.x", value)])
+            };
+            let (body, counts) =
+                write_counted(&[counter_with_exemplars(vec![ex])], Dialect::OpenMetrics1_0);
+            assert_eq!(
+                body,
+                "# TYPE requests counter\nrequests_total 17 # {trace_id=\"abababababababababababababababab\"} 0.1\n# EOF\n",
+                "value length {}",
+                value.len()
+            );
+            assert!(counts.is_empty(), "{counts:?}");
+        }
     }
 
     /// A gauge's exemplars are dropped, counted; `otlp_in` produces them on `Gauge` and on the

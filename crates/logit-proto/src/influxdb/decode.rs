@@ -16,8 +16,9 @@
 use super::line::{
     lines, parse_line, FieldValue, Line, LineError, MAX_TIMESTAMP_NS, MIN_TIMESTAMP_NS,
 };
-use super::{Precision, ATTR_MEASUREMENT, CARRIER_PREFIX, FIELD_ATTR_PREFIX};
+use super::{Precision, ATTR_MEASUREMENT, FIELD_ATTR_PREFIX};
 use bytes::Bytes;
+use logit_core::attrs::is_private;
 use logit_core::interner::{intern, KeyCache, Symbol};
 use logit_core::subslice;
 use logit_core::{
@@ -39,8 +40,8 @@ pub struct DecodeStats {
     pub points: usize,
     /// Points merged into an earlier event of the same series and timestamp.
     pub merged: usize,
-    /// Tags omitted for a key under the reserved `influxdb.` prefix, counted
-    /// `logit.input.tags.omitted{reason="reserved_prefix"}`.
+    /// Tags omitted for a key under the private `_logit.` prefix or the string-field prefix
+    /// `influxdb.field.`, counted `logit.input.tags.omitted{reason="reserved_prefix"}`.
     pub tags_omitted_reserved_prefix: usize,
 }
 
@@ -51,7 +52,7 @@ pub struct InfluxDecoder {
     telemetry: Telemetry,
     /// Tag and string-field keys, memoized as other decoders memoize theirs.
     keys: KeyCache,
-    /// `influxdb.measurement`, interned once.
+    /// `_logit.influxdb.measurement`, interned once.
     measurement_key: Symbol,
     /// Scratch for `<measurement>.<field>` and `influxdb.field.<key>`.
     name: String,
@@ -183,7 +184,7 @@ impl InfluxDecoder {
     fn open_event(&mut self, body: &Bytes, line: &Line<'_>, timestamp: i64) -> Event {
         let mut attributes = AttrMap::new();
         for (key, value) in &line.tags {
-            if key.starts_with(CARRIER_PREFIX) {
+            if key.starts_with(FIELD_ATTR_PREFIX) || is_private(key) {
                 self.stats.tags_omitted_reserved_prefix += 1;
                 continue;
             }
@@ -450,7 +451,7 @@ mod tests {
             "influxdb_in",
             "listener",
         ));
-        let body = Bytes::from_static(b"m,influxdb.x=1 f=1i\nbad");
+        let body = Bytes::from_static(b"m,_logit.x=1 f=1i\nbad");
         assert!(decoder
             .decode_body(body, Precision::Ns, 0, Arc::new(Resource::default()))
             .is_err());
@@ -466,14 +467,24 @@ mod tests {
             "listener",
         ));
         let body = Bytes::from_static(
-            b"m,influxdb.measurement=x,influxdb.field.f=y,host=a f=1i 1\nn,influxdb.z=1 f=1i 1",
+            b"m,_logit.influxdb.measurement=x,influxdb.field.f=y,host=a,_logit.influxdb.bucket=b \
+              f=1i 1\n\
+              n,influxdb.z=1,logit.x=c,_logitx=d,influxdb.field.x=e,influxdb.measurement=v f=1i 1",
         );
         let batch =
             decoder.decode_body(body, Precision::Ns, 0, Arc::new(Resource::default())).unwrap();
         assert_eq!(str_attr(&batch.events[0], ATTR_MEASUREMENT), Some("m"));
         assert_eq!(batch.events[0].attributes.get("influxdb.field.f"), None);
         assert_eq!(str_attr(&batch.events[0], "host"), Some("a"));
-        assert_eq!(decoder.stats().tags_omitted_reserved_prefix, 3);
+        assert_eq!(batch.events[0].attributes.get("_logit.influxdb.bucket"), None);
+        let second = &batch.events[1];
+        assert_eq!(str_attr(second, "logit.x"), Some("c"), "only `_logit.` is private");
+        assert_eq!(str_attr(second, "_logitx"), Some("d"), "the prefix ends in a dot");
+        assert_eq!(second.attributes.get("influxdb.field.x"), None, "a string field's prefix");
+        assert_eq!(str_attr(second, "influxdb.z"), Some("1"), "the rest of `influxdb.` is public");
+        assert_eq!(str_attr(second, "influxdb.measurement"), Some("v"), "not the carrier");
+        assert_eq!(str_attr(second, ATTR_MEASUREMENT), Some("n"));
+        assert_eq!(decoder.stats().tags_omitted_reserved_prefix, 4);
 
         let mut total = 0.0;
         for event in registry.drain(0) {
@@ -494,7 +505,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(total, 3.0);
+        assert_eq!(total, 4.0);
     }
 
     #[test]

@@ -151,7 +151,7 @@ exposition/OpenMetrics format already describes.
 
 Reference: <https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/>. See
 [ADR `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md) for `logit`'s
-`influxdb_in`/`influxdb_out` model mapping, the `influxdb.*` carrier, and the permitted
+`influxdb_in`/`influxdb_out` model mapping, the `_logit.influxdb.*` carrier, and the permitted
 normalizations.
 
 `<measurement>[,<tag_key>=<tag_value>...] <field_key>=<field_value>[,<field_key>=<field_value>...] [<timestamp>]`.
@@ -314,7 +314,7 @@ Cloud 10.5.2605.9 indexed 1,000 dimensions on one object. `logit`'s mapping is
 | Tags/labels | none | string k:v, bare | string k:v, bare | typed `AnyValue` attrs | string labels | string labels (interned, 2.0) | string tag values | identity parts only | `k=v`, string | `fields` dimensions, flat, string or number |
 | Resource/scope identity | — | — | `resources` (`host`, `device`, others) | `Resource`+`Scope` | job/instance labels (convention) | job/instance labels | tags (convention) | host/plugin parts | path prefix (convention) | `host`/`source`/`sourcetype`/`index` envelope |
 | schema_url | — | — | — | yes | — | — | — | — | — | — |
-| Events/service checks | — | `_e{}` / `_sc` (in `logit`: `log` (`_e`) / `Gauge` + `statsd.service_check.*` carriers (`_sc`), both ways -- `docs/adr/statsd-output.md`'s amendment) | `/intake/` or `/api/v1/events` / `/api/v1/check_run` (in `logit`: DogStatsD's carriers) | (as logs, not metrics) | — | — | — | notifications (`Message`+`Severity` parts; in `logit`: `log` + `collectd.severity`) | — | (as log events) |
+| Events/service checks | — | `_e{}` / `_sc` (in `logit`: `log` (`_e`) / `Gauge` + `_logit.statsd.service_check.*` carriers (`_sc`), both ways -- `docs/adr/statsd-output.md`'s amendment) | `/intake/` or `/api/v1/events` / `/api/v1/check_run` (in `logit`: DogStatsD's carriers) | (as logs, not metrics) | — | — | — | notifications (`Message`+`Severity` parts; in `logit`: `log` + `_logit.collectd.severity`) | — | (as log events) |
 | Container id | — | `\|c:` | — | resource attrs | — | — | — | — | — | — |
 | Multi-value point | `a:1:2:3\|c` | yes | several points per series | one point per `Metric` (batch-level regroup) | one line per series | one series per point | multiple fields/point | one value/part | one value/line (expandable — `multi_value: expand` renders several dotted sub-paths) | many `metric_name:<n>` per object (multi-metric form), one value each |
 | No-recorded-value / stale marker | — | — | — | `flags` bit 0 | staleness marker (internal) | — | — | — | — | — |

@@ -35,8 +35,10 @@
 //! [`logit_core::Severity`], and [`logit_core::time::TimestampError`].
 //!
 //! PRI must be 1-3 digits with no leading zero (except `<0>`) and at most 191, or the line is
-//! malformed. It yields `syslog.facility` and `syslog.severity` (`Value::U64`) and a `Severity`
-//! (see `map_severity`). The other attributes:
+//! malformed. It yields `syslog.facility` and the private carrier `_logit.syslog.severity` (both
+//! `Value::U64`) and a `Severity` (see `map_severity`). `_logit.syslog.severity` is the raw value
+//! `syslog_out` prefers over the lossy `Severity`, and every other sink ignores it (ADR
+//! `private-attribute-namespace`). The other attributes:
 //!
 //! - `syslog.timestamp`: the sender's TIMESTAMP (below).
 //! - `syslog.hostname`: HOSTNAME.

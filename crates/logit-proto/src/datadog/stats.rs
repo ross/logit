@@ -54,40 +54,40 @@ pub const METRIC_ERROR_SUMMARY: &str = "datadog.stats.error_summary";
 /// The unit `datadog.stats.duration` carries.
 pub const DURATION_UNIT: &str = "ns";
 
-/// `datadog.stats.name`: the group's operation `Name`. Always present on a decoded group, even
-/// empty, because it is what marks an event as APM stats ([`super::is_datadog_stats`]).
-pub const ATTR_STATS_NAME: &str = "datadog.stats.name";
-pub const ATTR_HTTP_STATUS_CODE: &str = "datadog.stats.http_status_code";
-pub const ATTR_DB_TYPE: &str = "datadog.stats.db_type";
-pub const ATTR_SYNTHETICS: &str = "datadog.stats.synthetics";
-pub const ATTR_IS_TRACE_ROOT: &str = "datadog.stats.is_trace_root";
-pub const ATTR_GRPC_STATUS_CODE: &str = "datadog.stats.grpc_status_code";
-pub const ATTR_HTTP_METHOD: &str = "datadog.stats.http_method";
-pub const ATTR_HTTP_ENDPOINT: &str = "datadog.stats.http_endpoint";
-pub const ATTR_SERVICE_SOURCE: &str = "datadog.stats.service_source";
-pub const ATTR_PEER_TAGS: &str = "datadog.stats.peer_tags";
-pub const ATTR_ADDITIONAL_METRIC_TAGS: &str = "datadog.stats.additional_metric_tags";
-pub const ATTR_SPAN_DERIVED_PRIMARY_TAGS: &str = "datadog.stats.span_derived_primary_tags";
+/// `_logit.datadog.stats.name`: the group's operation `Name`. Always present on a decoded group,
+/// even empty, because it is what marks an event as APM stats ([`super::is_datadog_stats`]).
+pub const ATTR_STATS_NAME: &str = "_logit.datadog.stats.name";
+pub const ATTR_HTTP_STATUS_CODE: &str = "_logit.datadog.stats.http_status_code";
+pub const ATTR_DB_TYPE: &str = "_logit.datadog.stats.db_type";
+pub const ATTR_SYNTHETICS: &str = "_logit.datadog.stats.synthetics";
+pub const ATTR_IS_TRACE_ROOT: &str = "_logit.datadog.stats.is_trace_root";
+pub const ATTR_GRPC_STATUS_CODE: &str = "_logit.datadog.stats.grpc_status_code";
+pub const ATTR_HTTP_METHOD: &str = "_logit.datadog.stats.http_method";
+pub const ATTR_HTTP_ENDPOINT: &str = "_logit.datadog.stats.http_endpoint";
+pub const ATTR_SERVICE_SOURCE: &str = "_logit.datadog.stats.service_source";
+pub const ATTR_PEER_TAGS: &str = "_logit.datadog.stats.peer_tags";
+pub const ATTR_ADDITIONAL_METRIC_TAGS: &str = "_logit.datadog.stats.additional_metric_tags";
+pub const ATTR_SPAN_DERIVED_PRIMARY_TAGS: &str = "_logit.datadog.stats.span_derived_primary_tags";
 /// The bucket's `Duration` (U64 ns) and nonzero `AgentTimeShift` (I64 ns), on each of its groups.
-pub const ATTR_BUCKET_DURATION: &str = "datadog.stats.bucket.duration";
-pub const ATTR_BUCKET_AGENT_TIME_SHIFT: &str = "datadog.stats.bucket.agent_time_shift";
+pub const ATTR_BUCKET_DURATION: &str = "_logit.datadog.stats.bucket.duration";
+pub const ATTR_BUCKET_AGENT_TIME_SHIFT: &str = "_logit.datadog.stats.bucket.agent_time_shift";
 
 /// `ClientStatsPayload` fields, as batch resource attributes. `RESOURCE_ATTR_TRACER_HOSTNAME` /
 /// `_ENV` / `_APP_VERSION` / `_LANGUAGE_NAME` / `_VERSION` / `_RUNTIME_ID` / `_CONTAINER_ID` are
 /// [`super`]'s constants, shared with [`super::traces`]'s `TracerPayload` fields.
-pub const RESOURCE_ATTR_STATS_SEQUENCE: &str = "datadog.stats.sequence";
-pub const RESOURCE_ATTR_STATS_AGENT_AGGREGATION: &str = "datadog.stats.agent_aggregation";
-pub const RESOURCE_ATTR_STATS_SERVICE: &str = "datadog.stats.service";
-pub const RESOURCE_ATTR_STATS_TAGS: &str = "datadog.stats.tags";
-pub const RESOURCE_ATTR_STATS_GIT_COMMIT_SHA: &str = "datadog.stats.git_commit_sha";
-pub const RESOURCE_ATTR_STATS_IMAGE_TAG: &str = "datadog.stats.image_tag";
-pub const RESOURCE_ATTR_STATS_PROCESS_TAGS_HASH: &str = "datadog.stats.process_tags_hash";
-pub const RESOURCE_ATTR_STATS_PROCESS_TAGS: &str = "datadog.stats.process_tags";
+pub const RESOURCE_ATTR_STATS_SEQUENCE: &str = "_logit.datadog.stats.sequence";
+pub const RESOURCE_ATTR_STATS_AGENT_AGGREGATION: &str = "_logit.datadog.stats.agent_aggregation";
+pub const RESOURCE_ATTR_STATS_SERVICE: &str = "_logit.datadog.stats.service";
+pub const RESOURCE_ATTR_STATS_TAGS: &str = "_logit.datadog.stats.tags";
+pub const RESOURCE_ATTR_STATS_GIT_COMMIT_SHA: &str = "_logit.datadog.stats.git_commit_sha";
+pub const RESOURCE_ATTR_STATS_IMAGE_TAG: &str = "_logit.datadog.stats.image_tag";
+pub const RESOURCE_ATTR_STATS_PROCESS_TAGS_HASH: &str = "_logit.datadog.stats.process_tags_hash";
+pub const RESOURCE_ATTR_STATS_PROCESS_TAGS: &str = "_logit.datadog.stats.process_tags";
 /// `StatsPayload` envelope fields, as batch resource attributes (`agentHostname`, `agentEnv`, and
 /// `agentVersion` reuse [`RESOURCE_ATTR_AGENT_HOSTNAME`], [`RESOURCE_ATTR_AGENT_ENV`], and
 /// [`RESOURCE_ATTR_AGENT_VERSION`]).
-pub const RESOURCE_ATTR_STATS_CLIENT_COMPUTED: &str = "datadog.stats.client_computed";
-pub const RESOURCE_ATTR_STATS_SPLIT_PAYLOAD: &str = "datadog.stats.split_payload";
+pub const RESOURCE_ATTR_STATS_CLIENT_COMPUTED: &str = "_logit.datadog.stats.client_computed";
+pub const RESOURCE_ATTR_STATS_SPLIT_PAYLOAD: &str = "_logit.datadog.stats.split_payload";
 
 /// The bin limit a decoded stats sketch keeps: the Agent's `LogCollapsingLowestDenseDDSketch(0.01,
 /// 2048)` (`pkg/trace/stats/statsraw.go`).
@@ -777,7 +777,7 @@ impl DatadogEncoder {
     /// The batch's stats events as one `ClientStatsPayload`, buckets rebuilt by grouping on
     /// `(timestamp, bucket.duration, bucket.agent_time_shift)` in first-seen order. `envelope`
     /// says whether the caller writes a `StatsPayload` envelope from the resource's
-    /// `datadog.agent.*` fields; without one they have no wire form.
+    /// `_logit.datadog.agent.*` fields; without one they have no wire form.
     fn client_payload(&mut self, batch: &EventBatch, envelope: bool) -> Option<ClientStatsPayload> {
         let resource = &*batch.resource;
         let mut buckets: Vec<ClientStatsBucket> = Vec::new();
@@ -821,6 +821,7 @@ impl DatadogEncoder {
         for (key, _) in attrs.iter() {
             let key = resolve(key);
             if !is_group_key(key)
+                && !logit_core::attrs::is_private(key)
                 && !PAYLOAD_STRINGS.contains(&key)
                 && !PAYLOAD_SCALARS.contains(&key)
                 && !(envelope && ENVELOPE_KEYS.contains(&key))
@@ -884,7 +885,8 @@ impl DatadogEncoder {
             },
         };
         for (key, _) in event.attributes.iter() {
-            if !is_group_key(resolve(key)) {
+            let key = resolve(key);
+            if !is_group_key(key) && !logit_core::attrs::is_private(key) {
                 self.tag_omitted("no_wire_form");
             }
         }
@@ -1692,6 +1694,70 @@ mod tests {
         let mut event = Event::metric(TS as i64, attrs, metrics.next().unwrap());
         event.metrics.extend(metrics);
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] }
+    }
+
+    /// A private attribute, on the event or the resource, has no wire form and is never counted
+    /// `no_wire_form`; a public one still is.
+    #[test]
+    fn a_private_attribute_is_never_counted_no_wire_form() {
+        let (mut e, registry) = encoder();
+        let mut batch = stats_batch(
+            vec![MetricRecord::new(intern(METRIC_HITS), MetricKind::counter(1.0))],
+            &[("_logit.x", Value::str("e")), ("env", Value::str("prod"))],
+        );
+        let mut resource = Resource::default();
+        resource.attributes.insert("_logit.y", Value::str("r"));
+        batch.resource = Arc::new(resource);
+        e.encode_client_stats_v06(&batch).unwrap();
+        let omitted: f64 = registry
+            .drain(0)
+            .iter()
+            .filter(|ev| {
+                ev.attributes.get("reason").and_then(Value::as_str) == Some("no_wire_form")
+            })
+            .flat_map(|ev| ev.metrics.iter())
+            .filter(|m| resolve(m.name) == "logit.output.tags.omitted")
+            .map(|m| match m.kind {
+                MetricKind::Sum(s) => s.value.as_f64(),
+                _ => 0.0,
+            })
+            .sum();
+        assert_eq!(omitted, 1.0, "only `env` is counted");
+    }
+
+    /// The v0.6 route has no envelope and no series fields, so a resource's Agent hostname and an
+    /// event's series interval have no wire form there. They are private, so they are skipped
+    /// uncounted, like any other `_logit.` key; a public key that isn't a group field is
+    /// still counted `no_wire_form`.
+    #[test]
+    fn the_v06_route_skips_its_unread_carriers_uncounted() {
+        let (mut e, registry) = encoder();
+        let mut batch = stats_batch(
+            vec![MetricRecord::new(intern(METRIC_HITS), MetricKind::counter(1.0))],
+            &[
+                (super::super::ATTR_INTERVAL, Value::I64(10)),
+                ("_logit.statsd.type", Value::str("c")),
+                ("env", Value::str("prod")),
+            ],
+        );
+        let mut resource = Resource::default();
+        resource.attributes.insert(RESOURCE_ATTR_AGENT_HOSTNAME, Value::str("agent-7"));
+        batch.resource = Arc::new(resource);
+        e.encode_client_stats_v06(&batch).unwrap();
+        let omitted: f64 = registry
+            .drain(0)
+            .iter()
+            .filter(|ev| {
+                ev.attributes.get("reason").and_then(Value::as_str) == Some("no_wire_form")
+            })
+            .flat_map(|ev| ev.metrics.iter())
+            .filter(|m| resolve(m.name) == "logit.output.tags.omitted")
+            .map(|m| match m.kind {
+                MetricKind::Sum(s) => s.value.as_f64(),
+                _ => 0.0,
+            })
+            .sum();
+        assert_eq!(omitted, 1.0, "only `env`, no private key");
     }
 
     #[test]

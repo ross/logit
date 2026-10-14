@@ -42,7 +42,7 @@
 //! |---|---|---|
 //! | measurement | event attribute [`ATTR_MEASUREMENT`], `Value::Str` | -- |
 //! | tag `k=v` | event attribute `k`, `Value::Str`, never a resource attribute | -- |
-//! | tag key under [`CARRIER_PREFIX`] | omitted (normalization 12) | `logit.input.tags.omitted{reason="reserved_prefix"}` |
+//! | tag key under the private `_logit.` prefix or [`FIELD_ATTR_PREFIX`] | omitted (normalization 12) | `logit.input.tags.omitted{reason="reserved_prefix"}` |
 //! | float / integer / unsigned / boolean field `f` | a [`logit_core::MetricRecord`] named `<measurement>.f`, `Gauge(F64 \| I64 \| U64 \| Bool)` | -- |
 //! | N numeric or boolean fields | N records on the one event, in wire order | -- |
 //! | string field `f="x"` | event attribute `influxdb.field.f` ([`FIELD_ATTR_PREFIX`]), `Value::Str` | -- |
@@ -52,6 +52,16 @@
 //! | a line that fails the grammar, or a timestamp outside the range | the whole body fails: [`line::LineError`] with the 1-based line index, the line's text, and the reason | -- |
 //! | `org`, `orgID`, `bucket` | resource attributes [`RESOURCE_ATTR_ORG`], [`RESOURCE_ATTR_ORG_ID`], [`RESOURCE_ATTR_BUCKET`], set by the listener on the resource it passes in | -- |
 //! | `Scope` | `None` | -- |
+//!
+//! The measurement and the three resource attributes are private carriers under
+//! `_logit.influxdb.`
+//! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)), so
+//! only `influxdb_out` reads them and every other sink leaves them off its wire. A string field's
+//! `influxdb.field.<key>` is public data that any sink may render.
+//!
+//! A sender's tag never becomes a carrier or a string field: a key under `_logit.` is private to
+//! `logit`, and one under `influxdb.field.` would read back as a string field. Any other tag
+//! under `influxdb.` is an ordinary tag.
 //!
 //! A tag value, string value, or measurement that unescaping left unchanged is a zero-copy slice
 //! of the body; one that changed is a copy. `_time` and `_value` arrive as ordinary tags: influxd
@@ -78,7 +88,8 @@
 //!   the carrier line, counted `logit.output.metrics.normalized{reason="carrier_mismatch"}`. A
 //!   carrier event with only string fields still writes its line; one with no field writes none.
 //! - **Both paths**: the tags are the same, from the attribute table below, and every key under
-//!   [`CARRIER_PREFIX`] or `statsd.` is skipped as a tag, uncounted.
+//!   the private `_logit.` namespace or [`FIELD_ATTR_PREFIX`] is skipped as a tag, uncounted
+//!   ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
@@ -113,7 +124,7 @@
 //! | an empty key or value | omitted | `tags.omitted{reason="empty"}` |
 //! | a key or value with a line break, ending in `\`, or with `\` directly before a space | omitted | `tags.omitted{reason="unencodable"}` |
 //! | key `_measurement`, `_field`, or `time` | omitted: influxd rejects the whole write | `tags.omitted{reason="reserved"}` |
-//! | key under `influxdb.` or `statsd.` | not a tag | -- |
+//! | key under `_logit.` or `influxdb.field.` | not a tag | -- |
 //!
 //! <!-- encode-table:end -->
 //!
@@ -150,7 +161,8 @@
 //!     always a `Gauge`, so this applies only to an event from another protocol.
 //! 11. A listener's sender attributes (`network.peer.*`, `client.*`) are added under `peer:`,
 //!     `proxy_protocol:`, or `forwarded:`.
-//! 12. A tag key under the reserved `influxdb.` prefix is omitted, counted.
+//! 12. A tag key under the private `_logit.` prefix or the string-field prefix `influxdb.field.`
+//!     is omitted, counted.
 //! 13. A duplicate field key within one line: the last value wins.
 //! 14. An absent timestamp: the request's arrival time truncated to `precision`, one instant for
 //!     every such point in the request.
@@ -176,14 +188,14 @@ pub use line::LineError;
 
 /// The event attribute carrying a point's measurement, so the encoder can rebuild the line and
 /// cross-protocol egress keeps the measurement in the record name (`<measurement>.<field>`).
-pub const ATTR_MEASUREMENT: &str = "influxdb.measurement";
-/// A string field rides as `influxdb.field.<key>` (`Value::Str`); strings are not metrics.
+pub const ATTR_MEASUREMENT: &str = "_logit.influxdb.measurement";
+/// A string field rides as `influxdb.field.<key>` (`Value::Str`); strings are not metrics. The
+/// attribute is public data, but the decoder refuses a tag under it and the encoder never writes
+/// one as a tag, so a tag and a string field can't trade places.
 pub const FIELD_ATTR_PREFIX: &str = "influxdb.field.";
-/// Every carrier attribute shares this prefix; the encoder never writes one as a tag.
-pub const CARRIER_PREFIX: &str = "influxdb.";
-pub const RESOURCE_ATTR_ORG: &str = "influxdb.org";
-pub const RESOURCE_ATTR_ORG_ID: &str = "influxdb.org_id";
-pub const RESOURCE_ATTR_BUCKET: &str = "influxdb.bucket";
+pub const RESOURCE_ATTR_ORG: &str = "_logit.influxdb.org";
+pub const RESOURCE_ATTR_ORG_ID: &str = "_logit.influxdb.org_id";
+pub const RESOURCE_ATTR_BUCKET: &str = "_logit.influxdb.bucket";
 
 /// The `precision` query parameter of a write: the unit of every timestamp in the body, and the
 /// unit a timestamp-less point's arrival time is truncated to.

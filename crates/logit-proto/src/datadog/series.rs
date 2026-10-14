@@ -35,7 +35,7 @@ use std::sync::{Arc, LazyLock};
 
 type JsonMap = Map<String, JsonValue>;
 
-/// `datadog.type`'s two values; `count` and `gauge` are said by the model kind itself.
+/// `_logit.datadog.type`'s two values; `count` and `gauge` are said by the model kind itself.
 const TYPE_RATE: &str = "rate";
 const TYPE_UNSPECIFIED: &str = "unspecified";
 
@@ -125,8 +125,8 @@ pub(super) struct WireSeries<'a> {
     pub origin: OriginCodes,
 }
 
-/// `datadog.origin.*`: the protobuf `Origin`'s three codes plus the JSON API's `metric_type`.
-/// A zero code is absent, the protobuf default.
+/// `_logit.datadog.origin.*`: the protobuf `Origin`'s three codes plus the JSON API's
+/// `metric_type`. A zero code is absent, the protobuf default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct OriginCodes {
     pub product: u64,
@@ -162,10 +162,11 @@ impl<'a> WireSeries<'a> {
     }
 
     /// Tags first, then the wire's own fields, so a tag spelled like a carrier (`host.name:x`)
-    /// loses to the field it names.
-    pub(super) fn attributes(&self) -> AttrMap {
+    /// loses to the field it names. Also returns how many tags were skipped for a private key,
+    /// for the caller to count once the series delivers a point.
+    pub(super) fn attributes(&self) -> (AttrMap, usize) {
         let mut attrs = AttrMap::new();
-        insert_tags(&mut attrs, self.tags.iter().copied());
+        let reserved = insert_tags(&mut attrs, self.tags.iter().copied());
         if let Some(host) = self.host.filter(|h| !h.is_empty()) {
             attrs.insert(ATTR_HOST_NAME, Value::str(host));
         }
@@ -191,8 +192,8 @@ impl<'a> WireSeries<'a> {
         if self.interval != 0 {
             attrs.insert(ATTR_INTERVAL, Value::I64(self.interval));
         }
-        // A route that carries a type always decides `datadog.type`, so a tag spelled
-        // `datadog.type:rate` can't turn a GAUGE or COUNT into a RATE on re-encode.
+        // A route that carries a type always decides `_logit.datadog.type`, from the wire type
+        // alone.
         if let Some(wire_type) = self.wire_type {
             match wire_type.type_attr() {
                 Some(t) => attrs.insert(ATTR_TYPE, Value::str(t)),
@@ -211,7 +212,7 @@ impl<'a> WireSeries<'a> {
                 attrs.insert(key, Value::U64(code));
             }
         }
-        attrs
+        (attrs, reserved)
     }
 }
 
@@ -351,7 +352,8 @@ impl DatadogDecoder {
         let name = intern(metric);
         let unit = unit.filter(|u| !u.is_empty()).map(intern);
         let wire_type = series.wire_type.unwrap_or(WireType::Gauge);
-        let attrs = series.attributes();
+        let (attrs, reserved) = series.attributes();
+        let first = out.len();
         for (seconds, value) in points {
             if !value.is_finite() {
                 self.metric_not_decoded(MetricIn::NonFiniteValue, 1);
@@ -364,6 +366,9 @@ impl DatadogDecoder {
             let mut record = MetricRecord::new(name, wire_type.kind(value));
             record.unit = unit;
             out.push(Event::metric(timestamp, attrs.clone(), record));
+        }
+        if out.len() > first {
+            self.reserved_tags(reserved);
         }
     }
 
@@ -484,7 +489,8 @@ impl DatadogDecoder {
                 }
             };
             let name = intern(metric);
-            let attrs = series.attributes();
+            let (attrs, reserved) = series.attributes();
+            let first = out.len();
             for point in points {
                 let Some((seconds, values)) = distribution_point(point) else {
                     self.metric_not_decoded(MetricIn::BadPoint, 1);
@@ -500,6 +506,9 @@ impl DatadogDecoder {
                 }
                 let record = MetricRecord::new(name, MetricKind::Samples(Samples::new(values)));
                 out.push(Event::metric(timestamp, attrs.clone(), record));
+            }
+            if out.len() > first {
+                self.reserved_tags(reserved);
             }
         }
         Ok(batch(out))
@@ -647,9 +656,8 @@ static CONSUMED: LazyLock<[Symbol; 15]> = LazyLock::new(|| {
 });
 
 /// [`CONSUMED`] plus a service check's own carriers: on a check's later records (its first is
-/// the service-checks route's), those belong to the check and are never rendered as tags, as
-/// `statsd_out` never renders a `statsd.*` carrier. Rendered, they'd make the relayed series
-/// decode as a service check itself.
+/// the service-checks route's), those belong to the check and are never rendered as tags. The
+/// private-key skip already keeps them off the wire; this list is belt and braces.
 static CONSUMED_WITH_CHECK: LazyLock<Vec<Symbol>> = LazyLock::new(|| {
     let mut keys = CONSUMED.to_vec();
     keys.extend(
@@ -674,11 +682,11 @@ pub(super) struct Carriers {
     pub resources: Vec<(String, String)>,
     pub source_type_name: Option<String>,
     pub interval: i64,
-    /// `datadog.type`'s value, when it is one this codec knows.
+    /// `_logit.datadog.type`'s value, when it is one this codec knows.
     pub wire_type: Option<WireType>,
     pub origin: OriginCodes,
-    /// How many `datadog.agent.*` carriers (a sketch payload's `CommonMetadata`) are present;
-    /// only the sketches route writes them, from the batch resource.
+    /// How many `_logit.datadog.agent.*` carriers (a sketch payload's `CommonMetadata`) are
+    /// present; only the sketches route writes them, from the batch resource.
     pub agent_metadata: usize,
 }
 
@@ -721,7 +729,8 @@ impl Carriers {
         }
     }
 
-    /// The v2 `resources` list: `host` first, then `device`, then `datadog.resources` in order.
+    /// The v2 `resources` list: `host` first, then `device`, then `_logit.datadog.resources` in
+    /// order.
     fn resource_list(&self) -> Vec<(&str, &str)> {
         let mut out = Vec::with_capacity(self.resources.len() + 2);
         if let Some(host) = &self.host {
@@ -1110,7 +1119,7 @@ impl DatadogEncoder {
 }
 
 /// The attributes a metrics route never renders as a tag for `event`: the carriers it reads into
-/// wire fields of their own, and a service check's `statsd.service_check.*` too.
+/// wire fields of their own, and a service check's `_logit.statsd.service_check.*` too.
 fn tag_skip(resource: &Resource, event: &Event) -> &'static [Symbol] {
     if is_service_check(resource, event) {
         &CONSUMED_WITH_CHECK
@@ -1196,12 +1205,17 @@ mod tests {
     }
 
     /// `metric_tag_count` is the length of the `tags` list the series encoder writes: carriers
-    /// (host, device, a service check's own fields) excluded, resource tags and repeats included.
+    /// (host, device, a service check's own fields) and private keys excluded, resource tags and
+    /// repeats included. A private key is never counted `tags.omitted`, even one no tag could
+    /// hold.
     #[test]
     fn metric_tag_count_is_the_wire_tag_count() {
         let mut resource = Resource::default();
         resource.attributes.insert("region", Value::str("eu"));
+        resource.attributes.insert("_logit.y", Value::str("r"));
         let mut plain = AttrMap::new();
+        plain.insert("_logit.x", Value::str("e"));
+        plain.insert("_logit.m", Value::Map(Box::new(AttrMap::new())));
         plain.insert(ATTR_HOST_NAME, Value::str("h"));
         plain.insert(ATTR_DEVICE, Value::str("d"));
         plain.insert("team", Value::Array(vec![Value::str("a"), Value::str("a")]));
@@ -1219,11 +1233,20 @@ mod tests {
                 scope: None,
                 events: vec![event],
             };
-            let (mut e, _) = encoder();
+            let (mut e, registry) = encoder();
             let body = e.encode_series_v2_protobuf(&batch).unwrap();
             let payload = MetricPayload::decode(body).unwrap();
             assert_eq!(payload.series[0].tags.len(), 3, "region:eu, team:a twice");
+            assert!(payload.series[0].tags.iter().all(|t| !t.contains("_logit")));
             assert_eq!(metric_tag_count(&batch.resource, &batch.events[0]), 3);
+            assert!(
+                !registry
+                    .drain(0)
+                    .iter()
+                    .flat_map(|ev| &ev.metrics)
+                    .any(|m| resolve(m.name) == "logit.output.tags.omitted"),
+                "a private key is never counted"
+            );
         }
     }
 
@@ -1247,6 +1270,37 @@ mod tests {
         assert_eq!(a.get(ATTR_TYPE), Some(&Value::str("rate")));
         assert_eq!(a.get(ATTR_INTERVAL), Some(&Value::I64(20)));
         assert_eq!(a.get(ATTR_SOURCE_TYPE_NAME), Some(&Value::str("my_check")));
+    }
+
+    /// A private tag on a series, an event, or a service check is left off what's delivered and
+    /// counted, once per series however many points it has; a series that delivers no point
+    /// counts nothing. `logit.x` and `_logitx` aren't private.
+    #[test]
+    fn a_private_tag_is_omitted_and_counted_and_lookalikes_are_not() {
+        let (mut d, registry) = decoder();
+        let series = br#"{"series":[
+            {"metric":"m","points":[[1700000000,1],[1700000001,2]],
+             "tags":["env:prod","_logit.datadog.interval:5","logit.x:1","_logitx"]},
+            {"metric":"m","points":[[1700000000,null]],"tags":["_logit.y:1"]}]}"#;
+        let batch = d.decode_series_v1(series, RECEIVED_AT).unwrap();
+        assert_eq!(batch.events.len(), 2);
+        for event in &batch.events {
+            let a = &event.attributes;
+            assert_eq!(a.get("env"), Some(&Value::str("prod")));
+            assert_eq!(a.get("logit.x"), Some(&Value::str("1")));
+            assert_eq!(a.get("_logitx"), Some(&Value::Bool(true)));
+            assert_eq!(a.len(), 3, "no private key survives: {a:?}");
+        }
+        let event = br#"{"title":"t","text":"x","tags":["_logit.z:1","env:prod"]}"#;
+        let batch = d.decode_events(event, RECEIVED_AT).unwrap();
+        assert_eq!(batch.events[0].attributes.get("_logit.z"), None);
+        let check = br#"[{"check":"c","status":0,"tags":["_logit.z:1","env:prod"]}]"#;
+        let batch = d.decode_service_checks(check, RECEIVED_AT).unwrap();
+        assert_eq!(batch.events[0].attributes.get("_logit.z"), None);
+        assert_eq!(
+            counted(&registry, "logit.input.tags.omitted", ("reason", "reserved_prefix")),
+            3.0
+        );
     }
 
     #[test]

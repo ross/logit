@@ -21,8 +21,8 @@
 //! - 1-6 events, one record each, paths from `[A-Za-z0-9_.-]{1,20}`, which the sanitizer doesn't
 //!   touch (normalization 10 is tested in `encode.rs`);
 //! - 0-4 tags per event in arbitrary order (normalization 4), with **distinct** names (a repeat is
-//!   normalization 5) from `[A-Za-z0-9_-]{1,20}`, whose lack of `.` keeps a tag from looking like
-//!   a `statsd.`/`collectd.` carrier; values from `[A-Za-z0-9_.-]{1,20}`;
+//!   normalization 5) from `[A-Za-z0-9_-]{1,20}`, whose lack of `.` keeps a tag out of the private
+//!   `_logit.` namespace; values from `[A-Za-z0-9_.-]{1,20}`;
 //! - any **finite** `f64`, subnormals and `-0.0` included (normalization 8);
 //! - whole-second timestamps in `1..=2_000_000_000` (normalization 6; a non-positive second is a
 //!   counted drop).

@@ -587,7 +587,7 @@ mod survey_shapes {
             "pino_http_log" => "reqId",
             "access_log" => "backend_type",
             "server_span" => "user_agent.original",
-            "collectd_3_record" => "collectd.type",
+            "collectd_3_record" => "_logit.collectd.type",
             "otlp_log_record" => "thread.name",
             other => unreachable!("unknown shape {other}"),
         }

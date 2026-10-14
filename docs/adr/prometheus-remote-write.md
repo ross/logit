@@ -186,39 +186,39 @@ in-order check expects.
 
 `instance` and `job` arrive as ordinary labels — both are optional per spec, neither is structurally
 distinguished on the wire — and stay ordinary event attributes, verbatim. The receiver stamps no
-`prometheus.target`, lifts nothing into `Resource`, and builds one `EventBatch` per request with an
-**empty `Resource`** and `received_at` = now.
+`_logit.prometheus.target`, lifts nothing into `Resource`, and builds one `EventBatch` per request
+with an **empty `Resource`** and `received_at` = now.
 
 This is the opposite of what `prometheus_in`'s *scrape* mode does, and the difference is a fact
 about what each mode knows. A scrape knows the target it connected to, so
 [ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)'s "Attribute
-conventions" has it stamp `instance` and `prometheus.target` as resource attributes it genuinely
-observed. A receiver observed a TCP connection from a sender that may be relaying for thousands of
-targets; the `instance` label in the payload is the *producer's* claim about a target the receiver
-never touched, and promoting a payload label to resource identity is inventing structure the wire
-did not carry. Keeping labels as labels also makes remote-write → remote-write a fixed point with
-nothing to undo, and costs nothing on the other egress: `prometheus_out` renders resource attributes
-as ordinary labels anyway (`logit_core::attrs::merged`, event wins), so an exposition of a received
-request is byte-identical whether `instance` rode as a label or as a resource attribute. An operator
-who wants resource identity gets it from a downstream `set` component or Lua, which is where a
-decision about *this* deployment's topology belongs.
+conventions" has it stamp `instance` and `_logit.prometheus.target` as resource attributes it
+genuinely observed. A receiver observed a TCP connection from a sender that may be relaying for
+thousands of targets; the `instance` label in the payload is the *producer's* claim about a target
+the receiver never touched, and promoting a payload label to resource identity is inventing
+structure the wire did not carry. Keeping labels as labels also makes remote-write → remote-write a
+fixed point with nothing to undo, and costs nothing on the other egress: `prometheus_out` renders
+resource attributes as ordinary labels anyway (`logit_core::attrs::merged`, event wins), so an
+exposition of a received request is byte-identical whether `instance` rode as a label or as a
+resource attribute. An operator who wants resource identity gets it from a downstream `set`
+component or Lua, which is where a decision about *this* deployment's topology belongs.
 
 ### Timestamps: received without the marker, sent always
 
 Every remote-write sample carries a timestamp — it is not optional the way an exposition sample's
 is. The receiver sets `Event::timestamp` from it and **does not set the
-`prometheus.timestamp: true` marker attribute**. That marker means "the producer chose to expose a
-timestamp on this line," which is a fact worth preserving across an exposition round trip; a
-transport that mandates one is not that choice. Setting it would make a remote-write → exposition
+`_logit.prometheus.timestamp: true` marker attribute**. That marker means "the producer chose to
+expose a timestamp on this line," which is a fact worth preserving across an exposition round trip;
+a transport that mandates one is not that choice. Setting it would make a remote-write → exposition
 relay stamp an explicit timestamp on *every* line it writes, which no scrape of that same data would
 have produced.
 
 Suppressing the marker takes a decoder-side switch, because the marker is not the receiver's to
-omit today: `families_to_events` inserts `prometheus.timestamp: true` whenever `Series.timestamp`
-is `Some` (`crates/logit-proto/src/prometheus/mod.rs`), and on this transport it always is.
-`PrometheusDecoder::with_timestamp_marker(bool)` defaults to **`true`**, which is exactly today's
-behaviour for the scrape path, and the receiver passes `false`: `Event::timestamp` is still set from
-the sample, only the marker attribute is omitted.
+omit today: `families_to_events` inserts `_logit.prometheus.timestamp: true` whenever
+`Series.timestamp` is `Some` (`crates/logit-proto/src/prometheus/mod.rs`), and on this transport it
+always is. `PrometheusDecoder::with_timestamp_marker(bool)` defaults to **`true`**, which is exactly
+today's behaviour for the scrape path, and the receiver passes `false`: `Event::timestamp` is still
+set from the sample, only the marker attribute is omitted.
 
 The sender goes the other way and **always emits a timestamp**, via
 `PrometheusEncoder::with_timestamps_always(true)`, because the wire has no way to omit one. Net:
@@ -473,9 +473,9 @@ hand-written `generated/mod.rs` mirrors OTLP's `#[path]`/`#[rustfmt::skip]` nest
   cap is a denial-of-service bound, not a workload tuning knob, and every value an operator would
   reach for it with is a symptom of a sender that should be sending smaller requests. 4 MiB against
   a default `max_samples_per_send` of 2000 is not close to binding.
-- **Setting `prometheus.timestamp: true` on receive**, for symmetry with the scrape path. Rejected:
-  the marker records a *producer's choice* to expose a timestamp, and remote-write gives the
-  producer no choice. Setting it would make every relayed line carry an explicit timestamp on
+- **Setting `_logit.prometheus.timestamp: true` on receive**, for symmetry with the scrape path.
+  Rejected: the marker records a *producer's choice* to expose a timestamp, and remote-write gives
+  the producer no choice. Setting it would make every relayed line carry an explicit timestamp on
   exposition egress — visible, wrong, and impossible to undo downstream without knowing which
   transport the event arrived on.
 
@@ -586,3 +586,11 @@ report:
 
 A flagged multi-series record stays `skipped{reason="no_recorded_value"}`, and
 `degraded{reason="sub_ms_collapsed"}` is unchanged.
+
+## Amendment (2026-10-13): the timestamp marker and the target are private
+
+[ADR `private-attribute-namespace`](private-attribute-namespace.md) renames the two attributes
+this record names: the marker `prometheus.timestamp` is `_logit.prometheus.timestamp`, and the
+scrape-mode resource attribute `prometheus.target` is `_logit.prometheus.target`. The sections
+above use the new names. Neither decision here changes: the receiver still stamps no target and
+sets no marker, and the sender still writes a timestamp on every sample.

@@ -200,13 +200,13 @@ fn canonical_pid(token: &[u8]) -> Option<u64> {
     std::str::from_utf8(token).ok()?.parse().ok()
 }
 
-/// The `syslog.*` carrier keys, interned once per process so each line pays a sorted
-/// `insert_sym`, not an interner hash and shard lock. A `LazyLock` rather than a decoder field
-/// (as collectd's `AttrKeys` is) because the parsers are free functions; `KEYS.x` is one acquire
-/// load after first use.
+/// The `syslog.*` and `_logit.syslog.severity` keys, interned once per process so each line pays
+/// a sorted `insert_sym`, not an interner hash and shard lock. A `LazyLock` rather than a decoder
+/// field (as collectd's `AttrKeys` is) because the parsers are free functions; `KEYS.x` is one
+/// acquire load after first use.
 static KEYS: LazyLock<SyslogKeys> = LazyLock::new(|| SyslogKeys {
     facility: intern("syslog.facility"),
-    severity: intern("syslog.severity"),
+    severity: intern("_logit.syslog.severity"),
     timestamp: intern("syslog.timestamp"),
     hostname: intern("syslog.hostname"),
     tag: intern("syslog.tag"),
@@ -869,7 +869,7 @@ mod tests {
         assert_eq!(message_str(&event), r#"{"status":200}"#);
         assert_eq!(event.log.as_ref().unwrap().severity, Some(Severity::Info)); // 134 % 8 = 6
         assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(134 / 8)));
-        assert_eq!(event.attributes.get("syslog.severity"), Some(&Value::U64(6)));
+        assert_eq!(event.attributes.get("_logit.syslog.severity"), Some(&Value::U64(6)));
         assert_eq!(event.attributes.get("syslog.hostname").and_then(Value::as_str), Some("myhost"));
         assert_eq!(
             event.attributes.get("syslog.tag").and_then(Value::as_str),
@@ -1280,7 +1280,7 @@ mod tests {
         let event = only_event(decode(line));
         assert_eq!(message_str(&event), "'su root' failed for lonvick on /dev/pts/8");
         assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(4)));
-        assert_eq!(event.attributes.get("syslog.severity"), Some(&Value::U64(2)));
+        assert_eq!(event.attributes.get("_logit.syslog.severity"), Some(&Value::U64(2)));
         assert_eq!(
             event.attributes.get("syslog.hostname").and_then(Value::as_str),
             Some("mymachine.example.com")
@@ -1302,7 +1302,7 @@ mod tests {
         let event = only_event(decode(line));
         assert_eq!(message_str(&event), "%% It's time to make the do-nuts.");
         assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(20)));
-        assert_eq!(event.attributes.get("syslog.severity"), Some(&Value::U64(5)));
+        assert_eq!(event.attributes.get("_logit.syslog.severity"), Some(&Value::U64(5)));
         assert_eq!(
             event.attributes.get("syslog.hostname").and_then(Value::as_str),
             Some("192.0.2.1")
@@ -1452,7 +1452,7 @@ mod tests {
     #[test]
     fn a_tag_less_rfc3164_msg_starting_1_space_falls_back_to_rfc3164() {
         let event = falls_back("<14>1 worker died");
-        assert_eq!(event.attributes.get("syslog.severity"), Some(&Value::U64(6)));
+        assert_eq!(event.attributes.get("_logit.syslog.severity"), Some(&Value::U64(6)));
         assert!(event.attributes.get("syslog.tag").is_none());
         assert!(event.attributes.get("syslog.hostname").is_none());
         falls_back("<13>1 2 3 msg");
