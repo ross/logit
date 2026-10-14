@@ -567,7 +567,9 @@ fn build_tag_suffix(
 
     for (key, value) in logit_core::attrs::merged(resource, event) {
         let key = resolve(key);
-        if FOREIGN_CARRIER_PREFIXES.iter().any(|prefix| key.starts_with(prefix)) {
+        if FOREIGN_CARRIER_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+            || logit_core::attrs::is_private(key)
+        {
             continue;
         }
         if tags == Tags::Drop {
@@ -1251,6 +1253,25 @@ mod tests {
         assert_eq!(lines, vec!["sys.cpu;env=prod 1 1700000000"]);
         assert_eq!(stats.tags_omitted_dialect, 0);
         assert_eq!(stats.tags_omitted_unrepresentable, 0);
+    }
+
+    /// A private attribute, on the event or the resource, is skipped **uncounted** under both
+    /// `tags:` modes; a public sibling still renders, or is counted under `drop`.
+    #[test]
+    fn private_attributes_are_skipped_uncounted() {
+        let ev = tagged(&[("_logit.x", Value::from("e")), ("env", Value::from("prod"))]);
+        let mut resource = Resource::default();
+        resource.attributes.insert("_logit.y", "r");
+        let batch = EventBatch { resource: Arc::new(resource), scope: None, events: vec![ev] };
+
+        let (lines, _, stats, _) = encode_with(&batch, |e| e);
+        assert_eq!(lines, vec!["sys.cpu;env=prod 1 1700000000"]);
+        assert_eq!(stats.tags_omitted_dialect, 0);
+        assert_eq!(stats.tags_omitted_unrepresentable, 0);
+
+        let (lines, _, stats, _) = encode_with(&batch, |e| e.with_tags(Tags::Drop));
+        assert_eq!(lines, vec!["sys.cpu 1 1700000000"]);
+        assert_eq!(stats.tags_omitted_dialect, 1, "only `env` is counted");
     }
 
     // -- sanitization -----------------------------------------------------------------------------
