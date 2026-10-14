@@ -1,11 +1,11 @@
 //! Route ownership across Datadog's encoders: a batch fanned out to every route leaves each item
 //! on exactly the route(s) that own it. A service check's first record (its `Gauge(status)`) is
-//! `encode_service_checks`'s alone, and a Datadog event (a `log` carrying `statsd.event.title`) is
-//! `encode_events`'s alone; every other route skips them silently. Any later metric on a service
-//! check still leaves as an ordinary series, as `statsd_out` sends `metrics[1..]` as ordinary
-//! lines. APM stats (an event carrying `datadog.stats.name`) are the stats routes' alone, whole:
-//! their `Sum`s and summary `Distribution`s never leave as series or sketches. The fixed-point
-//! suites can't see this: each decodes and encodes on one route.
+//! `encode_service_checks`'s alone, and a Datadog event (a `log` carrying
+//! `_logit.statsd.event.title`) is `encode_events`'s alone; every other route skips them silently.
+//! Any later metric on a service check still leaves as an ordinary series, as `statsd_out` sends
+//! `metrics[1..]` as ordinary lines. APM stats (an event carrying `datadog.stats.name`) are the
+//! stats routes' alone, whole: their `Sum`s and summary `Distribution`s never leave as series or
+//! sketches. The fixed-point suites can't see this: each decodes and encodes on one route.
 
 use bytes::Bytes;
 use logit_core::interner::{intern, resolve};
@@ -94,7 +94,7 @@ fn a_service_checks_later_metrics_still_leave_as_series() {
         // The check's own carriers stay with the check: rendered as tags, they would make the
         // relayed series decode as a service check and vanish from the series route next hop.
         let attrs = &relayed.events[0].attributes;
-        assert_eq!(attrs.get("statsd.service_check.name"), None, "{route}");
+        assert_eq!(attrs.get("_logit.statsd.service_check.name"), None, "{route}");
         assert_eq!(attrs.get("env").and_then(|v| v.as_str()), Some("prod"), "{route}");
         let (_, again) =
             series_routes(&relayed).into_iter().find(|(r, _)| *r == route).expect("the same route");

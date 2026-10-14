@@ -657,7 +657,7 @@ static CONSUMED: LazyLock<[Symbol; 15]> = LazyLock::new(|| {
 
 /// [`CONSUMED`] plus a service check's own carriers: on a check's later records (its first is
 /// the service-checks route's), those belong to the check and are never rendered as tags, as
-/// `statsd_out` never renders a `statsd.*` carrier. Rendered, they'd make the relayed series
+/// `statsd_out` never renders a `_logit.statsd.*` carrier. Rendered, they'd make the relayed series
 /// decode as a service check itself.
 static CONSUMED_WITH_CHECK: LazyLock<Vec<Symbol>> = LazyLock::new(|| {
     let mut keys = CONSUMED.to_vec();
@@ -1119,7 +1119,7 @@ impl DatadogEncoder {
 }
 
 /// The attributes a metrics route never renders as a tag for `event`: the carriers it reads into
-/// wire fields of their own, and a service check's `statsd.service_check.*` too.
+/// wire fields of their own, and a service check's `_logit.statsd.service_check.*` too.
 fn tag_skip(resource: &Resource, event: &Event) -> &'static [Symbol] {
     if is_service_check(resource, event) {
         &CONSUMED_WITH_CHECK
