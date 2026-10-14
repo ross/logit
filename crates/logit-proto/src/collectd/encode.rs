@@ -710,6 +710,9 @@ fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx)
             }
             continue;
         }
+        if logit_core::attrs::is_private(key) {
+            continue;
+        }
         if key == "host.name" && matches!(value, Value::Str(_) | Value::Bytes(_)) {
             carriers.host_name = Some(value);
         }
@@ -2123,6 +2126,22 @@ mod tests {
         assert!(counted(&registry, "logit.output.tags.omitted", ("reason", "no_wire_form")));
         let decoded = decode_all(&packets);
         assert_eq!(attr(&decoded[0], "env"), None, "collectd has no tag concept at all");
+    }
+
+    /// A private attribute, on the event or the resource, is skipped uncounted; a public sibling
+    /// is still counted `no_wire_form`.
+    #[test]
+    fn a_private_attribute_is_skipped_uncounted() {
+        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
+        event.attributes.insert("_logit.x", Value::from("e"));
+        event.attributes.insert("env", Value::from("prod"));
+        let mut resource = Resource::default();
+        resource.attributes.insert("_logit.y", "r");
+        let batch = EventBatch { resource: Arc::new(resource), scope: None, events: vec![event] };
+        let (packets, stats) = encode(&batch, DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(stats.tags_omitted_no_wire_form, 1, "only `env` is counted");
+        assert_eq!(stats.tags_omitted_unrepresentable, 0);
+        assert_eq!(decode_all(&packets).len(), 1);
     }
 
     #[test]

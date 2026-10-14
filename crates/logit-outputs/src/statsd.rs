@@ -294,7 +294,8 @@
 //! [`EncodeCtx`], so a
 //! carrier set only on the resource (a `set` transform's `resource:` block, say) is honored like
 //! an event-level one. `append_dialect_extras`/`statsd_wire_type` read `EncodeCtx`, never
-//! `event.attributes`, which keeps the filter and the read symmetric.
+//! `event.attributes`, which keeps the filter and the read symmetric. A private `_logit.` attribute
+//! is skipped too, uncounted under either dialect (ADR `private-attribute-namespace`).
 //!
 //! ## DogStatsD events and service checks
 //!
@@ -924,6 +925,9 @@ fn build_tag_suffix<'a>(
                 // A wrong-typed carrier or an unknown `statsd.*` key is ignored, not an error.
                 _ => {}
             }
+            continue;
+        }
+        if crate::attrs::is_private(key_str) {
             continue;
         }
 
@@ -3637,6 +3641,39 @@ mod tests {
         )]);
         // Carriers appear only in their own segments, never beside `env`.
         assert_eq!(msgs, vec!["hits:1|c|#env:prod|c:abcd1234|T0"]);
+    }
+
+    /// A private attribute, on the event or the resource, is never a tag under DogStatsD and is
+    /// never counted `tags_omitted_dialect` under plain statsd; a public sibling is either.
+    #[test]
+    fn private_attributes_are_never_tags_and_never_counted() {
+        let mut resource = Resource::default();
+        resource.attributes.insert("_logit.y", "r");
+        let event = metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[("_logit.x", Value::str("e")), ("env", "prod".into())],
+        );
+        for (format, line, dialect) in
+            [(Format::DogStatsd, "hits:1|c|#env:prod", 0), (Format::Statsd, "hits:1|c", 1)]
+        {
+            let mut encoder = StatsdEncoder::new(format);
+            let mut out = MessageBuf::default();
+            let batch = EventBatch {
+                resource: Arc::new(resource.clone()),
+                scope: None,
+                events: vec![event.clone()],
+            };
+            let stats = encoder.encode_into(&batch, &mut out);
+            let msgs: Vec<_> =
+                out.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
+            assert_eq!(msgs, vec![line], "{format:?}");
+            assert_eq!(
+                stats,
+                EncodeStats { tags_omitted_dialect: dialect, ..EncodeStats::default() },
+                "{format:?}: only `env` is counted"
+            );
+        }
     }
 
     // -- external data (`|e:`) and cardinality (`|card:`) ---------------------------------------
