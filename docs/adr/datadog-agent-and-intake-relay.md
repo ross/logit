@@ -112,9 +112,10 @@ Three facts from the survey drive the shape of the decision:
    `datadog.resources`, `datadog.source_type_name`, `datadog.origin.*`, `datadog.chunk.*`,
    `datadog.tracer.*`, `datadog.agent.*`, `datadog.stats.*`); Datadog's own OTLP-honored names for
    span fields (`service.name`, `resource.name`, `span.type`); `meta`/`metrics` keys verbatim;
-   `statsd.event.*`/`statsd.service_check.*` for events and service checks, which are the same
-   Datadog concepts DogStatsD carries. A Datadog `rate` is a `Gauge` with `datadog.type: rate`,
-   not a `Sum`, because folding a per-second value into a delta multiplies and rounds.
+   `_logit.statsd.event.*`/`_logit.statsd.service_check.*` for events and service checks, which are
+   the same Datadog concepts DogStatsD carries. A Datadog `rate` is a `Gauge` with
+   `datadog.type: rate`, not a `Sum`, because folding a per-second value into a delta multiplies
+   and rounds.
 
 9. **Trace ids** are built from a uint64 and `_dd.p.tid` on decode, and emitted as the low 64
    bits plus `_dd.p.tid` when the high bits are nonzero.
