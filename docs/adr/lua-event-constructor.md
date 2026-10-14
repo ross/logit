@@ -238,3 +238,12 @@ Every `MetricValue` variant round-trips through `Event.new(e:to_table())` at its
 this ADR's shape symmetry holds; `crates/logit-script/tests/event_new_fixed_point.rs` generates
 values of every variant. The flattening the Decision describes still applies to attribute values,
 not to a metric's value.
+
+## Amendment: exemplar values are typed (2026-10-13)
+
+An exemplar's value is a `logit_core::MetricValue` under [ADR
+`typed-metric-scalar`](typed-metric-scalar.md)'s exemplar amendment. `to_table()` writes `type =
+"i64"`, `"u64"`, or `"bool"` beside a non-`f64` exemplar `value` and no `type` key for an `f64`.
+`Event.new` takes the same optional `type` on an exemplar table, defaulting to `"f64"` and parsed
+by the rules in the typed metric values amendment above. The finiteness rule applies to an `f64`
+exemplar value only.

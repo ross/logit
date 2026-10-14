@@ -42,11 +42,11 @@
 //! | `exponential_histogram` | `scale`, `temporality`, `count`, `zero_count`, `zero_threshold`, `positive`, `negative` (each `{"offset": o, "counts": [..]}`, omitted when its counts are empty), then `sum`, `min`, `max` when present |
 //! | `summary` | `count`, `sum`, `quantiles` (`[{"quantile": q, "value": v}]` in wire order) |
 //!
-//! A `sum`'s `value`, a `gauge`'s `value`, and a `gauge_delta`'s `delta` are a `MetricValue`
-//! (`docs/adr/typed-metric-scalar.md`), written in its own JSON type: a number for `F64` (the
-//! non-finite rule below applies), an integer for `I64` and `U64` (a `U64` above 2^53 keeps every
-//! digit), and a boolean for `Bool`. A whole-number `F64` and an `I64` of the same value both
-//! write the same digits.
+//! A `sum`'s `value`, a `gauge`'s `value`, a `gauge_delta`'s `delta`, and an exemplar's `value`
+//! are a `MetricValue` (`docs/adr/typed-metric-scalar.md`), written in its own JSON type: a
+//! number for `F64` (the non-finite rule below applies), an integer for `I64` and `U64` (a `U64`
+//! above 2^53 keeps every digit), and a boolean for `Bool`. A whole-number `F64` and an `I64` of
+//! the same value both write the same digits.
 //!
 //! Values: `Null`, `Bool`, `I64`, `U64` are JSON's own; `F64` is a JSON number, except that a
 //! non-finite one, which JSON has no form for, is the string `"NaN"`, `"inf"`, or `"-inf"` (the
@@ -560,7 +560,7 @@ fn walk_exemplar<W: TreeWriter>(w: &mut W, exemplar: &Exemplar) {
     let mut obj = w.open_map();
     w.key(&mut obj, "timestamp");
     w.timestamp(exemplar.timestamp);
-    push_f64(w, &mut obj, "value", exemplar.value);
+    push_metric_value(w, &mut obj, "value", exemplar.value);
     if let Some(trace) = &exemplar.trace {
         walk_trace_ref(w, &mut obj, trace);
     }
@@ -1085,13 +1085,19 @@ mod tests {
         record.exemplars = vec![
             Exemplar {
                 timestamp: 5,
-                value: 0.25,
+                value: MetricValue::F64(0.25),
                 trace: Some(TraceRef { trace_id: [0x11; 16], span_id: Some([0x22; 8]), flags: 0 }),
                 filtered_attributes: attrs(&[("exemplar.key", Value::str("v"))]),
             },
             Exemplar {
                 timestamp: 0,
-                value: f64::NAN,
+                value: MetricValue::F64(f64::NAN),
+                trace: None,
+                filtered_attributes: AttrMap::new(),
+            },
+            Exemplar {
+                timestamp: 0,
+                value: MetricValue::U64(u64::MAX),
                 trace: None,
                 filtered_attributes: AttrMap::new(),
             },
@@ -1102,7 +1108,8 @@ mod tests {
                 "\"value\":1,\"exemplars\":[{{\"timestamp\":\"1970-01-01T00:00:00.000000005Z\",\
                  \"value\":0.25,\"trace_id\":\"{}\",\"span_id\":\"{}\",\"trace_flags\":0,\
                  \"attributes\":{{\"exemplar.key\":\"v\"}}}},\
-                 {{\"timestamp\":\"{T0}\",\"value\":\"NaN\"}}]}}",
+                 {{\"timestamp\":\"{T0}\",\"value\":\"NaN\"}},\
+                 {{\"timestamp\":\"{T0}\",\"value\":18446744073709551615}}]}}",
                 "11".repeat(16),
                 "22".repeat(8)
             )),

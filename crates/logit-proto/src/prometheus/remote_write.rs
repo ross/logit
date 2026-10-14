@@ -1178,10 +1178,10 @@ fn bound(value: f64) -> String {
     out
 }
 
-fn exemplar_out(exemplar: &Exemplar) -> ExemplarOut {
+fn exemplar_out(exemplar: &Exemplar, encoder: &PrometheusEncoder) -> ExemplarOut {
     ExemplarOut {
         labels: text::exemplar_labels(exemplar),
-        value: exemplar.value,
+        value: encoder.scalar(exemplar.value),
         timestamp_ms: exemplar.timestamp / 1_000_000,
     }
 }
@@ -1210,7 +1210,7 @@ fn flatten(
             name: primary.into_owned(),
             extra: None,
             value: *v,
-            exemplars: series.exemplars.iter().map(exemplar_out).collect(),
+            exemplars: series.exemplars.iter().map(|e| exemplar_out(e, encoder)).collect(),
         }),
         Point::Gauge(v) | Point::Unknown(v) => {
             drop_exemplars(encoder);
@@ -1262,12 +1262,13 @@ fn flatten(
                 // there is no one-per-bucket cap to respect.
                 let mut claimed = Vec::new();
                 for (i, exemplar) in series.exemplars.iter().enumerate() {
-                    if used[i] || exemplar.value.is_nan() {
+                    let value = exemplar.value.as_f64();
+                    if used[i] || value.is_nan() {
                         continue;
                     }
-                    if exemplar.value > previous && exemplar.value <= *le {
+                    if value > previous && value <= *le {
                         used[i] = true;
-                        claimed.push(exemplar_out(exemplar));
+                        claimed.push(exemplar_out(exemplar, encoder));
                     }
                 }
                 previous = *le;

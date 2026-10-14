@@ -360,7 +360,7 @@ pub struct ExpHistogram {
 pub struct Summary { pub quantiles: Vec<(f64, f64)>, pub count: u64, pub sum: f64 }
 
 pub struct Exemplar {
-    pub timestamp: i64, pub value: f64, pub trace: Option<TraceRef>,
+    pub timestamp: i64, pub value: MetricValue, pub trace: Option<TraceRef>,
     pub filtered_attributes: AttrMap,
 }
 

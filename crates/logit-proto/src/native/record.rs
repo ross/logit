@@ -205,18 +205,6 @@ fn read_exact_i64(bytes: &mut Bytes) -> Result<i64, CodecError> {
     Ok(i64::from_le_bytes(buf))
 }
 
-fn read_exact_f64(bytes: &mut Bytes) -> Result<f64, CodecError> {
-    if bytes.len() != 8 {
-        return Err(CodecError::Malformed(format!(
-            "expected 8 bytes for an f64, got {}",
-            bytes.len()
-        )));
-    }
-    let mut buf = [0u8; 8];
-    bytes.copy_to_slice(&mut buf);
-    Ok(f64::from_le_bytes(buf))
-}
-
 fn write_symbol_field(out: &mut BytesMut, dict: &mut DictBuilder, tag: u8, sym: Symbol) {
     let idx = dict.intern(sym);
     write_scalar_field(out, tag, 4, |b| b.extend_from_slice(&idx.to_le_bytes()));
@@ -600,10 +588,9 @@ fn write_exemplar(out: &mut BytesMut, dict: &mut DictBuilder, exemplar: &Exempla
             b.extend_from_slice(&exemplar.timestamp.to_le_bytes())
         });
     }
-    if exemplar.value != 0.0 {
-        write_scalar_field(out, EX_VALUE, 8, |b| {
-            b.extend_from_slice(&exemplar.value.to_le_bytes())
-        });
+    // Strict: `I64(0)` and `Bool(false)` differ from the default and are written.
+    if exemplar.value != MetricValue::F64(0.0) {
+        write_scalar_field(out, EX_VALUE, SCALAR_LEN as usize, |b| write_scalar(b, exemplar.value));
     }
     if let Some(trace) = &exemplar.trace {
         write_field(out, EX_TRACE, |b| write_trace_ref(b, trace));
@@ -617,13 +604,18 @@ fn write_exemplar(out: &mut BytesMut, dict: &mut DictBuilder, exemplar: &Exempla
 
 fn read_exemplar(bytes: &mut Bytes, dict: &Dict) -> Result<Exemplar, CodecError> {
     let mut timestamp = 0i64;
-    let mut value = 0.0f64;
+    let mut value = MetricValue::F64(0.0);
     let mut trace = None;
     let mut filtered_attributes = logit_core::AttrMap::new();
     for_each_field(bytes, |tag, field| {
         match tag {
             EX_TIMESTAMP => timestamp = read_exact_i64(field)?,
-            EX_VALUE => value = read_exact_f64(field)?,
+            EX_VALUE => {
+                value = read_scalar(field)?;
+                if !field.is_empty() {
+                    return Err(trailing_bytes("exemplar value", field.len()));
+                }
+            }
             EX_TRACE => trace = Some(read_trace_ref(field)?),
             EX_FILTERED_ATTRIBUTES => filtered_attributes = read_attr_map(field, dict)?,
             _unknown => field.clear(),
@@ -1434,6 +1426,34 @@ mod tests {
         }
     }
 
+    /// An exemplar's value is the typed scalar: every variant survives, and `I64(0)` and
+    /// `Bool(false)` aren't elided as the `F64(0.0)` default.
+    #[test]
+    fn round_trips_every_metric_value_as_an_exemplar_value() {
+        let name = logit_core::interner::intern("record_test_exemplar_scalar");
+        let values = [
+            MetricValue::F64(0.0),
+            MetricValue::F64(-0.5),
+            MetricValue::I64(0),
+            MetricValue::I64(i64::MAX),
+            MetricValue::I64((1 << 53) + 1),
+            MetricValue::U64(u64::MAX),
+            MetricValue::U64(0),
+            MetricValue::Bool(true),
+            MetricValue::Bool(false),
+        ];
+        for value in values {
+            let mut record = MetricRecord::new(name, MetricKind::gauge(1.0));
+            record.exemplars = vec![Exemplar {
+                timestamp: 5,
+                value,
+                trace: None,
+                filtered_attributes: AttrMap::new(),
+            }];
+            assert_eq!(dict_round_trip_metric(&record), record, "{value:?}");
+        }
+    }
+
     /// A scalar body with a given type byte and eight value bytes.
     fn scalar_kind_body(kind_tag: u8, type_byte: u8, value: u64) -> Bytes {
         let mut out = BytesMut::new();
@@ -1487,13 +1507,13 @@ mod tests {
             exemplars: vec![
                 Exemplar {
                     timestamp: 100,
-                    value: 42.0,
+                    value: MetricValue::F64(42.0),
                     trace: Some(TraceRef { trace_id: [1; 16], span_id: Some([2; 8]), flags: 1 }),
                     filtered_attributes: attrs.clone(),
                 },
                 Exemplar {
                     timestamp: 200,
-                    value: 43.0,
+                    value: MetricValue::I64(0),
                     trace: None,
                     filtered_attributes: AttrMap::new(),
                 },

@@ -53,7 +53,7 @@ Settled with Ross (2026-10-13), recorded in full in the two ADRs:
 | 15 | The encoder moves to `crates/logit-proto/src/influxdb/`, beside the decoder. | `influxdb-line-protocol-relay` |
 | 16 | Four stacked PRs: `influx/w0` docs, `influx/w1` `MetricValue`, `influx/w2` codec, `influx/w3` listener. | this plan |
 
-Also settled in design: `Exemplar.value` stays `f64`. `stdio_out`'s `format: json` prints `I64`
+Also settled in design: `Exemplar.value` stays `f64` (typed later; see [ADR `typed-metric-scalar`](../adr/typed-metric-scalar.md)'s exemplar amendment). `stdio_out`'s `format: json` prints `I64`
 and `U64` as JSON integers. A string-only point is an event with no metrics that `influxdb_out`
 writes under the carrier and every other sink skips. `influxdb.field.*` reaches other sinks as a
 tag or label unless a `remove` drops it.

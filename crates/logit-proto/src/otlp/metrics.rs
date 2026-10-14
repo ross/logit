@@ -20,7 +20,8 @@
 //! `MetricValue` type: `F64` → `as_double`, `I64` → `as_int`, a `U64` that fits an `int64` →
 //! `as_int`. A `U64` above `i64::MAX` has no integer form and leaves as `as_double`, counted
 //! `logit.output.metrics.normalized{reason="u64_as_double"}`; a `Bool` leaves as `as_int` `0` or
-//! `1`, counted `logit.output.metrics.normalized{reason="bool_value"}`.
+//! `1`, counted `logit.output.metrics.normalized{reason="bool_value"}`. An `Exemplar`'s value
+//! follows the same rule, counted the same way, once per exemplar.
 //! - `Histogram{buckets,temporality,sum,min,max}` → `Histogram`: exact. `buckets` holds per-bucket
 //!   counts, not cumulative ones, and a trailing `f64::INFINITY` bound becomes the implicit final
 //!   bucket `explicit_bounds` expects. Carries exemplars.
@@ -57,7 +58,8 @@
 //!
 //! **Decode.** `Sum` → `MetricKind::Sum{value,temporality,monotonic}` from real fields; a
 //! cumulative `Sum` stays a `Sum`. A `NumberDataPoint`'s `as_int` decodes as `MetricValue::I64`
-//! and `as_double` as `F64`, so `otlp_in -> otlp_out` keeps an integer point an integer.
+//! and `as_double` as `F64`, so `otlp_in -> otlp_out` keeps an integer point an integer. An
+//! `Exemplar`'s `as_int` and `as_double` decode the same way, and one with neither is `F64(0.0)`.
 //! `Histogram` → `Histogram{buckets,temporality,sum,min,max}`, rebuilding the trailing infinite bucket when `bucket_counts` has one more entry than
 //! `explicit_bounds` (the OTLP-mandated shape). `Summary` → `Summary{quantiles,count,sum}`, each quantile read with no range check.
 //! `ExponentialHistogram` → `ExponentialHistogram` field for field (scale, zero count and
@@ -117,7 +119,7 @@ fn start_time(record_start: i64) -> u64 {
 
 /// Drops `TraceRef.flags`: OTLP's `Exemplar` has no trace-flags field, a permanent lossy mapping
 /// (`docs/known-gaps/mappings.md`'s cross-protocol table).
-fn encode_exemplar(e: &Exemplar) -> pb::Exemplar {
+fn encode_exemplar(e: &Exemplar, telemetry: &Telemetry) -> pb::Exemplar {
     let (trace_id, span_id) = match &e.trace {
         Some(t) => (t.trace_id.to_vec(), t.span_id.map(|id| id.to_vec()).unwrap_or_default()),
         None => (Vec::new(), Vec::new()),
@@ -127,7 +129,10 @@ fn encode_exemplar(e: &Exemplar) -> pb::Exemplar {
         time_unix_nano: e.timestamp.max(0) as u64,
         span_id,
         trace_id,
-        value: Some(pb::exemplar::Value::AsDouble(e.value)),
+        value: Some(match number_wire(e.value, telemetry) {
+            NumberWire::Int(v) => pb::exemplar::Value::AsInt(v),
+            NumberWire::Double(v) => pb::exemplar::Value::AsDouble(v),
+        }),
     }
 }
 
@@ -136,9 +141,9 @@ fn encode_exemplar(e: &Exemplar) -> pb::Exemplar {
 /// OTLP's `Exemplar` has no field to read it from.
 fn decode_exemplar(e: pb::Exemplar) -> Exemplar {
     let value = match e.value {
-        Some(pb::exemplar::Value::AsDouble(d)) => d,
-        Some(pb::exemplar::Value::AsInt(i)) => i as f64,
-        None => 0.0,
+        Some(pb::exemplar::Value::AsDouble(d)) => MetricValue::F64(d),
+        Some(pb::exemplar::Value::AsInt(i)) => MetricValue::I64(i),
+        None => MetricValue::F64(0.0),
     };
     let trace = TraceRef::from_bytes(&e.trace_id, &e.span_id, 0);
     let mut filtered_attributes = AttrMap::new();
@@ -146,8 +151,8 @@ fn decode_exemplar(e: pb::Exemplar) -> Exemplar {
     Exemplar { timestamp: common::wire_nanos(e.time_unix_nano), value, trace, filtered_attributes }
 }
 
-fn encode_exemplars(exemplars: &[Exemplar]) -> Vec<pb::Exemplar> {
-    exemplars.iter().map(encode_exemplar).collect()
+fn encode_exemplars(exemplars: &[Exemplar], telemetry: &Telemetry) -> Vec<pb::Exemplar> {
+    exemplars.iter().map(|e| encode_exemplar(e, telemetry)).collect()
 }
 
 fn decode_exemplars(exemplars: Vec<pb::Exemplar>) -> Vec<Exemplar> {
@@ -174,28 +179,43 @@ fn number_data_point(
     }
 }
 
-/// A scalar's `NumberDataPoint.value`: `as_int` for an integer that fits an `int64`, else
-/// `as_double`. A `U64` above `i64::MAX` and a `Bool` (as `0` or `1`) are counted.
-fn number_to_pb(value: MetricValue, telemetry: &Telemetry) -> pb::number_data_point::Value {
-    use pb::number_data_point::Value as V;
+/// The OTLP form of a scalar, shared by `NumberDataPoint.value` and `Exemplar.value`, which are
+/// separate generated `oneof`s with the same two arms.
+enum NumberWire {
+    Int(i64),
+    Double(f64),
+}
+
+/// `as_int` for an integer that fits an `int64`, else `as_double`. A `U64` above `i64::MAX` and a
+/// `Bool` (as `0` or `1`) are counted.
+fn number_wire(value: MetricValue, telemetry: &Telemetry) -> NumberWire {
     match value {
-        MetricValue::F64(v) => V::AsDouble(v),
-        MetricValue::I64(v) => V::AsInt(v),
+        MetricValue::F64(v) => NumberWire::Double(v),
+        MetricValue::I64(v) => NumberWire::Int(v),
         MetricValue::U64(v) => match i64::try_from(v) {
-            Ok(v) => V::AsInt(v),
+            Ok(v) => NumberWire::Int(v),
             Err(_) => {
                 telemetry.count(
                     "logit.output.metrics.normalized",
                     1.0,
                     &[("reason", "u64_as_double")],
                 );
-                V::AsDouble(v as f64)
+                NumberWire::Double(v as f64)
             }
         },
         MetricValue::Bool(b) => {
             telemetry.count("logit.output.metrics.normalized", 1.0, &[("reason", "bool_value")]);
-            V::AsInt(i64::from(b))
+            NumberWire::Int(i64::from(b))
         }
+    }
+}
+
+/// A scalar's `NumberDataPoint.value`; see [`number_wire`].
+fn number_to_pb(value: MetricValue, telemetry: &Telemetry) -> pb::number_data_point::Value {
+    use pb::number_data_point::Value as V;
+    match number_wire(value, telemetry) {
+        NumberWire::Int(v) => V::AsInt(v),
+        NumberWire::Double(v) => V::AsDouble(v),
     }
 }
 
@@ -222,7 +242,8 @@ pub(crate) fn encode_metric(
     let attributes = common::attrs_to_key_values(&event.attributes);
     let ts = event.timestamp.max(0) as u64;
     let start = start_time(record.start_timestamp);
-    let exemplars = encode_exemplars(&record.exemplars);
+    // Only the four kinds below carry exemplars on the wire, so only they count a normalization.
+    let exemplars = || encode_exemplars(&record.exemplars, telemetry);
 
     let data = match &record.kind {
         MetricKind::Sum(s) => pb::metric::Data::Sum(pb::Sum {
@@ -231,7 +252,7 @@ pub(crate) fn encode_metric(
                 start,
                 ts,
                 record.flags,
-                exemplars,
+                exemplars(),
                 s.value,
                 telemetry,
             )],
@@ -244,7 +265,7 @@ pub(crate) fn encode_metric(
                 start,
                 ts,
                 record.flags,
-                exemplars,
+                exemplars(),
                 *v,
                 telemetry,
             )],
@@ -263,7 +284,7 @@ pub(crate) fn encode_metric(
                     sum: h.sum,
                     bucket_counts,
                     explicit_bounds,
-                    exemplars,
+                    exemplars: exemplars(),
                     flags: record.flags,
                     min: h.min,
                     max: h.max,
@@ -290,7 +311,7 @@ pub(crate) fn encode_metric(
                         bucket_counts: e.negative.1.clone(),
                     }),
                     flags: record.flags,
-                    exemplars,
+                    exemplars: exemplars(),
                     min: e.min,
                     max: e.max,
                     zero_threshold: e.zero_threshold,
@@ -1139,7 +1160,7 @@ mod tests {
         filtered_attributes.insert("dropped", "attr");
         Exemplar {
             timestamp: 42,
-            value: 3.5,
+            value: MetricValue::F64(3.5),
             trace: Some(TraceRef { trace_id: [7; 16], span_id: Some([8; 8]), flags: 0 }),
             filtered_attributes,
         }
@@ -1170,6 +1191,60 @@ mod tests {
         }
     }
 
+    fn gauge_with_exemplar_value(value: MetricValue) -> MetricRecord {
+        MetricRecord {
+            exemplars: vec![Exemplar { value, ..exemplar() }],
+            ..MetricRecord::new(intern("m"), MetricKind::gauge(1.0))
+        }
+    }
+
+    /// An `as_int` exemplar decodes as `I64` and encodes back as `as_int`, including past 2^53
+    /// where an `f64` can't hold the integer.
+    #[test]
+    fn an_int_exemplar_keeps_its_integer_through_a_round_trip() {
+        for v in [i64::MAX, (1i64 << 53) + 1, -7, 0] {
+            let rec = gauge_with_exemplar_value(MetricValue::I64(v));
+            let mut diag = Diagnostics::default();
+            let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+            let Some(pb::metric::Data::Gauge(gauge)) = &metric.data else { panic!("not a Gauge") };
+            assert_eq!(
+                gauge.data_points[0].exemplars[0].value,
+                Some(pb::exemplar::Value::AsInt(v))
+            );
+            let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+            assert_eq!(events[0].metrics[0].exemplars[0].value, MetricValue::I64(v));
+        }
+    }
+
+    /// An exemplar value takes `number_to_pb`'s arm choice and its counters.
+    #[test]
+    fn an_exemplar_value_encodes_as_int_or_as_double_by_its_type() {
+        use pb::exemplar::Value as V;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
+        let cases = [
+            (MetricValue::F64(1.5), V::AsDouble(1.5), None),
+            (MetricValue::I64(-3), V::AsInt(-3), None),
+            (MetricValue::U64(i64::MAX as u64), V::AsInt(i64::MAX), None),
+            (MetricValue::U64(u64::MAX), V::AsDouble(u64::MAX as f64), Some("u64_as_double")),
+            (MetricValue::Bool(true), V::AsInt(1), Some("bool_value")),
+            (MetricValue::Bool(false), V::AsInt(0), Some("bool_value")),
+        ];
+        for (value, expected, reason) in cases {
+            let rec = gauge_with_exemplar_value(value);
+            let mut diag = Diagnostics::default();
+            let metric = encode_metric(&event(), &rec, &telemetry, &mut diag).unwrap();
+            let Some(pb::metric::Data::Gauge(gauge)) = metric.data else { panic!("not a Gauge") };
+            assert_eq!(gauge.data_points[0].exemplars[0].value, Some(expected), "{value:?}");
+            let counted: Vec<String> = registry
+                .drain(0)
+                .iter()
+                .filter_map(|e| e.attributes.get("reason")?.as_str().map(str::to_string))
+                .collect();
+            assert_eq!(counted, reason.map(str::to_string).into_iter().collect::<Vec<_>>());
+        }
+    }
+
     /// `SummaryDataPoint` has no `exemplars` field, so a summary's exemplars are dropped.
     #[test]
     fn a_summary_drops_its_exemplars_because_the_wire_type_has_nowhere_to_put_them() {
@@ -1185,6 +1260,35 @@ mod tests {
             events[0].metrics[0].exemplars.is_empty(),
             "a Summary must not carry exemplars back -- the wire type has no field for them"
         );
+    }
+
+    /// An exemplar on a kind whose wire type has no exemplars field is dropped without counting
+    /// a value normalization it never performed.
+    #[test]
+    fn an_exemplar_on_a_kind_without_exemplars_counts_no_normalization() {
+        let kinds = [
+            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 }),
+            MetricKind::GaugeDelta(MetricValue::F64(1.0)),
+        ];
+        for kind in kinds {
+            for value in [MetricValue::Bool(true), MetricValue::U64(u64::MAX)] {
+                let registry = Registry::new();
+                let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
+                let rec = MetricRecord {
+                    exemplars: vec![Exemplar { value, ..exemplar() }],
+                    ..MetricRecord::new(intern("m"), kind.clone())
+                };
+                let mut diag = Diagnostics::default();
+                let _ = encode_metric(&event(), &rec, &telemetry, &mut diag);
+                let normalized = registry
+                    .drain(0)
+                    .iter()
+                    .filter_map(|e| e.attributes.get("reason")?.as_str().map(str::to_string))
+                    .filter(|r| r == "bool_value" || r == "u64_as_double")
+                    .count();
+                assert_eq!(normalized, 0, "{kind:?} {value:?}");
+            }
+        }
     }
 
     // -- proptest: decode(encode(x)) == x over a generator of MetricRecords -----------------
@@ -1249,7 +1353,7 @@ mod tests {
 
         /// A fixed, non-zero id (`TraceRef::from_bytes` rejects all-zero); only presence varies.
         fn arb_exemplar() -> impl Strategy<Value = Exemplar> {
-            (0i64..2_000_000_000_000_000_000i64, -1e6f64..1e6f64, any::<bool>()).prop_map(
+            (0i64..2_000_000_000_000_000_000i64, arb_value(), any::<bool>()).prop_map(
                 |(timestamp, value, has_trace)| {
                     let trace = has_trace.then_some(TraceRef {
                         trace_id: [0xAB; 16],

@@ -420,7 +420,7 @@ pub struct Summary {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Exemplar {
     pub timestamp: i64,
-    pub value: f64,
+    pub value: MetricValue,
     pub trace: Option<TraceRef>,
     pub filtered_attributes: AttrMap,
 }

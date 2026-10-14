@@ -803,8 +803,11 @@ none gets one. Every kind but the sketches *can* be built whole: `Event.new` con
 sketches by name. See "Constructing events" below.
 
 `exemplars` is a read-only snapshot table, one entry per `logit_core::Exemplar`: `{timestamp=
-<nanos-string>, value=<number>, trace_id=<hex-or-nil>, span_id=<hex-or-nil>,
-trace_flags=<integer-or-nil>, attributes=<table>}`. `trace_flags` is `nil` exactly when
+<nanos-string>, value=<number>, type=<string-or-nil>, trace_id=<hex-or-nil>,
+span_id=<hex-or-nil>, trace_flags=<integer-or-nil>, attributes=<table>}`. An exemplar's `value` is
+a `MetricValue`, and `type` is `"i64"`, `"u64"`, or `"bool"` for a non-`f64` value and absent for
+an `f64`, with `value` encoded as a metric's is (see "`to_table()` names a non-`f64` type"
+above). `trace_flags` is `nil` exactly when
 `trace_id` is, the same rule `event.log.trace_flags` follows. Lua can't add, remove, or mutate an
 individual exemplar in place, only read the whole list or rebuild the record with `Event.new`.
 
@@ -989,7 +992,8 @@ An exemplar table, `to_table()`'s exemplar snapshot shape (see "Reading and writ
 | Key | Type / encoding | Required? |
 |---|---|---|
 | `timestamp` | decimal-nanos string | **required** |
-| `value` | finite number | **required** |
+| `value` | finite number, or what `type` requires | **required** |
+| `type` | `"f64"`, `"i64"`, `"u64"`, or `"bool"`, parsed as for a `sum`'s `type` | optional, default `"f64"` |
 | `trace_id` | 32-char hex string, not all-zero | optional, default no trace context |
 | `span_id` | 16-char hex string, not all-zero; only with `trace_id` | optional |
 | `trace_flags` | integer 0-255; only with `trace_id` | optional, default `0` |
@@ -1177,7 +1181,7 @@ empty table an empty `Map`. So these don't round-trip through `Event.new(e:to_ta
   integer, so it comes back `Value::I64(3)`. A fractional `F64` is unaffected.
 - A `Value::Null` `message`, which `to_table()` emits as an absent key and `Event.new` rejects as
   missing.
-- A NaN or infinite `sum`/`gauge`/`samples`/exemplar `value` (or `sample_rate`), which the
+- A NaN or infinite `sum`/`gauge`/`samples`/`f64` exemplar `value` (or `sample_rate`), which the
   finiteness rule above rejects. `to_table()` emits the raw float, and the pipeline does admit
   such a point: `prometheus_in` carries OpenMetrics `NaN`/`+Inf` through verbatim, and `otlp_in`
   passes an `AsDouble` through unfiltered. A script rebuilding a scraped event must fix or drop

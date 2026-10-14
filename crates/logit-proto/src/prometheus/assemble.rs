@@ -121,7 +121,7 @@
 
 use super::{DecodeDrop, FamilyType, MetricFamily, Point, PrometheusDecoder, Series};
 use logit_core::trace::{parse_span_id, parse_trace_id};
-use logit_core::{parse_decimal_nanos, AttrMap, Exemplar, TraceRef, Value};
+use logit_core::{parse_decimal_nanos, AttrMap, Exemplar, MetricValue, TraceRef, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1118,5 +1118,5 @@ pub(super) fn exemplar_from_labels(
     for (key, value) in labels {
         filtered_attributes.insert(&key, Value::str(value));
     }
-    Exemplar { timestamp, value, trace, filtered_attributes }
+    Exemplar { timestamp, value: MetricValue::F64(value), trace, filtered_attributes }
 }

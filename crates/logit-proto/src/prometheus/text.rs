@@ -882,7 +882,7 @@ impl Writer<'_> {
                 push_exemplar_labels(self.out, exemplar);
                 self.out.push(b' ');
                 self.number.clear();
-                push_float_str(&mut self.number, exemplar.value);
+                push_float_str(&mut self.number, self.encoder.scalar(exemplar.value));
                 self.out.extend_from_slice(self.number.as_bytes());
                 if exemplar.timestamp != 0 {
                     self.out.push(b' ');
@@ -918,10 +918,11 @@ impl Writer<'_> {
         le: f64,
     ) -> Option<&'e Exemplar> {
         for (i, exemplar) in series.exemplars.iter().enumerate() {
-            if self.used.get(i).copied().unwrap_or(true) || exemplar.value.is_nan() {
+            if self.used.get(i).copied().unwrap_or(true) || exemplar.value.as_f64().is_nan() {
                 continue;
             }
-            if exemplar.value > previous && exemplar.value <= le {
+            let value = exemplar.value.as_f64();
+            if value > previous && value <= le {
                 self.used[i] = true;
                 return Some(exemplar);
             }
@@ -1548,7 +1549,7 @@ mod tests {
         let families = parsed(body, Dialect::OpenMetrics1_0);
         let series = &families[0].series[0];
         assert_eq!(series.exemplars.len(), 3);
-        assert_eq!(series.exemplars[0].value, 0.054);
+        assert_eq!(series.exemplars[0].value, logit_core::MetricValue::F64(0.054));
         assert!(series.exemplars[0].trace.is_none(), "an empty exemplar label set has no trace");
         assert!(
             series.exemplars[1].trace.is_none(),
@@ -2251,7 +2252,12 @@ mod tests {
         for (key, value) in attrs {
             filtered_attributes.insert(key, Value::str(*value));
         }
-        Exemplar { timestamp: 0, value, trace: None, filtered_attributes }
+        Exemplar {
+            timestamp: 0,
+            value: logit_core::MetricValue::F64(value),
+            trace: None,
+            filtered_attributes,
+        }
     }
 
     fn counter_with_exemplars(exemplars: Vec<Exemplar>) -> MetricFamily {
@@ -2271,6 +2277,22 @@ mod tests {
         let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
         assert_eq!(body, "# TYPE requests counter\nrequests_total 17 # {n=\"1\"} 0.1\n# EOF\n");
         assert_eq!(counts, vec![("exemplar_omitted".to_string(), 2.0)]);
+    }
+
+    /// An exemplar's value is a double on the wire, so a typed one is written as its number and a
+    /// `Bool` is counted `normalized{reason="bool_value"}` like a `Sum`'s or `Gauge`'s.
+    #[test]
+    fn a_typed_exemplar_value_is_written_as_a_double_and_a_bool_is_counted() {
+        let typed = |value| Exemplar { value, ..exemplar(0.0, &[]) };
+        let family = counter_with_exemplars(vec![typed(logit_core::MetricValue::I64(7))]);
+        let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
+        assert_eq!(body, "# TYPE requests counter\nrequests_total 17 # {} 7\n# EOF\n");
+        assert!(counts.is_empty(), "{counts:?}");
+
+        let family = counter_with_exemplars(vec![typed(logit_core::MetricValue::Bool(true))]);
+        let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
+        assert_eq!(body, "# TYPE requests counter\nrequests_total 17 # {} 1\n# EOF\n");
+        assert_eq!(counts, vec![("bool_value".to_string(), 1.0)]);
     }
 
     /// Two exemplars whose values land in one bucket's range: the second is dropped, counted.

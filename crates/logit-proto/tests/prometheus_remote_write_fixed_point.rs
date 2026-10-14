@@ -35,7 +35,7 @@
 //! [ADR `lossless-transit`]: ../../../docs/adr/lossless-transit.md
 
 use logit_core::interner::resolve;
-use logit_core::{AttrMap, Exemplar, MetricKind, Registry, TraceRef, Value};
+use logit_core::{AttrMap, Exemplar, MetricKind, MetricValue, Registry, TraceRef, Value};
 use logit_proto::prometheus::generated::io::prometheus::write::v2 as pb2;
 use logit_proto::prometheus::generated::prometheus as pb1;
 use logit_proto::prometheus::remote_write::{
@@ -610,7 +610,7 @@ fn a_stale_marker_round_trips_as_its_exact_bit_pattern() {
 fn histogram_exemplars_are_placed_on_the_bucket_their_value_falls_in() {
     let exemplar = |value: f64| Exemplar {
         timestamp: TIMESTAMP,
-        value,
+        value: MetricValue::F64(value),
         trace: None,
         filtered_attributes: AttrMap::new(),
     };
@@ -1302,7 +1302,7 @@ fn exemplars(kind: FamilyType, timestamp: i64) -> BoxedStrategy<Vec<Exemplar>> {
                     filtered_attributes.insert(&key, Value::str(value));
                 }
             }
-            vec![Exemplar { timestamp, value, trace, filtered_attributes }]
+            vec![Exemplar { timestamp, value: MetricValue::F64(value), trace, filtered_attributes }]
         }
     })
     .boxed()

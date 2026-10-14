@@ -244,7 +244,7 @@ pub enum WireMetricKind {
 )]
 pub struct WireExemplar {
     pub timestamp: i64,
-    pub value: f64,
+    pub value: WireScalar,
     pub trace: Option<WireTraceRef>,
     pub filtered_attributes: Vec<(u32, WireValue)>,
 }
@@ -604,7 +604,7 @@ fn wire_to_metric_kind(kind: &WireMetricKind) -> MetricKind {
 fn exemplar_to_wire(dict: &mut DictBuilder, exemplar: &Exemplar) -> WireExemplar {
     WireExemplar {
         timestamp: exemplar.timestamp,
-        value: exemplar.value,
+        value: scalar_to_wire(exemplar.value),
         trace: exemplar.trace.map(|t| WireTraceRef {
             trace_id: t.trace_id,
             span_id: t.span_id,
@@ -617,7 +617,7 @@ fn exemplar_to_wire(dict: &mut DictBuilder, exemplar: &Exemplar) -> WireExemplar
 fn wire_to_exemplar(strings: &[Symbol], wire: &WireExemplar) -> Exemplar {
     Exemplar {
         timestamp: wire.timestamp,
-        value: wire.value,
+        value: scalar_from_wire(wire.value),
         trace: wire.trace.as_ref().map(|t| TraceRef {
             trace_id: t.trace_id,
             span_id: t.span_id,
@@ -962,7 +962,7 @@ mod tests {
             start_timestamp: 100,
             exemplars: vec![Exemplar {
                 timestamp: 42,
-                value: 7.0,
+                value: MetricValue::F64(7.0),
                 trace: Some(TraceRef { trace_id: [0xAB; 16], span_id: Some([0xCD; 8]), flags: 1 }),
                 filtered_attributes: {
                     let mut m = AttrMap::new();

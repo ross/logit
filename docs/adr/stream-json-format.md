@@ -94,3 +94,10 @@ including the non-finite spellings, and a whole-number `F64` still writes the sa
 treats the value as a float must now accept a boolean. `kafka_out`'s `format: msgpack` follows
 the same walker and writes MessagePack integers and booleans. `ndjson.rs`'s module doc is the
 grammar.
+
+## Amendment: exemplar values are typed (2026-10-13)
+
+An exemplar's `value` is a `MetricValue` too ([ADR `typed-metric-scalar`](typed-metric-scalar.md)'s
+exemplar amendment). `format: json` writes it as a `Sum`'s value is written: `I64` and `U64` as
+JSON integers, `Bool` as a JSON boolean, and `F64` unchanged. `kafka_out`'s `format: msgpack`
+follows.
