@@ -157,6 +157,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `attrs` outgrows that room can exceed the bound, and the splitter drops it unseen. `attrs` comes
   from `--log-opt labels`, `env`, and `tag`. The slack and the bound are `envelope_cap` in
   `crates/logit-inputs/src/docker.rs`.
+- **A truncation counts at most one of a held entry and the unterminated line behind it.**
+  When `docker_in`'s file is truncated in place, the decoder counts each stream's held reassembly
+  `logit.input.frames.dropped{reason="truncated"}` (a drop in progress was counted `oversize`
+  when it began), and the driver counts the unterminated line only when the decoder holds
+  neither, because that line most often continues the held message. An unterminated line that
+  starts a message on the other stream, beside a held reassembly or a drop in progress, is lost
+  uncounted. The partial
+  line can't name its stream: json-file writes `stream` after `log`.
+  - **To close:** parse the stream from the partial line when its envelope got that far.
 - **`held_from` is the oldest held line across both streams, so a long reassembly on one stream
   pins the checkpoint.** The other stream's lines after that offset are already emitted, and a
   crash or a clean stop replays them. Replay, not loss.

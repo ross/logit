@@ -16,6 +16,9 @@
 //!   `metadata_error` diagnostic.
 //! - **Diagnostics** of its own: `bad_time` (read time used instead), `long_line`,
 //!   `metadata_error`, and the info keys `container_renamed` and `container_deselected`.
+//! - **Counters** of its own: the decoder counts a reassembled message it loses as
+//!   `logit.input.frames.dropped{reason="oversize"|"truncated"}`, as the driver counts a line
+//!   ([`DockerDecoder`]).
 //!
 //! See `docs/adr/file-tailing-and-docker-json-logs.md` and
 //! `docs/adr/docker-container-identity-and-minimal-watches.md`.
@@ -192,8 +195,8 @@ struct PartialEntry {
 struct StreamState {
     partial: Option<PartialEntry>,
     /// Set once a reassembly is dropped for exceeding `max_line_bytes`: the stream's later
-    /// fragments are discarded uncounted until the entry that ends the line clears it, as in
-    /// `LineSplitter`'s `dropping`.
+    /// fragments are discarded, the message already counted, until the entry that ends the line
+    /// clears it, as in `LineSplitter`'s `dropping`.
     dropping: bool,
 }
 
@@ -206,21 +209,37 @@ struct StreamState {
 /// reassembly never exceeds it. A `Malformed` entry flushes every stream's held fragment as its
 /// own event before the error, so a fragment is never spliced across a rejected line; a drop in
 /// progress stays in progress.
+///
+/// It counts the messages it loses as `logit.input.frames.dropped`, one per message: `oversize`
+/// when a drop starts, and `truncated` for each stream's held reassembly that
+/// [`TailDecoder::reset`] discards. A stream already dropping holds nothing to count again.
 pub struct DockerDecoder {
     resource: Arc<Resource>,
     /// Indexed as [`STREAMS`].
     streams: [StreamState; 2],
     max_line_bytes: usize,
     diag: Diagnostics,
+    telemetry: Telemetry,
 }
 
 impl DockerDecoder {
     pub(crate) fn new(resource: Arc<Resource>, max_line_bytes: usize) -> Self {
-        Self { resource, streams: Default::default(), max_line_bytes, diag: Diagnostics::default() }
+        Self {
+            resource,
+            streams: Default::default(),
+            max_line_bytes,
+            diag: Diagnostics::default(),
+            telemetry: Telemetry::default(),
+        }
     }
 
     pub(crate) fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
+        self
+    }
+
+    pub(crate) fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
         self
     }
 
@@ -263,6 +282,8 @@ impl DockerDecoder {
         ));
     }
 }
+
+const FRAMES_DROPPED: &str = "logit.input.frames.dropped";
 
 /// One json-file entry. Every string is a `Cow`: `serde_json` borrows a string only when it has
 /// no escapes, and dockerd writes `<`, `>`, `&`, and control bytes as `\u00XX` in `attrs` keys and
@@ -324,6 +345,7 @@ impl TailDecoder for DockerDecoder {
         if held_len + text.len() > self.max_line_bytes {
             state.partial = None;
             state.dropping = !is_complete;
+            self.telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", "oversize")]);
             self.diag.warn_throttled(
                 "long_line",
                 "a docker log line exceeded max_line_bytes and was dropped whole",
@@ -373,6 +395,10 @@ impl TailDecoder for DockerDecoder {
     }
 
     fn reset(&mut self) {
+        let held = self.streams.iter().filter(|s| s.partial.is_some()).count();
+        if held > 0 {
+            self.telemetry.count(FRAMES_DROPPED, held as f64, &[("reason", "truncated")]);
+        }
         // Both halves: a stale `dropping` would swallow the new generation's first complete
         // entry, as a stale `partial` would splice into it.
         self.streams = Default::default();
@@ -447,6 +473,7 @@ struct DockerDecoderFactory {
     labels: Vec<String>,
     max_line_bytes: usize,
     diag: Diagnostics,
+    telemetry: Telemetry,
     meta: BTreeMap<PathBuf, CachedMeta>,
     generation: u64,
 }
@@ -517,7 +544,9 @@ impl DecoderFactory<DockerDecoder> for DockerDecoderFactory {
             Some(identity) => identity.resource.clone(),
             None => id_only_resource(container_dir),
         };
-        Ok(DockerDecoder::new(resource, self.max_line_bytes).with_diagnostics(self.diag.clone()))
+        Ok(DockerDecoder::new(resource, self.max_line_bytes)
+            .with_diagnostics(self.diag.clone())
+            .with_telemetry(self.telemetry.clone()))
     }
 
     fn refresh(&mut self, path: &Path, decoder: &mut DockerDecoder) -> Refresh {
@@ -590,6 +619,7 @@ impl DockerInput {
             labels,
             max_line_bytes: config.max_line_bytes,
             diag: Diagnostics::default(),
+            telemetry: Telemetry::default(),
             meta: BTreeMap::new(),
             generation: 0,
         };
@@ -604,6 +634,7 @@ impl DockerInput {
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.inner.factory_mut().telemetry = telemetry.clone();
         self.inner = self.inner.with_telemetry(telemetry);
         self
     }
@@ -1050,6 +1081,52 @@ mod tests {
         assert!(d.holds_entry(), "the stdout drop outlives close");
     }
 
+    /// An oversize reassembly counts one `frames.dropped{reason="oversize"}` when its drop
+    /// starts, however many fragments the drop then discards, and a message dropped from a
+    /// complete entry counts one too.
+    #[test]
+    fn an_oversize_message_counts_one_dropped_frame() {
+        let mut probe = TelemetryProbe::new();
+        let mut d = DockerDecoder::new(Arc::new(Resource::default()), 10)
+            .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let mut out = Vec::new();
+        d.decode_line(entry("stdout", "01234"), 0, &mut out).unwrap();
+        d.decode_line(entry("stdout", "56789AB"), 0, &mut out).unwrap();
+        d.decode_line(entry("stdout", "more"), 0, &mut out).unwrap();
+        d.decode_line(entry("stdout", "end\n"), 0, &mut out).unwrap();
+        d.decode_line(entry("stderr", "0123456789ABCDEF\n"), 0, &mut out).unwrap();
+        d.decode_line(entry("stdout", "ok\n"), 0, &mut out).unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("ok", "stdout")]));
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]), 2.0);
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "truncated")]), 0.0);
+    }
+
+    /// `reset` counts one `frames.dropped{reason="truncated"}` per stream holding a reassembly,
+    /// none for a stream mid-drop (already counted `oversize`), and none when nothing is held.
+    #[test]
+    fn reset_counts_each_held_reassembly_as_one_truncated_frame() {
+        let mut probe = TelemetryProbe::new();
+        let mut d = DockerDecoder::new(Arc::new(Resource::default()), 10)
+            .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let mut out = Vec::new();
+        d.reset();
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[]), 0.0, "nothing held");
+
+        d.decode_line(entry("stdout", "a-"), 0, &mut out).unwrap();
+        d.decode_line(entry("stdout", "b-"), 0, &mut out).unwrap();
+        d.decode_line(entry("stderr", "c-"), 0, &mut out).unwrap();
+        d.reset();
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "truncated")]), 2.0);
+
+        d.decode_line(entry("stdout", "0123456789ABCDEF"), 0, &mut out).unwrap();
+        d.reset();
+        assert!(!d.holds_entry());
+        d.reset();
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "truncated")]), 2.0);
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]), 1.0);
+        assert!(out.is_empty());
+    }
+
     #[test]
     fn bad_time_is_not_reported_for_entries_discarded_while_dropping() {
         let diag = Diagnostics::new("test");
@@ -1205,6 +1282,7 @@ mod tests {
             labels: vec![],
             max_line_bytes: 1024,
             diag: Diagnostics::new("test"),
+            telemetry: Telemetry::default(),
             meta: BTreeMap::new(),
             generation: 0,
         };
@@ -1978,12 +2056,67 @@ mod tests {
             vec!["restarted"],
             "the pre-truncation partial must not be spliced onto the first post-truncation entry"
         );
+        assert_eq!(
+            probe.sum("logit.input.frames.dropped", &[("reason", "truncated")]),
+            1.0,
+            "the discarded partial is counted once"
+        );
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]), 0.0);
 
         running.stop().await;
         assert!(
             rx.try_recv().is_err(),
             "the discarded partial must not resurface on close -- proves reset() ran, not close()"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A truncation that discards a held reassembly and the unterminated line after it counts
+    /// one lost message, not one for each; an unterminated line alone counts one.
+    #[tokio::test]
+    async fn a_truncation_counts_a_held_reassembly_and_its_unterminated_line_once() {
+        let root = scratch_dir("docker-truncate-count");
+        let id = "7".repeat(64);
+        let log_path = container(&root, &id, "web", "nginx:1.25");
+        let padding = "x".repeat(48);
+        let fragment = format!(
+            r#"{{"log":"partial-{padding}","stream":"stdout","time":"2026-08-17T19:35:46.000000000Z"}}"#
+        ) + "\n";
+        let unterminated = r#"{"log":"rest-of-it","stream":"std"#;
+        std::fs::write(&log_path, format!("{fragment}{unterminated}")).unwrap();
+
+        let (fanout, mut rx) = fanout_channel(8);
+        let filter = ContainerFilter::new(vec![], true);
+        let mut probe = TelemetryProbe::new();
+        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config())
+            .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running = spawn_input(input, fanout).await;
+        probe
+            .wait_for("the fragment's line to be read", |t| t.sum("logit.input.lines", &[]) >= 1.0)
+            .await;
+
+        let complete = |log: &str| {
+            format!(
+                r#"{{"log":"{log}\n","stream":"stdout","time":"2026-08-17T19:35:47.000000000Z"}}"#
+            ) + "\n"
+        };
+        // `std::fs::write` opens with `O_TRUNC`: same inode, shorter length, a truncation.
+        std::fs::write(&log_path, complete("one")).unwrap();
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["one"]);
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "truncated")]), 1.0);
+
+        // An unterminated line behind a complete entry, so the decoder holds nothing.
+        // One `write`, so the read that returns the complete entry also holds the line after it.
+        let appended = format!("{}{unterminated}", complete(&format!("two-{padding}")));
+        let mut file = std::fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+        file.write_all(appended.as_bytes()).unwrap();
+        drop(file);
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec![format!("two-{padding}")]);
+        std::fs::write(&log_path, complete("3")).unwrap();
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["3"]);
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "truncated")]), 2.0);
+
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2045,6 +2178,12 @@ mod tests {
             messages(&events),
             vec!["ok"],
             "a stale dropping flag must not swallow the next generation's first complete entry"
+        );
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]), 1.0);
+        assert_eq!(
+            probe.sum("logit.input.frames.dropped", &[("reason", "truncated")]),
+            0.0,
+            "a drop in progress was counted when it started"
         );
 
         running.stop().await;
@@ -2773,6 +2912,7 @@ mod tests {
             labels: vec![],
             max_line_bytes: 1024,
             diag: diag.clone(),
+            telemetry: Telemetry::default(),
             meta: BTreeMap::new(),
             generation: 0,
         }

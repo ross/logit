@@ -2117,6 +2117,9 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     completed message after reassembly) and the two agree.~~ **changed (#442):** one pre-append
     check covers fragments and the closing entry alike.
   - `strip_suffix('\n')` is total given `is_complete`.
+  - A lost message counts once: `logit.input.frames.dropped{reason="oversize"}` when a drop
+    starts, `{reason="truncated"}` in `reset` per stream holding a reassembly, and the driver's
+    `reconcile_truncation` skips the unterminated line when the decoder holds an entry.
   - ~~Unknown `stream` returns `Malformed` and emits nothing — the driver counts it as
     `bad_line` and clears scratch (`read_one`'s `Err` arm in `driver.rs`).~~ **fixed (#442):**
     a `Malformed` entry flushes the held fragments first, and the driver absorbs them before it
@@ -2145,7 +2148,10 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   never-parses-inner-line (`docker_in_never_parses_the_inner_application_line`); plus
   driver-level truncation interactions
   `a_truncation_discards_a_docker_partial_entry_held_from_the_previous_generation` and
-  `a_truncation_clears_a_docker_dropping_state_so_the_next_generation_is_not_swallowed`.
+  `a_truncation_clears_a_docker_dropping_state_so_the_next_generation_is_not_swallowed`; the
+  counters in `an_oversize_message_counts_one_dropped_frame`,
+  `reset_counts_each_held_reassembly_as_one_truncated_frame`, and
+  `a_truncation_counts_a_held_reassembly_and_its_unterminated_line_once`.
 - **Suggested verification approach:** proptest over fragment sequences (including interleaved
   malformed entries and truncations) against a model reassembler; a real `docker run` emitting
   >16 KiB lines on both streams.

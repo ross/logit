@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-10-08
+updated: 2026-10-13
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -609,3 +609,15 @@ dropped whole" section names, as `lines_in` counts one. An in-place truncation s
 truncation, counts `logit.input.frames.dropped{reason="truncated"}`. `docker_in`'s decoder, which
 drops a reassembled message over the bound and resets its held partial entries at a truncation,
 has no telemetry handle and still reports only `long_line`.
+
+## Amendment: `docker_in`'s decoder counts its loss (2026-10-13)
+
+`DockerDecoder` now holds a telemetry handle and counts the messages it loses under the driver's
+names. A reassembled message over `max_line_bytes` counts one
+`logit.input.frames.dropped{reason="oversize"}` when its drop starts, beside `long_line`, and the
+fragments the drop then discards count nothing more. `reset` counts one
+`logit.input.frames.dropped{reason="truncated"}` for each stream holding a reassembly, and
+nothing for a stream mid-drop. At a truncation the driver counts the line splitter's unterminated
+line only when the decoder holds no entry, so a held reassembly and the unterminated line that
+continues it count once. The cost is that an unterminated line on the other stream, beside a held
+reassembly or a drop in progress, goes uncounted (`docs/known-gaps/tailing.md`).

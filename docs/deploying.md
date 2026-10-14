@@ -2303,16 +2303,18 @@ see [ADR
   throttled `logit.component.diagnostics{key="scan_error"}` naming the first failing path and its
   errno. A sustained nonzero rate is a permissions or descriptor-limit problem to fix; until it's
   fixed, a file renamed out of that directory stays open.
-- `logit.component.diagnostics{key="long_line"}` (count, via the `Diagnostics` bridge): a line
-  dropped whole for exceeding `max_line_bytes`, also counted
-  `logit.input.frames.dropped{reason="oversize"}`. A long line is never truncated and passed
+- `logit.component.diagnostics{key="long_line"}` (count, via the `Diagnostics` bridge): a line,
+  or under `docker_in` a reassembled message, dropped whole for exceeding `max_line_bytes`, also
+  counted `logit.input.frames.dropped{reason="oversize"}`. A long line is never truncated and passed
   through, because a truncated line would hand a downstream JSON parser something that looks
   well-formed but isn't the real line.
 - `logit.component.diagnostics{key="truncated"}` and `logit.input.files.truncated` (counts): a
   tracked file's length shrinking under it. That's rare, but real for a tool that recreates a log
   file in place instead of renaming it away first. The file is reread from its start, and an
   unterminated line held from before the truncation is discarded and counted
-  `logit.input.frames.dropped{reason="truncated"}`.
+  `logit.input.frames.dropped{reason="truncated"}`. Under `docker_in`, each stream's held
+  reassembly is discarded and counted the same way, once with the unterminated line that
+  continues it.
 - `logit.component.diagnostics{key="metadata_error"}` (`docker_in` only): a container's
   `config.v2.json` couldn't be read or parsed. That container's lines still flow, with a
   `container.id`-only resource instead of the full identity. A missing file is retried on every poll
@@ -3378,7 +3380,7 @@ at the cluster's IAM bootstrap port (`9098` inside AWS, `9198` for public access
 | `format:` | Value | Default `record:` |
 |---|---|---|
 | `json` | the event's JSON object, the one `stdio_out`'s `format: json` writes on a line ([`ndjson.rs`](../crates/logit-outputs/src/ndjson.rs) has the grammar) | `event` |
-| `text` | the log body alone; an event with no log record is skipped, counted `logit.output.events.skipped{reason="no_log"}` | `event` |
+| `text` | the log body alone; an event with no log record is skipped, counted `logit.output.events.skipped{reason="no_log"}`, and an event's metrics and span beside its log are left out, counted `logit.output.metrics.omitted{reason="format"}` and `logit.output.spans.omitted{reason="format"}` | `event` |
 | `msgpack` | the `json` object, key for key, as MessagePack; raw bytes are a `bin` and NaN and the infinities are floats ([`msgpack.rs`](../crates/logit-outputs/src/msgpack.rs)) | `event` |
 | `native` | a frame of `logit`'s own format, which a `logit` reads back with no loss | `batch` |
 | `otlp_proto` | one OTLP protobuf export request of one signal, which the OpenTelemetry Collector's Kafka receiver reads; see "OTLP for a Collector" below | none; `record:` is rejected |
@@ -3466,7 +3468,8 @@ table of every broker error it reads.
 
 **What to watch.** `logit.output.requests{class}`, `logit.output.records` for what Kafka
 accepted, `logit.output.records.dropped{reason}`, `logit.output.records.unkeyed`, under
-`format: text`, `logit.output.events.skipped{reason="no_log"}`, and under `format: otlp_proto` or `otlp_json`,
+`format: text`, `logit.output.events.skipped{reason="no_log"}` and the `metrics.omitted` and
+`spans.omitted` counts, and under `format: otlp_proto` or `otlp_json`,
 `logit.output.metrics.skipped`, `logit.output.metrics.dropped`, and
 `logit.output.metrics.degraded` for metrics OTLP can't carry as they are.
 `docs/design/internal-telemetry.md`'s `kafka_out` section has every counter.
