@@ -2491,7 +2491,7 @@
               ]
             },
             "attributes": {
-              "description": "Which top-level attributes to expand. `all` (the default) expands every nested attribute, the useful default for a source whose keys you don't control (a Kubernetes label map, an OTLP `KvlistValue`). `all` never selects a `_logit.*` attribute, which a decoder writes for its own protocol's output; name one to flatten it. A named list holds literal attribute names, never paths. Rejected if both this and `resource` are `none`, or if a named list is empty or contains an empty or duplicate name.",
+              "description": "Which top-level attributes to expand. `all` (the default) expands every nested attribute, the useful default for a source whose keys you don't control (a Kubernetes label map, an OTLP `KvlistValue`). `all` never selects an attribute under the `_logit.` prefix, which protocol codecs reserve for their own use; name one to flatten it. A named list holds literal attribute names, never paths. Rejected if both this and `resource` are `none`, or if a named list is empty or contains an empty or duplicate name.",
               "default": "all",
               "allOf": [
                 {
