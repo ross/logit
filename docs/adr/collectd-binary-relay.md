@@ -129,8 +129,8 @@ permitted normalizations below says an integer becomes a double, and none change
 ### Attribute conventions
 
 Rule (b) of [ADR `lossless-transit`](lossless-transit.md): the raw five-tuple identity rides on
-`collectd.*` attributes and wins on collectd egress. Consumed by `collectd_out`; ordinary tags to
-every other sink.
+`collectd.*` attributes and wins on collectd egress. Consumed by `collectd_out`; skipped, uncounted, by `graphite_out`; ordinary tags to every
+other sink.
 
 | Attribute | Value | Meaning |
 |---|---|---|
