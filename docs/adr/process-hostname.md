@@ -94,7 +94,9 @@ the sink's `hostname:` (`syslog_out` only), then the process hostname.
 | `datadog_out` | `host.name`, else a DogStatsD `host:` tag; for an event or service check, `statsd.*.host` first; for a log, `hostname` first, and `syslog.hostname` or `host` also count | a series' `host` resource, a v1, distribution, or sketch `host`, a log's `hostname`, an event's `host`, a check's `host_name` |
 
 Each relay pair gains a permitted normalization: an item that arrived with no host leaves with
-the relay's hostname. The Consequences' recipe for host-less `internal` events, a `remove` of
+the relay's hostname. A Datadog metric its sender marked hostless isn't filled; the process
+hostname amendment of [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)
+lists the hostless spellings. The Consequences' recipe for host-less `internal` events, a `remove` of
 `host.name` after `internal`, now holds only for `collectd_out`: the other three sinks fill the
 removed host back in with the same name. Trace and stats hostnames in `datadog_out` and everything in
 `datadog_trace_out` stay verbatim relay metadata. `collectd_out` is unchanged, for the reason in

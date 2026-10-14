@@ -116,14 +116,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     their series merged under it. Datadog bills per host, so this costs what one Agent would.
   - **Workaround:** stamp `host.name` per sender upstream with `set`, or have each DogStatsD
     client send a `host:` tag (or `h:` on an event or check).
-- **`datadog_out` fills an Agent's hostless sample on the v1, distribution-point, and sketch
-  routes.** The Agent sends `"host":""` only for a sample marked hostless: an empty
-  `host:` tag, or serverless mode. `datadog_in` decodes `""` as no host, so `logit` can't tell it
-  from a missing one, and `datadog_out` fills it with the process hostname. On v2 the Agent writes
-  a `host` resource with no name, which `datadog_out` keeps and never fills.
-  - **Consequence:** a sample the Agent kept hostless reports under the relay's host.
-  - **Workaround:** have the Agent send v2 series (its default), or stamp `host.name` upstream
-    with `set`.
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   v0.4 has no field for a chunk's `_logit.datadog.chunk.*` fields (sampling priority, origin,
   dropped flag, tags) or for the tracer payload fields no request header carries
