@@ -21,8 +21,8 @@
 //! has no `_logit.statsd.*.host`. On encode, a `Str` [`ATTR_HOST_TAG`] (`statsd_in`'s reading of a
 //! DogStatsD `#host:` tag) is the host when `host.name` is absent or empty, and is then never a tag,
 //! as the Agent's `extractTagsMetadata` reads it (`host_tag`). [`DatadogEncoder::with_default_host`]
-//! (`datadog_out`'s process hostname) fills the host of anything that carries none. Events and
-//! service checks reuse
+//! (`datadog_out`'s process hostname) fills the host of anything that carries none and isn't
+//! marked hostless. Events and service checks reuse
 //! `crates/logit-proto/src/statsd/decode.rs`'s `_logit.statsd.event.*` /
 //! `_logit.statsd.service_check.*` names: they are the same Datadog concepts DogStatsD carries.
 //! Tags fold into attributes by [`tags`]'s rule; timestamps convert by [`time`]'s.
@@ -68,6 +68,7 @@
 //! | `tags` | attributes by [`tags`]'s rule | -- |
 //! | a tag whose key is under the private `_logit.` prefix | omitted; counted once per series that delivers a point | `logit.input.tags.omitted{reason="reserved_prefix"}` |
 //! | the first named `host` resource; v1 and distribution `host` | [`ATTR_HOST_NAME`] | -- |
+//! | a v1 or distribution `"host":""` (present and empty: the Agent's hostless sample) | [`ATTR_HOSTLESS`] `Bool(true)`; an absent `host` decodes to neither | -- |
 //! | the first named `device` resource; v1 `device` | [`ATTR_DEVICE`] (the Agent's v2 serializer sends a v1 `device` as that resource, UNVERIFIED: the recorded Agent ran no check that sets one) | -- |
 //! | every other resource, including an empty-named or second `host` | [`ATTR_RESOURCES`]: `Array` of `Map{type, name}`, in wire order | -- |
 //! | `source_type_name` | [`ATTR_SOURCE_TYPE_NAME`] when non-empty | -- |
@@ -90,7 +91,7 @@
 //! | one `Dogsketch` | one `Event`, `MetricKind::Distribution` under `Mapping::agent`; `timestamp` = `ts` s (absent: `received_at` on its second, counted as above) | -- |
 //! | `k > 0` / `k < 0` / `k == 0` with count `n` | positive bin `key: k` / negative bin `key: -k` / the zero count; repeated keys sum | -- |
 //! | `cnt`, `min`, `max`, `sum` | the sketch's exact summary (`SketchStats`); `avg` is ignored | -- |
-//! | `metric`, `host`, `tags`, `metadata.origin` | as for a series | -- |
+//! | `metric`, `host`, `tags`, `metadata.origin` | as for a series; an empty `host` is [`ATTR_HOSTLESS`], because protobuf can't tell it from an absent one and the Agent sends one only for a sample it made hostless | -- |
 //! | no bins and `cnt == 0` | skipped | `logit.input.metrics.skipped{reason="empty_sketch"}` |
 //! | `k`/`n` lengths differ, a key outside ±32767, `cnt <= 0` with populated bins, a non-finite `min`/`max`/`sum`, or no `metric` | dropped | `logit.input.metrics.dropped{reason="bad_sketch"}` + diag `bad_sketch` |
 //! | legacy `distributions` entries | dropped: not implemented | `dropped{reason="legacy_distribution"}`, one per entry |
@@ -126,10 +127,11 @@
 //! | a record flagged `NO_RECORDED_VALUE` | skipped; Datadog has no no-value marker | `logit.output.metrics.skipped{reason="no_recorded_value"}` |
 //! | a non-finite value or sample | dropped (JSON has no `NaN`) | `logit.output.metrics.dropped{reason="non_finite_value"}` |
 //! | `Event::timestamp` | whole seconds, rounded toward negative infinity | -- |
-//! | [`ATTR_HOST_NAME`] | v2: a `{type: "host"}` resource, first; v1 and distribution: `host`, always; sketch: `host` | -- |
-//! | no [`ATTR_HOST_NAME`] or an empty one, and a `Str` [`ATTR_HOST_TAG`] (a DogStatsD `#host:` tag) | the host, where [`ATTR_HOST_NAME`] would go, and not a tag. An empty one is a sample marked hostless: no v2 host resource, a v1, distribution, or sketch `host` of `""`, never filled | -- |
-//! | a `host`-typed entry in [`ATTR_RESOURCES`] and no host from the rows above (the Agent's hostless v2 series: a `host` resource with no name) | v2: that entry, in order (the other routes omit it, per the `no_wire_form` row); never filled | -- |
-//! | no host from any row above ([`ATTR_HOST_NAME`] absent or empty) | the default host ([`DatadogEncoder::with_default_host`]) where [`ATTR_HOST_NAME`] would go; with none, no v2 resource and a v1, distribution, or sketch `host` of `""`. A non-`Str` [`ATTR_HOST_NAME`] is counted `unrepresentable` and never replaced | -- |
+//! | [`ATTR_HOST_NAME`] | v2: a `{type: "host"}` resource, first; v1, distribution, and sketch: `host` | -- |
+//! | no [`ATTR_HOST_NAME`] or an empty one, and a `Str` [`ATTR_HOST_TAG`] (a DogStatsD `#host:` tag) | the host, where [`ATTR_HOST_NAME`] would go, and not a tag. An empty one is a sample marked hostless: written as the hostless rows below, never filled | -- |
+//! | a `host`-typed entry in [`ATTR_RESOURCES`] and no host from the rows above (the Agent's hostless v2 series: a `host` resource with no name) | v2: that entry, in order; v1, distribution, and sketch: a `host` of `""` (the entry itself is omitted, per the `no_wire_form` row); never filled | -- |
+//! | [`ATTR_HOSTLESS`] `true` and no host from the rows above | v2: a `{type: "host", name: ""}` resource, the Agent's spelling; v1, distribution, and sketch: a `host` of `""`; never filled | -- |
+//! | no host from any row above ([`ATTR_HOST_NAME`] absent or empty) | the default host ([`DatadogEncoder::with_default_host`]) where [`ATTR_HOST_NAME`] would go; with none, no v2 resource, no v1 or distribution `host`, and a sketch `host` of `""`. A non-`Str` [`ATTR_HOST_NAME`] is counted `unrepresentable` and never replaced | -- |
 //! | [`ATTR_DEVICE`] | v1: `device`; v2: a `{type: "device"}` resource after the host | -- |
 //! | [`ATTR_RESOURCES`] | v2 resources after host and device, in order | -- |
 //! | the `_logit.datadog.origin.*` codes | protobuf and sketch `metadata.origin` (no `metric_type`); JSON v2 `metadata.origin` (no `category`) | -- |
@@ -137,8 +139,10 @@
 //! | batch resource `_logit.datadog.agent.version` / `.timezone` / `.epoch` / `.internal_ip` / `.public_ip` | sketches: payload `metadata` (`CommonMetadata`, `api_key` `""`); omitted when the resource carries none | -- |
 //! | `MetricRecord::unit` | v1 and v2 `unit` when `Some` | -- |
 //!
-//! v1 JSON emits the Agent's field set: `metric`, `points`, `tags`, `host`, `type`, and `interval`
-//! always; `device`, `source_type_name`, and `unit` when present. Names and tags go out as-is,
+//! v1 JSON emits the Agent's field set: `metric`, `points`, `tags`, `type`, and `interval` always;
+//! `host`, `device`, `source_type_name`, and `unit` when present. `host` is absent only with no
+//! host, no hostless mark, and no default host, which `datadog_out` always sets: an empty one
+//! would decode as hostless. Names and tags go out as-is,
 //! because Datadog sanitizes them itself.
 //!
 //! ## Permitted normalizations (metrics)
@@ -166,9 +170,10 @@
 //! 9. a series, distribution point, or sketch with no host of its own leaves with the relay's
 //!    process hostname (`datadog_out`'s default host). Its own host is a non-empty `host.name`,
 //!    else a `host:` tag, which leaves as the host and not a tag, as the Agent's `extractTagsMetadata`
-//!    reads it. An empty `host:` tag, or a v2 `host` resource with no name, keeps it hostless and
-//!    is never filled. A v1, distribution, or sketch `"host":""` decodes as no host, so it is
-//!    filled (`docs/known-gaps/datadog.md`).
+//!    reads it. A hostless sample is never filled: an empty `host:` tag, a v2 `host` resource with
+//!    no name, or a v1, distribution, or sketch `"host":""` ([`ATTR_HOSTLESS`]). Across routes it
+//!    leaves in the target's hostless spelling: `""` on v1, distribution points, and sketches, and
+//!    a `host` resource with no name on v2;
 //! 10. a tag whose key is under the private `_logit.` prefix is omitted and counted.
 //!
 //! # Logs, events, service checks (`logs`, `events`, `service_checks`)
@@ -558,6 +563,10 @@ pub const ATTR_DEVICE: &str = "_logit.datadog.device";
 /// `_logit.datadog.resources`: every series resource whose `type` isn't `host`, as an `Array` of
 /// `Map{type, name}`.
 pub const ATTR_RESOURCES: &str = "_logit.datadog.resources";
+/// `_logit.datadog.hostless`: `Bool(true)` on a v1 series, distribution point, or sketch whose
+/// `host` arrived present and empty, the Agent's spelling of a sample it marked hostless. The
+/// encoders then send `""` and never fill it with the default host.
+pub const ATTR_HOSTLESS: &str = "_logit.datadog.hostless";
 /// `_logit.datadog.origin.product` / `.category` / `.service`: the protobuf `Origin` codes (U64).
 pub const ATTR_ORIGIN_PRODUCT: &str = "_logit.datadog.origin.product";
 pub const ATTR_ORIGIN_CATEGORY: &str = "_logit.datadog.origin.category";

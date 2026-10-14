@@ -29,8 +29,8 @@ use logit_proto::datadog::stats::{
     METRIC_TOP_LEVEL_HITS,
 };
 use logit_proto::datadog::{
-    DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_SERVICE_NAME,
-    RESOURCE_ATTR_TRACER_HOSTNAME,
+    DatadogDecoder, DatadogEncoder, ATTR_HOSTLESS, ATTR_HOST_NAME, ATTR_RESOURCES,
+    ATTR_SERVICE_NAME, RESOURCE_ATTR_TRACER_HOSTNAME,
 };
 use prost::Message;
 use std::collections::HashMap;
@@ -306,6 +306,63 @@ async fn every_route_relays_its_batch_unchanged() {
         };
         assert_eq!(recv_batch(&mut rx).await, expected, "{name}");
     }
+    assert_nothing_delivered(&mut rx).await;
+}
+
+/// An Agent's hostless sample, `"host":""` on the v1, distribution-point, and sketch routes, relays
+/// hostless through a sink with a default host. A distribution point and a sketch arrive as
+/// sent. A v1 series leaves on v2, the series route `datadog_out` sends, as the Agent's v2
+/// spelling: a `host` resource with no name, which the next hop keeps unfilled too.
+#[tokio::test]
+async fn a_hostless_sample_relays_hostless() {
+    let (addr, mut rx) = listener().await;
+    let registry = Registry::new();
+    let mut out = sink(addr, &registry);
+    let now = now_s();
+    let points = format!(
+        r#"{{"series":[{{"metric":"latency","points":[[{now},[1.0]]],"host":"","tags":["env:prod"]}}]}}"#
+    );
+    let points = decoder().decode_distribution_points(points.as_bytes(), 0).unwrap();
+    let sketch = SketchPayload {
+        sketches: vec![Sketch {
+            metric: "request.latency".into(),
+            host: String::new(),
+            dogsketches: vec![Dogsketch {
+                ts: now,
+                cnt: 1,
+                min: 1.0,
+                max: 1.0,
+                avg: 1.0,
+                sum: 1.0,
+                k: vec![1338],
+                n: vec![1],
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let sketch = decoder().decode_sketches(&sketch, 0).unwrap();
+    for (name, batch) in [("distribution points", points), ("sketches", sketch)] {
+        assert_eq!(batch.events[0].attributes.get(ATTR_HOSTLESS), Some(&Value::Bool(true)));
+        out.send(&batch).await.unwrap_or_else(|err| panic!("{name}: {err:#}"));
+        assert_eq!(recv_batch(&mut rx).await, batch, "{name}");
+    }
+
+    let v1 = format!(r#"{{"series":[{{"metric":"load","points":[[{now},0.5]],"host":""}}]}}"#);
+    let v1 = decoder().decode_series_v1(v1.as_bytes(), 0).unwrap();
+    out.send(&v1).await.unwrap();
+    let mut expected = v1.clone();
+    let attrs = &mut expected.events[0].attributes;
+    attrs.remove(ATTR_HOSTLESS);
+    let mut host = AttrMap::new();
+    host.insert("type", Value::str("host"));
+    host.insert("name", Value::str(""));
+    attrs.insert(ATTR_RESOURCES, Value::Array(vec![Value::Map(Box::new(host))]));
+    let arrived = recv_batch(&mut rx).await;
+    assert_eq!(arrived, expected);
+    out.send(&arrived).await.unwrap();
+    assert_eq!(recv_batch(&mut rx).await, expected, "a second hop");
     assert_nothing_delivered(&mut rx).await;
 }
 

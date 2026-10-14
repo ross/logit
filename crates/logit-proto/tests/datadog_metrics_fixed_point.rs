@@ -116,7 +116,7 @@ fn v1_agent_minimal_series_keeps_its_always_present_fields() {
 
 /// The Agent's v2 spelling of a hostless series, a `host` resource with no name, stays hostless
 /// through an encoder with a default host: one `{host, ""}` resource, nothing filled, and still a
-/// fixed point.
+/// fixed point. Sent on v1 instead, it leaves as the v1 spelling, `"host":""`.
 #[test]
 fn an_agent_hostless_v2_series_is_not_filled_with_the_default_host() {
     let body = MetricPayload {
@@ -138,6 +138,75 @@ fn an_agent_hostless_v2_series_is_not_filled_with_the_default_host() {
         vec![PbResource { r#type: "host".into(), name: "".into() }]
     );
     assert_eq!(decode(Route::V2Protobuf, &b1).events, d1.events);
+    let v1: JsonValue = serde_json::from_slice(&relay.encode_series_v1(&d1).unwrap()).unwrap();
+    assert_eq!(v1["series"][0]["host"], "");
+}
+
+/// The v1, distribution-point, and sketch spelling of a hostless sample, `"host":""`, stays `""`
+/// through an encoder with a default host, and is a fixed point there. An absent host takes the
+/// default host, and a host of the sample's own is kept.
+#[test]
+fn an_empty_host_is_not_filled_with_the_default_host() {
+    let v1 = |host: &str| {
+        format!(
+            r#"{{"series":[{{"metric":"m","points":[[1700000000,1.0]]{host},"type":"gauge"}}]}}"#
+        )
+    };
+    let points = |host: &str| {
+        format!(
+            r#"{{"series":[{{"metric":"m","points":[[1700000000,[1.0]]]{host},"type":"distribution"}}]}}"#
+        )
+    };
+    let sketch = |host: &str| {
+        SketchPayload {
+            sketches: vec![Sketch {
+                metric: "m".into(),
+                host: host.into(),
+                dogsketches: vec![Dogsketch {
+                    ts: 1_700_000_000,
+                    cnt: 1,
+                    min: 1.0,
+                    max: 1.0,
+                    avg: 1.0,
+                    sum: 1.0,
+                    k: vec![1338],
+                    n: vec![1],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec()
+    };
+    let mut relay = DatadogEncoder::new().with_default_host(Some("relay".into()));
+    let json_host = |body: Bytes| -> JsonValue {
+        serde_json::from_slice::<JsonValue>(&body).unwrap()["series"][0]["host"].clone()
+    };
+    for (field, want) in [(r#","host":"""#, ""), ("", "relay"), (r#","host":"h""#, "h")] {
+        for route in [Route::V1, Route::DistributionPoints] {
+            let body = match route {
+                Route::V1 => v1(field),
+                _ => points(field),
+            };
+            let d1 = decode(route, body.as_bytes());
+            let b1 = match route {
+                Route::V1 => relay.encode_series_v1(&d1),
+                _ => relay.encode_distribution_points(&d1),
+            }
+            .unwrap();
+            assert_eq!(json_host(b1.clone()), want, "{route:?} {field}");
+            if want != "relay" {
+                assert_eq!(decode(route, &b1).events, d1.events, "{route:?} {field}");
+            }
+        }
+    }
+    // Protobuf can't tell an absent sketch host from an empty one: both are hostless.
+    for (host, want) in [("", ""), ("h", "h")] {
+        let d1 = decode(Route::Sketches, &sketch(host));
+        let b1 = relay.encode_sketches(&d1).unwrap();
+        assert_eq!(SketchPayload::decode(b1.clone()).unwrap().sketches[0].host, want);
+        assert_eq!(decode(Route::Sketches, &b1).events, d1.events, "{host}");
+    }
 }
 
 #[test]

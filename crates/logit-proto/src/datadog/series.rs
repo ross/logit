@@ -16,10 +16,10 @@ use super::tags::{count_tags, insert_tags, render_tags};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
 use super::{
     host_tag, is_datadog_stats, is_service_check, DatadogDecoder, DatadogEncoder, ATTR_DEVICE,
-    ATTR_HOST_NAME, ATTR_HOST_TAG, ATTR_INTERVAL, ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE,
-    ATTR_ORIGIN_PRODUCT, ATTR_ORIGIN_SERVICE, ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE,
-    RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP, RESOURCE_ATTR_AGENT_PUBLIC_IP,
-    RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION,
+    ATTR_HOSTLESS, ATTR_HOST_NAME, ATTR_HOST_TAG, ATTR_INTERVAL, ATTR_ORIGIN_CATEGORY,
+    ATTR_ORIGIN_METRIC_TYPE, ATTR_ORIGIN_PRODUCT, ATTR_ORIGIN_SERVICE, ATTR_RESOURCES,
+    ATTR_SOURCE_TYPE_NAME, ATTR_TYPE, RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP,
+    RESOURCE_ATTR_AGENT_PUBLIC_IP, RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION,
 };
 use crate::CodecError;
 use bytes::Bytes;
@@ -167,8 +167,10 @@ impl<'a> WireSeries<'a> {
     pub(super) fn attributes(&self) -> (AttrMap, usize) {
         let mut attrs = AttrMap::new();
         let reserved = insert_tags(&mut attrs, self.tags.iter().copied());
-        if let Some(host) = self.host.filter(|h| !h.is_empty()) {
-            attrs.insert(ATTR_HOST_NAME, Value::str(host));
+        match self.host {
+            Some("") => attrs.insert(ATTR_HOSTLESS, Value::Bool(true)),
+            Some(host) => attrs.insert(ATTR_HOST_NAME, Value::str(host)),
+            None => {}
         }
         if let Some(device) = self.device.filter(|d| !d.is_empty()) {
             attrs.insert(ATTR_DEVICE, Value::str(device));
@@ -635,9 +637,10 @@ fn distribution_point(point: &JsonValue) -> Option<(Option<i64>, Vec<f64>)> {
 // -- encode ---------------------------------------------------------------------------------------
 
 /// Every attribute a metrics route reads into a wire field of its own; never rendered as a tag.
-static CONSUMED: LazyLock<[Symbol; 15]> = LazyLock::new(|| {
+static CONSUMED: LazyLock<[Symbol; 16]> = LazyLock::new(|| {
     [
         intern(ATTR_HOST_NAME),
+        intern(ATTR_HOSTLESS),
         intern(ATTR_TYPE),
         intern(ATTR_INTERVAL),
         intern(ATTR_SOURCE_TYPE_NAME),
@@ -678,6 +681,10 @@ static CONSUMED_WITH_CHECK: LazyLock<Vec<Symbol>> = LazyLock::new(|| {
 pub(super) struct Carriers {
     pub tags: Vec<String>,
     pub host: Option<String>,
+    /// The sender marked the sample hostless: [`ATTR_HOSTLESS`] is `true`, the DogStatsD `#host:`
+    /// tag is empty, or [`ATTR_RESOURCES`] holds a `host` entry. Never filled with the default
+    /// host.
+    pub hostless: bool,
     pub device: Option<String>,
     pub resources: Vec<(String, String)>,
     pub source_type_name: Option<String>,
@@ -729,12 +736,21 @@ impl Carriers {
         }
     }
 
+    /// The v1 and distribution-point `host`: the event's host, `""` for a hostless sample, and
+    /// `None`, the field omitted, for an event with neither, so an absent `host` stays absent.
+    fn json_host(&self) -> Option<&str> {
+        self.host.as_deref().or(self.hostless.then_some(""))
+    }
+
     /// The v2 `resources` list: `host` first, then `device`, then `_logit.datadog.resources` in
     /// order.
     fn resource_list(&self) -> Vec<(&str, &str)> {
         let mut out = Vec::with_capacity(self.resources.len() + 2);
         if let Some(host) = &self.host {
             out.push((RESOURCE_HOST, host.as_str()));
+        } else if self.hostless && !self.resources.iter().any(|(kind, _)| kind == RESOURCE_HOST) {
+            // The Agent's v2 spelling of a hostless sample, which a later hop keeps unfilled.
+            out.push((RESOURCE_HOST, ""));
         }
         if let Some(device) = &self.device {
             out.push((RESOURCE_DEVICE, device.as_str()));
@@ -843,6 +859,13 @@ impl DatadogEncoder {
                     own_host_unwritable |= !ok;
                     ok
                 }
+                ATTR_HOSTLESS => match value {
+                    Value::Bool(b) => {
+                        c.hostless = *b;
+                        true
+                    }
+                    _ => false,
+                },
                 ATTR_DEVICE => non_empty_str(value).map(|s| c.device = s).is_some(),
                 ATTR_SOURCE_TYPE_NAME => {
                     non_empty_str(value).map(|s| c.source_type_name = s).is_some()
@@ -904,9 +927,13 @@ impl DatadogEncoder {
             match host_tag(resource, event) {
                 Some(tag) if !tag.is_empty() => c.host = Some(tag.to_string()),
                 // An empty `#host:` tag: marked hostless, as the Agent reads it.
-                Some(_) => {}
+                Some(_) => c.hostless = true,
                 // The Agent's v2 spelling of a hostless series: a `host` resource with no name.
-                None if c.resources.iter().any(|(kind, _)| *kind == RESOURCE_HOST) => {}
+                None if c.resources.iter().any(|(kind, _)| *kind == RESOURCE_HOST) => {
+                    c.hostless = true;
+                }
+                // The v1, distribution, and sketch spelling: `"host":""`.
+                None if c.hostless => {}
                 None => c.host = self.default_host.as_deref().map(str::to_string),
             }
         }
@@ -1064,8 +1091,8 @@ impl DatadogEncoder {
         json_body(series)
     }
 
-    /// `/api/v1/series`, with the Agent's own field set: `tags`, `host`, `type`, and `interval`
-    /// always; `device`, `source_type_name`, and `unit` when present.
+    /// `/api/v1/series`, with the Agent's own field set: `tags`, `type`, and `interval` always;
+    /// `host`, `device`, `source_type_name`, and `unit` when present.
     pub fn encode_series_v1(&mut self, batch: &EventBatch) -> Option<Bytes> {
         let mut series = Vec::new();
         self.each_series(batch, Route::V1, |event, record, c, wire_type, value| {
@@ -1073,7 +1100,9 @@ impl DatadogEncoder {
             s.insert("metric".into(), resolve(record.name).into());
             s.insert("points".into(), json!([[nanos_to_seconds(event.timestamp), value]]));
             s.insert("tags".into(), c.tags.clone().into());
-            s.insert("host".into(), c.host.clone().unwrap_or_default().into());
+            if let Some(host) = c.json_host() {
+                s.insert("host".into(), host.into());
+            }
             if let Some(device) = &c.device {
                 s.insert("device".into(), device.as_str().into());
             }
@@ -1122,13 +1151,15 @@ impl DatadogEncoder {
                 let c = carriers.get_or_insert_with(|| {
                     self.carriers(&batch.resource, event, Route::Distribution)
                 });
-                series.push(json!({
-                    "metric": resolve(record.name),
-                    "points": [[nanos_to_seconds(event.timestamp), values]],
-                    "host": c.host.clone().unwrap_or_default(),
-                    "tags": c.tags,
-                    "type": "distribution",
-                }));
+                let mut s = JsonMap::new();
+                s.insert("metric".into(), resolve(record.name).into());
+                s.insert("points".into(), json!([[nanos_to_seconds(event.timestamp), values]]));
+                if let Some(host) = c.json_host() {
+                    s.insert("host".into(), host.into());
+                }
+                s.insert("tags".into(), c.tags.clone().into());
+                s.insert("type".into(), "distribution".into());
+                series.push(JsonValue::Object(s));
             }
         }
         json_body(series)
@@ -1579,8 +1610,9 @@ mod tests {
 
     /// A DogStatsD `#host:` tag (`statsd_in`'s `host` attribute) with no `host.name`: used as the
     /// host and not rendered as a tag, as the Agent's `extractTagsMetadata` does; an empty
-    /// `host.name` counts as none. Empty, `host` is a hostless sample: no host, no fill, no tag.
-    /// With a non-empty `host.name`, `host` stays a tag.
+    /// `host.name` counts as none. Empty, `host` is a hostless sample: no fill and no tag, a
+    /// `host` of `""`, and on v2 the Agent's `host` resource with no name. With a non-empty
+    /// `host.name`, `host` stays a tag.
     #[test]
     fn a_host_tag_is_the_host_only_without_host_name() {
         let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
@@ -1598,7 +1630,12 @@ mod tests {
                 json!([{ "type": "host", "name": "web1" }]),
                 json!(["env:prod"]),
             ),
-            (&[("host", ""), ("env", "prod")][..], "", JsonValue::Null, json!(["env:prod"])),
+            (
+                &[("host", ""), ("env", "prod")][..],
+                "",
+                json!([{ "type": "host", "name": "" }]),
+                json!(["env:prod"]),
+            ),
             (
                 &[("host", "web1"), (ATTR_HOST_NAME, "")][..],
                 "web1",
@@ -1631,13 +1668,74 @@ mod tests {
         }
     }
 
-    /// With no default host, a hostless v1 series keeps the Agent's `""`.
+    /// `_logit.datadog.hostless` keeps every series route unfilled: `""` on v1 and distribution
+    /// points, the Agent's `host` resource with no name on v2, and never a tag. A `host.name`
+    /// still wins over it.
     #[test]
-    fn with_no_default_host_a_hostless_v1_series_sends_an_empty_host() {
+    fn a_hostless_carrier_is_never_filled() {
+        let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let mut hostless = AttrMap::new();
+        hostless.insert(ATTR_HOSTLESS, Value::Bool(true));
+        let mut named = hostless.clone();
+        named.insert(ATTR_HOST_NAME, Value::str("h"));
+        for (attrs, want) in [(hostless, ""), (named, "h")] {
+            let gauge = one_event_batch(attrs.clone(), MetricKind::gauge(1.0));
+            let v1: JsonValue =
+                serde_json::from_slice(&e.encode_series_v1(&gauge).unwrap()).unwrap();
+            assert_eq!(v1["series"][0]["host"], want);
+            assert_eq!(v1["series"][0]["tags"], json!([]));
+            let v2: JsonValue =
+                serde_json::from_slice(&e.encode_series_v2_json(&gauge).unwrap()).unwrap();
+            assert_eq!(v2["series"][0]["resources"], json!([{ "type": "host", "name": want }]));
+            let proto =
+                MetricPayload::decode(e.encode_series_v2_protobuf(&gauge).unwrap()).unwrap();
+            assert_eq!(
+                proto.series[0].resources,
+                vec![metric_payload::Resource { r#type: "host".into(), name: want.into() }]
+            );
+            let samples = one_event_batch(attrs, MetricKind::Samples(Samples::new([1.0])));
+            let points: JsonValue =
+                serde_json::from_slice(&e.encode_distribution_points(&samples).unwrap()).unwrap();
+            assert_eq!(points["series"][0]["host"], want);
+        }
+    }
+
+    /// A v1 or distribution-point `"host":""` decodes to `_logit.datadog.hostless`; an absent
+    /// `host` decodes to nothing.
+    #[test]
+    fn an_empty_wire_host_decodes_as_hostless() {
+        let mut d = DatadogDecoder::new();
+        let v1 = |host: &str| {
+            format!(r#"{{"series":[{{"metric":"m","points":[[1700000000,1]]{host}}}]}}"#)
+        };
+        let dist = |host: &str| {
+            format!(r#"{{"series":[{{"metric":"m","points":[[1700000000,[1]]]{host}}}]}}"#)
+        };
+        for (host, hostless) in [(r#","host":"""#, Some(&Value::Bool(true))), ("", None)] {
+            let b = d.decode_series_v1(v1(host).as_bytes(), 0).unwrap();
+            assert_eq!(b.events[0].attributes.get(ATTR_HOSTLESS), hostless, "{host}");
+            assert_eq!(b.events[0].attributes.get(ATTR_HOST_NAME), None, "{host}");
+            let b = d.decode_distribution_points(dist(host).as_bytes(), 0).unwrap();
+            assert_eq!(b.events[0].attributes.get(ATTR_HOSTLESS), hostless, "{host}");
+        }
+    }
+
+    /// With no default host, a v1 series or distribution point with no host omits `host`, so
+    /// it never decodes as hostless; a hostless one keeps the Agent's `""`.
+    #[test]
+    fn with_no_default_host_only_a_hostless_series_sends_an_empty_host() {
         let (mut e, _) = encoder();
-        let b = one_event_batch(AttrMap::new(), MetricKind::gauge(1.0));
-        let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
-        assert_eq!(v1["series"][0]["host"], "");
+        let mut hostless = AttrMap::new();
+        hostless.insert(ATTR_HOSTLESS, Value::Bool(true));
+        for (attrs, want) in [(AttrMap::new(), JsonValue::Null), (hostless, json!(""))] {
+            let b = one_event_batch(attrs.clone(), MetricKind::gauge(1.0));
+            let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
+            assert_eq!(v1["series"][0]["host"], want);
+            let b = one_event_batch(attrs, MetricKind::Samples(Samples::new([1.0])));
+            let points: JsonValue =
+                serde_json::from_slice(&e.encode_distribution_points(&b).unwrap()).unwrap();
+            assert_eq!(points["series"][0]["host"], want);
+        }
     }
 
     /// A `host.name` that isn't a string is the event's own host: omitted and counted, never
@@ -1652,7 +1750,7 @@ mod tests {
         attrs.insert(ATTR_HOST_NAME, Value::I64(7));
         let b = one_event_batch(attrs, MetricKind::gauge(1.0));
         let v1: JsonValue = serde_json::from_slice(&e.encode_series_v1(&b).unwrap()).unwrap();
-        assert_eq!(v1["series"][0]["host"], "");
+        assert_eq!(v1["series"][0]["host"], JsonValue::Null);
         assert_eq!(
             counted(&registry, "logit.output.tags.omitted", ("reason", "unrepresentable")),
             1.0
