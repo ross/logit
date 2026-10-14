@@ -31,9 +31,9 @@ use tokio::sync::watch;
 pub struct InternalInput {
     interval: Duration,
     registry: Arc<Registry>,
-    /// `service.name = logit`, built once and `Arc`-shared by every batch. `internal` is the one
-    /// input that stamps it: its data is `logit`'s own, where another listener's belongs to
-    /// other services.
+    /// `service.name = logit` and `host.name = <the process hostname>`, built once and
+    /// `Arc`-shared by every batch. `internal` is the one input that stamps them: its data is
+    /// `logit`'s own, where another listener's belongs to other services and hosts.
     resource: Arc<Resource>,
     /// `{ name: "logit", version: CARGO_PKG_VERSION }`, built once and `Arc`-shared like
     /// `resource`. Downstream identifies `logit`'s own points, spans, and logs by it; no other
@@ -45,9 +45,12 @@ pub struct InternalInput {
 }
 
 impl InternalInput {
-    pub fn new(interval: Duration, registry: Arc<Registry>) -> Self {
+    /// `hostname` is the process hostname (`logit_pipeline::host::resolve`), stamped as
+    /// `host.name` on every batch's resource.
+    pub fn new(interval: Duration, registry: Arc<Registry>, hostname: &str) -> Self {
         let mut attributes = AttrMap::new();
         attributes.insert("service.name", "logit");
+        attributes.insert("host.name", hostname);
         Self {
             interval,
             registry,
@@ -345,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn a_tick_with_nothing_buffered_sends_nothing() {
         let registry = Registry::new();
-        let mut input = InternalInput::new(Duration::from_millis(1), registry);
+        let mut input = InternalInput::new(Duration::from_millis(1), registry, "test-host");
         let (tx, mut rx) = mpsc::channel(1);
         let fanout = Fanout::new(vec![tx]);
 
@@ -360,7 +363,7 @@ mod tests {
         let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         component_telemetry.count("logit.input.datagrams", 1.0, &[]);
 
-        let mut input = InternalInput::new(Duration::from_millis(1), registry);
+        let mut input = InternalInput::new(Duration::from_millis(1), registry, "test-host");
         let (tx, mut rx) = mpsc::channel(1);
         let fanout = Fanout::new(vec![tx]);
 
@@ -382,8 +385,8 @@ mod tests {
     async fn a_tick_samples_its_own_process_level_gauges() {
         let registry = Registry::new();
         let own_telemetry = registry.telemetry_for("self", "internal", "listener");
-        let mut input =
-            InternalInput::new(Duration::from_millis(1), registry).with_telemetry(own_telemetry);
+        let mut input = InternalInput::new(Duration::from_millis(1), registry, "test-host")
+            .with_telemetry(own_telemetry);
         let (tx, mut rx) = mpsc::channel(2);
         let fanout = Fanout::new(vec![tx]);
 
@@ -533,7 +536,7 @@ mod tests {
             CALLS.fetch_add(1, Ordering::Relaxed);
             Some(1)
         }
-        let mut input = InternalInput::new(Duration::from_millis(1), Registry::new())
+        let mut input = InternalInput::new(Duration::from_millis(1), Registry::new(), "test-host")
             .with_heap_stats(counted_heap);
         input.process.read_status = counted_status;
         input.process.read_cpu = counted_cpu;
@@ -553,7 +556,7 @@ mod tests {
         let diag = Diagnostics::default();
 
         let mut answering = fixed_sampler();
-        answering.heap = InternalInput::new(Duration::from_millis(1), Registry::new())
+        answering.heap = InternalInput::new(Duration::from_millis(1), Registry::new(), "test-host")
             .with_heap_stats(|| Some(42))
             .process
             .heap;
@@ -569,14 +572,15 @@ mod tests {
     }
 
     /// OTLP backends read a trace's service name off the root span's resource; with an empty one,
-    /// Grafana's Traces Drilldown shows `<root span not yet received>`.
+    /// Grafana's Traces Drilldown shows `<root span not yet received>`. `host.name` tells
+    /// several instances in one backend apart.
     #[tokio::test]
-    async fn every_batch_carries_service_name_on_its_resource() {
+    async fn every_batch_carries_service_and_host_name_on_its_resource() {
         let registry = Registry::new();
         let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         component_telemetry.count("logit.input.datagrams", 1.0, &[]);
 
-        let mut input = InternalInput::new(Duration::from_millis(1), registry);
+        let mut input = InternalInput::new(Duration::from_millis(1), registry, "test-host");
         let (tx, mut rx) = mpsc::channel(1);
         let fanout = Fanout::new(vec![tx]);
 
@@ -591,6 +595,10 @@ mod tests {
             batch.resource.attributes.get("service.name").and_then(|v| v.as_str()),
             Some("logit")
         );
+        assert_eq!(
+            batch.resource.attributes.get("host.name").and_then(|v| v.as_str()),
+            Some("test-host")
+        );
     }
 
     #[tokio::test]
@@ -599,7 +607,7 @@ mod tests {
         let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         component_telemetry.count("logit.input.datagrams", 1.0, &[]);
 
-        let mut input = InternalInput::new(Duration::from_millis(1), registry);
+        let mut input = InternalInput::new(Duration::from_millis(1), registry, "test-host");
         let (tx, mut rx) = mpsc::channel(1);
         let fanout = Fanout::new(vec![tx]);
 
@@ -622,8 +630,8 @@ mod tests {
         let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         component_telemetry.count("logit.input.datagrams", 1.0, &[]);
 
-        let mut input =
-            InternalInput::new(Duration::from_millis(1), registry).with_telemetry(own_telemetry);
+        let mut input = InternalInput::new(Duration::from_millis(1), registry, "test-host")
+            .with_telemetry(own_telemetry);
         let (tx, mut rx) = mpsc::channel(4);
         let fanout = Fanout::new(vec![tx]);
 
@@ -666,8 +674,8 @@ mod tests {
             None,
         ));
 
-        let mut input =
-            InternalInput::new(Duration::from_millis(1), registry).with_telemetry(own_telemetry);
+        let mut input = InternalInput::new(Duration::from_millis(1), registry, "test-host")
+            .with_telemetry(own_telemetry);
         let (tx, mut rx) = mpsc::channel(4);
         let fanout = Fanout::new(vec![tx]);
 
@@ -711,8 +719,8 @@ mod tests {
             tracing::warn!(target: "logit", component = "stat", key = "bad_datagram", "malformed");
         });
 
-        let mut input =
-            InternalInput::new(Duration::from_millis(1), registry).with_telemetry(own_telemetry);
+        let mut input = InternalInput::new(Duration::from_millis(1), registry, "test-host")
+            .with_telemetry(own_telemetry);
         let (tx, mut rx) = mpsc::channel(4);
         let fanout = Fanout::new(vec![tx]);
 
@@ -761,7 +769,7 @@ mod tests {
         let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         component_telemetry.count("logit.input.datagrams", 1.0, &[]);
 
-        let mut input = InternalInput::new(Duration::from_secs(60), registry);
+        let mut input = InternalInput::new(Duration::from_secs(60), registry, "test-host");
         let (tx, mut rx) = mpsc::channel(4);
         let fanout = Fanout::new(vec![tx]);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -792,7 +800,7 @@ mod tests {
         let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         component_telemetry.count("logit.input.datagrams", 1.0, &[]);
 
-        let mut input = InternalInput::new(Duration::from_secs(60), registry);
+        let mut input = InternalInput::new(Duration::from_secs(60), registry, "test-host");
         let (tx, mut rx) = mpsc::channel(4);
         let fanout = Fanout::new(vec![tx]);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -827,7 +835,7 @@ mod tests {
         let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         component_telemetry.count("logit.input.datagrams", 1.0, &[]);
 
-        let mut input = InternalInput::new(Duration::from_secs(60), registry);
+        let mut input = InternalInput::new(Duration::from_secs(60), registry, "test-host");
         let (tx, mut rx) = mpsc::channel(4);
         let fanout = Fanout::new(vec![tx]);
 

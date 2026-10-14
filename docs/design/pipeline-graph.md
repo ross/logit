@@ -398,6 +398,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 69. A `splunk_hec_in` with an empty `bind`, a `tokens` entry that is empty or has surrounding
     whitespace, or a `max_request_bytes` of `0`.
 87. A `has_stale`/`drop_stale` with a `max_age` or a `max_ahead` of `0s`.
+88. A top-level `hostname` that is empty or only whitespace.
 70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL, carries a query
     or fragment, or ends in a HEC route rather than the `/services/collector` base, an empty or
     whitespace-padded `token`, `timeout: 0s`, an `ack_timeout` without `ack: true` or of `0s`, a

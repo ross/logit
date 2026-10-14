@@ -40,7 +40,7 @@
 //!
 //! | Wire | Model |
 //! |---|---|
-//! | `host` | resource [`RESOURCE_ATTR_HOST_NAME`] (`Str`) |
+//! | `host` | resource [`RESOURCE_ATTR_HOST_NAME`] (`Str`); on encode, when the resource has no `host.name`, [`SplunkEncoder::with_default_host`]'s value (`splunk_hec_out`'s process hostname) |
 //! | `source` | resource [`RESOURCE_ATTR_SOURCE`] |
 //! | `sourcetype` | resource [`RESOURCE_ATTR_SOURCETYPE`] |
 //! | `index` | resource [`RESOURCE_ATTR_INDEX`] |
@@ -119,7 +119,9 @@
 //!    blank one, and a span's `fields` key spelled like a carrier the envelope also sets are
 //!    dropped and counted;
 //! 9. a hex id (a span's, parent's, or link's `trace_id`/`span_id`, and a log's `trace_id`/`span_id`
-//!    fields when they parse) is read in either case and leaves lowercase.
+//!    fields when they parse) is read in either case and leaves lowercase;
+//! 10. an object that arrived with no `host` leaves with the relay's process hostname as its
+//!     `host` ([`SplunkEncoder::with_default_host`]); a `host` it carries is never replaced.
 //!
 //! The model-side losses (a resource attribute returning as an event attribute, `Sum`
 //! temporality, the multi-number kinds under `MultiValue`) are in [`metrics`], [`logs`], and
@@ -784,6 +786,8 @@ pub struct SplunkEncoder {
     telemetry: Telemetry,
     diagnostics: Diagnostics,
     multi_value: MultiValue,
+    /// The `host` of a batch whose resource has no `host.name`.
+    default_host: Option<Arc<str>>,
     /// One object's bytes, reused across objects.
     scratch: Vec<u8>,
 }
@@ -792,6 +796,9 @@ pub struct SplunkEncoder {
 struct BatchContext<'a> {
     envelope: Envelope,
     resource: &'a Resource,
+    /// [`SplunkEncoder::with_default_host`]'s value, set only when the resource has no
+    /// `host.name`. Shared rather than copied into `envelope`, so filling costs no allocation.
+    default_host: Option<Arc<str>>,
 }
 
 impl SplunkEncoder {
@@ -816,6 +823,13 @@ impl SplunkEncoder {
         self
     }
 
+    /// The `host` written for a batch whose resource carries no `host.name`. A `host.name` that
+    /// isn't a `Str` is still the batch's own, so it's omitted and counted, never replaced.
+    pub fn with_default_host(mut self, host: Option<Arc<str>>) -> Self {
+        self.default_host = host;
+        self
+    }
+
     /// Writes one HEC object per entry of `out` (cleared first), in batch order.
     pub fn encode_objects(&mut self, batch: &EventBatch, out: &mut MessageBuf<ObjectMeta>) {
         out.clear();
@@ -827,7 +841,11 @@ impl SplunkEncoder {
                 &[("reason", "unrepresentable")],
             );
         }
-        let ctx = BatchContext { envelope, resource: &batch.resource };
+        let default_host = match batch.resource.attributes.get_sym(CARRIERS.host) {
+            None => self.default_host.clone(),
+            Some(_) => None,
+        };
+        let ctx = BatchContext { envelope, resource: &batch.resource, default_host };
         for (event_index, event) in batch.events.iter().enumerate() {
             if event.log.is_none() && event.metrics.is_empty() && event.span.is_none() {
                 self.unencoded(Unencoded::NoPayload, 1);
@@ -880,16 +898,21 @@ impl SplunkEncoder {
     }
 }
 
-/// Writes an object's envelope (`time` and every carrier present) and returns it open, for the
-/// caller to add `event` and `fields`.
-fn begin_object<'a>(out: &'a mut Vec<u8>, timestamp: i64, envelope: &Envelope) -> JsonObject<'a> {
+/// Writes an object's envelope (`time` and every carrier present, `host` falling back to the
+/// default) and returns it open, for the caller to add `event` and `fields`.
+fn begin_object<'a>(
+    out: &'a mut Vec<u8>,
+    timestamp: i64,
+    ctx: &BatchContext<'_>,
+) -> JsonObject<'a> {
     let mut obj = JsonObject::begin(out);
     time::write_hec_time(obj.key("time"), timestamp);
+    let envelope = &ctx.envelope;
     for (key, value) in [
-        ("host", &envelope.host),
-        ("source", &envelope.source),
-        ("sourcetype", &envelope.sourcetype),
-        ("index", &envelope.index),
+        ("host", envelope.host.as_deref().or(ctx.default_host.as_deref())),
+        ("source", envelope.source.as_deref()),
+        ("sourcetype", envelope.sourcetype.as_deref()),
+        ("index", envelope.index.as_deref()),
     ] {
         if let Some(value) = value {
             write_str(obj.key(key), value);
@@ -1207,6 +1230,50 @@ pub(crate) mod tests {
             counted(&registry, "logit.output.tags.omitted", ("reason", "unrepresentable")),
             1.0
         );
+    }
+
+    /// One object per payload of `body`'s first batch, encoded with `relay` as the default host.
+    fn encode_with_default_host(body: &str) -> Vec<Vec<u8>> {
+        let batch = decode(body).remove(0);
+        let mut out = MessageBuf::default();
+        SplunkEncoder::new()
+            .with_default_host(Some(Arc::from("relay")))
+            .encode_objects(&batch, &mut out);
+        out.iter().map(<[u8]>::to_vec).collect()
+    }
+
+    #[test]
+    fn a_hostless_object_of_every_signal_leaves_with_the_default_host() {
+        let objects = encode_with_default_host(
+            r#"{"event":"a","time":1}{"time":1,"event":"metric","fields":{"metric_name:m":1}}{"time":1,"event":{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","start_time":1,"end_time":2}}"#,
+        );
+        assert_eq!(objects.len(), 3);
+        for object in &objects {
+            assert!(
+                String::from_utf8_lossy(object).contains(r#","host":"relay","event":"#),
+                "{}",
+                String::from_utf8_lossy(object)
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_the_object_carries_beats_the_default_host() {
+        let objects = encode_with_default_host(r#"{"event":"a","time":1,"host":"web-1"}"#);
+        assert_eq!(objects, vec![br#"{"time":1,"host":"web-1","event":"a"}"#.to_vec()]);
+    }
+
+    #[test]
+    fn a_non_string_host_name_is_omitted_not_replaced_by_the_default_host() {
+        let mut batch = decode(r#"{"event":"a","time":1}"#).remove(0);
+        let mut resource = (*batch.resource).clone();
+        resource.attributes.insert("host.name", Value::I64(3));
+        batch.resource = Arc::new(resource);
+        let mut out = MessageBuf::default();
+        SplunkEncoder::new()
+            .with_default_host(Some(Arc::from("relay")))
+            .encode_objects(&batch, &mut out);
+        assert_eq!(out.iter().next().unwrap(), br#"{"time":1,"event":"a"}"#);
     }
 
     #[test]

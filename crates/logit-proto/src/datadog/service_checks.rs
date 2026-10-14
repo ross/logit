@@ -11,7 +11,9 @@ use super::logs::{new_batch, parse_json};
 use super::outcomes::{MetricIn, MetricOut};
 use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, or_received};
-use super::{is_service_check, DatadogDecoder, DatadogEncoder};
+use super::{
+    host_tag, is_service_check, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_HOST_TAG,
+};
 use crate::json::{value_text, write_i64, write_str, JsonObject};
 use crate::CodecError;
 use bytes::Bytes;
@@ -19,6 +21,7 @@ use logit_core::attrs::merged;
 use logit_core::interner::intern;
 use logit_core::{AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Symbol, Value};
 use serde_json::Value as Json;
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 /// `statsd_in`'s service-check attribute names (`crates/logit-proto/src/statsd/decode.rs`), reused
@@ -37,6 +40,8 @@ struct CheckKeys {
     message: Symbol,
     host: Symbol,
     statsd_timestamp: Symbol,
+    host_name: Symbol,
+    host_tag: Symbol,
 }
 
 static KEYS: LazyLock<CheckKeys> = LazyLock::new(|| CheckKeys {
@@ -45,6 +50,8 @@ static KEYS: LazyLock<CheckKeys> = LazyLock::new(|| CheckKeys {
     message: intern(ATTR_SERVICE_CHECK_MESSAGE),
     host: intern(ATTR_SERVICE_CHECK_HOST),
     statsd_timestamp: intern(ATTR_STATSD_TIMESTAMP),
+    host_name: intern(ATTR_HOST_NAME),
+    host_tag: intern(ATTR_HOST_TAG),
 });
 
 impl DatadogDecoder {
@@ -154,8 +161,20 @@ impl DatadogEncoder {
                 continue;
             };
 
+            // `statsd.service_check.host`, else `host.name`, else a DogStatsD `#host:` tag, else
+            // the default. A `host.name` or `host` read this way leaves as the host and not a
+            // tag; the Agent consumes a `host:` tag even when `h:` wins.
+            let non_empty = |key: Symbol| find(key).filter(|v| v.as_str() != Some(""));
+            let own_host = non_empty(keys.host);
+            let host_name = if own_host.is_none() { non_empty(keys.host_name) } else { None };
+            let host_tag = host_tag(&batch.resource, event);
+            let mut skip =
+                vec![keys.name, keys.status, keys.message, keys.host, keys.statsd_timestamp];
+            // An empty `host.name` is no host, so it isn't a tag either.
+            let empty_host_name = find(keys.host_name).is_some_and(|v| v.as_str() == Some(""));
+            skip.extend((host_name.is_some() || empty_host_name).then_some(keys.host_name));
+            skip.extend(host_tag.map(|_| keys.host_tag));
             let mut tags = Vec::new();
-            let skip = [keys.name, keys.status, keys.message, keys.host, keys.statsd_timestamp];
             let dropped = render_tags(attrs.iter().map(|(k, v)| (*k, *v)), &skip, &mut tags);
             if dropped.unrepresentable > 0 {
                 self.telemetry.count(
@@ -171,7 +190,13 @@ impl DatadogEncoder {
             any = true;
             let mut obj = JsonObject::begin(&mut out);
             write_str(obj.key("check"), &value_text(name));
-            write_str(obj.key("host_name"), &find(keys.host).map(value_text).unwrap_or_default());
+            let host = match (own_host.or(host_name), host_tag) {
+                (Some(host), _) => value_text(host),
+                // An empty `#host:` tag: marked hostless, never filled.
+                (None, Some(tag)) => Cow::Borrowed(tag),
+                (None, None) => Cow::Borrowed(self.default_host.as_deref().unwrap_or_default()),
+            };
+            write_str(obj.key("host_name"), &host);
             write_i64(obj.key("timestamp"), nanos_to_seconds(event.timestamp));
             write_i64(obj.key("status"), status as i64);
             write_str(obj.key("message"), &find(keys.message).map(value_text).unwrap_or_default());
@@ -200,6 +225,7 @@ mod tests {
     use super::*;
     use logit_core::interner::resolve;
     use logit_core::telemetry::Registry;
+    use std::sync::Arc;
 
     const RECEIVED_AT: i64 = 1_690_000_000_000_000_000;
 
@@ -263,6 +289,82 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&out).unwrap(),
             r#"[{"check":"app.ok","host_name":"","timestamp":1700000000,"status":1,"message":"","tags":[]}]"#
+        );
+    }
+
+    /// `statsd.service_check.host`, then `host.name` (then no tag of that name), then the
+    /// default host.
+    #[test]
+    fn encode_fills_a_missing_host_with_host_name_then_the_default_host() {
+        let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let encode_with = |batch: &EventBatch| {
+            String::from_utf8(encoder.encode_service_checks(batch).unwrap().to_vec()).unwrap()
+        };
+        let hostless = decode(r#"[{"check":"app.ok","timestamp":1700000000,"status":1}]"#);
+        assert_eq!(
+            encode_with(&hostless),
+            r#"[{"check":"app.ok","host_name":"relay","timestamp":1700000000,"status":1,"message":"","tags":[]}]"#
+        );
+
+        let mut stamped = hostless.clone();
+        let mut resource = Resource::default();
+        resource.attributes.insert(ATTR_HOST_NAME, Value::str("web-1"));
+        stamped.resource = Arc::new(resource);
+        assert_eq!(
+            encode_with(&stamped),
+            r#"[{"check":"app.ok","host_name":"web-1","timestamp":1700000000,"status":1,"message":"","tags":[]}]"#
+        );
+
+        let mut own =
+            decode(r#"[{"check":"app.ok","host_name":"h","timestamp":1700000000,"status":1}]"#);
+        own.resource = stamped.resource.clone();
+        assert_eq!(
+            encode_with(&own),
+            r#"[{"check":"app.ok","host_name":"h","timestamp":1700000000,"status":1,"message":"","tags":["host.name:web-1"]}]"#
+        );
+    }
+
+    /// A DogStatsD `#host:` tag (`statsd_in`'s `host`) is the host after `h:` and `host.name`,
+    /// and is consumed, not tagged, whenever there's no `host.name`; an empty one stays hostless.
+    #[test]
+    fn a_host_tag_is_the_host_after_h_and_host_name() {
+        let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let encode_with = |body: &str| {
+            String::from_utf8(encoder.encode_service_checks(&decode(body)).unwrap().to_vec())
+                .unwrap()
+        };
+        let check = |host: &str, tags: &str| {
+            format!(
+                r#"[{{"check":"c","host_name":"{host}","timestamp":1700000000,"status":0,"message":"","tags":{tags}}}]"#
+            )
+        };
+        assert_eq!(
+            encode_with(
+                r#"[{"check":"c","timestamp":1700000000,"status":0,"tags":["host:web1"]}]"#
+            ),
+            check("web1", "[]")
+        );
+        assert_eq!(
+            encode_with(
+                r#"[{"check":"c","timestamp":1700000000,"status":0,"tags":["host:web1","host.name:"]}]"#
+            ),
+            check("web1", "[]")
+        );
+        assert_eq!(
+            encode_with(r#"[{"check":"c","timestamp":1700000000,"status":0,"tags":["host:"]}]"#),
+            check("", "[]")
+        );
+        assert_eq!(
+            encode_with(
+                r#"[{"check":"c","host_name":"h","timestamp":1700000000,"status":0,"tags":["host:web1"]}]"#
+            ),
+            check("h", "[]")
+        );
+        assert_eq!(
+            encode_with(
+                r#"[{"check":"c","timestamp":1700000000,"status":0,"tags":["host:web1","host.name:m"]}]"#
+            ),
+            check("m", r#"["host:web1"]"#)
         );
     }
 

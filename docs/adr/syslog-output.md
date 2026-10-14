@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-10-13
+updated: 2026-10-14
 ---
 
 # Syslog egress: format, transport, and header-field precedence
@@ -309,3 +309,14 @@ message and uses the shared errno helper for an oversize datagram.
 ## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
 
 `Output::duplicate_safe()` is gone, and `at_least_once` is every sink's default posture. `syslog_out` now defaults to `at_least_once` on both transports: an `Ambiguous` fault (a timeout, or a write that fails after part of a batch left) is retried for up to `buffer.retry_budget`, and a resend can repeat a log line at the receiver. `buffer.delivery: at_most_once` restores the conservative posture this ADR chose. The reasoning above about a duplicated log line still holds; the decision to accept it by default changed. See [`delivery-semantics.md`](delivery-semantics.md) item 5.
+
+## Amendment: the process hostname is the HOSTNAME default (2026-10-14)
+
+`syslog_out`'s HOSTNAME fallback is now its `hostname:`, else the process hostname
+([ADR `process-hostname`](process-hostname.md)): the top-level `hostname:`, else the kernel
+hostname. Under `logit run` the fallback is never empty, so an event with no `syslog.hostname`
+leaves with a hostname instead of RFC 5424's NILVALUE `-` or an omitted RFC 3164 token. HOSTNAME
+is absent only when sanitizing empties it.
+
+The precedence above is unchanged: an event's own `syslog.hostname` wins, so a relayed line keeps
+its origin's hostname. A line that arrived with none leaves with the relay's.

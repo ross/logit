@@ -256,17 +256,16 @@ and re-emits `TimeHR = received_at`, since there is no better time to hand back.
 
 collectd's own receiver (`network_dispatch_values`) rejects any `Values` list with an empty host (or
 plugin, or type) with `-EINVAL`. `collectd_out` treats that as a hard invariant on its own egress,
-but resolves it by **omission, not fabrication**: a `collectd.host` attribute wins when
-present and non-empty, falling back to `host.name` (event, then resource attribute) next, and
-finally to the sink's own optional `hostname:` config field — config-supplied only, exactly like
-`syslog_out`'s own `hostname:` field (`crates/logit-config/src/lib.rs`'s `SyslogOut::hostname` doc:
-omitted entirely rather than a literal `logit` default, "so a relayed line's origin is never
-silently overwritten with something that looks like a config mistake"). There is deliberately **no
-OS-hostname read and no placeholder default**: `docs/known-gaps/telemetry.md` already records that
-an OS-hostname source is *deferred pending a dependency, not added as a one-off* (its `internal`
-resource-identity entry — "there is no OS-hostname source anywhere in the workspace"), and this pair
-leaves that deferral untouched rather than working around it with a Linux-only
-`/proc/sys/kernel/hostname` read of its own.
+but resolves it by **omission, not fabrication**: a `collectd.host` attribute wins when present and
+non-empty, falling back to `host.name` (event, then resource attribute) next, and finally to the
+sink's own optional `hostname:` config field — config-supplied only, exactly like `syslog_out`'s own
+`hostname:` field (`crates/logit-config/src/lib.rs`'s `SyslogOut::hostname` doc: omitted entirely
+rather than a literal `logit` default, "so a relayed line's origin is never silently overwritten
+with something that looks like a config mistake"). There is deliberately **no OS-hostname read and
+no placeholder default** in this sink. (Amended 2026-10-14: the process now resolves a hostname
+([ADR `process-hostname`](process-hostname.md)) and `internal` stamps it as `host.name`, but
+`collectd_out` still doesn't fall back to it, because one made-up host would merge every
+unlabeled sender into a single host's metrics.)
 
 When none of the three resolves — no `collectd.host`, no `host.name` anywhere on event or
 resource, and no configured `hostname:` — the value list is **dropped whole**, counted

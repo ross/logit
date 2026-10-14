@@ -225,8 +225,8 @@ impl CollectdEncoder {
     /// The host written when neither `collectd.host` nor `host.name` is present
     /// (`collectd_out`'s `hostname:`).
     ///
-    /// **Operator-supplied, with no default.** The encoder neither reads the OS hostname (deferred,
-    /// `docs/known-gaps/mappings.md`) nor invents a placeholder: a receiver keys every series on
+    /// **Operator-supplied, with no default.** The encoder neither reads the OS hostname
+    /// (`docs/adr/process-hostname.md`) nor invents a placeholder: a receiver keys every series on
     /// the host, so one made-up name would merge every unlabelled sender into one host's metrics.
     /// With nothing configured and nothing on the event, the list is dropped and counted.
     ///

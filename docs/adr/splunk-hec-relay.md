@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-10-13
+updated: 2026-10-14
 ---
 
 # Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment
@@ -595,3 +595,15 @@ the counters this record's decisions name move as follows. Behavior doesn't chan
   `metrics.skipped{metric_kind}`.
 
 The codec module docs under `crates/logit-proto/src/splunk/` hold the full mapping.
+
+## Amendment: the process hostname fills a missing `host` (2026-10-14)
+
+`splunk_hec_out` writes the process hostname ([ADR `process-hostname`](process-hostname.md)) as
+the envelope `host` of a batch whose resource has no `host.name`. Decisions 2 and 6 stand: there
+is still no per-sink `host` field, and a `host.name` the batch carries always wins. A `host.name`
+that isn't a string is the batch's own value, so it stays omitted and counted rather than
+replaced.
+
+A relayed object that arrived with no `host` now leaves with the relay's hostname, which joins the
+codec's permitted normalizations (`crates/logit-proto/src/splunk/mod.rs`). Without it, Splunk
+assigns the HEC input's default host, which is the Splunk server's name, not the sender's.

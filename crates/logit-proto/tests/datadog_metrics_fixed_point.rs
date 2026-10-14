@@ -114,6 +114,32 @@ fn v1_agent_minimal_series_keeps_its_always_present_fields() {
     );
 }
 
+/// The Agent's v2 spelling of a hostless series, a `host` resource with no name, stays hostless
+/// through an encoder with a default host: one `{host, ""}` resource, nothing filled, and still a
+/// fixed point.
+#[test]
+fn an_agent_hostless_v2_series_is_not_filled_with_the_default_host() {
+    let body = MetricPayload {
+        series: vec![MetricSeries {
+            metric: "agent.gauge".into(),
+            resources: vec![PbResource { r#type: "host".into(), name: "".into() }],
+            points: vec![MetricPoint { value: 42.0, timestamp: 1_700_000_000 }],
+            r#type: 3,
+            ..Default::default()
+        }],
+    }
+    .encode_to_vec();
+    let d1 = decode(Route::V2Protobuf, &body);
+    let mut relay = DatadogEncoder::new().with_default_host(Some("relay".into()));
+    let b1 = relay.encode_series_v2_protobuf(&d1).unwrap();
+    let payload = MetricPayload::decode(b1.clone()).unwrap();
+    assert_eq!(
+        payload.series[0].resources,
+        vec![PbResource { r#type: "host".into(), name: "".into() }]
+    );
+    assert_eq!(decode(Route::V2Protobuf, &b1).events, d1.events);
+}
+
 #[test]
 fn v1_public_form() {
     let body = json_bytes(json!({"series":[

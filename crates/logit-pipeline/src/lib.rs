@@ -21,6 +21,7 @@ mod disk_queue_verification;
 pub mod fanout;
 pub mod fault;
 pub mod graph;
+pub mod host;
 pub mod input;
 pub mod listen;
 pub mod output;

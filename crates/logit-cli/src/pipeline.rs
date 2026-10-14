@@ -332,7 +332,11 @@ fn prepare(
     reopen: Option<watch::Receiver<u64>>,
     tls_reloader: &TlsReloader,
 ) -> anyhow::Result<PrepareResult> {
+    let configured_hostname = config.hostname.clone();
     let graph = graph::resolve(config)?;
+    // After `graph::resolve`, so rule 88's message wins over an empty `hostname:`.
+    let hostname = logit_pipeline::host::resolve(configured_hostname.as_deref())?;
+    tracing::info!(target: "logit", hostname = %hostname, "hostname resolved");
 
     // Graph rule 13 allows at most one `internal`; its `span_sample_rate` configures the registry.
     let internal_component = graph.components.iter().find_map(|(id, c)| match &c.kind {
@@ -353,9 +357,16 @@ fn prepare(
     let mut telemetry: HashMap<String, Telemetry> = HashMap::with_capacity(graph.components.len());
     for id in ids {
         let component = &graph.components[id];
-        let (spec, component_telemetry) =
-            build_spec(id, component, &base_dir, registry.as_ref(), reopen.as_ref(), tls_reloader)
-                .with_context(|| format!("component '{id}'"))?;
+        let (spec, component_telemetry) = build_spec(
+            id,
+            component,
+            &base_dir,
+            registry.as_ref(),
+            reopen.as_ref(),
+            tls_reloader,
+            &hostname,
+        )
+        .with_context(|| format!("component '{id}'"))?;
         specs.insert(id.clone(), spec);
         telemetry.insert(id.clone(), component_telemetry);
     }
@@ -422,6 +433,10 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<Vec<String>> {
 ///
 /// Every TLS component (a listener, a sink, or `prometheus_in`'s scrape client) registers its
 /// certificate files with `tls_reloader`, under the component's own `Diagnostics` and `Telemetry`.
+///
+/// `hostname` is the process hostname (`logit_pipeline::host`). `internal` stamps it as
+/// `host.name`, and `syslog_out`, `splunk_hec_out`, and `datadog_out` fill it in for an event that
+/// carries no host of its own.
 fn build_spec(
     id: &str,
     component: &ResolvedComponent,
@@ -429,6 +444,7 @@ fn build_spec(
     registry: Option<&Arc<Registry>>,
     reopen: Option<&watch::Receiver<u64>>,
     tls_reloader: &TlsReloader,
+    hostname: &Arc<str>,
 ) -> anyhow::Result<(NodeSpec, Telemetry)> {
     use logit_config::ComponentKind::*;
     // Every arm clones this rather than moving it: it's returned too, so the node runtime's layer 2
@@ -908,7 +924,7 @@ fn build_spec(
                 .cloned()
                 .expect("graph::resolve's rule 13 guarantees a Registry whenever an 'internal' component does");
             #[allow(unused_mut)]
-            let mut input = InternalInput::new(*interval, registry)
+            let mut input = InternalInput::new(*interval, registry, hostname)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
             #[cfg(feature = "jemalloc")]
@@ -1186,6 +1202,7 @@ fn build_spec(
         DatadogOut { api_key, site, endpoints, compression, timeout, headers, tls } => {
             let output = DatadogOutput::new(api_key)?
                 .with_site(site.clone())
+                .with_default_host(hostname.clone())
                 .with_endpoints(DatadogOutEndpoints {
                     api: endpoints.api.clone(),
                     logs: endpoints.logs.clone(),
@@ -1252,6 +1269,7 @@ fn build_spec(
                 .with_timeout(*timeout)
                 // Saturates on a 32-bit target: a cap past the address space is no cap.
                 .with_max_body_bytes(usize::try_from(*max_body_bytes).unwrap_or(usize::MAX))
+                .with_default_host(hostname.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
                 .with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
@@ -1400,7 +1418,7 @@ fn build_spec(
             transport,
             format,
             facility,
-            hostname,
+            hostname: configured_hostname,
             app_name,
             max_message_bytes,
             connect_timeout,
@@ -1415,11 +1433,11 @@ fn build_spec(
                     SyslogOutput::tcp(endpoint.clone(), *connect_timeout)
                 }
             };
+            // Filled only where an event has no `syslog.hostname` of its own.
+            let default_hostname = configured_hostname.as_deref().unwrap_or(&**hostname);
             let mut encoder = SyslogEncoder::new(syslog_format(*format), facility.as_u8())
-                .with_max_message_bytes(*max_message_bytes as usize);
-            if let Some(hostname) = hostname {
-                encoder = encoder.with_hostname(hostname.clone());
-            }
+                .with_max_message_bytes(*max_message_bytes as usize)
+                .with_hostname(default_hostname);
             if let Some(app_name) = app_name {
                 encoder = encoder.with_app_name(app_name.clone());
             }
@@ -2335,15 +2353,23 @@ mod tests {
         }
     }
 
-    /// [`super::build_spec`] with no reopen generation and a throwaway TLS reloader, shadowing
-    /// it for every test below.
+    /// [`super::build_spec`] with no reopen generation, a throwaway TLS reloader, and a fixed
+    /// hostname, shadowing it for every test below.
     fn build_spec(
         id: &str,
         component: &ResolvedComponent,
         base_dir: &Path,
         registry: Option<&Arc<Registry>>,
     ) -> anyhow::Result<(NodeSpec, Telemetry)> {
-        super::build_spec(id, component, base_dir, registry, None, &TlsReloader::new())
+        super::build_spec(
+            id,
+            component,
+            base_dir,
+            registry,
+            None,
+            &TlsReloader::new(),
+            &Arc::from("test-host"),
+        )
     }
     use logit_config::{Component, ComponentKind, InternalLogs};
     use std::collections::HashMap as Map;
@@ -2656,6 +2682,194 @@ mod tests {
             build_spec("out", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Output(_, _, _)
         ));
+    }
+
+    /// `syslog_out`'s HOSTNAME default is its `hostname:`, else the process hostname, and an
+    /// event's own `syslog.hostname` beats either.
+    #[tokio::test]
+    async fn build_spec_gives_syslog_out_the_process_hostname_unless_it_configures_one() {
+        use logit_core::{AttrMap, BodyFormat, Event, EventBatch, LogRecord, Resource, Value};
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = receiver.local_addr().unwrap().to_string();
+        let log = |attributes: AttrMap| {
+            let record = LogRecord {
+                message: Value::str("m"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            };
+            Event::log(1_700_000_000_000_000_000, attributes, record)
+        };
+        let mut own = AttrMap::new();
+        own.insert("syslog.hostname", Value::str("own"));
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![log(AttrMap::new()), log(own)],
+        };
+        for (configured, want) in [(None, "test-host"), (Some("configured"), "configured")] {
+            let component = ResolvedComponent {
+                buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
+                sources: vec!["in".to_string()],
+                targets: Vec::new(),
+                consumers: vec![],
+                kind: ComponentKind::SyslogOut {
+                    endpoint: endpoint.clone(),
+                    transport: logit_config::SyslogTransport::Udp,
+                    format: logit_config::SyslogFormat::Rfc5424,
+                    facility: logit_config::SyslogFacility::default(),
+                    hostname: configured.map(String::from),
+                    app_name: None,
+                    max_message_bytes: 8192,
+                    connect_timeout: Duration::from_secs(5),
+                    tls: None,
+                    structured_data: None,
+                },
+            };
+            let NodeSpec::Output(mut output, _, _) =
+                build_spec("out", &component, Path::new(""), None).unwrap().0
+            else {
+                panic!("syslog_out builds an output");
+            };
+            output.send(&batch).await.unwrap();
+            for expected in [want, "own"] {
+                let mut datagram = [0u8; 2048];
+                let n = tokio::time::timeout(
+                    logit_pipeline::test_util::RECV_TIMEOUT,
+                    receiver.recv(&mut datagram),
+                )
+                .await
+                .expect("a syslog datagram")
+                .unwrap();
+                let line = std::str::from_utf8(&datagram[..n]).unwrap();
+                // `<PRI>1 TIMESTAMP HOSTNAME ...`
+                assert_eq!(line.split(' ').nth(2), Some(expected), "{line}");
+            }
+        }
+    }
+
+    /// The body of the one HTTP request `listener` receives, answered `status` with `reply`.
+    async fn capture_one_request(
+        listener: tokio::net::TcpListener,
+        status: &str,
+        reply: &str,
+    ) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let body_start = loop {
+            let n = conn.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "the connection closed before the headers ended");
+            request.extend_from_slice(&chunk[..n]);
+            if let Some(i) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..body_start]).to_ascii_lowercase();
+        let length: usize = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .expect("a content-length header")
+            .trim()
+            .parse()
+            .unwrap();
+        while request.len() < body_start + length {
+            let n = conn.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "the connection closed before the body ended");
+            request.extend_from_slice(&chunk[..n]);
+        }
+        let response =
+            format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\n\r\n{reply}", reply.len());
+        conn.write_all(response.as_bytes()).await.unwrap();
+        request.split_off(body_start)
+    }
+
+    /// A batch of one hostless gauge that is also a hostless log, stamped now: `datadog_out`
+    /// drops a stale one.
+    fn hostless_batch() -> logit_core::EventBatch {
+        use logit_core::{BodyFormat, Event, LogRecord, MetricKind, MetricRecord, Resource};
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        let mut event = Event::log(
+            i64::try_from(now.as_nanos()).unwrap(),
+            logit_core::AttrMap::new(),
+            LogRecord {
+                message: logit_core::Value::str("m"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        event
+            .metrics
+            .push(MetricRecord::new(logit_core::interner::intern("load"), MetricKind::gauge(1.0)));
+        logit_core::EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![event],
+        }
+    }
+
+    fn sink_component(json: &str) -> ResolvedComponent {
+        let component: Component = serde_json::from_str(json).unwrap();
+        ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec![],
+            kind: component.kind,
+        }
+    }
+
+    /// `splunk_hec_out` sends the process hostname as a hostless batch's `host`.
+    #[tokio::test]
+    async fn build_spec_gives_splunk_hec_out_the_process_hostname() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let component = sink_component(&format!(
+            r#"{{"type": "splunk_hec_out", "endpoint": "http://{addr}/services/collector",
+                "token": "t", "compression": "none"}}"#
+        ));
+        let NodeSpec::Output(mut output, _, _) =
+            build_spec("out", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("splunk_hec_out builds an output");
+        };
+        let server =
+            tokio::spawn(capture_one_request(listener, "200 OK", r#"{"text":"Success","code":0}"#));
+        output.send(&hostless_batch()).await.unwrap();
+        let body = String::from_utf8(server.await.unwrap()).unwrap();
+        assert!(body.contains(r#""host":"test-host""#), "{body}");
+    }
+
+    /// `datadog_out` sends the process hostname as a hostless log's `hostname`.
+    #[tokio::test]
+    async fn build_spec_gives_datadog_out_the_process_hostname() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let component = sink_component(&format!(
+            r#"{{"type": "datadog_out", "api_key": "k", "compression": "none",
+                "endpoints": {{"logs": "http://{addr}"}}}}"#
+        ));
+        let NodeSpec::Output(mut output, _, _) =
+            build_spec("out", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("datadog_out builds an output");
+        };
+        let mut batch = hostless_batch();
+        batch.events[0].metrics.clear();
+        let server = tokio::spawn(capture_one_request(listener, "202 Accepted", "{}"));
+        output.send(&batch).await.unwrap();
+        let body = String::from_utf8(server.await.unwrap()).unwrap();
+        assert!(body.contains(r#""hostname":"test-host""#), "{body}");
     }
 
     fn graphite_out_kind(

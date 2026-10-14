@@ -345,7 +345,7 @@ impl SplunkEncoder {
                 fields.insert(dim, Value::str(value.as_str()));
             }
             self.scratch.clear();
-            let mut obj = begin_object(&mut self.scratch, event.timestamp, &ctx.envelope);
+            let mut obj = begin_object(&mut self.scratch, event.timestamp, ctx);
             write_str(obj.key("event"), METRIC_EVENT);
             let mut key = String::new();
             write_fields(&mut obj, &fields, |inner| {

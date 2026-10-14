@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-10-13
+updated: 2026-10-14
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -427,3 +427,36 @@ decisions above use the new spelling. Four things follow for the Datadog pairs:
   turns a `GAUGE` into a `RATE`. An operator who wants a carrier on a series from another
   protocol stamps it with `set`, as `fixtures/datadog-direct.yaml` stamps
   `_logit.datadog.interval`.
+
+## Amendment: the process hostname fills a missing host (2026-10-14)
+
+`datadog_out` writes the process hostname ([ADR `process-hostname`](process-hostname.md)) as the
+host of a series, distribution point, sketch, log, event, or service check that carries none of
+its own. Decision 10 stands: there's no per-sink host field, and a host the event or its resource
+carries always wins. Trace and stats payloads keep their tracer and Agent hostnames verbatim, and
+`datadog_trace_out` is unchanged.
+
+- **A DogStatsD `host:` tag is a host.** `statsd_in` decodes `#host:web1` to the attribute
+  `host`. With no `host.name`, or an empty one, a `Str` `host` is the host and isn't sent as a tag, as the Agent's
+  `extractTagsMetadata` (datadog-agent 7.83.3, `comp/dogstatsd/server/impl/enrich.go`) reads it.
+  An empty one marks a sample hostless, and it is never filled. With `host.name`
+  present, `host` stays an ordinary tag.
+- **Events and service checks read `host.name` and `host`.** Their host is `_logit.statsd.event.host` or
+  `_logit.statsd.service_check.host` (the `h:` field), else `host.name`, else `host`, else the process
+  hostname. A `host.name` or `host` used this way leaves as the host and not as a tag.
+- **A log with a host Datadog reads isn't filled.** Datadog's log preprocessing takes the host
+  from `host`, `hostname`, or `syslog.hostname`. A log carrying `hostname`, `host.name`,
+  `syslog.hostname`, or `host` gets no default `hostname`, and the last two leave as the
+  attributes they were.
+- **An Agent's hostless v2 series stays hostless.** The Agent writes a hostless series as a
+  `host` resource with no name, which decodes into `_logit.datadog.resources`. A series carrying such an
+  entry is never filled, and the entry is kept, so the relay stays a fixed point. The v1,
+  distribution-point, and sketch routes spell the same thing `"host":""`, which decodes as no
+  host and is filled, a gap in `docs/known-gaps/datadog.md`.
+- **One `logit` is one Datadog host for hostless senders.** A metric with no `host:` tag, or an
+  event or check with no `h:` field and no `host:` tag, relayed through `logit` reports under the
+  relay's hostname, as it would through one Agent. Datadog bills per host, so this matches what
+  an Agent costs. To keep a host per sender, stamp `host.name` upstream with `set`.
+
+A relayed item that arrived with no host now leaves with the relay's hostname, which joins both
+of the codec's permitted-normalization lists (`crates/logit-proto/src/datadog/mod.rs`).

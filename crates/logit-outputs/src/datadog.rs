@@ -27,8 +27,10 @@
 //! ```
 //!
 //! There are no per-sink host, service, source, or tag fields (ADR decision 10): the encoders read
-//! them from each event's attributes and the batch resource, so an upstream `set` stamps them.
-//! Graph rule 66 validates the block.
+//! them from each event's attributes and the batch resource, so an upstream `set` stamps them. A
+//! series, sketch, log, event, or service check that carries no host gets the process hostname
+//! ([`DatadogOutput::with_default_host`]); trace and stats payloads keep their own hostnames
+//! verbatim. Graph rule 66 validates the block.
 //!
 //! ## Routes
 //!
@@ -292,6 +294,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The default `site:`, Datadog's US1.
@@ -680,6 +683,7 @@ pub struct DatadogOutput {
     headers: HeaderMap,
     /// Built by [`DatadogOutput::with_tls`]; `None` keeps `reqwest`'s default trust.
     tls: Option<rustls::ClientConfig>,
+    default_host: Option<Arc<str>>,
     /// Counts through views of `telemetry`/`diag` gated by `accounting`
     /// ([`DatadogOutput::new_encoder`]).
     encoder: DatadogEncoder,
@@ -720,6 +724,7 @@ impl DatadogOutput {
             client: build_client(DEFAULT_TIMEOUT, None),
             headers: HeaderMap::new(),
             tls: None,
+            default_host: None,
             encoder: DatadogEncoder::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
@@ -742,6 +747,14 @@ impl DatadogOutput {
     /// Base URLs replacing the derived hosts (`endpoints:`).
     pub fn with_endpoints(mut self, endpoints: DatadogEndpoints) -> Self {
         self.endpoints = endpoints;
+        self
+    }
+
+    /// The host of a series, sketch, log, event, or service check that carries none of its own:
+    /// `logit run` passes the process hostname.
+    pub fn with_default_host(mut self, host: impl Into<Arc<str>>) -> Self {
+        self.default_host = Some(host.into());
+        self.encoder = self.new_encoder();
         self
     }
 
@@ -834,6 +847,7 @@ impl DatadogOutput {
         DatadogEncoder::new()
             .with_telemetry(self.telemetry.gated(gate))
             .with_diagnostics(self.diag.gated(gate))
+            .with_default_host(self.default_host.clone())
     }
 
     /// Reads send times from `clock` instead of the wall clock.
@@ -1237,7 +1251,7 @@ mod tests {
     use logit_proto::datadog::{DatadogDecoder, ATTR_RESOURCE_NAME, METRIC_TOP_LEVEL};
     use std::io::Read;
     use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     const KEY: &str = "0123456789abcdef0123456789abcdef";
     /// The send time every test pins, so each window's edge is exact.

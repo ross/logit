@@ -32,6 +32,8 @@ rustls-pki-types.workspace = true
 webpki-roots.workspace = true
 # `tls::not_after`'s calendar arithmetic. Already in the graph through `logit-core`.
 jiff.workspace = true
+# `host::resolve`'s kernel hostname lookup.
+rustix.workspace = true
 
 [features]
 # Arms the fault-injection seam (`src/fault.rs`) outside this crate's own tests. Only ever a

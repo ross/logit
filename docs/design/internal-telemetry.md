@@ -51,15 +51,19 @@ every sink already work.
 
 ## Resource identity
 
-Every batch `internal` sends carries `service.name = logit` on its `Arc<Resource>`
-(`crates/logit-inputs/src/internal.rs`), built once in `InternalInput::new` because the resource is
-batch-level and identical on every tick. This lets an OTLP backend (Tempo, in the demo) resolve a
-root span's service. Without it, the root span still arrives but has no `service.name`, and
+Every batch `internal` sends carries `service.name = logit` and `host.name = <the process
+hostname>` on its `Arc<Resource>` (`crates/logit-inputs/src/internal.rs`), built once in
+`InternalInput::new` because the resource is batch-level and identical on every tick.
+`service.name` lets an OTLP backend (Tempo, in the demo) resolve a root span's service. Without it,
+the root span still arrives but has no `service.name`, and
 Grafana's Traces Drilldown renders that as `<root span not yet received>`, the same text it shows
-for a genuinely missing span. Don't mistake one failure for the other.
+for a genuinely missing span. Don't mistake one failure for the other. `host.name` tells several
+`logit` instances apart in one backend. The hostname is resolved once at `logit run` startup, from
+the top-level `hostname:` or the kernel ([ADR `process-hostname`](../adr/process-hostname.md)).
 
-`internal` is the only input allowed to make this claim. `service.name` names *the producer* of
-the telemetry, not the source of the data, and `internal`'s telemetry genuinely is `logit`'s own.
+`internal` is the only input allowed to make this claim. `service.name` and `host.name` name *the
+producer* of the telemetry, not the source of the data, and `internal`'s telemetry genuinely is
+`logit`'s own.
 Inputs fall into three categories:
 
 - **No claim.** `syslog_in`/`statsd_in`/`lines_in` always use `Resource::default()`. The data they ingest
@@ -70,17 +74,20 @@ Inputs fall into three categories:
 - **Discovered facts.** `docker_in` stamps `container.*` (id, name, image, opt-in labels), read
   locally off the container's own `config.v2.json`. These are facts about where the data came
   from, with the same standing `syslog_in`'s parsed hostname has, not an assertion `logit` makes up.
+  `internal`'s `host.name` is the same kind of fact, about where `logit` itself runs.
   `docker_in` still never claims `service.name`/`service.namespace` on the operator's behalf. That
   stays a `set` transform's job downstream
   ([ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md)),
   which is what the demo's `nginx_identity` does. `set`'s `map_resource` overlays onto whatever
   resource it's handed, so `container.*` survives downstream of it untouched.
 
-**Why `service.name` alone, and not `service.version`.** In the demo, `victoria_out` also sources
-`self`, and `prometheus_out` folds resource attributes into labels (`logit_proto::prometheus`'s
-"Encode" table), as `influxdb_out` folds them into tags, so this attribute is a label on every
-`logit.*` series. A constant tag is a one-time, harmless addition to series identity; a version tag
-would re-key every series on each release. The OTLP instrumentation scope carries the version
+**Why `service.name` and `host.name`, and not `service.version`.** In the demo, `victoria_out`
+also sources `self`, and `prometheus_out` folds resource attributes into labels
+(`logit_proto::prometheus`'s "Encode" table), as `influxdb_out` folds them into tags, so these
+attributes are labels on every `logit.*` series. A tag constant for the life of the process is a
+one-time, harmless addition to series identity; a version tag would re-key every series on each
+release. `host.name` re-keys when the hostname changes: in Kubernetes that is each pod, which is
+what telling instances apart means. Set `hostname:` to a node name if that isn't wanted. The OTLP instrumentation scope carries the version
 instead, without that cost: `internal` stamps
 `Scope { name: "logit", version: env!("CARGO_PKG_VERSION") }` on every batch it sends
 (`crates/logit-inputs/src/internal.rs`'s `InternalInput::scope`), `Arc`-shared across the batch

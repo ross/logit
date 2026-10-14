@@ -3,7 +3,9 @@
 //! conversion and ordered writer it shares with the other JSON routes live in [`crate::json`].
 
 use super::time::{millis_to_nanos, nanos_to_millis, or_received};
-use super::{is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_SOURCE};
+use super::{
+    is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_HOST_TAG, ATTR_SOURCE,
+};
 use crate::json::{json_to_value, value_text, write_i64, write_str, write_value, JsonObject};
 use crate::CodecError;
 use bytes::Bytes;
@@ -38,6 +40,10 @@ struct LogKeys {
     ddsource: Symbol,
     ddtags: Symbol,
     host_name: Symbol,
+    /// Hosts Datadog's log preprocessing reads from a top-level attribute, so a log carrying one
+    /// has a host of its own and never gets the default.
+    syslog_hostname: Symbol,
+    host_tag: Symbol,
     service_name: Symbol,
     source: Symbol,
     message: Symbol,
@@ -53,6 +59,8 @@ static KEYS: LazyLock<LogKeys> = LazyLock::new(|| LogKeys {
     ddsource: intern(ATTR_DDSOURCE),
     ddtags: intern(ATTR_DDTAGS),
     host_name: intern(ATTR_HOST_NAME),
+    syslog_hostname: intern("syslog.hostname"),
+    host_tag: intern(ATTR_HOST_TAG),
     service_name: intern(ATTR_SERVICE_NAME),
     source: intern(ATTR_SOURCE),
     message: intern("message"),
@@ -243,6 +251,13 @@ impl DatadogEncoder {
             } else if primary == keys.ddsource {
                 if let Some(source) = &self.default_source {
                     write_str(obj.key(key), source);
+                }
+            } else if primary == keys.hostname
+                && find(keys.syslog_hostname).is_none()
+                && find(keys.host_tag).is_none()
+            {
+                if let Some(host) = &self.default_host {
+                    write_str(obj.key(key), host);
                 }
             }
         }
@@ -502,6 +517,40 @@ pub(super) mod tests {
         assert_eq!(item["at"], "1970-01-01T00:00:00.000000000Z");
         assert!(item.get("host.name").is_none());
         assert!(item.get("service.name").is_none());
+    }
+
+    /// `hostname`, then `host.name`, then the default host.
+    #[test]
+    fn encode_fills_a_missing_hostname_with_the_default_host() {
+        let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let encode_with = |body: &str| {
+            let out = encoder.encode_logs(&decode(body)).unwrap();
+            serde_json::from_slice::<Json>(&out).unwrap()[0]["hostname"].clone()
+        };
+        assert_eq!(encode_with(r#"[{"message":"a"}]"#), "relay");
+        assert_eq!(encode_with(r#"[{"message":"a","hostname":"h"}]"#), "h");
+        assert_eq!(encode_with(r#"[{"message":"a","host.name":"m"}]"#), "m");
+        assert_eq!(
+            std::str::from_utf8(
+                &DatadogEncoder::new().encode_logs(&decode(r#"[{"message":"a"}]"#)).unwrap()
+            )
+            .unwrap(),
+            r#"[{"message":"a","timestamp":1690000000000}]"#
+        );
+    }
+
+    /// A `syslog.hostname` or `host` is a host Datadog's log preprocessing reads, so a log
+    /// carrying either gets no default `hostname`, and each leaves as the attribute it was.
+    #[test]
+    fn a_syslog_hostname_or_host_attribute_suppresses_the_default_host() {
+        let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        for key in ["syslog.hostname", "host"] {
+            let out =
+                encoder.encode_logs(&decode(&format!(r#"[{{"message":"a","{key}":"web1"}}]"#)));
+            let item = &serde_json::from_slice::<Json>(&out.unwrap()).unwrap()[0];
+            assert!(item.get("hostname").is_none(), "{key}: {item}");
+            assert_eq!(item[key], "web1");
+        }
     }
 
     #[test]
