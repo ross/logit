@@ -59,5 +59,6 @@ forces a clean build once a month.
 - Until that first `main` push, PRs restore the previous month's entry, so the reset costs one
   slow `main` run and no slow PR runs. If entries still grow enough to slow the restore, change
   the month to an ISO week (`date -u +%G-W%V`).
-- A `main` run that fails saves nothing, so the next `main` run restores the older entry again.
+- A `main` run that fails saves nothing, so the next `main` run restores the month's older
+  entry again, or builds from scratch again if the failed run was the month's first.
 - After a version bump, every PR runs cold until a push to `main` saves under the new version.
