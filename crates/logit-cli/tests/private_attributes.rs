@@ -2,9 +2,9 @@
 //! no other protocol's wire, and no encoder counts them as anything.
 //!
 //! Each case decodes one carrier-bearing input with the real decoder, then encodes the result
-//! through every protocol encoder. No wire output may contain the bytes `_logit.`, and each
-//! cross-protocol encoder's counts (its stats struct and the telemetry it emits) must equal what it
-//! counts for the same batch with every top-level private key removed. `datadog_out` reads
+//! through every protocol encoder. No wire output may contain the bytes `_logit.` or, sanitized,
+//! `_logit_`, and each cross-protocol encoder's counts (its stats struct and the telemetry it
+//! emits) must equal what it counts for the same batch with every top-level private key removed. `datadog_out` reads
 //! statsd's event carriers, as the ADR permits, and its counts still match; a sink whose reading of
 //! another protocol's carriers changes a count needs an exemption here. The whole-event renders,
 //! `stdio_out`'s `format: json` and the native frame, must keep every private key. The rule is
@@ -39,7 +39,9 @@ use logit_proto::{
     Signal, SignalEncoder,
 };
 
-const PRIVATE: &[u8] = b"_logit.";
+/// A private key as it can reach a wire: verbatim, or with its dots sanitized to `_`, as
+/// `prometheus_out` writes a label name (`_logit_statsd_type`).
+const PRIVATE: [&[u8]; 2] = [b"_logit.", b"_logit_"];
 
 fn interop(path: &str) -> Vec<u8> {
     let full = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/interop").join(path);
@@ -489,7 +491,7 @@ fn no_protocol_encoder_writes_or_counts_a_private_key() {
             let (wire, counts) = run(&sink, &case.batch);
             written += wire.iter().filter(|m| !m.is_empty()).count();
             for message in &wire {
-                if let Some(at) = find(message, PRIVATE) {
+                if let Some(at) = PRIVATE.iter().find_map(|needle| find(message, needle)) {
                     let end = message.len().min(at + 60);
                     failures.push(format!(
                         "{pair}: the wire carries a private key: {:?}",
