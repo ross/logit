@@ -97,7 +97,7 @@
 //! | `unit`, `description`, `start_timestamp`, exemplars; `EventBatch::scope`; `Resource::schema_url` | dropped | -- |
 //! | a log or span payload | skipped | -- |
 //! | a measurement starting `#` | dropped: influxd reads the line as a comment | `metrics.dropped{reason="comment_measurement"}`, diagnostic `encode_error` |
-//! | a measurement or carrier field key with no spelling | dropped, once per field | `metrics.dropped{reason="unencodable_key"}` |
+//! | a measurement or carrier field key with no spelling (encode.rs's "Escaping"), such as one starting with a tab or NUL | dropped, once per field | `metrics.dropped{reason="unencodable_key"}` |
 //! | carrier field key `time` | dropped: influxd answers `422` | `metrics.dropped{reason="reserved_key"}` |
 //! | carrier string field over 1 MiB | dropped: influxd answers `422` | `metrics.dropped{reason="oversize_value"}` |
 //! | `event.timestamp` | the line's timestamp in nanoseconds; a same-series point already in the batch takes the next free nanosecond (normalization 9) | `metrics.dropped{reason="timestamp_overflow"}` when none is free below `i64::MAX` |
@@ -137,9 +137,9 @@
 //!    spelling arrived.
 //! 6. Escaping: the encoder writes only the escapes the grammar requires, so a backslash a sender
 //!    wrote doubled leaves as it was read, and a key the grammar can't spell is left out, counted:
-//!    a measurement or field key ending in `\` or with `\` before a delimiter is
-//!    `metrics.dropped{reason="unencodable_key"}`, and a tag key or value ending in `\` or with `\` before
-//!    a space is `tags.omitted{reason="unencodable"}`.
+//!    a measurement or field key starting with a tab or NUL, ending in `\`, or with `\` before a
+//!    delimiter is `metrics.dropped{reason="unencodable_key"}`, and a tag key or value ending in
+//!    `\` or with `\` before a space is `tags.omitted{reason="unencodable"}`.
 //! 7. Timestamps: every point leaves with a timestamp in nanoseconds, so `precision` isn't
 //!    carried, and a point that arrived with none leaves with its receipt time (see item 14).
 //! 8. Comments, blank lines, and runs of spaces are dropped. A CRLF line ending, a tab separator,

@@ -341,3 +341,47 @@ fn a_tag_value_starting_with_an_equals_sign_is_a_fixed_point() {
         7,
     )]));
 }
+
+/// A fuzz crash input (`fuzz/seeds/influxdb_line/regress-*`, the first byte the precision
+/// selector) decoded, then encoded: each key in `unencodable` is dropped and counted, and what is
+/// written decodes and is a fixed point from there.
+fn assert_crash_input_is_a_fixed_point(input: &[u8], unencodable: usize) {
+    let resource = Arc::new(Resource::default());
+    let source = batch(decode(Bytes::copy_from_slice(&input[1..]), &resource));
+    let mut encoder = InfluxLineEncoder::default();
+    let encoded = encoder.encode(&source).expect("the encoder never fails a batch");
+    assert_eq!(encoder.stats().dropped_unencodable_key, unencodable, "wire: {encoded:?}");
+    let decoded = decode(encoded.clone(), &resource);
+    assert_eq!(encode(&batch(decoded)), encoded, "encode(decode(encode(b))) == encode(b)");
+}
+
+/// The field key `\r` has no spelling and drops, which leaves the NUL-led key first after the
+/// space before the fields, where influxd skips a NUL as whitespace: written, the line reads as a
+/// missing field key. A field key starting with a tab or NUL is dropped wherever it falls.
+#[test]
+fn a_field_key_starting_with_a_nul_is_never_written() {
+    assert_crash_input_is_a_fixed_point(b":a \r=0,\0=0", 2);
+}
+
+/// As above, with the dropped key a backslash-escaped newline the line splitter keeps in the line.
+#[test]
+fn a_field_key_starting_with_a_nul_after_an_escaped_newline_is_never_written() {
+    assert_crash_input_is_a_fixed_point(b"\nE \\\n=-0,\0=4", 2);
+}
+
+/// A measurement or field key starting with a tab or NUL loses that byte where influxd skips
+/// whitespace, so it is dropped and counted; the rest of the batch survives.
+#[test]
+fn a_measurement_or_field_key_starting_with_a_tab_or_nul_is_dropped() {
+    let neighbor = point("n", &[], &[("f", MetricValue::I64(1))], &[], 6);
+    let source = batch(vec![
+        point("\tm", &[], &[("f", MetricValue::I64(1))], &[], 5),
+        point("\0m", &[], &[("f", MetricValue::I64(1))], &[], 5),
+        point("m", &[], &[("\tf", MetricValue::I64(1)), ("\0g", MetricValue::I64(1))], &[], 5),
+        neighbor.clone(),
+    ]);
+    let mut encoder = InfluxLineEncoder::default();
+    let encoded = encoder.encode(&source).expect("the encoder never fails a batch");
+    assert_eq!(encoder.stats().dropped_unencodable_key, 4, "wire: {encoded:?}");
+    assert_eq!(decode(encoded.clone(), &source.resource), vec![neighbor], "wire: {encoded:?}");
+}

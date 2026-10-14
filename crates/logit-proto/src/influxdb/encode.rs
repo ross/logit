@@ -22,6 +22,10 @@
 //! write a line `influxd` would read differently or reject with the whole batch:
 //!
 //! - any key ending in `\`, since that backslash would escape the delimiter after it;
+//! - a measurement or field key starting with a tab or NUL. Each starts where `influxd` skips
+//!   whitespace (a line's start, and the run after the space before the fields), and a tab or NUL
+//!   is whitespace there, so the key would lose its first byte, or the field key would read as
+//!   missing. A tag key or value follows a `,` or `=`, where nothing is skipped, so it keeps one;
 //! - a measurement with a `\` directly before `,`, space, or `=`: `influxd` stores the series but
 //!   no query reads it back;
 //! - a field key with a `\` directly before `,`, space, `=`, or `"`. Written, the backslash and
@@ -806,10 +810,10 @@ pub fn tag_value<'a>(scratch: &'a mut String, v: &'a Value) -> Option<&'a str> {
     }
 }
 
-/// A measurement the line can lead with (this module's "Escaping"): non-empty, no line break, no
-/// trailing `\`, and no `\` directly before `,`, space, or `=`.
+/// A measurement the line can lead with (this module's "Escaping"): non-empty, no leading tab or
+/// NUL, no line break, no trailing `\`, and no `\` directly before `,`, space, or `=`.
 fn measurement_encodable(s: &str) -> bool {
-    if s.is_empty() || s.contains(['\n', '\r']) {
+    if s.is_empty() || starts_skippable(s) || s.contains(['\n', '\r']) {
         return false;
     }
     let bytes = s.as_bytes();
@@ -826,13 +830,22 @@ fn tag_encodable(s: &str) -> bool {
     !s.contains(['\n', '\r']) && !s.ends_with('\\') && !s.contains("\\ ")
 }
 
-/// A carrier field key with a spelling: non-empty, as [`tag_encodable`], and no `\` directly
-/// before a character [`push_escaped_field_key`] escapes (this module's "Escaping").
+/// A carrier field key with a spelling: non-empty, no leading tab or NUL, as [`tag_encodable`],
+/// and no `\` directly before a character [`push_escaped_field_key`] escapes (this module's
+/// "Escaping").
 fn field_key_encodable(s: &str) -> bool {
     let bytes = s.as_bytes();
     !s.is_empty()
+        && !starts_skippable(s)
         && tag_encodable(s)
         && bytes.windows(2).all(|w| w[0] != b'\\' || !matches!(w[1], b',' | b' ' | b'=' | b'"'))
+}
+
+/// Whether `s` starts with a byte other than a space that `influxd` skips as whitespace at the
+/// start of a line or of the field section: a tab or NUL. A leading space is written `\ `, which
+/// nothing skips.
+fn starts_skippable(s: &str) -> bool {
+    s.starts_with(['\t', '\0'])
 }
 
 /// Appends a measurement, escaping `,` and space. `=` and `\` go as themselves.

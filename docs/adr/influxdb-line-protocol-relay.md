@@ -238,9 +238,9 @@ the same list with the same numbers, and the two lists must stay numbered alike:
    arrived.
 6. Escaping: the encoder writes only the escapes the grammar requires, so a backslash a sender
    wrote doubled leaves as it was read, and a key the grammar can't spell is left out, counted:
-   a measurement or field key ending in `\` or with `\` before a delimiter is
-   `metrics.dropped{reason="unencodable_key"}`, and a tag key or value ending in `\` or with `\`
-   before a space is `tags.omitted{reason="unencodable"}`.
+   a measurement or field key starting with a tab or NUL, ending in `\`, or with `\` before a
+   delimiter is `metrics.dropped{reason="unencodable_key"}`, and a tag key or value ending in `\`
+   or with `\` before a space is `tags.omitted{reason="unencodable"}`.
 7. Timestamps: every point leaves with a timestamp in nanoseconds, so `precision` isn't carried,
    and a point that arrived with none leaves with its receipt time (see item 14).
 8. Comments, blank lines, and runs of spaces are dropped. A CRLF line ending, a tab separator, and
@@ -270,9 +270,11 @@ tag key, tag value, and field key:
   is not an escape: it decodes to two backslashes. The encoder writes a backslash as itself and
   escapes only `,`, space, and (outside a measurement) `=`, each with one backslash.
 - A key that ends in a backslash has no spelling: the backslash would escape the delimiter. A
-  measurement or field key with a backslash before a delimiter has none either. A tag key or value
-  has none with a backslash before a space, written as a `\\` pair that leaves the space bare and
-  ends the tag section early. A backslash before `,` or `=` in a tag is written as `\\,` or `\\=`
+  measurement or field key with a backslash before a delimiter has none either, and neither has
+  one starting with a tab or NUL: it starts where `influxd` skips whitespace, a line's start or the
+  run after the space before the fields, and loses that byte. A tag key or value has none with a
+  backslash before a space, written as a `\\` pair that leaves the space bare and ends the tag
+  section early. A backslash before `,` or `=` in a tag is written as `\\,` or `\\=`
   and reads back as written, because `influxd`'s line splitter counts `,` and `=` only after a bare
   space has ended the tag section (probe row 2.13). The encoder drops the point (a measurement, a
   field key) or omits the tag (a tag key or value), counting a point or field
