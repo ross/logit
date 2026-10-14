@@ -11,12 +11,12 @@
 #   logit.shape.value_bytes   = label-value lengths
 #
 # Labels per series is wire labels plus a small constant. Scrape mode puts its own identity
-# (`instance`, `prometheus.target`) on the resource, which `resource: drop` removes, so an event's
-# attributes are the exposition line's labels plus at most `prometheus.type` (on a family whose
-# wire type the model has no kind for; node_exporter's `node_netstat_*`/`node_vmstat_*` families
-# are untyped, so about 2% of its series carry it: docs/design/data-shapes.md §3, "Labels per
-# series") and `prometheus.timestamp` (when the line carried one; these exporters don't). A
-# histogram's `le` and a summary's `quantile` are structure inside the metric record, not labels,
+# (`instance`, `_logit.prometheus.target`) on the resource, which `resource: drop` removes, so an
+# event's attributes are the exposition line's labels plus at most `_logit.prometheus.type` (on a
+# family whose wire type the model has no kind for; node_exporter's `node_netstat_*`/`node_vmstat_*`
+# families are untyped, so about 2% of its series carry it: docs/design/data-shapes.md §3, "Labels
+# per series") and `_logit.prometheus.timestamp` (when the line carried one; these exporters don't).
+# A histogram's `le` and a summary's `quantile` are structure inside the metric record, not labels,
 # so a histogram family contributes one event rather than one per bucket.
 #
 # One `prometheus_in` per target, named after the exporter, rather than one component with six
@@ -70,8 +70,8 @@ components:
 
   # blackbox_exporter's `/probe` endpoint, the shape an operator scrapes: a synthetic check per
   # request, answered with that probe's result series. The `target`/`module` query string is part
-  # of the URL; `prometheus_in` strips a query string from the `prometheus.target` attribute it
-  # stamps but sends the URL as given.
+  # of the URL; `prometheus_in` strips a query string from the `_logit.prometheus.target` attribute
+  # it stamps but sends the URL as given.
   blackbox_probe:
     type: prometheus_in
     scrape_targets: ["http://blackbox-exporter:9115/probe?module=http_2xx&target=http://nginx"]
@@ -95,7 +95,7 @@ components:
   #
   # `resource: drop` is the default, stated: no observed resource attribute leaves this pipeline,
   # and it is why the attribute counts are wire labels rather than wire labels +
-  # `instance`/`prometheus.target`.
+  # `instance`/`_logit.prometheus.target`.
   tap_node_exporter:
     type: shape
     sources: [node_exporter]

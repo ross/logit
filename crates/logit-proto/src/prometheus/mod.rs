@@ -59,21 +59,22 @@
 //! | `counter` sample (name verbatim, `_total` included) | `Sum { value, Cumulative, monotonic: true }` |
 //! | `gauge` | `Gauge(v)` |
 //! | `histogram` (`_bucket{le}` cumulative, `_sum`, `_count`) | `Histogram { buckets: per-bucket counts by successive difference, trailing `(+Inf, n)`, Cumulative, sum, min/max: None }` |
-//! | `gaugehistogram` (OM, `_gsum`/`_gcount`) | the same `Histogram`, plus `prometheus.type: "gaugehistogram"` |
+//! | `gaugehistogram` (OM, `_gsum`/`_gcount`) | the same `Histogram`, plus `_logit.prometheus.type: "gaugehistogram"` |
 //! | `summary` (`{quantile}`, `_sum`, `_count`) | `Summary { quantiles, count, sum }` |
-//! | `untyped` (text) / `unknown` (OM) / no `# TYPE` | `Gauge(v)` + `prometheus.type: "untyped"` \| `"unknown"` |
-//! | `info` (OM, `X_info{...} 1`) | `Gauge(1)` + `prometheus.type: "info"`, `name = X` (`_info` stripped) |
-//! | `stateset` (OM) | one `Gauge(0\|1)` per state line + `prometheus.type: "stateset"` |
+//! | `untyped` (text) / `unknown` (OM) / no `# TYPE` | `Gauge(v)` + `_logit.prometheus.type: "untyped"` \| `"unknown"` |
+//! | `info` (OM, `X_info{...} 1`) | `Gauge(1)` + `_logit.prometheus.type: "info"`, `name = X` (`_info` stripped) |
+//! | `stateset` (OM) | one `Gauge(0\|1)` per state line + `_logit.prometheus.type: "stateset"` |
 //! | `# HELP` / `# UNIT` | `description` / `unit` (interned) |
 //! | `_created` (OM) | `start_timestamp` (seconds → nanos) |
-//! | [`Point::Stale`] (remote-write's stale-marker NaN) | the family type's own kind with an empty payload -- `counter` → `Sum{NaN, Cumulative, monotonic}`, `gauge`/`unknown`/`untyped`/`info`/`stateset` → `Gauge(NaN)`, `histogram`/`gaugehistogram` → a bucket-less `Histogram`, `summary` → an empty `Summary` -- and **`flags = FLAG_NO_RECORDED_VALUE`**, which carries the meaning ([`logit_core::MetricRecord::flags`]). The `prometheus.type` marker is unchanged |
-//! | sample timestamp | `Event::timestamp` + `prometheus.timestamp: true`; absent → `received_at_nanos`, no marker. The marker says *the producer chose to expose a timestamp on this line*, so a transport that mandates one turns it off with [`PrometheusDecoder::with_timestamp_marker`]`(false)` and sets only the timestamp |
+//! | [`Point::Stale`] (remote-write's stale-marker NaN) | the family type's own kind with an empty payload -- `counter` → `Sum{NaN, Cumulative, monotonic}`, `gauge`/`unknown`/`untyped`/`info`/`stateset` → `Gauge(NaN)`, `histogram`/`gaugehistogram` → a bucket-less `Histogram`, `summary` → an empty `Summary` -- and **`flags = FLAG_NO_RECORDED_VALUE`**, which carries the meaning ([`logit_core::MetricRecord::flags`]). The `_logit.prometheus.type` marker is unchanged |
+//! | sample timestamp | `Event::timestamp` + `_logit.prometheus.timestamp: true`; absent → `received_at_nanos`, no marker. The marker says *the producer chose to expose a timestamp on this line*, so a transport that mandates one turns it off with [`PrometheusDecoder::with_timestamp_marker`]`(false)` and sets only the timestamp |
 //! | OM exemplar | `Exemplar { value, timestamp, trace, filtered_attributes }` -- `trace_id`/`span_id` labels become a [`logit_core::TraceRef`] when both are valid hex (consumed); every other exemplar label, and an invalid id, stays in `filtered_attributes`. Bucket exemplars all collect onto the one record. |
 //!
 //! ## Encode: events → families ([`events_to_families`])
 //!
 //! The inverse, plus the rules for model kinds Prometheus has no wire type for. Labels are
-//! `resource` attributes merged with event attributes (event wins), `prometheus.*` skipped.
+//! `resource` attributes merged with event attributes (event wins), private `_logit.*` keys
+//! skipped.
 //!
 //! | Model | Wire |
 //! |---|---|
@@ -81,18 +82,18 @@
 //! | `Sum{Cumulative, !monotonic}` | `gauge` -- Prometheus has no non-monotonic counter; `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}` |
 //! | a `Sum` or `Gauge` value, or an exemplar's value, of `I64`/`U64`/`Bool` | the sample's double, on both wires: an integer's nearest `f64`, a `Bool` `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}` |
 //! | `Sum{Delta}` / `Histogram{Delta}` | **dropped**, `logit.output.metrics.dropped{reason="unresolved_delta"}` + `warn_throttled("delta_temporality_unresolved")` -- put an `aggregate` with `temporality: cumulative` in front of the sink |
-//! | `Gauge` | `gauge`, or whatever `prometheus.type` says (consumed): `untyped`/`unknown`/`info`/`stateset` |
+//! | `Gauge` | `gauge`, or whatever `_logit.prometheus.type` says (consumed): `untyped`/`unknown`/`info`/`stateset` |
 //! | `GaugeDelta` | **dropped**, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` + `warn_throttled("gauge_delta_unresolved")` (the same counter and greppable key every other sink uses) |
-//! | `Histogram{Cumulative}` | `histogram`: running-sum buckets, `+Inf` = total, `_sum` only when `Some`; `min`/`max` dropped (known-gaps row); `prometheus.type: "gaugehistogram"` → `_gsum`/`_gcount` |
+//! | `Histogram{Cumulative}` | `histogram`: running-sum buckets, `+Inf` = total, `_sum` only when `Some`; `min`/`max` dropped (known-gaps row); `_logit.prometheus.type: "gaugehistogram"` → `_gsum`/`_gcount` |
 //! | `Summary` | `summary` + `_created` (OM) |
 //! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_sum` + `_count`; `_sum` is [`DdSketch::sum`], exact unlike a quantile (approximate only when [`DdSketch::stats_exact`] is `false`, i.e. the sketch's stats were derived from its bins) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
 //! | `Samples` | `Samples::sketch()`, then exactly as above -- `degraded{metric_kind="samples"}` |
 //! | `Set` / `SetMembers` | `gauge` of `estimate()` / the distinct member count -- `degraded{metric_kind="set"\|"set_members"}` |
 //! | `ExponentialHistogram` | for exposition, **skipped**, `logit.output.metrics.skipped{metric_kind="exponential_histogram"}`: neither text dialect has native-histogram syntax. For remote-write ([`PrometheusEncoder::with_destination`]), **dropped**, `logit.output.metrics.dropped{reason="native_histogram"}`: the wire carries native histograms, and this codec doesn't map them yet |
 //! | `flags & NO_RECORDED_VALUE` | **skipped**, `logit.output.metrics.skipped{reason="no_recorded_value"}` (`MetricRecord::flags`' own doc: every non-OTLP sink must treat a flagged point as carrying no reading) -- unless [`PrometheusEncoder::with_stale_markers`]`(true)`, see the row below |
-//! | `flags & NO_RECORDED_VALUE` on a `Gauge` or `Sum`, with [`PrometheusEncoder::with_stale_markers`]`(true)` | [`Point::Stale`] in the family the kind would have chosen anyway (`Sum{monotonic}` → `counter`, `Sum{!monotonic}` → `gauge` + `degraded{metric_kind="non_monotonic_sum"}`, `Gauge` → `gauge` or whatever `prometheus.type` says). Temporality is ignored on this path: a stale marker has no value to be delta about. A flagged `Histogram`/`Summary`/`ExponentialHistogram`/sketch/set stays on the skip row above -- those expand to several derived series and one flag says nothing about which of them existed (`docs/known-gaps/mappings.md`) |
+//! | `flags & NO_RECORDED_VALUE` on a `Gauge` or `Sum`, with [`PrometheusEncoder::with_stale_markers`]`(true)` | [`Point::Stale`] in the family the kind would have chosen anyway (`Sum{monotonic}` → `counter`, `Sum{!monotonic}` → `gauge` + `degraded{metric_kind="non_monotonic_sum"}`, `Gauge` → `gauge` or whatever `_logit.prometheus.type` says). Temporality is ignored on this path: a stale marker has no value to be delta about. A flagged `Histogram`/`Summary`/`ExponentialHistogram`/sketch/set stays on the skip row above -- those expand to several derived series and one flag says nothing about which of them existed (`docs/known-gaps/mappings.md`) |
 //! | exemplars | carried onto the family; [`text`] emits them on `_total`/`_bucket` lines in OpenMetrics only, at most one per line, each on the bucket its own value falls in. One that has no line left to sit on -- a counter's second exemplar, two in one bucket's range, one over OpenMetrics' 128-code-point label budget -- is dropped, `logit.output.metrics.degraded{reason="exemplar_omitted"}` (text 0.0.4 drops all of them uncounted: that is the operator's dialect choice, not a lossy mapping) |
-//! | `Event::timestamp` | emitted only when `prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
+//! | `Event::timestamp` | emitted only when `_logit.prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.omitted{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `omitted{reason="unrepresentable"}` path |
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.omitted{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is omitted -- `logit.output.labels.omitted{reason="reserved"}` |
 //! | two names sanitizing onto one wire name | the family whose *model* name sorts first is exposed, the rest are **dropped** -- `logit.output.metrics.dropped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug |
@@ -101,14 +102,15 @@
 //! | two records, one name, different family types | the first record's type wins, the rest are **dropped**, `logit.output.metrics.dropped{reason="type_conflict"}` -- one name cannot carry two `# TYPE` lines |
 //! | `EventBatch::scope`, `Resource::schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
 //!
-//! ## Well-known attributes (`prometheus.*`) and target identity
+//! ## Well-known attributes (`_logit.prometheus.*`) and target identity
 //!
 //! Rule (b) of [ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md) -- the raw,
 //! protocol-native fact rides alongside the normalized model field and wins on the way back out.
-//! Every `prometheus.*` attribute is *consumed* by the encode side (never rendered as a label) and
-//! appears as an ordinary tag at every other sink. A private `_logit.` attribute is never a label
-//! either, and never counted
-//! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
+//! Every `_logit.prometheus.*` attribute is private
+//! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)):
+//! the encode side never renders it as a label, and every other sink leaves it off its wire. Like
+//! any private `_logit.` attribute, it's never counted. An attribute spelled
+//! `prometheus.<name>` without the prefix is an ordinary label.
 //! `docs/design/data-model.md`'s well-known-attribute table is the canonical list; in short:
 //! [`ATTR_TYPE`] (`Value::Str`) names the wire family type the model has no distinct kind for;
 //! [`ATTR_TIMESTAMP`] (`Value::Bool(true)`) means "this sample carried its own timestamp";
@@ -188,15 +190,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// The wire family type the model has no distinct kind for (`untyped`, `unknown`, `info`,
 /// `stateset`, `gaugehistogram`) -- see the module doc's well-known-attribute section.
-pub const ATTR_TYPE: &str = "prometheus.type";
+pub const ATTR_TYPE: &str = "_logit.prometheus.type";
 /// `Value::Bool(true)`: this sample carried its own timestamp on the wire, so the encode side
 /// re-emits one on that line (and only on that line).
-pub const ATTR_TIMESTAMP: &str = "prometheus.timestamp";
-/// The full scrape URL -- a **resource** attribute stamped by `prometheus_in`, consumed here like
-/// every other `prometheus.*` attribute.
-pub const ATTR_TARGET: &str = "prometheus.target";
+pub const ATTR_TIMESTAMP: &str = "_logit.prometheus.timestamp";
+/// The full scrape URL -- a **resource** attribute stamped by `prometheus_in`, private like every
+/// other `_logit.prometheus.*` attribute.
+pub const ATTR_TARGET: &str = "_logit.prometheus.target";
 /// `host:port` of the scraped target: an **unprefixed** resource attribute stamped by
-/// `prometheus_in`, *outside* the consumed `prometheus.*` namespace so it renders as
+/// `prometheus_in`, *outside* the private `_logit.` namespace so it renders as
 /// the `instance` label Prometheus's own scrape adds. Two targets exposing the same exporter stay
 /// distinct series through a relay because of it; an event-level `instance` wins over the
 /// resource's (`honor_labels` semantics), which the resource/event merge already gives.
@@ -218,15 +220,10 @@ pub fn is_stale_nan(value: f64) -> bool {
     value.to_bits() == STALE_NAN_BITS
 }
 
-/// The `prometheus.` prefix every well-known attribute above shares; the encode side skips the
-/// whole namespace when building labels rather than matching the four names individually, so a
-/// later addition is automatically not leaked onto the wire as a label.
-const ATTR_PREFIX: &str = "prometheus.";
-
 /// A family's wire type. `Untyped` and `Unknown` are the same *semantics* (an unannotated sample)
 /// under two dialect spellings, kept apart so `prometheus_in -> prometheus_out` re-emits the
-/// spelling it received (`prometheus.type` carries it through the model). Each dialect writes the
-/// other's spelling as its own -- see [`text`]'s module doc.
+/// spelling it received (`_logit.prometheus.type` carries it through the model). Each dialect
+/// writes the other's spelling as its own -- see [`text`]'s module doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FamilyType {
     Counter,
@@ -246,7 +243,7 @@ pub enum FamilyType {
 }
 
 impl FamilyType {
-    /// The `# TYPE` keyword for this type in its own dialect -- also the `prometheus.type`
+    /// The `# TYPE` keyword for this type in its own dialect -- also the `_logit.prometheus.type`
     /// attribute value for the five types the model has no distinct kind for.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -279,8 +276,8 @@ impl FamilyType {
         })
     }
 
-    /// Whether this type needs a `prometheus.type` marker attribute to survive the model: the five
-    /// types that all decode onto a plain `Gauge`/`Histogram` and would otherwise be
+    /// Whether this type needs a `_logit.prometheus.type` marker attribute to survive the model:
+    /// the five types that all decode onto a plain `Gauge`/`Histogram` and would otherwise be
     /// indistinguishable from one on the way back out.
     fn needs_marker(self) -> bool {
         matches!(
@@ -409,8 +406,8 @@ impl PrometheusDecoder {
         Self::default()
     }
 
-    /// Whether [`families_to_events`] stamps `prometheus.timestamp: true` on a series that carried
-    /// its own timestamp. Default `true`, for a scrape: an exposition sample's timestamp is
+    /// Whether [`families_to_events`] stamps `_logit.prometheus.timestamp: true` on a series that
+    /// carried its own timestamp. Default `true`, for a scrape: an exposition sample's timestamp is
     /// optional, so its presence is a producer choice worth preserving across a round trip.
     ///
     /// A remote-write receiver sets this `false`. Every remote-write sample carries a timestamp, so
@@ -590,7 +587,7 @@ impl PrometheusEncoder {
     }
 
     /// Whether every series gets `Series::timestamp = Some(event.timestamp)` regardless of the
-    /// `prometheus.timestamp` marker. Default `false`, the mirror of
+    /// `_logit.prometheus.timestamp` marker. Default `false`, the mirror of
     /// [`PrometheusDecoder::with_timestamp_marker`]: exposition timestamps are optional, so only a
     /// sample that arrived with one gets one back.
     ///
@@ -605,8 +602,8 @@ impl PrometheusEncoder {
     /// marker, and a bare NaN sample would read as a real reading of NaN.
     ///
     /// A remote-write sender sets this `true`. Only single-series kinds convert (`Gauge`, `Sum`,
-    /// and a `prometheus.type`-marked gauge); a flagged `Histogram`, `Summary` or sketch kind stays
-    /// skipped and counted, for the reason the module doc's encode table gives.
+    /// and a `_logit.prometheus.type`-marked gauge); a flagged `Histogram`, `Summary` or sketch
+    /// kind stays skipped and counted, for the reason the module doc's encode table gives.
     pub fn with_stale_markers(mut self, stale: bool) -> Self {
         self.stale_markers = stale;
         self
@@ -1117,9 +1114,9 @@ fn record_to_point(
     })
 }
 
-/// The wire family type a `prometheus.type` attribute names, when the event carries one this codec
-/// recognizes -- the five types the model has no distinct kind for (see the module doc's well-known
-/// attribute section).
+/// The wire family type a `_logit.prometheus.type` attribute names, when the event carries one this
+/// codec recognizes -- the five types the model has no distinct kind for (see the module doc's
+/// well-known attribute section).
 fn declared_type(event: &Event) -> Option<FamilyType> {
     event.attributes.get(ATTR_TYPE).and_then(|v| v.as_str()).and_then(FamilyType::from_keyword)
 }
@@ -1202,8 +1199,8 @@ pub(crate) fn cumulative_counts(buckets: &[(f64, u64)]) -> (Vec<(f64, u64)>, u64
     (out, running)
 }
 
-/// Resource attributes merged with event attributes (event wins on a collision), `prometheus.*`
-/// skipped, each name sanitized, each value stringified -- the label set for one series.
+/// Resource attributes merged with event attributes (event wins on a collision), private `_logit.*`
+/// keys skipped, each name sanitized, each value stringified -- the label set for one series.
 ///
 /// Ordering and collision resolution are decided on the **rendered** label names, not on `Symbol`
 /// order: the emitted label set is sorted by the name that appears on the wire, and when two
@@ -1225,7 +1222,7 @@ fn build_labels(
     let mut candidates: Vec<(&str, Cow<'_, str>, String)> = Vec::new();
     for (key, value) in logit_core::attrs::merged(resource, event) {
         let key = resolve(key);
-        if key.starts_with(ATTR_PREFIX) || logit_core::attrs::is_private(key) {
+        if logit_core::attrs::is_private(key) {
             continue;
         }
         // A repeated DogStatsD tag key arrives as a `Value::Array` in wire order
@@ -1766,7 +1763,7 @@ mod tests {
             assert_eq!(families[0].series[0].point, expected_point, "marker {marker}");
             assert!(
                 families[0].series[0].labels.is_empty(),
-                "`prometheus.*` attributes are consumed, never rendered as labels"
+                "`_logit.prometheus.*` attributes are consumed, never rendered as labels"
             );
         }
     }
@@ -2127,8 +2124,8 @@ mod tests {
         );
     }
 
-    /// Target identity is *not* in the consumed namespace: `instance` renders, `prometheus.target`
-    /// does not.
+    /// Target identity is *not* in the private namespace: `instance` renders,
+    /// `_logit.prometheus.target` does not.
     #[test]
     fn the_instance_resource_attribute_renders_while_prometheus_target_is_consumed() {
         let resource = resource_with(&[
@@ -2140,6 +2137,19 @@ mod tests {
             encode(&resource, &event)[0].series[0].labels,
             labels(&[("instance", "node-exporter:9100")])
         );
+    }
+
+    /// Only the private prefix is skipped: an attribute spelled `prometheus.<name>` with no
+    /// `_logit.` in front is an ordinary label, as it is at every other sink.
+    #[test]
+    fn an_unprefixed_prometheus_dotted_attribute_renders_as_a_label() {
+        let event = event_with(
+            &[("prometheus.type", Value::from("x"))],
+            record("m", MetricKind::gauge(1.0)),
+        );
+        let families = encode(&Resource::default(), &event);
+        assert_eq!(families[0].kind, FamilyType::Gauge);
+        assert_eq!(families[0].series[0].labels, labels(&[("prometheus_type", "x")]));
     }
 
     #[test]

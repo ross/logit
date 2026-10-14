@@ -157,7 +157,7 @@
 //!   that loses a *reading* rather than a rendering of one;
 //! - `Untyped` is spelled `Unknown` on both versions: the metadata enums have one value for "no
 //!   type", so a text 0.0.4 relay's `untyped` comes back as `unknown`. Both decode to the same
-//!   `Gauge` + `prometheus.type` marker and both write as `untyped` in text 0.0.4;
+//!   `Gauge` + `_logit.prometheus.type` marker and both write as `untyped` in text 0.0.4;
 //! - a counter's value sample gains `_total` when the model name lacks it, as in both exposition
 //!   dialects;
 //! - 1.0 drops `Series::created` (above);

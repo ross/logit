@@ -160,20 +160,20 @@
 //!
 //! **Labels stay labels.** `instance` and `job` arrive as ordinary labels (both optional per spec,
 //! neither structurally distinguished on the wire) and stay ordinary event attributes, verbatim.
-//! Nothing is lifted into `Resource` and no `prometheus.target` is stamped, the opposite of scrape
-//! mode, because each mode knows something different: a scrape connected to the target it names,
-//! while a receiver observed a TCP connection from a sender that may be relaying for thousands of
-//! targets. Promoting a payload label to resource identity would invent structure the wire did
-//! not carry and change the label set a remote-write → remote-write relay re-emits. An operator
-//! who wants resource identity adds it with a downstream `set` component or Lua.
+//! Nothing is lifted into `Resource` and no `_logit.prometheus.target` is stamped, the opposite of
+//! scrape mode, because each mode knows something different: a scrape connected to the target it
+//! names, while a receiver observed a TCP connection from a sender that may be relaying for
+//! thousands of targets. Promoting a payload label to resource identity would invent structure the
+//! wire did not carry and change the label set a remote-write → remote-write relay re-emits. An
+//! operator who wants resource identity adds it with a downstream `set` component or Lua.
 //!
 //! **Timestamps and timestamp groups.** A remote-write `TimeSeries` is one label set and N
 //! samples; a `Series` holds one point and one timestamp. So the codec partitions a request's
 //! samples by timestamp and returns one family list per distinct timestamp in ascending order
 //! (`logit_proto::prometheus::remote_write`'s own doc), and this receiver concatenates them into
 //! one batch: N events per series, in timestamp order. `Event::timestamp` comes from the sample,
-//! and the decoder runs with `with_timestamp_marker(false)`, so **no `prometheus.timestamp: true`
-//! attribute is set**: that marker records a *producer's choice* to expose a timestamp on an
+//! and the decoder runs with `with_timestamp_marker(false)`, so **no `_logit.prometheus.timestamp:
+//! true` attribute is set**: that marker records a *producer's choice* to expose a timestamp on an
 //! exposition line, and a transport that mandates one is not that choice. Setting it would make a
 //! remote-write → exposition relay stamp an explicit timestamp on every line it writes, which no
 //! scrape of the same data would have produced.
@@ -382,8 +382,8 @@ const USER_AGENT_VALUE: &str = concat!("logit/", env!("CARGO_PKG_VERSION"));
 pub use logit_pipeline::tls::TlsClientSettings;
 
 /// One configured scrape target: the URL to `GET`, its [`redact_url`]ed form (for everything that
-/// isn't the request itself: diagnostics text, `prometheus.target`), and the `Resource` every
-/// batch built from it carries. Built once in [`PrometheusInput::new`].
+/// isn't the request itself: diagnostics text, `_logit.prometheus.target`), and the `Resource`
+/// every batch built from it carries. Built once in [`PrometheusInput::new`].
 #[derive(Clone)]
 struct Target {
     url: String,
@@ -413,20 +413,20 @@ fn instance_of(index: usize, url: &str) -> String {
 }
 
 /// `url` with its userinfo (`user:pass@`) and query string stripped: what everything but the
-/// scrape request itself (`prometheus.target`, every `scrape_failed` diagnostic) uses. `reqwest`
-/// turns `http://user:pass@host/metrics` into an `Authorization` header, but the configured
-/// `String` still holds the password, and `prometheus.target` reaches every sink the pipeline
-/// routes to (InfluxDB tags, statsd tag sets, a forwarded OTLP resource, a stdout/file render).
-/// The query string goes too, since `?token=...` is as real a credential shape. The fragment is
-/// kept. Parsing also normalizes the result (host lowercased, a default port dropped), which is
-/// harmless for a valid absolute URL.
+/// scrape request itself (`_logit.prometheus.target`, every `scrape_failed` diagnostic) uses.
+/// `reqwest` turns `http://user:pass@host/metrics` into an `Authorization` header, but the
+/// configured `String` still holds the password, and `_logit.prometheus.target` rides the batch to
+/// every sink the pipeline routes to. A protocol sink leaves a private attribute off its wire, but
+/// a stdout or file render and the native hop carry it. The query string goes too, since `?token=...` is as real a credential shape. The
+/// fragment is kept. Parsing also normalizes the result (host lowercased, a default port dropped),
+/// which is harmless for a valid absolute URL.
 ///
 /// Falls back to `<unparseable target #{index}>`, never the raw `url` and never a placeholder
 /// shared across targets. Rule 40 (`logit-pipeline::graph`) only approximates a URL grammar
 /// (scheme plus non-empty authority), so `http://999.999.999.999/metrics`,
 /// `http://[::1/metrics`, `http://host:99999/metrics`, or a host with a space or an invalid
 /// percent-escape reaches this function; `index` (the target's position in `scrape_targets`)
-/// keeps two such targets from colliding onto one `instance`/`prometheus.target` and merging
+/// keeps two such targets from colliding onto one `instance`/`_logit.prometheus.target` and merging
 /// their series.
 fn redact_url(index: usize, url: &str) -> String {
     match reqwest::Url::parse(url) {
@@ -2299,13 +2299,13 @@ mod tests {
             Some(addr.to_string().as_str())
         );
         assert_eq!(
-            batch.resource.attributes.get("prometheus.target").and_then(|v| v.as_str()),
+            batch.resource.attributes.get("_logit.prometheus.target").and_then(|v| v.as_str()),
             Some(url.as_str())
         );
     }
 
-    /// `prometheus.target` never carries a scrape URL's userinfo or query string, while the request
-    /// itself still authenticates with them.
+    /// `_logit.prometheus.target` never carries a scrape URL's userinfo or query string, while the
+    /// request itself still authenticates with them.
     #[tokio::test]
     async fn the_prometheus_target_attribute_strips_userinfo_and_query() {
         let (addr, captured) = canned_server(CannedResponse::Body {
@@ -2322,8 +2322,12 @@ mod tests {
         input.tick(&fanout).await;
 
         let batch = recv_batch(&mut rx).await;
-        let target =
-            batch.resource.attributes.get("prometheus.target").and_then(|v| v.as_str()).unwrap();
+        let target = batch
+            .resource
+            .attributes
+            .get("_logit.prometheus.target")
+            .and_then(|v| v.as_str())
+            .unwrap();
         assert_eq!(target, format!("http://{addr}/metrics"), "got: {target}");
         assert!(!target.contains("pass"), "got: {target}");
         assert!(!target.contains("token"), "got: {target}");
@@ -2480,8 +2484,8 @@ mod tests {
     }
 
     /// Two targets that pass rule 40 but fail `reqwest::Url::parse` (`redact_url`'s doc lists the
-    /// shapes) get distinct `instance`/`prometheus.target` values, so their `up=0` series don't
-    /// collapse downstream.
+    /// shapes) get distinct `instance`/`_logit.prometheus.target` values, so their `up=0` series
+    /// don't collapse downstream.
     #[test]
     fn two_unparseable_targets_get_distinct_resources() {
         let input = PrometheusInput::new(
@@ -2498,7 +2502,11 @@ mod tests {
             .targets
             .iter()
             .map(|t| {
-                t.resource.attributes.get("prometheus.target").and_then(|v| v.as_str()).unwrap()
+                t.resource
+                    .attributes
+                    .get("_logit.prometheus.target")
+                    .and_then(|v| v.as_str())
+                    .unwrap()
             })
             .collect();
         assert_ne!(target_attrs[0], target_attrs[1], "got: {target_attrs:?}");
@@ -3040,7 +3048,7 @@ mod tests {
     }
 
     /// Three samples of one series become **one** batch of three events in ascending timestamp
-    /// order, none carrying the `prometheus.timestamp` marker.
+    /// order, none carrying the `_logit.prometheus.timestamp` marker.
     #[tokio::test]
     async fn a_multi_timestamp_request_becomes_one_ordered_batch_with_no_timestamp_marker() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -3937,7 +3945,7 @@ mod tests {
             "three wire series, one model record: {:#?}",
             batch.events
         );
-        // No `prometheus.type` marker: `MetricKind::Histogram` *is* the type, and the marker
+        // No `_logit.prometheus.type` marker: `MetricKind::Histogram` *is* the type, and the marker
         // exists only for the family types the model has no kind of its own for.
         assert_eq!(batch.events[0].attributes.get(ATTR_TYPE), None);
 
