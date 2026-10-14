@@ -29,11 +29,13 @@ host-matched user on top of `ci`.
 - **The tag is content-addressed.** It is the first 12 hex characters of `Dockerfile.dev`'s
   sha256. A tag that already exists is never overwritten, so a tag always names one toolchain.
 - **`ci.yml` names the tag literally**, because a `container.image` expression can't call
-  `hashFiles`. `advisories.yml` runs in the same image and names the same tag
-  ([ADR `advisories-off-the-pr-gate`](advisories-off-the-pr-gate.md)), so a tag bump edits both
-  files. Its first step runs `script/ci-image check`, which compares the hash recorded in
+  `hashFiles`. Its first step runs `script/ci-image check`, which compares the hash recorded in
   the image (`/etc/logit-ci-image`) with the checked-out `Dockerfile.dev` and fails the job on a
-  mismatch. CI therefore never runs a toolchain the repo no longer declares.
+  mismatch. `ci.yml` therefore never runs a toolchain the repo no longer declares.
+  `advisories.yml` runs in the same image and names the same tag
+  ([ADR `advisories-off-the-pr-gate`](advisories-off-the-pr-gate.md)), so a tag bump edits both
+  files. It has no `check` step, so that guard doesn't catch a stale tag there; a reviewer of the
+  bump does.
 - **The package links to the repo** through the `org.opencontainers.image.source` label, as the
   release image does, so it inherits the repo's visibility.
 - **Changing `Dockerfile.dev` takes one PR.** The edit changes the hash, so the PR's own CI fails
