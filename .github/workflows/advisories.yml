@@ -36,6 +36,9 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
+          # The container runs as root over a workspace the runner user owns, and checkout's
+          # safe.directory entry doesn't outlive its step.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           if git diff --quiet "$BASE_SHA" HEAD -- Cargo.lock deny.toml; then
             echo "Cargo.lock and deny.toml are unchanged; skipping the advisory check."
@@ -71,6 +74,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      # create-pull-request runs git here, as root over a workspace the runner user owns.
+      - name: Trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       # Runs only `cargo update` and `cargo deny`, neither of which compiles code or runs a build
       # script. Keep it that way: a later step in this job holds a token that can push.
