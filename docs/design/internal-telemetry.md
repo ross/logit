@@ -1593,19 +1593,31 @@ With a `span:` block, `.spans{id="present"|"minted"}` (count) alongside `.lifted
 minted `SpanRecord`'s id came from the line or from `mint_id`. This is the `kv_metrics`
 `.derived`/`.derived.skipped` pattern applied to lifting a trace context.
 
-##### Filters: `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`
+##### Filters: `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`
 
 `crates/logit-transforms/src/signals.rs`, `crates/logit-transforms/src/attributes.rs`,
-`crates/logit-transforms/src/provenance.rs`;
+`crates/logit-transforms/src/provenance.rs`, `crates/logit-transforms/src/stale.rs`;
 [ADR `attribute-filtering-components`](../adr/attribute-filtering-components.md),
-[ADR `provenance-filtering-components`](../adr/provenance-filtering-components.md).
+[ADR `provenance-filtering-components`](../adr/provenance-filtering-components.md),
+[ADR `stale-event-filtering`](../adr/stale-event-filtering.md).
 
-None of the seven counts the events it removes: the runtime's `logit.component.events.discarded`
+None of the nine counts the events it removes: the runtime's `logit.component.events.discarded`
 does, under the filter's own id. `keep_signals`/`drop_signals` record
 `logit.transform.payloads.stripped{signal}` (count), one per payload slot cleared, because
-the event survives a strip; no other filter mutates a forwarded event, so the other five record
-nothing of their own. None has `Diagnostics`, because matching a fixed set or clearing a fixed
-signal set can't fail.
+the event survives a strip. `has_stale`/`drop_stale` record why an event was classed stale (below).
+No other filter mutates a forwarded event or has a reason to give, so the other five record
+nothing of their own. Only `drop_stale` has `Diagnostics`; matching a fixed set or clearing a fixed
+signal set can't fail, and `has_stale` discarding fresh events is its normal work.
+
+`has_stale`/`drop_stale` record two counters, both emitted only when nonzero:
+
+- `logit.transform.stale.exceeded{bound="max_age"|"max_ahead"}` (count): one per event classed
+  stale, by the bound it crossed.
+- `logit.transform.stale.unjudged` (count): one per event with no time to judge (an instant of 0),
+  which `drop_stale` forwards and `has_stale` discards.
+
+`drop_stale` also emits a throttled diagnostic, key `stale_event`, carrying the observed age and
+the bound crossed.
 
 `has_attributes`/`drop_attributes` deliberately have **no cache-miss counter** for their
 resource-match cache (`Matcher`, `Set::map_resource`'s `Arc::ptr_eq` idiom applied to a read).

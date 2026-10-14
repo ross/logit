@@ -81,7 +81,10 @@ Three rules hold across the vocabulary:
   `logit.transform.events.filtered` duplicates `events.discarded` on every filter and `sample`,
   so it's removed. `logit.transform.sample.decisions{outcome, by}` stays, because `by` says why,
   with the outcome `dropped` renamed `discarded`. `logit.transform.payloads.stripped{signal}`
-  stays, because the event survives a strip.
+  stays, because the event survives a strip. `logit.transform.stale.exceeded{bound}` and
+  `logit.transform.stale.unjudged` on `drop_stale` and `has_stale` follow the same rule: they say
+  why an event was discarded, which the untagged `events.discarded` can't
+  ([ADR `stale-event-filtering`](stale-event-filtering.md)).
 - **An unrouted event is a config error, not a count.** Graph rule 7 (a non-sink component needs a
   consumer) loses rule 50's router exemption: a router (`route`, or `lua` with `targets:`) needs an
   ordinary consumer, which receives every event no target claims. An operator who wants those

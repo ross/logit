@@ -107,6 +107,14 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## `aggregate`
 
+- **`aggregate` has no late-data handling.** Its windows are wall-clock, so a replay after an
+  outage (a sender's `buffer.disk:` spool, or a `tail_in` backlog restamped by `timestamp`)
+  merges into the current window whatever the events' age. Put `drop_stale` before `aggregate` to discard what is older than
+  `max_age`, or `has_stale` to archive it
+  ([ADR `stale-event-filtering`](../adr/stale-event-filtering.md)).
+  - **Trade-off:** under `temporality: cumulative`, merging a late delta keeps the running total
+    correct (`increase()` is right, `rate()` spikes), while discarding it leaves the total low by
+    the counted amount.
 - **Nothing bounds how many series one window holds.** `max_retained_series` caps only what
   survives a flush. Within a window every distinct `(name, unit, attribute set)` opens a series,
   and memory grows with that count until the flush drains it.
