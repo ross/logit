@@ -107,9 +107,9 @@ it stays public under `influxdb.field.`, and any sink may render it.
 | `_logit.influxdb.bucket` | resource | `Str` | the request's `bucket` query parameter |
 
 A tag key under the private `_logit.` prefix is omitted, counted
-`logit.input.tags.omitted{reason="reserved_prefix"}` (normalization 12), as on every metric-wire
-decoder (the private namespace ADR's inbound guard). A tag key under `influxdb.field.` would read
-back as a string field, so it's omitted and counted the same way. Any other tag key under
+`logit.input.tags.omitted{reason="reserved_prefix"}` (normalization 12), as on each of the five
+tag-bearing metric wires (the private namespace ADR's inbound guard). A tag key under
+`influxdb.field.` would read back as a string field, so it's omitted and counted the same way. Any other tag key under
 `influxdb.` is an ordinary tag.
 
 ### Egress, with and without the carrier
