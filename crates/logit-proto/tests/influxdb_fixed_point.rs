@@ -25,7 +25,7 @@
 //!   and instant (normalization 2 would merge them).
 
 use bytes::Bytes;
-use logit_core::interner::intern;
+use logit_core::interner::{intern, resolve};
 use logit_core::{
     AttrMap, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Value,
 };
@@ -355,9 +355,9 @@ fn assert_crash_input_is_a_fixed_point(input: &[u8], unencodable: usize) {
     assert_eq!(encode(&batch(decoded)), encoded, "encode(decode(encode(b))) == encode(b)");
 }
 
-/// The field key `\r` has no spelling and drops, which leaves the NUL-led key first after the
-/// space before the fields, where influxd skips a NUL as whitespace: written, the line reads as a
-/// missing field key. A field key starting with a tab or NUL is dropped wherever it falls.
+/// The field key `\r` has no spelling and drops, which leaves the NUL-led key the line's only
+/// field, first after the space before the fields, where influxd skips a NUL as whitespace:
+/// written, the line reads as a missing field key, so it drops too.
 #[test]
 fn a_field_key_starting_with_a_nul_is_never_written() {
     assert_crash_input_is_a_fixed_point(b":a \r=0,\0=0", 2);
@@ -369,19 +369,84 @@ fn a_field_key_starting_with_a_nul_after_an_escaped_newline_is_never_written() {
     assert_crash_input_is_a_fixed_point(b"\nE \\\n=-0,\0=4", 2);
 }
 
-/// A measurement or field key starting with a tab or NUL loses that byte where influxd skips
-/// whitespace, so it is dropped and counted; the rest of the batch survives.
+/// Encodes `source` and returns the decoded events, each event's metrics sorted by name, with the
+/// `unencodable_key` count: a field whose key starts with a tab or NUL may move (normalization 4).
+fn round_trip_by_key(source: &EventBatch) -> (Vec<Event>, usize, Bytes) {
+    let mut encoder = InfluxLineEncoder::default();
+    let encoded = encoder.encode(source).expect("the encoder never fails a batch");
+    let dropped = encoder.stats().dropped_unencodable_key;
+    (sorted_by_key(decode(encoded.clone(), &source.resource)), dropped, encoded)
+}
+
+fn sorted_by_key(mut events: Vec<Event>) -> Vec<Event> {
+    for event in &mut events {
+        event.metrics.sort_by_key(|m| resolve(m.name).to_owned());
+    }
+    events
+}
+
+/// A measurement starting with a tab or NUL loses that byte at the line's start, where influxd
+/// skips whitespace, so it is dropped and counted; the rest of the batch survives. A field key
+/// starting with one beside a plain key is kept, written second.
 #[test]
 fn a_measurement_or_field_key_starting_with_a_tab_or_nul_is_dropped() {
     let neighbor = point("n", &[], &[("f", MetricValue::I64(1))], &[], 6);
+    let kept = point("m", &[], &[("\tf", MetricValue::I64(1)), ("g", MetricValue::I64(2))], &[], 5);
     let source = batch(vec![
         point("\tm", &[], &[("f", MetricValue::I64(1))], &[], 5),
         point("\0m", &[], &[("f", MetricValue::I64(1))], &[], 5),
-        point("m", &[], &[("\tf", MetricValue::I64(1)), ("\0g", MetricValue::I64(1))], &[], 5),
+        kept.clone(),
         neighbor.clone(),
     ]);
-    let mut encoder = InfluxLineEncoder::default();
-    let encoded = encoder.encode(&source).expect("the encoder never fails a batch");
-    assert_eq!(encoder.stats().dropped_unencodable_key, 4, "wire: {encoded:?}");
-    assert_eq!(decode(encoded.clone(), &source.resource), vec![neighbor], "wire: {encoded:?}");
+    let (decoded, dropped, encoded) = round_trip_by_key(&source);
+    assert_eq!(dropped, 2, "wire: {encoded:?}");
+    assert_eq!(decoded, sorted_by_key(vec![kept, neighbor]), "wire: {encoded:?}");
+}
+
+/// After the `,` between fields influxd skips nothing, so a field key starting with a tab or NUL
+/// reads back whole anywhere but first: the encoder writes a plain-keyed field first, numeric or
+/// string, and every field round-trips with nothing dropped.
+#[test]
+fn a_tab_or_nul_led_field_key_is_written_after_a_plain_one() {
+    let source = batch(vec![
+        point("m", &[], &[("a", MetricValue::I64(1)), ("\0b", MetricValue::I64(2))], &[], 1),
+        point(
+            "m",
+            &[],
+            &[
+                ("\0b", MetricValue::I64(2)),
+                ("\tc", MetricValue::F64(0.5)),
+                ("a", MetricValue::I64(1)),
+            ],
+            &[],
+            2,
+        ),
+        point("m", &[], &[("\0b", MetricValue::Bool(true))], &[("s", "text")], 3),
+        point("m", &[], &[("a", MetricValue::U64(7))], &[("\ts", "text")], 4),
+    ]);
+    let (decoded, dropped, encoded) = round_trip_by_key(&source);
+    assert_eq!(dropped, 0, "wire: {encoded:?}");
+    assert_eq!(decoded, sorted_by_key(source.events.clone()), "wire: {encoded:?}");
+    let first = encoded.split(|&b| b == b'\n').next().unwrap();
+    assert_eq!(first, b"m a=1i,\0b=2i 1", "wire: {encoded:?}");
+}
+
+/// A line whose every field key starts with a tab or NUL has no field that can lead it: each
+/// field is dropped and counted, and no line is written.
+#[test]
+fn an_all_tab_or_nul_led_field_set_is_dropped() {
+    let neighbor = point("n", &[], &[("f", MetricValue::I64(1))], &[], 6);
+    let source = batch(vec![
+        point(
+            "m",
+            &[],
+            &[("\tf", MetricValue::I64(1)), ("\0g", MetricValue::I64(1))],
+            &[("\0s", "x")],
+            5,
+        ),
+        neighbor.clone(),
+    ]);
+    let (decoded, dropped, encoded) = round_trip_by_key(&source);
+    assert_eq!(dropped, 3, "wire: {encoded:?}");
+    assert_eq!(decoded, vec![neighbor], "wire: {encoded:?}");
 }

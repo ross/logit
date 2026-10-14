@@ -232,15 +232,17 @@ the same list with the same numbers, and the two lists must stay numbered alike:
    wire differ between processes.
 4. Field order: numeric and boolean fields leave in wire order (a field a later duplicate adds
    goes after the existing ones), and string fields leave after them, in an order the encoder
-   doesn't preserve. A field's identity is its key, so order carries no meaning at the receiver.
+   doesn't preserve. A field whose key starts with a tab or NUL is never written first. A field's
+   identity is its key, so order carries no meaning at the receiver.
 5. Number spelling: a float leaves as the shortest string that round-trips its `f64`, an integer
    keeps its `i` or `u` suffix, and a boolean leaves as `true` or `false` whatever spelling
    arrived.
 6. Escaping: the encoder writes only the escapes the grammar requires, so a backslash a sender
    wrote doubled leaves as it was read, and a key the grammar can't spell is left out, counted:
-   a measurement or field key starting with a tab or NUL, ending in `\`, or with `\` before a
-   delimiter is `metrics.dropped{reason="unencodable_key"}`, and a tag key or value ending in `\`
-   or with `\` before a space is `tags.omitted{reason="unencodable"}`.
+   a measurement starting with a tab or NUL, a field key starting with one on a line whose every
+   field key does, and a measurement or field key ending in `\` or with `\` before a delimiter
+   are `metrics.dropped{reason="unencodable_key"}`, and a tag key or value ending in `\` or with
+   `\` before a space is `tags.omitted{reason="unencodable"}`.
 7. Timestamps: every point leaves with a timestamp in nanoseconds, so `precision` isn't carried,
    and a point that arrived with none leaves with its receipt time (see item 14).
 8. Comments, blank lines, and runs of spaces are dropped. A CRLF line ending, a tab separator, and
@@ -270,9 +272,12 @@ tag key, tag value, and field key:
   is not an escape: it decodes to two backslashes. The encoder writes a backslash as itself and
   escapes only `,`, space, and (outside a measurement) `=`, each with one backslash.
 - A key that ends in a backslash has no spelling: the backslash would escape the delimiter. A
-  measurement or field key with a backslash before a delimiter has none either, and neither has
-  one starting with a tab or NUL: it starts where `influxd` skips whitespace, a line's start or the
-  run after the space before the fields, and loses that byte. A tag key or value has none with a
+  measurement or field key with a backslash before a delimiter has none either. A measurement
+  starting with a tab or NUL has none: it starts where `influxd` skips whitespace, at a line's
+  start, and loses that byte. The first field key starts where `influxd` skips whitespace too, in
+  the run after the space before the fields, but nothing is skipped after the `,` between fields,
+  so the encoder writes a field whose key starts with a tab or NUL after one whose key doesn't,
+  and drops it only when every field key on the line starts with one. A tag key or value has none with a
   backslash before a space, written as a `\\` pair that leaves the space bare and ends the tag
   section early. A backslash before `,` or `=` in a tag is written as `\\,` or `\\=`
   and reads back as written, because `influxd`'s line splitter counts `,` and `=` only after a bare
