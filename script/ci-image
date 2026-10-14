@@ -30,7 +30,7 @@ check)
     if [ "${BUILT}" != "${HASH}" ]; then
         echo "error: this CI image was built from Dockerfile.dev ${BUILT}, but the checkout's is ${HASH}." >&2
         echo "Dockerfile.dev changed: run the \"Publish CI image\" workflow (gh workflow run \"Publish CI image\" --ref <branch>)," >&2
-        echo "then set ci.yml's container image to ${REF}." >&2
+        echo "then set the container image in ci.yml and advisories.yml to ${REF}." >&2
         exit 1
     fi
     echo "OK: CI image matches Dockerfile.dev (${HASH})"

@@ -1,7 +1,10 @@
 #!/bin/bash
-# Usage: script/audit
-# Supply-chain checks: the license/ban policy in deny.toml, and known vulnerabilities across the
-# dependency graph.
+# Usage: script/audit [advisories|bans|licenses|sources ...]
+# Supply-chain checks through cargo-deny, against deny.toml's policy. With no arguments, runs all
+# four checks. `bans`, `licenses`, and `sources` depend only on the checkout, so script/cibuild
+# runs those. `advisories` reads the RustSec database as it is when the check runs, so a new
+# advisory can fail it with no change to the checkout; .github/workflows/advisories.yml runs it
+# (docs/adr/advisories-off-the-pr-gate.md).
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
@@ -12,5 +15,4 @@ if ! in_project_environment; then
     exit
 fi
 
-cargo deny check
-cargo audit
+cargo deny check "$@"

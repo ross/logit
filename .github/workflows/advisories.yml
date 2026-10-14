@@ -1,0 +1,143 @@
+name: Advisories
+
+# The RustSec advisory check, kept off ci.yml because a new advisory fails it with no change to the
+# checkout (docs/adr/advisories-off-the-pr-gate.md). A pull request runs it only when it changes
+# Cargo.lock or deny.toml; `main` runs it on every push and daily. When the daily or a manual run
+# on `main` fails, `fixup` opens a PR with semver-compatible bumps, or an issue for what a bump
+# can't clear.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # GitHub's cron is UTC: 09:00 UTC is 05:00 US Eastern during daylight saving time. A scheduled
+    # run can start late when GitHub is busy.
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    container:
+      # The same image as ci.yml's. A tag bump changes both files (docs/adr/ci-image-on-ghcr.md).
+      # script/common.sh detects $CI (set by GitHub Actions) and runs commands directly in it.
+      image: ghcr.io/ross/logit-ci:0827e2f8eb86
+    steps:
+      - uses: actions/checkout@v4
+
+      # The job always starts, because it can be a required check: a workflow-level `paths:`
+      # filter would leave a required check pending forever on a PR it skips.
+      - name: Check whether the PR changes Cargo.lock or deny.toml
+        id: scope
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          if git diff --quiet "$BASE_SHA" HEAD -- Cargo.lock deny.toml; then
+            echo "Cargo.lock and deny.toml are unchanged; skipping the advisory check."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check RustSec advisories
+        if: github.event_name != 'pull_request' || steps.scope.outputs.run == 'true'
+        run: ./script/audit advisories
+
+  fixup:
+    needs: advisories
+    # Without a status function, `if:` implies success() and the job would never run after a
+    # failure.
+    if: >-
+      failure()
+      && needs.advisories.result == 'failure'
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Holds ADVISORY_PR_TOKEN, and is restricted to `main`.
+    environment: advisories
+    concurrency:
+      group: advisories-fixup
+    permissions:
+      contents: read
+      issues: write
+    container:
+      image: ghcr.io/ross/logit-ci:0827e2f8eb86
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Runs only `cargo update` and `cargo deny`, neither of which compiles code or runs a build
+      # script. Keep it that way: a later step in this job holds a token that can push.
+      - name: Bump flagged crates within semver
+        id: fixup
+        env:
+          HAS_PR_TOKEN: ${{ secrets.ADVISORY_PR_TOKEN != '' }}
+        run: python3 .github/scripts/advisory_fixup.py "$RUNNER_TEMP/advisory-fixup"
+
+      # A PAT rather than GITHUB_TOKEN, because GitHub doesn't run workflows on a PR that
+      # GITHUB_TOKEN opens, and the PR needs CI.
+      - name: Open or update the fix-up PR
+        if: steps.fixup.outputs.pr == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.ADVISORY_PR_TOKEN }}
+          branch: fix/rustsec-advisories
+          base: main
+          add-paths: Cargo.lock
+          title: ${{ steps.fixup.outputs.title }}
+          commit-message: ${{ steps.fixup.outputs.title }}
+          body-path: ${{ steps.fixup.outputs.pr_body }}
+          author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          committer: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          delete-branch: true
+
+      # One open issue labeled `rustsec` at a time. A run comments on it only when the list
+      # differs from the last one posted, so a daily run doesn't repeat itself.
+      - name: Open or comment on the advisory issue
+        if: steps.fixup.outputs.issue == 'true'
+        uses: actions/github-script@v8
+        env:
+          BODY_PATH: ${{ steps.fixup.outputs.issue_body }}
+        with:
+          script: |
+            const fs = require('fs');
+            const listing = fs.readFileSync(process.env.BODY_PATH, 'utf8').trim();
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = `${listing}\n\nFrom [the advisories workflow](${run}).`;
+            const label = 'rustsec';
+            try {
+              await github.rest.issues.getLabel({ ...context.repo, name: label });
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              await github.rest.issues.createLabel({
+                ...context.repo, name: label, color: 'b60205',
+                description: 'Flagged by the RustSec advisory check',
+              });
+            }
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              ...context.repo, state: 'open', labels: label,
+            });
+            const issue = open.find((i) => !i.pull_request);
+            if (!issue) {
+              const created = await github.rest.issues.create({
+                ...context.repo, title: 'RustSec advisories need a hand fix', body, labels: [label],
+              });
+              core.info(`Opened ${created.data.html_url}`);
+              return;
+            }
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number: issue.number,
+            });
+            const last = comments.length ? comments[comments.length - 1].body : issue.body;
+            if ((last || '').startsWith(listing)) {
+              core.info(`${issue.html_url} already lists these advisories`);
+              return;
+            }
+            await github.rest.issues.createComment({ ...context.repo, issue_number: issue.number, body });
+            core.info(`Commented on ${issue.html_url}`);

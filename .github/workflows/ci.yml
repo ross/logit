@@ -14,7 +14,8 @@ jobs:
     container:
       # Dockerfile.dev's `ci` stage, published by the "Publish CI image" workflow and tagged by
       # Dockerfile.dev's hash (docs/adr/ci-image-on-ghcr.md). `script/ci-image tag` prints the
-      # tag for the checked-out Dockerfile.dev. script/common.sh detects $CI (set by GitHub
+      # tag for the checked-out Dockerfile.dev; advisories.yml names the same tag, so a bump
+      # changes both files. script/common.sh detects $CI (set by GitHub
       # Actions) and runs commands directly in it instead of `docker compose run`.
       image: ghcr.io/ross/logit-ci:0827e2f8eb86
     steps:

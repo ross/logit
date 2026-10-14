@@ -3,8 +3,8 @@ name: Publish CI image
 # Manual only (docs/adr/ci-image-on-ghcr.md). Builds the `ci` stage of Dockerfile.dev and pushes it
 # to `ghcr.io/ross/logit-ci`, tagged by Dockerfile.dev's hash; an existing tag is never
 # overwritten. Run it when Dockerfile.dev changes, from the Actions tab or
-# `gh workflow run "Publish CI image" --ref <branch>`, then set ci.yml's container image to the
-# tag it prints.
+# `gh workflow run "Publish CI image" --ref <branch>`, then set the container image in ci.yml and
+# advisories.yml to the tag it prints.
 on:
   workflow_dispatch:
 

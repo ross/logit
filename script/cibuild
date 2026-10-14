@@ -1,7 +1,9 @@
 #!/bin/bash
 # Usage: script/cibuild
-# Runs the checks CI runs, in the same order. .github/workflows/ci.yml calls this script rather
-# than duplicating its steps, so a clean local run means a clean CI run.
+# Runs the checks CI's build job runs, in the same order. .github/workflows/ci.yml calls this
+# script rather than duplicating its steps, so a clean local run means a clean build job. The
+# RustSec advisory check isn't here: it depends on the advisory database as well as the checkout,
+# so .github/workflows/advisories.yml runs it (`script/audit advisories` locally).
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
@@ -27,6 +29,6 @@ echo "## test ##################################################################
 "${SCRIPT_PATH}/test"
 
 echo "## supply chain ##################################################################"
-"${SCRIPT_PATH}/audit"
+"${SCRIPT_PATH}/audit" bans licenses sources
 
 echo "## complete ######################################################################"

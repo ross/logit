@@ -1,6 +1,6 @@
 ---
 created: 2026-10-09
-updated: 2026-10-09
+updated: 2026-10-14
 ---
 
 # Run CI in an image prebaked from `Dockerfile.dev` and published to GHCR
@@ -29,7 +29,9 @@ host-matched user on top of `ci`.
 - **The tag is content-addressed.** It is the first 12 hex characters of `Dockerfile.dev`'s
   sha256. A tag that already exists is never overwritten, so a tag always names one toolchain.
 - **`ci.yml` names the tag literally**, because a `container.image` expression can't call
-  `hashFiles`. Its first step runs `script/ci-image check`, which compares the hash recorded in
+  `hashFiles`. `advisories.yml` runs in the same image and names the same tag
+  ([ADR `advisories-off-the-pr-gate`](advisories-off-the-pr-gate.md)), so a tag bump edits both
+  files. Its first step runs `script/ci-image check`, which compares the hash recorded in
   the image (`/etc/logit-ci-image`) with the checked-out `Dockerfile.dev` and fails the job on a
   mismatch. CI therefore never runs a toolchain the repo no longer declares.
 - **The package links to the repo** through the `org.opencontainers.image.source` label, as the
@@ -37,7 +39,7 @@ host-matched user on top of `ci`.
 - **Changing `Dockerfile.dev` takes one PR.** The edit changes the hash, so the PR's own CI fails
   `check` until the new image exists. Dispatch the workflow on the PR's branch
   (`gh workflow run "Publish CI image" --ref <branch>`), which works once the workflow file is on
-  `main`, then bump the tag in `ci.yml` in the same PR. Only the first image needs two PRs,
+  `main`, then bump the tag in `ci.yml` and `advisories.yml` in the same PR. Only the first image needs two PRs,
   because the workflow file isn't on `main` until its PR merges.
 
 ## Alternatives considered
@@ -54,7 +56,7 @@ host-matched user on top of `ci`.
 
 ## Consequences
 - Every edit to `Dockerfile.dev`, comments included, changes the tag and needs a republish and a
-  `ci.yml` bump.
+  tag bump in `ci.yml` and `advisories.yml`.
 - The base image still comes from Docker Hub, but only in the manual publish job, not on every CI
   run.
 - The image holds no cargo registry, because the tool installs use build cache mounts.

@@ -158,8 +158,8 @@ The scripts run `sudo docker` by default. If your account is in the `docker` gro
 | `script/format [--check]` | Run `cargo fmt`. |
 | `script/schema` | Regenerate `schema/logit.schema.json` from the config types. |
 | `script/validate` | Run `logit validate` on every shipped config. |
-| `script/audit` | Run supply-chain checks (`cargo-deny`, `cargo-audit`). |
-| `script/cibuild` | Run the full CI sequence. |
+| `script/audit [checks]` | Run `cargo-deny`'s supply-chain checks: advisories, bans, licenses, and sources. |
+| `script/cibuild` | Run the CI build job's sequence. |
 | `script/console` | Open a shell in the dev container. |
 | `script/server [config]` | Start the local test stack and run `logit` against a config. |
 | `script/image [tag]` | Build the production image. |
@@ -190,8 +190,8 @@ you pass another config.
 ## Contributing
 
 Work on a branch and open a pull request; nobody commits to `main` directly. Run `script/cibuild`
-before you open the pull request, because it runs the same sequence as CI. A significant design
-decision gets an ADR in [docs/adr/](docs/adr), copied from
+before you open the pull request, because it runs the same sequence as CI's build job. A
+significant design decision gets an ADR in [docs/adr/](docs/adr), copied from
 [docs/adr/TEMPLATE.md](docs/adr/TEMPLATE.md). [AGENTS.md](AGENTS.md) has the branch and PR naming
 conventions and the constraints that tests enforce, such as exact allocation counts.
 
