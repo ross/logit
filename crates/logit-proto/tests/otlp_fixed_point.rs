@@ -77,7 +77,7 @@ fn exemplar() -> Exemplar {
     filtered_attributes.insert("dropped", "attr");
     Exemplar {
         timestamp: 1_700_000_000_100_000_000,
-        value: 3.5,
+        value: MetricValue::F64(3.5),
         trace: Some(TraceRef { trace_id: [7; 16], span_id: Some([6; 8]), flags: 0 }),
         filtered_attributes,
     }

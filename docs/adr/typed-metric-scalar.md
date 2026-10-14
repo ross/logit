@@ -43,7 +43,8 @@ variant.
   `COUNTER` and `ABSOLUTE` as `U64`, `DERIVE` as `I64`, and `GAUGE` as `F64`. The InfluxDB codec
   reads `1.0` as `F64`, `1i` as `I64`, `1u` as `U64`, and `true`/`false` as `Bool`. Every other
   decoder has an untyped wire and produces `F64`.
-- **Out of scope.** `Exemplar.value` stays `f64`, so an OTLP exemplar's `as_int` becomes a
+- **Out of scope.** (The exemplar part is superseded by the exemplar amendment below.)
+  `Exemplar.value` stays `f64`, so an OTLP exemplar's `as_int` becomes a
   new `docs/known-gaps/mappings.md` row. The multi-number kinds (`Samples`, `Distribution`,
   `Histogram`, `Summary`, and the rest) keep their `f64` fields: no protocol `logit` relays types
   their values.
@@ -134,8 +135,8 @@ replay into a newer one. `docs/design/wire-protocol.md` and the bake-off's wire 
 - **Closes two existing losses.** An OTLP `as_int` point relays as `as_int`, and a collectd
   `COUNTER` above 2^53 relays as the sender's number. `docs/known-gaps/mappings.md`'s
   `decode (collectd)` precision row closes, and new rows record `Bool` written as `1`/`0` at
-  numeric-only sinks, a `U64` above `i64::MAX` leaving OTLP as a double, and an OTLP exemplar's
-  `as_int` decoded as a double.
+  numeric-only sinks, a `U64` above `i64::MAX` leaving OTLP as a double, and (until the exemplar
+  amendment below) an OTLP exemplar's `as_int` decoded as a double.
 - `MetricValue` is expected to be 16 bytes and `Sum` to grow to 24, with `MetricKind` still bound
   by `Samples`'s size.
   `crates/logit-core/tests/type_sizes.rs` gains exact pins for both, and `docs/design/memory.md`
@@ -164,3 +165,29 @@ The Decision's decoder list names OTLP, collectd, and InfluxDB as the typed wire
 the wire, so `datadog_in` decodes each as a `Sum` of `U64` and `datadog_out` writes it back as is.
 The `logit.input.stats.degraded{reason="inexact_count"}` degradation that rounded a count above
 2^53 is gone with it. Every other decoder still produces `F64`.
+
+## Amendment: Exemplar values are typed (2026-10-13)
+
+The Decision's "Out of scope" item kept `Exemplar.value` as `f64`, on the grounds that an exemplar
+is a sampled illustration of a point, not the point. `Exemplar.value` is now a `MetricValue`.
+OTLP types an exemplar's value as `as_int` or `as_double`, and `otlp_in -> otlp_out` is a lossless
+pair under [ADR `lossless-transit`](lossless-transit.md), which that rationale doesn't override.
+The `docs/known-gaps/mappings.md` row that accepted an `as_int` above 2^53 decoding as an
+approximate double is gone.
+
+- **OTLP.** `otlp_in` decodes `as_int` as `I64` and `as_double` as `F64`. `otlp_out` applies the
+  Egress rule above unchanged, the one a `Sum` or `Gauge` point follows: `U64` above `i64::MAX`
+  leaves as `as_double`, counted `u64_as_double`, and `Bool` leaves as `1` or `0`, counted
+  `bool_value`.
+- **Native wire.** An exemplar's value is the typed scalar, the same type byte and 8 bytes as a
+  `Gauge` or `Sum` value, with no compatibility path for old frames.
+- **Prometheus.** Exposition and remote-write carry a double. `prometheus_in` decodes `F64`,
+  and `prometheus_out` writes `as_f64()` and counts a `Bool` `bool_value`, as for a `Sum` or `Gauge`.
+- **Render.** `stdio_out` writes an exemplar's value as it writes a `Sum`'s: a JSON integer for
+  `I64` and `U64`, a boolean for `Bool`, and `5 (i64)` in the human block.
+- **Lua.** An exemplar table from `to_table()` gains a `type` key beside `value` for a non-`f64`
+  value, and `Event.new` takes the same optional `type` on an exemplar table, parsed as a metric
+  value's `type` is.
+
+The multi-number kinds (`Samples`, `Distribution`, `Histogram`, `Summary`, and the rest) stay out
+of scope.

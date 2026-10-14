@@ -1864,8 +1864,18 @@ mod tests {
         let registry = logit_core::Registry::new();
         let mut record = MetricRecord::new(intern("hits"), cumulative_counter(2.0));
         record.exemplars = vec![
-            Exemplar { timestamp: 0, value: 1.0, trace: None, filtered_attributes: AttrMap::new() },
-            Exemplar { timestamp: 0, value: 2.0, trace: None, filtered_attributes: AttrMap::new() },
+            Exemplar {
+                timestamp: 0,
+                value: logit_core::MetricValue::F64(1.0),
+                trace: None,
+                filtered_attributes: AttrMap::new(),
+            },
+            Exemplar {
+                timestamp: 0,
+                value: logit_core::MetricValue::F64(2.0),
+                trace: None,
+                filtered_attributes: AttrMap::new(),
+            },
         ];
         let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_expire_after(Duration::ZERO)
@@ -3260,8 +3270,18 @@ mod tests {
         let telemetry = registry.telemetry_for("out", "prometheus_out", "sink");
         let mut record = MetricRecord::new(intern("hits"), cumulative_counter(2.0));
         record.exemplars = vec![
-            Exemplar { timestamp: 0, value: 1.0, trace: None, filtered_attributes: AttrMap::new() },
-            Exemplar { timestamp: 0, value: 2.0, trace: None, filtered_attributes: AttrMap::new() },
+            Exemplar {
+                timestamp: 0,
+                value: logit_core::MetricValue::F64(1.0),
+                trace: None,
+                filtered_attributes: AttrMap::new(),
+            },
+            Exemplar {
+                timestamp: 0,
+                value: logit_core::MetricValue::F64(2.0),
+                trace: None,
+                filtered_attributes: AttrMap::new(),
+            },
         ];
         let b = batch(vec![
             Event::metric(0, AttrMap::new(), record),

@@ -83,7 +83,12 @@ fn fixture_log() -> LogRecord {
 fn fixture_exemplar(trace: Option<TraceRef>) -> Exemplar {
     let mut filtered_attributes = AttrMap::new();
     filtered_attributes.insert("dropped", "attr");
-    Exemplar { timestamp: 1_700_000_000_100_000_000, value: 3.5, trace, filtered_attributes }
+    Exemplar {
+        timestamp: 1_700_000_000_100_000_000,
+        value: logit_core::MetricValue::F64(3.5),
+        trace,
+        filtered_attributes,
+    }
 }
 
 /// A `Sum` carrying `description`/`start_timestamp`/two exemplars (one with a trace, one

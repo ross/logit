@@ -73,7 +73,12 @@ fn span_with_ext_batch() -> EventBatch {
 fn otlp_exemplar(trace: Option<TraceRef>) -> Exemplar {
     let mut filtered_attributes = AttrMap::new();
     filtered_attributes.insert("dropped", "attr");
-    Exemplar { timestamp: 1_700_000_000_100_000_000, value: 3.5, trace, filtered_attributes }
+    Exemplar {
+        timestamp: 1_700_000_000_100_000_000,
+        value: logit_core::MetricValue::I64(3),
+        trace,
+        filtered_attributes,
+    }
 }
 
 /// A `Gauge` flagged `FLAG_NO_RECORDED_VALUE`: the "point kept, flagged, not skipped" shape

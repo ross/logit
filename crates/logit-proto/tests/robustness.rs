@@ -43,7 +43,8 @@
 
 use bytes::{Bytes, BytesMut};
 use logit_core::{
-    AttrMap, Event, EventBatch, Exemplar, LogRecord, Provenance, Resource, Severity, Value,
+    AttrMap, Event, EventBatch, Exemplar, LogRecord, MetricValue, Provenance, Resource, Severity,
+    Value,
 };
 use logit_proto::frame::{self, Compression};
 use logit_proto::framing::{FrameError, Framer, FramingMode, Oversize, MAX_FRAME_BYTES};
@@ -2961,7 +2962,7 @@ type Arm = (&'static str, fn(usize) -> Vec<u8>, f64);
 
 // `docs/design/wire-protocol.md`'s "Decode amplification" table, element by element.
 const RATIO_EVENT: f64 = 864.0;
-const RATIO_EXEMPLAR: f64 = 440.0;
+const RATIO_EXEMPLAR: f64 = 448.0;
 const RATIO_MAP_VALUE: f64 = 144.0;
 const RATIO_SPAN_EVENT: f64 = 89.6;
 const RATIO_SET_MEMBER: f64 = 32.0;
@@ -3431,7 +3432,12 @@ fn remote_write_counter(
 }
 
 fn remote_write_exemplar(timestamp: i64) -> Exemplar {
-    Exemplar { timestamp, value: 1.0, trace: None, filtered_attributes: AttrMap::new() }
+    Exemplar {
+        timestamp,
+        value: MetricValue::F64(1.0),
+        trace: None,
+        filtered_attributes: AttrMap::new(),
+    }
 }
 
 fn assert_remote_write_fixed_point(body: &[u8], version: remote_write::Version) {
