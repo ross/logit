@@ -129,6 +129,23 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** send OTel spans with `otlp_out`, to the Agent's OTLP receiver or to Datadog.
   - **Revisit trigger:** the Agent-equivalent trace processor the plan defers
     ([plan §14](../plans/datadog-relay.md#14-not-in-this-stack-an-agent-equivalent-trace-processor)).
+- **`datadog_trace_out` sends every numeric span attribute as a Datadog `metrics` entry.** The
+  span encoder puts each `F64`, `I64`, and `U64` attribute in the span's `metrics` map, and strings,
+  bools (as `"true"` or `"false"`), and every other value in `meta`. That is right for a span
+  `datadog_trace_in` decoded, because the decoder stores a tracer's `metrics` map as `F64`
+  attributes and its `meta` map as strings (the mapping table in `logit_proto::datadog`). It is
+  wrong for a span from any other source: an OTel span's integer attribute such as
+  `http.response.status_code` (`I64`) leaves in `metrics`, so Datadog doesn't offer it as a span
+  tag. The sink counts an integer that doesn't convert exactly
+  (`degraded{reason="int_as_f64"}`) but not this misclassification. The decode side counts
+  `key_collision` and has no such gap.
+  - **Consequence:** numeric attributes from OTel-origin and Lua-authored spans can't be used as
+    tags in Datadog's span search and filters.
+  - **Workaround:** a `lua` stage ahead of `datadog_trace_out` that rewrites the integer
+    attributes you want as tags into strings.
+  - **Revisit trigger:** a user who needs numeric OTel attributes as Datadog tags. Possible fixes,
+    not decided: a typed home for span metrics (a `metrics` map on `SpanExt`), or a rule that
+    depends on where the span came from.
 - **`datadog_out` sends no Agent-style `h`/`ms` aggregates, and no explicit-bucket
   `Histogram`.** An Agent turns a DogStatsD `h` or `ms` into `.avg`, `.count`, `.median`,
   `.95percentile`, and `.max` series. `aggregate` in front of `datadog_out` sends a sketch
