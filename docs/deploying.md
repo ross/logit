@@ -2776,8 +2776,8 @@ trace rather than dropping priority-0 ones, which would leave them out of the re
 
 **Tracer headers become resource attributes.** `Datadog-Meta-Lang`, `-Lang-Version`,
 `-Tracer-Version`, `Datadog-Container-ID`, and the tracer's other identity and client-computation
-headers land on the batch resource as `datadog.tracer.*`, which `datadog_trace_out` writes back as
-headers. For `/v0.7/traces`, the payload's own fields win over a header.
+headers land on the batch resource as `_logit.datadog.tracer.*`, which `datadog_trace_out` writes
+back as headers. For `/v0.7/traces`, the payload's own fields win over a header.
 
 **The Unix socket.** `socket:` binds a Unix stream socket, as the Agent's `receiver_socket` does.
 The directory must already exist. A stale socket file from an earlier run is replaced, but a path
@@ -3160,19 +3160,19 @@ producer's resend of the whole body repeats nothing. A `503` with `Retry-After: 
 pipeline didn't take the body within 5 seconds and nothing of it was taken, counted
 `logit.input.batches.deferred`; the producer keeps the body and resends it.
 
-**What arrives.** Each point becomes one event with its tags as attributes and `influxdb.measurement` naming the
-measurement. Each numeric or boolean field becomes a gauge named `MEASUREMENT.FIELD`, and each
-string field an `influxdb.field.FIELD` attribute.
-`org`, `orgID`, and `bucket` become the resource attributes `influxdb.org`, `influxdb.org_id`, and
-`influxdb.bucket`. Use `route` on `influxdb.bucket` to send each bucket to its own
-`influxdb_out`, since `influxdb_out` writes to the one org and bucket in its own config and
-ignores the resource attributes. `crates/logit-proto/src/influxdb/mod.rs`'s module doc has the
-mapping table.
+**What arrives.** Each point becomes one event with its tags as attributes and the private
+attribute `_logit.influxdb.measurement` naming the measurement. Each numeric or boolean field
+becomes a gauge named `MEASUREMENT.FIELD`, and each string field an `influxdb.field.FIELD`
+attribute. `org`, `orgID`, and `bucket` become the private resource attributes
+`_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. Use `route` on
+`_logit.influxdb.bucket` to send each bucket to its own `influxdb_out`, since `influxdb_out`
+writes to the one org and bucket in its own config and ignores the resource attributes. No sink
+writes a `_logit.` attribute as a tag or label.
+`crates/logit-proto/src/influxdb/mod.rs`'s module doc has the mapping table.
 
-**Remove the carrier ahead of other sinks.** `influxdb.measurement` and `influxdb.field.*` are
-ordinary attributes everywhere but `influxdb_out`, so `prometheus_out` and `graphite_out` write
-them as labels or tags. Add a `remove` stage for them on any leg that doesn't end in
-`influxdb_out`.
+**Remove string fields ahead of other sinks.** `influxdb.field.*` attributes are ordinary
+attributes everywhere but `influxdb_out`, so `prometheus_out` and `graphite_out` write them as
+labels or tags. Add a `remove` stage for them on any leg that doesn't end in `influxdb_out`.
 
 **A destination fault never reaches the producer.** `influxdb_in` answers `204` once the batch is
 in every downstream inbox, before `influxdb_out` writes it. A `422` for a field type conflict
@@ -3183,8 +3183,9 @@ retries), are all invisible to the producer, which believes its writes succeeded
 **What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
 answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened. A nonzero
 `logit.input.tags.omitted{reason="reserved_prefix"}` means a producer sends a tag key starting
-with `influxdb.` or `_logit.`, which the decoder leaves off the point because it would collide
-with a carrier. `statsd_in`, `graphite_in`, `datadog_in`, and `prometheus_in`'s remote-write
+with `_logit.` or `influxdb.field.`, which the decoder leaves off the point because it would
+collide with a carrier or a string field. `statsd_in`, `graphite_in`, `datadog_in`, and
+`prometheus_in`'s remote-write
 receiver emit the same counter for a `_logit.` key. A sustained `logit.input.batches.deferred` means the pipeline isn't keeping up. A nonzero
 `logit.input.connections.rejected{reason="limit"}` means the `max_connections` cap is binding.
 `docs/design/internal-telemetry.md`'s `influxdb_in` section has every counter.

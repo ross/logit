@@ -96,10 +96,10 @@
 //!
 //! An element [`tag_value`] can't render (`Null`, `Bytes`, `Timestamp`, `Map`, a nested `Array`)
 //! is skipped and counted `EncodeStats::tags_omitted_unrepresentable` **per element**; an array
-//! whose every element drops emits no tag and leaves no stray `,`. A tag named `statsd.type` in the
-//! `#` segment can decode to an `Array` too; it matches no [`Carriers`] arm (each expects a
-//! `Value::Str`/`Value::U64`) and is filtered out of the tag segment uncounted, like any
-//! wrong-typed carrier.
+//! whose every element drops emits no tag and leaves no stray `,`. A `_logit.statsd.*` carrier
+//! holding an `Array` (set from Lua, or relayed from another protocol) matches no [`Carriers`] arm
+//! (each expects a `Value::Str`/`Value::U64`) and is filtered out of the tag segment uncounted,
+//! like any wrong-typed carrier.
 //!
 //! ## Metric-kind coverage
 //!
@@ -145,8 +145,8 @@
 //! Every `|g` component goes through the negative-gauge path ("Negative absolute gauges" below):
 //! `-0` writes `0`, and a negative value is the indivisible `0|g` + `-v|g` pair. A `|c`
 //! component needs no pair. `aggregate` re-emits a series' attributes, so an expanded
-//! `Distribution` still carries `statsd.type`; expansion ignores it, since it names the wire type
-//! of samples that are gone.
+//! `Distribution` still carries `_logit.statsd.type`; expansion ignores it, since it names the wire
+//! type of samples that are gone.
 //!
 //! An expanded line is an ordinary metric line. It carries the event's `|#` tags and dialect
 //! extras, and never `@<rate>`: a summary already absorbed each sample's rate, and a rate on a
@@ -266,18 +266,20 @@
 //!
 //! ## `|c:<container-id>` and `|T<timestamp>`
 //!
-//! Both are DogStatsD-only line extensions this sink round-trips. `statsd.container_id` (a
+//! Both are DogStatsD-only line extensions this sink round-trips. `_logit.statsd.container_id` (a
 //! `Value::Str` `statsd_in` stamps from an incoming `|c:<id>`) renders as `|c:<id>`, sanitized like
-//! a tag value so an embedded `:` survives. `statsd.timestamp == Value::U64(secs)` (the raw wire
-//! seconds `statsd_in` stamps alongside setting `Event::timestamp`) renders as `|T<secs>` **from
-//! the carrier, never from `event.timestamp`**: a stage that rebuilds `Event::timestamp` after
-//! decode (`aggregate`'s flush) can't fabricate or collapse a `|T`, since the carrier rides on the
-//! series key like any other attribute. A `statsd.timestamp` that isn't a `Value::U64` (reachable
-//! from a cross-protocol relay or Lua, never from `statsd_in`) isn't emitted.
+//! a tag value so an embedded `:` survives. `_logit.statsd.timestamp == Value::U64(secs)` (the raw
+//! wire seconds `statsd_in` stamps alongside setting `Event::timestamp`) renders as `|T<secs>`
+//! **from the carrier, never from `event.timestamp`**: a stage that rebuilds `Event::timestamp`
+//! after decode (`aggregate`'s flush) can't fabricate or collapse a `|T`, since the carrier rides
+//! on the series key like any other attribute. A `_logit.statsd.timestamp` that isn't a
+//! `Value::U64` (reachable from a cross-protocol relay or Lua, never from `statsd_in`) isn't
+//! emitted.
 //!
-//! `statsd.external_data` and `statsd.cardinality` (DogStatsD v1.5's `|e:` and v1.6's `|card:`)
-//! round-trip the same way as `|c:`: a `Value::Str` carrier. Cardinality is sanitized like a tag
-//! value; external data keeps its own `,` separators ([`is_forbidden_in_external_data`]).
+//! `_logit.statsd.external_data` and `_logit.statsd.cardinality` (DogStatsD v1.5's `|e:` and v1.6's
+//! `|card:`) round-trip the same way as `|c:`: a `Value::Str` carrier. Cardinality is sanitized
+//! like a tag value; external data keeps its own `,` separators
+//! ([`is_forbidden_in_external_data`]).
 //!
 //! On a metric line the segments follow the tag segment, in the order `|c:`, `|e:`, `|card:`, `|T`
 //! (`append_dialect_extras`), the order the `datadog` Python client writes them in
@@ -287,24 +289,23 @@
 //! order. Under `Format::Statsd` none has
 //! anywhere to go, so each is omitted and counted (`EncodeStats::omitted_dialect_fields`).
 //!
-//! `statsd.*` attributes (`statsd.type`, `statsd.container_id`, `statsd.timestamp`, and the
-//! rest) are protocol-namespaced carriers, not tags: `build_tag_suffix` filters the prefix out of
-//! the `|#k:v,...` segment, as `syslog_out` never re-emits its own `syslog.*` attributes as
-//! SD-ELEMENT fields. The same merged resource⊕event walk captures every carrier into
-//! [`EncodeCtx`], so a
-//! carrier set only on the resource (a `set` transform's `resource:` block, say) is honored like
-//! an event-level one. `append_dialect_extras`/`statsd_wire_type` read `EncodeCtx`, never
-//! `event.attributes`, which keeps the filter and the read symmetric. A private `_logit.` attribute
-//! is skipped too, uncounted under either dialect (ADR `private-attribute-namespace`).
+//! `_logit.statsd.*` attributes (`_logit.statsd.type`, `_logit.statsd.container_id`,
+//! `_logit.statsd.timestamp`, and the rest) are this sink's own carriers, not tags:
+//! `build_tag_suffix` reads them by exact name and keeps them out of the `|#k:v,...` segment, as it
+//! keeps out every other private `_logit.` attribute, uncounted under either dialect (ADR
+//! `private-attribute-namespace`). The same merged resource⊕event walk captures every carrier into
+//! [`EncodeCtx`], so a carrier set only on the resource (a `set` transform's `resource:` block,
+//! say) is honored like an event-level one. `append_dialect_extras`/`statsd_wire_type` read
+//! `EncodeCtx`, never `event.attributes`, which keeps the filter and the read symmetric.
 //!
 //! ## DogStatsD events and service checks
 //!
-//! An **event** is `event.log.is_some()` *and* `statsd.event.title` present as a `Value::Str` (the
-//! shape `statsd_in`'s `parse_event` produces), the event's value winning over the resource's as
-//! in `crate::attrs::merged`. A **service check** is `statsd.service_check.name` present as a
-//! `Value::Str`. [`StatsdEncoder::encode_into`] detects them in two tiers, split on
-//! `event.metrics.is_empty()`, because most metrics-empty events are plain log/span lines with no
-//! `statsd.*` carrier at all:
+//! An **event** is `event.log.is_some()` *and* `_logit.statsd.event.title` present as a
+//! `Value::Str` (the shape `statsd_in`'s `parse_event` produces), the event's value winning over
+//! the resource's as in `crate::attrs::merged`. A **service check** is
+//! `_logit.statsd.service_check.name` present as a `Value::Str`. [`StatsdEncoder::encode_into`]
+//! detects them in two tiers, split on `event.metrics.is_empty()`, because most metrics-empty
+//! events are plain log/span lines with no `_logit.statsd.*` carrier at all:
 //!
 //! - A metrics-empty event gets one *unmerged* [`is_dogstatsd_event`] lookup (event attributes,
 //!   then resource). The common "not an event" case skips [`build_tag_suffix`]'s full merged walk
@@ -313,38 +314,39 @@
 //! - An event with metrics (a service check, or an ordinary metric event) always runs the full
 //!   walk, and service-check detection reads `Carriers::service_check_name` off it.
 //!
-//! Either way the full walk into [`Carriers`] is where `statsd.type`/`statsd.container_id`/
-//! `statsd.timestamp` are captured too, so `event.attributes` is never read a second time.
+//! Either way the full walk into [`Carriers`] is where
+//! `_logit.statsd.type`/`_logit.statsd.container_id`/`_logit.statsd.timestamp` are captured too,
+//! so `event.attributes` is never read a second time.
 //!
 //! **Event wire form**, one line: `_e{tlen,xlen}:title|text`, then, in this order and only when
-//! present and valid: `|d:<secs>` (from the `statsd.timestamp` carrier; `d:`, never `|T`, since an
-//! event's timestamp is a named field of its own grammar), `|h:<host>`, `|p:<priority>`
+//! present and valid: `|d:<secs>` (from the `_logit.statsd.timestamp` carrier; `d:`, never `|T`,
+//! since an event's timestamp is a named field of its own grammar), `|h:<host>`, `|p:<priority>`
 //! (`normal`/`low` only), `|t:<alert_type>` (`info`/`success`/`warning`/`error` only),
 //! `|k:<aggregation_key>`, `|s:<source_type>`, the `|#...` tag segment (via
 //! [`build_tag_suffix`]/[`append_tags`], as for a metric line), then `|c:<container id>`,
-//! `|e:<external data>`, `|card:<cardinality>`. `title`
-//! is `statsd.event.title`; `text` is the log `message`, which must be a `Value::Str` (anything
-//! else drops the event, counted `EncodeStats::dropped_unencodable_value`), with every real `\n`
-//! escaped to the two bytes `\n` (`statsd_in`'s `unescape_event_text` is the mirror). `tlen`/`xlen`
-//! are the *byte* lengths of the sanitized title and escaped text: `parse_event` slices by those
-//! byte counts, so a char count would corrupt a multi-byte title or text. Severity is never
-//! re-derived from `LogRecord.severity` to synthesize a missing `t:` field: under rule (b)
-//! (`docs/adr/lossless-transit.md`) the raw carrier outranks the normalized field on this
-//! protocol's own egress, and an absent carrier means an absent wire field.
+//! `|e:<external data>`, `|card:<cardinality>`. `title` is `_logit.statsd.event.title`; `text` is
+//! the log `message`, which must be a `Value::Str` (anything else drops the event, counted
+//! `EncodeStats::dropped_unencodable_value`), with every real `\n` escaped to the two bytes `\n`
+//! (`statsd_in`'s `unescape_event_text` is the mirror). `tlen`/`xlen` are the *byte* lengths of the
+//! sanitized title and escaped text: `parse_event` slices by those byte counts, so a char count
+//! would corrupt a multi-byte title or text. Severity is never re-derived from `LogRecord.severity`
+//! to synthesize a missing `t:` field: under rule (b) (`docs/adr/lossless-transit.md`) the raw
+//! carrier outranks the normalized field on this protocol's own egress, and an absent carrier means
+//! an absent wire field.
 //!
 //! **Service-check wire form**, one line: `_sc|<name>|<status>`, then `|d:<secs>`, `|h:<host>`,
 //! the `|#...` tag segment, `|c:<container id>`, `|e:<external data>`, `|card:<cardinality>`, and
-//! last `|m:<message>`, the reference order. The event's **first** metric is the check and must be a
-//! `Gauge`; otherwise the whole event is dropped and counted
-//! (`EncodeStats::dropped_invalid_service_check`) rather than falling through to a `name:v|g`
-//! line, since the point is the check, not a gauge that shares its value. `name` is the
-//! `statsd.service_check.name` carrier, **not** the metric's normalized name (rule (b) again),
-//! sanitized with [`is_forbidden_in_extended_field`] rather than [`is_forbidden_in_name`], so it
-//! keeps `.` and spaces as sent. `status` is `statsd.service_check.status` when it's a `U64` in
-//! `0..=3`, else the gauge's value if finite and rounding into `0..=3`, else the check is dropped
-//! and counted (`dropped_invalid_service_check`) rather than written with a status DogStatsD's own
-//! decoder would reject. Metrics after the first render as ordinary lines (`render_metric`) right
-//! after the `_sc` line.
+//! last `|m:<message>`, the reference order. The event's **first** metric is the check and must be
+//! a `Gauge`; otherwise the whole event is dropped and counted
+//! (`EncodeStats::dropped_invalid_service_check`) rather than falling through to a `name:v|g` line,
+//! since the point is the check, not a gauge that shares its value. `name` is the
+//! `_logit.statsd.service_check.name` carrier, **not** the metric's normalized name (rule (b)
+//! again), sanitized with [`is_forbidden_in_extended_field`] rather than [`is_forbidden_in_name`],
+//! so it keeps `.` and spaces as sent. `status` is `_logit.statsd.service_check.status` when it's a
+//! `U64` in `0..=3`, else the gauge's value if finite and rounding into `0..=3`, else the check is
+//! dropped and counted (`dropped_invalid_service_check`) rather than written with a status
+//! DogStatsD's own decoder would reject. Metrics after the first render as ordinary lines
+//! (`render_metric`) right after the `_sc` line.
 //!
 //! **Sanitization**, one rule per field, all substitution:
 //!
@@ -371,9 +373,9 @@
 //! tallied into `tags_omitted_dialect`: both counters incrementing for one skipped line is
 //! expected, not a double count.
 //!
-//! `statsd.event.*`/`statsd.service_check.*` are carriers like `statsd.type`: the same
-//! `key_str.starts_with("statsd.")` check in [`build_tag_suffix`] keeps them out of every line's
-//! `|#k:v,...` segment.
+//! `_logit.statsd.event.*`/`_logit.statsd.service_check.*` are carriers like `_logit.statsd.type`:
+//! the same `key_str.starts_with("_logit.statsd.")` check in [`build_tag_suffix`] keeps them out of
+//! every line's `|#k:v,...` segment.
 
 use crate::accounting::BatchAccounting;
 use crate::count_request;
@@ -443,8 +445,8 @@ pub struct EncodeStats {
     pub degraded_kinds: KindCounts,
     /// One bucket for every kind of unencodable input: a non-finite value in a
     /// `Samples`/`Sum`/`Gauge`/`GaugeDelta`; an empty `Samples`/`SetMembers` record; or an event
-    /// whose log `message` isn't a UTF-8 `Value::Str`, or whose `statsd.event.title` isn't valid
-    /// UTF-8 ([`is_dogstatsd_event`] accepts any `Value::Str`), which drops the whole event
+    /// whose log `message` isn't a UTF-8 `Value::Str`, or whose `_logit.statsd.event.title` isn't
+    /// valid UTF-8 ([`is_dogstatsd_event`] accepts any `Value::Str`), which drops the whole event
     /// ([`render_event`]). An out-of-range `Samples.sample_rate` or an out-of-set event
     /// priority/alert type still emits its line, so it counts in [`Self::omitted_invalid_values`]
     /// instead.
@@ -459,14 +461,15 @@ pub struct EncodeStats {
     /// or whose key is empty or sanitizes to nothing. Counted **per wire tag**, as
     /// [`Self::tags_omitted_dialect`] is. See the module doc's "Multi-value tags" section.
     pub tags_omitted_unrepresentable: usize,
-    /// A timer's `h`/`d` wire type (`statsd.type`) collapsed to `ms` under `Format::Statsd`.
+    /// A timer's `h`/`d` wire type (`_logit.statsd.type`) collapsed to `ms` under `Format::Statsd`.
     /// Counted once per `Samples` record, not per split line.
     pub type_normalized_dialect: usize,
     /// A `Bool` metric value written as `1` or `0`: the statsd wire has no boolean. Counted
     /// once per value.
     pub bool_values: usize,
-    /// `statsd.container_id`/`statsd.external_data`/`statsd.cardinality`/`statsd.timestamp`
-    /// omitted under `Format::Statsd` (`append_dialect_extras`), from a line that is still sent. Counted once per field per emitted line, so a negative-gauge pair
+    /// `_logit.statsd.container_id`, `_logit.statsd.external_data`, `_logit.statsd.cardinality`,
+    /// and `_logit.statsd.timestamp` omitted under `Format::Statsd` (`append_dialect_extras`), from
+    /// a line that is still sent. Counted once per field per emitted line, so a negative-gauge pair
     /// or a multi-member `SetMembers` record counts once per physical line.
     pub omitted_dialect_fields: usize,
     /// A `SetMembers` member that differs from its raw bytes after lossy UTF-8 and
@@ -476,7 +479,7 @@ pub struct EncodeStats {
     /// wire form: the operator's choice of dialect, so `messages.skipped`, not a loss. See the module doc's "DogStatsD events and service checks" section.
     pub skipped_dialect_events: usize,
     /// A service check whose first metric isn't a `Gauge`, or with no status in `0..=3` from either
-    /// the `statsd.service_check.status` carrier or the gauge's rounded value. See
+    /// the `_logit.statsd.service_check.status` carrier or the gauge's rounded value. See
     /// [`render_service_check`].
     pub dropped_invalid_service_check: usize,
     /// A field omitted from a line that is still emitted because its value is out of range: an
@@ -657,7 +660,7 @@ impl FramedEncoder for StatsdEncoder {
         for event in &batch.events {
             if event.metrics.is_empty() {
                 // Usually a plain log/span line, rarely a DogStatsD event; telling them apart
-                // needs only `statsd.event.title`, not the full merged walk (module doc's
+                // needs only `_logit.statsd.event.title`, not the full merged walk (module doc's
                 // "DogStatsD events and service checks" section).
                 if !is_dogstatsd_event(&batch.resource, event) {
                     stats.skipped_no_metrics += 1;
@@ -790,9 +793,9 @@ impl FramedEncoder for StatsdEncoder {
     }
 }
 
-/// Whether a metrics-empty event is a DogStatsD event: a log carrying `statsd.event.title` as a
-/// `Value::Str`, the event's value winning over the resource's as in `crate::attrs::merged`. At
-/// most two `AttrMap::get` lookups (each a binary search, not a scan), so a plain log line skips
+/// Whether a metrics-empty event is a DogStatsD event: a log carrying `_logit.statsd.event.title`
+/// as a `Value::Str`, the event's value winning over the resource's as in `crate::attrs::merged`.
+/// At most two `AttrMap::get` lookups (each a binary search, not a scan), so a plain log line skips
 /// [`build_tag_suffix`]'s walk over every attribute. Gates only the metrics-empty path of
 /// [`StatsdEncoder::encode_into`].
 fn is_dogstatsd_event(resource: &Resource, event: &Event) -> bool {
@@ -801,8 +804,8 @@ fn is_dogstatsd_event(resource: &Resource, event: &Event) -> bool {
     }
     let title = event
         .attributes
-        .get("statsd.event.title")
-        .or_else(|| resource.attributes.get("statsd.event.title"));
+        .get("_logit.statsd.event.title")
+        .or_else(|| resource.attributes.get("_logit.statsd.event.title"));
     matches!(title, Some(Value::Str(_)))
 }
 
@@ -826,8 +829,8 @@ struct EncodeCtx<'a> {
     out: &'a mut MessageBuf,
 }
 
-/// Out-parameter for [`build_tag_suffix`]'s merged walk: the `statsd.*` carriers, captured as
-/// they're filtered out of the tag segment, so the read and the filter stay symmetric. Separate
+/// Out-parameter for [`build_tag_suffix`]'s merged walk: the `_logit.statsd.*` carriers, captured
+/// as they're filtered out of the tag segment, so the read and the filter stay symmetric. Separate
 /// from [`EncodeCtx`] because `EncodeCtx::tag_suffix` borrows the `String` `build_tag_suffix` still
 /// holds `&mut` while capturing.
 #[derive(Debug, Default, Clone, Copy)]
@@ -837,15 +840,15 @@ struct Carriers<'a> {
     external_data: Option<&'a str>,
     cardinality: Option<&'a str>,
     timestamp_secs: Option<u64>,
-    /// `statsd.event.title`, present only if valid UTF-8. [`is_dogstatsd_event`] detects an event
-    /// by the raw attribute, so this can be `None` on a detected event.
+    /// `_logit.statsd.event.title`, present only if valid UTF-8. [`is_dogstatsd_event`] detects an
+    /// event by the raw attribute, so this can be `None` on a detected event.
     event_title: Option<&'a str>,
     event_priority: Option<&'a str>,
     event_alert_type: Option<&'a str>,
     event_aggregation_key: Option<&'a str>,
     event_source_type: Option<&'a str>,
     event_host: Option<&'a str>,
-    /// `statsd.service_check.name`; its presence is the service-check detection rule.
+    /// `_logit.statsd.service_check.name`; its presence is the service-check detection rule.
     service_check_name: Option<&'a str>,
     service_check_status: Option<u64>,
     service_check_message: Option<&'a str>,
@@ -858,8 +861,8 @@ struct Carriers<'a> {
 /// stays empty and every would-be wire tag counts into `stats.tags_omitted_dialect`.
 ///
 /// Each tag goes through [`push_one_tag`], once per scalar attribute and once per **element** of a
-/// `Value::Array` (module doc's "Multi-value tags"). The same walk captures the `statsd.*` carriers
-/// into `carriers`.
+/// `Value::Array` (module doc's "Multi-value tags"). The same walk captures the `_logit.statsd.*`
+/// carriers into `carriers`.
 fn build_tag_suffix<'a>(
     suffix: &mut String,
     scratch: &mut String,
@@ -872,57 +875,58 @@ fn build_tag_suffix<'a>(
     suffix.clear();
     for (key, value) in crate::attrs::merged(resource, event) {
         let key_str = logit_core::interner::resolve(key);
-        // `statsd.*` attributes are protocol carriers `statsd_in` stamps from a line's own
-        // segments, emitted through their own segments, so never also as tags. Not counted as a
-        // drop: the carrier is being used, not lost (`syslog_out` filters `syslog.*` the same way).
-        if key_str.starts_with("statsd.") {
+        // This sink's own carriers, which `statsd_in` stamps from a line's own segments and this
+        // sink emits through those segments, so never also as tags. Not counted as a drop: the
+        // carrier is being used, not lost. Every other private key falls to the next arm.
+        if key_str.starts_with("_logit.statsd.") {
             match (key_str, value) {
-                ("statsd.type", Value::Str(s)) => {
+                ("_logit.statsd.type", Value::Str(s)) => {
                     carriers.statsd_type = std::str::from_utf8(s).ok();
                 }
-                ("statsd.container_id", Value::Str(s)) => {
+                ("_logit.statsd.container_id", Value::Str(s)) => {
                     carriers.container_id = std::str::from_utf8(s).ok();
                 }
-                ("statsd.external_data", Value::Str(s)) => {
+                ("_logit.statsd.external_data", Value::Str(s)) => {
                     carriers.external_data = std::str::from_utf8(s).ok();
                 }
-                ("statsd.cardinality", Value::Str(s)) => {
+                ("_logit.statsd.cardinality", Value::Str(s)) => {
                     carriers.cardinality = std::str::from_utf8(s).ok();
                 }
-                ("statsd.timestamp", Value::U64(secs)) => {
+                ("_logit.statsd.timestamp", Value::U64(secs)) => {
                     carriers.timestamp_secs = Some(*secs);
                 }
-                ("statsd.event.title", Value::Str(s)) => {
+                ("_logit.statsd.event.title", Value::Str(s)) => {
                     carriers.event_title = std::str::from_utf8(s).ok();
                 }
-                ("statsd.event.priority", Value::Str(s)) => {
+                ("_logit.statsd.event.priority", Value::Str(s)) => {
                     carriers.event_priority = std::str::from_utf8(s).ok();
                 }
-                ("statsd.event.alert_type", Value::Str(s)) => {
+                ("_logit.statsd.event.alert_type", Value::Str(s)) => {
                     carriers.event_alert_type = std::str::from_utf8(s).ok();
                 }
-                ("statsd.event.aggregation_key", Value::Str(s)) => {
+                ("_logit.statsd.event.aggregation_key", Value::Str(s)) => {
                     carriers.event_aggregation_key = std::str::from_utf8(s).ok();
                 }
-                ("statsd.event.source_type", Value::Str(s)) => {
+                ("_logit.statsd.event.source_type", Value::Str(s)) => {
                     carriers.event_source_type = std::str::from_utf8(s).ok();
                 }
-                ("statsd.event.host", Value::Str(s)) => {
+                ("_logit.statsd.event.host", Value::Str(s)) => {
                     carriers.event_host = std::str::from_utf8(s).ok();
                 }
-                ("statsd.service_check.name", Value::Str(s)) => {
+                ("_logit.statsd.service_check.name", Value::Str(s)) => {
                     carriers.service_check_name = std::str::from_utf8(s).ok();
                 }
-                ("statsd.service_check.status", Value::U64(v)) => {
+                ("_logit.statsd.service_check.status", Value::U64(v)) => {
                     carriers.service_check_status = Some(*v);
                 }
-                ("statsd.service_check.message", Value::Str(s)) => {
+                ("_logit.statsd.service_check.message", Value::Str(s)) => {
                     carriers.service_check_message = std::str::from_utf8(s).ok();
                 }
-                ("statsd.service_check.host", Value::Str(s)) => {
+                ("_logit.statsd.service_check.host", Value::Str(s)) => {
                     carriers.service_check_host = std::str::from_utf8(s).ok();
                 }
-                // A wrong-typed carrier or an unknown `statsd.*` key is ignored, not an error.
+                // A wrong-typed carrier or an unknown `_logit.statsd.*` key is ignored, not an
+                // error.
                 _ => {}
             }
             continue;
@@ -1585,7 +1589,7 @@ fn write_counter_line(
     append_dialect_extras(line, ctx);
 }
 
-/// The `statsd.type` carrier when it names a timer wire type (`ms`/`h`/`d`), else `"ms"`.
+/// The `_logit.statsd.type` carrier when it names a timer wire type (`ms`/`h`/`d`), else `"ms"`.
 fn statsd_wire_type(ctx: &EncodeCtx) -> &'static str {
     match ctx.statsd_type {
         Some("ms") => "ms",
@@ -2953,9 +2957,9 @@ mod tests {
         let sketch = sketch_of(&[1.0, 2.0]);
         let attrs = [
             ("env", Value::str("prod")),
-            ("statsd.container_id", Value::str("abc")),
-            ("statsd.timestamp", Value::U64(1_700_000_000)),
-            ("statsd.type", Value::str("h")),
+            ("_logit.statsd.container_id", Value::str("abc")),
+            ("_logit.statsd.timestamp", Value::U64(1_700_000_000)),
+            ("_logit.statsd.type", Value::str("h")),
         ];
         let (msgs, _) =
             encode(vec![metric_event("d", MetricKind::Distribution(sketch.clone()), &attrs)]);
@@ -2976,8 +2980,8 @@ mod tests {
         let sketch = sketch_of(&[1.0, 2.0]);
         let attrs = [
             ("env", Value::str("prod")),
-            ("statsd.container_id", Value::str("abc")),
-            ("statsd.timestamp", Value::U64(1_700_000_000)),
+            ("_logit.statsd.container_id", Value::str("abc")),
+            ("_logit.statsd.timestamp", Value::U64(1_700_000_000)),
         ];
         let (msgs, stats) = encode_with_format(
             vec![metric_event("d", MetricKind::Distribution(sketch.clone()), &attrs)],
@@ -3329,7 +3333,7 @@ mod tests {
             let (msgs, _) = encode(vec![metric_event(
                 "timer",
                 MetricKind::Samples(logit_core::Samples::new([1.0])),
-                &[("statsd.type", Value::str(wire_type))],
+                &[("_logit.statsd.type", Value::str(wire_type))],
             )]);
             assert_eq!(msgs, vec![format!("timer:1|{expected}")]);
         }
@@ -3340,7 +3344,7 @@ mod tests {
         let (msgs, _) = encode(vec![metric_event(
             "timer",
             MetricKind::Samples(logit_core::Samples::new([1.0])),
-            &[("statsd.type", Value::str("bogus"))],
+            &[("_logit.statsd.type", Value::str("bogus"))],
         )]);
         assert_eq!(msgs, vec!["timer:1|ms"]);
     }
@@ -3369,7 +3373,7 @@ mod tests {
             vec![metric_event(
                 "timer",
                 MetricKind::Samples(logit_core::Samples::new([1.0, 2.0])),
-                &[("statsd.type", Value::str("h"))],
+                &[("_logit.statsd.type", Value::str("h"))],
             )],
             Format::Statsd,
         );
@@ -3551,7 +3555,7 @@ mod tests {
         let (msgs, _) = encode(vec![metric_event(
             "hits",
             MetricKind::counter(1.0),
-            &[("statsd.container_id", Value::str("abcd1234"))],
+            &[("_logit.statsd.container_id", Value::str("abcd1234"))],
         )]);
         assert_eq!(msgs, vec!["hits:1|c|c:abcd1234"]);
     }
@@ -3560,7 +3564,7 @@ mod tests {
     #[test]
     fn a_container_id_on_the_resource_is_emitted_as_pipe_c_under_dogstatsd() {
         let mut resource_attrs = AttrMap::new();
-        resource_attrs.insert("statsd.container_id", Value::str("res-id"));
+        resource_attrs.insert("_logit.statsd.container_id", Value::str("res-id"));
         let resource = Arc::new(Resource { attributes: resource_attrs, ..Default::default() });
         let batch = EventBatch {
             resource,
@@ -3580,7 +3584,7 @@ mod tests {
         let (msgs, _) = encode(vec![metric_event(
             "hits",
             MetricKind::counter(1.0),
-            &[("statsd.timestamp", Value::U64(5))],
+            &[("_logit.statsd.timestamp", Value::U64(5))],
         )]);
         assert_eq!(msgs, vec!["hits:1|c|T5"]);
     }
@@ -3592,20 +3596,20 @@ mod tests {
             MetricKind::counter(1.0),
             &[
                 ("env", "prod".into()),
-                ("statsd.container_id", Value::str("abcd1234")),
-                ("statsd.timestamp", Value::U64(5)),
+                ("_logit.statsd.container_id", Value::str("abcd1234")),
+                ("_logit.statsd.timestamp", Value::U64(5)),
             ],
         )]);
         assert_eq!(msgs, vec!["hits:1|c|#env:prod|c:abcd1234|T5"]);
     }
 
-    /// A non-`U64` `statsd.timestamp` (a Lua or cross-protocol attribute) emits no `|T`.
+    /// A non-`U64` `_logit.statsd.timestamp` (a Lua or cross-protocol attribute) emits no `|T`.
     #[test]
     fn a_non_u64_statsd_timestamp_value_is_not_emitted() {
         let (msgs, _) = encode(vec![metric_event(
             "hits",
             MetricKind::counter(1.0),
-            &[("statsd.timestamp", true.into())],
+            &[("_logit.statsd.timestamp", true.into())],
         )]);
         assert!(!msgs[0].contains('T'));
     }
@@ -3617,8 +3621,8 @@ mod tests {
                 "hits",
                 MetricKind::counter(1.0),
                 &[
-                    ("statsd.container_id", Value::str("abcd1234")),
-                    ("statsd.timestamp", Value::U64(5)),
+                    ("_logit.statsd.container_id", Value::str("abcd1234")),
+                    ("_logit.statsd.timestamp", Value::U64(5)),
                 ],
             )],
             Format::Statsd,
@@ -3633,9 +3637,9 @@ mod tests {
             "hits",
             MetricKind::counter(1.0),
             &[
-                ("statsd.type", Value::str("ms")),
-                ("statsd.container_id", Value::str("abcd1234")),
-                ("statsd.timestamp", Value::U64(0)),
+                ("_logit.statsd.type", Value::str("ms")),
+                ("_logit.statsd.container_id", Value::str("abcd1234")),
+                ("_logit.statsd.timestamp", Value::U64(0)),
                 ("env", "prod".into()),
             ],
         )]);
@@ -3686,10 +3690,10 @@ mod tests {
             MetricKind::counter(1.0),
             &[
                 ("env", "prod".into()),
-                ("statsd.container_id", Value::str("abcd1234")),
-                ("statsd.external_data", Value::str("it-false,cn-web,pu-abc")),
-                ("statsd.cardinality", Value::str("high")),
-                ("statsd.timestamp", Value::U64(5)),
+                ("_logit.statsd.container_id", Value::str("abcd1234")),
+                ("_logit.statsd.external_data", Value::str("it-false,cn-web,pu-abc")),
+                ("_logit.statsd.cardinality", Value::str("high")),
+                ("_logit.statsd.timestamp", Value::U64(5)),
             ],
         )]);
         assert_eq!(stats, EncodeStats::default());
@@ -3705,12 +3709,12 @@ mod tests {
             metric_event(
                 "a",
                 MetricKind::counter(1.0),
-                &[("statsd.external_data", Value::str("x"))],
+                &[("_logit.statsd.external_data", Value::str("x"))],
             ),
             metric_event(
                 "b",
                 MetricKind::counter(1.0),
-                &[("statsd.cardinality", Value::str("low"))],
+                &[("_logit.statsd.cardinality", Value::str("low"))],
             ),
         ]);
         assert_eq!(msgs, vec!["a:1|c|e:x", "b:1|c|card:low"]);
@@ -3725,10 +3729,10 @@ mod tests {
                 "hits",
                 MetricKind::counter(1.0),
                 &[
-                    ("statsd.container_id", Value::str("abcd1234")),
-                    ("statsd.external_data", Value::str("ext")),
-                    ("statsd.cardinality", Value::str("high")),
-                    ("statsd.timestamp", Value::U64(5)),
+                    ("_logit.statsd.container_id", Value::str("abcd1234")),
+                    ("_logit.statsd.external_data", Value::str("ext")),
+                    ("_logit.statsd.cardinality", Value::str("high")),
+                    ("_logit.statsd.timestamp", Value::U64(5)),
                 ],
             )],
             Format::Statsd,
@@ -3746,8 +3750,8 @@ mod tests {
             "hits",
             MetricKind::counter(1.0),
             &[
-                ("statsd.external_data", Value::str("a|b#c:d\ne,f g")),
-                ("statsd.cardinality", Value::str("hi gh,x")),
+                ("_logit.statsd.external_data", Value::str("a|b#c:d\ne,f g")),
+                ("_logit.statsd.cardinality", Value::str("hi gh,x")),
             ],
         )]);
         assert_eq!(msgs, vec!["hits:1|c|e:a_b#c:d_e,f_g|card:hi_gh_x"]);
@@ -3759,9 +3763,9 @@ mod tests {
             "t",
             "x",
             &[
-                ("statsd.container_id", Value::str("cid1")),
-                ("statsd.external_data", Value::str("ext1")),
-                ("statsd.cardinality", Value::str("low")),
+                ("_logit.statsd.container_id", Value::str("cid1")),
+                ("_logit.statsd.external_data", Value::str("ext1")),
+                ("_logit.statsd.cardinality", Value::str("low")),
                 ("env", "prod".into()),
             ],
         );
@@ -3775,11 +3779,11 @@ mod tests {
             "check",
             MetricKind::gauge(0.0),
             &[
-                ("statsd.service_check.status", Value::U64(0)),
-                ("statsd.container_id", Value::str("cid1")),
-                ("statsd.external_data", Value::str("ext1")),
-                ("statsd.cardinality", Value::str("orchestrator")),
-                ("statsd.service_check.message", Value::str("all good")),
+                ("_logit.statsd.service_check.status", Value::U64(0)),
+                ("_logit.statsd.container_id", Value::str("cid1")),
+                ("_logit.statsd.external_data", Value::str("ext1")),
+                ("_logit.statsd.cardinality", Value::str("orchestrator")),
+                ("_logit.statsd.service_check.message", Value::str("all good")),
             ],
         );
         let (msgs, _) = encode(vec![event]);
@@ -3813,7 +3817,7 @@ mod tests {
 
     fn event_line_event(title: &str, text: &str, extra_attrs: &[(&str, Value)]) -> Event {
         let mut attributes = AttrMap::new();
-        attributes.insert("statsd.event.title", Value::str(title));
+        attributes.insert("_logit.statsd.event.title", Value::str(title));
         for (k, v) in extra_attrs {
             attributes.insert(k, v.clone());
         }
@@ -3839,13 +3843,13 @@ mod tests {
             "héllo",
             "world",
             &[
-                ("statsd.timestamp", Value::U64(1_700_000_000)),
-                ("statsd.event.host", Value::str("web1")),
-                ("statsd.event.priority", Value::str("low")),
-                ("statsd.event.alert_type", Value::str("error")),
-                ("statsd.event.aggregation_key", Value::str("key1")),
-                ("statsd.event.source_type", Value::str("my_app")),
-                ("statsd.container_id", Value::str("cid1")),
+                ("_logit.statsd.timestamp", Value::U64(1_700_000_000)),
+                ("_logit.statsd.event.host", Value::str("web1")),
+                ("_logit.statsd.event.priority", Value::str("low")),
+                ("_logit.statsd.event.alert_type", Value::str("error")),
+                ("_logit.statsd.event.aggregation_key", Value::str("key1")),
+                ("_logit.statsd.event.source_type", Value::str("my_app")),
+                ("_logit.statsd.container_id", Value::str("cid1")),
                 ("env", "prod".into()),
             ],
         );
@@ -3876,7 +3880,8 @@ mod tests {
 
     #[test]
     fn an_invalid_event_priority_is_omitted_and_counted() {
-        let event = event_line_event("t", "x", &[("statsd.event.priority", Value::str("urgent"))]);
+        let event =
+            event_line_event("t", "x", &[("_logit.statsd.event.priority", Value::str("urgent"))]);
         let (msgs, stats) = encode(vec![event]);
         assert_eq!(msgs, vec!["_e{1,1}:t|x"]);
         // A dropped field on an emitted line, not a dropped message.
@@ -3886,8 +3891,11 @@ mod tests {
 
     #[test]
     fn an_invalid_event_alert_type_is_omitted_and_counted() {
-        let event =
-            event_line_event("t", "x", &[("statsd.event.alert_type", Value::str("critical"))]);
+        let event = event_line_event(
+            "t",
+            "x",
+            &[("_logit.statsd.event.alert_type", Value::str("critical"))],
+        );
         let (msgs, stats) = encode(vec![event]);
         assert_eq!(msgs, vec!["_e{1,1}:t|x"]);
         assert_eq!(stats.omitted_invalid_values, 1);
@@ -3897,7 +3905,7 @@ mod tests {
     #[test]
     fn an_event_with_a_non_string_log_message_is_dropped_and_counted() {
         let mut attributes = AttrMap::new();
-        attributes.insert("statsd.event.title", Value::str("t"));
+        attributes.insert("_logit.statsd.event.title", Value::str("t"));
         let event = Event::log(
             0,
             attributes,
@@ -3921,7 +3929,8 @@ mod tests {
     #[test]
     fn an_event_with_a_non_utf8_title_is_dropped_and_counted_rather_than_panicking() {
         let mut attributes = AttrMap::new();
-        attributes.insert("statsd.event.title", Value::Str(bytes::Bytes::from_static(b"\xff")));
+        attributes
+            .insert("_logit.statsd.event.title", Value::Str(bytes::Bytes::from_static(b"\xff")));
         let event = Event::log(
             0,
             attributes,
@@ -3945,7 +3954,7 @@ mod tests {
         let event = event_line_event(
             "t",
             "x",
-            &[("statsd.event.host", Value::str("web1")), ("env", "prod".into())],
+            &[("_logit.statsd.event.host", Value::str("web1")), ("env", "prod".into())],
         );
         let (msgs, _) = encode(vec![event]);
         assert_eq!(msgs, vec!["_e{1,1}:t|x|h:web1|#env:prod"]);
@@ -3954,7 +3963,7 @@ mod tests {
     #[test]
     fn event_carriers_set_on_the_resource_are_honored() {
         let mut resource_attrs = AttrMap::new();
-        resource_attrs.insert("statsd.event.title", Value::str("from-resource"));
+        resource_attrs.insert("_logit.statsd.event.title", Value::str("from-resource"));
         let resource = Arc::new(Resource { attributes: resource_attrs, ..Default::default() });
         let event = Event::log(
             0,
@@ -3993,7 +4002,7 @@ mod tests {
 
     fn service_check_event(name: &str, status: MetricKind, extra_attrs: &[(&str, Value)]) -> Event {
         let mut attributes = AttrMap::new();
-        attributes.insert("statsd.service_check.name", Value::str(name));
+        attributes.insert("_logit.statsd.service_check.name", Value::str(name));
         for (k, v) in extra_attrs {
             attributes.insert(k, v.clone());
         }
@@ -4006,10 +4015,10 @@ mod tests {
             "my.check",
             MetricKind::gauge(1.0),
             &[
-                ("statsd.timestamp", Value::U64(1_700_000_000)),
-                ("statsd.service_check.host", Value::str("web1")),
+                ("_logit.statsd.timestamp", Value::U64(1_700_000_000)),
+                ("_logit.statsd.service_check.host", Value::str("web1")),
                 ("env", "prod".into()),
-                ("statsd.container_id", Value::str("cid1")),
+                ("_logit.statsd.container_id", Value::str("cid1")),
             ],
         );
         let (msgs, stats) = encode(vec![event]);
@@ -4023,7 +4032,7 @@ mod tests {
         let event = service_check_event(
             "chk",
             MetricKind::gauge(0.0),
-            &[("statsd.service_check.message", Value::str("a|b"))],
+            &[("_logit.statsd.service_check.message", Value::str("a|b"))],
         );
         let (msgs, _) = encode(vec![event]);
         assert_eq!(msgs, vec!["_sc|chk|0|m:a_b"]);
@@ -4034,7 +4043,7 @@ mod tests {
         let event = service_check_event(
             "chk",
             MetricKind::gauge(3.0),
-            &[("statsd.service_check.status", Value::U64(1))],
+            &[("_logit.statsd.service_check.status", Value::U64(1))],
         );
         let (msgs, _) = encode(vec![event]);
         assert_eq!(msgs, vec!["_sc|chk|1"]);
@@ -4052,7 +4061,7 @@ mod tests {
         let event = service_check_event(
             "chk",
             MetricKind::gauge(9.0),
-            &[("statsd.service_check.status", Value::U64(5))],
+            &[("_logit.statsd.service_check.status", Value::U64(5))],
         );
         let (msgs, stats) = encode(vec![event]);
         assert!(msgs.is_empty());
@@ -4071,7 +4080,7 @@ mod tests {
     #[test]
     fn a_non_gauge_first_metric_on_a_service_check_event_is_dropped_and_counted() {
         let mut attributes = AttrMap::new();
-        attributes.insert("statsd.service_check.name", Value::str("chk"));
+        attributes.insert("_logit.statsd.service_check.name", Value::str("chk"));
         let event = Event::metric(
             0,
             attributes,
@@ -4085,7 +4094,7 @@ mod tests {
     #[test]
     fn a_second_metric_on_a_service_check_event_renders_as_a_normal_line_after_it() {
         let mut attributes = AttrMap::new();
-        attributes.insert("statsd.service_check.name", Value::str("chk"));
+        attributes.insert("_logit.statsd.service_check.name", Value::str("chk"));
         let mut event =
             Event::metric(0, attributes, MetricRecord::new(intern("chk"), MetricKind::gauge(0.0)));
         event.metrics.push(MetricRecord::new(intern("extra"), MetricKind::counter(1.0)));
@@ -4098,7 +4107,7 @@ mod tests {
         let event = service_check_event(
             "chk",
             MetricKind::gauge(0.0),
-            &[("statsd.service_check.message", Value::str("m")), ("env", "prod".into())],
+            &[("_logit.statsd.service_check.message", Value::str("m")), ("env", "prod".into())],
         );
         let (msgs, _) = encode(vec![event]);
         assert_eq!(msgs, vec!["_sc|chk|0|#env:prod|m:m"]);
@@ -5426,7 +5435,10 @@ mod tests {
         ));
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
         assert_eq!(relayed[0].attributes.get("host").and_then(|v| v.as_str()), Some("web1"));
-        assert_eq!(relayed[0].attributes.get("statsd.type").and_then(|v| v.as_str()), Some("ms"));
+        assert_eq!(
+            relayed[0].attributes.get("_logit.statsd.type").and_then(|v| v.as_str()),
+            Some("ms")
+        );
     }
 
     /// A multi-member set line relays as one line per member, members in order.
@@ -5459,10 +5471,13 @@ mod tests {
         let relayed = decode_one(&msgs[0]);
         assert_eq!(relayed[0].timestamp, 1_700_000_000_000_000_000);
         assert_eq!(
-            relayed[0].attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+            relayed[0].attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
             Some("abcd1234")
         );
-        assert_eq!(relayed[0].attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
+        assert_eq!(
+            relayed[0].attributes.get("_logit.statsd.timestamp"),
+            Some(&Value::U64(1_700_000_000))
+        );
     }
 
     #[test]
@@ -5480,10 +5495,13 @@ mod tests {
             Some(Value::str("line one\nline two"))
         );
         assert_eq!(
-            relayed[0].attributes.get("statsd.event.title").and_then(|v| v.as_str()),
+            relayed[0].attributes.get("_logit.statsd.event.title").and_then(|v| v.as_str()),
             Some("title")
         );
-        assert_eq!(relayed[0].attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
+        assert_eq!(
+            relayed[0].attributes.get("_logit.statsd.timestamp"),
+            Some(&Value::U64(1_700_000_000))
+        );
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
     }
 
@@ -5500,11 +5518,14 @@ mod tests {
             matches!(relayed[0].metrics[0].kind, MetricKind::Gauge(v) if v == MetricValue::F64(2.0))
         );
         assert_eq!(
-            relayed[0].attributes.get("statsd.service_check.name").and_then(|v| v.as_str()),
+            relayed[0].attributes.get("_logit.statsd.service_check.name").and_then(|v| v.as_str()),
             Some("my.check")
         );
         assert_eq!(
-            relayed[0].attributes.get("statsd.service_check.message").and_then(|v| v.as_str()),
+            relayed[0]
+                .attributes
+                .get("_logit.statsd.service_check.message")
+                .and_then(|v| v.as_str()),
             Some("a b")
         );
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
