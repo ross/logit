@@ -3,8 +3,8 @@
 //!
 //! A check decodes to exactly the [`Event::metric`] `statsd_in`'s DogStatsD `_sc|...` parser builds
 //! (`crates/logit-proto/src/statsd/decode.rs`'s `parse_service_check`): a `Gauge(status)` named
-//! after the check, plus the same `statsd.service_check.*` attributes, so either one re-encodes on
-//! either route.
+//! after the check, plus the same `_logit.statsd.service_check.*` attributes, so either one
+//! re-encodes on either route.
 
 use super::events::{non_empty_str, seconds, ATTR_STATSD_TIMESTAMP};
 use super::logs::{new_batch, parse_json};
@@ -23,10 +23,10 @@ use std::sync::LazyLock;
 
 /// `statsd_in`'s service-check attribute names (`crates/logit-proto/src/statsd/decode.rs`), reused
 /// verbatim.
-pub const ATTR_SERVICE_CHECK_NAME: &str = "statsd.service_check.name";
-pub const ATTR_SERVICE_CHECK_STATUS: &str = "statsd.service_check.status";
-pub const ATTR_SERVICE_CHECK_MESSAGE: &str = "statsd.service_check.message";
-pub const ATTR_SERVICE_CHECK_HOST: &str = "statsd.service_check.host";
+pub const ATTR_SERVICE_CHECK_NAME: &str = "_logit.statsd.service_check.name";
+pub const ATTR_SERVICE_CHECK_STATUS: &str = "_logit.statsd.service_check.status";
+pub const ATTR_SERVICE_CHECK_MESSAGE: &str = "_logit.statsd.service_check.message";
+pub const ATTR_SERVICE_CHECK_HOST: &str = "_logit.statsd.service_check.host";
 
 /// The highest valid status: 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN.
 const MAX_STATUS: u64 = 3;
@@ -123,10 +123,10 @@ impl DatadogDecoder {
 }
 
 impl DatadogEncoder {
-    /// Encodes every event carrying `statsd.service_check.name` whose first metric is a `Gauge`
-    /// as one `/api/v1/check_run` JSON array, every key present on every item; `None` when no
-    /// event qualifies. Any other event is skipped silently (it belongs to another route); a check
-    /// with no valid status is skipped and counted.
+    /// Encodes every event carrying `_logit.statsd.service_check.name` whose first metric is a
+    /// `Gauge` as one `/api/v1/check_run` JSON array, every key present on every item; `None` when
+    /// no event qualifies. Any other event is skipped silently (it belongs to another route); a
+    /// check with no valid status is skipped and counted.
     pub fn encode_service_checks(&self, batch: &EventBatch) -> Option<Bytes> {
         let keys = &*KEYS;
         let mut out = Vec::new();

@@ -1399,6 +1399,37 @@ async fn a_tagged_statsd_gauge_relays_as_a_gauge_with_its_tag_counted_away() {
     );
 }
 
+/// `statsd_in` stamps `_logit.statsd.type` on a `|ms` line beside its tags. The carrier is
+/// private, so `collectd_out` skips it uncounted and counts only the sender's own tag. collectd
+/// has no wire form for a raw sample list, so the record drops by kind; the tag count happens
+/// first, per event.
+#[tokio::test]
+async fn a_statsd_timer_counts_only_its_own_tag_as_having_no_wire_form() {
+    let mut cross = CrossHarness::new().await;
+    let batch = cross.statsd_decode(b"latency:12|ms|#env:prod").await;
+    let event = &batch.events[0];
+    assert_eq!(event.attributes.get("env").and_then(Value::as_str), Some("prod"));
+    assert_eq!(
+        event.attributes.len(),
+        2,
+        "the fixture's premise: the decoder stamps its type carrier beside the tag"
+    );
+
+    let registry = Registry::new();
+    let mut sink = CollectdOutput::udp(cross.collectd.capture_addr.to_string())
+        .unwrap()
+        .with_telemetry(registry.telemetry_for("out", "collectd_out", "sink"))
+        .with_encoder(CollectdEncoder::new().with_hostname("relay-host"));
+    sink.send(&batch).await.expect("a fully-dropped batch is not a send error");
+
+    let totals = Totals::of(registry.drain(0));
+    assert_eq!(
+        totals.sum("logit.output.tags.omitted", &[("reason", "no_wire_form")]),
+        1.0,
+        "only `env` has no wire form; the private type carrier is skipped uncounted"
+    );
+}
+
 // -- `collectd_in -> aggregate -> collectd_out` --------------------------------------------------------
 
 /// COUNTER and DERIVE decode to a cumulative `Sum`, which `aggregate` forwards untouched

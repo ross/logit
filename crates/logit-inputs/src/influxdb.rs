@@ -52,8 +52,9 @@
 //! deadline ([`crate::http::deliver_with_deadline`]) that reaches every consumer or none; a `503`
 //! therefore always means nothing of the body was taken, and a client may resend it whole.
 //!
-//! **Resource cache.** `org`, `orgID`, and `bucket`, each when non-empty, become the resource
-//! attributes `influxdb.org`, `influxdb.org_id`, and `influxdb.bucket`. Requests naming the same
+//! **Resource cache.** `org`, `orgID`, and `bucket`, each when non-empty, become the private
+//! resource attributes `_logit.influxdb.org`, `_logit.influxdb.org_id`, and
+//! `_logit.influxdb.bucket`. Requests naming the same
 //! three strings share one `Arc<Resource>`, so a downstream batch accumulator, which groups on the
 //! resource's pointer, merges them. The cache holds at most [`RESOURCE_CACHE_CAP`] entries and is
 //! cleared whole when a new one would pass it: an accidental flood of distinct buckets costs only
@@ -1098,7 +1099,7 @@ mod tests {
         assert_eq!(batch.events.len(), 2);
         let cpu = &batch.events[0];
         assert_eq!(cpu.timestamp, 1_700_000_000_000_000_000);
-        assert_eq!(str_attr(&cpu.attributes, "influxdb.measurement"), Some("cpu"));
+        assert_eq!(str_attr(&cpu.attributes, "_logit.influxdb.measurement"), Some("cpu"));
         assert_eq!(str_attr(&cpu.attributes, "host"), Some("a"));
         assert_eq!(
             fields(cpu),
@@ -1106,8 +1107,8 @@ mod tests {
         );
         assert_eq!(fields(&batch.events[1]), [("mem.used", MetricValue::U64(7))]);
         let resource = &batch.resource.attributes;
-        assert_eq!(str_attr(resource, "influxdb.org"), Some("acme"));
-        assert_eq!(str_attr(resource, "influxdb.bucket"), Some("metrics"));
+        assert_eq!(str_attr(resource, "_logit.influxdb.org"), Some("acme"));
+        assert_eq!(str_attr(resource, "_logit.influxdb.bucket"), Some("metrics"));
         assert_eq!(resource.len(), 2);
     }
 
@@ -1271,14 +1272,21 @@ mod tests {
     async fn the_resource_carries_org_org_id_and_bucket() {
         let (addr, mut rx) = start_default().await;
         let cases: [(&str, &[(&str, &str)]); 3] = [
-            ("org=acme&bucket=b", &[("influxdb.org", "acme"), ("influxdb.bucket", "b")]),
+            (
+                "org=acme&bucket=b",
+                &[("_logit.influxdb.org", "acme"), ("_logit.influxdb.bucket", "b")],
+            ),
             (
                 "orgID=0123456789abcdef&bucket=b",
-                &[("influxdb.org_id", "0123456789abcdef"), ("influxdb.bucket", "b")],
+                &[("_logit.influxdb.org_id", "0123456789abcdef"), ("_logit.influxdb.bucket", "b")],
             ),
             (
                 "org=acme&orgID=01&bucket=b%20x&org=other",
-                &[("influxdb.org", "acme"), ("influxdb.org_id", "01"), ("influxdb.bucket", "b x")],
+                &[
+                    ("_logit.influxdb.org", "acme"),
+                    ("_logit.influxdb.org_id", "01"),
+                    ("_logit.influxdb.bucket", "b x"),
+                ],
             ),
         ];
         for (query, expected) in cases {
@@ -1608,10 +1616,10 @@ mod tests {
     #[tokio::test]
     async fn requests_bytes_and_reserved_tags_are_counted() {
         let (addr, mut rx, registry) = start_counted(|i| i, 16).await;
-        let body = b"m,influxdb.x=y,host=a f=1";
+        let body = b"m,_logit.x=y,host=a f=1";
         post(&addr, WRITE, "", body).await;
         let batch = recv_batch(&mut rx).await;
-        assert_eq!(batch.events[0].attributes.get("influxdb.x"), None);
+        assert_eq!(batch.events[0].attributes.get("_logit.x"), None);
         request_raw(&addr, "GET", "/ping", "", b"").await;
         request_raw(&addr, "GET", "/health", "", b"").await;
         let totals = Totals::of(registry.drain(0));

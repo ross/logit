@@ -1,6 +1,6 @@
 ---
 created: 2026-10-07
-updated: 2026-10-07
+updated: 2026-10-13
 ---
 
 # `statsd_out` multi-value expansion: summarized kinds leave as dotted counter and gauge lines by default
@@ -130,8 +130,8 @@ Three cases fall outside the table:
   as `|c`. The flag is what's lost, which is why the record counts as degraded.
 
 `aggregate` re-emits a series' attributes on its flush, so a `Distribution` still carries
-`statsd.type` (`ms`, `h`, or `d`). Expansion ignores it: the carrier names the raw wire type of
-samples that are no longer there.
+`_logit.statsd.type` (`ms`, `h`, or `d`). Expansion ignores it: the carrier names the raw wire type
+of samples that are no longer there.
 
 **Why the split falls there.** A statsd server sums every `|c` line for a name across its flush
 interval and across every sender. For a per-window count or sum, that's the correct merge, and

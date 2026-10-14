@@ -37,12 +37,13 @@
 //!
 //! ## Header-field precedence
 //!
-//! Per event, per field, first hit wins: the `syslog.*` attribute, then the configured default,
-//! then a format-appropriate absence (`-` for RFC 5424's NILVALUE, an omitted token for RFC 3164).
-//! `syslog.severity` outranks `log.severity` because `logit_proto::syslog`'s `map_severity` is lossy: it
-//! collapses syslog's eight severities onto five `Severity` variants (0-2 all become `Fatal`, 5 and
-//! 6 both become `Info`). Preferring the raw attribute keeps a relay byte-faithful;
-//! [`syslog_severity_of`] is the fallback for a log record that didn't come from `syslog_in`.
+//! Per event, per field, first hit wins: the `syslog.*` attribute (`_logit.syslog.severity` for
+//! severity), then the configured default, then a format-appropriate absence (`-` for RFC 5424's
+//! NILVALUE, an omitted token for RFC 3164). `_logit.syslog.severity` outranks `log.severity`
+//! because `logit_proto::syslog`'s `map_severity` is lossy: it collapses syslog's eight severities
+//! onto five `Severity` variants (0-2 all become `Fatal`, 5 and 6 both become `Info`). Preferring
+//! the raw attribute keeps a relay byte-faithful; [`syslog_severity_of`] is the fallback for a log
+//! record that didn't come from `syslog_in`.
 //!
 //! **PROCID** (`syslog.pid`) is a `Value::U64`, or a `Value::Str` when the origin's PROCID wasn't
 //! numeric; [`resolve_pid`] returns the [`Pid`] enum covering both. On a 5424 output a `Pid::Str`
@@ -520,11 +521,11 @@ fn resolve_facility(attrs: &AttrMap, default: u8) -> u8 {
     }
 }
 
-/// `syslog.severity` if present and in range (`Value::U64(n)`, `n <= 7`), outranking
+/// `_logit.syslog.severity` if present and in range (`Value::U64(n)`, `n <= 7`), outranking
 /// `log.severity` (module doc's "Header-field precedence"). Else [`syslog_severity_of`], else `6`
 /// (info).
 fn resolve_severity(attrs: &AttrMap, log_severity: Option<Severity>) -> u8 {
-    if let Some(Value::U64(n)) = attrs.get("syslog.severity") {
+    if let Some(Value::U64(n)) = attrs.get("_logit.syslog.severity") {
         if *n <= 7 {
             return *n as u8;
         }
@@ -536,9 +537,9 @@ fn resolve_severity(attrs: &AttrMap, log_severity: Option<Severity>) -> u8 {
 }
 
 /// The lossy inverse of `logit_proto::syslog`'s `map_severity`, for an event with no
-/// `syslog.severity`. `Fatal` maps to `2` (crit), not `0` (emerg): `emerg` means "system unusable",
-/// a claim `Fatal` never makes. `Trace` has no syslog equivalent and maps to `7` (debug), as
-/// `Debug` does.
+/// `_logit.syslog.severity`. `Fatal` maps to `2` (crit), not `0` (emerg): `emerg` means "system
+/// unusable", a claim `Fatal` never makes. `Trace` has no syslog equivalent and maps to `7`
+/// (debug), as `Debug` does.
 fn syslog_severity_of(severity: Severity) -> u8 {
     match severity {
         Severity::Trace => 7,
@@ -1542,7 +1543,7 @@ mod tests {
     #[test]
     fn syslog_severity_attribute_outranks_log_severity() {
         let mut attrs = AttrMap::new();
-        attrs.insert("syslog.severity", Value::U64(1)); // alert
+        attrs.insert("_logit.syslog.severity", Value::U64(1)); // alert
         let event = Event::log(
             0,
             attrs,
@@ -1590,7 +1591,7 @@ mod tests {
     #[test]
     fn out_of_range_syslog_severity_falls_back() {
         let mut attrs = AttrMap::new();
-        attrs.insert("syslog.severity", Value::U64(9));
+        attrs.insert("_logit.syslog.severity", Value::U64(9));
         let event = Event::log(
             0,
             attrs,

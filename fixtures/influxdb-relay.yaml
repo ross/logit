@@ -8,8 +8,9 @@
 # module doc: duplicate points in one body merge, tag order isn't preserved (influxd sorts the series key itself), string fields leave
 # after the numeric ones, numbers leave in their shortest spelling, and every point leaves with a
 # nanosecond timestamp (one that arrived with none gets its receipt time). Each write's `org` and
-# `bucket` ride on the batch as the resource attributes `influxdb.org` and `influxdb.bucket`, which
-# are never tags; this sink writes to its own `org`/`bucket` below, whatever the client named.
+# `bucket` ride on the batch as the private resource attributes `_logit.influxdb.org` and
+# `_logit.influxdb.bucket`, which no sink writes as tags; this sink writes to its own
+# `org`/`bucket` below, whatever the client named.
 #
 # Run it with `script/server fixtures/influxdb-relay.yaml`. compose.yaml's `dev` service publishes
 # no ports, so drive the listener from inside that container (`docker compose exec dev bash`;

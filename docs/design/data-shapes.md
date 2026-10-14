@@ -215,8 +215,8 @@ series *is* per-event attribute width.
 
 Scraped exporters are the narrowest thing in the survey, and what width they have is on the wire:
 `prometheus_in` puts `instance` and its target on the `Resource`, so the counts above are the
-exporter's own labels plus, for about 2% of node_exporter's series, one `prometheus.type` marking a
-family the exporter left untyped. Series that carry their identity as labels run wider —
+exporter's own labels plus, for about 2% of node_exporter's series, one `_logit.prometheus.type`
+marking a family the exporter left untyped. Series that carry their identity as labels run wider —
 remote-write (which has nowhere else to put `job` and `instance`), cAdvisor, kube-state-metrics, a
 tagged statsd line, a collectd value list — but top out at 10–11. A default carbon plaintext feed
 carries **no** attributes at all: both agents bake identity into the dotted path unless tag support
@@ -350,8 +350,9 @@ producers running synthetic workloads — grammar/packing evidence, not traffic 
 The statsd corpus's shape was derived independently from the captured bytes, by a parser sharing
 nothing with the harness, and `shape` reproduced it exactly: events per datagram
 `1×48, 7×1, 8×3, 10×3, 11×1`; attributes per event `0×38, 1×17, 5×4, 6×9, 7×20, 8×32`. Both agree
-with the corpus's own README. Attribute counts sit above wire tag counts by exactly the `statsd.*`
-carriers the decoder stamps. This is what licenses reading the other captures as measurements.
+with the corpus's own README. Attribute counts sit above wire tag counts by exactly the
+`_logit.statsd.*` carriers the decoder stamps. This is what licenses reading the other captures as
+measurements.
 
 ### 5.2 `exporters`, `hostagents` — infrastructure metrics
 
@@ -512,7 +513,7 @@ its 128-byte cap.
 
 - The sshd shape (6) sits inside the measured syslog range.
 - The statsd shape (3 tags) is on the low side of the recorded clients' 0–8 (median 6 on a tagged
-  line, once the decoder's own `statsd.*` carriers are counted).
+  line, once the decoder's own `_logit.statsd.*` carriers are counted).
 - The "modelled on pino, no live process captured" wide-JSON shape (32) is wider than any library
   measured (9–15). It is an access-log or audit-log width, not an application-log one.
 

@@ -264,11 +264,11 @@ def leg_9():
     if not ours:
         return "FAIL", "prometheus_in scraped no vi_rw1_gauge from /federate"
     attrs, metric = ours[-1]
-    kind = attrs.get("prometheus.type")
-    stamped = attrs.get("prometheus.timestamp") is True
+    kind = attrs.get("_logit.prometheus.type")
+    stamped = attrs.get("_logit.prometheus.timestamp") is True
     return "PASS", (
         f"{len(ours)} scrapes of vi_rw1_gauge, rendered `{json.dumps(metric)}`, "
-        f"prometheus.type={kind if kind else 'absent'}, "
+        f"_logit.prometheus.type={kind if kind else 'absent'}, "
         f"wire timestamp {'kept' if stamped else 'absent'}"
     )
 

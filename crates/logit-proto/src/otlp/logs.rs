@@ -5,9 +5,10 @@
 //! `severity_text` match when the number is unspecified or out of range, else `None`.
 //!
 //! Decode's 24-to-6 collapse is lossy (`INFO2` and `INFO4` both become `Info`), so the raw values
-//! survive as attributes, the shape `syslog.severity` uses (ADR `syslog-output`'s "Header-field
-//! precedence", ADR `lossless-transit` rule (b)): `otel.severity_number` (`Value::I64`, when
-//! non-zero) and `otel.severity_text` (`Value::Str`, when non-empty).
+//! survive as private carrier attributes, the shape `_logit.syslog.severity` uses (ADR
+//! `syslog-output`'s "Header-field precedence", ADR `lossless-transit` rule (b), ADR
+//! `private-attribute-namespace`): `_logit.otel.severity_number` (`Value::I64`, when non-zero) and
+//! `_logit.otel.severity_text` (`Value::Str`, when non-empty).
 //!
 //! Encode treats that pair as one unit:
 //! - **Neither attribute:** each band's base number (`Trace`→1, `Debug`→5, `Info`→9, `Warn`→13,
@@ -18,8 +19,9 @@
 //!   never sent (`10`/`"Info"` where the wire had `10`/`""`).
 //!
 //! `take_severity_attrs` removes an attribute only when it's usable: a number (`I64` or `U64`) in
-//! `1..=24`, or any `as_str`-able text. An unusable one stays as an ordinary attribute and counts
-//! as absent. So neither raw attribute leaks into the emitted attribute set.
+//! `1..=24`, or any `as_str`-able text. An unusable one stays in the map and counts as absent.
+//! Either way it never reaches the emitted attribute set, because `attrs_to_key_values` skips
+//! every private key.
 //!
 //! **`BodyFormat` has no OTLP field.** It round-trips through a `logit.body_format` attribute
 //! (`"raw" | "json" | "structured"`), inserted on encode and removed on decode.
@@ -136,22 +138,23 @@ fn encode_trace(event: &Event, log: &LogRecord) -> (Vec<u8>, Vec<u8>, u32) {
     (Vec::new(), Vec::new(), 0)
 }
 
-/// Removes and returns `otel.severity_number`/`otel.severity_text` from `attrs`.
+/// Removes and returns `_logit.otel.severity_number`/`_logit.otel.severity_text` from `attrs`.
 ///
 /// **Peeks before removing**: only a `Value::I64`/`Value::U64` number in `1..=24` or an
-/// `as_str`-able text is taken. Anything else stays in `attrs` as an ordinary attribute.
+/// `as_str`-able text is taken. Anything else stays in `attrs`, where the private-key skip keeps
+/// it off the wire.
 fn take_severity_attrs(attrs: &mut AttrMap) -> (Option<i32>, Option<String>) {
-    let number = match attrs.get("otel.severity_number") {
+    let number = match attrs.get("_logit.otel.severity_number") {
         Some(Value::I64(i)) if (1..=24).contains(i) => Some(*i as i32),
         Some(Value::U64(u)) if (1..=24).contains(u) => Some(*u as i32),
         _ => None,
     };
     if number.is_some() {
-        attrs.remove("otel.severity_number");
+        attrs.remove("_logit.otel.severity_number");
     }
-    let text = attrs.get("otel.severity_text").and_then(|v| v.as_str()).map(str::to_string);
+    let text = attrs.get("_logit.otel.severity_text").and_then(|v| v.as_str()).map(str::to_string);
     if text.is_some() {
-        attrs.remove("otel.severity_text");
+        attrs.remove("_logit.otel.severity_text");
     }
     (number, text)
 }
@@ -209,10 +212,10 @@ pub(crate) fn decode_log_record(record: pb::LogRecord, mut attrs: AttrMap) -> Ev
     let severity = decode_severity(record.severity_number, &record.severity_text);
     // Raw severity survives alongside the normalized Severity (module doc).
     if record.severity_number != 0 {
-        attrs.insert("otel.severity_number", Value::I64(record.severity_number as i64));
+        attrs.insert("_logit.otel.severity_number", Value::I64(record.severity_number as i64));
     }
     if !record.severity_text.is_empty() {
-        attrs.insert("otel.severity_text", record.severity_text.as_str());
+        attrs.insert("_logit.otel.severity_text", record.severity_text.as_str());
     }
     let message = record.body.map(common::any_value_to_value).unwrap_or(Value::Null);
     // 0 means "unknown", not the epoch (module doc).
@@ -676,12 +679,12 @@ mod tests {
         let decoded = decode_log_record(wire, AttrMap::new());
         assert_eq!(decoded.log.as_ref().unwrap().severity, Some(Severity::Info));
         assert_eq!(
-            decoded.attributes.get("otel.severity_number"),
+            decoded.attributes.get("_logit.otel.severity_number"),
             Some(&Value::I64(10)),
             "the raw number must survive on the event's attributes"
         );
         assert_eq!(
-            decoded.attributes.get("otel.severity_text").and_then(|v| v.as_str()),
+            decoded.attributes.get("_logit.otel.severity_text").and_then(|v| v.as_str()),
             Some("INFO2"),
             "the raw text must survive on the event's attributes"
         );
@@ -693,15 +696,14 @@ mod tests {
         );
         assert_eq!(re_encoded.severity_text, "INFO2");
         assert!(
-            re_encoded
-                .attributes
-                .iter()
-                .all(|kv| kv.key != "otel.severity_number" && kv.key != "otel.severity_text"),
+            re_encoded.attributes.iter().all(|kv| kv.key != "_logit.otel.severity_number"
+                && kv.key != "_logit.otel.severity_text"),
             "the raw severity attributes must not also leak out as plain attributes"
         );
     }
 
-    /// A log with no `otel.severity_*` attributes encodes the band base and the variant name.
+    /// A log with no `_logit.otel.severity_*` attributes encodes the band base and the variant
+    /// name.
     #[test]
     fn a_non_otlp_sourced_log_still_encodes_the_band_base() {
         let record = plain_log(LogRecord {
@@ -772,40 +774,40 @@ mod tests {
     #[test]
     fn take_severity_attrs_honours_a_u64_number() {
         let mut attrs = AttrMap::new();
-        attrs.insert("otel.severity_number", Value::U64(10));
+        attrs.insert("_logit.otel.severity_number", Value::U64(10));
         let (number, _text) = take_severity_attrs(&mut attrs);
         assert_eq!(number, Some(10));
-        assert_eq!(attrs.get("otel.severity_number"), None, "a usable value must be removed");
+        assert_eq!(
+            attrs.get("_logit.otel.severity_number"),
+            None,
+            "a usable value must be removed"
+        );
     }
 
-    /// An out-of-range or wrong-type `otel.severity_number` stays as an ordinary attribute.
+    /// An out-of-range or wrong-type `_logit.otel.severity_number` stays in the map.
     #[test]
     fn take_severity_attrs_leaves_an_unusable_number_in_place() {
         for value in [Value::I64(-1), Value::I64(99), Value::str("10")] {
             let mut attrs = AttrMap::new();
-            attrs.insert("otel.severity_number", value.clone());
+            attrs.insert("_logit.otel.severity_number", value.clone());
             let (number, _text) = take_severity_attrs(&mut attrs);
             assert_eq!(number, None, "{value:?} must not be used as a raw override");
             assert_eq!(
-                attrs.get("otel.severity_number"),
+                attrs.get("_logit.otel.severity_number"),
                 Some(&value),
-                "{value:?} must be left in place as an ordinary attribute"
+                "{value:?} must be left in place"
             );
         }
     }
 
-    /// A wrong-type `otel.severity_text` (`Bytes`, not `Str`) stays as an ordinary attribute.
+    /// A wrong-type `_logit.otel.severity_text` (`Bytes`, not `Str`) stays in the map.
     #[test]
     fn take_severity_attrs_leaves_unusable_text_in_place() {
         let mut attrs = AttrMap::new();
         let value = Value::Bytes(bytes::Bytes::from_static(b"\xff\xfe"));
-        attrs.insert("otel.severity_text", value.clone());
+        attrs.insert("_logit.otel.severity_text", value.clone());
         let (_number, text) = take_severity_attrs(&mut attrs);
         assert_eq!(text, None, "non-string bytes must not be used as a raw override");
-        assert_eq!(
-            attrs.get("otel.severity_text"),
-            Some(&value),
-            "must be left in place as an ordinary attribute"
-        );
+        assert_eq!(attrs.get("_logit.otel.severity_text"), Some(&value), "must be left in place");
     }
 }

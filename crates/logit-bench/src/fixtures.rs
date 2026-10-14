@@ -113,7 +113,7 @@ pub const STATSD_EVENT_LINE_WITH_ESCAPED_NEWLINE: &str = "_e{5,12}:title|line1\\
 
 /// A DogStatsD service check (`_sc|name|status|...`) line, Datadog's documented example (as in
 /// `crates/logit-proto/src/statsd/decode.rs`'s `dogstatsd_docs_example_service_check_decodes`).
-/// Decodes to one [`logit_core::MetricKind::Gauge`] event plus the `statsd.service_check.*`
+/// Decodes to one [`logit_core::MetricKind::Gauge`] event plus the `_logit.statsd.service_check.*`
 /// carriers.
 pub const STATSD_SERVICE_CHECK_LINE: &str =
     "_sc|Redis connection|2|#env:dev|m:Redis connection timed out after 10s";
