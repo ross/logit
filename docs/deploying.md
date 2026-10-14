@@ -926,6 +926,10 @@ acknowledges a replayed record at or below its sender's mark without forwarding 
 [Forwarding between `logit` nodes](#forwarding-between-logit-nodes)). A record without a
 complete identity and sequence is corrupt and skipped, never replayed.
 
+A replay delivers events however old they are, and an `aggregate` downstream merges them into its
+current window. Put `drop_stale` before the `aggregate` to discard events older than `max_age`, or
+`has_stale` to route them to an archive ([ADR `stale-event-filtering`](adr/stale-event-filtering.md)).
+
 ```yaml
 buffer:
   disk:
