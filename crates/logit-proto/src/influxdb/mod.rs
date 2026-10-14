@@ -88,8 +88,7 @@
 //!   the carrier line, counted `logit.output.metrics.normalized{reason="carrier_mismatch"}`. A
 //!   carrier event with only string fields still writes its line; one with no field writes none.
 //! - **Both paths**: the tags are the same, from the attribute table below, and every key under
-//!   the private `_logit.` namespace, [`FIELD_ATTR_PREFIX`], or `statsd.` is skipped as a tag,
-//!   uncounted
+//!   the private `_logit.` namespace or [`FIELD_ATTR_PREFIX`] is skipped as a tag, uncounted
 //!   ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
 //!
 //! | Model | Wire | Counter |
@@ -125,7 +124,7 @@
 //! | an empty key or value | omitted | `tags.omitted{reason="empty"}` |
 //! | a key or value with a line break, ending in `\`, or with `\` directly before a space | omitted | `tags.omitted{reason="unencodable"}` |
 //! | key `_measurement`, `_field`, or `time` | omitted: influxd rejects the whole write | `tags.omitted{reason="reserved"}` |
-//! | key under `_logit.`, `influxdb.field.`, or `statsd.` | not a tag | -- |
+//! | key under `_logit.` or `influxdb.field.` | not a tag | -- |
 //!
 //! <!-- encode-table:end -->
 //!

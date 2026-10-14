@@ -100,8 +100,8 @@
 //! | `MetricRecord`'s `unit`, `description`, `start_timestamp`, `exemplars`; `EventBatch::scope`; `Resource::schema_url` | dropped | none; `docs/known-gaps/mappings.md` rows -- carbon has no field for any of them |
 //! | an event with no metrics at all | skipped | [`EncodeStats::skipped_no_metrics`], no counter (nothing was lost) |
 //!
-//! Attributes in the `statsd.` namespace are **skipped uncounted**, as `influxdb_out` skips them:
-//! they are another protocol's consumed carriers. So is every private `_logit.` attribute
+//! Every private `_logit.` attribute is **skipped uncounted**, as `influxdb_out` skips it: it is
+//! a carrier, not a tag
 //! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
 //! Resource attributes *do* become tags (as at `influxdb_out`/`statsd_out`); a `graphite_in`
 //! resource is empty, so the pair stays a fixed point, and cross-protocol it is a

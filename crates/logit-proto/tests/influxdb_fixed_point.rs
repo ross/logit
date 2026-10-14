@@ -15,10 +15,10 @@
 //!
 //! - a measurement that starts with a letter (a leading `#` would make a comment) and may hold
 //!   `,`, `=`, and spaces, which the encoder escapes;
-//! - 0-4 tags with distinct keys outside the reserved names, the private `_logit.` prefix, the
-//!   `influxdb.field.` string-field prefix, and the `statsd.` carriers, keys and values that may
-//!   hold `,`, `=`, spaces, and `"`; no backslash in any name,
-//!   since a backslash before a delimiter has no spelling (normalization 6);
+//! - 0-4 tags with distinct keys outside the reserved names, the private `_logit.` prefix, and
+//!   the `influxdb.field.` string-field prefix, keys and values that may hold `,`, `=`, spaces,
+//!   and `"`; no backslash in any name, since a backslash before a delimiter has no spelling
+//!   (normalization 6);
 //! - 1-4 numeric or boolean fields of every type, any finite `f64` (normalization 5), and 0-2
 //!   string fields with any characters, quotes, backslashes, and newlines included, all keys
 //!   distinct and none `time`;
@@ -245,7 +245,6 @@ fn reserved_tag(key: &str) -> bool {
     matches!(key, "time" | "_measurement" | "_field")
         || logit_core::attrs::is_private(key)
         || key.starts_with(FIELD_ATTR_PREFIX)
-        || key.starts_with("statsd.")
 }
 
 #[derive(Debug, Clone)]

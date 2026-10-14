@@ -30,10 +30,6 @@ use std::ops::Range;
 /// Nanoseconds per second -- the divisor an egress timestamp floors by.
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
-/// statsd's consumed-carrier namespace, skipped **uncounted** as `influxdb_out` skips it: counting
-/// it as dropped would report a loss that never happened.
-const FOREIGN_CARRIER_PREFIXES: [&str; 1] = ["statsd."];
-
 /// Per-batch outcome counts from [`GraphiteEncoder::encode_into`], for tests and benches.
 /// Production telemetry comes from the counters the encoder emits itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -567,9 +563,7 @@ fn build_tag_suffix(
 
     for (key, value) in logit_core::attrs::merged(resource, event) {
         let key = resolve(key);
-        if FOREIGN_CARRIER_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
-            || logit_core::attrs::is_private(key)
-        {
+        if logit_core::attrs::is_private(key) {
             continue;
         }
         if tags == Tags::Drop {
