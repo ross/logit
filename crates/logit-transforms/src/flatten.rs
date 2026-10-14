@@ -7,8 +7,8 @@
 //! whole. A key collision is last write wins, with no diagnostic. There is no cap on how many keys
 //! one value expands into; [`MAX_DEPTH`] is the only bound (`docs/known-gaps/runtime.md`).
 //!
-//! `all` never selects a private `_logit.*` attribute, because its protocol's sink reads it by its
-//! exact name and shape; a named private attribute still flattens (ADR
+//! `all` never selects an attribute under the private `_logit.` prefix, which protocol codecs
+//! reserve for their own use; a named private attribute still flattens (ADR
 //! `private-attribute-namespace`).
 //!
 //! No flush state; it reuses per-instance [`Scratch`] buffers for the path and interned keys.
