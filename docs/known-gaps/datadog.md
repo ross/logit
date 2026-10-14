@@ -130,17 +130,17 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** the Agent-equivalent trace processor the plan defers
     ([plan §14](../plans/datadog-relay.md#14-not-in-this-stack-an-agent-equivalent-trace-processor)).
 - **`datadog_trace_out` sends every numeric span attribute as a Datadog `metrics` entry.** The
-  span encoder puts each `F64`, `I64`, and `U64` attribute in the span's `metrics` map, and strings,
-  bools (as `"true"` or `"false"`), and every other value in `meta`. That is right for a span
-  `datadog_trace_in` decoded, because the decoder stores a tracer's `metrics` map as `F64`
-  attributes and its `meta` map as strings (the mapping table in `logit_proto::datadog`). It is
-  wrong for a span from any other source: an OTel span's integer attribute such as
-  `http.response.status_code` (`I64`) leaves in `metrics`, so Datadog doesn't offer it as a span
-  tag. The sink counts an integer that doesn't convert exactly
-  (`degraded{reason="int_as_f64"}`) but not this misclassification. The decode side counts
-  `key_collision` and has no such gap.
-  - **Consequence:** numeric attributes from OTel-origin and Lua-authored spans can't be used as
-    tags in Datadog's span search and filters.
+  span encoder puts each `F64`, `I64`, and `U64` attribute in the span's `metrics` map, each
+  `Bytes` attribute in `meta_struct`, and strings, bools (as `"true"` or `"false"`), and every
+  other value in `meta`. That is right for a span `datadog_trace_in` decoded, because the decoder
+  stores a tracer's `metrics` map as `F64` attributes, its `meta` map as strings, and its
+  `meta_struct` as `Bytes` (the mapping table in `logit_proto::datadog`). It is wrong for a span
+  from any other source: an OTel span's integer attribute such as `http.response.status_code`
+  (`I64`) leaves in `metrics`, where Datadog reads a numeric span measure rather than a tag. The
+  sink counts an integer that loses bits in the `f64` conversion (`degraded{reason="int_as_f64"}`)
+  but not this misclassification. The decode side counts `key_collision` and has no such gap.
+  - **Consequence:** numeric attributes from OTel-origin and Lua-authored spans reach Datadog as
+    span measures, not tags.
   - **Workaround:** a `lua` stage ahead of `datadog_trace_out` that rewrites the integer
     attributes you want as tags into strings.
   - **Revisit trigger:** a user who needs numeric OTel attributes as Datadog tags. Possible fixes,
