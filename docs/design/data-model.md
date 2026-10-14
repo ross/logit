@@ -104,35 +104,12 @@ as `Value::U64`, because RFC 5424's PROCID is free-form PRINTUSASCII. `syslog.ti
 ([ADR `timestamp-transform`](../adr/timestamp-transform.md)). See
 [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md).
 
-**A carrier is private: it lives under `_logit.<protocol>.`** (`_logit.statsd.type`). A carrier is
-a protocol's raw wire spelling of something the model normalizes, or a payload field only that
-protocol's own sink reads. [ADR `private-attribute-namespace`](../adr/private-attribute-namespace.md)
-lists which keys are private and which stay public, and records why. The prefix has one
-definition, `logit_core::attrs::PRIVATE_PREFIX`, tested by `logit_core::attrs::is_private`. The
-rules:
-
-- **Every protocol sink ignores `_logit.*`** when it renders an event's or resource's top-level
-  attributes as tags, labels, fields, or attributes, except its own `_logit.<protocol>.*` keys,
-  which it reads by exact name. The skip is silent: no `omitted`, `no_wire_form`, or `dialect`
-  counter counts a private key. A `_logit.` key nested inside a map value is data and renders.
-- **Full-event renders carry everything**: `stdio_out` and `file_out` in every format, `kafka_out`
-  under `json`, `msgpack`, and `native`, and the native wire (`logit_out`, `logit_in`, the
-  `buffer.disk:` spool).
-- **Any component may read any private key**, sinks included, for information another protocol
-  left there: `datadog_out` reads `_logit.statsd.event.*`. The ignore rule governs generic
-  rendering only.
-- **`keep` drops private keys** like any key not in `fields`, unless `private: keep`, which
-  retains the whole namespace. **`flatten`'s `all`** never selects a private key; a named one still
-  flattens. **`aggregate`** keys series on private keys like any attribute. `remove`, `route`,
-  `has_attributes`, `drop_attributes`, `set`, and Lua name private keys explicitly, so a private
-  key may appear in operator config.
-- **Metric-wire tag decoders refuse the prefix.** DogStatsD `|#` tags, Datadog series tags,
-  InfluxDB tags, Prometheus labels, and carbon `;k=v` tags drop a key under `_logit.` and count it
-  as `logit.input.tags.omitted{reason="reserved_prefix"}`. Log and span decoders and the parsing
-  transforms don't.
-
-A key under [ADR `lossless-transit`](../adr/lossless-transit.md)'s rule (c), such as
-`logit.body_format`, is the opposite case: public, and meant to cross a foreign wire.
+**The private namespace `_logit.`** is reserved for protocol codecs' own use. Its one definition
+is `logit_core::attrs::PRIVATE_PREFIX`, tested by `logit_core::attrs::is_private`. `keep` drops a
+`_logit.*` attribute like any key not in `fields`, unless `private: keep`, which retains the whole
+namespace. `flatten`'s `all` never selects a `_logit.*` attribute; naming one still flattens it.
+[ADR `private-attribute-namespace`](../adr/private-attribute-namespace.md) records the rule codecs
+and sinks follow for the namespace.
 
 **The raw, protocol-native value rides alongside the normalized field and wins on the way back
 out.** `syslog_in`/`syslog_out` set this precedent for `syslog.severity`

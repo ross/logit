@@ -2412,11 +2412,9 @@ pub enum ComponentKind {
     /// `private` doesn't retain.
     Keep {
         fields: Vec<String>,
-        /// What happens to `_logit.*` attributes, which a decoder writes so the same protocol's
-        /// output can reproduce the original wire form (`_logit.statsd.type` for a statsd timer's
-        /// type letter, say). `drop` (the default) treats them like any other key not in
-        /// `fields`. `keep` retains every one of them alongside `fields`, so a relay through `keep`
-        /// stays faithful at its like-protocol output.
+        /// What happens to attributes under the `_logit.` prefix, which protocol codecs reserve for
+        /// their own use. `drop` (the default) treats them like any other key not in `fields`;
+        /// `keep` retains every one of them alongside `fields`.
         #[serde(default)]
         private: KeepPrivate,
     },

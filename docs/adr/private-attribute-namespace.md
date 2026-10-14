@@ -23,7 +23,7 @@ sink:
 - `graphite_out` skips `statsd.*` and `collectd.*`.
 - `prometheus_out` skips only `prometheus.*`.
 - `datadog_out`'s series encoder skips a fixed list of 15 keys.
-- `otlp_out` skips nothing.
+- `otlp_out` skips only its own `otel.severity_*` carriers.
 
 So the input ahead of a sink changes that sink's series identity. A `statsd_in -> collectd_out`
 pipeline counts `statsd.type` as a tag with no wire form, a `collectd_in -> prometheus_out`
@@ -63,7 +63,7 @@ By protocol, these move under `_logit.`:
 
 | Protocol | Private keys |
 |---|---|
-| statsd | every `statsd.*` attribute: `type`, `container_id`, `timestamp`, `event.*`, `service_check.*` |
+| statsd | every `statsd.*` attribute: `type`, `container_id`, `external_data`, `cardinality`, `timestamp`, `event.*`, `service_check.*` |
 | Prometheus | every `prometheus.*` attribute: `type`, `timestamp`, and the resource attribute `target` |
 | collectd | every `collectd.*` attribute: the five-tuple, `interval`, and `severity` |
 | Datadog | every `datadog.*` attribute: series, events, service checks, Agent fields, trace chunk, stats, tracer headers, `span.error`, and `source` |
@@ -75,8 +75,8 @@ These stay public:
 
 - `influxdb.field.<key>`: a string field's content, which is data, not a carrier.
 - `syslog.timestamp`: the sender's own stamp. `Event.timestamp` is receipt time until a
-  `timestamp` component resolves it, so the attribute duplicates nothing, and the `timestamp`
-  transform reads it by this name.
+  `timestamp` component resolves it, so the attribute duplicates nothing, and an operator names it
+  in that component's config.
 - `syslog.hostname`, `syslog.tag`, `syslog.pid`, `syslog.msgid`, `syslog.sd`, and
   `syslog.facility`: header facts with no typed home that any destination can use.
 - `com.splunk.*` and `otel.log.*`: the OpenTelemetry `splunk_hec` exporter's public vocabulary,
@@ -112,9 +112,9 @@ rule as `otlp_out` does.
 ### Any component may read the private namespace
 
 The ignore rule governs generic rendering only. Any component, sinks included, may read any
-private key for information another protocol left there: `datadog_out` reads
-`_logit.statsd.event.*` to send a DogStatsD event to Datadog's events API, and `collectd_out`
-could read `_logit.prometheus.type`. This is a permission, not a mandate: nothing requires a
+private key for information another protocol left there. `datadog_out` reading the statsd event
+carriers (`_logit.statsd.event.*`) to send a DogStatsD event to Datadog's events API is the
+standing example, and `collectd_out` could read `_logit.prometheus.type`. This is a permission, not a mandate: nothing requires a
 component to look.
 
 ### Transforms
