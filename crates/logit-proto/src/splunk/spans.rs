@@ -291,12 +291,17 @@ fn has_unwritable_fields(span: &SpanRecord) -> bool {
 }
 
 fn write_attributes(obj: &mut JsonObject<'_>, attributes: &AttrMap) {
-    if attributes.is_empty() {
+    let mut public = attributes
+        .iter()
+        .map(|(key, value)| (resolve(key), value))
+        .filter(|(key, _)| !logit_core::attrs::is_private(key))
+        .peekable();
+    if public.peek().is_none() {
         return;
     }
     let mut inner = JsonObject::begin(obj.key("attributes"));
-    for (key, value) in attributes.iter() {
-        write_value(inner.key(resolve(key)), value);
+    for (key, value) in public {
+        write_value(inner.key(key), value);
     }
     inner.finish();
 }
@@ -315,8 +320,9 @@ impl SplunkEncoder {
         }
         let mut fields = AttrMap::new();
         for (key, value) in ctx.resource.attributes.iter() {
-            if !super::is_carrier(key) {
-                flatten_into(resolve(key), value, &mut fields);
+            let name = resolve(key);
+            if !super::is_carrier(key) && !logit_core::attrs::is_private(name) {
+                flatten_into(name, value, &mut fields);
             }
         }
 
@@ -428,6 +434,39 @@ mod tests {
         let json = |s: &str| serde_json::from_str::<Json>(s).unwrap();
         assert_eq!(json(&once), json(SPAN), "the exporter's object comes back member for member");
         assert_eq!(decode(&once), batches);
+    }
+
+    /// A private attribute never reaches a span's, a span event's, or a link's `attributes`, or
+    /// the object's `fields` from the resource; a `_logit.` key nested inside a map is data and
+    /// stays.
+    #[test]
+    fn a_private_attribute_never_reaches_the_span_object() {
+        let registry = Registry::new();
+        let mut batch = decode(SPAN).remove(0);
+        let mut resource = (*batch.resource).clone();
+        resource.attributes.insert("_logit.y", Value::str("r"));
+        batch.resource = Arc::new(resource);
+        let event = &mut batch.events[0];
+        event.attributes.insert("_logit.x", Value::str("e"));
+        event.attributes.insert(
+            "nested",
+            Value::Map(Box::new(AttrMap::from_iter([("_logit.z", Value::str("p"))]))),
+        );
+        let span = event.span.as_mut().unwrap();
+        span.events[0].attributes.insert("_logit.x", Value::str("e"));
+        span.links[0].attributes.insert("_logit.x", Value::str("e"));
+        let mut out = MessageBuf::default();
+        encoder(&registry).encode_objects(&batch, &mut out);
+        let json: Json = serde_json::from_slice(out.iter().next().unwrap()).unwrap();
+        let hec = &json["event"];
+        assert_eq!(
+            hec["attributes"],
+            serde_json::json!({"http.method": "GET", "n": {"deep": 1}, "nested": {"_logit.z": "p"}})
+        );
+        assert_eq!(hec["events"][0]["attributes"], serde_json::json!({"k": "v"}));
+        assert!(hec["links"][0].get("attributes").is_none(), "{}", hec["links"][0]);
+        assert_eq!(json["fields"], serde_json::json!({"service.name": "cart"}));
+        assert!(registry.drain(0).is_empty(), "a private key is never counted");
     }
 
     #[test]

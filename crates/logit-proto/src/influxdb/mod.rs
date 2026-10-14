@@ -82,7 +82,9 @@
 //!   the carrier line, counted `logit.output.metrics.normalized{reason="carrier_mismatch"}`. A
 //!   carrier event with only string fields still writes its line; one with no field writes none.
 //! - **Both paths**: the tags are the same, from the attribute table below, and every key under
-//!   [`CARRIER_PREFIX`] or `statsd.` is skipped as a tag, uncounted.
+//!   [`CARRIER_PREFIX`], `statsd.`, or the private `_logit.` namespace is skipped as a tag,
+//!   uncounted
+//!   ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|

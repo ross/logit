@@ -2412,11 +2412,9 @@ pub enum ComponentKind {
     /// `private` doesn't retain.
     Keep {
         fields: Vec<String>,
-        /// What happens to `_logit.*` attributes, which a decoder writes so the same protocol's
-        /// output can reproduce the original wire form (`_logit.statsd.type` for a statsd timer's
-        /// type letter, say). `drop` (the default) treats them like any other key not in
-        /// `fields`. `keep` retains every one of them alongside `fields`, so a relay through `keep`
-        /// stays faithful at its like-protocol output.
+        /// What happens to attributes under the `_logit.` prefix, which protocol codecs reserve for
+        /// their own use. `drop` (the default) treats them like any other key not in `fields`;
+        /// `keep` retains every one of them alongside `fields`.
         #[serde(default)]
         private: KeepPrivate,
     },
@@ -2806,9 +2804,9 @@ pub enum ComponentKind {
     Flatten {
         /// Which top-level attributes to expand. `all` (the default) expands every nested
         /// attribute, the useful default for a source whose keys you don't control (a Kubernetes
-        /// label map, an OTLP `KvlistValue`). `all` never selects a `_logit.*` attribute, which a
-        /// decoder writes for its own protocol's output; name one to flatten it. A named list
-        /// holds literal attribute names, never paths. Rejected if both this and `resource` are
+        /// label map, an OTLP `KvlistValue`). `all` never selects an attribute under the `_logit.`
+        /// prefix, which protocol codecs reserve for their own use; name one to flatten it. A named
+        /// list holds literal attribute names, never paths. Rejected if both this and `resource` are
         /// `none`, or if a named list is empty or contains an empty or duplicate name.
         #[serde(default = "default_flatten_attributes")]
         attributes: FlattenFields,

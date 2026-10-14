@@ -270,14 +270,14 @@ already counted as debt: an OTLP `as_int` point leaving `otlp_out` as a double, 
 
 ## Amendment: rule (b)'s carriers are private (2026-10-13)
 
-Rule (b)'s protocol-namespaced carriers now live under one private prefix, `_logit.`, with the
-protocol segment kept: `syslog.severity` becomes `_logit.syslog.severity`, and
-`otel.severity_number` becomes `_logit.otel.severity_number`. Every protocol sink ignores
-`_logit.*` when it renders attributes, except its own carriers, which it reads by exact name. See
-[ADR `private-attribute-namespace`](private-attribute-namespace.md) for which keys move, the
-ignore rule, the inbound guard on metric-wire tags, and how `keep` and `flatten` treat the
-namespace.
+[ADR `private-attribute-namespace`](private-attribute-namespace.md) decides that rule (b)'s
+protocol-namespaced carriers live under one private prefix, `_logit.`, with the protocol segment
+kept: `syslog.severity` is spelled `_logit.syslog.severity`, and `otel.severity_number` is spelled
+`_logit.otel.severity_number`. Under that decision, every protocol sink ignores `_logit.*` when it
+renders attributes, except its own carriers, which it reads by exact name. See that ADR for which
+keys move, the ignore rule, the inbound guard on metric-wire tags, and how `keep` and `flatten`
+treat the namespace.
 
 Rules (b) and (c) are opposites. A rule (c) key (`logit.body_format`) is public: it exists to cross
-a foreign wire and every sink renders it. A rule (b) carrier is private: it exists for its own
+a foreign wire, where a sink writes it. A rule (b) carrier is private: it exists for its own
 protocol's sink and never crosses a foreign wire as a tag, label, field, or attribute.

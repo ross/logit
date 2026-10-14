@@ -247,7 +247,7 @@ impl DatadogEncoder {
             }
         }
         for (key, value) in &attrs {
-            if consumed.contains(key) {
+            if consumed.contains(key) || logit_core::attrs::is_private(resolve(*key)) {
                 continue;
             }
             if *key == keys.message || *key == keys.timestamp {
@@ -527,6 +527,27 @@ pub(super) mod tests {
             counted(&registry, "logit.output.tags.omitted", ("reason", "reserved_key")),
             1.0
         );
+    }
+
+    /// A private attribute, on the event or the resource, never becomes a field and is never
+    /// counted; a public sibling still does.
+    #[test]
+    fn encode_never_writes_a_private_attribute() {
+        let registry = Registry::new();
+        let encoder = DatadogEncoder::new().with_telemetry(registry.telemetry_for(
+            "datadog_out",
+            "datadog_out",
+            "sink",
+        ));
+        let mut batch = decode(r#"{"message":"m","timestamp":1000}"#);
+        batch.events[0].attributes.insert("_logit.x", Value::str("e"));
+        batch.events[0].attributes.insert("env", Value::str("prod"));
+        let mut resource = Resource::default();
+        resource.attributes.insert("_logit.y", Value::str("r"));
+        batch.resource = Arc::new(resource);
+        let out = String::from_utf8(encoder.encode_logs(&batch).unwrap().to_vec()).unwrap();
+        assert_eq!(out, r#"[{"message":"m","timestamp":1000,"env":"prod"}]"#);
+        assert!(registry.drain(0).is_empty(), "a private key is never counted");
     }
 
     fn with_trace(mut batch: EventBatch, trace: logit_core::TraceRef) -> EventBatch {

@@ -1,6 +1,6 @@
 //! `AttrMap`: the small, sorted, interned-key map behind event attributes, plus [`merged`], the
 //! resource-then-event merge-join shared by every codec that renders both onto one wire form, and
-//! [`is_private`], the test for the `_logit.` namespace every protocol sink skips.
+//! [`is_private`], the test for the private `_logit.` namespace.
 //!
 //! Most events carry under a dozen attributes, where a sorted `SmallVec` beats a `HashMap` on
 //! lookup and iteration, and its deterministic order is what the wire format's dictionary encoding
@@ -127,9 +127,7 @@ pub fn merged<'a>(
     })
 }
 
-/// The prefix of the private attribute namespace: a protocol's raw wire spelling of something the
-/// model normalizes, or a payload field only that protocol's own sink reads, kept under
-/// `_logit.<protocol>.` (`_logit.statsd.type`).
+/// The prefix of the private attribute namespace, which protocol codecs reserve for their own use.
 ///
 /// See ADR `private-attribute-namespace` (`docs/adr/private-attribute-namespace.md`) and
 /// `docs/design/data-model.md`'s "Well-known attribute names".
@@ -137,9 +135,8 @@ pub const PRIVATE_PREFIX: &str = "_logit.";
 
 /// Whether `key` is in the private namespace, [`PRIVATE_PREFIX`].
 ///
-/// A protocol sink skips every private key when it renders tags, labels, fields, or attributes,
-/// except its own `_logit.<protocol>.*` keys, which it reads by exact name. Don't filter inside
-/// [`merged`]: sinks read their own private keys through it.
+/// ADR `private-attribute-namespace` has the rule sinks follow for these keys. Don't filter inside
+/// [`merged`]: under that rule, a sink reads its own private keys through it.
 pub fn is_private(key: &str) -> bool {
     key.starts_with(PRIVATE_PREFIX)
 }

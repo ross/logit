@@ -101,9 +101,12 @@
 //! | an event with no metrics at all | skipped | [`EncodeStats::skipped_no_metrics`], no counter (nothing was lost) |
 //!
 //! Attributes in the `statsd.`/`collectd.` namespaces are **skipped uncounted**, as `influxdb_out`
-//! skips `statsd.`: they are another protocol's consumed carriers. Resource attributes *do* become
-//! tags (as at `influxdb_out`/`statsd_out`); a `graphite_in` resource is empty, so the pair stays
-//! a fixed point, and cross-protocol it is a `docs/known-gaps/mappings.md` row.
+//! skips `statsd.`: they are another protocol's consumed carriers. So is every private `_logit.`
+//! attribute
+//! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
+//! Resource attributes *do* become tags (as at `influxdb_out`/`statsd_out`); a `graphite_in`
+//! resource is empty, so the pair stays a fixed point, and cross-protocol it is a
+//! `docs/known-gaps/mappings.md` row.
 //!
 //! ## Sanitization
 //!

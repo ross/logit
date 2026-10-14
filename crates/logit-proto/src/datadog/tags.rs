@@ -71,7 +71,7 @@ pub struct Dropped {
 /// nothing, numbers → `k:<display>`, `Timestamp` → `k:<RFC 3339>`, `Array` → one tag per element
 /// under the same rules, `Map`/`Bytes`/`Null` → omitted and counted. Keys in `skip` are the ones a
 /// caller already consumed into a wire field of its own (`host.name`, the `datadog.*` carriers)
-/// and are never rendered.
+/// and are never rendered, and neither is a private `_logit.` key, which is never counted.
 pub fn render_tags<'a>(
     pairs: impl IntoIterator<Item = (Symbol, &'a Value)>,
     skip: &[Symbol],
@@ -79,10 +79,11 @@ pub fn render_tags<'a>(
 ) -> Dropped {
     let mut dropped = Dropped::default();
     for (key, value) in pairs {
-        if skip.contains(&key) {
+        let name = resolve(key);
+        if skip.contains(&key) || logit_core::attrs::is_private(name) {
             continue;
         }
-        render_one(resolve(key), value, out, &mut dropped);
+        render_one(name, value, out, &mut dropped);
     }
     dropped
 }
@@ -113,7 +114,7 @@ pub fn count_tags<'a>(
 ) -> usize {
     pairs
         .into_iter()
-        .filter(|(key, _)| !skip.contains(key))
+        .filter(|(key, _)| !skip.contains(key) && !logit_core::attrs::is_private(resolve(*key)))
         .map(|(_, value)| count_one(value))
         .sum()
 }
