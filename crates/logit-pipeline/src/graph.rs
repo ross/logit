@@ -4871,7 +4871,10 @@ mod tests {
     }
 
     fn keep(fields: Vec<&str>) -> ComponentKind {
-        ComponentKind::Keep { fields: fields.into_iter().map(String::from).collect() }
+        ComponentKind::Keep {
+            fields: fields.into_iter().map(String::from).collect(),
+            private: Default::default(),
+        }
     }
 
     fn route(by: logit_config::RouteBy, routes: &[(&str, &str)]) -> ComponentKind {
@@ -6247,7 +6250,14 @@ mod tests {
     fn keep_and_remove_resolve_as_transforms() {
         let graph = resolve(cfg(vec![
             ("in", vec![], listener()),
-            ("keep", vec!["in"], ComponentKind::Keep { fields: vec!["status".to_string()] }),
+            (
+                "keep",
+                vec!["in"],
+                ComponentKind::Keep {
+                    fields: vec!["status".to_string()],
+                    private: Default::default(),
+                },
+            ),
             (
                 "remove",
                 vec!["keep"],

@@ -7,8 +7,9 @@
 
 use super::part::{self, DsValue};
 use super::{
-    nanos_to_cdtime, ATTR_PREFIX, ATTR_SEVERITY, CDTIME_ONE_SECOND, DATA_MAX_NAME_LEN,
-    MAX_VALUES_PER_LIST, NOTIF_MAX_MSG_LEN,
+    nanos_to_cdtime, ATTR_HOST, ATTR_PLUGIN_INSTANCE, ATTR_PREFIX, ATTR_SEVERITY,
+    ATTR_TYPE_INSTANCE, CDTIME_ONE_SECOND, DATA_MAX_NAME_LEN, MAX_VALUES_PER_LIST,
+    NOTIF_MAX_MSG_LEN,
 };
 use crate::{FramedEncoder, MessageBuf};
 use bytes::Bytes;
@@ -29,7 +30,7 @@ const MAX_IDENTITY_BYTES: usize = DATA_MAX_NAME_LEN - 1;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStats {
     /// Metrics-empty events that aren't notification attempts (a span, or a log without
-    /// `collectd.severity`). Not a loss: nothing to carry.
+    /// `_logit.collectd.severity`). Not a loss: nothing to carry.
     pub skipped_no_metrics: usize,
     /// A metric kind collectd has no data-source type for (every post-summarization kind, plus a
     /// delta non-monotonic `Sum`), tagged with the kind.
@@ -65,12 +66,13 @@ pub struct EncodeStats {
     /// A single value list larger than `max_packet_bytes`: dropped whole, never split across
     /// datagrams (a split list would be dispatched against the wrong identity).
     pub dropped_oversize_list: usize,
-    /// An attribute outside the `collectd.` namespace (collectd has no tags), once per attribute
-    /// per event, including `host.name`, which host resolution reads but can't carry as itself.
+    /// An attribute that is neither a collectd carrier nor under the private `_logit.` prefix
+    /// (collectd has no tags), once per attribute per event, including `host.name`, which host
+    /// resolution reads but can't carry as itself.
     pub tags_omitted_no_wire_form: usize,
-    /// A `collectd.*` attribute with no wire form here: an identity field that isn't
-    /// `Str`/`Bytes`, an interval that isn't a finite positive `F64`, a `collectd.severity` that
-    /// isn't `U64` or rides on a value list, or a `collectd.*` name this codec doesn't know.
+    /// A collectd carrier with no wire form here: an identity field that isn't `Str`/`Bytes`, an
+    /// interval that isn't a finite positive `F64`, a `_logit.collectd.severity` that isn't `U64`
+    /// or rides on a value list, or a `_logit.collectd.*` name this codec doesn't know.
     pub tags_omitted_unrepresentable: usize,
     /// An identity field that had a NUL or `/` replaced with `_`. Counted once per field.
     pub identity_sanitized_substituted: usize,
@@ -220,8 +222,8 @@ impl CollectdEncoder {
         self
     }
 
-    /// The host written when neither `collectd.host` nor `host.name` is present (`collectd_out`'s
-    /// `hostname:`).
+    /// The host written when neither `collectd.host` nor `host.name` is present
+    /// (`collectd_out`'s `hostname:`).
     ///
     /// **Operator-supplied, with no default.** The encoder neither reads the OS hostname (deferred,
     /// `docs/known-gaps/mappings.md`) nor invents a placeholder: a receiver keys every series on
@@ -264,9 +266,9 @@ impl FramedEncoder for CollectdEncoder {
         for event in &batch.events {
             if event.metrics.is_empty() {
                 // A `log`-only event is a notification *attempt* only if it carries
-                // `collectd.severity`; otherwise it is the uncounted no-metrics skip. A plain scan,
-                // not `collect_carriers`, so a non-attempt doesn't count every attribute as
-                // `tags_omitted_no_wire_form`.
+                // `_logit.collectd.severity`; otherwise it is the uncounted no-metrics skip. A
+                // plain scan, not `collect_carriers`, so a non-attempt doesn't count every
+                // attribute as `tags_omitted_no_wire_form`.
                 let is_notification_attempt = event.log.is_some()
                     && logit_core::attrs::merged(&batch.resource, event)
                         .any(|(key, _)| logit_core::interner::resolve(key) == ATTR_SEVERITY);
@@ -296,9 +298,9 @@ impl FramedEncoder for CollectdEncoder {
 
             let carriers = collect_carriers(&batch.resource, event, &mut ctx);
 
-            // Metrics win: `collectd.severity` has no wire form on a value list. `collect_carriers`
-            // counted a wrong-typed one; it leaves the `U64` case for the caller, which knows the
-            // path.
+            // Metrics win: `_logit.collectd.severity` has no wire form on a value list.
+            // `collect_carriers` counted a wrong-typed one; it leaves the `U64` case for the
+            // caller, which knows the path.
             if carriers.severity.is_some() {
                 ctx.tag_omitted_unrepresentable();
             }
@@ -324,7 +326,7 @@ impl FramedEncoder for CollectdEncoder {
                 // Like-relay: the identity is the wire's own and the whole `MetricList` is one
                 // value list, in order, so the decode side's `MAX_VALUES_PER_LIST` cap applies.
                 // `aggregate`/`kv_metrics` can put far more records on one event, and a `set`
-                // stamping `collectd.type` routes it here.
+                // stamping `_logit.collectd.type` routes it here.
                 if event.metrics.len() > MAX_VALUES_PER_LIST {
                     ctx.drop_too_many_values(event.metrics.len());
                     continue;
@@ -542,11 +544,11 @@ impl Ctx<'_> {
         );
         self.diag.warn_throttled(
             "no_host",
-            "collectd_out: no host to write -- the event carries neither `collectd.host` nor \
-             `host.name`, and this sink has no `hostname:` configured; dropping. Set `hostname:` \
-             on the sink, or stamp `host.name` with a `set` transform: collectd's receiver rejects \
-             an empty host, and inventing one would merge every unlabelled sender into one host's \
-             metrics",
+            "collectd_out: no host to write -- the event carries neither `collectd.host` \
+             nor `host.name`, and this sink has no `hostname:` configured; dropping. Set \
+             `hostname:` on the sink, or stamp `host.name` with a `set` transform: collectd's \
+             receiver rejects an empty host, and inventing one would merge every unlabelled sender \
+             into one host's metrics",
         );
     }
 
@@ -603,8 +605,8 @@ impl Ctx<'_> {
         self.diag.warn_throttled(
             "notification_dropped",
             format_args!(
-                "collectd_out: a log event's collectd.severity ({severity:?}) is not one of 1 \
-                 (FAILURE), 2 (WARNING), or 4 (OKAY); dropping the notification"
+                "collectd_out: a log event's _logit.collectd.severity ({severity:?}) is not one of \
+                 1 (FAILURE), 2 (WARNING), or 4 (OKAY); dropping the notification"
             ),
         );
     }
@@ -653,7 +655,7 @@ impl Ctx<'_> {
     }
 }
 
-/// The `collectd.*` carriers (plus `host.name`) read off one event's merged attributes.
+/// The collectd carriers (plus `host.name`) read off one event's merged attributes.
 #[derive(Default, Clone, Copy)]
 struct Carriers<'a> {
     host: Option<&'a Value>,
@@ -674,22 +676,30 @@ struct Carriers<'a> {
 }
 
 /// Walks one event's attributes merged over its resource ([`logit_core::attrs::merged`]; the
-/// event wins), capturing the `collectd.*` carriers and counting everything with no wire form.
+/// event wins), capturing the collectd carriers and counting everything with no wire
+/// form.
 fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx) -> Carriers<'a> {
     let mut carriers = Carriers::default();
     for (key, value) in logit_core::attrs::merged(resource, event) {
         let key = logit_core::interner::resolve(key);
+        // The three public identity fields, read by exact name.
+        let public = match key {
+            ATTR_HOST => Some(&mut carriers.host),
+            ATTR_PLUGIN_INSTANCE => Some(&mut carriers.plugin_instance),
+            ATTR_TYPE_INSTANCE => Some(&mut carriers.type_instance),
+            _ => None,
+        };
+        if let Some(slot) = public {
+            match value {
+                Value::Str(_) | Value::Bytes(_) => *slot = Some(value),
+                _ => ctx.tag_omitted_unrepresentable(),
+            }
+            continue;
+        }
         if let Some(field) = key.strip_prefix(ATTR_PREFIX) {
             match (field, value) {
-                ("host", Value::Str(_) | Value::Bytes(_)) => carriers.host = Some(value),
                 ("plugin", Value::Str(_) | Value::Bytes(_)) => carriers.plugin = Some(value),
-                ("plugin_instance", Value::Str(_) | Value::Bytes(_)) => {
-                    carriers.plugin_instance = Some(value)
-                }
                 ("type", Value::Str(_) | Value::Bytes(_)) => carriers.type_ = Some(value),
-                ("type_instance", Value::Str(_) | Value::Bytes(_)) => {
-                    carriers.type_instance = Some(value)
-                }
                 ("interval", Value::F64(seconds)) if seconds.is_finite() && *seconds > 0.0 => {
                     // Exact for every interval a decoded list carries: `10.0` is `10 << 30` ticks.
                     carriers.interval_cdtime = (seconds * CDTIME_ONE_SECOND as f64).round() as u64;
@@ -705,9 +715,13 @@ fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx)
                     carriers.severity_present = true;
                     ctx.tag_omitted_unrepresentable();
                 }
-                // A wrong-typed carrier, a non-positive interval, or an unknown `collectd.*` name.
+                // A wrong-typed carrier, a non-positive interval, or an unknown `_logit.collectd.*`
+                // name.
                 _ => ctx.tag_omitted_unrepresentable(),
             }
+            continue;
+        }
+        if logit_core::attrs::is_private(key) {
             continue;
         }
         if key == "host.name" && matches!(value, Value::Str(_) | Value::Bytes(_)) {
@@ -1226,7 +1240,8 @@ mod tests {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
-    /// A like-relay event: `collectd.*` identity present, so the encoder re-emits it verbatim.
+    /// A like-relay event: collectd identity attributes present, so the encoder re-emits it
+    /// verbatim.
     fn relay_event(records: Vec<MetricRecord>) -> Event {
         let mut event = Event::empty(
             TS,
@@ -2125,6 +2140,22 @@ mod tests {
         assert_eq!(attr(&decoded[0], "env"), None, "collectd has no tag concept at all");
     }
 
+    /// A private attribute, on the event or the resource, is skipped uncounted; a public sibling
+    /// is still counted `no_wire_form`.
+    #[test]
+    fn a_private_attribute_is_skipped_uncounted() {
+        let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
+        event.attributes.insert("_logit.x", Value::from("e"));
+        event.attributes.insert("env", Value::from("prod"));
+        let mut resource = Resource::default();
+        resource.attributes.insert("_logit.y", "r");
+        let batch = EventBatch { resource: Arc::new(resource), scope: None, events: vec![event] };
+        let (packets, stats) = encode(&batch, DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(stats.tags_omitted_no_wire_form, 1, "only `env` is counted");
+        assert_eq!(stats.tags_omitted_unrepresentable, 0);
+        assert_eq!(decode_all(&packets).len(), 1);
+    }
+
     #[test]
     fn a_collectd_identity_carrier_of_the_wrong_value_type_is_counted_unrepresentable() {
         let mut event = relay_event(vec![record("load.load", MetricKind::gauge(0.5))]);
@@ -2142,7 +2173,7 @@ mod tests {
         assert_eq!(stats, EncodeStats { skipped_no_metrics: 1, ..EncodeStats::default() });
     }
 
-    /// A resource-level `collectd.*` carrier works, and an event-level one wins over it.
+    /// A resource-level collectd carrier works, and an event-level one wins over it.
     #[test]
     fn resource_carriers_apply_and_event_carriers_win() {
         let mut resource_attrs = AttrMap::new();
@@ -2162,7 +2193,7 @@ mod tests {
         assert_eq!(attr(&decoded[0], ATTR_PLUGIN), Some(Value::from("from-event")));
     }
 
-    /// Metrics win: `collectd.severity` on an event with metrics is counted
+    /// Metrics win: `_logit.collectd.severity` on an event with metrics is counted
     /// `tags_omitted_unrepresentable`.
     #[test]
     fn a_severity_attribute_on_a_metrics_bearing_event_is_dropped_and_counted() {
@@ -2179,7 +2210,7 @@ mod tests {
         assert_eq!(
             decoded[0].attributes.get(ATTR_SEVERITY),
             None,
-            "collectd.severity never reaches the wire on a value list"
+            "_logit.collectd.severity never reaches the wire on a value list"
         );
     }
 
@@ -2223,8 +2254,9 @@ mod tests {
         }
     }
 
-    /// A notification-shaped event: `log` set, no metrics, `collectd.severity` as the raw wire
-    /// value. `log_severity` is independent, so a test can build mismatches the encoder ignores.
+    /// A notification-shaped event: `log` set, no metrics, `_logit.collectd.severity` as the raw
+    /// wire value. `log_severity` is independent, so a test can build mismatches the encoder
+    /// ignores.
     fn notification_event(wire_severity: Value, log_severity: Severity, message: &str) -> Event {
         let mut attrs = attrs(&[
             (ATTR_HOST, Value::from("web-1")),
@@ -2309,8 +2341,8 @@ mod tests {
         }
     }
 
-    /// A wrong-typed `collectd.severity` is still an *attempt*: counted as an unrepresentable tag
-    /// and a dropped notification, not `skipped_no_metrics`.
+    /// A wrong-typed `_logit.collectd.severity` is still an *attempt*: counted as an
+    /// unrepresentable tag and a dropped notification, not `skipped_no_metrics`.
     #[test]
     fn a_severity_attribute_of_the_wrong_type_is_an_attempt_that_fails() {
         let event = notification_event(Value::from("2"), Severity::Warn, "x");
@@ -2318,10 +2350,11 @@ mod tests {
         assert!(packets.is_empty());
         assert_eq!(stats.dropped_notification, 1);
         assert_eq!(stats.tags_omitted_unrepresentable, 1);
-        assert_eq!(stats.skipped_no_metrics, 0, "a present collectd.severity is an attempt");
+        assert_eq!(stats.skipped_no_metrics, 0, "a present _logit.collectd.severity is an attempt");
     }
 
-    /// A `log`-only event with **no** `collectd.severity` is not an attempt: `skipped_no_metrics`.
+    /// A `log`-only event with **no** `_logit.collectd.severity` is not an attempt:
+    /// `skipped_no_metrics`.
     #[test]
     fn a_log_event_without_collectd_severity_is_not_a_notification() {
         let event = Event::log(

@@ -1004,8 +1004,10 @@ fn build_spec(
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone()),
         )),
-        Keep { fields } => NodeSpec::Transform(Box::new(
-            KeepTransform::new(fields.clone()).with_telemetry(telemetry.clone()),
+        Keep { fields, private } => NodeSpec::Transform(Box::new(
+            KeepTransform::new(fields.clone())
+                .with_private(*private)
+                .with_telemetry(telemetry.clone()),
         )),
         Remove { fields } => NodeSpec::Transform(Box::new(
             RemoveTransform::new(fields.clone()).with_telemetry(telemetry.clone()),
@@ -4716,7 +4718,10 @@ mod tests {
             sources: vec!["in".to_string()],
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
-            kind: ComponentKind::Keep { fields: vec!["status".to_string()] },
+            kind: ComponentKind::Keep {
+                fields: vec!["status".to_string()],
+                private: Default::default(),
+            },
         };
         assert!(matches!(
             build_spec("keep", &component, Path::new(""), None).unwrap().0,

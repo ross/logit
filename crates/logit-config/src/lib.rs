@@ -259,7 +259,8 @@ pub enum FlattenFields {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FlattenKeyword {
-    /// Expand every nested attribute (or resource attribute). The default for `attributes`.
+    /// Expand every nested attribute (or resource attribute) outside `_logit.*`. The default for
+    /// `attributes`.
     All,
     /// Expand nothing. The default for `resource`.
     None,
@@ -1300,8 +1301,9 @@ pub enum ComponentKind {
     /// matching data-source count and kinds is named `<plugin>.<type>.<ds_name>` rather than
     /// `<plugin>.<type>.<i>` (a single-data-source list is `<plugin>.<type>` either way). A
     /// missing or unparseable file fails startup. Names never change what `collectd_out` puts
-    /// back on the wire; it re-encodes from the `collectd.*` attributes. collectd's own
-    /// `types.db` is GPL-licensed and not shipped with `logit`; point this at the installed copy.
+    /// back on the wire; it re-encodes from the identity attributes this input stamps on each
+    /// event. collectd's own `types.db` is GPL-licensed and not shipped with `logit`; point this
+    /// at the installed copy.
     CollectdIn {
         bind: String,
         #[serde(default)]
@@ -2019,8 +2021,9 @@ pub enum ComponentKind {
     /// line protocol body (gzip accepted) and `org` or `orgID`, `bucket`, and `precision` in the
     /// query string, `GET /ping`, and `GET /health`, answering influxd's own JSON error bodies.
     /// A request with `Authorization: Token <t>` or `Bearer <t>` is checked against `tokens:`.
-    /// `org`, `orgID`, and `bucket` become the resource attributes `influxdb.org`,
-    /// `influxdb.org_id`, and `influxdb.bucket`. A body with any line that doesn't parse is
+    /// `org`, `orgID`, and `bucket` become the resource attributes `_logit.influxdb.org`,
+    /// `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`, which a `route` can match on and
+    /// which no sink writes as a tag. A body with any line that doesn't parse is
     /// refused whole with `400`, and nothing of it is delivered. When the pipeline can't start
     /// taking a request's data within 5s, the request gets `503` with `Retry-After: 1`, nothing
     /// of it is delivered, and the client retries it. The v1 `/write` endpoint isn't served.
@@ -2407,8 +2410,16 @@ pub enum ComponentKind {
     /// Retains only the named attributes, dropping the rest: an allowlist, so a new field
     /// appearing in a log format later cannot silently become a new tag dimension. Place it
     /// before `aggregate`, whose series key includes every attribute, to bound series cardinality
-    /// and per-window memory. An empty `fields` list is legal and drops every attribute.
-    Keep { fields: Vec<String> },
+    /// and per-window memory. An empty `fields` list is legal and drops every attribute that
+    /// `private` doesn't retain.
+    Keep {
+        fields: Vec<String>,
+        /// What happens to attributes under the `_logit.` prefix, which protocol codecs reserve for
+        /// their own use. `drop` (the default) treats them like any other key not in `fields`;
+        /// `keep` retains every one of them alongside `fields`.
+        #[serde(default)]
+        private: KeepPrivate,
+    },
     /// Drops the named attributes, keeping the rest.
     Remove { fields: Vec<String> },
     /// Stamps constant values onto every event's attributes and/or the batch's resource. A
@@ -2795,9 +2806,10 @@ pub enum ComponentKind {
     Flatten {
         /// Which top-level attributes to expand. `all` (the default) expands every nested
         /// attribute, the useful default for a source whose keys you don't control (a Kubernetes
-        /// label map, an OTLP `KvlistValue`). A named list holds literal attribute names, never
-        /// paths. Rejected if both this and `resource` are `none`, or if a named list is empty or
-        /// contains an empty or duplicate name.
+        /// label map, an OTLP `KvlistValue`). `all` never selects an attribute under the `_logit.`
+        /// prefix, which protocol codecs reserve for their own use; name one to flatten it. A named
+        /// list holds literal attribute names, never paths. Rejected if both this and `resource` are
+        /// `none`, or if a named list is empty or contains an empty or duplicate name.
         #[serde(default = "default_flatten_attributes")]
         attributes: FlattenFields,
         /// Also expand the batch's resource attributes, under the same rules, once per batch.
@@ -4070,6 +4082,18 @@ fn default_max_tracked_keys() -> usize {
 /// `shape`'s `max_tracked_keysets` default.
 fn default_max_tracked_keysets() -> usize {
     4096
+}
+
+/// `keep`'s `private` field: whether `_logit.*` attributes are dropped like any unnamed key or
+/// retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KeepPrivate {
+    /// Drop every `_logit.*` attribute not named in `fields`. The default.
+    #[default]
+    Drop,
+    /// Retain every `_logit.*` attribute.
+    Keep,
 }
 
 /// `flatten`'s `arrays` field: whether an array expands by index or is treated as a leaf.
@@ -5938,9 +5962,22 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::Keep { fields } => {
+            ComponentKind::Keep { fields, private } => {
                 assert_eq!(fields, vec!["status".to_string(), "method".to_string()]);
+                assert_eq!(private, KeepPrivate::Drop);
             }
+            other => panic!("expected Keep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keep_component_deserializes_private_keep() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "keep", "sources": ["in"], "fields": ["status"], "private": "keep"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Keep { private, .. } => assert_eq!(private, KeepPrivate::Keep),
             other => panic!("expected Keep, got {other:?}"),
         }
     }

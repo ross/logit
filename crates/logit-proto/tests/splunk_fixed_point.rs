@@ -542,3 +542,29 @@ proptest! {
         assert_fixed_point(&body);
     }
 }
+
+// -- cross-protocol -------------------------------------------------------------------------------
+
+/// A `syslog_in` decode encoded for `splunk_hec_out` carries the public header facts as `fields`
+/// and leaves out the private severity carrier (ADR `private-attribute-namespace`): the
+/// normalized severity already reaches Splunk as `otel.log.severity.*`.
+#[test]
+fn a_syslog_decode_sends_public_header_fields_and_no_private_severity() {
+    use logit_proto::syslog::SyslogDecoder;
+    use logit_proto::Decoder;
+
+    let line = b"<165>1 2026-10-13T12:00:00Z web-1 app 42 ID7 - hello";
+    let batch = SyslogDecoder::new(std::sync::Arc::new(logit_core::Resource::default()))
+        .decode(bytes::Bytes::from_static(line))
+        .expect("a valid RFC 5424 line decodes");
+    let body = encode(&[batch]);
+    let object: Json = serde_json::from_slice(&body).expect("one HEC object");
+    let fields = object["fields"].as_object().expect("a fields object");
+    assert_eq!(fields.get("syslog.facility"), Some(&json!(20)), "{object}");
+    assert_eq!(fields.get("syslog.msgid"), Some(&json!("ID7")), "{object}");
+    assert!(
+        fields.keys().all(|key| !key.contains("severity") || key.starts_with("otel.log.")),
+        "no syslog severity carrier may reach Splunk: {object}"
+    );
+    assert!(!String::from_utf8_lossy(&body).contains("_logit."), "{object}");
+}

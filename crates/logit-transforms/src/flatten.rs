@@ -7,8 +7,13 @@
 //! whole. A key collision is last write wins, with no diagnostic. There is no cap on how many keys
 //! one value expands into; [`MAX_DEPTH`] is the only bound (`docs/known-gaps/runtime.md`).
 //!
+//! `all` never selects an attribute under the private `_logit.` prefix, which protocol codecs
+//! reserve for their own use; a named private attribute still flattens (ADR
+//! `private-attribute-namespace`).
+//!
 //! No flush state; it reuses per-instance [`Scratch`] buffers for the path and interned keys.
 
+use logit_core::attrs::is_private;
 use logit_core::interner::{intern, resolve, KeyCache};
 use logit_core::{AttrMap, Event, Resource, Symbol, Telemetry, Value};
 use logit_pipeline::Transform;
@@ -62,7 +67,7 @@ impl CompiledFields {
 
     fn selects(&self, key: Symbol) -> bool {
         match self {
-            CompiledFields::All => true,
+            CompiledFields::All => !is_private(resolve(key)),
             CompiledFields::None => false,
             CompiledFields::Named(names) => names.contains(&key),
         }
@@ -149,7 +154,8 @@ fn flatten_map(
     // Phase 1: select. `Value::Null` stands in until phase 2 takes the value; a real `Null` is
     // never `expandable`, so it can't be confused with a stand-in.
     for (sym, value) in attrs.iter() {
-        if fields.selects(sym) && expandable(value, arrays) {
+        // `expandable` first: it's cheaper than `selects`, which resolves the key under `All`.
+        if expandable(value, arrays) && fields.selects(sym) {
             scratch.pending.push((sym, Value::Null));
         }
     }
@@ -324,6 +330,32 @@ mod tests {
         assert!(f.process(&resource, &mut event));
         assert_eq!(event.attributes.get("foo"), None, "the source attribute is consumed");
         assert_eq!(event.attributes.get("foo.key"), Some(&Value::str("bar")));
+    }
+
+    #[test]
+    fn all_leaves_a_nested_private_attribute_whole() {
+        let mut f = flatten_all();
+        let resource = default_resource();
+        let carrier = map(&[("key", Value::str("bar"))]);
+        let mut event = event_with_attrs(&[
+            ("_logit.x", carrier.clone()),
+            ("foo", map(&[("key", Value::str("bar"))])),
+        ]);
+        assert!(f.process(&resource, &mut event));
+        assert_eq!(event.attributes.get("_logit.x"), Some(&carrier));
+        assert_eq!(event.attributes.get("_logit.x.key"), None);
+        assert_eq!(event.attributes.get("foo.key"), Some(&Value::str("bar")));
+    }
+
+    #[test]
+    fn a_named_private_attribute_still_flattens() {
+        let mut f =
+            Flatten::new(Fields::Named(vec!["_logit.x".to_string()]), Fields::None, Arrays::Index);
+        let resource = default_resource();
+        let mut event = event_with_attrs(&[("_logit.x", map(&[("key", Value::str("bar"))]))]);
+        assert!(f.process(&resource, &mut event));
+        assert_eq!(event.attributes.get("_logit.x"), None);
+        assert_eq!(event.attributes.get("_logit.x.key"), Some(&Value::str("bar")));
     }
 
     #[test]

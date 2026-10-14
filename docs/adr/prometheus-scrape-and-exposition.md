@@ -93,14 +93,14 @@ MetricRecord] }` per series; labels become `Value::Str` attributes verbatim.
 | `counter` sample `X` (name kept verbatim, `_total` included) | `Sum { value, Cumulative, monotonic: true }`, `name = X` |
 | `gauge` | `Gauge(v)` |
 | `histogram` (`_bucket{le}` cumulative, `_sum`, `_count`) | `Histogram { buckets: per-bucket counts by successive difference, trailing (+Inf, n), Cumulative, sum, min/max: None }` |
-| `gaugehistogram` (OM, `_gsum`/`_gcount`) | same `Histogram` + attr `prometheus.type: "gaugehistogram"` |
+| `gaugehistogram` (OM, `_gsum`/`_gcount`) | same `Histogram` + attr `_logit.prometheus.type: "gaugehistogram"` |
 | `summary` (`{quantile}`, `_sum`, `_count`) | `Summary { quantiles, count, sum }` |
-| `untyped` / `unknown` / no `# TYPE` | `Gauge(v)` + attr `prometheus.type: "untyped"` \| `"unknown"` |
-| `info` (OM, `X_info{...} 1`) | `Gauge(1)` + `prometheus.type: "info"`, `name = X` (family name, suffix stripped) |
-| `stateset` (OM) | one `Gauge(0\|1)` per state line + `prometheus.type: "stateset"` |
+| `untyped` / `unknown` / no `# TYPE` | `Gauge(v)` + attr `_logit.prometheus.type: "untyped"` \| `"unknown"` |
+| `info` (OM, `X_info{...} 1`) | `Gauge(1)` + `_logit.prometheus.type: "info"`, `name = X` (family name, suffix stripped) |
+| `stateset` (OM) | one `Gauge(0\|1)` per state line + `_logit.prometheus.type: "stateset"` |
 | `# HELP` / `# UNIT` | `description` / `unit` (interned) |
 | `_created` (OM) | `start_timestamp` (seconds → ns) |
-| sample timestamp | `Event::timestamp` + marker attr `prometheus.timestamp: true`; absent → scrape start time, no marker |
+| sample timestamp | `Event::timestamp` + marker attr `_logit.prometheus.timestamp: true`; absent → scrape start time, no marker |
 | OM exemplar | `Exemplar { value, timestamp, trace: TraceRef when trace_id/span_id labels are valid hex (consumed), filtered_attributes: remaining labels }`; histogram bucket exemplars collect onto the record |
 
 **The `+Inf` bucket is a successive difference like every other bucket, not a separate total.**
@@ -123,9 +123,9 @@ can't carry natively:
 | `Sum{Cumulative, monotonic}` | `counter`; sample name = `<name>_total`, appended if the model name lacked it, in **both** dialects. Text 0.0.4 has no family/sample split: `# TYPE`/`# HELP` name that same full sample name (`# TYPE http_requests_total counter` / `http_requests_total 5`). OM strips the trailing `_total` for `# TYPE`/`# HELP`/`# UNIT` (`# TYPE http_requests counter`) while the sample line keeps it (`http_requests_total 5`); `_created` (OM only, on the family name: `http_requests_created`) from `start_timestamp` when non-zero |
 | `Sum{Cumulative, !monotonic}` | `gauge` (Prometheus has no non-monotonic counter) — counted `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}` |
 | `Sum{Delta}` / `Histogram{Delta}` | **skipped**, `logit.output.metrics.skipped{metric_kind="delta_sum"\|"delta_histogram"}` + `warn_throttled("delta_temporality_unresolved")` naming `aggregate`'s `temporality: cumulative` |
-| `Gauge` | `gauge`; `prometheus.type` attr (consumed) overrides the family type to `untyped`/`unknown`/`info`/`stateset` — see "Cross-dialect family types" below for what each becomes when the output dialect lacks that wire type |
+| `Gauge` | `gauge`; `_logit.prometheus.type` attr (consumed) overrides the family type to `untyped`/`unknown`/`info`/`stateset` — see "Cross-dialect family types" below for what each becomes when the output dialect lacks that wire type |
 | `GaugeDelta` | skipped, `warn_throttled("gauge_delta_unresolved")` (shared key across sinks) |
-| `Histogram{Cumulative}` | `histogram`: running-sum buckets, `+Inf` = total, `_sum` only when `Some`, `_count` = bucket total; `min`/`max` dropped (known-gaps row); `prometheus.type: gaugehistogram` → `_gsum`/`_gcount` on OM egress, `_sum`/`_count` on text egress (text has no `gaugehistogram`) |
+| `Histogram{Cumulative}` | `histogram`: running-sum buckets, `+Inf` = total, `_sum` only when `Some`, `_count` = bucket total; `min`/`max` dropped (known-gaps row); `_logit.prometheus.type: gaugehistogram` → `_gsum`/`_gcount` on OM egress, `_sum`/`_count` on text egress (text has no `gaugehistogram`) |
 | `Summary` | `summary` + `_created` (OM) |
 | `Distribution(sketch)` | `summary` with `DISTRIBUTION_QUANTILES` (reused from `otlp/metrics.rs`, made `pub(crate)`) with `_sum` and `_count` (the sketch's exact sum and count; see the 2026-10-03 amendment) — `degraded{metric_kind="distribution"}` |
 | `Samples` | `s.sketch()` then as above — `degraded{metric_kind="samples"}` |
@@ -133,19 +133,19 @@ can't carry natively:
 | `ExponentialHistogram` | skipped, `skipped{metric_kind="exponential_histogram"}` (text has no native-histogram syntax) |
 | `flags & NO_RECORDED_VALUE` | skipped, `skipped{reason="no_recorded_value"}` |
 | exemplars | OM only, on `_total`/`_bucket` lines (bucket chosen by value); text mode drops them (dialect choice, not counted) |
-| `Event::timestamp` | emitted only when `prometheus.timestamp: true` is present (consumed); ms in text, float s in OM |
-| labels | `logit_core::attrs::merged(resource, event)` (event wins), skipping the consumed `prometheus.type`/`prometheus.timestamp`/`prometheus.target` attributes; `Value::Str/I64/U64/F64/Bool` stringified; a multi-valued `Array` (a relayed, repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) renders its **last** representable element, counted `logit.output.labels.normalized{reason="multi_value"}` once per attribute; `Null/Bytes/Timestamp/Map`, and an `Array` with no representable element, dropped — `logit.output.labels.dropped{reason="unrepresentable"}` |
+| `Event::timestamp` | emitted only when `_logit.prometheus.timestamp: true` is present (consumed); ms in text, float s in OM |
+| labels | `logit_core::attrs::merged(resource, event)` (event wins), skipping every private `_logit.*` attribute, `_logit.prometheus.type`/`_logit.prometheus.timestamp`/`_logit.prometheus.target` among them; `Value::Str/I64/U64/F64/Bool` stringified; a multi-valued `Array` (a relayed, repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) renders its **last** representable element, counted `logit.output.labels.normalized{reason="multi_value"}` once per attribute; `Null/Bytes/Timestamp/Map`, and an `Array` with no representable element, dropped — `logit.output.labels.dropped{reason="unrepresentable"}` |
 | names | see "Names and sanitization" below |
 | `unit` / `description` | `# UNIT` (OM only) / `# HELP` |
 | `EventBatch::scope`, `Resource.schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
 
-**Cross-dialect family types.** `prometheus.type` and `gaugehistogram` cover model kinds that have
-no wire type of their own, but the two output dialects don't have the same *set* of wire types as
-each other, so encoding to the dialect that lacks one has to pick something else rather than
+**Cross-dialect family types.** `_logit.prometheus.type` and `gaugehistogram` cover model kinds that
+have no wire type of their own, but the two output dialects don't have the same *set* of wire types
+as each other, so encoding to the dialect that lacks one has to pick something else rather than
 emitting a spec-invalid family:
 
 - **OM egress:** `untyped` (text 0.0.4's catch-all, which OpenMetrics dropped) becomes `unknown`
-  (OpenMetrics's own catch-all). A `prometheus.type: "info"` attribute re-appends the `_info`
+  (OpenMetrics's own catch-all). A `_logit.prometheus.type: "info"` attribute re-appends the `_info`
   suffix OM's `info` type requires on the sample name (decode strips it — see the decode table
   above — so this is the exact inverse): `# TYPE X info` / sample `X_info 1`, family name `X`
   bare, matching the counter row's family/sample split above.
@@ -173,8 +173,8 @@ pre-merge — the same shape `families_to_events`'s per-series `Event` construct
 
 `prometheus_in` stamps two facts about the target it scraped onto that scrape's `Resource`:
 **unprefixed `instance`** (`Value::Str`, `host:port` — exactly what Prometheus's own scrape adds
-to every series it collects) and `prometheus.target` (`Value::Str`, the full scrape URL, namespaced
-because it has no equivalent normalized field anywhere else in the model). `instance` is
+to every series it collects) and `_logit.prometheus.target` (`Value::Str`, the full scrape URL,
+namespaced because it has no equivalent normalized field anywhere else in the model). `instance` is
 deliberately **not** namespaced: `prometheus_out` renders resource attributes as ordinary labels,
 the same as every other sink renders resource attributes as tags, so `instance` needs no special
 casing to reach the exposed series — it's just a resource attribute like any other, present on
@@ -186,33 +186,38 @@ registry key). An event-level `instance` attribute (one a transform stamped down
 the resource-level one `prometheus_in` set, the same "event wins" merge every other resource/event
 attribute conflict already resolves by — `honor_labels` semantics, in Prometheus's own terms.
 
-Two remaining `prometheus.*` well-known attributes (`docs/design/data-model.md`'s table, rule (b)
-of [ADR `lossless-transit`](lossless-transit.md): a protocol's own raw encoding of something the
-model already normalizes rides as a protocol-namespaced attribute that outranks the normalized
-field on that protocol's own egress) are consumed by `prometheus_out`, never rendered as an
-ordinary label there:
+Two remaining `_logit.prometheus.*` well-known attributes (`docs/design/data-model.md`'s table,
+rule (b) of [ADR `lossless-transit`](lossless-transit.md): a protocol's own raw encoding of
+something the model already normalizes rides as a protocol-namespaced attribute that outranks the
+normalized field on that protocol's own egress) are consumed by `prometheus_out`, never rendered as
+an ordinary label there:
 
-- `prometheus.type` (`Value::Str`): the wire family type when the model has no distinct kind for
-  it (`untyped`, `unknown`, `info`, `stateset`, `gaugehistogram`).
-- `prometheus.timestamp` (`Value::Bool(true)`): the sample carried its own timestamp on the wire;
-  `prometheus_out` re-emits one on that line only. Same shape as the planned `statsd.timestamp`.
+- `_logit.prometheus.type` (`Value::Str`): the wire family type when the model has no distinct kind
+  for it (`untyped`, `unknown`, `info`, `stateset`, `gaugehistogram`).
+- `_logit.prometheus.timestamp` (`Value::Bool(true)`): the sample carried its own timestamp on the
+  wire; `prometheus_out` re-emits one on that line only. Same shape as
+  `_logit.statsd.timestamp`.
 
-Plus the resource-level `prometheus.target` above, consumed the same way — `prometheus.target` is
-factual, like `docker_in`'s `container.*` attributes and `instance` above (none is an invented
-`service.name`); `prometheus.type`/`prometheus.timestamp` instead record how to re-encode a
-sample, not a fact about it. Every other sink treats all three as plain tags like any other
-attribute, since only `prometheus_out` knows to consume them. `job` is
-deliberately **not** stamped by `prometheus_in`, unlike `instance`: it is operator identity (which
-scrape config this target belongs to), not a fact about the target itself, and Prometheus's own
-server derives it from the scrape config, not the target's response — there is no factual value
-`prometheus_in` could stamp the way it can for `instance`. An operator gets `job` with a downstream
-`set` component (or Lua) stamping it from whatever they know about the topology.
+Plus the resource-level `_logit.prometheus.target` above, consumed the same way.
+`_logit.prometheus.target` is factual, like `docker_in`'s `container.*` attributes and `instance`
+above (none is an invented `service.name`); `_logit.prometheus.type` and
+`_logit.prometheus.timestamp` instead record how to re-encode a sample, not a fact about it. All
+three are private ([ADR `private-attribute-namespace`](private-attribute-namespace.md)): every
+other protocol sink leaves them off its tags, labels, and fields, uncounted, the way it leaves off
+any `_logit.*` attribute. A whole-event render (`stdio_out`, `file_out`, `kafka_out`'s `json`,
+`msgpack`, and `native` formats, and the native hop) keeps them.
+
+`job` is deliberately **not** stamped by `prometheus_in`, unlike `instance`: it is operator
+identity (which scrape config this target belongs to), not a fact about the target itself, and
+Prometheus's own server derives it from the scrape config, not the target's response — there is no
+factual value `prometheus_in` could stamp the way it can for `instance`. An operator gets `job`
+with a downstream `set` component (or Lua) stamping it from whatever they know about the topology.
 
 Because of this, `prometheus_in -> prometheus_out` with no transforms is not quite an untouched
 byte-for-byte relay on labels — it is a fixed point modulo one named, permitted normalization: the
 scrape adds an `instance` label that wasn't on the wire at the target, exactly as Prometheus's own
 scrape does (see "Permitted normalizations for this pair" below). Nothing else `prometheus_in`
-stamped (`prometheus.target`) leaks onto the exposed series, since it stays consumed; an operator
+stamped (`_logit.prometheus.target`) leaks onto the exposed series, since it's private; an operator
 who wants a `job` label, or federation-style relabeling beyond `instance`, sets it explicitly.
 
 ### Names and sanitization
@@ -418,7 +423,7 @@ already shipped:
   `protoc` invocation in any build path, generated output committed. `snap`, the Snappy
   compression remote-write requires on the wire, is BSD-3-Clause, already an allowed license in
   `deny.toml`.
-- `prometheus.*` attributes and the name/label sanitization rules above are dialect- and
+- `_logit.prometheus.*` attributes and the name/label sanitization rules above are dialect- and
   transport-independent — they're about the model↔`MetricFamily` mapping, not about text syntax —
   so a remote-write relay is a fixed point on the same terms as the text-format one, with no
   separate attribute convention to design later.
@@ -468,12 +473,12 @@ scrape time; it remains the one sink outside all three codec traits, by design.)
   config identity of its own to draw `job` from beyond "which `prometheus_in` component this is,"
   which is already the component's own graph id, not a value worth duplicating onto every event as
   a label the operator didn't ask to see.
-- **Leaving `prometheus.type` and `prometheus.timestamp` as plain, rendered labels too**, matching
-  `instance`, rather than a consumed attribute pair. Rejected: unlike `instance`, both describe how
-  `prometheus_out` should encode the record, not a fact about the series itself — rendering them
-  would leak `logit`'s own decode bookkeeping onto the wire as an extra label no Prometheus-native
-  producer would ever emit, breaking the fixed point in the other direction instead of preserving
-  it.
+- **Leaving `_logit.prometheus.type` and `_logit.prometheus.timestamp` as plain, rendered labels
+  too**, matching `instance`, rather than a consumed attribute pair. Rejected: unlike `instance`,
+  both describe how `prometheus_out` should encode the record, not a fact about the series itself —
+  rendering them would leak `logit`'s own decode bookkeeping onto the wire as an extra label no
+  Prometheus-native producer would ever emit, breaking the fixed point in the other direction
+  instead of preserving it.
 - **UTF-8, quoted metric/label names (the Prometheus 3 "UTF-8 names" feature).** Deferred, not
   rejected: it's a real feature of newer Prometheus versions, but adopting it now would mean
   designing the sanitization/collision rules above twice — once for the ASCII-safe grammar every
@@ -544,3 +549,21 @@ An exposition's `ExponentialHistogram` stays `skipped{metric_kind="exponential_h
 flagged or stale record stays `skipped{reason="no_recorded_value"|"stale"}`: neither text dialect
 has a form for them. The canonical tables are `crates/logit-proto/src/prometheus/mod.rs`'s and
 `text.rs`'s module docs.
+
+## Amendment (2026-10-13): the carriers are private
+
+[ADR `private-attribute-namespace`](private-attribute-namespace.md) moves the three carriers this
+record names under the private prefix: `prometheus.type` is `_logit.prometheus.type`,
+`prometheus.timestamp` is `_logit.prometheus.timestamp`, and the resource attribute
+`prometheus.target` is `_logit.prometheus.target`. The sections above use the new names.
+
+Two consequences follow:
+
+- Every other protocol sink leaves the three off its tags, labels, and fields, uncounted. Before,
+  they reached every other sink as ordinary tags, so a `prometheus_in -> influxdb_out` pipeline
+  wrote a `prometheus.type` tag on each untyped series. A whole-event render (`stdio_out`,
+  `file_out`, `kafka_out`'s `json`, `msgpack`, and `native` formats, and the native hop) still
+  carries them.
+- `prometheus_out` skips every `_logit.*` attribute when it builds labels, and no longer skips
+  the `prometheus.` prefix. An attribute spelled `prometheus.<name>` without the private prefix
+  is an ordinary label.

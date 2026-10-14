@@ -19,6 +19,10 @@
 //! precedence merges them at render time, as `crates/logit-proto/src/influxdb/encode.rs`'s
 //! `render_tag_suffix` does.
 //!
+//! **Private attributes stay home.** Every top-level attribute set leaves without its private
+//! `_logit.` keys ([`attrs_to_key_values`]), and a map nested inside an attribute keeps them
+//! (ADR `private-attribute-namespace`).
+//!
 //! **`AnyValue` nesting has no local depth cap.** Neither [`any_value_to_value`] nor the OTLP/JSON
 //! walk (`json`'s `any_value`) counts depth. Each parser's own limit bounds them: serde_json
 //! rejects past 128 JSON levels (at most 41 `AnyValue` levels), and prost past 100 nested
@@ -30,7 +34,7 @@
 use crate::otlp::generated::opentelemetry::proto::common::v1 as pb;
 use bytes::Bytes;
 use logit_core::interner::resolve;
-use logit_core::{AttrMap, Resource, Scope, Value};
+use logit_core::{AttrMap, Resource, Scope, Symbol, Value};
 
 /// Converts a wire timestamp to the model's. OTLP's `*_unix_nano` fields are `fixed64`, and the
 /// model's timestamps are `i64` nanoseconds, so a wire value past `i64::MAX` (a date past
@@ -66,7 +70,7 @@ pub(crate) fn value_to_any_value(value: &Value) -> pb::AnyValue {
             values: items.iter().map(value_to_any_value).collect(),
         })),
         Value::Map(map) => {
-            Some(Any::KvlistValue(pb::KeyValueList { values: attrs_to_key_values(map) }))
+            Some(Any::KvlistValue(pb::KeyValueList { values: map_to_key_values(map) }))
         }
     };
     pb::AnyValue { value: inner }
@@ -96,17 +100,31 @@ pub(crate) fn any_value_to_value(any: pb::AnyValue) -> Value {
     }
 }
 
-/// Renders `attrs` as OTLP `KeyValue`s, in `AttrMap`'s own sorted-`Symbol` iteration order.
+/// Renders a top-level attribute set (an event's, a resource's, a scope's, a span event's, a
+/// link's, or an exemplar's) as OTLP `KeyValue`s, in `AttrMap`'s own sorted-`Symbol` iteration
+/// order, skipping every private `_logit.` key (ADR `private-attribute-namespace`).
+/// `dropped_attributes_count` is the producer's count and doesn't include them.
 pub(crate) fn attrs_to_key_values(attrs: &AttrMap) -> Vec<pb::KeyValue> {
     attrs
         .iter()
-        .map(|(key, value)| pb::KeyValue {
-            key: resolve(key).to_string(),
-            value: Some(value_to_any_value(value)),
-            // Profiling-signal-only (common.proto).
-            key_strindex: 0,
-        })
+        .filter(|(key, _)| !logit_core::attrs::is_private(resolve(*key)))
+        .map(|(key, value)| key_value(key, value))
         .collect()
+}
+
+/// A `Value::Map` nested inside an attribute as OTLP `KeyValue`s, every key kept: a nested key is
+/// data, so one spelled `_logit.` renders.
+fn map_to_key_values(map: &AttrMap) -> Vec<pb::KeyValue> {
+    map.iter().map(|(key, value)| key_value(key, value)).collect()
+}
+
+fn key_value(key: Symbol, value: &Value) -> pb::KeyValue {
+    pb::KeyValue {
+        key: resolve(key).to_string(),
+        value: Some(value_to_any_value(value)),
+        // Profiling-signal-only (common.proto).
+        key_strindex: 0,
+    }
 }
 
 /// Inserts every `KeyValue` into `attrs`; on a duplicate key, the later entry wins.
@@ -215,6 +233,49 @@ pub(crate) fn pb_to_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A top-level private attribute never leaves on an event, a resource, or a scope, and
+    /// doesn't change `dropped_attributes_count`; a `_logit.` key nested inside a map is data and
+    /// does.
+    #[test]
+    fn a_top_level_private_attribute_is_skipped_and_a_nested_one_kept() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("_logit.x", Value::str("e"));
+        attrs.insert("env", Value::str("prod"));
+        attrs.insert(
+            "nested",
+            Value::Map(Box::new(AttrMap::from_iter([("_logit.z", Value::str("p"))]))),
+        );
+        let keys = |kvs: &[pb::KeyValue]| kvs.iter().map(|kv| kv.key.clone()).collect::<Vec<_>>();
+
+        let event = attrs_to_key_values(&attrs);
+        let mut event_keys = keys(&event);
+        event_keys.sort();
+        assert_eq!(event_keys, ["env", "nested"]);
+        let nested = event.iter().find(|kv| kv.key == "nested").unwrap();
+        let Some(pb::any_value::Value::KvlistValue(list)) =
+            nested.value.as_ref().and_then(|v| v.value.as_ref())
+        else {
+            panic!("a map leaves as a KvlistValue: {nested:?}");
+        };
+        assert_eq!(keys(&list.values), ["_logit.z"]);
+
+        let resource = Resource {
+            attributes: attrs.clone(),
+            dropped_attributes_count: 2,
+            ..Resource::default()
+        };
+        let resource = resource_to_pb(&resource);
+        assert!(keys(&resource.attributes).iter().all(|k| k != "_logit.x"));
+        assert_eq!(resource.attributes.len(), 2);
+        assert_eq!(resource.dropped_attributes_count, 2);
+
+        let scope = Scope { attributes: attrs, dropped_attributes_count: 3, ..Scope::default() };
+        let scope = scope_to_pb(Some(&scope));
+        assert!(keys(&scope.attributes).iter().all(|k| k != "_logit.x"));
+        assert_eq!(scope.attributes.len(), 2);
+        assert_eq!(scope.dropped_attributes_count, 3);
+    }
 
     #[test]
     fn every_value_variant_round_trips_through_anyvalue() {

@@ -46,6 +46,12 @@ scripts depend on the table shape, the choice is expensive to undo.
 `event.attributes` is a second userdata over the same underlying event, not a copy, so chained
 access like the example above materializes only what it reads or writes.
 
+**A protocol carrier is an ordinary attribute to a script.** Read or write one by its full key,
+such as `event.attributes["_logit.statsd.type"]` or `resource["_logit.influxdb.bucket"]`;
+the dots in the key mean only bracket indexing reaches it. The carrier's own sink reads it, and
+every other protocol sink ignores the private `_logit.` namespace when it renders attributes
+([ADR `private-attribute-namespace`](../adr/private-attribute-namespace.md)).
+
 **A table assigned to an attribute converts raw and at most 128 levels deep.** Conversion reads
 the table without its metatable, so no `__index`, `__len`, or other metamethod runs while it does.
 A table nested past 128 levels, a self-referencing one such as `t.self = t` included, is an error

@@ -98,15 +98,15 @@
 //! in request headers. `Datadog-Meta-Lang`, `-Lang-Version`, `-Lang-Interpreter`,
 //! `-Lang-Interpreter-Vendor`, `-Tracer-Version`, `Datadog-Container-ID`, `Datadog-Entity-ID`,
 //! `Datadog-External-Env`, `Datadog-Client-Computed-Top-Level`, `Datadog-Client-Computed-Stats`,
-//! and `Datadog-Client-Dropped-P0-{Traces,Spans}` become `datadog.tracer.*` batch resource attributes,
-//! per the codec's Traces table. On v0.7 the payload's own fields win: a header fills a field only
-//! where the payload left it empty. `datadog_trace_out` restores the headers from the same
-//! attributes. `/v0.6/stats` takes three of them, `Datadog-Meta-Lang`, `-Tracer-Version`, and
+//! and `Datadog-Client-Dropped-P0-{Traces,Spans}` become `_logit.datadog.tracer.*` batch resource
+//! attributes, per the codec's Traces table. On v0.7 the payload's own fields win: a header fills a
+//! field only where the payload left it empty. `datadog_trace_out` restores the headers from the
+//! same attributes. `/v0.6/stats` takes three of them, `Datadog-Meta-Lang`, `-Tracer-Version`, and
 //! `Datadog-Container-ID`, each only where the `ClientStatsPayload` left `Lang`, `TracerVersion`,
 //! or `ContainerID` empty: the Agent fills those three the same way before it forwards a payload,
 //! and a recorded dd-trace-py 4.15 sends its stats with `Lang` and `TracerVersion` empty and the
-//! values in the headers (`testdata/interop/datadog/tracer-v04-v0-6-stats-000.*`). The rest have
-//! no stats field.
+//! values in the headers (`testdata/interop/datadog/tracer-v04-v0-6-stats-000.*`). The rest have no
+//! stats field.
 //!
 //! `X-Datadog-Trace-Count` is compared with the number of traces on the wire (v0.3/v0.4's trace
 //! arrays, v0.5's, v0.7's chunks). A mismatch is the throttled diagnostic `trace_count_mismatch`,

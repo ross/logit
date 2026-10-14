@@ -113,7 +113,7 @@ pub const STATSD_EVENT_LINE_WITH_ESCAPED_NEWLINE: &str = "_e{5,12}:title|line1\\
 
 /// A DogStatsD service check (`_sc|name|status|...`) line, Datadog's documented example (as in
 /// `crates/logit-proto/src/statsd/decode.rs`'s `dogstatsd_docs_example_service_check_decodes`).
-/// Decodes to one [`logit_core::MetricKind::Gauge`] event plus the `statsd.service_check.*`
+/// Decodes to one [`logit_core::MetricKind::Gauge`] event plus the `_logit.statsd.service_check.*`
 /// carriers.
 pub const STATSD_SERVICE_CHECK_LINE: &str =
     "_sc|Redis connection|2|#env:dev|m:Redis connection timed out after 10s";
@@ -1615,9 +1615,10 @@ pub fn remote_write_request_v2() -> Vec<u8> {
     pb::Request { symbols, timeseries }.encode_to_vec()
 }
 
-/// A collectd like-relay event: `collectd.host`/`plugin`/`type`/`interval` and one gauge record.
-/// `collectd_out`'s encoder fast-paths this into one Values part (`logit_proto::collectd`'s module
-/// doc, the "like-relay" row); an event without `collectd.type` takes the per-record fallback.
+/// A collectd like-relay event: `collectd.host`, `_logit.collectd.plugin`/`type`/`interval`, and
+/// one gauge record. `collectd_out`'s encoder fast-paths this into one Values part
+/// (`logit_proto::collectd`'s module doc, the "like-relay" row); an event without
+/// `_logit.collectd.type` takes the per-record fallback.
 pub fn collectd_event() -> Event {
     let mut attributes = AttrMap::new();
     attributes.insert(logit_proto::collectd::ATTR_HOST, Value::str("fixture-host"));
@@ -1994,9 +1995,10 @@ pub fn wide_server_span_event() -> Event {
 /// `MetricList`'s single inline slot costs anything (`docs/design/memory.md` §8 item 13).
 ///
 /// Six attributes, collectd's measured width: §3 reports p50 = p90 = max = **6**, and six is the
-/// full `collectd.*` identity set the decoder stamps (`crates/logit-proto/src/collectd/mod.rs`):
-/// host, plugin, plugin instance, type, type instance, interval. So the map stays *inline* while
-/// the metric list spills, the inverse of every log fixture above.
+/// full collectd identity set the decoder stamps
+/// (`crates/logit-proto/src/collectd/mod.rs`): host, plugin, plugin instance, type, type instance,
+/// interval. So the map stays *inline* while the metric list spills, the inverse of every log
+/// fixture above.
 ///
 /// Built by hand rather than decoded from [`collectd_load_packet`], which yields the same three
 /// records but only four attributes (no instances). The record names are what `CollectdDecoder`

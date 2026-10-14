@@ -86,9 +86,11 @@ shape `SetValue` already takes. A named entry is a **literal top-level attribute
 path**, exactly as `keep`/`kv_metrics`/`scale` field names already are — `flatten` is what *makes*
 a nested field addressable by those components afterward, not a new addressing syntax layered on
 top of them. `attributes` defaults to `all`: the motivating shapes (a Kubernetes label map, an
-OTLP `KvlistValue`) are ones the operator doesn't enumerate keys for. `resource` defaults to
-`none`: a resource is a small, mostly operator-declared identity map, and paying a per-batch
-`Resource` rebuild for a map that usually isn't nested is a cost with no case behind it.
+OTLP `KvlistValue`) are ones the operator doesn't enumerate keys for. `all` never selects an
+attribute under the private `_logit.` prefix, which protocol codecs reserve for their own use; a
+named entry still flattens one ([ADR `private-attribute-namespace`](private-attribute-namespace.md)).
+`resource` defaults to `none`: a resource is a small, mostly operator-declared identity map, and
+paying a per-batch `Resource` rebuild for a map that usually isn't nested is a cost with no case behind it.
 `arrays: skip` treats an array as a leaf wherever it appears and leaves a top-level array attribute
 untouched entirely — the escape hatch for a source whose arrays are wide data rather than
 structure.

@@ -37,12 +37,13 @@
 //!
 //! ## Header-field precedence
 //!
-//! Per event, per field, first hit wins: the `syslog.*` attribute, then the configured default,
-//! then a format-appropriate absence (`-` for RFC 5424's NILVALUE, an omitted token for RFC 3164).
-//! `syslog.severity` outranks `log.severity` because `logit_proto::syslog`'s `map_severity` is lossy: it
-//! collapses syslog's eight severities onto five `Severity` variants (0-2 all become `Fatal`, 5 and
-//! 6 both become `Info`). Preferring the raw attribute keeps a relay byte-faithful;
-//! [`syslog_severity_of`] is the fallback for a log record that didn't come from `syslog_in`.
+//! Per event, per field, first hit wins: the `syslog.*` attribute (`_logit.syslog.severity` for
+//! severity), then the configured default, then a format-appropriate absence (`-` for RFC 5424's
+//! NILVALUE, an omitted token for RFC 3164). `_logit.syslog.severity` outranks `log.severity`
+//! because `logit_proto::syslog`'s `map_severity` is lossy: it collapses syslog's eight severities
+//! onto five `Severity` variants (0-2 all become `Fatal`, 5 and 6 both become `Info`). Preferring
+//! the raw attribute keeps a relay byte-faithful; [`syslog_severity_of`] is the fallback for a log
+//! record that didn't come from `syslog_in`.
 //!
 //! **PROCID** (`syslog.pid`) is a `Value::U64`, or a `Value::Str` when the origin's PROCID wasn't
 //! numeric; [`resolve_pid`] returns the [`Pid`] enum covering both. On a 5424 output a `Pid::Str`
@@ -73,12 +74,13 @@
 //!   [`render_sd_value`]; the `syslog.sd` contract constrains only the outer two `Map` layers.
 //!
 //! **Opt-in `structured_data`**: when [`SyslogEncoder::with_structured_data`] sets an SD-ID and the
-//! output is 5424, every event attribute whose key doesn't start with `syslog.` is emitted as one
-//! extra SD-ELEMENT under that SD-ID (PARAM-NAME = attribute key; same validation, skip, and count
-//! rule; the element is omitted when no attribute qualifies). This closes the
-//! `syslog_in -> json -> syslog_out` gap: an attribute a transform added still reaches the wire. A
-//! relayed multi-valued statsd tag (`team: Value::Array[Str("a"), Str("b")]`) takes
-//! [`write_sd_param`]'s `Array` arm and emits `team="a" team="b"`.
+//! output is 5424, every event attribute whose key doesn't start with `syslog.` and isn't private
+//! (ADR `private-attribute-namespace`) is emitted as one extra SD-ELEMENT under that SD-ID
+//! (PARAM-NAME = attribute key; same validation, skip, and count rule; the element is omitted when
+//! no attribute qualifies). This closes the `syslog_in -> json -> syslog_out` gap: an attribute a
+//! transform added still reaches the wire. A relayed multi-valued statsd tag
+//! (`team: Value::Array[Str("a"), Str("b")]`) takes [`write_sd_param`]'s `Array` arm and emits
+//! `team="a" team="b"`.
 //!
 //! - **No default private enterprise number ships.** `sd_id` must contain exactly one `@` (e.g.
 //!   `myapp@12345`), checked in `with_structured_data`. RFC 5424's `32473` example PEN is
@@ -519,11 +521,11 @@ fn resolve_facility(attrs: &AttrMap, default: u8) -> u8 {
     }
 }
 
-/// `syslog.severity` if present and in range (`Value::U64(n)`, `n <= 7`), outranking
+/// `_logit.syslog.severity` if present and in range (`Value::U64(n)`, `n <= 7`), outranking
 /// `log.severity` (module doc's "Header-field precedence"). Else [`syslog_severity_of`], else `6`
 /// (info).
 fn resolve_severity(attrs: &AttrMap, log_severity: Option<Severity>) -> u8 {
-    if let Some(Value::U64(n)) = attrs.get("syslog.severity") {
+    if let Some(Value::U64(n)) = attrs.get("_logit.syslog.severity") {
         if *n <= 7 {
             return *n as u8;
         }
@@ -535,9 +537,9 @@ fn resolve_severity(attrs: &AttrMap, log_severity: Option<Severity>) -> u8 {
 }
 
 /// The lossy inverse of `logit_proto::syslog`'s `map_severity`, for an event with no
-/// `syslog.severity`. `Fatal` maps to `2` (crit), not `0` (emerg): `emerg` means "system unusable",
-/// a claim `Fatal` never makes. `Trace` has no syslog equivalent and maps to `7` (debug), as
-/// `Debug` does.
+/// `_logit.syslog.severity`. `Fatal` maps to `2` (crit), not `0` (emerg): `emerg` means "system
+/// unusable", a claim `Fatal` never makes. `Trace` has no syslog equivalent and maps to `7`
+/// (debug), as `Debug` does.
 fn syslog_severity_of(severity: Severity) -> u8 {
     match severity {
         Severity::Trace => 7,
@@ -857,10 +859,10 @@ fn write_structured_data(
         }
     }
     if let Some(cfg) = structured_data {
-        // Checked before the collision, so an event with only `syslog.*` attributes, which would
-        // emit no opt-in element anyway, isn't counted as a drop.
-        let has_extra_attrs =
-            attrs.iter().any(|(sym, _)| !interner::resolve(sym).starts_with("syslog."));
+        let is_extra = |key: &str| !key.starts_with("syslog.") && !crate::attrs::is_private(key);
+        // Checked before the collision, so an event with only `syslog.*` and private attributes,
+        // which would emit no opt-in element anyway, isn't counted as a drop.
+        let has_extra_attrs = attrs.iter().any(|(sym, _)| is_extra(interner::resolve(sym)));
         if has_extra_attrs {
             // `syslog_in` reads a line with a repeated SD-ID as RFC 3164, so on a collision the
             // origin's element wins and the opt-in one is dropped rather than make the far end
@@ -886,7 +888,7 @@ fn write_structured_data(
                     &cfg.sd_id,
                     attrs
                         .iter()
-                        .filter(|(sym, _)| !interner::resolve(*sym).starts_with("syslog."))
+                        .filter(|(sym, _)| is_extra(interner::resolve(*sym)))
                         .map(|(sym, v)| (interner::resolve(sym), v)),
                     stats,
                     diag,
@@ -1541,7 +1543,7 @@ mod tests {
     #[test]
     fn syslog_severity_attribute_outranks_log_severity() {
         let mut attrs = AttrMap::new();
-        attrs.insert("syslog.severity", Value::U64(1)); // alert
+        attrs.insert("_logit.syslog.severity", Value::U64(1)); // alert
         let event = Event::log(
             0,
             attrs,
@@ -1589,7 +1591,7 @@ mod tests {
     #[test]
     fn out_of_range_syslog_severity_falls_back() {
         let mut attrs = AttrMap::new();
-        attrs.insert("syslog.severity", Value::U64(9));
+        attrs.insert("_logit.syslog.severity", Value::U64(9));
         let event = Event::log(
             0,
             attrs,
@@ -3039,6 +3041,27 @@ mod tests {
         let (msgs, _) = encode_with(&mut encoder, vec![event]);
         assert!(msgs[0].contains(r#"env="prod""#));
         assert!(!msgs[0].contains("syslog.hostname"));
+    }
+
+    /// A private attribute never becomes an opt-in SD-PARAM, and an event with only private and
+    /// `syslog.*` attributes emits no opt-in element and counts no collision.
+    #[test]
+    fn structured_data_excludes_private_keys_uncounted() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("_logit.x", Value::str("e"));
+        attrs.insert("env", Value::str("prod"));
+        let public = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut attrs = AttrMap::new();
+        attrs.insert("_logit.x", Value::str("e"));
+        attrs.insert("syslog.sd", sd_value(vec![("myapp@12345", vec![("orig", Value::str("1"))])]));
+        let private_only = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder =
+            SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("myapp@12345").unwrap();
+        let (msgs, stats) = encode_with(&mut encoder, vec![public, private_only]);
+        assert!(msgs[0].contains(r#"[myapp@12345 env="prod"]"#), "got: {}", msgs[0]);
+        assert!(msgs[1].contains(r#"[myapp@12345 orig="1"]"#), "got: {}", msgs[1]);
+        assert!(msgs.iter().all(|m| !m.contains("_logit")), "got: {msgs:?}");
+        assert_sd_omitted(&stats, 0, 0, 0);
     }
 
     #[test]
