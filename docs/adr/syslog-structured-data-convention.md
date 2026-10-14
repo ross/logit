@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-13
+updated: 2026-10-14
 ---
 
 # RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission
@@ -266,3 +266,12 @@ Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the messa
 counts it `logit.output.structured_data.omitted{reason}` with the same reasons, and the
 `EncodeStats` fields this record cites are `omitted_invalid_sd_name` and
 `omitted_sd_id_collision`.
+
+## Amendment (2026-10-14): a hostless line leaves with the relay's hostname
+
+`syslog_out`'s HOSTNAME fallback is its `hostname:`, else the process hostname
+([ADR `process-hostname`](process-hostname.md)), so every `syslog_out` now has one. The
+normalization under "Consequences" that a configured sink `hostname` fills only an absent
+`syslog.hostname` now applies to every relay: a message that omitted HOSTNAME, or sent RFC 5424's
+NILVALUE `-` for it, isn't byte-identical after `syslog_in -> syslog_out`, because it gains the
+relay's hostname. A HOSTNAME the origin sent is never replaced.

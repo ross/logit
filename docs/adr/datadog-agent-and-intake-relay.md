@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-10-13
+updated: 2026-10-14
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -401,3 +401,22 @@ names, so that any nonzero `*.dropped` is loss. The decisions above stand; only 
 
 `crates/logit-proto/src/datadog/mod.rs`'s module doc has every counter, and
 [internal-telemetry.md](../design/internal-telemetry.md) has the operator-facing tables.
+
+## Amendment: the process hostname fills a missing host (2026-10-14)
+
+`datadog_out` writes the process hostname ([ADR `process-hostname`](process-hostname.md)) as the
+host of a series, distribution point, sketch, log, event, or service check that carries none of
+its own. Decision 10 stands: there's no per-sink host field, and a host the event or its resource
+carries always wins. Trace and stats payloads keep their tracer and Agent hostnames verbatim, and
+`datadog_trace_out` is unchanged.
+
+- **Events and service checks read `host.name`.** Their host is `statsd.event.host` or
+  `statsd.service_check.host`, else `host.name`, else the process hostname. A `host.name` used
+  this way leaves as the host and not as a `host.name:<value>` tag.
+- **One `logit` is one Datadog host for hostless senders.** A DogStatsD client that sets no `h:`
+  tag relayed through `logit` reports under the relay's hostname, as it would through one Agent.
+  Datadog bills per host, so this matches what an Agent costs. To keep a host per sender, stamp
+  `host.name` upstream with `set`.
+
+A relayed item that arrived with no host now leaves with the relay's hostname, which joins both
+of the codec's permitted-normalization lists (`crates/logit-proto/src/datadog/mod.rs`).

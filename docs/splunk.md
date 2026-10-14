@@ -115,7 +115,10 @@ delta `Sum` reads in Splunk as a series of samples, not a running total: put `ag
 `splunk_hec_out` has no per-sink `index` or `sourcetype` field. It writes each object's envelope
 from the batch's resource attributes `com.splunk.index`, `com.splunk.source`,
 `com.splunk.sourcetype`, and `host.name`, so stamp them upstream with a `set` component, as
-`splunk-hec-send.yaml` does. An event without them takes the token's defaults in Splunk. An index
+`splunk-hec-send.yaml` does. An event without them takes the token's defaults in Splunk, except
+`host`: an event with no `host.name` goes out with `logit`'s process hostname
+([deploying.md's "Hostname"](deploying.md#hostname)), so senders relayed through one `logit` with
+no host of their own all show its host. An index
 the token isn't allowed to write draws a `400` code 7 naming the object after it; `splunk_hec_out`
 drops the bad object and resends the ones after it (below); keep the `index` you stamp in the token's
 allowed list. Every other

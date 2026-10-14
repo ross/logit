@@ -175,6 +175,19 @@ counts each named series `logit.output.records.dropped{route="series", reason="r
 `logit.output.records`, and logs `series_rejected` with the first entry. The batch isn't retried:
 the rest of the request was stored.
 
+### Hostless senders report as one Datadog host
+
+`datadog_out` sends `logit`'s process hostname
+([deploying.md's "Hostname"](deploying.md#hostname)) as the host of a metric, log, event, or
+service check that carries none of its own. That's what an Agent does for a DogStatsD client that
+sets no `h:` tag, so a `logit` on each host behaves as the Agent it replaces. A central `logit`
+receiving from many hosts is different: every hostless sender reports under the relay's one host,
+their series merge under it, and the per-host view of them is lost. Datadog bills per host, so
+the cost matches one Agent.
+
+To keep a host per sender, stamp `host.name` upstream with `set` (or have each DogStatsD client
+set `h:`). A host the data carries is never replaced.
+
 ### `at_least_once` can duplicate a request, and everything but series is stored twice
 
 The default posture is `at_least_once`, so a `5xx` or a timeout is retried. One batch goes out

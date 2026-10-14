@@ -169,8 +169,9 @@ components:
   # user owns /var/lib/logit, and a named volume mounted there starts with that owner. logit
   # exits if it can't create a spool.
 
-  # Datadog reads `host.name` from each event's resource; on a per-host logit, stamp it with a
-  # `set` ahead of the gates.
+  # Datadog reads `host.name` from each event and its resource. Anything without one goes out
+  # under logit's own hostname, which suits a per-host logit; on a central one, stamp each
+  # sender's host with a `set` ahead of the gates.
   datadog_out:
     type: datadog_out
     sources: [logs, delta_10s]

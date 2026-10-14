@@ -107,13 +107,14 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** keep metrics under 100 tags with `keep` or `remove` upstream.
   - **Revisit trigger:** Datadog documents or answers a different limit; the series route's `202`
     body states it (`limit=100`).
-- **`datadog_out` sends a Datadog event's and a service check's host as a tag.** Their encoders
-  read the host only from `statsd.event.host` and `statsd.service_check.host`, so a `host.name`
-  that `set` stamps on the resource renders as a `host.name:<value>` tag, and Datadog shows the
-  event or check with no host.
-  - **Consequence:** events and checks sent directly, not through an Agent, have no host in
-    Datadog unless the DogStatsD client set `h:`.
-  - **Workaround:** `set` `statsd.event.host` and `statsd.service_check.host` as attributes.
+- **`datadog_out` reports every hostless sender under the relay's hostname.** A metric, log,
+  event, or service check with no host of its own (no `host.name`, and for a log no `hostname`,
+  for an event or check no `statsd.*.host`) goes out with the process hostname, as an Agent sends
+  its own hostname for a DogStatsD client that sets no `h:` tag.
+  - **Consequence:** many senders behind one central `logit` show in Datadog as one host, with
+    their series merged under it. Datadog bills per host, so this costs what one Agent would.
+  - **Workaround:** stamp `host.name` per sender upstream with `set`, or have each DogStatsD
+    client set `h:`.
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   v0.4 has no field for a chunk's `datadog.chunk.*` fields (sampling priority, origin, dropped
   flag, tags) or for the tracer payload fields no request header carries

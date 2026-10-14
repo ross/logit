@@ -40,10 +40,10 @@ its resource beside `service.name`.
 - **No process-global.** `logit_pipeline::host::resolve` runs in `prepare` and the result is a
   parameter to `build_spec`, so tests choose their own hostname.
 
-`logit` claims `host.name` only for its own telemetry (`internal`). The follow-up workstream makes
+`logit` claims `host.name` only for its own telemetry (`internal`). A follow-up makes
 `syslog_out`, `splunk_hec_out`, and `datadog_out` fall back to the process hostname for events that
-carry no host of their own. That fallback fills a missing value and never overwrites a host an
-event carries. `collectd_out` keeps its `no_host` drop: its ADR's stance that inventing a host
+carry no host of their own (see the amendment below). That fallback fills a missing value and never
+overwrites a host an event carries. `collectd_out` keeps its `no_host` drop: its ADR's stance that inventing a host
 merges every unlabeled sender into one host's metrics stands. A relay's events reach `collectd_out`
 with the origin's `collectd.host`, and only `internal`'s events, which now carry `host.name`, gain a
 host.
@@ -80,3 +80,22 @@ host.
   place a `remove` of `host.name` after `internal`.
 - `rustix` joins `logit-pipeline`'s direct dependencies (the `system` feature). It was already
   transitive.
+
+## Amendment: three sinks fall back to the process hostname (2026-10-14)
+
+`build_spec` passes the process hostname to `syslog_out`, `splunk_hec_out`, and `datadog_out`.
+Each sends it as the host of an event that carries none, in this order: the event's own host, then
+the sink's `hostname:` (`syslog_out` only), then the process hostname.
+
+| Sink | The event's own host | Where the process hostname goes |
+|---|---|---|
+| `syslog_out` | `syslog.hostname` | HOSTNAME, unless the sink sets `hostname:` |
+| `splunk_hec_out` | resource `host.name` | the envelope `host` |
+| `datadog_out` | `host.name`; for an event or service check, `statsd.*.host` first; for a log, `hostname` first | a series' `host` resource, a v1, distribution, or sketch `host`, a log's `hostname`, an event's `host`, a check's `host_name` |
+
+Each relay pair gains a permitted normalization: an item that arrived with no host leaves with
+the relay's hostname. The Consequences' recipe for host-less `internal` events, a `remove` of
+`host.name` after `internal`, now holds only for `collectd_out`: the other three sinks fill the
+removed host back in with the same name. Trace and stats hostnames in `datadog_out` and everything in
+`datadog_trace_out` stay verbatim relay metadata. `collectd_out` is unchanged, for the reason in
+the Decision above.

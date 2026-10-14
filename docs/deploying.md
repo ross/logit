@@ -525,10 +525,23 @@ was considered.
 own `internal` telemetry, so several instances writing to one metrics backend stay
 distinguishable. The startup log records it as `hostname resolved`.
 
-`host.name` also changes what `internal`'s events do at sinks that read it: `collectd_out` sends it
-as the host, `datadog_out` sets the series `host` (which can register a new Datadog host), and
-`splunk_hec_out` sets the envelope `host`. To send another name, set `hostname:`. To send none,
-place a `remove` of `host.name` after `internal`.
+Three sinks also send it as the host of any event that carries none of its own. They never
+replace a host an event or its resource carries:
+
+| Sink | The event's own host | Where the hostname goes otherwise |
+|---|---|---|
+| `syslog_out` | `syslog.hostname` | HOSTNAME, unless the sink sets its own `hostname:` |
+| `splunk_hec_out` | resource `host.name` | the envelope `host` |
+| `datadog_out` | `hostname` (logs), `statsd.event.host` or `statsd.service_check.host`, then `host.name` | the host of a metric, log, event, or service check |
+
+So a relay sends the relay's hostname for whatever arrived without one. Through `datadog_out`,
+that means every hostless DogStatsD sender reports as one Datadog host, as it would through one
+Agent; see [`docs/datadog.md`](datadog.md). To keep a host per sender, stamp `host.name` upstream
+with `set`.
+
+`internal`'s events carry `host.name`, so `collectd_out` sends it as their host too, and
+`datadog_out` reports them under it, which can register a new Datadog host. To send another name,
+set `hostname:`.
 
 The hostname is, in order:
 
@@ -2873,7 +2886,9 @@ response text quoted in a log line or error has the key replaced with `<redacted
 
 **Host, service, and tags come from the data.** There's no `host:` or `tags:` field on the sink.
 Each route's encoder reads `host.name`, `service`, `ddsource`, and the rest from event attributes
-and the batch resource, so stamp them upstream with `set`, as the example does for `host.name`.
+and the batch resource, so stamp them upstream with `set`, as the example does for `host.name`. A
+metric, log, event, or service check with no host goes out under the process hostname
+([Hostname](#hostname)), so senders with no host of their own all report as the relay's host.
 
 **Compression.** `compression: gzip`, the default, gzips every body except two. Distribution
 points go zlib-deflated, which is what Datadog documents for that route. Events go uncompressed,
@@ -3255,8 +3270,10 @@ it needs `tls: {insecure_skip_verify: true}`.
 
 **Index, source, sourcetype, and host come from the resource.** There are no per-sink fields for
 them: the sink reads `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and
-`host.name` from the batch resource, so stamp them upstream with `set`, as the example does. Every
-other attribute goes out in `fields`, as an indexed field, a nested one flattened to dotted keys.
+`host.name` from the batch resource, so stamp them upstream with `set`, as the example does. A
+batch with no `host.name` goes out with the process hostname ([Hostname](#hostname)) as its
+`host`. Every other attribute goes out in `fields`, as an indexed field, a nested one flattened to
+dotted keys.
 
 **Metrics.** A gauge or a sum goes out as one `metric_name:<name>` field with a `metric_type`
 dimension (`Gauge` or `Sum`). A kind with more than one number is dropped under `multi_value:
