@@ -22,6 +22,13 @@
 //! write a line `influxd` would read differently or reject with the whole batch:
 //!
 //! - any key ending in `\`, since that backslash would escape the delimiter after it;
+//! - a measurement starting with a tab or NUL, and a field key starting with one when every field
+//!   key on the line does. `influxd` skips whitespace at a line's start and in the run after the
+//!   space before the fields, and a tab or NUL is whitespace there, so the measurement would lose
+//!   its first byte and the first field key would read as missing. After the `,` between fields
+//!   nothing is skipped, so such a field key is written after a field whose key starts with
+//!   anything else, and drops only when no such field exists. A tag key or value follows a `,` or
+//!   `=`, where nothing is skipped, so it keeps a leading tab or NUL;
 //! - a measurement with a `\` directly before `,`, space, or `=`: `influxd` stores the series but
 //!   no query reads it back;
 //! - a field key with a `\` directly before `,`, space, `=`, or `"`. Written, the backslash and
@@ -144,6 +151,9 @@ pub struct InfluxLineEncoder {
     line: String,
     /// The `k=v,k=v` field set for the line being assembled.
     fields: String,
+    /// Carrier fields whose key starts with a tab or NUL, held while `fields` is empty: such a
+    /// key can't be a line's first field (this module's "Escaping").
+    deferred: String,
     /// Scratch for rendering one non-string tag value; a `Value::Str` tag is borrowed instead.
     scratch: String,
     /// Scratch for [`allocate_timestamp`]'s walk. A fresh `Vec` would allocate on every timestamp
@@ -169,6 +179,7 @@ impl InfluxLineEncoder {
             tag_suffix: String::new(),
             line: String::new(),
             fields: String::new(),
+            deferred: String::new(),
             scratch: String::new(),
             visited: Vec::new(),
             series: HashMap::new(),
@@ -204,12 +215,13 @@ impl Encoder for InfluxLineEncoder {
             tag_suffix,
             line,
             fields,
+            deferred,
             scratch,
             visited,
             series,
             stats,
         } = self;
-        let mut ctx = Ctx { diag, stats, line, fields, series, visited, buf: &mut buf };
+        let mut ctx = Ctx { diag, stats, line, fields, deferred, series, visited, buf: &mut buf };
         for event in &batch.events {
             let carrier = carrier_measurement(event, *measurement_key);
             if event.metrics.is_empty() && carrier.is_none() {
@@ -261,6 +273,7 @@ struct Ctx<'a> {
     stats: &'a mut EncodeStats,
     line: &'a mut String,
     fields: &'a mut String,
+    deferred: &'a mut String,
     series: &'a mut HashMap<String, HashMap<i64, i64>>,
     visited: &'a mut Vec<i64>,
     buf: &'a mut String,
@@ -307,6 +320,7 @@ impl Ctx<'_> {
     /// counted `carrier_mismatch`.
     fn encode_carrier_event(&mut self, tag_suffix: &str, event: &Event, measurement: &str) {
         self.fields.clear();
+        self.deferred.clear();
         let mut written = 0;
         for metric in &event.metrics {
             if self.skip_no_recorded_value(metric) {
@@ -324,10 +338,7 @@ impl Ctx<'_> {
                     continue;
                 }
             }
-            separator(self.fields);
-            push_escaped_field_key(self.fields, key);
-            self.fields.push('=');
-            push_typed_value(self.fields, value);
+            self.push_carrier_field(key, FieldValue::Typed(value));
             written += 1;
         }
         for (key, value) in event.attributes.iter() {
@@ -345,11 +356,14 @@ impl Ctx<'_> {
                 self.stats.dropped_oversize_value += 1;
                 continue;
             }
-            separator(self.fields);
-            push_escaped_field_key(self.fields, field);
-            self.fields.push('=');
-            push_quoted(self.fields, text);
+            self.push_carrier_field(field, FieldValue::Str(text));
             written += 1;
+        }
+        // Only fields whose key starts with a tab or NUL: none can lead the line, so each drops.
+        if self.fields.is_empty() && !self.deferred.is_empty() {
+            self.stats.dropped_unencodable_key += written;
+            self.deferred.clear();
+            written = 0;
         }
         // An empty field set writes no line: every field that dropped was counted where it
         // dropped, and with no field at all there is nothing to write.
@@ -366,6 +380,26 @@ impl Ctx<'_> {
             }
             self.stats.metrics_normalized_carrier_mismatch += 1;
             self.encode_record_line(tag_suffix, metric, event.timestamp);
+        }
+    }
+
+    /// Appends one carrier field to the line's field set. A key starting with a tab or NUL waits
+    /// in `deferred` until another field leads, then follows that field in its original order.
+    fn push_carrier_field(&mut self, key: &str, value: FieldValue<'_>) {
+        let leads = self.fields.is_empty();
+        let hold = leads && starts_skippable(key);
+        let out = if hold { &mut *self.deferred } else { &mut *self.fields };
+        separator(out);
+        push_escaped_field_key(out, key);
+        out.push('=');
+        match value {
+            FieldValue::Typed(v) => push_typed_value(out, v),
+            FieldValue::Str(text) => push_quoted(out, text),
+        }
+        if leads && !hold && !self.deferred.is_empty() {
+            self.fields.push(',');
+            self.fields.push_str(self.deferred);
+            self.deferred.clear();
         }
     }
 
@@ -753,6 +787,12 @@ fn push_typed_value(out: &mut String, v: MetricValue) {
     }
 }
 
+/// A carrier field's value: a metric's typed number or boolean, or a quoted string.
+enum FieldValue<'a> {
+    Typed(MetricValue),
+    Str(&'a str),
+}
+
 /// Comma between field entries. Keyed off "anything written yet", not a loop index: non-finite
 /// entries are skipped, and an index would leave a leading comma when the first one was.
 fn separator(out: &mut String) {
@@ -806,10 +846,10 @@ pub fn tag_value<'a>(scratch: &'a mut String, v: &'a Value) -> Option<&'a str> {
     }
 }
 
-/// A measurement the line can lead with (this module's "Escaping"): non-empty, no line break, no
-/// trailing `\`, and no `\` directly before `,`, space, or `=`.
+/// A measurement the line can lead with (this module's "Escaping"): non-empty, no leading tab or
+/// NUL, no line break, no trailing `\`, and no `\` directly before `,`, space, or `=`.
 fn measurement_encodable(s: &str) -> bool {
-    if s.is_empty() || s.contains(['\n', '\r']) {
+    if s.is_empty() || starts_skippable(s) || s.contains(['\n', '\r']) {
         return false;
     }
     let bytes = s.as_bytes();
@@ -827,12 +867,21 @@ fn tag_encodable(s: &str) -> bool {
 }
 
 /// A carrier field key with a spelling: non-empty, as [`tag_encodable`], and no `\` directly
-/// before a character [`push_escaped_field_key`] escapes (this module's "Escaping").
+/// before a character [`push_escaped_field_key`] escapes (this module's "Escaping"). A key
+/// starting with a tab or NUL has a spelling anywhere but first, which
+/// [`Ctx::push_carrier_field`] arranges.
 fn field_key_encodable(s: &str) -> bool {
     let bytes = s.as_bytes();
     !s.is_empty()
         && tag_encodable(s)
         && bytes.windows(2).all(|w| w[0] != b'\\' || !matches!(w[1], b',' | b' ' | b'=' | b'"'))
+}
+
+/// Whether `s` starts with a byte other than a space that `influxd` skips as whitespace at the
+/// start of a line or of the field section, but not after a `,` between fields: a tab or NUL. A
+/// leading space is written `\ `, which nothing skips.
+fn starts_skippable(s: &str) -> bool {
+    s.starts_with(['\t', '\0'])
 }
 
 /// Appends a measurement, escaping `,` and space. `=` and `\` go as themselves.
