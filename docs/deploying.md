@@ -1871,7 +1871,10 @@ components:
   `logit.input.frames.dropped{reason="oversize"|"drained"|"truncated"}`. On either transport, a malformed
   *line* is the decoder's `logit.input.messages.dropped{reason="malformed"}` (diagnostic `bad_line`),
   not a framing error, and a datagram or frame that isn't UTF-8 is
-  `logit.input.frames.dropped{reason="undecodable"}`.
+  `logit.input.frames.dropped{reason="undecodable"}`. A nonzero
+  `logit.input.tags.omitted{reason="reserved_prefix"}` means a producer sends a `|#` tag key
+  starting with `_logit.`, which the decoder leaves off the line because it would collide with a
+  carrier.
 
 ### `statsd_in`: DogStatsD over a Unix socket
 
@@ -2716,8 +2719,11 @@ timeout, and then the same retry.
 they're answered, and `logit.input.requests.rejected{reason}` says why a `4xx` happened: a nonzero
 `unknown_route` means an Agent is using a route this listener doesn't speak, and `auth` a key
 mismatch. A nonzero `logit.input.connections.rejected{reason="limit"}` means the
-`max_connections` cap is binding. `docs/design/internal-telemetry.md`'s `datadog_in` section has
-every counter, and its `datadog` codec section the per-item drops inside a request that decoded.
+`max_connections` cap is binding. A nonzero `logit.input.tags.omitted{reason="reserved_prefix"}`
+means a producer sends a tag key starting with `_logit.`, which the decoder leaves off the series,
+sketch, event, or check because it would collide with a carrier.
+`docs/design/internal-telemetry.md`'s `datadog_in` section has every counter, and its `datadog`
+codec section the per-item drops inside a request that decoded.
 
 ## `datadog_trace_in`: standing in for the Agent's APM API
 
@@ -3176,8 +3182,9 @@ retries), are all invisible to the producer, which believes its writes succeeded
 **What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
 answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened. A nonzero
 `logit.input.tags.omitted{reason="reserved_prefix"}` means a producer sends a tag key starting
-with `influxdb.`, which the decoder leaves off the point because it would collide with the
-carrier. A sustained `logit.input.batches.deferred` means the pipeline isn't keeping up. A nonzero
+with `influxdb.` or `_logit.`, which the decoder leaves off the point because it would collide
+with a carrier. `statsd_in`, `graphite_in`, `datadog_in`, and `prometheus_in`'s remote-write
+receiver emit the same counter for a `_logit.` key. A sustained `logit.input.batches.deferred` means the pipeline isn't keeping up. A nonzero
 `logit.input.connections.rejected{reason="limit"}` means the `max_connections` cap is binding.
 `docs/design/internal-telemetry.md`'s `influxdb_in` section has every counter.
 
