@@ -2324,7 +2324,11 @@ fn syslog_pri_accepts_0_and_191_and_rejects_192_and_00() {
     for (pri, facility, severity) in [("0", 0, 0), ("191", 23, 7)] {
         let event = syslog_event(format!("<{pri}>msg").as_bytes());
         assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(facility)), "{pri}");
-        assert_eq!(event.attributes.get("syslog.severity"), Some(&Value::U64(severity)), "{pri}");
+        assert_eq!(
+            event.attributes.get("_logit.syslog.severity"),
+            Some(&Value::U64(severity)),
+            "{pri}"
+        );
     }
     for pri in ["192", "00", "000", "0191"] {
         assert!(syslog_decode(format!("<{pri}>msg").as_bytes()).is_empty(), "{pri}");

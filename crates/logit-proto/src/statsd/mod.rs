@@ -31,7 +31,7 @@
 //!   rule only `aggregate` sketches. The weighting bound lives there too: `Samples::weight` clamps
 //!   `round(1 / sample_rate)` to `Samples::MAX_WEIGHT` (1000), and `aggregate` counts a clamp as
 //!   `logit.transform.samples.weight_clamped` with a `sample_rate_clamped` diagnostic. The wire
-//!   type letter survives as the `statsd.type` attribute (rule (b) of
+//!   type letter survives as the `_logit.statsd.type` attribute (rule (b) of
 //!   `docs/adr/lossless-transit.md`), since all three land on the same `Samples` shape.
 //! - `s` (set): **one `Event` per line**, every value in one
 //!   [`logit_core::MetricKind::SetMembers`], each member a zero-copy `Bytes` slice of the datagram,
@@ -46,22 +46,22 @@
 //! **`|c:<container-id>` and `|T<unix-seconds>` apply to every metric type**, not only the `c`/`g`
 //! the DogStatsD spec restricts them to (`docs/design/telemetry-landscape.md`): a
 //! forward-compatible superset. `|c:<id>` (v1.2+; v1.4+'s `ci-`/`in-`-prefixed forms land verbatim)
-//! stamps `statsd.container_id: Value::Str`, a zero-copy datagram slice. `|T<secs>` sets
+//! stamps `_logit.statsd.container_id: Value::Str`, a zero-copy datagram slice. `|T<secs>` sets
 //! [`Event::timestamp`](logit_core::Event::timestamp) to `secs * 1_000_000_000` in place of the
 //! receipt time `decode_into`'s `received_at` supplies, and stamps
-//! `statsd.timestamp: Value::U64(secs)`, the raw wire value. The carrier is what survives a stage
-//! that rebuilds `Event::timestamp` (`aggregate`'s flush), and it tells a wire timestamp from a
-//! receipt-time one. A `|T` that isn't an unsigned integer (the form is under the rejection
-//! rules below), or whose nanoseconds overflow `i64`, rejects only that line as `bad_line`. Both
+//! `_logit.statsd.timestamp: Value::U64(secs)`, the raw wire value. The carrier is what survives a
+//! stage that rebuilds `Event::timestamp` (`aggregate`'s flush), and it tells a wire timestamp from
+//! a receipt-time one. A `|T` that isn't an unsigned integer (the form is under the rejection rules
+//! below), or whose nanoseconds overflow `i64`, rejects only that line as `bad_line`. Both
 //! attributes are protocol-namespaced carriers (`docs/adr/lossless-transit.md`). Every other
 //! unrecognized `|` segment is accepted and ignored, for forward compatibility.
 //!
 //! **`|e:<external-data>` (v1.5, Agent 7.57+) and `|card:<cardinality>` (v1.6, Agent 7.64+)** stamp
-//! `statsd.external_data` and `statsd.cardinality`, both `Value::Str` zero-copy slices, on every
-//! metric type and on events and service checks (as `e:`/`card:` fields). Both are carried
-//! verbatim: `card:` isn't checked against the Agent's `none`/`low`/`orchestrator`/`high`, since
-//! a relay carries what the client sent, and an empty `|e:` stamps an empty string, as an empty
-//! `|c:` does.
+//! `_logit.statsd.external_data` and `_logit.statsd.cardinality`, both `Value::Str` zero-copy
+//! slices, on every metric type and on events and service checks (as `e:`/`card:` fields). Both are
+//! carried verbatim: `card:` isn't checked against the Agent's `none`/`low`/`orchestrator`/`high`,
+//! since a relay carries what the client sent, and an empty `|e:` stamps an empty string, as an
+//! empty `|c:` does.
 //!
 //! A line is rejected as `bad_line` when it has no `:` or an empty name, no `|<type>`, an unknown
 //! type, a `c`/`g`/`ms`/`h`/`d` value that doesn't parse or isn't finite (`NaN`/`inf` parse as
@@ -98,12 +98,15 @@
 //!
 //! **The fold applies to the `#` payload only.** Every `#` segment on a line unions into the same
 //! attribute map (`|#a:1|#a:2` folds as `|#a:1,a:2` would), while `@`, `|c:` and `|T` are
-//! last-segment-wins. A repeated `|T`/`|c:`/type therefore never reaches `insert_tags`. A tag
-//! **literally named** `statsd.type` (or any `statsd.*` carrier key) inside `#` does, and can
-//! decode to an `Array`. On egress it matches no `statsd_out` carrier arm (each expects a
-//! `Value::Str`/`Value::U64`) and is filtered out of the tag segment uncounted, as any wrong-typed
-//! carrier is. On a `ms`/`h`/`d` line the decoder's own `statsd.type` stamp runs after the tags
-//! and overwrites it.
+//! last-segment-wins. A repeated `|T`/`|c:`/type therefore never reaches `insert_tags`, and a tag
+//! can't spell a carrier key, because every carrier sits under the private prefix the next
+//! paragraph omits.
+//!
+//! **A tag key under the private `_logit.` prefix is omitted**, on a metric line, an event, or a
+//! service check, so a sender's tag never reads back as a carrier
+//! (`docs/adr/private-attribute-namespace.md`). The line still decodes, and each omitted token
+//! counts `logit.input.tags.omitted{reason="reserved_prefix"}`; a line rejected for another
+//! reason counts none.
 //!
 //! ## DogStatsD events and service checks
 //!
@@ -122,11 +125,11 @@
 //!
 //! **Event**: `_e{<TITLE_LEN>,<TEXT_LEN>}:<TITLE>|<TEXT>|d:<secs>|h:<hostname>|p:<normal|low>|
 //! t:<info|success|warning|error>|k:<aggregation_key>|s:<source_type_name>|#<tags>|
-//! c:<container_id>|e:<external_data>|card:<cardinality>`. `TITLE_LEN`/`TEXT_LEN` are byte lengths as on the wire and decide the split,
-//! since `TEXT` may contain `|` and `:`. The line is rejected when a length runs past the line,
-//! lands mid-UTF-8-char (checked via `str::get`, so never a panic), or no `|` follows the title,
-//! when the `{a,b}` header is malformed, or when a `t:`/`p:` value is unrecognized. It decodes to
-//! one [`Event::log`](logit_core::Event::log):
+//! c:<container_id>|e:<external_data>|card:<cardinality>`. `TITLE_LEN`/`TEXT_LEN` are byte lengths
+//! as on the wire and decide the split, since `TEXT` may contain `|` and `:`. The line is rejected
+//! when a length runs past the line, lands mid-UTF-8-char (checked via `str::get`, so never a
+//! panic), or no `|` follows the title, when the `{a,b}` header is malformed, or when a `t:`/`p:`
+//! value is unrecognized. It decodes to one [`Event::log`](logit_core::Event::log):
 //!
 //! - `message` is `TEXT` with its `\n` (backslash, `n`) escape unescaped to a newline; zero-copy
 //!   when there is nothing to unescape. The title is never unescaped.
@@ -134,27 +137,27 @@
 //!   and is `None` when `t:` is absent.
 //! - `event_name` stays `None`: a title is free text, and interning it would grow the global
 //!   interner without bound.
-//! - Attributes (all `Value::Str`, zero-copy where possible): `statsd.event.title` (always),
-//!   `statsd.event.priority` (`p:`, raw), `statsd.event.alert_type` (`t:`, raw),
-//!   `statsd.event.aggregation_key` (`k:`), `statsd.event.source_type` (`s:`),
-//!   `statsd.event.host` (`h:`), each only if present, plus `statsd.timestamp`,
-//!   `statsd.container_id`, `statsd.external_data`, `statsd.cardinality` and `#tags` as on a
-//!   metric line. `d:<secs>` plays `|T`'s role (same
-//!   checked parse, same event timestamp and carrier); `|T` itself is an unrecognized field here
-//!   and is ignored.
+//! - Attributes (all `Value::Str`, zero-copy where possible): `_logit.statsd.event.title` (always),
+//!   `_logit.statsd.event.priority` (`p:`, raw), `_logit.statsd.event.alert_type` (`t:`, raw),
+//!   `_logit.statsd.event.aggregation_key` (`k:`), `_logit.statsd.event.source_type` (`s:`),
+//!   `_logit.statsd.event.host` (`h:`), each only if present, plus `_logit.statsd.timestamp`,
+//!   `_logit.statsd.container_id`, `_logit.statsd.external_data`, `_logit.statsd.cardinality` and
+//!   `#tags` as on a metric line. `d:<secs>` plays `|T`'s role (same checked parse, same event
+//!   timestamp and carrier); `|T` itself is an unrecognized field here and is ignored.
 //!
 //! **Service check**: `_sc|<NAME>|<STATUS>|d:<secs>|h:<hostname>|#<tags>|c:<container_id>|
-//! e:<external_data>|card:<cardinality>|m:<message>`. `NAME` must be non-empty and `STATUS` an integer `0..=3`
-//! (OK/WARNING/CRITICAL/UNKNOWN), or the line is rejected. The fields come in any order, and each,
-//! `m:` included, ends at the next `|`: the DogStatsD reference puts `m:` last, but the `datadog`
-//! Python client writes `c:` and `card:` after it, and the Agent reads `m:` up to the next `|`
-//! (both recorded, `testdata/interop/datadog/README.md`). So a message can't contain `|`. It
-//! decodes to one [`Event::metric`](logit_core::Event::metric), `MetricKind::gauge(status as f64)`
-//! under the check's name (interned, like a metric name), with attributes
-//! `statsd.service_check.name` (always, `Value::Str`: `MetricRecord` has nowhere else to carry it),
-//! `statsd.service_check.status` (always, `Value::U64`), `statsd.service_check.message` (`m:`,
-//! verbatim) and `statsd.service_check.host` (`h:`), plus `statsd.timestamp`,
-//! `statsd.container_id`, `statsd.external_data`, `statsd.cardinality` and `#tags` as above.
+//! e:<external_data>|card:<cardinality>|m:<message>`. `NAME` must be non-empty and `STATUS` an
+//! integer `0..=3` (OK/WARNING/CRITICAL/UNKNOWN), or the line is rejected. The fields come in any
+//! order, and each, `m:` included, ends at the next `|`: the DogStatsD reference puts `m:` last,
+//! but the `datadog` Python client writes `c:` and `card:` after it, and the Agent reads `m:` up to
+//! the next `|` (both recorded, `testdata/interop/datadog/README.md`). So a message can't contain
+//! `|`. It decodes to one [`Event::metric`](logit_core::Event::metric), `MetricKind::gauge(status
+//! as f64)` under the check's name (interned, like a metric name), with attributes
+//! `_logit.statsd.service_check.name` (always, `Value::Str`: `MetricRecord` has nowhere else to
+//! carry it), `_logit.statsd.service_check.status` (always, `Value::U64`),
+//! `_logit.statsd.service_check.message` (`m:`, verbatim) and `_logit.statsd.service_check.host`
+//! (`h:`), plus `_logit.statsd.timestamp`, `_logit.statsd.container_id`,
+//! `_logit.statsd.external_data`, `_logit.statsd.cardinality` and `#tags` as above.
 //!
 //! **Tag values, `|c:<id>`, and set members are zero-copy slices of the datagram**, like every
 //! field `syslog_in`'s decoder extracts: [`logit_core::subslice::share`] rebuilds each `Bytes` as a

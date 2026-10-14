@@ -37,7 +37,7 @@
 //! | `field-order` | **4** | string fields leave after the numeric ones |
 //! | `comments` | **8** | comments, blank lines, and runs of spaces drop |
 //! | `precision-s` | **7** | a body posted at `precision=s` leaves in nanoseconds, a negative timestamp included |
-//! | `reserved-prefix` | **12** | a tag under `influxdb.` drops, counted |
+//! | `reserved-prefix` | **12** | a tag under `_logit.` or `influxdb.field.` drops, counted; any other `influxdb.` tag passes |
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -66,7 +66,8 @@ const TOKEN: &str = "logit-round-trip-token";
 
 /// Every tag key the corpus names, in string order. See the module doc for why [`Harness::new`]
 /// interns them before anything else.
-const CORPUS_TAG_KEYS: [&str; 7] = ["b", "city", "country", "cpu", "host", "t,k", "w"];
+const CORPUS_TAG_KEYS: [&str; 8] =
+    ["b", "city", "country", "cpu", "host", "influxdb.foo", "t,k", "w"];
 
 /// `influxdb_in` delivers a request's batch, or refuses it, before it answers, so nothing a
 /// request caused is in flight once its response is read; the window is a margin against a stray
@@ -272,7 +273,7 @@ async fn precision_s() {
 async fn reserved_prefix() {
     let mut h = assert_case("reserved-prefix").await;
     let totals = h.probe.poll();
-    assert_eq!(totals.sum("logit.input.tags.omitted", &[("reason", "reserved_prefix")]), 1.0);
+    assert_eq!(totals.sum("logit.input.tags.omitted", &[("reason", "reserved_prefix")]), 2.0);
     assert!(!totals.has("logit.input.tags.dropped", &[]), "the point is delivered");
 }
 

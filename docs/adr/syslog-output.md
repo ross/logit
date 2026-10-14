@@ -109,13 +109,15 @@ component.
 ### Header-field precedence: round-trip `syslog.*` attributes, config as fallback
 
 Per event, per field, the event's own `syslog.*` attribute wins when present (exactly what
-`SyslogDecoder` writes on the way in); a configured default is the fallback; a format-appropriate
-absence (`-` for RFC 5424's NILVALUE, an omitted token for RFC 3164) is the last resort. This makes
-`syslog_in -> syslog_out` a real relay rather than a lossy re-encoding, and gives a receiver
-meaningful `host`/`app` stream labels (via Alloy's `__syslog_message_hostname`/`__syslog_message_
-app_name` relabeling) from the very first line, with no config beyond `endpoint`.
+`SyslogDecoder` writes on the way in), and for severity that attribute is the private carrier
+`_logit.syslog.severity` ([ADR `private-attribute-namespace`](private-attribute-namespace.md));
+a configured default is the fallback; a format-appropriate absence (`-` for RFC 5424's NILVALUE,
+an omitted token for RFC 3164) is the last resort. This makes `syslog_in -> syslog_out` a real
+relay rather than a lossy re-encoding, and gives a receiver meaningful `host`/`app` stream labels
+(via Alloy's `__syslog_message_hostname`/`__syslog_message_app_name` relabeling) from the very
+first line, with no config beyond `endpoint`.
 
-**`syslog.severity` deliberately outranks `log.severity`.** `syslog_in`'s PRI-to-`Severity` mapping
+**`_logit.syslog.severity` outranks `log.severity`.** `syslog_in`'s PRI-to-`Severity` mapping
 is lossy by construction — `logit_core::Severity` has six variants where syslog has eight, so
 `map_severity` collapses `emerg`/`alert`/`crit` (0/1/2) onto `Fatal` and `notice`/`info` (5/6) onto
 `Info`. Preferring the raw attribute is what makes a relay byte-faithful for the severities that
@@ -206,9 +208,9 @@ stats; the only thing that changed is that there is now a trait naming the shape
   left the host.** Rejected: that's an argument about `Fault` classification, not about whether
   re-delivery of an *already-sent* message is safe. Conflating them would silently widen
   `Ambiguous` retries on a sink that has no way to absorb the resulting duplicates.
-- **`log.severity` outranking `syslog.severity`.** Rejected: it would silently rewrite, on every
-  relay hop, a `crit` line's severity to `emerg` and a `notice` line's to `info` — the opposite of
-  a relay's job.
+- **`log.severity` outranking `_logit.syslog.severity`.** Rejected: it would silently rewrite, on
+  every relay hop, a `crit` line's severity to `emerg` and a `notice` line's to `info` — the
+  opposite of a relay's job.
 - **A single fixed delivery guarantee, ignoring transport.** Not applicable here beyond ADR `buffered-sink-delivery`'s
   own decision; `duplicate_safe` is a per-sink fact regardless of transport, and both transports
   answer it the same way for the same reason (no destination-side idempotency).

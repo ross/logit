@@ -306,9 +306,10 @@ fn dogsketch_with_negative_zero_positive_and_large_counts() {
 
 #[test]
 fn a_datadog_type_tag_never_rewrites_a_gauge_or_count() {
-    // The wire type always wins over a tag spelled like its carrier: a GAUGE or COUNT tagged
-    // `datadog.type:rate` (or `:unspecified`) relays as itself, and the tag is gone.
-    for tag in ["datadog.type:rate", "datadog.type:unspecified"] {
+    // A tag spelled like the type carrier is under the private prefix, so the decoder omits it: a
+    // GAUGE or COUNT tagged `_logit.datadog.type:rate` (or `:unspecified`) relays as itself, and
+    // the tag is gone.
+    for tag in ["_logit.datadog.type:rate", "_logit.datadog.type:unspecified"] {
         for (proto_type, v1_type) in [(3, "gauge"), (1, "count")] {
             let tags = vec![tag.to_string(), "env:prod".to_string()];
             let protobuf = MetricPayload {
@@ -326,7 +327,11 @@ fn a_datadog_type_tag_never_rewrites_a_gauge_or_count() {
             ]}));
             for (route, body) in [(Route::V2Protobuf, protobuf), (Route::V1, v1)] {
                 let events = assert_fixed_point(route, &body);
-                assert_eq!(events[0].attributes.get("datadog.type"), None, "{route:?} {tag}");
+                assert_eq!(
+                    events[0].attributes.get("_logit.datadog.type"),
+                    None,
+                    "{route:?} {tag}"
+                );
                 let out = encode(route, &decode(route, &body)).unwrap();
                 let (wire_type, wire_tags) = match route {
                     Route::V2Protobuf => {
@@ -413,11 +418,11 @@ fn sketch_payload_common_metadata_relays_on_the_resource() {
 
     let d1 = decode(Route::Sketches, &body);
     let resource = &d1.resource.attributes;
-    assert_eq!(resource.get("datadog.agent.version"), Some(&Value::str("7.50.3")));
-    assert_eq!(resource.get("datadog.agent.timezone"), Some(&Value::str("UTC")));
-    assert_eq!(resource.get("datadog.agent.epoch"), Some(&Value::F64(1_700_000_000.25)));
-    assert_eq!(resource.get("datadog.agent.internal_ip"), Some(&Value::str("10.0.0.7")));
-    assert_eq!(resource.get("datadog.agent.public_ip"), Some(&Value::str("203.0.113.9")));
+    assert_eq!(resource.get("_logit.datadog.agent.version"), Some(&Value::str("7.50.3")));
+    assert_eq!(resource.get("_logit.datadog.agent.timezone"), Some(&Value::str("UTC")));
+    assert_eq!(resource.get("_logit.datadog.agent.epoch"), Some(&Value::F64(1_700_000_000.25)));
+    assert_eq!(resource.get("_logit.datadog.agent.internal_ip"), Some(&Value::str("10.0.0.7")));
+    assert_eq!(resource.get("_logit.datadog.agent.public_ip"), Some(&Value::str("203.0.113.9")));
     // The API key is a credential: never stored.
     assert_eq!(resource.len(), 5);
 

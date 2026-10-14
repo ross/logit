@@ -15,11 +15,12 @@ the decoder differs from `influxd`.
   - **Consequence:** a dashboard or client that reads back through `logit` gets `404`.
   - **Workaround:** query the destination directly.
 - **`org` and `bucket` are carried, not routed.** `influxdb_in` records `org`, `orgID`, and
-  `bucket` as the resource attributes `influxdb.org`, `influxdb.org_id`, and `influxdb.bucket`.
-  `influxdb_out` writes to the one org and bucket in its own config and ignores them.
+  `bucket` as the private resource attributes `_logit.influxdb.org`, `_logit.influxdb.org_id`, and
+  `_logit.influxdb.bucket`. `influxdb_out` writes to the one org and bucket in its own config and
+  ignores them.
   - **Consequence:** two producers writing to different buckets through one `influxdb_in` land in
     the one bucket `influxdb_out` names.
-  - **Workaround:** a `route` on `influxdb.bucket` into one `influxdb_out` per destination.
+  - **Workaround:** a `route` on `_logit.influxdb.bucket` into one `influxdb_out` per destination.
 - **A destination fault never reaches the producer.** `influxdb_in` answers `204` once the batch
   is in every downstream inbox, before `influxdb_out` writes it. A `422` for a field type
   conflict (`Rejected`, the batch drops), a `404` for a missing bucket, and a `401` for the sink's

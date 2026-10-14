@@ -984,7 +984,7 @@ mod tests {
         let events = running.events(3, "the three lines of one datagram").await;
         assert_eq!(names(&events), vec!["a", "b", "c"]);
         assert_eq!(
-            events[1].attributes.get("statsd.cardinality").and_then(Value::as_str),
+            events[1].attributes.get("_logit.statsd.cardinality").and_then(Value::as_str),
             Some("low")
         );
 

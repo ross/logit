@@ -1,5 +1,6 @@
 //! `AttrMap`: the small, sorted, interned-key map behind event attributes, plus [`merged`], the
-//! resource-then-event merge-join shared by every codec that renders both onto one wire form.
+//! resource-then-event merge-join shared by every codec that renders both onto one wire form, and
+//! [`is_private`], the test for the private `_logit.` namespace.
 //!
 //! Most events carry under a dozen attributes, where a sorted `SmallVec` beats a `HashMap` on
 //! lookup and iteration, and its deterministic order is what the wire format's dictionary encoding
@@ -124,6 +125,20 @@ pub fn merged<'a>(
             (None, None) => None,
         }
     })
+}
+
+/// The prefix of the private attribute namespace, which protocol codecs reserve for their own use.
+///
+/// See ADR `private-attribute-namespace` (`docs/adr/private-attribute-namespace.md`) and
+/// `docs/design/data-model.md`'s "Well-known attribute names".
+pub const PRIVATE_PREFIX: &str = "_logit.";
+
+/// Whether `key` is in the private namespace, [`PRIVATE_PREFIX`].
+///
+/// ADR `private-attribute-namespace` has the rule sinks follow for these keys. Don't filter inside
+/// [`merged`]: under that rule, a sink reads its own private keys through it.
+pub fn is_private(key: &str) -> bool {
+    key.starts_with(PRIVATE_PREFIX)
 }
 
 #[cfg(test)]
@@ -282,6 +297,28 @@ mod tests {
             .map(|(k, v)| (interner::resolve(k).to_string(), v.as_str().unwrap().to_string()))
             .collect();
         assert_eq!(collect(&resource, &event), expected);
+    }
+
+    #[test]
+    fn a_key_under_the_private_prefix_is_private() {
+        assert!(is_private("_logit.x"));
+        assert!(is_private("_logit.statsd.type"));
+    }
+
+    #[test]
+    fn the_bare_prefix_without_its_dot_is_not_private() {
+        assert!(!is_private("_logit"));
+    }
+
+    #[test]
+    fn a_public_logit_key_is_not_private() {
+        assert!(!is_private("logit.x"));
+        assert!(!is_private("logit.body_format"));
+    }
+
+    #[test]
+    fn the_prefix_matches_only_at_the_start_of_a_key() {
+        assert!(!is_private("x._logit.y"));
     }
 
     mod properties {

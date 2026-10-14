@@ -108,13 +108,15 @@ Three facts from the survey drive the shape of the decision:
    [ADR `committed-pregenerated-otlp-protobuf`](committed-pregenerated-otlp-protobuf.md)'s
    rejection of hand-rolled protobuf to decoding, and to families without maps.
 
-8. **Attribute vocabulary.** `datadog.*` for raw encodings (`datadog.type`, `datadog.interval`,
-   `datadog.resources`, `datadog.source_type_name`, `datadog.origin.*`, `datadog.chunk.*`,
-   `datadog.tracer.*`, `datadog.agent.*`, `datadog.stats.*`); Datadog's own OTLP-honored names for
-   span fields (`service.name`, `resource.name`, `span.type`); `meta`/`metrics` keys verbatim;
-   `statsd.event.*`/`statsd.service_check.*` for events and service checks, which are the same
-   Datadog concepts DogStatsD carries. A Datadog `rate` is a `Gauge` with `datadog.type: rate`,
-   not a `Sum`, because folding a per-second value into a delta multiplies and rounds.
+8. **Attribute vocabulary.** `_logit.datadog.*` for raw encodings (`_logit.datadog.type`,
+   `_logit.datadog.interval`, `_logit.datadog.resources`, `_logit.datadog.source_type_name`,
+   `_logit.datadog.origin.*`, `_logit.datadog.chunk.*`, `_logit.datadog.tracer.*`,
+   `_logit.datadog.agent.*`, `_logit.datadog.stats.*`); Datadog's own OTLP-honored names for span
+   fields (`service.name`, `resource.name`, `span.type`); `meta`/`metrics` keys verbatim;
+   `_logit.statsd.event.*`/`_logit.statsd.service_check.*` for events and service checks, which
+   are the same Datadog concepts DogStatsD carries. A Datadog `rate` is a `Gauge` with
+   `_logit.datadog.type: rate`, not a `Sum`, because folding a per-second value into a delta
+   multiplies and rounds.
 
 9. **Trace ids** are built from a uint64 and `_dd.p.tid` on decode, and emitted as the low 64
    bits plus `_dd.p.tid` when the high bits are nonzero.
@@ -176,10 +178,10 @@ Three facts from the survey drive the shape of the decision:
     `/v0.7/traces` under `version: v0.7`) and `POST /v0.6/stats`, msgpack, with no sampler: the
     Agent's `rate_by_service` reply is ignored. The rest of the decision:
     - **v0.4 is the default form**, because most tracers send it and every Agent takes it. The
-      tracer carriers a v0.4 request keeps only in headers (`datadog.tracer.language_name` and the
-      rest `datadog_trace_in` reads) go back out as those headers under either form, so a
-      v0.4-origin batch relays with nothing lost; a tracer header's carrier is never written into
-      a span's `meta`, on any trace form. Under v0.4 the chunk carriers and the payload carriers no
+      tracer carriers a v0.4 request keeps only in headers (`_logit.datadog.tracer.language_name`
+      and the rest `datadog_trace_in` reads) go back out as those headers under either form, so a
+      v0.4-origin batch relays with nothing lost; a tracer header's carrier is never written into a
+      span's `meta`, on any trace form. Under v0.4 the chunk carriers and the payload carriers no
       header has are dropped and counted `no_wire_form`; v0.7 carries them.
     - **`socket:` is an HTTP/1.1 client over the Unix socket**, a pooled `hyper_util` client whose
       connector dials the path for each new connection, beside `reqwest` for `endpoint:`; the two
@@ -402,6 +404,30 @@ names, so that any nonzero `*.dropped` is loss. The decisions above stand; only 
 `crates/logit-proto/src/datadog/mod.rs`'s module doc has every counter, and
 [internal-telemetry.md](../design/internal-telemetry.md) has the operator-facing tables.
 
+## Amendment: the carriers are private (2026-10-13)
+
+[ADR `private-attribute-namespace`](private-attribute-namespace.md) moves every `datadog.*`
+carrier this record names under the private `_logit.` prefix, protocol segment kept:
+`_logit.datadog.interval`, `_logit.datadog.tracer.*`, `_logit.datadog.chunk.*`, and the rest. The
+decisions above use the new spelling. Four things follow for the Datadog pairs:
+
+- **Datadog's own names stay public.** `_dd.*`, `_top_level`, and `_sampling_priority_v1` are
+  span data a tracer or the Agent wrote, and Datadog shows them; they aren't carriers. The APM
+  stats metric names (`datadog.stats.hits` and the rest) are metric names, not attributes.
+- **Every other sink ignores the carriers.** A `datadog_trace_in -> otlp_out` pipeline sends no
+  tracer header as an OTLP resource attribute, and a `datadog_in -> influxdb_out` pipeline writes
+  no `_logit.datadog.interval` tag.
+- **The Datadog sinks follow the same rule.** `datadog_out` and `datadog_trace_out` read their own
+  carriers by exact name, and skip every other `_logit.` key when they render tags, log fields,
+  or span `meta` and `metrics`, without counting it. That includes their own carriers a route
+  doesn't read: a stray `_logit.datadog.interval` on a log never becomes a log field, and the
+  v0.6 stats route, which has no envelope, skips the Agent carriers uncounted.
+- **A tag can't spell a carrier.** `datadog_in` drops a series tag under `_logit.` and counts it
+  `logit.input.tags.omitted{reason="reserved_prefix"}`, so a `_logit.datadog.type:rate` tag never
+  turns a `GAUGE` into a `RATE`. An operator who wants a carrier on a series from another
+  protocol stamps it with `set`, as `fixtures/datadog-direct.yaml` stamps
+  `_logit.datadog.interval`.
+
 ## Amendment: the process hostname fills a missing host (2026-10-14)
 
 `datadog_out` writes the process hostname ([ADR `process-hostname`](process-hostname.md)) as the
@@ -415,15 +441,15 @@ carries always wins. Trace and stats payloads keep their tracer and Agent hostna
   `extractTagsMetadata` (datadog-agent 7.83.3, `comp/dogstatsd/server/impl/enrich.go`) reads it.
   An empty one marks a sample hostless, and it is never filled. With `host.name`
   present, `host` stays an ordinary tag.
-- **Events and service checks read `host.name` and `host`.** Their host is `statsd.event.host` or
-  `statsd.service_check.host` (the `h:` field), else `host.name`, else `host`, else the process
+- **Events and service checks read `host.name` and `host`.** Their host is `_logit.statsd.event.host` or
+  `_logit.statsd.service_check.host` (the `h:` field), else `host.name`, else `host`, else the process
   hostname. A `host.name` or `host` used this way leaves as the host and not as a tag.
 - **A log with a host Datadog reads isn't filled.** Datadog's log preprocessing takes the host
   from `host`, `hostname`, or `syslog.hostname`. A log carrying `hostname`, `host.name`,
   `syslog.hostname`, or `host` gets no default `hostname`, and the last two leave as the
   attributes they were.
 - **An Agent's hostless v2 series stays hostless.** The Agent writes a hostless series as a
-  `host` resource with no name, which decodes into `datadog.resources`. A series carrying such an
+  `host` resource with no name, which decodes into `_logit.datadog.resources`. A series carrying such an
   entry is never filled, and the entry is kept, so the relay stays a fixed point. The v1,
   distribution-point, and sketch routes spell the same thing `"host":""`, which decodes as no
   host and is filled, a gap in `docs/known-gaps/datadog.md`.

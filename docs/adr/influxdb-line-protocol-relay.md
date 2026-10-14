@@ -68,7 +68,7 @@ One point decodes to one `Event`:
 
 | Wire | Model |
 |---|---|
-| measurement | event attribute `influxdb.measurement`, `Value::Str` |
+| measurement | event attribute `_logit.influxdb.measurement`, `Value::Str` |
 | tag `k=v` | event attribute `k`, `Value::Str`, never a resource attribute |
 | float field `f=1.5` | `MetricRecord` named `<measurement>.f`, `Gauge(F64(1.5))` |
 | integer field `f=1i` | `<measurement>.f`, `Gauge(I64(1))` |
@@ -78,7 +78,7 @@ One point decodes to one `Event`:
 | N numeric or boolean fields | N records on the one `Event`, in wire order |
 | timestamp | `event.timestamp`, scaled to nanoseconds by `precision` |
 | no timestamp | `event.timestamp` = the request's receipt time |
-| `org`, `orgID`, `bucket` | resource attributes `influxdb.org`, `influxdb.org_id`, `influxdb.bucket` |
+| `org`, `orgID`, `bucket` | resource attributes `_logit.influxdb.org`, `_logit.influxdb.org_id`, `_logit.influxdb.bucket` |
 
 Tags stay event attributes, as `graphite_in` and `statsd_in` keep theirs: a per-tag-set resource
 would defeat batch accumulation, which keys on the resource's pointer. N fields as N records on one
@@ -90,45 +90,51 @@ convention between writer and reader, so the decoder doesn't guess one.
 `crates/logit-proto/src/influxdb/mod.rs`'s module doc holds the canonical decode and encode tables
 once `influx/w2` lands, with every skip and its counter. This ADR doesn't repeat them.
 
-### The `influxdb.*` carrier
+### The `_logit.influxdb.*` carrier
 
 Rule (b) of [ADR `lossless-transit`](lossless-transit.md): the protocol's own spelling rides on
-protocol-namespaced attributes that `influxdb_out` reads and every other sink treats as ordinary
-attributes.
+attributes that `influxdb_out` reads. The measurement, org, and bucket are private carriers under
+`_logit.influxdb.`, which every other sink leaves off its wire
+([ADR `private-attribute-namespace`](private-attribute-namespace.md)). A string field is data, so
+it stays public under `influxdb.field.`, and any sink may render it.
 
 | Attribute | Scope | Value | Meaning |
 |---|---|---|---|
-| `influxdb.measurement` | event | `Str` | the point's measurement; its presence selects the carrier path on `influxdb_out` |
-| `influxdb.field.<key>` | event | `Str` | a string field named `<key>` |
-| `influxdb.org` | resource | `Str` | the request's `org` query parameter |
-| `influxdb.org_id` | resource | `Str` | the request's `orgID` query parameter |
-| `influxdb.bucket` | resource | `Str` | the request's `bucket` query parameter |
+| `_logit.influxdb.measurement` | event | `Str` | the point's measurement; its presence selects the carrier path on `influxdb_out` |
+| `influxdb.field.<key>` | event | `Str` | a string field named `<key>`; public |
+| `_logit.influxdb.org` | resource | `Str` | the request's `org` query parameter |
+| `_logit.influxdb.org_id` | resource | `Str` | the request's `orgID` query parameter |
+| `_logit.influxdb.bucket` | resource | `Str` | the request's `bucket` query parameter |
 
-A tag key that starts with `influxdb.` would collide with the carrier, so the decoder omits it,
-counted `logit.input.tags.omitted{reason="reserved_prefix"}` (normalization 12).
+A tag key under the private `_logit.` prefix is omitted, counted
+`logit.input.tags.omitted{reason="reserved_prefix"}` (normalization 12), as on each of the five
+tag-bearing metric wires (the private namespace ADR's inbound guard). A tag key under
+`influxdb.field.` would read back as a string field, so it's omitted and counted the same way. Any other tag key under
+`influxdb.` is an ordinary tag.
 
 ### Egress, with and without the carrier
 
-**With `influxdb.measurement`**, `influxdb_out` writes one line per event. The measurement comes
-from the carrier. Each record whose name starts with `<measurement>.` becomes a field whose key is
-the rest of the name, in record order, with its typed suffix
+**With `_logit.influxdb.measurement`**, `influxdb_out` writes one line per event. The measurement
+comes from the carrier. Each record whose name starts with `<measurement>.` becomes a field whose
+key is the rest of the name, in record order, with its typed suffix
 ([ADR `typed-metric-scalar`](typed-metric-scalar.md)). Each `influxdb.field.<key>` attribute
-becomes a string field `<key>`, never a tag. Every `influxdb.*` attribute is skipped as a tag, as
-`statsd.*` is today. An event with string fields and no metrics still writes a line. A record that
+becomes a string field `<key>`, never a tag. Every private `_logit.` attribute and every
+`influxdb.field.` attribute is skipped as a tag, uncounted. An event with string fields and no
+metrics still writes a line. A record that
 doesn't match the prefix, or isn't a scalar kind, takes the path below, counted
 `logit.output.metrics.normalized{reason="carrier_mismatch"}`.
 
 **Without the carrier**, `influxdb_out` keeps today's behavior: one line per `MetricRecord`, the
 record name as the measurement, and a `value=` field, now typed.
 
-`influxdb_out` keeps its configured `org` and `bucket`. It doesn't read `influxdb.org` or
-`influxdb.bucket` to choose a destination.
+`influxdb_out` keeps its configured `org` and `bucket`. It doesn't read `_logit.influxdb.org` or
+`_logit.influxdb.bucket` to choose a destination.
 
 Other sinks see the decoded shape. A record named `cpu.usage_user` reaches `prometheus_out` as
-`cpu_usage_user` after sanitizing, the name Telegraf's own Prometheus output uses. A string-only
-point has no metrics, so metric sinks skip it, and `influxdb.field.*` and `influxdb.measurement`
-reach them as ordinary tags or labels unless a `remove` drops them. Both are cross-protocol rows in
-`docs/known-gaps/mappings.md`.
+`cpu_usage_user` after sanitizing, the name Telegraf's own Prometheus output uses. The measurement
+and the org and bucket never reach another sink's wire, because they're private. A string-only
+point has no metrics, so metric sinks skip it, and `influxdb.field.*` reaches them as ordinary tags
+or labels unless a `remove` drops it.
 
 ### Strings are attributes, not metrics
 
@@ -252,7 +258,8 @@ the same list with the same numbers, and the two lists must stay numbered alike:
     always a `Gauge`, so this applies only to an event from another protocol.
 11. A listener's sender attributes (`network.peer.*`, `client.*`) are added under `peer:`,
     `proxy_protocol:`, or `forwarded:`.
-12. A tag key under the reserved `influxdb.` prefix is omitted, counted.
+12. A tag key under the private `_logit.` prefix or the string-field prefix `influxdb.field.` is
+    omitted, counted.
 13. A duplicate field key within one line: the last value wins.
 14. An absent timestamp: the request's arrival time truncated to `precision`, one instant for every
     such point in the request.
@@ -358,8 +365,17 @@ list; this section summarizes it. Each deviation is a choice or a consequence of
   when `influx/w3` lands.
 - Known-gaps rows, added with the codec and the listener: what `influxdb_out` drops or reshapes
   from other protocols (`SetMembers`, `ExponentialHistogram`, `unit`, `description`, exemplars, a
-  sketch leaving as `count`/`sum`/`p50`/`p90`/`p99`, and the rest), the carrier leaking as tags at
-  other sinks, a string-only point skipped at other sinks, the v1 `/write` route, no query or
+  sketch leaving as `count`/`sum`/`p50`/`p90`/`p99`, and the rest), string fields leaking as tags
+  at other sinks, a string-only point skipped at other sinks, the v1 `/write` route, no query or
   delete API, org and bucket not routed, and destination faults not reaching the producer.
 - The pair's evidence is a recorded Telegraf corpus and a probe of a real `influxd`, listed in the
   plan's "Verification".
+
+## Amendment: the carriers move under `_logit.influxdb.` (2026-10-13)
+
+The measurement and the org, org ID, and bucket carriers are private under `_logit.influxdb.`, as
+[ADR `private-attribute-namespace`](private-attribute-namespace.md) decides, so they no longer
+leak as tags or labels at other sinks and no `remove` is needed ahead of one. `influxdb.field.<key>`
+stays public. The decoder's reserved tag prefix narrows from `influxdb.` to `influxdb.field.`,
+beside the private `_logit.` guard, so a wire tag such as `influxdb.host` now decodes as an
+ordinary tag. The sections above describe the amended form.

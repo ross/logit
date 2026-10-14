@@ -308,6 +308,9 @@ hand after the fact; this pair starts with one list, not two):
 13. A pickle sender's spelling (protocol version, opcode choice, memo use) leaves as `graphite_out`'s
     protocol-2 writer spelling. Added 2026-10-09; see "Amendment: the reader accepts pickle
     protocol 0".
+14. A tag whose name is under the private `_logit.` prefix is omitted at decode, counted. Added
+    2026-10-13 by [ADR `private-attribute-namespace`](private-attribute-namespace.md)'s inbound
+    guard.
 
 ## Alternatives considered
 

@@ -426,7 +426,7 @@
           "additionalProperties": false
         },
         {
-          "description": "collectd's binary `network` plugin protocol over UDP.\n\n`bind` is an ordinary `host:port`; collectd's own default port is `25826`. When the address is a multicast group (collectd's defaults are `239.192.74.66` and `ff18::efc0:4a42`), the listener sets `SO_REUSEADDR`, binds the unspecified address on that port, and joins the group on the default interface. There is no `multicast:` field; the address says it. Such a listener also accepts unicast datagrams sent to that port from any source: joining a group is additive, not a filter.\n\n`types_db` names zero or more collectd `types.db` files (relative paths resolve against the config file's directory), read at startup and merged in order, later files overriding earlier ones. They supply data-source names only: a value list whose type resolves with a matching data-source count and kinds is named `<plugin>.<type>.<ds_name>` rather than `<plugin>.<type>.<i>` (a single-data-source list is `<plugin>.<type>` either way). A missing or unparseable file fails startup. Names never change what `collectd_out` puts back on the wire; it re-encodes from the `collectd.*` attributes. collectd's own `types.db` is GPL-licensed and not shipped with `logit`; point this at the installed copy.",
+          "description": "collectd's binary `network` plugin protocol over UDP.\n\n`bind` is an ordinary `host:port`; collectd's own default port is `25826`. When the address is a multicast group (collectd's defaults are `239.192.74.66` and `ff18::efc0:4a42`), the listener sets `SO_REUSEADDR`, binds the unspecified address on that port, and joins the group on the default interface. There is no `multicast:` field; the address says it. Such a listener also accepts unicast datagrams sent to that port from any source: joining a group is additive, not a filter.\n\n`types_db` names zero or more collectd `types.db` files (relative paths resolve against the config file's directory), read at startup and merged in order, later files overriding earlier ones. They supply data-source names only: a value list whose type resolves with a matching data-source count and kinds is named `<plugin>.<type>.<ds_name>` rather than `<plugin>.<type>.<i>` (a single-data-source list is `<plugin>.<type>` either way). A missing or unparseable file fails startup. Names never change what `collectd_out` puts back on the wire; it re-encodes from the identity attributes this input stamps on each event. collectd's own `types.db` is GPL-licensed and not shipped with `logit`; point this at the installed copy.",
           "type": "object",
           "required": [
             "bind",
@@ -1043,7 +1043,7 @@
           "additionalProperties": false
         },
         {
-          "description": "A stand-in for InfluxDB 2.x's write API: what an `influxdb_out`, Telegraf's `influxdb_v2` output, or any InfluxDB 2.x client's URL points at. Serves `POST /api/v2/write` with a line protocol body (gzip accepted) and `org` or `orgID`, `bucket`, and `precision` in the query string, `GET /ping`, and `GET /health`, answering influxd's own JSON error bodies. A request with `Authorization: Token <t>` or `Bearer <t>` is checked against `tokens:`. `org`, `orgID`, and `bucket` become the resource attributes `influxdb.org`, `influxdb.org_id`, and `influxdb.bucket`. A body with any line that doesn't parse is refused whole with `400`, and nothing of it is delivered. When the pipeline can't start taking a request's data within 5s, the request gets `503` with `Retry-After: 1`, nothing of it is delivered, and the client retries it. The v1 `/write` endpoint isn't served.",
+          "description": "A stand-in for InfluxDB 2.x's write API: what an `influxdb_out`, Telegraf's `influxdb_v2` output, or any InfluxDB 2.x client's URL points at. Serves `POST /api/v2/write` with a line protocol body (gzip accepted) and `org` or `orgID`, `bucket`, and `precision` in the query string, `GET /ping`, and `GET /health`, answering influxd's own JSON error bodies. A request with `Authorization: Token <t>` or `Bearer <t>` is checked against `tokens:`. `org`, `orgID`, and `bucket` become the resource attributes `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`, which a `route` can match on and which no sink writes as a tag. A body with any line that doesn't parse is refused whole with `400`, and nothing of it is delivered. When the pipeline can't start taking a request's data within 5s, the request gets `503` with `Retry-After: 1`, nothing of it is delivered, and the client retries it. The v1 `/write` endpoint isn't served.",
           "type": "object",
           "required": [
             "bind",
@@ -1667,7 +1667,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Retains only the named attributes, dropping the rest: an allowlist, so a new field appearing in a log format later cannot silently become a new tag dimension. Place it before `aggregate`, whose series key includes every attribute, to bound series cardinality and per-window memory. An empty `fields` list is legal and drops every attribute.",
+          "description": "Retains only the named attributes, dropping the rest: an allowlist, so a new field appearing in a log format later cannot silently become a new tag dimension. Place it before `aggregate`, whose series key includes every attribute, to bound series cardinality and per-window memory. An empty `fields` list is legal and drops every attribute that `private` doesn't retain.",
           "type": "object",
           "required": [
             "fields",
@@ -1680,6 +1680,15 @@
               "items": {
                 "type": "string"
               }
+            },
+            "private": {
+              "description": "What happens to attributes under the `_logit.` prefix, which protocol codecs reserve for their own use. `drop` (the default) treats them like any other key not in `fields`; `keep` retains every one of them alongside `fields`.",
+              "default": "drop",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/KeepPrivate"
+                }
+              ]
             },
             "receive": true,
             "sources": true,
@@ -2490,7 +2499,7 @@
               ]
             },
             "attributes": {
-              "description": "Which top-level attributes to expand. `all` (the default) expands every nested attribute, the useful default for a source whose keys you don't control (a Kubernetes label map, an OTLP `KvlistValue`). A named list holds literal attribute names, never paths. Rejected if both this and `resource` are `none`, or if a named list is empty or contains an empty or duplicate name.",
+              "description": "Which top-level attributes to expand. `all` (the default) expands every nested attribute, the useful default for a source whose keys you don't control (a Kubernetes label map, an OTLP `KvlistValue`). `all` never selects an attribute under the `_logit.` prefix, which protocol codecs reserve for their own use; name one to flatten it. A named list holds literal attribute names, never paths. Rejected if both this and `resource` are `none`, or if a named list is empty or contains an empty or duplicate name.",
               "default": "all",
               "allOf": [
                 {
@@ -4243,7 +4252,7 @@
       "description": "The blanket modes of `FlattenFields`.",
       "oneOf": [
         {
-          "description": "Expand every nested attribute (or resource attribute). The default for `attributes`.",
+          "description": "Expand every nested attribute (or resource attribute) outside `_logit.*`. The default for `attributes`.",
           "type": "string",
           "enum": [
             "all"
@@ -4813,6 +4822,25 @@
         }
       },
       "additionalProperties": false
+    },
+    "KeepPrivate": {
+      "description": "`keep`'s `private` field: whether `_logit.*` attributes are dropped like any unnamed key or retained.",
+      "oneOf": [
+        {
+          "description": "Drop every `_logit.*` attribute not named in `fields`. The default.",
+          "type": "string",
+          "enum": [
+            "drop"
+          ]
+        },
+        {
+          "description": "Retain every `_logit.*` attribute.",
+          "type": "string",
+          "enum": [
+            "keep"
+          ]
+        }
+      ]
     },
     "LinesTransport": {
       "description": "`lines_in`'s transport. `tcp` is the default and the only transport that takes `tls:`. Under `tcp` and `unix_stream` a line ends at its `\\n`. Under `udp` and `unix` a datagram carries one or more newline-separated lines, and its end ends the last one.\n\nUnder `unix` and `unix_stream`, `bind` is the socket's absolute path, shorter than 108 bytes, not a `host:port`.",

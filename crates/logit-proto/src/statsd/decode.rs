@@ -7,6 +7,7 @@
 
 use crate::{CodecError, Decoder};
 use bytes::Bytes;
+use logit_core::attrs::is_private;
 use logit_core::subslice;
 use logit_core::{
     interner::{intern, KeyCache},
@@ -18,6 +19,10 @@ use std::sync::{Arc, LazyLock};
 /// A line the decoder rejected, by `reason`: `malformed`, beside the throttled `bad_line`
 /// diagnostic. Every other line of its datagram or packet still decodes.
 const MESSAGES_DROPPED: &str = "logit.input.messages.dropped";
+
+/// A `|#` tag left off a delivered line because its key is private, by `reason`:
+/// `reserved_prefix`.
+const TAGS_OMITTED: &str = "logit.input.tags.omitted";
 
 /// Decodes statsd/DogStatsD bytes into events; testable without a socket.
 ///
@@ -40,7 +45,8 @@ pub struct StatsdDecoder {
     /// Where a rejected line counts `logit.input.messages.dropped{reason="malformed"}`.
     telemetry: Telemetry,
     /// Tag keys memoised `&str -> Symbol`: a client's tag names repeat on every line, so after the
-    /// first each is a `memcmp`, not an interner probe. The `statsd.*` carrier keys are in `KEYS`.
+    /// first each is a `memcmp`, not an interner probe. The `_logit.statsd.*` carrier keys are in
+    /// `KEYS`.
     keys: KeyCache,
 }
 
@@ -80,6 +86,8 @@ impl Decoder for StatsdDecoder {
     ) -> Result<(Arc<Resource>, Option<Arc<Scope>>), CodecError> {
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| CodecError::Malformed(format!("invalid utf-8: {e}")))?;
+        // Private tags omitted from lines that decoded; a rejected line's tags count nothing.
+        let mut reserved = 0;
         for line in text.split('\n') {
             // Trailing whitespace is payload on an `_e{`/`_sc|` line (`super`'s module doc,
             // "DogStatsD events and service checks"), so only other lines are trimmed at the end.
@@ -94,36 +102,43 @@ impl Decoder for StatsdDecoder {
             }
             // Per-line isolation: clients pack independent metrics into one datagram, so a bad
             // line is reported and dropped without discarding the others.
-            match parse_line(&bytes, line, received_at, &mut self.keys) {
-                Ok(mut line_events) => out.append(&mut line_events),
+            let mut line_reserved = 0;
+            match parse_line(&bytes, line, received_at, &mut self.keys, &mut line_reserved) {
+                Ok(mut line_events) => {
+                    reserved += line_reserved;
+                    out.append(&mut line_events);
+                }
                 Err(err) => {
                     self.telemetry.count(MESSAGES_DROPPED, 1.0, &[("reason", "malformed")]);
                     self.diag.warn_throttled("bad_line", err);
                 }
             }
         }
+        if reserved > 0 {
+            self.telemetry.count(TAGS_OMITTED, reserved as f64, &[("reason", "reserved_prefix")]);
+        }
         // statsd has no instrumentation scope.
         Ok((self.resource.clone(), None))
     }
 }
 
-/// The `statsd.*` carrier keys, interned once per process so each line pays a sorted
+/// The `_logit.statsd.*` carrier keys, interned once per process so each line pays a sorted
 /// `insert_sym`, not an interner hash and shard lock. A `LazyLock` rather than a decoder field
 /// because the parsers are free functions; `KEYS.x` is one acquire load after first use.
 static KEYS: LazyLock<StatsdKeys> = LazyLock::new(|| StatsdKeys {
-    container_id: intern("statsd.container_id"),
-    external_data: intern("statsd.external_data"),
-    cardinality: intern("statsd.cardinality"),
-    timestamp: intern("statsd.timestamp"),
-    type_: intern("statsd.type"),
-    event_title: intern("statsd.event.title"),
-    event_host: intern("statsd.event.host"),
-    event_priority: intern("statsd.event.priority"),
-    event_aggregation_key: intern("statsd.event.aggregation_key"),
-    event_source_type: intern("statsd.event.source_type"),
-    service_check_name: intern("statsd.service_check.name"),
-    service_check_status: intern("statsd.service_check.status"),
-    service_check_host: intern("statsd.service_check.host"),
+    container_id: intern("_logit.statsd.container_id"),
+    external_data: intern("_logit.statsd.external_data"),
+    cardinality: intern("_logit.statsd.cardinality"),
+    timestamp: intern("_logit.statsd.timestamp"),
+    type_: intern("_logit.statsd.type"),
+    event_title: intern("_logit.statsd.event.title"),
+    event_host: intern("_logit.statsd.event.host"),
+    event_priority: intern("_logit.statsd.event.priority"),
+    event_aggregation_key: intern("_logit.statsd.event.aggregation_key"),
+    event_source_type: intern("_logit.statsd.event.source_type"),
+    service_check_name: intern("_logit.statsd.service_check.name"),
+    service_check_status: intern("_logit.statsd.service_check.status"),
+    service_check_host: intern("_logit.statsd.service_check.host"),
 });
 
 struct StatsdKeys {
@@ -150,12 +165,25 @@ struct StatsdKeys {
 /// `super`'s module doc, "DogStatsD tags", has the full rule and what it leaves alone. The
 /// remove-then-insert per token is two binary searches over the sorted map, the same two-step
 /// `syslog_in`'s `insert_param` uses.
-fn insert_tags(attributes: &mut AttrMap, bytes: &Bytes, tags: &str, keys: &mut KeyCache) {
+///
+/// A key under the private `_logit.` prefix is skipped and added to `reserved`, so a sender's tag
+/// never reads back as a carrier.
+fn insert_tags(
+    attributes: &mut AttrMap,
+    bytes: &Bytes,
+    tags: &str,
+    keys: &mut KeyCache,
+    reserved: &mut usize,
+) {
     for tag in tags.split(',').filter(|t| !t.is_empty()) {
         let (key, value) = match tag.split_once(':') {
             Some((k, v)) => (k, Value::Str(subslice::share(bytes, v.as_bytes()))),
             None => (tag, Value::Bool(true)),
         };
+        if is_private(key) {
+            *reserved += 1;
+            continue;
+        }
         let key = keys.get_or_intern(key);
         let merged = match attributes.remove_sym(key) {
             None => value,
@@ -184,18 +212,19 @@ fn tag_element_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// Stamps `statsd.container_id`, a protocol-namespaced carrier (`docs/adr/lossless-transit.md`),
-/// as a zero-copy datagram slice, for a metric line's `|c:` and an event's or service check's `c:`.
+/// Stamps `_logit.statsd.container_id`, a protocol-namespaced carrier
+/// (`docs/adr/lossless-transit.md`), as a zero-copy datagram slice, for a metric line's `|c:` and
+/// an event's or service check's `c:`.
 fn insert_container_id(attributes: &mut AttrMap, bytes: &Bytes, container_id: &str) {
     attributes
         .insert_sym(KEYS.container_id, Value::Str(subslice::share(bytes, container_id.as_bytes())));
 }
 
-/// Stamps `statsd.external_data` (`|e:`) or `statsd.cardinality` (`|card:`) when `field` is one
-/// of them, returning whether it was. The metric, event, and service-check parsers share it: both
-/// are protocol-namespaced carriers (`docs/adr/lossless-transit.md`), zero-copy datagram slices
-/// kept verbatim, last segment wins. `card:` values aren't checked against the Agent's
-/// `none|low|orchestrator|high`: a relay carries what the client sent.
+/// Stamps `_logit.statsd.external_data` (`|e:`) or `_logit.statsd.cardinality` (`|card:`) when
+/// `field` is one of them, returning whether it was. The metric, event, and service-check parsers
+/// share it: both are protocol-namespaced carriers (`docs/adr/lossless-transit.md`), zero-copy
+/// datagram slices kept verbatim, last segment wins. `card:` values aren't checked against the
+/// Agent's `none|low|orchestrator|high`: a relay carries what the client sent.
 fn insert_origin_field(attributes: &mut AttrMap, bytes: &Bytes, field: &str) -> bool {
     if let Some(external_data) = field.strip_prefix("e:") {
         attributes.insert_sym(
@@ -215,7 +244,7 @@ fn insert_origin_field(attributes: &mut AttrMap, bytes: &Bytes, field: &str) -> 
 }
 
 /// Parses a `|T<unix-seconds>`/`d:<unix-seconds>` value into `(nanos, secs)`: `nanos` for
-/// `Event::timestamp`, `secs` for the `statsd.timestamp` carrier.
+/// `Event::timestamp`, `secs` for the `_logit.statsd.timestamp` carrier.
 ///
 /// Anything `u64::from_str` refuses, or seconds whose nanosecond conversion overflows `i64`,
 /// rejects the line rather than falling back to receipt time. `from_str` takes a leading `+`
@@ -237,13 +266,15 @@ fn parse_line(
     line: &str,
     timestamp: i64,
     keys: &mut KeyCache,
+    reserved: &mut usize,
 ) -> Result<Vec<Event>, CodecError> {
     // Only these two sigils are special; a legal `_`-prefixed metric name falls through.
     if line.starts_with("_e{") {
-        return parse_event(bytes, line, timestamp, keys).map(|event| vec![event]);
+        return parse_event(bytes, line, timestamp, keys, reserved).map(|event| vec![event]);
     }
     if line.starts_with("_sc|") {
-        return parse_service_check(bytes, line, timestamp, keys).map(|event| vec![event]);
+        return parse_service_check(bytes, line, timestamp, keys, reserved)
+            .map(|event| vec![event]);
     }
 
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
@@ -271,7 +302,7 @@ fn parse_line(
             }
             sample_rate = parsed;
         } else if let Some(tags) = extra.strip_prefix('#') {
-            insert_tags(&mut attributes, bytes, tags, keys);
+            insert_tags(&mut attributes, bytes, tags, keys, reserved);
         } else if let Some(container_id) = extra.strip_prefix("c:") {
             // Carried verbatim, `ci-`/`in-` prefixes included, on every metric type.
             insert_container_id(&mut attributes, bytes, container_id);
@@ -313,7 +344,6 @@ fn parse_line(
             }
             samples.sample_rate = sample_rate;
             let mut attrs = attributes.clone();
-            // Stamped after the tags, so it overwrites a `#statsd.type` tag.
             attrs.insert_sym(KEYS.type_, Value::Str(subslice::share(bytes, type_part.as_bytes())));
             let kind = MetricKind::Samples(samples);
             Ok(vec![Event::metric(line_timestamp, attrs, MetricRecord::new(intern(name), kind))])
@@ -341,6 +371,7 @@ fn parse_event(
     line: &str,
     timestamp: i64,
     keys: &mut KeyCache,
+    reserved: &mut usize,
 ) -> Result<Event, CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed dogstatsd event: {line:?}"));
 
@@ -368,7 +399,7 @@ fn parse_event(
         let fields = after_text.strip_prefix('|').ok_or_else(malformed)?;
         for field in fields.split('|') {
             if let Some(tags) = field.strip_prefix('#') {
-                insert_tags(&mut attributes, bytes, tags, keys);
+                insert_tags(&mut attributes, bytes, tags, keys, reserved);
             } else if let Some(container_id) = field.strip_prefix("c:") {
                 insert_container_id(&mut attributes, bytes, container_id);
             } else if insert_origin_field(&mut attributes, bytes, field) {
@@ -398,7 +429,7 @@ fn parse_event(
                     _ => return Err(malformed()),
                 });
                 attributes.insert(
-                    "statsd.event.alert_type",
+                    "_logit.statsd.event.alert_type",
                     Value::Str(subslice::share(bytes, alert_type.as_bytes())),
                 );
             } else if let Some(key) = field.strip_prefix("k:") {
@@ -461,6 +492,7 @@ fn parse_service_check(
     line: &str,
     timestamp: i64,
     keys: &mut KeyCache,
+    reserved: &mut usize,
 ) -> Result<Event, CodecError> {
     let malformed =
         || CodecError::Malformed(format!("malformed dogstatsd service check: {line:?}"));
@@ -489,11 +521,11 @@ fn parse_service_check(
         for field in fields.split('|') {
             if let Some(message) = field.strip_prefix("m:") {
                 attributes.insert(
-                    "statsd.service_check.message",
+                    "_logit.statsd.service_check.message",
                     Value::Str(subslice::share(bytes, message.as_bytes())),
                 );
             } else if let Some(tags) = field.strip_prefix('#') {
-                insert_tags(&mut attributes, bytes, tags, keys);
+                insert_tags(&mut attributes, bytes, tags, keys, reserved);
             } else if let Some(container_id) = field.strip_prefix("c:") {
                 insert_container_id(&mut attributes, bytes, container_id);
             } else if insert_origin_field(&mut attributes, bytes, field) {
@@ -630,7 +662,7 @@ mod tests {
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
         let text = std::str::from_utf8(&bytes).unwrap();
-        parse_line(&bytes, text, 0, &mut KeyCache::new())
+        parse_line(&bytes, text, 0, &mut KeyCache::new(), &mut 0)
             .expect_err("expected this line to be rejected")
     }
 
@@ -858,15 +890,15 @@ mod tests {
         }
     }
 
-    /// Each of `ms`/`h`/`d` keeps its type letter as `statsd.type`.
+    /// Each of `ms`/`h`/`d` keeps its type letter as `_logit.statsd.type`.
     #[test]
     fn statsd_type_is_stamped_for_each_timer_type() {
         for (line, expected) in [("x:1|ms", "ms"), ("x:1|h", "h"), ("x:1|d", "d")] {
             let events = decode(line);
             assert_eq!(
-                events[0].attributes.get("statsd.type").and_then(|v| v.as_str()),
+                events[0].attributes.get("_logit.statsd.type").and_then(|v| v.as_str()),
                 Some(expected),
-                "statsd.type should be stamped for {line:?}"
+                "_logit.statsd.type should be stamped for {line:?}"
             );
         }
     }
@@ -914,9 +946,39 @@ mod tests {
         );
         assert!(matches!(event.attributes.get("tc_urgent"), Some(Value::Bool(true))));
         assert_eq!(
-            event.attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
             Some("abc")
         );
+    }
+
+    /// A private tag on a metric, an event, or a service check is left off the delivered event and
+    /// counted, and a rejected line's private tag counts nothing. `logit.x` and `_logitx` aren't
+    /// private.
+    #[test]
+    fn a_private_tag_is_omitted_and_counted_and_lookalikes_are_not() {
+        let registry = logit_core::Registry::new();
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
+            .with_telemetry(registry.telemetry_for("statsd_in", "statsd_in", "listener"));
+        let datagram = "a:1|c|#env:prod,_logit.statsd.type:ms,logit.x:1,_logitx\n\
+                        _e{1,1}:t|x|#_logit.y:1,env:prod\n\
+                        _sc|chk|0|#_logit.z,env:prod\n\
+                        bad:1|zz|#_logit.w:1";
+        let events = decoder.decode(Bytes::from(datagram)).unwrap().events;
+        assert_eq!(events.len(), 3);
+        // The event and the service check keep the decoder's own private carriers; only a tag's
+        // private key is omitted.
+        for (event, tag_key) in events.iter().zip(["_logit.statsd.type", "_logit.y", "_logit.z"]) {
+            assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+            assert_eq!(event.attributes.get(tag_key), None, "{tag_key} must not survive");
+        }
+        assert!(
+            events[0].attributes.iter().all(|(k, _)| !is_private(logit_core::interner::resolve(k))),
+            "a counter line stamps no carrier, so no private key survives: {:?}",
+            events[0].attributes
+        );
+        assert_eq!(events[0].attributes.get("logit.x").and_then(|v| v.as_str()), Some("1"));
+        assert_eq!(events[0].attributes.get("_logitx"), Some(&Value::Bool(true)));
+        assert_eq!(input_counter(&registry, "logit.input.tags.omitted", "reserved_prefix"), 3.0);
     }
 
     #[test]
@@ -1038,14 +1100,18 @@ mod tests {
         );
     }
 
-    /// A tag literally named `statsd.type` folds like any other repeated key. A `c` line, because
-    /// on `ms`/`h`/`d` the decoder's own `statsd.type` stamp overwrites it.
+    /// A tag spelled like a former carrier key, `statsd.type`, is an ordinary public tag: it folds
+    /// like any other repeated key and sits beside the decoder's own `_logit.statsd.type` stamp.
     #[test]
-    fn a_tag_literally_named_statsd_type_folds_into_an_array_like_any_other() {
-        let events = decode("page.views:1|c|#statsd.type:ms,statsd.type:h");
+    fn a_tag_named_like_a_former_carrier_is_an_ordinary_tag() {
+        let events = decode("page.views:1|ms|#statsd.type:ms,statsd.type:h");
         assert_eq!(
             events[0].attributes.get("statsd.type"),
             Some(&Value::Array(vec![Value::str("ms"), Value::str("h")]))
+        );
+        assert_eq!(
+            events[0].attributes.get("_logit.statsd.type").and_then(|v| v.as_str()),
+            Some("ms")
         );
     }
 
@@ -1121,7 +1187,7 @@ mod tests {
     fn container_id_segment_becomes_an_attribute() {
         let events = decode("hits:1|c|c:abcdef0123456789");
         assert_eq!(
-            events[0].attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+            events[0].attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
             Some("abcdef0123456789")
         );
     }
@@ -1132,9 +1198,9 @@ mod tests {
         for line in ["x:1|ms|c:cid", "x:1|s|c:cid", "x:1|g|c:cid"] {
             let events = decode(line);
             assert_eq!(
-                events[0].attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+                events[0].attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
                 Some("cid"),
-                "expected statsd.container_id on {line:?}"
+                "expected _logit.statsd.container_id on {line:?}"
             );
         }
     }
@@ -1144,7 +1210,10 @@ mod tests {
         let events = decode("hits:1|c|T1700000000");
         let event = &events[0];
         assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000);
-        assert_eq!(event.attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
+        assert_eq!(
+            event.attributes.get("_logit.statsd.timestamp"),
+            Some(&Value::U64(1_700_000_000))
+        );
     }
 
     #[test]
@@ -1170,16 +1239,19 @@ mod tests {
             let events = decode(line);
             assert_eq!(events.len(), 1, "{line}");
             assert_eq!(
-                events[0].attributes.get("statsd.timestamp"),
+                events[0].attributes.get("_logit.statsd.timestamp"),
                 Some(&Value::U64(1_700_000_000)),
                 "{line}"
             );
         }
         let event = &decode("_e{+2,+4}:hi|body|d:+5")[0];
-        assert_eq!(event.attributes.get("statsd.timestamp"), Some(&Value::U64(5)));
+        assert_eq!(event.attributes.get("_logit.statsd.timestamp"), Some(&Value::U64(5)));
         assert_eq!(event.log.as_ref().unwrap().message.as_str(), Some("body"));
         let check = &decode("_sc|check|+1")[0];
-        assert_eq!(check.attributes.get("statsd.service_check.status"), Some(&Value::U64(1)));
+        assert_eq!(
+            check.attributes.get("_logit.statsd.service_check.status"),
+            Some(&Value::U64(1))
+        );
     }
 
     /// `|c:`/`|T`/`@rate`/`#tags` combine freely, in any order, on the same line.
@@ -1197,7 +1269,7 @@ mod tests {
             let event = &events[0];
             assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000, "line: {line:?}");
             assert_eq!(
-                event.attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+                event.attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
                 Some("abc123"),
                 "line: {line:?}"
             );
@@ -1207,7 +1279,7 @@ mod tests {
                 "line: {line:?}"
             );
             assert_eq!(
-                event.attributes.get("statsd.timestamp"),
+                event.attributes.get("_logit.statsd.timestamp"),
                 Some(&Value::U64(1_700_000_000)),
                 "line: {line:?}"
             );
@@ -1246,11 +1318,11 @@ mod tests {
         assert_eq!(log.body_format, BodyFormat::Raw);
         assert_eq!(log.event_name, None);
         assert_eq!(
-            event.attributes.get("statsd.event.title").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.event.title").and_then(|v| v.as_str()),
             Some("An exception occurred")
         );
         assert_eq!(
-            event.attributes.get("statsd.event.alert_type").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.event.alert_type").and_then(|v| v.as_str()),
             Some("warning")
         );
         assert_eq!(event.attributes.get("err_type").and_then(|v| v.as_str()), Some("bad_file"));
@@ -1270,12 +1342,15 @@ mod tests {
             matches!(event.metrics[0].kind, MetricKind::Gauge(v) if v == MetricValue::F64(2.0))
         );
         assert_eq!(
-            event.attributes.get("statsd.service_check.name").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.service_check.name").and_then(|v| v.as_str()),
             Some("Redis connection")
         );
-        assert_eq!(event.attributes.get("statsd.service_check.status"), Some(&Value::U64(2)));
         assert_eq!(
-            event.attributes.get("statsd.service_check.message").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.service_check.status"),
+            Some(&Value::U64(2))
+        );
+        assert_eq!(
+            event.attributes.get("_logit.statsd.service_check.message").and_then(|v| v.as_str()),
             Some("Redis connection timed out after 10s")
         );
         assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("dev"));
@@ -1292,35 +1367,38 @@ mod tests {
         // `t:success` maps to `Severity::Info`, same as `t:info`.
         assert_eq!(log.severity, Some(Severity::Info));
         assert_eq!(
-            event.attributes.get("statsd.event.title").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.event.title").and_then(|v| v.as_str()),
             Some("title")
         );
         assert_eq!(
-            event.attributes.get("statsd.event.priority").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.event.priority").and_then(|v| v.as_str()),
             Some("low")
         );
         assert_eq!(
-            event.attributes.get("statsd.event.alert_type").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.event.alert_type").and_then(|v| v.as_str()),
             Some("success")
         );
         assert_eq!(
-            event.attributes.get("statsd.event.aggregation_key").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.event.aggregation_key").and_then(|v| v.as_str()),
             Some("agg1")
         );
         assert_eq!(
-            event.attributes.get("statsd.event.source_type").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.event.source_type").and_then(|v| v.as_str()),
             Some("src1")
         );
         assert_eq!(
-            event.attributes.get("statsd.event.host").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.event.host").and_then(|v| v.as_str()),
             Some("host1")
         );
         assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
         assert_eq!(
-            event.attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
             Some("cid1")
         );
-        assert_eq!(event.attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
+        assert_eq!(
+            event.attributes.get("_logit.statsd.timestamp"),
+            Some(&Value::U64(1_700_000_000))
+        );
     }
 
     /// TEXT may contain `|` and `:`, and its `\n` escape becomes a newline; the title's doesn't.
@@ -1376,7 +1454,10 @@ mod tests {
         let events = decode("_e{5,4}:title|text|d:1700000000");
         let event = only_log_event(events);
         assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000);
-        assert_eq!(event.attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
+        assert_eq!(
+            event.attributes.get("_logit.statsd.timestamp"),
+            Some(&Value::U64(1_700_000_000))
+        );
     }
 
     #[test]
@@ -1384,7 +1465,7 @@ mod tests {
         let events = decode("_e{5,4}:title|text|c:cid1");
         let event = only_log_event(events);
         assert_eq!(
-            event.attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+            event.attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
             Some("cid1")
         );
     }
@@ -1395,14 +1476,17 @@ mod tests {
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000);
-        assert_eq!(event.attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
+        assert_eq!(
+            event.attributes.get("_logit.statsd.timestamp"),
+            Some(&Value::U64(1_700_000_000))
+        );
     }
 
     #[test]
     fn service_check_container_id_becomes_an_attribute() {
         let events = decode("_sc|check|0|c:cid2");
         assert_eq!(
-            events[0].attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+            events[0].attributes.get("_logit.statsd.container_id").and_then(|v| v.as_str()),
             Some("cid2")
         );
     }
@@ -1424,11 +1508,15 @@ mod tests {
             assert_eq!(events.len(), 1, "line: {line:?}");
             let event = &events[0];
             assert_eq!(
-                attr_str(event, "statsd.external_data"),
+                attr_str(event, "_logit.statsd.external_data"),
                 Some("it-false,cn-web,pu-abc"),
                 "line: {line:?}"
             );
-            assert_eq!(attr_str(event, "statsd.cardinality"), Some("high"), "line: {line:?}");
+            assert_eq!(
+                attr_str(event, "_logit.statsd.cardinality"),
+                Some("high"),
+                "line: {line:?}"
+            );
         }
     }
 
@@ -1436,15 +1524,15 @@ mod tests {
     #[test]
     fn an_unrecognized_cardinality_is_carried_verbatim() {
         let events = decode("x:1|c|card:bogus");
-        assert_eq!(attr_str(&events[0], "statsd.cardinality"), Some("bogus"));
+        assert_eq!(attr_str(&events[0], "_logit.statsd.cardinality"), Some("bogus"));
     }
 
     #[test]
     fn external_data_and_cardinality_become_attributes_on_an_event() {
         let event = only_log_event(decode("_e{5,4}:title|text|c:cid|e:ext1|card:low"));
-        assert_eq!(attr_str(&event, "statsd.container_id"), Some("cid"));
-        assert_eq!(attr_str(&event, "statsd.external_data"), Some("ext1"));
-        assert_eq!(attr_str(&event, "statsd.cardinality"), Some("low"));
+        assert_eq!(attr_str(&event, "_logit.statsd.container_id"), Some("cid"));
+        assert_eq!(attr_str(&event, "_logit.statsd.external_data"), Some("ext1"));
+        assert_eq!(attr_str(&event, "_logit.statsd.cardinality"), Some("low"));
     }
 
     #[test]
@@ -1452,9 +1540,9 @@ mod tests {
         let events = decode("_sc|check|0|e:ext2|card:orchestrator|m:all good");
         assert_eq!(events.len(), 1);
         let event = &events[0];
-        assert_eq!(attr_str(event, "statsd.external_data"), Some("ext2"));
-        assert_eq!(attr_str(event, "statsd.cardinality"), Some("orchestrator"));
-        assert_eq!(attr_str(event, "statsd.service_check.message"), Some("all good"));
+        assert_eq!(attr_str(event, "_logit.statsd.external_data"), Some("ext2"));
+        assert_eq!(attr_str(event, "_logit.statsd.cardinality"), Some("orchestrator"));
+        assert_eq!(attr_str(event, "_logit.statsd.service_check.message"), Some("all good"));
     }
 
     #[test]
@@ -1462,8 +1550,11 @@ mod tests {
         for line in ["x:1|c|c:cid", "_e{5,4}:title|text", "_sc|check|0"] {
             let events = decode(line);
             let event = &events[0];
-            assert!(event.attributes.get("statsd.external_data").is_none(), "line: {line:?}");
-            assert!(event.attributes.get("statsd.cardinality").is_none(), "line: {line:?}");
+            assert!(
+                event.attributes.get("_logit.statsd.external_data").is_none(),
+                "line: {line:?}"
+            );
+            assert!(event.attributes.get("_logit.statsd.cardinality").is_none(), "line: {line:?}");
         }
     }
 
@@ -1472,9 +1563,9 @@ mod tests {
     fn an_empty_external_data_or_cardinality_is_an_empty_string_like_an_empty_container_id() {
         let events = decode("x:1|c|c:|e:|card:");
         let event = &events[0];
-        assert_eq!(attr_str(event, "statsd.container_id"), Some(""));
-        assert_eq!(attr_str(event, "statsd.external_data"), Some(""));
-        assert_eq!(attr_str(event, "statsd.cardinality"), Some(""));
+        assert_eq!(attr_str(event, "_logit.statsd.container_id"), Some(""));
+        assert_eq!(attr_str(event, "_logit.statsd.external_data"), Some(""));
+        assert_eq!(attr_str(event, "_logit.statsd.cardinality"), Some(""));
     }
 
     /// Both carriers are zero-copy slices of the datagram, like `|c:`.
@@ -1484,7 +1575,7 @@ mod tests {
         let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
         let mut out = Vec::new();
         decoder.decode_into(datagram.clone(), 0, &mut out).unwrap();
-        let Some(Value::Str(value)) = out[0].attributes.get("statsd.external_data") else {
+        let Some(Value::Str(value)) = out[0].attributes.get("_logit.statsd.external_data") else {
             panic!("expected a Str");
         };
         assert!(logit_core::subslice::within(&datagram, value), "expected a slice of the datagram");
@@ -1496,11 +1587,11 @@ mod tests {
     fn service_check_message_ends_at_the_next_pipe() {
         let events = decode("_sc|check|0|m:slow upstream|c:in-7|card:low");
         let event = &events[0];
-        assert_eq!(attr_str(event, "statsd.service_check.message"), Some("slow upstream"));
-        assert_eq!(attr_str(event, "statsd.container_id"), Some("in-7"));
-        assert_eq!(attr_str(event, "statsd.cardinality"), Some("low"));
+        assert_eq!(attr_str(event, "_logit.statsd.service_check.message"), Some("slow upstream"));
+        assert_eq!(attr_str(event, "_logit.statsd.container_id"), Some("in-7"));
+        assert_eq!(attr_str(event, "_logit.statsd.cardinality"), Some("low"));
         let events = decode("_sc|check|0|m:a|b|c");
-        assert_eq!(attr_str(&events[0], "statsd.service_check.message"), Some("a"));
+        assert_eq!(attr_str(&events[0], "_logit.statsd.service_check.message"), Some("a"));
     }
 
     /// A trailing space on an `_sc|` line is kept as message content.
@@ -1508,7 +1599,10 @@ mod tests {
     fn service_check_message_trailing_whitespace_is_kept() {
         let events = decode("_sc|check|0|m:disk almost full ");
         assert_eq!(
-            events[0].attributes.get("statsd.service_check.message").and_then(|v| v.as_str()),
+            events[0]
+                .attributes
+                .get("_logit.statsd.service_check.message")
+                .and_then(|v| v.as_str()),
             Some("disk almost full ")
         );
     }
@@ -1629,15 +1723,20 @@ mod tests {
 
     /// The total of `logit.input.messages.dropped{reason}` in `registry`. Drains, so call once.
     fn messages_dropped(registry: &logit_core::Registry, reason: &str) -> f64 {
+        input_counter(registry, "logit.input.messages.dropped", reason)
+    }
+
+    /// The total of counter `metric{reason}` in `registry`. Drains, so call once.
+    fn input_counter(registry: &logit_core::Registry, metric: &str, reason: &str) -> f64 {
         registry
             .drain(0)
             .iter()
             .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some(reason))
             .flat_map(|e| &e.metrics)
-            .filter(|m| logit_core::interner::resolve(m.name) == "logit.input.messages.dropped")
+            .filter(|m| logit_core::interner::resolve(m.name) == metric)
             .map(|m| match &m.kind {
                 MetricKind::Sum(sum) => sum.value.as_f64(),
-                other => panic!("messages.dropped must be a counter, got {other:?}"),
+                other => panic!("{metric} must be a counter, got {other:?}"),
             })
             .sum()
     }
@@ -1722,7 +1821,7 @@ mod tests {
             "a per-request tag the client hung off the line"
         );
         assert!(
-            event.attributes.get("statsd.container_id").is_some(),
+            event.attributes.get("_logit.statsd.container_id").is_some(),
             "DogStatsd volunteers `|c:<id>` when it can see its own container"
         );
     }
@@ -1744,7 +1843,7 @@ mod tests {
         );
         assert!(
             event.attributes.get("env").is_none()
-                && event.attributes.get("statsd.container_id").is_none(),
+                && event.attributes.get("_logit.statsd.container_id").is_none(),
             "the plain-statsd dialect has no tag or container-id syntax at all"
         );
     }
@@ -1782,33 +1881,40 @@ mod tests {
             assert!(diagnostics.is_empty(), "packet {i} raised {diagnostics:?}");
             assert_eq!(events.len(), 1, "packet {i}: one construct per unbuffered packet");
             let event = events.into_iter().next().unwrap();
-            assert!(attr_str(&event, "statsd.container_id").is_some_and(|c| c.starts_with("in-")));
+            assert!(attr_str(&event, "_logit.statsd.container_id")
+                .is_some_and(|c| c.starts_with("in-")));
             decoded.push(event);
         }
-        let kinds: Vec<&str> =
-            decoded.iter().take(7).map(|e| attr_str(e, "statsd.type").unwrap_or("-")).collect();
+        let kinds: Vec<&str> = decoded
+            .iter()
+            .take(7)
+            .map(|e| attr_str(e, "_logit.statsd.type").unwrap_or("-"))
+            .collect();
         assert_eq!(kinds, ["-", "-", "h", "d", "-", "ms", "-"], "the type carriers of the metrics");
         assert!(matches!(decoded[0].metrics[0].kind, MetricKind::Sum(_)));
         assert!(matches!(decoded[4].metrics[0].kind, MetricKind::SetMembers(_)));
         for event in &decoded[..7] {
-            assert_eq!(attr_str(event, "statsd.external_data"), Some(RECORDED_EXTERNAL_ENV));
+            assert_eq!(attr_str(event, "_logit.statsd.external_data"), Some(RECORDED_EXTERNAL_ENV));
         }
         let cards: Vec<&str> =
-            decoded.iter().map(|e| attr_str(e, "statsd.cardinality").unwrap()).collect();
+            decoded.iter().map(|e| attr_str(e, "_logit.statsd.cardinality").unwrap()).collect();
         assert_eq!(
             cards,
             ["low", "high", "low", "low", "low", "low", "low", "orchestrator", "low"]
         );
         // `|T` last on the line, and its value the client's own.
-        assert_eq!(decoded[6].attributes.get("statsd.timestamp"), Some(&Value::U64(1_790_000_000)));
+        assert_eq!(
+            decoded[6].attributes.get("_logit.statsd.timestamp"),
+            Some(&Value::U64(1_790_000_000))
+        );
         assert_eq!(decoded[6].timestamp, 1_790_000_000_000_000_000);
         // The event and the service check: no `e:` on either from this client.
-        assert_eq!(attr_str(&decoded[7], "statsd.event.title"), Some("Deploy finished"));
-        assert_eq!(attr_str(&decoded[7], "statsd.external_data"), None);
+        assert_eq!(attr_str(&decoded[7], "_logit.statsd.event.title"), Some("Deploy finished"));
+        assert_eq!(attr_str(&decoded[7], "_logit.statsd.external_data"), None);
         let check = &decoded[8];
-        assert_eq!(attr_str(check, "statsd.service_check.name"), Some("record.can_connect"));
-        assert_eq!(attr_str(check, "statsd.service_check.message"), Some("slow upstream"));
-        assert_eq!(attr_str(check, "statsd.external_data"), None);
+        assert_eq!(attr_str(check, "_logit.statsd.service_check.name"), Some("record.can_connect"));
+        assert_eq!(attr_str(check, "_logit.statsd.service_check.message"), Some("slow upstream"));
+        assert_eq!(attr_str(check, "_logit.statsd.external_data"), None);
     }
 
     #[test]

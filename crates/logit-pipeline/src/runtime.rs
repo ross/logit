@@ -13205,7 +13205,11 @@ mod tests {
                 ("data_in", vec![], statsd_in()),
                 ("data_out", vec!["data_in"], influxdb_out()),
                 ("self", vec![], internal_kind()),
-                ("windowed", vec!["data_in", "self"], ComponentKind::Keep { fields: vec![] }),
+                (
+                    "windowed",
+                    vec!["data_in", "self"],
+                    ComponentKind::Keep { fields: vec![], private: Default::default() },
+                ),
                 ("shared_out", vec!["windowed"], influxdb_out()),
                 ("telemetry_out", vec!["self"], influxdb_out()),
             ],

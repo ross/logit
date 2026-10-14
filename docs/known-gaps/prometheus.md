@@ -143,9 +143,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   built, and a non-goal of [ADR `victoriametrics-interop`](../adr/victoriametrics-interop.md).
 - **A series scraped back from VictoriaMetrics's `/federate` is untyped.** `/federate` emits no
   `# TYPE` or `# HELP`, so `prometheus_in` decodes every series as a `Gauge` tagged
-  `prometheus.type="untyped"`: a counter can't be told from a gauge, and a histogram's `_bucket`,
-  `_sum`, and `_count` arrive as unrelated series (verified, leg 9). VictoriaMetrics stores no
-  metric type, so there's nothing for `logit` to recover.
+  `_logit.prometheus.type: "untyped"`: a counter can't be told from a gauge, and a histogram's
+  `_bucket`, `_sum`, and `_count` arrive as unrelated series (verified, leg 9). VictoriaMetrics
+  stores no metric type, so there's nothing for `logit` to recover.
 - **Some rows of `prometheus_out`'s and `influxdb_out`'s response-class tables rest on
   documentation and secondhand bodies, not a recorded response.** `prometheus_out`'s Grafana Cloud
   `401` body (`authentication error: invalid authentication credentials`) comes from a forum

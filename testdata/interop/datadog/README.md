@@ -121,8 +121,8 @@ Each item below was UNVERIFIED in `docs/plans/datadog-relay.md` or ADR
   `TracerVersion`, and `ContainerID` from those headers. **Changed:** `datadog_trace_in` does the
   same on `/v0.6/stats`, which it previously ignored all headers on.
 - **Tracers send `Datadog-External-Env`**, the tracer's copy of `DD_EXTERNAL_ENV`. **Changed:**
-  `datadog_trace_in` carries it as `datadog.tracer.external_env` and `datadog_trace_out` sends it
-  back, as it does `Datadog-Entity-ID`.
+  `datadog_trace_in` carries it as `_logit.datadog.tracer.external_env` and `datadog_trace_out`
+  sends it back, as it does `Datadog-Entity-ID`.
 - **A 7.83 Agent sends three probes the intake stand-in didn't answer.** The key check is
   `GET /api/v1/validate?api_key=<key>` with no `DD-API-KEY` header, so `datadog_in` with
   `api_keys` set answered it `403`. The trace agent fetches `GET /api/v2/validate` (with the

@@ -1723,7 +1723,7 @@ deployment conventions:
   `load.load.shortterm` instead of `load.load.0`. List several files to merge them in order, a later
   file overriding an earlier one. A file that can't be read or parsed fails startup, naming the
   path and line. It changes only what a cross-protocol sink (InfluxDB, Prometheus, statsd) calls the
-  series: `collectd_out` re-encodes from the `collectd.*` attributes, so a
+  series: `collectd_out` re-encodes from the `collectd.*` and `_logit.collectd.*` attributes, so a
   `collectd_in -> collectd_out` relay puts the same bytes on the wire either way.
 
 [`fixtures/collectd-to-influxdb.yaml`](../fixtures/collectd-to-influxdb.yaml) is a complete,
@@ -1732,9 +1732,11 @@ above as commented alternatives. **Don't put an `aggregate` between them.** Unli
 [`fixtures/statsd-to-influxdb.yaml`](../fixtures/statsd-to-influxdb.yaml), it has none, because a
 collectd value list is already one pre-aggregated reading per `Interval` with its own timestamp;
 re-windowing it would average averages and re-stamp them with the flush time. The file's header
-comment lists what the cross-protocol hop costs: the `collectd.*` attributes become ordinary
-InfluxDB tags instead of wire identity, and one N-data-source list becomes N measurements named
-`plugin.type.ds` sharing a tag set and a timestamp.
+comment lists what the cross-protocol hop costs. `collectd.host`, `collectd.plugin_instance`, and
+`collectd.type_instance` become InfluxDB tags, so lists from different hosts or instances stay
+apart. The plugin, type, interval, and severity ride on private `_logit.collectd.*` attributes that
+only `collectd_out` writes; the plugin and type already make up the measurement name. One
+N-data-source list becomes N measurements named `plugin.type.ds` sharing a tag set and a timestamp.
 
 ### `graphite_in`: carbon plaintext and pickle, TCP or UDP
 
@@ -1922,7 +1924,10 @@ components:
   `logit.input.frames.dropped{reason="oversize"|"drained"|"truncated"}`. On either transport, a malformed
   *line* is the decoder's `logit.input.messages.dropped{reason="malformed"}` (diagnostic `bad_line`),
   not a framing error, and a datagram or frame that isn't UTF-8 is
-  `logit.input.frames.dropped{reason="undecodable"}`.
+  `logit.input.frames.dropped{reason="undecodable"}`. A nonzero
+  `logit.input.tags.omitted{reason="reserved_prefix"}` means a producer sends a `|#` tag key
+  starting with `_logit.`, which the decoder leaves off the line because it would collide with a
+  carrier.
 
 ### `statsd_in`: DogStatsD over a Unix socket
 
@@ -2030,8 +2035,8 @@ nothing in a datagram, and `logit validate` rejects `protocol: pickle` under `tr
 one:
 
 - **Renaming a metric upstream silently changes the series carbon stores it under.** There is no
-  `graphite.*` carrier like `collectd_out`'s `collectd.*` or `syslog_out`'s `syslog.*`: the wire
-  path *is* [`MetricRecord::name`](design/data-model.md), with no `prefix:`/`template:` field and
+  `graphite.*` carrier like `collectd_out`'s `_logit.collectd.*` or `syslog_out`'s `syslog.*`: the
+  wire path *is* [`MetricRecord::name`](design/data-model.md), with no `prefix:`/`template:` field and
   nothing to restore identity from. A `lua`/`set` stage that renames a metric between `graphite_in`
   and `graphite_out` leaves no wire fact to notice the rename against, unlike a collectd or syslog
   relay, where identity attributes ride alongside the (possibly transformed) event. If a pipeline
@@ -2041,8 +2046,9 @@ one:
   into a filesystem path: a `;env=prod` tag suffix becomes literal `;` characters in a **whisper
   directory name**, not a rejected line. There is no error; `carbon-cache` creates directories
   nobody intended. If the destination might be an older Graphite, set `tags: drop`: every attribute
-  is then left off the wire (counted `logit.output.tags.omitted{reason="dialect"}`). Confirm an
-  unfamiliar cluster's tag support before using `tags: carbon` against it.
+  but a private `_logit.` one is then left off the wire and counted
+  `logit.output.tags.omitted{reason="dialect"}`. Confirm an unfamiliar cluster's tag support before
+  using `tags: carbon` against it.
 - **`multi_value: skip` (the default) drops what carbon's one-number-per-datapoint wire can't
   carry.** `Samples`, `Distribution`, `Histogram`, `ExponentialHistogram`, `Summary`, `Set`, and
   `SetMembers` records are dropped whole and counted `logit.output.metrics.skipped{metric_kind=...}`
@@ -2770,8 +2776,11 @@ timeout, and then the same retry.
 they're answered, and `logit.input.requests.rejected{reason}` says why a `4xx` happened: a nonzero
 `unknown_route` means an Agent is using a route this listener doesn't speak, and `auth` a key
 mismatch. A nonzero `logit.input.connections.rejected{reason="limit"}` means the
-`max_connections` cap is binding. `docs/design/internal-telemetry.md`'s `datadog_in` section has
-every counter, and its `datadog` codec section the per-item drops inside a request that decoded.
+`max_connections` cap is binding. A nonzero `logit.input.tags.omitted{reason="reserved_prefix"}`
+means a producer sends a tag key starting with `_logit.`, which the decoder leaves off the series,
+sketch, event, or check because it would collide with a carrier.
+`docs/design/internal-telemetry.md`'s `datadog_in` section has every counter, and its `datadog`
+codec section the per-item drops inside a request that decoded.
 
 ## `datadog_trace_in`: standing in for the Agent's APM API
 
@@ -2823,8 +2832,8 @@ trace rather than dropping priority-0 ones, which would leave them out of the re
 
 **Tracer headers become resource attributes.** `Datadog-Meta-Lang`, `-Lang-Version`,
 `-Tracer-Version`, `Datadog-Container-ID`, and the tracer's other identity and client-computation
-headers land on the batch resource as `datadog.tracer.*`, which `datadog_trace_out` writes back as
-headers. For `/v0.7/traces`, the payload's own fields win over a header.
+headers land on the batch resource as `_logit.datadog.tracer.*`, which `datadog_trace_out` writes
+back as headers. For `/v0.7/traces`, the payload's own fields win over a header.
 
 **The Unix socket.** `socket:` binds a Unix stream socket, as the Agent's `receiver_socket` does.
 The directory must already exist. A stale socket file from an earlier run is replaced, but a path
@@ -3209,19 +3218,19 @@ producer's resend of the whole body repeats nothing. A `503` with `Retry-After: 
 pipeline didn't take the body within 5 seconds and nothing of it was taken, counted
 `logit.input.batches.deferred`; the producer keeps the body and resends it.
 
-**What arrives.** Each point becomes one event with its tags as attributes and `influxdb.measurement` naming the
-measurement. Each numeric or boolean field becomes a gauge named `MEASUREMENT.FIELD`, and each
-string field an `influxdb.field.FIELD` attribute.
-`org`, `orgID`, and `bucket` become the resource attributes `influxdb.org`, `influxdb.org_id`, and
-`influxdb.bucket`. Use `route` on `influxdb.bucket` to send each bucket to its own
-`influxdb_out`, since `influxdb_out` writes to the one org and bucket in its own config and
-ignores the resource attributes. `crates/logit-proto/src/influxdb/mod.rs`'s module doc has the
-mapping table.
+**What arrives.** Each point becomes one event with its tags as attributes and the private
+attribute `_logit.influxdb.measurement` naming the measurement. Each numeric or boolean field
+becomes a gauge named `MEASUREMENT.FIELD`, and each string field an `influxdb.field.FIELD`
+attribute. `org`, `orgID`, and `bucket` become the private resource attributes
+`_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. Use `route` on
+`_logit.influxdb.bucket` to send each bucket to its own `influxdb_out`, since `influxdb_out`
+writes to the one org and bucket in its own config and ignores the resource attributes. No sink
+writes a `_logit.` attribute as a tag or label.
+`crates/logit-proto/src/influxdb/mod.rs`'s module doc has the mapping table.
 
-**Remove the carrier ahead of other sinks.** `influxdb.measurement` and `influxdb.field.*` are
-ordinary attributes everywhere but `influxdb_out`, so `prometheus_out` and `graphite_out` write
-them as labels or tags. Add a `remove` stage for them on any leg that doesn't end in
-`influxdb_out`.
+**Remove string fields ahead of other sinks.** `influxdb.field.*` attributes are ordinary
+attributes everywhere but `influxdb_out`, so `prometheus_out` and `graphite_out` write them as
+labels or tags. Add a `remove` stage for them on any leg that doesn't end in `influxdb_out`.
 
 **A destination fault never reaches the producer.** `influxdb_in` answers `204` once the batch is
 in every downstream inbox, before `influxdb_out` writes it. A `422` for a field type conflict
@@ -3232,8 +3241,10 @@ retries), are all invisible to the producer, which believes its writes succeeded
 **What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
 answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened. A nonzero
 `logit.input.tags.omitted{reason="reserved_prefix"}` means a producer sends a tag key starting
-with `influxdb.`, which the decoder leaves off the point because it would collide with the
-carrier. A sustained `logit.input.batches.deferred` means the pipeline isn't keeping up. A nonzero
+with `_logit.` or `influxdb.field.`, which the decoder leaves off the point because it would
+collide with a carrier or a string field. `statsd_in`, `graphite_in`, `datadog_in`, and
+`prometheus_in`'s remote-write receiver emit the same counter for a `_logit.` key. A sustained
+`logit.input.batches.deferred` means the pipeline isn't keeping up. A nonzero
 `logit.input.connections.rejected{reason="limit"}` means the `max_connections` cap is binding.
 `docs/design/internal-telemetry.md`'s `influxdb_in` section has every counter.
 

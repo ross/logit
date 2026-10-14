@@ -84,6 +84,7 @@
 //! | `Event::timestamp` (a span's: its start) | `time`, seconds with up to nine decimals ([`time::write_hec_time`]) | -- |
 //! | a carrier that isn't a `Str` | omitted | `logit.output.tags.omitted{reason="unrepresentable"}`, once per batch |
 //! | every other resource attribute, then every event attribute (the event's winning on a key) | `fields`, a `Map` flattened to dotted keys by [`crate::json::flatten_into`] (a span's event attributes go in its `attributes` instead) | -- |
+//! | a private `_logit.` attribute, on the resource or the event, a span event, or a link | omitted ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)); a `_logit.` key nested inside a map is data and flattens | -- |
 //! | an event with no log, metric, or span | nothing | `logit.output.events.skipped{reason="no_payload"}` |
 //!
 //! [`logs`], [`metrics`], and [`spans`] each carry their own rows.
@@ -867,12 +868,16 @@ impl SplunkEncoder {
     fn object_fields(resource: &Resource, event: &Event) -> AttrMap {
         let mut fields = AttrMap::new();
         for (key, value) in resource.attributes.iter() {
-            if !is_carrier(key) {
-                flatten_into(resolve(key), value, &mut fields);
+            let name = resolve(key);
+            if !is_carrier(key) && !logit_core::attrs::is_private(name) {
+                flatten_into(name, value, &mut fields);
             }
         }
         for (key, value) in event.attributes.iter() {
-            flatten_into(resolve(key), value, &mut fields);
+            let name = resolve(key);
+            if !logit_core::attrs::is_private(name) {
+                flatten_into(name, value, &mut fields);
+            }
         }
         fields
     }

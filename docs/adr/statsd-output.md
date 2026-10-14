@@ -268,7 +268,7 @@ timestamp.**
 `MetricKind::Samples` (`crates/logit-outputs/src/statsd.rs`'s `render_samples`) renders under
 `format: dogstatsd` as one multi-value line, `name:v1:v2:...|<type>[|@rate]` — DogStatsD's own
 multi-value extension, the same one `logit_proto::statsd::decode::parse_line` parses on the way in.
-`<type>` is read off the record's `statsd.type` attribute when it names `ms`/`h`/`d`
+`<type>` is read off the record's `_logit.statsd.type` attribute when it names `ms`/`h`/`d`
 (`statsd_wire_type`), defaulting to `ms` when the attribute is absent or names anything else
 (`an_unrecognized_statsd_type_attribute_falls_back_to_ms`); `@rate` is omitted whenever
 `sample_rate == 1.0`. Under `format: statsd`, which has no multi-value grammar, each value becomes
@@ -287,7 +287,7 @@ preserved. A member that comes out different from its raw bytes is counted
 
 ### `|c:`/`|T` carriage: dogstatsd only, dropped and counted under `format: statsd`
 
-`statsd.container_id` renders as `|c:<id>` and the per-line `statsd.timestamp ==
+`_logit.statsd.container_id` renders as `|c:<id>` and the per-line `_logit.statsd.timestamp ==
 Value::U64(secs)` carrier renders as `|T<secs>`, using that carrier's own value verbatim — both
 only under `Format::DogStatsd` (`append_dialect_extras`), appended after the tag segment to
 **every** physical line an event produces, so a negative-absolute-gauge's two-line pair or a
@@ -296,29 +296,29 @@ carrier is present and holds a `Value::U64` (a wire `|T<secs>` segment always pr
 that), never derived from `Event::timestamp` — a receipt-time stamp is not a wire-supplied
 timestamp, and a stage that rebuilds `Event::timestamp` after decode (`aggregate`'s flush,
 notably) can't fabricate or collapse a `|T` this way, since the carrier rides on the series key
-like any other attribute. A `statsd.timestamp` present but not a `Value::U64` (never produced by
-`statsd_in` itself, but reachable from a cross-protocol relay or a Lua-authored attribute) is
+like any other attribute. A `_logit.statsd.timestamp` present but not a `Value::U64` (never produced
+by `statsd_in` itself, but reachable from a cross-protocol relay or a Lua-authored attribute) is
 simply not emitted (`a_non_u64_statsd_timestamp_value_is_not_emitted`). Under `format: statsd`,
 neither field has anywhere to go — both are dropped and counted once per field per emitted
 physical line (`EncodeStats::dropped_dialect_fields`,
 `container_id_and_timestamp_are_dropped_and_counted_under_plain_statsd`).
 
-### `statsd.*` is never emitted as a tag, and is read off the merged resource⊕event view
+### `_logit.statsd.*` is never emitted as a tag, and is read off the merged resource⊕event view
 
-`statsd.type`/`statsd.container_id`/`statsd.timestamp` are protocol-namespaced carriers this
-decoder stamped from a line's own wire-type/`|c:`/`|T` segments, not ordinary attributes —
-`build_tag_suffix` filters every key starting with `statsd.` out of the generic `|#k:v,...`
-segment before it's ever considered as a tag, uncounted (a carrier being read for its real
-purpose, not data being dropped), the same way `syslog_out` never re-emits its own `syslog.*`
-attributes as a generic SD-ELEMENT field. That same merged walk (resource attributes first, event
-attributes overriding on collision, `crate::attrs::merged`) is also where all three carriers are
-captured, into `EncodeCtx`'s own fields, rather than a second, separate read of `event.attributes`
-afterward — `append_dialect_extras`/`statsd_wire_type` read `EncodeCtx`, never `event.attributes`,
-directly. This means a carrier set only on the **resource** (a `set` transform's `resource:`
-block, say) is honored exactly like one an event carries directly
-(`a_container_id_on_the_resource_is_emitted_as_pipe_c_under_dogstatsd`) — filtering a key out of
-the tag segment and reading it for its dedicated segment are now symmetric, where before only the
-event's own attributes were ever read back.
+`_logit.statsd.type`/`_logit.statsd.container_id`/`_logit.statsd.timestamp` are this sink's own
+carriers, which the decoder stamped from a line's own wire-type/`|c:`/`|T` segments, not ordinary
+attributes. `build_tag_suffix` reads every key under its own prefix, `_logit.statsd.`, by exact
+name and keeps it out of the generic `|#k:v,...` segment, uncounted: the carrier is being read for
+its real purpose, not dropped. Every other private `_logit.` key is skipped after that arm, also
+uncounted ([ADR `private-attribute-namespace`](private-attribute-namespace.md)). That same merged
+walk (resource attributes first, event attributes overriding on collision, `crate::attrs::merged`)
+is also where all three carriers are captured, into `EncodeCtx`'s own fields, rather than a
+second, separate read of `event.attributes` afterward — `append_dialect_extras`/`statsd_wire_type`
+read `EncodeCtx`, never `event.attributes`, directly. This means a carrier set only on the
+**resource** (a `set` transform's `resource:` block, say) is honored like one an event carries
+directly (`a_container_id_on_the_resource_is_emitted_as_pipe_c_under_dogstatsd`) — filtering a key
+out of the tag segment and reading it for its dedicated segment are now symmetric, where before
+only the event's own attributes were ever read back.
 
 ### What's still deferred, and why that's now the "opt-in summarization" carve-out
 
@@ -428,32 +428,33 @@ An event decodes to one [`Event::log`](../design/data-model.md): `message` is `T
 (backslash, `n`) two-byte escape unescaped to a real newline (zero-copy when there's nothing to
 unescape); `severity` maps `t:error`/`t:warning`/`t:success`/`t:info` to
 `Error`/`Warn`/`Info`/`Info`, `None` when `t:` is absent; `body_format` is `Raw`. Every field
-`_e{...}` can carry becomes a `statsd.event.*` attribute (rule (b),
+`_e{...}` can carry becomes a `_logit.statsd.event.*` attribute (rule (b),
 [ADR `lossless-transit`](lossless-transit.md): a protocol-namespaced carrier for a concept this
-model has no normalized field for) rather than a `LogRecord` field: `statsd.event.title` (always),
-`statsd.event.priority`/`statsd.event.alert_type` (only when sent, raw wire value),
-`statsd.event.aggregation_key`, `statsd.event.source_type`, `statsd.event.host` — plus the same
-`statsd.timestamp`/`statsd.container_id`/`#tags` handling every metric line already gets, with
-`d:<secs>` (not `|T<secs>`) playing the timestamp segment's role here.
+model has no normalized field for) rather than a `LogRecord` field: `_logit.statsd.event.title`
+(always), `_logit.statsd.event.priority`/`_logit.statsd.event.alert_type` (only when sent, raw wire
+value), `_logit.statsd.event.aggregation_key`, `_logit.statsd.event.source_type`,
+`_logit.statsd.event.host` — plus the same
+`_logit.statsd.timestamp`/`_logit.statsd.container_id`/`#tags` handling every metric line already
+gets, with `d:<secs>` (not `|T<secs>`) playing the timestamp segment's role here.
 
 A service check decodes to one `Event::metric`, `MetricKind::Gauge(status as f64)` under the
 check's own (interned) name — deliberately the same metric shape a plain `name:v|g` line produces,
 so every consumer already built for a `Gauge` (retention, relay, `influxdb_out`/`stdio_out`
-rendering) handles a service check with no special-casing. `statsd.service_check.name` (always —
-`MetricRecord`'s own name has nowhere to carry the raw wire spelling, rule (b) again),
-`statsd.service_check.status` (always, `Value::U64`), `statsd.service_check.message` (`m:`, only
-if present, verbatim including any `|` it contains — `m:` is always the *last* field on the wire,
-so it can consume the rest of the line; superseded: `m:` now ends at the next `|`, see the
-2026-09-24 amendment), `statsd.service_check.host` (`h:`, only if present),
-`statsd.timestamp`/`statsd.container_id`/`#tags` round out the carrier set.
+rendering) handles a service check with no special-casing. `_logit.statsd.service_check.name`
+(always — `MetricRecord`'s own name has nowhere to carry the raw wire spelling, rule (b) again),
+`_logit.statsd.service_check.status` (always, `Value::U64`), `_logit.statsd.service_check.message`
+(`m:`, only if present, verbatim including any `|` it contains — `m:` is always the *last* field on
+the wire, so it can consume the rest of the line; superseded: `m:` now ends at the next `|`, see the
+2026-09-24 amendment), `_logit.statsd.service_check.host` (`h:`, only if present),
+`_logit.statsd.timestamp`/`_logit.statsd.container_id`/`#tags` round out the carrier set.
 
 **`event_name` stays `None`, deliberately.** An event title is free text an operator or their
 application chose at send time — not a fixed, bounded vocabulary the way a metric or tag name is —
 so interning it the way `event_name` interning works elsewhere would grow the global interner
 without bound for something that was never meant to be a repeated, low-cardinality identifier. This
-is a deliberate design decision, not a gap: `statsd.event.title` (a zero-copy `Value::Str` slice of
-the datagram, not interned) already carries the exact same information losslessly, so nothing is
-lost by leaving `event_name` unset.
+is a deliberate design decision, not a gap: `_logit.statsd.event.title` (a zero-copy `Value::Str`
+slice of the datagram, not interned) already carries the exact same information losslessly, so
+nothing is lost by leaving `event_name` unset.
 
 ### Canonical field order, and `d:` never `|T`
 
@@ -464,13 +465,13 @@ consumes the rest of the line on decode; the order stands, the reason is superse
 2026-09-24 amendment) — the same "tags in `AttrMap` order, not wire order"
 normalization this ADR's previous amendment already permits by name for an ordinary metric line's
 segments, applied to these two grammars' own named fields instead of a generic `|` segment order.
-`d:<secs>` (never `|T<secs>`) renders from the `statsd.timestamp` carrier's own `U64` value on
-both shapes — an event/service-check line's timestamp is a *named* field of its own grammar, not
+`d:<secs>` (never `|T<secs>`) renders from the `_logit.statsd.timestamp` carrier's own `U64` value
+on both shapes — an event/service-check line's timestamp is a *named* field of its own grammar, not
 the generic `|T` extension `append_dialect_extras` emits on an ordinary metric line, so it gets its
 own dedicated field rather than borrowing that path. Severity is never re-derived from
-`LogRecord.severity` to synthesize a `t:` field when `statsd.event.alert_type` is absent: the raw
-carrier outranks the normalized field on this protocol's own egress (rule (b) again), so an absent
-carrier means an absent wire field, never an invented one.
+`LogRecord.severity` to synthesize a `t:` field when `_logit.statsd.event.alert_type` is absent: the
+raw carrier outranks the normalized field on this protocol's own egress (rule (b) again), so an
+absent carrier means an absent wire field, never an invented one.
 
 ### Sanitization
 
@@ -507,11 +508,12 @@ produces more than one, but a cross-protocol relay or a Lua-authored event could
 must be a `Gauge`; anything else drops the whole event and counts
 `EncodeStats::dropped_invalid_service_check` (`logit.output.messages.dropped{reason=
 "invalid_service_check"}`) rather than silently falling through to an ordinary metric line for a
-value that was never meant to be one. `status` comes from `statsd.service_check.status` when it's
-a `U64` in `0..=3`; otherwise the gauge's own value, if finite and rounding into `0..=3`; otherwise
-the same drop-and-count applies — DogStatsD's own decoder would reject an out-of-range status, so
-this sink never writes one. Any metrics *after* the first on a service-check event still render as
-ordinary lines, right after the `_sc` line — only the first metric is claimed by the check.
+value that was never meant to be one. `status` comes from `_logit.statsd.service_check.status` when
+it's a `U64` in `0..=3`; otherwise the gauge's own value, if finite and rounding into `0..=3`;
+otherwise the same drop-and-count applies — DogStatsD's own decoder would reject an out-of-range
+status, so this sink never writes one. Any metrics *after* the first on a service-check event still
+render as ordinary lines, right after the `_sc` line — only the first metric is claimed by the
+check.
 
 ### Closing test enumeration
 
@@ -571,9 +573,9 @@ join the byte-for-byte corpus; `dogstatsd-event-all-fields`/`service-check-all-f
 wholly-dropped batch never sends a datagram for the UDP harness to capture); and
 `statsd_in_aggregate_statsd_out_relay_is_exact_for_a_service_check` pins a service check surviving
 a real `aggregate` window intact, `d:`/`m:` included — `aggregate` absorbs it exactly like an
-ordinary gauge (its `MetricKind::Gauge` shape, "last write wins"), with every `statsd.service_check.*`
-carrier riding on the series key alongside the value, the same guarantee this ADR's previous
-amendment already pins for `|T` on an ordinary counter.
+ordinary gauge (its `MetricKind::Gauge` shape, "last write wins"), with every
+`_logit.statsd.service_check.*` carrier riding on the series key alongside the value, the same
+guarantee this ADR's previous amendment already pins for `|T` on an ordinary counter.
 
 ## Amendment: a repeated tag key is a multi-value tag, not a collapse
 
@@ -601,9 +603,8 @@ duplicate token still dedupes at decode, matching the agent (`#team:a,team:a` ->
 tag's decoded shape is byte-identical to what it was before this fold existed — every fixture,
 allocation row, and unit test that assumed a plain `Value::Str` keeps passing unchanged. See
 `crates/logit-proto/src/statsd/mod.rs`'s module doc, "DogStatsD tags" section, for the full
-decode-side account, including the `statsd.*`-carrier-key corner (a tag literally named
-`statsd.type` can now decode to an `Array`, which matches no egress carrier arm and is filtered out
-uncounted, exactly as a wrong-typed carrier already was).
+decode-side account. A tag can't spell a carrier key: the decoder omits every tag key under the
+private `_logit.` prefix, counted `reserved_prefix`.
 
 The bare-tag note in "Sanitization" above (`Value::Bool(true)` renders as a bare tag) extends to the mixed
 form: a bare token and a valued one that share a key are not duplicates, and **both forms survive,
@@ -657,7 +658,9 @@ repeated tag key folding into an `Array` in wire order
 (`#team:a,team:a` -> `Str("a")`, no `Array`); a bare/valued mix folding in order in both directions
 (`#urgent,urgent:1` and `#urgent:1,urgent`); three occurrences folding into three elements; the same
 fold applying on an event line (`_e{...}|#k:a,k:b`) and a service-check line, since both go through
-`insert_tags`; `a_tag_literally_named_statsd_type_folds_into_an_array_like_any_other`; and an
+`insert_tags`; `a_tag_literally_named_statsd_type_folds_into_an_array_like_any_other` (renamed
+`a_tag_named_like_a_former_carrier_is_an_ordinary_tag` by the 2026-10-13 amendment below: a
+`#statsd.type` tag is now an ordinary public tag); and an
 extension of `dogstatsd_tag_value_is_a_zero_copy_slice_of_the_datagram`'s structural assertion to cover an
 `Array`'s elements. `crates/logit-outputs/src/statsd.rs` gained: `Array[Str,Str]` rendering
 `|#k:a,k:b`; `Array[Bool(true),Str]` rendering `|#k,k:1`; `Array[I64,I64]` rendering `|#k:1,k:2`;
@@ -763,14 +766,14 @@ Both directions change:
 
 - **Decode:** `statsd_in` ends `m:` at the next `|`. The segments after it parse as they would
   anywhere else on the line (`service_check_message_ends_at_the_next_pipe`).
-- **Encode:** `statsd_out` substitutes `_` for a `|` in `statsd.service_check.message`, as it
+- **Encode:** `statsd_out` substitutes `_` for a `|` in `_logit.statsd.service_check.message`, as it
   already did for a service check's name and host, because no receiver can read a `|` there
   (`a_service_check_message_s_pipe_is_substituted`). `m:` stays last in the canonical field order.
 
 A message containing `|` no longer relays byte-for-byte; the substitution joins this ADR's
-permitted normalizations. `docs/design/data-model.md`'s `statsd.service_check.message` row carries
-the rule, and [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s W7a
-amendment records the same finding from the Datadog side.
+permitted normalizations. `docs/design/data-model.md`'s `_logit.statsd.service_check.message` row
+carries the rule, and [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s
+W7a amendment records the same finding from the Datadog side.
 
 ## Amendment: the shared stream driver and datagram packer (2026-09-29)
 
@@ -825,3 +828,17 @@ The `EncodeStats` fields follow: `skipped_dialect_events`, `skipped_no_recorded_
 `a_real_event_dropped_under_statsd_also_tallies_its_tags_into_tags_dropped_dialect` is
 `a_real_event_skipped_under_statsd_also_tallies_its_tags_into_tags_omitted_dialect`.
 `crates/logit-outputs/src/statsd.rs`'s `report_encode_stats` is the canonical mapping.
+
+## Amendment (2026-10-13): carriers move under `_logit.statsd.`
+
+Every carrier this record names moved under the private prefix
+([ADR `private-attribute-namespace`](private-attribute-namespace.md)): `statsd.type` is now
+`_logit.statsd.type`, and the same for `container_id`, `external_data`, `cardinality`,
+`timestamp`, `event.*`, and `service_check.*`. This record's text uses the new names. `statsd_out`
+reads its own carriers by exact name and skips every other private key uncounted. Every other
+protocol's sink skips these carriers the same way, so a `statsd_in -> collectd_out` relay counts a sender's tag as having no wire form and no longer
+counts `statsd.type` with it
+(`crates/logit-cli/tests/collectd_round_trip.rs`'s
+`a_statsd_timer_counts_only_its_own_tag_as_having_no_wire_form`). There's no alias and no decode
+path for the old names. A DogStatsD tag can no longer spell a carrier key, because the decoder
+omits every tag key under `_logit.`.

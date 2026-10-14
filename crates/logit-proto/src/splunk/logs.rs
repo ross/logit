@@ -363,6 +363,30 @@ mod tests {
         ));
     }
 
+    /// A private attribute, on the event or the resource, never becomes a field and is never
+    /// counted; a `_logit.` key nested inside a map is data and flattens like any other.
+    #[test]
+    fn a_private_attribute_never_becomes_a_field() {
+        let registry = Registry::new();
+        let mut resource = Resource::default();
+        resource.attributes.insert("_logit.y", Value::str("r"));
+        let mut attrs = AttrMap::new();
+        attrs.insert("_logit.x", Value::str("e"));
+        attrs.insert("keep", Value::str("x"));
+        attrs
+            .insert("n", Value::Map(Box::new(AttrMap::from_iter([("_logit.z", Value::str("p"))]))));
+        let batch = EventBatch {
+            resource: Arc::new(resource),
+            scope: None,
+            events: vec![Event::log(0, attrs, log_record(Value::str("m"), BodyFormat::Raw))],
+        };
+        let mut out = MessageBuf::default();
+        encoder(&registry).encode_objects(&batch, &mut out);
+        let json: Json = serde_json::from_slice(out.iter().next().unwrap()).unwrap();
+        assert_eq!(json["fields"], serde_json::json!({"keep": "x", "n._logit.z": "p"}));
+        assert!(registry.drain(0).is_empty(), "a private key is never counted");
+    }
+
     #[test]
     fn blank_messages_are_dropped_and_counted() {
         let registry = Registry::new();

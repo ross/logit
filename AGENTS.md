@@ -133,7 +133,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `logfmt`, `kv` | the de-facto `key=value` parsers | [ADR `logfmt-and-kv-parsing`](docs/adr/logfmt-and-kv-parsing.md) |
 | `regex` | named capture groups into attributes | [ADR `regex-transform`](docs/adr/regex-transform.md) |
 | `kv_metrics` | turns attributes already on an event into metrics on that same event | [ADR `kv-metrics-semantics`](docs/adr/kv-metrics-semantics.md) |
-| `keep` | retains only the named attributes (an allowlist); place it before `aggregate` to bound series cardinality | [ADR `kv-metrics-semantics`](docs/adr/kv-metrics-semantics.md) |
+| `keep` | retains only the named attributes (an allowlist), plus the private `_logit.*` namespace under `private: keep`; place it before `aggregate` to bound series cardinality | [ADR `kv-metrics-semantics`](docs/adr/kv-metrics-semantics.md), [ADR `private-attribute-namespace`](docs/adr/private-attribute-namespace.md) |
 | `remove` | drops the named attributes | — |
 | `set` | stamps constant values onto event attributes and/or the batch resource | [ADR `operator-declared-resource-attributes`](docs/adr/operator-declared-resource-attributes.md) |
 | `scale` | multiplies named numeric attributes by a constant factor (unit conversion) | [ADR `scale-transform`](docs/adr/scale-transform.md) |
@@ -252,6 +252,12 @@ the first three pairs, [docs/plans/datadog-relay.md](docs/plans/datadog-relay.md
 Datadog pairs, and [docs/plans/splunk-relay.md](docs/plans/splunk-relay.md) for the Splunk pair, and
 [docs/plans/influxdb-relay.md](docs/plans/influxdb-relay.md) for the InfluxDB pair. What the model and codecs carry for them:
 
+- **Carriers**: a protocol's raw wire facts with no typed home ride as attributes under the
+  private `_logit.<protocol>.` prefix (`_logit.statsd.type`). That protocol's own sink reads them,
+  and every other protocol sink ignores them, uncounted, when it renders attributes
+  ([ADR `private-attribute-namespace`](docs/adr/private-attribute-namespace.md);
+  [docs/design/data-model.md](docs/design/data-model.md)'s "Well-known attribute names" is the
+  canonical statement).
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
 - **OTLP**: scope grouping, start time, description, exemplars, a `NO_RECORDED_VALUE` point
@@ -260,9 +266,9 @@ Datadog pairs, and [docs/plans/splunk-relay.md](docs/plans/splunk-relay.md) for 
 - **syslog**: structured data as `syslog.sd`, timestamp precedence, bytes MSG, and opt-in
   structured-data emission.
 - **statsd**: raw timers/sets, `|c:`/`|e:`/`|card:`/`|T`, and events/service checks.
-- **Datadog**: `datadog.*` carriers for every raw field without a typed home (a `rate`'s type, a
-  count's interval, resources, origin, trace chunk, tracer, and Agent fields), `DdSketch` under
-  `Mapping::agent` for the Agent's metrics sketches and `Mapping::logarithmic` for APM stats
+- **Datadog**: `_logit.datadog.*` carriers for every raw field without a typed home (a `rate`'s
+  type, a count's interval, resources, origin, trace chunk, tracer, and Agent fields), `DdSketch`
+  under `Mapping::agent` for the Agent's metrics sketches and `Mapping::logarithmic` for APM stats
   sketches, 128-bit trace ids through `_dd.p.tid`, and APM stats as metric events.
 - **Splunk**: the OTel `splunk_hec` exporter's vocabulary (`com.splunk.*` and `host.name` on the
   resource, `otel.log.*` into typed log fields), `time` parsed without an `f64`, and the
@@ -340,7 +346,7 @@ Per pair:
 - **`collectd_in -> collectd_out`**: `crates/logit-proto`'s `collectd` codec holds both
   directions in one module whose doc is the mapping table. It covers both kinds collectd's binary
   `network` protocol carries: value lists, and notifications as a log event with a
-  `collectd.severity` attribute. A sticky-identity
+  `_logit.collectd.severity` attribute. A sticky-identity
   decoder turns one datagram into one event per Values part, with its N data sources as N
   `MetricRecord`s in wire order. A multicast `bind:` is detected from the address and joined with
   no extra field. An optional `types_db:` names those data sources without ever changing what
@@ -374,8 +380,8 @@ Per pair:
   [fixtures/datadog-direct.yaml](fixtures/datadog-direct.yaml)).
 - **`datadog_trace_in -> datadog_trace_out`** (a Datadog Agent's APM API): v0.3, v0.4, v0.5,
   and v0.7 msgpack traces and `/v0.6/stats` over TCP or the Agent's Unix socket, the tracer's
-  request headers carried as `datadog.tracer.*` resource attributes and restored as headers. v0.4
-  egress, the default, relays a v0.4 tracer losslessly; a v0.7 tracer's chunk fields need
+  request headers carried as `_logit.datadog.tracer.*` resource attributes and restored as
+  headers. v0.4 egress, the default, relays a v0.4 tracer losslessly; a v0.7 tracer's chunk fields need
   `version: v0.7`. A `503` from `datadog_trace_in` defers a payload only for the tracer's short
   retry window
   ([fixtures/datadog-agent-standin.yaml](fixtures/datadog-agent-standin.yaml),
@@ -415,15 +421,16 @@ Per pair:
 - **`influxdb_in -> influxdb_out`** (InfluxDB 2.x line protocol over the v2 write API):
   `crates/logit-proto/src/influxdb/` is one codec whose `mod.rs` doc is the mapping table, the
   permitted-normalization list, and "Deviations from influxd". A point decodes to one `Event`: the
-  measurement as the attribute `influxdb.measurement`, tags as event attributes, each numeric or
-  boolean field as a typed `Gauge` named `<measurement>.<field>` ([ADR
-  `typed-metric-scalar`](docs/adr/typed-metric-scalar.md)), and each string field as
-  `influxdb.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as `influxdb.org`,
-  `influxdb.org_id`, and `influxdb.bucket`, and `influxdb_out` writes to its own configured org
-  and bucket, so a `route` on the bucket picks a destination. The presence of
-  `influxdb.measurement` selects the carrier path on `influxdb_out`; those attributes are ordinary
-  labels at every other sink, so a `remove` belongs ahead of one. A tag key under the
-  `influxdb.` prefix is dropped, counted. `influxdb_in` parses the whole body before building any
+  measurement as the private attribute `_logit.influxdb.measurement`, tags as event attributes,
+  each numeric or boolean field as a typed `Gauge` named `<measurement>.<field>` ([ADR
+  `typed-metric-scalar`](docs/adr/typed-metric-scalar.md)), and each string field as the public
+  `influxdb.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as
+  `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`, and
+  `influxdb_out` writes to its own configured org and bucket, so a `route` on the bucket picks a
+  destination. The presence of `_logit.influxdb.measurement` selects the carrier path on
+  `influxdb_out`. Every other sink ignores the private carriers and renders `influxdb.field.*` as
+  ordinary labels, so a `remove` of those belongs ahead of one. A tag key under `_logit.` or
+  `influxdb.field.` is dropped, counted. `influxdb_in` parses the whole body before building any
   event, so a bad line delivers nothing and the whole request is one batch, delivered all or
   nothing. It acknowledges with `204` once the batch is in every downstream inbox, so a
   destination's `422`, `404`, or `401` reaches `influxdb_out`'s fault classes and never the
@@ -769,7 +776,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/kafka-interop` | Out-of-CI interop harness (`tools/kafka-interop/`, [its README](tools/kafka-interop/README.md)) — runs pinned `apache/kafka:4.2.0` and Redpanda, each with a plain, a TLS, a mutual-TLS, a SASL_PLAINTEXT, and a SASL_SSL listener, beside one `logit` per leg per broker (`tools/kafka-interop/logit-*.yaml`), reads every topic back with `kafka-console-consumer.sh` and kcat, and prints one `PASS`/`GAP`/`FAIL` row per leg and broker: partition parity with `kafka-console-producer.sh`, each `compression`, idempotent dedup under a `tc netem` drop of the broker's responses (with a non-idempotent control), TLS, mutual TLS and its refusal of a client with no certificate, SASL PLAIN, SCRAM-SHA-256, and SCRAM-SHA-512 and a wrong password's refusal, OAUTHBEARER against a pinned `mock-oauth2-server` (client credentials, a fixed token, and a refused token), a future-stamped record dropped and counted, and `otlp_proto` and `otlp_json` read back by a pinned `otel/opentelemetry-collector-contrib` `kafkareceiver` per broker (`tools/kafka-interop/collector.yaml`: every signal's fields as sent, `key: trace_id` partitions against the Java partitioner and the Collector's `kafkaexporter`, and a request split under `max_request_bytes`). Generates its private CA into the run directory, `perf/results/kafka-interop/<timestamp>/` (gitignored). One compose project, `kafka-interop`, so one run at a time per daemon (`KAFKA_INTEROP_SKIP_IMAGE=1` reuses the image). Runs on the host and drives docker. Not part of `cibuild` |
 | `script/soak run <scenario>\|list\|check <run-dir>\|self-test` | Out-of-CI soak harness (`tools/soak/`, [its README](tools/soak/README.md), [docs/plans/soak-harness.md](docs/plans/soak-harness.md)) — runs a scenario's stack (VictoriaMetrics or a Kafka broker, the `logit` under test, a second `logit` as the load source, and any service a scenario's `compose =` override adds, such as a second VictoriaMetrics) in compose, applies one-shot `tc netem` and Docker lifecycle faults (`pause`, `stop`, `kill`, `restart`, `partition`), plus `mark` and `exit` windows for events the SUT's own config causes, on the scenario's timeline, and scores a watchdog's checks (`run`, `timeline`, `exit`, `restarts`, `self_log`, `ready`, `progress`, `rss_slope`, `fd_slope`), a loss ledger (`ledger.wire`, `ledger.intake`, `ledger.edge`, `ledger.script` under `[ledger] sut_script`, `ledger.aggregate`, `ledger.egress`, `ledger.summary`, `ledger.replay`, `ledger.windows` under `[ledger] vm_every_window`, `ledger.sent` for an external or Kafka target, and `ledger.topic` for a Kafka target), `identity.sink`, `recovery`, and one `expect.<name>` row per `[[expect]]` table into `perf/results/soak/<stamp>/results.md`; `check` re-scores a run directory offline. `--duration` overrides the scenario's (hours are fine; run under `tmux`, see the README's "Long runs"), `--seed N` draws a `[random]` scenario's schedule from another seed, `--keep` leaves the stack up. Needs Python 3.11+ on the host; `self-test` runs first inside `run`. One compose project per scenario, `soak-<scenario>`, so two scenarios can run at once (`SOAK_SKIP_IMAGE=1` reuses the images). A scenario with an external target (`statsd-datadog`) reads its credentials from `SOAK_EXTERNAL_ENV`, by default the git-ignored `perf/results/soak-external.env`, and refuses to start without them. Runs on the host and drives docker. Not part of `cibuild` |
 | `script/differential <corpus> [--check]` | Out-of-CI generator for a differential corpus under `testdata/differential/` (`pickle`: the carbon pickle reader against CPython 3.12, Python 2.7, and carbon 1.1.10's receiver; `prom-text`: the exposition decoder against Prometheus 3.14.0's `model/textparse`, built from `tools/differential/prom-text/go.mod`), in images pinned by tag and digest; `--check` regenerates into a temporary directory and exits 1 if the committed corpus differs ([testdata/differential/README.md](testdata/differential/README.md)). Runs on the host and drives docker, like `script/record-fixtures`. Not part of `cibuild` |
-| `script/audit` | `cargo-deny` + `cargo-audit` |
+| `script/audit [check ...]` | `cargo deny check`: advisories, bans, licenses, and sources, or the named ones. `cibuild` and CI run all but advisories, which reads the live RustSec database; Dependabot security updates file the bump PRs ([ADR `advisories-off-ci`](docs/adr/advisories-off-ci.md)) |
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
 | `script/image [tag]` | Build the production runtime image (`Dockerfile`, not `Dockerfile.dev`) |
@@ -1069,7 +1076,7 @@ where `script/perf run`/`attribute`/`flamegraph` write their (gitignored) output
 
 `testdata/differential/` holds those corpora: generated and deterministic, unlike `testdata/interop/`'s captures, each case's bytes beside a JSON file with the reference's reading and the verdict `logit` must give, and a `divergence` on every case where the two differ. `prometheus-text/` differs in its inputs: its `cases/` are hand-built and committed as inputs, its readings sit under `reference/`, and it reads `testdata/interop/prometheus-scrape/`'s recorded bodies in place. Its tests read it with `std::fs` and no reference installed, and `fuzz/seedgen` turns every case into a seed; [its README](testdata/differential/README.md) has the rest.
 
-`fuzz/` is the cargo-fuzz harness `script/unsafe-check fuzz` drives ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)), its own workspace outside the root one like `tools/protogen`, so `libfuzzer-sys` never enters the stable build: one target per file in `fuzz_targets/`, 26 today, each also a row of `script/unsafe-check`'s `FUZZ_TARGETS` (depending on `logit-core` and `logit-proto` only), `seedgen/` (a plain binary that writes `seeds/<target>/` deterministically from `testdata/interop/{otlp,prometheus,prometheus-scrape,statsd,syslog,graphite,collectd,datadog,influxdb}/`, every corpus under `testdata/differential/`, every `*.in` body under `crates/logit-cli/tests/fixtures/prometheus/`, `tools/record-fixtures/prometheus-metadata-target.prom`, `crates/logit-proto/tests/support/influxdb_lines.rs`, and encoder round trips), and the committed `seeds/`, where a `regress-*` file is a minimized crash input. `fuzz/corpus/`, `fuzz/artifacts/`, `fuzz/coverage/`, and `fuzz/target/` are gitignored; `script/format` covers the workspace and `script/lint` type-checks it on stable (`cargo check`), while clippy, `cargo-deny`, and `cargo-audit` don't.
+`fuzz/` is the cargo-fuzz harness `script/unsafe-check fuzz` drives ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)), its own workspace outside the root one like `tools/protogen`, so `libfuzzer-sys` never enters the stable build: one target per file in `fuzz_targets/`, 26 today, each also a row of `script/unsafe-check`'s `FUZZ_TARGETS` (depending on `logit-core` and `logit-proto` only), `seedgen/` (a plain binary that writes `seeds/<target>/` deterministically from `testdata/interop/{otlp,prometheus,prometheus-scrape,statsd,syslog,graphite,collectd,datadog,influxdb}/`, every corpus under `testdata/differential/`, every `*.in` body under `crates/logit-cli/tests/fixtures/prometheus/`, `tools/record-fixtures/prometheus-metadata-target.prom`, `crates/logit-proto/tests/support/influxdb_lines.rs`, and encoder round trips), and the committed `seeds/`, where a `regress-*` file is a minimized crash input. `fuzz/corpus/`, `fuzz/artifacts/`, `fuzz/coverage/`, and `fuzz/target/` are gitignored; `script/format` covers the workspace and `script/lint` type-checks it on stable (`cargo check`), while clippy and `cargo-deny` don't.
 
 `perf/load/*.yaml` are the **sidecar load specs** for real-socket scenarios
 ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)):
