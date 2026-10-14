@@ -170,9 +170,10 @@ out.append("")
 out.append("## Attributes per event")
 out.append("")
 out.append(
-    "collectd's identity fields (`collectd.host`, `collectd.plugin`, `collectd.plugin_instance`,"
-    " `collectd.type`, `collectd.type_instance`) and Telegraf's own tags land as ordinary event"
-    " attributes -- this is the width a `keep`/interner sizing decision on this leg would see."
+    "collectd's identity fields (`_logit.collectd.host`, `_logit.collectd.plugin`,"
+    " `_logit.collectd.plugin_instance`, `_logit.collectd.type`, `_logit.collectd.type_instance`)"
+    " and Telegraf's own tags land as ordinary event attributes -- this is the width a"
+    " `keep`/interner sizing decision on this leg would see."
 )
 out.append("")
 out.append("| source | events | p50 | p90 | max | >4 | >8 | >12 | >16 | value -> count |")

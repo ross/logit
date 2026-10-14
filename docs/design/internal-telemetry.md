@@ -914,7 +914,7 @@ lets it see, beside the diagnostic that names it:
 | `encrypted_packet_dropped` | `logit.input.frames.dropped{reason="encrypted"}` | A `SecurityLevel Encrypt` datagram. This codec holds no keys. |
 | `types_db_mismatch` | -- | The configured `types_db` defines the list's type with a different data-source count or kinds than arrived, so its records fall back to index naming. |
 | `notification_dropped` | `logit.input.events.dropped{reason="invalid_notification"}` | A `0x0100`/`0x0101` notification with an out-of-set severity, an empty message, or no host set: the notification counterpart of `incomplete_identity`. |
-| `record_name_cut` | -- | A value list whose Plugin or Type is past 127 bytes, cut to 127 in its record name; the `collectd.*` attributes keep every byte. |
+| `record_name_cut` | -- | A value list whose Plugin or Type is past 127 bytes, cut to 127 in its record name; the `_logit.collectd.*` attributes keep every byte. |
 
 A type simply *missing* from `types_db` is deliberately not reported, because that's routine, not a
 misconfiguration.
@@ -2057,8 +2057,8 @@ The sink adds only what a socket send can produce and the codec can't know:
   datagram's own lists are dropped, not the whole batch, and sending continues with the next
   datagram.
 
-A `log`-only event carrying a `collectd.severity` attribute is a notification, and the codec's
-diagnostics mirror `collectd_in`'s: `notification_dropped` (severity absent despite being
+A `log`-only event carrying a `_logit.collectd.severity` attribute is a notification, and the
+codec's diagnostics mirror `collectd_in`'s: `notification_dropped` (severity absent despite being
 attempted, or outside `{1, 2, 4}`), `empty_message`, `oversize_notification`, and
 `message_truncated` (a message over 255 bytes).
 

@@ -24,7 +24,7 @@ use std::sync::Arc;
 /// The most bytes of a Plugin or Type a record name carries: [`DATA_MAX_NAME_LEN`] minus the
 /// NUL, the longest string collectd's own receiver takes. A list interns one name per data
 /// source in the never-evicting interner, so a longer part would be copied there up to
-/// [`MAX_VALUES_PER_LIST`] times; the `collectd.*` attribute keeps every byte.
+/// [`MAX_VALUES_PER_LIST`] times; the `_logit.collectd.*` attribute keeps every byte.
 const MAX_NAME_SEGMENT_BYTES: usize = DATA_MAX_NAME_LEN - 1;
 
 /// What a datagram loses past an Encryption part or a malformed part behind decoded lists, by
@@ -48,7 +48,7 @@ pub struct CollectdDecoder {
     /// Scratch for the record name being built (`<plugin>.<type>[.<i>]`), a field so a
     /// 64-data-source list allocates no `String`.
     name: String,
-    /// The `collectd.*` attribute keys, interned once so the per-list path uses
+    /// The `_logit.collectd.*` attribute keys, interned once so the per-list path uses
     /// [`AttrMap::insert_sym`] instead of re-hashing them.
     keys: AttrKeys,
     /// The operator-supplied `types.db`, loaded once per component; `None` means index naming.
@@ -56,7 +56,7 @@ pub struct CollectdDecoder {
     types_db: Option<Arc<TypesDb>>,
 }
 
-/// The interned `collectd.*` attribute keys; see [`CollectdDecoder::keys`].
+/// The interned `_logit.collectd.*` attribute keys; see [`CollectdDecoder::keys`].
 struct AttrKeys {
     host: Symbol,
     plugin: Symbol,
@@ -149,7 +149,7 @@ struct Sticky {
     type_instance: Option<Range<usize>>,
     /// Unix nanoseconds; `0` means no Time/TimeHR part yet, so the list takes `received_at`.
     time_ns: i64,
-    /// Raw `cdtime_t`; `0` means unspecified, which leaves `collectd.interval` absent.
+    /// Raw `cdtime_t`; `0` means unspecified, which leaves `_logit.collectd.interval` absent.
     interval_cdtime: u64,
     /// The raw severity from the latest `0x0101` part; `0` (never a valid severity) means none yet.
     /// Read only by [`CollectdDecoder::decode_notification`].
@@ -366,13 +366,13 @@ impl CollectdDecoder {
         let plugin_name = &plugin_bytes[..plugin_bytes.len().min(MAX_NAME_SEGMENT_BYTES)];
         let type_name = &type_bytes[..type_bytes.len().min(MAX_NAME_SEGMENT_BYTES)];
         if plugin_name.len() < plugin_bytes.len() || type_name.len() < type_bytes.len() {
-            // Two Plugins or Types sharing their first 127 bytes now share a name, and a sink
-            // that drops `collectd.*` attributes (`graphite_out`) writes them as one series.
+            // Two Plugins or Types sharing their first 127 bytes now share a name, and every sink
+            // but `collectd_out` ignores `_logit.collectd.*`, so it writes them as one series.
             self.diag.warn_throttled(
                 "record_name_cut",
                 format_args!(
                     "collectd: a {}-byte plugin or {}-byte type is past collectd's 127-byte \
-                     limit; cutting it to 127 bytes in the record name, the collectd.* \
+                     limit; cutting it to 127 bytes in the record name, the _logit.collectd.* \
                      attributes keep it whole",
                     plugin_bytes.len(),
                     type_bytes.len()
@@ -461,7 +461,7 @@ impl CollectdDecoder {
         out: &mut Vec<Event>,
     ) {
         // `notification_t` has no interval field, so a notification never carries
-        // `collectd.interval`, even when an earlier list in the datagram set one.
+        // `_logit.collectd.interval`, even when an earlier list in the datagram set one.
         let severity = match sticky.severity {
             1 => Severity::Error,
             2 => Severity::Warn,
@@ -1183,7 +1183,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A notification never carries `collectd.interval`, even when a sticky `IntervalHR` is set.
+    /// A notification never carries `_logit.collectd.interval`, even when a sticky `IntervalHR` is
+    /// set.
     #[test]
     fn a_notification_never_carries_an_interval_even_when_one_is_sticky() {
         let events = decode(

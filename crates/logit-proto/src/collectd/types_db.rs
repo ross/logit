@@ -11,7 +11,7 @@
 //! points `collectd_in`'s `types_db:` at their installed copy (conventionally
 //! `/usr/share/collectd/types.db`); tests use the hand-written [`TEST_TYPES_DB`].
 //!
-//! **Names are display only.** The relay rides on the `collectd.*` attributes, the
+//! **Names are display only.** The relay rides on the `_logit.collectd.*` attributes, the
 //! [`logit_core::MetricList`] order, and the per-record kinds, never the record name (see
 //! [`super`]'s module doc). The names change only what a cross-protocol sink calls the series.
 //!

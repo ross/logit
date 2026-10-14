@@ -5,8 +5,9 @@
 //! Two properties, per fixture:
 //!
 //! 1. **`decode(encode(b)) == b`**, whole-event `PartialEq`. Every fixture has the shape a real
-//!    decode produces (identity on `collectd.*` attributes, a positive timestamp, integral values
-//!    for COUNTER/DERIVE/ABSOLUTE, names `<plugin>.<type>[.<i>]`), so the check isn't a tautology.
+//!    decode produces (identity on `_logit.collectd.*` attributes, a positive timestamp, integral
+//!    values for COUNTER/DERIVE/ABSOLUTE, names `<plugin>.<type>[.<i>]`), so the check isn't a
+//!    tautology.
 //! 2. **`encode(decode(encode(b))) == encode(b)` on bytes**, which catches a codec that writes two
 //!    byte strings for one batch (a non-deterministic elision decision, a sometimes-written part).
 //!
@@ -321,7 +322,7 @@ fn a_mixed_data_source_list_is_a_fixed_point() {
     });
 }
 
-/// No `collectd.interval` leaves as `IntervalHR 0` and comes back absent, not `F64(0.0)`.
+/// No `_logit.collectd.interval` leaves as `IntervalHR 0` and comes back absent, not `F64(0.0)`.
 #[test]
 fn a_list_with_no_interval_is_a_fixed_point() {
     let mut attrs = identity(Some("short"));
@@ -658,7 +659,7 @@ fn gen_time() -> impl Strategy<Value = GenNumber> {
 }
 
 /// A list's interval: legacy whole seconds, or an arbitrary `cdtime_t` below 2^53 ticks (~97
-/// days), the exact-integer range of the `Value::F64` that carries `collectd.interval`.
+/// days), the exact-integer range of the `Value::F64` that carries `_logit.collectd.interval`.
 fn gen_interval() -> impl Strategy<Value = GenNumber> {
     prop_oneof![
         (0u64..3600).prop_map(GenNumber::Legacy),

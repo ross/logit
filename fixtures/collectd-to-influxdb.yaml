@@ -11,10 +11,13 @@
 # This direction is lossy where the relay isn't (a `collectd_in -> collectd_out` pair keeps all of
 # it):
 #
-#   * the `collectd.*` attributes (host, plugin, plugin_instance, type, type_instance, interval)
-#     become InfluxDB tags, one per attribute.
+#   * the `_logit.collectd.*` attributes (host, plugin, plugin_instance, type, type_instance,
+#     interval) are private and never reach InfluxDB, so the measurement name is the only identity
+#     left: lists from different hosts, or with different plugin or type instances, of the same
+#     plugin and type share a series. To keep any of them as a tag, copy it to a public attribute
+#     name in a `lua` stage between the two components.
 #   * a multi-data-source value list becomes N measurements named `plugin.type.ds`
-#     (`load.load.shortterm`, `interface.if_octets.rx`) sharing a tag set and a timestamp.
+#     (`load.load.shortterm`, `interface.if_octets.rx`) sharing a timestamp.
 #   * `ds` naming needs `types_db:` below. Without it the same list is `load.load.0/1/2`: stable
 #     and correct, but not what a collectd operator's dashboards are named after.
 #   * COUNTER/DERIVE/ABSOLUTE all land as fields; InfluxDB has no representation for monotonicity

@@ -52,7 +52,7 @@
 //! | `unknown-and-signature-parts` | **5** | an unknown `0x00FF` part and a `0x0200` Signature part between two lists: skipped by length, dropped on egress, and the list behind them still decodes |
 //! | `nan-gauge` | **6** | a non-canonical NaN payload (`0xFFF8_0000_0000_0001`) decodes to a `NO_RECORDED_VALUE`-flagged `Gauge(0.0)` and leaves as this platform's canonical `f64::NAN` |
 //! | `sub-second-time` | **2** | a `cdtime_t` whose sub-second bits move one 2⁻³⁰ s tick on the first hop; the second hop is byte-identical to the first |
-//! | `notification-failure`/`-warning`/`-okay` | none ([`SAME_AS_INPUT`]) | one notification each, severity 1/2/4: an `Event::log` with `collectd.severity` and `LogRecord::severity` `Error`/`Warn`/`Info`, no metrics |
+//! | `notification-failure`/`-warning`/`-okay` | none ([`SAME_AS_INPUT`]) | one notification each, severity 1/2/4: an `Event::log` with `_logit.collectd.severity` and `LogRecord::severity` `Error`/`Warn`/`Info`, no metrics |
 //!
 //! One case is one-way lossy, so it asserts the `.expected` wire bytes only:
 //!
@@ -96,11 +96,12 @@
 //!
 //! ## Cross-protocol
 //!
-//! `statsd_in -> collectd_out` exercises the encoder's fallback path (no `collectd.*` identity),
-//! including its two likeliest drops: a sampled counter's non-integral extrapolation, and a
-//! DogStatsD tag, which collectd has no wire form for. `collectd_in -> aggregate -> collectd_out`
-//! pins that a cumulative `Sum` (what COUNTER and DERIVE decode to) passes through `aggregate`
-//! untouched, so the relay stays byte-identical with a window in the middle.
+//! `statsd_in -> collectd_out` exercises the encoder's fallback path (no `_logit.collectd.*`
+//! identity), including its two likeliest drops: a sampled counter's non-integral extrapolation,
+//! and a DogStatsD tag, which collectd has no wire form for. `collectd_in -> aggregate ->
+//! collectd_out` pins that a cumulative `Sum` (what COUNTER and DERIVE decode to) passes through
+//! `aggregate` untouched, so the relay stays byte-identical with a window in the middle.
+//! `collectd_in -> prometheus_out` pins that the private identity attributes never become labels.
 
 use bytes::Bytes;
 use logit_core::{Diagnostics, EventBatch, MetricKind, Registry, Resource, Value};
@@ -1444,4 +1445,36 @@ async fn collectd_in_aggregate_collectd_out_relay_is_exact_for_cumulative_sums()
         aggregator.flush(1_800_000_000_000_000_000).is_empty(),
         "a window that absorbed nothing has nothing to emit"
     );
+}
+
+/// `collectd_in -> prometheus_out`: a value list's identity rides on private `_logit.collectd.*`
+/// attributes, which a Prometheus exposition never renders as labels, so nothing named after a
+/// collectd field reaches the scrape body.
+#[test]
+fn a_value_list_relayed_to_prometheus_carries_no_collectd_labels() {
+    let batch = direct_batch(&read_fixture("single-gauge", "in"));
+    assert_eq!(attr(&batch.events[0], ATTR_PLUGIN), Some(Value::from("memory")));
+
+    let mut encoder = logit_proto::prometheus::PrometheusEncoder::new();
+    let families = logit_proto::prometheus::events_to_families(
+        batch.events.iter().map(|event| (&*batch.resource, event)),
+        &mut encoder,
+    );
+    let names: Vec<&str> = families.iter().map(|family| family.name.as_str()).collect();
+    assert_eq!(names, vec!["memory_memory"], "the record name still reaches the exposition");
+    let labels: Vec<&str> = families
+        .iter()
+        .flat_map(|family| &family.series)
+        .flat_map(|series| series.labels.iter().map(|(name, _)| name.as_str()))
+        .collect();
+    assert!(labels.is_empty(), "no collectd carrier may become a label: {labels:?}");
+
+    let mut body = Vec::new();
+    logit_proto::prometheus::text::write(
+        &families,
+        logit_proto::prometheus::text::Dialect::Text0_0_4,
+        &mut body,
+    );
+    let body = String::from_utf8(body).expect("exposition must be utf-8");
+    assert!(!body.contains("collectd"), "exposition:\n{body}");
 }

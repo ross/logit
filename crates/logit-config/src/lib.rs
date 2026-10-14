@@ -1301,8 +1301,9 @@ pub enum ComponentKind {
     /// matching data-source count and kinds is named `<plugin>.<type>.<ds_name>` rather than
     /// `<plugin>.<type>.<i>` (a single-data-source list is `<plugin>.<type>` either way). A
     /// missing or unparseable file fails startup. Names never change what `collectd_out` puts
-    /// back on the wire; it re-encodes from the `collectd.*` attributes. collectd's own
-    /// `types.db` is GPL-licensed and not shipped with `logit`; point this at the installed copy.
+    /// back on the wire; it re-encodes from the identity attributes this input stamps on each
+    /// event. collectd's own `types.db` is GPL-licensed and not shipped with `logit`; point this
+    /// at the installed copy.
     CollectdIn {
         bind: String,
         #[serde(default)]
@@ -3448,8 +3449,9 @@ pub enum ComponentKind {
         #[serde(default = "default_collectd_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
-        /// Used only when an event carries neither `collectd.host` nor `host.name` (one that
-        /// never passed through `collectd_in`, say). No default, so a relayed list's origin is
+        /// Used only when an event carries neither the origin host `collectd_in` records
+        /// (`_logit.collectd.host`) nor `host.name` (one that never passed through `collectd_in`,
+        /// say). No default, so a relayed list's origin is
         /// never silently overwritten. With nothing configured and nothing on the event, the list
         /// is dropped and counted (`logit.output.metrics.dropped{reason="no_host"}`): collectd's
         /// receiver rejects an empty host.

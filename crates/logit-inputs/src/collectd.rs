@@ -41,8 +41,8 @@
 //! [`logit_proto::collectd::types_db`]'s.
 //!
 //! **`types_db` never changes what a `collectd_in -> collectd_out` relay puts back on the wire**:
-//! `collectd_out` re-encodes from the `collectd.*` attributes, the `MetricList` order, and each
-//! record's kind, never the record name. It changes only what other sinks call the series.
+//! `collectd_out` re-encodes from the `_logit.collectd.*` attributes, the `MetricList` order, and
+//! each record's kind, never the record name. It changes only what other sinks call the series.
 //!
 //! collectd's `types.db` is GPL-licensed and not shipped with `logit`; point this at the copy the
 //! collectd installation already has.
@@ -238,8 +238,11 @@ mod tests {
         assert_eq!(event.metrics.len(), 1);
         assert_eq!(resolve(event.metrics[0].name), "memory.memory");
         assert_eq!(event.metrics[0].kind, MetricKind::gauge(1.5));
-        assert_eq!(event.attributes.get("collectd.host"), Some(&Value::from("web-1")));
-        assert_eq!(event.attributes.get("collectd.type_instance"), Some(&Value::from("used")));
+        assert_eq!(event.attributes.get("_logit.collectd.host"), Some(&Value::from("web-1")));
+        assert_eq!(
+            event.attributes.get("_logit.collectd.type_instance"),
+            Some(&Value::from("used"))
+        );
 
         handle.abort();
     }
@@ -290,7 +293,7 @@ mod tests {
     }
 
     /// `with_peer` reaches the datagram driver: the sender's address lands beside the decoded
-    /// `collectd.*` attributes.
+    /// `_logit.collectd.*` attributes.
     #[tokio::test]
     async fn with_peer_stamps_the_senders_address() {
         use crate::peer::{PEER_ADDRESS, PEER_PORT};
@@ -309,7 +312,7 @@ mod tests {
         let attrs = &events[0].attributes;
         assert_eq!(attrs.get(PEER_ADDRESS), Some(&Value::from("127.0.0.1")));
         assert_eq!(attrs.get(PEER_PORT), Some(&Value::I64(i64::from(port))));
-        assert_eq!(attrs.get("collectd.host"), Some(&Value::from("web-1")));
+        assert_eq!(attrs.get("_logit.collectd.host"), Some(&Value::from("web-1")));
         running.stop().await;
     }
 
@@ -434,8 +437,8 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
         for name in INTEROP_FIXTURES {
             let (events, _) = decode_interop(name, types_db);
             if let Some(event) = events.into_iter().find(|e| {
-                attr_str(e, "collectd.plugin") == Some(plugin)
-                    && attr_str(e, "collectd.type") == Some(type_)
+                attr_str(e, "_logit.collectd.plugin") == Some(plugin)
+                    && attr_str(e, "_logit.collectd.type") == Some(type_)
             }) {
                 return event;
             }
@@ -470,18 +473,18 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
             );
             for event in &events {
                 assert_eq!(
-                    attr_str(event, "collectd.host"),
+                    attr_str(event, "_logit.collectd.host"),
                     Some("logit-fixture"),
                     "{name}: tools/record-fixtures/collectd.conf sets `Hostname \"logit-fixture\"`"
                 );
                 let plugin =
-                    attr_str(event, "collectd.plugin").expect("every list carries a plugin");
+                    attr_str(event, "_logit.collectd.plugin").expect("every list carries a plugin");
                 assert!(
                     matches!(plugin, "load" | "memory" | "interface"),
                     "{name}: the config loads exactly these three read plugins, got {plugin:?}"
                 );
                 assert_eq!(
-                    event.attributes.get("collectd.interval"),
+                    event.attributes.get("_logit.collectd.interval"),
                     Some(&Value::F64(1.0)),
                     "{name}: `Interval 1`, carried as an IntervalHR part of 2^30 ticks"
                 );
@@ -542,8 +545,8 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
                 record.kind
             );
         }
-        assert_eq!(load.attributes.get("collectd.plugin_instance"), None);
-        assert_eq!(load.attributes.get("collectd.type_instance"), None);
+        assert_eq!(load.attributes.get("_logit.collectd.plugin_instance"), None);
+        assert_eq!(load.attributes.get("_logit.collectd.type_instance"), None);
     }
 
     #[test]
@@ -558,7 +561,7 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
         assert_eq!(memory.metrics.len(), 1);
         assert_eq!(resolve(memory.metrics[0].name), "memory.memory");
         assert!(
-            attr_str(&memory, "collectd.type_instance").is_some(),
+            attr_str(&memory, "_logit.collectd.type_instance").is_some(),
             "the memory plugin distinguishes used/free/cached/... by type_instance"
         );
     }
@@ -580,10 +583,10 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
         let names: Vec<&str> = if_octets.metrics.iter().map(|r| resolve(r.name)).collect();
         assert_eq!(names, ["interface.if_octets.rx", "interface.if_octets.tx"]);
         assert!(
-            attr_str(&if_octets, "collectd.plugin_instance").is_some(),
+            attr_str(&if_octets, "_logit.collectd.plugin_instance").is_some(),
             "the interface plugin puts the interface name in plugin_instance"
         );
-        assert_eq!(if_octets.attributes.get("collectd.type_instance"), None);
+        assert_eq!(if_octets.attributes.get("_logit.collectd.type_instance"), None);
     }
 
     /// A real `threshold`-plugin notification decodes to one FAILURE log record. Provenance:
@@ -600,11 +603,11 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert!(event.metrics.is_empty(), "a notification carries no metrics");
-        assert_eq!(attr_str(event, "collectd.host"), Some("logit-fixture"));
-        assert_eq!(attr_str(event, "collectd.plugin"), Some("load"));
-        assert_eq!(attr_str(event, "collectd.type"), Some("load"));
+        assert_eq!(attr_str(event, "_logit.collectd.host"), Some("logit-fixture"));
+        assert_eq!(attr_str(event, "_logit.collectd.plugin"), Some("load"));
+        assert_eq!(attr_str(event, "_logit.collectd.type"), Some("load"));
         assert_eq!(
-            event.attributes.get("collectd.severity"),
+            event.attributes.get("_logit.collectd.severity"),
             Some(&Value::U64(1)),
             "both WarningMax and FailureMax are breached; collectd reports the more severe"
         );
