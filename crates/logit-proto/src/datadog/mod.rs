@@ -19,8 +19,8 @@
 //! constants below are the only spelling. `host.name` carries a series' `host` resource, a
 //! sketch's `host`, or a log's `hostname` fallback, and an event's or service check's host when it
 //! has no `statsd.*.host`. On encode, a `Str` [`ATTR_HOST_TAG`] (`statsd_in`'s reading of a
-//! DogStatsD `#host:` tag) is the host when `host.name` is absent, and is then never a tag, as the
-//! Agent's `extractTagsMetadata` reads it (`host_tag`). [`DatadogEncoder::with_default_host`]
+//! DogStatsD `#host:` tag) is the host when `host.name` is absent or empty, and is then never a tag,
+//! as the Agent's `extractTagsMetadata` reads it (`host_tag`). [`DatadogEncoder::with_default_host`]
 //! (`datadog_out`'s process hostname) fills the host of anything that carries none. Events and
 //! service checks reuse
 //! `crates/logit-proto/src/statsd/decode.rs`'s `statsd.event.*` / `statsd.service_check.*` names:
@@ -120,7 +120,7 @@
 //! | a non-finite value or sample | dropped (JSON has no `NaN`) | `logit.output.metrics.dropped{reason="non_finite_value"}` |
 //! | `Event::timestamp` | whole seconds, rounded toward negative infinity | -- |
 //! | [`ATTR_HOST_NAME`] | v2: a `{type: "host"}` resource, first; v1 and distribution: `host`, always; sketch: `host` | -- |
-//! | no [`ATTR_HOST_NAME`], and a `Str` [`ATTR_HOST_TAG`] (a DogStatsD `#host:` tag) | the host, where [`ATTR_HOST_NAME`] would go, and not a tag. An empty one is a sample marked hostless: no v2 host resource, a v1, distribution, or sketch `host` of `""`, never filled | -- |
+//! | no [`ATTR_HOST_NAME`] or an empty one, and a `Str` [`ATTR_HOST_TAG`] (a DogStatsD `#host:` tag) | the host, where [`ATTR_HOST_NAME`] would go, and not a tag. An empty one is a sample marked hostless: no v2 host resource, a v1, distribution, or sketch `host` of `""`, never filled | -- |
 //! | a `host`-typed entry in [`ATTR_RESOURCES`] and no host from the rows above (the Agent's hostless v2 series: a `host` resource with no name) | v2: that entry, in order (the other routes omit it, per the `no_wire_form` row); never filled | -- |
 //! | no host from any row above ([`ATTR_HOST_NAME`] absent or empty) | the default host ([`DatadogEncoder::with_default_host`]) where [`ATTR_HOST_NAME`] would go; with none, no v2 resource and a v1, distribution, or sketch `host` of `""`. A non-`Str` [`ATTR_HOST_NAME`] is counted `unrepresentable` and never replaced | -- |
 //! | [`ATTR_DEVICE`] | v1: `device`; v2: a `{type: "device"}` resource after the host | -- |
@@ -157,8 +157,8 @@
 //!    routes (v2 protobuf, sketches) never go through that parser and carry values bit-exact
 //!    either way;
 //! 9. a series, distribution point, or sketch with no host of its own leaves with the relay's
-//!    process hostname (`datadog_out`'s default host). Its own host is `host.name`, else a
-//!    `host:` tag, which leaves as the host and not a tag, as the Agent's `extractTagsMetadata`
+//!    process hostname (`datadog_out`'s default host). Its own host is a non-empty `host.name`,
+//!    else a `host:` tag, which leaves as the host and not a tag, as the Agent's `extractTagsMetadata`
 //!    reads it. An empty `host:` tag, or a v2 `host` resource with no name, keeps it hostless and
 //!    is never filled. A v1, distribution, or sketch `"host":""` decodes as no host, so it is
 //!    filled (`docs/known-gaps/datadog.md`).
@@ -255,10 +255,10 @@
 //! | **events** ([`DatadogEncoder::encode_events`]): an event with a `log` carrying `statsd.event.title` | [`events::EventFormat::AgentEnvelope`] (the default): one envelope for the batch, `apiKey` `""`, groups keyed by `statsd.event.source_type` (else `api`) in sorted order; [`events::EventFormat::PublicV1`]: one object per event | -- |
 //! | resource [`RESOURCE_ATTR_AGENT_HOSTNAME`] | envelope `internalHostname`, `""` when absent | -- |
 //! | the event fields | Agent item keys in the Agent's order: `msg_title`, `msg_text`, `timestamp` (seconds), `priority`, `host` (always, `""` when absent), `tags`, `alert_type`, `aggregation_key`, `source_type_name`, `event_type`, then `device_name`, `related_event_id`; the public form uses `title`, `text`, `date_happened` and omits an absent `host`. Empty optional fields are omitted | -- |
-//! | `statsd.event.host`, else `host.name`, else a `Str` `host` (a DogStatsD `#host:` tag), else the default host | `host`. An empty `host` marks the event hostless and is never filled: `""` in the Agent form, omitted in the public form. A `host.name` read as the host is not a tag, and neither is a `host` whenever there's no `host.name` | -- |
+//! | `statsd.event.host`, else `host.name`, else a `Str` `host` (a DogStatsD `#host:` tag), else the default host | `host`. An empty `host` marks the event hostless and is never filled: `""` in the Agent form, omitted in the public form. A `host.name` read as the host, or an empty one, is not a tag, and neither is a `host` whenever `host.name` is absent or empty | -- |
 //! | no `statsd.event.alert_type` | `alert_type` from `severity`: `Error`/`Fatal` → `error`, `Warn` → `warning`, `Info` → `info`, else omitted | -- |
 //! | **service checks** ([`DatadogEncoder::encode_service_checks`]): an event carrying `statsd.service_check.name` whose first metric is a `Gauge` | one array item with every key: `check`, `host_name` (`""`), `timestamp` (seconds), `status`, `message` (`""`), `tags` (`[]`) | -- |
-//! | `statsd.service_check.host`, else `host.name`, else a `Str` `host` (a DogStatsD `#host:` tag), else the default host | `host_name`; `""` when the `host` is empty (marked hostless, never filled) or nothing applies. A `host.name` read as the host is not a tag, and neither is a `host` whenever there's no `host.name` | -- |
+//! | `statsd.service_check.host`, else `host.name`, else a `Str` `host` (a DogStatsD `#host:` tag), else the default host | `host_name`; `""` when the `host` is empty (marked hostless, never filled) or nothing applies. A `host.name` read as the host, or an empty one, is not a tag, and neither is a `host` whenever `host.name` is absent or empty | -- |
 //! | `statsd.service_check.status` `U64` 0 to 3, else the gauge when it is an integer 0 to 3 | `status` | otherwise dropped: `logit.output.metrics.dropped{reason="invalid_status"}` |
 //! | every attribute not consumed above (events and checks) | `tags`, by [`tags::render_tags`]; `statsd.timestamp` (DogStatsD's timestamp carrier) is never rendered | `logit.output.tags.omitted{reason="unrepresentable"}` for a `Map`/`Bytes`/`Null` |
 //!
@@ -282,7 +282,7 @@
 //!    (`datadog_out`'s default host); an empty `host:` tag keeps an event or check hostless;
 //! 8. an event or service check with no `h:` field (`statsd.*.host`) takes a `host.name:<h>`
 //!    tag, else a `host:<h>` tag, as its host, which then leaves as the host and not a tag; a
-//!    `host:` tag is never written back while there's no `host.name`, as the Agent consumes it.
+//!    `host:` tag is never written back while `host.name` is absent or empty, as the Agent consumes it.
 //!
 //! # Traces (`traces`, `traces_msgpack`, `traces_proto`)
 //!
@@ -516,13 +516,14 @@ static HOST_KEYS: LazyLock<(Symbol, Symbol)> =
 
 /// The DogStatsD `#host:` tag an event carries, read as the Agent's `extractTagsMetadata`
 /// (datadog-agent 7.83.3, `comp/dogstatsd/server/impl/enrich.go`) reads it: a `Str` `host`
-/// attribute, only when there's no `host.name`. The encoders then consume it as the host, never
-/// as a tag. `Some("")` is a sample the sender marked hostless, which is never filled.
+/// attribute, only when there's no `host.name` or an empty one. The encoders then consume it as
+/// the host, never as a tag. `Some("")` is a sample the sender marked hostless, which is never filled.
 pub(crate) fn host_tag<'a>(resource: &'a Resource, event: &'a Event) -> Option<&'a str> {
     let (host_name, host) = *HOST_KEYS;
     let mut tag = None;
     for (key, value) in merged(resource, event) {
-        if key == host_name {
+        // An empty `host.name` is no host, as the encoders read it; any other value blocks the tag.
+        if key == host_name && value.as_str() != Some("") {
             return None;
         }
         if key == host {

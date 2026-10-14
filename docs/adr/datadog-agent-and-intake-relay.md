@@ -411,7 +411,7 @@ carries always wins. Trace and stats payloads keep their tracer and Agent hostna
 `datadog_trace_out` is unchanged.
 
 - **A DogStatsD `host:` tag is a host.** `statsd_in` decodes `#host:web1` to the attribute
-  `host`. With no `host.name`, a `Str` `host` is the host and isn't sent as a tag, as the Agent's
+  `host`. With no `host.name`, or an empty one, a `Str` `host` is the host and isn't sent as a tag, as the Agent's
   `extractTagsMetadata` (datadog-agent 7.83.3, `comp/dogstatsd/server/impl/enrich.go`) reads it.
   An empty one marks a sample hostless, and it is never filled. With `host.name`
   present, `host` stays an ordinary tag.

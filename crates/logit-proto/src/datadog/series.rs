@@ -1524,8 +1524,9 @@ mod tests {
     }
 
     /// A DogStatsD `#host:` tag (`statsd_in`'s `host` attribute) with no `host.name`: used as the
-    /// host and not rendered as a tag, as the Agent's `extractTagsMetadata` does. Empty, it's a
-    /// hostless sample: no host, no fill, no tag. With `host.name`, `host` stays a tag.
+    /// host and not rendered as a tag, as the Agent's `extractTagsMetadata` does; an empty
+    /// `host.name` counts as none. Empty, `host` is a hostless sample: no host, no fill, no tag.
+    /// With a non-empty `host.name`, `host` stays a tag.
     #[test]
     fn a_host_tag_is_the_host_only_without_host_name() {
         let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
@@ -1544,6 +1545,12 @@ mod tests {
                 json!(["env:prod"]),
             ),
             (&[("host", ""), ("env", "prod")][..], "", JsonValue::Null, json!(["env:prod"])),
+            (
+                &[("host", "web1"), (ATTR_HOST_NAME, "")][..],
+                "web1",
+                json!([{ "type": "host", "name": "web1" }]),
+                json!([]),
+            ),
             (
                 &[("host", "web1"), (ATTR_HOST_NAME, "h")][..],
                 "h",

@@ -332,7 +332,9 @@ impl DatadogEncoder {
         let host_name = if own_host.is_none() { optional(keys.host_name) } else { None };
         let host_tag = host_tag(resource, event);
         let mut skip = keys.consumed().to_vec();
-        skip.extend(host_name.map(|_| keys.host_name));
+        // An empty `host.name` is no host, so it isn't a tag either.
+        let empty_host_name = find(keys.host_name).is_some_and(|v| v.as_str() == Some(""));
+        skip.extend((host_name.is_some() || empty_host_name).then_some(keys.host_name));
         skip.extend(host_tag.map(|_| keys.host_tag));
 
         let mut tags = Vec::new();
@@ -616,6 +618,13 @@ mod tests {
         assert_eq!(
             encode_with(
                 r#"{"title":"t","text":"x","date_happened":5,"tags":["host:web1"]}"#,
+                public
+            ),
+            [r#"{"title":"t","text":"x","date_happened":5,"host":"web1"}"#]
+        );
+        assert_eq!(
+            encode_with(
+                r#"{"title":"t","text":"x","date_happened":5,"tags":["host:web1","host.name:"]}"#,
                 public
             ),
             [r#"{"title":"t","text":"x","date_happened":5,"host":"web1"}"#]
