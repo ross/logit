@@ -2435,7 +2435,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.input.logs.dropped{reason="not_an_object"\|"no_message"}` | count | a log array element that isn't an object, or a log with no `message` |
 | `logit.input.events.dropped{reason="malformed"\|"no_title"}` | count | an events-envelope group that isn't an array or an item that isn't an object, or an event with neither a title nor a text |
 | `logit.input.metrics.dropped{reason="malformed"\|"no_name"\|"invalid_status"}` | count | a service check that isn't an object, has no `check` name, or has a status outside 0 to 3 |
-| `logit.output.metrics.dropped{reason="invalid_status"}` | count | a service-check event with no status in 0 to 3, on either its `statsd.service_check.status` or its gauge |
+| `logit.output.metrics.dropped{reason="invalid_status"}` | count | a service-check event with no status in 0 to 3, on either its `_logit.statsd.service_check.status` or its gauge |
 | `logit.output.tags.omitted{reason="reserved_key"}` | count | a log attribute named `message` or `timestamp`, which would collide with the log's own wire fields |
 | `logit.input.stats.dropped{reason="malformed_payload"\|"malformed_bucket"\|"malformed_group"}` | count | an APM stats `ClientStatsPayload` (in an intake `StatsPayload`), bucket, or group that isn't a well-formed map, dropped while the rest decodes |
 | `logit.input.stats.skipped{reason="empty_bucket"}` | count | an APM stats bucket with no groups, which decodes to no events |

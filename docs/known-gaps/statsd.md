@@ -30,12 +30,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 - **`statsd_out` has no `unit` and no metric renaming/prefixing, and carries an egress timestamp
   only on a `|T`-marked line.**
-  - **Timestamp:** `statsd_out` stamps any event without a `statsd.timestamp` `U64` carrier
+  - **Timestamp:** `statsd_out` stamps any event without a `_logit.statsd.timestamp` `U64` carrier
     (everything but a relayed `|T`-carrying line) with the receiver's receipt time, like
     `syslog_out`.
     DogStatsD's `|T<unix-seconds>` segment (`format: dogstatsd` only) round-trips: `statsd_in`
-    sets `Event::timestamp` from it and stamps a `statsd.timestamp: Value::U64(secs)` carrier with
-    the raw wire value. `statsd_out` re-emits `|T<secs>` from that carrier, never from
+    sets `Event::timestamp` from it and stamps a `_logit.statsd.timestamp: Value::U64(secs)` carrier
+    with the raw wire value. `statsd_out` re-emits `|T<secs>` from that carrier, never from
     `Event::timestamp`, so a stage that rebuilds `Event::timestamp` (notably `aggregate`'s flush)
     can't fabricate or collapse a `|T`. The classic grammar has no timestamp segment, so
     `format: statsd` omits `|T` and counts it (`fields.omitted{reason="dialect"}`).

@@ -18,9 +18,9 @@
 //! `_logit.datadog.*` ([ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)'s carrier
 //! rule); the constants below are the only spelling. `host.name` carries a series' `host` resource,
 //! a sketch's `host`, or a log's `hostname` fallback. Events and service checks reuse
-//! `crates/logit-proto/src/statsd/decode.rs`'s `statsd.event.*` / `statsd.service_check.*` names:
-//! they are the same Datadog concepts DogStatsD carries. Tags fold into attributes by [`tags`]'s
-//! rule; timestamps convert by [`time`]'s.
+//! `crates/logit-proto/src/statsd/decode.rs`'s `_logit.statsd.event.*` /
+//! `_logit.statsd.service_check.*` names: they are the same Datadog concepts DogStatsD carries.
+//! Tags fold into attributes by [`tags`]'s rule; timestamps convert by [`time`]'s.
 //!
 //! Every encoder here reads its own carriers by exact name, and skips every other private `_logit.`
 //! attribute, its own unread carriers included, wherever it renders attributes generically (tags,
@@ -116,7 +116,7 @@
 //! | `GaugeDelta` | dropped by the series encoders: nothing upstream resolved it to a gauge | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` |
 //! | `SetMembers`, `Histogram`, `ExponentialHistogram`, `Summary` | skipped by the series encoders | `logit.output.metrics.skipped{metric_kind="set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` |
 //! | a kind another metrics route carries | left for that route, uncounted: only the series encoders count skips, and only of kinds no route carries | -- |
-//! | record 0 of a service check (`statsd.service_check.name` present and a `Gauge` first metric) | left for the service-checks route, uncounted; any later record encodes as usual, without the check's `statsd.service_check.*` carriers as tags | -- |
+//! | record 0 of a service check (`_logit.statsd.service_check.name` present and a `Gauge` first metric) | left for the service-checks route, uncounted; any later record encodes as usual, without the check's `_logit.statsd.service_check.*` carriers as tags | -- |
 //! | every record of an APM stats event ([`stats::ATTR_STATS_NAME`] present; [`is_datadog_stats`]) | left for the stats routes, uncounted: its `Sum`s and summary `Distribution`s are a stats group, not series or sketches | -- |
 //! | a record flagged `NO_RECORDED_VALUE` | skipped; Datadog has no no-value marker | `logit.output.metrics.skipped{reason="no_recorded_value"}` |
 //! | a non-finite value or sample | dropped (JSON has no `NaN`) | `logit.output.metrics.dropped{reason="non_finite_value"}` |
@@ -160,11 +160,11 @@
 //! # Logs, events, service checks (`logs`, `events`, `service_checks`)
 //!
 //! All three are JSON. Events and service checks decode to exactly what `statsd_in`'s DogStatsD
-//! `_e{...}`/`_sc|...` parsers build, under the same `statsd.event.*`/`statsd.service_check.*`
-//! names ([`events::ATTR_EVENT_TITLE`] and its siblings, [`service_checks::ATTR_SERVICE_CHECK_NAME`]
-//! and its siblings), so a DogStatsD event and an intake event are indistinguishable in the model
-//! and either re-encodes on either protocol. Every decoded batch's `Resource` is empty except an
-//! events envelope's.
+//! `_e{...}`/`_sc|...` parsers build, under the same
+//! `_logit.statsd.event.*`/`_logit.statsd.service_check.*` names ([`events::ATTR_EVENT_TITLE`] and
+//! its siblings, [`service_checks::ATTR_SERVICE_CHECK_NAME`] and its siblings), so a DogStatsD
+//! event and an intake event are indistinguishable in the model and either re-encodes on either
+//! protocol. Every decoded batch's `Resource` is empty except an events envelope's.
 //!
 //! ## Decode: logs (`/api/v2/logs`, `/v1/input`) → events
 //!
@@ -198,13 +198,13 @@
 //! | envelope `apiKey` | dropped; a credential, never stored | -- |
 //! | envelope group that isn't an array, or an item that isn't an object | dropped | `logit.input.events.dropped{reason="malformed"}` + diag `malformed_event` |
 //! | neither a title nor a text | item dropped | `logit.input.events.dropped{reason="no_title"}` |
-//! | `msg_title`/`title` | `statsd.event.title` (`""` when only a text arrived) | -- |
+//! | `msg_title`/`title` | `_logit.statsd.event.title` (`""` when only a text arrived) | -- |
 //! | `msg_text`/`text` | `LogRecord::message` = `Str`, `body_format: Raw`, `event_name: None` | -- |
 //! | `timestamp`/`date_happened` seconds | `Event::timestamp`; absent or `0` → `received_at` | -- |
-//! | `priority`, `host`, `aggregation_key` | `statsd.event.priority`, `.host`, `.aggregation_key` | -- |
+//! | `priority`, `host`, `aggregation_key` | `_logit.statsd.event.priority`, `.host`, `.aggregation_key` | -- |
 //! | `tags` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for an omitted tag |
-//! | `alert_type` | `statsd.event.alert_type`, verbatim; `severity`: `error` → `Error`, `warning` → `Warn`, `success`/`info` → `Info`, else `None` | -- |
-//! | `source_type_name`, else the envelope group key unless it is `api` | `statsd.event.source_type` | -- |
+//! | `alert_type` | `_logit.statsd.event.alert_type`, verbatim; `severity`: `error` → `Error`, `warning` → `Warn`, `success`/`info` → `Info`, else `None` | -- |
+//! | `source_type_name`, else the envelope group key unless it is `api` | `_logit.statsd.event.source_type` | -- |
 //! | `event_type` (Agent) | [`ATTR_EVENT_TYPE`] | -- |
 //! | `device_name`, `related_event_id` (public) | [`ATTR_EVENT_DEVICE_NAME`], [`ATTR_EVENT_RELATED_EVENT_ID`] (the id as `I64`) | -- |
 //!
@@ -215,10 +215,10 @@
 //! | body: a JSON array of objects (one bare object is accepted too) | one [`logit_core::Event::metric`] per check | anything else: `CodecError::Malformed` |
 //! | an element that isn't an object | dropped | `logit.input.metrics.dropped{reason="malformed"}` + diag `malformed_service_check` |
 //! | `check`, absent or empty | dropped | `logit.input.metrics.dropped{reason="no_name"}` |
-//! | `check` | the record's name, and `statsd.service_check.name` | -- |
-//! | `status` 0 to 3 | `MetricKind::Gauge(status)`, and `statsd.service_check.status` = `U64` | -- |
+//! | `check` | the record's name, and `_logit.statsd.service_check.name` | -- |
+//! | `status` 0 to 3 | `MetricKind::Gauge(status)`, and `_logit.statsd.service_check.status` = `U64` | -- |
 //! | `status` absent, negative, above 3, or not an integer | dropped | `logit.input.metrics.dropped{reason="invalid_status"}` |
-//! | `message`, `host_name`, non-empty | `statsd.service_check.message`, `.host` | -- |
+//! | `message`, `host_name`, non-empty | `_logit.statsd.service_check.message`, `.host` | -- |
 //! | `tags`, an array or `null` | attributes, by [`tags`]'s rule; a key under the private `_logit.` prefix omitted | `logit.input.tags.omitted{reason="reserved_prefix"}` for an omitted tag |
 //! | `timestamp` seconds | `Event::timestamp`; absent or `0` → `received_at` | -- |
 //!
@@ -227,15 +227,15 @@
 //! Each encoder reads the merged resource and event attributes (the event's value winning), and
 //! skips an event that belongs to another route without counting it: that is ordinary fan-out. The
 //! carriers decide which route owns an event, through one shared predicate per route, so the routes
-//! never disagree: a `log` carrying `statsd.event.title` is a Datadog event, sent only by
-//! `encode_events`; `statsd.service_check.name` with a `Gauge` first metric is a service check,
-//! whose record 0 is sent only by `encode_service_checks` (the metrics routes send its later
+//! never disagree: a `log` carrying `_logit.statsd.event.title` is a Datadog event, sent only by
+//! `encode_events`; `_logit.statsd.service_check.name` with a `Gauge` first metric is a service
+//! check, whose record 0 is sent only by `encode_service_checks` (the metrics routes send its later
 //! records, as `statsd_out` does); `_logit.datadog.stats.name` marks APM stats, sent whole and only
 //! by the stats routes (see "APM stats" below).
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
-//! | **logs** ([`DatadogEncoder::encode_logs`]): an event with a `log` and no `statsd.event.title` | one object in a JSON array; `None` when no event qualifies | -- |
+//! | **logs** ([`DatadogEncoder::encode_logs`]): an event with a `log` and no `_logit.statsd.event.title` | one object in a JSON array; `None` when no event qualifies | -- |
 //! | `LogRecord::message` | `message`: a `Str` as-is, `Bytes` as lossy UTF-8, anything else as its JSON text | -- |
 //! | attribute `status`, else `severity` | `status` (`severity.as_str()`), omitted when neither | -- |
 //! | `Event::timestamp` | `timestamp`, integer milliseconds | -- |
@@ -246,13 +246,13 @@
 //! | every other attribute | a top-level key: `Map`/`Array` nested, `Bytes` → base64, `Timestamp` → RFC 3339, non-finite `F64` → `null` | -- |
 //! | an attribute named `message` or `timestamp` | omitted: it would collide with the wire's own | `logit.output.tags.omitted{reason="reserved_key"}` |
 //! | `LogRecord::trace`, when no `trace_id` or `span_id` attribute is present | `trace_id` (32 lowercase hex) and, when the ref has one, `span_id` (16 lowercase hex), after the attributes: the OTel form Datadog's log intake detects. An attribute of either name suppresses both, so a relayed intake log re-encodes unchanged | -- |
-//! | **events** ([`DatadogEncoder::encode_events`]): an event with a `log` carrying `statsd.event.title` | [`events::EventFormat::AgentEnvelope`] (the default): one envelope for the batch, `apiKey` `""`, groups keyed by `statsd.event.source_type` (else `api`) in sorted order; [`events::EventFormat::PublicV1`]: one object per event | -- |
+//! | **events** ([`DatadogEncoder::encode_events`]): an event with a `log` carrying `_logit.statsd.event.title` | [`events::EventFormat::AgentEnvelope`] (the default): one envelope for the batch, `apiKey` `""`, groups keyed by `_logit.statsd.event.source_type` (else `api`) in sorted order; [`events::EventFormat::PublicV1`]: one object per event | -- |
 //! | resource [`RESOURCE_ATTR_AGENT_HOSTNAME`] | envelope `internalHostname`, `""` when absent | -- |
 //! | the event fields | Agent item keys in the Agent's order: `msg_title`, `msg_text`, `timestamp` (seconds), `priority`, `host` (always, `""` when absent), `tags`, `alert_type`, `aggregation_key`, `source_type_name`, `event_type`, then `device_name`, `related_event_id`; the public form uses `title`, `text`, `date_happened` and omits an absent `host`. Empty optional fields are omitted | -- |
-//! | no `statsd.event.alert_type` | `alert_type` from `severity`: `Error`/`Fatal` → `error`, `Warn` → `warning`, `Info` → `info`, else omitted | -- |
-//! | **service checks** ([`DatadogEncoder::encode_service_checks`]): an event carrying `statsd.service_check.name` whose first metric is a `Gauge` | one array item with every key: `check`, `host_name` (`""`), `timestamp` (seconds), `status`, `message` (`""`), `tags` (`[]`) | -- |
-//! | `statsd.service_check.status` `U64` 0 to 3, else the gauge when it is an integer 0 to 3 | `status` | otherwise dropped: `logit.output.metrics.dropped{reason="invalid_status"}` |
-//! | every attribute not consumed above (events and checks) | `tags`, by [`tags::render_tags`]; `statsd.timestamp` (DogStatsD's timestamp carrier) is never rendered | `logit.output.tags.omitted{reason="unrepresentable"}` for a `Map`/`Bytes`/`Null` |
+//! | no `_logit.statsd.event.alert_type` | `alert_type` from `severity`: `Error`/`Fatal` → `error`, `Warn` → `warning`, `Info` → `info`, else omitted | -- |
+//! | **service checks** ([`DatadogEncoder::encode_service_checks`]): an event carrying `_logit.statsd.service_check.name` whose first metric is a `Gauge` | one array item with every key: `check`, `host_name` (`""`), `timestamp` (seconds), `status`, `message` (`""`), `tags` (`[]`) | -- |
+//! | `_logit.statsd.service_check.status` `U64` 0 to 3, else the gauge when it is an integer 0 to 3 | `status` | otherwise dropped: `logit.output.metrics.dropped{reason="invalid_status"}` |
+//! | every attribute not consumed above (events and checks) | `tags`, by [`tags::render_tags`]; `_logit.statsd.timestamp` (DogStatsD's timestamp carrier) is never rendered | `logit.output.tags.omitted{reason="unrepresentable"}` for a `Map`/`Bytes`/`Null` |
 //!
 //! ## Permitted normalizations (logs, events, service checks)
 //!
@@ -639,15 +639,15 @@ fn merged_get<'a>(resource: &'a Resource, event: &'a Event, key: &str) -> Option
     event.attributes.get(key).or_else(|| resource.attributes.get(key))
 }
 
-/// A service check: `statsd.service_check.name` present and a `Gauge` first metric, exactly what
-/// [`DatadogEncoder::encode_service_checks`] sends. Its record 0 belongs to that route alone; the
-/// metrics routes skip it and send any later records as ordinary metrics, as `statsd_out` does.
+/// A service check: `_logit.statsd.service_check.name` present and a `Gauge` first metric, the
+/// shape [`DatadogEncoder::encode_service_checks`] sends. Its record 0 belongs to that route alone;
+/// the metrics routes skip it and send any later records as ordinary metrics, as `statsd_out` does.
 pub fn is_service_check(resource: &Resource, event: &Event) -> bool {
     matches!(event.metrics.first().map(|m| &m.kind), Some(MetricKind::Gauge(_)))
         && merged_get(resource, event, service_checks::ATTR_SERVICE_CHECK_NAME).is_some()
 }
 
-/// A Datadog (or DogStatsD) event: a `log` carrying `statsd.event.title`, exactly what
+/// A Datadog (or DogStatsD) event: a `log` carrying `_logit.statsd.event.title`, the shape
 /// [`DatadogEncoder::encode_events`] sends. The logs route skips it.
 pub fn is_datadog_event(resource: &Resource, event: &Event) -> bool {
     event.log.is_some() && merged_get(resource, event, events::ATTR_EVENT_TITLE).is_some()

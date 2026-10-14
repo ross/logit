@@ -350,8 +350,9 @@ producers running synthetic workloads — grammar/packing evidence, not traffic 
 The statsd corpus's shape was derived independently from the captured bytes, by a parser sharing
 nothing with the harness, and `shape` reproduced it exactly: events per datagram
 `1×48, 7×1, 8×3, 10×3, 11×1`; attributes per event `0×38, 1×17, 5×4, 6×9, 7×20, 8×32`. Both agree
-with the corpus's own README. Attribute counts sit above wire tag counts by exactly the `statsd.*`
-carriers the decoder stamps. This is what licenses reading the other captures as measurements.
+with the corpus's own README. Attribute counts sit above wire tag counts by exactly the
+`_logit.statsd.*` carriers the decoder stamps. This is what licenses reading the other captures as
+measurements.
 
 ### 5.2 `exporters`, `hostagents` — infrastructure metrics
 
@@ -512,7 +513,7 @@ its 128-byte cap.
 
 - The sshd shape (6) sits inside the measured syslog range.
 - The statsd shape (3 tags) is on the low side of the recorded clients' 0–8 (median 6 on a tagged
-  line, once the decoder's own `statsd.*` carriers are counted).
+  line, once the decoder's own `_logit.statsd.*` carriers are counted).
 - The "modelled on pino, no live process captured" wide-JSON shape (32) is wider than any library
   measured (9–15). It is an access-log or audit-log width, not an application-log one.
 

@@ -4,8 +4,8 @@
 //! events, service checks").
 //!
 //! An event decodes to exactly the [`Event::log`] `statsd_in`'s DogStatsD `_e{...}` parser builds
-//! (`crates/logit-proto/src/statsd/decode.rs`'s `parse_event`): the same `statsd.event.*` attribute
-//! names, the same `alert_type` → severity mapping, the text as a `Raw` `Str` message. A
+//! (`crates/logit-proto/src/statsd/decode.rs`'s `parse_event`): the same `_logit.statsd.event.*`
+//! attribute names, the same `alert_type` → severity mapping, the text as a `Raw` `Str` message. A
 //! DogStatsD event and a Datadog-API event are indistinguishable in the model, so either one
 //! re-encodes on either route.
 
@@ -30,15 +30,15 @@ use std::sync::LazyLock;
 
 /// `statsd_in`'s event attribute names (`crates/logit-proto/src/statsd/decode.rs`), reused
 /// verbatim.
-pub const ATTR_EVENT_TITLE: &str = "statsd.event.title";
-pub const ATTR_EVENT_PRIORITY: &str = "statsd.event.priority";
-pub const ATTR_EVENT_HOST: &str = "statsd.event.host";
-pub const ATTR_EVENT_ALERT_TYPE: &str = "statsd.event.alert_type";
-pub const ATTR_EVENT_AGGREGATION_KEY: &str = "statsd.event.aggregation_key";
-pub const ATTR_EVENT_SOURCE_TYPE: &str = "statsd.event.source_type";
-/// `statsd.timestamp`: `statsd_in`'s raw `d:`/`|T` carrier. The event's own timestamp already says
-/// it, so the encoders never render it as a tag.
-pub const ATTR_STATSD_TIMESTAMP: &str = "statsd.timestamp";
+pub const ATTR_EVENT_TITLE: &str = "_logit.statsd.event.title";
+pub const ATTR_EVENT_PRIORITY: &str = "_logit.statsd.event.priority";
+pub const ATTR_EVENT_HOST: &str = "_logit.statsd.event.host";
+pub const ATTR_EVENT_ALERT_TYPE: &str = "_logit.statsd.event.alert_type";
+pub const ATTR_EVENT_AGGREGATION_KEY: &str = "_logit.statsd.event.aggregation_key";
+pub const ATTR_EVENT_SOURCE_TYPE: &str = "_logit.statsd.event.source_type";
+/// `_logit.statsd.timestamp`: `statsd_in`'s raw `d:`/`|T` carrier. The event's own timestamp
+/// already says it, so the encoders never render it as a tag.
+pub const ATTR_STATSD_TIMESTAMP: &str = "_logit.statsd.timestamp";
 
 /// The envelope's `events` map key for an event with no `source_type_name`.
 const NO_SOURCE: &str = "api";
@@ -248,10 +248,10 @@ pub(super) fn seconds(value: &Json) -> Option<i64> {
 }
 
 impl DatadogEncoder {
-    /// Encodes every event carrying `statsd.event.title` in `format`: [`EventFormat::AgentEnvelope`]
-    /// gives at most one body for the whole batch, [`EventFormat::PublicV1`] one body per event.
-    /// An event without a title (a plain log) or without a `log` is skipped silently: it belongs
-    /// to another route.
+    /// Encodes every event carrying `_logit.statsd.event.title` in `format`:
+    /// [`EventFormat::AgentEnvelope`] gives at most one body for the whole batch,
+    /// [`EventFormat::PublicV1`] one body per event. An event without a title (a plain log) or
+    /// without a `log` is skipped silently: it belongs to another route.
     pub fn encode_events(&self, batch: &EventBatch, format: EventFormat) -> Vec<Bytes> {
         let keys = &*KEYS;
         let titled = batch.events.iter().filter(|e| is_datadog_event(&batch.resource, e));
@@ -431,20 +431,20 @@ mod tests {
         assert_eq!(log.severity, Some(Severity::Warn));
         assert_eq!(log.body_format, BodyFormat::Raw);
         assert_eq!(log.event_name, None);
-        assert_eq!(attr(event, "statsd.event.title"), Some("deploy"));
-        assert_eq!(attr(event, "statsd.event.priority"), Some("low"));
-        assert_eq!(attr(event, "statsd.event.host"), Some("web1"));
-        assert_eq!(attr(event, "statsd.event.alert_type"), Some("warning"));
-        assert_eq!(attr(event, "statsd.event.aggregation_key"), Some("agg"));
+        assert_eq!(attr(event, "_logit.statsd.event.title"), Some("deploy"));
+        assert_eq!(attr(event, "_logit.statsd.event.priority"), Some("low"));
+        assert_eq!(attr(event, "_logit.statsd.event.host"), Some("web1"));
+        assert_eq!(attr(event, "_logit.statsd.event.alert_type"), Some("warning"));
+        assert_eq!(attr(event, "_logit.statsd.event.aggregation_key"), Some("agg"));
         assert_eq!(attr(event, "_logit.datadog.event_type"), Some("deploy_event"));
         assert_eq!(attr(event, "env"), Some("prod"));
         assert_eq!(event.attributes.get("urgent"), Some(&Value::Bool(true)));
         // `api` means no source.
-        assert_eq!(attr(event, "statsd.event.source_type"), None);
+        assert_eq!(attr(event, "_logit.statsd.event.source_type"), None);
 
         let second = &batch.events[1];
-        assert_eq!(attr(second, "statsd.event.source_type"), Some("nagios"));
-        assert_eq!(attr(second, "statsd.event.host"), None);
+        assert_eq!(attr(second, "_logit.statsd.event.source_type"), Some("nagios"));
+        assert_eq!(attr(second, "_logit.statsd.event.host"), None);
         assert_eq!(second.log.as_ref().unwrap().severity, None);
     }
 
@@ -465,10 +465,10 @@ mod tests {
         let batch = decode(body);
         assert!(batch.resource.attributes.is_empty());
         let event = &batch.events[0];
-        assert_eq!(attr(event, "statsd.event.title"), Some("T"));
-        assert_eq!(attr(event, "statsd.event.alert_type"), Some("user_update"));
+        assert_eq!(attr(event, "_logit.statsd.event.title"), Some("T"));
+        assert_eq!(attr(event, "_logit.statsd.event.alert_type"), Some("user_update"));
         assert_eq!(event.log.as_ref().unwrap().severity, None);
-        assert_eq!(attr(event, "statsd.event.source_type"), Some("jenkins"));
+        assert_eq!(attr(event, "_logit.statsd.event.source_type"), Some("jenkins"));
         assert_eq!(attr(event, "_logit.datadog.event.device_name"), Some("sda"));
         assert_eq!(
             event.attributes.get("_logit.datadog.event.related_event_id"),
@@ -493,7 +493,7 @@ mod tests {
             .unwrap();
         assert!(batch.resource.attributes.is_empty());
         assert_eq!(batch.events.len(), 1);
-        assert_eq!(attr(&batch.events[0], "statsd.event.title"), Some(""));
+        assert_eq!(attr(&batch.events[0], "_logit.statsd.event.title"), Some(""));
         assert_eq!(batch.events[0].timestamp, RECEIVED_AT);
         assert_eq!(counted(&registry, "logit.input.events.dropped", ("reason", "no_title")), 1.0);
     }

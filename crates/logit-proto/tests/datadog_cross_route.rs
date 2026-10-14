@@ -1,9 +1,9 @@
 //! Route ownership across Datadog's encoders: a batch fanned out to every route leaves each item on
 //! only the route(s) that own it. A service check's first record (its `Gauge(status)`) is
-//! `encode_service_checks`'s alone, and a Datadog event (a `log` carrying `statsd.event.title`) is
-//! `encode_events`'s alone; every other route skips them silently. Any later metric on a service
-//! check still leaves as an ordinary series, as `statsd_out` sends `metrics[1..]` as ordinary
-//! lines. APM stats (an event carrying `_logit.datadog.stats.name`) are the stats routes' alone,
+//! `encode_service_checks`'s alone, and a Datadog event (a `log` carrying
+//! `_logit.statsd.event.title`) is `encode_events`'s alone; every other route skips them silently.
+//! Any later metric on a service check still leaves as an ordinary series, as `statsd_out` sends
+//! `metrics[1..]` as ordinary lines. APM stats (an event carrying `_logit.datadog.stats.name`) are the stats routes' alone,
 //! whole: their `Sum`s and summary `Distribution`s never leave as series or sketches. The
 //! fixed-point suites can't see this: each decodes and encodes on one route.
 
@@ -91,10 +91,10 @@ fn a_service_checks_later_metrics_still_leave_as_series() {
         assert_eq!(metrics.len(), 1);
         assert_eq!(resolve(metrics[0].name), "db.latency", "{route}");
         assert_eq!(metrics[0].kind, MetricKind::gauge(3.5), "{route}");
-        // The check's own carriers stay with the check: rendered as tags, they would make the
-        // relayed series decode as a service check and vanish from the series route next hop.
+        // The check's own carriers stay with the check. The private-key skip keeps them off the
+        // series wire, and `CONSUMED_WITH_CHECK` lists them as belt and braces.
         let attrs = &relayed.events[0].attributes;
-        assert_eq!(attrs.get("statsd.service_check.name"), None, "{route}");
+        assert_eq!(attrs.get("_logit.statsd.service_check.name"), None, "{route}");
         assert_eq!(attrs.get("env").and_then(|v| v.as_str()), Some("prod"), "{route}");
         let (_, again) =
             series_routes(&relayed).into_iter().find(|(r, _)| *r == route).expect("the same route");

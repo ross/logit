@@ -108,12 +108,13 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** Datadog documents or answers a different limit; the series route's `202`
     body states it (`limit=100`).
 - **`datadog_out` sends a Datadog event's and a service check's host as a tag.** Their encoders
-  read the host only from `statsd.event.host` and `statsd.service_check.host`, so a `host.name`
-  that `set` stamps on the resource renders as a `host.name:<value>` tag, and Datadog shows the
-  event or check with no host.
+  read the host only from `_logit.statsd.event.host` and `_logit.statsd.service_check.host`, so a
+  `host.name` that `set` stamps on the resource renders as a `host.name:<value>` tag, and Datadog
+  shows the event or check with no host.
   - **Consequence:** events and checks sent directly, not through an Agent, have no host in
     Datadog unless the DogStatsD client set `h:`.
-  - **Workaround:** `set` `statsd.event.host` and `statsd.service_check.host` as attributes.
+  - **Workaround:** `set` `_logit.statsd.event.host` and `_logit.statsd.service_check.host` as
+    attributes.
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   v0.4 has no field for a chunk's `_logit.datadog.chunk.*` fields (sampling priority, origin,
   dropped flag, tags) or for the tracer payload fields no request header carries
