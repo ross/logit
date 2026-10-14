@@ -47,7 +47,7 @@ schema:     ## Regenerate schema/logit.schema.json
 validate:   ## logit validate over every shipped config (demo/, examples/, fixtures/)
 	./script/validate
 
-audit:      ## Supply-chain checks (cargo-deny, cargo-audit)
+audit:      ## Supply-chain checks (cargo-deny)
 	./script/audit
 
 cibuild:    ## Run the full CI-equivalent check sequence
