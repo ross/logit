@@ -730,6 +730,9 @@ impl DatadogEncoder {
         for (sym, value) in logit_core::attrs::merged(resource, event) {
             let key = resolve(sym);
             if !is_carrier(key, value, event) {
+                if logit_core::attrs::is_private(key) {
+                    continue;
+                }
                 match self.slot(value) {
                     Slot::Meta(s) => wire.meta.push((key.to_string(), s)),
                     Slot::Metric(f) => wire.metrics.push((key.to_string(), f)),
@@ -795,6 +798,7 @@ impl DatadogEncoder {
                 let mut attributes: StrMap = link
                     .attributes
                     .iter()
+                    .filter(|(k, _)| !logit_core::attrs::is_private(resolve(*k)))
                     .map(|(k, v)| (resolve(k).to_string(), self.text(v)))
                     .collect();
                 sort_map(&mut attributes);
@@ -825,6 +829,7 @@ impl DatadogEncoder {
                 let mut attributes: Vec<(String, WireAny)> = e
                     .attributes
                     .iter()
+                    .filter(|(k, _)| !logit_core::attrs::is_private(resolve(*k)))
                     .map(|(k, v)| (resolve(k).to_string(), self.any(v, true)))
                     .collect();
                 sort_map(&mut attributes);
@@ -1044,6 +1049,52 @@ mod tests {
         assert_eq!(keys, sorted, "maps are key-sorted");
         let deg = |r| counted(&registry, "logit.output.spans.degraded", ("reason", r));
         assert_eq!(deg("int_as_f64"), 2.0, "i64::MAX and u64::MAX");
+    }
+
+    /// A private attribute, on the event, the resource, a link, or a span event, never reaches
+    /// `meta`, `metrics`, `meta_struct`, or a link's or span event's attributes, and is never
+    /// counted, even a `Bytes` one a v0.5 body has no `meta_struct` for.
+    #[test]
+    fn a_private_attribute_never_reaches_the_span_and_is_never_counted() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("_logit.x", Value::str("e"));
+        attrs.insert("_logit.f", Value::F64(0.5));
+        attrs.insert("_logit.b", Value::Bytes(Bytes::from_static(b"\x01")));
+        attrs.insert("env", Value::str("prod"));
+        let mut resource = Resource::default();
+        resource.attributes.insert("_logit.y", Value::str("r"));
+
+        let (e, registry) = encoder();
+        let b = batch(resource.clone(), vec![Event::span(0, attrs.clone(), otel_span([0; 16]))]);
+        let s = &only_chunk(&e, &b, Form::V05).spans[0];
+        assert!(s.meta.iter().any(|(k, _)| k == "env"));
+        assert!(s.meta.iter().all(|(k, _)| !k.starts_with("_logit")), "{:?}", s.meta);
+        assert!(s.metrics.is_empty(), "{:?}", s.metrics);
+        assert!(s.meta_struct.is_empty());
+        assert!(registry.drain(0).is_empty(), "a private key is never counted");
+
+        let mut span = otel_span([0; 16]);
+        let mut private = AttrMap::new();
+        private.insert("_logit.z", Value::str("p"));
+        private.insert("n", Value::I64(4));
+        span.links.push(SpanLink {
+            trace_id: [1; 16],
+            span_id: [2; 8],
+            attributes: private.clone(),
+            flags: 0,
+            trace_state: None,
+            dropped_attributes_count: 0,
+        });
+        span.events.push(SpanEvent {
+            timestamp: 7,
+            name: Value::str("boom"),
+            attributes: private,
+            dropped_attributes_count: 0,
+        });
+        let b = batch(resource, vec![Event::span(0, attrs, span)]);
+        let s = &only_chunk(&e, &b, Form::Agent).spans[0];
+        assert_eq!(s.span_links[0].attributes, vec![("n".to_string(), "4".to_string())]);
+        assert_eq!(s.span_events[0].attributes, vec![("n".to_string(), WireAny::Int(4))]);
     }
 
     #[test]

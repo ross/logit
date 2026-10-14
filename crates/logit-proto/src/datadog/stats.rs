@@ -821,6 +821,7 @@ impl DatadogEncoder {
         for (key, _) in attrs.iter() {
             let key = resolve(key);
             if !is_group_key(key)
+                && !logit_core::attrs::is_private(key)
                 && !PAYLOAD_STRINGS.contains(&key)
                 && !PAYLOAD_SCALARS.contains(&key)
                 && !(envelope && ENVELOPE_KEYS.contains(&key))
@@ -884,7 +885,8 @@ impl DatadogEncoder {
             },
         };
         for (key, _) in event.attributes.iter() {
-            if !is_group_key(resolve(key)) {
+            let key = resolve(key);
+            if !is_group_key(key) && !logit_core::attrs::is_private(key) {
                 self.tag_omitted("no_wire_form");
             }
         }
@@ -1692,6 +1694,35 @@ mod tests {
         let mut event = Event::metric(TS as i64, attrs, metrics.next().unwrap());
         event.metrics.extend(metrics);
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] }
+    }
+
+    /// A private attribute, on the event or the resource, has no wire form and is never counted
+    /// `no_wire_form`; a public one still is.
+    #[test]
+    fn a_private_attribute_is_never_counted_no_wire_form() {
+        let (mut e, registry) = encoder();
+        let mut batch = stats_batch(
+            vec![MetricRecord::new(intern(METRIC_HITS), MetricKind::counter(1.0))],
+            &[("_logit.x", Value::str("e")), ("env", Value::str("prod"))],
+        );
+        let mut resource = Resource::default();
+        resource.attributes.insert("_logit.y", Value::str("r"));
+        batch.resource = Arc::new(resource);
+        e.encode_client_stats_v06(&batch).unwrap();
+        let omitted: f64 = registry
+            .drain(0)
+            .iter()
+            .filter(|ev| {
+                ev.attributes.get("reason").and_then(Value::as_str) == Some("no_wire_form")
+            })
+            .flat_map(|ev| ev.metrics.iter())
+            .filter(|m| resolve(m.name) == "logit.output.tags.omitted")
+            .map(|m| match m.kind {
+                MetricKind::Sum(s) => s.value.as_f64(),
+                _ => 0.0,
+            })
+            .sum();
+        assert_eq!(omitted, 1.0, "only `env` is counted");
     }
 
     #[test]

@@ -1196,12 +1196,17 @@ mod tests {
     }
 
     /// `metric_tag_count` is the length of the `tags` list the series encoder writes: carriers
-    /// (host, device, a service check's own fields) excluded, resource tags and repeats included.
+    /// (host, device, a service check's own fields) and private keys excluded, resource tags and
+    /// repeats included. A private key is never counted `tags.omitted`, even one no tag could
+    /// hold.
     #[test]
     fn metric_tag_count_is_the_wire_tag_count() {
         let mut resource = Resource::default();
         resource.attributes.insert("region", Value::str("eu"));
+        resource.attributes.insert("_logit.y", Value::str("r"));
         let mut plain = AttrMap::new();
+        plain.insert("_logit.x", Value::str("e"));
+        plain.insert("_logit.m", Value::Map(Box::new(AttrMap::new())));
         plain.insert(ATTR_HOST_NAME, Value::str("h"));
         plain.insert(ATTR_DEVICE, Value::str("d"));
         plain.insert("team", Value::Array(vec![Value::str("a"), Value::str("a")]));
@@ -1219,11 +1224,20 @@ mod tests {
                 scope: None,
                 events: vec![event],
             };
-            let (mut e, _) = encoder();
+            let (mut e, registry) = encoder();
             let body = e.encode_series_v2_protobuf(&batch).unwrap();
             let payload = MetricPayload::decode(body).unwrap();
             assert_eq!(payload.series[0].tags.len(), 3, "region:eu, team:a twice");
+            assert!(payload.series[0].tags.iter().all(|t| !t.contains("_logit")));
             assert_eq!(metric_tag_count(&batch.resource, &batch.events[0]), 3);
+            assert!(
+                !registry
+                    .drain(0)
+                    .iter()
+                    .flat_map(|ev| &ev.metrics)
+                    .any(|m| resolve(m.name) == "logit.output.tags.omitted"),
+                "a private key is never counted"
+            );
         }
     }
 
