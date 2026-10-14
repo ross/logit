@@ -639,7 +639,7 @@ impl ComponentBuffer {
             attrs.insert("role", self.role);
             let kind = match pending {
                 Pending::Count(v) => MetricKind::counter(v),
-                Pending::Gauge(v) => MetricKind::Gauge(v),
+                Pending::Gauge(v) => MetricKind::gauge(v),
                 Pending::Timing(sketch) => MetricKind::Distribution(sketch),
             };
             events.push(Event::metric(now, attrs, MetricRecord::new(intern(key.name), kind)));
@@ -885,6 +885,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MetricValue;
     use std::cell::Cell;
 
     // `now_unix_nanos`'s wall-clock override.
@@ -922,7 +923,7 @@ mod tests {
             .flat_map(|e| e.metrics.iter())
             .filter(|m| crate::interner::resolve(m.name) == name)
             .map(|m| match &m.kind {
-                MetricKind::Sum(s) => s.value,
+                MetricKind::Sum(s) => s.value.as_f64(),
                 other => panic!("expected Sum, got {other:?}"),
             })
             .sum()
@@ -1042,7 +1043,7 @@ mod tests {
         let events = registry.drain(0);
         assert_eq!(events.len(), 1);
         match &events[0].metrics[0].kind {
-            MetricKind::Sum(s) => assert_eq!(s.value, 3.0),
+            MetricKind::Sum(s) => assert_eq!(s.value, MetricValue::F64(3.0)),
             other => panic!("expected Sum, got {other:?}"),
         }
     }
@@ -1057,7 +1058,7 @@ mod tests {
         let events = registry.drain(0);
         assert_eq!(events.len(), 1);
         match &events[0].metrics[0].kind {
-            MetricKind::Gauge(v) => assert_eq!(*v, 42.0),
+            MetricKind::Gauge(v) => assert_eq!(*v, MetricValue::F64(42.0)),
             other => panic!("expected Gauge, got {other:?}"),
         }
     }
@@ -1098,7 +1099,7 @@ mod tests {
         let events = registry.drain(0);
         assert_eq!(events.len(), 1);
         match &events[0].metrics[0].kind {
-            MetricKind::Sum(s) => assert_eq!(s.value, 2.0),
+            MetricKind::Sum(s) => assert_eq!(s.value, MetricValue::F64(2.0)),
             other => panic!("expected Sum, got {other:?}"),
         }
     }
@@ -1159,7 +1160,7 @@ mod tests {
             "both calls should coalesce into one point, not fragment into two"
         );
         match &events[0].metrics[0].kind {
-            MetricKind::Sum(s) => assert_eq!(s.value, 3.0),
+            MetricKind::Sum(s) => assert_eq!(s.value, MetricValue::F64(3.0)),
             other => panic!("expected Sum, got {other:?}"),
         }
     }
@@ -1181,7 +1182,7 @@ mod tests {
             .find(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("cardinality"))
             .expect("a cardinality-drop counter event should be present");
         match &dropped.metrics[0].kind {
-            MetricKind::Sum(s) => assert_eq!(s.value, 5.0),
+            MetricKind::Sum(s) => assert_eq!(s.value, MetricValue::F64(5.0)),
             other => panic!("expected Sum, got {other:?}"),
         }
     }
@@ -1237,7 +1238,7 @@ mod tests {
         let events = registry.drain(0);
         assert_eq!(events.len(), 1, "both handles should coalesce into one buffer, not race two");
         match &events[0].metrics[0].kind {
-            MetricKind::Sum(s) => assert_eq!(s.value, 2.0),
+            MetricKind::Sum(s) => assert_eq!(s.value, MetricValue::F64(2.0)),
             other => panic!("expected Sum, got {other:?}"),
         }
         // The first registration's kind/role wins.
@@ -1429,7 +1430,7 @@ mod tests {
             .find(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("buffer_full"))
             .expect("a buffer_full drop counter event should be present");
         match &dropped.metrics[0].kind {
-            MetricKind::Sum(s) => assert_eq!(s.value, 5.0),
+            MetricKind::Sum(s) => assert_eq!(s.value, MetricValue::F64(5.0)),
             other => panic!("expected Sum, got {other:?}"),
         }
     }
@@ -1521,7 +1522,7 @@ mod tests {
                 .filter_map(|e| {
                     e.metrics.iter().find_map(|m| {
                         (crate::interner::resolve(m.name) == name).then_some(match &m.kind {
-                            MetricKind::Sum(s) => s.value,
+                            MetricKind::Sum(s) => s.value.as_f64(),
                             _ => 0.0,
                         })
                     })
@@ -1686,7 +1687,7 @@ mod tests {
             .find(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("buffer_full"))
             .expect("a buffer_full drop counter event should be present");
         match &dropped.metrics[0].kind {
-            MetricKind::Sum(s) => assert_eq!(s.value, 5.0),
+            MetricKind::Sum(s) => assert_eq!(s.value, MetricValue::F64(5.0)),
             other => panic!("expected Sum, got {other:?}"),
         }
     }

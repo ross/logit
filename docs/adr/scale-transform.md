@@ -16,7 +16,7 @@ Accepted
 reports response time in **milliseconds**; nginx's `$request_time` reports it in **seconds**. Two
 sources reporting the same measurement name in different units would sum/quantile nonsense
 together if a panel ever queried them unfiltered, and `influxdb_out` never writes a metric's
-`unit:` at all (it encodes name, tags, and value only — `crates/logit-outputs/src/influxdb.rs`), so
+`unit:` at all (it encodes name, tags, and value only — `crates/logit-proto/src/influxdb/encode.rs`), so
 nothing downstream of `kv_metrics` can catch or correct the mismatch after the fact.
 
 `kv_metrics` itself can't do this: it only *reads* a field into a metric value

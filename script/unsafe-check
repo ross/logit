@@ -95,7 +95,9 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # 32; protocol 0's densest repeat, the three-byte `g0\n`, makes fewer events, and its decoded
 # strings' scratch is at most twice the payload. `collectd`'s is its two cut bytes and a 65,507-byte UDP payload; its worst input, one-byte
 # notification messages six bytes apart, is a measured 13.5 MiB `Vec`, pinned under 16 in the
-# collectd section. `prom_text`'s is its dialect byte and a body one byte short of 64 KiB; its
+# collectd section. `influxdb_line`'s is its precision byte and a 64 KiB body; its worst input,
+# `a f=1 N` lines with distinct timestamps so nothing merges, is a measured 5.2 MiB events `Vec`,
+# pinned under 16 in the influxdb section. `prom_text`'s is its dialect byte and a body one byte short of 64 KiB; its
 # worst input, distinct one- to three-character names on `aa 1` lines, is one family of one
 # series per five or six bytes, and the target's model mapping makes one 864-byte `Event` of
 # each: a measured 13.5 MiB `Vec`, pinned under 16 in the prometheus text section. The four
@@ -107,10 +109,10 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # because the split interns nothing. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
 #
 # `native_batch`, `native_hop_batch`, `statsd`, `syslog`, `graphite_plaintext`,
-# `graphite_pickle`, `collectd`, `prom_text`, `prom_remote_write`, `message_json`,
+# `graphite_pickle`, `collectd`, `influxdb_line`, `prom_text`, `prom_remote_write`, `message_json`,
 # `message_logfmt`, and `message_kv` run in fork mode: the process-wide interner never evicts, so
 # a long-lived fuzz process accumulates every dictionary string, metric name, tag key, SD-ID,
-# PARAM-NAME, carbon path, Prometheus exemplar label name and family name, and log-message key it
+# PARAM-NAME, carbon path, InfluxDB metric name, Prometheus exemplar label name and family name, and log-message key it
 # decodes until the arena outgrows the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal, as it
 # is outside fork mode.
 FUZZ_TARGETS=(
@@ -135,6 +137,7 @@ FUZZ_TARGETS=(
     "graphite_plaintext|65536|16|-fork=1 -ignore_ooms=0"
     "graphite_pickle|65537|32|-fork=1 -ignore_ooms=0"
     "collectd|65509|16|-fork=1 -ignore_ooms=0"
+    "influxdb_line|65537|16|-fork=1 -ignore_ooms=0"
     "message_json|65537|16|-fork=1 -ignore_ooms=0"
     "message_csv|65537|16|"
     "message_logfmt|65537|16|-fork=1 -ignore_ooms=0"

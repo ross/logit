@@ -314,7 +314,7 @@ pub(super) mod tests {
             for m in &event.metrics {
                 if resolve(m.name) == metric {
                     if let MetricKind::Sum(sum) = &m.kind {
-                        total += sum.value;
+                        total += sum.value.as_f64();
                     }
                 }
             }
@@ -323,7 +323,7 @@ pub(super) mod tests {
     }
 
     fn metric_event() -> Event {
-        Event::metric(0, AttrMap::new(), MetricRecord::new(intern("m"), MetricKind::Gauge(1.0)))
+        Event::metric(0, AttrMap::new(), MetricRecord::new(intern("m"), MetricKind::gauge(1.0)))
     }
 
     #[test]

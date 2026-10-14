@@ -102,7 +102,7 @@ error.
   see [Intake gaps](known-gaps/intake.md)). An orchestrator sending SIGTERM ahead of SIGKILL doesn't silently drop a window of
   metrics.
 - **SIGTERM closes every HTTP listener's connections.** `otlp_in`, `datadog_in`,
-  `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver stop accepting
+  `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver stop accepting
   when the drain starts (at the signal, or after `shutdown.delay`), close their idle keep-alive and gRPC connections at once, and serve out any
   request in flight. An HTTP/2 connection gets a `GOAWAY`, so an OpenTelemetry SDK exporter
   reconnects instead of reusing it. Two bounds cap the wait: a connection with nothing in flight
@@ -549,7 +549,7 @@ that recorded the point.
 | Event | Level | When |
 |---|---|---|
 | `starting` | info | Config loaded, before graph resolution — named even if the config goes on to fail. |
-| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`lines_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
+| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`lines_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`/`influxdb_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `shutdown delay elapsed` | info | `shutdown.delay` has run out after a SIGTERM/SIGINT and the drain is starting. Carries `delay`. Not logged when the delay is `0s`, when the signal arrived before `ready`, or when a node failure started the drain first. |
@@ -659,12 +659,7 @@ and the [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-account
 
 **Alert on any nonzero `logit.*.dropped` count, grouped by its `component` and `reason`
 attributes.** Every `*.dropped` counter is loss: data that should have left `logit` and didn't.
-Its `reason` says where to look, so you don't need a list of reasons to exclude.
-`influxdb_out` is the exception: it counts its loss only as `logit.component.diagnostics`, so
-alert on `key="gauge_delta_unresolved"` (an unresolved relative gauge) and `key="encode_error"`
-(a metric it failed to encode) for it as well. `encode_error` also counts a `SetMembers` or
-`ExponentialHistogram` metric, which line protocol has no form for, so read its message before
-treating it as loss. Its `no_recorded_value` key isn't loss: the record had no value to send. An outcome your
+Its `reason` says where to look, so you don't need a list of reasons to exclude. An outcome your
 config asked for never counts as dropped: a filter, `sample`, `aggregate`, or Lua script removing
 an event counts `logit.component.events.discarded`, and a tag or field removed from a record that's
 still delivered counts `*.omitted`. The full vocabulary is in
@@ -1210,7 +1205,7 @@ backpressure), but its accept queue has the same shape of problem:
 A stream listener has no receive queue (its connection's flow control is the backpressure), but a
 connection can open and then say nothing while holding one of the listener's
 `max_connections` permits. `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` (each with
-`transport: tcp`), `logit_in`, `otlp_in`, `datadog_in`, `datadog_trace_in`, and `splunk_hec_in`
+`transport: tcp`), `logit_in`, `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `influxdb_in`
 bound that with `handshake_timeout:`, **5s by default**, a duration string (`5s`, `1m`, `1h30m`)
 like `connect_timeout`:
 
@@ -1239,6 +1234,7 @@ budget of the configured length, so a TLS connection that says nothing costs up 
 | `datadog_in` | the same phases as `otlp_in` |
 | `datadog_trace_in` | on `bind:`, the same phases as `otlp_in`; on `socket:`, the wait for the connection's first byte |
 | `splunk_hec_in` | the same phases as `otlp_in` |
+| `influxdb_in` | the same phases as `otlp_in` |
 | `prometheus_in` (remote-write receiver) | the same phases as `otlp_in`, under `bind_tls:`, each bounded by a fixed 5 seconds; this kind has no `handshake_timeout:` field |
 
 **Under `proxy_protocol: true`, give the load balancer a PROXY-aware health check.** A plain TCP
@@ -1278,7 +1274,7 @@ holds its connection-cap permit forever, and enough of them fill the listener's
 `max_connections` cap.
 `idle_timeout:` is the opt-in field that closes such a connection. It applies to the kinds
 `handshake_timeout` covers (`syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` with
-`transport: tcp`; `logit_in`; `otlp_in`, `datadog_in`, `datadog_trace_in`, and `splunk_hec_in`)
+`transport: tcp`; `logit_in`; `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `influxdb_in`)
 and to `prometheus_in` in remote-write receiver mode, which shares `otlp_in`'s HTTP idle machinery
 and has no `handshake_timeout`; see
 [Prometheus remote-write](#prometheus-remote-write-receiving-sending-and-picking-a-version). See
@@ -1366,7 +1362,7 @@ Every stream listener serves at most `max_connections:` connections at once, **1
 A connection arriving past the cap is closed, never queued, and counted
 `logit.input.connections.rejected{reason="limit"}`. The field is on `syslog_in`, `graphite_in`,
 `statsd_in`, and `lines_in` under a stream transport (`tcp`, and `unix_stream` on `statsd_in` and
-`lines_in`), `logit_in`, `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in` in remote-write
+`lines_in`), `logit_in`, `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in` in remote-write
 receiver mode. The cap exists to protect the sinks: each open connection holds a file descriptor,
 and a fleet of senders leaking connections would otherwise run the process out of descriptors,
 leaving the sinks unable to open sockets, which loses data. Rejecting inbound connections keeps
@@ -1386,7 +1382,7 @@ components:
 | Kind | Past the cap |
 |---|---|
 | `syslog_in`, `graphite_in`, `statsd_in`, `lines_in` (stream transports, the shared driver) | closed as soon as it's accepted, before any TLS handshake or read; the plaintext wires have no way to say "try later" |
-| `otlp_in`, `datadog_in`, `splunk_hec_in`, `prometheus_in` (receiver) | closed as soon as it's accepted, before any TLS handshake or HTTP exchange; the client retries under its own policy |
+| `otlp_in`, `datadog_in`, `splunk_hec_in`, `influxdb_in`, `prometheus_in` (receiver) | closed as soon as it's accepted, before any TLS handshake or HTTP exchange; the client retries under its own policy |
 | `datadog_trace_in` | the same, with the TCP listener and the Unix socket counted against one cap; `/info` reports the cap as `connection_limit` |
 | `logit_in` | the TLS handshake completes (under `tls:`), then the peer is told `Reject{INTERNAL}`; a `logit_out` treats that as retryable and reconnects once there's room (see [Forwarding between `logit` nodes](#forwarding-between-logit-nodes)) |
 
@@ -1433,7 +1429,7 @@ remote-write receiver, and rule 55 rejects a non-default value alongside `scrape
 the same `bind:` address while the first still holds it: an overlapping replacement during a
 rolling upgrade, for example. It's off by default, and on every kind that binds a port:
 `statsd_in`, `syslog_in`, `graphite_in`, `lines_in`, and `collectd_in` over TCP or UDP;
-`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `logit_in`; `prometheus_in` in
+`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `logit_in`; `prometheus_in` in
 receiver mode; and `prometheus_out` in exposition mode. Both processes must set it and run as the
 same effective user; otherwise the second bind fails with an address-in-use error and startup
 exits `1`.
@@ -1473,6 +1469,7 @@ Which listener takes which field:
 | `datadog_in` | HTTP over TCP | Yes | Yes | Yes | |
 | `datadog_trace_in` | HTTP over TCP (`bind:`) and a Unix socket (`socket:`) | Yes, both | `bind:` only | Yes, both | `proxy_protocol: true` with `socket:` and no `bind:` is rejected |
 | `splunk_hec_in` | HTTP over TCP | Yes | Yes | Yes | |
+| `influxdb_in` | HTTP over TCP | Yes | Yes | Yes | |
 | `prometheus_in` | The remote-write receiver (`bind:`) | Yes | Yes | Yes | Receiver mode only: each is rejected beside `scrape_targets:` |
 | `logit_in` | TCP | No | No | No | See [runtime gaps](known-gaps/runtime.md) |
 
@@ -3111,6 +3108,75 @@ mismatch, `encoding` for a client sending something other than gzip, `oversize` 
 `max_connections` cap is binding. `docs/design/internal-telemetry.md`'s `splunk_hec_in` section
 has every counter.
 
+## `influxdb_in`: standing in for InfluxDB 2.x
+
+`influxdb_in` answers a write client the way InfluxDB 2.x's write API does, so Telegraf's
+`outputs.influxdb_v2`, the InfluxDB client libraries, and an `influxdb_out` on another `logit`
+send it what they'd send InfluxDB with nothing changed but their URL. See [ADR
+`influxdb-line-protocol-relay`](adr/influxdb-line-protocol-relay.md) for the design.
+
+```yaml
+components:
+  influx:
+    type: influxdb_in
+    bind: 127.0.0.1:8086
+    tokens: [!env INFLUXDB_TOKEN]   # empty or absent accepts any token
+    # max_request_bytes: 25MiB      # the default; as sent and after gzip
+    # idle_timeout: 120s            # off by default
+```
+
+`tls:`, `handshake_timeout:`, `max_connections:`, `peer:`, `proxy_protocol:`, `forwarded:`, and
+`reuse_port:` behave as on `otlp_in`. The generated schema, `schema/logit.schema.json`, has every
+field.
+
+**Routes.** `POST /api/v2/write` takes line protocol, with `org` or `orgID`, `bucket`, and
+`precision` (`ns`, `us`, `ms`, `s`; nanoseconds when absent) in the query string. `GET` and `HEAD`
+on `/ping` and `/health` answer without a token, as `influxd` does. Any other path gets `404`,
+the v1 `/write` route and a trailing `/` included (`influxd` redirects the latter with `308`),
+and a known path with the wrong method gets `405`. Every error body is `influxd`'s
+`{"code","message"}`. The module doc of `crates/logit-inputs/src/influxdb.rs` has the response
+table, and the order the listener checks a request in.
+
+**Authentication and compression.** With `tokens` set, a write needs `Authorization: Token <t>` or
+`Bearer <t>` naming one of them; otherwise it gets `401`. A token is never logged or kept on an
+event. Add `tls:` before binding beyond loopback, or the token crosses the network in the clear.
+The body is identity or lowercase `gzip`; any other `Content-Encoding` gets `415`, where `influxd`
+passes it through undecoded. A body labeled `gzip` that doesn't decompress gets `400`, where
+`influxd` answers `500`.
+
+**All or nothing.** A body with any line that doesn't parse gets `400` and delivers nothing, so a
+producer's resend of the whole body repeats nothing. A `503` with `Retry-After: 1` means the
+pipeline didn't take the body within 5 seconds and nothing of it was taken, counted
+`logit.input.batches.deferred`; the producer keeps the body and resends it.
+
+**What arrives.** Each point becomes one event with its tags as attributes and `influxdb.measurement` naming the
+measurement. Each numeric or boolean field becomes a gauge named `MEASUREMENT.FIELD`, and each
+string field an `influxdb.field.FIELD` attribute.
+`org`, `orgID`, and `bucket` become the resource attributes `influxdb.org`, `influxdb.org_id`, and
+`influxdb.bucket`. Use `route` on `influxdb.bucket` to send each bucket to its own
+`influxdb_out`, since `influxdb_out` writes to the one org and bucket in its own config and
+ignores the resource attributes. `crates/logit-proto/src/influxdb/mod.rs`'s module doc has the
+mapping table.
+
+**Remove the carrier ahead of other sinks.** `influxdb.measurement` and `influxdb.field.*` are
+ordinary attributes everywhere but `influxdb_out`, so `prometheus_out` and `graphite_out` write
+them as labels or tags. Add a `remove` stage for them on any leg that doesn't end in
+`influxdb_out`.
+
+**A destination fault never reaches the producer.** `influxdb_in` answers `204` once the batch is
+in every downstream inbox, before `influxdb_out` writes it. A `422` for a field type conflict
+(the batch drops), and a `404` or `401` from the destination (the sink holds its queue and
+retries), are all invisible to the producer, which believes its writes succeeded. Watch
+`influxdb_out`'s `batches.dropped{reason="rejected"}` and `logit.component.retrying` instead.
+
+**What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
+answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened. A nonzero
+`logit.input.tags.omitted{reason="reserved_prefix"}` means a producer sends a tag key starting
+with `influxdb.`, which the decoder leaves off the point because it would collide with the
+carrier. A sustained `logit.input.batches.deferred` means the pipeline isn't keeping up. A nonzero
+`logit.input.connections.rejected{reason="limit"}` means the `max_connections` cap is binding.
+`docs/design/internal-telemetry.md`'s `influxdb_in` section has every counter.
+
 ## `splunk_hec_out`: sending to Splunk over HEC
 
 [`docs/splunk.md`](splunk.md) compares sending directly with sending through SC4S or the Splunk
@@ -4209,7 +4275,7 @@ reconnecting doesn't show as `connection_error` on the far end.
 
 `docs/known-gaps/native-hop.md` tracks what's still open: `logit_in` acknowledges frames in the
 order they arrive, so a batch slow to forward holds up the ones behind it, and `logit_in`'s shutdown
-grace, like the five HTTP listeners', is fixed at 5s with no `receive:`-shaped knob to change it.
+grace, like the six HTTP listeners', is fixed at 5s with no `receive:`-shaped knob to change it.
 
 ## The nginx-side recipe
 

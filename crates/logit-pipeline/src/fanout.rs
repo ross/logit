@@ -636,7 +636,7 @@ mod tests {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
                 MetricKind::Sum(s) if logit_core::interner::resolve(m.name) == name => {
-                    Some(s.value)
+                    Some(s.value.as_f64())
                 }
                 _ => None,
             })

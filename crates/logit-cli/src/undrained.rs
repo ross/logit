@@ -77,8 +77,8 @@ pub fn leftovers(events: Vec<Event>) -> Vec<Leftover> {
         for record in &event.metrics {
             // `Registry::drain` emits only these three kinds.
             let reading = match &record.kind {
-                MetricKind::Sum(sum) => Reading::Value(sum.value),
-                MetricKind::Gauge(v) => Reading::Value(*v),
+                MetricKind::Sum(sum) => Reading::Value(sum.value.as_f64()),
+                MetricKind::Gauge(v) => Reading::Value(v.as_f64()),
                 MetricKind::Distribution(sketch) => {
                     Reading::Distribution { count: sketch.count() as u64, sum: sketch.sum() }
                 }

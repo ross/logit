@@ -22,9 +22,9 @@ use std::sync::Arc;
 
 use logit_core::{
     interner, AttrMap, BodyFormat, DdSketch, Event, EventBatch, Exemplar, ExpHistogram, Histogram,
-    HyperLogLog, LogRecord, MetricKind, MetricList, MetricRecord, Resource, Samples, Scope,
-    Severity, SpanEvent, SpanExt, SpanKind, SpanLink, SpanRecord, SpanStatus, Sum, Summary, Symbol,
-    Temporality, TraceRef, Value,
+    HyperLogLog, LogRecord, MetricKind, MetricList, MetricRecord, MetricValue, Resource, Samples,
+    Scope, Severity, SpanEvent, SpanExt, SpanKind, SpanLink, SpanRecord, SpanStatus, Sum, Summary,
+    Symbol, Temporality, TraceRef, Value,
 };
 
 // `WireValue` is directly recursive (`Array`/`Map` hold more `WireValue`s), so `rkyv`'s derive
@@ -106,10 +106,28 @@ pub struct WireLog {
     serde::Deserialize,
     Debug,
     Clone,
+    Copy,
+    PartialEq,
+)]
+pub enum WireScalar {
+    F64(f64),
+    I64(i64),
+    U64(u64),
+    Bool(bool),
+}
+
+#[derive(
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+    Debug,
+    Clone,
     PartialEq,
 )]
 pub struct WireSum {
-    pub value: f64,
+    pub value: WireScalar,
     pub temporality: u8,
     pub monotonic: bool,
 }
@@ -200,8 +218,8 @@ pub struct WireSummary {
 )]
 pub enum WireMetricKind {
     Sum(WireSum),
-    Gauge(f64),
-    GaugeDelta(f64),
+    Gauge(WireScalar),
+    GaugeDelta(WireScalar),
     Samples(WireSamples),
     /// `DdSketch::to_bytes()`: the canonical, cross-language blob `logit_proto::native` also
     /// uses (`crates/logit-core/src/sketch.rs`).
@@ -467,15 +485,33 @@ fn temporality_from_tag(tag: u8) -> Temporality {
     }
 }
 
+fn scalar_to_wire(v: MetricValue) -> WireScalar {
+    match v {
+        MetricValue::F64(v) => WireScalar::F64(v),
+        MetricValue::I64(v) => WireScalar::I64(v),
+        MetricValue::U64(v) => WireScalar::U64(v),
+        MetricValue::Bool(v) => WireScalar::Bool(v),
+    }
+}
+
+fn scalar_from_wire(v: WireScalar) -> MetricValue {
+    match v {
+        WireScalar::F64(v) => MetricValue::F64(v),
+        WireScalar::I64(v) => MetricValue::I64(v),
+        WireScalar::U64(v) => MetricValue::U64(v),
+        WireScalar::Bool(v) => MetricValue::Bool(v),
+    }
+}
+
 fn metric_kind_to_wire(kind: &MetricKind) -> WireMetricKind {
     match kind {
         MetricKind::Sum(sum) => WireMetricKind::Sum(WireSum {
-            value: sum.value,
+            value: scalar_to_wire(sum.value),
             temporality: temporality_tag(sum.temporality),
             monotonic: sum.monotonic,
         }),
-        MetricKind::Gauge(v) => WireMetricKind::Gauge(*v),
-        MetricKind::GaugeDelta(v) => WireMetricKind::GaugeDelta(*v),
+        MetricKind::Gauge(v) => WireMetricKind::Gauge(scalar_to_wire(*v)),
+        MetricKind::GaugeDelta(v) => WireMetricKind::GaugeDelta(scalar_to_wire(*v)),
         MetricKind::Samples(s) => WireMetricKind::Samples(WireSamples {
             values: s.values.iter().copied().collect(),
             rate: s.sample_rate,
@@ -519,12 +555,12 @@ fn metric_kind_to_wire(kind: &MetricKind) -> WireMetricKind {
 fn wire_to_metric_kind(kind: &WireMetricKind) -> MetricKind {
     match kind {
         WireMetricKind::Sum(sum) => MetricKind::Sum(Sum {
-            value: sum.value,
+            value: scalar_from_wire(sum.value),
             temporality: temporality_from_tag(sum.temporality),
             monotonic: sum.monotonic,
         }),
-        WireMetricKind::Gauge(v) => MetricKind::Gauge(*v),
-        WireMetricKind::GaugeDelta(v) => MetricKind::GaugeDelta(*v),
+        WireMetricKind::Gauge(v) => MetricKind::Gauge(scalar_from_wire(*v)),
+        WireMetricKind::GaugeDelta(v) => MetricKind::GaugeDelta(scalar_from_wire(*v)),
         WireMetricKind::Samples(s) => MetricKind::Samples(Samples {
             values: s.values.iter().copied().collect(),
             sample_rate: s.rate,
@@ -937,7 +973,7 @@ mod tests {
             ..MetricRecord::new(
                 interner::intern("wire_mirror_test.sum"),
                 MetricKind::Sum(Sum {
-                    value: 3.0,
+                    value: MetricValue::F64(3.0),
                     temporality: Temporality::Cumulative,
                     monotonic: false,
                 }),

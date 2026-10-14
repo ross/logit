@@ -13,6 +13,7 @@ pub mod forwarded;
 pub mod frame;
 pub mod framing;
 pub mod graphite;
+pub mod influxdb;
 pub mod json;
 pub mod message;
 pub mod msgbuf;

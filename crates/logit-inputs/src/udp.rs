@@ -2794,7 +2794,7 @@ mod tests {
                     "kernel.dropped must carry reason=socket"
                 );
                 match &m.kind {
-                    logit_core::MetricKind::Sum(sum) => sum.value,
+                    logit_core::MetricKind::Sum(sum) => sum.value.as_f64(),
                     other => panic!("kernel.dropped must be a counter, got {other:?}"),
                 }
             })
@@ -2809,7 +2809,7 @@ mod tests {
             .flat_map(|event| &event.metrics)
             .filter(|m| logit_core::interner::resolve(m.name) == name)
             .map(|m| match &m.kind {
-                logit_core::MetricKind::Gauge(v) => *v,
+                logit_core::MetricKind::Gauge(v) => v.as_f64(),
                 other => panic!("{name} must be a gauge, got {other:?}"),
             })
             .next()
@@ -3843,7 +3843,7 @@ mod tests {
             .flat_map(|event| &event.metrics)
             .filter(|m| logit_core::interner::resolve(m.name) == name)
             .map(|m| match &m.kind {
-                logit_core::MetricKind::Sum(sum) => sum.value,
+                logit_core::MetricKind::Sum(sum) => sum.value.as_f64(),
                 other => panic!("{name} must be a counter, got {other:?}"),
             })
             .sum()

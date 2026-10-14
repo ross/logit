@@ -92,8 +92,8 @@ MiB, because a legitimate 64 MiB lz4 frame allocates its full `uncompressed_len`
 
 The fourth `FUZZ_TARGETS` column holds extra libFuzzer arguments for one target, passed by `fuzz`
 and never by `fuzz-tmin`. The two native batch targets, `statsd`, `syslog`, the two graphite
-targets, `collectd`, the two Prometheus decode targets, and `message_json`, `message_logfmt`,
-and `message_kv` use it to run in fork mode (`-fork=1 -ignore_ooms=0`). The process-wide
+targets, `collectd`, `influxdb_line`, the two Prometheus decode targets, and `message_json`,
+`message_logfmt`, and `message_kv` use it to run in fork mode (`-fork=1 -ignore_ooms=0`). The process-wide
 interner never evicts, so a long-lived fuzz process accumulates every dictionary string, metric
 name, tag key, SD-ID, PARAM-NAME, carbon path, Prometheus exemplar label name and family name,
 and log-message key it decodes until the arena outgrows the malloc limit, and fork mode restarts
@@ -399,6 +399,13 @@ Cluster 9 adds one target per moved or already-movable parser:
   with a second-generation encode/decode fixed point;
 - `prom_text`: the Prometheus text and OpenMetrics decoder;
 - `message_json`, `message_csv`, `message_logfmt`, and `message_kv`: the log-message tokenizers.
+
+The InfluxDB line-protocol codec adds one more:
+
+- `influxdb_line`: a whole write body through `InfluxDecoder::decode_body`, the first byte
+  choosing the `precision`, with an all-or-nothing oracle against the body's lines parsed one at
+  a time and a second-generation encode/decode fixed point. Its seeds are the Telegraf-shaped
+  body in `crates/logit-proto/tests/support/influxdb_lines.rs` and constructed lines.
 
 `prom_remote_write` also gains a structured mode, which builds a request from its input so the
 symbol-table rules are reachable, and a fixed-point oracle on every input.

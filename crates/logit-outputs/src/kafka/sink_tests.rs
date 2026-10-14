@@ -354,7 +354,7 @@ async fn a_repeated_encode_of_one_batch_counts_encode_side_points_once() {
     let mut mixed = event("a", "m");
     mixed.metrics.push(logit_core::MetricRecord::new(
         logit_core::interner::intern("m"),
-        logit_core::MetricKind::Gauge(1.0),
+        logit_core::MetricKind::Gauge(1.0.into()),
     ));
     mixed.span = Some(logit_core::SpanRecord {
         trace_id: [1; 16],
@@ -433,7 +433,7 @@ fn metric_event() -> Event {
         AttrMap::new(),
         logit_core::MetricRecord::new(
             logit_core::interner::intern("m"),
-            logit_core::MetricKind::Gauge(1.0),
+            logit_core::MetricKind::gauge(1.0),
         ),
     )
 }

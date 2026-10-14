@@ -1369,7 +1369,11 @@ mod tests {
     }
 
     fn cumulative_counter(value: f64) -> MetricKind {
-        MetricKind::Sum(Sum { value, temporality: Temporality::Cumulative, monotonic: true })
+        MetricKind::Sum(Sum {
+            value: logit_core::MetricValue::F64(value),
+            temporality: Temporality::Cumulative,
+            monotonic: true,
+        })
     }
 
     /// One of every shape the exposition format carries, rendered by every byte-exact test: a
@@ -1402,12 +1406,12 @@ mod tests {
             &[(LABEL_INSTANCE, Value::str("node-a:9100"))],
             vec![
                 metric_event("http_requests", cumulative_counter(5.0), &[]),
-                metric_event("temperature", MetricKind::Gauge(21.5), &[]),
+                metric_event("temperature", MetricKind::gauge(21.5), &[]),
                 Event::metric(0, AttrMap::new(), histogram),
                 Event::metric(0, AttrMap::new(), summary),
                 metric_event(
                     "build",
-                    MetricKind::Gauge(1.0),
+                    MetricKind::gauge(1.0),
                     &[(ATTR_TYPE, Value::str("info")), ("version", Value::str("1.2.3"))],
                 ),
                 Event::metric(
@@ -1417,7 +1421,7 @@ mod tests {
                         map.insert(ATTR_TIMESTAMP, Value::Bool(true));
                         map
                     },
-                    MetricRecord::new(intern("stamped"), MetricKind::Gauge(3.0)),
+                    MetricRecord::new(intern("stamped"), MetricKind::gauge(3.0)),
                 ),
             ],
         )
@@ -1810,7 +1814,7 @@ mod tests {
         )]))
         .await
         .unwrap();
-        sink.send(&batch(vec![metric_event("x", MetricKind::Gauge(2.0), &[])])).await.unwrap();
+        sink.send(&batch(vec![metric_event("x", MetricKind::gauge(2.0), &[])])).await.unwrap();
 
         let (_sink, url) = bound(sink).await;
         assert_eq!(
@@ -1830,7 +1834,11 @@ mod tests {
             .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
         sink.send(&batch(vec![metric_event(
             "hits",
-            MetricKind::Sum(Sum { value: 3.0, temporality: Temporality::Delta, monotonic: true }),
+            MetricKind::Sum(Sum {
+                value: logit_core::MetricValue::F64(3.0),
+                temporality: Temporality::Delta,
+                monotonic: true,
+            }),
             &[],
         )]))
         .await
@@ -1982,7 +1990,7 @@ mod tests {
             .flat_map(|e| &e.metrics)
             .filter(|m| logit_core::interner::resolve(m.name) == SERIES)
             .map(|m| match m.kind {
-                MetricKind::Gauge(v) => v,
+                MetricKind::Gauge(v) => v.as_f64(),
                 ref other => panic!("{SERIES} must be a gauge, got {other:?}"),
             })
             .collect();
@@ -2025,8 +2033,8 @@ mod tests {
             .flat_map(|e| &e.metrics)
             .filter(|m| logit_core::interner::resolve(m.name) == name)
             .map(|m| match m.kind {
-                MetricKind::Sum(ref s) => s.value,
-                MetricKind::Gauge(v) => v,
+                MetricKind::Sum(ref s) => s.value.as_f64(),
+                MetricKind::Gauge(v) => v.as_f64(),
                 ref other => panic!("{name} should be a counter or gauge, got {other:?}"),
             })
             .sum()
@@ -2446,7 +2454,7 @@ mod tests {
     async fn a_flagged_gauge_is_sent_as_a_stale_nan_sample() {
         let (url, seen) = canned_receiver(StatusCode::OK, "").await;
         let mut sink = sender(&url);
-        let mut record = MetricRecord::new(intern("temperature"), MetricKind::Gauge(0.0));
+        let mut record = MetricRecord::new(intern("temperature"), MetricKind::gauge(0.0));
         record.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         sink.send(&batch(vec![Event::metric(1_000_000_000, AttrMap::new(), record)]))
             .await
@@ -2475,7 +2483,7 @@ mod tests {
             MetricRecord::new(
                 intern("requests"),
                 MetricKind::Sum(Sum {
-                    value: 1.0,
+                    value: logit_core::MetricValue::F64(1.0),
                     temporality: Temporality::Delta,
                     monotonic: true,
                 }),
@@ -2552,22 +2560,22 @@ mod tests {
             Event::metric(
                 1_000_000_000,
                 AttrMap::new(),
-                MetricRecord::new(intern("a"), MetricKind::Gauge(1.0)),
+                MetricRecord::new(intern("a"), MetricKind::gauge(1.0)),
             ),
             Event::metric(
                 1_000_000_000,
                 AttrMap::new(),
-                MetricRecord::new(intern("b"), MetricKind::Gauge(2.0)),
+                MetricRecord::new(intern("b"), MetricKind::gauge(2.0)),
             ),
             Event::metric(
                 2_000_000_000,
                 AttrMap::new(),
-                MetricRecord::new(intern("a"), MetricKind::Gauge(3.0)),
+                MetricRecord::new(intern("a"), MetricKind::gauge(3.0)),
             ),
             Event::metric(
                 2_000_000_000,
                 AttrMap::new(),
-                MetricRecord::new(intern("b"), MetricKind::Gauge(4.0)),
+                MetricRecord::new(intern("b"), MetricKind::gauge(4.0)),
             ),
         ]))
         .await
@@ -2581,7 +2589,7 @@ mod tests {
                 .flat_map(|e| &e.metrics)
                 .filter(|m| logit_core::interner::resolve(m.name) == "logit.output.samples")
                 .map(|m| match m.kind {
-                    MetricKind::Sum(ref s) => s.value,
+                    MetricKind::Sum(ref s) => s.value.as_f64(),
                     ref other => panic!("samples should be a counter, got {other:?}"),
                 })
                 .sum::<f64>(),
@@ -3022,7 +3030,11 @@ mod tests {
     use logit_pipeline::test_util::TelemetryProbe;
 
     fn delta_sum(value: f64) -> MetricKind {
-        MetricKind::Sum(Sum { value, temporality: Temporality::Delta, monotonic: true })
+        MetricKind::Sum(Sum {
+            value: logit_core::MetricValue::F64(value),
+            temporality: Temporality::Delta,
+            monotonic: true,
+        })
     }
 
     /// A delta `Sum` the codec drops with its diagnostic, and nothing else: a batch that sends

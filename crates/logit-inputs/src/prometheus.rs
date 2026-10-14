@@ -454,7 +454,7 @@ fn synthetic_event(timestamp: i64, name: &'static str, value: f64) -> Event {
     Event::metric(
         timestamp,
         AttrMap::new(),
-        MetricRecord::new(intern(name), MetricKind::Gauge(value)),
+        MetricRecord::new(intern(name), MetricKind::gauge(value)),
     )
 }
 
@@ -1978,7 +1978,7 @@ mod tests {
                         return None;
                     }
                     match m.kind {
-                        MetricKind::Gauge(v) => Some(v),
+                        MetricKind::Gauge(v) => Some(v.as_f64()),
                         _ => None,
                     }
                 })
@@ -1999,7 +1999,7 @@ mod tests {
                     return None;
                 }
                 match m.kind {
-                    MetricKind::Sum(sum) => Some(sum.value),
+                    MetricKind::Sum(sum) => Some(sum.value.as_f64()),
                     _ => None,
                 }
             })
@@ -2018,7 +2018,7 @@ mod tests {
                     return None;
                 }
                 match m.kind {
-                    MetricKind::Gauge(value) => Some(value),
+                    MetricKind::Gauge(value) => Some(value.as_f64()),
                     _ => None,
                 }
             })
@@ -2636,7 +2636,7 @@ mod tests {
                     return None;
                 }
                 match m.kind {
-                    MetricKind::Gauge(v) => Some(v),
+                    MetricKind::Gauge(v) => Some(v.as_f64()),
                     _ => None,
                 }
             })

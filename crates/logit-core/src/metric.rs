@@ -89,6 +89,144 @@ impl MetricRecord {
     }
 }
 
+/// The scalar a [`MetricKind::Gauge`], [`MetricKind::GaugeDelta`], or [`Sum`] carries, typed as
+/// the wire typed it (`docs/adr/typed-metric-scalar.md`). A decoder whose wire has no scalar type
+/// produces `F64`.
+///
+/// `PartialEq` is strict: it compares the variant as well as the value, so `F64(1.0) != I64(1)`.
+/// A fixed-point test comparing batches relies on that to catch a relay that changed a type; use
+/// [`MetricValue::as_f64`] to compare numerically.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MetricValue {
+    F64(f64),
+    I64(i64),
+    U64(u64),
+    /// InfluxDB's boolean field. Reads as `0` or `1` wherever a number is needed.
+    Bool(bool),
+}
+
+impl MetricValue {
+    /// The value as an `f64`; `Bool` reads as `0.0` or `1.0`. Lossy above 2^53 for an integer:
+    /// call [`MetricValue::as_f64_exact`] where the loss must be counted.
+    pub fn as_f64(self) -> f64 {
+        match self {
+            MetricValue::F64(v) => v,
+            MetricValue::I64(v) => v as f64,
+            MetricValue::U64(v) => v as f64,
+            MetricValue::Bool(b) => f64::from(u8::from(b)),
+        }
+    }
+
+    /// [`MetricValue::as_f64`], plus whether the `f64` is the same number. Only an integer whose
+    /// magnitude exceeds 2^53 can be inexact, and not every such integer is: `2^53 + 2` survives
+    /// the conversion, `2^53 + 1` doesn't. `F64` and `Bool` are always exact.
+    pub fn as_f64_exact(self) -> (f64, bool) {
+        let f = self.as_f64();
+        let exact = match self {
+            // `f64 as i128` is exact for every value an `i64` or `u64` rounds to (at most 2^64),
+            // where `f64 as u64` would saturate `2^64` back to `u64::MAX` and read as exact.
+            MetricValue::I64(v) => f as i128 == i128::from(v),
+            MetricValue::U64(v) => f as i128 == i128::from(v),
+            MetricValue::F64(_) | MetricValue::Bool(_) => true,
+        };
+        (f, exact)
+    }
+
+    /// Whether the value is finite; an integer or a `Bool` always is.
+    pub fn is_finite(self) -> bool {
+        match self {
+            MetricValue::F64(v) => v.is_finite(),
+            MetricValue::I64(_) | MetricValue::U64(_) | MetricValue::Bool(_) => true,
+        }
+    }
+
+    /// The variant's lowercase name: `"f64"`, `"i64"`, `"u64"`, or `"bool"`. The Lua API's `type`
+    /// key reads and writes these names.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            MetricValue::F64(_) => "f64",
+            MetricValue::I64(_) => "i64",
+            MetricValue::U64(_) => "u64",
+            MetricValue::Bool(_) => "bool",
+        }
+    }
+
+    /// `self + other`, widening when the operands' types can't hold the result, and whether the
+    /// result's type differs from either operand's. `aggregate` counts that flag as
+    /// `logit.transform.metrics.normalized{reason="widened"}`.
+    ///
+    /// | Operands | Result |
+    /// |---|---|
+    /// | same type | that type; an `I64` or `U64` overflow gives `F64` |
+    /// | either is `F64` | `F64` |
+    /// | `I64` and `U64` | `I64` if the sum fits, else `U64` if it fits, else `F64` |
+    /// | `Bool` and `Bool` | `I64`, the count of `true`s |
+    /// | `Bool` and another type | the `Bool` as `0` or `1` of that type, then the rows above |
+    ///
+    /// `Bool + Bool` is `I64` rather than `Bool` because a sum of booleans is a count: keeping
+    /// `Bool` would make `true + true` either `true` (losing a count) or an error. The flag is
+    /// `true` for any mixed-type pair, an overflow, and `Bool + Bool`, and `false` only for a
+    /// same-type sum that kept its type.
+    pub fn checked_add(self, other: Self) -> (Self, bool) {
+        use MetricValue::{Bool, F64, I64, U64};
+        let float = |a: Self, b: Self| F64(a.as_f64() + b.as_f64());
+        let result = match (self, other) {
+            (F64(a), F64(b)) => F64(a + b),
+            (F64(_), _) | (_, F64(_)) => float(self, other),
+            (I64(a), I64(b)) => a.checked_add(b).map_or_else(|| float(self, other), I64),
+            (U64(a), U64(b)) => a.checked_add(b).map_or_else(|| float(self, other), U64),
+            (I64(_) | U64(_), I64(_) | U64(_)) => {
+                let wide = int_as_i128(self) + int_as_i128(other);
+                i64::try_from(wide)
+                    .map(I64)
+                    .or_else(|_| u64::try_from(wide).map(U64))
+                    .unwrap_or_else(|_| float(self, other))
+            }
+            (Bool(a), Bool(b)) => I64(i64::from(a) + i64::from(b)),
+            (Bool(a), I64(_)) => I64(i64::from(a)).checked_add(other).0,
+            (I64(_), Bool(b)) => self.checked_add(I64(i64::from(b))).0,
+            (Bool(a), U64(_)) => U64(u64::from(a)).checked_add(other).0,
+            (U64(_), Bool(b)) => self.checked_add(U64(u64::from(b))).0,
+        };
+        let same = |a: Self, b: Self| std::mem::discriminant(&a) == std::mem::discriminant(&b);
+        let widened = !same(result, self) || !same(result, other);
+        (result, widened)
+    }
+}
+
+/// An `I64` or `U64` as an `i128`, which holds the sum of any two without overflow.
+fn int_as_i128(v: MetricValue) -> i128 {
+    match v {
+        MetricValue::I64(v) => i128::from(v),
+        MetricValue::U64(v) => i128::from(v),
+        MetricValue::F64(_) | MetricValue::Bool(_) => unreachable!("only called on integers"),
+    }
+}
+
+impl From<f64> for MetricValue {
+    fn from(v: f64) -> Self {
+        MetricValue::F64(v)
+    }
+}
+
+impl From<i64> for MetricValue {
+    fn from(v: i64) -> Self {
+        MetricValue::I64(v)
+    }
+}
+
+impl From<u64> for MetricValue {
+    fn from(v: u64) -> Self {
+        MetricValue::U64(v)
+    }
+}
+
+impl From<bool> for MetricValue {
+    fn from(v: bool) -> Self {
+        MetricValue::Bool(v)
+    }
+}
+
 /// Metric kinds are mergeable: in the split-collection topology (`docs/OVERVIEW.md`) two edge
 /// nodes' aggregates may be combined downstream, and that must be exact where the math allows
 /// (`Sum`, `Gauge`, `Set`) and correctly error-bounded where it can't (`Distribution`). See
@@ -102,11 +240,11 @@ impl MetricRecord {
 pub enum MetricKind {
     /// A counter is `Sum { temporality: Delta, monotonic: true }`; see [`MetricKind::counter`].
     Sum(Sum),
-    Gauge(f64),
+    Gauge(MetricValue),
     /// An unresolved relative adjustment to a gauge's previous value (statsd's leading `+`/`-`).
     /// Must never reach a sink: `aggregate`, the only component holding the running gauge value,
     /// resolves it into a [`MetricKind::Gauge`] (`docs/adr/relative-gauge-adjustments.md`).
-    GaugeDelta(f64),
+    GaugeDelta(MetricValue),
     /// Raw observations: statsd `ms`/`h`/`d`, and `kv_metrics`' `distributions:` entries.
     Samples(Samples),
     /// Produced only by `aggregate`, merging a run of [`MetricKind::Samples`].
@@ -127,7 +265,16 @@ pub enum MetricKind {
 impl MetricKind {
     /// A monotonic delta sum: a counter increment.
     pub fn counter(v: f64) -> Self {
-        MetricKind::Sum(Sum { value: v, temporality: Temporality::Delta, monotonic: true })
+        MetricKind::Sum(Sum {
+            value: MetricValue::F64(v),
+            temporality: Temporality::Delta,
+            monotonic: true,
+        })
+    }
+
+    /// An `F64` gauge, for a decoder whose wire carries no scalar type.
+    pub fn gauge(v: f64) -> Self {
+        MetricKind::Gauge(MetricValue::F64(v))
     }
 
     /// The snake_case variant name the Lua API and `stdio_out` render as `kind`. There is no
@@ -150,7 +297,7 @@ impl MetricKind {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sum {
-    pub value: f64,
+    pub value: MetricValue,
     pub temporality: Temporality,
     pub monotonic: bool,
 }
@@ -1002,8 +1149,8 @@ mod tests {
     fn metric_kind_name_covers_every_variant() {
         let cases = [
             (MetricKind::counter(1.0), "sum"),
-            (MetricKind::Gauge(1.0), "gauge"),
-            (MetricKind::GaugeDelta(1.0), "gauge_delta"),
+            (MetricKind::gauge(1.0), "gauge"),
+            (MetricKind::GaugeDelta(MetricValue::F64(1.0)), "gauge_delta"),
             (MetricKind::Samples(Samples::new([1.0])), "samples"),
             (MetricKind::Distribution(DdSketch::new()), "distribution"),
             (MetricKind::SetMembers(vec![bytes::Bytes::from_static(b"a")]), "set_members"),
@@ -1044,8 +1191,101 @@ mod tests {
     fn counter_constructor_builds_a_delta_monotonic_sum() {
         assert_eq!(
             MetricKind::counter(3.0),
-            MetricKind::Sum(Sum { value: 3.0, temporality: Temporality::Delta, monotonic: true })
+            MetricKind::Sum(Sum {
+                value: MetricValue::F64(3.0),
+                temporality: Temporality::Delta,
+                monotonic: true,
+            })
         );
+    }
+
+    #[test]
+    fn gauge_constructor_builds_an_f64_gauge() {
+        assert_eq!(MetricKind::gauge(2.5), MetricKind::Gauge(MetricValue::F64(2.5)));
+    }
+
+    #[test]
+    fn metric_value_equality_compares_the_variant() {
+        use MetricValue::{Bool, F64, I64, U64};
+        assert_ne!(F64(1.0), I64(1));
+        assert_ne!(I64(1), U64(1));
+        assert_ne!(U64(1), Bool(true));
+        assert_eq!(I64(1), I64(1));
+        assert_eq!(MetricValue::from(7_u64), U64(7));
+        assert_eq!(MetricValue::from(-7_i64), I64(-7));
+        assert_eq!(MetricValue::from(0.5), F64(0.5));
+        assert_eq!(MetricValue::from(true), Bool(true));
+    }
+
+    #[test]
+    fn metric_value_type_names_and_finiteness() {
+        use MetricValue::{Bool, F64, I64, U64};
+        assert_eq!(F64(0.0).type_name(), "f64");
+        assert_eq!(I64(0).type_name(), "i64");
+        assert_eq!(U64(0).type_name(), "u64");
+        assert_eq!(Bool(false).type_name(), "bool");
+        assert!(F64(1.0).is_finite());
+        assert!(!F64(f64::NAN).is_finite());
+        assert!(!F64(f64::INFINITY).is_finite());
+        assert!(I64(i64::MIN).is_finite());
+        assert!(U64(u64::MAX).is_finite());
+        assert!(Bool(true).is_finite());
+    }
+
+    #[test]
+    fn metric_value_as_f64_exact_marks_integers_an_f64_cannot_hold() {
+        use MetricValue::{Bool, F64, I64, U64};
+        const P53: u64 = 1 << 53;
+        assert_eq!(U64(P53).as_f64_exact(), (P53 as f64, true));
+        assert_eq!(I64(P53 as i64).as_f64_exact(), (P53 as f64, true));
+        assert!(!U64(P53 + 1).as_f64_exact().1);
+        assert!(!I64(P53 as i64 + 1).as_f64_exact().1);
+        assert!(!I64(-(P53 as i64) - 1).as_f64_exact().1);
+        assert!(I64(-(P53 as i64)).as_f64_exact().1);
+        // Rounds to 2^64, which a saturating `as u64` would read back as `u64::MAX`.
+        assert!(!U64(u64::MAX).as_f64_exact().1);
+        // Above 2^53 an even integer can still be exact.
+        assert!(U64(P53 + 2).as_f64_exact().1);
+        assert!(I64(i64::MIN).as_f64_exact().1);
+        assert_eq!(Bool(true).as_f64_exact(), (1.0, true));
+        assert_eq!(Bool(false).as_f64(), 0.0);
+        assert_eq!(F64(0.1).as_f64_exact(), (0.1, true));
+    }
+
+    #[test]
+    fn metric_value_checked_add_widening_table() {
+        use MetricValue::{Bool, F64, I64, U64};
+        let cases: &[(MetricValue, MetricValue, MetricValue, bool)] = &[
+            // Same type keeps the type.
+            (F64(1.5), F64(2.0), F64(3.5), false),
+            (I64(-3), I64(5), I64(2), false),
+            (U64(3), U64(5), U64(8), false),
+            // Integer overflow widens to F64.
+            (I64(i64::MAX), I64(1), F64(i64::MAX as f64 + 1.0), true),
+            (I64(i64::MIN), I64(-1), F64(i64::MIN as f64 - 1.0), true),
+            (U64(u64::MAX), U64(1), F64(u64::MAX as f64 + 1.0), true),
+            // I64 and U64: I64 if it fits, else U64, else F64.
+            (I64(-5), U64(3), I64(-2), true),
+            (U64(3), I64(-5), I64(-2), true),
+            (I64(1), U64(i64::MAX as u64), U64(i64::MAX as u64 + 1), true),
+            (I64(-1), U64(u64::MAX), U64(u64::MAX - 1), true),
+            (I64(1), U64(u64::MAX), F64(u64::MAX as f64 + 1.0), true),
+            // Any F64 operand gives F64.
+            (F64(0.5), I64(2), F64(2.5), true),
+            (U64(2), F64(0.5), F64(2.5), true),
+            (F64(0.5), Bool(true), F64(1.5), true),
+            // Bool reads as 0 or 1; two Bools count as I64.
+            (Bool(true), Bool(true), I64(2), true),
+            (Bool(false), Bool(false), I64(0), true),
+            (Bool(true), I64(4), I64(5), true),
+            (I64(4), Bool(false), I64(4), true),
+            (Bool(true), U64(4), U64(5), true),
+            (U64(u64::MAX), Bool(true), F64(u64::MAX as f64 + 1.0), true),
+            (I64(i64::MAX), Bool(true), F64(i64::MAX as f64 + 1.0), true),
+        ];
+        for &(a, b, expected, widened) in cases {
+            assert_eq!(a.checked_add(b), (expected, widened), "{a:?} + {b:?}");
+        }
     }
 
     #[test]
@@ -1073,7 +1313,7 @@ mod tests {
     #[test]
     fn metric_record_new_fills_defaults() {
         let name = crate::interner::intern("metric_record_new_test");
-        let record = MetricRecord::new(name, MetricKind::Gauge(1.0));
+        let record = MetricRecord::new(name, MetricKind::gauge(1.0));
         assert_eq!(record.unit, None);
         assert_eq!(record.description, None);
         assert_eq!(record.start_timestamp, 0);

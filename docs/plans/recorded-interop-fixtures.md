@@ -375,3 +375,10 @@ started. DogStatsD events (`_e{...}`) and service checks (`_sc|...`) are *newly*
 neither client's high-level API emits them in an ordinary application workload, so a capture would
 need a producer written specifically for them; see `testdata/interop/statsd/README.md`'s own "what
 isn't covered here (yet)" section for the rest.
+
+## Amendment (2026-10-13): InfluxDB line protocol, recorded
+
+`script/record-fixtures influxdb` records Telegraf 1.40.2's `outputs.influxdb_v2` (gzip and
+identity bodies) into `testdata/interop/influxdb/`, replayed by
+`crates/logit-proto/tests/influxdb_interop.rs`. Telegraf streams every body chunked, whatever its encoding, so
+`raw_capture.py --accept-chunked` removes the chunk framing and keeps the payload verbatim.

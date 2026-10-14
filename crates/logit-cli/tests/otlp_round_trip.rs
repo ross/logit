@@ -105,7 +105,7 @@ fn fixture_described_metric() -> MetricRecord {
         ..MetricRecord::new(
             intern("requests"),
             MetricKind::Sum(Sum {
-                value: 3.0,
+                value: logit_core::MetricValue::F64(3.0),
                 temporality: Temporality::Cumulative,
                 monotonic: true,
             }),
@@ -119,7 +119,7 @@ fn fixture_described_metric() -> MetricRecord {
 fn fixture_flagged_metric() -> MetricRecord {
     MetricRecord {
         flags: MetricRecord::FLAG_NO_RECORDED_VALUE,
-        ..MetricRecord::new(intern("round_trip_flagged_metric"), MetricKind::Gauge(0.0))
+        ..MetricRecord::new(intern("round_trip_flagged_metric"), MetricKind::gauge(0.0))
     }
 }
 

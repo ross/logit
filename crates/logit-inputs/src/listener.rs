@@ -261,7 +261,7 @@ mod tests {
                 MetricKind::Gauge(v)
                     if logit_core::interner::resolve(m.name) == "logit.input.connections" =>
                 {
-                    Some(v)
+                    Some(v.as_f64())
                 }
                 _ => None,
             })
@@ -369,7 +369,7 @@ mod tests {
                 MetricKind::Sum(sum)
                     if logit_core::interner::resolve(m.name) == "logit.input.accept.errors" =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })

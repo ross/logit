@@ -1,0 +1,3 @@
+cpu,cpu=cpu-total,host=web-1 usage_user=1.2531328320802004,usage_system=0.6265664160401002,usage_idle=97.99498746867168,usage_iowait=0,usage_steal=0 1700000000000000000
+mem,host=web-1 total=16777216000i,available=8388608000i,used=8388608000i,used_percent=50,free=4194304000i 1700000000000000000
+system,host=web-1 load1=0.52,load5=0.48,load15=0.41,n_cpus=8i,n_users=2i,uptime=273600i,uptime_format="3 days,  4:00" 1700000000000000000

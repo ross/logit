@@ -138,7 +138,7 @@ mod tests {
                 logit_core::MetricKind::Sum(sum)
                     if logit_core::interner::resolve(m.name) == name =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })

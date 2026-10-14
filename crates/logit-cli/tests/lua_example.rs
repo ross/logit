@@ -107,7 +107,7 @@ fn set_members(record: &logit_core::MetricRecord) -> Vec<String> {
 
 fn sum_value(record: &logit_core::MetricRecord) -> f64 {
     match &record.kind {
-        logit_core::MetricKind::Sum(sum) => sum.value,
+        logit_core::MetricKind::Sum(sum) => sum.value.as_f64(),
         other => panic!("expected Sum, got: {other:?}"),
     }
 }

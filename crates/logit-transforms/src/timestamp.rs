@@ -586,7 +586,7 @@ mod tests {
                     if name.starts_with("logit.transform.timestamp.") {
                         let reason =
                             e.attributes.get("reason").and_then(|v| v.as_str()).map(String::from);
-                        out.push((name, reason, sum.value));
+                        out.push((name, reason, sum.value.as_f64()));
                     }
                 }
             }

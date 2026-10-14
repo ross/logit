@@ -736,15 +736,19 @@ fn input_stats(events: &[logit_core::Event], component: &str) -> InputStats {
         for metric in &event.metrics {
             let name = interner::resolve(metric.name);
             match (name, &metric.kind) {
-                (INPUT_DATAGRAMS, MetricKind::Sum(sum)) => stats.datagrams += sum.value as u64,
-                (INPUT_READS, MetricKind::Sum(sum)) => stats.reads += sum.value as u64,
-                (KERNEL_DROPS, MetricKind::Sum(sum)) => stats.kernel_drops += sum.value as u64,
+                (INPUT_DATAGRAMS, MetricKind::Sum(sum)) => {
+                    stats.datagrams += sum.value.as_f64() as u64
+                }
+                (INPUT_READS, MetricKind::Sum(sum)) => stats.reads += sum.value.as_f64() as u64,
+                (KERNEL_DROPS, MetricKind::Sum(sum)) => {
+                    stats.kernel_drops += sum.value.as_f64() as u64
+                }
                 (DATAGRAMS_DROPPED, MetricKind::Sum(sum)) => {
-                    stats.queue_dropped += sum.value as u64
+                    stats.queue_dropped += sum.value.as_f64() as u64
                 }
                 (RCVBUF_UTILIZATION, MetricKind::Gauge(value)) => {
                     stats.kernel_sampled = true;
-                    stats.rcvbuf_utilization_max = stats.rcvbuf_utilization_max.max(*value)
+                    stats.rcvbuf_utilization_max = stats.rcvbuf_utilization_max.max(value.as_f64())
                 }
                 // Presence only: the sampler emits it on every successful `SO_MEMINFO` read,
                 // even when a zero granted buffer leaves utilization uncomputable.
@@ -756,7 +760,7 @@ fn input_stats(events: &[logit_core::Event], component: &str) -> InputStats {
                         .and_then(Value::as_str)
                         .unwrap_or("unknown")
                         .to_string();
-                    *stats.diagnostics.entry(key).or_default() += sum.value as u64;
+                    *stats.diagnostics.entry(key).or_default() += sum.value.as_f64() as u64;
                 }
                 _ => {}
             }
@@ -1773,9 +1777,9 @@ mod tests {
             point("statsd", KERNEL_DROPS, MetricKind::counter(7.0)),
             point("statsd", KERNEL_DROPS, MetricKind::counter(3.0)),
             point("statsd", DATAGRAMS_DROPPED, MetricKind::counter(5.0)),
-            point("statsd", RCVBUF_UTILIZATION, MetricKind::Gauge(0.25)),
-            point("statsd", RCVBUF_UTILIZATION, MetricKind::Gauge(0.91)),
-            point("statsd", RCVBUF_UTILIZATION, MetricKind::Gauge(0.10)),
+            point("statsd", RCVBUF_UTILIZATION, MetricKind::gauge(0.25)),
+            point("statsd", RCVBUF_UTILIZATION, MetricKind::gauge(0.91)),
+            point("statsd", RCVBUF_UTILIZATION, MetricKind::gauge(0.10)),
             // Another component's numbers must not be folded in.
             point("out", INPUT_DATAGRAMS, MetricKind::counter(999.0)),
         ];

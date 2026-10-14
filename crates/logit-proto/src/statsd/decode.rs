@@ -10,8 +10,8 @@ use bytes::Bytes;
 use logit_core::subslice;
 use logit_core::{
     interner::{intern, KeyCache},
-    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, MetricKind, MetricRecord, Resource,
-    Samples, Scope, Severity, Symbol, Telemetry, Value,
+    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, MetricKind, MetricRecord, MetricValue,
+    Resource, Samples, Scope, Severity, Symbol, Telemetry, Value,
 };
 use std::sync::{Arc, LazyLock};
 
@@ -515,7 +515,7 @@ fn parse_service_check(
     Ok(Event::metric(
         line_timestamp,
         attributes,
-        MetricRecord::new(intern(name), MetricKind::Gauge(status as f64)),
+        MetricRecord::new(intern(name), MetricKind::gauge(status as f64)),
     ))
 }
 
@@ -552,9 +552,9 @@ fn build_event(
             // `sample_rate` is ignored: a gauge value is not a count of occurrences.
             let value = parse_finite_value(raw_value, "gauge", line)?;
             if raw_value.starts_with('+') || raw_value.starts_with('-') {
-                MetricKind::GaugeDelta(value)
+                MetricKind::GaugeDelta(MetricValue::F64(value))
             } else {
-                MetricKind::Gauge(value)
+                MetricKind::gauge(value)
             }
         }
         // `parse_line` handles `ms`/`h`/`d`/`s` itself, one event per line.
@@ -639,7 +639,7 @@ mod tests {
         let metric = only_metric(decode("page.views:1|c"));
         assert_eq!(intern("page.views"), metric.name);
         assert!(
-            matches!(metric.kind, MetricKind::Sum(logit_core::Sum { value, .. }) if value == 1.0)
+            matches!(metric.kind, MetricKind::Sum(logit_core::Sum { value, .. }) if value == MetricValue::F64(1.0))
         );
     }
 
@@ -648,7 +648,7 @@ mod tests {
         let metric = only_metric(decode("page.views:2|c|@0.5"));
         assert!(matches!(
             metric.kind,
-            MetricKind::Sum(logit_core::Sum { value, .. }) if (value - 4.0).abs() < 1e-9
+            MetricKind::Sum(logit_core::Sum { value, .. }) if (value.as_f64() - 4.0).abs() < 1e-9
         ));
     }
 
@@ -689,7 +689,7 @@ mod tests {
         }
         let metric = only_metric(decode("hits:1e307|c|@0.5"));
         assert!(
-            matches!(metric.kind, MetricKind::Sum(logit_core::Sum { value, .. }) if value == 2e307)
+            matches!(metric.kind, MetricKind::Sum(logit_core::Sum { value, .. }) if value == MetricValue::F64(2e307))
         );
     }
 
@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn gauge() {
         let metric = only_metric(decode("cpu.load:0.75|g"));
-        assert!(matches!(metric.kind, MetricKind::Gauge(v) if v == 0.75));
+        assert!(matches!(metric.kind, MetricKind::Gauge(v) if v == MetricValue::F64(0.75)));
     }
 
     /// `f64::from_str` accepts a leading `+` as it does `-`, which `build_event`'s `"g"` arm relies
@@ -733,27 +733,27 @@ mod tests {
     #[test]
     fn a_leading_plus_decodes_as_a_gauge_delta() {
         let metric = only_metric(decode("conns:+5|g"));
-        assert!(matches!(metric.kind, MetricKind::GaugeDelta(v) if v == 5.0));
+        assert!(matches!(metric.kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(5.0)));
     }
 
     #[test]
     fn a_leading_minus_decodes_as_a_gauge_delta() {
         let metric = only_metric(decode("conns:-5|g"));
-        assert!(matches!(metric.kind, MetricKind::GaugeDelta(v) if v == -5.0));
+        assert!(matches!(metric.kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(-5.0)));
     }
 
     /// Sign detection must not turn an unsigned gauge into a delta.
     #[test]
     fn an_unsigned_gauge_value_still_decodes_as_an_absolute_gauge() {
         let metric = only_metric(decode("cpu.load:5|g"));
-        assert!(matches!(metric.kind, MetricKind::Gauge(v) if v == 5.0));
+        assert!(matches!(metric.kind, MetricKind::Gauge(v) if v == MetricValue::F64(5.0)));
     }
 
     /// `+0` is a legal no-op delta, distinct from an unsigned `0` (`Gauge(0.0)`).
     #[test]
     fn a_leading_plus_zero_is_a_legal_no_op_delta_not_an_error() {
         let metric = only_metric(decode("conns:+0|g"));
-        assert!(matches!(metric.kind, MetricKind::GaugeDelta(v) if v == 0.0));
+        assert!(matches!(metric.kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(0.0)));
     }
 
     /// A sign never bypasses the finiteness check.
@@ -772,7 +772,9 @@ mod tests {
     fn a_signed_gauge_with_tags_and_a_sample_rate_decodes() {
         let events = decode("conns:-5|g|@0.5|#host:web1");
         let event = &events[0];
-        assert!(matches!(event.metrics[0].kind, MetricKind::GaugeDelta(v) if v == -5.0));
+        assert!(
+            matches!(event.metrics[0].kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(-5.0))
+        );
         assert_eq!(event.attributes.get("host").and_then(|v| v.as_str()), Some("web1"));
     }
 
@@ -782,10 +784,10 @@ mod tests {
         let events = decode("conns:+1:-2|g");
         assert_eq!(events.len(), 2);
         assert!(
-            matches!(only_metric(vec![events[0].clone()]).kind, MetricKind::GaugeDelta(v) if v == 1.0)
+            matches!(only_metric(vec![events[0].clone()]).kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(1.0))
         );
         assert!(
-            matches!(only_metric(vec![events[1].clone()]).kind, MetricKind::GaugeDelta(v) if v == -2.0)
+            matches!(only_metric(vec![events[1].clone()]).kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(-2.0))
         );
     }
 
@@ -1264,7 +1266,9 @@ mod tests {
         assert!(event.log.is_none() && event.span.is_none());
         assert_eq!(event.metrics.len(), 1);
         assert_eq!(intern("Redis connection"), event.metrics[0].name);
-        assert!(matches!(event.metrics[0].kind, MetricKind::Gauge(v) if v == 2.0));
+        assert!(
+            matches!(event.metrics[0].kind, MetricKind::Gauge(v) if v == MetricValue::F64(2.0))
+        );
         assert_eq!(
             event.attributes.get("statsd.service_check.name").and_then(|v| v.as_str()),
             Some("Redis connection")
@@ -1531,7 +1535,7 @@ mod tests {
         let metric = only_metric(decode("_total.count:1|c"));
         assert_eq!(intern("_total.count"), metric.name);
         assert!(
-            matches!(metric.kind, MetricKind::Sum(logit_core::Sum { value, .. }) if value == 1.0)
+            matches!(metric.kind, MetricKind::Sum(logit_core::Sum { value, .. }) if value == MetricValue::F64(1.0))
         );
     }
 
@@ -1632,7 +1636,7 @@ mod tests {
             .flat_map(|e| &e.metrics)
             .filter(|m| logit_core::interner::resolve(m.name) == "logit.input.messages.dropped")
             .map(|m| match &m.kind {
-                MetricKind::Sum(sum) => sum.value,
+                MetricKind::Sum(sum) => sum.value.as_f64(),
                 other => panic!("messages.dropped must be a counter, got {other:?}"),
             })
             .sum()

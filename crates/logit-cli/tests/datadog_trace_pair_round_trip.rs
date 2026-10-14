@@ -95,7 +95,7 @@ fn counted(points: &[Event], metric: &str, reason: &str) -> f64 {
         .flat_map(|e| e.metrics.iter())
         .filter(|m| resolve(m.name) == metric)
         .map(|m| match &m.kind {
-            MetricKind::Sum(s) => s.value,
+            MetricKind::Sum(s) => s.value.as_f64(),
             _ => 0.0,
         })
         .sum()

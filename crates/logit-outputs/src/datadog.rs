@@ -1350,7 +1350,7 @@ mod tests {
             for record in &event.metrics {
                 if let MetricKind::Sum(s) = &record.kind {
                     if resolve(record.name) == metric {
-                        sum += s.value;
+                        sum += s.value.as_f64();
                     }
                 }
             }
@@ -1373,7 +1373,7 @@ mod tests {
     }
 
     fn gauge(ts: i64) -> Event {
-        metric(ts, MetricKind::Gauge(1.5))
+        metric(ts, MetricKind::gauge(1.5))
     }
 
     fn sketch(ts: i64) -> Event {
@@ -1409,7 +1409,7 @@ mod tests {
         let mut attrs = AttrMap::new();
         attrs.insert(ATTR_SERVICE_CHECK_NAME, Value::str("app.ok"));
         attrs.insert(ATTR_SERVICE_CHECK_STATUS, Value::U64(0));
-        Event::metric(ts, attrs, MetricRecord::new(intern("app.ok"), MetricKind::Gauge(0.0)))
+        Event::metric(ts, attrs, MetricRecord::new(intern("app.ok"), MetricKind::gauge(0.0)))
     }
 
     fn stats(ts: i64) -> Event {
@@ -1604,7 +1604,7 @@ mod tests {
         let mut s = DdSketch::new();
         s.add(1.0);
         let routes: [(&str, &str, MetricKind); 3] = [
-            ("series", "/api/v2/series", MetricKind::Gauge(1.0)),
+            ("series", "/api/v2/series", MetricKind::gauge(1.0)),
             (
                 "distribution_points",
                 "/api/v1/distribution_points",
@@ -2214,7 +2214,11 @@ mod tests {
 
     /// A non-monotonic delta sum, which the series codec skips and counts.
     fn non_monotonic_delta(ts: i64) -> Event {
-        let sum = Sum { value: 1.0, temporality: Temporality::Delta, monotonic: false };
+        let sum = Sum {
+            value: logit_core::MetricValue::F64(1.0),
+            temporality: Temporality::Delta,
+            monotonic: false,
+        };
         metric(ts, MetricKind::Sum(sum))
     }
 
@@ -2240,7 +2244,7 @@ mod tests {
     fn encode_side_batch() -> EventBatch {
         batch(vec![
             gauge(NOW),
-            tagged("wide", MetricKind::Gauge(1.0), MAX_METRIC_TAGS + 1),
+            tagged("wide", MetricKind::gauge(1.0), MAX_METRIC_TAGS + 1),
             non_monotonic_delta(NOW),
             gauge(NOW - 2 * HOUR),
             oversized_sketch(NOW),

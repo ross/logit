@@ -38,7 +38,7 @@ pub use event::{Event, EventBatch, MetricList};
 pub use interner::Symbol;
 pub use metric::{
     DdSketch, Exemplar, ExpHistogram, Histogram, HllDecodeError, HyperLogLog, MetricKind,
-    MetricRecord, Samples, Sum, Summary, Temporality, SAMPLES_INLINE,
+    MetricRecord, MetricValue, Samples, Sum, Summary, Temporality, SAMPLES_INLINE,
 };
 pub use provenance::Provenance;
 pub use resource::{Resource, Scope};

@@ -1,0 +1,16 @@
+mem,host=telegraf-fixture high_total=0u,used=48236580864u,commit_limit=75738832896u,low_total=0u,slab=4363173888u,sunreclaim=1451102208u,vmalloc_total=35184372087808u,used_percent=35.91762312470364,shared=21153751040u,swap_total=8589930496u,active=72904290304u,free=2348589056u,high_free=0u,huge_page_size=2097152u,huge_pages_total=0u,inactive=45819793408u,swap_cached=12288u,swap_free=217088u,total=134297808896u,available_percent=64.08237687529636,committed_as=67442835456u,huge_pages_free=0u,sreclaimable=2912071680u,write_back_tmp=0u,buffered=3219456u,low_free=0u,page_tables=172269568u,write_back=20480u,dirty=23117824u,mapped=1498140672u,vmalloc_chunk=0u,vmalloc_used=191447040u,available=86061228032u,cached=106140454912u 1791914014000000000
+interop_types,host=telegraf-fixture,kind=all b_true=true,b_false=false,i_pos=42i,i_neg=-7i,i_max=9223372036854775807i,u_big=18446744073709551615u,u_small=3u,f_plain=1.5,f_exp=0.00000015,f_neg=-0.25,s_plain="hello" 1700000000000000000
+interop_multi,host=fixture-a,region=eu a=1i,b=2.5,c=true,d="four",e=5u 1700000000000000000
+interop_multi,host=fixture-b,region=us a=10i,b=25.5,c=false,d="forty",e=50u 1700000000000000000
+interop_dup,host=telegraf-fixture,id=1 v=1i 1700000000000000000
+interop_dup,host=telegraf-fixture,id=1 v=2i 1700000000000000000
+interop_dup,host=telegraf-fixture,id=1 w=3i 1700000000000000000
+interop_escapes,host=telegraf-fixture,plain=x,tag\ space=a\ b,tag\,comma=c\,d,tag\=eq=e\=f v=1i,f\ s=2i,f\,c=3i,f\=e=4i 1700000000000000000
+interop_escapes\ and\,more,host=telegraf-fixture,t=v n=1i 1700000000000000000
+interop_strings,host=telegraf-fixture,kind=quotes s_quote="say \"hi\"",s_slash="back\\slash",s_both="a\\\"b\\\\",s_comma="a, b=c d" 1700000000000000000
+interop_strings,host=telegraf-fixture,kind=newline s_nl="line1
+line2" 1700000000000000000
+interop_unicode,host=telegraf-fixture,tag=héllo s="日本語" 1700000000000000000
+system,host=telegraf-fixture n_cpus=32i,n_physical_cpus=16i,load1=8.45,load5=8.89,load15=8.7 1791914014000000000
+system,host=telegraf-fixture uptime=578142u 1791914014000000000
+system,host=telegraf-fixture uptime_format="6 days, 16:35" 1791914014000000000

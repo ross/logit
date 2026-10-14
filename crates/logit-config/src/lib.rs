@@ -2014,6 +2014,114 @@ pub enum ComponentKind {
         #[serde(default)]
         reuse_port: bool,
     },
+    /// A stand-in for InfluxDB 2.x's write API: what an `influxdb_out`, Telegraf's `influxdb_v2`
+    /// output, or any InfluxDB 2.x client's URL points at. Serves `POST /api/v2/write` with a
+    /// line protocol body (gzip accepted) and `org` or `orgID`, `bucket`, and `precision` in the
+    /// query string, `GET /ping`, and `GET /health`, answering influxd's own JSON error bodies.
+    /// A request with `Authorization: Token <t>` or `Bearer <t>` is checked against `tokens:`.
+    /// `org`, `orgID`, and `bucket` become the resource attributes `influxdb.org`,
+    /// `influxdb.org_id`, and `influxdb.bucket`. A body with any line that doesn't parse is
+    /// refused whole with `400`, and nothing of it is delivered. When the pipeline can't start
+    /// taking a request's data within 5s, the request gets `503` with `Retry-After: 1`, nothing
+    /// of it is delivered, and the client retries it. The v1 `/write` endpoint isn't served.
+    #[serde(rename = "influxdb_in")]
+    InfluxDbIn {
+        /// The `host:port` to listen on. InfluxDB's port is `8086`.
+        bind: String,
+        /// Terminates TLS on this listener when present; plaintext when omitted.
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// The API tokens this listener accepts, from each write request's `Authorization: Token
+        /// <token>` or `Authorization: Bearer <token>` header. A request with no token, or one
+        /// not listed, gets `401`. Empty, the default, accepts any request, whatever token it
+        /// carries. `/ping` and `/health` never need a token. Take each entry from the
+        /// environment (`!env INFLUXDB_TOKEN`) rather than writing a token into the file. A token
+        /// is never kept on an event. An empty entry, or one with leading or trailing
+        /// whitespace, is rejected.
+        #[serde(default)]
+        tokens: Vec<String>,
+        /// Caps one write request body, both as sent and after gzip decompression; a larger one
+        /// gets `413`. A byte-count string. Defaults to `"25MiB"`. InfluxDB itself sets no limit
+        /// by default, so this is a choice made here to bound memory; raise it for senders that
+        /// batch more. `0` is rejected.
+        #[serde(default = "default_influxdb_max_request_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_request_bytes: u64,
+        /// How long one connection has, per pre-request phase, before this listener closes it
+        /// and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then
+        /// the TLS accept when `tls:` is set, or on a plaintext listener the wait for its first
+        /// byte. Each phase gets its own budget, so a silent connection costs up to twice this
+        /// value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected. Also the grace an
+        /// idle close gives the HTTP server, as on `otlp_in`.
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
+        /// How long one connection may sit with no request in flight before this listener closes
+        /// it and frees its connection-cap slot, with `otlp_in`'s semantics. Off unless set; `0s`
+        /// is rejected. Write clients keep their connections open between batches, so set it well
+        /// above a client's flush interval if you set it at all. It also bounds a request body
+        /// that stalls mid-upload, answered `408`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
+        /// The most connections this listener serves at once. One arriving past it is closed at
+        /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
+        /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
+        /// keep the total across listeners under the process's `nofile` limit.
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Every event of a request carries the same values, and
+        /// either attribute replaces a same-named one decoded from the request. No reverse DNS
+        /// lookup is made.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        #[serde(default)]
+        peer: bool,
+        /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
+        /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
+        /// the original client it names on each event as `client.address` and `client.port`.
+        /// Off by default. The header is read before any TLS handshake, within
+        /// `handshake_timeout`. A connection without a valid header is closed and counted as
+        /// `logit.input.connections.rejected{reason="proxy_header"}`. A header that names no
+        /// client, such as a proxy's own health check, keeps the connection and stamps nothing.
+        /// Either attribute replaces a same-named one decoded from the request; `peer:` still
+        /// reports the proxy.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
+        /// The forwarding header that names each request's client: `x_forwarded_for`
+        /// (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first
+        /// element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header
+        /// is read, even when another is present, and only its first instance. A usable
+        /// address replaces `client.address` and `client.port` for that request as a pair, ahead of
+        /// the client a PROXY header names: the header's port, when it has one, becomes
+        /// `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY
+        /// header's client, if any, standing, and so does a value with no usable address
+        /// (`unknown`, an obfuscated name, anything that isn't an IP address), which is also
+        /// counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port`
+        /// always report the socket peer.
+        ///
+        /// Make the port reachable only through the proxy, and have the proxy overwrite the header
+        /// rather than append to one the client sent: any client that can connect to it directly,
+        /// or whose header the proxy keeps, can send its own header and name any address as
+        /// `client.address`.
+        #[serde(default)]
+        forwarded: Option<ForwardedHeader>,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits connections between them by source address and
+        /// port. Both processes must set it and run as the same effective user, or the second bind
+        /// fails with an address-in-use error. Off by default.
+        #[serde(default)]
+        reuse_port: bool,
+    },
     /// Tails one or more files as a log source, one line per event; rotation-, truncation-, and
     /// checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final
     /// path component (`/var/log/app/*.log`) and matches any run of non-`/` characters. An empty
@@ -4084,6 +4192,11 @@ pub fn default_splunk_max_body_bytes() -> u64 {
 /// Mirrors `logit_inputs::splunk::DEFAULT_MAX_REQUEST_BYTES`, kept in sync by hand.
 fn default_splunk_max_request_bytes() -> u64 {
     5 * 1024 * 1024
+}
+
+/// Mirrors `logit_inputs::influxdb::DEFAULT_MAX_REQUEST_BYTES`, kept in sync by hand.
+fn default_influxdb_max_request_bytes() -> u64 {
+    25 * 1024 * 1024
 }
 
 /// Mirrors `logit_inputs::splunk::DEFAULT_MAX_ACK_CHANNELS`, kept in sync by hand.
@@ -7201,6 +7314,58 @@ mod tests {
     }
 
     #[test]
+    fn influxdb_in_defaults_and_a_byte_count_cap() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "influxdb_in", "bind": "0.0.0.0:8086"}"#).unwrap();
+        match component.kind {
+            ComponentKind::InfluxDbIn {
+                bind,
+                tls,
+                tokens,
+                max_request_bytes,
+                handshake_timeout,
+                idle_timeout,
+                max_connections,
+                peer,
+                proxy_protocol,
+                forwarded,
+                reuse_port,
+            } => {
+                assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
+                assert_eq!(bind, "0.0.0.0:8086");
+                assert_eq!(tls, None);
+                assert!(tokens.is_empty());
+                assert_eq!(max_request_bytes, 25 * 1024 * 1024);
+                assert_eq!(handshake_timeout, Duration::from_secs(5));
+                assert_eq!(idle_timeout, None);
+                assert_eq!(max_connections, default_max_connections());
+                assert!(!peer, "opt-in -- no peer address unless asked for");
+                assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
+                assert_eq!(forwarded, None, "opt-in -- no forwarding header unless asked for");
+            }
+            other => panic!("expected InfluxDbIn, got {other:?}"),
+        }
+        let component: Component = serde_json::from_str(
+            r#"{"type": "influxdb_in", "bind": "0.0.0.0:8086", "tokens": ["t"],
+                "max_request_bytes": "1MiB"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            component.kind,
+            ComponentKind::InfluxDbIn { max_request_bytes: 1_048_576, .. }
+        ));
+    }
+
+    #[test]
+    fn influxdb_in_rejects_an_unknown_field() {
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "influxdb_in", "bind": "0.0.0.0:8086", "max_ack_channels": 4}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("max_ack_channels"), "got: {err}");
+    }
+
+    #[test]
     fn splunk_hec_out_defaults_and_a_byte_count_cap() {
         let component: Component = serde_json::from_str(
             r#"{"type": "splunk_hec_out", "endpoint": "https://splunk:8088/services/collector",
@@ -7766,9 +7931,9 @@ mod tests {
         }
     }
 
-    /// The ten stream-listener kinds, each as a minimal JSON object, for the `max_connections`
+    /// The eleven stream-listener kinds, each as a minimal JSON object, for the `max_connections`
     /// parse tests below.
-    const STREAM_LISTENERS: [&str; 10] = [
+    const STREAM_LISTENERS: [&str; 11] = [
         r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp""#,
         r#"{"type": "lines_in", "bind": "0.0.0.0:5170""#,
         r#"{"type": "graphite_in", "bind": "0.0.0.0:2003""#,
@@ -7777,6 +7942,7 @@ mod tests {
         r#"{"type": "datadog_in", "bind": "0.0.0.0:8080""#,
         r#"{"type": "datadog_trace_in", "bind": "0.0.0.0:8126""#,
         r#"{"type": "splunk_hec_in", "bind": "0.0.0.0:8088""#,
+        r#"{"type": "influxdb_in", "bind": "0.0.0.0:8086""#,
         r#"{"type": "logit_in", "bind": "0.0.0.0:5140""#,
         r#"{"type": "prometheus_in", "bind": "0.0.0.0:9201""#,
     ];
@@ -7791,6 +7957,7 @@ mod tests {
             | ComponentKind::DatadogIn { max_connections, .. }
             | ComponentKind::DatadogTraceIn { max_connections, .. }
             | ComponentKind::SplunkHecIn { max_connections, .. }
+            | ComponentKind::InfluxDbIn { max_connections, .. }
             | ComponentKind::LogitIn { max_connections, .. }
             | ComponentKind::PrometheusIn { max_connections, .. } => *max_connections,
             other => panic!("not a stream listener: {other:?}"),
@@ -7798,7 +7965,7 @@ mod tests {
     }
 
     /// One `#[serde(default = ..)]` copy per kind: a typo on any one would silently change that
-    /// kind's cap, so all ten are checked.
+    /// kind's cap, so all eleven are checked.
     #[test]
     fn max_connections_defaults_to_1024_on_every_stream_listener() {
         for head in STREAM_LISTENERS {
@@ -9231,6 +9398,7 @@ mod tests {
             "datadog_in",
             "datadog_trace_in",
             "splunk_hec_in",
+            "influxdb_in",
             "logit_in",
             "prometheus_in",
             "prometheus_out",
@@ -9248,6 +9416,7 @@ mod tests {
                     | ComponentKind::DatadogIn { reuse_port, .. }
                     | ComponentKind::DatadogTraceIn { reuse_port, .. }
                     | ComponentKind::SplunkHecIn { reuse_port, .. }
+                    | ComponentKind::InfluxDbIn { reuse_port, .. }
                     | ComponentKind::LogitIn { reuse_port, .. }
                     | ComponentKind::PrometheusIn { reuse_port, .. }
                     | ComponentKind::PrometheusOut { reuse_port, .. } => reuse_port,

@@ -26,8 +26,8 @@ use bytes::Bytes;
 use logit_core::attrs::merged;
 use logit_core::interner::{intern, resolve};
 use logit_core::{
-    AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Samples, Symbol, Temporality,
-    Value,
+    AttrMap, Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Samples, Symbol,
+    Temporality, Value,
 };
 use prost::Message;
 use serde_json::{json, Map, Value as JsonValue};
@@ -94,7 +94,7 @@ impl WireType {
     fn kind(self, value: f64) -> MetricKind {
         match self {
             WireType::Count => MetricKind::counter(value),
-            WireType::Gauge | WireType::Rate | WireType::Unspecified => MetricKind::Gauge(value),
+            WireType::Gauge | WireType::Rate | WireType::Unspecified => MetricKind::gauge(value),
         }
     }
 
@@ -790,6 +790,19 @@ impl DatadogEncoder {
         self.telemetry.count(metric, 1.0, &[tag]);
     }
 
+    /// A scalar's wire double: Datadog stores every point as a double, so an integer leaves as
+    /// its nearest `f64` and a `Bool` as `1` or `0`, counted.
+    pub(super) fn scalar(&self, value: MetricValue) -> f64 {
+        if let MetricValue::Bool(_) = value {
+            self.telemetry.count(
+                "logit.output.metrics.normalized",
+                1.0,
+                &[("reason", "bool_value")],
+            );
+        }
+        value.as_f64()
+    }
+
     pub(super) fn out_degraded(&self, reason: &'static str) {
         self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("reason", reason)]);
     }
@@ -879,7 +892,7 @@ impl DatadogEncoder {
     fn series_value(&self, record: &MetricRecord, carriers: &Carriers) -> Option<(WireType, f64)> {
         let (wire_type, value) = match &record.kind {
             MetricKind::Sum(sum) => match (sum.temporality, sum.monotonic) {
-                (Temporality::Delta, true) => (WireType::Count, sum.value),
+                (Temporality::Delta, true) => (WireType::Count, self.scalar(sum.value)),
                 (Temporality::Delta, false) => {
                     self.metric_not_sent(MetricOut::Kind("non_monotonic_delta_sum"));
                     return None;
@@ -889,7 +902,9 @@ impl DatadogEncoder {
                     return None;
                 }
             },
-            MetricKind::Gauge(v) => (carriers.wire_type.unwrap_or(WireType::Gauge), *v),
+            MetricKind::Gauge(v) => {
+                (carriers.wire_type.unwrap_or(WireType::Gauge), self.scalar(*v))
+            }
             MetricKind::Set(hll) => {
                 self.out_degraded("set_estimate");
                 (WireType::Gauge, hll.estimate() as f64)
@@ -1148,7 +1163,7 @@ mod tests {
             for m in &event.metrics {
                 if resolve(m.name) == metric {
                     if let MetricKind::Sum(s) = &m.kind {
-                        total += s.value;
+                        total += s.value.as_f64();
                     }
                 }
             }
@@ -1194,10 +1209,10 @@ mod tests {
         check.insert(ATTR_SERVICE_CHECK_NAME, Value::str("app.ok"));
         check.insert(ATTR_SERVICE_CHECK_MESSAGE, Value::str("fine"));
         let mut check_event =
-            Event::metric(TS, check, MetricRecord::new(intern("app.ok"), MetricKind::Gauge(0.0)));
-        check_event.metrics.push(MetricRecord::new(intern("m"), MetricKind::Gauge(1.0)));
+            Event::metric(TS, check, MetricRecord::new(intern("app.ok"), MetricKind::gauge(0.0)));
+        check_event.metrics.push(MetricRecord::new(intern("m"), MetricKind::gauge(1.0)));
         let plain_event =
-            Event::metric(TS, plain, MetricRecord::new(intern("m"), MetricKind::Gauge(1.0)));
+            Event::metric(TS, plain, MetricRecord::new(intern("m"), MetricKind::gauge(1.0)));
         for event in [plain_event, check_event] {
             let batch = EventBatch {
                 resource: Arc::new(resource.clone()),
@@ -1223,7 +1238,7 @@ mod tests {
         let m = &e.metrics[0];
         assert_eq!(resolve(m.name), "my.metric");
         assert_eq!(m.unit.map(resolve), Some("byte"));
-        assert_eq!(m.kind, MetricKind::Gauge(1.5));
+        assert_eq!(m.kind, MetricKind::gauge(1.5));
         let a = &e.attributes;
         assert_eq!(a.get("env"), Some(&Value::str("prod")));
         assert_eq!(a.get("urgent"), Some(&Value::Bool(true)));
@@ -1239,9 +1254,9 @@ mod tests {
         let (mut d, _) = decoder();
         for (t, kind, attr) in [
             (r#""count""#, MetricKind::counter(2.0), None),
-            (r#""gauge""#, MetricKind::Gauge(2.0), None),
-            (r#""""#, MetricKind::Gauge(2.0), Some("unspecified")),
-            ("null", MetricKind::Gauge(2.0), None),
+            (r#""gauge""#, MetricKind::gauge(2.0), None),
+            (r#""""#, MetricKind::gauge(2.0), Some("unspecified")),
+            ("null", MetricKind::gauge(2.0), None),
         ] {
             let body =
                 format!(r#"{{"series":[{{"metric":"m","points":[[1700000000,2]],"type":{t}}}]}}"#);
@@ -1272,7 +1287,7 @@ mod tests {
                 .flat_map(|e| e.metrics.iter())
                 .filter(|m| resolve(m.name) == metric)
                 .map(|m| match m.kind {
-                    MetricKind::Sum(Sum { value, .. }) => value,
+                    MetricKind::Sum(Sum { value, .. }) => value.as_f64(),
                     _ => 0.0,
                 })
                 .sum()
@@ -1379,7 +1394,7 @@ mod tests {
         assert_eq!(batch.events.len(), 1);
         let a = &batch.events[0].attributes;
         assert_eq!(a.get(ATTR_ORIGIN_CATEGORY), Some(&Value::U64(2)));
-        assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(1.0));
+        assert_eq!(batch.events[0].metrics[0].kind, MetricKind::gauge(1.0));
         assert_eq!(
             counted(&registry, "logit.input.metrics.dropped", ("reason", "bad_series")),
             1.0
@@ -1414,13 +1429,13 @@ mod tests {
             MetricKind::counter(3.0),
             MetricKind::Set(hll),
             MetricKind::Sum(Sum {
-                value: 1.0,
+                value: MetricValue::F64(1.0),
                 temporality: Temporality::Cumulative,
                 monotonic: true,
             }),
-            MetricKind::GaugeDelta(1.0),
+            MetricKind::GaugeDelta(MetricValue::F64(1.0)),
             MetricKind::Samples(Samples::new([1.0])),
-            MetricKind::Gauge(f64::NAN),
+            MetricKind::gauge(f64::NAN),
         ] {
             events.push(Event::metric(TS, attrs.clone(), MetricRecord::new(intern("m"), kind)));
         }
@@ -1456,7 +1471,7 @@ mod tests {
         let b = one_event_batch(AttrMap::new(), MetricKind::Samples(Samples::new([1.0])));
         assert!(e.encode_series_v1(&b).is_none());
         assert!(e.encode_series_v2_protobuf(&b).is_none());
-        let b = one_event_batch(AttrMap::new(), MetricKind::Gauge(1.0));
+        let b = one_event_batch(AttrMap::new(), MetricKind::gauge(1.0));
         assert!(e.encode_distribution_points(&b).is_none());
     }
 
@@ -1468,7 +1483,7 @@ mod tests {
         attrs.insert(ATTR_TYPE, Value::str("rate"));
         attrs.insert(ATTR_INTERVAL, Value::I64(10));
         attrs.insert(ATTR_ORIGIN_SERVICE, Value::U64(5));
-        let mut record = MetricRecord::new(intern("r"), MetricKind::Gauge(0.5));
+        let mut record = MetricRecord::new(intern("r"), MetricKind::gauge(0.5));
         record.unit = Some(intern("second"));
         let b = batch(vec![Event::metric(TS, attrs, record)]);
         let payload = MetricPayload::decode(e.encode_series_v2_protobuf(&b).unwrap()).unwrap();
@@ -1506,7 +1521,7 @@ mod tests {
         let mut attrs = AttrMap::new();
         attrs.insert(ATTR_ORIGIN_PRODUCT, Value::U64(1));
         attrs.insert(ATTR_INTERVAL, Value::str("ten"));
-        let b = one_event_batch(attrs, MetricKind::Gauge(1.0));
+        let b = one_event_batch(attrs, MetricKind::gauge(1.0));
         e.encode_series_v1(&b).unwrap();
         let drained = registry.drain(0);
         let reason = |r: &str| {

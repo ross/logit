@@ -41,7 +41,11 @@
 //! A histogram's bucket counts add with `saturating_add`, not `+`: they are wire-supplied `u64`s,
 //! so a producer sending `u64::MAX` twice pins the bucket at `u64::MAX` (wrong but still monotonic)
 //! instead of panicking or wrapping the total backwards under an unchanged `start_timestamp`.
-//! `Sum`'s `f64` saturates to `inf` on its own.
+//! A `Sum` or gauge value is a typed `MetricValue`: the first record of a series seeds it with its
+//! own type, and every later one folds in with `MetricValue::checked_add`, which keeps an integer
+//! an integer and widens on a mixed-type pair or an overflow, counted as
+//! `logit.transform.metrics.normalized{reason="widened"}` (`docs/adr/typed-metric-scalar.md`'s
+//! "Arithmetic widens, counted"). An `F64` total saturates to `inf` on its own.
 //!
 //! An incoming *cumulative* `Sum` passes through in both modes: re-summing a running total would
 //! double-count it. `docs/adr/prometheus-scrape-and-exposition.md` covers the consumer that needs
@@ -50,8 +54,8 @@
 use bytes::Bytes;
 use logit_core::interner::Symbol;
 use logit_core::{
-    AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, Samples, Scope, SpanLink, Sum,
-    Telemetry, Temporality, Value,
+    AttrMap, Diagnostics, Event, MetricKind, MetricRecord, MetricValue, Resource, Samples, Scope,
+    SpanLink, Sum, Telemetry, Temporality, Value,
 };
 use logit_pipeline::{FlushOutput, TraceContext, Transform};
 use smallvec::SmallVec;
@@ -293,7 +297,7 @@ enum Accumulator {
     /// `Sum` reaches an accumulator, so the emitted `temporality` comes from the stage's mode, not
     /// the input records (see `into_kind`).
     Sum {
-        total: f64,
+        total: MetricValue,
         monotonic: bool,
     },
     /// Per-bucket running totals, constructed only under [`AggregateTemporality::Cumulative`].
@@ -304,7 +308,7 @@ enum Accumulator {
     /// `at` is the source event's timestamp, which picks the last-write-wins value; the window has
     /// no timestamp until flush.
     Gauge {
-        value: f64,
+        value: MetricValue,
         at: i64,
     },
     Distribution(logit_core::DdSketch),
@@ -380,11 +384,15 @@ fn opener_for(
 }
 
 impl Opener<'_> {
-    /// The empty accumulator; `process` merges the opening record into it right after.
+    /// The empty accumulator; `process` merges the opening record into it right after. A `Sum`'s
+    /// or gauge's placeholder value is never read: the opening record replaces it, so the series
+    /// takes that record's type rather than widening against an `F64` zero.
     fn open(self) -> Accumulator {
         match self {
-            Opener::Sum { monotonic } => Accumulator::Sum { total: 0.0, monotonic },
-            Opener::Gauge => Accumulator::Gauge { value: 0.0, at: i64::MIN },
+            Opener::Sum { monotonic } => {
+                Accumulator::Sum { total: MetricValue::F64(0.0), monotonic }
+            }
+            Opener::Gauge => Accumulator::Gauge { value: MetricValue::F64(0.0), at: i64::MIN },
             Opener::Distribution => Accumulator::Distribution(logit_core::DdSketch::new()),
             Opener::RawSamples { sample_rate } => {
                 Accumulator::Samples(Samples { values: SmallVec::new(), sample_rate })
@@ -417,6 +425,8 @@ struct Tally {
     kind_conflict: u32,
     histogram_bounds_mismatch: u32,
     non_finite: u32,
+    /// Folds whose `MetricValue::checked_add` changed the type; not a pass-through.
+    widened: u32,
 }
 
 impl Tally {
@@ -438,6 +448,13 @@ impl Tally {
                     &[("reason", reason)],
                 );
             }
+        }
+        if self.widened > 0 {
+            telemetry.count(
+                "logit.transform.metrics.normalized",
+                f64::from(self.widened),
+                &[("reason", "widened")],
+            );
         }
     }
 }
@@ -700,8 +717,9 @@ impl Aggregator {
             };
             let entry = self.groups[gi].series.entry(key);
             // Whether this metric opened a new series. Not derivable afterward: a real
-            // `Gauge(0.0)` at `at: i64::MIN` looks identical to an unseeded delta's result. Only
-            // `GaugeDelta` uses it.
+            // `Gauge(0.0)` at `at: i64::MIN` looks identical to an unseeded delta's result. The
+            // `Sum` and `GaugeDelta` arms seed the series' value from it, and `GaugeDelta`'s
+            // unseeded count reads it.
             let was_vacant = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
             let state = entry.or_insert_with(|| SeriesState {
                 accumulator: opener.open(),
@@ -727,7 +745,13 @@ impl Aggregator {
                 MetricKind::Sum(Sum { temporality: Temporality::Delta, value, .. }) => {
                     match &mut state.accumulator {
                         Accumulator::Sum { total, .. } => {
-                            *total += value;
+                            if was_vacant {
+                                *total = *value;
+                            } else {
+                                let (sum, widened) = total.checked_add(*value);
+                                *total = sum;
+                                tally.widened += u32::from(widened);
+                            }
                             true
                         }
                         _ => false,
@@ -795,8 +819,15 @@ impl Aggregator {
                         // A delta applies in arrival order and never advances `at` (the `..`),
                         // which keeps an absolute's last-write-wins rule meaningful however many
                         // deltas land between two absolutes
-                        // (`docs/adr/relative-gauge-adjustments.md`).
-                        *value += d;
+                        // (`docs/adr/relative-gauge-adjustments.md`). A delta opening the series
+                        // resolves against zero, which keeps its own type.
+                        if was_vacant {
+                            *value = *d;
+                        } else {
+                            let (sum, widened) = value.checked_add(*d);
+                            *value = sum;
+                            tally.widened += u32::from(widened);
+                        }
                         true
                     }
                     _ => false,
@@ -1560,7 +1591,7 @@ mod tests {
 
     fn counter_value(kind: &MetricKind) -> f64 {
         match kind {
-            MetricKind::Sum(sum) => sum.value,
+            MetricKind::Sum(sum) => sum.value.as_f64(),
             other => panic!("expected Sum, got {other:?}"),
         }
     }
@@ -1592,14 +1623,16 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
         // Deliberately out of arrival order: the later-timestamped value (5) arrives first.
-        feed(&mut agg, &resource, metric_event("temp", MetricKind::Gauge(5.0), 50));
-        feed(&mut agg, &resource, metric_event("temp", MetricKind::Gauge(1.0), 10));
+        feed(&mut agg, &resource, metric_event("temp", MetricKind::gauge(5.0), 50));
+        feed(&mut agg, &resource, metric_event("temp", MetricKind::gauge(1.0), 10));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1);
         match kind_of(&events[0]) {
-            MetricKind::Gauge(v) => assert_eq!(*v, 5.0, "should keep the value stamped at t=50"),
+            MetricKind::Gauge(v) => {
+                assert_eq!(*v, MetricValue::F64(5.0), "should keep the value stamped at t=50")
+            }
             other => panic!("expected Gauge, got {other:?}"),
         }
     }
@@ -1666,7 +1699,7 @@ mod tests {
         let resource = default_resource();
         for kind in [
             MetricKind::Sum(Sum {
-                value: 1.0,
+                value: MetricValue::F64(1.0),
                 temporality: Temporality::Cumulative,
                 monotonic: true,
             }),
@@ -1731,12 +1764,14 @@ mod tests {
         };
         let mut hll = logit_core::HyperLogLog::new();
         hll.insert(b"a");
-        let sum = |temporality| MetricKind::Sum(Sum { value: 1.0, temporality, monotonic: true });
+        let sum = |temporality| {
+            MetricKind::Sum(Sum { value: MetricValue::F64(1.0), temporality, monotonic: true })
+        };
         vec![
             sum(Temporality::Delta),
             sum(Temporality::Cumulative),
-            MetricKind::Gauge(1.0),
-            MetricKind::GaugeDelta(1.0),
+            MetricKind::gauge(1.0),
+            MetricKind::GaugeDelta(MetricValue::F64(1.0)),
             MetricKind::Samples(Samples::new([1.0])),
             MetricKind::Distribution(Samples::new([1.0]).sketch()),
             MetricKind::SetMembers(vec![Bytes::from_static(b"a")]),
@@ -1785,7 +1820,7 @@ mod tests {
     /// One accumulator of every `Accumulator` variant.
     fn accumulator(variant: usize) -> Accumulator {
         match variant {
-            0 => Accumulator::Sum { total: 1.0, monotonic: true },
+            0 => Accumulator::Sum { total: MetricValue::F64(1.0), monotonic: true },
             1 => Accumulator::Histogram(logit_core::Histogram {
                 buckets: vec![(1.0, 1)],
                 temporality: Temporality::Cumulative,
@@ -1793,7 +1828,7 @@ mod tests {
                 min: None,
                 max: None,
             }),
-            2 => Accumulator::Gauge { value: 1.0, at: 0 },
+            2 => Accumulator::Gauge { value: MetricValue::F64(1.0), at: 0 },
             3 => Accumulator::Distribution(Samples::new([1.0]).sketch()),
             4 => Accumulator::Samples(Samples::new([1.0])),
             5 => Accumulator::Set(logit_core::HyperLogLog::new()),
@@ -1888,7 +1923,7 @@ mod tests {
         let cumulative = metric_event(
             "m",
             MetricKind::Sum(Sum {
-                value: 5.0,
+                value: MetricValue::F64(5.0),
                 temporality: Temporality::Cumulative,
                 monotonic: true,
             }),
@@ -1920,7 +1955,7 @@ mod tests {
             metric_event(
                 "m",
                 MetricKind::Sum(Sum {
-                    value: 1.0,
+                    value: MetricValue::F64(1.0),
                     temporality: Temporality::Delta,
                     monotonic: false,
                 }),
@@ -1933,7 +1968,7 @@ mod tests {
             metric_event(
                 "m",
                 MetricKind::Sum(Sum {
-                    value: 2.0,
+                    value: MetricValue::F64(2.0),
                     temporality: Temporality::Delta,
                     monotonic: true,
                 }),
@@ -1945,7 +1980,7 @@ mod tests {
         let (_, events) = &flushed[0];
         match kind_of(&events[0]) {
             MetricKind::Sum(sum) => {
-                assert_eq!(sum.value, 3.0);
+                assert_eq!(sum.value, MetricValue::F64(3.0));
                 assert_eq!(sum.temporality, Temporality::Delta);
                 assert!(!sum.monotonic, "should carry the first record's monotonic flag (false)");
             }
@@ -1958,7 +1993,7 @@ mod tests {
     fn gauge_delta_is_not_in_the_pass_through_matches() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        let event = metric_event("temp", MetricKind::GaugeDelta(5.0), 0);
+        let event = metric_event("temp", MetricKind::GaugeDelta(MetricValue::F64(5.0)), 0);
         assert!(
             feed(&mut agg, &resource, event).is_none(),
             "a GaugeDelta-only event should absorb"
@@ -1973,13 +2008,19 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
         let resource = default_resource();
 
-        assert!(feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 0))
-            .is_none());
+        assert!(feed(
+            &mut agg,
+            &resource,
+            metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(5.0)), 0)
+        )
+        .is_none());
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
         match kind_of(&events[0]) {
-            MetricKind::Gauge(v) => assert_eq!(*v, 5.0, "unseeded delta resolves against 0.0"),
+            MetricKind::Gauge(v) => {
+                assert_eq!(*v, MetricValue::F64(5.0), "unseeded delta resolves against 0.0")
+            }
             other => panic!("expected Gauge, got {other:?}"),
         }
 
@@ -1990,7 +2031,7 @@ mod tests {
                     if logit_core::interner::resolve(m.name)
                         == "logit.transform.gauge.delta.unseeded" =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -2002,13 +2043,17 @@ mod tests {
     fn absolute_then_delta_adds_to_the_absolute() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 1));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(10.0), 0));
+        feed(
+            &mut agg,
+            &resource,
+            metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(5.0)), 1),
+        );
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
         match kind_of(&events[0]) {
-            MetricKind::Gauge(v) => assert_eq!(*v, 15.0),
+            MetricKind::Gauge(v) => assert_eq!(*v, MetricValue::F64(15.0)),
             other => panic!("expected Gauge, got {other:?}"),
         }
     }
@@ -2018,13 +2063,19 @@ mod tests {
     fn delta_then_absolute_is_subsumed_by_the_absolute() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 0));
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 1));
+        feed(
+            &mut agg,
+            &resource,
+            metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(5.0)), 0),
+        );
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(10.0), 1));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
         match kind_of(&events[0]) {
-            MetricKind::Gauge(v) => assert_eq!(*v, 10.0, "the absolute should win outright"),
+            MetricKind::Gauge(v) => {
+                assert_eq!(*v, MetricValue::F64(10.0), "the absolute should win outright")
+            }
             other => panic!("expected Gauge, got {other:?}"),
         }
     }
@@ -2034,14 +2085,18 @@ mod tests {
     fn a_delta_never_advances_the_last_write_wins_timestamp() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 50));
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 60));
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(99.0), 50));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(10.0), 50));
+        feed(
+            &mut agg,
+            &resource,
+            metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(5.0)), 60),
+        );
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(99.0), 50));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
         match kind_of(&events[0]) {
-            MetricKind::Gauge(v) => assert_eq!(*v, 99.0),
+            MetricKind::Gauge(v) => assert_eq!(*v, MetricValue::F64(99.0)),
             other => panic!("expected Gauge, got {other:?}"),
         }
     }
@@ -2050,14 +2105,22 @@ mod tests {
     fn two_deltas_accumulate() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 1));
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(-3.0), 2));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(10.0), 0));
+        feed(
+            &mut agg,
+            &resource,
+            metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(5.0)), 1),
+        );
+        feed(
+            &mut agg,
+            &resource,
+            metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(-3.0)), 2),
+        );
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
         match kind_of(&events[0]) {
-            MetricKind::Gauge(v) => assert_eq!(*v, 12.0),
+            MetricKind::Gauge(v) => assert_eq!(*v, MetricValue::F64(12.0)),
             other => panic!("expected Gauge, got {other:?}"),
         }
     }
@@ -2069,10 +2132,12 @@ mod tests {
         let resource = default_resource();
         assert!(feed(&mut agg, &resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
 
-        let conflicting = metric_event("m", MetricKind::GaugeDelta(5.0), 0);
+        let conflicting = metric_event("m", MetricKind::GaugeDelta(MetricValue::F64(5.0)), 0);
         let passed = feed(&mut agg, &resource, conflicting);
         assert!(passed.is_some(), "the conflicting delta should be forwarded, not absorbed");
-        assert!(matches!(passed.unwrap().metrics[0].kind, MetricKind::GaugeDelta(v) if v == 5.0));
+        assert!(
+            matches!(passed.unwrap().metrics[0].kind, MetricKind::GaugeDelta(v) if v == MetricValue::F64(5.0))
+        );
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -2084,7 +2149,11 @@ mod tests {
     fn a_gauge_delta_never_survives_aggregate() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 0));
+        feed(
+            &mut agg,
+            &resource,
+            metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(5.0)), 0),
+        );
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -2224,7 +2293,7 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
         let resource = default_resource();
 
-        let mut flagged = metric_event("conns", MetricKind::Gauge(0.0), 0);
+        let mut flagged = metric_event("conns", MetricKind::gauge(0.0), 0);
         flagged.metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         let passed = feed(&mut agg, &resource, flagged);
         assert!(passed.is_some(), "a flagged record must be forwarded, not absorbed");
@@ -2246,7 +2315,7 @@ mod tests {
                     if logit_core::interner::resolve(m.name)
                         == "logit.transform.metrics.passed_through" =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -2260,7 +2329,7 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
         assert!(feed(&mut agg, &resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
-        let conflicting = metric_event("m", MetricKind::Gauge(5.0), 0);
+        let conflicting = metric_event("m", MetricKind::gauge(5.0), 0);
         let passed = feed(&mut agg, &resource, conflicting);
         assert!(passed.is_some(), "the conflicting event should be forwarded, not absorbed");
 
@@ -2365,12 +2434,14 @@ mod tests {
         assert!(feed(&mut agg, &resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
 
         let mut event = metric_event("m", MetricKind::counter(1.0), 0);
-        event.metrics.push(MetricRecord::new(intern("m"), MetricKind::Gauge(5.0)));
+        event.metrics.push(MetricRecord::new(intern("m"), MetricKind::gauge(5.0)));
 
         let passed =
             feed(&mut agg, &resource, event).expect("the conflicting gauge should be forwarded");
         assert_eq!(passed.metrics.len(), 1, "the absorbed counter should not also be forwarded");
-        assert!(matches!(passed.metrics[0].kind, MetricKind::Gauge(v) if v == 5.0));
+        assert!(
+            matches!(passed.metrics[0].kind, MetricKind::Gauge(v) if v == MetricValue::F64(5.0))
+        );
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -2476,7 +2547,9 @@ mod tests {
     fn gauge_value(events: &[Event], name: &str) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Gauge(v) if logit_core::interner::resolve(m.name) == name => Some(*v),
+                MetricKind::Gauge(v) if logit_core::interner::resolve(m.name) == name => {
+                    Some(v.as_f64())
+                }
                 _ => None,
             })
         })
@@ -2502,7 +2575,7 @@ mod tests {
             .flat_map(|e| &e.metrics)
             .filter_map(|m| match &m.kind {
                 MetricKind::Sum(sum) if logit_core::interner::resolve(m.name) == name => {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -2567,20 +2640,28 @@ mod tests {
     fn a_delta_in_the_next_window_resolves_against_the_previous_windows_final_value() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(10.0), 0));
         let flushed = flush_events(&mut agg, 100);
         match kind_of(&flushed[0].1[0]) {
-            MetricKind::Gauge(v) => assert_eq!(*v, 10.0),
+            MetricKind::Gauge(v) => assert_eq!(*v, MetricValue::F64(10.0)),
             other => panic!("expected Gauge, got {other:?}"),
         }
 
         // Window 2: only a delta.
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 150));
+        feed(
+            &mut agg,
+            &resource,
+            metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(5.0)), 150),
+        );
         let flushed = flush_events(&mut agg, 200);
         assert_eq!(flushed.len(), 1);
         match kind_of(&flushed[0].1[0]) {
             MetricKind::Gauge(v) => {
-                assert_eq!(*v, 15.0, "the delta should resolve against window 1's final value")
+                assert_eq!(
+                    *v,
+                    MetricValue::F64(15.0),
+                    "the delta should resolve against window 1's final value"
+                )
             }
             other => panic!("expected Gauge, got {other:?}"),
         }
@@ -2590,7 +2671,7 @@ mod tests {
     fn a_retained_idle_gauge_emits_nothing_that_window() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(10.0), 0));
         assert_eq!(flush_events(&mut agg, 100).len(), 1, "window 1 emits the gauge");
 
         let flushed = agg.flush(200);
@@ -2606,15 +2687,21 @@ mod tests {
             .with_series_retention(2, 100)
             .with_telemetry(telemetry);
         let resource = default_resource();
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(10.0), 0));
         assert_eq!(agg.flush(100).len(), 1, "flush 1: emits, idle_windows resets to 0");
         assert!(agg.flush(200).is_empty(), "flush 2: idle_windows -> 1, still under retention 2");
         assert!(agg.flush(300).is_empty(), "flush 3: idle_windows -> 2, now evicted");
 
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 350));
+        feed(
+            &mut agg,
+            &resource,
+            metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(5.0)), 350),
+        );
         let flushed = flush_events(&mut agg, 400);
         match kind_of(&flushed[0].1[0]) {
-            MetricKind::Gauge(v) => assert_eq!(*v, 5.0, "should resolve against 0.0 post-eviction"),
+            MetricKind::Gauge(v) => {
+                assert_eq!(*v, MetricValue::F64(5.0), "should resolve against 0.0 post-eviction")
+            }
             other => panic!("expected Gauge, got {other:?}"),
         }
 
@@ -2625,7 +2712,7 @@ mod tests {
                     if logit_core::interner::resolve(m.name)
                         == "logit.transform.gauge.delta.unseeded" =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -2644,7 +2731,7 @@ mod tests {
                 .with_series_retention(retention, 100)
                 .with_telemetry(telemetry);
             let resource = default_resource();
-            feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+            feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(10.0), 0));
             assert_eq!(agg.flush(100).len(), 1);
             for idle in 1..=retention {
                 assert!(agg.flush(100 + i64::from(idle) * 100).is_empty());
@@ -2668,15 +2755,17 @@ mod tests {
     fn series_retention_zero_reproduces_the_strictly_tumbling_output() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(0, 0);
         let resource = default_resource();
-        feed(&mut agg, &resource, metric_event("temp", MetricKind::Gauge(5.0), 50));
-        feed(&mut agg, &resource, metric_event("temp", MetricKind::Gauge(1.0), 10));
+        feed(&mut agg, &resource, metric_event("temp", MetricKind::gauge(5.0), 50));
+        feed(&mut agg, &resource, metric_event("temp", MetricKind::gauge(1.0), 10));
 
         let flushed = flush_events(&mut agg, 100);
         assert_eq!(flushed.len(), 1);
         let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1);
         match kind_of(&events[0]) {
-            MetricKind::Gauge(v) => assert_eq!(*v, 5.0, "should keep the value stamped at t=50"),
+            MetricKind::Gauge(v) => {
+                assert_eq!(*v, MetricValue::F64(5.0), "should keep the value stamped at t=50")
+            }
             other => panic!("expected Gauge, got {other:?}"),
         }
 
@@ -2691,14 +2780,15 @@ mod tests {
     fn an_absolute_gauge_in_the_next_window_with_an_earlier_timestamp_is_still_accepted() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 500));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(10.0), 500));
         flush_events(&mut agg, 1000);
 
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(99.0), 1));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(99.0), 1));
         let flushed = flush_events(&mut agg, 2000);
         match kind_of(&flushed[0].1[0]) {
             MetricKind::Gauge(v) => assert_eq!(
-                *v, 99.0,
+                *v,
+                MetricValue::F64(99.0),
                 "an earlier-timestamped absolute must still win against a reset `at`"
             ),
             other => panic!("expected Gauge, got {other:?}"),
@@ -2751,7 +2841,7 @@ mod tests {
             feed(
                 &mut agg,
                 &resource,
-                metric_event(&format!("g{i}"), MetricKind::Gauge(i as f64), 0),
+                metric_event(&format!("g{i}"), MetricKind::gauge(i as f64), 0),
             );
         }
         // Three retainable series against a cap of 2.
@@ -2767,7 +2857,7 @@ mod tests {
                     if logit_core::interner::resolve(m.name)
                         == "logit.transform.series.evicted" =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -2790,7 +2880,7 @@ mod tests {
                     if logit_core::interner::resolve(m.name)
                         == "logit.transform.series.evicted" =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -2821,14 +2911,14 @@ mod tests {
             names
         };
 
-        feed(&mut agg, &resource, metric_event("a", MetricKind::Gauge(1.0), 0));
-        feed(&mut agg, &resource, metric_event("b", MetricKind::Gauge(1.0), 0));
+        feed(&mut agg, &resource, metric_event("a", MetricKind::gauge(1.0), 0));
+        feed(&mut agg, &resource, metric_event("b", MetricKind::gauge(1.0), 0));
         agg.flush(100);
         registry.drain(0);
 
         // `a` and `b` are idle for one flush and `c` is active: one of the idle pair goes, the
         // newer.
-        feed(&mut agg, &resource, metric_event("c", MetricKind::Gauge(1.0), 150));
+        feed(&mut agg, &resource, metric_event("c", MetricKind::gauge(1.0), 150));
         agg.flush(200);
         assert_eq!(names(&agg), ["a", "c"]);
         let drained = registry.drain(0);
@@ -2837,7 +2927,7 @@ mod tests {
 
         // All three active: the newest goes.
         for name in ["d", "c", "a"] {
-            feed(&mut agg, &resource, metric_event(name, MetricKind::Gauge(1.0), 250));
+            feed(&mut agg, &resource, metric_event(name, MetricKind::gauge(1.0), 250));
         }
         agg.flush(300);
         assert_eq!(names(&agg), ["a", "c"]);
@@ -2985,13 +3075,13 @@ mod tests {
             for j in 0..SOAK_FRESH {
                 let id = format!("{w}-{j}");
                 let event =
-                    metric_event_with_tags("fresh", MetricKind::Gauge(1.0), ts, &[("id", &id)]);
+                    metric_event_with_tags("fresh", MetricKind::gauge(1.0), ts, &[("id", &id)]);
                 feed(&mut agg, &resource, event);
             }
             for i in 0..SOAK_STABLE {
                 let id = i.to_string();
                 let event =
-                    metric_event_with_tags("stable", MetricKind::Gauge(1.0), ts, &[("id", &id)]);
+                    metric_event_with_tags("stable", MetricKind::gauge(1.0), ts, &[("id", &id)]);
                 feed(&mut agg, &resource, event);
             }
             agg.flush(ts + 999);
@@ -3012,7 +3102,7 @@ mod tests {
     }
 
     fn soak_gauge(i: usize) -> MetricKind {
-        MetricKind::Gauge(i as f64)
+        MetricKind::gauge(i as f64)
     }
 
     fn soak_counter(_: usize) -> MetricKind {
@@ -3082,7 +3172,7 @@ mod tests {
         let resource = default_resource();
         let ctx_a = TraceContext::new_root();
         agg.observe_batch_context(ctx_a);
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(10.0), 0));
 
         let flushed = agg.flush(100);
         let (_, _, events) = &flushed[0];
@@ -3091,7 +3181,11 @@ mod tests {
 
         let ctx_b = TraceContext::new_root();
         agg.observe_batch_context(ctx_b);
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(1.0), 150));
+        feed(
+            &mut agg,
+            &resource,
+            metric_event("conns", MetricKind::GaugeDelta(MetricValue::F64(1.0)), 150),
+        );
         let flushed = agg.flush(200);
         let (_, _, events) = &flushed[0];
         let (_, links) = &events[0];
@@ -3108,7 +3202,7 @@ mod tests {
     fn flush_emits_no_empty_resource_events_group() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
-        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::gauge(10.0), 0));
         agg.flush(100); // retains "conns", idle from here on
 
         let flushed = agg.flush(200);
@@ -3160,7 +3254,7 @@ mod tests {
                     if logit_core::interner::resolve(m.name)
                         == "logit.transform.samples.weight_clamped" =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -3236,7 +3330,7 @@ mod tests {
                         && e.attributes.get("reason").and_then(|v| v.as_str())
                             == Some("rate_mismatch") =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -3281,7 +3375,7 @@ mod tests {
                         == "logit.transform.samples.fallback"
                         && e.attributes.get("reason").and_then(|v| v.as_str()) == Some("cap") =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -3470,7 +3564,7 @@ mod tests {
                         == "logit.transform.set_members.fallback"
                         && e.attributes.get("reason").and_then(|v| v.as_str()) == Some("cap") =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })
@@ -3616,7 +3710,7 @@ mod tests {
         let flushed = flush_events(&mut agg, 100);
         assert_eq!(flushed.len(), 1);
         assert_eq!(flushed[0].1.len(), 1);
-        assert_eq!(sum_of(&flushed[0].1[0]).value, 10.0);
+        assert_eq!(sum_of(&flushed[0].1[0]).value, MetricValue::F64(10.0));
 
         for ts in 100..105 {
             feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), ts));
@@ -3626,7 +3720,11 @@ mod tests {
         assert_eq!(flushed.len(), 1);
         assert_eq!(flushed[0].1.len(), 1);
         let second = &flushed[0].1[0];
-        assert_eq!(sum_of(second).value, 15.0, "the running total carries across the window");
+        assert_eq!(
+            sum_of(second).value,
+            MetricValue::F64(15.0),
+            "the running total carries across the window"
+        );
         assert_eq!(start_timestamp_of(second), 0);
     }
 
@@ -3691,7 +3789,7 @@ mod tests {
 
         // `b` opens first, at index 0, and is memoized last; `a` holds a retained gauge.
         feed(&mut agg, &b, metric_event("hits", MetricKind::counter(1.0), 0));
-        feed(&mut agg, &a, metric_event("temp", MetricKind::Gauge(20.0), 0));
+        feed(&mut agg, &a, metric_event("temp", MetricKind::gauge(20.0), 0));
         feed(&mut agg, &b, metric_event("hits", MetricKind::counter(1.0), 1));
         assert_eq!(agg.groups.len(), 2);
 
@@ -3852,7 +3950,7 @@ mod tests {
         feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(3.0), 1_500));
         let flushed = flush_events(&mut agg, 100_000);
         let first = &flushed[0].1[0];
-        assert_eq!(sum_of(first).value, 5.0, "window 1's own increments");
+        assert_eq!(sum_of(first).value, MetricValue::F64(5.0), "window 1's own increments");
         assert_eq!(sum_of(first).temporality, Temporality::Cumulative);
         assert!(sum_of(first).monotonic, "MetricKind::counter is monotonic, and that carries");
         assert_eq!(
@@ -3864,7 +3962,11 @@ mod tests {
         feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(4.0), 110_000));
         let flushed = flush_events(&mut agg, 200_000);
         let second = &flushed[0].1[0];
-        assert_eq!(sum_of(second).value, 9.0, "5 carried forward plus 4 this window");
+        assert_eq!(
+            sum_of(second).value,
+            MetricValue::F64(9.0),
+            "5 carried forward plus 4 this window"
+        );
         assert_eq!(sum_of(second).temporality, Temporality::Cumulative);
         assert_eq!(
             start_timestamp_of(second),
@@ -3879,14 +3981,18 @@ mod tests {
         let mut agg = cumulative_agg();
         let resource = default_resource();
         let up_down = |v: f64| {
-            MetricKind::Sum(Sum { value: v, temporality: Temporality::Delta, monotonic: false })
+            MetricKind::Sum(Sum {
+                value: MetricValue::F64(v),
+                temporality: Temporality::Delta,
+                monotonic: false,
+            })
         };
         feed(&mut agg, &resource, metric_event("queue.depth", up_down(5.0), 10));
         feed(&mut agg, &resource, metric_event("queue.depth", up_down(-2.0), 20));
 
         let flushed = flush_events(&mut agg, 100);
         let emitted = sum_of(&flushed[0].1[0]);
-        assert_eq!(emitted.value, 3.0);
+        assert_eq!(emitted.value, MetricValue::F64(3.0));
         assert_eq!(emitted.temporality, Temporality::Cumulative);
         assert!(!emitted.monotonic, "a non-monotonic sum stays non-monotonic");
     }
@@ -3903,7 +4009,11 @@ mod tests {
 
         feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 2_500));
         let flushed = flush_events(&mut agg, 3_000);
-        assert_eq!(sum_of(&flushed[0].1[0]).value, 8.0, "the idle window didn't reset the total");
+        assert_eq!(
+            sum_of(&flushed[0].1[0]).value,
+            MetricValue::F64(8.0),
+            "the idle window didn't reset the total"
+        );
         assert_eq!(start_timestamp_of(&flushed[0].1[0]), 100, "still the original start");
     }
 
@@ -4071,7 +4181,11 @@ mod tests {
         feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 3_500));
         let flushed = flush_events(&mut agg, 4_000);
         let restarted = &flushed[0].1[0];
-        assert_eq!(sum_of(restarted).value, 1.0, "an evicted series restarts from zero");
+        assert_eq!(
+            sum_of(restarted).value,
+            MetricValue::F64(1.0),
+            "an evicted series restarts from zero"
+        );
         assert_eq!(
             start_timestamp_of(restarted),
             3_500,
@@ -4121,7 +4235,7 @@ mod tests {
             feed(&mut agg, &resource, metric_event("anchor", MetricKind::counter(1.0), ts));
             feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), ts));
             let hits = hits_of(flush_events(&mut agg, now));
-            assert_eq!(sum_of(&hits).value, 1.0, "re-created at ts {ts}");
+            assert_eq!(sum_of(&hits).value, MetricValue::F64(1.0), "re-created at ts {ts}");
             let got = start_timestamp_of(&hits);
             assert!(
                 previous_point <= got && got <= hits.timestamp,
@@ -4184,7 +4298,7 @@ mod tests {
         let incoming = metric_event(
             "m",
             MetricKind::Sum(Sum {
-                value: 42.0,
+                value: MetricValue::F64(42.0),
                 temporality: Temporality::Cumulative,
                 monotonic: true,
             }),
@@ -4204,7 +4318,7 @@ mod tests {
 
         let flushed = flush_events(&mut agg, 10_000);
         let emitted = &flushed[0].1[0];
-        assert_eq!(sum_of(emitted).value, 4.0);
+        assert_eq!(sum_of(emitted).value, MetricValue::F64(4.0));
         assert_eq!(sum_of(emitted).temporality, Temporality::Delta);
         assert_eq!(start_timestamp_of(emitted), 0, "delta records carry no start time");
         assert!(agg.flush(20_000).is_empty(), "and the series tumbles, retention or not");
@@ -4283,7 +4397,11 @@ mod tests {
             // gauge_delta_unseeded, kind_conflict, sample_rate_clamped, sum_non_finite.
             let mut agg = Aggregator::new(Duration::from_secs(10));
             feed(&mut agg, &resource, metric_event("n", MetricKind::counter(f64::NAN), 0));
-            feed(&mut agg, &resource, metric_event("g", MetricKind::GaugeDelta(1.0), 0));
+            feed(
+                &mut agg,
+                &resource,
+                metric_event("g", MetricKind::GaugeDelta(MetricValue::F64(1.0)), 0),
+            );
             feed(&mut agg, &resource, metric_event("g", MetricKind::counter(1.0), 0));
             feed(&mut agg, &resource, metric_event("s", samples(0.0001, &[1.0]), 0));
 
@@ -4343,7 +4461,7 @@ mod tests {
         let mut agg = cumulative_agg().with_telemetry(telemetry);
         let resource = default_resource();
 
-        let mut no_value = MetricRecord::new(intern("nv"), MetricKind::Gauge(0.0));
+        let mut no_value = MetricRecord::new(intern("nv"), MetricKind::gauge(0.0));
         no_value.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         let histogram = |bound: f64| {
             MetricKind::Histogram(logit_core::Histogram {
@@ -4359,7 +4477,7 @@ mod tests {
             MetricRecord::new(
                 intern("cum"),
                 MetricKind::Sum(Sum {
-                    value: 1.0,
+                    value: MetricValue::F64(1.0),
                     temporality: Temporality::Cumulative,
                     monotonic: true,
                 }),
@@ -4368,7 +4486,7 @@ mod tests {
                 intern("q"),
                 MetricKind::Summary(logit_core::Summary { quantiles: vec![], count: 0, sum: 0.0 }),
             ),
-            MetricRecord::new(intern("g"), MetricKind::Gauge(1.0)),
+            MetricRecord::new(intern("g"), MetricKind::gauge(1.0)),
             MetricRecord::new(intern("g"), MetricKind::counter(1.0)),
             MetricRecord::new(intern("h"), histogram(1.0)),
             MetricRecord::new(intern("h"), histogram(2.0)),
@@ -4415,7 +4533,7 @@ mod tests {
             assert!(forwarded.is_some(), "a non-finite delta sum is forwarded");
         }
         feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(2.0), 0));
-        assert_eq!(sum_of(&flush_events(&mut agg, 10)[0].1[0]).value, 3.0);
+        assert_eq!(sum_of(&flush_events(&mut agg, 10)[0].1[0]).value, MetricValue::F64(3.0));
     }
 
     /// `min` and `max` follow the `sum` rule: a record with observations but no `min` (or `max`)
@@ -4599,6 +4717,147 @@ mod tests {
             }
             other => panic!("expected a Set, got {other:?}"),
         }
+    }
+
+    // -- Typed values (`docs/adr/typed-metric-scalar.md`) ----------------------------------------
+
+    fn typed_sum(value: MetricValue) -> MetricKind {
+        MetricKind::Sum(Sum { value, temporality: Temporality::Delta, monotonic: true })
+    }
+
+    /// Feeds each value as a delta `Sum` of one series into a telemetry-attached `agg`, flushes
+    /// at `now`, and returns the emitted value and the `widened` count.
+    fn fold_sums(
+        agg: Aggregator,
+        values: &[MetricValue],
+        now: i64,
+    ) -> (Aggregator, MetricValue, Option<f64>) {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = agg.with_telemetry(telemetry);
+        let resource = default_resource();
+        for (ts, v) in values.iter().enumerate() {
+            feed(&mut agg, &resource, metric_event("hits", typed_sum(*v), now - 10 + ts as i64));
+        }
+        let flushed = flush_events(&mut agg, now);
+        let value = sum_of(&flushed[0].1[0]).value;
+        let widened = counter_with_tag(
+            &registry.drain(0),
+            "logit.transform.metrics.normalized",
+            "reason",
+            "widened",
+        );
+        (agg, value, widened)
+    }
+
+    #[test]
+    fn i64_sums_stay_i64() {
+        let agg = Aggregator::new(Duration::from_secs(10));
+        let (_, value, widened) =
+            fold_sums(agg, &[MetricValue::I64(3), MetricValue::I64(-1), MetricValue::I64(4)], 100);
+        assert_eq!(value, MetricValue::I64(6));
+        assert_eq!(widened, None, "a same-type fold isn't widened");
+    }
+
+    #[test]
+    fn u64_sums_stay_u64_and_exact_above_2_pow_53() {
+        let agg = Aggregator::new(Duration::from_secs(10));
+        let big = 1_u64 << 53;
+        let (_, value, widened) =
+            fold_sums(agg, &[MetricValue::U64(big), MetricValue::U64(1)], 100);
+        assert_eq!(value, MetricValue::U64(big + 1), "an f64 can't hold 2^53 + 1");
+        assert_eq!(widened, None);
+    }
+
+    #[test]
+    fn an_i64_overflow_widens_to_f64_and_is_counted() {
+        let agg = Aggregator::new(Duration::from_secs(10));
+        let (_, value, widened) =
+            fold_sums(agg, &[MetricValue::I64(i64::MAX), MetricValue::I64(1)], 100);
+        assert_eq!(value, MetricValue::F64(i64::MAX as f64 + 1.0));
+        assert_eq!(widened, Some(1.0));
+    }
+
+    #[test]
+    fn an_i64_and_an_f64_sum_widens_to_f64_and_is_counted() {
+        let agg = Aggregator::new(Duration::from_secs(10));
+        let (_, value, widened) =
+            fold_sums(agg, &[MetricValue::I64(2), MetricValue::F64(0.5)], 100);
+        assert_eq!(value, MetricValue::F64(2.5));
+        assert_eq!(widened, Some(1.0));
+    }
+
+    /// The first record seeds the series with its own type: a lone `Bool` isn't widened against
+    /// an `F64` zero.
+    #[test]
+    fn the_first_record_seeds_the_series_with_its_own_type() {
+        let agg = Aggregator::new(Duration::from_secs(10));
+        let (_, value, widened) = fold_sums(agg, &[MetricValue::Bool(true)], 100);
+        assert_eq!(value, MetricValue::Bool(true));
+        assert_eq!(widened, None);
+    }
+
+    #[test]
+    fn a_cumulative_i64_counter_stays_i64_across_two_flushes() {
+        let (mut agg, first, _) =
+            fold_sums(cumulative_agg(), &[MetricValue::I64(2), MetricValue::I64(3)], 100);
+        assert_eq!(first, MetricValue::I64(5));
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("hits", typed_sum(MetricValue::I64(4)), 150));
+        let flushed = flush_events(&mut agg, 200);
+        let second = sum_of(&flushed[0].1[0]);
+        assert_eq!(second.value, MetricValue::I64(9), "the carried total keeps its type");
+        assert_eq!(second.temporality, Temporality::Cumulative);
+    }
+
+    #[test]
+    fn a_gauge_delta_on_an_i64_gauge_stays_i64() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
+        let resource = default_resource();
+        let gauge = MetricKind::Gauge(MetricValue::I64(10));
+        feed(&mut agg, &resource, metric_event("conns", gauge, 0));
+        let delta = MetricKind::GaugeDelta(MetricValue::I64(-3));
+        feed(&mut agg, &resource, metric_event("conns", delta, 1));
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(kind_of(&flushed[0].1[0]), &MetricKind::Gauge(MetricValue::I64(7)));
+        let events = registry.drain(0);
+        let widened =
+            counter_with_tag(&events, "logit.transform.metrics.normalized", "reason", "widened");
+        assert_eq!(widened, None);
+    }
+
+    #[test]
+    fn an_f64_gauge_delta_on_an_i64_gauge_widens_and_is_counted() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
+        let resource = default_resource();
+        feed(
+            &mut agg,
+            &resource,
+            metric_event("conns", MetricKind::Gauge(MetricValue::I64(10)), 0),
+        );
+        let delta = MetricKind::GaugeDelta(MetricValue::F64(0.5));
+        feed(&mut agg, &resource, metric_event("conns", delta, 1));
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(kind_of(&flushed[0].1[0]), &MetricKind::Gauge(MetricValue::F64(10.5)));
+        let events = registry.drain(0);
+        let widened =
+            counter_with_tag(&events, "logit.transform.metrics.normalized", "reason", "widened");
+        assert_eq!(widened, Some(1.0));
+    }
+
+    /// An unseeded delta opens the series with its own type, as a `Sum`'s first record does.
+    #[test]
+    fn an_unseeded_i64_delta_resolves_to_an_i64_gauge() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        let delta = MetricKind::GaugeDelta(MetricValue::I64(5));
+        feed(&mut agg, &resource, metric_event("conns", delta, 0));
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(kind_of(&flushed[0].1[0]), &MetricKind::Gauge(MetricValue::I64(5)));
     }
 }
 

@@ -1026,7 +1026,7 @@ async fn a_multi_data_source_list_stays_one_event_with_records_in_wire_order() {
     assert_eq!(decoded.events.len(), 1);
     assert_eq!(
         decoded.events[0].metrics.iter().map(|m| m.kind.clone()).collect::<Vec<_>>(),
-        vec![MetricKind::Gauge(0.05), MetricKind::Gauge(0.15), MetricKind::Gauge(0.25)],
+        vec![MetricKind::gauge(0.05), MetricKind::gauge(0.15), MetricKind::gauge(0.25)],
         "the three gauges must come back in the order they went out"
     );
 }
@@ -1038,7 +1038,7 @@ async fn a_nan_gauge_is_a_flagged_point_on_both_sides_of_the_relay() {
     let raw = read_fixture("nan-gauge", "in");
     let batch = direct_batch(&raw);
     let record = &batch.events[0].metrics[0];
-    assert_eq!(record.kind, MetricKind::Gauge(0.0));
+    assert_eq!(record.kind, MetricKind::gauge(0.0));
     assert!(record.is_no_recorded_value(), "collectd's NaN is the model's NO_RECORDED_VALUE");
 
     let mut harness = Harness::new().await;
@@ -1207,7 +1207,7 @@ async fn an_encryption_part_drops_the_datagram_tail_and_is_counted() {
     let batch = harness.drain_decoded(1).await;
 
     assert_eq!(batch.events.len(), 1, "only the plaintext list before the Encryption part");
-    assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(3600.0));
+    assert_eq!(batch.events[0].metrics[0].kind, MetricKind::gauge(3600.0));
     assert!(
         counted(&registry, "logit.component.diagnostics", ("key", "encrypted_packet_dropped")),
         "the dropped tail must be reported, not silent"
@@ -1246,7 +1246,7 @@ async fn a_truncated_values_part_keeps_the_lists_already_decoded_and_is_counted(
     let batch = harness.drain_decoded(1).await;
 
     assert_eq!(batch.events.len(), 1, "the well-formed list in front of the bad part survives");
-    assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(0.5));
+    assert_eq!(batch.events[0].metrics[0].kind, MetricKind::gauge(0.5));
     assert!(counted(&registry, "logit.component.diagnostics", ("key", "bad_part")));
 }
 
@@ -1259,7 +1259,7 @@ async fn a_list_with_a_cleared_host_is_skipped_and_counted() {
     let batch = harness.drain_decoded(1).await;
 
     assert_eq!(batch.events.len(), 1, "only the list that still had a host");
-    assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(0.5));
+    assert_eq!(batch.events[0].metrics[0].kind, MetricKind::gauge(0.5));
     assert!(counted(&registry, "logit.component.diagnostics", ("key", "incomplete_identity")));
 }
 
@@ -1325,7 +1325,7 @@ async fn a_statsd_counter_relays_as_one_absolute_list() {
     assert_eq!(name_of(&event.metrics[0]), "hits.absolute");
     match &event.metrics[0].kind {
         MetricKind::Sum(sum) => {
-            assert_eq!(sum.value, 5.0);
+            assert_eq!(sum.value, logit_core::MetricValue::U64(5));
             assert_eq!(sum.temporality, logit_core::Temporality::Delta);
             assert!(sum.monotonic);
         }
@@ -1341,7 +1341,7 @@ async fn a_sampled_statsd_counter_with_a_fractional_value_is_dropped_and_counted
     let mut cross = CrossHarness::new().await;
     let batch = cross.statsd_decode(b"page.views:2|c|@0.3").await;
     let value = match &batch.events[0].metrics[0].kind {
-        MetricKind::Sum(sum) => sum.value,
+        MetricKind::Sum(sum) => sum.value.as_f64(),
         other => panic!("expected a Sum, got {other:?}"),
     };
     assert!((value - 6.666_666_666_666_667).abs() < 1e-9, "the fixture's premise: {value}");
@@ -1384,7 +1384,7 @@ async fn a_tagged_statsd_gauge_relays_as_a_gauge_with_its_tag_counted_away() {
     assert_eq!(attr(event, ATTR_PLUGIN), Some(Value::from("temp")));
     assert_eq!(attr(event, ATTR_TYPE), Some(Value::from("gauge")));
     assert_eq!(name_of(&event.metrics[0]), "temp.gauge");
-    assert_eq!(event.metrics[0].kind, MetricKind::Gauge(21.5));
+    assert_eq!(event.metrics[0].kind, MetricKind::gauge(21.5));
     assert_eq!(event.attributes.get("env"), None, "collectd has no wire form for a tag");
 
     // Both sinks share one `Telemetry`, so the tag is counted once per sink.

@@ -448,7 +448,7 @@ async fn aggregate_carries_the_first_records_description_into_help() {
         .with_temporality(AggregateTemporality::Cumulative)
         .with_series_retention(5, 100);
     for (i, description) in ["Queue depth.", "A later description."].into_iter().enumerate() {
-        let gauge = record("depth", MetricKind::Gauge(i as f64), description);
+        let gauge = record("depth", MetricKind::gauge(i as f64), description);
         assert!(!tumbling.process(&resource, &mut Event::metric(0, AttrMap::new(), gauge)));
     }
     let to_batches = |flushed: logit_pipeline::FlushOutput| -> Vec<EventBatch> {

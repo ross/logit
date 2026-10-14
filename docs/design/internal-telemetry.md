@@ -770,7 +770,7 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 | `logit.input.connections.rejected{reason="limit"}` | count | a connection closed at the connection cap, before any TLS handshake |
 | `logit.input.connections.rejected{reason="proxy_header"}` | count | a connection under `proxy_protocol: true` whose PROXY header was missing, malformed, cut short by the peer closing, or not complete within `handshake_timeout`; read before any TLS handshake |
 | `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
-| `logit.input.connections.closed{reason="idle"\|"shutdown"}` | count | `idle`: an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. `shutdown`: an HTTP listener (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver) closed an open connection at shutdown, one count per connection whose close sequence finished before `run_input`'s backstop. It lands after the shutdown signal, so only a dedicated `internal` pipeline exports it (see "With a dedicated pipeline, `internal` drains last"). The stream listeners and `logit_in` don't count a shutdown close |
+| `logit.input.connections.closed{reason="idle"\|"shutdown"}` | count | `idle`: an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. `shutdown`: an HTTP listener (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver) closed an open connection at shutdown, one count per connection whose close sequence finished before `run_input`'s backstop. It lands after the shutdown signal, so only a dedicated `internal` pipeline exports it (see "With a dedicated pipeline, `internal` drains last"). The stream listeners and `logit_in` don't count a shutdown close |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
 | `logit.input.frames.dropped{reason="oversize"\|"drained"\|"malformed"\|"truncated"\|"undecodable"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses. `drained` is a line-framed listener's line that crossed its bound before its `LF` arrived: counted once, after which the connection discards input until its next `LF`. `undecodable` is a frame the decoder rejected whole (the `bad_frame` diagnostic): the only reason counted *after* `logit.input.frames`, so it is also in that count |
 
@@ -789,7 +789,7 @@ metric: a handshake failure surfaces as `connection_error`.
 `logit.input.accept.errors{reason}` and the `accept_error` key are not the driver's alone. Every
 connection-oriented listener records them from one shared helper, on each of its accept loops:
 this driver's TCP and Unix sockets, `logit_in`, `otlp_in`, `prometheus_in`'s bind mode,
-`datadog_in`, `datadog_trace_in`'s TCP and Unix sockets, and `splunk_hec_in`.
+`datadog_in`, `datadog_trace_in`'s TCP and Unix sockets, `splunk_hec_in`, and `influxdb_in`.
 
 There's no stream counterpart of `logit.input.reads`: a stream listener's reads aren't
 message-aligned, so a read count over a frame count wouldn't be a fill ratio of anything.
@@ -1276,6 +1276,40 @@ closes cleanly or resets before sending a request byte, after a complete PROXY h
 message text only, never a tag, and a token never appears at all), `busy` (a `503`), and
 `closed_consumer` (a `503` code 9 or `500` code 8).
 
+##### `influxdb_in`
+
+`crates/logit-inputs/src/influxdb.rs`, codec in `crates/logit-proto/src/influxdb/`,
+[ADR `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md).
+
+**The connection metrics are `splunk_hec_in`'s verbatim**, from the same accept loop and shared
+idle tracker: `logit.input.connections`, `logit.input.connections.rejected{reason="limit"}`,
+`logit.input.connections.closed{reason="idle"|"shutdown"}`, and the accept-queue gauges. Under
+`proxy_protocol: true`, `logit.input.connections.rejected{reason="proxy_header"}` counts a
+connection refused for its PROXY header.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, `busy` (a `503`), or `closed_consumer` (a `503`: no consumer took the batch); `route` is `write` (`/api/v2/write`), `ping`, `health`, or `unknown` for a path this listener doesn't serve |
+| `logit.input.request.duration` | timing | one per request, every exit included, time spent waiting on a busy downstream too |
+| `logit.input.request.bytes` | count | the body size as sent (before gzip decompression), once the body has been read |
+| `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `oversize` (`413`, as sent or decompressed), `auth` (`401`), `encoding` (`415`, anything but identity or lowercase gzip), `malformed_encoding` (`400`, a gzip stream that doesn't decompress), `precision` (`400`), `no_bucket` (`404`), `no_org` (`400`), `malformed` (`400`, a line that fails to parse), `stalled` (`408`, only with `idle_timeout:` set), or `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload) |
+| `logit.input.batches.deferred` | count | batches a busy `503` left with the client to resend, disjoint from `logit.component.batches.sent` |
+| `logit.input.batches.dropped{reason="closed_consumer"}` | count | batches no consumer took, answered `503`. The refused batch is also counted in `logit.component.batches.sent` and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}` |
+| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | tags the decoder left off a point because their key starts with `influxdb.`, which would collide with the carrier attributes. The point is delivered. Counted by the codec, under this component's id |
+
+**A busy request is not a lost one**, as on `splunk_hec_in`: after 5 seconds without the pipeline
+taking the request's batch, the request gets `503` with `Retry-After: 1`, counted `class="busy"`
+and `batches.deferred`, and nothing of it is delivered, so the client resends it whole. A
+request's body decodes to one batch, delivered all or nothing under one deadline.
+
+`Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a plaintext peer that
+closes cleanly or resets before sending a request byte, after a complete PROXY header under
+`proxy_protocol: true`), `proxy_header` (any `connections.rejected{reason="proxy_header"}`
+refusal), `forwarded` (under `forwarded:`, a request whose named header names no usable client; the
+header name and the reason appear in the message text, never the value), `request_rejected` (every
+rejection except `unknown_route` and `method`; the peer address appears in the message text only,
+never a tag, and a token never appears at all), `busy` (a `503`), and `closed_consumer` (a `503`).
+
 ##### `tail_in` and `docker_in`
 
 `crates/logit-inputs/src/tail/driver.rs`, `docker.rs`: one shared `Tailer<D, F>` driver.
@@ -1457,7 +1491,9 @@ Series retention across the window boundary comes from
 `docs/adr/aggregation-window-semantics.md`'s gauge-retention amendment and its cumulative
 amendment, which reuses the same two bounds and counters for a `temporality: cumulative`
 `Sum`/`Histogram`. Absorbing raw kinds comes from the same ADR's "raw samples and set members"
-amendment.
+amendment. A fold that changes a value's type counts
+`logit.transform.metrics.normalized{reason="widened"}`; see
+[Typed metric values](#typed-metric-values).
 
 `Diagnostics` keys: `series_retention_full` and `gauge_delta_unseeded` (mirroring the eviction and
 unseeded counters); `samples_rate_mismatch`, `samples_cap_exceeded`, `set_members_cap_exceeded`,
@@ -1723,6 +1759,20 @@ A script's `print(...)` is a self-log line, never stdout: `print: <arguments, ta
 runs before the id is known; `crates/logit-script/src/print.rs`). At `info` it sits below the
 lowest `logs:` threshold `internal` accepts, so it reaches the process log but never the pipeline.
 
+#### Typed metric values
+
+A `Gauge`, `GaugeDelta`, or `Sum` value is an `F64`, `I64`, `U64`, or `Bool`
+([ADR `typed-metric-scalar`](../adr/typed-metric-scalar.md)). One counter family on each side of
+the pipeline counts each place a value changes type or loses precision, one per record:
+
+| Name | Where | Meaning |
+|---|---|---|
+| `logit.transform.metrics.normalized{reason="widened"}` | `aggregate` | a fold whose result type differs from an operand's: a mixed-type pair, an integer overflow, or a `Bool` in the sum, with the result usually `F64` (`MetricValue::checked_add`'s table) |
+| `logit.transform.metrics.normalized{reason="inexact_read"}` | `lua`, `lua_file` | a script read an `I64` or `U64` value above 2^53 as a Lua number that isn't the same integer |
+| `logit.output.metrics.normalized{reason="bool_value"}` | every sink whose metric wire is numeric-only | a `Bool` written as `1` or `0`, because the wire has no boolean |
+| `logit.output.metrics.normalized{reason="u64_as_double"}` | `otlp_out`, `kafka_out` under `format: otlp_proto \| otlp_json` | a `U64` above `i64::MAX` written as `as_double`, because OTLP's `as_int` is signed |
+| `logit.output.metrics.normalized{reason="inexact"}` | `collectd_out` | an `I64` or `U64` gauge written as a collectd `GAUGE` double that isn't the same integer |
+
 #### Outputs
 
 Every sink's retry counting is layer 2 (`logit.component.retries`), not something each sink tracks
@@ -1813,15 +1863,33 @@ sinks tag one count per request with its status class or `network_error`
 
 ##### `influxdb_out`
 
-`crates/logit-outputs/src/influxdb.rs`.
+The sink is `crates/logit-outputs/src/influxdb.rs`; the encoder is `crates/logit-proto/src/influxdb/encode.rs`,
+whose `EncodeStats` is the source for the counters below. The sink emits them once per batch, however
+many attempts the runtime makes.
 
 - `logit.output.requests{class="2xx|4xx|5xx|network_error"}`, `logit.output.request.duration` (per
   attempt), and `logit.output.batch.bytes`: the encode and HTTP-response detail a generic
   `send.duration` timer can't distinguish.
-- `logit.output.tags.normalized{reason="multi_value"}`: a multi-valued tag (from a relayed,
-  repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) rendered as its last
-  representable element, once per attribute. Line protocol has no multi-value tag, so this is the
-  fallback. Lossy; see above.
+
+| Counter | What it counts |
+|---|---|
+| `logit.output.tags.normalized{reason="multi_value"}` | a multi-valued tag (from a relayed, repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) rendered as its last representable element, once per attribute. Line protocol has no multi-value tag, so this is the fallback. Lossy; see above |
+| `logit.output.tags.omitted{reason="unrepresentable"}` | a tag whose value has no plain-text form: `Null`, `Bytes`, `Timestamp`, `Map`, or an `Array` with no representable element |
+| `logit.output.tags.omitted{reason="empty"}` | a tag with an empty key or value, which `influxd` rejects |
+| `logit.output.tags.omitted{reason="unencodable"}` | a tag key or value with a newline, a trailing backslash, or a backslash before a space, which line protocol can't spell |
+| `logit.output.tags.omitted{reason="reserved"}` | a tag key `influxd` reserves: `_measurement`, `_field`, or `time` |
+| `logit.output.metrics.normalized{reason="carrier_mismatch"}` | a record on an `influxdb.measurement` carrier event that doesn't fit the carrier line (its name lacks the `<measurement>.` prefix, or its kind isn't a `Gauge` or `Sum`), written as its own line |
+| `logit.output.metrics.dropped{reason="unencodable_value"}` | a non-finite `Gauge` or `Sum` value, or carrier field |
+| `logit.output.metrics.dropped{reason="unencodable_key"}` | a measurement or field key with no line-protocol spelling, once per field |
+| `logit.output.metrics.dropped{reason="reserved_key"}` | a carrier field named `time`, which `influxd` refuses |
+| `logit.output.metrics.dropped{reason="oversize_value"}` | a string field over `influxd`'s 1 MiB field cap |
+| `logit.output.metrics.dropped{reason="no_fields"}` | a line left with no field: a `Histogram` with no finite bound, or a `Summary` with no finite quantile |
+| `logit.output.metrics.dropped{reason="comment_measurement"}` | a measurement starting with `#`, which `influxd` reads as a comment line |
+| `logit.output.metrics.dropped{reason="timestamp_overflow"}` | a series with no free timestamp slot left before `i64::MAX` |
+| `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | an unresolved `GaugeDelta` |
+| `logit.output.metrics.skipped{reason="no_recorded_value"}` | a record flagged `NO_RECORDED_VALUE`; line protocol has no "no reading" marker |
+| `logit.output.metrics.skipped{metric_kind="set_members"\|"exponential_histogram"}` | a kind with no line-protocol shape |
+
 - A `MetricKind::GaugeDelta` reaching this encoder unresolved means the pipeline is missing an
   `aggregate` component (`docs/adr/relative-gauge-adjustments.md`). It reports under its own
   `logit.component.diagnostics{key="gauge_delta_unresolved"}`, not the generic `encode_error` every
@@ -2349,7 +2417,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.input.stats.dropped{reason="malformed_payload"\|"malformed_bucket"\|"malformed_group"}` | count | an APM stats `ClientStatsPayload` (in an intake `StatsPayload`), bucket, or group that isn't a well-formed map, dropped while the rest decodes |
 | `logit.input.stats.skipped{reason="empty_bucket"}` | count | an APM stats bucket with no groups, which decodes to no events |
 | `logit.input.stats.dropped{reason="interpolation"\|"bad_sketch"}` | count | an `OkSummary`/`ErrorSummary` dropped from its group: an interpolated DDSketch mapping, which isn't implemented, or bytes that aren't a usable DDSketch |
-| `logit.input.stats.degraded{reason="unknown_trilean"\|"bucket_start_overflow"\|"inexact_count"}` | count | an `IsTraceRoot` outside 0 to 2 (dropped), a bucket `Start` above `i64::MAX` (clamped), or a count above 2^53 that `f64` can't hold exactly |
+| `logit.input.stats.degraded{reason="unknown_trilean"\|"bucket_start_overflow"}` | count | an `IsTraceRoot` outside 0 to 2 (dropped), or a bucket `Start` above `i64::MAX` (clamped) |
 | `logit.output.stats.dropped{reason="unrecognized_record"}` | count | a record on an APM stats event that is none of the six stats records, or one of their names with another kind |
 | `logit.output.stats.degraded{reason="fractional_count"\|"bad_count"\|"count_overflow"\|"negative_timestamp"}` | count | a stats count rounded to an integer, a negative or non-finite count sent as 0, a count above 2^64 sent as `u64::MAX`, or a negative timestamp sent as bucket start 0 |
 | `logit.output.stats.degraded{reason="agent_mapping"\|"bin_limit"\|"exact_summary"}` | count | a stats summary sent under the Agent mapping's logarithmic reading, with a bin limit other than 2048, or with an exact summary the DDSketch protobuf can't carry |

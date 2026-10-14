@@ -2071,7 +2071,8 @@ mod tests {
     /// request.
     fn nothing_to_send_batch() -> EventBatch {
         let name = logit_core::interner::intern("conns");
-        let delta = MetricRecord::new(name, MetricKind::GaugeDelta(5.0));
+        let delta =
+            MetricRecord::new(name, MetricKind::GaugeDelta(logit_core::MetricValue::F64(5.0)));
         EventBatch {
             resource: Arc::new(Resource::default()),
             scope: None,

@@ -186,8 +186,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     rename component (`set` only stamps constants).
   - **Revisit trigger:** either server turns out to matter; then build a native rename, or a
     preset.
-- **`forwarded:` trusts the header it names.** The five HTTP listeners (`otlp_in`, `datadog_in`,
-  `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver) and
+- **`forwarded:` trusts the header it names.** The six HTTP listeners (`otlp_in`, `datadog_in`,
+  `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver) and
   `http_access` each read the client from the leftmost entry of the one forwarding header
   `forwarded:` names, with no trusted-proxy list and no hop count
   ([ADR `forwarded-header-parsing`](../adr/forwarded-header-parsing.md)). That's right behind one

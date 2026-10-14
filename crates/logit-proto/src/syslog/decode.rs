@@ -1142,7 +1142,7 @@ mod tests {
             .flat_map(|e| &e.metrics)
             .filter(|m| logit_core::interner::resolve(m.name) == "logit.input.messages.dropped")
             .map(|m| match &m.kind {
-                logit_core::MetricKind::Sum(sum) => sum.value,
+                logit_core::MetricKind::Sum(sum) => sum.value.as_f64(),
                 other => panic!("messages.dropped must be a counter, got {other:?}"),
             })
             .sum()

@@ -15,14 +15,14 @@
 //! through all, matching Lua's reference semantics (`local e2 = event` aliases the event).
 
 use crate::value::{
-    attribute_error, attrmap_to_lua_table, exact_u64_to_lua, lua_to_value, lua_value_matches,
-    value_to_lua,
+    attribute_error, attrmap_to_lua_table, exact_i64_to_lua, exact_u64_to_lua, lua_to_value,
+    lua_value_matches, value_to_lua,
 };
 use logit_core::interner::{intern, resolve};
 use logit_core::trace::{parse_span_id, parse_trace_id, to_hex};
 use logit_core::{
-    Event, Exemplar, LogRecord, MetricKind, MetricRecord, SpanEvent, SpanLink, SpanRecord,
-    Temporality, TraceRef,
+    Event, Exemplar, LogRecord, MetricKind, MetricRecord, MetricValue, SpanEvent, SpanLink,
+    SpanRecord, Telemetry, Temporality, TraceRef,
 };
 use mlua::{
     AnyUserData, Lua, MetaMethod, RegistryKey, Table, UserData, UserDataMethods, Value as LuaValue,
@@ -805,6 +805,65 @@ fn opt_number<'lua>(v: Option<f64>) -> LuaValue<'lua> {
     }
 }
 
+/// A `sum`/`gauge`/`gauge_delta` value as the Lua number a script reads: `as_f64()`, so `Bool`
+/// reads as `0` or `1`. An integer above 2^53 that the double can't hold is counted
+/// `logit.transform.metrics.normalized{reason="inexact_read"}` on the worker's telemetry handle
+/// (`crate::ScriptWorker::with_telemetry`), once per read. It stays a number, unlike an attribute
+/// or a `count`, so arithmetic and comparison keep working (`docs/adr/typed-metric-scalar.md`'s
+/// "Lua sees a number").
+fn metric_value_to_lua<'lua>(lua: &'lua Lua, value: MetricValue) -> LuaValue<'lua> {
+    let (v, exact) = value.as_f64_exact();
+    if !exact {
+        if let Some(telemetry) = lua.app_data_ref::<Telemetry>() {
+            telemetry.count(
+                "logit.transform.metrics.normalized",
+                1.0,
+                &[("reason", "inexact_read")],
+            );
+        }
+    }
+    LuaValue::Number(v)
+}
+
+/// The value a `value` write stores. A number equal to `current.as_f64()` keeps `current`, variant
+/// and all, so `m.value = m.value` leaves an `I64`, a `U64` above 2^53, or a `Bool` untouched;
+/// any other number is an `F64`. This is its own check, not `lua_value_matches`: that compares
+/// against `value_to_lua`'s form, which isn't the form a metric value reads as.
+fn written_metric_value(
+    value: LuaValue,
+    current: MetricValue,
+    field: &str,
+) -> mlua::Result<MetricValue> {
+    let n = require_finite_number(value, field)?;
+    Ok(match n == current.as_f64() {
+        true => current,
+        false => MetricValue::F64(n),
+    })
+}
+
+/// A `sum`/`gauge`/`gauge_delta` value for `to_table()`: an `F64` as a number; an `I64` or `U64`
+/// as an integer up to 2^53 and a decimal string above it, the form an attribute and a `count`
+/// take, so `Event.new` rebuilds the same integer; a `Bool` as `0` or `1`. `to_table()` writes the
+/// matching `type` key beside every non-`F64` value.
+fn metric_value_to_table<'lua>(lua: &'lua Lua, value: MetricValue) -> mlua::Result<LuaValue<'lua>> {
+    match value {
+        MetricValue::F64(v) => Ok(LuaValue::Number(v)),
+        MetricValue::I64(v) => exact_i64_to_lua(lua, v),
+        MetricValue::U64(v) => exact_u64_to_lua(lua, v),
+        MetricValue::Bool(b) => Ok(LuaValue::Integer(i64::from(b))),
+    }
+}
+
+/// Sets `value`, and `type` for a non-`F64` value, on a `to_table()` metric table. An `F64` adds
+/// no key, so a float-only event's table costs what it did before `type` existed.
+fn set_metric_value(lua: &Lua, table: &Table, value: MetricValue) -> mlua::Result<()> {
+    table.set("value", metric_value_to_table(lua, value)?)?;
+    if !matches!(value, MetricValue::F64(_)) {
+        table.set("type", value.type_name())?;
+    }
+    Ok(())
+}
+
 /// A finite number for a `value` write. NaN and the infinities are errors rather than values a
 /// sink or `aggregate` must defend against.
 fn require_finite_number(value: LuaValue, field: &str) -> mlua::Result<f64> {
@@ -927,8 +986,10 @@ impl UserData for MetricProxy {
                     Ok(LuaValue::Table(t))
                 }
                 "value" => match &m.kind {
-                    MetricKind::Sum(s) => Ok(LuaValue::Number(s.value)),
-                    MetricKind::Gauge(v) | MetricKind::GaugeDelta(v) => Ok(LuaValue::Number(*v)),
+                    MetricKind::Sum(s) => Ok(metric_value_to_lua(lua, s.value)),
+                    MetricKind::Gauge(v) | MetricKind::GaugeDelta(v) => {
+                        Ok(metric_value_to_lua(lua, *v))
+                    }
                     _ => Ok(LuaValue::Nil),
                 },
                 "temporality" => match &m.kind {
@@ -1124,15 +1185,17 @@ impl UserData for MetricProxy {
                     }
                     "value" => match &mut m.kind {
                         MetricKind::Sum(s) => {
-                            s.value = require_finite_number(
+                            s.value = written_metric_value(
                                 value,
+                                s.value,
                                 &format!("event.metrics[{}].value", index + 1),
                             )?;
                             Ok(())
                         }
                         MetricKind::Gauge(v) => {
-                            *v = require_finite_number(
+                            *v = written_metric_value(
                                 value,
+                                *v,
                                 &format!("event.metrics[{}].value", index + 1),
                             )?;
                             Ok(())
@@ -1221,12 +1284,11 @@ fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<
 
     match &record.kind {
         MetricKind::Sum(s) => {
-            table.set("value", s.value)?;
+            set_metric_value(lua, &table, s.value)?;
             table.set("temporality", s.temporality.as_str())?;
             table.set("monotonic", s.monotonic)?;
         }
-        MetricKind::Gauge(v) => table.set("value", *v)?,
-        MetricKind::GaugeDelta(v) => table.set("value", *v)?,
+        MetricKind::Gauge(v) | MetricKind::GaugeDelta(v) => set_metric_value(lua, &table, *v)?,
         MetricKind::Samples(s) => {
             let values = lua.create_table()?;
             for (i, v) in s.values.iter().enumerate() {
@@ -1568,7 +1630,11 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn sum_kind() -> MetricKind {
-        MetricKind::Sum(Sum { value: 12.5, temporality: Temporality::Cumulative, monotonic: false })
+        MetricKind::Sum(Sum {
+            value: MetricValue::F64(12.5),
+            temporality: Temporality::Cumulative,
+            monotonic: false,
+        })
     }
 
     fn samples_kind() -> MetricKind {
@@ -1925,7 +1991,7 @@ pub(crate) mod tests {
             end
             "#,
         );
-        w.process(metric_event(MetricKind::Gauge(3.25))).unwrap();
+        w.process(metric_event(MetricKind::gauge(3.25))).unwrap();
     }
 
     #[test]
@@ -1940,7 +2006,7 @@ pub(crate) mod tests {
             end
             "#,
         );
-        w.process(metric_event(MetricKind::GaugeDelta(-1.5))).unwrap();
+        w.process(metric_event(MetricKind::GaugeDelta(MetricValue::F64(-1.5)))).unwrap();
 
         let w = worker(
             r#"
@@ -1950,7 +2016,7 @@ pub(crate) mod tests {
             end
             "#,
         );
-        let err = process_err(&w, metric_event(MetricKind::GaugeDelta(-1.5)));
+        let err = process_err(&w, metric_event(MetricKind::GaugeDelta(MetricValue::F64(-1.5))));
         assert!(err.contains("read-only on a gauge_delta metric"), "{err}");
     }
 
@@ -2176,7 +2242,7 @@ pub(crate) mod tests {
         let out = emitted(w.process(metric_event(sum_kind())).unwrap());
         match &out.metrics[0].kind {
             MetricKind::Sum(s) => {
-                assert_eq!(s.value, 99.0);
+                assert_eq!(s.value, MetricValue::F64(99.0));
                 assert_eq!(s.temporality, Temporality::Delta);
                 assert!(s.monotonic);
             }
@@ -2194,8 +2260,8 @@ pub(crate) mod tests {
             end
             "#,
         );
-        let out = emitted(w.process(metric_event(MetricKind::Gauge(1.0))).unwrap());
-        assert_eq!(out.metrics[0].kind, MetricKind::Gauge(7.5));
+        let out = emitted(w.process(metric_event(MetricKind::gauge(1.0))).unwrap());
+        assert_eq!(out.metrics[0].kind, MetricKind::gauge(7.5));
     }
 
     #[test]
@@ -2210,6 +2276,134 @@ pub(crate) mod tests {
         );
         let err = process_err(&w, metric_event(histogram_kind()));
         assert!(err.contains("read-only on a histogram metric"), "{err}");
+    }
+
+    /// `logit.transform.metrics.normalized{reason="inexact_read"}`'s total in `registry`.
+    fn inexact_reads(registry: &logit_core::Registry) -> f64 {
+        registry
+            .drain(0)
+            .iter()
+            .filter(|e| e.attributes.get("reason") == Some(&Value::from("inexact_read")))
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| resolve(m.name) == "logit.transform.metrics.normalized")
+            .map(|m| match m.kind {
+                MetricKind::Sum(s) => s.value.as_f64(),
+                ref other => panic!("expected a counter, got {other:?}"),
+            })
+            .sum()
+    }
+
+    #[test]
+    fn an_inexact_value_read_is_counted() {
+        let registry = logit_core::Registry::new();
+        let w = worker(
+            r#"
+            function process(event)
+                local _ = event.metrics[1].value
+                return event
+            end
+            "#,
+        )
+        .with_telemetry(registry.telemetry_for("script", "lua", "transform"))
+        .unwrap();
+        w.process(metric_event(MetricKind::Gauge(MetricValue::U64(1 << 53)))).unwrap();
+        assert_eq!(inexact_reads(&registry), 0.0, "2^53 is a Lua number");
+        w.process(metric_event(MetricKind::Gauge(MetricValue::U64((1 << 53) + 1)))).unwrap();
+        assert_eq!(inexact_reads(&registry), 1.0, "2^53 + 1 rounds");
+    }
+
+    #[test]
+    fn a_value_read_is_a_number_of_every_variant() {
+        let w = worker(
+            r#"
+            function process(event)
+                local v = event.metrics[1].value
+                event.attributes.read = v
+                event.attributes.read_type = type(v)
+                return event
+            end
+            "#,
+        );
+        for (value, read) in [
+            (MetricValue::Bool(true), Value::I64(1)),
+            (MetricValue::Bool(false), Value::I64(0)),
+            (MetricValue::I64(-4), Value::I64(-4)),
+            (MetricValue::U64(4), Value::I64(4)),
+            (MetricValue::F64(4.5), Value::F64(4.5)),
+        ] {
+            let out = emitted(w.process(metric_event(MetricKind::Gauge(value))).unwrap());
+            assert_eq!(out.attributes.get("read"), Some(&read), "{value:?}");
+            assert_eq!(out.attributes.get("read_type"), Some(&Value::from("number")));
+        }
+    }
+
+    #[test]
+    fn a_value_written_back_unchanged_keeps_its_variant() {
+        let w = worker(
+            r#"
+            function process(event)
+                local m = event.metrics[1]
+                m.value = m.value
+                return event
+            end
+            "#,
+        );
+        for value in [
+            MetricValue::I64(-4),
+            MetricValue::U64((1 << 53) + 1),
+            MetricValue::Bool(true),
+            MetricValue::F64(4.5),
+        ] {
+            for kind in [
+                MetricKind::Gauge(value),
+                MetricKind::Sum(Sum { value, temporality: Temporality::Delta, monotonic: true }),
+            ] {
+                let out = emitted(w.process(metric_event(kind.clone())).unwrap());
+                assert_eq!(out.metrics[0].kind, kind);
+            }
+        }
+    }
+
+    #[test]
+    fn a_changed_value_write_stores_f64() {
+        let w = worker(
+            r#"
+            function process(event)
+                local m = event.metrics[1]
+                m.value = m.value + 1
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(metric_event(MetricKind::Gauge(MetricValue::I64(4)))).unwrap());
+        assert_eq!(out.metrics[0].kind, MetricKind::Gauge(MetricValue::F64(5.0)));
+        let out =
+            emitted(w.process(metric_event(MetricKind::Gauge(MetricValue::Bool(false)))).unwrap());
+        assert_eq!(out.metrics[0].kind, MetricKind::Gauge(MetricValue::F64(1.0)));
+    }
+
+    #[test]
+    fn to_table_names_a_non_f64_value_type() {
+        let w = worker(
+            r#"
+            function process(event)
+                local m = event:to_table().metrics[1]
+                event.attributes.value = m.value
+                event.attributes.type = m.type or "absent"
+                return event
+            end
+            "#,
+        );
+        for (value, read, type_name) in [
+            (MetricValue::F64(4.5), Value::F64(4.5), "absent"),
+            (MetricValue::I64(-4), Value::I64(-4), "i64"),
+            (MetricValue::U64(u64::MAX), Value::from("18446744073709551615"), "u64"),
+            (MetricValue::Bool(true), Value::I64(1), "bool"),
+        ] {
+            let out = emitted(w.process(metric_event(MetricKind::Gauge(value))).unwrap());
+            assert_eq!(out.attributes.get("value"), Some(&read), "{value:?}");
+            assert_eq!(out.attributes.get("type"), Some(&Value::from(type_name)));
+        }
     }
 
     #[test]

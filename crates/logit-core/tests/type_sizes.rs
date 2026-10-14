@@ -13,8 +13,9 @@
 #![cfg(target_pointer_width = "64")]
 
 use logit_core::{
-    AttrMap, DdSketch, Event, LogRecord, MetricKind, MetricList, MetricRecord, Provenance,
-    Resource, Samples, Scope, SpanExt, SpanRecord, Symbol, TraceRef, Value, SAMPLES_INLINE,
+    AttrMap, DdSketch, Event, LogRecord, MetricKind, MetricList, MetricRecord, MetricValue,
+    Provenance, Resource, Samples, Scope, SpanExt, SpanRecord, Sum, Symbol, TraceRef, Value,
+    SAMPLES_INLINE,
 };
 use std::mem::{size_of, size_of_val};
 
@@ -59,6 +60,20 @@ fn attr_map_pays_its_inline_capacity_whether_or_not_it_spills() {
         spilled.insert(&format!("k{i}"), Value::I64(i));
     }
     assert_eq!(size_of_val(&spilled), size_of::<AttrMap>());
+}
+
+/// The scalar `Gauge`, `GaugeDelta`, and `Sum` carry: an 8-byte payload and a discriminant padded to
+/// its alignment. `Sum` adds two one-byte fields, padded to 24. Both stay well under `Samples`, so
+/// neither moves `MetricKind`.
+#[test]
+fn metric_value_is_an_eight_byte_payload_plus_a_discriminant() {
+    assert_eq!(size_of::<MetricValue>(), 16);
+    assert_eq!(
+        size_of::<Sum>(),
+        24,
+        "value: MetricValue (16) + temporality: Temporality (1) + monotonic: bool (1), padded to \
+         MetricValue's 8-byte alignment"
+    );
 }
 
 /// `MetricKind`'s two largest variants, sized to match: `Distribution` inlines a `DdSketch`, now

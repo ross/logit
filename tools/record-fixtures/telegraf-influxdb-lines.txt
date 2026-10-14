@@ -1,0 +1,15 @@
+# Read by Telegraf's inputs.file (data_format = "influx") on every collection. Telegraf parses
+# each line and its output serializer writes it back, so what reaches the capture is Telegraf's
+# own escaping and field ordering, not this file's bytes.
+interop_types,kind=all b_true=true,b_false=false,i_pos=42i,i_neg=-7i,i_max=9223372036854775807i,u_big=18446744073709551615u,u_small=3u,f_plain=1.5,f_exp=1.5e-7,f_neg=-0.25,s_plain="hello" 1700000000000000000
+interop_multi,host=fixture-a,region=eu a=1i,b=2.5,c=true,d="four",e=5u 1700000000000000000
+interop_multi,host=fixture-b,region=us a=10i,b=25.5,c=false,d="forty",e=50u 1700000000000000000
+interop_dup,id=1 v=1i 1700000000000000000
+interop_dup,id=1 v=2i 1700000000000000000
+interop_dup,id=1 w=3i 1700000000000000000
+interop_escapes,tag\ space=a\ b,tag\,comma=c\,d,tag\=eq=e\=f,plain=x v=1i,f\ s=2i,f\,c=3i,f\=e=4i 1700000000000000000
+interop_escapes\ and\,more,t=v n=1i 1700000000000000000
+interop_strings,kind=quotes s_quote="say \"hi\"",s_slash="back\\slash",s_both="a\\\"b\\\\",s_comma="a, b=c d" 1700000000000000000
+interop_strings,kind=newline s_nl="line1
+line2" 1700000000000000000
+interop_unicode,tag=héllo s="日本語" 1700000000000000000

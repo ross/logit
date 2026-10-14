@@ -327,7 +327,7 @@ fn the_agent_series_carry_the_dogstatsd_clients_metrics() {
     assert_eq!(str_attr(rate, "env"), Some("record"));
 
     let gauge = by_name["record.queue.depth"];
-    assert_eq!(gauge.metrics[0].kind, MetricKind::Gauge(17.0));
+    assert_eq!(gauge.metrics[0].kind, MetricKind::gauge(17.0));
     assert_eq!(str_attr(gauge, ATTR_TYPE), None, "a plain gauge carries no type carrier");
 
     for aggregate in ["avg", "count", "max", "median", "95percentile"] {
@@ -336,14 +336,14 @@ fn the_agent_series_carry_the_dogstatsd_clients_metrics() {
             assert!(by_name.contains_key(&name), "{name} missing: {:?}", by_name.keys());
         }
     }
-    assert_eq!(by_name["record.users.active"].metrics[0].kind, MetricKind::Gauge(1.0));
+    assert_eq!(by_name["record.users.active"].metrics[0].kind, MetricKind::gauge(1.0));
 
     let lagged: Vec<&Event> =
         events(&series).filter(|e| metric_name(e) == "record.batch.lag").collect();
     assert_eq!(lagged.len(), 3, "one `|T` gauge per transport");
     for event in lagged {
         assert_eq!(event.timestamp, 1_790_000_000_000_000_000, "the client's own timestamp");
-        assert_eq!(event.metrics[0].kind, MetricKind::Gauge(2.5));
+        assert_eq!(event.metrics[0].kind, MetricKind::gauge(2.5));
     }
 }
 
@@ -373,7 +373,7 @@ fn the_agent_service_check_ends_its_message_at_the_next_pipe() {
         events(&batches).filter(|e| metric_name(e) == "record.can_connect").collect();
     assert_eq!(checks.len(), 3, "one per transport");
     for check in checks {
-        assert_eq!(check.metrics[0].kind, MetricKind::Gauge(1.0), "status WARNING");
+        assert_eq!(check.metrics[0].kind, MetricKind::gauge(1.0), "status WARNING");
         assert_eq!(str_attr(check, "statsd.service_check.message"), Some("slow upstream"));
         assert_eq!(str_attr(check, "statsd.service_check.host"), Some("record-host"));
     }

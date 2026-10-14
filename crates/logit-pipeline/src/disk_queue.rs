@@ -1971,8 +1971,8 @@ pub(crate) mod test_support {
             .flat_map(|e| e.metrics.iter())
             .filter(|m| m.name == name_sym)
             .map(|m| match &m.kind {
-                logit_core::MetricKind::Sum(s) => s.value,
-                logit_core::MetricKind::Gauge(v) => *v,
+                logit_core::MetricKind::Sum(s) => s.value.as_f64(),
+                logit_core::MetricKind::Gauge(v) => v.as_f64(),
                 _ => 0.0,
             })
             .sum()

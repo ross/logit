@@ -97,6 +97,7 @@
 //! |---|---|---|
 //! | `Sum{Delta, monotonic}` | series `count`, `interval` from [`ATTR_INTERVAL`], else `0` | -- |
 //! | `Gauge` | series `gauge`; `rate` or unspecified when [`ATTR_TYPE`] says so | -- |
+//! | a `Sum` or `Gauge` value of `I64`/`U64`/`Bool` | the point's double: an integer's nearest `f64`, a `Bool` `1` or `0` | `logit.output.metrics.normalized{reason="bool_value"}` for a `Bool` |
 //! | `Set` | series `gauge` of `estimate()`, the Agent's `s` | `logit.output.metrics.degraded{reason="set_estimate"}` |
 //! | `Samples` | a distribution point only; with `sample_rate < 1`, each value repeated `weight()` times, because the route has no rate | `degraded{reason="sample_rate_expanded"}` |
 //! | `Distribution` under `Mapping::agent` | a sketch only: `Dogsketch{ts, cnt, min, max, avg: sum/cnt, sum, k, n}`, `k` ascending (negative bins from the largest magnitude as `-key`, then `0`, then positive), a count above 65535 split into repeated entries | -- |
@@ -402,7 +403,7 @@
 //! | an unknown key; a `nil` value | skipped; the field's zero value (msgp's own rules) | -- |
 //! | one `ClientGroupedStats` of a bucket | one `Event::metric`; `timestamp` = the bucket's `Start` (ns) | a `Start` above `i64::MAX`: clamped, `logit.input.stats.degraded{reason="bucket_start_overflow"}` |
 //! | a bucket with no groups | nothing | `logit.input.stats.skipped{reason="empty_bucket"}` |
-//! | `Hits`, `Errors`, `TopLevelHits` | `datadog.stats.hits`, `.errors`, `.top_level_hits`: delta monotonic `Sum` of the `uint64` as `f64`, always present | above 2^53 and not exactly representable: `degraded{reason="inexact_count"}` |
+//! | `Hits`, `Errors`, `TopLevelHits` | `datadog.stats.hits`, `.errors`, `.top_level_hits`: delta monotonic `Sum` of the `uint64` as `U64`, exact, always present | -- |
 //! | `Duration` | `datadog.stats.duration`: the same, unit `ns` | the same |
 //! | `OkSummary`, `ErrorSummary` | `datadog.stats.ok_summary`, `.error_summary`: `Distribution` under `Mapping::logarithmic(gamma, indexOffset, 2048)`, sparse `binCounts` and `contiguousBinCounts` both read (a key in both sums), `zeroCount`; the summary (`count`/`min`/`max`/`sum`) derived from the bins; absent when the wire bytes are empty | -- |
 //! | a summary whose `interpolation` isn't `NONE` | that record dropped; its keys aren't the logarithmic mapping's, and decoding them isn't implemented | `logit.input.stats.dropped{reason="interpolation"}` |
@@ -435,7 +436,7 @@
 //! |---|---|---|
 //! | a group attribute (the event's, else the resource's) | its field above; `""`, `0`, `false`, or `[]` when absent | a value of the wrong type: `logit.output.tags.omitted{reason="unrepresentable"}` |
 //! | any other event attribute; a resource attribute that is none of the fields above (`datadog.agent.*` and the two envelope flags count on the v0.6 route, which has no envelope) | omitted | `tags.omitted{reason="no_wire_form"}`, one per attribute (a resource's once per body) |
-//! | a delta `Sum` hits/errors/top-level-hits/duration | `uint64`, rounded to the nearest integer | a fraction: `logit.output.stats.degraded{reason="fractional_count"}`; negative or non-finite: `0`, `degraded{reason="bad_count"}`; above 2^64: `u64::MAX`, `degraded{reason="count_overflow"}` |
+//! | a delta `Sum` hits/errors/top-level-hits/duration | `uint64`: a `U64` or non-negative `I64` as is, a `Bool` as `1` or `0`, an `F64` rounded to the nearest integer | a `Bool`: `logit.output.metrics.normalized{reason="bool_value"}`; a negative `I64`: `0`, `degraded{reason="bad_count"}`; a fraction: `logit.output.stats.degraded{reason="fractional_count"}`; negative or non-finite: `0`, `degraded{reason="bad_count"}`; above 2^64: `u64::MAX`, `degraded{reason="count_overflow"}` |
 //! | an ok/error summary `Distribution` under a logarithmic mapping | a DDSketch protobuf: its `gamma` and `indexOffset`, `interpolation: NONE`, both stores as sparse `binCounts` in ascending key order, `zeroCount`. Hand-encoded, since prost's `HashMap` would order the bins at random | a bin limit other than 2048 (a receiver collapses at 2048): `degraded{reason="bin_limit"}`; a summary tracked from observations (`stats_exact`), which the protobuf has no field for: `degraded{reason="exact_summary"}` |
 //! | the same under `Mapping::agent` | `gamma = 1.015625`, `indexOffset = bias + 0.5`, keys unchanged: Datadog's own conversion, reading the Agent's round-half-to-even key as the logarithmic floor. Only a value on an exact tie keys differently, and the exact summary is lost | `degraded{reason="agent_mapping"}` |
 //! | a record of another name, or a known name of another kind (a cumulative `Sum`, say) | dropped | `logit.output.stats.dropped{reason="unrecognized_record"}` |
@@ -445,7 +446,7 @@
 //!
 //! `datadog_in -> datadog_out` on one stats route, and `datadog_trace_in -> datadog_trace_out` on
 //! `/v0.6/stats`, is a fixed point modulo this list (`tests/datadog_stats_fixed_point.rs` pins
-//! items 1-5):
+//! items 1-4):
 //!
 //! 1. every map key is written, in Go field order, zero values included: a tracer's omitted key or
 //!    `nil` leaves as the explicit zero value, and an unknown key is dropped;
@@ -455,8 +456,7 @@
 //!    merge, their groups in first-seen order;
 //! 4. an intake `StatsPayload` leaves as one `StatsPayload` per `ClientStatsPayload` (batching),
 //!    its envelope restated on each;
-//! 5. a count above 2^53 that `f64` can't hold exactly is rounded, and counted;
-//! 6. on `/v0.6/stats`, a `Lang`, `TracerVersion`, or `ContainerID` the payload left empty leaves
+//! 5. on `/v0.6/stats`, a `Lang`, `TracerVersion`, or `ContainerID` the payload left empty leaves
 //!    in the payload when the request's matching header carried it, as it does behind an Agent.
 
 pub mod generated;
@@ -887,7 +887,7 @@ mod tests {
                 AttrMap::new(),
                 logit_core::MetricRecord::new(
                     logit_core::interner::intern("m"),
-                    MetricKind::Gauge(1.0),
+                    MetricKind::gauge(1.0),
                 ),
             ),
         ]);

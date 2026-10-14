@@ -15,6 +15,12 @@
 //! Per kind:
 //! - `Sum{value,temporality,monotonic}` → `Sum`: exact; carries `record.exemplars`.
 //! - `Gauge(v)` → `Gauge`: exact; carries exemplars.
+//!
+//! A `Sum` or `Gauge` value is a `NumberDataPoint`'s `as_int` or `as_double` by its
+//! `MetricValue` type: `F64` → `as_double`, `I64` → `as_int`, a `U64` that fits an `int64` →
+//! `as_int`. A `U64` above `i64::MAX` has no integer form and leaves as `as_double`, counted
+//! `logit.output.metrics.normalized{reason="u64_as_double"}`; a `Bool` leaves as `as_int` `0` or
+//! `1`, counted `logit.output.metrics.normalized{reason="bool_value"}`.
 //! - `Histogram{buckets,temporality,sum,min,max}` → `Histogram`: exact. `buckets` holds per-bucket
 //!   counts, not cumulative ones, and a trailing `f64::INFINITY` bound becomes the implicit final
 //!   bucket `explicit_bounds` expects. Carries exemplars.
@@ -50,8 +56,9 @@
 //! sketch, a mergeable cardinality estimator) can't all be re-expressed *as* OTLP.
 //!
 //! **Decode.** `Sum` → `MetricKind::Sum{value,temporality,monotonic}` from real fields; a
-//! cumulative `Sum` stays a `Sum`. `Histogram` → `Histogram{buckets,temporality,sum,min,max}`,
-//! rebuilding the trailing infinite bucket when `bucket_counts` has one more entry than
+//! cumulative `Sum` stays a `Sum`. A `NumberDataPoint`'s `as_int` decodes as `MetricValue::I64`
+//! and `as_double` as `F64`, so `otlp_in -> otlp_out` keeps an integer point an integer.
+//! `Histogram` → `Histogram{buckets,temporality,sum,min,max}`, rebuilding the trailing infinite bucket when `bucket_counts` has one more entry than
 //! `explicit_bounds` (the OTLP-mandated shape). `Summary` → `Summary{quantiles,count,sum}`, each quantile read with no range check.
 //! `ExponentialHistogram` → `ExponentialHistogram` field for field (scale, zero count and
 //! threshold, positive and negative offset and bucket counts, temporality, count, sum/min/max),
@@ -78,7 +85,7 @@ use crate::otlp::generated::opentelemetry::proto::metrics::v1 as pb;
 use logit_core::interner::{intern, resolve};
 use logit_core::{
     AttrMap, DdSketch, Diagnostics, Event, Exemplar, ExpHistogram, Histogram, MetricKind,
-    MetricRecord, Sum, Summary, Telemetry, Temporality, TraceRef,
+    MetricRecord, MetricValue, Sum, Summary, Telemetry, Temporality, TraceRef,
 };
 
 /// The quantiles every sketch-to-quantiles degradation in this crate reports. `crate::prometheus`
@@ -154,7 +161,8 @@ fn number_data_point(
     ts: u64,
     flags: u32,
     exemplars: Vec<pb::Exemplar>,
-    value: f64,
+    value: MetricValue,
+    telemetry: &Telemetry,
 ) -> pb::NumberDataPoint {
     pb::NumberDataPoint {
         attributes,
@@ -162,15 +170,41 @@ fn number_data_point(
         time_unix_nano: ts,
         exemplars,
         flags,
-        value: Some(pb::number_data_point::Value::AsDouble(value)),
+        value: Some(number_to_pb(value, telemetry)),
     }
 }
 
-fn number_value(value: Option<pb::number_data_point::Value>) -> f64 {
+/// A scalar's `NumberDataPoint.value`: `as_int` for an integer that fits an `int64`, else
+/// `as_double`. A `U64` above `i64::MAX` and a `Bool` (as `0` or `1`) are counted.
+fn number_to_pb(value: MetricValue, telemetry: &Telemetry) -> pb::number_data_point::Value {
+    use pb::number_data_point::Value as V;
     match value {
-        Some(pb::number_data_point::Value::AsDouble(d)) => d,
-        Some(pb::number_data_point::Value::AsInt(i)) => i as f64,
-        None => 0.0,
+        MetricValue::F64(v) => V::AsDouble(v),
+        MetricValue::I64(v) => V::AsInt(v),
+        MetricValue::U64(v) => match i64::try_from(v) {
+            Ok(v) => V::AsInt(v),
+            Err(_) => {
+                telemetry.count(
+                    "logit.output.metrics.normalized",
+                    1.0,
+                    &[("reason", "u64_as_double")],
+                );
+                V::AsDouble(v as f64)
+            }
+        },
+        MetricValue::Bool(b) => {
+            telemetry.count("logit.output.metrics.normalized", 1.0, &[("reason", "bool_value")]);
+            V::AsInt(i64::from(b))
+        }
+    }
+}
+
+/// `as_int` decodes as `I64` and `as_double` as `F64`; a point with neither is `F64(0.0)`.
+fn number_value(value: Option<pb::number_data_point::Value>) -> MetricValue {
+    match value {
+        Some(pb::number_data_point::Value::AsDouble(d)) => MetricValue::F64(d),
+        Some(pb::number_data_point::Value::AsInt(i)) => MetricValue::I64(i),
+        None => MetricValue::F64(0.0),
     }
 }
 
@@ -199,6 +233,7 @@ pub(crate) fn encode_metric(
                 record.flags,
                 exemplars,
                 s.value,
+                telemetry,
             )],
             aggregation_temporality: temporality_to_pb(s.temporality),
             is_monotonic: s.monotonic,
@@ -211,6 +246,7 @@ pub(crate) fn encode_metric(
                 record.flags,
                 exemplars,
                 *v,
+                telemetry,
             )],
         }),
         MetricKind::Histogram(h) => {
@@ -548,9 +584,39 @@ mod tests {
             pb::metric::Data::Sum(sum) => {
                 assert!(sum.is_monotonic);
                 assert_eq!(sum.aggregation_temporality, pb::AggregationTemporality::Delta as i32);
-                assert_eq!(number_value(sum.data_points[0].value), 3.0);
+                assert_eq!(number_value(sum.data_points[0].value), MetricValue::F64(3.0));
             }
             other => panic!("expected Sum, got {other:?}"),
+        }
+    }
+
+    /// Each `MetricValue` picks its `NumberDataPoint` arm; a `U64` above `i64::MAX` and a `Bool`
+    /// are counted under their own reasons.
+    #[test]
+    fn a_scalar_encodes_as_int_or_as_double_by_its_type() {
+        use pb::number_data_point::Value as V;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
+        let cases = [
+            (MetricValue::F64(1.5), V::AsDouble(1.5), None),
+            (MetricValue::I64(-3), V::AsInt(-3), None),
+            (MetricValue::U64(i64::MAX as u64), V::AsInt(i64::MAX), None),
+            (MetricValue::U64(u64::MAX), V::AsDouble(u64::MAX as f64), Some("u64_as_double")),
+            (MetricValue::Bool(true), V::AsInt(1), Some("bool_value")),
+        ];
+        for (value, expected, reason) in cases {
+            let mut diag = Diagnostics::default();
+            let metric =
+                encode_metric(&event(), &record(MetricKind::Gauge(value)), &telemetry, &mut diag)
+                    .unwrap();
+            let Some(pb::metric::Data::Gauge(gauge)) = metric.data else { panic!("not a Gauge") };
+            assert_eq!(gauge.data_points[0].value, Some(expected), "{value:?}");
+            let counted: Vec<String> = registry
+                .drain(0)
+                .iter()
+                .filter_map(|e| e.attributes.get("reason")?.as_str().map(str::to_string))
+                .collect();
+            assert_eq!(counted, reason.map(str::to_string).into_iter().collect::<Vec<_>>());
         }
     }
 
@@ -558,7 +624,7 @@ mod tests {
     #[test]
     fn a_cumulative_non_monotonic_sum_round_trips_both_flags() {
         let kind = MetricKind::Sum(Sum {
-            value: 7.0,
+            value: MetricValue::F64(7.0),
             temporality: Temporality::Cumulative,
             monotonic: false,
         });
@@ -576,7 +642,7 @@ mod tests {
         let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
         match &events[0].metrics[0].kind {
             MetricKind::Sum(s) => {
-                assert_eq!(s.value, 7.0);
+                assert_eq!(s.value, MetricValue::F64(7.0));
                 assert_eq!(s.temporality, Temporality::Cumulative);
                 assert!(!s.monotonic);
             }
@@ -586,9 +652,11 @@ mod tests {
 
     #[test]
     fn a_gauge_encodes_to_a_gauge() {
-        let metric = encode(MetricKind::Gauge(4.5)).unwrap();
+        let metric = encode(MetricKind::gauge(4.5)).unwrap();
         match metric.data.unwrap() {
-            pb::metric::Data::Gauge(g) => assert_eq!(number_value(g.data_points[0].value), 4.5),
+            pb::metric::Data::Gauge(g) => {
+                assert_eq!(number_value(g.data_points[0].value), MetricValue::F64(4.5))
+            }
             other => panic!("expected Gauge, got {other:?}"),
         }
     }
@@ -857,8 +925,12 @@ mod tests {
         let diag_registry = Registry::new();
         let mut diag = Diagnostics::new("otlp_out")
             .with_telemetry(diag_registry.telemetry_for("otlp_out", "otlp_out", "diag"));
-        let result =
-            encode_metric(&event(), &record(MetricKind::GaugeDelta(5.0)), &telemetry, &mut diag);
+        let result = encode_metric(
+            &event(),
+            &record(MetricKind::GaugeDelta(MetricValue::F64(5.0))),
+            &telemetry,
+            &mut diag,
+        );
         assert!(result.is_none(), "a GaugeDelta metric must not produce a Metric at all");
         let events = registry.drain(0);
         let points = |name: &str, (key, value): (&str, &str)| {
@@ -888,7 +960,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0].metrics[0].kind {
             MetricKind::Sum(s) => {
-                assert_eq!(s.value, 3.0);
+                assert_eq!(s.value, MetricValue::F64(3.0));
                 assert_eq!(s.temporality, Temporality::Delta);
                 assert!(s.monotonic);
             }
@@ -904,7 +976,15 @@ mod tests {
             unit: String::new(),
             metadata: Vec::new(),
             data: Some(pb::metric::Data::Sum(pb::Sum {
-                data_points: vec![number_data_point(Vec::new(), 1000, 1000, 0, Vec::new(), 7.0)],
+                data_points: vec![number_data_point(
+                    Vec::new(),
+                    1000,
+                    1000,
+                    0,
+                    Vec::new(),
+                    MetricValue::F64(7.0),
+                    &Telemetry::default(),
+                )],
                 aggregation_temporality: pb::AggregationTemporality::Cumulative as i32,
                 is_monotonic: true,
             })),
@@ -913,7 +993,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0].metrics[0].kind {
             MetricKind::Sum(s) => {
-                assert_eq!(s.value, 7.0);
+                assert_eq!(s.value, MetricValue::F64(7.0));
                 assert_eq!(s.temporality, Temporality::Cumulative);
                 assert!(s.monotonic);
             }
@@ -923,10 +1003,10 @@ mod tests {
 
     #[test]
     fn a_gauge_decodes_as_a_gauge() {
-        let metric = encode(MetricKind::Gauge(1.5)).unwrap();
+        let metric = encode(MetricKind::gauge(1.5)).unwrap();
         let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
         match &events[0].metrics[0].kind {
-            MetricKind::Gauge(v) => assert_eq!(*v, 1.5),
+            MetricKind::Gauge(v) => assert_eq!(*v, MetricValue::F64(1.5)),
             other => panic!("expected Gauge, got {other:?}"),
         }
     }
@@ -960,7 +1040,7 @@ mod tests {
     /// A `NO_RECORDED_VALUE` point is kept, flagged, not skipped.
     #[test]
     fn a_no_recorded_value_flag_keeps_the_point_flagged_rather_than_skipping_it() {
-        let mut metric = encode(MetricKind::Gauge(1.0)).unwrap();
+        let mut metric = encode(MetricKind::gauge(1.0)).unwrap();
         if let Some(pb::metric::Data::Gauge(g)) = &mut metric.data {
             g.data_points[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         }
@@ -975,7 +1055,7 @@ mod tests {
         let flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         let kinds = [
             MetricKind::counter(1.0),
-            MetricKind::Gauge(2.0),
+            MetricKind::gauge(2.0),
             MetricKind::Histogram(histogram(Temporality::Delta)),
             MetricKind::ExponentialHistogram(exp_histogram(Temporality::Delta)),
             MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 }),
@@ -1004,7 +1084,7 @@ mod tests {
 
     #[test]
     fn a_non_zero_start_timestamp_is_preferred_over_the_events_timestamp() {
-        let mut rec = record(MetricKind::Gauge(1.0));
+        let mut rec = record(MetricKind::gauge(1.0));
         rec.start_timestamp = 500;
         let mut diag = Diagnostics::default();
         let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
@@ -1020,7 +1100,7 @@ mod tests {
 
     #[test]
     fn a_zero_start_timestamp_stays_zero_on_the_wire() {
-        let rec = record(MetricKind::Gauge(1.0)); // start_timestamp: 0 (unknown)
+        let rec = record(MetricKind::gauge(1.0)); // start_timestamp: 0 (unknown)
         let mut diag = Diagnostics::default();
         let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
         match &metric.data {
@@ -1037,7 +1117,7 @@ mod tests {
 
     #[test]
     fn a_description_round_trips_when_present_and_is_empty_when_absent() {
-        let mut rec = record(MetricKind::Gauge(1.0));
+        let mut rec = record(MetricKind::gauge(1.0));
         rec.description = Some(intern("a metric description"));
         let mut diag = Diagnostics::default();
         let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
@@ -1045,7 +1125,7 @@ mod tests {
         let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
         assert_eq!(events[0].metrics[0].description.map(resolve), Some("a metric description"));
 
-        let no_description = record(MetricKind::Gauge(1.0));
+        let no_description = record(MetricKind::gauge(1.0));
         let mut diag = Diagnostics::default();
         let metric =
             encode_metric(&event(), &no_description, &Telemetry::default(), &mut diag).unwrap();
@@ -1070,7 +1150,7 @@ mod tests {
     fn exemplars_round_trip_for_sum_gauge_histogram_and_exponential_histogram() {
         let kinds = [
             MetricKind::counter(1.0),
-            MetricKind::Gauge(2.0),
+            MetricKind::gauge(2.0),
             MetricKind::Histogram(histogram(Temporality::Delta)),
             MetricKind::ExponentialHistogram(exp_histogram(Temporality::Delta)),
         ];
@@ -1117,8 +1197,16 @@ mod tests {
             prop_oneof![Just(Temporality::Delta), Just(Temporality::Cumulative)]
         }
 
+        /// `F64` and `I64` only: a `U64` decodes back as `I64` and a `Bool` as `I64` `0`/`1`.
+        fn arb_value() -> impl Strategy<Value = MetricValue> {
+            prop_oneof![
+                (-1e6f64..1e6f64).prop_map(MetricValue::F64),
+                any::<i64>().prop_map(MetricValue::I64),
+            ]
+        }
+
         fn arb_sum() -> impl Strategy<Value = Sum> {
-            (-1e6f64..1e6f64, arb_temporality(), any::<bool>())
+            (arb_value(), arb_temporality(), any::<bool>())
                 .prop_map(|(value, temporality, monotonic)| Sum { value, temporality, monotonic })
         }
 
@@ -1153,7 +1241,7 @@ mod tests {
         fn arb_kind() -> impl Strategy<Value = MetricKind> {
             prop_oneof![
                 arb_sum().prop_map(MetricKind::Sum),
-                (-1e6f64..1e6f64).prop_map(MetricKind::Gauge),
+                arb_value().prop_map(MetricKind::Gauge),
                 arb_histogram().prop_map(MetricKind::Histogram),
                 arb_summary().prop_map(MetricKind::Summary),
             ]

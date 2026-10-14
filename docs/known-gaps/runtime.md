@@ -133,9 +133,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     fix then is a test that doesn't depend on a thread-local subscriber, such as one reading
     `Diagnostics::occurrences`.
 - **`logit_in` doesn't record the sending peer's address.** Every other network listener takes
-  `peer:` and, on TCP, `proxy_protocol:`: those on the shared socket drivers and the five HTTP
-  listeners (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s
-  remote-write receiver), which also take `forwarded:`
+  `peer:` and, on TCP, `proxy_protocol:`: those on the shared socket drivers and the six HTTP
+  listeners (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and
+  `prometheus_in`'s remote-write receiver), which also take `forwarded:`
   ([ADR `listener-peer-address`](../adr/listener-peer-address.md)). `logit_in` accepts its
   connections itself, takes none of the three, and stamps no `network.peer.*` or `client.*`.
   - **Consequence:** a pipeline can't tell which of several `logit_out` senders on one `logit_in`

@@ -82,7 +82,7 @@ fn a_datadog_event_never_leaves_as_a_log() {
 #[test]
 fn a_service_checks_later_metrics_still_leave_as_series() {
     let mut batch = checks();
-    batch.events[0].metrics.push(MetricRecord::new(intern("db.latency"), MetricKind::Gauge(3.5)));
+    batch.events[0].metrics.push(MetricRecord::new(intern("db.latency"), MetricKind::gauge(3.5)));
     for (route, body) in series_routes(&batch) {
         let body = body.unwrap_or_else(|| panic!("{route}: the appended metric was dropped"));
         let relayed = decode_series(route, &body);
@@ -90,7 +90,7 @@ fn a_service_checks_later_metrics_still_leave_as_series() {
         let metrics = &relayed.events[0].metrics;
         assert_eq!(metrics.len(), 1);
         assert_eq!(resolve(metrics[0].name), "db.latency", "{route}");
-        assert_eq!(metrics[0].kind, MetricKind::Gauge(3.5), "{route}");
+        assert_eq!(metrics[0].kind, MetricKind::gauge(3.5), "{route}");
         // The check's own carriers stay with the check: rendered as tags, they would make the
         // relayed series decode as a service check and vanish from the series route next hop.
         let attrs = &relayed.events[0].attributes;
@@ -175,7 +175,7 @@ fn apm_stats_beside_a_series_leave_only_the_series_on_a_metrics_route() {
     let checks = checks();
     let mut gauge = checks.events[1].clone();
     gauge.attributes = Default::default();
-    gauge.metrics[0] = MetricRecord::new(intern("queue.depth"), MetricKind::Gauge(4.0));
+    gauge.metrics[0] = MetricRecord::new(intern("queue.depth"), MetricKind::gauge(4.0));
     batch.events.push(gauge);
     for (route, body) in series_routes(&batch) {
         let relayed = decode_series(route, &body.expect("the gauge"));

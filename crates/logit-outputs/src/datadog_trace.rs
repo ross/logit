@@ -1187,7 +1187,7 @@ mod tests {
             for record in &event.metrics {
                 if let MetricKind::Sum(s) = &record.kind {
                     if resolve(record.name) == metric {
-                        sum += s.value;
+                        sum += s.value.as_f64();
                     }
                 }
             }

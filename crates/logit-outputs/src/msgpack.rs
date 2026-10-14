@@ -213,9 +213,13 @@ pub(crate) mod tests {
         let mut samples = Samples::new([1.5, 2.0]);
         samples.sample_rate = 0.5;
         let kinds = vec![
-            MetricKind::Sum(Sum { value: 3.0, temporality: Temporality::Delta, monotonic: true }),
-            MetricKind::Gauge(f64::INFINITY),
-            MetricKind::GaugeDelta(-0.0),
+            MetricKind::Sum(Sum {
+                value: logit_core::MetricValue::F64(3.0),
+                temporality: Temporality::Delta,
+                monotonic: true,
+            }),
+            MetricKind::gauge(f64::INFINITY),
+            MetricKind::GaugeDelta(logit_core::MetricValue::F64(-0.0)),
             MetricKind::Samples(samples),
             MetricKind::SetMembers(vec![
                 Bytes::from_static(b"alice"),
@@ -264,7 +268,7 @@ pub(crate) mod tests {
             }];
             metric_event.metrics.push(record);
         }
-        let mut nrv = MetricRecord::new(intern("m.nrv"), MetricKind::Gauge(0.0));
+        let mut nrv = MetricRecord::new(intern("m.nrv"), MetricKind::gauge(0.0));
         nrv.flags = 1;
         metric_event.metrics.push(nrv);
 

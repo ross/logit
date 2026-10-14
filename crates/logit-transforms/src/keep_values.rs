@@ -471,7 +471,7 @@ mod tests {
     fn counter_value(events: &[Event], name: &str) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Sum(sum) if resolve(m.name) == name => Some(sum.value),
+                MetricKind::Sum(sum) if resolve(m.name) == name => Some(sum.value.as_f64()),
                 _ => None,
             })
         })

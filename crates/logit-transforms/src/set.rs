@@ -201,7 +201,7 @@ mod tests {
                     if logit_core::interner::resolve(m.name)
                         == "logit.transform.set.resource.rebuilt" =>
                 {
-                    Some(sum.value)
+                    Some(sum.value.as_f64())
                 }
                 _ => None,
             })

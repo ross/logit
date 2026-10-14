@@ -428,6 +428,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     isn't a legal Kafka topic name, a `key` naming an empty attribute, a `key` other than `none`
     with `record: batch` (`format: native`'s default), `idempotent: true` without `acks: all`, a
     `max_request_bytes` of `0`, `timeout: 0s`, or a bad `tls`.
+86. An `influxdb_in` with an empty `bind`, a `tokens` entry that is empty or has surrounding
+    whitespace, or a `max_request_bytes` of `0`.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

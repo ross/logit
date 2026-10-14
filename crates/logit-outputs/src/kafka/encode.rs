@@ -1045,7 +1045,7 @@ mod tests {
         for name in ["a", "b"] {
             event.metrics.push(logit_core::MetricRecord::new(
                 intern(name),
-                logit_core::MetricKind::Gauge(1.0),
+                logit_core::MetricKind::Gauge(1.0.into()),
             ));
         }
         event.span = Some(logit_core::SpanRecord {
@@ -1071,9 +1071,10 @@ mod tests {
     fn text_counts_the_metrics_and_span_it_leaves_out_of_a_written_record() {
         let mut metric_only = log_event(0, Value::Null);
         metric_only.log = None;
-        metric_only
-            .metrics
-            .push(logit_core::MetricRecord::new(intern("m"), logit_core::MetricKind::Gauge(1.0)));
+        metric_only.metrics.push(logit_core::MetricRecord::new(
+            intern("m"),
+            logit_core::MetricKind::Gauge(1.0.into()),
+        ));
         let b = batch(
             AttrMap::new(),
             vec![mixed_event("one"), metric_only, mixed_event(&"x".repeat(64)), mixed_event("two")],

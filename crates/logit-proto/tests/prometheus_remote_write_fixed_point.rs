@@ -88,8 +88,8 @@ fn reasons_from(registry: &Registry, prefix: &str) -> Vec<(String, u64)> {
                     return None;
                 }
                 Some(match &metric.kind {
-                    MetricKind::Sum(sum) => sum.value,
-                    MetricKind::Gauge(value) => *value,
+                    MetricKind::Sum(sum) => sum.value.as_f64(),
+                    MetricKind::Gauge(value) => value.as_f64(),
                     _ => 0.0,
                 })
             })?;
