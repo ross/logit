@@ -2983,10 +2983,9 @@ pub enum ComponentKind {
     /// metric, log, event, or service check with no host goes out with the process hostname, so
     /// hostless senders relayed through one `logit` report as one Datadog host. A metric its
     /// sender marked hostless (an empty `host:` tag, or an Agent's empty host) stays hostless.
-    /// Points
-    /// older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service
-    /// checks) are dropped and counted before sending. Traces go out only once a Datadog Agent
-    /// has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.
+    /// Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for
+    /// service checks) are dropped and counted before sending. Traces go out only once a Datadog
+    /// Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.
     DatadogOut {
         /// The Datadog API key, sent as `DD-API-KEY` on every request and never logged. Take it
         /// from the environment (`!env DD_API_KEY`) rather than writing it into the file. An

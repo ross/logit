@@ -457,7 +457,8 @@ carries always wins. Trace and stats payloads keep their tracer and Agent hostna
   leaves as `""` on those three routes and as a `host` resource with no name on v2, as does a
   sample with an empty `host:` tag, so a later hop keeps it hostless too. To keep an absent
   `host` absent, the v1 and distribution-point encoders omit `host` when there's no host, no
-  hostless mark, and no default host.
+  hostless mark, and no default host, or when `host.name` isn't a string, which is never
+  replaced.
 - **An empty sketch host is hostless.** Protobuf can't tell an empty sketch `host` from an
   absent one, so `logit` reads every empty one as hostless. That's what it means from every
   sender found, in datadog-agent 7.83.3:

@@ -131,7 +131,7 @@
 //! | no [`ATTR_HOST_NAME`] or an empty one, and a `Str` [`ATTR_HOST_TAG`] (a DogStatsD `#host:` tag) | the host, where [`ATTR_HOST_NAME`] would go, and not a tag. An empty one is a sample marked hostless: written as the hostless rows below, never filled | -- |
 //! | a `host`-typed entry in [`ATTR_RESOURCES`] and no host from the rows above (the Agent's hostless v2 series: a `host` resource with no name) | v2: that entry, in order; v1, distribution, and sketch: a `host` of `""` (the entry itself is omitted, per the `no_wire_form` row); never filled | -- |
 //! | [`ATTR_HOSTLESS`] `true` and no host from the rows above | v2: a `{type: "host", name: ""}` resource, the Agent's spelling; v1, distribution, and sketch: a `host` of `""`; never filled | -- |
-//! | no host from any row above ([`ATTR_HOST_NAME`] absent or empty) | the default host ([`DatadogEncoder::with_default_host`]) where [`ATTR_HOST_NAME`] would go; with none, no v2 resource, no v1 or distribution `host`, and a sketch `host` of `""`. A non-`Str` [`ATTR_HOST_NAME`] is counted `unrepresentable` and never replaced | -- |
+//! | no host from any row above ([`ATTR_HOST_NAME`] absent or empty) | the default host ([`DatadogEncoder::with_default_host`]) where [`ATTR_HOST_NAME`] would go; with none, no v2 resource, no v1 or distribution `host`, and a sketch `host` of `""`. A non-`Str` [`ATTR_HOST_NAME`] is counted `unrepresentable` and never replaced: no v2 resource, no v1 or distribution `host`, and a sketch `host` of `""` | -- |
 //! | [`ATTR_DEVICE`] | v1: `device`; v2: a `{type: "device"}` resource after the host | -- |
 //! | [`ATTR_RESOURCES`] | v2 resources after host and device, in order | -- |
 //! | the `_logit.datadog.origin.*` codes | protobuf and sketch `metadata.origin` (no `metric_type`); JSON v2 `metadata.origin` (no `category`) | -- |
@@ -141,9 +141,9 @@
 //!
 //! v1 JSON emits the Agent's field set: `metric`, `points`, `tags`, `type`, and `interval` always;
 //! `host`, `device`, `source_type_name`, and `unit` when present. `host` is absent only with no
-//! host, no hostless mark, and no default host, which `datadog_out` always sets: an empty one
-//! would decode as hostless. Names and tags go out as-is,
-//! because Datadog sanitizes them itself.
+//! host, no hostless mark, and no default host (`datadog_out` always sets one), or with a
+//! non-`Str` [`ATTR_HOST_NAME`], which is never replaced: an empty one would decode as hostless.
+//! Names and tags go out as-is, because Datadog sanitizes them itself.
 //!
 //! ## Permitted normalizations (metrics)
 //!
