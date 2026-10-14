@@ -4,14 +4,18 @@
 //! The first hop is a tracer's request, built as `datadog_trace_in_round_trip.rs` builds it: a body
 //! on the codec's fixed point plus a dd-trace tracer's headers. The listener delivers batch `B`;
 //! `datadog_trace_out` sends `B` back to a listener, which must deliver `B` again. What this file
-//! adds over the codec's fixed-point tests is the header restoration (`datadog.tracer.*` carriers
-//! out as `Datadog-Meta-*` and friends, and in again), the routes, and the Unix-socket client.
+//! adds over the codec's fixed-point tests is the header restoration (`_logit.datadog.tracer.*`
+//! carriers out as `Datadog-Meta-*` and friends, and in again), the routes, and the Unix-socket
+//! client. One test sends the first hop's batch to `otlp_out` instead, where no carrier may
+//! reach the wire.
 
 use bytes::Bytes;
 use logit_core::interner::{intern, resolve};
 use logit_core::{AttrMap, Event, EventBatch, MetricKind, MetricRecord, Registry, Resource, Value};
 use logit_inputs::datadog_trace::DatadogTraceInput;
+use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_outputs::datadog_trace::{DatadogTraceOutput, TracerApiForm};
+use logit_outputs::otlp::{OtlpOutput, OtlpTransport as OtlpOutTransport};
 use logit_pipeline::test_util::recv_batch;
 use logit_pipeline::{Fanout, Input, Output};
 use logit_proto::datadog::generated::trace::{AgentPayload, Span, TraceChunk, TracerPayload};
@@ -226,6 +230,41 @@ async fn a_v04_origin_batch_relays_equal_through_v04() {
     assert_eq!(recv_batch(&mut rx).await, batch);
     let points = registry.drain(0);
     assert_eq!(counted(&points, "logit.output.spans.degraded", "no_wire_form"), 0.0);
+}
+
+/// The tracer headers are private carriers: relayed to OTLP, a v0.4 trace's spans arrive with no
+/// header-derived resource attribute and no `_logit.` key anywhere on the wire.
+#[tokio::test]
+async fn tracer_header_carriers_never_reach_an_otlp_wire() {
+    let (addr, mut rx) = tcp_listener().await;
+    let batch = first_hop(addr, &mut rx, "/v0.4/traces", &v04_body()).await;
+    assert_eq!(
+        batch.resource.attributes.get(RESOURCE_ATTR_TRACER_LANGUAGE_NAME),
+        Some(&Value::str("python")),
+        "the carriers are on the batch datadog_trace_in delivers"
+    );
+
+    let mut otlp_in = OtlpInput::new("127.0.0.1:0", OtlpInTransport::Http);
+    otlp_in.bind().await.expect("binding otlp_in");
+    let otlp_addr = otlp_in.local_addr().expect("bind leaves an address");
+    let (tx, mut otlp_rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let _ = otlp_in.run(Fanout::new(vec![tx])).await;
+    });
+    let mut out = OtlpOutput::new(format!("http://{otlp_addr}"), OtlpOutTransport::Http).unwrap();
+    out.send(&batch).await.expect("otlp_in accepts");
+
+    let received = recv_batch(&mut otlp_rx).await;
+    assert_eq!(received.events.len(), batch.events.len(), "every span arrives");
+    let leaked: Vec<&str> = received
+        .resource
+        .attributes
+        .iter()
+        .chain(received.events.iter().flat_map(|e| e.attributes.iter()))
+        .map(|(k, _)| resolve(k))
+        .filter(|k| k.starts_with("_logit.") || k.starts_with("datadog."))
+        .collect();
+    assert!(leaked.is_empty(), "carriers on the OTLP wire: {leaked:?}");
 }
 
 /// A v0.7 request's chunk and tracer payload fields go back in the payload.

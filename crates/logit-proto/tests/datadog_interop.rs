@@ -374,8 +374,8 @@ fn the_agent_service_check_ends_its_message_at_the_next_pipe() {
     assert_eq!(checks.len(), 3, "one per transport");
     for check in checks {
         assert_eq!(check.metrics[0].kind, MetricKind::gauge(1.0), "status WARNING");
-        assert_eq!(str_attr(check, "statsd.service_check.message"), Some("slow upstream"));
-        assert_eq!(str_attr(check, "statsd.service_check.host"), Some("record-host"));
+        assert_eq!(str_attr(check, "_logit.statsd.service_check.message"), Some("slow upstream"));
+        assert_eq!(str_attr(check, "_logit.statsd.service_check.host"), Some("record-host"));
     }
     assert!(events(&batches).any(|e| metric_name(e) == "datadog.agent.up"));
 }
@@ -386,16 +386,16 @@ fn the_agent_service_check_ends_its_message_at_the_next_pipe() {
 fn the_agent_events_arrive_in_the_intake_envelope() {
     let batches: Vec<EventBatch> = captures("agent-intake-").iter().flat_map(replay).collect();
     let titles: Vec<&str> =
-        events(&batches).filter_map(|e| str_attr(e, "statsd.event.title")).collect();
+        events(&batches).filter_map(|e| str_attr(e, "_logit.statsd.event.title")).collect();
     assert!(titles.contains(&"Agent Startup"), "{titles:?}");
     let deploys = titles.iter().filter(|t| **t == "Deploy finished").count();
     assert_eq!(deploys, 3, "one per transport: {titles:?}");
     let deploy = events(&batches)
-        .find(|e| str_attr(e, "statsd.event.title") == Some("Deploy finished"))
+        .find(|e| str_attr(e, "_logit.statsd.event.title") == Some("Deploy finished"))
         .unwrap();
     let log = deploy.log.as_ref().expect("an event is a log");
     assert_eq!(log.message.as_str(), Some("record-fixtures 1.2.3 is live"));
-    assert_eq!(str_attr(deploy, "statsd.event.aggregation_key"), Some("deploy-123"));
+    assert_eq!(str_attr(deploy, "_logit.statsd.event.aggregation_key"), Some("deploy-123"));
 }
 
 /// The tailed file's three lines, the JSON one kept as a string: the Agent parses nothing.
@@ -487,7 +487,7 @@ fn the_tracer_s_client_stats_name_the_tracer_only_in_headers() {
     assert!(!capture.header("datadog-meta-tracer-version").is_empty());
     let batches = replay(&capture);
     let batch = &batches[0];
-    assert_eq!(batch.resource.attributes.get("datadog.tracer.language_name"), None);
+    assert_eq!(batch.resource.attributes.get("_logit.datadog.tracer.language_name"), None);
     let group = events(&batches).find(|e| str_attr(e, ATTR_STATS_NAME).is_some()).unwrap();
     assert_eq!(str_attr(group, ATTR_STATS_NAME), Some("flask.request"));
     let summary = group

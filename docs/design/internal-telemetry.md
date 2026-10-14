@@ -866,7 +866,10 @@ and `oversize` is a packet declaring more than 64 KiB, which closes the connecti
 listener because every connection's decoder clone shares one set of counts; the rest of the
 datagram or packet still decodes. The driver's `bad_datagram`/`bad_frame` key, with
 `frames.dropped{reason="undecodable"}`, fires only for the single whole-frame failure
-`StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. The decoder carries a
+`StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. A `|#` tag whose key
+starts with `_logit.`, the private carrier prefix, is left off its metric, event, or service check
+and counted `logit.input.tags.omitted{reason="reserved_prefix"}`; the line is delivered, and a
+line rejected for another reason counts none. The decoder carries a
 sampled `ms`/`h`/`d` line's `@<rate>` verbatim and clamps nothing; `aggregate` bounds the weight a
 rate implies at `Samples::MAX_WEIGHT` and reports a clamp as
 `logit.transform.samples.weight_clamped` and a `sample_rate_clamped` diagnostic under its own
@@ -918,7 +921,7 @@ lets it see, beside the diagnostic that names it:
 | `encrypted_packet_dropped` | `logit.input.frames.dropped{reason="encrypted"}` | A `SecurityLevel Encrypt` datagram. This codec holds no keys. |
 | `types_db_mismatch` | -- | The configured `types_db` defines the list's type with a different data-source count or kinds than arrived, so its records fall back to index naming. |
 | `notification_dropped` | `logit.input.events.dropped{reason="invalid_notification"}` | A `0x0100`/`0x0101` notification with an out-of-set severity, an empty message, or no host set: the notification counterpart of `incomplete_identity`. |
-| `record_name_cut` | -- | A value list whose Plugin or Type is past 127 bytes, cut to 127 in its record name; the `collectd.*` attributes keep every byte. |
+| `record_name_cut` | -- | A value list whose Plugin or Type is past 127 bytes, cut to 127 in its record name; the `_logit.collectd.plugin` and `_logit.collectd.type` attributes keep every byte. |
 
 A type simply *missing* from `types_db` is deliberately not reported, because that's routine, not a
 misconfiguration.
@@ -960,7 +963,9 @@ per driver. A pickle frame the decoder rejects whole (`bad_pickle`) counts
 The codec adds its own counters under both transports:
 `logit.input.metrics.dropped{reason="bad_line"|"bad_tag"|"bad_timestamp"|"non_finite_value"|
 "bad_shape"}` and `logit.input.tags.normalized{reason="duplicate_key"}` (a repeated carbon tag key
-collapsing to its last value, which is what carbon's own `TaggedSeries.parse` does). Its
+collapsing to its last value, which is what carbon's own `TaggedSeries.parse` does), and
+`logit.input.tags.omitted{reason="reserved_prefix"}` (a tag whose name starts with `_logit.`, the
+private carrier prefix, left off a delivered datapoint). Its
 per-connection accumulator flushes as `receive.flushed{reason="closed"}` when a client hangs up and
 `{reason="shutdown"}` only when the component itself is stopping.
 
@@ -1124,6 +1129,11 @@ decode-side reason is loss, so this codec counts no `logit.input.metrics.skipped
   declaration the request itself carried is a statement about the samples in front of it; one from
   the cache is a memory of what some other message said. It never appears with an empty cache, and
   a steady stream of it means the table and the senders disagree about a family's shape.
+
+One more codec counter isn't a sample at all: `logit.input.tags.omitted{reason="reserved_prefix"}`
+counts a label whose name starts with `_logit.`, the private carrier prefix, left off a delivered
+series, once per event. Only remote-write can carry such a name; the exposition grammar has no `.`
+in a label name.
 
 `Diagnostics` keys: `bound` (bind mode's listener), `scrape_failed` (scrape mode; the failing
 target's redacted URL appears in the message text only, never a tag), `write_rejected` (bind mode,
@@ -1302,7 +1312,7 @@ connection refused for its PROXY header.
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `oversize` (`413`, as sent or decompressed), `auth` (`401`), `encoding` (`415`, anything but identity or lowercase gzip), `malformed_encoding` (`400`, a gzip stream that doesn't decompress), `precision` (`400`), `no_bucket` (`404`), `no_org` (`400`), `malformed` (`400`, a line that fails to parse), `stalled` (`408`, only with `idle_timeout:` set), or `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload) |
 | `logit.input.batches.deferred` | count | batches a busy `503` left with the client to resend, disjoint from `logit.component.batches.sent` |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | batches no consumer took, answered `503`. The refused batch is also counted in `logit.component.batches.sent` and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}` |
-| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | tags the decoder left off a point because their key starts with `influxdb.`, which would collide with the carrier attributes. The point is delivered. Counted by the codec, under this component's id |
+| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | tags the decoder left off a point because their key starts with `_logit.`, the private carrier prefix, or `influxdb.field.`, which would read back as a string field. The point is delivered. Counted by the codec, under this component's id |
 
 **A busy request is not a lost one**, as on `splunk_hec_in`: after 5 seconds without the pipeline
 taking the request's batch, the request gets `503` with `Retry-After: 1`, counted `class="busy"`
@@ -1897,7 +1907,7 @@ many attempts the runtime makes.
 | `logit.output.tags.omitted{reason="empty"}` | a tag with an empty key or value, which `influxd` rejects |
 | `logit.output.tags.omitted{reason="unencodable"}` | a tag key or value with a newline, a trailing backslash, or a backslash before a space, which line protocol can't spell |
 | `logit.output.tags.omitted{reason="reserved"}` | a tag key `influxd` reserves: `_measurement`, `_field`, or `time` |
-| `logit.output.metrics.normalized{reason="carrier_mismatch"}` | a record on an `influxdb.measurement` carrier event that doesn't fit the carrier line (its name lacks the `<measurement>.` prefix, or its kind isn't a `Gauge` or `Sum`), written as its own line |
+| `logit.output.metrics.normalized{reason="carrier_mismatch"}` | a record on a `_logit.influxdb.measurement` carrier event that doesn't fit the carrier line (its name lacks the `<measurement>.` prefix, or its kind isn't a `Gauge` or `Sum`), written as its own line |
 | `logit.output.metrics.dropped{reason="unencodable_value"}` | a non-finite `Gauge` or `Sum` value, or carrier field |
 | `logit.output.metrics.dropped{reason="unencodable_key"}` | a measurement or field key with no line-protocol spelling, once per field |
 | `logit.output.metrics.dropped{reason="reserved_key"}` | a carrier field named `time`, which `influxd` refuses |
@@ -2054,8 +2064,8 @@ The sink adds only what a socket send can produce and the codec can't know:
   datagram's own lists are dropped, not the whole batch, and sending continues with the next
   datagram.
 
-A `log`-only event carrying a `collectd.severity` attribute is a notification, and the codec's
-diagnostics mirror `collectd_in`'s: `notification_dropped` (severity absent despite being
+A `log`-only event carrying a `_logit.collectd.severity` attribute is a notification, and the
+codec's diagnostics mirror `collectd_in`'s: `notification_dropped` (severity absent despite being
 attempted, or outside `{1, 2, 4}`), `empty_message`, `oversize_notification`, and
 `message_truncated` (a message over 255 bytes).
 
@@ -2422,16 +2432,17 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.input.metrics.dropped{reason="bad_sketch"\|"legacy_distribution"}` | count | a malformed `Dogsketch`, or a legacy `distributions` entry, which isn't implemented |
 | `logit.input.metrics.skipped{reason="empty_sketch"}` | count | a `Dogsketch` with no bins and zero count |
 | `logit.input.metrics.degraded{reason="no_timestamp"}` | count | a point or sketch with no timestamp, stamped with `received_at` |
+| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | a tag whose key starts with `_logit.`, the private carrier prefix, left off a delivered series, sketch, event, or service check, counted per tag: once per series or sketch however many points it delivers |
 | `logit.output.metrics.skipped{metric_kind="cumulative_sum"\|"non_monotonic_delta_sum"\|"set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` | count | a metric kind no Datadog route carries; counted by the series encoders only |
 | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | count | a `GaugeDelta` nothing upstream resolved to a gauge; counted by the series encoders only |
 | `logit.output.metrics.skipped{reason="no_recorded_value"\|"empty_sketch"}` | count | a flagged record, or a sketch with nothing in it |
 | `logit.output.metrics.dropped{reason="non_finite_value"\|"oversized_sketch"}` | count | a non-finite value, or a sketch whose counts split into more than `MAX_DOGSKETCH_ENTRIES` `k`/`n` entries |
 | `logit.output.metrics.degraded{reason="set_estimate"\|"sample_rate_expanded"\|"rebinned"\|"fractional_count"}` | count | a `Set` sent as a gauge of its estimate, a sampled `Samples` expanded into repeated values, a non-Agent sketch re-binned into the Agent mapping, or a fractional bin count rounded |
-| `logit.output.tags.omitted{reason="unrepresentable"\|"no_wire_form"}` | count | a tag value with no tag form (`Map`, `Bytes`, `Null`) or a carrier attribute of the wrong type; a `datadog.*` carrier the target route has no field for |
+| `logit.output.tags.omitted{reason="unrepresentable"\|"no_wire_form"}` | count | a tag value with no tag form (`Map`, `Bytes`, `Null`) or a carrier attribute of the wrong type; a `_logit.datadog.*` carrier the target route has no field for |
 | `logit.input.logs.dropped{reason="not_an_object"\|"no_message"}` | count | a log array element that isn't an object, or a log with no `message` |
 | `logit.input.events.dropped{reason="malformed"\|"no_title"}` | count | an events-envelope group that isn't an array or an item that isn't an object, or an event with neither a title nor a text |
 | `logit.input.metrics.dropped{reason="malformed"\|"no_name"\|"invalid_status"}` | count | a service check that isn't an object, has no `check` name, or has a status outside 0 to 3 |
-| `logit.output.metrics.dropped{reason="invalid_status"}` | count | a service-check event with no status in 0 to 3, on either its `statsd.service_check.status` or its gauge |
+| `logit.output.metrics.dropped{reason="invalid_status"}` | count | a service-check event with no status in 0 to 3, on either its `_logit.statsd.service_check.status` or its gauge |
 | `logit.output.tags.omitted{reason="reserved_key"}` | count | a log attribute named `message` or `timestamp`, which would collide with the log's own wire fields |
 | `logit.input.stats.dropped{reason="malformed_payload"\|"malformed_bucket"\|"malformed_group"}` | count | an APM stats `ClientStatsPayload` (in an intake `StatsPayload`), bucket, or group that isn't a well-formed map, dropped while the rest decodes |
 | `logit.input.stats.skipped{reason="empty_bucket"}` | count | an APM stats bucket with no groups, which decodes to no events |
@@ -2442,7 +2453,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.output.stats.degraded{reason="agent_mapping"\|"bin_limit"\|"exact_summary"}` | count | a stats summary sent under the Agent mapping's logarithmic reading, with a bin limit other than 2048, or with an exact summary the DDSketch protobuf can't carry |
 | `logit.input.spans.dropped{reason="malformed"\|"idx_payload"}` | count | a span, trace array, or chunk that doesn't parse (a v0.5 span of the wrong arity or with a dictionary index out of range included), dropped while the rest decodes; an `AgentPayload`'s v1.0 `idxTracerPayloads` entry, which isn't implemented |
 | `logit.input.spans.degraded{reason="bad_tid"\|"negative_duration"\|"key_collision"\|"timestamp_range"\|"bad_attribute_type"\|"invalid_utf8"}` | count | an unparseable `_dd.p.tid` (kept as an attribute, high half zero), a negative duration clamped to 0, one key in two of `meta`/`metrics`/`meta_struct` (or a field spelled like a carrier) keeping one value, a span event time above `i64::MAX` clamped, a span event attribute of unknown type dropped, or a non-UTF-8 string read lossily |
-| `logit.output.spans.degraded{reason="no_wire_form"}` | count | a span field the target form has no home for, one per item: `status: Ok`, span `flags`, a status message, `trace_state`, a dropped count; `datadog.chunk.*` in v0.4/v0.5; `datadog.tracer.*` in v0.4/v0.5 and `datadog.agent.*` below `AgentPayload` (once per request body); `meta_struct`, links, and events in v0.5 |
+| `logit.output.spans.degraded{reason="no_wire_form"}` | count | a span field the target form has no home for, one per item: `status: Ok`, span `flags`, a status message, `trace_state`, a dropped count; `_logit.datadog.chunk.*` in v0.4/v0.5; `_logit.datadog.tracer.*` in v0.4/v0.5 and `_logit.datadog.agent.*` below `AgentPayload` (once per request body); `meta_struct`, links, and events in v0.5 |
 | `logit.output.spans.degraded{reason="int_as_f64"\|"json_text"\|"negative_duration"\|"timestamp_range"}` | count | an integer attribute sent as an inexact `metrics` double, an `Array`/`Map`/`Null` sent as JSON text, a span ending before it starts sent with duration 0, or a negative span event time sent as 0 |
 
 `Diagnostics` keys: `bad_series` and `bad_sketch`; `malformed_log`, `bad_timestamp` (a log

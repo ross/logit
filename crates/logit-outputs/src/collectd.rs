@@ -229,9 +229,9 @@ mod tests {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
-    /// A like-relay event: `collectd.*` identity and one gauge. Decode-shaped so whole-`Event`
-    /// equality against a real decode is meaningful: the record name is `<plugin>.<type>`, the
-    /// decoder's naming rule for a single-data-source list.
+    /// A like-relay event: collectd identity attributes and one gauge. Decode-shaped so
+    /// whole-`Event` equality against a real decode is meaningful: the record name is
+    /// `<plugin>.<type>`, the decoder's naming rule for a single-data-source list.
     fn relay_event(host: &str, plugin: &str, value: f64) -> Event {
         let mut event = Event::empty(
             TS,
@@ -249,8 +249,8 @@ mod tests {
         event
     }
 
-    /// A fallback-shaped event: no `collectd.*` identity, so it encodes only with a configured
-    /// `hostname:`, via the fallback naming path.
+    /// A fallback-shaped event: no collectd identity attributes, so it encodes only with a
+    /// configured `hostname:`, via the fallback naming path.
     fn counter_event(name: &str, value: f64) -> Event {
         Event::metric(
             TS,

@@ -30,10 +30,6 @@ use std::ops::Range;
 /// Nanoseconds per second -- the divisor an egress timestamp floors by.
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
-/// Another protocol's consumed-carrier namespaces, skipped **uncounted** as `influxdb_out` skips
-/// `statsd.`: counting them as dropped would report a loss that never happened.
-const FOREIGN_CARRIER_PREFIXES: [&str; 2] = ["statsd.", "collectd."];
-
 /// Per-batch outcome counts from [`GraphiteEncoder::encode_into`], for tests and benches.
 /// Production telemetry comes from the counters the encoder emits itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -567,7 +563,7 @@ fn build_tag_suffix(
 
     for (key, value) in logit_core::attrs::merged(resource, event) {
         let key = resolve(key);
-        if FOREIGN_CARRIER_PREFIXES.iter().any(|prefix| key.starts_with(prefix)) {
+        if logit_core::attrs::is_private(key) {
             continue;
         }
         if tags == Tags::Drop {
@@ -1239,18 +1235,38 @@ mod tests {
         assert_eq!(counted(&registry, "logit.output.tags.omitted", ("reason", "dialect")), 2.0);
     }
 
-    /// `statsd.` and `collectd.` carriers are skipped **uncounted**.
+    /// collectd's public identity renders as a carbon tag; its private carrier is skipped
+    /// **uncounted**.
     #[test]
-    fn foreign_protocol_carriers_are_skipped_uncounted() {
+    fn collectd_public_identity_renders_and_its_private_carrier_is_skipped() {
         let ev = tagged(&[
-            ("statsd.type", Value::from("ms")),
-            ("collectd.plugin", Value::from("cpu")),
+            ("collectd.host", Value::from("web-1")),
+            ("_logit.collectd.plugin", Value::from("cpu")),
             ("env", Value::from("prod")),
         ]);
         let (lines, _, stats, _) = encode_with(&batch(vec![ev]), |e| e);
+        assert_eq!(lines, vec!["sys.cpu;collectd.host=web-1;env=prod 1 1700000000"]);
+        assert_eq!(stats.tags_omitted_dialect, 0);
+        assert_eq!(stats.tags_omitted_unrepresentable, 0);
+    }
+
+    /// A private attribute, on the event or the resource, is skipped **uncounted** under both
+    /// `tags:` modes; a public sibling still renders, or is counted under `drop`.
+    #[test]
+    fn private_attributes_are_skipped_uncounted() {
+        let ev = tagged(&[("_logit.x", Value::from("e")), ("env", Value::from("prod"))]);
+        let mut resource = Resource::default();
+        resource.attributes.insert("_logit.y", "r");
+        let batch = EventBatch { resource: Arc::new(resource), scope: None, events: vec![ev] };
+
+        let (lines, _, stats, _) = encode_with(&batch, |e| e);
         assert_eq!(lines, vec!["sys.cpu;env=prod 1 1700000000"]);
         assert_eq!(stats.tags_omitted_dialect, 0);
         assert_eq!(stats.tags_omitted_unrepresentable, 0);
+
+        let (lines, _, stats, _) = encode_with(&batch, |e| e.with_tags(Tags::Drop));
+        assert_eq!(lines, vec!["sys.cpu 1 1700000000"]);
+        assert_eq!(stats.tags_omitted_dialect, 1, "only `env` is counted");
     }
 
     // -- sanitization -----------------------------------------------------------------------------

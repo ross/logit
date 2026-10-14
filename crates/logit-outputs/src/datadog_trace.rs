@@ -41,10 +41,10 @@
 //! log. Traces go out before stats, sequentially.
 //!
 //! **`version`.** `v0.4` (the default) is what most tracers send and every Agent takes. It has no
-//! trace chunk and no tracer payload, so the chunk carriers (`datadog.chunk.*`) and the tracer
-//! payload carriers no request header carries (`datadog.tracer.runtime_id`, `.env`, `.hostname`,
-//! `.app_version`, `.tags`, `.container_debug`) are dropped and counted by the encoder as
-//! `logit.output.spans.degraded{reason="no_wire_form"}`. `v0.7` carries all of them in its
+//! trace chunk and no tracer payload, so the chunk carriers (`_logit.datadog.chunk.*`) and the
+//! tracer payload carriers no request header carries (`_logit.datadog.tracer.runtime_id`, `.env`,
+//! `.hostname`, `.app_version`, `.tags`, `.container_debug`) are dropped and counted by the encoder
+//! as `logit.output.spans.degraded{reason="no_wire_form"}`. `v0.7` carries all of them in its
 //! `TracerPayload`. A v0.4-origin batch (what most tracers send `datadog_trace_in`) relays through
 //! either with nothing lost.
 //!
@@ -1389,7 +1389,10 @@ mod tests {
         let spans = DatadogDecoder::new().decode_traces_v04(&c[0].body, 0).unwrap();
         for event in &spans.events {
             assert!(
-                event.attributes.iter().all(|(k, _)| !resolve(k).starts_with("datadog.tracer.")),
+                event
+                    .attributes
+                    .iter()
+                    .all(|(k, _)| !resolve(k).starts_with("_logit.datadog.tracer.")),
                 "no carrier leaks into a span tag: {:?}",
                 event.attributes
             );

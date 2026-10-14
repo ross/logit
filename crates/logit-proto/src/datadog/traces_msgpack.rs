@@ -403,7 +403,7 @@ impl DatadogDecoder {
     }
 
     /// `/v0.4/traces` (and `/v0.3`'s msgpack): an array of traces, each an array of span maps.
-    /// One event per span, in wire order. v0.4 has no chunk, so no `datadog.chunk.*`, and no
+    /// One event per span, in wire order. v0.4 has no chunk, so no `_logit.datadog.chunk.*`, and no
     /// payload, so the batch resource is empty. `received_at` is unused: a span's `start` is its
     /// timestamp.
     pub fn decode_traces_v04(
@@ -480,7 +480,7 @@ impl DatadogDecoder {
     }
 
     /// `/v0.7/traces`: one msgpack `TracerPayload` map. Its fields become the batch resource, its
-    /// chunks' fields `datadog.chunk.*` on every span of the chunk.
+    /// chunks' fields `_logit.datadog.chunk.*` on every span of the chunk.
     pub fn decode_tracer_payload_v07(
         &mut self,
         body: &[u8],

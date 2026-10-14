@@ -148,9 +148,9 @@ Four facts from the survey drive the shape of the decision:
 15. **The exporter's severity fields are kept beside the typed field.** `otel.log.severity.number`
     and `.text` decode into `LogRecord::severity` by OTLP's band-then-text rule and stay as
     attributes, because the band collapses 24 numbers to 6 (the rule (b) precedent `otlp_in`
-    sets with `otel.severity_number`); the encoder writes them from `severity` only when neither
-    attribute is present. `otel.log.name` and a valid `trace_id`/`span_id` pair are consumed
-    into `event_name` and `trace`, which hold them without loss.
+    sets with `_logit.otel.severity_number`); the encoder writes them from `severity` only when
+    neither attribute is present. `otel.log.name` and a valid `trace_id`/`span_id` pair are
+    consumed into `event_name` and `trace`, which hold them without loss.
 
 16. **Lenient where Splunk rejects a whole request.** `/raw` needs no channel (Splunk requires one
     only with `useACK`, and `splunk_hec_in` has no ack state). An object with no `event` or a
