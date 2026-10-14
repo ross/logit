@@ -389,7 +389,7 @@ fn sorted_by_key(mut events: Vec<Event>) -> Vec<Event> {
 /// skips whitespace, so it is dropped and counted; the rest of the batch survives. A field key
 /// starting with one beside a plain key is kept, written second.
 #[test]
-fn a_measurement_or_field_key_starting_with_a_tab_or_nul_is_dropped() {
+fn a_measurement_starting_with_a_tab_or_nul_is_dropped_and_a_field_key_is_kept() {
     let neighbor = point("n", &[], &[("f", MetricValue::I64(1))], &[], 6);
     let kept = point("m", &[], &[("\tf", MetricValue::I64(1)), ("g", MetricValue::I64(2))], &[], 5);
     let source = batch(vec![
