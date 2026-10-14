@@ -24,10 +24,15 @@ One miss on PR #685 also met a crates.io outage and failed, and a failed run sav
 its rerun missed again.
 
 ## Decision
-`ci.yml` restores the cache with `actions/cache/restore` on every run, under the exact lockfile
-key with `restore-keys` set to the key's prefix, and saves it with `actions/cache/save` only on a
-push to `main` that didn't hit the exact key. The key carries a version (`cargo-v3`); bumping it
-starts the cache over.
+`ci.yml` restores the cache with `actions/cache/restore` on every run and saves it with
+`actions/cache/save` only on a push to `main` that didn't hit the exact key. The key is a version
+(`cargo-v3`), the UTC month, and the lockfile hash. On `main`, `restore-keys` is the prefix
+through the current month; on a PR, it's the prefix through the version, so it matches any month.
+Bumping the version starts the cache over.
+
+Cargo never removes build output from `target`, so a `main` entry restored through a prefix
+carries every crate version built since the last clean build. Holding `main` to its own month
+forces a clean build once a month.
 
 ## Alternatives considered
 - **`Swatinem/rust-cache`.** It saves the same way and also prunes workspace artifacts from
@@ -35,6 +40,8 @@ starts the cache over.
   action to fix a problem the first-party split already fixes.
 - **Cache the registry only.** Entries stay small and crates.io is still avoided, but every run
   compiles all 292 crates, about 6 minutes against 1m40s. Rejected.
+- **A key with no time component, reset by bumping the version.** Nothing prompts the bump, so
+  `target` grows until someone notices a slow restore. Rejected for the monthly reset.
 - **Fetch the crates into the CI image.** No crates.io at all, but every Dependabot lockfile bump
   ([`advisories-off-ci`](advisories-off-ci.md)) would need an image republish
   ([`ci-image-on-ghcr`](ci-image-on-ghcr.md)). Rejected.
@@ -45,9 +52,12 @@ starts the cache over.
 - A PR that changes `Cargo.lock` or `Cargo.toml` restores `main`'s newest entry through the
   prefix. Cargo downloads only the crates it lacks and rebuilds only the changed crates and their
   dependents, on every push to that PR until the change reaches `main`.
-- A `main` run that restores through the prefix saves a new entry that includes the old one's
-  `target`, so stale artifacts from replaced crate versions accumulate across lockfile bumps.
-  Bump the key's version when entries grow enough to slow the restore.
+- Within a month, a `main` run that restores through the prefix saves a new entry that includes
+  the old one's `target`, so artifacts from replaced crate versions accumulate across lockfile
+  bumps. The first `main` push each month finds no entry, builds from scratch, about 11 minutes,
+  and saves a clean one. Earlier months' entries go unread and are evicted after 7 days.
+- Until that first `main` push, PRs restore the previous month's entry, so the reset costs one
+  slow `main` run and no slow PR runs. If entries still grow enough to slow the restore, change
+  the month to an ISO week (`date -u +%G-W%V`).
 - A `main` run that fails saves nothing, so the next `main` run restores the older entry again.
-- The PR that introduces a new key version runs cold, and so does every PR until a push to
-  `main` saves under it.
+- After a version bump, every PR runs cold until a push to `main` saves under the new version.
