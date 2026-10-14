@@ -160,7 +160,7 @@
 //! something else). The four under `_logit.collectd.` are private
 //! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)):
 //! every other sink ignores them, because the record name or a typed field already carries what
-//! they say. `collectd.host`, `collectd.plugin_instance`, and `collectd.type_instance` are public
+//! `plugin`, `type`, and `severity` say, and only `collectd_out` reads `interval`. `collectd.host`, `collectd.plugin_instance`, and `collectd.type_instance` are public
 //! identity with no other home, so every other sink renders them as ordinary tags.
 //! `docs/design/data-model.md`'s well-known-attribute table is the canonical list.
 //!

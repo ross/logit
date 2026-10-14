@@ -135,22 +135,23 @@ component to look.
 
 ### The inbound guard
 
-The five decoders whose wire carries arbitrary metric tag keys drop a key under `_logit.` and
-count it as `logit.input.tags.omitted{reason="reserved_prefix"}`; the point itself is kept:
+The decoders for the five tag-bearing metric wires drop a key under `_logit.` and count it as
+`logit.input.tags.omitted{reason="reserved_prefix"}`; the point itself is kept:
 
-- DogStatsD `|#` tags.
-- Datadog series tags.
+- DogStatsD `|#` tags, on metrics, events, and service checks.
+- Datadog series, sketch, event, and service-check tags.
 - InfluxDB line-protocol tags.
-- Prometheus labels.
+- Prometheus remote-write labels.
 - carbon `;k=v` tags.
 
 Without the guard, a sender's tag would be read back as carrier data at that carrier's own sink.
 
-Log and span decoders, and the parsing transforms (`json`, `logfmt`, `kv`, `csv`, `regex`), don't
-guard. A `_logit.*` key they admit is taken as the carrier it names at that carrier's own sink.
-The metric-wire guard generalizes a counter `influxdb_in` already keeps for its own prefix;
-the log-side parsers have no tag-omission counter, and a producer has to choose the `_logit.`
-prefix to reach a carrier. Under [ADR `deployment-threat-model`](deployment-threat-model.md),
+Every other decoder admits the key uncounted: OTLP metric data-point attributes and Splunk HEC
+metric `fields` included, the log and span decoders, and the parsing transforms (`json`,
+`logfmt`, `kv`, `csv`, `regex`). A top-level `_logit.*` key they admit is taken as the carrier
+it names at that carrier's own sink. The guard generalizes a counter `influxdb_in` already keeps
+for its own prefix; the other decoders have no tag-omission counter, and a producer has to choose
+the `_logit.` prefix to reach a carrier. Under [ADR `deployment-threat-model`](deployment-threat-model.md),
 that makes it a documented gap rather than a guard to add.
 
 ## Alternatives considered

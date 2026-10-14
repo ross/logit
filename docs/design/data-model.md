@@ -131,13 +131,14 @@ private, which stay public, and why. The prefix has one definition,
   flattens. **`aggregate`** keys series on private keys like any attribute. `remove`, `route`,
   `has_attributes`, `drop_attributes`, `set`, and Lua name private keys explicitly, so a private
   key may appear in operator config (`set` stamping `_logit.datadog.interval`).
-- **Metric-wire tag decoders refuse the prefix.** DogStatsD `|#` tags, Datadog intake tags (series,
-  sketches, events, service checks), InfluxDB tags, Prometheus remote-write labels, and carbon
-  `;k=v` tags drop a key under `_logit.` and count it as
-  `logit.input.tags.omitted{reason="reserved_prefix"}`; the point itself is kept. Log and span
-  decoders and the parsing transforms (`json`, `logfmt`, `kv`, `csv`, `regex`) don't guard: a
-  `_logit.*` key they admit is read as the carrier it names at that carrier's own sink, and skipped
-  everywhere else (`docs/known-gaps/mappings.md`).
+- **The five tag-bearing metric wires refuse the prefix.** DogStatsD `|#` tags, Datadog intake
+  tags (series, sketches, events, service checks), InfluxDB tags, Prometheus remote-write labels,
+  and carbon `;k=v` tags drop a key under `_logit.` and count it as
+  `logit.input.tags.omitted{reason="reserved_prefix"}`; the point itself is kept. Every other
+  decoder admits the key uncounted: OTLP and Splunk HEC metrics included, the log and span
+  decoders, and the parsing transforms (`json`, `logfmt`, `kv`, `csv`, `regex`). A top-level
+  `_logit.*` key they admit is read as the carrier it names at that carrier's own sink, and
+  skipped everywhere else (`docs/known-gaps/mappings.md`).
 
 A key under [ADR `lossless-transit`](../adr/lossless-transit.md)'s rule (c), such as
 `logit.body_format`, is the opposite case: public, and meant to cross a foreign wire.
@@ -238,8 +239,9 @@ list by a five-tuple (host, plugin, plugin instance, type, type instance) where 
 `MetricRecord.name`, and carries a per-list reporting interval the model has no field for. The raw
 wire facts ride alongside as attributes and win on the way back out. `collectd_out` **consumes**
 all seven (never re-emits one as anything else). That is what makes `collectd_in -> collectd_out` a
-fixed point. The four under `_logit.collectd.` are private: the record name or a typed field
-already says what they carry, so every other sink ignores them. `collectd.host`,
+fixed point. The four under `_logit.collectd.` are private, and every other sink ignores them:
+the record name or a typed field already says what `plugin`, `type`, and `severity` carry, and
+only `collectd_out` reads `interval`. `collectd.host`,
 `collectd.plugin_instance`, and `collectd.type_instance` are public identity with no other home,
 and every other sink renders them as ordinary tags; hiding them would merge different hosts' and
 instances' lists into one series.

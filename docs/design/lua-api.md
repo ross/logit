@@ -48,8 +48,8 @@ access like the example above materializes only what it reads or writes.
 
 **A protocol carrier is an ordinary attribute to a script.** Read or write one by its full key,
 such as `event.attributes["_logit.statsd.type"]` or `resource["_logit.influxdb.bucket"]`;
-the dots in the key mean only bracket indexing reaches it. Every protocol sink but the carrier's
-own ignores the private `_logit.` namespace
+the dots in the key mean only bracket indexing reaches it. The carrier's own sink reads it, and
+every other protocol sink ignores the private `_logit.` namespace when it renders attributes
 ([ADR `private-attribute-namespace`](../adr/private-attribute-namespace.md)).
 
 **A table assigned to an attribute converts raw and at most 128 levels deep.** Conversion reads

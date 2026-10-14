@@ -253,8 +253,8 @@ Datadog pairs, and [docs/plans/splunk-relay.md](docs/plans/splunk-relay.md) for 
 [docs/plans/influxdb-relay.md](docs/plans/influxdb-relay.md) for the InfluxDB pair. What the model and codecs carry for them:
 
 - **Carriers**: a protocol's raw wire facts with no typed home ride as attributes under the
-  private `_logit.<protocol>.` prefix (`_logit.statsd.type`), which only that protocol's own sink
-  reads and every other protocol sink ignores, uncounted
+  private `_logit.<protocol>.` prefix (`_logit.statsd.type`). That protocol's own sink reads them,
+  and every other protocol sink ignores them, uncounted, when it renders attributes
   ([ADR `private-attribute-namespace`](docs/adr/private-attribute-namespace.md);
   [docs/design/data-model.md](docs/design/data-model.md)'s "Well-known attribute names" is the
   canonical statement).
