@@ -1987,8 +1987,9 @@ one:
   into a filesystem path: a `;env=prod` tag suffix becomes literal `;` characters in a **whisper
   directory name**, not a rejected line. There is no error; `carbon-cache` creates directories
   nobody intended. If the destination might be an older Graphite, set `tags: drop`: every attribute
-  is then left off the wire (counted `logit.output.tags.omitted{reason="dialect"}`). Confirm an
-  unfamiliar cluster's tag support before using `tags: carbon` against it.
+  but a private `_logit.` one is then left off the wire and counted
+  `logit.output.tags.omitted{reason="dialect"}`. Confirm an unfamiliar cluster's tag support before
+  using `tags: carbon` against it.
 - **`multi_value: skip` (the default) drops what carbon's one-number-per-datapoint wire can't
   carry.** `Samples`, `Distribution`, `Histogram`, `ExponentialHistogram`, `Summary`, `Set`, and
   `SetMembers` records are dropped whole and counted `logit.output.metrics.skipped{metric_kind=...}`
