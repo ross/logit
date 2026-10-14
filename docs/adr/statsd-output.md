@@ -658,8 +658,9 @@ repeated tag key folding into an `Array` in wire order
 (`#team:a,team:a` -> `Str("a")`, no `Array`); a bare/valued mix folding in order in both directions
 (`#urgent,urgent:1` and `#urgent:1,urgent`); three occurrences folding into three elements; the same
 fold applying on an event line (`_e{...}|#k:a,k:b`) and a service-check line, since both go through
-`insert_tags`; `a_tag_literally_named_statsd_type_folds_into_an_array_like_any_other` (removed by
-the 2026-10-13 amendment below: the decoder now omits such a tag); and an
+`insert_tags`; `a_tag_literally_named_statsd_type_folds_into_an_array_like_any_other` (renamed
+`a_tag_named_like_a_former_carrier_is_an_ordinary_tag` by the 2026-10-13 amendment below: a
+`#statsd.type` tag is now an ordinary public tag); and an
 extension of `dogstatsd_tag_value_is_a_zero_copy_slice_of_the_datagram`'s structural assertion to cover an
 `Array`'s elements. `crates/logit-outputs/src/statsd.rs` gained: `Array[Str,Str]` rendering
 `|#k:a,k:b`; `Array[Bool(true),Str]` rendering `|#k,k:1`; `Array[I64,I64]` rendering `|#k:1,k:2`;

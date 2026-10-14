@@ -656,9 +656,8 @@ static CONSUMED: LazyLock<[Symbol; 15]> = LazyLock::new(|| {
 });
 
 /// [`CONSUMED`] plus a service check's own carriers: on a check's later records (its first is
-/// the service-checks route's), those belong to the check and are never rendered as tags, as
-/// `statsd_out` never renders a `_logit.statsd.*` carrier. Rendered, they'd make the relayed series
-/// decode as a service check itself.
+/// the service-checks route's), those belong to the check and are never rendered as tags. The
+/// private-key skip already keeps them off the wire; this list is belt and braces.
 static CONSUMED_WITH_CHECK: LazyLock<Vec<Symbol>> = LazyLock::new(|| {
     let mut keys = CONSUMED.to_vec();
     keys.extend(

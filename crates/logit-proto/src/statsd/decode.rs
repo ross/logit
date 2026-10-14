@@ -1100,6 +1100,21 @@ mod tests {
         );
     }
 
+    /// A tag spelled like a former carrier key, `statsd.type`, is an ordinary public tag: it folds
+    /// like any other repeated key and sits beside the decoder's own `_logit.statsd.type` stamp.
+    #[test]
+    fn a_tag_named_like_a_former_carrier_is_an_ordinary_tag() {
+        let events = decode("page.views:1|ms|#statsd.type:ms,statsd.type:h");
+        assert_eq!(
+            events[0].attributes.get("statsd.type"),
+            Some(&Value::Array(vec![Value::str("ms"), Value::str("h")]))
+        );
+        assert_eq!(
+            events[0].attributes.get("_logit.statsd.type").and_then(|v| v.as_str()),
+            Some("ms")
+        );
+    }
+
     fn only_metric_event(events: Vec<Event>) -> Event {
         assert_eq!(events.len(), 1, "expected exactly one event");
         events.into_iter().next().unwrap()

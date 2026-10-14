@@ -91,8 +91,8 @@ fn a_service_checks_later_metrics_still_leave_as_series() {
         assert_eq!(metrics.len(), 1);
         assert_eq!(resolve(metrics[0].name), "db.latency", "{route}");
         assert_eq!(metrics[0].kind, MetricKind::gauge(3.5), "{route}");
-        // The check's own carriers stay with the check: rendered as tags, they would make the
-        // relayed series decode as a service check and vanish from the series route next hop.
+        // The check's own carriers stay with the check. The private-key skip keeps them off the
+        // series wire, and `CONSUMED_WITH_CHECK` lists them as belt and braces.
         let attrs = &relayed.events[0].attributes;
         assert_eq!(attrs.get("_logit.statsd.service_check.name"), None, "{route}");
         assert_eq!(attrs.get("env").and_then(|v| v.as_str()), Some("prod"), "{route}");

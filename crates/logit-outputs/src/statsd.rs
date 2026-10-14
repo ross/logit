@@ -96,10 +96,10 @@
 //!
 //! An element [`tag_value`] can't render (`Null`, `Bytes`, `Timestamp`, `Map`, a nested `Array`)
 //! is skipped and counted `EncodeStats::tags_omitted_unrepresentable` **per element**; an array
-//! whose every element drops emits no tag and leaves no stray `,`. A tag named `_logit.statsd.type`
-//! in the `#` segment can decode to an `Array` too; it matches no [`Carriers`] arm (each expects a
-//! `Value::Str`/`Value::U64`) and is filtered out of the tag segment uncounted, like any
-//! wrong-typed carrier.
+//! whose every element drops emits no tag and leaves no stray `,`. A `_logit.statsd.*` carrier
+//! holding an `Array` (set from Lua, or relayed from another protocol) matches no [`Carriers`] arm
+//! (each expects a `Value::Str`/`Value::U64`) and is filtered out of the tag segment uncounted,
+//! like any wrong-typed carrier.
 //!
 //! ## Metric-kind coverage
 //!
