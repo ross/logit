@@ -23,14 +23,28 @@ jobs:
       - name: Check the CI image matches Dockerfile.dev
         run: ./script/ci-image check
 
-      - uses: actions/cache@v4
+      # Only main saves (docs/adr/ci-cargo-cache-saved-on-main.md). A PR restores main's entry,
+      # falling back by prefix when its lockfile differs, and cargo fetches and rebuilds only
+      # what changed. The image's CARGO_HOME is /usr/local/cargo; `~` is /github/home in a
+      # container job. The root manifest's [profile.*] tables decide what `target` holds.
+      - uses: actions/cache/restore@v4
+        id: cargo-cache
         with:
-          # The image's CARGO_HOME is /usr/local/cargo; `~` is /github/home in a container job.
           path: |
             /usr/local/cargo/registry/index
             /usr/local/cargo/registry/cache
             target
-          # The root manifest's [profile.*] tables decide what the cached target dir holds.
-          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-v3-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-v3-
 
       - run: ./script/cibuild
+
+      # A save under an existing key fails, so skip it on an exact hit.
+      - uses: actions/cache/save@v4
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            /usr/local/cargo/registry/index
+            /usr/local/cargo/registry/cache
+            target
+          key: ${{ runner.os }}-cargo-v3-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
