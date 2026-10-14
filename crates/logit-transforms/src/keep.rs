@@ -8,24 +8,43 @@
 //! `event.attributes`, so an unpruned high-cardinality attribute (client address, user agent, a
 //! full request path) that reaches `aggregate` explodes both series cardinality and per-window
 //! memory. `keep` ahead of it is what bounds the tag set `aggregate` keys on.
+//!
+//! **`keep` drops `_logit.*` attributes like any unnamed key** unless `private: keep`, which
+//! retains the whole private namespace (`logit_core::attrs::is_private`) alongside `fields`. See
+//! ADR `private-attribute-namespace`.
 
+use logit_config::KeepPrivate;
+use logit_core::attrs::is_private;
 use logit_core::interner::resolve;
 use logit_core::{AttrMap, Event, Resource, Telemetry};
 use logit_pipeline::Transform;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Retains only the named attributes, dropping the rest.
+/// Retains only the named attributes, and the private namespace under [`KeepPrivate::Keep`],
+/// dropping the rest.
 ///
-/// An empty `fields` list is legal and drops every attribute; it isn't a config error.
+/// An empty `fields` list is legal and drops every attribute it doesn't otherwise retain; it isn't
+/// a config error.
 pub struct Keep {
     fields: HashSet<String>,
+    private: KeepPrivate,
     telemetry: Telemetry,
 }
 
 impl Keep {
     pub fn new(fields: Vec<String>) -> Self {
-        Self { fields: fields.into_iter().collect(), telemetry: Telemetry::default() }
+        Self {
+            fields: fields.into_iter().collect(),
+            private: KeepPrivate::Drop,
+            telemetry: Telemetry::default(),
+        }
+    }
+
+    /// Sets what happens to `_logit.*` attributes; [`KeepPrivate::Drop`] by default.
+    pub fn with_private(mut self, private: KeepPrivate) -> Self {
+        self.private = private;
+        self
     }
 
     /// Attaches a telemetry handle.
@@ -40,8 +59,10 @@ impl Keep {
 
 impl Transform for Keep {
     fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
-        event.attributes =
-            filtered(&event.attributes, &self.telemetry, |key| self.fields.contains(key));
+        let keep_private = self.private == KeepPrivate::Keep;
+        event.attributes = filtered(&event.attributes, &self.telemetry, |key| {
+            (keep_private && is_private(key)) || self.fields.contains(key)
+        });
         true
     }
 }
@@ -180,6 +201,58 @@ mod tests {
         let mut event = event_with_attrs(&[("a", "1")]);
         assert!(keep.process(&resource, &mut event));
         assert!(event.attributes.is_empty());
+    }
+
+    #[test]
+    fn keep_drops_private_keys_by_default() {
+        let mut keep = Keep::new(vec!["a".to_string()]);
+        let resource = default_resource();
+        let mut event = event_with_attrs(&[("a", "1"), ("_logit.statsd.type", "ms")]);
+        assert!(keep.process(&resource, &mut event));
+        assert_eq!(attr_keys(&event), vec!["a"]);
+    }
+
+    #[test]
+    fn keep_passes_private_keys_under_private_keep() {
+        let mut keep = Keep::new(vec!["a".to_string()]).with_private(KeepPrivate::Keep);
+        let resource = default_resource();
+        let mut event = event_with_attrs(&[
+            ("a", "1"),
+            ("b", "2"),
+            ("_logit.statsd.type", "ms"),
+            ("_logit.prometheus.type", "untyped"),
+        ]);
+        assert!(keep.process(&resource, &mut event));
+        assert_eq!(event.attributes.len(), 3);
+        assert_eq!(event.attributes.get("a"), Some(&Value::str("1")));
+        assert_eq!(event.attributes.get("_logit.statsd.type"), Some(&Value::str("ms")));
+        assert_eq!(event.attributes.get("_logit.prometheus.type"), Some(&Value::str("untyped")));
+    }
+
+    #[test]
+    fn private_keep_with_no_fields_still_drops_public_keys() {
+        let mut keep = Keep::new(vec![]).with_private(KeepPrivate::Keep);
+        let resource = default_resource();
+        let mut event =
+            event_with_attrs(&[("a", "1"), ("logit.body_format", "json"), ("_logit.x", "y")]);
+        assert!(keep.process(&resource, &mut event));
+        assert_eq!(attr_keys(&event), vec!["_logit.x"]);
+    }
+
+    #[test]
+    fn a_private_key_retained_under_private_keep_counts_as_kept() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("keep_private", "keep", "transform");
+        let mut keep = Keep::new(vec!["a".to_string()])
+            .with_private(KeepPrivate::Keep)
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+        let mut event = event_with_attrs(&[("a", "1"), ("b", "2"), ("_logit.x", "y")]);
+        assert!(keep.process(&resource, &mut event));
+
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.transform.attributes.kept"), Some(2.0));
+        assert_eq!(counter_value(&events, "logit.transform.attributes.omitted"), Some(1.0));
     }
 
     #[test]

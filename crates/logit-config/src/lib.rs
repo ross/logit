@@ -259,7 +259,8 @@ pub enum FlattenFields {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FlattenKeyword {
-    /// Expand every nested attribute (or resource attribute). The default for `attributes`.
+    /// Expand every nested attribute (or resource attribute) outside `_logit.*`. The default for
+    /// `attributes`.
     All,
     /// Expand nothing. The default for `resource`.
     None,
@@ -2407,8 +2408,18 @@ pub enum ComponentKind {
     /// Retains only the named attributes, dropping the rest: an allowlist, so a new field
     /// appearing in a log format later cannot silently become a new tag dimension. Place it
     /// before `aggregate`, whose series key includes every attribute, to bound series cardinality
-    /// and per-window memory. An empty `fields` list is legal and drops every attribute.
-    Keep { fields: Vec<String> },
+    /// and per-window memory. An empty `fields` list is legal and drops every attribute that
+    /// `private` doesn't retain.
+    Keep {
+        fields: Vec<String>,
+        /// What happens to `_logit.*` attributes, which a decoder writes so the same protocol's
+        /// output can reproduce the original wire form (`_logit.statsd.type` for a statsd timer's
+        /// type letter, say). `drop` (the default) treats them like any other key not in
+        /// `fields`. `keep` retains every one of them alongside `fields`, so a relay through `keep`
+        /// stays faithful at its like-protocol output.
+        #[serde(default)]
+        private: KeepPrivate,
+    },
     /// Drops the named attributes, keeping the rest.
     Remove { fields: Vec<String> },
     /// Stamps constant values onto every event's attributes and/or the batch's resource. A
@@ -2795,9 +2806,10 @@ pub enum ComponentKind {
     Flatten {
         /// Which top-level attributes to expand. `all` (the default) expands every nested
         /// attribute, the useful default for a source whose keys you don't control (a Kubernetes
-        /// label map, an OTLP `KvlistValue`). A named list holds literal attribute names, never
-        /// paths. Rejected if both this and `resource` are `none`, or if a named list is empty or
-        /// contains an empty or duplicate name.
+        /// label map, an OTLP `KvlistValue`). `all` never selects a `_logit.*` attribute, which a
+        /// decoder writes for its own protocol's output; name one to flatten it. A named list
+        /// holds literal attribute names, never paths. Rejected if both this and `resource` are
+        /// `none`, or if a named list is empty or contains an empty or duplicate name.
         #[serde(default = "default_flatten_attributes")]
         attributes: FlattenFields,
         /// Also expand the batch's resource attributes, under the same rules, once per batch.
@@ -4070,6 +4082,18 @@ fn default_max_tracked_keys() -> usize {
 /// `shape`'s `max_tracked_keysets` default.
 fn default_max_tracked_keysets() -> usize {
     4096
+}
+
+/// `keep`'s `private` field: whether `_logit.*` attributes are dropped like any unnamed key or
+/// retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KeepPrivate {
+    /// Drop every `_logit.*` attribute not named in `fields`. The default.
+    #[default]
+    Drop,
+    /// Retain every `_logit.*` attribute.
+    Keep,
 }
 
 /// `flatten`'s `arrays` field: whether an array expands by index or is treated as a leaf.
@@ -5938,9 +5962,22 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::Keep { fields } => {
+            ComponentKind::Keep { fields, private } => {
                 assert_eq!(fields, vec!["status".to_string(), "method".to_string()]);
+                assert_eq!(private, KeepPrivate::Drop);
             }
+            other => panic!("expected Keep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keep_component_deserializes_private_keep() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "keep", "sources": ["in"], "fields": ["status"], "private": "keep"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Keep { private, .. } => assert_eq!(private, KeepPrivate::Keep),
             other => panic!("expected Keep, got {other:?}"),
         }
     }
