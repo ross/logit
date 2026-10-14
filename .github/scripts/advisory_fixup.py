@@ -19,7 +19,7 @@ It writes OUT_DIR/pr-body.md and OUT_DIR/issue-body.md, and these step outputs t
   but `HAS_PR_TOKEN` isn't `true`, so no PR can carry it.
 
 Exits nonzero only when cargo-deny fails without reporting an advisory, such as when it can't fetch
-the database.
+the database. test_advisory_fixup.py beside it tests the matching; nothing in CI runs it.
 """
 
 import json
@@ -82,6 +82,46 @@ def locked_versions():
     return versions
 
 
+def version_key(version):
+    """1.2.3-rc.1+meta -> (1, 2, 3); enough to order and group the releases Cargo.lock holds."""
+    return tuple(int(p) for p in version.split("+")[0].split("-")[0].split("."))
+
+
+def semver_line(version):
+    """The part of a version that a semver-compatible update keeps: 1.2.3 -> (1,), 0.2.3 -> (0, 2)."""
+    parts = version_key(version)
+    for i, p in enumerate(parts):
+        if p != 0 or i == len(parts) - 1:
+            return tuple(parts[: i + 1])
+    return tuple(parts)
+
+
+def cleared(before, after, old_lock, new_lock):
+    """Return the findings in `before` that the bump cleared, each with `new` set to its new version.
+
+    A crate can be locked at several versions, each flagged by the same advisory, and only some may
+    have a patched release. So each finding follows its own locked version into the new lock: the
+    same version if it's still there, else the version the bump added in its semver-compatible
+    line. It's cleared when that version differs from the old one and the same advisory doesn't
+    flag it after the bump.
+    """
+    still = {(f["id"], f["crate"], f["version"]) for f in after}
+    fixed = []
+    for f in before:
+        crate, old = f["crate"], f["version"]
+        now = new_lock.get(crate, set())
+        if old in now:
+            new = old
+        else:
+            added = now - old_lock.get(crate, set())
+            same_line = [v for v in added if semver_line(v) == semver_line(old)]
+            new = max(same_line, key=version_key) if same_line else None
+        if (f["id"], crate, new) not in still and new != old:
+            f["new"] = new or "removed"
+            fixed.append(f)
+    return fixed
+
+
 def advisory_link(f):
     if f["id"].startswith("RUSTSEC-"):
         return f"[{f['id']}](https://rustsec.org/advisories/{f['id']}.html)"
@@ -120,13 +160,8 @@ def main():
     new_lock = locked_versions()
     after = check() if new_lock != old_lock else before
 
-    # A bump changes the version, so a finding is matched across the two runs by advisory and crate.
-    still = {(f["id"], f["crate"]) for f in after}
-    fixed = [f for f in before if (f["id"], f["crate"]) not in still]
+    fixed = cleared(before, after, old_lock, new_lock)
     remaining = after
-    for f in fixed:
-        added = sorted(new_lock.get(f["crate"], set()) - old_lock.get(f["crate"], set()))
-        f["new"] = ", ".join(added) if added else "removed"
 
     bumps = sorted({(f["crate"], f["new"]) for f in fixed})
     title = "fix(deps): bump {} for {}".format(
