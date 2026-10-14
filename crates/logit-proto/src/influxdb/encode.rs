@@ -576,7 +576,10 @@ fn render_tag_suffix(
     suffix.clear();
     for (key, value) in logit_core::attrs::merged(resource, event) {
         let key = resolve(key);
-        if key.starts_with(CARRIER_PREFIX) || key.starts_with(STATSD_PREFIX) {
+        if key.starts_with(CARRIER_PREFIX)
+            || key.starts_with(STATSD_PREFIX)
+            || logit_core::attrs::is_private(key)
+        {
             continue;
         }
         let is_multi_value = matches!(value, Value::Array(_));
@@ -1173,6 +1176,24 @@ mod tests {
         let out = String::from_utf8(encoder.encode(&batch).unwrap().to_vec()).unwrap();
         assert_eq!(out, "page.views,env=prod value=1 1700000000000000000\n");
         assert_eq!(*encoder.stats(), EncodeStats::default(), "carriers are skipped uncounted");
+    }
+
+    /// A private attribute, on the event or the resource, never becomes a tag and is never
+    /// counted; a public sibling still does.
+    #[test]
+    fn private_attributes_never_become_tags_and_are_uncounted() {
+        let mut resource = Resource::default();
+        resource.attributes.insert("_logit.y", "r");
+        let event = metric_event(
+            "page.views",
+            MetricKind::counter(1.0),
+            &[("_logit.x", "e"), ("env", "prod")],
+        );
+        let mut encoder = InfluxLineEncoder::default();
+        let batch = EventBatch { resource: Arc::new(resource), scope: None, events: vec![event] };
+        let out = String::from_utf8(encoder.encode(&batch).unwrap().to_vec()).unwrap();
+        assert_eq!(out, "page.views,env=prod value=1 1700000000000000000\n");
+        assert_eq!(*encoder.stats(), EncodeStats::default(), "private keys are skipped uncounted");
     }
 
     #[test]
