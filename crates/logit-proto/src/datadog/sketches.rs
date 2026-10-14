@@ -98,7 +98,7 @@ impl DatadogDecoder {
     }
 }
 
-/// A payload's `CommonMetadata` as `datadog.agent.*` resource attributes, each only when
+/// A payload's `CommonMetadata` as `_logit.datadog.agent.*` resource attributes, each only when
 /// non-empty (or, for the epoch, nonzero). `api_key` is a credential: dropped, never stored.
 fn common_metadata_resource(metadata: Option<&CommonMetadata>) -> Resource {
     let mut resource = Resource::default();
@@ -119,8 +119,8 @@ fn common_metadata_resource(metadata: Option<&CommonMetadata>) -> Resource {
     resource
 }
 
-/// The batch resource's `datadog.agent.*` attributes back as a `CommonMetadata`, `api_key` empty;
-/// `None` when the resource carries none of them. A carrier of the wrong `Value` type is
+/// The batch resource's `_logit.datadog.agent.*` attributes back as a `CommonMetadata`, `api_key`
+/// empty; `None` when the resource carries none of them. A carrier of the wrong `Value` type is
 /// dropped and counted `unrepresentable` by the per-event carrier walk.
 fn common_metadata(resource: &Resource) -> Option<CommonMetadata> {
     let attrs = &resource.attributes;

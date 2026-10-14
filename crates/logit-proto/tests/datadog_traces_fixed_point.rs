@@ -107,7 +107,7 @@ fn assert_cross_form(batch: &EventBatch) {
             .iter()
             .filter(|(k, v)| {
                 matches!(v, Value::Bytes(_))
-                    || logit_core::interner::resolve(*k).starts_with("datadog.chunk.")
+                    || logit_core::interner::resolve(*k).starts_with("_logit.datadog.chunk.")
             })
             .map(|(k, _)| k)
             .collect();
@@ -408,11 +408,11 @@ fn a_rich_tracer_payload_in_every_form() {
     resource.attributes.remove(RESOURCE_ATTR_AGENT_HOSTNAME);
     resource.attributes.remove(RESOURCE_ATTR_AGENT_ENV);
     for key in [
-        "datadog.agent.version",
-        "datadog.agent.target_tps",
-        "datadog.agent.error_tps",
-        "datadog.agent.rare_sampler_enabled",
-        "datadog.agent.tags",
+        "_logit.datadog.agent.version",
+        "_logit.datadog.agent.target_tps",
+        "_logit.datadog.agent.error_tps",
+        "_logit.datadog.agent.rare_sampler_enabled",
+        "_logit.datadog.agent.tags",
     ] {
         resource.attributes.remove(key);
     }
@@ -443,7 +443,7 @@ fn key() -> impl Strategy<Value = String> {
         Just("env".to_string()),
         Just("version".to_string()),
         Just("service.name".to_string()),
-        Just("datadog.span.error".to_string()),
+        Just("_logit.datadog.span.error".to_string()),
         "[a-z][a-z0-9_.]{0,8}",
     ]
 }

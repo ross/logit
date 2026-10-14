@@ -247,7 +247,7 @@ impl DatadogEncoder {
             }
         }
         for (key, value) in &attrs {
-            if consumed.contains(key) || logit_core::attrs::is_private(resolve(*key)) {
+            if consumed.contains(key) || super::is_foreign_private(resolve(*key)) {
                 continue;
             }
             if *key == keys.message || *key == keys.timestamp {
@@ -529,8 +529,8 @@ pub(super) mod tests {
         );
     }
 
-    /// A private attribute, on the event or the resource, never becomes a field and is never
-    /// counted; a public sibling still does.
+    /// Another protocol's private attribute, on the event or the resource, never becomes a field
+    /// and is never counted; a public sibling still does.
     #[test]
     fn encode_never_writes_a_private_attribute() {
         let registry = Registry::new();

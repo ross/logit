@@ -407,9 +407,9 @@ fn intake_stats_payload_with_two_clients_is_a_fixed_point() {
     assert_eq!(batches[1].events.len(), 2);
     for b in &batches {
         let a = &b.resource.attributes;
-        assert_eq!(a.get("datadog.agent.hostname"), Some(&Value::str("agent-7")));
-        assert_eq!(a.get("datadog.stats.client_computed"), Some(&Value::Bool(true)));
-        assert_eq!(a.get("datadog.stats.split_payload"), None);
+        assert_eq!(a.get("_logit.datadog.agent.hostname"), Some(&Value::str("agent-7")));
+        assert_eq!(a.get("_logit.datadog.stats.client_computed"), Some(&Value::Bool(true)));
+        assert_eq!(a.get("_logit.datadog.stats.split_payload"), None);
     }
 }
 

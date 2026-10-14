@@ -23,7 +23,7 @@
 //! absent timestamps (stamped with a whole-second `RECEIVED_AT`), extra keys with nested objects
 //! and arrays, repeated and bare tags, both event shapes, and `null` check tags. Generated extra
 //! log keys start with `x` so none collides with a reserved wire field or with one of the model
-//! names the encoder falls back to (`host.name`, `service.name`, `datadog.source`); those
+//! names the encoder falls back to (`host.name`, `service.name`, `_logit.datadog.source`); those
 //! fallbacks are a named normalization with their own unit test in `datadog/logs.rs`.
 
 use bytes::Bytes;

@@ -487,7 +487,7 @@ fn the_tracer_s_client_stats_name_the_tracer_only_in_headers() {
     assert!(!capture.header("datadog-meta-tracer-version").is_empty());
     let batches = replay(&capture);
     let batch = &batches[0];
-    assert_eq!(batch.resource.attributes.get("datadog.tracer.language_name"), None);
+    assert_eq!(batch.resource.attributes.get("_logit.datadog.tracer.language_name"), None);
     let group = events(&batches).find(|e| str_attr(e, ATTR_STATS_NAME).is_some()).unwrap();
     assert_eq!(str_attr(group, ATTR_STATS_NAME), Some("flask.request"));
     let summary = group

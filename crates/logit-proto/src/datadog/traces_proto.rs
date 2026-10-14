@@ -137,10 +137,10 @@ fn tracer(t: TracerPayload) -> WireTracer {
 
 impl DatadogDecoder {
     /// `/api/v0.2/traces`: one batch per `TracerPayload`, each resource carrying that payload's
-    /// `datadog.tracer.*` and the envelope's `datadog.agent.*`. An `AgentPayload` with no tracer
-    /// payloads decodes to no batches. `idxTracerPayloads` (the v1.0 string-table form, not
-    /// implemented) are dropped and counted `idx_payload`, one per payload. `received_at` is
-    /// unused: a span's `start` is its timestamp.
+    /// `_logit.datadog.tracer.*` and the envelope's `_logit.datadog.agent.*`. An `AgentPayload`
+    /// with no tracer payloads decodes to no batches. `idxTracerPayloads` (the v1.0 string-table
+    /// form, not implemented) are dropped and counted `idx_payload`, one per payload. `received_at`
+    /// is unused: a span's `start` is its timestamp.
     pub fn decode_agent_payload(
         &mut self,
         body: &[u8],

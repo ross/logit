@@ -1,11 +1,11 @@
-//! Route ownership across Datadog's encoders: a batch fanned out to every route leaves each item
-//! on exactly the route(s) that own it. A service check's first record (its `Gauge(status)`) is
+//! Route ownership across Datadog's encoders: a batch fanned out to every route leaves each item on
+//! only the route(s) that own it. A service check's first record (its `Gauge(status)`) is
 //! `encode_service_checks`'s alone, and a Datadog event (a `log` carrying `statsd.event.title`) is
 //! `encode_events`'s alone; every other route skips them silently. Any later metric on a service
 //! check still leaves as an ordinary series, as `statsd_out` sends `metrics[1..]` as ordinary
-//! lines. APM stats (an event carrying `datadog.stats.name`) are the stats routes' alone, whole:
-//! their `Sum`s and summary `Distribution`s never leave as series or sketches. The fixed-point
-//! suites can't see this: each decodes and encodes on one route.
+//! lines. APM stats (an event carrying `_logit.datadog.stats.name`) are the stats routes' alone,
+//! whole: their `Sum`s and summary `Distribution`s never leave as series or sketches. The
+//! fixed-point suites can't see this: each decodes and encodes on one route.
 
 use bytes::Bytes;
 use logit_core::interner::{intern, resolve};

@@ -105,7 +105,7 @@ impl DatadogDecoder {
     /// Decodes an events body. An object whose `events` member is an object is the Agent's
     /// envelope; any other object is one public `/api/v1/events` event. Either way each event
     /// becomes one [`Event::log`]; one with neither a title nor a text is skipped and counted.
-    /// The envelope's `internalHostname` is the batch `Resource`'s `datadog.agent.hostname`.
+    /// The envelope's `internalHostname` is the batch `Resource`'s `_logit.datadog.agent.hostname`.
     pub fn decode_events(
         &mut self,
         body: &[u8],
@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(attr(event, "statsd.event.host"), Some("web1"));
         assert_eq!(attr(event, "statsd.event.alert_type"), Some("warning"));
         assert_eq!(attr(event, "statsd.event.aggregation_key"), Some("agg"));
-        assert_eq!(attr(event, "datadog.event_type"), Some("deploy_event"));
+        assert_eq!(attr(event, "_logit.datadog.event_type"), Some("deploy_event"));
         assert_eq!(attr(event, "env"), Some("prod"));
         assert_eq!(event.attributes.get("urgent"), Some(&Value::Bool(true)));
         // `api` means no source.
@@ -469,8 +469,11 @@ mod tests {
         assert_eq!(attr(event, "statsd.event.alert_type"), Some("user_update"));
         assert_eq!(event.log.as_ref().unwrap().severity, None);
         assert_eq!(attr(event, "statsd.event.source_type"), Some("jenkins"));
-        assert_eq!(attr(event, "datadog.event.device_name"), Some("sda"));
-        assert_eq!(event.attributes.get("datadog.event.related_event_id"), Some(&Value::I64(42)));
+        assert_eq!(attr(event, "_logit.datadog.event.device_name"), Some("sda"));
+        assert_eq!(
+            event.attributes.get("_logit.datadog.event.related_event_id"),
+            Some(&Value::I64(42))
+        );
         assert_eq!(encode(&batch, EventFormat::PublicV1), [body]);
     }
 

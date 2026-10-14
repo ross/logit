@@ -14,17 +14,20 @@
 //!
 //! # Shared vocabulary
 //!
-//! Raw Datadog fields the model has no typed home for live in event attributes under `datadog.*`
-//! ([ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)'s carrier rule); the
-//! constants below are the only spelling. `host.name` carries a series' `host` resource, a
-//! sketch's `host`, or a log's `hostname` fallback. Events and service checks reuse
+//! Raw Datadog fields the model has no typed home for live in event attributes under
+//! `_logit.datadog.*` ([ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)'s carrier
+//! rule); the constants below are the only spelling. `host.name` carries a series' `host` resource,
+//! a sketch's `host`, or a log's `hostname` fallback. Events and service checks reuse
 //! `crates/logit-proto/src/statsd/decode.rs`'s `statsd.event.*` / `statsd.service_check.*` names:
 //! they are the same Datadog concepts DogStatsD carries. Tags fold into attributes by [`tags`]'s
 //! rule; timestamps convert by [`time`]'s.
 //!
-//! Every encoder here skips a private `_logit.` attribute wherever it renders attributes
-//! generically (tags, log fields, span `meta`, `metrics`, and `meta_struct`, link and span-event
-//! attributes, and the stats routes' `no_wire_form` count) and never counts one
+//! Every Datadog carrier is under the private prefix [`CARRIER_PREFIX`], `_logit.datadog.`, and
+//! every encoder here reads its carriers by exact name. A key under that prefix is this codec's own:
+//! one a route doesn't read as a carrier is written or counted as any other name would be. Another
+//! protocol's private `_logit.` key is skipped wherever an encoder renders attributes generically
+//! (tags, log fields, span `meta`, `metrics`, and `meta_struct`, link and span-event attributes, and
+//! the stats routes' `no_wire_form` count), and never counted
 //! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
 //!
 //! **The listener adds sender attributes after decode.** Under `datadog_in`'s or
@@ -73,9 +76,9 @@
 //! | a body that isn't JSON (or protobuf), isn't a JSON object, or has a `series` that isn't an array | `CodecError::Malformed` | -- |
 //! | an object with no `series` member (the Agent's `{}` connectivity probe, which the intake answers `202`) | an empty batch | -- |
 //!
-//! A tag spelled like a carrier (`host.name:x`) loses to the wire field it names. On a route with
-//! a `type` (every series route, not distribution points), that includes `datadog.type`: a GAUGE
-//! or COUNT series drops a `datadog.type:rate` tag rather than turning into a RATE on re-encode.
+//! A tag spelled like a carrier (`host.name:x`) loses to the wire field it names. A tag can't spell
+//! a Datadog carrier: every one is under the private `_logit.` prefix, which the row above omits,
+//! so a `_logit.datadog.type:rate` tag never turns a GAUGE or COUNT series into a RATE.
 //!
 //! ## Decode: sketches → events
 //!
@@ -123,9 +126,9 @@
 //! | [`ATTR_HOST_NAME`] | v2: a `{type: "host"}` resource, first; v1 and distribution: `host`, always (`""` when absent); sketch: `host` | -- |
 //! | [`ATTR_DEVICE`] | v1: `device`; v2: a `{type: "device"}` resource after the host | -- |
 //! | [`ATTR_RESOURCES`] | v2 resources after host and device, in order | -- |
-//! | the `datadog.origin.*` codes | protobuf and sketch `metadata.origin` (no `metric_type`); JSON v2 `metadata.origin` (no `category`) | -- |
-//! | a carrier the route has no field for (v1: resources and origin; distribution points: all but the host; sketches: device, resources, source type, interval, type, `metric_type`; every route but sketches: the `datadog.agent.*` payload metadata) | omitted | `logit.output.tags.omitted{reason="no_wire_form"}`, one per carrier |
-//! | batch resource `datadog.agent.version` / `.timezone` / `.epoch` / `.internal_ip` / `.public_ip` | sketches: payload `metadata` (`CommonMetadata`, `api_key` `""`); omitted when the resource carries none | -- |
+//! | the `_logit.datadog.origin.*` codes | protobuf and sketch `metadata.origin` (no `metric_type`); JSON v2 `metadata.origin` (no `category`) | -- |
+//! | a carrier the route has no field for (v1: resources and origin; distribution points: all but the host; sketches: device, resources, source type, interval, type, `metric_type`; every route but sketches: the `_logit.datadog.agent.*` payload metadata) | omitted | `logit.output.tags.omitted{reason="no_wire_form"}`, one per carrier |
+//! | batch resource `_logit.datadog.agent.version` / `.timezone` / `.epoch` / `.internal_ip` / `.public_ip` | sketches: payload `metadata` (`CommonMetadata`, `api_key` `""`); omitted when the resource carries none | -- |
 //! | `MetricRecord::unit` | v1 and v2 `unit` when `Some` | -- |
 //!
 //! v1 JSON emits the Agent's field set: `metric`, `points`, `tags`, `host`, `type`, and `interval`
@@ -224,13 +227,13 @@
 //! ## Encode: events → logs, events, service checks
 //!
 //! Each encoder reads the merged resource and event attributes (the event's value winning), and
-//! skips an event that belongs to another route without counting it: that is ordinary fan-out.
-//! The carriers decide which route owns an event, through one shared predicate per route, so the
-//! routes never disagree: a `log` carrying `statsd.event.title` is a Datadog event, sent only by
+//! skips an event that belongs to another route without counting it: that is ordinary fan-out. The
+//! carriers decide which route owns an event, through one shared predicate per route, so the routes
+//! never disagree: a `log` carrying `statsd.event.title` is a Datadog event, sent only by
 //! `encode_events`; `statsd.service_check.name` with a `Gauge` first metric is a service check,
 //! whose record 0 is sent only by `encode_service_checks` (the metrics routes send its later
-//! records, as `statsd_out` does); `datadog.stats.name` marks APM stats, sent whole and only by
-//! the stats routes (see "APM stats" below).
+//! records, as `statsd_out` does); `_logit.datadog.stats.name` marks APM stats, sent whole and only
+//! by the stats routes (see "APM stats" below).
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
@@ -265,8 +268,8 @@
 //! 3. a non-string log `message` leaves as its JSON text;
 //! 4. an envelope item's `source_type_name` is restated from its group key; the Agent's
 //!    `tags: null` on a check leaves as `[]`; an empty optional event field is omitted;
-//! 5. a log with `host.name`, `service.name`, or `datadog.source` but no `hostname`, `service`, or
-//!    `ddsource` leaves under the Datadog name;
+//! 5. a log with `host.name`, `service.name`, or `_logit.datadog.source` but no `hostname`,
+//!    `service`, or `ddsource` leaves under the Datadog name;
 //! 6. tags reorder by attribute order, and an exact duplicate tag is dropped.
 //! 7. an event's or check's tag whose key is under the private `_logit.` prefix is omitted and
 //!    counted.
@@ -313,12 +316,12 @@
 //! | a string that isn't UTF-8 | lossy UTF-8 | `degraded{reason="invalid_utf8"}` |
 //! | v0.7/`AgentPayload` chunk `priority` | [`traces::ATTR_CHUNK_PRIORITY`] (`I64`) on every span of the chunk, omitted when `-128` (`PriorityNone`); a v0.7 chunk with no `priority` key is 0, as in Go | -- |
 //! | chunk `origin`, `dropped_trace`, `tags` | [`traces::ATTR_CHUNK_ORIGIN`] (non-empty), [`traces::ATTR_CHUNK_DROPPED_TRACE`] (`true`), [`traces::ATTR_CHUNK_TAGS`] (`Map` of `Str`, non-empty), on every span | -- |
-//! | `TracerPayload` fields | batch resource `datadog.tracer.container_id`, `.language_name`, `.language_version`, `.tracer_version`, `.runtime_id`, `.env`, `.hostname`, `.app_version` (`Str`), `.tags` (`Map`), each when non-empty; `.container_debug` (`Map` of its non-zero fields) whenever present | -- |
-//! | tracer API request headers (read by `datadog_trace_in`, not by these decoders): `Datadog-Meta-Lang`, `-Lang-Version`, `-Tracer-Version`, `Datadog-Container-ID` | batch resource `datadog.tracer.language_name`, `.language_version`, `.tracer_version`, `.container_id` (`Str`), each when non-empty; on v0.7 only where the `TracerPayload` left the field empty | -- |
+//! | `TracerPayload` fields | batch resource `_logit.datadog.tracer.container_id`, `.language_name`, `.language_version`, `.tracer_version`, `.runtime_id`, `.env`, `.hostname`, `.app_version` (`Str`), `.tags` (`Map`), each when non-empty; `.container_debug` (`Map` of its non-zero fields) whenever present | -- |
+//! | tracer API request headers (read by `datadog_trace_in`, not by these decoders): `Datadog-Meta-Lang`, `-Lang-Version`, `-Tracer-Version`, `Datadog-Container-ID` | batch resource `_logit.datadog.tracer.language_name`, `.language_version`, `.tracer_version`, `.container_id` (`Str`), each when non-empty; on v0.7 only where the `TracerPayload` left the field empty | -- |
 //! | `Datadog-Meta-Lang-Interpreter`, `-Lang-Interpreter-Vendor`, `Datadog-Entity-ID`, `Datadog-External-Env` | [`RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER`], [`RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR`], [`RESOURCE_ATTR_TRACER_ENTITY_ID`], [`RESOURCE_ATTR_TRACER_EXTERNAL_ENV`] (`Str`), each when non-empty | -- |
 //! | `Datadog-Client-Computed-Top-Level` (any non-empty value); `Datadog-Client-Computed-Stats` (any non-empty value but a Go `false` spelling) | [`RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL`], [`RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS`] = `Bool(true)`; absent otherwise | -- |
 //! | `Datadog-Client-Dropped-P0-Traces`, `-Spans` | [`RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES`], [`RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS`] (`U64`); a value that isn't an unsigned integer is left out | diag `bad_header` |
-//! | `AgentPayload` fields | every batch's resource: [`RESOURCE_ATTR_AGENT_HOSTNAME`], `datadog.agent.env`, [`RESOURCE_ATTR_AGENT_VERSION`] (`Str`), `.target_tps`, `.error_tps` (`F64`, nonzero), `.rare_sampler_enabled` (`true`), `.tags` (`Map`) | -- |
+//! | `AgentPayload` fields | every batch's resource: [`RESOURCE_ATTR_AGENT_HOSTNAME`], `_logit.datadog.agent.env`, [`RESOURCE_ATTR_AGENT_VERSION`] (`Str`), `.target_tps`, `.error_tps` (`F64`, nonzero), `.rare_sampler_enabled` (`true`), `.tags` (`Map`) | -- |
 //! | `AgentPayload.idxTracerPayloads` (v1.0) | dropped: not implemented | `logit.input.spans.dropped{reason="idx_payload"}`, one per payload |
 //! | a span (v0.5: wrong arity, a dictionary index out of range), trace array, or chunk that doesn't parse | dropped; the rest decodes | `dropped{reason="malformed"}` + diag `malformed_span` |
 //! | a body whose structure doesn't parse (not the top-level shape, truncated, bad protobuf) | -- | `CodecError::Malformed` |
@@ -345,9 +348,9 @@
 //! | `Timestamp` | `meta` as RFC 3339 | -- |
 //! | `Array`, `Map`, `Null` | `meta` as JSON text | `degraded{reason="json_text"}` |
 //! | links; events (a scalar or an array of scalars natively, anything else as a string) | `span_links`, `span_events` | `int_as_f64` for a `U64` event value above `i64::MAX`; `json_text`; `timestamp_range` for a negative event time |
-//! | `datadog.chunk.*` of a chunk's first span | v0.7/`AgentPayload` chunk `priority` (`-128` when absent), `origin`, `dropped_trace`, `tags` | -- |
-//! | batch resource `datadog.tracer.*` / `datadog.agent.*` | v0.7: one `TracerPayload`; `AgentPayload`: one payload around one `TracerPayload` | -- |
-//! | a carrier the form has no field for: `datadog.chunk.*` in v0.4/v0.5 (per span), `datadog.tracer.*` in v0.4/v0.5 and `datadog.agent.*` below `AgentPayload` (per body), `meta_struct`/links/events in v0.5 | dropped | `degraded{reason="no_wire_form"}`, one per item |
+//! | `_logit.datadog.chunk.*` of a chunk's first span | v0.7/`AgentPayload` chunk `priority` (`-128` when absent), `origin`, `dropped_trace`, `tags` | -- |
+//! | batch resource `_logit.datadog.tracer.*` / `_logit.datadog.agent.*` | v0.7: one `TracerPayload`; `AgentPayload`: one payload around one `TracerPayload` | -- |
+//! | a carrier the form has no field for: `_logit.datadog.chunk.*` in v0.4/v0.5 (per span), `_logit.datadog.tracer.*` in v0.4/v0.5 and `_logit.datadog.agent.*` below `AgentPayload` (per body), `meta_struct`/links/events in v0.5 | dropped | `degraded{reason="no_wire_form"}`, one per item |
 //! | a tracer header's carrier ([`TRACER_STR_HEADERS`], [`TRACER_FLAG_HEADERS`], [`TRACER_U64_HEADERS`]) on the batch resource | never a span tag: a payload field where the form has one (v0.7's `language_name`, say), else dropped | `no_wire_form`, per body, except under [`DatadogEncoder::encode_tracer_api_traces`], whose caller sends each as its request header |
 //! | `status: Ok`, span `flags`, `SpanExt` status message / `trace_state` / dropped counts, a link's or event's dropped-attribute count | dropped: Datadog has no field | `degraded{reason="no_wire_form"}`, one per field |
 //!
@@ -419,32 +422,32 @@
 //! | a summary that isn't a DDSketch, has no mapping, or has a `gamma`/`indexOffset` no mapping can use | that record dropped | `dropped{reason="bad_sketch"}` + diag `bad_stats_sketch` |
 //! | `Service`, `Resource`, `Type`, `SpanKind` | `service.name`, `resource.name`, `span.type`, `span.kind` (ADR decision 8), when non-empty | -- |
 //! | `Name` | [`stats::ATTR_STATS_NAME`], always, even empty: it is what marks the event as APM stats | -- |
-//! | `DBType`, `GRPCStatusCode`, `HTTPMethod`, `HTTPEndpoint`, `srv_src` | `datadog.stats.db_type`, `.grpc_status_code`, `.http_method`, `.http_endpoint`, `.service_source`, when non-empty | -- |
-//! | `HTTPStatusCode` | `datadog.stats.http_status_code` (`U64`), when nonzero | -- |
-//! | `Synthetics` | `datadog.stats.synthetics` = `Bool(true)`, when true | -- |
-//! | `IsTraceRoot` `1` / `2` / `0` | `datadog.stats.is_trace_root` `"true"` / `"false"` / absent | any other value: absent, `degraded{reason="unknown_trilean"}` |
-//! | `PeerTags`, `AdditionalMetricTags`, `SpanDerivedPrimaryTags` | `datadog.stats.peer_tags`, `.additional_metric_tags`, `.span_derived_primary_tags`: `Array` of `Str`, when non-empty | -- |
-//! | bucket `Duration`, `AgentTimeShift` | each of its groups' `datadog.stats.bucket.duration` (`U64`, always) and `.bucket.agent_time_shift` (`I64`, when nonzero) | -- |
-//! | `ClientStatsPayload` `Hostname`, `Env`, `Version`, `Lang`, `TracerVersion`, `RuntimeID`, `ContainerID` | batch resource `datadog.tracer.hostname`, `.env`, `.app_version`, `.language_name`, `.tracer_version`, `.runtime_id`, `.container_id`, when non-empty | -- |
-//! | `/v0.6/stats` request headers (read by `datadog_trace_in`, not by these decoders): `Datadog-Meta-Lang`, `-Tracer-Version`, `Datadog-Container-ID` | batch resource `datadog.tracer.language_name`, `.tracer_version`, `.container_id` (`Str`), each when non-empty and only where the payload's `Lang`, `TracerVersion`, or `ContainerID` left it unset, as the Agent's stats receiver fills them | -- |
-//! | `AgentAggregation`, `Service`, `GitCommitSha`, `ImageTag`, `ProcessTags` | resource `datadog.stats.agent_aggregation`, `.service`, `.git_commit_sha`, `.image_tag`, `.process_tags`, when non-empty | -- |
-//! | `Sequence`, `ProcessTagsHash`; `Tags` | resource `datadog.stats.sequence`, `.process_tags_hash` (`U64`), when nonzero; `datadog.stats.tags` (`Array` of `Str`), when non-empty | -- |
-//! | `StatsPayload` `AgentHostname`, `AgentEnv`, `AgentVersion` | every batch's resource [`RESOURCE_ATTR_AGENT_HOSTNAME`], `datadog.agent.env`, [`RESOURCE_ATTR_AGENT_VERSION`], when non-empty | -- |
-//! | `ClientComputed`, `SplitPayload` | every batch's resource `datadog.stats.client_computed`, `.split_payload` = `Bool(true)`, when true | -- |
+//! | `DBType`, `GRPCStatusCode`, `HTTPMethod`, `HTTPEndpoint`, `srv_src` | `_logit.datadog.stats.db_type`, `.grpc_status_code`, `.http_method`, `.http_endpoint`, `.service_source`, when non-empty | -- |
+//! | `HTTPStatusCode` | `_logit.datadog.stats.http_status_code` (`U64`), when nonzero | -- |
+//! | `Synthetics` | `_logit.datadog.stats.synthetics` = `Bool(true)`, when true | -- |
+//! | `IsTraceRoot` `1` / `2` / `0` | `_logit.datadog.stats.is_trace_root` `"true"` / `"false"` / absent | any other value: absent, `degraded{reason="unknown_trilean"}` |
+//! | `PeerTags`, `AdditionalMetricTags`, `SpanDerivedPrimaryTags` | `_logit.datadog.stats.peer_tags`, `.additional_metric_tags`, `.span_derived_primary_tags`: `Array` of `Str`, when non-empty | -- |
+//! | bucket `Duration`, `AgentTimeShift` | each of its groups' `_logit.datadog.stats.bucket.duration` (`U64`, always) and `.bucket.agent_time_shift` (`I64`, when nonzero) | -- |
+//! | `ClientStatsPayload` `Hostname`, `Env`, `Version`, `Lang`, `TracerVersion`, `RuntimeID`, `ContainerID` | batch resource `_logit.datadog.tracer.hostname`, `.env`, `.app_version`, `.language_name`, `.tracer_version`, `.runtime_id`, `.container_id`, when non-empty | -- |
+//! | `/v0.6/stats` request headers (read by `datadog_trace_in`, not by these decoders): `Datadog-Meta-Lang`, `-Tracer-Version`, `Datadog-Container-ID` | batch resource `_logit.datadog.tracer.language_name`, `.tracer_version`, `.container_id` (`Str`), each when non-empty and only where the payload's `Lang`, `TracerVersion`, or `ContainerID` left it unset, as the Agent's stats receiver fills them | -- |
+//! | `AgentAggregation`, `Service`, `GitCommitSha`, `ImageTag`, `ProcessTags` | resource `_logit.datadog.stats.agent_aggregation`, `.service`, `.git_commit_sha`, `.image_tag`, `.process_tags`, when non-empty | -- |
+//! | `Sequence`, `ProcessTagsHash`; `Tags` | resource `_logit.datadog.stats.sequence`, `.process_tags_hash` (`U64`), when nonzero; `_logit.datadog.stats.tags` (`Array` of `Str`), when non-empty | -- |
+//! | `StatsPayload` `AgentHostname`, `AgentEnv`, `AgentVersion` | every batch's resource [`RESOURCE_ATTR_AGENT_HOSTNAME`], `_logit.datadog.agent.env`, [`RESOURCE_ATTR_AGENT_VERSION`], when non-empty | -- |
+//! | `ClientComputed`, `SplitPayload` | every batch's resource `_logit.datadog.stats.client_computed`, `.split_payload` = `Bool(true)`, when true | -- |
 //!
 //! ## Encode: events → stats
 //!
-//! The stats routes send every event [`is_datadog_stats`] accepts and nothing else, uncounted,
-//! as ordinary fan-out; every other route skips such an event whole. Buckets are rebuilt by
-//! grouping on `(Event::timestamp, datadog.stats.bucket.duration,
-//! datadog.stats.bucket.agent_time_shift)`, in first-seen order; every map writes every key, in
-//! the Go struct's field order, as msgp's `EncodeMsg` does. `encode_stats_payload` wraps the
+//! The stats routes send every event [`is_datadog_stats`] accepts and nothing else, uncounted, as
+//! ordinary fan-out; every other route skips such an event whole. Buckets are rebuilt by grouping
+//! on `(Event::timestamp, _logit.datadog.stats.bucket.duration,
+//! _logit.datadog.stats.bucket.agent_time_shift)`, in first-seen order; every map writes every key,
+//! in the Go struct's field order, as msgp's `EncodeMsg` does. `encode_stats_payload` wraps the
 //! batch's one `ClientStatsPayload`.
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
 //! | a group attribute (the event's, else the resource's) | its field above; `""`, `0`, `false`, or `[]` when absent | a value of the wrong type: `logit.output.tags.omitted{reason="unrepresentable"}` |
-//! | any other event attribute; a resource attribute that is none of the fields above (`datadog.agent.*` and the two envelope flags count on the v0.6 route, which has no envelope) | omitted | `tags.omitted{reason="no_wire_form"}`, one per attribute (a resource's once per body); none for a private `_logit.` one |
+//! | any other event attribute; a resource attribute that is none of the fields above (`_logit.datadog.agent.*` and the two envelope flags count on the v0.6 route, which has no envelope) | omitted | `tags.omitted{reason="no_wire_form"}`, one per attribute (a resource's once per body); none for another protocol's private `_logit.` key |
 //! | a delta `Sum` hits/errors/top-level-hits/duration | `uint64`: a `U64` or non-negative `I64` as is, a `Bool` as `1` or `0`, an `F64` rounded to the nearest integer | a `Bool`: `logit.output.metrics.normalized{reason="bool_value"}`; a negative `I64`: `0`, `degraded{reason="bad_count"}`; a fraction: `logit.output.stats.degraded{reason="fractional_count"}`; negative or non-finite: `0`, `degraded{reason="bad_count"}`; above 2^64: `u64::MAX`, `degraded{reason="count_overflow"}` |
 //! | an ok/error summary `Distribution` under a logarithmic mapping | a DDSketch protobuf: its `gamma` and `indexOffset`, `interpolation: NONE`, both stores as sparse `binCounts` in ascending key order, `zeroCount`. Hand-encoded, since prost's `HashMap` would order the bins at random | a bin limit other than 2048 (a receiver collapses at 2048): `degraded{reason="bin_limit"}`; a summary tracked from observations (`stats_exact`), which the protobuf has no field for: `degraded{reason="exact_summary"}` |
 //! | the same under `Mapping::agent` | `gamma = 1.015625`, `indexOffset = bias + 0.5`, keys unchanged: Datadog's own conversion, reading the Agent's round-half-to-even key as the logarithmic floor. Only a value on an exact tie keys differently, and the exact summary is lost | `degraded{reason="agent_mapping"}` |
@@ -493,78 +496,94 @@ use std::collections::{HashMap, HashSet};
 
 /// `host.name`: the Datadog host of a series/sketch/log, as an event attribute.
 pub const ATTR_HOST_NAME: &str = "host.name";
-/// `datadog.type`: `rate` or `unspecified`; absent for `count` and `gauge`, whose model kinds say
-/// so themselves.
-pub const ATTR_TYPE: &str = "datadog.type";
-/// `datadog.interval`: a count's or rate's interval in seconds (I64), present only when nonzero.
-pub const ATTR_INTERVAL: &str = "datadog.interval";
-/// `datadog.source_type_name`: the check or integration that produced a series.
-pub const ATTR_SOURCE_TYPE_NAME: &str = "datadog.source_type_name";
-/// `datadog.device`: the v1 series `device` field.
-pub const ATTR_DEVICE: &str = "datadog.device";
-/// `datadog.resources`: every series resource whose `type` isn't `host`, as an `Array` of
+/// `_logit.datadog.type`: `rate` or `unspecified`; absent for `count` and `gauge`, whose model
+/// kinds say so themselves.
+pub const ATTR_TYPE: &str = "_logit.datadog.type";
+/// `_logit.datadog.interval`: a count's or rate's interval in seconds (I64), present only when
+/// nonzero.
+pub const ATTR_INTERVAL: &str = "_logit.datadog.interval";
+/// `_logit.datadog.source_type_name`: the check or integration that produced a series.
+pub const ATTR_SOURCE_TYPE_NAME: &str = "_logit.datadog.source_type_name";
+/// `_logit.datadog.device`: the v1 series `device` field.
+pub const ATTR_DEVICE: &str = "_logit.datadog.device";
+/// `_logit.datadog.resources`: every series resource whose `type` isn't `host`, as an `Array` of
 /// `Map{type, name}`.
-pub const ATTR_RESOURCES: &str = "datadog.resources";
-/// `datadog.origin.product` / `.category` / `.service`: the protobuf `Origin` codes (U64).
-pub const ATTR_ORIGIN_PRODUCT: &str = "datadog.origin.product";
-pub const ATTR_ORIGIN_CATEGORY: &str = "datadog.origin.category";
-pub const ATTR_ORIGIN_SERVICE: &str = "datadog.origin.service";
-/// `datadog.origin.metric_type`: the JSON v2 API's extra origin code, which the protobuf lacks.
-pub const ATTR_ORIGIN_METRIC_TYPE: &str = "datadog.origin.metric_type";
-/// `datadog.event_type`: the Agent-only event field.
-pub const ATTR_EVENT_TYPE: &str = "datadog.event_type";
-/// `datadog.event.device_name` / `.related_event_id`: the public events API's extra fields.
-pub const ATTR_EVENT_DEVICE_NAME: &str = "datadog.event.device_name";
-pub const ATTR_EVENT_RELATED_EVENT_ID: &str = "datadog.event.related_event_id";
-/// `datadog.source`: a log's `ddsource` when it arrives from elsewhere than a Datadog log payload
-/// (an upstream `set`); a decoded Datadog log keeps `ddsource` verbatim instead.
-pub const ATTR_SOURCE: &str = "datadog.source";
-/// `datadog.agent.hostname`: an events envelope's `internalHostname`, as a resource attribute.
-pub const RESOURCE_ATTR_AGENT_HOSTNAME: &str = "datadog.agent.hostname";
-/// `datadog.agent.version` / `.timezone` / `.epoch` / `.internal_ip` / `.public_ip`: a sketch
-/// payload's `CommonMetadata`, as resource attributes (`epoch` an `F64`, the rest `Str`).
-pub const RESOURCE_ATTR_AGENT_VERSION: &str = "datadog.agent.version";
-pub const RESOURCE_ATTR_AGENT_TIMEZONE: &str = "datadog.agent.timezone";
-pub const RESOURCE_ATTR_AGENT_EPOCH: &str = "datadog.agent.epoch";
-pub const RESOURCE_ATTR_AGENT_INTERNAL_IP: &str = "datadog.agent.internal_ip";
-pub const RESOURCE_ATTR_AGENT_PUBLIC_IP: &str = "datadog.agent.public_ip";
-/// `datadog.agent.env`: an `AgentPayload`'s or a stats `StatsPayload` envelope's `env`, as a
+pub const ATTR_RESOURCES: &str = "_logit.datadog.resources";
+/// `_logit.datadog.origin.product` / `.category` / `.service`: the protobuf `Origin` codes (U64).
+pub const ATTR_ORIGIN_PRODUCT: &str = "_logit.datadog.origin.product";
+pub const ATTR_ORIGIN_CATEGORY: &str = "_logit.datadog.origin.category";
+pub const ATTR_ORIGIN_SERVICE: &str = "_logit.datadog.origin.service";
+/// `_logit.datadog.origin.metric_type`: the JSON v2 API's extra origin code, which the protobuf
+/// lacks.
+pub const ATTR_ORIGIN_METRIC_TYPE: &str = "_logit.datadog.origin.metric_type";
+/// `_logit.datadog.event_type`: the Agent-only event field.
+pub const ATTR_EVENT_TYPE: &str = "_logit.datadog.event_type";
+/// `_logit.datadog.event.device_name` / `.related_event_id`: the public events API's extra fields.
+pub const ATTR_EVENT_DEVICE_NAME: &str = "_logit.datadog.event.device_name";
+pub const ATTR_EVENT_RELATED_EVENT_ID: &str = "_logit.datadog.event.related_event_id";
+/// `_logit.datadog.source`: a log's `ddsource` when it arrives from elsewhere than a Datadog log
+/// payload (an upstream `set`); a decoded Datadog log keeps `ddsource` verbatim instead.
+pub const ATTR_SOURCE: &str = "_logit.datadog.source";
+/// `_logit.datadog.agent.hostname`: an events envelope's `internalHostname`, as a resource
+/// attribute.
+pub const RESOURCE_ATTR_AGENT_HOSTNAME: &str = "_logit.datadog.agent.hostname";
+/// `_logit.datadog.agent.version` / `.timezone` / `.epoch` / `.internal_ip` / `.public_ip`: a
+/// sketch payload's `CommonMetadata`, as resource attributes (`epoch` an `F64`, the rest `Str`).
+pub const RESOURCE_ATTR_AGENT_VERSION: &str = "_logit.datadog.agent.version";
+pub const RESOURCE_ATTR_AGENT_TIMEZONE: &str = "_logit.datadog.agent.timezone";
+pub const RESOURCE_ATTR_AGENT_EPOCH: &str = "_logit.datadog.agent.epoch";
+pub const RESOURCE_ATTR_AGENT_INTERNAL_IP: &str = "_logit.datadog.agent.internal_ip";
+pub const RESOURCE_ATTR_AGENT_PUBLIC_IP: &str = "_logit.datadog.agent.public_ip";
+/// `_logit.datadog.agent.env`: an `AgentPayload`'s or a stats `StatsPayload` envelope's `env`, as a
 /// resource attribute. Shared by [`traces`] and [`stats`], so it lives here rather than in either.
-pub const RESOURCE_ATTR_AGENT_ENV: &str = "datadog.agent.env";
-/// `datadog.tracer.*`: a `TracerPayload`'s or a stats `ClientStatsPayload`'s fields, as batch
-/// resource attributes. Shared by [`traces`] and [`stats`], so they live here rather than in
+pub const RESOURCE_ATTR_AGENT_ENV: &str = "_logit.datadog.agent.env";
+/// `_logit.datadog.tracer.*`: a `TracerPayload`'s or a stats `ClientStatsPayload`'s fields, as
+/// batch resource attributes. Shared by [`traces`] and [`stats`], so they live here rather than in
 /// either; each module also has its own carriers with no counterpart in the other.
-pub const RESOURCE_ATTR_TRACER_CONTAINER_ID: &str = "datadog.tracer.container_id";
-pub const RESOURCE_ATTR_TRACER_LANGUAGE_NAME: &str = "datadog.tracer.language_name";
-pub const RESOURCE_ATTR_TRACER_VERSION: &str = "datadog.tracer.tracer_version";
-pub const RESOURCE_ATTR_TRACER_RUNTIME_ID: &str = "datadog.tracer.runtime_id";
-pub const RESOURCE_ATTR_TRACER_ENV: &str = "datadog.tracer.env";
-pub const RESOURCE_ATTR_TRACER_HOSTNAME: &str = "datadog.tracer.hostname";
-pub const RESOURCE_ATTR_TRACER_APP_VERSION: &str = "datadog.tracer.app_version";
-/// `datadog.tracer.language_interpreter` / `.language_interpreter_vendor` / `.entity_id` /
+pub const RESOURCE_ATTR_TRACER_CONTAINER_ID: &str = "_logit.datadog.tracer.container_id";
+pub const RESOURCE_ATTR_TRACER_LANGUAGE_NAME: &str = "_logit.datadog.tracer.language_name";
+pub const RESOURCE_ATTR_TRACER_VERSION: &str = "_logit.datadog.tracer.tracer_version";
+pub const RESOURCE_ATTR_TRACER_RUNTIME_ID: &str = "_logit.datadog.tracer.runtime_id";
+pub const RESOURCE_ATTR_TRACER_ENV: &str = "_logit.datadog.tracer.env";
+pub const RESOURCE_ATTR_TRACER_HOSTNAME: &str = "_logit.datadog.tracer.hostname";
+pub const RESOURCE_ATTR_TRACER_APP_VERSION: &str = "_logit.datadog.tracer.app_version";
+/// `_logit.datadog.tracer.language_interpreter` / `.language_interpreter_vendor` / `.entity_id` /
 /// `.external_env`: a tracer's `Datadog-Meta-Lang-Interpreter`,
 /// `Datadog-Meta-Lang-Interpreter-Vendor`, `Datadog-Entity-ID`, and `Datadog-External-Env` request
 /// headers (`Str`), which no payload carries. `Datadog-External-Env` is the tracer's copy of the
 /// `DD_EXTERNAL_ENV` a DogStatsD client sends as `|e:`, which the Agent's origin detection reads.
-pub const RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER: &str = "datadog.tracer.language_interpreter";
+pub const RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER: &str =
+    "_logit.datadog.tracer.language_interpreter";
 pub const RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR: &str =
-    "datadog.tracer.language_interpreter_vendor";
-pub const RESOURCE_ATTR_TRACER_ENTITY_ID: &str = "datadog.tracer.entity_id";
-pub const RESOURCE_ATTR_TRACER_EXTERNAL_ENV: &str = "datadog.tracer.external_env";
-/// `datadog.tracer.client_computed_top_level` / `.client_computed_stats`: a tracer's
+    "_logit.datadog.tracer.language_interpreter_vendor";
+pub const RESOURCE_ATTR_TRACER_ENTITY_ID: &str = "_logit.datadog.tracer.entity_id";
+pub const RESOURCE_ATTR_TRACER_EXTERNAL_ENV: &str = "_logit.datadog.tracer.external_env";
+/// `_logit.datadog.tracer.client_computed_top_level` / `.client_computed_stats`: a tracer's
 /// `Datadog-Client-Computed-Top-Level` and `Datadog-Client-Computed-Stats` request headers, as
 /// `Bool(true)` when set and absent otherwise.
 pub const RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL: &str =
-    "datadog.tracer.client_computed_top_level";
-pub const RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS: &str = "datadog.tracer.client_computed_stats";
-/// `datadog.tracer.dropped_p0_traces` / `.dropped_p0_spans`: a tracer's
+    "_logit.datadog.tracer.client_computed_top_level";
+pub const RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS: &str =
+    "_logit.datadog.tracer.client_computed_stats";
+/// `_logit.datadog.tracer.dropped_p0_traces` / `.dropped_p0_spans`: a tracer's
 /// `Datadog-Client-Dropped-P0-Traces` and `-Spans` request headers (`U64`), the priority-0
 /// traces and spans it dropped before sending.
-pub const RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES: &str = "datadog.tracer.dropped_p0_traces";
-pub const RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS: &str = "datadog.tracer.dropped_p0_spans";
+pub const RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES: &str = "_logit.datadog.tracer.dropped_p0_traces";
+pub const RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS: &str = "_logit.datadog.tracer.dropped_p0_spans";
 
-/// The tracer API's request headers that carry `datadog.tracer.*` resource attributes, spelled
-/// in lowercase as `http::HeaderName` stores them. `datadog_trace_in` reads them and
+/// The private prefix every Datadog carrier above lives under.
+pub const CARRIER_PREFIX: &str = "_logit.datadog.";
+
+/// Whether `key` is another protocol's private key, which an encoder here skips without counting
+/// it. A key under [`CARRIER_PREFIX`] is this codec's own: one a route doesn't read as a carrier
+/// is written or counted as any other name would be, so a tracer's `meta` key spelled like a
+/// carrier relays verbatim and a carrier a route has no field for is counted `no_wire_form`.
+fn is_foreign_private(key: &str) -> bool {
+    logit_core::attrs::is_private(key) && !key.starts_with(CARRIER_PREFIX)
+}
+
+/// The tracer API's request headers that carry `_logit.datadog.tracer.*` resource attributes,
+/// spelled in lowercase as `http::HeaderName` stores them. `datadog_trace_in` reads them and
 /// `datadog_trace_out` writes them back; the mapping is in this module's doc, under "Traces".
 pub const HEADER_META_LANG: &str = "datadog-meta-lang";
 pub const HEADER_META_LANG_VERSION: &str = "datadog-meta-lang-version";
@@ -645,7 +664,7 @@ pub fn is_datadog_event(resource: &Resource, event: &Event) -> bool {
     event.log.is_some() && merged_get(resource, event, events::ATTR_EVENT_TITLE).is_some()
 }
 
-/// APM stats: `datadog.stats.name` present (the event's, else the resource's), exactly what
+/// APM stats: `_logit.datadog.stats.name` present (the event's, else the resource's), the events
 /// [`DatadogEncoder::encode_client_stats_v06`] and [`DatadogEncoder::encode_stats_payload`] send.
 /// Every metrics route skips such an event whole: its records are a stats group's, not series.
 pub fn is_datadog_stats(resource: &Resource, event: &Event) -> bool {
@@ -700,11 +719,11 @@ pub fn is_agent_processed(root: &Event) -> bool {
 }
 
 /// Whether `event`'s span carries an attribute only a Datadog span has: on the event,
-/// `resource.name`, `span.type`, `datadog.span.error`, a `datadog.chunk.*` carrier,
+/// `resource.name`, `span.type`, `_logit.datadog.span.error`, a `_logit.datadog.chunk.*` carrier,
 /// [`METRIC_SAMPLING_PRIORITY`], [`METRIC_TOP_LEVEL`], or a key starting `_dd.` (the tracer's and
 /// Agent's own `meta`/`metrics` namespace, `_dd.p.tid` and `_dd.p.dm` included); on the batch
-/// resource, a `datadog.tracer.*` or `datadog.agent.*` carrier. `service.name` alone doesn't
-/// count: every OTel resource carries it.
+/// resource, a `_logit.datadog.tracer.*` or `_logit.datadog.agent.*` carrier. `service.name` alone
+/// doesn't count: every OTel resource carries it.
 pub fn is_datadog_span(resource: &Resource, event: &Event) -> bool {
     const SPAN_KEYS: [&str; 9] = [
         ATTR_RESOURCE_NAME,
@@ -724,7 +743,7 @@ pub fn is_datadog_span(resource: &Resource, event: &Event) -> bool {
     on_event
         || resource.attributes.iter().any(|(sym, _)| {
             let key = resolve(sym);
-            key.starts_with("datadog.tracer.") || key.starts_with("datadog.agent.")
+            key.starts_with("_logit.datadog.tracer.") || key.starts_with("_logit.datadog.agent.")
         })
 }
 
@@ -829,7 +848,8 @@ impl DatadogDecoder {
 pub struct DatadogEncoder {
     telemetry: Telemetry,
     diagnostics: Diagnostics,
-    /// `ddsource` for a log that carries neither `ddsource` nor `datadog.source`; `None` omits it.
+    /// `ddsource` for a log that carries neither `ddsource` nor `_logit.datadog.source`; `None`
+    /// omits it.
     default_source: Option<String>,
 }
 
@@ -928,8 +948,8 @@ mod tests {
         assert_eq!(Ready.drop_reason(), None);
     }
 
-    /// `_top_level: 0` isn't the mark, and a `datadog.tracer.*` resource makes an otherwise bare
-    /// span Datadog-origin.
+    /// `_top_level: 0` isn't the mark, and a `_logit.datadog.tracer.*` resource makes an otherwise
+    /// bare span Datadog-origin.
     #[test]
     fn a_zero_top_level_is_unprocessed_and_a_tracer_resource_marks_the_origin() {
         assert!(!is_agent_processed(&span(1, 1, None, &[(METRIC_TOP_LEVEL, Value::F64(0.0))])));
