@@ -101,11 +101,14 @@
 //! Rule (b) of [ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md) -- the raw,
 //! protocol-native fact rides alongside the normalized model field and wins on the way back out.
 //! Every `prometheus.*` attribute is *consumed* by the encode side (never rendered as a label) and
-//! appears as an ordinary tag at every other sink. `docs/design/data-model.md`'s well-known-attribute
-//! table is the canonical list; in short: [`ATTR_TYPE`] (`Value::Str`) names the wire family type the
-//! model has no distinct kind for; [`ATTR_TIMESTAMP`] (`Value::Bool(true)`) means "this sample
-//! carried its own timestamp"; [`ATTR_TARGET`] (`Value::Str`, a **resource** attribute stamped by
-//! `prometheus_in`) is the full scrape URL.
+//! appears as an ordinary tag at every other sink. A private `_logit.` attribute is never a label
+//! either, and never counted
+//! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
+//! `docs/design/data-model.md`'s well-known-attribute table is the canonical list; in short:
+//! [`ATTR_TYPE`] (`Value::Str`) names the wire family type the model has no distinct kind for;
+//! [`ATTR_TIMESTAMP`] (`Value::Bool(true)`) means "this sample carried its own timestamp";
+//! [`ATTR_TARGET`] (`Value::Str`, a **resource** attribute stamped by `prometheus_in`) is the full
+//! scrape URL.
 //!
 //! Target identity is the exception: `prometheus_in` also stamps an **unprefixed**
 //! [`LABEL_INSTANCE`] (`instance`, `host:port`) on the resource, which this encoder therefore
@@ -1203,7 +1206,7 @@ fn build_labels(
     let mut candidates: Vec<(&str, Cow<'_, str>, String)> = Vec::new();
     for (key, value) in logit_core::attrs::merged(resource, event) {
         let key = resolve(key);
-        if key.starts_with(ATTR_PREFIX) {
+        if key.starts_with(ATTR_PREFIX) || logit_core::attrs::is_private(key) {
             continue;
         }
         // A repeated DogStatsD tag key arrives as a `Value::Array` in wire order
@@ -2125,6 +2128,28 @@ mod tests {
 
     fn has_point(points: &[(String, String)], name: &str, reason: &str) -> bool {
         points.iter().any(|(n, r)| n == name && r == reason)
+    }
+
+    /// A private attribute, on the event or the resource, is never a label and never counted,
+    /// even one whose value no label could hold; a public sibling still renders.
+    #[test]
+    fn a_private_attribute_is_never_a_label_and_never_counted() {
+        let event = event_with(
+            &[
+                ("_logit.x", Value::from("e")),
+                ("_logit.m", Value::Map(Box::new(AttrMap::new()))),
+                ("env", Value::from("prod")),
+            ],
+            record("m", MetricKind::gauge(1.0)),
+        );
+        let resource = resource_with(&[("_logit.y", Value::from("r"))]);
+        let (families, registry, _) = encode_counted(&resource, &event);
+        assert_eq!(families[0].series[0].labels, labels(&[("env", "prod")]));
+        let points = label_points(&registry);
+        assert!(
+            points.iter().all(|(name, _)| !name.starts_with("logit.output.labels.")),
+            "{points:?}"
+        );
     }
 
     /// A multi-value attribute renders its **last** representable element, counted as normalized.
