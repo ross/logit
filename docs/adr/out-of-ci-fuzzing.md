@@ -143,8 +143,8 @@ lib test and joins `script/unsafe-check`'s `MIRI_TARGETS`, so Miri runs it.
 
 ### What `script/cibuild` doesn't cover
 
-`fuzz/` is outside the root workspace, so clippy, `script/audit` (`cargo-deny`), and `script/test` never reach it. Nothing in `fuzz/` ships, and its only
-dependency outside the root lock's set is `libfuzzer-sys`. `script/format` does reach it, with
+`fuzz/` is outside the root workspace, so clippy, `script/audit` (`cargo-deny`), and
+`script/test` never reach it. Nothing in `fuzz/` ships, and its only dependency outside the root lock's set is `libfuzzer-sys`. `script/format` does reach it, with
 `cargo fmt --manifest-path fuzz/Cargo.toml`, so `rustfmt.toml` holds there too, and `script/lint`
 type-checks it on the stable toolchain, so a `fuzz/` crate that no longer compiles against a
 changed decoder API fails CI (the 2026-10-11 amendment). The sanitizer builds and the runs stay
