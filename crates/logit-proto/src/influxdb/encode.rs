@@ -48,7 +48,7 @@
 //! warm encode allocates only the body, a key per new series, and the series maps' growth
 //! (`docs/design/memory.md`'s `influx_encode_100_events` row).
 
-use super::{ATTR_MEASUREMENT, CARRIER_PREFIX, FIELD_ATTR_PREFIX};
+use super::{ATTR_MEASUREMENT, FIELD_ATTR_PREFIX};
 use crate::{CodecError, Encoder};
 use bytes::Bytes;
 use logit_core::interner::{intern, resolve, Symbol};
@@ -61,8 +61,8 @@ use std::collections::HashMap;
 // (`docs/design/memory.md`).
 use std::fmt::Write;
 
-/// Another protocol's carrier namespace, skipped as a tag **uncounted**, as the `influxdb.`
-/// carrier is: these are `statsd_out`'s own wire segments (rule (b) of
+/// Another protocol's carrier namespace, skipped as a tag **uncounted**, as a private key is:
+/// these are `statsd_out`'s own wire segments (rule (b) of
 /// `docs/adr/lossless-transit.md`), and free text such as `statsd.event.title` would become an
 /// indexed, high-cardinality tag.
 const STATSD_PREFIX: &str = "statsd.";
@@ -130,11 +130,11 @@ pub struct EncodeStats {
 
 /// Encodes an [`EventBatch`] as InfluxDB line protocol.
 ///
-/// Only `metrics` and the `influxdb.field.*` carrier have a line-protocol mapping; a log body or
+/// Only `metrics` and `influxdb.field.*` string fields have a line-protocol mapping; a log body or
 /// span is skipped, since InfluxDB has no established convention for either. Without the
-/// `influxdb.measurement` carrier, each metric on an event becomes its own line sharing that
-/// event's tags (`docs/adr/multi-payload-events.md`); with it, the event is one multi-field line
-/// ([`super`]'s "Encode" section).
+/// `_logit.influxdb.measurement` carrier, each metric on an event becomes its own line sharing
+/// that event's tags (`docs/adr/multi-payload-events.md`); with it, the event is one multi-field
+/// line ([`super`]'s "Encode" section).
 ///
 /// Public so `logit-bench` can drive it with no HTTP server: `docs/design/memory.md` pins its
 /// allocation count (`influx_encode_100_events`). Reusable buffers and the batch-scoped series
@@ -242,8 +242,8 @@ impl Encoder for InfluxLineEncoder {
     }
 }
 
-/// The event's `influxdb.measurement`, when it is a non-empty UTF-8 `Str`. Any other value isn't a
-/// carrier: the event takes the per-record path, and the attribute is still never a tag.
+/// The event's `_logit.influxdb.measurement`, when it is a non-empty UTF-8 `Str`. Any other value
+/// isn't a carrier: the event takes the per-record path, and the attribute is still never a tag.
 fn carrier_measurement(event: &Event, key: Symbol) -> Option<&str> {
     match event.attributes.get_sym(key)? {
         Value::Str(s) => std::str::from_utf8(s).ok().filter(|m| !m.is_empty()),
@@ -551,8 +551,9 @@ impl Ctx<'_> {
 /// attributes, with event attributes overriding on a key collision. Infallible: a tag that can't
 /// be represented is omitted alone, counted in `stats`, rather than failing the point.
 ///
-/// Every `influxdb.`- and `statsd.`-prefixed key is skipped, uncounted: those are carriers
-/// (rule (b), `docs/adr/lossless-transit.md`), not tags.
+/// Every private `_logit.` key, `influxdb.field.` key, and `statsd.` key is skipped, uncounted: the
+/// first and last are carriers (`docs/adr/private-attribute-namespace.md`), not tags, and an
+/// `influxdb.field.` key is a string field, which the carrier path writes as a field.
 ///
 /// The maps are merge-joined ([`logit_core::attrs::merged`]) rather than cloned and re-inserted:
 /// no `AttrMap` copy per event and no `resolve` -> `intern` round trip per key.
@@ -576,9 +577,9 @@ fn render_tag_suffix(
     suffix.clear();
     for (key, value) in logit_core::attrs::merged(resource, event) {
         let key = resolve(key);
-        if key.starts_with(CARRIER_PREFIX)
+        if logit_core::attrs::is_private(key)
+            || key.starts_with(FIELD_ATTR_PREFIX)
             || key.starts_with(STATSD_PREFIX)
-            || logit_core::attrs::is_private(key)
         {
             continue;
         }
@@ -1152,13 +1153,14 @@ mod tests {
         assert_eq!(stats.skipped_exponential_histogram, 1);
     }
 
-    /// `statsd.*` and `influxdb.*` carriers never become tags; an ordinary sibling attribute
-    /// still does.
+    /// `statsd.*` and `_logit.influxdb.*` carriers and `influxdb.field.*` string fields never
+    /// become tags; an ordinary sibling attribute does, and so does a public key under
+    /// `influxdb.` that isn't a string field.
     #[test]
-    fn statsd_and_influxdb_dot_attributes_never_become_tags() {
+    fn carriers_and_string_fields_never_become_tags() {
         let mut resource = Resource::default();
-        resource.attributes.insert("influxdb.bucket", "metrics");
-        resource.attributes.insert("influxdb.org", "logit");
+        resource.attributes.insert("_logit.influxdb.bucket", "metrics");
+        resource.attributes.insert("_logit.influxdb.org", "logit");
         let event = metric_event(
             "page.views",
             MetricKind::counter(1.0),
@@ -1168,13 +1170,19 @@ mod tests {
                 ("statsd.event.title", "deploy"),
                 ("statsd.service_check.message", "a|b"),
                 ("influxdb.field.note", "hello"),
+                ("influxdb.foo", "bar"),
                 ("env", "prod"),
             ],
         );
         let mut encoder = InfluxLineEncoder::default();
         let batch = EventBatch { resource: Arc::new(resource), scope: None, events: vec![event] };
         let out = String::from_utf8(encoder.encode(&batch).unwrap().to_vec()).unwrap();
-        assert_eq!(out, "page.views,env=prod value=1 1700000000000000000\n");
+        // Tag order follows interning order, which other tests in the process can change.
+        let (series, rest) = out.split_once(' ').unwrap();
+        let mut parts: Vec<&str> = series.split(',').collect();
+        parts[1..].sort_unstable();
+        assert_eq!(parts, ["page.views", "env=prod", "influxdb.foo=bar"], "got: {out}");
+        assert_eq!(rest, "value=1 1700000000000000000\n");
         assert_eq!(*encoder.stats(), EncodeStats::default(), "carriers are skipped uncounted");
     }
 
@@ -1727,7 +1735,7 @@ mod tests {
         assert_eq!(out, "nginx.requests value=1 1700000000000000000\n");
     }
 
-    // -- The `influxdb.*` carrier (`super`'s "Encode") ------------------------------------------
+    // -- The measurement carrier (`super`'s "Encode") -------------------------------------------
 
     /// An event as `influxdb_in` decodes one point: the measurement carrier and one `Gauge`
     /// record per field, named `<measurement>.<field>`.

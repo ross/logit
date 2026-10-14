@@ -2020,8 +2020,9 @@ pub enum ComponentKind {
     /// line protocol body (gzip accepted) and `org` or `orgID`, `bucket`, and `precision` in the
     /// query string, `GET /ping`, and `GET /health`, answering influxd's own JSON error bodies.
     /// A request with `Authorization: Token <t>` or `Bearer <t>` is checked against `tokens:`.
-    /// `org`, `orgID`, and `bucket` become the resource attributes `influxdb.org`,
-    /// `influxdb.org_id`, and `influxdb.bucket`. A body with any line that doesn't parse is
+    /// `org`, `orgID`, and `bucket` become the resource attributes `_logit.influxdb.org`,
+    /// `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`, which a `route` can match on and
+    /// which no sink writes as a tag. A body with any line that doesn't parse is
     /// refused whole with `400`, and nothing of it is delivered. When the pipeline can't start
     /// taking a request's data within 5s, the request gets `503` with `Retry-After: 1`, nothing
     /// of it is delivered, and the client retries it. The v1 `/write` endpoint isn't served.

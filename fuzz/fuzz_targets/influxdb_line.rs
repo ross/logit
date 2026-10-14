@@ -9,9 +9,9 @@
 //!   decodes, or fails, as a body of its own;
 //! - merging: the body is one event per distinct measurement, tag set, and timestamp among its
 //!   points, and no more events than points;
-//! - the model: every event carries `influxdb.measurement` as a `Str`; every attribute is a
-//!   `Str`; every metric is a `Gauge` named `<measurement>.<field>`; no tag under `influxdb.`
-//!   survives but the carriers the decoder writes;
+//! - the model: every event carries `_logit.influxdb.measurement` as a `Str`; every attribute is
+//!   a `Str`; every metric is a `Gauge` named `<measurement>.<field>`; no tag under the private
+//!   `_logit.` prefix survives, and the measurement carrier is the one private key;
 //! - zero copy: in a body with no backslash, nothing is unescaped, so every attribute is a slice
 //!   of the body;
 //! - the second-generation fixed point: re-encoding the decoded batch decodes (unless the
@@ -25,7 +25,7 @@ use logit_core::interner::resolve;
 use logit_core::{subslice, EventBatch, MetricKind, Resource, Value};
 use logit_proto::influxdb::encode::InfluxLineEncoder;
 use logit_proto::influxdb::line::{self, MAX_TIMESTAMP_NS, MIN_TIMESTAMP_NS};
-use logit_proto::influxdb::{InfluxDecoder, Precision, ATTR_MEASUREMENT, FIELD_ATTR_PREFIX};
+use logit_proto::influxdb::{InfluxDecoder, Precision, ATTR_MEASUREMENT};
 use logit_proto::Encoder;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -129,9 +129,7 @@ fuzz_target!(|data: &[u8]| {
             }
             let key = resolve(key);
             assert!(
-                !key.starts_with("influxdb.")
-                    || key == ATTR_MEASUREMENT
-                    || key.starts_with(FIELD_ATTR_PREFIX),
+                !logit_core::attrs::is_private(key) || key == ATTR_MEASUREMENT,
                 "model: reserved tag {key} survived"
             );
         }
@@ -152,7 +150,7 @@ fuzz_target!(|data: &[u8]| {
     let first = encode(&batch);
     let gen1 = match decode(&first, Precision::Ns) {
         Ok(gen1) => gen1,
-        // Two events of one series and instant (their only difference a dropped `influxdb.` tag)
+        // Two events of one series and instant (their only difference a dropped reserved tag)
         // at the range's end: the encoder's 1 ns nudge moves the second past it.
         Err(err) if err.reason.starts_with("time outside range") => return,
         Err(err) => panic!("fixed point: the encoder's body doesn't decode: {err}"),

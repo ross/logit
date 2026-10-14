@@ -1305,7 +1305,7 @@ connection refused for its PROXY header.
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `oversize` (`413`, as sent or decompressed), `auth` (`401`), `encoding` (`415`, anything but identity or lowercase gzip), `malformed_encoding` (`400`, a gzip stream that doesn't decompress), `precision` (`400`), `no_bucket` (`404`), `no_org` (`400`), `malformed` (`400`, a line that fails to parse), `stalled` (`408`, only with `idle_timeout:` set), or `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload) |
 | `logit.input.batches.deferred` | count | batches a busy `503` left with the client to resend, disjoint from `logit.component.batches.sent` |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | batches no consumer took, answered `503`. The refused batch is also counted in `logit.component.batches.sent` and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}` |
-| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | tags the decoder left off a point because their key starts with `_logit.`, the private carrier prefix, or `influxdb.`, which would collide with this codec's carrier attributes. The point is delivered. Counted by the codec, under this component's id |
+| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | tags the decoder left off a point because their key starts with `_logit.`, the private carrier prefix, or `influxdb.field.`, which would read back as a string field. The point is delivered. Counted by the codec, under this component's id |
 
 **A busy request is not a lost one**, as on `splunk_hec_in`: after 5 seconds without the pipeline
 taking the request's batch, the request gets `503` with `Retry-After: 1`, counted `class="busy"`
@@ -1900,7 +1900,7 @@ many attempts the runtime makes.
 | `logit.output.tags.omitted{reason="empty"}` | a tag with an empty key or value, which `influxd` rejects |
 | `logit.output.tags.omitted{reason="unencodable"}` | a tag key or value with a newline, a trailing backslash, or a backslash before a space, which line protocol can't spell |
 | `logit.output.tags.omitted{reason="reserved"}` | a tag key `influxd` reserves: `_measurement`, `_field`, or `time` |
-| `logit.output.metrics.normalized{reason="carrier_mismatch"}` | a record on an `influxdb.measurement` carrier event that doesn't fit the carrier line (its name lacks the `<measurement>.` prefix, or its kind isn't a `Gauge` or `Sum`), written as its own line |
+| `logit.output.metrics.normalized{reason="carrier_mismatch"}` | a record on a `_logit.influxdb.measurement` carrier event that doesn't fit the carrier line (its name lacks the `<measurement>.` prefix, or its kind isn't a `Gauge` or `Sum`), written as its own line |
 | `logit.output.metrics.dropped{reason="unencodable_value"}` | a non-finite `Gauge` or `Sum` value, or carrier field |
 | `logit.output.metrics.dropped{reason="unencodable_key"}` | a measurement or field key with no line-protocol spelling, once per field |
 | `logit.output.metrics.dropped{reason="reserved_key"}` | a carrier field named `time`, which `influxd` refuses |
