@@ -125,14 +125,14 @@ fn metric_with_description_and_exemplars_batch() -> EventBatch {
 }
 
 /// A log with `event_name`/a non-zero `observed_timestamp`/a dropped-attribute count, plus the
-/// `otel.severity_number`/`otel.severity_text` attributes a real OTLP decode stamps: the
-/// log-fidelity fields. Built already in the shape a real decode produces
+/// `_logit.otel.severity_number`/`_logit.otel.severity_text` attributes a real OTLP decode stamps:
+/// the log-fidelity fields. Built already in the shape a real decode produces
 /// (`crates/logit-proto/tests/otlp_fixed_point.rs`'s module doc says why that matters for the OTLP
 /// round-trip tests below).
 fn log_with_fidelity_fields_batch() -> EventBatch {
     let mut attrs = AttrMap::new();
-    attrs.insert("otel.severity_number", Value::I64(10));
-    attrs.insert("otel.severity_text", "INFO2");
+    attrs.insert("_logit.otel.severity_number", Value::I64(10));
+    attrs.insert("_logit.otel.severity_text", "INFO2");
     let log = LogRecord {
         message: Value::str("bakeoff log fixture"),
         severity: Some(Severity::Info),
@@ -382,7 +382,7 @@ fn otlp_preserves_span_ext_flags_links_and_events_exactly() {
 }
 
 /// `event_name`/`observed_timestamp`/`dropped_attributes_count` and the raw
-/// `otel.severity_number`/`otel.severity_text` attributes all round-trip through OTLP
+/// `_logit.otel.severity_number`/`_logit.otel.severity_text` attributes all round-trip through OTLP
 /// (`crates/logit-proto/src/otlp/logs.rs`'s module doc).
 #[test]
 fn otlp_preserves_log_event_name_observed_timestamp_dropped_count_and_severity_attrs() {

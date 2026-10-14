@@ -52,8 +52,8 @@ fn log_batch() -> EventBatch {
     let mut attrs = AttrMap::new();
     attrs.insert("custom.attr", "value");
     // What decoding SeverityNumber=10/"INFO2" stamps, matching Severity::Info.
-    attrs.insert("otel.severity_number", Value::I64(10));
-    attrs.insert("otel.severity_text", "INFO2");
+    attrs.insert("_logit.otel.severity_number", Value::I64(10));
+    attrs.insert("_logit.otel.severity_text", "INFO2");
 
     let log = LogRecord {
         message: Value::str("fully populated log fixture"),
@@ -375,20 +375,21 @@ fn without_scope(mut batch: EventBatch) -> EventBatch {
     batch
 }
 
-/// Only `otel.severity_number`: the missing text must round-trip as `""`, not the variant name
-/// (`otlp/logs.rs`'s pair-as-a-unit rule).
+/// Only `_logit.otel.severity_number`: the missing text must round-trip as `""`, not the variant
+/// name (`otlp/logs.rs`'s pair-as-a-unit rule).
 fn log_batch_with_severity_number_only() -> EventBatch {
     let mut batch = log_batch();
-    batch.events[0].attributes.remove("otel.severity_text");
+    batch.events[0].attributes.remove("_logit.otel.severity_text");
     batch
 }
 
-/// Only `otel.severity_text`: the missing number must round-trip as `0`, not the band's base.
+/// Only `_logit.otel.severity_text`: the missing number must round-trip as `0`, not the band's
+/// base.
 fn log_batch_with_severity_text_only() -> EventBatch {
     let mut batch = log_batch();
     let event = &mut batch.events[0];
-    event.attributes.remove("otel.severity_number");
-    event.attributes.insert("otel.severity_text", "warn");
+    event.attributes.remove("_logit.otel.severity_number");
+    event.attributes.insert("_logit.otel.severity_text", "warn");
     event.log.as_mut().unwrap().severity = Some(Severity::Warn);
     batch
 }

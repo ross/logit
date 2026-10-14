@@ -56,15 +56,15 @@ fn fixture_scope() -> Arc<Scope> {
     })
 }
 
-/// In the shape a real OTLP decode produces: `otel.severity_number`/`otel.severity_text` match
-/// `Severity::Info`'s `INFO2` (10) band member. Encode consumes these two attributes and decode
+/// In the shape a real OTLP decode produces: `_logit.otel.severity_number` and
+/// `_logit.otel.severity_text` match `Severity::Info`'s `INFO2` (10) band member. Encode consumes these two attributes and decode
 /// re-stamps them from the wire's severity fields, so attributes that disagree with the `Severity`
 /// wouldn't round-trip to themselves (the rule `crates/logit-proto/tests/otlp_fixed_point.rs`'s
 /// module doc states).
 fn fixture_log_attrs() -> AttrMap {
     let mut attrs = AttrMap::new();
-    attrs.insert("otel.severity_number", Value::I64(10));
-    attrs.insert("otel.severity_text", "INFO2");
+    attrs.insert("_logit.otel.severity_number", Value::I64(10));
+    attrs.insert("_logit.otel.severity_text", "INFO2");
     attrs
 }
 
