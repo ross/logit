@@ -107,14 +107,23 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** keep metrics under 100 tags with `keep` or `remove` upstream.
   - **Revisit trigger:** Datadog documents or answers a different limit; the series route's `202`
     body states it (`limit=100`).
-- **`datadog_out` reports every hostless sender under the relay's hostname.** A metric, log,
-  event, or service check with no host of its own (no `host.name`, and for a log no `hostname`,
-  for an event or check no `statsd.*.host`) goes out with the process hostname, as an Agent sends
-  its own hostname for a DogStatsD client that sets no `h:` tag.
+- **`datadog_out` reports every hostless sender under the relay's hostname.** It sends the
+  process hostname for a metric with no `host.name` and no DogStatsD `host:` tag, an event or
+  service check with no `h:` field, no `host.name`, and no `host:` tag, and a log with none of
+  `hostname`, `host.name`, `syslog.hostname`, or `host`. An Agent does the same for a DogStatsD
+  client that names no host.
   - **Consequence:** many senders behind one central `logit` show in Datadog as one host, with
     their series merged under it. Datadog bills per host, so this costs what one Agent would.
   - **Workaround:** stamp `host.name` per sender upstream with `set`, or have each DogStatsD
-    client set `h:`.
+    client send a `host:` tag (or `h:` on an event or check).
+- **`datadog_out` fills an Agent's hostless sample on the v1, distribution-point, and sketch
+  routes.** The Agent sends `"host":""` only for a sample marked hostless: an empty
+  `host:` tag, or serverless mode. `datadog_in` decodes `""` as no host, so `logit` can't tell it
+  from a missing one, and `datadog_out` fills it with the process hostname. On v2 the Agent writes
+  a `host` resource with no name, which `datadog_out` keeps and never fills.
+  - **Consequence:** a sample the Agent kept hostless reports under the relay's host.
+  - **Workaround:** have the Agent send v2 series (its default), or stamp `host.name` upstream
+    with `set`.
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   v0.4 has no field for a chunk's `datadog.chunk.*` fields (sampling priority, origin, dropped
   flag, tags) or for the tracer payload fields no request header carries

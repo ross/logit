@@ -178,15 +178,24 @@ the rest of the request was stored.
 ### Hostless senders report as one Datadog host
 
 `datadog_out` sends `logit`'s process hostname
-([deploying.md's "Hostname"](deploying.md#hostname)) as the host of a metric, log, event, or
-service check that carries none of its own. That's what an Agent does for a DogStatsD client that
-sets no `h:` tag, so a `logit` on each host behaves as the Agent it replaces. A central `logit`
-receiving from many hosts is different: every hostless sender reports under the relay's one host,
-their series merge under it, and the per-host view of them is lost. Datadog bills per host, so
-the cost matches one Agent.
+([deploying.md's "Hostname"](deploying.md#hostname)) as the host of anything that carries none of
+its own:
 
-To keep a host per sender, stamp `host.name` upstream with `set` (or have each DogStatsD client
-set `h:`). A host the data carries is never replaced.
+- a metric with no `host.name` and no DogStatsD `host:` tag;
+- an event or service check with no `h:` field, no `host.name`, and no `host:` tag;
+- a log with none of `hostname`, `host.name`, `syslog.hostname`, or `host`.
+
+That's what an Agent does for a DogStatsD client that names no host, so a `logit` on each host
+behaves as the Agent it replaces. A central `logit` receiving from many hosts is different: every
+hostless sender reports under the relay's one host, their series merge under it, and the per-host
+view of them is lost. Datadog bills per host, so the cost matches one Agent.
+
+To keep a host per sender, stamp `host.name` upstream with `set`, or have each DogStatsD client
+send a `host:` tag (or `h:` on an event or check). A host the data carries is never replaced. A
+`host:` tag is the host, and isn't sent as a tag, as the Agent reads it. A sample a client made
+hostless with an empty `host:` tag stays hostless. An Agent's hostless v2 series stays hostless
+too, but one on the v1, distribution-point, or sketch routes is filled
+(`docs/known-gaps/datadog.md`).
 
 ### `at_least_once` can duplicate a request, and everything but series is stored twice
 

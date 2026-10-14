@@ -91,7 +91,7 @@ the sink's `hostname:` (`syslog_out` only), then the process hostname.
 |---|---|---|
 | `syslog_out` | `syslog.hostname` | HOSTNAME, unless the sink sets `hostname:` |
 | `splunk_hec_out` | resource `host.name` | the envelope `host` |
-| `datadog_out` | `host.name`; for an event or service check, `statsd.*.host` first; for a log, `hostname` first | a series' `host` resource, a v1, distribution, or sketch `host`, a log's `hostname`, an event's `host`, a check's `host_name` |
+| `datadog_out` | `host.name`, else a DogStatsD `host:` tag; for an event or service check, `statsd.*.host` first; for a log, `hostname` first, and `syslog.hostname` or `host` also count | a series' `host` resource, a v1, distribution, or sketch `host`, a log's `hostname`, an event's `host`, a check's `host_name` |
 
 Each relay pair gains a permitted normalization: an item that arrived with no host leaves with
 the relay's hostname. The Consequences' recipe for host-less `internal` events, a `remove` of

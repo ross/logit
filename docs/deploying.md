@@ -532,12 +532,12 @@ replace a host an event or its resource carries:
 |---|---|---|
 | `syslog_out` | `syslog.hostname` | HOSTNAME, unless the sink sets its own `hostname:` |
 | `splunk_hec_out` | resource `host.name` | the envelope `host` |
-| `datadog_out` | `hostname` (logs), `statsd.event.host` or `statsd.service_check.host`, then `host.name` | the host of a metric, log, event, or service check |
+| `datadog_out` | a metric's `host.name` or DogStatsD `host:` tag; an event's or check's `h:` field, `host.name`, or `host:` tag; a log's `hostname`, `host.name`, `syslog.hostname`, or `host` | the host of a metric, log, event, or service check |
 
 So a relay sends the relay's hostname for whatever arrived without one. Through `datadog_out`,
-that means every hostless DogStatsD sender reports as one Datadog host, as it would through one
-Agent; see [`docs/datadog.md`](datadog.md). To keep a host per sender, stamp `host.name` upstream
-with `set`.
+that means every DogStatsD sender that names no host reports as one Datadog host, as it would
+through one Agent; see [`docs/datadog.md`](datadog.md), which also lists the hostless samples it
+keeps hostless. To keep a host per sender, stamp `host.name` upstream with `set`.
 
 `internal`'s events carry `host.name`, so `collectd_out` sends it as their host too, and
 `datadog_out` reports them under it, which can register a new Datadog host. To send another name,
