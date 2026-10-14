@@ -158,7 +158,7 @@ The scripts run `sudo docker` by default. If your account is in the `docker` gro
 | `script/format [--check]` | Run `cargo fmt`. |
 | `script/schema` | Regenerate `schema/logit.schema.json` from the config types. |
 | `script/validate` | Run `logit validate` on every shipped config. |
-| `script/audit` | Run supply-chain checks (`cargo-deny`, `cargo-audit`). |
+| `script/audit` | Run the `cargo-deny` supply-chain checks, advisories included. CI skips advisories. |
 | `script/cibuild` | Run the full CI sequence. |
 | `script/console` | Open a shell in the dev container. |
 | `script/server [config]` | Start the local test stack and run `logit` against a config. |

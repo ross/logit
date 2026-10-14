@@ -1,7 +1,8 @@
 #!/bin/bash
 # Usage: script/cibuild
 # Runs the checks CI runs, in the same order. .github/workflows/ci.yml calls this script rather
-# than duplicating its steps, so a clean local run means a clean CI run.
+# than duplicating its steps, so a clean local run means a clean CI run. The advisory check is
+# left to Dependabot and a local script/audit.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
@@ -27,6 +28,6 @@ echo "## test ##################################################################
 "${SCRIPT_PATH}/test"
 
 echo "## supply chain ##################################################################"
-"${SCRIPT_PATH}/audit"
+"${SCRIPT_PATH}/audit" bans licenses sources
 
 echo "## complete ######################################################################"
