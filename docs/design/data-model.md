@@ -203,8 +203,9 @@ Rules for the trace/span rows (`syslog.sd` follows its own ADR's rules instead):
 list by a five-tuple (host, plugin, plugin instance, type, type instance) where this model has one
 `MetricRecord.name`, and carries a per-list reporting interval the model has no field for. The raw
 wire facts ride alongside as attributes and win on the way back out. `collectd_out` **consumes**
-every `collectd.*` attribute (never re-emits it as anything else); every other sink sees it as an
-ordinary tag. That is what makes `collectd_in -> collectd_out` a fixed point.
+every `collectd.*` attribute (never re-emits it as anything else). `graphite_out` skips them
+uncounted, and every other sink sees them as ordinary tags. That is what makes
+`collectd_in -> collectd_out` a fixed point.
 
 These are **event** attributes, never resource ones. `logit_pipeline::BatchAccumulator::absorb`
 keys accumulation on `Arc::ptr_eq`, so a per-host resource would split every batch by sender; the
