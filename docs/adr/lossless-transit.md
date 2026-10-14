@@ -267,3 +267,17 @@ The pair needs a typed metric scalar, which the model didn't have:
 and `Sum` with `MetricValue { F64, I64, U64, Bool }`. That change also closes two losses this ADR
 already counted as debt: an OTLP `as_int` point leaving `otlp_out` as a double, and a collectd
 `COUNTER`, `DERIVE`, or `ABSOLUTE` above 2^53 decoding to a different number.
+
+## Amendment: rule (b)'s carriers are private (2026-10-13)
+
+Rule (b)'s protocol-namespaced carriers now live under one private prefix, `_logit.`, with the
+protocol segment kept: `syslog.severity` becomes `_logit.syslog.severity`, and
+`otel.severity_number` becomes `_logit.otel.severity_number`. Every protocol sink ignores
+`_logit.*` when it renders attributes, except its own carriers, which it reads by exact name. See
+[ADR `private-attribute-namespace`](private-attribute-namespace.md) for which keys move, the
+ignore rule, the inbound guard on metric-wire tags, and how `keep` and `flatten` treat the
+namespace.
+
+Rules (b) and (c) are opposites. A rule (c) key (`logit.body_format`) is public: it exists to cross
+a foreign wire and every sink renders it. A rule (b) carrier is private: it exists for its own
+protocol's sink and never crosses a foreign wire as a tag, label, field, or attribute.

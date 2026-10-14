@@ -1,0 +1,195 @@
+---
+created: 2026-10-13
+updated: 2026-10-13
+---
+
+# Private attribute namespace: protocol carriers live under `_logit.<protocol>.`, and every other protocol's sink ignores them
+
+## Status
+Accepted
+
+## Context
+
+[ADR `lossless-transit`](lossless-transit.md)'s rule (b) lets a decoder stamp a protocol's raw
+encoding of something the model normalizes as a protocol-namespaced attribute, so the same
+protocol's sink can reproduce the original wire form: `statsd.type`, `prometheus.timestamp`,
+`collectd.plugin`, `influxdb.measurement`, `datadog.interval`, `datadog.tracer.*`, and others.
+Each like-protocol pair is a fixed point because of them.
+
+At every other sink they're ordinary attributes, and which ones a sink renders is decided sink by
+sink:
+
+- `influxdb_out` skips its own carriers and `statsd.*`.
+- `graphite_out` skips `statsd.*` and `collectd.*`.
+- `prometheus_out` skips only `prometheus.*`.
+- `datadog_out`'s series encoder skips a fixed list of 15 keys.
+- `otlp_out` skips nothing.
+
+So the input ahead of a sink changes that sink's series identity. A `statsd_in -> collectd_out`
+pipeline counts `statsd.type` as a tag with no wire form, a `collectd_in -> prometheus_out`
+pipeline grows a `collectd_plugin` label, and an `influxdb_in -> otlp_out` pipeline sends
+`influxdb.measurement` as an OTLP attribute. The documented workaround, a `remove` ahead of each
+foreign sink, needs the operator to know every carrier of every protocol upstream, and has to be
+revisited whenever a codec adds one.
+
+Rule (c) of the same ADR reserves `logit.*` for the opposite case: a `logit`-specific concept that
+has to cross a foreign wire because it has nowhere else to go (`logit.body_format`). Nothing named
+the case of a key that must never cross one.
+
+## Decision
+
+**Carriers live under one private prefix, `_logit.`, with the protocol segment kept:
+`_logit.statsd.type`, `_logit.prometheus.timestamp`, `_logit.influxdb.measurement`.** Every
+protocol sink ignores `_logit.*` when it renders tags, labels, fields, or attributes, except its
+own `_logit.<protocol>.*` keys, which it reads by exact name. There is no list to maintain.
+
+`logit_core::attrs::PRIVATE_PREFIX` and `logit_core::attrs::is_private` are the one definition of
+the prefix. Every check in the codebase calls `is_private`; nothing spells the prefix out again.
+`logit_core::attrs::merged` doesn't filter, because each sink reads its own carriers through it.
+
+### What is private
+
+A key is private when it's one of these:
+
+- A protocol's raw wire spelling of something the model already normalizes into a typed field: a
+  severity, a metric kind's wire type, the fact that the wire carried its own timestamp, a name
+  the model folds into `MetricRecord.name`.
+- A payload or envelope field that only that protocol's own sink reads: a Datadog series interval,
+  a tracer's request headers, an InfluxDB bucket.
+
+Everything else a decoder stamps is public data that any sink may render.
+
+By protocol, these move under `_logit.`:
+
+| Protocol | Private keys |
+|---|---|
+| statsd | every `statsd.*` attribute: `type`, `container_id`, `timestamp`, `event.*`, `service_check.*` |
+| Prometheus | every `prometheus.*` attribute: `type`, `timestamp`, and the resource attribute `target` |
+| collectd | every `collectd.*` attribute: the five-tuple, `interval`, and `severity` |
+| Datadog | every `datadog.*` attribute: series, events, service checks, Agent fields, trace chunk, stats, tracer headers, `span.error`, and `source` |
+| InfluxDB | `influxdb.measurement`, and the resource attributes `influxdb.org`, `influxdb.org_id`, and `influxdb.bucket` |
+| syslog | `syslog.severity` |
+| OTLP | `otel.severity_number` and `otel.severity_text` |
+
+These stay public:
+
+- `influxdb.field.<key>`: a string field's content, which is data, not a carrier.
+- `syslog.timestamp`: the sender's own stamp. `Event.timestamp` is receipt time until a
+  `timestamp` component resolves it, so the attribute duplicates nothing, and the `timestamp`
+  transform reads it by this name.
+- `syslog.hostname`, `syslog.tag`, `syslog.pid`, `syslog.msgid`, `syslog.sd`, and
+  `syslog.facility`: header facts with no typed home that any destination can use.
+- `com.splunk.*` and `otel.log.*`: the OpenTelemetry `splunk_hec` exporter's public vocabulary,
+  which [ADR `splunk-hec-relay`](splunk-hec-relay.md) adopts.
+- `http.*`: OpenTelemetry semantic conventions.
+- `logit.body_format`, and any other rule (c) key: public by design, because it exists to cross a
+  foreign wire. `_logit.` is its opposite.
+- `_dd.*`: Datadog's own span meta and metrics keys, which Datadog shows as data.
+
+Datadog metric names under `datadog.stats.*` and protobuf package names aren't attributes, and
+this decision doesn't touch them.
+
+### The ignore rule
+
+When a protocol sink renders an event's or a resource's attributes as tags, labels, fields, or
+attributes, it skips every top-level key `is_private` accepts, except its own
+`_logit.<protocol>.*` keys. The skip is silent and uncounted: no `omitted`, `no_wire_form`, or
+`dialect` counter ever counts a private key, and no diagnostic names one. A private key isn't a
+tag the sink failed to write; it was never a tag.
+
+The rule applies to top-level attribute keys only. A `_logit.` key nested inside a `Value::Map`
+attribute is data and renders like any other map key.
+
+Renders whose purpose is the whole event carry everything, private keys included:
+
+- `stdio_out` and `file_out`, under the human render, `format: json`, and `format: native`.
+- `kafka_out` under `format: json`, `msgpack`, and `native`.
+- The native wire: `logit_out`, `logit_in`, and the `buffer.disk:` spool.
+
+`kafka_out`'s `otlp_proto` and `otlp_json` formats render attributes as OTLP does, and follow the
+rule as `otlp_out` does.
+
+### Any component may read the private namespace
+
+The ignore rule governs generic rendering only. Any component, sinks included, may read any
+private key for information another protocol left there: `datadog_out` reads
+`_logit.statsd.event.*` to send a DogStatsD event to Datadog's events API, and `collectd_out`
+could read `_logit.prometheus.type`. This is a permission, not a mandate: nothing requires a
+component to look.
+
+### Transforms
+
+- `keep` drops `_logit.*` like any key not in `fields`, unless `private: keep`, which retains the
+  whole private namespace alongside `fields`. A private key retained this way counts as kept in
+  `logit.transform.attributes.kept`. The default is `drop`, so a `keep` ahead of `aggregate`
+  bounds series cardinality the same way whatever the input.
+- `flatten`'s `all` (for `attributes` or `resource`) never selects a private key. A private key
+  named in a list still flattens.
+- `aggregate` keys series on private keys unchanged, as on any attribute.
+- `remove`, `route`, `has_attributes`, `drop_attributes`, `set`, and Lua name private keys
+  explicitly, with no prefix matching. A private key may therefore appear in operator config:
+  `set` stamping `_logit.datadog.interval`, or a `route` on `_logit.influxdb.bucket`.
+
+### The inbound guard
+
+The five decoders whose wire carries arbitrary metric tag keys drop a key under `_logit.` and
+count it as `logit.input.tags.omitted{reason="reserved_prefix"}`; the point itself is kept:
+
+- DogStatsD `|#` tags.
+- Datadog series tags.
+- InfluxDB line-protocol tags.
+- Prometheus labels.
+- carbon `;k=v` tags.
+
+Without the guard, a sender's tag would be read back as carrier data at that carrier's own sink.
+
+Log and span decoders, and the parsing transforms (`json`, `logfmt`, `kv`, `csv`, `regex`), don't
+guard. A `_logit.*` key they admit is taken as the carrier it names at that carrier's own sink.
+The metric-wire guard generalizes a counter `influxdb_in` already keeps for its own prefix;
+the log-side parsers have no tag-omission counter, and a producer has to choose the `_logit.`
+prefix to reach a carrier. Under [ADR `deployment-threat-model`](deployment-threat-model.md),
+that makes it a documented gap rather than a guard to add.
+
+## Alternatives considered
+
+- **A dedicated carrier field on `Event`.** Either a boxed map, which costs an allocation on every
+  carrier-bearing event, or inline storage, which adds bytes to every event whether it carries
+  one or not. [ADR `minimize-allocations-over-event-size`](minimize-allocations-over-event-size.md)
+  ranks allocations first, `docs/design/memory.md`'s "What was reclaimed, and what was
+  deliberately not" records two boxing changes measured and reverted on those grounds, and
+  [ADR `event-sizing-and-allocation-strategy`](event-sizing-and-allocation-strategy.md) requires a
+  perf VM measurement per signal class before any sizing change. A field would also hide carriers
+  from Lua, `route`, `set`, and `remove`, which address attributes.
+- **Bits in `MetricRecord.flags`.** `flags` is OTLP's `DataPointFlags`, written to the wire as
+  is, and `aggregate` zeroes it on a merge. Most carriers aren't booleans (a measurement name, a
+  five-tuple, a tracer header), log and span carriers have no `MetricRecord`, and a bit is
+  invisible to Lua, `route`, and `remove`.
+- **Per-sink skip lists (the status quo).** Each sink knows a different subset of foreign
+  carriers, so the output depends on the input, and every new carrier has to be added to every
+  other sink's list. The `remove` workaround moves the same list into every operator's config.
+- **Prefix matching on `remove`.** It makes the workaround shorter but leaves it the operator's
+  job, at every foreign sink, in every config.
+- **Filtering inside `attrs::merged`.** Every sink reads its own carriers through `merged`, so a
+  filter there hides them from the one sink that needs them; it would need an exception per sink,
+  which is the ignore rule written somewhere less visible.
+- **Reusing `logit.*`.** Rule (c) keys are meant to cross a foreign wire, and carriers never
+  should. One prefix for both would need a second list to tell them apart.
+- **One private segment with no protocol (`_logit.type`).** statsd, Prometheus, and collectd each
+  carry a `type`, with different meanings. The protocol segment keeps them apart and gives each
+  sink an exact own-prefix to read.
+
+## Consequences
+
+- Every carrier listed above is renamed in its decoder, its own sink, tests, fixtures, fuzz seeds,
+  and docs. `logit` is pre-release, so there are no aliases and no decode path for the old names.
+- Each protocol sink's render site gets one `is_private` check after its own-prefix arm and before
+  any counter. The per-sink foreign skip lists (`influxdb_out`'s `statsd.` skip, `graphite_out`'s
+  `FOREIGN_CARRIER_PREFIXES`) go away.
+- `docs/design/data-model.md`'s "Well-known attribute names" holds the per-key carrier tables
+  and the canonical statement of these rules; module docs and other docs point at it.
+- `docs/known-gaps/mappings.md` closes its rows that describe a carrier rendered as an ordinary
+  attribute at a foreign sink, and gains one for the unguarded decoders above.
+- A relay that runs `keep` between a like-protocol pair needs `private: keep` to stay a fixed
+  point.
+- A new decoder that stamps a carrier spells it `_logit.<protocol>.<name>`, and a new sink calls
+  `is_private` at its render site. Neither needs a change anywhere else.

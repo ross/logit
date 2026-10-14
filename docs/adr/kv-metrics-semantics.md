@@ -1,6 +1,6 @@
 ---
 created: 2026-08-30
-updated: 2026-08-30
+updated: 2026-10-13
 ---
 
 # `kv_metrics`: skip rules, numeric coercion, and no `tags:` field
@@ -71,6 +71,8 @@ reading numeric fields into metrics, nothing else.
 log format later (an nginx `log_format` gaining a directive) would silently become a new tag
 dimension on every metrics sink downstream, with nothing in the config visibly wrong. `keep`'s
 allowlist makes that structurally impossible: anything not explicitly named is dropped, known or not.
+The one opt-in exception is `private: keep`, which also retains the `_logit.*` namespace
+([ADR `private-attribute-namespace`](private-attribute-namespace.md)).
 `remove` still exists, for the narrower case of pruning a small number of known-noisy fields (a
 one-off debug attribute) without having to enumerate everything else that should survive.
 

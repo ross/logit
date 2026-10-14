@@ -133,7 +133,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `logfmt`, `kv` | the de-facto `key=value` parsers | [ADR `logfmt-and-kv-parsing`](docs/adr/logfmt-and-kv-parsing.md) |
 | `regex` | named capture groups into attributes | [ADR `regex-transform`](docs/adr/regex-transform.md) |
 | `kv_metrics` | turns attributes already on an event into metrics on that same event | [ADR `kv-metrics-semantics`](docs/adr/kv-metrics-semantics.md) |
-| `keep` | retains only the named attributes (an allowlist); place it before `aggregate` to bound series cardinality | [ADR `kv-metrics-semantics`](docs/adr/kv-metrics-semantics.md) |
+| `keep` | retains only the named attributes (an allowlist), plus the private `_logit.*` namespace under `private: keep`; place it before `aggregate` to bound series cardinality | [ADR `kv-metrics-semantics`](docs/adr/kv-metrics-semantics.md), [ADR `private-attribute-namespace`](docs/adr/private-attribute-namespace.md) |
 | `remove` | drops the named attributes | — |
 | `set` | stamps constant values onto event attributes and/or the batch resource | [ADR `operator-declared-resource-attributes`](docs/adr/operator-declared-resource-attributes.md) |
 | `scale` | multiplies named numeric attributes by a constant factor (unit conversion) | [ADR `scale-transform`](docs/adr/scale-transform.md) |
