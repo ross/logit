@@ -18,8 +18,7 @@
 //!   a notification with a host, a non-empty message, and a severity of 1, 2, or 4; every
 //!   attribute is one of the `ATTR_*` keys, every string a `Str` when valid UTF-8 and a `Bytes`
 //!   when not, sliced from the datagram; a record's name is `<plugin>.<type>`, each cut to 127
-//! bytes,
-//!   with `.<i>` after it in a list of more than one; a NaN GAUGE is a flagged `0.0`;
+//!   bytes, with `.<i>` after it in a list of more than one; a NaN GAUGE is a flagged `0.0`;
 //! - the second-generation fixed point: `W = encode(decode(x))` may differ from `x` by the
 //!   module doc's "Permitted normalizations", so the property starts at `W`, packed at
 //!   `DEFAULT_MAX_PACKET_BYTES`: decoding each datagram of `W` and encoding the events again gives

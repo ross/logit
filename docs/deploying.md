@@ -1981,8 +1981,8 @@ nothing in a datagram, and `logit validate` rejects `protocol: pickle` under `tr
 one:
 
 - **Renaming a metric upstream silently changes the series carbon stores it under.** There is no
-  `graphite.*` carrier like `collectd_out`'s `collectd.*` or `syslog_out`'s `syslog.*`: the wire
-  path *is* [`MetricRecord::name`](design/data-model.md), with no `prefix:`/`template:` field and
+  `graphite.*` carrier like `collectd_out`'s `_logit.collectd.*` or `syslog_out`'s `syslog.*`: the
+  wire path *is* [`MetricRecord::name`](design/data-model.md), with no `prefix:`/`template:` field and
   nothing to restore identity from. A `lua`/`set` stage that renames a metric between `graphite_in`
   and `graphite_out` leaves no wire fact to notice the rename against, unlike a collectd or syslog
   relay, where identity attributes ride alongside the (possibly transformed) event. If a pipeline
