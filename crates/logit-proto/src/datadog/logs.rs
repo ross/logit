@@ -189,9 +189,9 @@ fn status_severity(status: &str) -> Option<Severity> {
 
 impl DatadogEncoder {
     /// Encodes every event carrying a `log` as one `/api/v2/logs` JSON array; `None` when none
-    /// does. An event without a `log`, or a Datadog event (a `log` carrying `statsd.event.title`,
-    /// which [`DatadogEncoder::encode_events`] sends), is skipped silently: that is ordinary
-    /// fan-out, not a loss.
+    /// does. An event without a `log`, or a Datadog event (a `log` carrying
+    /// `_logit.statsd.event.title`, which [`DatadogEncoder::encode_events`] sends), is skipped
+    /// silently: that is ordinary fan-out, not a loss.
     pub fn encode_logs(&self, batch: &EventBatch) -> Option<Bytes> {
         let mut out = Vec::new();
         out.push(b'[');

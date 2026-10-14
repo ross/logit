@@ -35,7 +35,7 @@ use std::sync::{Arc, LazyLock};
 
 type JsonMap = Map<String, JsonValue>;
 
-/// `datadog.type`'s two values; `count` and `gauge` are said by the model kind itself.
+/// `_logit.datadog.type`'s two values; `count` and `gauge` are said by the model kind itself.
 const TYPE_RATE: &str = "rate";
 const TYPE_UNSPECIFIED: &str = "unspecified";
 
@@ -125,8 +125,8 @@ pub(super) struct WireSeries<'a> {
     pub origin: OriginCodes,
 }
 
-/// `datadog.origin.*`: the protobuf `Origin`'s three codes plus the JSON API's `metric_type`.
-/// A zero code is absent, the protobuf default.
+/// `_logit.datadog.origin.*`: the protobuf `Origin`'s three codes plus the JSON API's
+/// `metric_type`. A zero code is absent, the protobuf default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct OriginCodes {
     pub product: u64,
@@ -192,8 +192,8 @@ impl<'a> WireSeries<'a> {
         if self.interval != 0 {
             attrs.insert(ATTR_INTERVAL, Value::I64(self.interval));
         }
-        // A route that carries a type always decides `datadog.type`, so a tag spelled
-        // `datadog.type:rate` can't turn a GAUGE or COUNT into a RATE on re-encode.
+        // A route that carries a type always decides `_logit.datadog.type`, from the wire type
+        // alone.
         if let Some(wire_type) = self.wire_type {
             match wire_type.type_attr() {
                 Some(t) => attrs.insert(ATTR_TYPE, Value::str(t)),
@@ -656,9 +656,8 @@ static CONSUMED: LazyLock<[Symbol; 15]> = LazyLock::new(|| {
 });
 
 /// [`CONSUMED`] plus a service check's own carriers: on a check's later records (its first is
-/// the service-checks route's), those belong to the check and are never rendered as tags, as
-/// `statsd_out` never renders a `statsd.*` carrier. Rendered, they'd make the relayed series
-/// decode as a service check itself.
+/// the service-checks route's), those belong to the check and are never rendered as tags. The
+/// private-key skip already keeps them off the wire; this list is belt and braces.
 static CONSUMED_WITH_CHECK: LazyLock<Vec<Symbol>> = LazyLock::new(|| {
     let mut keys = CONSUMED.to_vec();
     keys.extend(
@@ -683,11 +682,11 @@ pub(super) struct Carriers {
     pub resources: Vec<(String, String)>,
     pub source_type_name: Option<String>,
     pub interval: i64,
-    /// `datadog.type`'s value, when it is one this codec knows.
+    /// `_logit.datadog.type`'s value, when it is one this codec knows.
     pub wire_type: Option<WireType>,
     pub origin: OriginCodes,
-    /// How many `datadog.agent.*` carriers (a sketch payload's `CommonMetadata`) are present;
-    /// only the sketches route writes them, from the batch resource.
+    /// How many `_logit.datadog.agent.*` carriers (a sketch payload's `CommonMetadata`) are
+    /// present; only the sketches route writes them, from the batch resource.
     pub agent_metadata: usize,
 }
 
@@ -730,7 +729,8 @@ impl Carriers {
         }
     }
 
-    /// The v2 `resources` list: `host` first, then `device`, then `datadog.resources` in order.
+    /// The v2 `resources` list: `host` first, then `device`, then `_logit.datadog.resources` in
+    /// order.
     fn resource_list(&self) -> Vec<(&str, &str)> {
         let mut out = Vec::with_capacity(self.resources.len() + 2);
         if let Some(host) = &self.host {
@@ -1119,7 +1119,7 @@ impl DatadogEncoder {
 }
 
 /// The attributes a metrics route never renders as a tag for `event`: the carriers it reads into
-/// wire fields of their own, and a service check's `statsd.service_check.*` too.
+/// wire fields of their own, and a service check's `_logit.statsd.service_check.*` too.
 fn tag_skip(resource: &Resource, event: &Event) -> &'static [Symbol] {
     if is_service_check(resource, event) {
         &CONSUMED_WITH_CHECK

@@ -10,7 +10,7 @@
 //!   value is finite; `Samples` and `SetMembers` are non-empty, and a sample rate is in `(0, 1]`;
 //!   only those five kinds and a log record appear; every `Value::Str` is valid UTF-8;
 //! - time: an event's timestamp is `received_at`, unless the line carried `|T`/`d:`, and a
-//!   `statsd.timestamp` of `U64(secs)` means a timestamp of `secs` seconds;
+//!   `_logit.statsd.timestamp` of `U64(secs)` means a timestamp of `secs` seconds;
 //! - provenance: every `Value::Str` attribute, tag values and array elements included, and every
 //!   set member, is a slice of the datagram. An event's message is too, unless its text had a
 //!   `\n` escape to unescape, the one copy path (`crates/logit-proto/src/statsd/mod.rs`'s
@@ -59,11 +59,11 @@ fn check_event(datagram: &Bytes, event: &Event) {
     for (_, value) in event.attributes.iter() {
         check_str(datagram, value);
     }
-    match event.attributes.get("statsd.timestamp") {
+    match event.attributes.get("_logit.statsd.timestamp") {
         Some(Value::U64(secs)) => assert_eq!(
             u128::from(*secs) * 1_000_000_000,
             event.timestamp as u128,
-            "time: statsd.timestamp names the event's timestamp"
+            "time: _logit.statsd.timestamp names the event's timestamp"
         ),
         _ => assert!(
             event.timestamp == RECEIVED_AT || event.timestamp % 1_000_000_000 == 0,

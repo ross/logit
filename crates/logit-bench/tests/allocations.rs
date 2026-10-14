@@ -250,7 +250,7 @@ fn statsd_decode_one_event_line_with_an_escaped_newline() {
 }
 
 /// A DogStatsD service check (`_sc|name|status|...`) decodes to one `Gauge` event whose
-/// `statsd.service_check.*` attributes are zero-copy datagram slices: the count is
+/// `_logit.statsd.service_check.*` attributes are zero-copy datagram slices: the count is
 /// [`statsd_decode_one_line`]'s per-line/per-batch `Vec<Event>` pair.
 #[test]
 fn statsd_decode_one_service_check_line() {
