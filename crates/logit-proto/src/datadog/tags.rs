@@ -3,19 +3,29 @@
 //! (`crates/logit-proto/src/statsd/decode.rs`'s `insert_tags`): the key ends at the first `:`, a
 //! bare token is `Bool(true)`, a repeated key folds into an `Array` in wire order, and only an
 //! exact duplicate token is deduped (the Agent's own rule; `urgent` and `urgent:1` both survive).
+//!
+//! A key under the private `_logit.` prefix is skipped and returned to the caller to count as
+//! `logit.input.tags.omitted{reason="reserved_prefix"}`, so a sender's tag never reads back as a
+//! carrier
+//! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
 
+use logit_core::attrs::is_private;
 use logit_core::interner::{intern, resolve};
 use logit_core::{AttrMap, Symbol, Value};
 
-/// Folds one tag into `attributes` under the shared rule.
-pub fn insert_tag(attributes: &mut AttrMap, tag: &str) {
+/// Folds one tag into `attributes` under the shared rule. Returns `true` when the tag's key is
+/// private and the tag was skipped.
+pub fn insert_tag(attributes: &mut AttrMap, tag: &str) -> bool {
     if tag.is_empty() {
-        return;
+        return false;
     }
     let (key, value) = match tag.split_once(':') {
         Some((k, v)) => (k, Value::str(v)),
         None => (tag, Value::Bool(true)),
     };
+    if is_private(key) {
+        return true;
+    }
     let key = intern(key);
     let merged = match attributes.remove_sym(key) {
         None => value,
@@ -29,13 +39,12 @@ pub fn insert_tag(attributes: &mut AttrMap, tag: &str) {
         Some(existing) => Value::Array(vec![existing, value]),
     };
     attributes.insert_sym(key, merged);
+    false
 }
 
-/// Folds every tag of a list into `attributes`.
-pub fn insert_tags<'a>(attributes: &mut AttrMap, tags: impl IntoIterator<Item = &'a str>) {
-    for tag in tags {
-        insert_tag(attributes, tag);
-    }
+/// Folds every tag of a list into `attributes`. Returns how many were skipped for a private key.
+pub fn insert_tags<'a>(attributes: &mut AttrMap, tags: impl IntoIterator<Item = &'a str>) -> usize {
+    tags.into_iter().filter(|tag| insert_tag(attributes, tag)).count()
 }
 
 /// Splits a comma-joined `ddtags` string into tags (empty tokens dropped).
@@ -140,6 +149,20 @@ mod tests {
             attrs.get("urgent"),
             Some(&Value::Array(vec![Value::Bool(true), Value::str("1")]))
         );
+    }
+
+    #[test]
+    fn a_private_tag_is_skipped_and_returned_and_lookalikes_are_not() {
+        let mut attrs = AttrMap::new();
+        let skipped = insert_tags(
+            &mut attrs,
+            ["env:prod", "_logit.datadog.interval:10", "_logit.x", "logit.x:1", "_logitx"],
+        );
+        assert_eq!(skipped, 2);
+        assert_eq!(attrs.get("env"), Some(&Value::str("prod")));
+        assert_eq!(attrs.get("logit.x"), Some(&Value::str("1")));
+        assert_eq!(attrs.get("_logitx"), Some(&Value::Bool(true)));
+        assert_eq!(attrs.len(), 3);
     }
 
     #[test]

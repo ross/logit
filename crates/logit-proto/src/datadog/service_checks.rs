@@ -99,7 +99,8 @@ impl DatadogDecoder {
 
         let mut attributes = AttrMap::new();
         if let Some(Json::Array(tags)) = obj.get("tags") {
-            insert_tags(&mut attributes, tags.iter().filter_map(Json::as_str));
+            let reserved = insert_tags(&mut attributes, tags.iter().filter_map(Json::as_str));
+            self.reserved_tags(reserved);
         }
         attributes.insert(ATTR_SERVICE_CHECK_NAME, Value::str(name));
         attributes.insert(ATTR_SERVICE_CHECK_STATUS, Value::U64(status));

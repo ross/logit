@@ -7,6 +7,7 @@
 
 use crate::{CodecError, Decoder};
 use bytes::Bytes;
+use logit_core::attrs::is_private;
 use logit_core::subslice;
 use logit_core::{
     interner::{intern, KeyCache},
@@ -18,6 +19,10 @@ use std::sync::{Arc, LazyLock};
 /// A line the decoder rejected, by `reason`: `malformed`, beside the throttled `bad_line`
 /// diagnostic. Every other line of its datagram or packet still decodes.
 const MESSAGES_DROPPED: &str = "logit.input.messages.dropped";
+
+/// A `|#` tag left off a delivered line because its key is private, by `reason`:
+/// `reserved_prefix`.
+const TAGS_OMITTED: &str = "logit.input.tags.omitted";
 
 /// Decodes statsd/DogStatsD bytes into events; testable without a socket.
 ///
@@ -80,6 +85,8 @@ impl Decoder for StatsdDecoder {
     ) -> Result<(Arc<Resource>, Option<Arc<Scope>>), CodecError> {
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| CodecError::Malformed(format!("invalid utf-8: {e}")))?;
+        // Private tags omitted from lines that decoded; a rejected line's tags count nothing.
+        let mut reserved = 0;
         for line in text.split('\n') {
             // Trailing whitespace is payload on an `_e{`/`_sc|` line (`super`'s module doc,
             // "DogStatsD events and service checks"), so only other lines are trimmed at the end.
@@ -94,13 +101,20 @@ impl Decoder for StatsdDecoder {
             }
             // Per-line isolation: clients pack independent metrics into one datagram, so a bad
             // line is reported and dropped without discarding the others.
-            match parse_line(&bytes, line, received_at, &mut self.keys) {
-                Ok(mut line_events) => out.append(&mut line_events),
+            let mut line_reserved = 0;
+            match parse_line(&bytes, line, received_at, &mut self.keys, &mut line_reserved) {
+                Ok(mut line_events) => {
+                    reserved += line_reserved;
+                    out.append(&mut line_events);
+                }
                 Err(err) => {
                     self.telemetry.count(MESSAGES_DROPPED, 1.0, &[("reason", "malformed")]);
                     self.diag.warn_throttled("bad_line", err);
                 }
             }
+        }
+        if reserved > 0 {
+            self.telemetry.count(TAGS_OMITTED, reserved as f64, &[("reason", "reserved_prefix")]);
         }
         // statsd has no instrumentation scope.
         Ok((self.resource.clone(), None))
@@ -150,12 +164,25 @@ struct StatsdKeys {
 /// `super`'s module doc, "DogStatsD tags", has the full rule and what it leaves alone. The
 /// remove-then-insert per token is two binary searches over the sorted map, the same two-step
 /// `syslog_in`'s `insert_param` uses.
-fn insert_tags(attributes: &mut AttrMap, bytes: &Bytes, tags: &str, keys: &mut KeyCache) {
+///
+/// A key under the private `_logit.` prefix is skipped and added to `reserved`, so a sender's tag
+/// never reads back as a carrier.
+fn insert_tags(
+    attributes: &mut AttrMap,
+    bytes: &Bytes,
+    tags: &str,
+    keys: &mut KeyCache,
+    reserved: &mut usize,
+) {
     for tag in tags.split(',').filter(|t| !t.is_empty()) {
         let (key, value) = match tag.split_once(':') {
             Some((k, v)) => (k, Value::Str(subslice::share(bytes, v.as_bytes()))),
             None => (tag, Value::Bool(true)),
         };
+        if is_private(key) {
+            *reserved += 1;
+            continue;
+        }
         let key = keys.get_or_intern(key);
         let merged = match attributes.remove_sym(key) {
             None => value,
@@ -237,13 +264,15 @@ fn parse_line(
     line: &str,
     timestamp: i64,
     keys: &mut KeyCache,
+    reserved: &mut usize,
 ) -> Result<Vec<Event>, CodecError> {
     // Only these two sigils are special; a legal `_`-prefixed metric name falls through.
     if line.starts_with("_e{") {
-        return parse_event(bytes, line, timestamp, keys).map(|event| vec![event]);
+        return parse_event(bytes, line, timestamp, keys, reserved).map(|event| vec![event]);
     }
     if line.starts_with("_sc|") {
-        return parse_service_check(bytes, line, timestamp, keys).map(|event| vec![event]);
+        return parse_service_check(bytes, line, timestamp, keys, reserved)
+            .map(|event| vec![event]);
     }
 
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
@@ -271,7 +300,7 @@ fn parse_line(
             }
             sample_rate = parsed;
         } else if let Some(tags) = extra.strip_prefix('#') {
-            insert_tags(&mut attributes, bytes, tags, keys);
+            insert_tags(&mut attributes, bytes, tags, keys, reserved);
         } else if let Some(container_id) = extra.strip_prefix("c:") {
             // Carried verbatim, `ci-`/`in-` prefixes included, on every metric type.
             insert_container_id(&mut attributes, bytes, container_id);
@@ -341,6 +370,7 @@ fn parse_event(
     line: &str,
     timestamp: i64,
     keys: &mut KeyCache,
+    reserved: &mut usize,
 ) -> Result<Event, CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed dogstatsd event: {line:?}"));
 
@@ -368,7 +398,7 @@ fn parse_event(
         let fields = after_text.strip_prefix('|').ok_or_else(malformed)?;
         for field in fields.split('|') {
             if let Some(tags) = field.strip_prefix('#') {
-                insert_tags(&mut attributes, bytes, tags, keys);
+                insert_tags(&mut attributes, bytes, tags, keys, reserved);
             } else if let Some(container_id) = field.strip_prefix("c:") {
                 insert_container_id(&mut attributes, bytes, container_id);
             } else if insert_origin_field(&mut attributes, bytes, field) {
@@ -461,6 +491,7 @@ fn parse_service_check(
     line: &str,
     timestamp: i64,
     keys: &mut KeyCache,
+    reserved: &mut usize,
 ) -> Result<Event, CodecError> {
     let malformed =
         || CodecError::Malformed(format!("malformed dogstatsd service check: {line:?}"));
@@ -493,7 +524,7 @@ fn parse_service_check(
                     Value::Str(subslice::share(bytes, message.as_bytes())),
                 );
             } else if let Some(tags) = field.strip_prefix('#') {
-                insert_tags(&mut attributes, bytes, tags, keys);
+                insert_tags(&mut attributes, bytes, tags, keys, reserved);
             } else if let Some(container_id) = field.strip_prefix("c:") {
                 insert_container_id(&mut attributes, bytes, container_id);
             } else if insert_origin_field(&mut attributes, bytes, field) {
@@ -630,7 +661,7 @@ mod tests {
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
         let text = std::str::from_utf8(&bytes).unwrap();
-        parse_line(&bytes, text, 0, &mut KeyCache::new())
+        parse_line(&bytes, text, 0, &mut KeyCache::new(), &mut 0)
             .expect_err("expected this line to be rejected")
     }
 
@@ -917,6 +948,33 @@ mod tests {
             event.attributes.get("statsd.container_id").and_then(|v| v.as_str()),
             Some("abc")
         );
+    }
+
+    /// A private tag on a metric, an event, or a service check is left off the delivered event and
+    /// counted, and a rejected line's private tag counts nothing. `logit.x` and `_logitx` aren't
+    /// private.
+    #[test]
+    fn a_private_tag_is_omitted_and_counted_and_lookalikes_are_not() {
+        let registry = logit_core::Registry::new();
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
+            .with_telemetry(registry.telemetry_for("statsd_in", "statsd_in", "listener"));
+        let datagram = "a:1|c|#env:prod,_logit.statsd.type:ms,logit.x:1,_logitx\n\
+                        _e{1,1}:t|x|#_logit.y:1,env:prod\n\
+                        _sc|chk|0|#_logit.z,env:prod\n\
+                        bad:1|zz|#_logit.w:1";
+        let events = decoder.decode(Bytes::from(datagram)).unwrap().events;
+        assert_eq!(events.len(), 3);
+        for event in &events {
+            assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+            assert!(
+                event.attributes.iter().all(|(k, _)| !is_private(logit_core::interner::resolve(k))),
+                "no private key survives: {:?}",
+                event.attributes
+            );
+        }
+        assert_eq!(events[0].attributes.get("logit.x").and_then(|v| v.as_str()), Some("1"));
+        assert_eq!(events[0].attributes.get("_logitx"), Some(&Value::Bool(true)));
+        assert_eq!(input_counter(&registry, "logit.input.tags.omitted", "reserved_prefix"), 3.0);
     }
 
     #[test]
@@ -1629,15 +1687,20 @@ mod tests {
 
     /// The total of `logit.input.messages.dropped{reason}` in `registry`. Drains, so call once.
     fn messages_dropped(registry: &logit_core::Registry, reason: &str) -> f64 {
+        input_counter(registry, "logit.input.messages.dropped", reason)
+    }
+
+    /// The total of counter `metric{reason}` in `registry`. Drains, so call once.
+    fn input_counter(registry: &logit_core::Registry, metric: &str, reason: &str) -> f64 {
         registry
             .drain(0)
             .iter()
             .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some(reason))
             .flat_map(|e| &e.metrics)
-            .filter(|m| logit_core::interner::resolve(m.name) == "logit.input.messages.dropped")
+            .filter(|m| logit_core::interner::resolve(m.name) == metric)
             .map(|m| match &m.kind {
                 MetricKind::Sum(sum) => sum.value.as_f64(),
-                other => panic!("messages.dropped must be a counter, got {other:?}"),
+                other => panic!("{metric} must be a counter, got {other:?}"),
             })
             .sum()
     }

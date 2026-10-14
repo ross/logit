@@ -170,7 +170,8 @@ impl DatadogDecoder {
 
         let mut attributes = AttrMap::new();
         if let Some(Json::Array(tags)) = obj.get("tags") {
-            insert_tags(&mut attributes, tags.iter().filter_map(Json::as_str));
+            let reserved = insert_tags(&mut attributes, tags.iter().filter_map(Json::as_str));
+            self.reserved_tags(reserved);
         }
         attributes.insert(ATTR_EVENT_TITLE, Value::str(title.unwrap_or_default()));
         let mut severity = None;

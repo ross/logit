@@ -42,7 +42,7 @@
 //! |---|---|---|
 //! | measurement | event attribute [`ATTR_MEASUREMENT`], `Value::Str` | -- |
 //! | tag `k=v` | event attribute `k`, `Value::Str`, never a resource attribute | -- |
-//! | tag key under [`CARRIER_PREFIX`] | omitted (normalization 12) | `logit.input.tags.omitted{reason="reserved_prefix"}` |
+//! | tag key under [`CARRIER_PREFIX`] or the private `_logit.` prefix | omitted (normalization 12) | `logit.input.tags.omitted{reason="reserved_prefix"}` |
 //! | float / integer / unsigned / boolean field `f` | a [`logit_core::MetricRecord`] named `<measurement>.f`, `Gauge(F64 \| I64 \| U64 \| Bool)` | -- |
 //! | N numeric or boolean fields | N records on the one event, in wire order | -- |
 //! | string field `f="x"` | event attribute `influxdb.field.f` ([`FIELD_ATTR_PREFIX`]), `Value::Str` | -- |
@@ -52,6 +52,10 @@
 //! | a line that fails the grammar, or a timestamp outside the range | the whole body fails: [`line::LineError`] with the 1-based line index, the line's text, and the reason | -- |
 //! | `org`, `orgID`, `bucket` | resource attributes [`RESOURCE_ATTR_ORG`], [`RESOURCE_ATTR_ORG_ID`], [`RESOURCE_ATTR_BUCKET`], set by the listener on the resource it passes in | -- |
 //! | `Scope` | `None` | -- |
+//!
+//! A sender's tag never becomes a carrier: a key under `_logit.` is private to `logit`
+//! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)),
+//! and one under `influxdb.` would collide with this codec's own attributes.
 //!
 //! A tag value, string value, or measurement that unescaping left unchanged is a zero-copy slice
 //! of the body; one that changed is a copy. `_time` and `_value` arrive as ordinary tags: influxd
@@ -152,7 +156,8 @@
 //!     always a `Gauge`, so this applies only to an event from another protocol.
 //! 11. A listener's sender attributes (`network.peer.*`, `client.*`) are added under `peer:`,
 //!     `proxy_protocol:`, or `forwarded:`.
-//! 12. A tag key under the reserved `influxdb.` prefix is omitted, counted.
+//! 12. A tag key under the reserved `influxdb.` prefix or the private `_logit.` prefix is
+//!     omitted, counted.
 //! 13. A duplicate field key within one line: the last value wins.
 //! 14. An absent timestamp: the request's arrival time truncated to `precision`, one instant for
 //!     every such point in the request.

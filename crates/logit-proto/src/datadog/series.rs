@@ -162,10 +162,11 @@ impl<'a> WireSeries<'a> {
     }
 
     /// Tags first, then the wire's own fields, so a tag spelled like a carrier (`host.name:x`)
-    /// loses to the field it names.
-    pub(super) fn attributes(&self) -> AttrMap {
+    /// loses to the field it names. Also returns how many tags were skipped for a private key,
+    /// for the caller to count once the series delivers a point.
+    pub(super) fn attributes(&self) -> (AttrMap, usize) {
         let mut attrs = AttrMap::new();
-        insert_tags(&mut attrs, self.tags.iter().copied());
+        let reserved = insert_tags(&mut attrs, self.tags.iter().copied());
         if let Some(host) = self.host.filter(|h| !h.is_empty()) {
             attrs.insert(ATTR_HOST_NAME, Value::str(host));
         }
@@ -211,7 +212,7 @@ impl<'a> WireSeries<'a> {
                 attrs.insert(key, Value::U64(code));
             }
         }
-        attrs
+        (attrs, reserved)
     }
 }
 
@@ -351,7 +352,8 @@ impl DatadogDecoder {
         let name = intern(metric);
         let unit = unit.filter(|u| !u.is_empty()).map(intern);
         let wire_type = series.wire_type.unwrap_or(WireType::Gauge);
-        let attrs = series.attributes();
+        let (attrs, reserved) = series.attributes();
+        let first = out.len();
         for (seconds, value) in points {
             if !value.is_finite() {
                 self.metric_not_decoded(MetricIn::NonFiniteValue, 1);
@@ -364,6 +366,9 @@ impl DatadogDecoder {
             let mut record = MetricRecord::new(name, wire_type.kind(value));
             record.unit = unit;
             out.push(Event::metric(timestamp, attrs.clone(), record));
+        }
+        if out.len() > first {
+            self.reserved_tags(reserved);
         }
     }
 
@@ -484,7 +489,8 @@ impl DatadogDecoder {
                 }
             };
             let name = intern(metric);
-            let attrs = series.attributes();
+            let (attrs, reserved) = series.attributes();
+            let first = out.len();
             for point in points {
                 let Some((seconds, values)) = distribution_point(point) else {
                     self.metric_not_decoded(MetricIn::BadPoint, 1);
@@ -500,6 +506,9 @@ impl DatadogDecoder {
                 }
                 let record = MetricRecord::new(name, MetricKind::Samples(Samples::new(values)));
                 out.push(Event::metric(timestamp, attrs.clone(), record));
+            }
+            if out.len() > first {
+                self.reserved_tags(reserved);
             }
         }
         Ok(batch(out))
@@ -1261,6 +1270,37 @@ mod tests {
         assert_eq!(a.get(ATTR_TYPE), Some(&Value::str("rate")));
         assert_eq!(a.get(ATTR_INTERVAL), Some(&Value::I64(20)));
         assert_eq!(a.get(ATTR_SOURCE_TYPE_NAME), Some(&Value::str("my_check")));
+    }
+
+    /// A private tag on a series, an event, or a service check is left off what's delivered and
+    /// counted, once per series however many points it has; a series that delivers no point
+    /// counts nothing. `logit.x` and `_logitx` aren't private.
+    #[test]
+    fn a_private_tag_is_omitted_and_counted_and_lookalikes_are_not() {
+        let (mut d, registry) = decoder();
+        let series = br#"{"series":[
+            {"metric":"m","points":[[1700000000,1],[1700000001,2]],
+             "tags":["env:prod","_logit.datadog.interval:5","logit.x:1","_logitx"]},
+            {"metric":"m","points":[[1700000000,null]],"tags":["_logit.y:1"]}]}"#;
+        let batch = d.decode_series_v1(series, RECEIVED_AT).unwrap();
+        assert_eq!(batch.events.len(), 2);
+        for event in &batch.events {
+            let a = &event.attributes;
+            assert_eq!(a.get("env"), Some(&Value::str("prod")));
+            assert_eq!(a.get("logit.x"), Some(&Value::str("1")));
+            assert_eq!(a.get("_logitx"), Some(&Value::Bool(true)));
+            assert_eq!(a.len(), 3, "no private key survives: {a:?}");
+        }
+        let event = br#"{"title":"t","text":"x","tags":["_logit.z:1","env:prod"]}"#;
+        let batch = d.decode_events(event, RECEIVED_AT).unwrap();
+        assert_eq!(batch.events[0].attributes.get("_logit.z"), None);
+        let check = br#"[{"check":"c","status":0,"tags":["_logit.z:1","env:prod"]}]"#;
+        let batch = d.decode_service_checks(check, RECEIVED_AT).unwrap();
+        assert_eq!(batch.events[0].attributes.get("_logit.z"), None);
+        assert_eq!(
+            counted(&registry, "logit.input.tags.omitted", ("reason", "reserved_prefix")),
+            3.0
+        );
     }
 
     #[test]

@@ -363,6 +363,9 @@ _tags/_multi_value` beside `statsd_format` (`:1014`).
 12. `Sum` temporality and monotonicity dropped — a normalization, not a skip.
 13. A pickle sender's spelling (protocol version, opcode choice, memo use) leaves as `graphite_out`'s
     protocol-2 writer spelling. Added by the ADR's protocol-0 amendment.
+14. A tag whose name is under the private `_logit.` prefix is omitted at decode, counted. Added
+    2026-10-13 by [ADR `private-attribute-namespace`](../adr/private-attribute-namespace.md)'s
+    inbound guard.
 
 ## Workstreams
 

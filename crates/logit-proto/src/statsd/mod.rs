@@ -105,6 +105,12 @@
 //! carrier is. On a `ms`/`h`/`d` line the decoder's own `statsd.type` stamp runs after the tags
 //! and overwrites it.
 //!
+//! **A tag key under the private `_logit.` prefix is omitted**, on a metric line, an event, or a
+//! service check, so a sender's tag never reads back as a carrier
+//! (`docs/adr/private-attribute-namespace.md`). The line still decodes, and each omitted token
+//! counts `logit.input.tags.omitted{reason="reserved_prefix"}`; a line rejected for another
+//! reason counts none.
+//!
 //! ## DogStatsD events and service checks
 //!
 //! Two more line shapes, picked out by their leading sigil before the grammar above applies: `_e{`
