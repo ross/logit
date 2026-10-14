@@ -17,11 +17,11 @@ components:
     type: set
     sources: [window]
     # datadog_out has no host field: it reads `host.name` from the resource, and a count's
-    # interval in seconds from `datadog.interval`, the window above.
+    # interval in seconds from `_logit.datadog.interval`, the window above.
     resource:
       host.name: logit-soak
     attributes:
-      datadog.interval: 10
+      _logit.datadog.interval: 10
   datadog:
     type: datadog_out
     sources: [host]
