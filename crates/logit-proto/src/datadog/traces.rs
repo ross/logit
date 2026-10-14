@@ -583,9 +583,10 @@ fn sort_map<V>(map: &mut [(String, V)]) {
 }
 
 /// Whether `key` is a carrier [`DatadogEncoder::wire_span`] consumes rather than sends as a
-/// `meta`/`metrics`/`meta_struct` entry. A carrier of the wrong `Value` type isn't one: it goes
-/// out by its type like any attribute, so a Datadog span whose own `meta` happens to use a
-/// carrier's name still relays. A payload carrier, or a tracer header's
+/// `meta`/`metrics`/`meta_struct` entry. A carrier of the wrong `Value` type isn't one. A public
+/// one (`service.name`, `resource.name`, `span.type`) goes out by its type like any attribute, so
+/// a Datadog span whose own `meta` uses one of those names still relays; a `_logit.datadog.*` one
+/// is skipped uncounted, like any private key. A payload carrier, or a tracer header's
 /// ([`super::is_tracer_header_attr`]), counts only on the resource.
 fn is_carrier(key: &str, value: &Value, event: &Event) -> bool {
     match (key, value) {
@@ -700,8 +701,8 @@ impl DatadogEncoder {
     }
 
     /// One span, and the chunk fields it carries. Attributes are the resource merged with the
-    /// event's; the carriers are consumed, everything else lands in `meta`/`metrics`/`meta_struct`
-    /// by its type.
+    /// event's; the carriers are consumed, a private key is skipped, and everything else lands in
+    /// `meta`/`metrics`/`meta_struct` by its type.
     fn wire_span(
         &self,
         resource: &Resource,

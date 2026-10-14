@@ -409,7 +409,7 @@ names, so that any nonzero `*.dropped` is loss. The decisions above stand; only 
 [ADR `private-attribute-namespace`](private-attribute-namespace.md) moves every `datadog.*`
 carrier this record names under the private `_logit.` prefix, protocol segment kept:
 `_logit.datadog.interval`, `_logit.datadog.tracer.*`, `_logit.datadog.chunk.*`, and the rest. The
-decisions above use the new spelling. Three things follow for the Datadog pairs:
+decisions above use the new spelling. Four things follow for the Datadog pairs:
 
 - **Datadog's own names stay public.** `_dd.*`, `_top_level`, and `_sampling_priority_v1` are
   span data a tracer or the Agent wrote, and Datadog shows them; they aren't carriers. The APM

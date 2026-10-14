@@ -329,8 +329,10 @@
 //! Every event with a `span`, grouped into one chunk per 128-bit trace id in first-appearance
 //! order, spans in batch order within it. Attributes are the resource merged with the event's
 //! (event wins); the carriers below are consumed, only when of the type decode gives them (a
-//! non-empty `Str` for the string ones): one of another type goes out by the typing rules like
-//! any attribute. Every map is sorted by key.
+//! non-empty `Str` for the string ones). A public carrier of another type (`service.name`,
+//! `resource.name`, `span.type`) goes out by the typing rules like any attribute; a
+//! `_logit.datadog.*` carrier of another type is skipped uncounted, like any private key. Every
+//! map is sorted by key.
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
