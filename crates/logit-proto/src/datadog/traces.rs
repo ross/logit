@@ -733,7 +733,7 @@ impl DatadogEncoder {
         for (sym, value) in logit_core::attrs::merged(resource, event) {
             let key = resolve(sym);
             if !is_carrier(key, value, event) {
-                if super::is_foreign_private(key) {
+                if logit_core::attrs::is_private(key) {
                     continue;
                 }
                 match self.slot(value) {
@@ -801,7 +801,7 @@ impl DatadogEncoder {
                 let mut attributes: StrMap = link
                     .attributes
                     .iter()
-                    .filter(|(k, _)| !super::is_foreign_private(resolve(*k)))
+                    .filter(|(k, _)| !logit_core::attrs::is_private(resolve(*k)))
                     .map(|(k, v)| (resolve(k).to_string(), self.text(v)))
                     .collect();
                 sort_map(&mut attributes);
@@ -832,7 +832,7 @@ impl DatadogEncoder {
                 let mut attributes: Vec<(String, WireAny)> = e
                     .attributes
                     .iter()
-                    .filter(|(k, _)| !super::is_foreign_private(resolve(*k)))
+                    .filter(|(k, _)| !logit_core::attrs::is_private(resolve(*k)))
                     .map(|(k, v)| (resolve(k).to_string(), self.any(v, true)))
                     .collect();
                 sort_map(&mut attributes);
@@ -1056,9 +1056,9 @@ mod tests {
         assert_eq!(deg("int_as_f64"), 2.0, "i64::MAX and u64::MAX");
     }
 
-    /// Another protocol's private attribute, on the event, the resource, a link, or a span event,
-    /// never reaches `meta`, `metrics`, `meta_struct`, or a link's or span event's attributes, and
-    /// is never counted, even a `Bytes` one a v0.5 body has no `meta_struct` for.
+    /// A private attribute, on the event, the resource, a link, or a span event, never reaches
+    /// `meta`, `metrics`, `meta_struct`, or a link's or span event's attributes, and is never
+    /// counted, even a `Bytes` one a v0.5 body has no `meta_struct` for.
     #[test]
     fn a_private_attribute_never_reaches_the_span_and_is_never_counted() {
         let mut attrs = AttrMap::new();

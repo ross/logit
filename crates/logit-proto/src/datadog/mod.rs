@@ -22,12 +22,10 @@
 //! they are the same Datadog concepts DogStatsD carries. Tags fold into attributes by [`tags`]'s
 //! rule; timestamps convert by [`time`]'s.
 //!
-//! Every Datadog carrier is under the private prefix [`CARRIER_PREFIX`], `_logit.datadog.`, and
-//! every encoder here reads its carriers by exact name. A key under that prefix is this codec's own:
-//! one a route doesn't read as a carrier is written or counted as any other name would be. Another
-//! protocol's private `_logit.` key is skipped wherever an encoder renders attributes generically
-//! (tags, log fields, span `meta`, `metrics`, and `meta_struct`, link and span-event attributes, and
-//! the stats routes' `no_wire_form` count), and never counted
+//! Every encoder here reads its own carriers by exact name, and skips every other private `_logit.`
+//! attribute, its own unread carriers included, wherever it renders attributes generically (tags,
+//! log fields, span `meta`, `metrics`, and `meta_struct`, link and span-event attributes, and the
+//! stats routes' `no_wire_form` count). It never counts one
 //! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
 //!
 //! **The listener adds sender attributes after decode.** Under `datadog_in`'s or
@@ -447,7 +445,7 @@
 //! | Model | Wire | Counter |
 //! |---|---|---|
 //! | a group attribute (the event's, else the resource's) | its field above; `""`, `0`, `false`, or `[]` when absent | a value of the wrong type: `logit.output.tags.omitted{reason="unrepresentable"}` |
-//! | any other event attribute; a resource attribute that is none of the fields above (`_logit.datadog.agent.*` and the two envelope flags count on the v0.6 route, which has no envelope) | omitted | `tags.omitted{reason="no_wire_form"}`, one per attribute (a resource's once per body); none for another protocol's private `_logit.` key |
+//! | any other event attribute; a resource attribute that is none of the fields above | omitted | `tags.omitted{reason="no_wire_form"}`, one per attribute (a resource's once per body); none for a private `_logit.` key, so the v0.6 route, which has no envelope, skips `_logit.datadog.agent.*` and the two envelope flags uncounted |
 //! | a delta `Sum` hits/errors/top-level-hits/duration | `uint64`: a `U64` or non-negative `I64` as is, a `Bool` as `1` or `0`, an `F64` rounded to the nearest integer | a `Bool`: `logit.output.metrics.normalized{reason="bool_value"}`; a negative `I64`: `0`, `degraded{reason="bad_count"}`; a fraction: `logit.output.stats.degraded{reason="fractional_count"}`; negative or non-finite: `0`, `degraded{reason="bad_count"}`; above 2^64: `u64::MAX`, `degraded{reason="count_overflow"}` |
 //! | an ok/error summary `Distribution` under a logarithmic mapping | a DDSketch protobuf: its `gamma` and `indexOffset`, `interpolation: NONE`, both stores as sparse `binCounts` in ascending key order, `zeroCount`. Hand-encoded, since prost's `HashMap` would order the bins at random | a bin limit other than 2048 (a receiver collapses at 2048): `degraded{reason="bin_limit"}`; a summary tracked from observations (`stats_exact`), which the protobuf has no field for: `degraded{reason="exact_summary"}` |
 //! | the same under `Mapping::agent` | `gamma = 1.015625`, `indexOffset = bias + 0.5`, keys unchanged: Datadog's own conversion, reading the Agent's round-half-to-even key as the logarithmic floor. Only a value on an exact tie keys differently, and the exact summary is lost | `degraded{reason="agent_mapping"}` |
@@ -570,17 +568,6 @@ pub const RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS: &str =
 /// traces and spans it dropped before sending.
 pub const RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES: &str = "_logit.datadog.tracer.dropped_p0_traces";
 pub const RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS: &str = "_logit.datadog.tracer.dropped_p0_spans";
-
-/// The private prefix every Datadog carrier above lives under.
-pub const CARRIER_PREFIX: &str = "_logit.datadog.";
-
-/// Whether `key` is another protocol's private key, which an encoder here skips without counting
-/// it. A key under [`CARRIER_PREFIX`] is this codec's own: one a route doesn't read as a carrier
-/// is written or counted as any other name would be, so a tracer's `meta` key spelled like a
-/// carrier relays verbatim and a carrier a route has no field for is counted `no_wire_form`.
-fn is_foreign_private(key: &str) -> bool {
-    logit_core::attrs::is_private(key) && !key.starts_with(CARRIER_PREFIX)
-}
 
 /// The tracer API's request headers that carry `_logit.datadog.tracer.*` resource attributes,
 /// spelled in lowercase as `http::HeaderName` stores them. `datadog_trace_in` reads them and

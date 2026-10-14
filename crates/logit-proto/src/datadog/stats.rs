@@ -821,7 +821,7 @@ impl DatadogEncoder {
         for (key, _) in attrs.iter() {
             let key = resolve(key);
             if !is_group_key(key)
-                && !super::is_foreign_private(key)
+                && !logit_core::attrs::is_private(key)
                 && !PAYLOAD_STRINGS.contains(&key)
                 && !PAYLOAD_SCALARS.contains(&key)
                 && !(envelope && ENVELOPE_KEYS.contains(&key))
@@ -886,7 +886,7 @@ impl DatadogEncoder {
         };
         for (key, _) in event.attributes.iter() {
             let key = resolve(key);
-            if !is_group_key(key) && !super::is_foreign_private(key) {
+            if !is_group_key(key) && !logit_core::attrs::is_private(key) {
                 self.tag_omitted("no_wire_form");
             }
         }
@@ -1696,8 +1696,8 @@ mod tests {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] }
     }
 
-    /// Another protocol's private attribute, on the event or the resource, has no wire form and
-    /// is never counted `no_wire_form`; a public one still is.
+    /// A private attribute, on the event or the resource, has no wire form and is never counted
+    /// `no_wire_form`; a public one still is.
     #[test]
     fn a_private_attribute_is_never_counted_no_wire_form() {
         let (mut e, registry) = encoder();
@@ -1725,17 +1725,19 @@ mod tests {
         assert_eq!(omitted, 1.0, "only `env` is counted");
     }
 
-    /// A Datadog carrier is this codec's own, not another protocol's private key: the v0.6 route
-    /// has no envelope, so a resource's Agent hostname and an event's stray series interval are
-    /// each counted `no_wire_form`, while another protocol's `_logit.` key isn't.
+    /// The v0.6 route has no envelope and no series fields, so a resource's Agent hostname and an
+    /// event's series interval have no wire form there. They are private, so they are skipped
+    /// uncounted, like any other `_logit.` key; a public key that isn't a group field is
+    /// still counted `no_wire_form`.
     #[test]
-    fn a_datadog_carrier_with_no_field_on_the_route_is_counted_no_wire_form() {
+    fn the_v06_route_skips_its_unread_carriers_uncounted() {
         let (mut e, registry) = encoder();
         let mut batch = stats_batch(
             vec![MetricRecord::new(intern(METRIC_HITS), MetricKind::counter(1.0))],
             &[
                 (super::super::ATTR_INTERVAL, Value::I64(10)),
                 ("_logit.statsd.type", Value::str("c")),
+                ("env", Value::str("prod")),
             ],
         );
         let mut resource = Resource::default();
@@ -1755,7 +1757,7 @@ mod tests {
                 _ => 0.0,
             })
             .sum();
-        assert_eq!(omitted, 2.0, "the interval and the Agent hostname, not the statsd key");
+        assert_eq!(omitted, 1.0, "only `env`, no private key");
     }
 
     #[test]

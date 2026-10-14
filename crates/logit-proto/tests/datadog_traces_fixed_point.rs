@@ -429,9 +429,8 @@ fn an_agent_payload_with_no_tracer_payloads_is_no_batches() {
 
 // -- proptest -------------------------------------------------------------------------------------
 
-/// Keys drawn from Datadog's reserved names, this crate's per-span carrier names, and ordinary
-/// ones. Not a chunk carrier's name: a span-level `meta` entry spelled like one is read as the
-/// chunk's field, which only one span per chunk supplies on encode.
+/// Keys drawn from Datadog's reserved names and ordinary ones. Never a `_logit.` key: that prefix is
+/// reserved for carriers, no tracer sends one, and an encoder skips one it doesn't read.
 fn key() -> impl Strategy<Value = String> {
     prop_oneof![
         Just("_dd.p.dm".to_string()),
@@ -443,7 +442,6 @@ fn key() -> impl Strategy<Value = String> {
         Just("env".to_string()),
         Just("version".to_string()),
         Just("service.name".to_string()),
-        Just("_logit.datadog.span.error".to_string()),
         "[a-z][a-z0-9_.]{0,8}",
     ]
 }

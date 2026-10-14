@@ -416,11 +416,12 @@ decisions above use the new spelling. Three things follow for the Datadog pairs:
   stats metric names (`datadog.stats.hits` and the rest) are metric names, not attributes.
 - **Every other sink ignores the carriers.** A `datadog_trace_in -> otlp_out` pipeline sends no
   tracer header as an OTLP resource attribute, and a `datadog_in -> influxdb_out` pipeline writes
-  no `_logit.datadog.interval` tag. `datadog_out` and `datadog_trace_out` read their own carriers
-  by exact name, as before, and treat any other `_logit.datadog.` key as they treat any other
-  name: a tracer's `meta` key spelled like a carrier still relays verbatim, and a carrier a route
-  has no field for is still counted `no_wire_form`. They skip another protocol's private key
-  without counting it.
+  no `_logit.datadog.interval` tag.
+- **The Datadog sinks follow the same rule.** `datadog_out` and `datadog_trace_out` read their own
+  carriers by exact name, and skip every other `_logit.` key when they render tags, log fields,
+  or span `meta` and `metrics`, without counting it. That includes their own carriers a route
+  doesn't read: a stray `_logit.datadog.interval` on a log never becomes a log field, and the
+  v0.6 stats route, which has no envelope, skips the Agent carriers uncounted.
 - **A tag can't spell a carrier.** `datadog_in` drops a series tag under `_logit.` and counts it
   `logit.input.tags.omitted{reason="reserved_prefix"}`, so a `_logit.datadog.type:rate` tag never
   turns a `GAUGE` into a `RATE`. An operator who wants a carrier on a series from another
