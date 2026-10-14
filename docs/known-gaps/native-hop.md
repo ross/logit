@@ -166,7 +166,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   restarted `logit_in`, an identity evicted from a full table, and a second `logit_in` behind a
   load balancer hold no mark for the sender, so each forwards the resend.
   [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md), decisions
-  5 and 6, accepts this: the at-least-once target prefers the duplicate to a loss.
+  5 and 6, accepts this: the at-least-once target prefers the duplicate to a loss. A
+  resend that arrives after an eviction is usually old, so `drop_stale` after `logit_in` discards it
+  ([ADR `stale-event-filtering`](../adr/stale-event-filtering.md)).
 
 - **A resend can race the frames an ended connection still holds, and be forwarded twice.**
   `logit_in` holds no lock per sender identity across a forward, and it raises a sender's mark

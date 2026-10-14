@@ -93,7 +93,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   [the plan's "Timestamp windows" section](../plans/datadog-relay.md#11-timestamp-windows-w5) has
   what a trial org stored.
   - **Consequence:** a `buffer.disk:` replay after an outage longer than 1 hour drops metrics
-    the intake might still have stored, counted `records.dropped{reason="stale"}`.
+    the intake might still have stored, counted `records.dropped{reason="stale"}`. To discard or archive old
+    events upstream of the sink, use `drop_stale` or `has_stale`
+    ([ADR `stale-event-filtering`](../adr/stale-event-filtering.md)).
   - **Revisit trigger:** Datadog documents a longer window, or an operator needs the replay.
 - **`datadog_out` copies Datadog's 100-tag limit on metrics.** A series, distribution point, or
   sketch whose `tags` list holds more than 100 strings is dropped before sending, counted

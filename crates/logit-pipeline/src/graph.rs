@@ -299,6 +299,8 @@
 //!     trailing whitespace (it could never match a request's token), or a `max_request_bytes` of
 //!     `0`. Its zero `handshake_timeout`/`idle_timeout` are rules 45/53's
 //!     (`docs/adr/influxdb-line-protocol-relay.md`).
+//! 87. A `has_stale` or `drop_stale` with a `max_age` of `0s`, or a `max_ahead` of `0s` when set:
+//!     a zero bound would call nearly every event stale (`docs/adr/stale-event-filtering.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -400,6 +402,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | DropAttributes { .. }
         | HasProvenance { .. }
         | DropProvenance { .. }
+        | HasStale { .. }
+        | DropStale { .. }
         | KeepValues { .. }
         | Bucket { .. }
         | Logfmt { .. }
@@ -471,6 +475,8 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         DropAttributes { .. } => "drop_attributes",
         HasProvenance { .. } => "has_provenance",
         DropProvenance { .. } => "drop_provenance",
+        HasStale { .. } => "has_stale",
+        DropStale { .. } => "drop_stale",
         KeepValues { .. } => "keep_values",
         Bucket { .. } => "bucket",
         Logfmt { .. } => "logfmt",
@@ -576,6 +582,8 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::DropAttributes { .. }
             | ComponentKind::HasProvenance { .. }
             | ComponentKind::DropProvenance { .. }
+            | ComponentKind::HasStale { .. }
+            | ComponentKind::DropStale { .. }
             | ComponentKind::KeepValues { .. }
             | ComponentKind::Bucket { .. }
             | ComponentKind::Logfmt { .. }
@@ -3942,6 +3950,28 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 87: `has_stale`/`drop_stale` (`docs/adr/stale-event-filtering.md`). A zero bound would
+    // call nearly every event stale.
+    for (id, component) in &components {
+        let (kind_name, max_age, max_ahead) = match &component.kind {
+            ComponentKind::HasStale { max_age, max_ahead } => ("has_stale", max_age, max_ahead),
+            ComponentKind::DropStale { max_age, max_ahead } => ("drop_stale", max_age, max_ahead),
+            _ => continue,
+        };
+        if max_age.is_zero() {
+            anyhow::bail!(
+                "component '{id}': {kind_name} 'max_age' must be greater than 0s -- a zero bound \
+                 would call nearly every event stale"
+            );
+        }
+        if max_ahead.is_some_and(|d| d.is_zero()) {
+            anyhow::bail!(
+                "component '{id}': {kind_name} 'max_ahead' must be greater than 0s -- a zero \
+                 bound would call nearly every event stale; remove it to turn the check off"
+            );
+        }
+    }
+
     // Rule 76: `timestamp` (`docs/adr/timestamp-transform.md`). `logit_core::zoned` decides what a
     // valid zone and pattern are, so this and the transform can't disagree. A zone is resolved here
     // once, never per event.
@@ -6786,6 +6816,41 @@ mod tests {
             ("out", vec!["tap"], sink()),
         ]));
         assert!(err.contains("max_tracked_keysets"), "{err}");
+    }
+
+    // ---- Rule 87: `has_stale`/`drop_stale` --------------------------------------------------------
+
+    fn stale_kinds(max_age: Duration, max_ahead: Option<Duration>) -> [ComponentKind; 2] {
+        [
+            ComponentKind::HasStale { max_age, max_ahead },
+            ComponentKind::DropStale { max_age, max_ahead },
+        ]
+    }
+
+    #[test]
+    fn a_stale_filter_with_positive_bounds_resolves() {
+        for kind in stale_kinds(Duration::from_secs(300), Some(Duration::from_secs(60))) {
+            let name = kind_name(&kind);
+            let graph = resolve_timestamp(kind).expect("should resolve");
+            assert_eq!(graph.components["stamped"].role(), Role::Transform);
+            assert_eq!(graph.components["stamped"].kind_name(), name);
+        }
+    }
+
+    #[test]
+    fn a_stale_filter_with_a_zero_max_age_is_rejected() {
+        for kind in stale_kinds(Duration::ZERO, None) {
+            let err = timestamp_err(kind);
+            assert!(err.contains("'max_age' must be greater than 0s"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn a_stale_filter_with_a_zero_max_ahead_is_rejected() {
+        for kind in stale_kinds(Duration::from_secs(300), Some(Duration::ZERO)) {
+            let err = timestamp_err(kind);
+            assert!(err.contains("'max_ahead' must be greater than 0s"), "got: {err}");
+        }
     }
 
     // ---- Rule 76: `timestamp` -------------------------------------------------------------------

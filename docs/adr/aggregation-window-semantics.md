@@ -63,7 +63,10 @@ winner, then discarded).
 **Windows are wall-clock-driven, not event-time.** A flush fires when the pipeline's clock reaches
 the deadline, regardless of what timestamps the accumulated events actually carry. There is no
 watermark, no late-data grace period, no reordering buffer: an event that arrives after its window's
-flush has already fired lands in the *next* window, full stop. This matches every other timing
+flush has already fired lands in the *next* window, full stop. A replayed backlog, such as a
+sender's `buffer.disk:` after an outage, likewise lands in the current window whatever its age.
+Put `drop_stale` ahead of `aggregate` to discard it, or `has_stale` to archive it
+([`stale-event-filtering`](stale-event-filtering.md)). This matches every other timing
 decision already made in this codebase (statsd stamps one wall-clock timestamp per datagram) and
 keeps the aggregator's state bounded and simple; a real event-time model is a larger design question
 for if/when it's actually needed.
@@ -411,12 +414,15 @@ went *down* is a genuine non-monotonic movement, not a reset), and different mea
 restarted and the counter must be re-based rather than differenced.
 
 So `temporality: cumulative` stamps every flushed `Sum`/`Histogram` with the series' **first-seen
-time** — the timestamp of the first event ever absorbed into that series (`SeriesState::first_seen`,
-captured from `event.timestamp`, the source's own clock). It never changes while the series lives. It
-changes in exactly one circumstance: the series is evicted and a later record re-creates it, which is
-precisely the event a consumer needs to be told about. A process restart is the same case by
-construction — a fresh `Aggregator` holds no series, so every series' first flush after the restart
-carries a new start time. The objection that there was "no way to detect that from the emitted
+time** — the timestamp of the first event ever absorbed into that series (`SeriesState::first_seen`).
+A new series opens with `max(event.timestamp, window_start)`, the source's own clock clamped to the
+start of the window it opened in. In the first window there is no start yet, so it opens with
+`event.timestamp` unclamped. The first flush that emits the series lowers it to the flush `now`
+if it's later, and the lowered value is kept, so it never moves while the series lives (see
+"Start time after a cap eviction"). It changes in exactly one circumstance: the series is evicted
+and a later record re-creates it, which is precisely the event a consumer needs to be told
+about. A process restart is the same case by construction — a fresh `Aggregator` holds no
+series, so every series' first flush after the restart carries a new start time. The objection that there was "no way to detect that from the emitted
 stream" no longer holds, because there is now a field whose whole job is to carry it.
 
 ### The unbounded-state half: the gauge amendment already built the answer

@@ -82,16 +82,17 @@ use logit_transforms::{
     Bucket as BucketTransform, BucketBound, BucketField, CsvParser,
     Distributions as TransformDistributions, DropAttributes as DropAttributesTransform,
     DropProvenance as DropProvenanceTransform, DropSignals as DropSignalsTransform,
-    Fields as TransformFields, Flatten as FlattenTransform,
+    DropStale as DropStaleTransform, Fields as TransformFields, Flatten as FlattenTransform,
     HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
-    HasSignal as HasSignalTransform, HttpAccess as HttpAccessTransform, HttpAccessConfig,
-    IdFormat as TraceIdFormatTransform, InvalidUtf8 as TransformInvalidUtf8, JsonParser,
-    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform,
-    Kv as KvTransform, KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform,
-    MatchMode as TransformMatchMode, Normalize as TransformNormalize, RegexParser,
-    Remove as RemoveTransform, Route as RouteTransform, Sample as SampleTransform,
-    Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform,
-    SignalSet, SpanLift, TimestampFormat as TimestampFormatTransform, TimestampResolver,
+    HasSignal as HasSignalTransform, HasStale as HasStaleTransform,
+    HttpAccess as HttpAccessTransform, HttpAccessConfig, IdFormat as TraceIdFormatTransform,
+    InvalidUtf8 as TransformInvalidUtf8, JsonParser, Keep as KeepTransform,
+    KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform, Kv as KvTransform,
+    KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
+    Normalize as TransformNormalize, RegexParser, Remove as RemoveTransform,
+    Route as RouteTransform, Sample as SampleTransform, Scale as ScaleTransform,
+    Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform, SignalSet, SpanLift,
+    TimestampFormat as TimestampFormatTransform, TimestampResolver,
     TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
@@ -1140,6 +1141,14 @@ fn build_spec(
                 always_keep.as_ref().map(to_sample_override),
             )
             .with_telemetry(telemetry.clone()),
+        )),
+        HasStale { max_age, max_ahead } => NodeSpec::Transform(Box::new(
+            HasStaleTransform::new(*max_age, *max_ahead).with_telemetry(telemetry.clone()),
+        )),
+        DropStale { max_age, max_ahead } => NodeSpec::Transform(Box::new(
+            DropStaleTransform::new(*max_age, *max_ahead)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
         )),
         // The config's `Vec<String>`s pass straight through; the transform interns them.
         HasProvenance { origin, previous } => NodeSpec::Transform(Box::new(
@@ -5378,6 +5387,36 @@ mod tests {
             build_spec("drop_provenance", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
+    }
+
+    #[test]
+    fn build_spec_builds_the_stale_transforms() {
+        for (name, kind) in [
+            (
+                "has_stale",
+                ComponentKind::HasStale { max_age: Duration::from_secs(300), max_ahead: None },
+            ),
+            (
+                "drop_stale",
+                ComponentKind::DropStale {
+                    max_age: Duration::from_secs(300),
+                    max_ahead: Some(Duration::from_secs(60)),
+                },
+            ),
+        ] {
+            let component = ResolvedComponent {
+                buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
+                sources: vec!["in".to_string()],
+                targets: Vec::new(),
+                consumers: vec!["out".to_string()],
+                kind,
+            };
+            assert!(matches!(
+                build_spec(name, &component, Path::new(""), None).unwrap().0,
+                NodeSpec::Transform(_)
+            ));
+        }
     }
 
     /// `socket_mode` reaches every Unix-socket listener: the bound socket file carries it.

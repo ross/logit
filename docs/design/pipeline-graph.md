@@ -115,6 +115,13 @@ pub enum ComponentKind {
     // Drops an event whose batch's origin/previous match every configured field -- has_provenance's
     // exact complement on the identical config, taken at the top level.
     DropProvenance { origin: Vec<String>, previous: Vec<String> },
+    // Forwards an event whose latest instant (a span's end, else event.timestamp) is more than
+    // `max_age` behind the wall clock, or, with `max_ahead` set, more than that ahead of it. An
+    // event with no timestamp is never stale (docs/adr/stale-event-filtering.md).
+    HasStale { max_age: Duration, max_ahead: Option<Duration> },
+    // Drops what has_stale forwards and forwards the rest -- its exact complement on the
+    // identical config.
+    DropStale { max_age: Duration, max_ahead: Option<Duration> },
     // Clamps attribute/resource-attribute values to a per-field allow-list -- `keep`'s value-side
     // sibling. A disallowed value becomes that field's `other` (or is removed if absent); an
     // optional, ordered `normalize` step (today just lowercasing) runs before the allow test and
@@ -179,7 +186,7 @@ collide, so the rule stays predictable when a protocol gains its second side lat
 `syslog_out` (RFC 3164/5424 over UDP or TCP, `docs/adr/syslog-output.md`) did after `SyslogIn`.
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
-`has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `bucket`,
+`has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `keep_values`, `bucket`,
 `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`, and any future
 native transform — take no suffix, because a transform has only one direction.
 
@@ -225,7 +232,7 @@ literal argument string.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, `kafka_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -390,6 +397,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 68. A `trace_context` `trace_id_high` outside `format: datadog`, or an empty one.
 69. A `splunk_hec_in` with an empty `bind`, a `tokens` entry that is empty or has surrounding
     whitespace, or a `max_request_bytes` of `0`.
+87. A `has_stale`/`drop_stale` with a `max_age` or a `max_ahead` of `0s`.
 70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL, carries a query
     or fragment, or ends in a HEC route rather than the `/services/collector` base, an empty or
     whitespace-padded `token`, `timeout: 0s`, an `ack_timeout` without `ack: true` or of `0s`, a

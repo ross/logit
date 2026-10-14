@@ -16,8 +16,11 @@
 //! batch it travels in.
 //!
 //! `format: text` skips an event with no log record and counts it in
-//! [`EncodeStats::no_log`]. A text body that contains `\n` can't be told from two bodies in a
-//! batch record.
+//! [`EncodeStats::no_log`]. An event whose body it writes leaves its metrics and span behind,
+//! counted in [`EncodeStats::metrics_omitted`] and [`EncodeStats::spans_omitted`] at encode, so
+//! a record the producer later drops as oversize, or the broker rejects or names, has still
+//! counted them. An event dropped as `oversize` under `record: batch` counts only there. A text body that contains `\n`
+//! can't be told from two bodies in a batch record.
 //!
 //! Under `record: batch`, events go into a record in batch order until the next would push its
 //! value over the encoder's `budget`, which the sink sets so a value that fits never trips the
@@ -169,6 +172,10 @@ pub struct EncodeStats {
     pub missing_key: usize,
     /// Events `format: text` skipped for having no log record.
     pub no_log: usize,
+    /// Metric records `format: text` left out of a record it wrote from the event's log.
+    pub metrics_omitted: usize,
+    /// Spans `format: text` left out of a record it wrote from the event's log.
+    pub spans_omitted: usize,
     /// Events dropped under `record: batch` because their value alone is over the budget; under
     /// an OTLP format, one per signal of an event whose request alone is over it.
     pub oversize: usize,
@@ -381,6 +388,16 @@ impl KafkaEncoder {
                 .value(self.format, false, &batch.resource, scope, event)
                 .expect("a text event here has a log record");
             out.push_with(value, meta);
+            self.count_omitted(event, stats);
+        }
+    }
+
+    /// Under `format: text`, counts the metrics and span `event` carries beside the log body
+    /// its record holds.
+    fn count_omitted(&self, event: &Event, stats: &mut EncodeStats) {
+        if self.format == RecordFormat::Text {
+            stats.metrics_omitted += event.metrics.len();
+            stats.spans_omitted += usize::from(event.span.is_some());
         }
     }
 
@@ -420,6 +437,7 @@ impl KafkaEncoder {
             }
             self.value.extend_from_slice(piece);
             count += 1;
+            self.count_omitted(event, stats);
         }
         if count > 0 {
             out.push_with(&self.value, RecordMeta { key: None, timestamp, signal: None });
@@ -1019,6 +1037,63 @@ mod tests {
         assert_eq!(batched.len(), 1);
         assert_eq!(batched[0].0, want.join(&b'\n'));
         assert_eq!(batched[0].1, RecordMeta { key: None, timestamp: 0, signal: None });
+    }
+
+    /// A log event that also carries two metric records and a span.
+    fn mixed_event(message: &str) -> Event {
+        let mut event = log_event(0, Value::str(message));
+        for name in ["a", "b"] {
+            event.metrics.push(logit_core::MetricRecord::new(
+                intern(name),
+                logit_core::MetricKind::Gauge(1.0.into()),
+            ));
+        }
+        event.span = Some(logit_core::SpanRecord {
+            trace_id: [1; 16],
+            span_id: [1; 8],
+            parent_span_id: None,
+            name: Value::str("s"),
+            kind: logit_core::SpanKind::Internal,
+            status: logit_core::SpanStatus::Unset,
+            events: vec![],
+            links: vec![],
+            end_timestamp: 1,
+            flags: 0,
+            ext: None,
+        });
+        event
+    }
+
+    /// `format: text` counts the metrics and span of each event whose body it writes, in both
+    /// record modes; an event skipped for no log or dropped as `oversize` counts none, and no
+    /// other format counts any.
+    #[test]
+    fn text_counts_the_metrics_and_span_it_leaves_out_of_a_written_record() {
+        let mut metric_only = log_event(0, Value::Null);
+        metric_only.log = None;
+        metric_only.metrics.push(logit_core::MetricRecord::new(
+            intern("m"),
+            logit_core::MetricKind::Gauge(1.0.into()),
+        ));
+        let b = batch(
+            AttrMap::new(),
+            vec![mixed_event("one"), metric_only, mixed_event(&"x".repeat(64)), mixed_event("two")],
+        );
+
+        let (out, stats) =
+            records(&mut encoder(RecordFormat::Text, RecordMode::Event, usize::MAX), &b);
+        assert_eq!(out.len(), 3);
+        assert_eq!((stats.no_log, stats.metrics_omitted, stats.spans_omitted), (1, 6, 3));
+
+        let (out, stats) = records(&mut encoder(RecordFormat::Text, RecordMode::Batch, 32), &b);
+        assert_eq!(out.len(), 1);
+        assert_eq!(stats.oversize, 1, "the 64-byte body");
+        assert_eq!((stats.no_log, stats.metrics_omitted, stats.spans_omitted), (1, 4, 2));
+
+        for format in [RecordFormat::Json, RecordFormat::Msgpack] {
+            let (_, stats) = records(&mut encoder(format, RecordMode::Event, usize::MAX), &b);
+            assert_eq!((stats.metrics_omitted, stats.spans_omitted), (0, 0), "{format:?}");
+        }
     }
 
     /// Under `record: batch`, each record takes events until the next would push it over the

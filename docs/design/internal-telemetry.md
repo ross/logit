@@ -466,7 +466,7 @@ config asked for never uses the word:
 |---|---|---|
 | `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
 | `logit.component.events.discarded` | A filter, `sample`, `aggregate`, or Lua script removed an event because the config asked it to. | None. |
-| `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, or sample value) removed from a record that's still delivered. | `reason` where more than one cause exists. |
+| `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, sample value, or a metric record or span beside a log body) removed from a record that's still delivered. | `reason` where more than one cause exists. |
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
 | `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. | `reason`, `metric_kind`, or `field`. |
 | `*.evicted`, `*.untracked` | An entry left a bounded bookkeeping table. No data was lost. | `reason` where more than one cause exists. |
@@ -1324,7 +1324,7 @@ own read-side counters:
 | `logit.input.lines` / `.line.bytes` | count | the read-side counterpart of `statsd_in`'s per-datagram pair, at line granularity: every line offered to the decoder, a rejected one and the unterminated line emitted at close included, and not a line dropped for `max_line_bytes` |
 | `logit.input.files.open` | gauge | sampled after every `scan` |
 | `.files.rotated` / `.files.truncated` | count | a known path now naming another inode (each such path in a scan, so a rotation chain under a wildcard counts every renamed name), or the same inode shrinking |
-| `logit.input.frames.dropped{reason="oversize"\|"truncated"}` | count | `oversize`: a line over `max_line_bytes`, dropped whole by the line splitter (with the `long_line` diagnostic), once each time it's read, so again after a restart; `truncated`: the unterminated line held from before an in-place truncation, discarded at it |
+| `logit.input.frames.dropped{reason="oversize"\|"truncated"}` | count | `oversize`: a line over `max_line_bytes`, dropped whole by the line splitter, or under `docker_in` a reassembled message over it, dropped whole by the decoder (each with the `long_line` diagnostic), once each time it's read, so again after a restart; `truncated`: what an in-place truncation discards, the unterminated line held from before it, or under `docker_in` each stream's held reassembly, counted once with the unterminated line that continues it |
 | `.scan.errors{op="read_dir"\|"stat"}` | count | the number of failed listings, or failed `stat`s, in one `scan`, recorded once per scan per operation that had one. A failure retires no tracked file it may name: `read_dir` is a pattern's directory, `stat` a matched path (or `docker_in`'s container directory) that failed with anything but `NotFound` or `NotADirectory`. A missing directory is not an error. The rule's canonical table is `crates/logit-inputs/src/tail/pattern.rs`'s module doc. See [ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md), decision 1 |
 | `.files.resume_rejected` | count | a resume refused, so the file starts at `0` instead: the file is shorter than the recorded head, its head bytes hash differently, or the offset is past its length. The fingerprint comes from a checkpoint entry or a de-selection retention. Decision 2 of the same ADR |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | every batch no consumer took, the refused one included. The driver then stops writing the checkpoint, which stays at the last one written (at or before the last line a consumer took), and stops. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`; batches after it that were never offered appear only here. |
@@ -1593,19 +1593,31 @@ With a `span:` block, `.spans{id="present"|"minted"}` (count) alongside `.lifted
 minted `SpanRecord`'s id came from the line or from `mint_id`. This is the `kv_metrics`
 `.derived`/`.derived.skipped` pattern applied to lifting a trace context.
 
-##### Filters: `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`
+##### Filters: `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`
 
 `crates/logit-transforms/src/signals.rs`, `crates/logit-transforms/src/attributes.rs`,
-`crates/logit-transforms/src/provenance.rs`;
+`crates/logit-transforms/src/provenance.rs`, `crates/logit-transforms/src/stale.rs`;
 [ADR `attribute-filtering-components`](../adr/attribute-filtering-components.md),
-[ADR `provenance-filtering-components`](../adr/provenance-filtering-components.md).
+[ADR `provenance-filtering-components`](../adr/provenance-filtering-components.md),
+[ADR `stale-event-filtering`](../adr/stale-event-filtering.md).
 
-None of the seven counts the events it removes: the runtime's `logit.component.events.discarded`
+None of the nine counts the events it removes: the runtime's `logit.component.events.discarded`
 does, under the filter's own id. `keep_signals`/`drop_signals` record
 `logit.transform.payloads.stripped{signal}` (count), one per payload slot cleared, because
-the event survives a strip; no other filter mutates a forwarded event, so the other five record
-nothing of their own. None has `Diagnostics`, because matching a fixed set or clearing a fixed
-signal set can't fail.
+the event survives a strip. `has_stale`/`drop_stale` record why an event was classed stale (below).
+No other filter mutates a forwarded event or has a reason to give, so the other five record
+nothing of their own. Only `drop_stale` has `Diagnostics`; matching a fixed set or clearing a fixed
+signal set can't fail, and `has_stale` discarding fresh events is its normal work.
+
+`has_stale`/`drop_stale` record two counters, both emitted only when nonzero:
+
+- `logit.transform.stale.exceeded{bound="max_age"|"max_ahead"}` (count): one per event classed
+  stale, by the bound it crossed.
+- `logit.transform.stale.unjudged` (count): one per event with no time to judge (an instant of 0),
+  which `drop_stale` forwards and `has_stale` discards.
+
+`drop_stale` also emits a throttled diagnostic, key `stale_event`, carrying the observed age and
+the bound crossed.
 
 `has_attributes`/`drop_attributes` deliberately have **no cache-miss counter** for their
 resource-match cache (`Matcher`, `Set::map_resource`'s `Arc::ptr_eq` idiom applied to a read).
@@ -1804,7 +1816,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 
 | Class | Counts | Counters |
 |---|---|---|
-| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.omitted`, `tags.normalized`, `messages.skipped`, `messages.normalized`, `messages.truncated`, `fields.omitted`, `events.skipped`, `events.dropped`, `structured_data.omitted`; the codec counters of `statsd_out`, `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.dropped`, `metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.omitted`, `labels.normalized`, `spans.degraded`, `stats.dropped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"too_many_tags"\|"needs_agent_processing"\|"not_datadog_origin"}` and its `too_many_tags` diagnostic; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `kafka_out`'s `records.dropped{reason="oversize"}`, `records.unkeyed`, `events.skipped{reason="no_log"}`, its `oversize` diagnostic, and under `format: otlp_proto` the OTLP codec's `metrics.skipped`, `metrics.dropped`, and `metrics.degraded`; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
+| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.omitted`, `tags.normalized`, `messages.skipped`, `messages.normalized`, `messages.truncated`, `fields.omitted`, `events.skipped`, `events.dropped`, `structured_data.omitted`; the codec counters of `statsd_out`, `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.dropped`, `metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.omitted`, `labels.normalized`, `spans.degraded`, `stats.dropped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"too_many_tags"\|"needs_agent_processing"\|"not_datadog_origin"}` and its `too_many_tags` diagnostic; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `kafka_out`'s `records.dropped{reason="oversize"}`, `records.unkeyed`, `events.skipped{reason="no_log"}`, `metrics.omitted{reason="format"}`, `spans.omitted{reason="format"}`, its `oversize` diagnostic, and under `format: otlp_proto` the OTLP codec's `metrics.skipped`, `metrics.dropped`, and `metrics.degraded`; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
 | Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
 | Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `datadog_out`'s `records.dropped{route="series", reason="rejected"}` from a series `202`'s body; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"\|"ambiguous_at_most_once"}`, from a `partial_success` (`rejected` only) or a verdict that names a signal, and the Datadog sinks' `records.dropped{route, reason="rejected"\|"ambiguous_at_most_once"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); `kafka_out`'s `records.dropped{reason="rejected"\|"invalid_timestamp"\|"invalid_record"\|"ambiguous_at_most_once"}` for a partition batch; and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `series_rejected`, `ack_unsupported`, `ack_timeout`, `oversize` for Splunk Cloud's answer, and `kafka_out`'s `rejected`, `invalid_timestamp`, and `invalid_record`). `otlp_out`, `datadog_out`, `datadog_trace_out`, and `kafka_out` meet each of their verdicts at most once per batch, because a retry never resends a signal, request, or partition batch the destination settled; only `splunk_hec_out` and the datagram sinks meet one again on a retry |
 
@@ -2233,6 +2245,7 @@ spans, or metrics it holds.
 | `logit.output.records.dropped{reason="ambiguous_at_most_once"}` | count | records left unsettled when `at_most_once` drops a batch after an `Ambiguous` attempt, or drops an `Ambiguous` partition batch before retrying a `Refused` one |
 | `logit.output.records.unkeyed` | count | records sent without a key because the configured `key:` had no value on their event, or under `format: otlp_proto` or `otlp_json` on their request's events or resource, once per batch |
 | `logit.output.events.skipped{reason="no_log"}` | count | events `format: text` skipped for having no log record, once per batch |
+| `logit.output.metrics.omitted{reason="format"}`, `logit.output.spans.omitted{reason="format"}` | count | under `format: text`, the metric records and spans left out of a record that carries their event's log body, one per metric record and one per span, once per batch; counted at encode, so a record later dropped (`oversize`, `rejected`, or named by the broker) has still counted them |
 | `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, `logit.output.metrics.degraded{metric_kind}` | count | under `format: otlp_proto` or `otlp_json`, metrics the OTLP codec skips, drops, or degrades, as `otlp_out` counts them, once per batch |
 
 `Diagnostics` keys, each throttled: `oversize`, naming the record count and the
