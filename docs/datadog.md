@@ -193,9 +193,10 @@ view of them is lost. Datadog bills per host, so the cost matches one Agent.
 To keep a host per sender, stamp `host.name` upstream with `set`, or have each DogStatsD client
 send a `host:` tag (or `h:` on an event or check). A host the data carries is never replaced. A
 `host:` tag is the host, and isn't sent as a tag, as the Agent reads it. A sample a client made
-hostless with an empty `host:` tag stays hostless. An Agent's hostless v2 series stays hostless
-too, but one on the v1, distribution-point, or sketch routes is filled
-(`docs/known-gaps/datadog.md`).
+hostless with an empty `host:` tag stays hostless, and so does a sample an Agent sends hostless:
+a v2 `host` resource with no name, or `"host":""` on the v1, distribution-point, and sketch
+routes. An empty sketch `host` always reads as hostless, because protobuf can't tell it from a
+missing one.
 
 ### `at_least_once` can duplicate a request, and everything but series is stored twice
 

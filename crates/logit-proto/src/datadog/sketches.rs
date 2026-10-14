@@ -358,7 +358,7 @@ fn rebin_to_agent(sketch: &DdSketch) -> DdSketch {
 mod tests {
     use super::*;
     use crate::datadog::generated::agentpayload::{sketch_payload::sketch::Distribution, Metadata};
-    use crate::datadog::{ATTR_HOST_NAME, ATTR_ORIGIN_PRODUCT};
+    use crate::datadog::{ATTR_HOSTLESS, ATTR_HOST_NAME, ATTR_ORIGIN_PRODUCT};
     use logit_core::{AttrMap, Registry, Value};
 
     const TS_S: i64 = 1_700_000_000;
@@ -492,7 +492,7 @@ mod tests {
         }
     }
 
-    /// A hostless sketch leaves with the default host; one with its own `host.name` keeps it.
+    /// A sketch with no host leaves with the default host; one with its own `host.name` keeps it.
     #[test]
     fn a_sketch_fills_only_a_missing_host() {
         let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
@@ -502,6 +502,35 @@ mod tests {
         b.events[0].attributes.insert(ATTR_HOST_NAME, Value::str("h"));
         let own = SketchPayload::decode(e.encode_sketches(&b).unwrap()).unwrap();
         assert_eq!(own.sketches[0].host, "h");
+    }
+
+    /// A sketch's empty wire `host` decodes to `_logit.datadog.hostless` and leaves as `""` again
+    /// through an encoder with a default host.
+    #[test]
+    fn an_empty_sketch_host_stays_hostless() {
+        let payload = SketchPayload {
+            sketches: vec![Sketch {
+                metric: "lat".into(),
+                dogsketches: vec![Dogsketch {
+                    ts: TS_S,
+                    cnt: 1,
+                    min: 1.0,
+                    max: 1.0,
+                    avg: 1.0,
+                    sum: 1.0,
+                    k: vec![1],
+                    n: vec![1],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let b = DatadogDecoder::new().decode_sketches(&payload.encode_to_vec(), 0).unwrap();
+        assert_eq!(b.events[0].attributes.get(ATTR_HOSTLESS), Some(&Value::Bool(true)));
+        let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let out = SketchPayload::decode(e.encode_sketches(&b).unwrap()).unwrap();
+        assert_eq!(out.sketches[0].host, "");
+        assert!(out.sketches[0].tags.is_empty(), "{:?}", out.sketches[0].tags);
     }
 
     /// A `host` attribute is a hostless sketch's host and not a tag; an empty one stays hostless.

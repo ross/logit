@@ -448,11 +448,37 @@ carries always wins. Trace and stats payloads keep their tracer and Agent hostna
   from `host`, `hostname`, or `syslog.hostname`. A log carrying `hostname`, `host.name`,
   `syslog.hostname`, or `host` gets no default `hostname`, and the last two leave as the
   attributes they were.
-- **An Agent's hostless v2 series stays hostless.** The Agent writes a hostless series as a
-  `host` resource with no name, which decodes into `_logit.datadog.resources`. A series carrying such an
-  entry is never filled, and the entry is kept, so the relay stays a fixed point. The v1,
-  distribution-point, and sketch routes spell the same thing `"host":""`, which decodes as no
-  host and is filled, a gap in `docs/known-gaps/datadog.md`.
+- **An Agent's hostless sample stays hostless.** On v2 the Agent writes a hostless series as a
+  `host` resource with no name, which decodes into `_logit.datadog.resources`. A series carrying
+  such an entry is never filled, and the entry is kept, so the relay stays a fixed point. The v1,
+  distribution-point, and sketch routes spell the same thing `"host":""`, which decodes to the
+  private carrier `_logit.datadog.hostless` (`Bool(true)`, an event attribute like the route's
+  other carriers), distinct from an absent `host`. A sample carrying it is never filled. It
+  leaves as `""` on those three routes and as a `host` resource with no name on v2, as does a
+  sample with an empty `host:` tag, so a later hop keeps it hostless too. To keep an absent
+  `host` absent, the v1 and distribution-point encoders omit `host` when there's no host, no
+  hostless mark, and no default host, or when `host.name` isn't a string, which is never
+  replaced.
+- **An empty sketch host is hostless.** Protobuf can't tell an empty sketch `host` from an
+  absent one, so `logit` reads every empty one as hostless. That's what it means from every
+  sender found, in datadog-agent 7.83.3:
+  - DogStatsD sets a sample's host to the Agent's hostname unless it has a `host:` tag
+    (`comp/dogstatsd/server/impl/enrich.go`, `extractTagsMetadata`), and clears it in serverless
+    mode (`enrichMetricSample`).
+  - A check's empty hostname gets the Agent's unless the check turned that off, as
+    `empty_default_hostname: true` and the KSM check do
+    (`pkg/aggregator/sender.go`, `sendMetricSample`; `pkg/collector/corechecks/checkbase.go`).
+  - The aggregator copies the sample's host into the sketch without defaulting
+    (`pkg/aggregator/time_sampler.go`, `newSketchSeries`).
+  - The Agent's own hostname is empty only in sidecar mode (Fargate or managed instances),
+    where "the task/pod is the unit of identity, not the host" (`pkg/util/hostname/common.go`,
+    `fromFargate`). It exits at startup when it can't resolve one
+    (`cmd/agent/subcommands/run/command.go`).
+
+  The OpenTelemetry Collector's Datadog exporter sends an empty host for a source that isn't a
+  host, such as an ECS Fargate task (`pkg/opentelemetry-mapping-go/otlp/metrics`,
+  `metrics_translator.go`). Filling any of these with the relay's hostname would invent a host
+  the sender declined to name. What the intake does with an empty sketch host isn't documented.
 - **One `logit` is one Datadog host for hostless senders.** A metric with no `host:` tag, or an
   event or check with no `h:` field and no `host:` tag, relayed through `logit` reports under the
   relay's hostname, as it would through one Agent. Datadog bills per host, so this matches what
