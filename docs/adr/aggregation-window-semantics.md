@@ -416,7 +416,8 @@ restarted and the counter must be re-based rather than differenced.
 So `temporality: cumulative` stamps every flushed `Sum`/`Histogram` with the series' **first-seen
 time** — the timestamp of the first event ever absorbed into that series (`SeriesState::first_seen`).
 A new series opens with `max(event.timestamp, window_start)`, the source's own clock clamped to the
-start of the window it opened in. The first flush that emits the series lowers it to the flush `now`
+start of the window it opened in. In the first window there is no start yet, so it opens with
+`event.timestamp` unclamped. The first flush that emits the series lowers it to the flush `now`
 if it's later, and the lowered value is kept, so it never moves while the series lives (see
 "Start time after a cap eviction"). It changes in exactly one circumstance: the series is evicted
 and a later record re-creates it, which is precisely the event a consumer needs to be told

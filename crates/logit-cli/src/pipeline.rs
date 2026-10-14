@@ -1142,7 +1142,6 @@ fn build_spec(
             )
             .with_telemetry(telemetry.clone()),
         )),
-        // The config's `Vec<String>`s pass straight through; the transform interns them.
         HasStale { max_age, max_ahead } => NodeSpec::Transform(Box::new(
             HasStaleTransform::new(*max_age, *max_ahead).with_telemetry(telemetry.clone()),
         )),
@@ -1151,6 +1150,7 @@ fn build_spec(
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone()),
         )),
+        // The config's `Vec<String>`s pass straight through; the transform interns them.
         HasProvenance { origin, previous } => NodeSpec::Transform(Box::new(
             HasProvenanceTransform::new(origin.clone(), previous.clone()),
         )),

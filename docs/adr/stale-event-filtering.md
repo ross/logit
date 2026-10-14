@@ -59,7 +59,7 @@ archive:
 The module doc of `crates/logit-transforms/src/stale.rs` is the canonical statement of the rules
 below.
 
-**The instant judged.** It is the latest time the event carries:
+**The instant judged.** It is the time the event finished:
 
 - the span's `end_timestamp` when the event has a span and that field is non-zero;
 - `event.timestamp` otherwise.
