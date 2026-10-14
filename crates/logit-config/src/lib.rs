@@ -2646,6 +2646,52 @@ pub enum ComponentKind {
         #[serde(default)]
         previous: Vec<String>,
     },
+    /// Forwards stale events, discarding fresh ones, judged against the wall clock. The time
+    /// judged is the span's end when the event has a span with one set, otherwise the event's
+    /// timestamp. An event whose time is 0 (unknown) is never stale. An event is stale when it is
+    /// older than `max_age`, or, with `max_ahead` set, further in the future than `max_ahead`; an
+    /// age equal to the bound is fresh. The clock is read once per batch.
+    ///
+    /// `max_age` must cover the clock skew between tiers, one `aggregate` flush interval, and
+    /// normal pipeline latency, or fresh events are called stale.
+    ///
+    /// With the same bounds, `has_stale` forwards what `drop_stale` discards. Point it at an
+    /// archive sink, such as a `file_out` with `format: native`, which keeps every field.
+    HasStale {
+        /// The oldest an event may be. Required; must be greater than zero.
+        #[serde(with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        max_age: Duration,
+        /// The furthest in the future an event may be. Off by default; when set, must be greater
+        /// than zero.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        max_ahead: Option<Duration>,
+    },
+    /// Forwards fresh events, discarding stale ones, judged against the wall clock. The time
+    /// judged is the span's end when the event has a span with one set, otherwise the event's
+    /// timestamp. An event whose time is 0 (unknown) is never stale. An event is stale when it is
+    /// older than `max_age`, or, with `max_ahead` set, further in the future than `max_ahead`; an
+    /// age equal to the bound is fresh. The clock is read once per batch.
+    ///
+    /// `max_age` must cover the clock skew between tiers, one `aggregate` flush interval, and
+    /// normal pipeline latency, or fresh events are called stale.
+    ///
+    /// Place it immediately before `aggregate`, or before any other component that keeps state
+    /// across events. Ahead of an `aggregate` with `temporality: cumulative`, discarding a
+    /// replayed delta leaves the running total low by that amount, while merging it late keeps
+    /// the total right but spikes the rate. `has_stale` forwards what this discards.
+    DropStale {
+        /// The oldest an event may be. Required; must be greater than zero.
+        #[serde(with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        max_age: Duration,
+        /// The furthest in the future an event may be. Off by default; when set, must be greater
+        /// than zero.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        max_ahead: Option<Duration>,
+    },
     /// Equality-only routing: one key read per event, one target per matching value. There is no
     /// predicate language; use `lua` for a condition. An event whose key is absent, or whose
     /// value no route names, is unrouted: it goes to this component's ordinary consumers, the
@@ -6451,6 +6497,33 @@ mod tests {
             }
             other => panic!("expected Timestamp, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stale_components_deserialize() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "drop_stale", "sources": ["in"], "max_age": "5m", "max_ahead": "1m"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DropStale { max_age, max_ahead } => {
+                assert_eq!(max_age, Duration::from_secs(300));
+                assert_eq!(max_ahead, Some(Duration::from_secs(60)));
+            }
+            other => panic!("expected DropStale, got {other:?}"),
+        }
+        let component: Component =
+            serde_json::from_str(r#"{"type": "has_stale", "sources": ["in"], "max_age": "5m"}"#)
+                .unwrap();
+        match component.kind {
+            ComponentKind::HasStale { max_age, max_ahead } => {
+                assert_eq!(max_age, Duration::from_secs(300));
+                assert_eq!(max_ahead, None);
+            }
+            other => panic!("expected HasStale, got {other:?}"),
+        }
+        assert!(serde_json::from_str::<Component>(r#"{"type": "drop_stale", "sources": ["in"]}"#)
+            .is_err());
     }
 
     #[test]

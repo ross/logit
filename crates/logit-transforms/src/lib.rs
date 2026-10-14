@@ -27,6 +27,7 @@ mod scale;
 mod set;
 mod shape;
 mod signals;
+mod stale;
 mod timestamp;
 mod trace_context;
 
@@ -51,6 +52,7 @@ pub use scale::Scale;
 pub use set::Set;
 pub use shape::{Shape, DEFAULT_MAX_TRACKED_KEYS, DEFAULT_MAX_TRACKED_KEYSETS};
 pub use signals::{DropSignals, HasSignal, KeepSignals, MatchMode, SignalSet};
+pub use stale::{DropStale, HasStale};
 pub use timestamp::{TimestampFormat, TimestampResolver};
 pub use trace_context::{IdFormat, SpanLift, TraceContext};
 

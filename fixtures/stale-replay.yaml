@@ -1,0 +1,56 @@
+# Keep replayed backlog out of an aggregate window, and archive it instead.
+#
+# After an outage, an edge `logit_out` delivers everything its buffer held, however old. An
+# `aggregate` window is wall-clock, so an hour of replayed counters would land in the current
+# 10s window. `drop_stale` in front of it discards events older than `max_age`; `has_stale` is
+# its exact complement and forwards only those, here into a native-format archive that keeps
+# every field.
+#
+# Topology:
+#
+#                          /--> fresh (drop_stale) --> windowed (aggregate) --> metrics_out
+#   [the wire] --> central_in
+#                          \--> late (has_stale) -----------------------------> archive
+#
+# `max_age` must cover clock skew between tiers, one aggregate flush interval, and pipeline
+# latency. This aggregate runs `temporality: delta` (the default). Ahead of a cumulative one,
+# discarding a replayed delta leaves the running total low by that amount, while merging it late
+# keeps the total right but spikes the rate.
+components:
+  central_in:
+    type: logit_in
+    bind: 0.0.0.0:5150
+
+  fresh:
+    type: drop_stale
+    sources: [central_in]
+    max_age: 5m
+    max_ahead: 1m          # optional; off by default
+
+  windowed:
+    type: aggregate
+    sources: [fresh]
+    interval: 10s
+
+  metrics_out:
+    type: stdio_out
+    sources: [windowed]
+    target: stdout
+    buffer:
+      overflow: drop_oldest   # stand-in sink; a real one gets a buffer.disk spool
+
+  late:
+    type: has_stale
+    sources: [central_in]
+    max_age: 5m
+    max_ahead: 1m
+
+  archive:
+    type: file_out
+    sources: [late]
+    path: /tmp/logit-stale-archive.native
+    format: native
+    rotate:
+      max_bytes: "100MiB"
+    buffer:
+      overflow: drop_oldest
