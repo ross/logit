@@ -151,7 +151,7 @@ exposition/OpenMetrics format already describes.
 
 Reference: <https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/>. See
 [ADR `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md) for `logit`'s
-`influxdb_in`/`influxdb_out` model mapping, the `influxdb.*` carrier, and the permitted
+`influxdb_in`/`influxdb_out` model mapping, the `_logit.influxdb.*` carrier, and the permitted
 normalizations.
 
 `<measurement>[,<tag_key>=<tag_value>...] <field_key>=<field_value>[,<field_key>=<field_value>...] [<timestamp>]`.
