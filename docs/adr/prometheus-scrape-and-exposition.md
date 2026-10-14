@@ -203,7 +203,9 @@ Plus the resource-level `_logit.prometheus.target` above, consumed the same way.
 above (none is an invented `service.name`); `_logit.prometheus.type` and
 `_logit.prometheus.timestamp` instead record how to re-encode a sample, not a fact about it. All
 three are private ([ADR `private-attribute-namespace`](private-attribute-namespace.md)): every
-other sink leaves them off its wire, uncounted, the way it leaves off any `_logit.*` attribute.
+other protocol sink leaves them off its tags, labels, and fields, uncounted, the way it leaves off
+any `_logit.*` attribute. A whole-event render (`stdio_out`, `file_out`, `kafka_out`'s `json`,
+`msgpack`, and `native` formats, and the native hop) keeps them.
 
 `job` is deliberately **not** stamped by `prometheus_in`, unlike `instance`: it is operator
 identity (which scrape config this target belongs to), not a fact about the target itself, and
@@ -557,9 +559,11 @@ record names under the private prefix: `prometheus.type` is `_logit.prometheus.t
 
 Two consequences follow:
 
-- Every other sink leaves the three off its wire, uncounted. Before, they reached every other
-  sink as ordinary tags, so a `prometheus_in -> influxdb_out` pipeline wrote a `prometheus.type`
-  tag on each untyped series.
+- Every other protocol sink leaves the three off its tags, labels, and fields, uncounted. Before,
+  they reached every other sink as ordinary tags, so a `prometheus_in -> influxdb_out` pipeline
+  wrote a `prometheus.type` tag on each untyped series. A whole-event render (`stdio_out`,
+  `file_out`, `kafka_out`'s `json`, `msgpack`, and `native` formats, and the native hop) still
+  carries them.
 - `prometheus_out` skips every `_logit.*` attribute when it builds labels, and no longer skips
   the `prometheus.` prefix. An attribute spelled `prometheus.<name>` without the private prefix
   is an ordinary label.

@@ -416,10 +416,11 @@ fn instance_of(index: usize, url: &str) -> String {
 /// scrape request itself (`_logit.prometheus.target`, every `scrape_failed` diagnostic) uses.
 /// `reqwest` turns `http://user:pass@host/metrics` into an `Authorization` header, but the
 /// configured `String` still holds the password, and `_logit.prometheus.target` rides the batch to
-/// every sink the pipeline routes to. A protocol sink leaves a private attribute off its wire, but
-/// a stdout or file render and the native hop carry it. The query string goes too, since `?token=...` is as real a credential shape. The
-/// fragment is kept. Parsing also normalizes the result (host lowercased, a default port dropped),
-/// which is harmless for a valid absolute URL.
+/// every sink the pipeline routes to. A protocol sink leaves a private attribute off its tags,
+/// labels, and fields, but a `stdio_out` or `file_out` render, a `kafka_out` record in its `json`,
+/// `msgpack`, or `native` format, and the native hop carry it. The query string goes too, since
+/// `?token=...` is as real a credential shape. The fragment is kept. Parsing also normalizes the
+/// result (host lowercased, a default port dropped), which is harmless for a valid absolute URL.
 ///
 /// Falls back to `<unparseable target #{index}>`, never the raw `url` and never a placeholder
 /// shared across targets. Rule 40 (`logit-pipeline::graph`) only approximates a URL grammar

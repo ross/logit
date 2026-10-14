@@ -215,8 +215,8 @@ series *is* per-event attribute width.
 
 Scraped exporters are the narrowest thing in the survey, and what width they have is on the wire:
 `prometheus_in` puts `instance` and its target on the `Resource`, so the counts above are the
-exporter's own labels plus, for about 2% of node_exporter's series, one `prometheus.type` marking a
-family the exporter left untyped. Series that carry their identity as labels run wider —
+exporter's own labels plus, for about 2% of node_exporter's series, one `_logit.prometheus.type`
+marking a family the exporter left untyped. Series that carry their identity as labels run wider —
 remote-write (which has nowhere else to put `job` and `instance`), cAdvisor, kube-state-metrics, a
 tagged statsd line, a collectd value list — but top out at 10–11. A default carbon plaintext feed
 carries **no** attributes at all: both agents bake identity into the dotted path unless tag support
