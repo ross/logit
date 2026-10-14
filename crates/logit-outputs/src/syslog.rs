@@ -73,12 +73,13 @@
 //!   [`render_sd_value`]; the `syslog.sd` contract constrains only the outer two `Map` layers.
 //!
 //! **Opt-in `structured_data`**: when [`SyslogEncoder::with_structured_data`] sets an SD-ID and the
-//! output is 5424, every event attribute whose key doesn't start with `syslog.` is emitted as one
-//! extra SD-ELEMENT under that SD-ID (PARAM-NAME = attribute key; same validation, skip, and count
-//! rule; the element is omitted when no attribute qualifies). This closes the
-//! `syslog_in -> json -> syslog_out` gap: an attribute a transform added still reaches the wire. A
-//! relayed multi-valued statsd tag (`team: Value::Array[Str("a"), Str("b")]`) takes
-//! [`write_sd_param`]'s `Array` arm and emits `team="a" team="b"`.
+//! output is 5424, every event attribute whose key doesn't start with `syslog.` and isn't private
+//! (ADR `private-attribute-namespace`) is emitted as one extra SD-ELEMENT under that SD-ID
+//! (PARAM-NAME = attribute key; same validation, skip, and count rule; the element is omitted when
+//! no attribute qualifies). This closes the `syslog_in -> json -> syslog_out` gap: an attribute a
+//! transform added still reaches the wire. A relayed multi-valued statsd tag
+//! (`team: Value::Array[Str("a"), Str("b")]`) takes [`write_sd_param`]'s `Array` arm and emits
+//! `team="a" team="b"`.
 //!
 //! - **No default private enterprise number ships.** `sd_id` must contain exactly one `@` (e.g.
 //!   `myapp@12345`), checked in `with_structured_data`. RFC 5424's `32473` example PEN is
@@ -857,10 +858,10 @@ fn write_structured_data(
         }
     }
     if let Some(cfg) = structured_data {
-        // Checked before the collision, so an event with only `syslog.*` attributes, which would
-        // emit no opt-in element anyway, isn't counted as a drop.
-        let has_extra_attrs =
-            attrs.iter().any(|(sym, _)| !interner::resolve(sym).starts_with("syslog."));
+        let is_extra = |key: &str| !key.starts_with("syslog.") && !crate::attrs::is_private(key);
+        // Checked before the collision, so an event with only `syslog.*` and private attributes,
+        // which would emit no opt-in element anyway, isn't counted as a drop.
+        let has_extra_attrs = attrs.iter().any(|(sym, _)| is_extra(interner::resolve(sym)));
         if has_extra_attrs {
             // `syslog_in` reads a line with a repeated SD-ID as RFC 3164, so on a collision the
             // origin's element wins and the opt-in one is dropped rather than make the far end
@@ -886,7 +887,7 @@ fn write_structured_data(
                     &cfg.sd_id,
                     attrs
                         .iter()
-                        .filter(|(sym, _)| !interner::resolve(*sym).starts_with("syslog."))
+                        .filter(|(sym, _)| is_extra(interner::resolve(*sym)))
                         .map(|(sym, v)| (interner::resolve(sym), v)),
                     stats,
                     diag,
@@ -3039,6 +3040,27 @@ mod tests {
         let (msgs, _) = encode_with(&mut encoder, vec![event]);
         assert!(msgs[0].contains(r#"env="prod""#));
         assert!(!msgs[0].contains("syslog.hostname"));
+    }
+
+    /// A private attribute never becomes an opt-in SD-PARAM, and an event with only private and
+    /// `syslog.*` attributes emits no opt-in element and counts no collision.
+    #[test]
+    fn structured_data_excludes_private_keys_uncounted() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("_logit.x", Value::str("e"));
+        attrs.insert("env", Value::str("prod"));
+        let public = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut attrs = AttrMap::new();
+        attrs.insert("_logit.x", Value::str("e"));
+        attrs.insert("syslog.sd", sd_value(vec![("myapp@12345", vec![("orig", Value::str("1"))])]));
+        let private_only = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder =
+            SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("myapp@12345").unwrap();
+        let (msgs, stats) = encode_with(&mut encoder, vec![public, private_only]);
+        assert!(msgs[0].contains(r#"[myapp@12345 env="prod"]"#), "got: {}", msgs[0]);
+        assert!(msgs[1].contains(r#"[myapp@12345 orig="1"]"#), "got: {}", msgs[1]);
+        assert!(msgs.iter().all(|m| !m.contains("_logit")), "got: {msgs:?}");
+        assert_sd_omitted(&stats, 0, 0, 0);
     }
 
     #[test]
