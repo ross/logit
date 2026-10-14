@@ -500,6 +500,20 @@ mod tests {
         assert_eq!(own.sketches[0].host, "h");
     }
 
+    /// A `host` attribute is a hostless sketch's host and not a tag; an empty one stays hostless.
+    #[test]
+    fn a_sketch_takes_its_host_from_a_host_tag() {
+        let mut e = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        for (tag, want) in [("web1", "web1"), ("", "")] {
+            let mut b = batch_of(heavy(1, 1.0));
+            b.events[0].attributes.insert("host", Value::str(tag));
+            let sketch =
+                &SketchPayload::decode(e.encode_sketches(&b).unwrap()).unwrap().sketches[0];
+            assert_eq!(sketch.host, want);
+            assert!(sketch.tags.is_empty(), "{:?}", sketch.tags);
+        }
+    }
+
     /// A sketch of `bins` positive bins, each counting `per_bin`.
     fn heavy(bins: i32, per_bin: f64) -> DdSketch {
         DdSketch::from_parts(

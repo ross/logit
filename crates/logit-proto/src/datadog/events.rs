@@ -13,8 +13,9 @@ use super::logs::{new_batch, parse_json};
 use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, or_received, seconds_f64_to_nanos, seconds_to_nanos};
 use super::{
-    is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_EVENT_DEVICE_NAME,
-    ATTR_EVENT_RELATED_EVENT_ID, ATTR_EVENT_TYPE, ATTR_HOST_NAME, RESOURCE_ATTR_AGENT_HOSTNAME,
+    host_tag, is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_EVENT_DEVICE_NAME,
+    ATTR_EVENT_RELATED_EVENT_ID, ATTR_EVENT_TYPE, ATTR_HOST_NAME, ATTR_HOST_TAG,
+    RESOURCE_ATTR_AGENT_HOSTNAME,
 };
 use crate::json::{json_to_value, value_text, write_i64, write_str, write_value, JsonObject};
 use crate::CodecError;
@@ -25,6 +26,7 @@ use logit_core::{
     AttrMap, BodyFormat, Event, EventBatch, LogRecord, Resource, Severity, Symbol, Value,
 };
 use serde_json::{Map, Value as Json};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
@@ -67,6 +69,7 @@ struct EventKeys {
     agent_hostname: Symbol,
     statsd_timestamp: Symbol,
     host_name: Symbol,
+    host_tag: Symbol,
 }
 
 impl EventKeys {
@@ -101,6 +104,7 @@ static KEYS: LazyLock<EventKeys> = LazyLock::new(|| EventKeys {
     agent_hostname: intern(RESOURCE_ATTR_AGENT_HOSTNAME),
     statsd_timestamp: intern(ATTR_STATSD_TIMESTAMP),
     host_name: intern(ATTR_HOST_NAME),
+    host_tag: intern(ATTR_HOST_TAG),
 });
 
 impl DatadogDecoder {
@@ -321,11 +325,15 @@ impl DatadogEncoder {
         // An optional field: written only when present and not an empty string.
         let optional = |key: Symbol| find(key).filter(|v| v.as_str() != Some(""));
         let agent = format == EventFormat::AgentEnvelope;
-        // `statsd.event.host`, else `host.name`, which then leaves as the host and not a tag.
+        // `statsd.event.host`, else `host.name`, else a DogStatsD `#host:` tag, else the default.
+        // A `host.name` or `host` read this way leaves as the host and not a tag; the Agent
+        // consumes a `host:` tag even when `h:` wins.
         let own_host = optional(keys.host);
         let host_name = if own_host.is_none() { optional(keys.host_name) } else { None };
+        let host_tag = host_tag(resource, event);
         let mut skip = keys.consumed().to_vec();
         skip.extend(host_name.map(|_| keys.host_name));
+        skip.extend(host_tag.map(|_| keys.host_tag));
 
         let mut tags = Vec::new();
         let dropped = render_tags(attrs.iter().map(|(k, v)| (*k, *v)), &skip, &mut tags);
@@ -349,12 +357,17 @@ impl DatadogEncoder {
         if let Some(priority) = optional(keys.priority) {
             write_str(obj.key("priority"), &value_text(priority));
         }
+        let host = match (own_host.or(host_name), host_tag) {
+            (Some(host), _) => Some(value_text(host)),
+            // An empty `#host:` tag: marked hostless, never filled.
+            (None, Some(tag)) => (!tag.is_empty()).then_some(Cow::Borrowed(tag)),
+            (None, None) => self.default_host.as_deref().map(Cow::Borrowed),
+        };
         // The Agent always writes `host`, empty or not; the public form only when set.
-        match (own_host.or(host_name), &self.default_host) {
-            (Some(host), _) => write_str(obj.key("host"), &value_text(host)),
-            (None, Some(host)) => write_str(obj.key("host"), host),
-            (None, None) if agent => write_str(obj.key("host"), ""),
-            (None, None) => {}
+        match host {
+            Some(host) => write_str(obj.key("host"), &host),
+            None if agent => write_str(obj.key("host"), ""),
+            None => {}
         }
         if !tags.is_empty() {
             let buf = obj.key("tags");
@@ -587,6 +600,52 @@ mod tests {
         assert_eq!(
             encode_with(&own_and_stamped, EventFormat::PublicV1),
             [r#"{"title":"t","text":"x","date_happened":5,"host":"h","tags":["host.name:web-1"]}"#]
+        );
+    }
+
+    /// A DogStatsD `#host:` tag (`statsd_in`'s `host`) is the host after `h:` and `host.name`,
+    /// and is consumed, not tagged, whenever there's no `host.name`; an empty one stays hostless.
+    #[test]
+    fn a_host_tag_is_the_host_after_h_and_host_name() {
+        let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let encode_with = |body: &str, format| -> Vec<String> {
+            let out = encoder.encode_events(&decode(body), format);
+            out.iter().map(|b| String::from_utf8(b.to_vec()).unwrap()).collect()
+        };
+        let public = EventFormat::PublicV1;
+        assert_eq!(
+            encode_with(
+                r#"{"title":"t","text":"x","date_happened":5,"tags":["host:web1"]}"#,
+                public
+            ),
+            [r#"{"title":"t","text":"x","date_happened":5,"host":"web1"}"#]
+        );
+        assert_eq!(
+            encode_with(r#"{"title":"t","text":"x","date_happened":5,"tags":["host:"]}"#, public),
+            [r#"{"title":"t","text":"x","date_happened":5}"#]
+        );
+        assert_eq!(
+            encode_with(
+                r#"{"title":"t","text":"x","date_happened":5,"tags":["host:"]}"#,
+                EventFormat::AgentEnvelope
+            ),
+            [
+                r#"{"apiKey":"","events":{"api":[{"msg_title":"t","msg_text":"x","timestamp":5,"host":""}]},"internalHostname":""}"#
+            ]
+        );
+        assert_eq!(
+            encode_with(
+                r#"{"title":"t","text":"x","date_happened":5,"host":"h","tags":["host:web1"]}"#,
+                public
+            ),
+            [r#"{"title":"t","text":"x","date_happened":5,"host":"h"}"#]
+        );
+        assert_eq!(
+            encode_with(
+                r#"{"title":"t","text":"x","date_happened":5,"tags":["host:web1","host.name:m"]}"#,
+                public
+            ),
+            [r#"{"title":"t","text":"x","date_happened":5,"host":"m","tags":["host:web1"]}"#]
         );
     }
 }
