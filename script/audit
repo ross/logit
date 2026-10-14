@@ -1,7 +1,8 @@
 #!/bin/bash
-# Usage: script/audit
-# Supply-chain checks: the license/ban policy in deny.toml, and known vulnerabilities across the
-# dependency graph.
+# Usage: script/audit [advisories|bans|licenses|sources ...]
+# Supply-chain checks from deny.toml. With no arguments, runs all four. CI runs everything but
+# advisories, because that check reads the live RustSec database and fails on a new advisory with
+# no change in the tree.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
@@ -12,5 +13,4 @@ if ! in_project_environment; then
     exit
 fi
 
-cargo deny check
-cargo audit
+cargo deny check "$@"
