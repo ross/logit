@@ -398,7 +398,7 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   module docs, `docs/design/wire-protocol.md`, `docs/deploying.md` (the `window:` field and the
   posture note), and the amended records.
 - **Measurement.** The perf VM measured `native-relay` at `window: 1` and `window: 32` on
-  2026-10-02 (`docs/design/performance.md` §1's native-relay ladder). At this ADR's binary,
-  `window: 32` costs 1.176 µs/event against `window: 1`'s 1.371, and `window: 1` is within 1.6% of
-  the last binary before the window. The plan's "Findings" section keeps the laptop `netem`
-  numbers.
+  2026-10-02 (`docs/design/performance.md` §1's native-relay ladder, as of `201bb5a7`). At this
+  ADR's binary, `window: 32` costs 1.176 µs/event against `window: 1`'s 1.371, and `window: 1` is
+  within 1.6% of the last binary before the window. The plan's "Findings" section keeps the
+  laptop `netem` numbers.

@@ -251,7 +251,8 @@ The VM numbers replace the laptop's for every question below. They ran on `Stand
 ([`docs/design/performance.md`](../design/performance.md)'s preamble has the box facts) against
 `efd50c1e` (C-, the `main` this plan's laptop run used) and `d1521c5f` (M, with the named acks).
 The tables are in `performance.md` §1, "`native-relay` under a 10 ms round trip, and the
-coalescing sweep", and its native-relay ladder. This section records what they settle.
+coalescing sweep", and in its native-relay ladder as of `201bb5a7`. This section records what
+they settle.
 
 - **Loopback, window 32.** M costs 0.858 µs/event against C-'s 0.958 (−10.4%), and runs 2,472,575
   events/s against 1,996,994, pooled over six repeats (twelve for M). That confirms the ADR's
