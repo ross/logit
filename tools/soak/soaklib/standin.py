@@ -425,7 +425,8 @@ class Counts:
     """What a `datadog` stand-in stored (`stored_counts`): `series` export-shaped, each
     `(series, timestamp)`'s value the sum of its distinct copies; `points` one `(timestamp_s,
     value)` per distinct copy, V's terms; `duplicates` one `(series key, timestamp_ms, value,
-    first seq, copy seq)` per copy of a point already stored; `conflicts` one `(series key,
+    first index, copy index)` per copy of a point already stored, each index the request's place
+    in the record, since `seq` starts again at 1 when the stand-in restarts; `conflicts` one `(series key,
     timestamp_ms, first value, later value)` per point stored again with another value;
     `undecodable` one `(seq, reason)` per stored body that doesn't decode; and `named` one
     `(seq, count, t)` per `series_errors` answer: the series it named and when it was answered,
@@ -445,7 +446,7 @@ def stored_counts(requests):
     counts = Counts()
     by_series = {}
     first = {}
-    for request in requests:
+    for index, request in enumerate(requests):
         if not request.get("stored"):
             continue
         try:
@@ -461,14 +462,14 @@ def stored_counts(requests):
             points = by_series.setdefault(key, {})
             for stamp, value in samples:
                 seen = first.setdefault((key, stamp), [])
-                same = next((seq for kept, seq in seen if kept == value
+                same = next((kept_at for kept, kept_at in seen if kept == value
                              or (math.isnan(kept) and math.isnan(value))), None)
                 if same is not None:
-                    counts.duplicates.append((key, stamp, value, same, request.get("seq")))
+                    counts.duplicates.append((key, stamp, value, same, index))
                     continue
                 if seen:
                     counts.conflicts.append((key, stamp, seen[0][0], value))
-                seen.append((value, request.get("seq")))
+                seen.append((value, index))
                 points[stamp] = points.get(stamp, 0.0) + value
                 counts.points.append((stamp / 1000, value))
     for key, points in sorted(by_series.items()):

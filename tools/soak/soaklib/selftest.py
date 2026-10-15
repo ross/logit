@@ -5450,7 +5450,7 @@ def _datadog_counts():
                                      (5000, 9.0)],
            f"V's terms are every distinct stored copy, a changed value summed beside the "
            f"first, got {counts.points}")
-    expect(counts.duplicates == [(a, 1000000, 1.0, 1, 2)]
+    expect(counts.duplicates == [(a, 1000000, 1.0, 0, 1)]
            and counts.conflicts == [(b, 1000000, 5.0, 6.0)],
            f"a same-value copy is a duplicate naming both requests and a changed one a "
            f"conflict, got {counts.duplicates} {counts.conflicts}")
@@ -5714,6 +5714,36 @@ def _datadog_checks():
                and "the sink resent a point it saw accepted" in rows["ledger.standin"].detail,
                f"a resend of a point the stand-in answered 2xx FAILs, got "
                f"{rows['ledger.standin']}")
+
+        # A 2xx in life 0 sent again in life 1: a new SUT life resends what its spool held.
+        def resent_next_life(requests):
+            again = copy.deepcopy(requests[0])
+            again.update(seq=99, t=T0 + 250)
+            return requests + [again]
+
+        rows = results("dd-duplicate-next-life", resent_next_life)
+        expect(rows["ledger.standin"].status == checks.PASS
+               and "2 duplicate copies of stored points (life 0 2)"
+               in rows["ledger.standin"].detail,
+               f"a 2xx point resent in a later SUT life is a reported duplicate, got "
+               f"{rows['ledger.standin']}")
+
+        # The stand-in restarts after the applied 503, and its request numbers start again at
+        # 1, so a later 2xx carries the 503's number. The resend must still read as one.
+        def restarted(requests):
+            requests = resent(requests)
+            applied_seq = requests[-2]["seq"]
+            requests[-1]["seq"] = 1
+            requests += [_datadog_request(seq, 301 + seq, []) for seq in
+                         range(2, applied_seq + 1)]
+            return requests
+
+        rows = results("dd-duplicate-restarted", restarted, timeline_extra=applied)
+        expect(rows["ledger.standin"].status == checks.PASS
+               and "2 duplicate copies of stored points (life 1 2)"
+               in rows["ledger.standin"].detail,
+               f"a resend after a stand-in restart reuses request numbers and is still a "
+               f"permitted duplicate, got {rows['ledger.standin']}")
 
         def changed(requests):
             again = copy.deepcopy(requests[-1])

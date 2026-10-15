@@ -1094,12 +1094,19 @@ and a diagnostic, and "Telemetry"). This list is the canonical copy of its verdi
   `records.dropped{reason="rejected"}` also counts the series a `202` body names, so it quotes
   `request_rejected`, `series_rejected`, or both, whichever the sink logged. Under per-request
   verdicts a rejected request drops its records and the batch survives when another request
-  was accepted, so both the batch and the record counter are read.
+  was accepted, so both the batch and the record counter are read. On a `datadog` stand-in
+  target (W9b), a drop inside a `respond` step that explains it is counted as cued instead: a
+  `rejected` batch inside a step with `class = "rejected"`, an `oversize` record drop inside a
+  `413` step, and a `rejected` record drop inside another rejected step or a `series_errors`
+  step, each through one aggregate interval and `recovery_bound` after the step. Outside every
+  matching step it FAILs. See "Stand-in targets".
 - On an external target, a batch dropped `disk_corrupt` (2026-10-13): FAIL, because
   `ledger.egress`, which FAILs it on a local or Kafka target, SKIPs there.
 - An `api_key_rejected` or `request_refused` line from the sink on stderr: FAIL, quoting the
   first. The sink reads that answer as `Refused` and holds its queue with no exit, so the run
-  can't deliver until the key or the endpoint is fixed.
+  can't deliver until the key or the endpoint is fixed. On a `datadog` stand-in target (W9b), a
+  line inside a step with `class = "refused"`, through the same widened window, is counted as
+  cued instead. See "Stand-in targets".
 - No `logit.output.requests` point, or none of class `2xx`: FAIL.
 - Any other counted drop (a batch's `overflow_*` or `shutdown` reason, a record's `stale`, `too_many_tags`, or other pre-send reason, the
   encoder's `metrics.skipped`, and its `metrics.dropped` for an encode fault): WARN.
@@ -1109,7 +1116,9 @@ and a diagnostic, and "Telemetry"). This list is the canonical copy of its verdi
   drain whose interval overlaps a fault window is the fault's retry; outside every one it
   WARNs with the count, because the destination has a floor of errors of its own.
 
-The row is a PASS whose detail starts with `SENT` when nothing above fires. `SENT` is a PASS
+On an external target, the row is a PASS whose detail starts with `SENT` when nothing above
+fires; on a Kafka or stand-in target the PASS doesn't, because the ledger goes on to the topic
+or the record. `SENT` is a PASS
 rather than a fifth status so `results.md` keeps PASS, WARN, FAIL, and SKIP and `worst()` needs
 no new rank. A `2xx` is the end of the evidence: the harness can't see a point the intake took
 and later discarded, nor tell an overwritten resend from a duplicate. `datadog_out` resends a
@@ -1220,7 +1229,7 @@ connection, and decodes no request `Content-Encoding`. What it would contribute,
 N", is a line of `http.server`, and it would bring Flask and gunicorn into a harness that is
 stdlib-only.
 
-**The stand-in.** `tools/soak/standin/standin.py` is about 250 lines of stdlib Python run in a
+**The stand-in.** `tools/soak/standin/standin.py` is about 290 lines of stdlib Python run in a
 stock `python:3.13.16-alpine3.24` image, so `script/soak` builds nothing for it. Its data port
 takes the sink's writes on the shape's path (`--shape remote_write`: `/api/v1/write`, default
 answer `200`; `--shape datadog`, W9b: `/api/v2/series`, default answer `202`); a write to any
@@ -1229,7 +1238,8 @@ the series route's `errors` list, protobuf field 1 (`repeated string`), with N e
 stand-in decodes nothing, so the entries name series by their place in the request. Its control port takes the driver's
 cues and answers `/health`. It prints one JSON line per request to stdout: the time, path,
 `Content-Encoding`, the cue in force, how it answered (`status` or `reset`), whether it stored
-the write (`apply`, else whether the status is `2xx`), and the raw body, base64. The driver's
+the write (`apply`, else whether the status is `2xx`), the cue's `series_errors` when it set one,
+and the raw body, base64. The driver's
 log capture collects that stdout with every other service's, so a `stop` and `start` of the
 stand-in keep one record, and `check` re-scores a run from it. SIGTERM lets each request in
 flight finish before the process exits, so a `stop` doesn't cut off an answer the record holds.
@@ -1270,16 +1280,10 @@ value at one `(series, timestamp)` is summed and FAILs `ledger.standin`. A `seri
 answer stores every series of its request but the first N, and the sink's `records.dropped`
 counts toward a positive gap, because those series are lost with no batch dropped.
 
-**`ledger.sent` against a `datadog` stand-in (W9b)** judges the sink as on an external target
-("External targets"), so its verdicts run without a real org, with one change: what a `respond`
-step cued is counted, named, and doesn't FAIL. A refusal line (`api_key_rejected`,
-`request_refused`) inside a step that expects `refused`, a `rejected` batch inside one that
-expects `rejected`, an `oversize` record drop inside a `413` step, and a `rejected` record drop
-inside another rejected step or a `series_errors` step are excused, each window through one
-aggregate interval and `recovery_bound` after the step, as for the cued `rejected` batch below.
-Outside a matching window each keeps its FAIL. Its PASS doesn't read `SENT`, because the ledger
-goes on to the record. `drops` leaves the sink's `records.dropped` and `metrics.dropped` to it,
-as on an external target. Under `remote_write`, `ledger.sent` SKIPs.
+**`ledger.sent` against a `datadog` stand-in (W9b)** judges the sink by the verdicts in
+"External targets", so they run without a real org; that list says which refusals and drops a
+`respond` step's cue excuses. `drops` leaves the sink's `records.dropped` and `metrics.dropped`
+to it, as on an external target. Under `remote_write`, `ledger.sent` SKIPs.
 
 **`ledger.standin`** judges the record against the sink:
 
@@ -3095,7 +3099,7 @@ What the run showed about `logit` and the harness:
   once, and `ledger.standin` reports the copies, as `at_least_once` permits.
 - **The sink counted 10 `network_error` requests against the record's 6 resets**; the other 4
   were connect failures to the stopped stand-in, which never reached it.
-- **Self-test**: 1,284 expectations, from 1,187 at W9a. Each new rule was reverted in turn and
+- **Self-test**: 1,286 expectations, from 1,187 at W9a. Each new rule was reverted in turn and
   failed at least one expectation; the PR lists them.
 
 ## Verification

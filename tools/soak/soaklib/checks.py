@@ -2944,7 +2944,7 @@ def check_ledger_standin(data):
         cue = request.get("cue")
         default = (request.get("answer") == "status"
                    and request.get("status") == standin.DEFAULT_STATUS[shape]
-                   and request.get("stored") is True and not request.get("series_errors"))
+                   and request.get("stored") is True)
         if cue is None:
             if not default and request.get("path") == path:
                 flag(FAIL, f"request #{request.get('seq')} was answered "
@@ -2997,7 +2997,6 @@ def _standin_datadog(data, led, sink, at_most_once, flag, lines):
     clause."""
     requests = data.standin_requests
     counts = data.standin_counts
-    by_seq = {request.get("seq"): request for request in requests}
     classed = {f.step: f for f in data.faults if f.action == "respond" and f.fault_class}
     for request in requests:
         fault = classed.get(request.get("cue"))
@@ -3036,22 +3035,25 @@ def _standin_datadog(data, led, sink, at_most_once, flag, lines):
                      f"{_n(want['oversize'])} by the record")
 
     copies = {}
-    for key, stamp, value, first_seq, copy_seq in counts.duplicates:
+    for key, stamp, value, first_at, copy_at in counts.duplicates:
         life = vm.life_at(led.life_starts, stamp / 1000)
         one = copies.setdefault(life, {"copies": 0, "amount": 0.0})
         one["copies"] += 1
         one["amount"] += value
-        first, again = by_seq.get(first_seq) or {}, by_seq.get(copy_seq) or {}
+        first, again = requests[first_at], requests[copy_at]
+        # `seq` starts again when the stand-in restarts, so the record position names them too.
+        first_seq = f"#{first.get('seq')} (record request {first_at + 1})"
+        copy_seq = f"#{again.get('seq')} (record request {copy_at + 1})"
         same_life = (vm.life_at(led.life_starts, first.get("t") or 0)
                      == vm.life_at(led.life_starts, again.get("t") or 0))
         name = dict(key).get("__name__", key)
         if standin.status_class(first) == "2xx" and same_life:
-            flag(FAIL, f"request #{copy_seq} stored {name} at {stamp // 1000} s again, which "
-                       f"request #{first_seq} stored under a 2xx: the sink resent a point it "
+            flag(FAIL, f"request {copy_seq} stored {name} at {stamp // 1000} s again, which "
+                       f"request {first_seq} stored under a 2xx: the sink resent a point it "
                        "saw accepted")
         elif at_most_once:
-            flag(FAIL, f"request #{copy_seq} stored {name} at {stamp // 1000} s again, first "
-                       f"stored by request #{first_seq}: a resend under at_most_once")
+            flag(FAIL, f"request {copy_seq} stored {name} at {stamp // 1000} s again, first "
+                       f"stored by request {first_seq}: a resend under at_most_once")
     for life, one in sorted(copies.items()):
         lines.append(f"life {life}: {_n(one['copies'])} duplicate copies of stored points, "
                      f"{_n(one['amount'])} counted again by the destination"
