@@ -24,6 +24,7 @@ script/soak run random-faults --seed 7           # the same scenario, another sc
 script/soak run statsd-datadog                   # an external target; needs a key, see "External targets"
 script/soak run kafka-broker-restart             # a Kafka target; see "Kafka targets"
 script/soak run standin-remote-write             # a stand-in target; see "Stand-in targets"
+script/soak run standin-datadog                  # a Datadog-shaped stand-in, no key needed
 script/soak check perf/results/soak/<stamp>      # re-score a run offline
 ```
 
@@ -177,13 +178,14 @@ during the stop and stops retrying after it. The topic is read back at the end a
 `ledger.egress` and `ledger.topic`, which FAILs a record stored twice; see
 [Kafka targets](#kafka-targets).
 
-Two scenarios run a sink against a scripted stand-in in place of VictoriaMetrics (see
+Three scenarios run a sink against a scripted stand-in in place of VictoriaMetrics (see
 [Stand-in targets](#stand-in-targets)):
 
 | Scenario | Length | What it drives |
 |---|---|---|
 | `standin-remote-write` | 35 minutes 40 seconds | `prometheus_out` (remote-write 1.0, Snappy) through every row of its sender-mode response-class table: nineteen 20 s steps, 105 s apart, from `503`, `429`, and each `400` body the sink reads, through `401`, `403`, `404`, `405`, `407`, `409`, `413`, `415`, `422`, `501`, and `302`, to a connection reset and a stop of the stand-in, each step naming the class the sink must read |
 | `standin-at-most-once` | 8 minutes 55 seconds | the same sink under `buffer.delivery: at_most_once`: a `503` and a reset drop the batch, a `401` holds it, a `400` drops it |
+| `standin-datadog` | 30 minutes 25 seconds | `datadog_out` (series, gzip, delta counts) through every row of its response-class table: sixteen 20 s steps, 105 s apart, from a `202` whose body names two series dropped, through `400`, `401`, `403`, `404`, `405`, `408`, `413`, `429`, `500`, `501`, a `503` after storing (its resend a duplicate), `302`, and `422`, to a connection reset and a stop of the stand-in |
 
 ### Faults
 
@@ -197,12 +199,13 @@ Two scenarios run a sink against a scripted stand-in in place of VictoriaMetrics
 | `partition` | `docker network disconnect` from every network | `docker network connect`, passing back each alias recorded before the disconnect |
 | `mark` | nothing: it marks a window for an event the SUT's own config causes, such as a stalled script. An optional `ready` names a readiness word the SUT must report inside it | nothing |
 | `exit` | nothing: on `logit` only, it names an exit the SUT makes on its own inside the window, with the `code` it leaves and the `key` of the ERROR line that explains it | `docker start` if the container has exited |
-| `respond` | on a stand-in only: POSTs the step's cue to its control port, so it answers `status` (with an optional `body`) or `answer = "reset"`, storing the write when `apply` says to or, by default, when the status is `2xx` | an empty cue, which restores the default answer |
+| `respond` | on a stand-in only: POSTs the step's cue to its control port, so it answers `status` (with an optional `body`) or `answer = "reset"`, storing the write when `apply` says to or, by default, when the status is `2xx`. Under the `datadog` shape a `2xx` can carry `series_errors = N`, a body naming the request's first N series dropped | an empty cue, which restores the default answer |
 
 A `mark`, `exit`, or `respond` window is a fault window like any other, so the checks excuse
 what happens inside it. None of them can go in a `[random]` schedule. A `respond` or a `stop` of
 a stand-in may name the `class` the sink must read its answers as (`clean`, `ambiguous`,
-`rejected`, or `refused`), which `ledger.standin` judges.
+`rejected`, or `refused`), which `ledger.standin` judges. Under the `datadog` shape the class must
+be the one `datadog_out`'s table gives the answer, and a `2xx` takes none.
 
 ```toml
 [[step]]
@@ -348,6 +351,7 @@ response-class table distinguishes runs under load, on cue:
 ```toml
 [target]
 kind = "standin"
+# shape = "datadog"        # the destination it plays; "remote_write" by default
 
 [[ledger.sink]]
 id = "remote_write"        # the sink; no backend or vm_selector
@@ -364,19 +368,32 @@ for = "20s"
 
 What changes for a stand-in target:
 
-- The stack runs `standin` in place of `victoria-metrics`. The SUT writes to `standin:8080`,
-  where the stand-in answers `200` with no cue, `404` on a path other than `/api/v1/write`, and
-  whatever the cue in force says otherwise. The driver cues it on its control port, published on
-  loopback. A fault may name `standin` (`netem`, `pause`, `stop`, `restart`, `partition`), and
-  only a stand-in takes `respond`.
+- The stack runs `standin` in place of `victoria-metrics`. The SUT writes to `standin:8080`.
+  With no cue, the stand-in answers its shape's default: `200` on `/api/v1/write` for
+  `remote_write`, and `202` on `/api/v2/series` for `datadog`. It answers `404` on any other
+  path, and whatever the cue in force says otherwise. The driver cues it on its control port,
+  published on loopback. A fault may name `standin` (`netem`, `pause`, `stop`, `restart`,
+  `partition`), and only a stand-in takes `respond`.
 - The record is the stand-in's stdout, `logs/standin.stdout`: one JSON line per request, with the
   cue in force, the answer, whether it stored the write, and the raw body. The checks decode it on
-  the host, so the SUT's sink must send remote-write 1.0 with `compression: snappy`; Python's
-  standard library has no zstd before 3.14.
-- V is every sample the stand-in stored, a later write of one `(label set, timestamp)` replacing
-  an earlier one, as a remote-write receiver overwrites. `ledger.egress` and `ledger.summary`
-  judge it as an export, and so does `ledger.windows` under `[ledger] vm_every_window`.
+  the host with Python's standard library, which has no zstd before 3.14. So a `remote_write`
+  sink must send remote-write 1.0 with `compression: snappy`, and `datadog_out` gzip (its
+  default) or `none`. Point `datadog_out` at the stand-in with `endpoints: { api:
+  http://standin:8080 }`.
+- Under `remote_write`, V is every sample the stand-in stored, a later write of one
+  `(label set, timestamp)` replacing an earlier one, as a remote-write receiver overwrites.
   `ledger.sent` SKIPs.
+- Under `datadog`, the SUT's `aggregate` runs `temporality: delta`, and V is the sum of every
+  point the stand-in stored. Datadog documents no deduplication of a `count`, so a resent point
+  is stored twice: V counts each distinct copy once, as a Kafka topic's records are, and
+  `ledger.standin` reports each extra copy as a duplicate. A `series_errors` answer stores every
+  series but the first N. `ledger.sent` judges the sink as on an external target, except that a
+  refusal line inside a step with `class = "refused"`, a `rejected` batch inside one with
+  `class = "rejected"`, an `oversize` record drop inside a `413` step, and a `rejected` record
+  drop inside another rejected step or a `series_errors` step are counted as cued instead of
+  FAILing.
+- Under either shape, `ledger.egress` and `ledger.summary` judge V as an export, and so does
+  `ledger.windows` under `[ledger] vm_every_window`.
 - `ledger.standin` judges the record against the sink: every body decodes; every sample of a write
   answered `2xx` was stored; no resend stored a different value; per SUT life the record's
   requests by status class equal the sink's `logit.output.requests`, and its resets are at most
@@ -384,7 +401,13 @@ What changes for a stand-in target:
   its span; and each step's `class` shows at the sink. `rejected` is a batch dropped `rejected`
   and no `retrying` line; `clean`, `refused`, and `ambiguous` are the `retrying` line's class
   word, `send failed (<class>)`, and no drop; under `at_most_once`, `ambiguous` is a batch dropped
-  `ambiguous_at_most_once`.
+  `ambiguous_at_most_once`. Under `datadog`, also: each answer under a classed step's cue is the
+  class `datadog_out`'s table gives it; per SUT life the sink's `records.dropped{reason="rejected"}`
+  equals the series the `series_errors` answers named plus the points of the requests answered
+  with a rejected status other than `413`, and `records.dropped{reason="oversize"}` the points of
+  the `413` answers; and a duplicate copy is reported under `at_least_once` and FAILs under
+  `at_most_once`, or when the copy it repeats was answered `2xx` in the same life, a point the
+  sink saw accepted and resent.
 - A batch dropped `rejected` inside a `respond` step with `class = "rejected"`, up to one
   aggregate interval plus `recovery_bound` after it, counts its gap without FAILing
   `ledger.egress` or `ledger.summary`. Outside every such step it FAILs, as on any target.
@@ -505,11 +528,11 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `ledger.windows` | under `[ledger] vm_every_window = true` only, and SKIPs on an external or Kafka target: a series in a SUT life has two samples more than 1.5 aggregate intervals apart, a killed life's last sample is more than 1.1 intervals before the kill, or a later life's first is more than 2 intervals after its start. The interval comes from the SUT config. A wider gap is excused as idle when the `sut_aggregate` component's `batches.sent` is 0 over the drains from a + (interval + p) / 2 to b − (interval − p) / 2, p being the drain period: no window was emitted, so none was lost. A pause, with no drains at all, counts 0. Any batch there FAILs the gap as windows emitted but not stored, whatever fault was running |
 | `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight |
 | `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0, or any one sink's Ab − V isn't, with a script's hop in place of E − A and one Ab − V term per sink under `copy`; a counted egress term is shown and not judged, unless a `rejected` or `disk_corrupt` drop is in its group's credit, which FAILs the row; on an external target the Ab − V term SKIPs |
-| `ledger.sent` | an external or Kafka target only, else SKIP: a batch a sink received didn't end in an accepted response; a clean external run's detail starts with `SENT`. See [External targets](#external-targets) |
-| `ledger.standin` | a stand-in target only, else SKIP: the record has a line that isn't JSON or a body that doesn't decode, a sample answered `2xx` wasn't stored, a resend stored a different value, its requests by status class differ from the sink's in a SUT life, an answer other than the default falls outside its `respond` step, or a step's `class` doesn't show at the sink. See [Stand-in targets](#stand-in-targets) |
+| `ledger.sent` | an external, Kafka, or `datadog` stand-in target only, else SKIP: a batch a sink received didn't end in an accepted response; a clean external run's detail starts with `SENT`. See [External targets](#external-targets) |
+| `ledger.standin` | a stand-in target only, else SKIP: the record has a line that isn't JSON or a body that doesn't decode, a sample answered `2xx` wasn't stored, a resend stored a different value, its requests by status class differ from the sink's in a SUT life, an answer other than the default falls outside its `respond` step, or a step's `class` doesn't show at the sink; under the `datadog` shape also an answer whose class isn't the step's by `datadog_out`'s table, a `records.dropped` count the record doesn't explain, or a duplicate under `at_most_once` or after a `2xx`. See [Stand-in targets](#stand-in-targets) |
 | `ledger.topic` | a Kafka target only, else SKIP: the topic wasn't read back; its distinct records number fewer than the sink saw accepted, or more with no dropped attempt to explain them (`WARN` with one, and `WARN` either way across a killed life); or a record is stored twice in a SUT life with no epoch bump (`WARN` after one). See [Kafka targets](#kafka-targets) |
 | `identity.sink` | at the final life's last drain before its final one, a sink's batches received, plus those a disk spool replayed at open and the one it counts dropped with a torn tail (`batches.dropped{reason="disk_torn"}`, a batch an earlier life received), differ from delivered + dropped + queued by more than one batch in flight |
-| `drops` | the SUT counts a `logit.*.dropped` no other row judges with a `rejected` or `disk_corrupt` reason; any other reason `WARN`s. The ledger's own terms (every `batches.dropped`, a node's `events.dropped` beside a batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B, and the script's `script_error`) and, on an external or Kafka target, a sink's `records.dropped` and `metrics.dropped` stay with the rows that balance them, so a drop is counted once. On an external target, where `ledger.egress` SKIPs, a `rejected` or `disk_corrupt` batch drop at a sink is `ledger.sent`'s FAIL, and one at any other node stays in this row |
+| `drops` | the SUT counts a `logit.*.dropped` no other row judges with a `rejected` or `disk_corrupt` reason; any other reason `WARN`s. The ledger's own terms (every `batches.dropped`, a node's `events.dropped` beside a batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B, and the script's `script_error`) and, on an external, Kafka, or `datadog` stand-in target, a sink's `records.dropped` and `metrics.dropped` stay with the rows that balance them, so a drop is counted once. On an external target, where `ledger.egress` SKIPs, a `rejected` or `disk_corrupt` batch drop at a sink is `ledger.sent`'s FAIL, and one at any other node stays in this row |
 | `recovery` | within `recovery_bound` of a fault's end, for any sink, no drain interval clear of other faults shows that sink not retrying, its buffer under 5% full or holding at most one batch, every listener's receive queue under 5% full, and the listeners' summed ingest at 95% of the generators' summed warmup rate; a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN`, and so does a run where no fault had an eligible interval |
 | `expect.<name>` | a scenario's own `[[expect]]` bound doesn't hold; see [Expectations](#expectations) |
 

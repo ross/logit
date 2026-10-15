@@ -336,6 +336,11 @@ for = "20s"
 - With the role map, a `respond`, or a `stop` with a `class`, is on a `standin` service. A
   `respond` never affects UDP ingress and always affects egress.
 - A `respond` can't appear in a `[random]` schedule, whose faults take no status or answer.
+- W9b adds `series_errors = N`, for a stand-in target with `shape = "datadog"` only, on a
+  `respond` with a `2xx` `status` and no `body`: the answer's body is the series route's
+  `errors` list naming N series dropped, which the checks take to be the request's first N.
+  Under that shape a `class` must be the one `datadog_out`'s table gives the answer
+  (`soaklib/standin.py`'s `datadog_fault_class`), and a `2xx` takes none.
 
 **`sut_script` (W7a)**, an optional `[ledger]` key, names a `lua` component between the
 listener and `aggregate`, and adds the script hop to the ledger ("The ledger and identities").
@@ -940,9 +945,10 @@ The rows:
   row judges the rest. A `rejected` or `disk_corrupt` drop in the final life's group FAILs the
   row as it FAILs `ledger.egress`, named beside its term, unless a cued step explains it (W9a).
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at each sink's own
-  telemetry; see "External targets". A Kafka target's sink is judged the same way; a stand-in
+  telemetry; see "External targets". A Kafka target's sink is judged the same way, and so is a
+  `datadog` stand-in's (W9b), with what a `respond` step cued excused; a `remote_write` stand-in
   target's `ledger.sent` SKIPs (W9a), because `ledger.standin` judges the sink against what the
-  stand-in recorded.
+  stand-in recorded. See "Stand-in targets".
 - `ledger.standin` (W9a), for a stand-in target, else SKIP: the stand-in's record against the
   sink; see "Stand-in targets".
 - `drops` (2026-10-13): every `logit.*.dropped` counter the SUT emitted that no row above
@@ -950,7 +956,8 @@ The rows:
   alone says a count is loss, so the row reads every such name rather than a list. It leaves
   out the terms the ledger balances (every `batches.dropped`, a node's `events.dropped` beside a
   batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B terms, and the
-  script's L_err) and, on an external or Kafka target, the sink's `records.dropped` and
+  script's L_err) and, on an external, Kafka, or `datadog` stand-in target, the sink's
+  `records.dropped` and
   `metrics.dropped`, which `ledger.sent` judges. A `rejected` or `disk_corrupt` reason FAILs;
   any other WARNs. On an external target `ledger.egress` SKIPs, so `ledger.sent` FAILs a
   `rejected` or `disk_corrupt` batch drop at a sink, and one at any other node stays in this
@@ -1191,7 +1198,7 @@ expectations: `batches.dropped` 0 through each fault, at least one `ambiguous` r
 the pause, so `ledger.topic`'s no-duplicate verdict rests on resends, and `retrying` above 0
 during the stop and 0 after it.
 
-### 8c. Stand-in targets (W9a)
+### 8c. Stand-in targets (W9a, W9b)
 
 A `[target]` table with `kind = "standin"` runs a scripted HTTP destination in place of
 VictoriaMetrics, so every row of a sink's response-class table
@@ -1200,6 +1207,7 @@ VictoriaMetrics, so every row of a sink's response-class table
 ```toml
 [target]
 kind = "standin"          # name defaults to "standin"
+shape = "remote_write"    # or "datadog" (W9b); "remote_write" by default
 
 [[ledger.sink]]           # one sink, with no backend or vm_selector
 id = "remote_write"
@@ -1215,7 +1223,10 @@ stdlib-only.
 **The stand-in.** `tools/soak/standin/standin.py` is about 250 lines of stdlib Python run in a
 stock `python:3.13.16-alpine3.24` image, so `script/soak` builds nothing for it. Its data port
 takes the sink's writes on the shape's path (`--shape remote_write`: `/api/v1/write`, default
-answer `200`); a write to any other path answers `404`. Its control port takes the driver's
+answer `200`; `--shape datadog`, W9b: `/api/v2/series`, default answer `202`); a write to any
+other path answers `404`. Under `datadog`, a cue's `series_errors` makes a `2xx` answer's body
+the series route's `errors` list, protobuf field 1 (`repeated string`), with N entries; the
+stand-in decodes nothing, so the entries name series by their place in the request. Its control port takes the driver's
 cues and answers `/health`. It prints one JSON line per request to stdout: the time, path,
 `Content-Encoding`, the cue in force, how it answered (`status` or `reset`), whether it stored
 the write (`apply`, else whether the status is `2xx`), and the raw body, base64. The driver's
@@ -1223,26 +1234,52 @@ log capture collects that stdout with every other service's, so a `stop` and `st
 stand-in keep one record, and `check` re-scores a run from it. SIGTERM lets each request in
 flight finish before the process exits, so a `stop` doesn't cut off an answer the record holds.
 
-**The schema.** The target takes an optional `name` (a slug) and refuses `env` and `topic`. It
+**The schema.** The target takes an optional `name` (a slug) and `shape` (`remote_write` or
+`datadog`), and refuses `env` and `topic`; any other target refuses `shape`. It
 needs one `[[ledger.sink]]`, and only one, with no `backend` or `vm_selector`.
 `vm_every_window` is allowed, since V has an export's shape.
 The stack runs the `standin` profile in place of `local`, and the role map must hold the
 `standin` service. Faults on `standin` are known only for this target. A `respond` step (§2)
 sets the answer.
 
-**The driver.** It reads the stand-in's published control port after `up` and waits for its
-`/health`, re-reads it after any revert of a fault on it, and POSTs each `respond` step's cue.
+**The driver.** It writes the target's `shape` to `compose.env` as `SOAK_STANDIN_SHAPE`, which
+compose.yaml passes to `--shape`. It reads the stand-in's published control port after `up` and
+waits for its `/health`, re-reads it after any revert of a fault on it, and POSTs each `respond` step's cue.
 Like a Kafka target's, the end sequence waits for the sink's queue to empty. It reads nothing
 back after the SUT stops: the record is in `logs/standin.stdout`.
 
-**V.** `soaklib/standin.py` decodes each stored request's body on the host: a Snappy block (a
-stdlib decoder, pinned against blocks `snap::raw` wrote, in
+**V.** `soaklib/standin.py` decodes each stored request's body on the host. Under
+`remote_write` it's a Snappy block (a stdlib decoder, pinned against blocks `snap::raw` wrote, in
 `tools/soak/standin/snap-vectors.json`) holding a remote-write 1.0 `WriteRequest`. V is every
 stored sample, with a later write of one `(label set, timestamp)` replacing an earlier one, as a
 remote-write receiver overwrites. The result has the export's shape, so `ledger.egress`,
 `ledger.summary`, and, under `vm_every_window`, `ledger.windows` read it as they read
-VictoriaMetrics. Python's
-stdlib has no zstd before 3.14, so a stand-in scenario's sink sends Snappy.
+VictoriaMetrics. Python's stdlib has no zstd before 3.14, so a `remote_write` sink sends Snappy.
+
+Under `datadog` (W9b) a body is a `MetricPayload`
+(`crates/logit-proto/proto/datadog/agent-payload/proto/metrics/agent_payload.proto`) under
+`datadog_out`'s default `gzip`, or `deflate` or none, decoded with the stdlib and a walker pinned
+against a body `datadog_out` sent (`tools/soak/standin/datadog-vectors.json`). The SUT's
+`aggregate` runs `temporality: delta`, so each point is one window's increment, and V is their
+sum, credited to the SUT life its timestamp falls in. Datadog documents no deduplication of a
+`count` point, and [ADR `delivery-semantics`](../adr/delivery-semantics.md) says a kind with no
+remedy is double-counted, so a resent point adds rather than overwrites. As for a Kafka topic, V
+counts each distinct copy of a `(series, timestamp, value)` once, so a duplicate can't cancel a
+loss of the same size, and a negative gap is a `surplus` that FAILs `ledger.egress`; a second
+value at one `(series, timestamp)` is summed and FAILs `ledger.standin`. A `series_errors`
+answer stores every series of its request but the first N, and the sink's `records.dropped`
+counts toward a positive gap, because those series are lost with no batch dropped.
+
+**`ledger.sent` against a `datadog` stand-in (W9b)** judges the sink as on an external target
+("External targets"), so its verdicts run without a real org, with one change: what a `respond`
+step cued is counted, named, and doesn't FAIL. A refusal line (`api_key_rejected`,
+`request_refused`) inside a step that expects `refused`, a `rejected` batch inside one that
+expects `rejected`, an `oversize` record drop inside a `413` step, and a `rejected` record drop
+inside another rejected step or a `series_errors` step are excused, each window through one
+aggregate interval and `recovery_bound` after the step, as for the cued `rejected` batch below.
+Outside a matching window each keeps its FAIL. Its PASS doesn't read `SENT`, because the ledger
+goes on to the record. `drops` leaves the sink's `records.dropped` and `metrics.dropped` to it,
+as on an external target. Under `remote_write`, `ledger.sent` SKIPs.
 
 **`ledger.standin`** judges the record against the sink:
 
@@ -1265,6 +1302,16 @@ stdlib has no zstd before 3.14, so a stand-in scenario's sink sends Snappy.
   span holds its first line. The row reads the stderr line rather than an `[[expect]]` because
   the class appears nowhere in telemetry: `requests{class}` buckets the status, and `retrying`
   is the same gauge for every held class.
+- Under `datadog` (W9b), also: each answer under a classed step's cue is the class
+  `datadog_out`'s response-class table gives it: `408`, `429`, any `5xx` (`501` included), and
+  a reset `ambiguous`; `401`, `403`, `404`, `405`, and `407` `refused`; `400`, `413`, and any
+  other `3xx` or `4xx` `rejected`; a connect failure, which never reaches the record, `clean`.
+  Per SUT life, the sink's `records.dropped{reason="rejected"}` equals the series the
+  `series_errors` answers named plus the points of the requests answered with a rejected status
+  other than `413`, and `records.dropped{reason="oversize"}` the points of the `413` answers.
+  Each duplicate copy is reported per life with the amount the destination counted twice:
+  permitted under `at_least_once`, and a FAIL under `at_most_once`, or when the copy it repeats
+  was answered `2xx` in the same life, a point the sink saw accepted and resent.
 
 **The scenarios.**
 
@@ -1277,14 +1324,19 @@ stdlib has no zstd before 3.14, so a stand-in scenario's sink sends Snappy.
   temporality the next window's totals overwrite a rejected batch, so the egress gap stays 0.
 - `standin-at-most-once`: the same SUT with `buffer.delivery: at_most_once`; a `503` and a reset
   drop `ambiguous_at_most_once`, a `401` holds, a `400` drops `rejected`.
+- `standin-datadog` (W9b): `statsd-datadog`'s generator and SUT, with `datadog_out` sending
+  series under `compression: gzip` to `endpoints: { api: http://standin:8080 }`. Sixteen 20 s
+  steps, 105 s apart: a `202` with `series_errors = 2`, then `400`, `401`, `403`, `404`, `405`,
+  `408`, `413`, `429`, `500`, `501`, a `503` after storing the write (its resend a duplicate),
+  `302`, `422`, a reset, and a `stop` of the stand-in, each but the first with its `class`.
+  Under delta temporality a rejected window is a counted gap.
 
 The black-hole control is a `2xx` the stand-in doesn't store (`status = 200`, `apply = false`).
 `ledger.standin` FAILs it wherever it falls. Under cumulative temporality the next stored totals
 overwrite a hole, so `ledger.egress` FAILs it as uncounted loss only when it holds the last
 samples and no drop in the life credits the gap (a self-test fixture), and a hole in the middle
 shows in `ledger.windows` under `vm_every_window` (a recorded by-hand run). It isn't a shipped
-scenario. W9b adds a Datadog-shaped stand-in and runs `ledger.sent` against
-it.
+scenario.
 
 ### 9. Not in this stack
 
@@ -1410,7 +1462,7 @@ where it needs them, and a small check extension.
    judged with that band plus a surplus band of up to one checkpoint interval of lines on top.
    Needs: a volume the writer and SUT share (the generator's `file_out` can write, G its count),
    the tail-side W, and that surplus band.
-10. **Deterministic destination errors (built in W9a, for `prometheus_out`; W9b adds
+10. **Deterministic destination errors (built in W9a, for `prometheus_out`, and W9b, for
     `datadog_out`).** A scripted HTTP stand-in answering `429`, `5xx`, `400`,
     and `413` on cue and recording what it accepts, so every row of a sink's response-class table
     ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "Each sink attributes from
@@ -1536,9 +1588,11 @@ that items 3, 7, and 11 need.
   the `standin` target, role, and profile, V from the stand-in's record, the `ledger.standin`
   row, the cued `rejected` excusal, and the `standin-remote-write` and `standin-at-most-once`
   scenarios ("Stand-in targets").
-- **W9b**: item 10 for `datadog_out`: a Datadog-shaped stand-in (series v2, a `202` whose body
-  names rejected series), `ledger.sent` and `drops` against it, and duplicates reported per
-  life as for a Kafka target.
+- **W9b**: item 10 for `datadog_out`: a Datadog-shaped stand-in (`[target] shape = "datadog"`,
+  series v2, a `202` whose body names rejected series through `series_errors`), V as the stored
+  delta points' sum, `ledger.sent` and `drops` against it with cued refusals and drops excused,
+  duplicates reported per life as for a Kafka target, and the `standin-datadog` scenario
+  ("Stand-in targets").
 - **W10**: item 7, a second SUT service and the ledger one hop longer.
 - **W11**: items 8 and 9, per-line wire counters, a shared volume, and the replay surplus band.
 - **W12**: items 11 and 12, the namespace-holder service, per-instance totals, and the `signal`
