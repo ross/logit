@@ -17,16 +17,19 @@
 #
 # `victoria-metrics` is in the `local` profile, which the driver enables for a local-target
 # scenario only, so an external target's stack runs without it. `kafka` is in the `kafka`
-# profile, which the driver enables for a Kafka-target scenario only, in place of `local`.
+# profile, which the driver enables for a Kafka-target scenario only, in place of `local`, and
+# `standin` is in the `standin` profile, for a stand-in-target scenario only.
 #
-# Every service carries a `soak.role` label, `sut`, `generator`, `backend`, or `broker` (the
-# Kafka target's broker), which is how the driver and the checks know it. A scenario's
+# Every service carries a `soak.role` label, `sut`, `generator`, `backend`, `broker` (the
+# Kafka target's broker), or `standin` (the stand-in target's destination), which is how the
+# driver and the checks know it. A scenario's
 # `compose =` override file is merged onto this one (`-f compose.yaml -f <override>`) and labels
 # any service it adds, such as a second backend.
 #
 # No `container_name` and no `name:`, so a second scenario under another project can't collide
-# with this one. The only published ports are the backends': each publishes its own ephemeral
-# loopback port, which the driver reads with `compose port` after every start of that backend.
+# with this one. The only published ports are the backends' and the stand-in's control port:
+# each publishes its own ephemeral loopback port, which the driver reads with `compose port`
+# after every start of that service.
 
 x-logit: &logit
   image: ${SOAK_IMAGE:-logit:soak}
@@ -89,13 +92,38 @@ services:
       start_interval: 2s
     logging: *logging
 
+  # The scripted HTTP destination, a stock Python image running standin/standin.py (stdlib
+  # only). The SUT writes to its data port, 8080, unpublished; the driver cues it on its control
+  # port, 8081. Its shape is the scenario's `[target] shape`, which the driver writes to
+  # compose.env. Its stdout is the record the checks read, so it rotates as `logit`'s logs do. A
+  # `stop` and `start` keep the container, and with it the one log.
+  standin:
+    image: python:3.13.16-alpine3.24
+    profiles: [standin]
+    labels: { soak.role: standin }
+    restart: "no"
+    command: ["python", "-u", "/standin/standin.py", "--shape",
+              "${SOAK_STANDIN_SHAPE:-remote_write}"]
+    volumes: ["./standin:/standin:ro,z"]
+    ports: ["127.0.0.1::8081"]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request as u; u.urlopen('http://127.0.0.1:8081/health', timeout=2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+    logging: *logging
+
   logit:
     <<: *logit
     labels: { soak.role: sut }
-    # Neither is required: each is in a profile only one target's stack runs.
+    # None is required: each is in a profile only one target's stack runs.
     depends_on:
       victoria-metrics: { condition: service_started, required: false }
       kafka: { condition: service_healthy, required: false }
+      standin: { condition: service_healthy, required: false }
     environment:
       DD_API_KEY: ${DD_API_KEY:-}
     volumes: ["${SOAK_SUT_CONFIG:?set by script/soak}:/config.yaml:ro,z"]

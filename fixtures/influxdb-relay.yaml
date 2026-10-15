@@ -9,8 +9,8 @@
 # after the numeric ones, numbers leave in their shortest spelling, and every point leaves with a
 # nanosecond timestamp (one that arrived with none gets its receipt time). Each write's `org` and
 # `bucket` ride on the batch as the private resource attributes `_logit.influxdb.org` and
-# `_logit.influxdb.bucket`, which no sink writes as tags; this sink writes to its own
-# `org`/`bucket` below, whatever the client named.
+# `_logit.influxdb.bucket`, which no sink writes as tags. The sink below sets no `bucket:`, so it
+# writes each batch to the bucket its client named, under its own `org:`.
 #
 # Run it with `script/server fixtures/influxdb-relay.yaml`. compose.yaml's `dev` service publishes
 # no ports, so drive the listener from inside that container (`docker compose exec dev bash`;
@@ -53,8 +53,15 @@ components:
     type: influxdb_out
     sources: [influx_in]
     url: http://influxdb:8086
+    # Replaces the client's org or orgID. Omit it to forward the client's; InfluxDB 2.x refuses a
+    # write that names no org.
     org: logit
-    bucket: metrics
+    # With no `bucket:`, a batch goes to the bucket its client named, and this is the bucket for a
+    # batch no `influxdb_in` received. A client's bucket that doesn't exist, or that the token
+    # can't write, drops that batch (`batches.dropped{reason="rejected"}`) rather than holding
+    # every other bucket's; the same answer for this bucket, or for `org:` above, holds and
+    # retries. Set `bucket: metrics` instead to send every batch to one bucket.
+    default_bucket: metrics
     token: !env INFLUXDB_TOKEN
     # buffer: (all defaults, docs/adr/buffered-sink-delivery.md). `delivery:` defaults to
     #   at_least_once: InfluxDB overwrites a point with the same measurement, tag set, and

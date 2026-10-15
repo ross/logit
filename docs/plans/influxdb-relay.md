@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-13
+updated: 2026-10-15
 ---
 
 # Enabling plan: `influxdb_in`/`influxdb_out` — a lossless InfluxDB line-protocol relay
@@ -42,7 +42,7 @@ Settled with Ross (2026-10-13), recorded in full in the two ADRs:
 | 4 | Tags become event attributes, `Value::Str`, never resource. | `influxdb-line-protocol-relay` |
 | 5 | One unparseable line answers `400` with InfluxDB's error JSON and forwards nothing from the body. | `influxdb-line-protocol-relay` |
 | 6 | Duplicate `(measurement, tags, timestamp)` in one body merges, last write wins per field. `influxdb_out`'s 1 ns nudge stays for points from different sources. | `influxdb-line-protocol-relay` |
-| 7 | `org`, `orgID`, and `bucket` become resource attributes `influxdb.org`, `influxdb.org_id`, `influxdb.bucket`. One request is one batch. `influxdb_out` keeps its fixed config. | `influxdb-line-protocol-relay` |
+| 7 | `org`, `orgID`, and `bucket` become resource attributes `influxdb.org`, `influxdb.org_id`, `influxdb.bucket`. One request is one batch. `influxdb_out` keeps its fixed config (superseded on 2026-10-15 by the ADR's "Amendment: `influxdb_out` follows the carried destination": with no `bucket:` configured, the sink writes to the org and bucket a batch carries). | `influxdb-line-protocol-relay` |
 | 8 | `precision=` honored, receipt time for an absent timestamp, gzip, an optional `tokens:` allowlist (`Token` or `Bearer`), `tls:` (not `bind_tls:`), `peer`/`proxy_protocol`/`forwarded`, `503` when busy. | `influxdb-line-protocol-relay` |
 | 9 | Egress is always typed: `influxdb_out` writes `Ni`, `Nu`, and `true`/`false`, with or without the carrier. | `typed-metric-scalar` |
 | 10 | Destination faults never reach the producer: `influxdb_in` answers `204` once the batch is in every downstream inbox. | `influxdb-line-protocol-relay` |
@@ -264,7 +264,9 @@ the listener:
 `influxdb_in -> influxdb_out` is a fixed point modulo the numbered normalizations in
 `crates/logit-proto/src/influxdb/mod.rs`'s module doc. The residual debt is listed once, in
 [`docs/known-gaps/influxdb.md`](../known-gaps/influxdb.md) (the unsupported v1 route, no query or
-delete API, `org` and `bucket` carried but not routed, destination faults the producer never sees,
+delete API, `org` and `bucket` carried but not routed (superseded on 2026-10-15 by the ADR's
+"Amendment: `influxdb_out` follows the carried destination", whose own gaps replace that entry),
+destination faults the producer never sees,
 and the places the listener's answers differ from `influxd`) and in the `encode (InfluxDB)` and
 `decode (InfluxDB)` rows of [`docs/known-gaps/mappings.md`](../known-gaps/mappings.md) (what
 `influxdb_out` drops or reshapes from other protocols, and the carrier at other sinks). A

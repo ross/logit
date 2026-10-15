@@ -1,0 +1,100 @@
+{
+  "_about": "A series body datadog_out sent to the stand-in (--shape datadog) under its default compression, gzip: logit:soak sha256:ac527cd4206d (847f57c8), generate_in at 200/s into a 2 s delta aggregate and a set stamping host.name logit-soak and _logit.datadog.interval 2, 2026-10-15. The record line's body_b64, as hex.",
+  "content_encoding": "gzip",
+  "content_type": "application/x-protobuf",
+  "datadog_out_series_body": "1f8b08000000000000ffa5cc3d0e40401040614424a6219bb8804a63e3ef007b08bd283608c98619477213677015add85a23f3aa577da040803f1a24018b1926cad1f4b348eccbf7e5a6d75d236157a651e8d85a15dfc7790599ab3cf821d46ca1620b055b683e8507e818a77f4a010000",
+  "datadog_out_series_body_expect": {
+    "series": [
+      {
+        "metric": "logit.soak.requests_1",
+        "resources": [
+          [
+            "host",
+            "logit-soak"
+          ]
+        ],
+        "tags": [],
+        "points": [
+          [
+            1792086775,
+            80.0
+          ]
+        ],
+        "type": "count",
+        "interval": 2
+      },
+      {
+        "metric": "logit.soak.requests_3",
+        "resources": [
+          [
+            "host",
+            "logit-soak"
+          ]
+        ],
+        "tags": [],
+        "points": [
+          [
+            1792086775,
+            80.0
+          ]
+        ],
+        "type": "count",
+        "interval": 2
+      },
+      {
+        "metric": "logit.soak.requests_2",
+        "resources": [
+          [
+            "host",
+            "logit-soak"
+          ]
+        ],
+        "tags": [],
+        "points": [
+          [
+            1792086775,
+            80.0
+          ]
+        ],
+        "type": "count",
+        "interval": 2
+      },
+      {
+        "metric": "logit.soak.requests_0",
+        "resources": [
+          [
+            "host",
+            "logit-soak"
+          ]
+        ],
+        "tags": [],
+        "points": [
+          [
+            1792086775,
+            80.0
+          ]
+        ],
+        "type": "count",
+        "interval": 2
+      },
+      {
+        "metric": "logit.soak.requests_4",
+        "resources": [
+          [
+            "host",
+            "logit-soak"
+          ]
+        ],
+        "tags": [],
+        "points": [
+          [
+            1792086775,
+            80.0
+          ]
+        ],
+        "type": "count",
+        "interval": 2
+      }
+    ]
+  }
+}

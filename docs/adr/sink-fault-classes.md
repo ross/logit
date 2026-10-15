@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-09
+updated: 2026-10-15
 ---
 
 # Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink
@@ -174,6 +174,12 @@ and in an amendment to the sink's own record:
   (`crates/logit-outputs/src/datadog_trace.rs`, "Faults, retries, and duplicate safety";
   [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md), "Amendment: response
   classes (2026-10-04)").
+- `influxdb_out`: a `403` or `404` is `Rejected` when the bucket or org it could concern came
+  from the batch's carrier, because the batch chose it; with both from config (`bucket:` or
+  `default_bucket:`, and `org:`) it stays `Refused` (`crates/logit-outputs/src/influxdb.rs`,
+  "Response classes";
+  [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md), "Amendment:
+  `influxdb_out` follows the carried destination (2026-10-15)").
 - `otlp_out`: an HTTP `401`, `403`, `404`, or `501` names one signal and is `Rejected`, and a
   server failure stays `Ambiguous` where the OTLP specification says not to retry it
   (`crates/logit-outputs/src/otlp.rs`, "Response classes"; "Amendment: `otlp_out` departs from the

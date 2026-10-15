@@ -3064,8 +3064,9 @@ mod tests {
                 targets: Vec::new(),
                 kind: ComponentKind::InfluxDbOut {
                     url: "http://localhost:8086".to_string(),
-                    org: "org".to_string(),
-                    bucket: "bucket".to_string(),
+                    org: Some("org".to_string()),
+                    bucket: Some("bucket".to_string()),
+                    default_bucket: None,
                     token: "TOKEN".to_string(),
                 },
             },
@@ -3171,8 +3172,9 @@ mod tests {
                 targets: Vec::new(),
                 kind: ComponentKind::InfluxDbOut {
                     url: "http://localhost:8086".to_string(),
-                    org: "org".to_string(),
-                    bucket: "bucket".to_string(),
+                    org: Some("org".to_string()),
+                    bucket: Some("bucket".to_string()),
+                    default_bucket: None,
                     token: "TOKEN".to_string(),
                 },
             },
@@ -3403,8 +3405,9 @@ mod tests {
     fn influxdb_out() -> ComponentKind {
         ComponentKind::InfluxDbOut {
             url: "http://localhost:8086".to_string(),
-            org: "org".to_string(),
-            bucket: "bucket".to_string(),
+            org: Some("org".to_string()),
+            bucket: Some("bucket".to_string()),
+            default_bucket: None,
             token: "TOKEN".to_string(),
         }
     }
@@ -3513,8 +3516,9 @@ mod tests {
                 targets: Vec::new(),
                 kind: ComponentKind::InfluxDbOut {
                     url: "http://localhost:8086".to_string(),
-                    org: "org".to_string(),
-                    bucket: "bucket".to_string(),
+                    org: Some("org".to_string()),
+                    bucket: Some("bucket".to_string()),
+                    default_bucket: None,
                     token: "TOKEN".to_string(),
                 },
             },
