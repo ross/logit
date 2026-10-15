@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-11
+updated: 2026-10-15
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -213,3 +213,20 @@ the topic's distinct record count with the records the sink saw accepted, and ju
 duplicate copies on their own: one FAILs in a SUT life with no producer epoch bump, because the
 broker discards a resend within an epoch, and WARNs after a bump, as `at_least_once` permits.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Kafka targets", has the rules.
+
+## Amendment: a stand-in's oracle is its record, and a cued rejection is counted (2026-10-15)
+
+A scenario can point its sink at a scripted HTTP stand-in (`[target] kind = "standin"`), so every
+row of the sink's response-class table runs under load. The stand-in is stdlib Python in a stock
+image, cued per step by the driver, and it prints each request it answers to stdout, raw body
+included. That record is the egress oracle: V is every sample of every write the stand-in says it
+stored, a later write of one `(label set, timestamp)` replacing an earlier one, and
+`ledger.standin` checks the record against the sink's request counts and each step's expected
+fault class. httpbin was considered and not used: its status is fixed by the URL, it keeps no
+record, and it can't store a write before failing it or reset a connection.
+
+A stand-in told to reject isn't a healthy backend, so this narrows the amendment above: a
+`rejected` batch drop whose drain falls inside a `respond` step that expects the `rejected`
+class, through one aggregate interval and `recovery_bound` after it, counts the gap and is named,
+but doesn't FAIL. A `rejected` drop anywhere else still FAILs.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Stand-in targets", has the rules.

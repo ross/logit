@@ -207,7 +207,7 @@ for = "45s"
   W7b any service a `compose` override adds. W3 adds `kill`, on the SUT only:
   the lines a killed generator sent after its last telemetry drain reach the SUT with no G
   behind them, and `ledger.wire` would net them against real loss. W7a adds `mark` and `exit`
-  (below).
+  (below). W9a adds `respond`, on a stand-in only (below).
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -307,14 +307,44 @@ for = "1m30s"
 - Neither may appear in a `[random]` schedule, which draws faults; an expected event happens
   at a time the scenario's own config sets.
 
+**Responds and classes (W9a)** script a stand-in target's answers ("Stand-in targets"):
+
+```toml
+[[step]]
+at = "0s"
+action = "respond"        # sets the stand-in's answer for the step's span
+on = "standin"            # a service with the role standin
+status = 400              # 100 to 599; or answer = "reset"
+body = "out of order sample"   # optional, with status only: the response body
+apply = false             # optional: store the write anyway (true) or not (false); by default
+                          # the stand-in stores what it answers 2xx
+class = "rejected"        # optional: the fault class the sink must read
+for = "20s"
+```
+
+- A `respond`'s apply POSTs `{step, status | answer, body, apply}` to the stand-in's control
+  port, and its revert POSTs `{}`, which restores the default answer. A non-200 from the control
+  port is the record's `rc` 1, so `timeline` FAILs it and the step has no window.
+- A `respond` sets one of `status`, an integer from 100 to 599, and `answer`, which is
+  `reset`: the stand-in reads the whole request, then closes the connection with an RST and no
+  response. `body` is a string, with `status` only. `apply` is true or false. None of the four
+  is allowed on another action.
+- `class`, one of `clean`, `ambiguous`, `rejected`, or `refused`, names the class the sink must
+  read the step's answers as
+  ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md)). It is allowed on a `respond` and
+  on a `stop`, whose connect failures are `clean`; `ledger.standin` judges it (§6).
+- With the role map, a `respond`, or a `stop` with a `class`, is on a `standin` service. A
+  `respond` never affects UDP ingress and always affects egress.
+- A `respond` can't appear in a `[random]` schedule, whose faults take no status or answer.
+
 **`sut_script` (W7a)**, an optional `[ledger]` key, names a `lua` component between the
 listener and `aggregate`, and adds the script hop to the ledger ("The ledger and identities").
 
 **Compose overrides, service roles, and sinks (W7b).** Every compose service carries a
-`soak.role` label: `sut`, `generator`, `backend`, or `broker` (a Kafka target's broker; see
-"Kafka targets"). The harness knows a service by its role, never its name, and keeps one SUT,
-`logit`. The base stack's generator is `generator`; from W8b an override can add more (see
-"Sources"). A scenario adds services with an optional top-level key naming an override file
+`soak.role` label: `sut`, `generator`, `backend`, `broker` (a Kafka target's broker; see
+"Kafka targets"), or `standin` (W9a, a stand-in target's destination; see "Stand-in
+targets"). The harness knows a service by its role, never its name, and keeps one SUT, `logit`.
+The base stack's generator is `generator`; from W8b an override can add more (see "Sources"). A scenario adds services with an optional top-level key naming an override file
 beside `scenario.toml`:
 
 ```toml
@@ -343,6 +373,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 - `load()` checks every rule above that needs no service list. The rest need the merged
   compose file, which only the driver reads (`docker compose config`, §3): every step's `on`
   and every random fault's is a service of the stack, a `kill` or `exit` is on the role `sut`,
+  a `respond`, or a `stop` with a `class`, is on the role `standin` (W9a),
   every `[[expect]]` service runs `logit`, every sink's `backend` has the role `backend`, the
   stack has one `sut` named `logit` and at least one `generator`, every source's `service` has
   the role `generator` and every `generator` has a source (W8b), and no service lacks a known
@@ -463,7 +494,8 @@ rss_slope = { logit = "FAIL" }   # row id -> service -> PASS | WARN | FAIL
   hour or more; a shorter `--duration` FAILs the row as `expected FAIL, got WARN`.
 
 A scenario may name an external target in a `[target]` table (W5); see "External targets". It
-may instead name a local Kafka broker as its target; see "Kafka targets".
+may instead name a local Kafka broker as its target; see "Kafka targets", or a scripted stand-in
+destination (W9a); see "Stand-in targets".
 
 ### 3. Compose (W1a)
 
@@ -480,6 +512,7 @@ service (W4; see "The driver loop and end sequence" for the arithmetic), and
 | `logit` (the SUT, role `sut`) | `depends_on: [victoria-metrics]`, not required from W5, when `victoria-metrics` moved to the compose profile `local` the driver enables for a local target only; `environment:` passes each variable an external target may list (`DD_API_KEY`), empty when unset |
 | `generator` (role `generator`) | `depends_on: {logit: {condition: service_healthy}}`. An override can add more generators (W8b), each with `extends` from this one and its own config volume |
 | `kafka` (role `broker`) | `apache/kafka:4.2.0`, a single-node KRaft broker in the compose profile `kafka`, which the driver enables for a Kafka target only; one partition per topic, topics created on first use, a `kafka-broker-api-versions.sh` health check the SUT's optional `depends_on` waits for. No published port: the driver reads the topic through `docker exec` |
+| `standin` (role `standin`, W9a) | `python:3.13.16-alpine3.24` running `tools/soak/standin/standin.py`, mounted read-only, in the compose profile `standin`, which the driver enables for a stand-in target only. Its data port, 8080, isn't published; its control port is, `ports: ["127.0.0.1::8081"]`, which the driver re-reads after any start of the service, as a backend's. A health check against the control port's `/health`, which the SUT's optional `depends_on` waits for. Its stdout is the record |
 
 Each service's role is its `soak.role` label (W7b). A scenario's `compose` override is passed
 after the base file, `-f compose.yaml -f <override>`, on every `compose` call, and copied into
@@ -826,7 +859,11 @@ The rows:
   couldn't read back, counts the gap like any other drop, but FAILs the life and group it falls
   in whatever the gap, with the reason named: neither happens against a healthy backend, and
   under cumulative temporality a later total can hide the rejected batch's increments, leaving
-  a gap of 0. The stderr `drain complete` line's `batches_dropped` counts shutdown drops only,
+  a gap of 0. A stand-in told to reject (W9a) isn't a healthy backend: a `rejected` drop at
+  the sink whose drain falls inside a `respond` step with `class = "rejected"`, from its apply
+  to one `aggregate` interval plus `recovery_bound` after its revert, counts the gap and is
+  named, `rejected 3 cued by c0s4, counted`, but doesn't FAIL; one outside every such window
+  still FAILs. The stderr `drain complete` line's `batches_dropped` counts shutdown drops only,
   process-wide, and never counts a gap; it only cross-checks telemetry's `shutdown` total. A
   killed life's gap passes inside its band (see "Which life a hop is judged in"); a SIGKILL
   counts no shutdown drops, but the life's drains can carry others, such as a queue's overflow
@@ -901,9 +938,13 @@ The rows:
   per egress group, each of which must be 0 or counted on its own, so a surplus at one sink
   can't net out loss at another. When an egress term is counted, it is shown as counted and the
   row judges the rest. A `rejected` or `disk_corrupt` drop in the final life's group FAILs the
-  row as it FAILs `ledger.egress`, named beside its term.
+  row as it FAILs `ledger.egress`, named beside its term, unless a cued step explains it (W9a).
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at each sink's own
-  telemetry; see "External targets".
+  telemetry; see "External targets". A Kafka target's sink is judged the same way; a stand-in
+  target's `ledger.sent` SKIPs (W9a), because `ledger.standin` judges the sink against what the
+  stand-in recorded.
+- `ledger.standin` (W9a), for a stand-in target, else SKIP: the stand-in's record against the
+  sink; see "Stand-in targets".
 - `drops` (2026-10-13): every `logit.*.dropped` counter the SUT emitted that no row above
   judges. Under [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md) the name
   alone says a count is loss, so the row reads every such name rather than a list. It leaves
@@ -1150,6 +1191,97 @@ expectations: `batches.dropped` 0 through each fault, at least one `ambiguous` r
 the pause, so `ledger.topic`'s no-duplicate verdict rests on resends, and `retrying` above 0
 during the stop and 0 after it.
 
+### 8c. Stand-in targets (W9a)
+
+A `[target]` table with `kind = "standin"` runs a scripted HTTP destination in place of
+VictoriaMetrics, so every row of a sink's response-class table
+([ADR `sink-fault-classes`](../adr/sink-fault-classes.md)) runs under load, on cue:
+
+```toml
+[target]
+kind = "standin"          # name defaults to "standin"
+
+[[ledger.sink]]           # one sink, with no backend or vm_selector
+id = "remote_write"
+```
+
+**httpbin, considered.** `httpbin`'s `/status/{code}` answers a status fixed by the URL, so
+changing the answer mid-run would mean changing the sink's endpoint and restarting the SUT; it
+keeps no record of what it received, can't store a write and then answer `5xx`, can't reset a
+connection, and decodes no request `Content-Encoding`. What it would contribute, "answer status
+N", is a line of `http.server`, and it would bring Flask and gunicorn into a harness that is
+stdlib-only.
+
+**The stand-in.** `tools/soak/standin/standin.py` is about 250 lines of stdlib Python run in a
+stock `python:3.13.16-alpine3.24` image, so `script/soak` builds nothing for it. Its data port
+takes the sink's writes on the shape's path (`--shape remote_write`: `/api/v1/write`, default
+answer `200`); a write to any other path answers `404`. Its control port takes the driver's
+cues and answers `/health`. It prints one JSON line per request to stdout: the time, path,
+`Content-Encoding`, the cue in force, how it answered (`status` or `reset`), whether it stored
+the write (`apply`, else whether the status is `2xx`), and the raw body, base64. The driver's
+log capture collects that stdout with every other service's, so a `stop` and `start` of the
+stand-in keep one record, and `check` re-scores a run from it. SIGTERM lets each request in
+flight finish before the process exits, so a `stop` doesn't cut off an answer the record holds.
+
+**The schema.** The target takes an optional `name` (a slug) and refuses `env` and `topic`. It
+needs one `[[ledger.sink]]`, and only one, with no `backend` or `vm_selector`.
+`vm_every_window` is allowed, since V has an export's shape.
+The stack runs the `standin` profile in place of `local`, and the role map must hold the
+`standin` service. Faults on `standin` are known only for this target. A `respond` step (§2)
+sets the answer.
+
+**The driver.** It reads the stand-in's published control port after `up` and waits for its
+`/health`, re-reads it after any revert of a fault on it, and POSTs each `respond` step's cue.
+Like a Kafka target's, the end sequence waits for the sink's queue to empty. It reads nothing
+back after the SUT stops: the record is in `logs/standin.stdout`.
+
+**V.** `soaklib/standin.py` decodes each stored request's body on the host: a Snappy block (a
+stdlib decoder, pinned against blocks `snap::raw` wrote, in
+`tools/soak/standin/snap-vectors.json`) holding a remote-write 1.0 `WriteRequest`. V is every
+stored sample, with a later write of one `(label set, timestamp)` replacing an earlier one, as a
+remote-write receiver overwrites. The result has the export's shape, so `ledger.egress`,
+`ledger.summary`, and, under `vm_every_window`, `ledger.windows` read it as they read
+VictoriaMetrics. Python's
+stdlib has no zstd before 3.14, so a stand-in scenario's sink sends Snappy.
+
+**`ledger.standin`** judges the record against the sink:
+
+- Every record line parses, and every body decodes. A resend that stored a different value for
+  a sample already stored FAILs; one that stored the same value is counted and reported.
+- Per SUT life, the record's requests by status class equal the sink's
+  `logit.output.requests{class}` for `2xx` to `5xx`; its resets are at most the sink's
+  `network_error`, which a connect failure also counts. A killed life's mismatch WARNs.
+- Every answer other than the default carries the cue of a `respond` step that applied
+  cleanly and falls inside its span, and every write went to the stand-in's path.
+- Each step with a `class` shows that class at the sink. `rejected`: a batch dropped `rejected`
+  from the step's apply to two `internal` intervals after its revert, and no `retrying` line in
+  the span. `clean`, `refused`, and `ambiguous`: the `retrying` line's class word, `send failed
+  (<class>): ...`, the only one in the span, and no drop; under `buffer.delivery: at_most_once`,
+  `ambiguous` drops the batch `ambiguous_at_most_once` instead, with no `retrying` line. The
+  write loop logs `retrying` on a held head's first failure and then once a minute, so a step's
+  span holds its first line. The row reads the stderr line rather than an `[[expect]]` because
+  the class appears nowhere in telemetry: `requests{class}` buckets the status, and `retrying`
+  is the same gauge for every held class.
+
+**The scenarios.**
+
+- `standin-remote-write`: `statsd-vm`'s generator and SUT, with `prometheus_out` sending
+  remote-write 1.0 under `compression: snappy` to the stand-in. Nineteen 20 s steps, 95 s apart,
+  walk the sink's sender-mode table: `503`, a `503` after storing the write (its resend stores
+  the same samples again), `429`, `400` with `out of order sample`, `400` with each
+  decompression prefix, `401`, `403`, `407`, `404`, `405`, `501`, `409`, `413`, `415`, `422`,
+  `302`, a reset, and a `stop` of the stand-in, each with its `class`. Under cumulative
+  temporality the next window's totals overwrite a rejected batch, so the egress gap stays 0.
+- `standin-at-most-once`: the same SUT with `buffer.delivery: at_most_once`; a `503` and a reset
+  drop `ambiguous_at_most_once`, a `401` holds, a `400` drops `rejected`.
+
+The black-hole control is a `2xx` the stand-in doesn't store (`status = 200`, `apply = false`).
+Under cumulative temporality the next stored totals overwrite a hole, so `ledger.egress` FAILs
+it as uncounted loss only when it holds the last samples (a self-test fixture), and a hole in
+the middle shows only in `ledger.windows`, under `vm_every_window` (a recorded by-hand run). It
+isn't a shipped scenario. W9b adds a Datadog-shaped stand-in and runs `ledger.sent` against
+it.
+
 ### 9. Not in this stack
 
 toxiproxy and TCP-level faults it alone can express; per-peer `tc filter` and `ifb` ingress
@@ -1274,7 +1406,8 @@ where it needs them, and a small check extension.
    judged with that band plus a surplus band of up to one checkpoint interval of lines on top.
    Needs: a volume the writer and SUT share (the generator's `file_out` can write, G its count),
    the tail-side W, and that surplus band.
-10. **Deterministic destination errors.** A scripted HTTP stand-in answering `429`, `5xx`, `400`,
+10. **Deterministic destination errors (built in W9a, for `prometheus_out`; W9b adds
+    `datadog_out`).** A scripted HTTP stand-in answering `429`, `5xx`, `400`,
     and `413` on cue and recording what it accepts, so every row of a sink's response-class table
     ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "Each sink attributes from
     everything its destination gives it") runs under load, and a Datadog-shaped one makes
@@ -1323,8 +1456,9 @@ that items 3, 7, and 11 need.
 | W8a | `soak/w8a` | `soak/w8a: counted drops of every reason, full-spool, slow-destination, and stop-during-outage soaks` | M | W7b |
 | W8b | `soak/w8b` | `soak/w8b: fan-in from two generators` | M | W8a |
 | W8c | `soak/w8c` | `soak/w8c: high-cardinality soaks, a slope reducer, and expected verdicts` | M | W8b |
-| W9 | `soak/w9` | `soak/w9: a scripted HTTP destination for every response class` | M | W8c |
-| W10 | `soak/w10` | `soak/w10: a native-hop soak between two logit processes` | M | W9 |
+| W9a | `soak/w9a` | `soak/w9a: a scripted HTTP stand-in for every remote-write response class` | M | W8c |
+| W9b | `soak/w9b` | `soak/w9b: a Datadog-shaped stand-in and ledger.sent against it` | M | W9a |
+| W10 | `soak/w10` | `soak/w10: a native-hop soak between two logit processes` | M | W9b |
 | W11 | `soak/w11` | `soak/w11: TCP-ingress and file-tailing soaks` | M | W10 |
 | W12 | `soak/w12` | `soak/w12: rolling-overlap, SIGHUP, and TLS-reload soaks` | M | W11 |
 
@@ -1394,13 +1528,19 @@ that items 3, 7, and 11 need.
 - **W8c**: item 6, a gauge `slope` reducer and a `run` window for `[[expect]]`, `rss_slope`
   and `fd_slope` judged per service, an `[expected]` verdict per row and per service, and the
   `cardinality` scenario.
-- **W9**: item 10, the scripted destination, and `ledger.sent` run against it.
+- **W9a**: item 10 for `prometheus_out`: the stand-in, the `respond` action and the `class` key,
+  the `standin` target, role, and profile, V from the stand-in's record, the `ledger.standin`
+  row, the cued `rejected` excusal, and the `standin-remote-write` and `standin-at-most-once`
+  scenarios ("Stand-in targets").
+- **W9b**: item 10 for `datadog_out`: a Datadog-shaped stand-in (series v2, a `202` whose body
+  names rejected series), `ledger.sent` and `drops` against it, and duplicates reported per
+  life as for a Kafka target.
 - **W10**: item 7, a second SUT service and the ledger one hop longer.
 - **W11**: items 8 and 9, per-line wire counters, a shared volume, and the replay surplus band.
 - **W12**: items 11 and 12, the namespace-holder service, per-instance totals, and the `signal`
   and certificate-rotation actions.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9 → W10 → W11 → W12, linear. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10 → W11 → W12, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
