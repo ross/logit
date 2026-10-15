@@ -1099,8 +1099,8 @@ and a diagnostic, and "Telemetry"). This list is the canonical copy of its verdi
   was accepted, so both the batch and the record counter are read. On a `datadog` stand-in
   target (W9b), a drop inside a `respond` step that explains it is counted as cued instead: a
   `rejected` batch inside a step with `class = "rejected"`, an `oversize` record drop inside a
-  `413` step, and a `rejected` record drop inside another rejected step or a `series_errors`
-  step, each through one aggregate interval and `recovery_bound` after the step. Outside every
+  `413` step classed `rejected`, and a `rejected` record drop inside another step classed
+  `rejected` or a `series_errors` step, each through one aggregate interval and `recovery_bound` after the step. Outside every
   matching step it FAILs. See "Stand-in targets".
 - On an external target, a batch dropped `disk_corrupt` (2026-10-13): FAIL, because
   `ledger.egress`, which FAILs it on a local or Kafka target, SKIPs there.

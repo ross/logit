@@ -390,9 +390,9 @@ What changes for a stand-in target:
   `ledger.standin` reports each extra copy as a duplicate. A `series_errors` answer stores every
   series but the first N. `ledger.sent` judges the sink as on an external target, except that a
   refusal line inside a step with `class = "refused"`, a `rejected` batch inside one with
-  `class = "rejected"`, an `oversize` record drop inside a `413` step, and a `rejected` record
-  drop inside another rejected step or a `series_errors` step are counted as cued instead of
-  FAILing.
+  `class = "rejected"`, an `oversize` record drop inside a `413` step classed `rejected`, and a
+  `rejected` record drop inside another step classed `rejected` or a `series_errors` step are
+  counted as cued instead of FAILing.
 - Under either shape, `ledger.egress` and `ledger.summary` judge V as an export, and so does
   `ledger.windows` under `[ledger] vm_every_window`.
 - `ledger.standin` judges the record against the sink: every body decodes; every sample of a write

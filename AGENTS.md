@@ -53,9 +53,8 @@ exists or a contract other `logit` processes depend on:
   `Rejected` loses data and reading a bad batch as `Refused` wedges the sink. A sink's own
   transport timeout is the only bound on an attempt, so every write and acknowledgment wait a sink
   makes must have one. `prometheus_out`'s and `datadog_out`'s tables are also restated as cued
-  steps in the `standin-remote-write` and `standin-datadog` soak scenarios
-  (`tools/soak/scenarios/`), so a change to either table updates that scenario's steps in the
-  same PR.
+  steps in the `standin-*` soak scenarios under `tools/soak/scenarios/`, and a change to either
+  table updates those scenarios' steps in the same PR.
 - **Any nonzero `*.dropped` is loss someone should look into**, and it's always tagged `reason`.
   An outcome the config asked for never uses the word: it's `events.discarded`, `*.omitted`,
   `*.skipped`, `*.evicted`, or `input.batches.deferred`. A loss reported only by a diagnostic gets
