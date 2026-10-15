@@ -4998,14 +4998,15 @@ TWO_SUT_COLLECTOR_CONFIG = ("components:\n"
                             "    interval: 10s\n")
 
 
-def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, script=None):
+def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, script=None, drops=()):
     """A two-SUT run: the generator and `logit` move `PER_DRAIN` lines per 5 s drain into
     `logit`'s one life; `collector` absorbs them in `window` and delivers one batch per drain
     to `sink`. The timeline holds a kill on `kill_on` over `TWO_SUT_KILL`, and `collector`'s
     telemetry shows `collector_lives` lives, 1 or 2. Its killed life leaves 2 batches queued,
     which its next life replays. `collector` counts one `events.dropped{reason="stale"}` at
     `window` and `logit` one `events.dropped{reason="closed_consumer"}` at `hop`. `script` sets
-    `[ledger] sut_script`."""
+    `[ledger] sut_script`. `drops` adds a count of 1 for each `(service, metric, component,
+    reason)`, `service` being "logit" or "collector"."""
     gen, ingress, egress = [], [], []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -5055,6 +5056,10 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, script=None)
                         component="window", attrs={"reason": "stale"}))
     ingress.append(_line(_stamp(T0 + 98), "logit.component.events.dropped", "sum", 1,
                          component="hop", attrs={"reason": "closed_consumer"}))
+    for service, metric, component, reason in drops:
+        (ingress if service == "logit" else egress).append(
+            _line(_stamp(T0 + 99), metric, "sum", 1, component=component,
+                  attrs={"reason": reason}))
     timeline = [
         _phase("start", 0, t0=T0),
         _action("apply", "c0s1", "kill", kill_on, TWO_SUT_KILL[0], TWO_SUT_KILL[0] + 0.1,
@@ -5145,6 +5150,22 @@ def _two_sut_checks():
                and "logit hop: logit.component.events.dropped{reason=\"closed_consumer\"} 1"
                in rows["drops"].detail,
                f"drops reads each SUT's counters and names the service, got {rows['drops']}")
+        extra = checks.check_drops(checks.RunData(_two_sut_run(tmp, "two-drops", drops=(
+            ("logit", "logit.component.batches.dropped", "hop", "rejected"),
+            ("logit", "logit.component.events.dropped", "in", "closed_consumer"),
+            ("logit", "logit.component.datagrams.dropped", "in", "queue_full"),
+            ("collector", "logit.component.batches.dropped", "sink", "rejected")))))
+        expect(extra.status == checks.FAIL
+               and "logit hop: logit.component.batches.dropped{reason=\"rejected\"} 1"
+               in extra.detail
+               and "logit in: logit.component.events.dropped{reason=\"closed_consumer\"} 1"
+               in extra.detail
+               and "logit in: logit.component.datagrams.dropped{reason=\"queue_full\"}"
+               not in extra.detail
+               and "collector sink: logit.component.batches.dropped" not in extra.detail,
+               f"across two SUTs drops reports a batch drop outside the last service's sinks "
+               f"and a listener's events.dropped, and leaves the sink and the final life's "
+               f"datagram drop to their rows, got {extra}")
         expect(data.sut_phase("sink_drained", "collector") is None
                and data.sut_phase("sink_drained", "logit")["held"],
                "an end-sequence phase is read for its own SUT service")

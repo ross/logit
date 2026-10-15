@@ -3489,7 +3489,7 @@ def check_expect(data):
     return [_expect_one(data, exp) for exp in expectations]
 
 
-def _balanced_drop(led, name, component, reason, batch_drops):
+def _balanced_drop(led, name, component, reason, batch_drops, service=None, life=None):
     """Whether another row already judges this `*.dropped` term, so `drops` leaves it out."""
     # Every node's `batches.dropped` is judged by `ledger.egress`, `ledger.summary`, and
     # `identity.sink` (a torn tail included), and a node's `events.dropped` beside a batch drop
@@ -3497,24 +3497,38 @@ def _balanced_drop(led, name, component, reason, batch_drops):
     # datagrams again. On an external target `ledger.egress` SKIPs and `ledger.summary` reads no
     # fault drop, so a `FAULT_DROP_REASONS` batch drop at a node other than a sink stays here;
     # `ledger.sent` FAILs one at a sink.
+    # With the listeners and `aggregate` in different SUT services, `ledger.egress`,
+    # `ledger.summary`, and `ledger.script` SKIP. Only `identity.sink` judges a
+    # `batches.dropped` term, and only at the last service's sinks, so a batch drop anywhere
+    # else stays here. `ledger.intake` reads `datagrams.dropped` and the `B` terms in the
+    # listeners' final life alone, so an earlier life's stay here, and no row reads a listener's
+    # `events.dropped` or a script's `script_error`. `ledger.wire` reads `kernel.dropped`.
+    across = led.across
     if name == "logit.component.batches.dropped":
+        if across:
+            return service == led.service and component in led.sinks
         return not (led.data.external and reason in FAULT_DROP_REASONS
                     and component not in led.sinks)
     if name == "logit.component.bytes.dropped":
         return True
     if name == "logit.component.events.dropped" and (component, reason) in batch_drops:
-        return True
-    if component in led.listeners:
-        if name in ("logit.component.datagrams.dropped", "logit.input.kernel.dropped",
-                    "logit.component.events.dropped"):
-            return True  # D, K, and X
+        return _balanced_drop(led, "logit.component.batches.dropped", component, reason,
+                              batch_drops, service, life)
+    if component in led.listeners and not (across and service != led.inn.service):
+        ingress_final = not across or life == led.inn.final
+        if name == "logit.input.kernel.dropped":
+            return True  # K
+        if name == "logit.component.datagrams.dropped":
+            return ingress_final  # D
+        if name == "logit.component.events.dropped":
+            return not across  # X
         if (name, reason) in (("logit.input.messages.dropped", "malformed"),
                               ("logit.input.frames.dropped", "undecodable"),
                               ("logit.input.frames.dropped", "oversize")):
-            return True  # B
+            return ingress_final  # B
     if (component == led.script and name == "logit.component.events.dropped"
             and reason == "script_error"):
-        return True  # L_err
+        return not across  # L_err
     if component in led.sinks and (led.data.external or led.data.kafka
                                     or led.data.standin_datadog) and name in (
             "logit.output.records.dropped", "logit.output.metrics.dropped"):
@@ -3526,7 +3540,8 @@ def check_drops(data):
     """Every `logit.*.dropped` counter a SUT service emitted that no other row judges: loss by
     the name alone (ADR `telemetry-loss-vocabulary`). A `FAULT_DROP_REASONS` reason FAILs, any
     other WARNs. Terms the ledger and the sink rows balance stay with them. With several SUT
-    services each line names its service."""
+    services each line names its service, and with the listeners and `aggregate` in different
+    services `_balanced_drop` leaves in the terms the SKIPped rows would have judged."""
     led = _ledger(data)
     skipped = _skip_without_sut("drops", led)
     if skipped:
@@ -3546,7 +3561,8 @@ def check_drops(data):
                     continue
                 component = point.attributes.get("component", "?")
                 reason = point.attributes.get("reason", "?")
-                if _balanced_drop(led, name, component, reason, batch_drops):
+                if _balanced_drop(led, name, component, reason, batch_drops, service,
+                                  point.life):
                     continue
                 key = (name, label + component, reason)
                 totals[key] = totals.get(key, 0) + point.value
