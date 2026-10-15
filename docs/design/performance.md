@@ -1324,14 +1324,10 @@ pass A, then pass B.
 - **Kernel drops rose 0.6–1.4 points from B0 to D-**, on both passes: `udp-statsd` 3.82/3.53% →
   4.44/4.45%, `udp-statsd-packed` 4.83/4.94% → 6.19/5.90%. D- to M adds at most 0.32 points. A
   binary's drift between its two passes is at most 0.29 points, so the rise is outside drift.
-  `udp-statsd-packed` now sits slightly above the 1–5% calibration band. No bisect covered the UDP
-  scenarios. The merges between B0 and D- that touch the UDP path include #543 (`peer` W4, sender
-  addresses on the shared drivers), #596 (a UDP decode-burst fix), and the move of `StatsdDecoder`
-  into `logit-proto` (#626); which one, if any, moved the knee is unmeasured. #543 grew the shared
-  UDP driver's `Datagram` from 40 to 80 bytes, half of it an `Option<Sender>` that every datagram
-  carries even with `peer:` off ([`memory.md`](memory.md) §5, "Listeners bound undecoded bytes
-  too"). Whether every datagram should pay for that field is an open question, and this drop rise
-  is one measurement that bears on it, still unbisected.
+  `udp-statsd-packed` now sits slightly above the 1–5% calibration band. A bisect on the desktop
+  ("Desktop bisect of the B0 → D- rise", below) finds one clean step, at `0c0b4c34`, the commit
+  in #678's stack that brought the loss vocabulary to UDP intake, and part of that step is code
+  layout. The rest of the rise didn't resolve to a commit.
 - **CPU per event doesn't separate the binaries.** Drift between a binary's two passes runs up to
   5.5% (M on `udp-statsd-packed`, 0.897 → 0.946), wider than any difference between binaries.
 - **`udp-statsd-small` is sender-bound.** At its shipped 760,000 datagrams/s it delivers about
@@ -1347,6 +1343,61 @@ pass A, then pass B.
   datagrams/s read 3.608 (B0), 2.289 (D-), and 3.777 (M) µs/event with exact delivery. The
   2026-10-02 session saw the same scenario read 2.637 and 5.483 on two binaries. It is the `-small`
   CPU number's usual noise (see "Reading the numbers"), not a regression.
+
+#### Desktop bisect of the B0 → D- rise
+
+These are desktop numbers (Ryzen AI MAX+ 395), not VM numbers, at desktop rate scales: don't
+compare them with the tables above. The desktop reads about 1.65× the VM's UDP capacity, so the
+scales were recalibrated to put B0 at 3–5% drops: `--rate-scale 1.65` for `udp-statsd` and `1.609`
+for `udp-statsd-packed`, with `--pin-sender 0,1 --pin-child 2,3`. Each binary ran under a
+`logit-perf` built at a matching commit; binaries older than the `kernel.drops` →
+`kernel.dropped` rename ran under `5da5ab8c`'s harness. Four rounds of `--repeat 5` ran with the
+binary order rotated each round. Another container at 215% CPU disturbed round 1, so the table
+reads rounds 2–4 only, 15 runs per cell. All 96 runs passed the `sent == received +
+kernel_dropped` self-check.
+
+#678 (`edc446d9`, D-) is a stacked merge whose first parent is `8c07211b`. The stack branches off
+`9dbfbae4`, a docs-only commit with the same `crates/` tree as `8c07211b`, so `8c07211b` is the
+base for each step. Drop cells give the range of the three round medians, then the pooled median.
+
+| Binary | `udp-statsd` drop | events/s | CPU µs/event | `-packed` drop | events/s | CPU µs/event |
+|---|---|---:|---:|---|---:|---:|
+| `8c07211b`, base | 7.55–7.91% (7.79%) | 2,220,614 | 0.533 | 6.76–8.10% (6.96%) | 2,159,825 | 0.564 |
+| `61f13afd`, router rule | 5.86–7.83% (6.80%) | 2,241,943 | 0.531 | 7.01–7.36% (7.06%) | 2,157,490 | 0.562 |
+| `47f81c35`, discards apart from loss | 6.80–7.05% (6.92%) | 2,241,920 | 0.527 | 7.18–7.47% (7.23%) | 2,153,305 | 0.558 |
+| `0c0b4c34`, UDP intake loss vocabulary | 9.41–9.91% (9.89%) | 2,165,648 | 0.541 | 9.14–9.60% (9.37%) | 2,103,828 | 0.575 |
+| `df3f3fbb`, merge of the three | 9.43–9.78% (9.69%) | 2,172,488 | 0.542 | 8.67–9.50% (9.15%) | 2,109,041 | 0.573 |
+| `edc446d9`, D- | 7.26–8.86% (8.16%) | 2,208,831 | 0.532 | 7.93–8.36% (7.95%) | 2,136,443 | 0.570 |
+
+- **The step is `0c0b4c34`.** It adds 2.1 points of drop on `udp-statsd` and 2.4 on `-packed`
+  against the base, and its round medians overlap the base's on neither scenario. events/s falls
+  2.5% and 2.6%, and CPU µs/event rises 1.5% and 2.0%. `61f13afd` and `47f81c35` read like the
+  base, and `df3f3fbb` reads like `0c0b4c34`. It's the only commit in the stack that touches
+  `crates/logit-inputs/src/udp.rs`.
+- **Its diff adds no telemetry call per datagram on these loads.** `BatchReader::read_batch` now
+  skips a `MSG_TRUNC` datagram instead of appending it, summing its bytes into `truncated_bytes`,
+  and counts every datagram it appends in a local `appended`, which it returns. `read_loop` makes
+  the same three `Telemetry::count` calls per `recvmmsg` call as before (`logit.input.reads`,
+  `logit.input.datagrams`, `logit.input.datagram.bytes`). The `reason="truncated"` pair on
+  `RECEIVE_QUEUE_METRICS`' two dropped names fires only for a batch that held a truncated
+  datagram, and these loads send none. `StatsdDecoder` gains a `Telemetry` field, and it and
+  `decode_loop` count `logit.input.messages.dropped` and `logit.input.frames.dropped` only on a
+  decode error, which fails a harness run.
+- **Part of the step is code layout.** D- reads 1.4–1.7 points below `0c0b4c34`, and its round
+  medians overlap the base's, though nothing between `df3f3fbb` and D- touches the UDP driver,
+  the statsd decoder, `logit-core`, or the node runtime. `0c0b4c34` also rewrites the graphite,
+  collectd, syslog, and statsd codecs and sinks, which moves code the UDP path doesn't run. This
+  is the pattern "`native-relay` is code-layout-sensitive" (§1) records. How much of the step is
+  the read path's own cost is open; a `perf` profile of `8c07211b` against `0c0b4c34` on
+  `udp-statsd` is the measurement that would separate the two
+  ([known gap](../known-gaps/intake.md#udp-intake)).
+- **The earlier interval didn't resolve to a commit.** From `54ee6468` (#543) to `91608a41` (#596's
+  first parent), builds read in two modes on `-packed`, a `fill` near 16 at about 3% drops or near
+  55 at 5–7%, and one `54ee6468` binary changed mode between measurement blocks. Near its knee the
+  receiver is bistable, and this data doesn't implicate #543, #596, or #626 individually. So it
+  says nothing about `Datagram`'s 80-byte footprint either way: whether every datagram should
+  carry #543's 40-byte `Option<Sender>` with `peer:` off stays an open question
+  ([`memory.md`](memory.md) §5, "Listeners bound undecoded bytes too").
 
 ### Reading the numbers
 
