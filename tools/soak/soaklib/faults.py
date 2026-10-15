@@ -19,31 +19,40 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line, and the container
   exits with `KILL_EXIT_CODE`. Its revert is a `docker start`, as a `stop`'s is. The container is
   never recreated, so its filesystem, a disk spool under `/tmp` included, survives the kill.
+- A `respond` sets a stand-in's answer: its apply POSTs the step's cue to the stand-in's
+  control port and its revert POSTs an empty cue, which restores the default. A refused or
+  failed POST is the record's `rc` 1, so `timeline` FAILs it and the step gets no window.
 - A `mark` and an `exit` name an event the SUT's own config causes, so neither apply makes a
   Docker call. An `exit`'s revert starts the container only when it has exited, and its record
   says whether it did (`started`): a revert that found the process still running starts no new
   life, and the checks then FAIL the exit that never happened.
 """
 
+import json
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 
-from .scenario import BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, SUT_ROLE
+from .scenario import BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, STANDIN_ROLE, SUT_ROLE
 
 NETEM_LIMIT = "100000"
 STOP_TIMEOUT_S = 30
 # 128 + SIGKILL: the exit code Docker records for a container a `kill` ended.
 KILL_EXIT_CODE = 137
+CUE_TIMEOUT_S = 10
 
 
 @dataclass
 class Context:
     """What an action needs from the driver: the Docker handle, each service's container id,
-    the netem image, and per-step state an apply leaves for its revert."""
+    the netem image, each stand-in's control URL, and per-step state an apply leaves for its
+    revert."""
 
     docker: object
     ids: dict
     netem_image: str
     state: dict = field(default_factory=dict)
+    standin_base: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -122,6 +131,32 @@ def restart_revert(ctx, step):
     return {"rc": 0, "stderr": ""}
 
 
+def post_cue(base, cue, timeout=CUE_TIMEOUT_S):
+    """POSTs `cue` to a stand-in's control URL `base`: `(rc, stderr)`, rc 0 on a 200."""
+    if not base:
+        return 1, "the stand-in has no published control port"
+    request = urllib.request.Request(f"{base}/cue", data=json.dumps(cue).encode(),
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return (0, "") if response.status == 200 else (1, f"status {response.status}")
+    except urllib.error.HTTPError as err:
+        return 1, f"status {err.code}: {err.read().decode(errors='replace')[:500]}"
+    except (urllib.error.URLError, OSError, ValueError) as err:
+        return 1, str(err)
+
+
+def respond_apply(ctx, step):
+    rc, stderr = post_cue(ctx.standin_base.get(step.on), step.cue())
+    return {"rc": rc, "stderr": stderr}
+
+
+def respond_revert(ctx, step):
+    rc, stderr = post_cue(ctx.standin_base.get(step.on), {})
+    return {"rc": rc, "stderr": stderr}
+
+
 def no_op(ctx, step):
     return {"rc": 0, "stderr": ""}
 
@@ -176,7 +211,7 @@ def _on_generator(step, roles):
 
 
 def _on_sut_or_destination(step, roles):
-    return roles.get(step.on) in (SUT_ROLE, BACKEND_ROLE, BROKER_ROLE)
+    return roles.get(step.on) in (SUT_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE)
 
 
 def _lifecycle_on_sut_or_generator_partition(step, roles):
@@ -185,6 +220,10 @@ def _lifecycle_on_sut_or_generator_partition(step, roles):
 
 def _always(step, roles):
     return True
+
+
+def _never(step, roles):
+    return False
 
 
 ACTIONS = {
@@ -237,6 +276,12 @@ ACTIONS = {
         revert=exit_revert,
         affects_udp_ingress=_always,
         affects_egress=_always,
+    ),
+    "respond": Action(
+        apply=respond_apply,
+        revert=respond_revert,
+        affects_udp_ingress=_never,
+        affects_egress=_on_sut_or_destination,
     ),
 }
 

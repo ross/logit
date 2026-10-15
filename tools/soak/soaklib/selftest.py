@@ -86,13 +86,34 @@ each source's datagram precondition, an imbalance on one listener FAILing named,
 summed E against A, a source's transforms judged hop by hop, `lines_in`'s oversize drops in B,
 R per listener from its own `receive:`, and `recovery` against the summed rate.
 
+For a stand-in target, it covers the Snappy decoder against blocks `snap::raw` wrote
+(`standin/snap-vectors.json`) and the malformed blocks it refuses, the `WriteRequest` walker,
+V rebuilt from a record (a later write replacing an earlier one, a same-value resend counted, a
+changed value and an undecodable body named), the stand-in's own handlers on loopback ports (its
+cue rules, each answer, a reset, a wrong path, and the record line each prints), `post_cue`,
+every `respond`, `class`, and `[target] kind = "standin"` rule, the stand-in's compose service,
+the driver re-reading its control port and sending a step's cue and an empty one, and the checks
+over a stand-in two-life run: V judged as an export, the black-hole control FAILing as uncounted
+loss, each `ledger.standin` rule broken in turn, each class's signature with and without its
+effect, under both postures, and a `rejected` drop excused inside a cued step and FAILing
+outside it. For the `datadog` shape, it covers a series body `datadog_out` sent
+(`standin/datadog-vectors.json`) through gzip and the `MetricPayload` walker, the other
+encodings and the bodies refused, V as the distinct points' sum (a duplicate named, a changed
+value summed), the `series_errors` answer and cue rules on loopback ports, the `[target] shape`,
+`series_errors`, and class rules, and the checks over a datadog stand-in run: duplicates
+reported under `at_least_once` and FAILing under `at_most_once` or after a 2xx, the
+`series_errors` and rejected-step reconciliation against `records.dropped`, and `ledger.sent`
+and `drops` with cued and uncued refusals and drops.
+
 No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
 suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
 a slip in a part's own stand-ins included, gets rc 127 from `Docker.run`'s `OSError` instead of
 running a command. A part that passes `prefix=` names its own fake and is unaffected.
 """
 
+import base64
 import copy
+import gzip
 import json
 import os
 import re
@@ -100,12 +121,14 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (checks, collect, docker, driver, faults, report, scenario, telemetry, topic,
-               vm)
+from . import (checks, collect, docker, driver, faults, report, scenario, standin, telemetry,
+               topic, vm)
 
 _FAILURES = []
 _PASSED = [0]
@@ -1047,7 +1070,8 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 external=False, sut_extra=(), stderr_extra=(), timeline_extra=(),
                 script=None, l_in_short=0, l_err_unreported=0, l_sent_short=0,
                 sut_end="stop", shutdown_in=("telemetry", "stderr"), dropped_at="sink",
-                dropped_reason="shutdown", kafka=False, topic_extra=(), topic_read=True, topic_records=None, **resolved):
+                dropped_reason="shutdown", kafka=False, topic_extra=(), topic_read=True, topic_records=None,
+                standin_edit=None, standin_shape="remote_write", **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
@@ -1069,7 +1093,13 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
     With `kafka`, the target is a Kafka topic: the same V lands as four delta records in
     `kafka-topic.ndjson`, two per life, plus `topic_extra` lines, and the timeline records the
     read unless `topic_read` is false. `topic_records(v0, v1)`, when given, returns the
-    `(offset, amount)` records to write in place of the four."""
+    `(offset, amount)` records to write in place of the four.
+
+    With `standin_edit`, the target is a stand-in: the same export becomes its record, one
+    stored `200` request per sample timestamp a second before it (`_standin_record`), the SUT's
+    `logit.output.requests` counts each in the drain after it, and `standin_edit(requests)`
+    returns the request lines to write, edited. Under `standin_shape` `"datadog"` the record is
+    `_datadog_record`'s, the export's samples as delta points."""
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -1178,6 +1208,12 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
         resolved.setdefault("target", {"kind": "external", "name": "datadog",
                                        "env": ["DD_API_KEY"]})
         ledger = {**LEDGER, "sink": [{"id": "sink"}]}
+    elif standin_edit is not None:
+        resolved.setdefault("target", {"kind": "standin", "name": "standin", "env": [],
+                                       "shape": standin_shape})
+        resolved.setdefault("services", {"logit": "sut", "generator": "generator",
+                                         "standin": "standin"})
+        ledger = resolved.pop("ledger", {**LEDGER, "sink": [{"id": "sink"}]})
     elif kafka:
         resolved.setdefault("target", {"kind": "kafka", "name": "kafka", "env": [],
                                        "topic": "soak"})
@@ -1238,8 +1274,15 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             export.append({"metric": {"__name__": f"x_{index}_total"},
                            "values": [share // 2, share, other // 2, other],
                            "timestamps": [int((T0 + s) * 1000) for s in (50, 100, 200, 300)]})
-    if external or kafka:
-        # Neither target has VictoriaMetrics, so the driver writes no export.
+    if standin_edit is not None:
+        record = (_datadog_record(export) if standin_shape == standin.DATADOG
+                  else _standin_record(export))
+        requests = standin_edit(record)
+        _write_standin(run_dir, requests, shape=standin_shape)
+        with open(run_dir / "logs" / "logit.stdout", "a") as out:
+            out.write("\n".join(_standin_telemetry(requests)) + "\n")
+    if external or kafka or standin_edit is not None:
+        # None of these targets has VictoriaMetrics, so the driver writes no export.
         export = []
     _write_export(run_dir, "sink", export)
     if kafka:
@@ -1250,6 +1293,90 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
         (run_dir / topic.TOPIC_FILE).write_text(
             "\n".join(records + list(topic_extra)) + "\n")
     return run_dir
+
+
+def _standin_request(seq, offset, series, status=200, stored=True, cue=None, answer="status",
+                     encoding="snappy", path="/api/v1/write"):
+    """One stand-in record line at `T0 + offset` whose body holds `series`, `[(labels,
+    [(timestamp_ms, value)])]`, compressed as literals."""
+    body = standin.snappy_compress_literal(standin.encode_write_request(series))
+    return {"event": "request", "seq": seq, "t": T0 + offset, "path": path,
+            "content_type": "application/x-protobuf", "content_encoding": encoding,
+            "bytes": len(body), "cue": cue, "answer": answer,
+            "status": None if answer == "reset" else status, "stored": stored,
+            "body_b64": base64.b64encode(body).decode()}
+
+
+def _standin_record(export):
+    """The requests a stand-in would record for `export`: one stored `200` per sample
+    timestamp, a second before it, holding every series' sample at that timestamp."""
+    by_stamp = {}
+    for one in export:
+        labels = dict(one["metric"])
+        for stamp, value in zip(one["timestamps"], one["values"]):
+            by_stamp.setdefault(stamp, []).append((labels, [(stamp, float(value))]))
+    return [_standin_request(seq, stamp / 1000 - T0 - 1, series)
+            for seq, (stamp, series) in enumerate(sorted(by_stamp.items()), start=1)]
+
+
+def _datadog_request(seq, offset, series, status=202, stored=True, cue=None, answer="status",
+                     encoding="gzip", path="/api/v2/series", series_errors=None):
+    """One `datadog` stand-in record line at `T0 + offset` whose body is a `MetricPayload` of
+    `series`, `[(metric, [(timestamp_s, value)])]`, each a `count` on host `logit-soak`, under
+    `encoding`."""
+    payload = standin.encode_metric_payload([
+        {"metric": metric, "resources": [("host", "logit-soak")], "tags": [],
+         "points": points, "type": "count", "interval": 10} for metric, points in series])
+    if encoding == "gzip":
+        body = gzip.compress(payload, mtime=0)
+    elif encoding == "deflate":
+        body = zlib.compress(payload)
+    else:
+        body = payload
+    line = {"event": "request", "seq": seq, "t": T0 + offset, "path": path,
+            "content_type": "application/x-protobuf", "content_encoding": encoding,
+            "bytes": len(body), "cue": cue, "answer": answer,
+            "status": None if answer == "reset" else status, "stored": stored,
+            "body_b64": base64.b64encode(body).decode()}
+    if series_errors is not None:
+        line["series_errors"] = series_errors
+    return line
+
+
+def _datadog_record(export):
+    """The requests a `datadog` stand-in would record for `export`: one stored `202` per sample
+    timestamp, a second before it, holding every series' increment since its previous sample in
+    the same SUT life (the first sample of a life is its own increment), named without the
+    `_total` suffix."""
+    by_stamp = {}
+    for one in export:
+        metric = one["metric"]["__name__"].removesuffix("_total")
+        previous = {}
+        for stamp, value in zip(one["timestamps"], one["values"]):
+            life = 0 if stamp / 1000 < T0 + STOP[1] else 1
+            delta = value - previous.get(life, 0)
+            previous[life] = value
+            by_stamp.setdefault(stamp, []).append((metric, [(stamp // 1000, float(delta))]))
+    return [_datadog_request(seq, stamp / 1000 - T0 - 1, series)
+            for seq, (stamp, series) in enumerate(sorted(by_stamp.items()), start=1)]
+
+
+def _write_standin(run_dir, requests, extra=(), shape="remote_write"):
+    """The stand-in's stdout: a `ready` line, `requests`, and `extra` raw lines."""
+    lines = [json.dumps({"event": "ready", "t": T0 - 5, "shape": shape})]
+    lines += [json.dumps(r) for r in requests] + list(extra)
+    (run_dir / "logs" / "standin.stdout").write_text("\n".join(lines) + "\n")
+
+
+def _standin_telemetry(requests, sink="sink"):
+    """The SUT's `logit.output.requests` for `requests`, each in the first 5 s drain at or
+    after it, by `standin.status_class`."""
+    lines = []
+    for request in requests:
+        drain = -(-(request["t"] - T0) // 5) * 5
+        lines.append(_line(_stamp(T0 + drain), "logit.output.requests", "sum", 1,
+                           component=sink, attrs={"class": standin.status_class(request)}))
+    return lines
 
 
 def _topic_record(t, amount, name="x_0"):
@@ -1612,9 +1739,10 @@ def _roles(root):
     `docker compose config`'s JSON; the rules that need the service list, against the base map
     and an override's; and the fault predicates, which judge a service by its role."""
     base = (root / "compose.yaml").read_text()
-    declared = {**scenario.BASE_ROLES, **scenario.KAFKA_ROLES}
+    declared = {**scenario.BASE_ROLES, **scenario.KAFKA_ROLES, **scenario.STANDIN_ROLES}
     expect(_declared_roles(base) == declared,
-           f"compose.yaml labels each service as BASE_ROLES and KAFKA_ROLES say, got "
+           f"compose.yaml labels each service as BASE_ROLES, KAFKA_ROLES, and STANDIN_ROLES "
+           f"say, got "
            f"{_declared_roles(base)}")
     config = json.dumps({"name": "p", "services": {
         "logit": {"labels": {"soak.role": "sut"}, "image": "x"},
@@ -4635,6 +4763,1137 @@ def _fanin_driver(root):
            f"the end sequence stops each generator, then the SUT, got {stopped}")
 
 
+def _standin_base(root):
+    path = root / "scenarios" / "standin-remote-write" / "scenario.toml"
+    return path, tomllib.loads(path.read_text())
+
+
+def _standin_codec(root):
+    """The stand-in record's decoders: Snappy blocks `snap::raw` wrote, a `WriteRequest` from
+    one, the literal-only encoder the fixtures use, and the malformed blocks it refuses."""
+    vectors = json.loads((root / "standin" / "snap-vectors.json").read_text())
+    text = b"abcabcabcabc" * 30 + b"0123456789" * 3 + bytes(range(256)) * 2
+    block = bytes.fromhex(vectors["text"])
+    expect(standin.snappy_decompress(block) == text,
+           "a snap::raw block with copies of both widths decodes to its input")
+    expect(len(block) < len(text) // 2, "the vector holds copies, not only literals")
+    series = [({"__name__": f"soak_requests_{i}_total"},
+               [(1791720000000 + 10000 * k, float(100 * k + i)) for k in range(3)])
+              for i in range(40)]
+    decoded = standin.write_request(standin.snappy_decompress(
+        bytes.fromhex(vectors["write_request"])))
+    expect(decoded == series, f"a snap::raw WriteRequest decodes to its 40 series, got "
+           f"{decoded[:2]}")
+    real = standin.write_request(standin.snappy_decompress(
+        bytes.fromhex(vectors["prometheus_out_body"])))
+    want = vectors["prometheus_out_body_expect"]
+    expect(len(real) == want["series"]
+           and all(len(samples) == 1 and samples[0][0] == want["timestamp_ms"]
+                   for _, samples in real)
+           and [real[0][0]["__name__"], real[0][1][0][1]] == want["first"]
+           and sum(samples[0][1] for _, samples in real) == want["value_sum"],
+           f"a body prometheus_out sent decodes to its series, got {real[:1]}")
+    raw = standin.encode_write_request(series)
+    expect(standin.snappy_decompress(standin.snappy_compress_literal(raw)) == raw
+           and standin.snappy_decompress(standin.snappy_compress_literal(b"x" * 70000))
+           == b"x" * 70000 and standin.snappy_decompress(b"\x00") == b"",
+           "the literal-only encoder round-trips short, long, and empty input")
+    negative = [({"__name__": "x"}, [(-5, -1.5)])]
+    expect(standin.write_request(standin.encode_write_request(negative)) == negative,
+           "a negative timestamp decodes as an int64")
+    for bad, what in ((block[:-3], "a truncated block"),
+                      (bytes([5, 0x01 | (1 << 2), 0x01]), "a copy before any output"),
+                      (bytes([9, 0x08, ord("a"), ord("b"), ord("c")]), "a length mismatch"),
+                      (b"", "an empty buffer")):
+        try:
+            standin.snappy_decompress(bad)
+            expect(False, f"{what} decoded")
+        except standin.DecodeError:
+            expect(True, "")
+    try:
+        standin.decode_body({"body_b64": base64.b64encode(block).decode(),
+                             "content_encoding": "zstd"})
+        expect(False, "a zstd body decoded")
+    except standin.DecodeError as err:
+        expect("not snappy" in str(err), f"a body not under snappy is named, got {err}")
+
+
+def _standin_record_parts():
+    """`stored_series` over a record: later writes replace earlier ones, a resend of the same
+    value counts, a changed value is a conflict, an unstored or undecodable request is left out
+    of V, and the request classes."""
+    a, b = {"__name__": "a_total"}, {"__name__": "b_total"}
+    requests = [
+        _standin_request(1, 10, [(a, [(1000, 1.0)]), (b, [(1000, 5.0)])]),
+        _standin_request(2, 11, [(a, [(1000, 1.0)])]),
+        _standin_request(3, 12, [(a, [(2000, 3.0)])], status=400, stored=False),
+        _standin_request(4, 13, [(b, [(1000, 6.0)])], status=503, stored=True, cue="c0s1"),
+        {**_standin_request(5, 14, [(a, [(3000, 9.0)])]), "body_b64": "!!"},
+        _standin_request(6, 15, [(a, [(4000, 4.0)])], answer="reset", stored=False),
+    ]
+    series, rewrites, conflicts, undecodable = standin.stored_series(requests)
+    expect(series == [{"metric": a, "timestamps": [1000], "values": [1.0]},
+                      {"metric": b, "timestamps": [1000], "values": [6.0]}],
+           f"V keeps each stored sample, the last write's value, got {series}")
+    expect(rewrites == 1 and conflicts == [(tuple(b.items()), 1000, 5.0, 6.0)]
+           and [seq for seq, _ in undecodable] == [5],
+           f"one same-value resend, one changed value, one bad body, got {rewrites} "
+           f"{conflicts} {undecodable}")
+    expect([standin.status_class(r) for r in requests]
+           == ["2xx", "2xx", "4xx", "5xx", "2xx", "network_error"],
+           "a request's class is its status bucket, a reset network_error")
+    text = "\n".join([json.dumps(requests[0]), json.dumps({"event": "cue", "cue": {}}),
+                      "Traceback (most recent call last):", "[1]", ""])
+    got, cues, unparsed = standin.read_record(text)
+    expect(len(got) == 1 and len(cues) == 1 and unparsed == 2,
+           f"the record splits requests, cues, and lines that aren't objects, got "
+           f"{len(got)} {len(cues)} {unparsed}")
+
+
+def _load_standin_server(root):
+    """tools/soak/standin/standin.py as a module, for its handlers."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("soak_standin_server",
+                                                  root / "standin" / "standin.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _standin_server(root):
+    """The stand-in's own handlers on loopback ports: its cue rules, the default answer, a
+    cued status with its body, `apply`, a reset, a write to the wrong path, and the record line
+    each prints; and `faults.post_cue` against its control port."""
+    import http.client
+    import http.server
+    import io
+    import threading
+    server = _load_standin_server(root)
+    for cue, needle in (({"step": "x"}, "one of `status` and `answer`"),
+                        ({"step": "x", "status": 200, "answer": "reset"}, "one of"),
+                        ({"step": "x", "status": 99}, "100 to 599"),
+                        ({"step": "x", "status": True}, "100 to 599"),
+                        ({"step": "x", "answer": "close"}, "`answer` must be"),
+                        ({"step": "x", "answer": "reset", "body": "x"}, "`body`"),
+                        ({"step": "x", "status": 200, "apply": 1}, "`apply`"),
+                        ({"status": 200}, "`step`"), ({"step": "x", "status": 200, "y": 1},
+                                                      "unknown keys"), ([], "JSON object")):
+        problems = server.cue_problems(cue)
+        expect(any(needle in p for p in problems), f"cue {cue} refused with {needle!r}, got "
+               f"{problems}")
+    expect(server.cue_problems({}) == [] and server.cue_problems(
+        {"step": "c0s1", "status": 400, "body": "x", "apply": True}) == [],
+           "an empty cue and a full one are accepted")
+
+    state = server.State("remote_write", "/api/v1/write")
+    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
+    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    threads = [threading.Thread(target=one.serve_forever, daemon=True) for one in (data, control)]
+    for thread in threads:
+        thread.start()
+    printed = io.StringIO()
+    real_stdout = server.sys.stdout
+    server.sys.stdout = printed
+    control_base = f"http://127.0.0.1:{control.server_address[1]}"
+
+    def post(path, body=b"payload"):
+        conn = http.client.HTTPConnection("127.0.0.1", data.server_address[1], timeout=5)
+        try:
+            conn.request("POST", path, body=body, headers={"Content-Encoding": "snappy"})
+            response = conn.getresponse()
+            return response.status, response.read().decode()
+        except (ConnectionError, http.client.HTTPException) as err:
+            return type(err).__name__, ""
+        finally:
+            conn.close()
+
+    try:
+        expect(vm.healthy(control_base), "the control port answers /health OK")
+        first = post("/api/v1/write")
+        rc, _ = faults.post_cue(control_base, {"step": "c0s4", "status": 400,
+                                               "body": "out of order sample"})
+        second = post("/api/v1/write")
+        rc_bad, err = faults.post_cue(control_base, {"step": "c0s5", "status": 99})
+        faults.post_cue(control_base, {"step": "c0s6", "status": 503, "apply": True})
+        third = post("/api/v1/write")
+        faults.post_cue(control_base, {"step": "c0s7", "answer": "reset"})
+        fourth = post("/api/v1/write")
+        faults.post_cue(control_base, {})
+        fifth = post("/api/v2/write")
+        sixth = post("/api/v1/write")
+        # A request's line is printed after its answer is written, so the last one can trail
+        # the client's read.
+        deadline = time.monotonic() + 5
+        while (printed.getvalue().count('"event": "request"') < 6
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+    finally:
+        server.sys.stdout = real_stdout
+        for one in (data, control):
+            one.shutdown()
+            one.server_close()
+    expect(first == (200, "") and second == (400, "out of order sample") and third[0] == 503
+           and fourth[0] in ("RemoteDisconnected", "ConnectionResetError")
+           and fifth[0] == 404 and sixth == (200, ""),
+           f"the stand-in answers its default, then each cue, got "
+           f"{[first, second, third, fourth, fifth, sixth]}")
+    expect(rc == 0 and rc_bad == 1 and "100 to 599" in err,
+           f"post_cue returns 0 on a 200 and 1 with the stand-in's reason, got {rc} {rc_bad} "
+           f"{err}")
+    expect(faults.post_cue(None, {})[0] == 1, "a stand-in with no port fails the cue")
+    lines = [json.loads(line) for line in printed.getvalue().splitlines()]
+    requests = [line for line in lines if line["event"] == "request"]
+    got = [(r["status"], r["answer"], r["stored"], r["cue"]) for r in requests]
+    expect(got == [(200, "status", True, None), (400, "status", False, "c0s4"),
+                   (503, "status", True, "c0s6"), (None, "reset", False, "c0s7"),
+                   (404, "status", False, None), (200, "status", True, None)],
+           f"each request's record line says how it was answered and whether it was stored, "
+           f"got {got}")
+    expect(base64.b64decode(requests[0]["body_b64"]) == b"payload"
+           and requests[0]["content_encoding"] == "snappy",
+           "a record line carries the raw body and its encoding")
+    expect(sum(1 for line in lines if line["event"] == "cue") == 4,
+           "every accepted cue is in the record, a refused one isn't")
+
+
+def _respond_rules(root):
+    """The `respond` action's and `class` key's rules, the `[target] kind = "standin"` rules,
+    the stand-in's roles, profile, image, and compose service, and the step's cue."""
+    path, base = _standin_base(root)
+    vm_path, vm_base = _base(root)
+
+    def mutate(raw, edit):
+        raw = copy.deepcopy(raw)
+        edit(raw)
+        return raw
+
+    def step(index, **changes):
+        def edit(raw):
+            for key in [k for k, v in changes.items() if v is None]:
+                raw["step"][index].pop(key, None)
+            raw["step"][index].update({k: v for k, v in changes.items() if v is not None})
+        return edit
+
+    windows = copy.deepcopy(base)
+    windows["ledger"]["vm_every_window"] = True
+    expect(scenario.from_dict(windows, path).ledger["vm_every_window"] is True,
+           "a stand-in target takes vm_every_window: its V has an export's shape")
+    loaded = scenario.from_dict(copy.deepcopy(base), path)
+    expect(loaded.standin and not loaded.kafka and not loaded.has_vm
+           and loaded.target == {"kind": "standin", "name": "standin", "env": [],
+                                 "shape": "remote_write"},
+           f"standin-remote-write loads as a stand-in target, got {loaded.target}")
+    roles = scenario.base_roles(loaded)
+    expect(roles == {"logit": "sut", "generator": "generator", "standin": "standin"},
+           f"a stand-in target's stack runs the stand-in and no backend, got {roles}")
+    expect(driver.profiles_for(loaded) == ["standin"],
+           "a stand-in target runs the standin compose profile")
+    first = scenario.expand(loaded)[0]
+    expect(first.cue() == {"step": "c0s1", "status": 503}
+           and first.expected() == {"status": 503, "class": "ambiguous"},
+           f"a respond step's cue and timeline fields, got {first.cue()} {first.expected()}")
+    applied = next(s for s in scenario.expand(loaded) if s.apply is not None)
+    expect(applied.cue() == {"step": applied.id, "status": 503, "apply": True},
+           f"`apply` travels in the cue, got {applied.cue()}")
+    for name, action in faults.ACTIONS.items():
+        one = scenario.Step(id="x", spec_index=0, cycle=0, action=name, on="standin", args="",
+                            start=0, end=1)
+        expect(action.affects_egress(one, roles),
+               f"a {name} on the stand-in affects the SUT's egress")
+    respond = scenario.Step(id="x", spec_index=0, cycle=0, action="respond", on="standin",
+                            args="", start=0, end=1)
+    expect(not faults.ACTIONS["respond"].affects_udp_ingress(respond, roles),
+           "a respond never affects UDP ingress")
+
+    cases = [
+        (base, step(0, status=None), "respond needs one of `status` and `answer`",
+         "a respond with neither"),
+        (base, step(0, answer="reset"), "respond needs one of `status` and `answer`",
+         "a respond with both"),
+        (base, step(0, status=600), "`status` must be an integer from 100 to 599",
+         "a status past 599"),
+        (base, step(0, status=True), "`status` must be an integer", "a boolean status"),
+        (base, step(0, status="503"), "`status` must be an integer", "a string status"),
+        (base, step(0, status=None, answer="close"), "`answer` must be one of reset",
+         "an unknown answer"),
+        (base, step(17, body="x"), "`body` is a string, and goes with `status` only",
+         "a body on a reset"),
+        (base, step(0, body=5), "`body` is a string", "a body that isn't a string"),
+        (base, step(0, apply="yes"), "`apply` must be true or false", "a string apply"),
+        (base, step(18, status=503), "`status` is for respond only", "a status on a stop"),
+        (base, step(18, answer="reset"), "`answer` is for respond only", "an answer on a stop"),
+        (base, step(0, **{"class": "lost"}), "`class` must be one of clean, ambiguous, "
+         "rejected, refused", "an unknown class"),
+        (base, lambda raw: raw["step"].append({"at": "29m", "action": "netem", "on": "logit",
+                                               "args": "loss 1%", "for": "10s",
+                                               "class": "clean"}),
+         "`class` is for respond and stop only", "a class on a netem"),
+        (base, step(0, on="logit"), "respond is for a standin service", "a respond on the SUT"),
+        (base, lambda raw: raw["step"].append({"at": "29m", "action": "stop", "on": "generator",
+                                               "for": "10s", "class": "clean"}),
+         "`class` on a stop is for a standin service", "a class on a generator's stop"),
+        (base, lambda raw: raw.update(target={"kind": "standin", "env": ["DD_API_KEY"]}),
+         "target.env is for an external target", "env on a stand-in target"),
+        (base, lambda raw: raw.update(target={"kind": "standin", "topic": "x"}),
+         "target.topic is for a kafka target", "a topic on a stand-in target"),
+        (base, lambda raw: raw.update(target={"kind": "standin", "name": "Stand In"}),
+         "target.name must be lowercase", "a stand-in target name"),
+        (base, lambda raw: raw["ledger"]["sink"].append({"id": "other"}),
+         "a standin target has one [[ledger.sink]]", "two sinks on a stand-in target"),
+        (base, lambda raw: raw["ledger"]["sink"][0].update(backend="victoria-metrics"),
+         "`backend` names a backend query, and the standin target", "a backend on its sink"),
+        (vm_base, lambda raw: raw["step"].append({"at": "12m", "action": "respond",
+                                                  "on": "standin", "status": 503,
+                                                  "for": "10s"}),
+         "unknown service `standin`", "a respond with the local target"),
+    ]
+    paths = {id(base): path, id(vm_base): vm_path}
+    for raw, edit, needle, what in cases:
+        _refused(paths[id(raw)], mutate(raw, edit), needle, what)
+    _refused(path, base, "reads its V from the standin service `standin`",
+             "a stand-in target on a stack with no stand-in",
+             roles={"logit": "sut", "generator": "generator"})
+    random_raw = copy.deepcopy(base)
+    for key in ("cycle", "step", "expect"):
+        random_raw.pop(key, None)
+    random_raw["random"] = {"seed": 1, "gap": {"min": "2m", "max": "3m"}, "fault": [
+        {"weight": 1, "action": "respond", "on": "standin", "for": {"min": "10s",
+                                                                   "max": "20s"}}]}
+    _refused(path, random_raw, "respond takes a status or an answer, which a [random] fault "
+             "can't set", "a respond in a [random] schedule")
+
+    compose = (root / "compose.yaml").read_text()
+    service = compose.split("\n  standin:")[1].split("\n  logit:")[0]
+    expect(f"image: {driver.STANDIN_IMAGE}" in service and "profiles: [standin]" in service
+           and "soak.role: standin" in service and 'restart: "no"' in service
+           and '"127.0.0.1::8081"' in service and "./standin:/standin:ro" in service,
+           "compose.yaml runs the pinned stand-in in its profile, labeled standin, its "
+           "control port published on loopback")
+    sut = compose.split("\n  logit:")[1].split("\n  generator:")[0]
+    expect("standin: { condition: service_healthy, required: false }" in sut,
+           "the SUT waits for a healthy stand-in when its profile runs")
+
+
+def _standin_driver(root):
+    """The driver around a stand-in: its control port re-read after a revert of a fault on it
+    and after a start, and a respond's apply and revert reaching `post_cue` with the step's cue
+    and an empty one."""
+    loaded = scenario.load(root / "scenarios" / "standin-remote-write" / "scenario.toml")
+    roles = scenario.base_roles(loaded)
+    run = driver.Run(root, loaded, loaded.duration, None, False, "/nonexistent", [],
+                     "logit:soak", roles=roles)
+
+    class Ports:
+        def __init__(self):
+            self.port_calls = []
+
+        def port(self, service, port):
+            self.port_calls.append((service, port))
+            return f"127.0.0.1:{40000 + len(self.port_calls)}"
+
+        def inspect(self, container, timeout=None):
+            return {"State": {"StartedAt": "x"}}
+
+    run.docker = Ports()
+    run.ids = {name: f"id-{name}" for name in roles}
+    stop = next(s for s in run.steps if s.action == "stop")
+    respond = run.steps[0]
+    run.after("apply", stop, {"rc": 0})
+    expect(run.docker.port_calls == [], "a stand-in's port isn't read while it is stopped")
+    run.after("revert", stop, {"rc": 0})
+    run.after("revert", respond, {"rc": 0})
+    expect(run.docker.port_calls == [("standin", 8081), ("standin", 8081)]
+           and run.standin_base["standin"] == "http://127.0.0.1:40002",
+           f"the control port is re-read after each revert on the stand-in, got "
+           f"{run.docker.port_calls} {run.standin_base}")
+    sent = []
+    real = faults.post_cue
+    faults.post_cue = lambda base, cue, timeout=None: (sent.append((base, cue)), (0, ""))[1]
+    try:
+        ctx = faults.Context(docker=None, ids={}, netem_image="x",
+                             standin_base={"standin": "http://h"})
+        applied = faults.ACTIONS["respond"].apply(ctx, respond)
+        reverted = faults.ACTIONS["respond"].revert(ctx, respond)
+    finally:
+        faults.post_cue = real
+    expect(sent == [("http://h", {"step": "c0s1", "status": 503}), ("http://h", {})]
+           and applied["rc"] == 0 and reverted["rc"] == 0,
+           f"a respond POSTs its cue, then an empty one, got {sent}")
+
+
+def _respond_fault(step, start, end, status=None, cls=None, answer=None, action="respond",
+                   on="standin", series_errors=None):
+    """A clean apply and revert of one step on the stand-in, offsets from `T0`."""
+    extra = {k: v for k, v in (("status", status), ("class", cls), ("answer", answer),
+                               ("series_errors", series_errors)) if v is not None}
+    return [_action("apply", step, action, on, start, affects_egress=True, **extra),
+            _action("revert", step, action, on, end - 1, end, affects_egress=True, **extra)]
+
+
+def _standin_checks():
+    """The checks over a stand-in two-life run: V from the record, `ledger.egress` judging it,
+    the black-hole control (a 2xx the stand-in didn't store) FAILing as uncounted loss,
+    `ledger.standin`'s record, request-class, cue, and class-signature rules, a `rejected` drop
+    excused inside a cued step and FAILing outside one, and `ledger.sent` SKIPping under the
+    `remote_write` shape."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, edit=lambda requests: requests, **kwargs):
+            run_dir = _ledger_run(tmp, name, standin_edit=edit, **kwargs)
+            return {r.id: r for r in checks.run_all(run_dir)}, run_dir
+
+        rows, _ = results("clean")
+        for row in ("ledger.egress", "ledger.summary", "ledger.standin", "drops"):
+            expect(rows[row].status == checks.PASS,
+                   f"a stand-in run that balances PASSes {row}, got {rows[row]}")
+        expect(rows["ledger.sent"].status == checks.SKIP
+               and rows["ledger.topic"].status == checks.SKIP,
+               f"ledger.sent and ledger.topic SKIP on a stand-in target, got "
+               f"{rows['ledger.sent']} {rows['ledger.topic']}")
+
+        rows, _ = results("windows", ledger={**LEDGER, "sink": [{"id": "sink"}],
+                                             "vm_every_window": True})
+        expect(rows["ledger.windows"].status != checks.SKIP,
+               f"ledger.windows judges a stand-in's V under vm_every_window, got "
+               f"{rows['ledger.windows']}")
+
+        def unstore(requests):
+            requests[-1]["stored"] = False
+            return requests
+
+        rows, _ = results("black-hole", unstore)
+        expect(rows["ledger.egress"].status == checks.FAIL
+               and "uncounted" in rows["ledger.egress"].detail,
+               f"a 2xx the stand-in didn't store FAILs as uncounted loss, got "
+               f"{rows['ledger.egress']}")
+
+        # A cued rejection gives the final life a drop credit, so ledger.egress counts any gap
+        # there; a black hole on the last write, answered 200 under its own cue, is then
+        # ledger.standin's alone to catch.
+        rejected = [_line(_stamp(T0 + 250), "logit.component.batches.dropped", "sum", 2,
+                          component="sink", attrs={"reason": "rejected"})]
+
+        def cued_hole(requests):
+            requests[-1].update(stored=False, cue="c0s3")
+            return requests
+
+        timeline = (_respond_fault("c0s2", 240, 260, status=400, cls="rejected")
+                    + _respond_fault("c0s3", 290, 305, status=200))
+        rows, _ = results("credited-hole", cued_hole, sut_extra=rejected,
+                          timeline_extra=timeline)
+        expect(rows["ledger.egress"].status == checks.PASS
+               and "counted" in rows["ledger.egress"].detail,
+               f"the rejection's credit lets ledger.egress count the hole, got "
+               f"{rows['ledger.egress']}")
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "answered 2xx were never stored" in rows["ledger.standin"].detail,
+               f"ledger.standin FAILs a 2xx the stand-in didn't store beside a cued rejection, "
+               f"got {rows['ledger.standin']}")
+
+        rows, run_dir = results("no-record")
+        (run_dir / "logs" / "standin.stdout").unlink()
+        rows = {r.id: r for r in checks.run_all(run_dir)}
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "no stand-in record" in rows["ledger.standin"].detail
+               and rows["ledger.egress"].status == checks.FAIL,
+               f"a missing record FAILs ledger.standin and leaves V empty, got "
+               f"{rows['ledger.standin']} {rows['ledger.egress']}")
+
+        def changed(requests):
+            body = standin.write_request(standin.snappy_decompress(
+                base64.b64decode(requests[0]["body_b64"])))
+            body[0][1][0] = (body[0][1][0][0], body[0][1][0][1] + 1)
+            return requests + [_standin_request(99, 60, body)]
+
+        rows, _ = results("changed", changed)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "a resend changed a sample" in rows["ledger.standin"].detail,
+               f"a resend storing a different value FAILs, got {rows['ledger.standin']}")
+
+        def garbled(requests):
+            requests[0]["body_b64"] = base64.b64encode(b"\x05nope").decode()
+            return requests
+
+        rows, _ = results("garbled", garbled)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "don't decode" in rows["ledger.standin"].detail,
+               f"a body that doesn't decode FAILs, got {rows['ledger.standin']}")
+
+        # A request the stand-in recorded that the sink never counted: the telemetry is
+        # written from the edited list, so drop its line by recording one more afterwards.
+        run_dir = _ledger_run(tmp, "uncounted-request", standin_edit=lambda r: r)
+        requests = standin.read_record((run_dir / "logs" / "standin.stdout").read_text())[0]
+        _write_standin(run_dir, requests + [_standin_request(50, 250, [], status=503,
+                                                             stored=False, cue="c9s9")])
+        rows = {r.id: r for r in checks.run_all(run_dir)}
+        detail = rows["ledger.standin"].detail + " ".join(rows["ledger.standin"].lines)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "answered 1 request(s) 5xx, sink counted 0" in detail
+               and "which no respond step applied cleanly" in detail,
+               f"a request the sink didn't count, under an unknown cue, FAILs, got "
+               f"{rows['ledger.standin']}")
+
+        def reset_uncounted(requests):
+            return requests + [_standin_request(51, 250, [], answer="reset", stored=False,
+                                                cue="c0s2")]
+
+        run_dir = _ledger_run(tmp, "reset", standin_edit=lambda r: r,
+                              timeline_extra=_respond_fault("c0s2", 240, 260, answer="reset"))
+        requests = standin.read_record((run_dir / "logs" / "standin.stdout").read_text())[0]
+        _write_standin(run_dir, reset_uncounted(requests))
+        rows = {r.id: r for r in checks.run_all(run_dir)}
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "reset 1 request(s), sink counted 0 network_error"
+               in rows["ledger.standin"].detail,
+               f"a reset the sink didn't count as network_error FAILs, got "
+               f"{rows['ledger.standin']}")
+        with open(run_dir / "logs" / "logit.stdout", "a") as out:
+            out.write("\n".join(_line(_stamp(T0 + o), "logit.output.requests", "sum", 1,
+                                      component="sink", attrs={"class": "network_error"})
+                                for o in (250, 255)) + "\n")
+        rows = {r.id: r for r in checks.run_all(run_dir)}
+        expect(rows["ledger.standin"].status == checks.PASS,
+               f"network_error at or above the resets PASSes (a connect failure counts there "
+               f"too), got {rows['ledger.standin']}")
+
+        def outside(requests):
+            requests[-1]["cue"] = "c0s2"
+            requests[-1]["status"] = 503
+            requests[-1]["stored"] = True
+            return requests
+
+        rows, _ = results("outside-span", outside,
+                          timeline_extra=_respond_fault("c0s2", 240, 260, status=503))
+        detail = " ".join(rows["ledger.standin"].lines)
+        expect(rows["ledger.standin"].status == checks.FAIL and "outside its span" in detail,
+               f"an answer under a cue outside its step's span FAILs, got "
+               f"{rows['ledger.standin']}")
+
+        def uncued(requests):
+            requests[-1]["status"] = 503
+            return requests
+
+        rows, _ = results("uncued", uncued)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "with no cue" in " ".join(rows["ledger.standin"].lines),
+               f"a non-default answer with no cue FAILs, got {rows['ledger.standin']}")
+
+
+def _class_signatures():
+    """`ledger.standin`'s check of each classed step, and the cued `rejected` excusal in
+    `ledger.egress`, `ledger.summary`, and `drops`, each against a run with the step and one
+    without it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def log(offset, message, key="retrying", component="sink", level="ERROR"):
+            return (offset, level, message, {"key": key, "component": component})
+
+        def run(name, cls, stderr=(), drops=(), status=503, answer=None, sut_config=None,
+                action="respond"):
+            extra = [_line(_stamp(T0 + offset), "logit.component.batches.dropped", "sum", n,
+                           component="sink", attrs={"reason": reason})
+                     for offset, reason, n in drops]
+            timeline = _respond_fault("c0s2", 240, 260, status=None if answer else status,
+                                      cls=cls, answer=answer, action=action)
+            run_dir = _ledger_run(tmp, name, standin_edit=lambda r: r, sut_extra=extra,
+                                  stderr_extra=stderr, timeline_extra=timeline)
+            if sut_config is not None:
+                (run_dir / "configs").mkdir(exist_ok=True)
+                (run_dir / "configs" / "sut.yaml").write_text(sut_config)
+                resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+                resolved["configs"] = {"sut": "sut.yaml"}
+                (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        held = [log(241, "send failed (ambiguous): 503: busy; retrying until it succeeds")]
+        rows = run("ambiguous", "ambiguous", held)
+        expect(rows["ledger.standin"].status == checks.PASS,
+               f"an ambiguous step with a retrying (ambiguous) line PASSes, got "
+               f"{rows['ledger.standin']}")
+        rows = run("ambiguous-as-refused", "ambiguous",
+                   [log(241, "send failed (refused): 503: busy; retrying until it succeeds")])
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "expected retrying (ambiguous) and no drop" in rows["ledger.standin"].detail,
+               f"an ambiguous step the sink read as refused FAILs, got {rows['ledger.standin']}")
+        rows = run("refused-silent", "refused", status=401)
+        expect(rows["ledger.standin"].status == checks.FAIL,
+               f"a refused step with no retrying line FAILs, got {rows['ledger.standin']}")
+        rows = run("refused-dropped", "refused",
+                   [log(241, "send failed (refused): 401: no; retrying until it succeeds")],
+                   drops=[(250, "rejected", 1)], status=401)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "dropped rejected 1" in rows["ledger.standin"].detail,
+               f"a refused step that dropped a batch FAILs, got {rows['ledger.standin']}")
+        rows = run("clean", "clean",
+                   [log(241, "send failed (clean): connect error; retrying until it succeeds")],
+                   action="stop")
+        expect(rows["ledger.standin"].status == checks.PASS,
+               f"a stop of the stand-in read clean PASSes, got {rows['ledger.standin']}")
+
+        rejected = [(250, "rejected", 2)]
+        rows = run("rejected", "rejected", drops=rejected, status=400)
+        expect(rows["ledger.standin"].status == checks.PASS,
+               f"a rejected step that dropped a batch PASSes, got {rows['ledger.standin']}")
+        for row in ("ledger.egress", "ledger.summary", "drops"):
+            expect(rows[row].status == checks.PASS,
+                   f"a rejected drop inside a cued rejected step doesn't FAIL {row}, got "
+                   f"{rows[row]}")
+        expect("rejected 2 cued by c0s2, counted" in rows["ledger.egress"].detail,
+               f"ledger.egress names the cued drops, got {rows['ledger.egress'].detail}")
+        rows = run("rejected-held", "rejected", held, status=400)
+        expect(rows["ledger.standin"].status == checks.FAIL,
+               f"a rejected step the sink retried FAILs, got {rows['ledger.standin']}")
+        late = [(260 + 10 + 45 + 5, "rejected", 1)]
+        rows = run("rejected-late", "rejected", drops=rejected + late, status=400)
+        for row in ("ledger.egress", "ledger.summary"):
+            expect(rows[row].status == checks.FAIL and "1 batch(es) rejected" in rows[row].detail,
+                   f"a rejected drop past the step's window FAILs {row}, got {rows[row]}")
+        rows = run("rejected-uncued", "refused", drops=rejected, status=401,
+                   stderr=[log(241, "send failed (refused): 401: no; retrying")])
+        expect(rows["ledger.egress"].status == checks.FAIL,
+               f"a rejected drop inside a step that expects another class FAILs ledger.egress, "
+               f"got {rows['ledger.egress']}")
+
+        amo = ("components:\n  window: { type: aggregate, interval: 10s }\n"
+               "  sink:\n    type: prometheus_out\n    buffer: { delivery: at_most_once }\n")
+        rows = run("amo", "ambiguous", drops=[(250, "ambiguous_at_most_once", 1)],
+                   sut_config=amo)
+        expect(rows["ledger.standin"].status == checks.PASS
+               and "at_most_once" in rows["ledger.standin"].detail,
+               f"under at_most_once an ambiguous step drops, got {rows['ledger.standin']}")
+        rows = run("amo-held", "ambiguous", held, sut_config=amo)
+        expect(rows["ledger.standin"].status == checks.FAIL,
+               f"under at_most_once an ambiguous step that retried FAILs, got "
+               f"{rows['ledger.standin']}")
+
+
+def _datadog_codec(root):
+    """The `datadog` shape's decoders: a series body `datadog_out` sent, from
+    `standin/datadog-vectors.json`, through gzip and the `MetricPayload` walker; deflate and no
+    compression; the fixture encoder's round trip; and the bodies and encodings refused."""
+    vectors = json.loads((root / "standin" / "datadog-vectors.json").read_text())
+    raw = bytes.fromhex(vectors["datadog_out_series_body"])
+    want = vectors["datadog_out_series_body_expect"]["series"]
+    decoded = standin.metric_payload(standin.decompress(raw, vectors["content_encoding"]))
+    got = [{"metric": one["metric"], "resources": [list(r) for r in one["resources"]],
+            "tags": one["tags"], "points": [list(p) for p in one["points"]],
+            "type": one["type"], "interval": one["interval"]} for one in decoded]
+    expect(vectors["content_encoding"] == "gzip" and got == want and len(got) == 5
+           and all(one["type"] == "count" and one["interval"] == 2
+                   and one["resources"] == [["host", "logit-soak"]] for one in got),
+           f"a gzip series body datadog_out sent decodes to its 5 count series, got {got[:1]}")
+    request = {"body_b64": base64.b64encode(raw).decode(), "content_encoding": "gzip"}
+    body = standin.decode_body(request, standin.DATADOG)
+    expect(len(body) == 5 and body[0][0] == {"__name__": want[0]["metric"], "type": "count",
+                                             "tags": "", "resources": "host:logit-soak"}
+           and body[0][1] == [(want[0]["points"][0][0] * 1000, want[0]["points"][0][1])],
+           f"decode_body names a datadog series by its name, type, tags, and resources, "
+           f"timestamps in ms, got {body[:1]}")
+    series = [{"metric": "m.b", "resources": [("host", "h"), ("device", "sda")],
+               "tags": ["env:x", "a"], "points": [(1791720000, 1.5), (-3, -2.0)],
+               "type": "gauge", "interval": 0},
+              {"metric": "m.a", "resources": [], "tags": [], "points": [], "type": "rate",
+               "interval": 20}]
+    payload = standin.encode_metric_payload(series)
+    expect(standin.metric_payload(payload) == series,
+           "the fixture encoder round-trips every field, a negative timestamp as an int64")
+    for encoding, data in (("gzip", gzip.compress(payload)), ("deflate", zlib.compress(payload)),
+                           (None, payload)):
+        expect(standin.decompress(data, encoding) == payload,
+               f"a {encoding or 'plain'} body decompresses")
+    labels = standin.datadog_labels(series[0])
+    expect(labels["tags"] == "a,env:x" and labels["resources"] == "device:sda,host:h",
+           f"a series' labels sort its tags and resources, got {labels}")
+    for data, encoding, needle in ((payload, "gzip", "gzip"), (b"\x78\x9c", "deflate",
+                                                               "deflate"),
+                                   (payload, "zstd", "not gzip, deflate, or none"),
+                                   (b"\x0a\x05\x12", None, "truncated")):
+        try:
+            standin.decode_body({"body_b64": base64.b64encode(data).decode(),
+                                 "content_encoding": encoding}, standin.DATADOG)
+            expect(False, f"a {encoding} body {data[:4]!r} decoded")
+        except standin.DecodeError as err:
+            expect(needle in str(err), f"a bad {encoding} body names {needle!r}, got {err}")
+
+
+def _datadog_counts():
+    """`stored_counts` over a `datadog` record: V sums distinct copies with no last write
+    winning, a same-value copy is a duplicate naming both requests, a changed value is a
+    conflict and still summed, a `series_errors` answer's first N series are left out and
+    named, an unstored or undecodable request is left out of V; and `acknowledged_unstored`
+    leaves the named series out."""
+    requests = [
+        _datadog_request(1, 10, [("a", [(1000, 1.0)]), ("b", [(1000, 5.0)])]),
+        _datadog_request(2, 11, [("a", [(1000, 1.0)])], status=503, cue="c0s1"),
+        _datadog_request(3, 12, [("b", [(1000, 6.0)])]),
+        _datadog_request(4, 13, [("a", [(2000, 3.0)])], status=400, stored=False),
+        _datadog_request(5, 14, [("c", [(3000, 7.0)]), ("a", [(3000, 2.0)])],
+                         series_errors=1, cue="c0s2"),
+        {**_datadog_request(6, 15, [("a", [(4000, 4.0)])]), "body_b64": "!!"},
+        _datadog_request(7, 16, [("a", [(5000, 9.0)])], encoding="deflate"),
+    ]
+    counts = standin.stored_counts(requests)
+    a = standin.series_key(standin.datadog_labels({"metric": "a", "type": "count", "tags": [],
+                                                   "resources": [("host", "logit-soak")]}))
+    b = standin.series_key(dict(a) | {"__name__": "b"})
+    expect(sorted(counts.points) == [(1000, 1.0), (1000, 5.0), (1000, 6.0), (3000, 2.0),
+                                     (5000, 9.0)],
+           f"V's terms are every distinct stored copy, a changed value summed beside the "
+           f"first, got {counts.points}")
+    expect(counts.duplicates == [(a, 1000000, 1.0, 0, 1)]
+           and counts.conflicts == [(b, 1000000, 5.0, 6.0)],
+           f"a same-value copy is a duplicate naming both requests and a changed one a "
+           f"conflict, got {counts.duplicates} {counts.conflicts}")
+    expect(counts.named == [(5, 1, T0 + 14)] and [s for s, _ in counts.undecodable] == [6],
+           f"a series_errors answer names its first series and a bad body is listed, got "
+           f"{counts.named} {counts.undecodable}")
+    b_series = next(one for one in counts.series if one["metric"]["__name__"] == "b")
+    expect(b_series["values"] == [11.0] and not any(
+        one["metric"]["__name__"] == "c" for one in counts.series),
+           f"the export sums a point's copies and holds no named series, got {counts.series}")
+    lost = standin.acknowledged_unstored(requests, counts.series, standin.DATADOG)
+    expect(lost == [], f"every 2xx point is stored but the named one, got {lost}")
+    counts.series = [one for one in counts.series if one["metric"]["__name__"] != "a"]
+    lost = standin.acknowledged_unstored(requests, counts.series, standin.DATADOG)
+    expect(sorted(stamp for _, stamp in lost) == [1000000, 3000000, 5000000],
+           f"a 2xx point missing from V is named, got {lost}")
+    expect(standin.points_in(requests[4], standin.DATADOG) == 2
+           and standin.points_in(requests[5], standin.DATADOG) == 0,
+           "points_in counts a body's points, and 0 for one that doesn't decode")
+
+
+def _datadog_server(root):
+    """The stand-in's `datadog` shape on loopback ports: the `series_errors` cue rules, the
+    default `202` on `/api/v2/series`, and a `series_errors` answer whose body `datadog_out`'s
+    `series_errors` reads as N entries, recorded with the count."""
+    import http.client
+    import http.server
+    import io
+    import threading
+    server = _load_standin_server(root)
+    for cue, shape, needle in (
+            ({"step": "x", "status": 202, "series_errors": 2}, "remote_write",
+             "for the datadog shape"),
+            ({"step": "x", "status": 202, "series_errors": 0}, "datadog", "positive integer"),
+            ({"step": "x", "status": 202, "series_errors": True}, "datadog", "positive integer"),
+            ({"step": "x", "status": 202, "series_errors": 1, "body": "x"}, "datadog",
+             "takes no `body`"),
+            ({"step": "x", "status": 400, "series_errors": 1}, "datadog", "2xx `status`"),
+            ({"step": "x", "answer": "reset", "series_errors": 1}, "datadog", "2xx `status`")):
+        problems = server.cue_problems(cue, shape)
+        expect(any(needle in p for p in problems), f"cue {cue} under {shape} refused with "
+               f"{needle!r}, got {problems}")
+    expect(server.cue_problems({"step": "x", "status": 202, "series_errors": 3}, "datadog") == [],
+           "a 202 with series_errors under the datadog shape is accepted")
+
+    def errors(body):
+        """`datadog_out`'s `series_errors`: field 1 entries, stopping at anything else."""
+        found, pos = [], 0
+        while pos < len(body):
+            key, pos = standin._varint(body, pos)
+            if key != (1 << 3 | 2):
+                break
+            size, pos = standin._varint(body, pos)
+            found.append(body[pos:pos + size].decode())
+            pos += size
+        return found
+
+    state = server.State("datadog", "/api/v2/series")
+    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
+    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    for one in (data, control):
+        threading.Thread(target=one.serve_forever, daemon=True).start()
+    printed = io.StringIO()
+    real_stdout = server.sys.stdout
+    server.sys.stdout = printed
+    control_base = f"http://127.0.0.1:{control.server_address[1]}"
+
+    def post(path):
+        conn = http.client.HTTPConnection("127.0.0.1", data.server_address[1], timeout=5)
+        try:
+            conn.request("POST", path, body=b"payload", headers={"Content-Encoding": "gzip"})
+            response = conn.getresponse()
+            return (response.status, response.getheader("Content-Type"), response.read())
+        finally:
+            conn.close()
+
+    try:
+        first = post("/api/v2/series")
+        rc, _ = faults.post_cue(control_base, {"step": "c0s1", "status": 202,
+                                               "series_errors": 2})
+        second = post("/api/v2/series")
+        rc_bad, err = faults.post_cue(control_base, {"step": "c0s2", "status": 400,
+                                                     "series_errors": 1})
+        faults.post_cue(control_base, {})
+        third = post("/api/v1/write")
+        deadline = time.monotonic() + 5
+        while (printed.getvalue().count('"event": "request"') < 3
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+    finally:
+        server.sys.stdout = real_stdout
+        for one in (data, control):
+            one.shutdown()
+            one.server_close()
+    expect(first[0] == 202 and first[2] == b"" and second[0] == 202
+           and second[1] == "application/x-protobuf" and len(errors(second[2])) == 2
+           and third[0] == 404,
+           f"the datadog shape answers 202, then a body naming 2 series, and 404 off its "
+           f"path, got {[first, second, third]}")
+    expect(rc == 0 and rc_bad == 1 and "2xx `status`" in err,
+           f"the control port refuses series_errors on a 400, got {rc} {rc_bad} {err}")
+    requests = [json.loads(line) for line in printed.getvalue().splitlines()
+                if '"event": "request"' in line]
+    got = [(r["status"], r["stored"], r.get("series_errors")) for r in requests]
+    expect(got == [(202, True, None), (202, True, 2), (404, False, None)],
+           f"the record carries series_errors on the answer that named series, got {got}")
+
+
+def _datadog_rules(root):
+    """`[target] shape`, the `series_errors` key, and the `datadog` shape's `class` rules;
+    `standin-datadog` loading with its shape, cue, and compose variable."""
+    path = root / "scenarios" / "standin-datadog" / "scenario.toml"
+    base = tomllib.loads(path.read_text())
+    rw_path, rw_base = _standin_base(root)
+    vm_path, vm_base = _base(root)
+    loaded = scenario.load(path)
+    expect(loaded.standin_shape == "datadog"
+           and loaded.target == {"kind": "standin", "name": "standin", "env": [],
+                                 "shape": "datadog"}
+           and scenario.target_json(loaded.target)["shape"] == "datadog",
+           f"standin-datadog loads as a datadog stand-in, got {loaded.target}")
+    first = scenario.expand(loaded)[0]
+    expect(first.cue() == {"step": "c0s1", "status": 202, "series_errors": 2}
+           and first.expected() == {"status": 202, "series_errors": 2},
+           f"series_errors travels in the cue and the timeline, got {first.cue()} "
+           f"{first.expected()}")
+    expect(scenario.load(rw_path).standin_shape == "remote_write"
+           and scenario.load(vm_path).standin_shape is None,
+           "a stand-in target's shape defaults to remote_write, and other targets have none")
+    compose = (root / "compose.yaml").read_text()
+    expect(f'"${{{scenario.STANDIN_SHAPE_ENV}:-remote_write}}"' in compose,
+           "compose.yaml passes the shape's compose variable to standin.py")
+
+    def mutate(raw, edit):
+        raw = copy.deepcopy(raw)
+        edit(raw)
+        return raw
+
+    def step(index, **changes):
+        def edit(raw):
+            for key in [k for k, v in changes.items() if v is None]:
+                raw["step"][index].pop(key, None)
+            raw["step"][index].update({k: v for k, v in changes.items() if v is not None})
+        return edit
+
+    cases = [
+        (base, lambda raw: raw["target"].update(shape="splunk"),
+         "target.shape must be one of remote_write, datadog", "an unknown shape"),
+        (vm_base, lambda raw: raw.update(target={"kind": "victoria-metrics",
+                                                 "shape": "datadog"}),
+         "target.shape is for a standin target", "a shape on the local target"),
+        (rw_base, step(0, status=202, series_errors=1, **{"class": None}),
+         "`series_errors` is for a standin target with shape 'datadog'",
+         "series_errors under the remote_write shape"),
+        (base, step(0, series_errors=0), "`series_errors` must be a positive integer",
+         "a zero series_errors"),
+        (base, step(0, series_errors="2"), "`series_errors` must be a positive integer",
+         "a string series_errors"),
+        (base, step(0, body="x"), "`series_errors` writes the body", "a body beside it"),
+        (base, step(1, series_errors=1), "`series_errors` goes with a 2xx `status`",
+         "series_errors on a 400"),
+        (base, step(15, series_errors=1), "`series_errors` is for respond only",
+         "series_errors on a stop"),
+        (base, step(1, **{"class": None}), "a respond other than a 2xx needs `class`",
+         "a 400 with no class"),
+        (base, step(14, **{"class": None}), "a respond other than a 2xx needs `class`",
+         "a reset with no class"),
+        (base, step(0, **{"class": "ambiguous"}), "a 2xx isn't a fault, so it takes no `class`",
+         "a class on a 202"),
+    ]
+    paths = {id(base): path, id(rw_base): rw_path, id(vm_base): vm_path}
+    for raw, edit, needle, what in cases:
+        _refused(paths[id(raw)], mutate(raw, edit), needle, what)
+    remote = copy.deepcopy(rw_base)
+    remote["step"][11]["status"] = 501
+    remote["step"][11].pop("class", None)
+    expect(scenario.from_dict(remote, rw_path).steps[11].fault_class is None,
+           "the remote_write shape doesn't require a class on a 501")
+    # The scenario's class is the expectation the checks judge against the sink, so the
+    # loader takes any class word on a fault.
+    stated = mutate(base, step(1, **{"class": "refused"}))
+    expect(scenario.from_dict(stated, path).steps[1].fault_class == "refused",
+           "the datadog shape loads a 400 classed refused, for the checks to judge")
+
+
+def _datadog_checks():
+    """The checks over a `datadog` stand-in two-life run: V as the sum of distinct points,
+    `ledger.sent` judging the sink with each cued refusal, rejected batch, and rejected or
+    oversize record excused inside a matching step and FAILing outside one, `drops` leaving the
+    sink's records to it, duplicates reported under `at_least_once` and FAILing under
+    `at_most_once` or after a 2xx, a changed resend summed into a surplus, the `series_errors`
+    and rejected-status reconciliation against `records.dropped`, and each request's class
+    against `datadog_out`'s table."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def log(offset, message, key, component="sink", level="WARN"):
+            return (offset, level, message, {"key": key, "component": component})
+
+        def drop(offset, metric, reason, n, received=False):
+            out = [_line(_stamp(T0 + offset), metric, "sum", n, component="sink",
+                         attrs={"reason": reason, "route": "series"})]
+            if received:
+                out.append(_line(_stamp(T0 + offset), "logit.component.batches.received",
+                                 "sum", n, component="sink"))
+            return out
+
+        def results(name, edit=lambda requests: requests, sut_config=None, **kwargs):
+            run_dir = _ledger_run(tmp, name, standin_edit=edit, standin_shape="datadog",
+                                  **kwargs)
+            if sut_config is not None:
+                (run_dir / "configs").mkdir(exist_ok=True)
+                (run_dir / "configs" / "sut.yaml").write_text(sut_config)
+                resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+                resolved["configs"] = {"sut": "sut.yaml"}
+                (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        rows = results("dd-clean")
+        for row in ("ledger.egress", "ledger.summary", "ledger.standin", "ledger.sent",
+                    "drops"):
+            expect(rows[row].status == checks.PASS,
+                   f"a datadog stand-in run that balances PASSes {row}, got {rows[row]}")
+        expect(not rows["ledger.sent"].detail.startswith("SENT")
+               and "ledger.egress and ledger.standin read the stand-in's record"
+               in rows["ledger.sent"].detail,
+               f"ledger.sent on a stand-in names the record as the rest of the evidence, got "
+               f"{rows['ledger.sent'].detail}")
+        expect("0 duplicate copies" in rows["ledger.standin"].detail
+               and "the sum of the distinct points' values" in " ".join(
+                   rows["ledger.egress"].lines),
+               f"V is the distinct points' sum, with no duplicate, got "
+               f"{rows['ledger.standin'].detail}")
+
+        # A 503 after storing (`apply`), resent: the copy is a duplicate.
+        def resent(requests):
+            again = copy.deepcopy(requests[-1])
+            requests[-1].update(status=503, cue="c0s2")
+            again.update(seq=99, t=again["t"] + 0.5)
+            return requests + [again]
+
+        applied = _respond_fault("c0s2", 290, 305, status=503)
+        rows = results("dd-duplicate", resent, timeline_extra=applied)
+        expect(rows["ledger.standin"].status == checks.PASS
+               and "2 duplicate copies of stored points (life 1 2)"
+               in rows["ledger.standin"].detail
+               and "which at_least_once permits" in " ".join(rows["ledger.standin"].lines),
+               f"a resend after an applied 503 is a duplicate at_least_once permits, reported, "
+               f"got {rows['ledger.standin']}")
+        expect(rows["ledger.egress"].status == checks.PASS,
+               f"a duplicate copy isn't summed into V, got {rows['ledger.egress']}")
+        amo = ("components:\n  window: { type: aggregate, interval: 10s }\n"
+               "  sink:\n    type: datadog_out\n    buffer: { delivery: at_most_once }\n")
+        rows = results("dd-duplicate-amo", resent, timeline_extra=applied, sut_config=amo)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "a resend under at_most_once" in rows["ledger.standin"].detail,
+               f"a duplicate under at_most_once FAILs, got {rows['ledger.standin']}")
+
+        def resent_accepted(requests):
+            again = copy.deepcopy(requests[-1])
+            again.update(seq=99, t=again["t"] + 0.5)
+            return requests + [again]
+
+        rows = results("dd-duplicate-2xx", resent_accepted)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "the sink resent a point it saw accepted" in rows["ledger.standin"].detail,
+               f"a resend of a point the stand-in answered 2xx FAILs, got "
+               f"{rows['ledger.standin']}")
+
+        # A 2xx in life 0 sent again in life 1: a new SUT life resends what its spool held.
+        def resent_next_life(requests):
+            again = copy.deepcopy(requests[0])
+            again.update(seq=99, t=T0 + 250)
+            return requests + [again]
+
+        rows = results("dd-duplicate-next-life", resent_next_life)
+        expect(rows["ledger.standin"].status == checks.PASS
+               and "2 duplicate copies of stored points (life 0 2)"
+               in rows["ledger.standin"].detail,
+               f"a 2xx point resent in a later SUT life is a reported duplicate, got "
+               f"{rows['ledger.standin']}")
+
+        # The stand-in restarts after the applied 503, and its request numbers start again at
+        # 1, so a later 2xx carries the 503's number. The resend must still read as one.
+        def restarted(requests):
+            requests = resent(requests)
+            applied_seq = requests[-2]["seq"]
+            requests[-1]["seq"] = 1
+            requests += [_datadog_request(seq, 301 + seq, []) for seq in
+                         range(2, applied_seq + 1)]
+            return requests
+
+        rows = results("dd-duplicate-restarted", restarted, timeline_extra=applied)
+        expect(rows["ledger.standin"].status == checks.PASS
+               and "2 duplicate copies of stored points (life 1 2)"
+               in rows["ledger.standin"].detail,
+               f"a resend after a stand-in restart reuses request numbers and is still a "
+               f"permitted duplicate, got {rows['ledger.standin']}")
+
+        def changed(requests):
+            again = copy.deepcopy(requests[-1])
+            body = standin.metric_payload(gzip.decompress(base64.b64decode(again["body_b64"])))
+            body[0]["points"] = [(stamp, value + 7) for stamp, value in body[0]["points"]]
+            payload = gzip.compress(standin.encode_metric_payload(body), mtime=0)
+            again.update(seq=99, t=again["t"] + 0.5,
+                         body_b64=base64.b64encode(payload).decode())
+            return requests + [again]
+
+        rows = results("dd-changed", changed)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "a resend changed a sample" in rows["ledger.standin"].detail
+               and rows["ledger.egress"].status == checks.FAIL
+               and "surplus" in rows["ledger.egress"].detail,
+               f"a changed resend is summed, no last write winning: a surplus, got "
+               f"{rows['ledger.standin']} {rows['ledger.egress']}")
+
+        # A 202 naming the request's first series, at +299 under its cue.
+        def named(requests):
+            requests[-1].update(series_errors=1, cue="c0s2")
+            return requests
+
+        cued_named = _respond_fault("c0s2", 290, 305, status=202, series_errors=1)
+        rows = results("dd-named", named, timeline_extra=cued_named,
+                       sut_extra=drop(300, "logit.output.records.dropped", "rejected", 1))
+        for row in ("ledger.standin", "ledger.egress", "ledger.summary", "ledger.sent",
+                    "drops"):
+            expect(rows[row].status == checks.PASS,
+                   f"a cued series_errors drop counted by the sink PASSes {row}, got {rows[row]}")
+        expect("records dropped: rejected 1" in rows["ledger.egress"].detail
+               and "record(s) dropped rejected 1 by c0s2" in rows["ledger.sent"].detail
+               and "1 series named by series_errors" in rows["ledger.standin"].detail,
+               f"the named series are counted, cued, and reported, got "
+               f"{rows['ledger.egress'].detail} | {rows['ledger.sent'].detail}")
+        rows = results("dd-named-uncounted", named, timeline_extra=cued_named)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "counted 0 record(s) dropped rejected, the record holds 1"
+               in rows["ledger.standin"].detail,
+               f"a named series the sink didn't count FAILs, got {rows['ledger.standin']}")
+        rows = results("dd-named-uncued", named,
+                       sut_extra=drop(300, "logit.output.records.dropped", "rejected", 1))
+        expect(rows["ledger.sent"].status == checks.FAIL
+               and "1 record(s) dropped rejected, refused" in rows["ledger.sent"].detail
+               and rows["drops"].status == checks.PASS,
+               f"an uncued record drop FAILs ledger.sent and stays out of drops, got "
+               f"{rows['ledger.sent']} {rows['drops']}")
+
+        # A 400 rejecting the last request, inside a cued rejected step and outside one.
+        def rejected(requests, status=400, cue="c0s2"):
+            requests[-1].update(status=status, stored=False, cue=cue)
+            return requests
+
+        def rejected_extra(reason="rejected"):
+            return (drop(300, "logit.output.records.dropped", reason, 2)
+                    + drop(300, "logit.component.batches.dropped", "rejected", 1, received=True))
+
+        held = log(299, "send failed (rejected): 400", "retrying", level="ERROR")
+        rejection = log(299.5, "https://standin/api/v2/series answered 400, 2 record(s) "
+                        "dropped: bad", "request_rejected")
+        cued_400 = _respond_fault("c0s2", 290, 305, status=400, cls="rejected")
+        rows = results("dd-rejected", rejected, timeline_extra=cued_400,
+                       sut_extra=rejected_extra(), stderr_extra=[rejection])
+        for row in ("ledger.standin", "ledger.sent", "ledger.egress", "drops"):
+            expect(rows[row].status == checks.PASS,
+                   f"a cued 400 PASSes {row}, got {rows[row]}")
+        expect("batch(es) dropped rejected 1 by c0s2" in rows["ledger.sent"].detail
+               and "record(s) dropped rejected 2 by c0s2" in rows["ledger.sent"].detail,
+               f"ledger.sent names the cued drops, got {rows['ledger.sent'].detail}")
+        rows = results("dd-rejected-uncued", rejected,
+                       sut_extra=rejected_extra(), stderr_extra=[rejection],
+                       timeline_extra=_respond_fault("c0s2", 290, 305, status=400))
+        expect(rows["ledger.sent"].status == checks.FAIL
+               and "1 batch(es) dropped rejected, the destination refused them"
+               in rows["ledger.sent"].detail,
+               f"a rejected batch inside a step with no class FAILs ledger.sent, got "
+               f"{rows['ledger.sent']}")
+        rows = results("dd-rejected-held", rejected, timeline_extra=cued_400,
+                       sut_extra=rejected_extra(), stderr_extra=[rejection, held])
+        expect(rows["ledger.standin"].status == checks.FAIL,
+               f"a 400 the sink retried FAILs its signature, got {rows['ledger.standin']}")
+        rows = results("dd-rejected-uncounted", rejected, timeline_extra=cued_400,
+                       sut_extra=drop(300, "logit.component.batches.dropped", "rejected", 1,
+                                      received=True))
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "counted 0 record(s) dropped rejected, the record holds 2"
+               in rows["ledger.standin"].detail,
+               f"a 400's points the sink didn't count dropped FAIL, got "
+               f"{rows['ledger.standin']}")
+
+        cued_413 = _respond_fault("c0s2", 290, 305, status=413, cls="rejected")
+        rows = results("dd-oversize", lambda r: rejected(r, 413), timeline_extra=cued_413,
+                       sut_extra=rejected_extra("oversize"))
+        expect(rows["ledger.sent"].status == checks.PASS
+               and rows["ledger.standin"].status == checks.PASS
+               and "record(s) dropped oversize 2 by c0s2" in rows["ledger.sent"].detail,
+               f"a cued 413's oversize records are excused, got {rows['ledger.sent']} "
+               f"{rows['ledger.standin']}")
+        rows = results("dd-oversize-in-400", rejected, timeline_extra=cued_400,
+                       sut_extra=rejected_extra("oversize"))
+        expect(rows["ledger.sent"].status == checks.FAIL
+               and "2 record(s) dropped oversize" in rows["ledger.sent"].detail
+               and rows["ledger.standin"].status == checks.FAIL,
+               f"oversize records inside a 400's step aren't its doing, got "
+               f"{rows['ledger.sent']} {rows['ledger.standin']}")
+
+        # A refusal: the sink holds, logs its class and the refusal line, and resends.
+        def refused(requests, status=403):
+            first = copy.deepcopy(requests[-1])
+            first.update(status=status, stored=False, cue="c0s2", seq=98)
+            requests[-1]["t"] += 0.5
+            return requests[:-1] + [first, requests[-1]]
+
+        key_line = log(299.2, "Datadog refused the API key: https://standin/api/v2/series "
+                       "answered 403 -- check 'api_key'", "api_key_rejected")
+        retrying = log(299.1, "send failed (refused): 403; retrying until it succeeds",
+                       "retrying", level="ERROR")
+        cued_403 = _respond_fault("c0s2", 290, 305, status=403, cls="refused")
+        rows = results("dd-refused", refused, timeline_extra=cued_403,
+                       stderr_extra=[retrying, key_line])
+        expect(rows["ledger.sent"].status == checks.PASS
+               and "api_key_rejected line(s) 1 by c0s2" in rows["ledger.sent"].detail
+               and rows["ledger.standin"].status == checks.PASS,
+               f"a cued 403's refusal line is excused, got {rows['ledger.sent']} "
+               f"{rows['ledger.standin']}")
+        late = log(250, "https://standin/api/v2/series answered 401: no", "request_refused")
+        rows = results("dd-refused-uncued", refused, timeline_extra=cued_403,
+                       stderr_extra=[retrying, key_line, late])
+        expect(rows["ledger.sent"].status == checks.FAIL
+               and "1 request_refused line(s) (status 401" in rows["ledger.sent"].detail,
+               f"a refusal line outside every cued refused step FAILs, got "
+               f"{rows['ledger.sent']}")
+        rows = results("dd-refused-as-ambiguous", refused, stderr_extra=[retrying, key_line],
+                       timeline_extra=_respond_fault("c0s2", 290, 305, status=403,
+                                                     cls="ambiguous"))
+        detail = " ".join(rows["ledger.standin"].lines)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "c0s2 (respond on standin, 403): ambiguous: retrying (refused), dropped 0; "
+               "expected retrying (ambiguous) and no drop" in detail
+               and rows["ledger.sent"].status == checks.FAIL,
+               f"a 403 the sink logged refused under a step classed ambiguous FAILs its "
+               f"signature and isn't excused, got "
+               f"{rows['ledger.standin']} {rows['ledger.sent']}")
+        rows = results("dd-501", lambda r: refused(r, 501), timeline_extra=_respond_fault(
+            "c0s2", 290, 305, status=501, cls="ambiguous"),
+            stderr_extra=[log(299.1, "send failed (ambiguous): 501; retrying", "retrying",
+                              level="ERROR")])
+        expect(rows["ledger.standin"].status == checks.PASS,
+               f"a 501 the sink read as ambiguous PASSes, got {rows['ledger.standin']}")
+        rows = results("dd-501-refused", lambda r: refused(r, 501), timeline_extra=_respond_fault(
+            "c0s2", 290, 305, status=501, cls="ambiguous"),
+            stderr_extra=[log(299.1, "send failed (refused): 501; retrying", "retrying",
+                              level="ERROR")])
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "expected retrying (ambiguous)" in rows["ledger.standin"].detail,
+               f"a 501 the sink read as refused FAILs its signature, got "
+               f"{rows['ledger.standin']}")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -4667,12 +5926,17 @@ def run(root, quiet=False):
                      _report, _expected_event_rules, _exit_driver, _ready_words, _exit_watchdog,
                      _script_ledger, _sink_ledger, _roles, _sink_rules, _driver_roles,
                      _sources_ledger, _source_rules, _fanin_driver, _per_service, _slope_edges,
-                     _expected_rules, _slope_reducer, _shipped):
+                     _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
+                     _standin_server, _respond_rules, _standin_driver, _standin_checks,
+                     _class_signatures, _datadog_codec, _datadog_counts, _datadog_server,
+                     _datadog_rules, _datadog_checks, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
-                              _fanin_driver, _expected_rules)
+                              _fanin_driver, _expected_rules, _standin_codec, _standin_server,
+                              _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
+                              _datadog_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")

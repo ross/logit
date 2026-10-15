@@ -38,6 +38,17 @@ listeners' symbols, since their events merge there; a source's `sut_transforms` 
 by hop in `ledger.edge`. `recovery` judges the listeners' summed ingest against the generators'
 summed warmup rate.
 
+A run against a stand-in target (`[target] kind = "standin"`) has no VictoriaMetrics either: V
+is what the stand-in's record says it stored (standin.py), in the export's shape, so
+`ledger.egress` and `ledger.summary` judge it as they judge an export, and `ledger.standin`
+judges the record against the sink's telemetry and each classed step's effect. A batch dropped
+`rejected` inside a `respond` step that expects the `rejected` class counts its gap and doesn't
+FAIL (`Ledger.cued_rejections`); outside one it FAILs as on any target. Under the `remote_write`
+shape `ledger.sent` SKIPs. Under the `datadog` shape V is the distinct stored points' delta
+sum, judged as a Kafka topic's is (a negative gap is a surplus), and `ledger.sent` judges the
+sink as on an external target, excusing a refusal line, a rejected batch, or a rejected or
+oversize record drop inside a `respond` step that explains it (`_sent_one`).
+
 `rss_slope` and `fd_slope` judge each `logit` service on its own line, and a scenario's
 `[expected]` table can set the verdict a service should get on either (`judge_services`).
 """
@@ -49,9 +60,10 @@ import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import collect, faults, telemetry, topic, vm
+from . import collect, faults, standin, telemetry, topic, vm
 from .scenario import (EXPECT_REDUCERS, EXTERNAL_TARGET, GENERATOR_ROLE, KAFKA_TARGET,
-                       LOCAL_TARGET, LOGIT_ROLES, RUN_WINDOW, parse_duration)
+                       LOCAL_TARGET, LOGIT_ROLES, RUN_WINDOW, STANDIN_ROLE, STANDIN_TARGET,
+                       parse_duration)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
@@ -153,10 +165,15 @@ class Fault:
     end: float
     affects_udp_ingress: bool
     affects_egress: bool
-    # A `mark`'s `ready` word, and an `exit`'s `code` and `key`; None elsewhere.
+    # A `mark`'s `ready` word, an `exit`'s `code` and `key`, a `respond`'s status or answer,
+    # and the fault class a step expects; None elsewhere.
     ready: object = None
     code: object = None
     key: object = None
+    status: object = None
+    answer: object = None
+    fault_class: object = None
+    series_errors: object = None
 
 
 class RunData:
@@ -197,6 +214,7 @@ class RunData:
         self.external = self.target.get("kind") == EXTERNAL_TARGET
         self.kafka = self.target.get("kind") == KAFKA_TARGET
         self.has_vm = self.target.get("kind") == LOCAL_TARGET
+        self.standin = self.target.get("kind") == STANDIN_TARGET
         # A Kafka target's topic, read back after the SUT stopped; None when the file is absent.
         try:
             self.topic_text = (self.run_dir / topic.TOPIC_FILE).read_text()
@@ -240,6 +258,34 @@ class RunData:
             except (OSError, ValueError):
                 pass
 
+        # A stand-in target's record, its stdout, and V rebuilt from it for the one sink: under
+        # the `datadog` shape the stored points by copy (`standin_counts`), whose distinct
+        # copies the ledger sums, with their series in the export's shape.
+        self.standin_requests, self.standin_cues, self.standin_unparsed = [], [], 0
+        self.standin_text = None
+        self.standin_store = ([], 0, [], [])
+        self.standin_shape = (self.target.get("shape", standin.REMOTE_WRITE) if self.standin
+                              else None)
+        self.standin_counts = None
+        self.standin_datadog = self.standin_shape == standin.DATADOG
+        if self.standin:
+            service = next((name for name, role in self.services.items()
+                            if role == STANDIN_ROLE), STANDIN_TARGET)
+            try:
+                self.standin_text = (self.run_dir / "logs" / f"{service}.stdout").read_text()
+            except OSError:
+                self.standin_text = None
+            (self.standin_requests, self.standin_cues,
+             self.standin_unparsed) = standin.read_record(self.standin_text)
+            if self.standin_shape == standin.DATADOG:
+                counts = standin.stored_counts(self.standin_requests)
+                self.standin_counts = counts
+                self.standin_store = (counts.series, 0, counts.conflicts, counts.undecodable)
+            else:
+                self.standin_store = standin.stored_series(self.standin_requests)
+            for sink in self.sinks:
+                self.vm_series[sink] = self.standin_store[0]
+
     @staticmethod
     def _fault(apply, end):
         return Fault(
@@ -248,6 +294,8 @@ class RunData:
             affects_udp_ingress=apply.get("affects_udp_ingress", False),
             affects_egress=apply.get("affects_egress", False),
             ready=apply.get("ready"), code=apply.get("code"), key=apply.get("key"),
+            status=apply.get("status"), answer=apply.get("answer"),
+            fault_class=apply.get("class"), series_errors=apply.get("series_errors"),
         )
 
     def offset(self, t):
@@ -953,10 +1001,11 @@ RECOVERED_RATE_SHARE = 0.95
 # Why a row that reads V SKIPs on an external target.
 NO_BACKEND = "external target: no backend query"
 NO_VM_KAFKA = "kafka target: no VictoriaMetrics"
+NO_VM_STANDIN = "standin target: no VictoriaMetrics"
 
 
 def no_vm_reason(data):
-    return NO_VM_KAFKA if data.kafka else NO_BACKEND
+    return NO_VM_KAFKA if data.kafka else NO_VM_STANDIN if data.standin else NO_BACKEND
 
 
 # `ledger.sent`'s reading of an external sink's telemetry (`datadog_out`'s module doc, "Faults,
@@ -981,7 +1030,9 @@ REFUSAL_KEYS = ("api_key_rejected", "request_refused")
 EPOCH_BUMP_REASONS = ("rejected", "invalid_timestamp", "invalid_record", "ambiguous_at_most_once")
 # The `batches.dropped` reasons that still count an egress gap but FAIL `ledger.egress` and
 # `ledger.summary` wherever they appear, each with what it says went wrong: against a healthy
-# backend a sink has nothing rejected and a spool reads back nothing corrupt.
+# backend a sink has nothing rejected and a spool reads back nothing corrupt. A stand-in told to
+# reject isn't a healthy backend, so a `rejected` drop inside such a step doesn't FAIL
+# (`Ledger.cued_rejections`).
 FAULT_DROP_REASONS = {"rejected": "rejected by the destination",
                       "disk_corrupt": "dropped from a corrupt disk spool"}
 _ANSWERED_RE = re.compile(r"answered (\d{3})")
@@ -1047,6 +1098,9 @@ def component_duration(text, component, key):
                 return None
     return None
 
+
+# The aggregate window assumed when the SUT config names none.
+DEFAULT_AGGREGATE_INTERVAL_S = 10.0
 
 # The listener symbols the ledger keeps per listener, each also summed over the listeners.
 LISTENER_SYMBOLS = ("W", "K", "D_tel", "D_shutdown", "B", "E", "X")
@@ -1237,6 +1291,16 @@ class Ledger:
                                                                     self.life_starts)
             self.duplicates = topic.duplicates_by_life(copies, self.life_starts)
             self.resets[sink], self.mismatched[sink] = {}, []
+        # A `datadog` stand-in's one sink has the stored points for its V, distinct copies
+        # only, credited to lives by point timestamp as a Kafka record is; each extra copy is a
+        # duplicate the destination counted again (`ledger.standin` judges them).
+        self.counts_sink = (self.sinks[0] if data.standin_counts is not None and self.sinks
+                            else None)
+        if self.counts_sink is not None:
+            sink = self.counts_sink
+            self.V[sink], self.V_total[sink] = topic.totals_by_life(
+                data.standin_counts.points, self.life_starts)
+            self.resets[sink], self.mismatched[sink] = {}, []
         # Per sink, what `edge` judges: the events it received, and under `route` the events
         # its target sent; and the events `aggregate` sent, once per send whatever its fan-out.
         self.S_in = {sink: sut.counter_by_life("logit.component.events.received",
@@ -1305,6 +1369,27 @@ class Ledger:
         self.R_text = f"R {_n(self.R)} = " + " + ".join(parts)
         # The aggregate's configured window, in seconds, or None when the config doesn't say.
         self.interval = component_duration(text, self.aggregate or "", "interval")
+        # Each `respond` step that expects the `rejected` class, as `(start, end, step)`: its
+        # span widened by one aggregate window and `recovery_bound`, inside which a sink's
+        # `rejected` drop is the step's doing (`cued_rejections`). `ledger.sent` excuses in the
+        # same windows the records a step explains, a `413`'s `oversize` and any other rejected
+        # status's or a `series_errors` answer's `rejected` (`cued_records`), and the refusal
+        # lines of a step that expects `refused` (`cued_refusals`).
+        widen = (self.interval or DEFAULT_AGGREGATE_INTERVAL_S) + data.recovery_bound
+
+        def cued(match):
+            return [(fault.start, fault.end + widen, fault.step) for fault in data.faults
+                    if fault.action == "respond" and match(fault)]
+
+        self.cued = cued(lambda fault: fault.fault_class == "rejected")
+        self.cued_records = {
+            "rejected": cued(lambda fault: (fault.fault_class == "rejected"
+                                            and fault.status != 413)
+                             or fault.series_errors is not None),
+            "oversize": cued(lambda fault: fault.fault_class == "rejected"
+                             and fault.status == 413),
+        }
+        self.cued_refusals = cued(lambda fault: fault.fault_class == "refused")
 
     def _sut_config_text(self):
         """The SUT config: the run directory's copy, else the path `compose.env` names."""
@@ -1494,7 +1579,10 @@ class Ledger:
         reported, not judged here.
 
         On a Kafka target, V counts each distinct record once, so a negative gap in a life that
-        wasn't killed is a `surplus`, never a duplicate: increments V holds and Ab doesn't."""
+        wasn't killed is a `surplus`, never a duplicate: increments V holds and Ab doesn't. A
+        `datadog` stand-in's V counts each distinct point copy once, and is judged the same way;
+        its sink's `records.dropped` also counts toward a positive gap, because a request a
+        series `2xx` body partly rejected loses series with no batch dropped."""
         status, verdict, gap = self._egress(life, sinks)
         if self.fault_drops(life, sinks):
             status = FAIL
@@ -1513,9 +1601,10 @@ class Ledger:
             gap += self.residual(life)
         if gap == 0:
             return PASS, "ok", gap
-        if gap > 0 and sum(self.drop_credit(life, sinks).values()) > 0:
+        if gap > 0 and (sum(self.drop_credit(life, sinks).values()) > 0
+                        or self.record_drops(life, sinks)):
             return PASS, "counted", gap
-        if gap < 0 and self.data.kafka:
+        if gap < 0 and (self.data.kafka or self.counts_sink in sinks):
             return FAIL, "surplus", gap
         return FAIL, "uncounted", gap
 
@@ -1525,6 +1614,19 @@ class Ledger:
         for (component, reason), batches in self.dropped_batches.get(life, {}).items():
             if keep(component):
                 drops[reason] = drops.get(reason, 0) + batches
+        return drops
+
+    def record_drops(self, life, sinks):
+        """`{reason: records}` a `datadog` stand-in's sink among `sinks` dropped in `life`
+        (`logit.output.records.dropped`), or {} for any other sink."""
+        if self.counts_sink not in sinks:
+            return {}
+        drops = {}
+        for point in self.sut.matching("logit.output.records.dropped",
+                                       component=self.counts_sink):
+            if point.life == life and isinstance(point.value, (int, float)) and point.value:
+                reason = point.attributes.get("reason", "?")
+                drops[reason] = drops.get(reason, 0) + point.value
         return drops
 
     def other_sinks_drops(self, life, sinks):
@@ -1541,9 +1643,47 @@ class Ledger:
         others = set(self.sinks) - set(sinks)
         return self._drops(life, lambda component: component not in others)
 
+    def cued_rejections(self, life, sinks):
+        """`({step: batches}, outside)`: the `rejected` batch drops at `sinks` in `life` whose
+        drain falls inside a cued window (`self.cued`), by step, and the count outside every
+        one. A drain's delta covers the interval before it, so a drop counted in the first
+        drain inside a window could predate the step by up to one `internal` interval."""
+        return self.cued_split("logit.component.batches.dropped", sinks, "rejected",
+                               self.cued, life)
+
+    def cued_split(self, name, sinks, reason, windows, life=None):
+        """`({step: count}, outside)`: the `name` counts of `reason` at `sinks`, in `life` or
+        every life when None, whose drain falls inside one of `windows` (`(start, end, step)`),
+        by step, and the count outside every one."""
+        excused, outside = {}, 0
+        for sink in sinks:
+            for ts, value, point_life in self.sut.counter_points(name, component=sink,
+                                                                 reason=reason):
+                if (life is not None and point_life != life) or not value:
+                    continue
+                step = next((step for start, end, step in windows if start < ts <= end), None)
+                if step is None:
+                    outside += value
+                else:
+                    excused[step] = excused.get(step, 0) + value
+        return excused, outside
+
+    def cued_text(self, life, sinks):
+        """The cued `rejected` drops in `life` at `sinks`, as text, or ""."""
+        excused, _ = self.cued_rejections(life, sinks)
+        if not excused:
+            return ""
+        order = [step for _, _, step in sorted(self.cued)]
+        return "rejected " + ", ".join(f"{_n(excused[step])} cued by {step}"
+                                       for step in order if step in excused)
+
     def fault_drops(self, life, sinks):
-        """The `FAULT_DROP_REASONS` drops in `life`'s `drop_credit`, as text, or ""."""
-        credit = self.drop_credit(life, sinks)
+        """The `FAULT_DROP_REASONS` drops in `life`'s `drop_credit`, as text, or "", less the
+        `rejected` drops a cued step explains (`cued_rejections`)."""
+        credit = dict(self.drop_credit(life, sinks))
+        excused, _ = self.cued_rejections(life, sinks)
+        if credit.get("rejected"):
+            credit["rejected"] -= sum(excused.values())
         return ", ".join(f"{_n(credit[reason])} batch(es) {what}"
                          for reason, what in FAULT_DROP_REASONS.items() if credit.get(reason))
 
@@ -1958,12 +2098,18 @@ def check_ledger_egress(data):
                 elsewhere = led.other_sinks_drops(life, sinks)
                 if elsewhere:
                     others = f", not counting {_reasons(elsewhere)} at the other sinks"
+                records = led.record_drops(life, sinks)
+                if records:
+                    others += f"; records dropped: {_reasons(records)}"
                 part += f" (batches dropped: {_reasons(credit)}{others})"
             elif credit and life in led.killed and life != led.final:
                 # A SIGKILL counts no shutdown drops, but the life's drains can carry others,
                 # such as a queue's overflow during a sink outage before the kill.
                 part += (f"; batches dropped: {_reasons(credit)}, reported, not judged: the "
                          "band judges a killed life's gap")
+            cued = led.cued_text(life, sinks)
+            if cued:
+                part += f"; {cued}, counted"
             fault = led.fault_drops(life, sinks)
             if fault:
                 part += f"; FAIL: {fault}"
@@ -1978,6 +2124,9 @@ def check_ledger_egress(data):
                 parts.insert(0, f"{_n(led.unparsed)} topic record(s) aren't JSON objects")
         for sink in empty:
             status = FAIL
+            if data.standin:
+                parts.insert(0, f"the stand-in's record holds no stored series for {sink}")
+                continue
             selector = next((one.get("vm_selector") for one in data.ledger.get("sink") or []
                              if one.get("id") == sink), None)
             parts.insert(0, f"no series in vm-export/{sink}.jsonl match vm_selector "
@@ -1995,6 +2144,13 @@ def check_ledger_egress(data):
             lines.append(f"{sink}: {_n(len(led.records) + copies)} topic record(s), "
                          f"{_n(len(led.records))} distinct, {_n(copies)} duplicate copies; V "
                          f"{_n(led.V_total[sink])} (the sum of the distinct records' delta sums)")
+            continue
+        if sink == led.counts_sink:
+            counts = data.standin_counts
+            lines.append(f"{sink}: {_n(len(counts.points) + len(counts.duplicates))} stored "
+                         f"point(s), {_n(len(counts.points))} distinct, "
+                         f"{_n(len(counts.duplicates))} duplicate copies; V "
+                         f"{_n(led.V_total[sink])} (the sum of the distinct points' values)")
             continue
         wrong = {name: n for name, n in led.resets[sink].items() if n != lives - 1}
         lines.append(f"{sink}: {len(led.series.get(sink, []))} series, reset-aware V "
@@ -2144,8 +2300,9 @@ def check_ledger_windows(data):
     interval after the life starts, the first window plus startup. Opt-in because `aggregate`
     emits a series only in a window that updated it, so an idle series has gaps by design. Under
     `temporality: cumulative` V reads only each life's last value, so a lost middle window
-    changes no total and only this row sees it."""
-    if not data.has_vm:
+    changes no total and only this row sees it. A stand-in target's V, rebuilt from its record
+    in the export's shape, is judged the same way."""
+    if not (data.has_vm or data.standin):
         return Result("ledger.windows", SKIP, no_vm_reason(data))
     if data.ledger.get("vm_every_window") is not True:
         return Result("ledger.windows", SKIP, "not enabled ([ledger] vm_every_window)")
@@ -2306,11 +2463,17 @@ def check_ledger_sent(data):
     whose detail starts with the word) when every batch each sink received ended in an accepted
     response, judged per sink and SUT life by the sink's batch identity and over the run by its
     drops, refusals, and request classes. A Kafka target's sink is judged the same way, and its
-    ledger goes on to the topic. A local target SKIPs. `docs/plans/soak-harness.md`,
-    "8. External targets (W5)", lists each FAIL and WARN."""
+    ledger goes on to the topic, as is a `datadog` stand-in's, whose ledger goes on to the
+    stand-in's record and which excuses what a `respond` step cued (`_sent_one`). A local
+    target and a `remote_write` stand-in SKIP. `docs/plans/soak-harness.md`, "8. External
+    targets (W5)", lists each FAIL and WARN."""
     if data.has_vm:
         return Result("ledger.sent", SKIP, "local target: ledger.egress judges delivery against "
                       "the backends")
+    if data.standin and not data.standin_datadog:
+        return Result("ledger.sent", SKIP, f"standin target, shape {data.standin_shape}: "
+                      "ledger.egress and ledger.standin judge delivery against the stand-in's "
+                      "record")
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.sent", led)
     if skipped:
@@ -2339,11 +2502,13 @@ def check_ledger_sent(data):
     for sink in led.sinks:
         summaries.append(_sent_one(data, led, sink, flag, lines))
     evidence = ("ledger.egress and ledger.topic read the topic back" if data.kafka else
-                f"{NO_BACKEND}, so a 2xx is the end of the evidence")
+                "ledger.egress and ledger.standin read the stand-in's record" if data.standin
+                else f"{NO_BACKEND}, so a 2xx is the end of the evidence")
     summary = "; ".join(summaries) + f" (one batch in flight allowed); {evidence}"
     if status == PASS:
-        # `SENT` marks a ledger that ends at the sink; a Kafka target's goes on to the topic.
-        lead = "" if data.kafka else "SENT "
+        # `SENT` marks a ledger that ends at the sink; a Kafka or stand-in target's goes on to
+        # what the destination holds.
+        lead = "" if data.kafka or data.standin else "SENT "
         return Result("ledger.sent", PASS, f"{lead}to {data.target.get('name')}: every batch "
                       f"received ended in an accepted response; {summary}", lines)
     worst_first = sorted(problems, key=lambda item: -_ORDER[item[0]])
@@ -2353,7 +2518,10 @@ def check_ledger_sent(data):
 
 def _sent_one(data, led, sink, flag, lines):
     """`ledger.sent`'s reading of one sink: flags each problem through `flag`, appends its
-    lines, and returns its summary."""
+    lines, and returns its summary. A refusal line, a `rejected` batch drop, or a `rejected` or
+    `oversize` record drop inside the window of a `respond` step that explains it
+    (`Ledger.cued`, `cued_records`, and `cued_refusals`) is counted as cued and excused; only a
+    stand-in target has such steps."""
     sut = led.sut
     # The request class an accepted answer carries: an HTTP sink's status class, or the class
     # `kafka_out` counts a successful produce attempt under.
@@ -2404,6 +2572,10 @@ def _sent_one(data, led, sink, flag, lines):
         first = next((entry for entry in diagnostics if entry.key in keys), None)
         if first is None:
             return f"no {' or '.join(keys)} line on stderr"
+        return quote(first)
+
+    def quote(first):
+        """One stderr line, with the status it names."""
         answered = _ANSWERED_RE.search(first.message)
         if answered:
             status_text = f"status {answered.group(1)}"
@@ -2415,17 +2587,44 @@ def _sent_one(data, led, sink, flag, lines):
             status_text = "a 2xx whose body named dropped series"
         return (f"{status_text}: {first.key} at {data.offset(first.ts)}: {first.message[:300]}")
 
+    cued = []
+    starts = {fault.step: fault.start for fault in data.faults}
+
+    def note_cued(what, excused):
+        if excused:
+            order = sorted(excused, key=lambda step: (starts.get(step, 0), step))
+            cued.append(f"{what} " + ", ".join(f"{_n(excused[step])} by {step}"
+                                               for step in order))
+
     for key in REFUSAL_KEYS:
-        count = sum(1 for entry in diagnostics if entry.key == key)
-        if count:
+        excused, outside = {}, []
+        for entry in diagnostics:
+            if entry.key != key:
+                continue
+            step = next((step for start, end, step in led.cued_refusals
+                         if entry.ts is not None and start < entry.ts <= end), None)
+            if step is None:
+                outside.append(entry)
+            else:
+                excused[step] = excused.get(step, 0) + 1
+        note_cued(f"{key} line(s)", excused)
+        if outside:
             flag(FAIL, f"{sink}: the destination refused a request, so the sink held its "
-                       f"queue: {count} {key} line(s) ({quoted(key)})")
+                       f"queue: {len(outside)} {key} line(s)"
+                       + (" outside every cued refused step" if excused else "")
+                       + f" ({quote(outside[0])})")
 
     batch_drops = _by_attr(sut, "logit.component.batches.dropped", "reason", component=sink)
     for reason, value in sorted(batch_drops.items()):
         if reason in REJECTED_BATCH_REASONS:
-            flag(FAIL, f"{sink}: {_n(value)} batch(es) dropped {reason}, the destination "
-                       f"refused them ({quoted('request_rejected')})")
+            excused, _ = led.cued_split("logit.component.batches.dropped", [sink], reason,
+                                        led.cued)
+            note_cued(f"batch(es) dropped {reason}", excused)
+            outside = value - sum(excused.values())
+            if outside:
+                flag(FAIL, f"{sink}: {_n(outside)} batch(es) dropped {reason}"
+                           + (" outside every cued rejected step" if excused else "")
+                           + f", the destination refused them ({quoted('request_rejected')})")
         elif data.external and reason in FAULT_DROP_REASONS:
             # On a Kafka target `ledger.egress` FAILs it instead.
             flag(FAIL, f"{sink}: {_n(value)} batch(es) {FAULT_DROP_REASONS[reason]}")
@@ -2434,6 +2633,12 @@ def _sent_one(data, led, sink, flag, lines):
     record_drops = _by_attr(sut, "logit.output.records.dropped", "reason", component=sink)
     for reason, value in sorted(record_drops.items()):
         if reason in REJECTED_RECORD_REASONS:
+            excused, _ = led.cued_split("logit.output.records.dropped", [sink], reason,
+                                        led.cued_records.get(reason, []))
+            note_cued(f"record(s) dropped {reason}", excused)
+            value -= sum(excused.values())
+            if not value:
+                continue
             # `rejected` counts both a rejected request's entries and the series a 2xx body
             # names, so it quotes whichever of the two the sink logged.
             groups = [("request_rejected", "oversize")]
@@ -2442,8 +2647,9 @@ def _sent_one(data, led, sink, flag, lines):
             found = [quoted(*keys) for keys in groups
                      if any(entry.key in keys for entry in diagnostics)]
             evidence = "; ".join(found) or quoted(*groups[0])
-            flag(FAIL, f"{sink}: {_n(value)} record(s) dropped {reason}, refused by the "
-                       f"destination or too large to send ({evidence})")
+            flag(FAIL, f"{sink}: {_n(value)} record(s) dropped {reason}"
+                       + (" outside every cued step" if excused else "")
+                       + f", refused by the destination or too large to send ({evidence})")
         else:
             flag(WARN, f"{sink}: {_n(value)} record(s) dropped {reason} before sending, counted")
     skipped_metrics = _by_attr(sut, "logit.output.metrics.skipped", "reason", component=sink)
@@ -2504,8 +2710,10 @@ def _sent_one(data, led, sink, flag, lines):
                     f"{_n(accepted)}")
     lines += [f"{sink}: {entry.key} at {data.offset(entry.ts)}: {entry.message[:300]}"
               for entry in diagnostics]
+    if cued:
+        lines.append(f"{sink}: cued by a respond step, excused: " + "; ".join(cued))
     return (f"{sink}: requests {shown or 'none'}; records accepted {_n(accepted)}; "
-            + "; ".join(identities))
+            + (f"cued, excused: {'; '.join(cued)}; " if cued else "") + "; ".join(identities))
 
 
 def check_ledger_topic(data):
@@ -2589,6 +2797,269 @@ def check_ledger_topic(data):
     if problems:
         detail += ": " + "; ".join(problems)
     return Result("ledger.topic", status, detail, lines)
+
+
+# What each fault class looks like at a sink (docs/adr/sink-fault-classes.md): `rejected` drops
+# the batch at once under either posture and logs no `retrying` line; `clean`, `refused`, and
+# `ambiguous` hold the head and log `retrying` with the class word, except `ambiguous` under
+# `at_most_once`, which drops the batch `ambiguous_at_most_once`. `write_loop` logs `retrying` on a
+# head's first failure and then at most once a minute, so a step's span holds its first line.
+_RETRYING_CLASS_RE = re.compile(r"^send failed \((\w+)\)")
+
+
+def _class_signature(data, led, sink, fault, at_most_once, slack):
+    """`(ok, text)` for one classed step at `sink`: the `retrying` class words its span holds,
+    and the batches the sink dropped from its start to `slack` after its end."""
+    words = sorted({match.group(1) for entry in data.stderr.get("logit", [])
+                    if entry.kind == "json" and entry.key == "retrying"
+                    and entry.component == sink and entry.ts is not None
+                    and fault.start <= entry.ts <= fault.end
+                    for match in [_RETRYING_CLASS_RE.match(entry.message)] if match})
+    drops = {}
+    for point in led.sut.matching("logit.component.batches.dropped", component=sink):
+        if (isinstance(point.value, (int, float)) and point.value
+                and fault.start < point.ts <= fault.end + slack):
+            reason = point.attributes.get("reason", "?")
+            drops[reason] = drops.get(reason, 0) + point.value
+    want = fault.fault_class
+    if want == "rejected":
+        expected, ok = "a rejected drop and no retrying line", (
+            drops.get("rejected", 0) > 0 and not words)
+    elif want == "ambiguous" and at_most_once:
+        expected, ok = "an ambiguous_at_most_once drop and no retrying line", (
+            drops.get("ambiguous_at_most_once", 0) > 0 and not words)
+    else:
+        expected, ok = f"retrying ({want}) and no drop", words == [want] and not drops
+    seen = (f"retrying {', '.join(f'({w})' for w in words) or 'none'}, dropped "
+            f"{_reasons(drops)}")
+    where = (f"{fault.step} ({fault.action} on {fault.on}"
+             + (f", {fault.status}" if fault.status is not None else "")
+             + (f", {fault.answer}" if fault.answer is not None else "") + ")")
+    return ok, f"{where}: {want}: {seen}" + ("" if ok else f"; expected {expected}")
+
+
+def check_ledger_standin(data):
+    """For a stand-in target, the record against the sink: every line parses and every body
+    decodes; every sample of a write answered `2xx` was stored, which is what catches a black
+    hole that a rejected step's drop credit would let `ledger.egress` count; no resend stored a
+    different value for a sample already stored; per SUT life, the
+    record's requests by status class equal the sink's `logit.output.requests` for 2xx to 5xx,
+    and its resets are at most the sink's `network_error`, which a connect failure also counts;
+    every answer other than the default carries the cue of a `respond` step and falls inside
+    its span, and every write went to the stand-in's path; and each step with a `class` shows
+    that class's effect at the sink (`_class_signature`). A killed life's mismatch WARNs, since
+    a kill loses that life's last telemetry interval. Every other target SKIPs.
+
+    Under the `datadog` shape (`_standin_datadog`), also: per SUT life, the sink's
+    `records.dropped{reason="rejected"}` equals the series the `series_errors` answers named
+    plus the points of the requests answered under the cue of a step classed `rejected`, other
+    than a `413`, and `records.dropped{reason="oversize"}` equals the points of the `413`
+    requests under such a step; and each duplicate copy of a stored point is reported: permitted
+    under `at_least_once` after an answer the sink didn't see accepted, and a FAIL under
+    `at_most_once`, or as a resend within one life of a point the stand-in answered `2xx`."""
+    if not data.standin:
+        return Result("ledger.standin", SKIP, f"{data.target.get('kind')} target: no stand-in")
+    if data.standin_text is None:
+        return Result("ledger.standin", FAIL, "no stand-in record (logs/standin.stdout)")
+    led = _ledger(data)
+    skipped = _skip_without_sut("ledger.standin", led)
+    if skipped:
+        return skipped
+    requests = data.standin_requests
+    shape = data.standin_shape
+    path = standin.PATHS[shape]
+    status = PASS
+    problems = []
+    lines = []
+
+    def flag(verdict, text):
+        nonlocal status
+        status = worst([status, verdict])
+        problems.append((verdict, text))
+
+    if not requests:
+        flag(FAIL, "the stand-in recorded no request")
+    if data.standin_unparsed:
+        flag(FAIL, f"{_n(data.standin_unparsed)} stand-in record line(s) aren't JSON objects")
+    _, rewrites, conflicts, _ = data.standin_store
+    undecodable = []
+    for request in requests:
+        try:
+            standin.decode_body(request, shape)
+        except standin.DecodeError as err:
+            undecodable.append(f"#{request.get('seq')}: {err}")
+    if undecodable:
+        what = ("a MetricPayload" if shape == standin.DATADOG else "a Snappy WriteRequest")
+        flag(FAIL, f"{len(undecodable)} request body(ies) don't decode as {what}: "
+                   f"{'; '.join(undecodable[:3])}")
+    for key, stamp, first, last in conflicts[:5]:
+        flag(FAIL, f"{dict(key).get('__name__', key)} at {stamp} ms stored {first:g}, then "
+                   f"{last:g}: a resend changed a sample")
+    if len(conflicts) > 5:
+        flag(FAIL, f"{len(conflicts) - 5} more changed sample(s)")
+    lost = standin.acknowledged_unstored(requests, data.standin_store[0], shape)
+    if lost:
+        key, stamp = lost[0]
+        flag(FAIL, f"{_n(len(lost))} sample(s) the stand-in answered 2xx were never stored, "
+                   f"first {dict(key).get('__name__', key)} at {data.offset(stamp / 1000)}: a "
+                   "write the sink saw accepted and the destination lost")
+    wrong_path = [r for r in requests if r.get("path") != path]
+    if wrong_path:
+        flag(FAIL, f"{len(wrong_path)} write(s) to a path other than {path}, first "
+                   f"{wrong_path[0].get('path')!r}")
+
+    sinks = led.sinks
+    sink = sinks[0] if sinks else None
+    by_life = {}
+    for request in requests:
+        life = vm.life_at(led.life_starts, request.get("t") or 0)
+        cls = standin.status_class(request)
+        by_life.setdefault(life, {})
+        by_life[life][cls] = by_life[life].get(cls, 0) + 1
+    for life in led.lives:
+        recorded = by_life.get(life, {})
+        counted = {}
+        for point in led.sut.matching("logit.output.requests", component=sink):
+            if point.life == life and isinstance(point.value, (int, float)):
+                cls = point.attributes.get("class", "?")
+                counted[cls] = counted.get(cls, 0) + point.value
+        verdict = WARN if life in led.killed and life != led.final else FAIL
+        for cls in sorted((set(recorded) | set(counted)) - {"network_error"}):
+            if recorded.get(cls, 0) != counted.get(cls, 0):
+                flag(verdict, f"life {life}: the stand-in answered {_n(recorded.get(cls, 0))} "
+                              f"request(s) {cls}, {sink} counted {_n(counted.get(cls, 0))}")
+        resets, errors = recorded.get("network_error", 0), counted.get("network_error", 0)
+        if resets > errors:
+            flag(verdict, f"life {life}: the stand-in reset {_n(resets)} request(s), {sink} "
+                          f"counted {_n(errors)} network_error")
+        lines.append(f"life {life}: recorded " + (", ".join(
+            f"{cls} {_n(n)}" for cls, n in sorted(recorded.items())) or "none")
+            + f"; {sink} counted " + (", ".join(
+                f"{cls} {_n(n)}" for cls, n in sorted(counted.items())) or "none"))
+
+    responds = {f.step: f for f in data.faults if f.action == "respond"}
+    seen_cues = {}
+    for request in requests:
+        cue = request.get("cue")
+        default = (request.get("answer") == "status"
+                   and request.get("status") == standin.DEFAULT_STATUS[shape]
+                   and request.get("stored") is True)
+        if cue is None:
+            if not default and request.get("path") == path:
+                flag(FAIL, f"request #{request.get('seq')} was answered "
+                           f"{request.get('answer')} {request.get('status')} with no cue")
+            continue
+        seen_cues[cue] = seen_cues.get(cue, 0) + 1
+        fault = responds.get(cue)
+        t = request.get("t") or 0
+        if fault is None:
+            flag(FAIL, f"request #{request.get('seq')} was answered under cue {cue}, which no "
+                       "respond step applied cleanly")
+        elif not fault.start - 1 <= t <= fault.end + 1:
+            flag(FAIL, f"request #{request.get('seq')} was answered under cue {cue} at "
+                       f"{data.offset(t)}, outside its span [{data.offset(fault.start)}, "
+                       f"{data.offset(fault.end)}]")
+    for step, fault in sorted(responds.items()):
+        if not seen_cues.get(step) and fault.fault_class is None:
+            flag(WARN, f"{step}: no request reached the stand-in under its cue")
+
+    drains = led.sut.drains
+    gaps = [b - a for a, b in zip(drains, drains[1:])]
+    slack = 2 * (statistics.median(gaps) if gaps else 5.0)
+    at_most_once = "at_most_once" in "".join(_component_blocks(led._sut_config_text(), sink or ""))
+    classed = [f for f in data.faults if f.fault_class is not None]
+    for fault in classed:
+        ok, text = _class_signature(data, led, sink, fault, at_most_once, slack)
+        lines.append(text)
+        if not ok:
+            flag(FAIL, text)
+
+    stored = sum(1 for r in requests if r.get("stored"))
+    if data.standin_datadog:
+        resent = _standin_datadog(data, led, sink, at_most_once, flag, lines)
+    else:
+        resent = f"{_n(rewrites)} resent sample(s) stored again with the same value"
+    summary = (f"{_n(len(requests))} request(s) recorded, {_n(stored)} stored, "
+               f"{_n(len(data.standin_cues))} cue(s); {resent}; {len(classed)} classed step(s) "
+               f"({'at_most_once' if at_most_once else 'at_least_once'})")
+    if status == PASS:
+        return Result("ledger.standin", PASS, summary + "; record, request classes, cues, and "
+                      "each step's class agree with the sink", lines)
+    worst_first = sorted(problems, key=lambda item: -_ORDER[item[0]])
+    return Result("ledger.standin", status, f"{worst_first[0][1]}; {summary}",
+                  [text for _, text in worst_first] + lines)
+
+
+def _standin_datadog(data, led, sink, at_most_once, flag, lines):
+    """`ledger.standin`'s rules for a `datadog` stand-in (`check_ledger_standin`'s docstring):
+    flags each problem through `flag`, appends its lines, and returns the summary's duplicate
+    clause."""
+    requests = data.standin_requests
+    counts = data.standin_counts
+    classed = {f.step: f for f in data.faults if f.action == "respond" and f.fault_class}
+
+    # The record's drops per life, by the request's time, against the sink's.
+    expected = {}
+    for seq, named, t in counts.named:
+        life = vm.life_at(led.life_starts, t or 0)
+        expected.setdefault(life, {"rejected": 0, "oversize": 0})["rejected"] += named
+    for request in requests:
+        # The step's `class` is the only statement of what the sink should read; the default
+        # 2xx and a `series_errors` 2xx carry none.
+        fault = classed.get(request.get("cue"))
+        if fault is None or fault.fault_class != "rejected":
+            continue
+        reason = "oversize" if request.get("status") == 413 else "rejected"
+        life = vm.life_at(led.life_starts, request.get("t") or 0)
+        expected.setdefault(life, {"rejected": 0, "oversize": 0})[reason] += (
+            standin.points_in(request, standin.DATADOG))
+    for life in led.lives:
+        verdict = WARN if life in led.killed and life != led.final else FAIL
+        want = expected.get(life, {"rejected": 0, "oversize": 0})
+        for reason in ("rejected", "oversize"):
+            got = sum(value for _, value, point_life in led.sut.counter_points(
+                "logit.output.records.dropped", component=sink, reason=reason)
+                if point_life == life)
+            if got != want[reason]:
+                what = ("the series series_errors answers named plus the points of requests "
+                        "answered under a rejected step" if reason == "rejected" else
+                        "the points of requests answered 413 under a rejected step")
+                flag(verdict, f"life {life}: {sink} counted {_n(got)} record(s) dropped "
+                              f"{reason}, the record holds {_n(want[reason])}: {what}")
+        lines.append(f"life {life}: records dropped rejected {_n(want['rejected'])}, oversize "
+                     f"{_n(want['oversize'])} by the record")
+
+    copies = {}
+    for key, stamp, value, first_at, copy_at in counts.duplicates:
+        life = vm.life_at(led.life_starts, stamp / 1000)
+        one = copies.setdefault(life, {"copies": 0, "amount": 0.0})
+        one["copies"] += 1
+        one["amount"] += value
+        first, again = requests[first_at], requests[copy_at]
+        # `seq` starts again when the stand-in restarts, so the record position names them too.
+        first_seq = f"#{first.get('seq')} (record request {first_at + 1})"
+        copy_seq = f"#{again.get('seq')} (record request {copy_at + 1})"
+        same_life = (vm.life_at(led.life_starts, first.get("t") or 0)
+                     == vm.life_at(led.life_starts, again.get("t") or 0))
+        name = dict(key).get("__name__", key)
+        if standin.status_class(first) == "2xx" and same_life:
+            flag(FAIL, f"request {copy_seq} stored {name} at {stamp // 1000} s again, which "
+                       f"request {first_seq} stored under a 2xx: the sink resent a point it "
+                       "saw accepted")
+        elif at_most_once:
+            flag(FAIL, f"request {copy_seq} stored {name} at {stamp // 1000} s again, first "
+                       f"stored by request {first_seq}: a resend under at_most_once")
+    for life, one in sorted(copies.items()):
+        lines.append(f"life {life}: {_n(one['copies'])} duplicate copies of stored points, "
+                     f"{_n(one['amount'])} counted again by the destination"
+                     + (", which at_least_once permits" if not at_most_once else ""))
+    total = sum(one["copies"] for one in copies.values())
+    amount = sum(one["amount"] for one in copies.values())
+    per_life = ", ".join(f"life {life} {_n(one['copies'])}"
+                         for life, one in sorted(copies.items()))
+    return (f"{_n(total)} duplicate copies of stored points ({per_life or 'none'}), "
+            f"{_n(amount)} counted twice by the destination, reported; "
+            f"{_n(sum(named for _, named, _ in counts.named))} series named by series_errors")
 
 
 def _step_value(series, t, default=0.0):
@@ -2927,9 +3398,10 @@ def _balanced_drop(led, name, component, reason, batch_drops):
     if (component == led.script and name == "logit.component.events.dropped"
             and reason == "script_error"):
         return True  # L_err
-    if component in led.sinks and not led.data.has_vm and name in (
+    if component in led.sinks and (led.data.external or led.data.kafka
+                                    or led.data.standin_datadog) and name in (
             "logit.output.records.dropped", "logit.output.metrics.dropped"):
-        return True  # `ledger.sent` judges these on an external or Kafka target
+        return True  # `ledger.sent` judges these on an external, Kafka, or datadog stand-in target
     return False
 
 
@@ -2974,7 +3446,8 @@ CHECKS = (
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_intake,
     check_ledger_edge, check_ledger_script, check_ledger_aggregate, check_ledger_egress,
     check_ledger_windows, check_ledger_replay, check_ledger_summary, check_ledger_sent,
-    check_ledger_topic, check_identity_sink, check_drops, check_recovery, check_expect,
+    check_ledger_topic, check_ledger_standin, check_identity_sink, check_drops, check_recovery,
+    check_expect,
 )
 
 

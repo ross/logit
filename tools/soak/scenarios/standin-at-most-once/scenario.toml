@@ -1,0 +1,101 @@
+# standin-remote-write's stand-in against an `at_most_once` sink: an `Ambiguous` answer (a 503 or
+# a reset) drops the batch `ambiguous_at_most_once` instead of retrying it, while a `Refused`
+# answer still holds and a `Rejected` one still drops. `ledger.standin` checks each step's effect
+# at the sink. The schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "standin-at-most-once"
+description = "standin-remote-write with buffer.delivery at_most_once: a 503 and a reset drop, a 401 holds, a 400 drops"
+duration = "8m55s"        # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"
+cycle = "6m55s"           # the last step, its recovery, and two progress windows
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[target]
+kind = "standin"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]           # the one sink, whose writes the stand-in records
+id = "remote_write"
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+[[step]]                  # c0s1: a 5xx: dropped, never retried
+at = "0s"
+action = "respond"
+on = "standin"
+status = 503
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s2: credentials: held under either posture
+at = "1m35s"
+action = "respond"
+on = "standin"
+status = 401
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s3: invalid samples: dropped under either posture
+at = "3m10s"
+action = "respond"
+on = "standin"
+status = 400
+body = "out of order sample"
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s4: a transport error after the request was sent: dropped
+at = "4m45s"
+action = "respond"
+on = "standin"
+answer = "reset"
+class = "ambiguous"
+for = "20s"
+
+[[expect]]
+name = "ambiguous-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "remote_write"
+attrs = { reason = "ambiguous_at_most_once" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "ambiguous-never-retries"
+service = "logit"
+metric = "logit.component.retries"
+component = "remote_write"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "refused-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "remote_write"
+step = "c0s2"
+window = "during"
+reduce = "max"
+min = 1

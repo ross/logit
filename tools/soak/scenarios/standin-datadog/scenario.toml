@@ -1,0 +1,285 @@
+# Every row of datadog_out's response-class table on the series route, against a scripted
+# stand-in under load: each step tells the stand-in what to answer for 20 s, 105 s apart, so a
+# 30 s progress window fits between one step's recovery and the next, and its `class` names the
+# fault class the sink must read (crates/logit-outputs/src/datadog.rs, "Faults, retries, and
+# duplicate safety"). The first step answers `202` with a body naming the request's first two
+# series dropped, as the intake does for a series it refuses. `ledger.standin` checks each
+# step's effect at the sink and the stand-in's record against the sink's telemetry, and
+# `ledger.sent` judges the sink, excusing what a step cued. V is the sum of the points the
+# stand-in stored, so a rejected window is a counted gap, and the `503` after storing leaves a
+# duplicate that `at_least_once` permits and the destination counts twice. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "standin-datadog"
+description = "statsd into datadog_out (series, gzip, delta counts) against a stand-in answering every row of the sink's response-class table in turn"
+duration = "30m25s"       # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "28m25s"          # the last step, its recovery, and two progress windows
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[target]
+kind = "standin"
+shape = "datadog"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]           # the one sink, whose writes the stand-in records
+id = "datadog"
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+[[step]]                  # c0s1: a 202 naming 2 series dropped
+at = "0s"
+action = "respond"
+on = "standin"
+status = 202
+series_errors = 2
+for = "20s"
+
+[[step]]                  # c0s2: 400, a bad payload: dropped
+at = "1m45s"
+action = "respond"
+on = "standin"
+status = 400
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s3: 401, a missing key: held
+at = "3m30s"
+action = "respond"
+on = "standin"
+status = 401
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s4: 403, an invalid key: held
+at = "5m15s"
+action = "respond"
+on = "standin"
+status = 403
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s5: 404, not the intake: held
+at = "7m"
+action = "respond"
+on = "standin"
+status = 404
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s6: 405, the path to the intake: held
+at = "8m45s"
+action = "respond"
+on = "standin"
+status = 405
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s7: 408, a request timeout: retried
+at = "10m30s"
+action = "respond"
+on = "standin"
+status = 408
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s8: 413, payload too large: dropped, its records counted oversize
+at = "12m15s"
+action = "respond"
+on = "standin"
+status = 413
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s9: 429, too many requests: retried
+at = "14m"
+action = "respond"
+on = "standin"
+status = 429
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s10: 500: retried
+at = "15m45s"
+action = "respond"
+on = "standin"
+status = 500
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s11: 501, a 5xx like any other here: retried
+at = "17m30s"
+action = "respond"
+on = "standin"
+status = 501
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s12: 503 after storing: a duplicate
+at = "19m15s"
+action = "respond"
+on = "standin"
+status = 503
+apply = true
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s13: a redirect, never followed: dropped
+at = "21m"
+action = "respond"
+on = "standin"
+status = 302
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s14: any other 4xx: dropped
+at = "22m45s"
+action = "respond"
+on = "standin"
+status = 422
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s15: a transport error after the request was sent: retried
+at = "24m30s"
+action = "respond"
+on = "standin"
+answer = "reset"
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s16: a connect failure: held
+at = "26m15s"
+action = "stop"
+on = "standin"
+class = "clean"
+for = "20s"
+# One expectation per class, beside ledger.standin's check of every step.
+[[expect]]
+name = "series-errors-drop-records"
+service = "logit"
+metric = "logit.output.records.dropped"
+attrs = { component = "datadog", reason = "rejected" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "series-errors-drop-no-batch"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "datadog"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "rejected-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "datadog"
+attrs = { reason = "rejected" }
+step = "c0s2"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "refused-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "datadog"
+step = "c0s4"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "refused-drops-nothing"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "datadog"
+step = "c0s4"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "ambiguous-retries"
+service = "logit"
+metric = "logit.component.retries"
+component = "datadog"
+step = "c0s7"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "oversize-drops-records"
+service = "logit"
+metric = "logit.output.records.dropped"
+attrs = { component = "datadog", reason = "oversize" }
+step = "c0s8"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "oversize-drops-batches"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "datadog"
+attrs = { reason = "rejected" }
+step = "c0s8"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "applied-5xx-retries"
+service = "logit"
+metric = "logit.component.retries"
+component = "datadog"
+step = "c0s12"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "clean-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "datadog"
+step = "c0s16"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "retrying-clears"
+service = "logit"
+metric = "logit.component.retrying"
+component = "datadog"
+step = "c0s16"
+window = "after"
+reduce = "last"
+max = 0
