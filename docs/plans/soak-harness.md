@@ -3025,6 +3025,79 @@ What the runs showed about `logit` and the harness:
   `Ledger.fault_drops` FAILs four of them: a cued `rejected` drop then FAILs `ledger.egress` and
   `ledger.summary`, and the drop past the step's window reads 3 batches instead of 1.
 
+### W9b: a Datadog-shaped stand-in for every `datadog_out` response class (2026-10-15)
+
+W9b adds the stand-in's `datadog` shape, `series_errors`, V as the stored delta points' sum with
+duplicates reported, and `ledger.sent` against a stand-in, with `standin-datadog`. Run
+`20261015T180002Z` used `logit:soak` `sha256:4bc148b6d2f5`, rebuilt by `script/soak` from the
+working tree at `45fdb280` plus W9b's harness changes (W9b changes no Rust, so the binary is
+W9a's), `logit-soak-netem:local` `sha256:ca9f9da8292d`, and `python:3.13.16-alpine3.24`
+`sha256:2d9aefe2fef0`, on the development host (32 cores, Docker 29.8.2). Its code is
+`19ec65f1`'s but for comments; `results.md` below is its re-score with `soak.py check` at
+`d71e2db4`, which orders `ledger.sent`'s cued drops by step and changes no verdict. Every row
+passed.
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 32 apply/revert action(s) returned 0; 0 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 2 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 1 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 19 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 156 readiness sample(s) read ok outside fault windows; 0 start(s) or unpause(s) ready in time |
+| `progress` | PASS | 20 30s window(s) outside fault windows, judged per sink (standin target: no VictoriaMetrics): datadog: deliveries in 20 of 20, no freshness samples; 570s of 1765s after warmup judged (32%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +0.0 (limit 64); 645s of 1765s after warmup judged (37%; WARN under 5%) \| logit PASS: MiB/h life 0 +0.8 (limit 64); 645s of 1765s after warmup judged (37%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 12 (limit +8) \| logit PASS: warmup median 11.5 -> end 12 (limit +8) |
+| `ledger.wire` | PASS | G 3,661,200 = W 3,661,200 + K 0 + wire 0 (by design: 0 in UDP-affecting windows, -87 steady, 87 at the end; steady loss judged 0, each run at 0 or more, against limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 3,661,200 vs E + B 3,661,200 (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E 3,661,200 == A 3,661,200 (listener to aggregate); A_sent 18,400 == S_in[datadog] 18,400 (aggregate to datadog) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 0: Ab 3,661,200 == A 3,661,200 (every event absorbed) |
+| `ledger.egress` | PASS | datadog: life 0 (final): Ab 3,661,200 − V[datadog] 3,500,400 = 160,800, counted (batches dropped: rejected 8; records dropped: oversize 200, rejected 604); rejected 2 cued by c0s2, 2 cued by c0s8, 2 cued by c0s13, 2 cued by c0s14, counted (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[datadog] 160,800 counted; wire G − (W + K) 0 over the run, by design |
+| `ledger.sent` | PASS | to standin: every batch received ended in an accepted response; datadog: requests 2xx 176, 3xx 2, 4xx 44, 5xx 20, network_error 10; records accepted 17,596; cued, excused: api_key_rejected line(s) 3 by c0s4; request_refused line(s) 3 by c0s3, 1 by c0s5, 1 by c0s6; batch(es) dropped rejected 2 by c0s2, 2 by c0s8, 2 by c0s13, 2 by c0s14; record(s) dropped oversize 200 by c0s8; record(s) dropped rejected 4 by c0s1, 200 by c0s2, 200 by c0s13, 200 by c0s14; datadog life 0 at +1849s: received 184 vs delivered 176 + dropped 8 + buffer.batches 0, gap 0 (one batch in flight allowed); ledger.egress and ledger.standin read the stand-in's record |
+| `ledger.topic` | SKIP | standin target: no topic |
+| `ledger.standin` | PASS | 248 request(s) recorded, 183 stored, 30 cue(s); 700 duplicate copies of stored points (life 0 700), 140,000 counted twice by the destination, reported; 4 series named by series_errors; 15 classed step(s) (at_least_once); record, request classes, cues, and each step's class agree with the sink |
+| `identity.sink` | PASS | final life 0 at +1849s: datadog: received 184 vs delivered 176 + dropped 8 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 16 of 16 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect.series-errors-drop-records` | PASS | delta of logit.output.records.dropped{component=datadog, reason=rejected} on logit, through c0s1: c0s1 (+60s, +125s]: 4 (over 13 drain(s)), want >= 1 |
+| `expect.series-errors-drop-no-batch` | PASS | delta of logit.component.batches.dropped{component=datadog} on logit, through c0s1: c0s1 (+60s, +125s]: 0 (over 13 drain(s)), want <= 0 |
+| `expect.rejected-drops` | PASS | delta of logit.component.batches.dropped{component=datadog, reason=rejected} on logit, through c0s2: c0s2 (+165s, +230s]: 2 (over 13 drain(s)), want >= 1 |
+| `expect.refused-holds` | PASS | max of logit.component.retrying{component=datadog} on logit, during c0s4: c0s4 (+375s, +395s]: 1 (1 sample(s) and the value in force at its start), want >= 1 |
+| `expect.refused-drops-nothing` | PASS | delta of logit.component.batches.dropped{component=datadog} on logit, through c0s4: c0s4 (+375s, +440s]: 0 (over 13 drain(s)), want <= 0 |
+| `expect.ambiguous-retries` | PASS | delta of logit.component.retries{component=datadog} on logit, during c0s7: c0s7 (+690s, +710s]: 6 (over 4 drain(s)), want >= 1 |
+| `expect.oversize-drops-records` | PASS | delta of logit.output.records.dropped{component=datadog, reason=oversize} on logit, through c0s8: c0s8 (+795s, +860s]: 200 (over 13 drain(s)), want >= 1 |
+| `expect.oversize-drops-batches` | PASS | delta of logit.component.batches.dropped{component=datadog, reason=rejected} on logit, through c0s8: c0s8 (+795s, +860s]: 2 (over 13 drain(s)), want >= 1 |
+| `expect.applied-5xx-retries` | PASS | delta of logit.component.retries{component=datadog} on logit, during c0s12: c0s12 (+1215s, +1235s]: 7 (over 4 drain(s)), want >= 1 |
+| `expect.clean-holds` | PASS | max of logit.component.retrying{component=datadog} on logit, during c0s16: c0s16 (+1635s, +1655s]: 1 (1 sample(s) and the value in force at its start), want >= 1 |
+| `expect.retrying-clears` | PASS | last of logit.component.retrying{component=datadog} on logit, after c0s16: c0s16 (+1655s, +1700s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
+
+What the run showed about `logit` and the harness:
+
+- **`datadog_out` reads every row of its table as documented, under load.** Each held step's
+  first `retrying` line named its class: `refused` for `401`, `403`, `404`, and `405`;
+  `ambiguous` for `408`, `429`, `500`, `501`, the `503`, and the reset; `clean` for the stopped
+  stand-in. Each `rejected` step (`400`, `413`, `302`, `422`) dropped its two windows with no
+  retry, and the `413` counted its 200 records `oversize`. The sink logged `api_key_rejected`
+  for the `403` and `request_refused` for the other refusals, all inside their steps.
+- **A `202` naming series counts them and drops no batch.** The `series_errors = 2` step's two
+  requests each named their first 2 series, and the sink counted 4 records dropped `rejected`
+  with no batch dropped.
+- **The egress gap is the cued loss, to the event.** Ab − V was 160,800: the 8 rejected windows
+  (4 steps, 2 windows each, 100 series at 200 increments) are 160,000, and the 4 named series
+  800.
+- **A resend after an applied `503` is stored again.** The `503` with `apply = true` stored 7
+  attempts of the held batch before the eighth was accepted, so the stand-in holds 700
+  duplicate copies, 140,000 increments a Datadog org would count twice. V counts each point
+  once, and `ledger.standin` reports the copies, as `at_least_once` permits.
+- **The sink counted 10 `network_error` requests against the record's 6 resets**; the other 4
+  were connect failures to the stopped stand-in, which never reached it.
+- **Self-test**: 1,284 expectations, from 1,187 at W9a. Each new rule was reverted in turn and
+  failed at least one expectation; the PR lists them.
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
