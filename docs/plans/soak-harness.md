@@ -1248,6 +1248,9 @@ stdlib has no zstd before 3.14, so a stand-in scenario's sink sends Snappy.
 
 - Every record line parses, and every body decodes. A resend that stored a different value for
   a sample already stored FAILs; one that stored the same value is counted and reported.
+- Every sample of a write the stand-in answered `2xx` was stored. `ledger.egress` counts any
+  positive gap in a life with a batch drop, so on a stand-in run with `rejected` steps a black
+  hole passes it; this rule, not `ledger.egress`, is what catches one there.
 - Per SUT life, the record's requests by status class equal the sink's
   `logit.output.requests{class}` for `2xx` to `5xx`; its resets are at most the sink's
   `network_error`, which a connect failure also counts. A killed life's mismatch WARNs.
@@ -1276,10 +1279,11 @@ stdlib has no zstd before 3.14, so a stand-in scenario's sink sends Snappy.
   drop `ambiguous_at_most_once`, a `401` holds, a `400` drops `rejected`.
 
 The black-hole control is a `2xx` the stand-in doesn't store (`status = 200`, `apply = false`).
-Under cumulative temporality the next stored totals overwrite a hole, so `ledger.egress` FAILs
-it as uncounted loss only when it holds the last samples (a self-test fixture), and a hole in
-the middle shows only in `ledger.windows`, under `vm_every_window` (a recorded by-hand run). It
-isn't a shipped scenario. W9b adds a Datadog-shaped stand-in and runs `ledger.sent` against
+`ledger.standin` FAILs it wherever it falls. Under cumulative temporality the next stored totals
+overwrite a hole, so `ledger.egress` FAILs it as uncounted loss only when it holds the last
+samples and no drop in the life credits the gap (a self-test fixture), and a hole in the middle
+shows in `ledger.windows` under `vm_every_window` (a recorded by-hand run). It isn't a shipped
+scenario. W9b adds a Datadog-shaped stand-in and runs `ledger.sent` against
 it.
 
 ### 9. Not in this stack
@@ -2960,7 +2964,9 @@ What the runs showed about `logit` and the harness:
   control's 20 s of `200`s that stored nothing left Ab − V at 0, because the next window's
   totals overwrite the hole. `ledger.windows` caught it, with one finding per series. A
   stand-in scenario that needs to see a lost window sets `vm_every_window`, which a scenario
-  with a `rejected` step can't, since a rejected window is lost too.
+  with a `rejected` step can't, since a rejected window is lost too. `ledger.standin`'s check
+  that every sample answered `2xx` was stored, added after review, FAILs the same run when it is
+  re-scored: 200 samples, 2 windows of 100 series.
 - **Self-test**: 1,185 expectations, from 1,074 on `main`. Reverting the cued excusal in
   `Ledger.fault_drops` FAILs four of them: a cued `rejected` drop then FAILs `ledger.egress` and
   `ledger.summary`, and the drop past the step's window reads 3 batches instead of 1.

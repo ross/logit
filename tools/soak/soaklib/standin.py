@@ -278,6 +278,26 @@ def stored_series(requests):
     return series, rewrites, conflicts, undecodable
 
 
+def acknowledged_unstored(requests, series):
+    """`(series key, timestamp)` for each sample of a request the stand-in answered `2xx` that
+    `series` (from `stored_series`) doesn't hold: a write the sink saw accepted that the
+    destination never kept. A body that doesn't decode is left to the caller."""
+    stored = {(series_key(one["metric"]), stamp) for one in series
+              for stamp in one["timestamps"]}
+    missing = []
+    for request in requests:
+        if status_class(request) != "2xx":
+            continue
+        try:
+            decoded = decode_body(request)
+        except DecodeError:
+            continue
+        for labels, samples in decoded:
+            key = series_key(labels)
+            missing += [(key, stamp) for stamp, _ in samples if (key, stamp) not in stored]
+    return missing
+
+
 def status_class(request):
     """The request's answer in `logit.output.requests`' vocabulary: `2xx` to `5xx` by status,
     `network_error` for a reset."""

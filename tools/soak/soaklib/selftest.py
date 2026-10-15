@@ -5109,6 +5109,29 @@ def _standin_checks():
                f"a 2xx the stand-in didn't store FAILs as uncounted loss, got "
                f"{rows['ledger.egress']}")
 
+        # A cued rejection gives the final life a drop credit, so ledger.egress counts any gap
+        # there; a black hole on the last write, answered 200 under its own cue, is then
+        # ledger.standin's alone to catch.
+        rejected = [_line(_stamp(T0 + 250), "logit.component.batches.dropped", "sum", 2,
+                          component="sink", attrs={"reason": "rejected"})]
+
+        def cued_hole(requests):
+            requests[-1].update(stored=False, cue="c0s3")
+            return requests
+
+        timeline = (_respond_fault("c0s2", 240, 260, status=400, cls="rejected")
+                    + _respond_fault("c0s3", 290, 305, status=200))
+        rows, _ = results("credited-hole", cued_hole, sut_extra=rejected,
+                          timeline_extra=timeline)
+        expect(rows["ledger.egress"].status == checks.PASS
+               and "counted" in rows["ledger.egress"].detail,
+               f"the rejection's credit lets ledger.egress count the hole, got "
+               f"{rows['ledger.egress']}")
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "answered 2xx were never stored" in rows["ledger.standin"].detail,
+               f"ledger.standin FAILs a 2xx the stand-in didn't store beside a cued rejection, "
+               f"got {rows['ledger.standin']}")
+
         rows, run_dir = results("no-record")
         (run_dir / "logs" / "standin.stdout").unlink()
         rows = {r.id: r for r in checks.run_all(run_dir)}

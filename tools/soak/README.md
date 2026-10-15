@@ -377,23 +377,24 @@ What changes for a stand-in target:
   an earlier one, as a remote-write receiver overwrites. `ledger.egress` and `ledger.summary`
   judge it as an export, and so does `ledger.windows` under `[ledger] vm_every_window`.
   `ledger.sent` SKIPs.
-- `ledger.standin` judges the record against the sink: every body decodes; no resend stored a
-  different value; per SUT life the record's requests by status class equal the sink's
-  `logit.output.requests`, and its resets are at most the sink's `network_error`; every answer
-  but the default carries a `respond` step's cue inside its span; and each step's `class` shows
-  at the sink. `rejected` is a batch dropped `rejected` and no `retrying` line; `clean`,
-  `refused`, and `ambiguous` are the `retrying` line's class word, `send failed (<class>)`, and no
-  drop; under `at_most_once`, `ambiguous` is a batch dropped `ambiguous_at_most_once`.
+- `ledger.standin` judges the record against the sink: every body decodes; every sample of a write
+  answered `2xx` was stored; no resend stored a different value; per SUT life the record's
+  requests by status class equal the sink's `logit.output.requests`, and its resets are at most
+  the sink's `network_error`; every answer but the default carries a `respond` step's cue inside
+  its span; and each step's `class` shows at the sink. `rejected` is a batch dropped `rejected`
+  and no `retrying` line; `clean`, `refused`, and `ambiguous` are the `retrying` line's class
+  word, `send failed (<class>)`, and no drop; under `at_most_once`, `ambiguous` is a batch dropped
+  `ambiguous_at_most_once`.
 - A batch dropped `rejected` inside a `respond` step with `class = "rejected"`, up to one
   aggregate interval plus `recovery_bound` after it, counts its gap without FAILing
   `ledger.egress` or `ledger.summary`. Outside every such step it FAILs, as on any target.
 
 To check that the ledger catches a destination that acknowledges and stores nothing, cue
-`status = 200` with `apply = false`. Under cumulative temporality the next stored totals
-overwrite the hole, so set `[ledger] vm_every_window = true`: `ledger.windows` FAILs the
-windows it lost. `ledger.egress` FAILs it as uncounted loss only when the hole holds the last
-samples. A rejected batch is a lost window too, so a scenario with a `rejected` step can't set
-`vm_every_window`.
+`status = 200` with `apply = false`: `ledger.standin` FAILs it. `ledger.egress` can't be relied
+on for it: under cumulative temporality the next stored totals overwrite the hole, and a
+`rejected` drop in the same life credits any gap. `[ledger] vm_every_window = true` also
+makes `ledger.windows` FAIL the windows it lost, but a rejected batch is a lost window too, so a
+scenario with a `rejected` step can't set it.
 
 ## A run
 
@@ -505,7 +506,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight |
 | `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0, or any one sink's Ab − V isn't, with a script's hop in place of E − A and one Ab − V term per sink under `copy`; a counted egress term is shown and not judged, unless a `rejected` or `disk_corrupt` drop is in its group's credit, which FAILs the row; on an external target the Ab − V term SKIPs |
 | `ledger.sent` | an external or Kafka target only, else SKIP: a batch a sink received didn't end in an accepted response; a clean external run's detail starts with `SENT`. See [External targets](#external-targets) |
-| `ledger.standin` | a stand-in target only, else SKIP: the record has a line that isn't JSON or a body that doesn't decode, a resend stored a different value, its requests by status class differ from the sink's in a SUT life, an answer other than the default falls outside its `respond` step, or a step's `class` doesn't show at the sink. See [Stand-in targets](#stand-in-targets) |
+| `ledger.standin` | a stand-in target only, else SKIP: the record has a line that isn't JSON or a body that doesn't decode, a sample answered `2xx` wasn't stored, a resend stored a different value, its requests by status class differ from the sink's in a SUT life, an answer other than the default falls outside its `respond` step, or a step's `class` doesn't show at the sink. See [Stand-in targets](#stand-in-targets) |
 | `ledger.topic` | a Kafka target only, else SKIP: the topic wasn't read back; its distinct records number fewer than the sink saw accepted, or more with no dropped attempt to explain them (`WARN` with one, and `WARN` either way across a killed life); or a record is stored twice in a SUT life with no epoch bump (`WARN` after one). See [Kafka targets](#kafka-targets) |
 | `identity.sink` | at the final life's last drain before its final one, a sink's batches received, plus those a disk spool replayed at open and the one it counts dropped with a torn tail (`batches.dropped{reason="disk_torn"}`, a batch an earlier life received), differ from delivered + dropped + queued by more than one batch in flight |
 | `drops` | the SUT counts a `logit.*.dropped` no other row judges with a `rejected` or `disk_corrupt` reason; any other reason `WARN`s. The ledger's own terms (every `batches.dropped`, a node's `events.dropped` beside a batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B, and the script's `script_error`) and, on an external or Kafka target, a sink's `records.dropped` and `metrics.dropped` stay with the rows that balance them, so a drop is counted once. On an external target, where `ledger.egress` SKIPs, a `rejected` or `disk_corrupt` batch drop at a sink is `ledger.sent`'s FAIL, and one at any other node stays in this row |

@@ -2719,7 +2719,9 @@ def _class_signature(data, led, sink, fault, at_most_once, slack):
 
 def check_ledger_standin(data):
     """For a stand-in target, the record against the sink: every line parses and every body
-    decodes; no resend stored a different value for a sample already stored; per SUT life, the
+    decodes; every sample of a write answered `2xx` was stored, which is what catches a black
+    hole that a rejected step's drop credit would let `ledger.egress` count; no resend stored a
+    different value for a sample already stored; per SUT life, the
     record's requests by status class equal the sink's `logit.output.requests` for 2xx to 5xx,
     and its resets are at most the sink's `network_error`, which a connect failure also counts;
     every answer other than the default carries the cue of a `respond` step and falls inside
@@ -2763,6 +2765,12 @@ def check_ledger_standin(data):
                    f"{last:g}: a resend changed a sample")
     if len(conflicts) > 5:
         flag(FAIL, f"{len(conflicts) - 5} more changed sample(s)")
+    lost = standin.acknowledged_unstored(requests, data.standin_store[0])
+    if lost:
+        key, stamp = lost[0]
+        flag(FAIL, f"{_n(len(lost))} sample(s) the stand-in answered 2xx were never stored, "
+                   f"first {dict(key).get('__name__', key)} at {data.offset(stamp / 1000)}: a "
+                   "write the sink saw accepted and the destination lost")
     wrong_path = [r for r in requests if r.get("path") != standin.REMOTE_WRITE_PATH]
     if wrong_path:
         flag(FAIL, f"{len(wrong_path)} write(s) to a path other than "

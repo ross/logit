@@ -16,8 +16,9 @@ request, then closes the connection with an RST and no response. The line is pri
 answer is written, so a request the sink saw answered is in the record unless the process died
 between the two. The checks decode the bodies on the host (`soaklib/standin.py`).
 
-SIGTERM stops both servers and lets each request in flight finish, so a `stop` of this service
-never cuts a response off after the sink's attempt was recorded.
+SIGTERM closes the data port's listening socket at once, so a connection that arrives after it is
+refused, which a sink reads as a connect failure, never as a reset after its request was sent.
+It then stops both servers and lets each request in flight finish.
 """
 
 import argparse
@@ -132,11 +133,15 @@ def data_handler(state):
             self.wfile.flush()
 
         def _reset(self):
-            # SO_LINGER with a zero timeout makes close() send an RST, never a FIN, so the
-            # client reads a reset, not an empty response.
+            # SO_LINGER with a zero timeout makes close() send an RST. It closes here, because
+            # socketserver's own close calls shutdown(SHUT_WR) first, which sends a FIN the
+            # client would read as an empty response. `rfile` holds a reference to the socket,
+            # so it closes first, or close() leaves the descriptor open.
             self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
                                        struct.pack("ii", 1, 0))
             self.close_connection = True
+            self.rfile.close()
+            self.connection.close()
 
     return Handler
 
@@ -209,6 +214,16 @@ def main(argv=None):
 
     def stop(signum, frame):
         state.stopping = True
+        # Before anything waits: until `serve_forever` returns, the kernel would go on
+        # completing handshakes into the backlog, and each would be reset when the server
+        # closes. close() alone isn't enough, because `serve_forever`'s poll holds the socket
+        # open until it wakes; shutdown() stops the listener now. `server_close` closes it
+        # again, which is harmless.
+        try:
+            data.socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        data.socket.close()
         threading.Thread(target=lambda: (data.shutdown(), control.shutdown())).start()
 
     signal.signal(signal.SIGTERM, stop)
