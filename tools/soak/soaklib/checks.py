@@ -1608,8 +1608,9 @@ class Ledger:
         excused, _ = self.cued_rejections(life, sinks)
         if not excused:
             return ""
-        return "rejected " + ", ".join(f"{_n(n)} cued by {step}"
-                                       for step, n in sorted(excused.items()))
+        order = [step for _, _, step in sorted(self.cued)]
+        return "rejected " + ", ".join(f"{_n(excused[step])} cued by {step}"
+                                       for step in order if step in excused)
 
     def fault_drops(self, life, sinks):
         """The `FAULT_DROP_REASONS` drops in `life`'s `drop_credit`, as text, or "", less the

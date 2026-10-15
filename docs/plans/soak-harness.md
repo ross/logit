@@ -1266,7 +1266,7 @@ stdlib has no zstd before 3.14, so a stand-in scenario's sink sends Snappy.
 **The scenarios.**
 
 - `standin-remote-write`: `statsd-vm`'s generator and SUT, with `prometheus_out` sending
-  remote-write 1.0 under `compression: snappy` to the stand-in. Nineteen 20 s steps, 95 s apart,
+  remote-write 1.0 under `compression: snappy` to the stand-in. Nineteen 20 s steps, 105 s apart,
   walk the sink's sender-mode table: `503`, a `503` after storing the write (its resend stores
   the same samples again), `429`, `400` with `out of order sample`, `400` with each
   decompression prefix, `401`, `403`, `407`, `404`, `405`, `501`, `409`, `413`, `415`, `422`,

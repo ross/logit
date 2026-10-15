@@ -182,7 +182,7 @@ Two scenarios run a sink against a scripted stand-in in place of VictoriaMetrics
 
 | Scenario | Length | What it drives |
 |---|---|---|
-| `standin-remote-write` | 32 minutes 40 seconds | `prometheus_out` (remote-write 1.0, Snappy) through every row of its sender-mode response-class table: nineteen 20 s steps, 95 s apart, from `503`, `429`, and each `400` body the sink reads, through `401`, `403`, `404`, `405`, `407`, `409`, `413`, `415`, `422`, `501`, and `302`, to a connection reset and a stop of the stand-in, each step naming the class the sink must read |
+| `standin-remote-write` | 35 minutes 40 seconds | `prometheus_out` (remote-write 1.0, Snappy) through every row of its sender-mode response-class table: nineteen 20 s steps, 105 s apart, from `503`, `429`, and each `400` body the sink reads, through `401`, `403`, `404`, `405`, `407`, `409`, `413`, `415`, `422`, `501`, and `302`, to a connection reset and a stop of the stand-in, each step naming the class the sink must read |
 | `standin-at-most-once` | 8 minutes 55 seconds | the same sink under `buffer.delivery: at_most_once`: a `503` and a reset drop the batch, a `401` holds it, a `400` drops it |
 
 ### Faults

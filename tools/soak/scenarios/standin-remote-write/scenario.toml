@@ -1,5 +1,6 @@
 # Every row of prometheus_out's sender-mode response-class table, against a scripted stand-in
-# under load: each step tells the stand-in what to answer for 20 s, and its `class` names the
+# under load: each step tells the stand-in what to answer for 20 s, 105 s apart, so a
+# 30 s progress window fits between one step's recovery and the next, and its `class` names the
 # fault class the sink must read (crates/logit-outputs/src/prometheus.rs, "Faults, retries and
 # duplicate safety (sender mode)"). `ledger.standin` checks each step's effect at the sink and
 # the stand-in's record against the sink's telemetry; V is what the stand-in stored. A rejected
@@ -8,11 +9,11 @@
 
 name = "standin-remote-write"
 description = "statsd-vm into prometheus_out RW1 Snappy, against a stand-in answering every row of the sink's response-class table in turn"
-duration = "32m40s"        # warmup + one cycle + cooldown
+duration = "35m40s"        # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "60s"          # >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
-cycle = "30m40s"           # the last step, its recovery, and two progress windows
+cycle = "33m40s"           # the last step, its recovery, and two progress windows
 
 [configs]
 sut = "logit-sut.yaml"
@@ -48,7 +49,7 @@ class = "ambiguous"
 for = "20s"
 
 [[step]]                  # c0s2: a 5xx after storing: the resend stores the same samples
-at = "1m35s"
+at = "1m45s"
 action = "respond"
 on = "standin"
 status = 503
@@ -57,7 +58,7 @@ class = "ambiguous"
 for = "20s"
 
 [[step]]                  # c0s3: 429: retried
-at = "3m10s"
+at = "3m30s"
 action = "respond"
 on = "standin"
 status = 429
@@ -65,7 +66,7 @@ class = "ambiguous"
 for = "20s"
 
 [[step]]                  # c0s4: 400 for invalid samples: dropped
-at = "4m45s"
+at = "5m15s"
 action = "respond"
 on = "standin"
 status = 400
@@ -74,7 +75,7 @@ class = "rejected"
 for = "20s"
 
 [[step]]                  # c0s5: VictoriaMetrics' decompression error: held
-at = "6m20s"
+at = "7m"
 action = "respond"
 on = "standin"
 status = 400
@@ -83,7 +84,7 @@ class = "refused"
 for = "20s"
 
 [[step]]                  # c0s6: client_golang's decompression error: held
-at = "7m55s"
+at = "8m45s"
 action = "respond"
 on = "standin"
 status = 400
@@ -92,7 +93,7 @@ class = "refused"
 for = "20s"
 
 [[step]]                  # c0s7: credentials: held
-at = "9m30s"
+at = "10m30s"
 action = "respond"
 on = "standin"
 status = 401
@@ -100,7 +101,7 @@ class = "refused"
 for = "20s"
 
 [[step]]                  # c0s8: credentials: held
-at = "11m5s"
+at = "12m15s"
 action = "respond"
 on = "standin"
 status = 403
@@ -108,7 +109,7 @@ class = "refused"
 for = "20s"
 
 [[step]]                  # c0s9: proxy credentials: held
-at = "12m40s"
+at = "14m"
 action = "respond"
 on = "standin"
 status = 407
@@ -116,7 +117,7 @@ class = "refused"
 for = "20s"
 
 [[step]]                  # c0s10: not a remote-write receiver: held
-at = "14m15s"
+at = "15m45s"
 action = "respond"
 on = "standin"
 status = 404
@@ -124,7 +125,7 @@ class = "refused"
 for = "20s"
 
 [[step]]                  # c0s11: not a remote-write receiver: held
-at = "15m50s"
+at = "17m30s"
 action = "respond"
 on = "standin"
 status = 405
@@ -132,7 +133,7 @@ class = "refused"
 for = "20s"
 
 [[step]]                  # c0s12: not a remote-write receiver: held
-at = "17m25s"
+at = "19m15s"
 action = "respond"
 on = "standin"
 status = 501
@@ -140,7 +141,7 @@ class = "refused"
 for = "20s"
 
 [[step]]                  # c0s13: Thanos receive's conflict: dropped
-at = "19m"
+at = "21m"
 action = "respond"
 on = "standin"
 status = 409
@@ -148,7 +149,7 @@ class = "rejected"
 for = "20s"
 
 [[step]]                  # c0s14: request too large: dropped
-at = "20m35s"
+at = "22m45s"
 action = "respond"
 on = "standin"
 status = 413
@@ -156,7 +157,7 @@ class = "rejected"
 for = "20s"
 
 [[step]]                  # c0s15: unsupported encoding: held
-at = "22m10s"
+at = "24m30s"
 action = "respond"
 on = "standin"
 status = 415
@@ -164,7 +165,7 @@ class = "refused"
 for = "20s"
 
 [[step]]                  # c0s16: any other 4xx: dropped
-at = "23m45s"
+at = "26m15s"
 action = "respond"
 on = "standin"
 status = 422
@@ -172,7 +173,7 @@ class = "rejected"
 for = "20s"
 
 [[step]]                  # c0s17: a redirect, never followed: dropped
-at = "25m20s"
+at = "28m"
 action = "respond"
 on = "standin"
 status = 302
@@ -180,7 +181,7 @@ class = "rejected"
 for = "20s"
 
 [[step]]                  # c0s18: a transport error after the request was sent: retried
-at = "26m55s"
+at = "29m45s"
 action = "respond"
 on = "standin"
 answer = "reset"
@@ -188,7 +189,7 @@ class = "ambiguous"
 for = "20s"
 
 [[step]]                  # c0s19: a connect failure: held
-at = "28m30s"
+at = "31m30s"
 action = "stop"
 on = "standin"
 class = "clean"
