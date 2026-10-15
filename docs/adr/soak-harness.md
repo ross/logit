@@ -280,3 +280,24 @@ the two sides in one life can't be judged across two processes until the ledger 
 between them, so it SKIPs then. The end sequence stops the SUT services in chain order, each
 only once what it holds has been forwarded.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Several SUT services", has the rules.
+
+## Amendment: the native hop is judged on run totals, with an end-to-end bound (2026-10-15)
+
+Two SUT services are joined by a `[[ledger.hop]]` naming the `logit_out` and the `logit_in`
+between them, and a scenario has at most one. The two processes' lives can't be paired: a kill
+on one side starts no life on the other, and frames a killed sender spooled cross in a later
+life of either. So each side's rows run on its own lives, as the amendment above set, and the
+hop itself gets its own row, `ledger.hop`, judged on run totals: the events the hop sink
+received, less its counted drops, against the events the `logit_in` forwarded. It passes at 0,
+and a kill or a pause is allowed only what it can cause: a killed side's last drain interval of
+counts, and, for a kill or a pause of the receiving side, one send window of frames forwarded
+twice ([ADR `native-hop-named-acks`](native-hop-named-acks.md),
+[`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)). A graceful stop of the
+receiving side is judged exact, because `logit_in` acknowledges everything it forwarded before
+it closes.
+
+A frame forwarded twice adds the same increments to every count after the hop and to V, so
+every per-life term on the receiving side balances around it. `ledger.summary` adds one bound no
+kill can loosen: V over the whole run is at most what the generators sent less every counted
+loss. A surplus anywhere past the hop breaks it.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "The native hop (W10b)", has the rules.

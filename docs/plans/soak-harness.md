@@ -465,16 +465,18 @@ services:
 
 - The SUT services form a chain: `logit`, then each further one in the order `[configs]` lists
   it (`Scenario.suts`, recorded in `scenario.resolved.json` as `suts`). The chain's last service
-  holds `sut_aggregate`, every `[[ledger.sink]]`, and a `sut_script`.
+  holds `sut_aggregate` and every `[[ledger.sink]]`.
+- From W10b a second SUT service needs a `[[ledger.hop]]` naming the native hop that joins it to
+  `logit`, and a scenario has at most one hop, so at most two SUT services ("The native hop
+  (W10b)" in §8d).
 - A further SUT's key is a slug, isn't `logit`, and has a compose variable,
   `scenario.config_env(service)`, that no source and no other SUT service shares. With the role
   map, the stack's `sut` services are `logit` and those keys, so a `sut` service the scenario
   doesn't declare is refused, as is a declared one the stack doesn't run as a `sut`.
 - A `kill` or an `exit` may name any SUT service. A fault on a further SUT service never affects
   UDP ingress (§4), since no generator sends to it.
-- W10b adds the ledger across the chain, `[[ledger.hop]]`; until a hop names the two ends,
-  the rows that equate a listener's symbols with `aggregate`'s in one life SKIP when the two are
-  in different services (§6).
+- The ledger across the two follows the hop (§8d). In W10a, before the hop ledger, the rows
+  that equate a listener's symbols with `aggregate`'s in one life SKIPped across two services.
 
 **`vm_every_window` (W3)**, an optional `[ledger]` key, turns on `ledger.windows`: every series
 has a sample in every `aggregate` window of every SUT life that `aggregate` emitted. Set it only
@@ -666,9 +668,10 @@ ticket with `${DOCKER} version` first.
    `vm-export/<sink>.jsonl` from its backend's `/api/v1/export` with `match[]=<vm_selector>`
    and `start=0`. With several SUT services (W10a), each stops in chain order, one
    `sut_stopped` phase naming each: before an earlier one stops, the driver waits until a drain
-   of its own stdout, two aggregate windows after the wait began, shows every sink it reports
-   with `buffer.batches` 0, and `retrying` and `logit.output.in_flight` 0 or never set (120 s
-   bound, a `sink_drained` phase naming the service); the last waits as above, on its sinks.
+   of its own stdout, two aggregate windows after the wait began, shows its `[[ledger.hop]]`
+   sink (W10b) with `buffer.batches` 0, and `retrying` and `logit.output.in_flight` 0 or never
+   set (120 s bound, a `sink_drained` phase naming the service); the last waits as above, on
+   its sinks.
 5. Collect: the last `docker logs` chunk per service, from its cursor to the end, into
    `.stdout` and `.stderr`, and `inspect/<svc>.json`.
    Then `compose down -v --remove-orphans`, unless `--keep`. A `try`/`finally` makes SIGINT still
@@ -692,9 +695,7 @@ listener symbols (W, K, D, B, E, X) are read on the ingress SUT's lives, and eve
 `aggregate` on (A, Ab, the sinks, V split per life, `ledger.windows`, `ledger.replay`,
 `identity.sink`, `progress`, `recovery`, `ledger.sent`) on the lives of the service holding
 `aggregate`, from its own telemetry and stderr. `drops` reads every SUT service and names it.
-Until W10b's hop ledger, a row that equates the two sides in one life, `ledger.script`,
-`ledger.egress`, and `ledger.summary`, SKIPs when they are different services, `ledger.edge`
-judges only the edges out of `aggregate`, and `ledger.intake` the final life's balance.
+The two are joined by the native hop's ledger (W10b, §8d), never by pairing their lives.
 
 A "fault window" below is a fault's span plus `recovery_bound` after it. A fault whose apply
 returned nonzero has none, so nothing after it is excused.
@@ -1402,6 +1403,88 @@ samples and no drop in the life credits the gap (a self-test fixture), and a hol
 shows in `ledger.windows` under `vm_every_window` (a recorded by-hand run). It isn't a shipped
 scenario.
 
+### 8d. The native hop (W10b)
+
+A scenario with two SUT services names the hop between them:
+
+```toml
+[[ledger.hop]]
+from = "logit"            # the SUT holding the logit_out: the ingress SUT
+sink = "hop"              # its logit_out component id
+to = "collector"          # the SUT holding the logit_in: the further SUT [configs] names
+listener = "hop"          # its logit_in component id
+```
+
+**The schema.** At most one `[[ledger.hop]]`, with the four keys and no other, `sink` and
+`listener` component ids, `from` `logit`, and `to` the one further SUT service `[configs]`
+names. Two SUT services with no hop are refused, and so is a hop beside `[ledger] sut_script` or
+a source's `sut_transforms`, whose rows judge a path into `aggregate` inside one process.
+
+**The driver.** Before it stops `logit`, the end sequence waits on the hop sink alone: its
+`buffer.batches` 0, and `retrying` and `logit.output.in_flight` 0 or never set, so everything it
+took has been acknowledged before `logit` stops. `collector` then stops as the last SUT does.
+
+**The symbols.** On `logit`'s lives, the hop sink's S_hop
+(`logit.component.events.received{component=<sink>}`), its counted drops
+(`logit.component.events.dropped`, every reason), and `logit.output.batches.resumed` and
+`logit.output.reconnects`. On `collector`'s lives, the `logit_in`'s E_B
+(`logit.component.events.sent{component=<listener>}`, the events of the frames it forwarded, and
+none of a resend it acknowledged under a mark), X_B (its `events.dropped`), and
+`logit.input.batches.resends`. E_B − X_B stands in for W − D − B − X on the far side: it feeds
+`aggregate` there. A frame's events are at most the largest events-over-batches of any hop sink
+drain, and a send window is the `logit_out`'s `window` (32 by default) frames of that many.
+
+**The rows.** Each side's rows run on its own lives; nothing pairs a life of one with a life of
+the other.
+
+- `ledger.wire` and `ledger.intake`'s balance, `logit`'s final life, as for one SUT.
+- `ledger.intake`'s earlier lives: `logit`'s W − D − B − X − S_hop in [0, R], since its hop
+  sink's inbox stands where `aggregate`'s would; `collector`'s E_B − X_B − Ab in [0, R_hop], 65
+  frames of the largest frame, `aggregate`'s inbox and its taken batch.
+- `ledger.edge`: ΣE == S_hop in `logit`'s final life, and E_B == A and each sink's edge in
+  `collector`'s.
+- `ledger.aggregate`, `ledger.egress`, `ledger.windows`, and `ledger.replay` for the sinks:
+  `collector`'s lives, with E_B − X_B − V for a stopped earlier life and the kill band's rate
+  read from E_B.
+- **`ledger.hop`**, on run totals: gap = ΣS_hop − Σ hop drops − ΣE_B. 0 passes. Each killed
+  `logit` life allows ± its last drain interval of S_hop, which its telemetry may not have
+  counted though its spool forwards it. Each killed `collector` life allows + its last drain
+  interval of E_B, which it forwarded but never exported, and − one send window of frames: its
+  marks are gone, so it forwards a resend of what it had forwarded and not acknowledged. Each
+  `pause` of `collector` allows − one send window: the resend can race the frames an ended
+  connection still holds ([`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)). Any
+  other gap FAILs, below the allowance as a surplus and above it as uncounted. A `rejected` or
+  `disk_corrupt` batch drop at the hop sink FAILs too. Resends, resumed frames, and reconnects
+  are shown beside it, and each fault's share of the gap, from both sides' running totals
+  interpolated at its start and at its end plus `recovery_bound`, is listed in the row's lines.
+- `ledger.summary`: W − D − E − B and E − S_hop in `logit`'s final life, E_B − A, A − Ab, and
+  each egress term in `collector`'s, with `ledger.hop` left to judge the hop. Beside them, one
+  bound end to end, which no kill or restart can loosen: each egress group's V over the whole
+  run is at most G less every counted loss (K, D, B, X, the hop's drops, and X_B). A duplicate
+  forwarded across the hop adds the same increments to E_B, A, Ab, and V, so every per-life term
+  balances around it; this bound and `ledger.hop` are what see it.
+- `ledger.replay` for the hop sink, for each killed `logit` life followed by another: its spool
+  commits a frame once `collector` acknowledges it and persists that every
+  `checkpoint_interval` (1 s by default), so the frames delivered since the last persist replay
+  again: replayed − queued is in [−1, the life's delivered batches per second over its last
+  drain interval × (that interval + the checkpoint interval)]. With `collector` down nothing is
+  delivered and the band is the single-SUT one.
+- `identity.sink` judges the hop sink too, at `logit`'s final life's last quiet drain;
+  `recovery` judges each side's sinks on its own drains, the hop sink against the listeners'
+  datagrams and `collector`'s sinks against E_B; `drops` keys every term on its service and
+  leaves out the hop sink's counted drops, which `ledger.hop` reads, and X_B.
+
+**The scenario.** `native-hop` (17 minutes: warmup 60 s, `recovery_bound` 60 s, a 14-minute
+cycle, cooldown 120 s) runs `logit` as `statsd_in → logit_out` (`window: 32`, `request_timeout:
+10s`, `buffer.disk`) and `collector` as `logit_in → aggregate` (10 s, cumulative,
+`series_retention: 360`) `→ prometheus_out` (remote-write 1.0, zstd, `buffer.disk`). Its steps:
+a netem delay on `logit` (200 ms ± 50 ms, 120 s) and then 10% loss (90 s), a 45 s partition of
+`collector`, a 30 s stop, a 30 s pause, and a 30 s kill of `collector`, a 30 s kill of `logit`
+with `collector` up, and a 30 s kill of `logit` inside a 90 s stop of `collector`. Its
+`[[expect]]` tables assert the replay after the first `logit` kill is deduplicated
+(`logit.input.batches.resends` above 0), `logit` reconnects after the `collector` kill, and the
+spool holds the hop's frames through the stop.
+
 ### 9. Not in this stack
 
 toxiproxy and TCP-level faults it alone can express; per-peer `tc filter` and `ifb` ingress
@@ -1501,10 +1584,13 @@ where it needs them, and a small check extension.
    surplus at B, not an overwrite in V. Proves [ADR `delivery-semantics`](../adr/delivery-semantics.md),
    "7. The native hop is effectively-once", and the resume in
    [ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), "4. The handshake carries
-   identities out and marks back". Faults on A or the link judge zero surplus; a restart of B
-   forgets its marks, so its resend is judged within the send window. Rows: the ledger one hop
-   longer, `ledger.replay` on A. Needs: a second SUT service, with `kill` on it (built in W10a,
-   §2's "Several SUT services"), and the hop ledger (W10b).
+   identities out and marks back". Faults on A or the link judge zero surplus, and so does a
+   graceful `stop` or `restart` of B: `logit_in` writes the accepted `Ack` for every frame it
+   forwarded before it answers `GOING_AWAY`, so nothing it forwarded is resent. Only a `kill` of
+   B, which forgets its marks, or a `pause` long enough to end A's connection, whose frames a
+   resend then races, can forward a frame twice, and the send window bounds that surplus.
+   Rows: the ledger one hop longer, `ledger.replay` on A. Built in W10a (a second SUT service,
+   §2's "Several SUT services") and W10b (the hop ledger and the `native-hop` scenario, §8d).
 8. **TCP ingress.** `syslog_in` or `lines_in` over TCP, or `statsd_in` with `transport: tcp`, from
    the generator's TCP sinks. A stalled SUT backs up into the sender
    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md), "No receive queue on
@@ -1665,8 +1751,11 @@ that items 3, 7, and 11 need.
   own, the rows from `aggregate` on judged on the lives of the service holding it, UDP
   attribution on the ingress SUT alone, and self-test fixtures for each. No scenario runs two
   SUTs yet.
-- **W10b**: the rest of item 7, the ledger one hop longer: `[[ledger.hop]]`, the rows joining
-  the two services, and the `native-hop` scenario.
+- **W10b**: the rest of item 7, the ledger one hop longer (§8d): `[[ledger.hop]]` and its
+  rules, the end sequence waiting on the hop sink, each side's rows on its own lives, the
+  `ledger.hop` row, the end-to-end bound in `ledger.summary`, the hop sink's replay band,
+  identity, and recovery, `drops` keyed on service and component, the `native-hop` scenario,
+  and a run of it under "Findings".
 - **W11**: items 8 and 9, per-line wire counters, a shared volume, and the replay surplus band.
 - **W12**: items 11 and 12, the namespace-holder service, per-instance totals, and the `signal`
   and certificate-rotation actions.

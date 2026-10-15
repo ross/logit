@@ -187,9 +187,16 @@ Three scenarios run a sink against a scripted stand-in in place of VictoriaMetri
 | `standin-at-most-once` | 8 minutes 55 seconds | the same sink under `buffer.delivery: at_most_once`: a `503` and a reset drop the batch, a `401` holds it, a `400` drops it |
 | `standin-datadog` | 30 minutes 25 seconds | `datadog_out` (series, gzip, delta counts) through every row of its response-class table: sixteen 20 s steps, 105 s apart, from a `202` whose body names two series dropped, through `400`, `401`, `403`, `404`, `405`, `408`, `413`, `429`, `500`, `501`, a `503` after storing (its resend a duplicate), `302`, and `422`, to a connection reset and a stop of the stand-in |
 
+`native-hop` runs a second `logit` under test, `collector`, at the far end of the native hop (see
+[Several SUT services](#several-sut-services)):
+
+| Scenario | Length | What it drives |
+|---|---|---|
+| `native-hop` | 17 minutes | `logit` takes statsd and forwards it with `logit_out` from a disk spool to `collector`'s `logit_in`, which aggregates into VictoriaMetrics: a netem delay and then 10% loss on `logit`'s sends, a partition, a stop, a pause, and a kill of `collector`, a kill of `logit` with `collector` up, and a kill of `logit` inside a stop of `collector`. `ledger.hop` judges the hop; its expectations assert the replay after the first `logit` kill is deduplicated, `logit` reconnects after the `collector` kill, and the spool holds the hop through the stop |
+
 ### Several SUT services
 
-A scenario can run a second `logit` under test, such as the far end of a native hop. `logit`
+A scenario can run a second `logit` under test, at the far end of a native hop. `logit`
 stays the ingress SUT, the one every generator sends to and every `[[ledger.source]]` listener is
 in. A further SUT service is declared by a `[configs]` key of its own, one that is neither `sut`
 nor a source's `service`, and added by the override as a service of that name with the role
@@ -200,6 +207,12 @@ nor a source's `service`, and added by the override as a service of that name wi
 sut = "logit-sut.yaml"
 collector = "logit-collector.yaml"   # a further SUT service
 generator = "logit-generator.yaml"
+
+[[ledger.hop]]            # the native hop joining them; one, at most
+from = "logit"            # the SUT holding the logit_out
+sink = "hop"              # its logit_out component id
+to = "collector"          # the SUT holding the logit_in
+listener = "hop"          # its logit_in component id
 ```
 
 ```yaml
@@ -212,19 +225,21 @@ services:
     depends_on: { collector: { condition: service_healthy } }
 ```
 
-The SUT services form a chain, `logit` first and then each further one in `[configs]` order;
-the last holds `sut_aggregate`, every `[[ledger.sink]]`, and a `sut_script`. A `sut` service the
-scenario doesn't declare is refused, and so is a declared one the stack doesn't run. A `kill` or
-an `exit` may name any SUT service, and a fault on a further one never counts as affecting UDP
-ingress. At the end the driver stops the SUT services in chain order: before an earlier one, it
-waits for every sink that service reports to empty with no `logit_out` frame in flight; before
-the last, it waits on the scenario's sinks as for one SUT. Each service's process lives are its
-own: the listener rows are judged on `logit`'s, the rows from `aggregate` on on the last
-service's, and `drops` reads every SUT. The ledger across two services, a native hop, isn't
-built yet, so `ledger.script`, `ledger.egress`, and `ledger.summary` `SKIP` when the listeners
-and `aggregate` are in different services, `ledger.edge` judges only the edges out of
-`aggregate`, and `ledger.intake` only the final life's balance. No shipped scenario runs two
-SUTs yet.
+The second SUT holds `sut_aggregate` and every `[[ledger.sink]]`. A second SUT needs the hop,
+`from` must be `logit` and `to` the SUT `[configs]` declares, and a hop can't be combined with
+`sut_script` or a source's `sut_transforms`. A `sut` service the scenario doesn't declare is
+refused, and so is a declared one the stack doesn't run. A `kill` or an `exit` may name either
+SUT, and a fault on `collector` never counts as affecting UDP ingress. At the end the driver
+stops `logit` once its hop sink's queue is empty with no frame in flight, then `collector` once
+the backends' totals hold.
+
+Each SUT's process lives are its own, and nothing pairs a life of one with a life of the other.
+The listener rows are judged on `logit`'s lives, with its hop sink's events received, S_hop,
+where `aggregate` would be; the rows from `aggregate` on are judged on `collector`'s, fed by its
+`logit_in`'s events sent, E_B. `ledger.hop` judges the hop on run totals, and `ledger.summary`
+adds a bound end to end: V over the run is at most what the generators sent less every counted
+loss, which catches a frame forwarded twice, since a duplicate balances every count after the
+hop. The plan's "The native hop (W10b)" has the rules.
 
 ### Faults
 
@@ -566,8 +581,9 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `ledger.script` | with `[ledger] sut_script` only, else SKIP: in the final SUT life, the listener's events sent differ from those the script received, those it received from those it emitted, discarded (`events.discarded`), and lost to an error (`events.dropped{reason="script_error"}`), or those it sent from those it emitted plus those `flush()` returned |
 | `ledger.egress` | for each sink under `copy`, or for the sinks' sum under `route`: the final SUT life's absorbed increments minus the backend's reset-aware total (Ab − V), or a stopped earlier life's datagrams read minus dropped, bad lines, the listener's counted event drops, and that total (W − D − B − X − V), is nonzero (SKIP on an external target; on a Kafka target V is the topic's distinct records, and a negative gap is a surplus), other than a positive gap in a life whose telemetry counts a batch `batches.dropped` under any reason at a node that can explain it: any node but a sink outside the group, so under `copy` another sink's drop doesn't count a sink's gap, while one at the sink or upstream of the fan-out does (every reason counts; see "The ledger and identities" in the plan's [6. The checks](../../docs/plans/soak-harness.md#6-the-checks-w1a-w1b)); a `rejected` or `disk_corrupt` batch counts the gap but FAILs the life whatever its size, unless a `respond` step that expects `rejected` explains it; a killed life's Ab − V falls outside its band (below, a surplus: the residual plus one drain interval of ingest; above, uncounted: one aggregate interval plus one drain interval of ingest), with the residual the kill lost reported beside it; or a sink's export matched no series. With a script, its `flush()` events leave Ab, its counted drops and errors leave a stopped life's gap, which the final drain exports because `internal` drains last. A series without one segment per SUT life `WARN`s |
 | `ledger.windows` | under `[ledger] vm_every_window = true` only, and SKIPs on an external or Kafka target: a series in a SUT life has two samples more than 1.5 aggregate intervals apart, a killed life's last sample is more than 1.1 intervals before the kill, or a later life's first is more than 2 intervals after its start. The interval comes from the SUT config. A wider gap is excused as idle when the `sut_aggregate` component's `batches.sent` is 0 over the drains from a + (interval + p) / 2 to b − (interval − p) / 2, p being the drain period: no window was emitted, so none was lost. A pause, with no drains at all, counts 0. Any batch there FAILs the gap as windows emitted but not stored, whatever fault was running |
-| `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight |
-| `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0, or any one sink's Ab − V isn't, with a script's hop in place of E − A and one Ab − V term per sink under `copy`; a counted egress term is shown and not judged, unless a `rejected` or `disk_corrupt` drop is in its group's credit, which FAILs the row; on an external target the Ab − V term SKIPs |
+| `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight; across a native hop, a killed `logit`'s hop sink replays fewer than one less, or more than its delivered batches per second over its last drain interval times that interval plus its spool's `checkpoint_interval` |
+| `ledger.hop` | across a native hop only, else no row: over the run, the hop sink's events received, less its counted drops, minus the `logit_in`'s events forwarded isn't 0, beyond the allowance a kill or a pause earns: a killed side's last drain interval of counts, and one send window of frames for a kill or a pause of the receiving side. A `rejected` or `disk_corrupt` batch drop at the hop sink FAILs too |
+| `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0, or any one sink's Ab − V isn't, with a script's hop in place of E − A and one Ab − V term per sink under `copy`; a counted egress term is shown and not judged, unless a `rejected` or `disk_corrupt` drop is in its group's credit, which FAILs the row; on an external target the Ab − V term SKIPs. Across a native hop E − A becomes E − S_hop in `logit`'s final life and E_B − A in `collector`'s, and the row FAILs a sink group whose V over the run exceeds G less every counted loss |
 | `ledger.sent` | an external, Kafka, or `datadog` stand-in target only, else SKIP: a batch a sink received didn't end in an accepted response; a clean external run's detail starts with `SENT`. See [External targets](#external-targets) |
 | `ledger.standin` | a stand-in target only, else SKIP: the record has a line that isn't JSON or a body that doesn't decode, a sample answered `2xx` wasn't stored, a resend stored a different value, its requests by status class differ from the sink's in a SUT life, an answer other than the default falls outside its `respond` step, or a step's `class` doesn't show at the sink; under the `datadog` shape also a `records.dropped` count the record doesn't explain, or a duplicate under `at_most_once` or after a `2xx`. See [Stand-in targets](#stand-in-targets) |
 | `ledger.topic` | a Kafka target only, else SKIP: the topic wasn't read back; its distinct records number fewer than the sink saw accepted, or more with no dropped attempt to explain them (`WARN` with one, and `WARN` either way across a killed life); or a record is stored twice in a SUT life with no epoch bump (`WARN` after one). See [Kafka targets](#kafka-targets) |
