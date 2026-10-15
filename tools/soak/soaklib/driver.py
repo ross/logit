@@ -34,8 +34,8 @@ needs at the code:
 - Every `generator` service, one per `[[ledger.source]]`, mounts the config `[configs]` names
   under its service name, through its own `compose.env` variable (`scenario.config_env()`), as
   does every SUT service after `logit` (`Scenario.suts`). The end sequence stops every generator
-  before it waits on the sinks, then each SUT service in chain order: an earlier one once each of
-  its sinks' queues is empty and nothing is in flight, the last, which holds the
+  before it waits on the sinks, then each SUT service in chain order: an earlier one once its
+  `[[ledger.hop]]` sink's queue is empty and nothing is in flight, the last, which holds the
   `[[ledger.sink]]` sinks, once their stored totals hold or their queues are empty.
 - Every `backend` service has its own published port, re-read after any revert of a fault on
   it. Freshness is sampled per `[[ledger.sink]]`, the end sequence waits until every sink's stored
@@ -601,7 +601,8 @@ class Run:
         suts = self.scenario.suts
         for service in suts:
             if service != suts[-1]:
-                self.wait_sink_drained(service, every_sink=True)
+                self.wait_sink_drained(service, sinks=[hop["sink"] for hop in self.scenario.hops
+                                                       if hop.get("from") == service])
             elif self.has_vm:
                 self.wait_quiet()
             else:
@@ -719,19 +720,20 @@ class Run:
             text, self.scenario.ledger.get("sut_aggregate", ""), "interval")
         return interval or DEFAULT_AGGREGATE_INTERVAL_S
 
-    def wait_sink_drained(self, service=scenario_mod.SUT_SERVICE, every_sink=False):
+    def wait_sink_drained(self, service=scenario_mod.SUT_SERVICE, sinks=None):
         """Waits until a drain of SUT `service` at least two aggregate windows after the wait
         began shows each sink's `buffer.batches` at 0, and its `retrying` and
         `logit.output.in_flight` (a `logit_out`'s frames not yet acknowledged) at 0 or never
-        set, bounded at `SINK_DRAIN_BOUND_S`. The sinks are the `[[ledger.sink]]` ids, or under
-        `every_sink` every component the drain reports a `buffer.batches` for, which an earlier
-        SUT in the chain is waited on with. For the last SUT this is the wait for a target with
+        set, bounded at `SINK_DRAIN_BOUND_S`. The sinks are `sinks`, by default the
+        `[[ledger.sink]]` ids; an earlier SUT in the chain is waited on with its
+        `[[ledger.hop]]` sink. For the last SUT this is the wait for a target with
         no backend to query (external, Kafka, or a stand-in). Two windows let `aggregate` flush
         the last lines the generators sent; a sink's queue then empties once its last send is
         accepted. Reads the newest `SINK_DRAIN_TAIL_LINES` of the
         service's stdout, which a run in progress hasn't collected yet. The phase names the
         service and records each sink's state under `sinks`."""
-        sinks = None if every_sink else [sink["id"] for sink in self.scenario.sinks]
+        if sinks is None:
+            sinks = [sink["id"] for sink in self.scenario.sinks]
         stopped = _now()
         hold_s = 2 * self.aggregate_interval()
         deadline = stopped + SINK_DRAIN_BOUND_S
@@ -743,12 +745,8 @@ class Run:
                                            timeout=POLL_TIMEOUT_S)
             tel = telemetry.parse_ndjson(result.stdout.splitlines())
             newest = max(tel.drains, default=None)
-            names = sinks
-            if names is None:
-                names = sorted({point.attributes.get("component") for point in
-                                tel.matching("logit.component.buffer.batches")} - {None})
             state = {}
-            for sink in names:
+            for sink in sinks:
                 queued = tel.gauge_series("logit.component.buffer.batches", component=sink)
                 retrying = tel.gauge_series("logit.component.retrying", component=sink)
                 in_flight = tel.gauge_series("logit.output.in_flight", component=sink)

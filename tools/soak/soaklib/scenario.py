@@ -64,9 +64,9 @@ STANDIN_ROLE = "standin"
 ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE)
 LOGIT_ROLES = (SUT_ROLE, GENERATOR_ROLE)
 # The ingress SUT: the service every generator sends to, whose config `[configs]` names under
-# `sut`. A scenario's override can add more SUT services, each named by its own `[configs]` key
-# and run after `logit` in the order `[configs]` lists them (`Scenario.suts`); the last one holds
-# `sut_aggregate` and every `[[ledger.sink]]`. Generators are any services with the role, each a
+# `sut`. A scenario's override can add one more SUT service, named by its own `[configs]` key
+# and by the `[[ledger.hop]]`'s `to`, after `logit` in the chain (`Scenario.suts`); the last SUT
+# holds `sut_aggregate` and every `[[ledger.sink]]`. Generators are any services with the role, each a
 # `[[ledger.source]]`: compose.yaml's `generator`, and any a scenario's override adds.
 SUT_SERVICE = "logit"
 # The role map compose.yaml's labels give with the `local` profile, for what can't run
@@ -152,7 +152,10 @@ RANGE_KEYS = {"min", "max"}
 # name, and each further SUT service's under its service name.
 SUT_CONFIG_KEY = "sut"
 LEDGER_KEYS = {"sut_aggregate", "sink", "source", "wire_loss_outside_faults"}
-OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script", "split"}
+OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script", "split", "hop"}
+# A `[[ledger.hop]]`: the native hop between two SUT services, `from`'s `logit_out` component
+# `sink` and `to`'s `logit_in` component `listener`. A scenario has at most one.
+HOP_KEYS = {"from", "sink", "to", "listener"}
 # The `[ledger]` keys a `[[ledger.source]]` table replaced, refused with a pointer to it.
 SOURCE_LEDGER_KEYS = ("generator_input", "generator_sink", "sut_listener")
 # A `[[ledger.source]]`: the generator service, its `generate_in` and UDP sink, the SUT listener
@@ -458,6 +461,11 @@ class Scenario:
         return list(self.ledger.get("sink") or [])
 
     @property
+    def hops(self):
+        """The `[[ledger.hop]]` tables, in order: none, or one."""
+        return list(self.ledger.get("hop") or [])
+
+    @property
     def sources(self):
         """The `[[ledger.source]]` tables, in order."""
         return list(self.ledger.get("source") or [])
@@ -657,6 +665,7 @@ def from_dict(raw, path):
         problems += _sink_problems(ledger, target["kind"])
         problems += _source_problems(ledger)
         problems += _extra_sut_problems(extra_suts, ledger)
+        problems += _hop_problems(ledger, extra_suts)
 
     steps = []
     for index, raw_step in enumerate(raw.get("step", [])):
@@ -904,6 +913,47 @@ def _source_problems(ledger):
         if ledger.get("sut_script") is not None:
             problems.append(f"{where}: `sut_transforms` and [ledger] sut_script can't be "
                             "combined; the script's hop is judged from every listener's E")
+    return problems
+
+
+def _hop_problems(ledger, extra_suts):
+    """What `[[ledger.hop]]` breaks: at most one table, of `HOP_KEYS` only, each a component id
+    or a service; `from` is `SUT_SERVICE` and `to` the one further SUT service `[configs]`
+    names; and no `sut_script` or `sut_transforms` beside it, whose rows judge a hop into
+    `aggregate` inside one process. Two SUT services need a hop, since the ledger can't join
+    them without one."""
+    hops = ledger.get("hop")
+    if hops is None:
+        if extra_suts:
+            return [f"configs: SUT services {SUT_SERVICE} and {', '.join(extra_suts)} need a "
+                    "[[ledger.hop]] naming the logit_out and logit_in between them"]
+        return []
+    if (not isinstance(hops, list) or len(hops) != 1
+            or not all(isinstance(hop, dict) for hop in hops)):
+        return ["ledger.hop must be one table, written [[ledger.hop]]; a scenario has at most "
+                "one hop"]
+    hop = hops[0]
+    problems = []
+    for key in sorted(set(hop) - HOP_KEYS):
+        problems.append(f"ledger.hop: unknown key `{key}`")
+    for key in sorted(HOP_KEYS - set(hop)):
+        problems.append(f"ledger.hop: missing `{key}`")
+    for key in ("sink", "listener"):
+        value = hop.get(key)
+        if key in hop and (not isinstance(value, str) or not _COMPONENT_ID.match(value)):
+            problems.append(f"ledger.hop: `{key}` must name a component id")
+    if "from" in hop and hop["from"] != SUT_SERVICE:
+        problems.append(f"ledger.hop: `from` must be {SUT_SERVICE}, the SUT the generators "
+                        "send to")
+    if "to" in hop and (len(extra_suts) != 1 or hop["to"] != extra_suts[0]):
+        problems.append("ledger.hop: `to` must be the one further SUT service [configs] names"
+                        + (f", {extra_suts[0]}" if len(extra_suts) == 1 else
+                           f"; it names {', '.join(extra_suts) or 'none'}"))
+    if ledger.get("sut_script") is not None:
+        problems.append("ledger.hop and ledger.sut_script can't be combined")
+    sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
+    if any(isinstance(source, dict) and "sut_transforms" in source for source in sources):
+        problems.append("ledger.hop and a source's `sut_transforms` can't be combined")
     return problems
 
 
