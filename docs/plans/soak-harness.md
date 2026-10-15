@@ -850,9 +850,10 @@ push counts its datagrams as shutdown drops without logging a line.
   life by timestamp, not to the life that delivered them. `identity.sink` stays on the final
   life, whose shutdown is ordinary.
 
-The number of SUT lives in telemetry must equal 1 plus the timeline's SUT starts: each `revert`
-of a `stop` or a `kill` on `logit`, an end-sequence early one included, and each `apply` of a
-`restart`, with `rc` 0. An unpause doesn't start a life. A life shorter than `internal`'s interval leaves at most
+The number of lives in each SUT service's telemetry must equal 1 plus that service's own
+starts on the timeline: each `revert` of a `stop` or a `kill` on it, an end-sequence early one
+included, and each `apply` of a `restart` of it, with `rc` 0. A start on one SUT service doesn't
+count toward another's. An unpause doesn't start a life. A life shorter than `internal`'s interval leaves at most
 its shutdown uptime point, so the next life's first uptime isn't lower and the two merge; on a
 mismatch every ledger, `identity.sink`, and `recovery` row SKIPs with the reason. They also SKIP when the SUT's telemetry has no
 `logit.process.uptime` point.
