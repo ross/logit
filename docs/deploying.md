@@ -3222,11 +3222,47 @@ pipeline didn't take the body within 5 seconds and nothing of it was taken, coun
 attribute `_logit.influxdb.measurement` naming the measurement. Each numeric or boolean field
 becomes a gauge named `MEASUREMENT.FIELD`, and each string field an `influxdb.field.FIELD`
 attribute. `org`, `orgID`, and `bucket` become the private resource attributes
-`_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. Use `route` on
-`_logit.influxdb.bucket` to send each bucket to its own `influxdb_out`, since `influxdb_out`
-writes to the one org and bucket in its own config and ignores the resource attributes. No sink
-writes a `_logit.` attribute as a tag or label.
+`_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. No sink writes a
+`_logit.` attribute as a tag or label.
 `crates/logit-proto/src/influxdb/mod.rs`'s module doc has the mapping table.
+
+**Relaying to the client's bucket.** An `influxdb_out` with no `bucket:` writes each batch to the
+bucket its client named, so one sink relays to every bucket the producers use:
+
+```yaml
+components:
+  influx_out:
+    type: influxdb_out
+    sources: [influx]
+    url: https://influxdb.example.com:8086
+    token: !env INFLUXDB_RELAY_TOKEN
+    default_bucket: other   # for a batch no influxdb_in received; omit to drop those, counted
+    # org: example          # replaces the client's org or orgID; omit to forward the client's
+```
+
+With `bucket:` set instead, every batch goes to that bucket and the client's is ignored. Setting
+`bucket:` and `default_bucket:` together is an error. Before choosing the carried form, know what
+it costs:
+
+- A `403` or `404` drops that batch, counted `batches.dropped{reason="rejected"}`, when the
+  bucket or the org came from the client, so one producer's missing bucket doesn't stop every
+  other producer. A bucket that's still being created loses what's written to it until it exists.
+  When both came from config (`bucket:` or `default_bucket:`, and `org:`), the same answers hold
+  the queue and retry, because every batch gets them. `bucket:` alone isn't enough: without
+  `org:`, the client's org is still forwarded. To hold on every `403` and `404`, configure both.
+- Any client `influxdb_in` accepts can write to any bucket the relay's token can write, because
+  `tokens:` doesn't tie a client to a bucket. Scope the relay's token to the producers' buckets,
+  or configure both `bucket:` and `org:`.
+  InfluxDB 2.x doesn't confine a bucket ID to the org sent with it, so a client that names a
+  bucket by ID can reach another org through an org-scoped token.
+- Without `org:`, a batch that didn't come from `influxdb_in` carries no org, and InfluxDB 2.x
+  answers that write `400`, which drops it. InfluxDB 3 ignores the org.
+- InfluxDB 3 Core creates a database for any bucket it doesn't know, so a client's typo becomes a
+  new database.
+
+`crates/logit-outputs/src/influxdb.rs`'s module doc has the full response table, and [ADR
+`influxdb-line-protocol-relay`](adr/influxdb-line-protocol-relay.md)'s 2026-10-15 amendment has
+the reasoning.
 
 **Remove string fields ahead of other sinks.** `influxdb.field.*` attributes are ordinary
 attributes everywhere but `influxdb_out`, so `prometheus_out` and `graphite_out` write them as
@@ -3234,8 +3270,8 @@ labels or tags. Add a `remove` stage for them on any leg that doesn't end in `in
 
 **A destination fault never reaches the producer.** `influxdb_in` answers `204` once the batch is
 in every downstream inbox, before `influxdb_out` writes it. A `422` for a field type conflict
-(the batch drops), and a `404` or `401` from the destination (the sink holds its queue and
-retries), are all invisible to the producer, which believes its writes succeeded. Watch
+(the batch drops), a `404` (the sink holds its queue and retries, or drops the batch when the
+bucket or org came from the client), and a `401` (the sink holds and retries), are all invisible to the producer, which believes its writes succeeded. Watch
 `influxdb_out`'s `batches.dropped{reason="rejected"}` and `logit.component.retrying` instead.
 
 **What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
@@ -3706,7 +3742,7 @@ and VictoriaTraces `:10428`.
 |---|---|---|---|
 | VictoriaMetrics `/api/v1/write` | `prometheus_out` | `endpoint: http://HOST:8428/api/v1/write`, `version: 1`, optionally `compression: zstd` | `version: 2` is stored nowhere, with a `204` (see "Choosing `version: 1` or `2`" above) |
 | vmagent scraping `logit` | `prometheus_out` | `bind:` | vmagent adds `job` and `instance` |
-| VictoriaMetrics `/api/v2/write` (InfluxDB line protocol) | `influxdb_out` | `url: http://HOST:8428`; `org`, `bucket`, and `token` are required but any value works | A field arrives as `<measurement>_<field>`. `org` and `bucket` become no label |
+| VictoriaMetrics `/api/v2/write` (InfluxDB line protocol) | `influxdb_out` | `url: http://HOST:8428`, `token`, and `bucket` or `default_bucket`; any values work | A field arrives as `<measurement>_<field>`. `org` and `bucket` become no label, but `influxdb_out` drops a batch it has no bucket for |
 | VictoriaMetrics `-graphiteListenAddr` | `graphite_out` | `protocol: plaintext`, `tags: carbon` (the default) | The listener is off until VictoriaMetrics starts with the flag. There's no pickle listener |
 | VictoriaMetrics `/opentelemetry/v1/metrics` | `otlp_out` | `endpoint: http://HOST:8428/opentelemetry` | HTTP only; VictoriaMetrics has no OTLP/gRPC listener |
 | VictoriaLogs `/insert/opentelemetry/v1/logs` | `otlp_out` | `endpoint: http://HOST:9428/insert/opentelemetry`, `headers: {VL-Stream-Fields: service.name}` | The OTLP body becomes `_msg` without a `VL-Msg-Field` header. HTTP only |

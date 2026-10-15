@@ -170,7 +170,8 @@ pub enum ComponentKind {
     // and came back once keyed, cross-process consistency turned out to be the part `lua` can't
     // express.
 
-    InfluxDbOut { url: String, org: String, bucket: String, token: String },
+    InfluxDbOut { url: String, org: Option<String>, bucket: Option<String>,
+                  default_bucket: Option<String>, token: String },
     OtlpOut { endpoint: String },
     LogitOut { endpoint: String },
     // A named destination a router directs events into (docs/adr/target-components.md). No
@@ -399,6 +400,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     whitespace, or a `max_request_bytes` of `0`.
 87. A `has_stale`/`drop_stale` with a `max_age` or a `max_ahead` of `0s`.
 88. A top-level `hostname` that is empty or only whitespace.
+89. An `influxdb_out` that sets both `bucket` and `default_bucket`.
 70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL, carries a query
     or fragment, or ends in a HEC route rather than the `/services/collector` base, an empty or
     whitespace-padded `token`, `timeout: 0s`, an `ack_timeout` without `ack: true` or of `0s`, a

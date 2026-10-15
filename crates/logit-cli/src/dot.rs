@@ -112,8 +112,9 @@ mod tests {
                 targets: Vec::new(),
                 kind: ComponentKind::InfluxDbOut {
                     url: "u".to_string(),
-                    org: "o".to_string(),
-                    bucket: "b".to_string(),
+                    org: Some("o".to_string()),
+                    bucket: Some("b".to_string()),
+                    default_bucket: None,
                     token: "T".to_string(),
                 },
             },
@@ -140,8 +141,9 @@ mod tests {
                 targets: Vec::new(),
                 kind: ComponentKind::InfluxDbOut {
                     url: "u".to_string(),
-                    org: "o".to_string(),
-                    bucket: "b".to_string(),
+                    org: Some("o".to_string()),
+                    bucket: Some("b".to_string()),
+                    default_bucket: None,
                     token: "T".to_string(),
                 },
             },

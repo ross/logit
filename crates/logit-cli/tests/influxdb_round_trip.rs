@@ -47,7 +47,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use logit_core::{interner, EventBatch};
 use logit_inputs::influxdb::InfluxDbInput;
-use logit_outputs::influxdb::InfluxDbOutput;
+use logit_outputs::influxdb::{Destination, InfluxDbOutput};
 use logit_pipeline::test_util::{assert_no_batch, recv_batch, TelemetryProbe};
 use logit_pipeline::{Delivered, Fanout, Input, Output};
 use logit_proto::influxdb::{InfluxDecoder, Precision};
@@ -163,8 +163,8 @@ impl Harness {
         let (capture_addr, captured) = spawn_capture().await;
         let out = InfluxDbOutput::new(
             format!("http://{capture_addr}"),
-            "central".into(),
-            "relayed".into(),
+            Some("central".into()),
+            Destination::Fixed("relayed".into()),
             "sink-token".into(),
         )
         .with_telemetry(probe.telemetry("out", "influxdb_out", "sink"));

@@ -104,7 +104,7 @@ Sinks live in `crates/logit-outputs`.
 
 | Kind | Code | What it does | Decision record |
 |---|---|---|---|
-| `influxdb_out` | `crates/logit-outputs/src/influxdb.rs` | InfluxDB 2.x line protocol over the write API | [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md), [ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md), [ADR `influxdb-line-protocol-relay`](docs/adr/influxdb-line-protocol-relay.md) |
+| `influxdb_out` | `crates/logit-outputs/src/influxdb.rs` | InfluxDB 2.x line protocol over the write API, to its configured `bucket:` and `org:`, each else the one `influxdb_in` carried (the bucket else `default_bucket:`); a `403`/`404` drops the batch when a carried value could be at fault | [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md), [ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md), [ADR `influxdb-line-protocol-relay`](docs/adr/influxdb-line-protocol-relay.md) |
 | `stdio_out` | `crates/logit-outputs/src/stdio.rs`, render in `human.rs` | an exhaustive, sectioned text block per event (default, `message: escaped \| multiline`), `format: json` (one object per event per line, `ndjson.rs`, what every harness reader consumes), or `format: native`; its file target is `file_out` with an empty rotation policy | [ADR `human-render-block-format`](docs/adr/human-render-block-format.md), [ADR `stream-json-format`](docs/adr/stream-json-format.md), [ADR `file-output-native-format`](docs/adr/file-output-native-format.md) |
 | `file_out` | `crates/logit-outputs/src/file.rs` | rotating file sink sharing `stdio_out`'s implementation | [ADR `rotating-file-output`](docs/adr/rotating-file-output.md) |
 | `syslog_out` | `crates/logit-outputs/src/syslog.rs` | RFC 3164/5424 over UDP, TCP, or TLS (RFC 5425) | [ADR `syslog-output`](docs/adr/syslog-output.md) |
@@ -425,9 +425,8 @@ Per pair:
   each numeric or boolean field as a typed `Gauge` named `<measurement>.<field>` ([ADR
   `typed-metric-scalar`](docs/adr/typed-metric-scalar.md)), and each string field as the public
   `influxdb.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as
-  `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`, and
-  `influxdb_out` writes to its own configured org and bucket, so a `route` on the bucket picks a
-  destination. The presence of `_logit.influxdb.measurement` selects the carrier path on
+  `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. `influxdb_out` writes
+  each batch there unless its own `bucket:` or `org:` overrides the matching carrier. The presence of `_logit.influxdb.measurement` selects the carrier path on
   `influxdb_out`. Every other sink ignores the private carriers and renders `influxdb.field.*` as
   ordinary labels, so a `remove` of those belongs ahead of one. A tag key under `_logit.` or
   `influxdb.field.` is dropped, counted. `influxdb_in` parses the whole body before building any

@@ -14,7 +14,7 @@
 use bytes::Bytes;
 use logit_core::{Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Value};
 use logit_inputs::influxdb::InfluxDbInput;
-use logit_outputs::influxdb::InfluxDbOutput;
+use logit_outputs::influxdb::{Destination, InfluxDbOutput};
 use logit_pipeline::test_util::{assert_no_batch, recv_batch, TelemetryProbe};
 use logit_pipeline::{classify, Delivered, Fanout, Fault, Input, Output};
 use logit_proto::influxdb::{
@@ -58,8 +58,13 @@ fn sink(
     bucket: &str,
     token: &str,
 ) -> InfluxDbOutput {
-    InfluxDbOutput::new(format!("http://{addr}"), org.into(), bucket.into(), token.into())
-        .with_telemetry(probe.telemetry("out", "influxdb_out", "sink"))
+    InfluxDbOutput::new(
+        format!("http://{addr}"),
+        Some(org.into()),
+        Destination::Fixed(bucket.into()),
+        token.into(),
+    )
+    .with_telemetry(probe.telemetry("out", "influxdb_out", "sink"))
 }
 
 /// The resource `influxdb_in` builds for a write naming [`ORG`] and [`BUCKET`].
@@ -235,4 +240,42 @@ async fn refusals_reach_the_sink_as_their_fault_class() {
     assert_eq!(totals.sum("logit.input.requests", &[("class", "rejected")]), 3.0);
     assert_eq!(totals.sum("logit.input.requests", &[("class", "ok")]), 0.0);
     assert_eq!(totals.sum("logit.output.requests", &[("class", "4xx")]), 3.0);
+}
+
+/// `influxdb_in -> influxdb_out -> influxdb_in` with no `bucket:` on the sink: writes to two
+/// buckets through one listener each arrive at the second listener under the bucket and org their
+/// client named (`logit_outputs::influxdb`'s module doc, "Destination resolution").
+#[tokio::test]
+async fn a_carried_bucket_and_org_relay_through_one_sink() {
+    let probe = TelemetryProbe::new();
+    let (front, mut front_rx) = listener(&probe).await;
+    let (back, mut back_rx) = listener(&probe).await;
+    let mut out = InfluxDbOutput::new(
+        format!("http://{back}"),
+        None,
+        Destination::Carried { default_bucket: None },
+        TOKEN.into(),
+    )
+    .with_telemetry(probe.telemetry("out", "influxdb_out", "sink"));
+    let client = reqwest::Client::new();
+    for bucket in ["alpha", "beta"] {
+        let status = client
+            .post(format!("http://{front}/api/v2/write"))
+            .query(&[("org", ORG), ("bucket", bucket), ("precision", "ns")])
+            .header("Authorization", format!("Token {TOKEN}"))
+            .body("cpu,host=web-1 usage=1.5 1700000000000000000\n")
+            .send()
+            .await
+            .expect("posting to influxdb_in")
+            .status();
+        assert_eq!(status.as_u16(), 204, "{bucket}");
+        let received = recv_batch(&mut front_rx).await;
+        out.send(&received).await.unwrap_or_else(|err| panic!("{bucket}: {err:#}"));
+        let relayed = recv_batch(&mut back_rx).await;
+        let carried = |key: &str| relayed.resource.attributes.get(key).and_then(Value::as_str);
+        assert_eq!(carried(RESOURCE_ATTR_BUCKET), Some(bucket));
+        assert_eq!(carried(RESOURCE_ATTR_ORG), Some(ORG), "{bucket}");
+        assert_eq!(relayed.events, received.events, "{bucket}");
+    }
+    assert_no_batch(&mut back_rx, NOTHING_MORE, "nothing more reaches the second listener").await;
 }
