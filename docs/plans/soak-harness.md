@@ -339,8 +339,10 @@ for = "20s"
 - W9b adds `series_errors = N`, for a stand-in target with `shape = "datadog"` only, on a
   `respond` with a `2xx` `status` and no `body`: the answer's body is the series route's
   `errors` list naming N series dropped, which the checks take to be the request's first N.
-  Under that shape a `class` must be the one `datadog_out`'s table gives the answer
-  (`soaklib/standin.py`'s `datadog_fault_class`), and a `2xx` takes none.
+  Under that shape every `respond` other than a `2xx` needs a `class`, and a `2xx` takes none.
+  The step's `class` is the harness's only copy of `datadog_out`'s response-class table, so the
+  loader checks that one is there, not which one it is; `ledger.standin` judges it against the
+  sink.
 
 **`sut_script` (W7a)**, an optional `[ledger]` key, names a `lua` component between the
 listener and `aggregate`, and adds the script hop to the ledger ("The ledger and identities").
@@ -1306,13 +1308,12 @@ to it, as on an external target. Under `remote_write`, `ledger.sent` SKIPs.
   span holds its first line. The row reads the stderr line rather than an `[[expect]]` because
   the class appears nowhere in telemetry: `requests{class}` buckets the status, and `retrying`
   is the same gauge for every held class.
-- Under `datadog` (W9b), also: each answer under a classed step's cue is the class
-  `datadog_out`'s response-class table gives it: `408`, `429`, any `5xx` (`501` included), and
-  a reset `ambiguous`; `401`, `403`, `404`, `405`, and `407` `refused`; `400`, `413`, and any
-  other `3xx` or `4xx` `rejected`; a connect failure, which never reaches the record, `clean`.
-  Per SUT life, the sink's `records.dropped{reason="rejected"}` equals the series the
-  `series_errors` answers named plus the points of the requests answered with a rejected status
-  other than `413`, and `records.dropped{reason="oversize"}` the points of the `413` answers.
+- Under `datadog` (W9b), also: per SUT life, the sink's `records.dropped{reason="rejected"}`
+  equals the series the `series_errors` answers named plus the points of the requests answered
+  under the cue of a step classed `rejected`, other than a `413`, and
+  `records.dropped{reason="oversize"}` the points of the `413` answers under such a step. The
+  expected class comes from the step alone; the harness keeps no copy of the sink's table to
+  check it against, so a step classed wrong FAILs its signature at the sink.
   Each duplicate copy is reported per life with the amount the destination counted twice:
   permitted under `at_least_once`, and a FAIL under `at_most_once`, or when the copy it repeats
   was answered `2xx` in the same life, a point the sink saw accepted and resent.

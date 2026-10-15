@@ -204,8 +204,9 @@ Three scenarios run a sink against a scripted stand-in in place of VictoriaMetri
 A `mark`, `exit`, or `respond` window is a fault window like any other, so the checks excuse
 what happens inside it. None of them can go in a `[random]` schedule. A `respond` or a `stop` of
 a stand-in may name the `class` the sink must read its answers as (`clean`, `ambiguous`,
-`rejected`, or `refused`), which `ledger.standin` judges. Under the `datadog` shape the class must
-be the one `datadog_out`'s table gives the answer, and a `2xx` takes none.
+`rejected`, or `refused`), which `ledger.standin` judges. Under the `datadog` shape every
+`respond` other than a `2xx` must name one, because its class is the only statement of what the
+sink should do with the answer, and a `2xx` takes none.
 
 ```toml
 [[step]]
@@ -401,13 +402,12 @@ What changes for a stand-in target:
   its span; and each step's `class` shows at the sink. `rejected` is a batch dropped `rejected`
   and no `retrying` line; `clean`, `refused`, and `ambiguous` are the `retrying` line's class
   word, `send failed (<class>)`, and no drop; under `at_most_once`, `ambiguous` is a batch dropped
-  `ambiguous_at_most_once`. Under `datadog`, also: each answer under a classed step's cue is the
-  class `datadog_out`'s table gives it; per SUT life the sink's `records.dropped{reason="rejected"}`
-  equals the series the `series_errors` answers named plus the points of the requests answered
-  with a rejected status other than `413`, and `records.dropped{reason="oversize"}` the points of
-  the `413` answers; and a duplicate copy is reported under `at_least_once` and FAILs under
-  `at_most_once`, or when the copy it repeats was answered `2xx` in the same life, a point the
-  sink saw accepted and resent.
+  `ambiguous_at_most_once`. Under `datadog`, also: per SUT life the sink's
+  `records.dropped{reason="rejected"}` equals the series the `series_errors` answers named plus the
+  points of the requests answered under a step classed `rejected`, other than a `413`, and
+  `records.dropped{reason="oversize"}` the points of the `413` answers under such a step; and a
+  duplicate copy is reported under `at_least_once` and FAILs under `at_most_once`, or when the copy
+  it repeats was answered `2xx` in the same life, a point the sink saw accepted and resent.
 - A batch dropped `rejected` inside a `respond` step with `class = "rejected"`, up to one
   aggregate interval plus `recovery_bound` after it, counts its gap without FAILing
   `ledger.egress` or `ledger.summary`. Outside every such step it FAILs, as on any target.
@@ -529,7 +529,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight |
 | `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0, or any one sink's Ab − V isn't, with a script's hop in place of E − A and one Ab − V term per sink under `copy`; a counted egress term is shown and not judged, unless a `rejected` or `disk_corrupt` drop is in its group's credit, which FAILs the row; on an external target the Ab − V term SKIPs |
 | `ledger.sent` | an external, Kafka, or `datadog` stand-in target only, else SKIP: a batch a sink received didn't end in an accepted response; a clean external run's detail starts with `SENT`. See [External targets](#external-targets) |
-| `ledger.standin` | a stand-in target only, else SKIP: the record has a line that isn't JSON or a body that doesn't decode, a sample answered `2xx` wasn't stored, a resend stored a different value, its requests by status class differ from the sink's in a SUT life, an answer other than the default falls outside its `respond` step, or a step's `class` doesn't show at the sink; under the `datadog` shape also an answer whose class isn't the step's by `datadog_out`'s table, a `records.dropped` count the record doesn't explain, or a duplicate under `at_most_once` or after a `2xx`. See [Stand-in targets](#stand-in-targets) |
+| `ledger.standin` | a stand-in target only, else SKIP: the record has a line that isn't JSON or a body that doesn't decode, a sample answered `2xx` wasn't stored, a resend stored a different value, its requests by status class differ from the sink's in a SUT life, an answer other than the default falls outside its `respond` step, or a step's `class` doesn't show at the sink; under the `datadog` shape also a `records.dropped` count the record doesn't explain, or a duplicate under `at_most_once` or after a `2xx`. See [Stand-in targets](#stand-in-targets) |
 | `ledger.topic` | a Kafka target only, else SKIP: the topic wasn't read back; its distinct records number fewer than the sink saw accepted, or more with no dropped attempt to explain them (`WARN` with one, and `WARN` either way across a killed life); or a record is stored twice in a SUT life with no epoch bump (`WARN` after one). See [Kafka targets](#kafka-targets) |
 | `identity.sink` | at the final life's last drain before its final one, a sink's batches received, plus those a disk spool replayed at open and the one it counts dropped with a torn tail (`batches.dropped{reason="disk_torn"}`, a batch an earlier life received), differ from delivered + dropped + queued by more than one batch in flight |
 | `drops` | the SUT counts a `logit.*.dropped` no other row judges with a `rejected` or `disk_corrupt` reason; any other reason `WARN`s. The ledger's own terms (every `batches.dropped`, a node's `events.dropped` beside a batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B, and the script's `script_error`) and, on an external, Kafka, or `datadog` stand-in target, a sink's `records.dropped` and `metrics.dropped` stay with the rows that balance them, so a drop is counted once. On an external target, where `ledger.egress` SKIPs, a `rejected` or `disk_corrupt` batch drop at a sink is `ledger.sent`'s FAIL, and one at any other node stays in this row |

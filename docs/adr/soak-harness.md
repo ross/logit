@@ -254,4 +254,10 @@ healthy destination, so this extends the cued-rejection rule above: a refusal li
 `oversize` record drop inside a `413` step, and a `rejected` record drop inside another rejected
 step or a step whose `202` names dropped series are counted as cued and don't FAIL. The same
 drops outside such a step FAIL as on any target.
+
+A `respond` step's `class` is the harness's only statement of the class a sink must read an
+answer as, and under this shape every non-`2xx` step must carry one. A second copy of the
+sink's table in the harness was considered and not kept: it checked the scenario against itself,
+never against `logit`, and could drift from the Rust table unnoticed. A class change in a sink
+updates its stand-in scenario's steps instead.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Stand-in targets", has the rules.

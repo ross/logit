@@ -2850,14 +2850,13 @@ def check_ledger_standin(data):
     that class's effect at the sink (`_class_signature`). A killed life's mismatch WARNs, since
     a kill loses that life's last telemetry interval. Every other target SKIPs.
 
-    Under the `datadog` shape (`_standin_datadog`), also: each answer under a classed step's cue
-    is the class `datadog_out`'s table gives it; per SUT life, the sink's
+    Under the `datadog` shape (`_standin_datadog`), also: per SUT life, the sink's
     `records.dropped{reason="rejected"}` equals the series the `series_errors` answers named
-    plus the points of the requests answered with a `rejected` status other than `413`, and
-    `records.dropped{reason="oversize"}` equals the points of the `413` requests; and each
-    duplicate copy of a stored point is reported: permitted under `at_least_once` after an
-    answer the sink didn't see accepted, and a FAIL under `at_most_once`, or as a resend within
-    one life of a point the stand-in answered `2xx`."""
+    plus the points of the requests answered under the cue of a step classed `rejected`, other
+    than a `413`, and `records.dropped{reason="oversize"}` equals the points of the `413`
+    requests under such a step; and each duplicate copy of a stored point is reported: permitted
+    under `at_least_once` after an answer the sink didn't see accepted, and a FAIL under
+    `at_most_once`, or as a resend within one life of a point the stand-in answered `2xx`."""
     if not data.standin:
         return Result("ledger.standin", SKIP, f"{data.target.get('kind')} target: no stand-in")
     if data.standin_text is None:
@@ -2998,13 +2997,6 @@ def _standin_datadog(data, led, sink, at_most_once, flag, lines):
     requests = data.standin_requests
     counts = data.standin_counts
     classed = {f.step: f for f in data.faults if f.action == "respond" and f.fault_class}
-    for request in requests:
-        fault = classed.get(request.get("cue"))
-        want = standin.datadog_fault_class(request)
-        if fault is not None and want != fault.fault_class:
-            flag(FAIL, f"request #{request.get('seq')} under {fault.step} was answered "
-                       f"{request.get('status') or request.get('answer')}, which datadog_out "
-                       f"reads as {want or 'accepted'}, not {fault.fault_class}")
 
     # The record's drops per life, by the request's time, against the sink's.
     expected = {}
@@ -3012,7 +3004,10 @@ def _standin_datadog(data, led, sink, at_most_once, flag, lines):
         life = vm.life_at(led.life_starts, t or 0)
         expected.setdefault(life, {"rejected": 0, "oversize": 0})["rejected"] += named
     for request in requests:
-        if standin.datadog_fault_class(request) != "rejected":
+        # The step's `class` is the only statement of what the sink should read; the default
+        # 2xx and a `series_errors` 2xx carry none.
+        fault = classed.get(request.get("cue"))
+        if fault is None or fault.fault_class != "rejected":
             continue
         reason = "oversize" if request.get("status") == 413 else "rejected"
         life = vm.life_at(led.life_starts, request.get("t") or 0)
@@ -3027,8 +3022,8 @@ def _standin_datadog(data, led, sink, at_most_once, flag, lines):
                 if point_life == life)
             if got != want[reason]:
                 what = ("the series series_errors answers named plus the points of requests "
-                        "answered a rejected status" if reason == "rejected" else
-                        "the points of requests answered 413")
+                        "answered under a rejected step" if reason == "rejected" else
+                        "the points of requests answered 413 under a rejected step")
                 flag(verdict, f"life {life}: {sink} counted {_n(got)} record(s) dropped "
                               f"{reason}, the record holds {_n(want[reason])}: {what}")
         lines.append(f"life {life}: records dropped rejected {_n(want['rejected'])}, oversize "

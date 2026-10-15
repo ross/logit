@@ -98,12 +98,12 @@ loss, each `ledger.standin` rule broken in turn, each class's signature with and
 effect, under both postures, and a `rejected` drop excused inside a cued step and FAILing
 outside it. For the `datadog` shape, it covers a series body `datadog_out` sent
 (`standin/datadog-vectors.json`) through gzip and the `MetricPayload` walker, the other
-encodings and the bodies refused, `datadog_out`'s class table, V as the distinct points' sum
-(a duplicate named, a changed value summed), the `series_errors` answer and cue rules on
-loopback ports, the `[target] shape`, `series_errors`, and class rules, and the checks over a
-datadog stand-in run: duplicates reported under `at_least_once` and FAILing under
-`at_most_once` or after a 2xx, the `series_errors` and rejected-status reconciliation against
-`records.dropped`, and `ledger.sent` and `drops` with cued and uncued refusals and drops.
+encodings and the bodies refused, V as the distinct points' sum (a duplicate named, a changed
+value summed), the `series_errors` answer and cue rules on loopback ports, the `[target] shape`,
+`series_errors`, and class rules, and the checks over a datadog stand-in run: duplicates
+reported under `at_least_once` and FAILing under `at_most_once` or after a 2xx, the
+`series_errors` and rejected-step reconciliation against `records.dropped`, and `ledger.sent`
+and `drops` with cued and uncued refusals and drops.
 
 No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
 suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
@@ -5412,18 +5412,6 @@ def _datadog_codec(root):
             expect(False, f"a {encoding} body {data[:4]!r} decoded")
         except standin.DecodeError as err:
             expect(needle in str(err), f"a bad {encoding} body names {needle!r}, got {err}")
-    for request, want_class in (({"status": 202}, None), ({"status": 400}, "rejected"),
-                                ({"status": 413}, "rejected"), ({"status": 302}, "rejected"),
-                                ({"status": 422}, "rejected"), ({"status": 401}, "refused"),
-                                ({"status": 403}, "refused"), ({"status": 404}, "refused"),
-                                ({"status": 405}, "refused"), ({"status": 407}, "refused"),
-                                ({"status": 408}, "ambiguous"), ({"status": 429}, "ambiguous"),
-                                ({"status": 500}, "ambiguous"), ({"status": 501}, "ambiguous"),
-                                ({"status": 503}, "ambiguous"),
-                                ({"answer": "reset", "status": None}, "ambiguous")):
-        expect(standin.datadog_fault_class(request) == want_class,
-               f"datadog_out's table reads {request} as {want_class}, got "
-               f"{standin.datadog_fault_class(request)}")
 
 
 def _datadog_counts():
@@ -5614,12 +5602,10 @@ def _datadog_rules(root):
          "series_errors on a 400"),
         (base, step(15, series_errors=1), "`series_errors` is for respond only",
          "series_errors on a stop"),
-        (base, step(1, **{"class": "refused"}), "datadog_out reads 400 as rejected, not refused",
-         "a class the table doesn't give"),
-        (base, step(10, **{"class": "refused"}), "datadog_out reads 501 as ambiguous",
-         "501, which prometheus_out reads as refused"),
-        (base, step(14, **{"class": "rejected"}), "datadog_out reads reset as ambiguous",
-         "a reset read as rejected"),
+        (base, step(1, **{"class": None}), "a respond other than a 2xx needs `class`",
+         "a 400 with no class"),
+        (base, step(14, **{"class": None}), "a respond other than a 2xx needs `class`",
+         "a reset with no class"),
         (base, step(0, **{"class": "ambiguous"}), "a 2xx isn't a fault, so it takes no `class`",
          "a class on a 202"),
     ]
@@ -5628,9 +5614,14 @@ def _datadog_rules(root):
         _refused(paths[id(raw)], mutate(raw, edit), needle, what)
     remote = copy.deepcopy(rw_base)
     remote["step"][11]["status"] = 501
-    remote["step"][11]["class"] = "refused"
-    expect(scenario.from_dict(remote, rw_path).steps[11].fault_class == "refused",
-           "the remote_write shape doesn't read classes against datadog_out's table")
+    remote["step"][11].pop("class", None)
+    expect(scenario.from_dict(remote, rw_path).steps[11].fault_class is None,
+           "the remote_write shape doesn't require a class on a 501")
+    # The scenario's class is the expectation the checks judge against the sink, so the
+    # loader takes any class word on a fault.
+    stated = mutate(base, step(1, **{"class": "refused"}))
+    expect(scenario.from_dict(stated, path).steps[1].fault_class == "refused",
+           "the datadog shape loads a 400 classed refused, for the checks to judge")
 
 
 def _datadog_checks():
@@ -5881,9 +5872,11 @@ def _datadog_checks():
                                                      cls="ambiguous"))
         detail = " ".join(rows["ledger.standin"].lines)
         expect(rows["ledger.standin"].status == checks.FAIL
-               and "which datadog_out reads as refused, not ambiguous" in detail
+               and "c0s2 (respond on standin, 403): ambiguous: retrying (refused), dropped 0; "
+               "expected retrying (ambiguous) and no drop" in detail
                and rows["ledger.sent"].status == checks.FAIL,
-               f"a 403 under a step classed ambiguous FAILs the table and isn't excused, got "
+               f"a 403 the sink logged refused under a step classed ambiguous FAILs its "
+               f"signature and isn't excused, got "
                f"{rows['ledger.standin']} {rows['ledger.sent']}")
         rows = results("dd-501", lambda r: refused(r, 501), timeline_extra=_respond_fault(
             "c0s2", 290, 305, status=501, cls="ambiguous"),

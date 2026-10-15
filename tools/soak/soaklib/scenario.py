@@ -1269,13 +1269,12 @@ def _expected_event_problems(spec, where):
 
 
 def _respond_problems(spec, where, shape=None):
-    """What a step breaks of the `respond` rules: one of `status` (an integer from 100 to
-    599) and `answer` (one of `RESPOND_ANSWERS`), `body` a string with `status` only, `apply`
-    true or false, `series_errors` a positive integer with a 2xx `status` and no `body` under
-    the `datadog` shape only, none of them on another action; and `class` one of
-    `FAULT_CLASSES`, on a `respond` or a `stop` only, and under the `datadog` shape the class
-    `datadog_out` reads the respond's answer as (`standin.datadog_fault_class`), with none on a
-    2xx. Whether a `respond`'s or a classed `stop`'s `on` is a stand-in needs the role map:
+    """What a step breaks of the `respond` rules: one of `status` (an integer from 100 to 599) and
+    `answer` (one of `RESPOND_ANSWERS`), `body` a string with `status` only, `apply` true or false,
+    `series_errors` a positive integer with a 2xx `status` and no `body` under the `datadog` shape
+    only, none of them on another action; and `class` one of `FAULT_CLASSES`, on a `respond` or a
+    `stop` only, and under the `datadog` shape required on a `respond` other than a 2xx and refused
+    on a 2xx. Whether a `respond`'s or a classed `stop`'s `on` is a stand-in needs the role map:
     `service_problems()`."""
     problems = []
     if spec.action == "respond":
@@ -1307,15 +1306,16 @@ def _respond_problems(spec, where, shape=None):
             if not (isinstance(spec.status, int) and not isinstance(spec.status, bool)
                     and 200 <= spec.status < 300):
                 problems.append(f"{where}: `series_errors` goes with a 2xx `status`")
-        if shape == DATADOG_SHAPE and spec.fault_class in FAULT_CLASSES:
-            want = standin_mod.datadog_fault_class({"status": spec.status,
-                                                    "answer": spec.answer})
-            if want is None:
+        if shape == DATADOG_SHAPE:
+            success = (isinstance(spec.status, int) and not isinstance(spec.status, bool)
+                       and 200 <= spec.status < 300)
+            if success and spec.fault_class is not None:
                 problems.append(f"{where}: a 2xx isn't a fault, so it takes no `class`")
-            elif spec.fault_class != want:
-                problems.append(f"{where}: datadog_out reads "
-                                f"{spec.status if spec.answer is None else spec.answer} as "
-                                f"{want}, not {spec.fault_class}")
+            elif not success and spec.fault_class is None:
+                # `ledger.standin` expects a request's dropped records from its step's class
+                # alone, so a step with none would leave a rejection unexpected.
+                problems.append(f"{where}: under the datadog shape a respond other than a 2xx "
+                                "needs `class`, the class datadog_out must read it as")
     else:
         for name in RESPOND_KEYS:
             if getattr(spec, name) is not None:

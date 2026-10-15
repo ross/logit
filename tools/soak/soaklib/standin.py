@@ -501,24 +501,6 @@ def acknowledged_unstored(requests, series, shape=REMOTE_WRITE):
     return missing
 
 
-def datadog_fault_class(request):
-    """The fault class `datadog_out` reads a request's answer as (crates/logit-outputs/src/
-    datadog.rs, "Faults, retries, and duplicate safety"'s table): None for a `2xx`; `ambiguous`
-    for `408`, `429`, any `5xx` (`501` included), and a reset; `refused` for `401`, `403`,
-    `404`, `405`, and `407`; `rejected` for `400`, `413`, and any other `3xx` or `4xx`. A
-    connect failure is `clean` and never reaches the record."""
-    if request.get("answer") == "reset":
-        return "ambiguous"
-    status = request.get("status")
-    if not isinstance(status, int) or 200 <= status < 300:
-        return None
-    if status in (408, 429) or 500 <= status <= 599:
-        return "ambiguous"
-    if status in (401, 403, 404, 405, 407):
-        return "refused"
-    return "rejected"
-
-
 def points_in(request, shape):
     """The points in a request's body, or 0 when it doesn't decode."""
     try:
