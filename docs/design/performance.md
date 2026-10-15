@@ -1353,8 +1353,8 @@ for `udp-statsd-packed`, with `--pin-sender 0,1 --pin-child 2,3`. Each binary ra
 `logit-perf` built at a matching commit; binaries older than the `kernel.drops` →
 `kernel.dropped` rename ran under `5da5ab8c`'s harness. Four rounds of `--repeat 5` ran with the
 binary order rotated each round. Another container at 215% CPU disturbed round 1, so the table
-reads rounds 2–4 only, 15 runs per cell. All 96 runs passed the `sent == received +
-kernel_dropped` self-check.
+reads rounds 2–4 only, 15 runs per cell. All 480 runs across the 12 bisected binaries, 240 of
+them for the six in the table, passed the `sent == received + kernel_dropped` self-check.
 
 #678 (`edc446d9`, D-) is a stacked merge whose first parent is `8c07211b`. The stack branches off
 `9dbfbae4`, a docs-only commit with the same `crates/` tree as `8c07211b`, so `8c07211b` is the
