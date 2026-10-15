@@ -27,10 +27,14 @@ ledger ends at each sink's own telemetry (docs/plans/soak-harness.md's "External
 `[target]` table with `kind = "kafka"` runs a local Kafka broker, the `kafka` service, in place of
 the `local` profile's backends: its one sink names no backend, faults on `kafka` are allowed for
 that target only, and the ledger's V is the topic it names, read back at the end
-(docs/plans/soak-harness.md's "Kafka targets").
+(docs/plans/soak-harness.md's "Kafka targets"). A `[target]` table with `kind = "standin"` runs
+the scripted stand-in destination, the `standin` service, in the same place: its one sink names
+no backend, `respond` steps tell it what to answer, and the ledger's V is what its record says it
+stored (docs/plans/soak-harness.md's "Stand-in targets").
 
 Services are known by role, from each compose service's `soak.role` label: `sut` (the `logit`
-under test), `generator`, `backend`, or `broker` (a Kafka target's broker). A scenario may add
+under test), `generator`, `backend`, `broker` (a Kafka target's broker), or `standin` (a
+stand-in target's destination). A scenario may add
 services with a `compose` override file, a second generator included, so the role map comes
 from the merged compose config,
 which only the driver can read (`docker compose config`). `load()` checks what needs no service
@@ -50,10 +54,12 @@ from pathlib import Path
 
 # The compose label naming a service's role, and the roles. A `sut` and a `generator` run
 # `logit`; a `backend` stores what a sink delivers and answers the checks' queries; a `broker`
-# is a Kafka target's broker, which the driver reads the topic back from.
+# is a Kafka target's broker, which the driver reads the topic back from; a `standin` is a stand-in
+# target's scripted destination, which answers as `respond` steps cue it and records each request.
 ROLE_LABEL = "soak.role"
 SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE = "sut", "generator", "backend", "broker"
-ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE)
+STANDIN_ROLE = "standin"
+ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE)
 LOGIT_ROLES = (SUT_ROLE, GENERATOR_ROLE)
 # The service the SUT runs as. Generators are any services with the role, each a
 # `[[ledger.source]]`: compose.yaml's `generator`, and any a scenario's override adds.
@@ -63,10 +69,13 @@ SUT_SERVICE = "logit"
 BASE_ROLES = {"logit": SUT_ROLE, "generator": GENERATOR_ROLE, "victoria-metrics": BACKEND_ROLE}
 # What the `kafka` profile adds to the role map in place of the `local` profile's backends.
 KAFKA_ROLES = {"kafka": BROKER_ROLE}
+# What the `standin` profile adds in their place.
+STANDIN_ROLES = {"standin": STANDIN_ROLE}
 
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
-ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "mark", "exit")
+ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "mark", "exit",
+                "respond")
 # Actions allowed on the SUT only, each with the reason. A `kill` exists to end a `logit` process
 # with no shutdown; on the generator, the lines it sent after its last telemetry drain reach the
 # SUT with no G behind them, and `ledger.wire` would net them against real loss. An `exit`
@@ -83,6 +92,16 @@ EXPECTED_EVENT_ACTIONS = ("mark", "exit")
 # The `/readyz` words a `mark`'s `ready` may name: every answer but `ok`
 # (crates/logit-cli/src/admin.rs, `readyz_wire`).
 READY_WORDS = ("starting", "stalled", "draining", "degraded")
+# A `respond` step's keys. It sets the stand-in's answer for its span: a `status` (with an
+# optional `body`) or `answer = "reset"`, and `apply`, whether the stand-in stores the write it
+# answers that way (by default, when the status is 2xx).
+RESPOND_KEYS = ("status", "body", "apply", "answer")
+RESPOND_ANSWERS = ("reset",)
+# The sink fault classes a step's `class` may name (docs/adr/sink-fault-classes.md), which the
+# checks read the SUT's telemetry and self-log against. `class` is for a `respond`, and for a
+# `stop` of a stand-in, whose connect failures are `clean`.
+FAULT_CLASSES = ("clean", "ambiguous", "rejected", "refused")
+CLASSED_ACTIONS = ("respond", "stop")
 
 # Faults during which a container's network namespace is gone or unusable for a one-shot
 # `docker run --network container:<id>`. An `exit` can end the process at any point in its
@@ -99,7 +118,8 @@ TOP_LEVEL_KEYS = {
 LOCAL_TARGET = "victoria-metrics"
 EXTERNAL_TARGET = "external"
 KAFKA_TARGET = "kafka"
-TARGET_KINDS = (LOCAL_TARGET, EXTERNAL_TARGET, KAFKA_TARGET)
+STANDIN_TARGET = "standin"
+TARGET_KINDS = (LOCAL_TARGET, EXTERNAL_TARGET, KAFKA_TARGET, STANDIN_TARGET)
 TARGET_KEYS = {"kind", "name", "env", "topic"}
 # Kafka's legal topic names (`Topic.validate`): ASCII letters, digits, `.`, `_`, and `-`, up to
 # 249 characters.
@@ -108,12 +128,13 @@ _TOPIC_NAME = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
 # `[target] env` entry outside this list would reach no container, so `validate()` refuses it;
 # the self-test checks that compose.yaml passes each one.
 EXTERNAL_ENV_PASSED = ("DD_API_KEY",)
-# The ledger keys that name a VictoriaMetrics query, which only the local target has.
+# The ledger keys that read an export: VictoriaMetrics', or a stand-in's record in its shape.
 VM_LEDGER_KEYS = {"vm_every_window"}
 _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PRIVATE_ENV_PREFIX = "soak-env-"
-STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key"}
+STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key", "class",
+             *RESPOND_KEYS}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
 RANGE_KEYS = {"min", "max"}
@@ -249,10 +270,23 @@ class StepSpec:
     on: str
     args: str
     for_: float
-    # A `mark`'s `ready` word, and an `exit`'s `code` and `key`; None elsewhere.
+    # A `mark`'s `ready` word, an `exit`'s `code` and `key`, a `respond`'s keys, and the fault
+    # class a step expects; None elsewhere.
     ready: object = None
     code: object = None
     key: object = None
+    status: object = None
+    body: object = None
+    apply: object = None
+    answer: object = None
+    fault_class: object = None
+
+
+# The `Step` fields `expected()` writes into its JSON and its timeline records, each under its
+# scenario key.
+STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", "status"),
+               ("body", "body"), ("apply", "apply"), ("answer", "answer"),
+               ("fault_class", "class"))
 
 
 @dataclass
@@ -304,12 +338,25 @@ class Step:
     ready: object = None
     code: object = None
     key: object = None
+    status: object = None
+    body: object = None
+    apply: object = None
+    answer: object = None
+    fault_class: object = None
 
     def expected(self):
-        """The `ready`, `code`, and `key` fields this step sets, for its JSON and its timeline
-        records."""
-        return {name: value for name, value in (("ready", self.ready), ("code", self.code),
-                                                ("key", self.key)) if value is not None}
+        """The fields this step sets (`STEP_FIELDS`), for its JSON and its timeline records."""
+        return {name: getattr(self, attr) for attr, name in STEP_FIELDS
+                if getattr(self, attr) is not None}
+
+    def cue(self):
+        """A `respond` step's cue for the stand-in's control port."""
+        cue = {"step": self.id}
+        for name in RESPOND_KEYS:
+            value = getattr(self, name)
+            if value is not None:
+                cue[name] = value
+        return cue
 
     def to_json(self):
         return {
@@ -361,7 +408,7 @@ class Scenario:
     expectations: list = field(default_factory=list)
     random: object = None
     # `{kind, name, env}`, plus `topic` for a Kafka target; kind `victoria-metrics` (the
-    # default), `external`, or `kafka`.
+    # default), `external`, `kafka`, or `standin`.
     target: dict = field(default_factory=lambda: {"kind": LOCAL_TARGET, "name": LOCAL_TARGET,
                                                   "env": []})
     # The compose override file beside scenario.toml, or None.
@@ -376,6 +423,10 @@ class Scenario:
     @property
     def kafka(self):
         return self.target.get("kind") == KAFKA_TARGET
+
+    @property
+    def standin(self):
+        return self.target.get("kind") == STANDIN_TARGET
 
     @property
     def has_vm(self):
@@ -511,12 +562,13 @@ def from_dict(raw, path):
         cycle = dur(raw, "cycle", "scenario")
 
     target = _parse_target(raw.get("target", {}), problems)
-    no_vm = target["kind"] != LOCAL_TARGET
+    # Only the local target has VictoriaMetrics to query, and a stand-in target's V has an
+    # export's shape, so the keys naming one are refused for any other target with their own
+    # message rather than ignored.
+    no_vm = target["kind"] not in (LOCAL_TARGET, STANDIN_TARGET)
     configs = raw.get("configs", {})
     ledger = raw.get("ledger", {})
     thresholds = dict(raw.get("thresholds", {}))
-    # Only the local target has VictoriaMetrics to query, so the keys naming one are refused
-    # with their own message rather than ignored.
     ledger_keys = LEDGER_KEYS - VM_LEDGER_KEYS if no_vm else LEDGER_KEYS
     ledger_optional = OPTIONAL_LEDGER_KEYS | (VM_LEDGER_KEYS if no_vm else set())
     if no_vm and isinstance(ledger, dict):
@@ -576,6 +628,9 @@ def from_dict(raw, path):
             args=raw_step.get("args", ""),
             for_=dur(raw_step, "for", where) if "for" in raw_step else 0.0,
             ready=raw_step.get("ready"), code=raw_step.get("code"), key=raw_step.get("key"),
+            status=raw_step.get("status"), body=raw_step.get("body"),
+            apply=raw_step.get("apply"), answer=raw_step.get("answer"),
+            fault_class=raw_step.get("class"),
         ))
         if "for" not in raw_step:
             problems.append(f"{where}: every fault needs `for`, so its revert is scheduled with it")
@@ -674,9 +729,9 @@ def target_json(target):
 def _sink_problems(ledger, kind):
     """What the `[[ledger.sink]]` tables and `[ledger] split` break: at least one sink, each a
     table of known keys with a distinct component `id`; for a local target a `backend` and a
-    `vm_selector` on every sink, and for an external or Kafka one neither; for a Kafka target
-    one sink only, the `kafka_out` whose topic is V; and under `split = "route"` at least two
-    sinks, each with a distinct `target`, which `copy` refuses. Whether `backend` names a
+    `vm_selector` on every sink, and for any other target neither; for a Kafka target one sink
+    only, the `kafka_out` whose topic is V, and for a stand-in target one sink only; and under
+    `split = "route"` at least two sinks, each with a distinct `target`, which `copy` refuses. Whether `backend` names a
     backend service needs the role map: `service_problems()`."""
     problems = []
     no_backend = kind != LOCAL_TARGET
@@ -691,6 +746,9 @@ def _sink_problems(ledger, kind):
     if kind == KAFKA_TARGET and len(sinks) != 1:
         problems.append("a kafka target has one [[ledger.sink]], the kafka_out whose topic the "
                         "ledger reads back")
+    if kind == STANDIN_TARGET and len(sinks) != 1:
+        problems.append("a standin target has one [[ledger.sink]], the sink whose writes the "
+                        "stand-in records")
     ids, targets = [], []
     for index, sink in enumerate(sinks):
         where = f"ledger.sink {index + 1}"
@@ -820,7 +878,8 @@ def _parse_target(table, problems):
     `problems` what breaks its rules: an unknown key or kind; for an external target, a `name`
     that isn't a slug, an `env` that isn't a list of distinct variable names compose.yaml
     passes, or a `topic`; for a Kafka target, a missing or illegal `topic`, a `name` that isn't
-    a slug, or an `env`; and for the local target, any `name`, `env`, or `topic`."""
+    a slug, or an `env`; for a stand-in target, a `name` that isn't a slug, an `env`, or a
+    `topic`; and for the local target, any `name`, `env`, or `topic`."""
     local = {"kind": LOCAL_TARGET, "name": LOCAL_TARGET, "env": []}
     if not isinstance(table, dict):
         problems.append("`target` must be a table, written [target]")
@@ -829,14 +888,25 @@ def _parse_target(table, problems):
         problems.append(f"target: unknown key `{key}`")
     kind = table.get("kind", LOCAL_TARGET)
     if kind not in TARGET_KINDS:
-        problems.append(f"target.kind must be {LOCAL_TARGET!r}, {EXTERNAL_TARGET!r}, or "
-                        f"{KAFKA_TARGET!r}, got {kind!r}")
+        problems.append(f"target.kind must be {LOCAL_TARGET!r}, {EXTERNAL_TARGET!r}, "
+                        f"{KAFKA_TARGET!r}, or {STANDIN_TARGET!r}, got {kind!r}")
         return local
     if kind == LOCAL_TARGET:
         for key in sorted({"name", "env", "topic"} & set(table)):
             problems.append(f"target.{key} is for an external or kafka target; the local "
                             f"target is {LOCAL_TARGET}")
         return local
+    if kind == STANDIN_TARGET:
+        if "env" in table:
+            problems.append("target.env is for an external target; the standin target runs "
+                            "inside the stack and needs no credentials")
+        if "topic" in table:
+            problems.append("target.topic is for a kafka target")
+        name = table.get("name", STANDIN_TARGET)
+        if not isinstance(name, str) or not _TARGET_NAME.match(name):
+            problems.append("target.name must be lowercase letters, digits, `_`, or `-`")
+            name = STANDIN_TARGET
+        return {"kind": kind, "name": name, "env": []}
     if kind == KAFKA_TARGET:
         if "env" in table:
             problems.append("target.env is for an external target; the kafka target runs "
@@ -1073,6 +1143,7 @@ def validate(scenario, duration=None, seed=None):
                 hint = "; reverts are scheduled from a fault's `for`, never written as steps"
             problems.append(f"{where}: unknown action `{spec.action}`{hint}")
         problems += _expected_event_problems(spec, where)
+        problems += _respond_problems(spec, where)
         if spec.for_ <= 0:
             problems.append(f"{where}: `for` must be longer than 0s")
         if spec.action == "netem":
@@ -1170,6 +1241,41 @@ def _expected_event_problems(spec, where):
     return problems
 
 
+def _respond_problems(spec, where):
+    """What a step breaks of the `respond` rules: one of `status` (an integer from 100 to
+    599) and `answer` (one of `RESPOND_ANSWERS`), `body` a string with `status` only, `apply`
+    true or false, none of them on another action; and `class` one of `FAULT_CLASSES`, on a
+    `respond` or a `stop` only. Whether a `respond`'s or a classed `stop`'s `on` is a stand-in
+    needs the role map: `service_problems()`."""
+    problems = []
+    if spec.action == "respond":
+        has_status, has_answer = spec.status is not None, spec.answer is not None
+        if has_status == has_answer:
+            problems.append(f"{where}: respond needs one of `status` and `answer`")
+        if has_status and (not isinstance(spec.status, int) or isinstance(spec.status, bool)
+                           or not 100 <= spec.status <= 599):
+            problems.append(f"{where}: `status` must be an integer from 100 to 599, got "
+                            f"{spec.status!r}")
+        if has_answer and spec.answer not in RESPOND_ANSWERS:
+            problems.append(f"{where}: `answer` must be one of {', '.join(RESPOND_ANSWERS)}, got "
+                            f"{spec.answer!r}")
+        if spec.body is not None and (not has_status or not isinstance(spec.body, str)):
+            problems.append(f"{where}: `body` is a string, and goes with `status` only")
+        if spec.apply is not None and not isinstance(spec.apply, bool):
+            problems.append(f"{where}: `apply` must be true or false")
+    else:
+        for name in RESPOND_KEYS:
+            if getattr(spec, name) is not None:
+                problems.append(f"{where}: `{name}` is for respond only")
+    if spec.fault_class is not None:
+        if spec.action not in CLASSED_ACTIONS:
+            problems.append(f"{where}: `class` is for {' and '.join(CLASSED_ACTIONS)} only")
+        elif spec.fault_class not in FAULT_CLASSES:
+            problems.append(f"{where}: `class` must be one of {', '.join(FAULT_CLASSES)}, got "
+                            f"{spec.fault_class!r}")
+    return problems
+
+
 def _random_problems(scenario, duration):
     """Every rule a `[random]` table breaks. `gap.min` must cover a fault's recovery and two
     progress windows, so each fault is followed by steady state the checks judge, and `cooldown`
@@ -1202,6 +1308,9 @@ def _random_problems(scenario, duration):
         if template.action in EXPECTED_EVENT_ACTIONS:
             problems.append(f"{where}: {template.action} names an expected event at a fixed "
                             "time, and a [random] schedule draws faults; write it as a [[step]]")
+        if template.action == "respond":
+            problems.append(f"{where}: respond takes a status or an answer, which a [random] "
+                            "fault can't set; write it as a [[step]]")
         if template.for_min <= 0:
             problems.append(f"{where}: `for.min` must be longer than 0s")
         if template.for_min > template.for_max:
@@ -1342,12 +1451,15 @@ def roles_from_config(text):
 
 def base_roles(scenario):
     """`BASE_ROLES` as the driver would resolve it for `scenario` with no override: without the
-    backends, which the `local` profile holds, for any target but the local one, and with
-    `KAFKA_ROLES`, which the `kafka` profile holds, for a Kafka target."""
+    backends, which the `local` profile holds, for any target but the local one, with
+    `KAFKA_ROLES`, which the `kafka` profile holds, for a Kafka target, and with
+    `STANDIN_ROLES`, which the `standin` profile holds, for a stand-in target."""
     roles = {name: role for name, role in BASE_ROLES.items()
              if scenario.has_vm or role != BACKEND_ROLE}
     if scenario.kafka:
         roles.update(KAFKA_ROLES)
+    if scenario.standin:
+        roles.update(STANDIN_ROLES)
     return roles
 
 
@@ -1384,25 +1496,34 @@ def role_problems(roles):
 def service_problems(scenario, roles):
     """Every rule that needs the stack's services, against `roles` (`{service: role}`): the
     role map's own rules; each step's and random fault's `on` a service of the stack, with a
-    `kill` or an `exit` on the SUT only; each `[[expect]]` service one that runs `logit`; for a
-    Kafka target, the broker `kafka`; each `[[ledger.source]]` service a generator, and every
-    generator a source's; and each local sink's `backend` a backend service."""
+    `kill` or an `exit` on the SUT only, and a `respond`, or a `stop` with a `class`, on a
+    stand-in only; each `[[expect]]` service one that runs `logit`; for a Kafka target, the
+    broker `kafka`; for a stand-in target, the stand-in `standin`; each `[[ledger.source]]`
+    service a generator, and every generator a source's; and each local sink's `backend` a
+    backend service."""
     problems = role_problems(roles)
     no_backend = ("; an external target's stack runs no backend" if scenario.external else
                   "; a kafka target's stack runs the broker and no backend" if scenario.kafka
-                  else "")
+                  else "; a standin target's stack runs the stand-in and no backend"
+                  if scenario.standin else "")
 
-    def on_problems(on, action, where, reason=True):
+    def on_problems(on, action, where, reason=True, classed=False):
         if on not in roles:
             return [f"{where}: unknown service `{on}`{no_backend}"]
         if action in SUT_ONLY_ACTIONS and roles[on] != SUT_ROLE:
             why = f": {SUT_ONLY_ACTIONS[action]}" if reason else ""
             return [f"{where}: {action} is for logit only{why}"]
+        if (action == "respond" or classed) and roles[on] != STANDIN_ROLE:
+            what = "respond" if action == "respond" else f"`class` on a {action}"
+            standins = sorted(n for n, r in roles.items() if r == STANDIN_ROLE)
+            return [f"{where}: {what} is for a {STANDIN_ROLE} service; the stack's are "
+                    f"{', '.join(standins) or 'none'}"]
         return []
 
     for spec in scenario.steps:
         problems += on_problems(spec.on, spec.action,
-                                f"step {spec.index + 1} ({spec.action or '?'} on {spec.on or '?'})")
+                                f"step {spec.index + 1} ({spec.action or '?'} on {spec.on or '?'})",
+                                classed=spec.fault_class is not None)
     if scenario.random is not None:
         for template in scenario.random.faults:
             problems += on_problems(template.on, template.action,
@@ -1421,6 +1542,9 @@ def service_problems(scenario, roles):
     if scenario.kafka and roles.get(KAFKA_TARGET) != BROKER_ROLE:
         problems.append(f"a kafka target reads its topic from the {BROKER_ROLE} service "
                         f"`{KAFKA_TARGET}`, which the stack doesn't run")
+    if scenario.standin and roles.get(STANDIN_TARGET) != STANDIN_ROLE:
+        problems.append(f"a standin target reads its V from the {STANDIN_ROLE} service "
+                        f"`{STANDIN_TARGET}`, which the stack doesn't run")
     sourced = []
     for index, source in enumerate(scenario.sources):
         service = source.get("service")
@@ -1470,7 +1594,9 @@ def expand(scenario, duration=None, seed=None):
                 steps.append(Step(
                     id=f"c{cycle}s{spec.index + 1}", spec_index=spec.index, cycle=cycle,
                     action=spec.action, on=spec.on, args=spec.args, start=start, end=end,
-                    ready=spec.ready, code=spec.code, key=spec.key,
+                    ready=spec.ready, code=spec.code, key=spec.key, status=spec.status,
+                    body=spec.body, apply=spec.apply, answer=spec.answer,
+                    fault_class=spec.fault_class,
                 ))
         cycle += 1
     steps.sort(key=lambda s: (s.start, s.spec_index))

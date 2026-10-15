@@ -1,0 +1,229 @@
+"""A scripted HTTP destination for a soak's SUT sink: it answers each write as the driver last
+told it to, and prints one JSON line per request to stdout, the record the checks read.
+
+Stdlib only; compose runs it in a stock Python image. It serves two ports:
+
+- The data port (`--data-port`) takes the sink's writes on `--path`. With no cue it answers the
+  shape's default (`200` for `remote_write`) with an empty body; a request to any other path
+  answers `404`, so a misconfigured endpoint can't pass for a stored write.
+- The control port (`--control-port`) takes `POST /cue` from the driver: a JSON object with
+  `step`, and either `status` (with an optional `body`) or `answer: "reset"`, and an optional
+  `apply`. An empty object restores the default. `GET /health` answers `OK`.
+
+Each request line records the raw body (`body_b64`) and whether the write counts as stored:
+`apply` when the cue sets it, else whether the answer is `2xx`. A `reset` reads the whole
+request, then closes the connection with an RST and no response. The line is printed after the
+answer is written, so a request the sink saw answered is in the record unless the process died
+between the two. The checks decode the bodies on the host (`soaklib/standin.py`).
+
+SIGTERM stops both servers and lets each request in flight finish, so a `stop` of this service
+never cuts a response off after the sink's attempt was recorded.
+"""
+
+import argparse
+import base64
+import http.server
+import json
+import signal
+import socket
+import struct
+import sys
+import threading
+import time
+
+DEFAULT_STATUS = {"remote_write": 200}
+DEFAULT_PATH = {"remote_write": "/api/v1/write"}
+# How long a keep-alive connection may sit idle before its thread lets it go, which bounds a
+# SIGTERM's wait for the threads.
+IDLE_TIMEOUT_S = 5
+
+_print_lock = threading.Lock()
+
+
+def emit(record):
+    with _print_lock:
+        sys.stdout.write(json.dumps(record, sort_keys=True) + "\n")
+        sys.stdout.flush()
+
+
+class State:
+    def __init__(self, shape, path):
+        self.shape = shape
+        self.path = path
+        self.lock = threading.Lock()
+        self.cue = {}
+        self.seq = 0
+        self.stopping = False
+
+    def take(self):
+        """The cue in force and the next request number."""
+        with self.lock:
+            self.seq += 1
+            return dict(self.cue), self.seq
+
+
+def cue_problems(cue):
+    if not isinstance(cue, dict):
+        return ["a cue is a JSON object"]
+    if not cue:
+        return []
+    problems = []
+    unknown = set(cue) - {"step", "status", "body", "answer", "apply"}
+    if unknown:
+        problems.append(f"unknown keys {sorted(unknown)}")
+    if not isinstance(cue.get("step"), str) or not cue.get("step"):
+        problems.append("`step` must name the step")
+    has_status, has_answer = "status" in cue, "answer" in cue
+    if has_status == has_answer:
+        problems.append("a cue sets one of `status` and `answer`")
+    if has_status and (not isinstance(cue["status"], int) or isinstance(cue["status"], bool)
+                       or not 100 <= cue["status"] <= 599):
+        problems.append("`status` must be an integer from 100 to 599")
+    if has_answer and cue["answer"] != "reset":
+        problems.append("`answer` must be \"reset\"")
+    if "body" in cue and (not has_status or not isinstance(cue["body"], str)):
+        problems.append("`body` is a string, with `status` only")
+    if "apply" in cue and not isinstance(cue["apply"], bool):
+        problems.append("`apply` must be true or false")
+    return problems
+
+
+def data_handler(state):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        timeout = IDLE_TIMEOUT_S
+
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else b""
+            cue, seq = state.take()
+            record = {
+                "event": "request", "seq": seq, "t": time.time(), "path": self.path,
+                "content_type": self.headers.get("Content-Type"),
+                "content_encoding": self.headers.get("Content-Encoding"),
+                "bytes": len(body), "cue": cue.get("step"),
+                "body_b64": base64.b64encode(body).decode(),
+            }
+            if self.path != state.path:
+                record.update(answer="status", status=404, stored=False)
+                self._answer(404, f"no write path {self.path}; this stand-in takes {state.path}")
+            elif cue.get("answer") == "reset":
+                record.update(answer="reset", status=None, stored=bool(cue.get("apply", False)))
+                self._reset()
+            else:
+                status = cue.get("status", DEFAULT_STATUS[state.shape])
+                stored = cue.get("apply", 200 <= status < 300)
+                record.update(answer="status", status=status, stored=bool(stored))
+                self._answer(status, cue.get("body", ""))
+            if state.stopping:
+                self.close_connection = True
+            emit(record)
+
+        def _answer(self, status, text):
+            payload = text.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            self.wfile.flush()
+
+        def _reset(self):
+            # SO_LINGER with a zero timeout makes close() send an RST, never a FIN, so the
+            # client reads a reset, not an empty response.
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                       struct.pack("ii", 1, 0))
+            self.close_connection = True
+
+    return Handler
+
+
+def control_handler(state):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _reply(self, status, obj):
+            payload = (json.dumps(obj) + "\n").encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            if self.path == "/health":
+                # Plain `OK`, as VictoriaMetrics answers, so the driver's one health probe
+                # reads both.
+                payload = b"OK"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            elif self.path == "/cue":
+                with state.lock:
+                    self._reply(200, state.cue)
+            else:
+                self._reply(404, {"error": f"no {self.path}"})
+
+        def do_POST(self):
+            if self.path != "/cue":
+                self._reply(404, {"error": f"no {self.path}"})
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                cue = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError as err:
+                self._reply(400, {"error": f"not JSON: {err}"})
+                return
+            problems = cue_problems(cue)
+            if problems:
+                self._reply(400, {"error": "; ".join(problems)})
+                return
+            with state.lock:
+                state.cue = dict(cue)
+            emit({"event": "cue", "t": time.time(), "cue": cue})
+            self._reply(200, cue)
+
+    return Handler
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--shape", choices=sorted(DEFAULT_STATUS), default="remote_write")
+    parser.add_argument("--path", help="the write path; the shape's own by default")
+    parser.add_argument("--data-port", type=int, default=8080)
+    parser.add_argument("--control-port", type=int, default=8081)
+    args = parser.parse_args(argv)
+    state = State(args.shape, args.path or DEFAULT_PATH[args.shape])
+    data = http.server.ThreadingHTTPServer(("0.0.0.0", args.data_port), data_handler(state))
+    control = http.server.ThreadingHTTPServer(("0.0.0.0", args.control_port),
+                                              control_handler(state))
+    # Joined on close, so a SIGTERM waits for each request in flight.
+    data.daemon_threads = False
+    data.block_on_close = True
+
+    def stop(signum, frame):
+        state.stopping = True
+        threading.Thread(target=lambda: (data.shutdown(), control.shutdown())).start()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    threads = [threading.Thread(target=server.serve_forever) for server in (data, control)]
+    for thread in threads:
+        thread.start()
+    emit({"event": "ready", "t": time.time(), "shape": args.shape, "path": state.path})
+    for thread in threads:
+        thread.join()
+    data.server_close()
+    control.server_close()
+    emit({"event": "stopped", "t": time.time()})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
