@@ -1327,7 +1327,11 @@ pass A, then pass B.
   `udp-statsd-packed` now sits slightly above the 1–5% calibration band. No bisect covered the UDP
   scenarios. The merges between B0 and D- that touch the UDP path include #543 (`peer` W4, sender
   addresses on the shared drivers), #596 (a UDP decode-burst fix), and the move of `StatsdDecoder`
-  into `logit-proto` (#626); which one, if any, moved the knee is unmeasured.
+  into `logit-proto` (#626); which one, if any, moved the knee is unmeasured. #543 grew the shared
+  UDP driver's `Datagram` from 40 to 80 bytes, half of it an `Option<Sender>` that every datagram
+  carries even with `peer:` off ([`memory.md`](memory.md) §5, "Listeners bound undecoded bytes
+  too"). Whether every datagram should pay for that field is an open question, and this drop rise
+  is one measurement that bears on it, still unbisected.
 - **CPU per event doesn't separate the binaries.** Drift between a binary's two passes runs up to
   5.5% (M on `udp-statsd-packed`, 0.897 → 0.946), wider than any difference between binaries.
 - **`udp-statsd-small` is sender-bound.** At its shipped 760,000 datagrams/s it delivers about

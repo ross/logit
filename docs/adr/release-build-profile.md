@@ -1,6 +1,6 @@
 ---
 created: 2026-10-03
-updated: 2026-10-03
+updated: 2026-10-15
 ---
 
 # Release profile: fat LTO and one codegen unit, measured against thin LTO and 16 units
@@ -80,6 +80,13 @@ Both patterns match the code-layout sensitivity that `docs/design/performance.md
 since 2026-09-28", as of `201bb5a7`) records for `json-parse-x3` and `logfmt-parse`. It's tracked in
 [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md#http-access-logs-nginx-haproxy-and-http_access). The UDP statsd drop-rate
 improvement is robust: the ranges don't overlap, and it held in 6 of 6 rounds.
+
+The `native-relay` differences between arms, +8% to +12% in the suite and +9% in the interleaved
+rerun, are about the size of the build-to-build layout noise that `docs/design/performance.md` §1
+("`native-relay` is code-layout-sensitive") measured on 2026-10-15: 5–10% between neighbouring
+`main` builds with no change on `native-relay`'s path. Each arm here is one build, so this evidence
+needs a bracket of neighbouring builds per arm before it counts. The decision below doesn't change
+on that account.
 
 ## Decision
 `[profile.release]` stays `lto = true`, `codegen-units = 1`.
