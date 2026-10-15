@@ -3498,15 +3498,17 @@ def _balanced_drop(led, name, component, reason, batch_drops, service=None, life
     # fault drop, so a `FAULT_DROP_REASONS` batch drop at a node other than a sink stays here;
     # `ledger.sent` FAILs one at a sink.
     # With the listeners and `aggregate` in different SUT services, `ledger.egress`,
-    # `ledger.summary`, and `ledger.script` SKIP. Only `identity.sink` judges a
-    # `batches.dropped` term, and only at the last service's sinks, so a batch drop anywhere
-    # else stays here. `ledger.intake` reads `datagrams.dropped` and the `B` terms in the
+    # `ledger.summary`, and `ledger.script` SKIP. `identity.sink` counts a dropped batch as
+    # delivered, so a fault reason balances there, and it reads the final life alone. A
+    # `batches.dropped` term is balanced only at the last service's sinks, in the final life,
+    # under a reason outside `FAULT_DROP_REASONS`; any other batch drop stays here. `ledger.intake` reads `datagrams.dropped` and the `B` terms in the
     # listeners' final life alone, so an earlier life's stay here, and no row reads a listener's
     # `events.dropped` or a script's `script_error`. `ledger.wire` reads `kernel.dropped`.
     across = led.across
     if name == "logit.component.batches.dropped":
         if across:
-            return service == led.service and component in led.sinks
+            return (service == led.service and component in led.sinks
+                    and life == led.final and reason not in FAULT_DROP_REASONS)
         return not (led.data.external and reason in FAULT_DROP_REASONS
                     and component not in led.sinks)
     if name == "logit.component.bytes.dropped":

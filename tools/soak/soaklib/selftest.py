@@ -5154,7 +5154,8 @@ def _two_sut_checks():
             ("logit", "logit.component.batches.dropped", "hop", "rejected"),
             ("logit", "logit.component.events.dropped", "in", "closed_consumer"),
             ("logit", "logit.component.datagrams.dropped", "in", "queue_full"),
-            ("collector", "logit.component.batches.dropped", "sink", "rejected")))))
+            ("collector", "logit.component.batches.dropped", "sink", "rejected"),
+            ("collector", "logit.component.batches.dropped", "sink", "shutdown")))))
         expect(extra.status == checks.FAIL
                and "logit hop: logit.component.batches.dropped{reason=\"rejected\"} 1"
                in extra.detail
@@ -5162,10 +5163,13 @@ def _two_sut_checks():
                in extra.detail
                and "logit in: logit.component.datagrams.dropped{reason=\"queue_full\"}"
                not in extra.detail
-               and "collector sink: logit.component.batches.dropped" not in extra.detail,
-               f"across two SUTs drops reports a batch drop outside the last service's sinks "
-               f"and a listener's events.dropped, and leaves the sink and the final life's "
-               f"datagram drop to their rows, got {extra}")
+               and "collector sink: logit.component.batches.dropped{reason=\"rejected\"} 1"
+               in extra.detail
+               and "collector sink: logit.component.batches.dropped{reason=\"shutdown\"} 1"
+               in extra.detail,
+               f"across two SUTs drops reports a batch drop outside the last service's sinks, "
+               f"a fault-reason or earlier-life sink drop, and a listener's events.dropped, "
+               f"and leaves the final life's datagram drop to its row, got {extra}")
         expect(data.sut_phase("sink_drained", "collector") is None
                and data.sut_phase("sink_drained", "logit")["held"],
                "an end-sequence phase is read for its own SUT service")
