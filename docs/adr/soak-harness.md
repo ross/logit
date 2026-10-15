@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-11
+updated: 2026-10-15
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -213,3 +213,51 @@ the topic's distinct record count with the records the sink saw accepted, and ju
 duplicate copies on their own: one FAILs in a SUT life with no producer epoch bump, because the
 broker discards a resend within an epoch, and WARNs after a bump, as `at_least_once` permits.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Kafka targets", has the rules.
+
+## Amendment: a stand-in's oracle is its record, and a cued rejection is counted (2026-10-15)
+
+A scenario can point its sink at a scripted HTTP stand-in (`[target] kind = "standin"`), so every
+row of the sink's response-class table runs under load. The stand-in is stdlib Python in a stock
+image, cued per step by the driver, and it prints each request it answers to stdout, raw body
+included. That record is the egress oracle: V is every sample of every write the stand-in says it
+stored, a later write of one `(label set, timestamp)` replacing an earlier one, and
+`ledger.standin` checks the record against the sink's request counts and each step's expected
+fault class. httpbin was considered and not used: its status is fixed by the URL, it keeps no
+record, and it can't store a write before failing it or reset a connection.
+
+A stand-in told to reject isn't a healthy backend, so this narrows the amendment above: a
+`rejected` batch drop whose drain falls inside a `respond` step that expects the `rejected`
+class, through one aggregate interval and `recovery_bound` after it, counts the gap and is named,
+but doesn't FAIL. A `rejected` drop anywhere else still FAILs.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Stand-in targets", has the rules.
+
+## Amendment: a Datadog stand-in counts a resend twice, and `ledger.sent` excuses what a step cued (2026-10-15)
+
+A stand-in target can play Datadog's series route (`[target] shape = "datadog"`), and its V is
+the sum of the `count` points it stored. Datadog documents no deduplication of a `count` point,
+and [ADR `delivery-semantics`](delivery-semantics.md) says a kind with no remedy is
+double-counted, so the harness assumes a resent point adds rather than overwrites.
+`datadog_out`'s module doc records a trial org storing a resent series point once; that's an
+observation, not a documented guarantee, so the harness doesn't rely on it.
+
+As for a Kafka topic, V counts each distinct stored copy of a `(series, timestamp, value)` once,
+so a duplicate can't cancel a loss of the same size, and a negative gap is a surplus that FAILs.
+`ledger.standin` reports each extra copy per SUT life, with the amount the destination counted
+twice. Under `at_least_once` a duplicate is permitted and reported, not failed. It FAILs under
+`at_most_once`, which never resends, and under either posture when the copy it repeats was
+answered `2xx` in the same life, because the sink then resent a point it saw accepted.
+
+`ledger.sent`, which ends an external target's ledger at the sink, runs against this shape too,
+so its verdicts are tested without a real org. A stand-in told to refuse or reject isn't a
+healthy destination, so this extends the cued-rejection rule above: a refusal line inside a
+`respond` step that expects `refused`, a `rejected` batch inside one that expects `rejected`, an
+`oversize` record drop inside a `413` step classed `rejected`, and a `rejected` record drop inside
+another step classed `rejected` or a step whose `202` names dropped series are counted as cued and
+don't FAIL. The same drops outside such a step FAIL as on any target.
+
+A `respond` step's `class` is the harness's only statement of the class a sink must read an
+answer as, and under this shape every non-`2xx` step must carry one. A second copy of the
+sink's table in the harness was considered and not kept: it checked the scenario against itself,
+never against `logit`, and could drift from the Rust table unnoticed. A class change in a sink
+updates its stand-in scenario's steps instead.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Stand-in targets", has the rules.

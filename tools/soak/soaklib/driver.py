@@ -48,6 +48,12 @@ needs at the code:
   has no backend, so its end sequence waits for the sink's queue to empty; after the SUT stops,
   it reads the target's topic back from the broker into `kafka-topic.ndjson` (topic.py), the
   ledger's V.
+- A stand-in target (`[target] kind = "standin"`) runs the `standin` compose profile, the scripted
+  destination with the role `standin`, in place of `local`. Its control port is published like a
+  backend's and re-read after any revert of a fault on it; a `respond` step POSTs its cue there.
+  `compose.env` carries its `[target] shape` for standin.py's `--shape`.
+  The end sequence waits for the sink's queue to empty, as for a Kafka target. Its record is its
+  stdout, which the log capture collects with every other service's.
 
 Every time in `timeline.jsonl`, `watchdog.jsonl`, `stats.ndjson`, and `vm-freshness.jsonl` is
 epoch seconds (`t`, `started_at`, `finished_at`), with `offset` measured from the timeline's zero:
@@ -69,6 +75,7 @@ from .docker import Docker
 NETEM_IMAGE = "logit-soak-netem:local"
 VM_IMAGE = "victoriametrics/victoria-metrics:v1.152.0"
 KAFKA_IMAGE = "apache/kafka:4.2.0"
+STANDIN_IMAGE = "python:3.13.16-alpine3.24"
 ADMIN = "http://127.0.0.1:9600"
 
 INSPECT_EVERY_S = 5
@@ -87,14 +94,17 @@ SUT_STOP_T = 60
 # stdout each poll reads, several drains of `internal` lines.
 SINK_DRAIN_BOUND_S = 120
 SINK_DRAIN_TAIL_LINES = 400
-# The aggregate window assumed when the SUT config names none.
-DEFAULT_AGGREGATE_INTERVAL_S = 10.0
+DEFAULT_AGGREGATE_INTERVAL_S = checks.DEFAULT_AGGREGATE_INTERVAL_S
 # The compose profile holding the backends, enabled for a local target only, and the one holding
 # the `kafka` broker, enabled for a Kafka target only.
 LOCAL_PROFILE = "local"
 KAFKA_PROFILE = "kafka"
+STANDIN_PROFILE = "standin"
 # The port a backend serves VictoriaMetrics' API on inside its container.
 BACKEND_PORT = 8428
+# The port a stand-in takes its cues and answers `/health` on inside its container.
+STANDIN_CONTROL_PORT = 8081
+STANDIN_UP_BOUND_S = 60
 # How long the topic read waits for its consumer: its own idle timeout, then the process.
 TOPIC_READ_TIMEOUT_S = 180
 
@@ -141,6 +151,8 @@ def profiles_for(scenario):
         return [LOCAL_PROFILE]
     if scenario.kafka:
         return [KAFKA_PROFILE]
+    if scenario.standin:
+        return [STANDIN_PROFILE]
     return []
 
 
@@ -162,6 +174,7 @@ class Run:
         self.external = scenario.external
         self.has_vm = scenario.has_vm
         self.kafka = scenario.kafka
+        self.standin = scenario.standin
         # The operator's env file for an external target. Compose reads `private_env`, a plain
         # copy outside the run directory, since the file can be in shell `export` form and
         # holds credentials.
@@ -183,8 +196,9 @@ class Run:
         self.ids = {}
         # `{service: role}`: given (the self-test), else resolved from compose in `prepare()`.
         self.roles = None if roles is None else dict(roles)
-        # Each backend's base URL, by service.
+        # Each backend's base URL, by service, and each stand-in's control URL.
         self.vm_base = {}
+        self.standin_base = {}
         self.active = {}
         self.down = set()
         self.paused = set()
@@ -207,6 +221,8 @@ class Run:
             + "".join(f"{scenario_mod.config_env(service)}="
                       f"{self.scenario.config_path(service)}\n"
                       for service in self.scenario.generators)
+            + (f"{scenario_mod.STANDIN_SHAPE_ENV}={self.scenario.standin_shape}\n"
+               if self.standin else "")
         )
         shutil.copy(self.scenario.path, self.run_dir / "scenario.toml")
         # The checks read the SUT's `receive:` limits from this copy.
@@ -232,7 +248,8 @@ class Run:
         (self.run_dir / "scenario.resolved.json").write_text(
             json.dumps(resolved, indent=2, sort_keys=True) + "\n"
         )
-        self.ctx = faults.Context(docker=self.docker, ids=self.ids, netem_image=NETEM_IMAGE)
+        self.ctx = faults.Context(docker=self.docker, ids=self.ids, netem_image=NETEM_IMAGE,
+                                  standin_base=self.standin_base)
         self.timeline = collect.Jsonl(self.run_dir / "timeline.jsonl")
         self.watchdog = collect.Jsonl(self.run_dir / "watchdog.jsonl")
         self.stats = collect.Jsonl(self.run_dir / "stats.ndjson")
@@ -285,7 +302,8 @@ class Run:
                    + "".join(f"-f {path} " for path in self.docker.compose_files) + "down -v")
             return 1
         images = ([self.image, NETEM_IMAGE] + ([VM_IMAGE] if self.has_vm else [])
-                  + ([KAFKA_IMAGE] if self.kafka else []))
+                  + ([KAFKA_IMAGE] if self.kafka else [])
+                  + ([STANDIN_IMAGE] if self.standin else []))
         collect.provenance(self.run_dir, self.root.parent.parent, self.docker,
                            images, self.scenario.name,
                            self.duration, self.seed, self.argv, self.seed_source)
@@ -332,6 +350,15 @@ class Run:
                     raise Abort(f"{backend} never answered /health")
                 time.sleep(1)
                 self.refresh_vm_base(backend)
+        for standin in self.services(scenario_mod.STANDIN_ROLE):
+            self.refresh_standin_base(standin)
+            deadline = _now() + STANDIN_UP_BOUND_S
+            while not (self.standin_base.get(standin)
+                       and vm.healthy(self.standin_base[standin])):
+                if _now() > deadline:
+                    raise Abort(f"{standin} never answered /health")
+                time.sleep(1)
+                self.refresh_standin_base(standin)
         for service in self.services(*scenario_mod.LOGIT_ROLES):
             info = self.docker.inspect(self.ids[service]) or {}
             self.started_at[service] = (info.get("State") or {}).get("StartedAt")
@@ -350,6 +377,10 @@ class Run:
     def refresh_vm_base(self, backend):
         address = self.docker.port(backend, BACKEND_PORT)
         self.vm_base[backend] = f"http://{address}" if address else None
+
+    def refresh_standin_base(self, standin):
+        address = self.docker.port(standin, STANDIN_CONTROL_PORT)
+        self.standin_base[standin] = f"http://{address}" if address else None
 
     def loop(self):
         queue = []
@@ -453,9 +484,11 @@ class Run:
                 self.pending_ready[service] = {"since": _now(), "step": step.id, "why": "start"}
         # Docker can publish a new host port on a start and on a network reconnect, so any
         # revert re-reads it; the freshness poll would otherwise query a dead port.
-        if (self.roles.get(service) == scenario_mod.BACKEND_ROLE
-                and (restarted or kind == "revert")):
-            self.refresh_vm_base(service)
+        if restarted or kind == "revert":
+            if self.roles.get(service) == scenario_mod.BACKEND_ROLE:
+                self.refresh_vm_base(service)
+            elif self.roles.get(service) == scenario_mod.STANDIN_ROLE:
+                self.refresh_standin_base(service)
 
     def poll_ready(self):
         for service, pending in list(self.pending_ready.items()):
@@ -679,9 +712,10 @@ class Run:
         return interval or DEFAULT_AGGREGATE_INTERVAL_S
 
     def wait_sink_drained(self):
-        """For an external or Kafka target, which has no backend to query: waits until a SUT drain at least two
-        aggregate windows after the generators stopped shows every sink's `buffer.batches` at 0
-        and its `retrying` at 0 or never set, bounded at `SINK_DRAIN_BOUND_S`. Two windows let
+        """For a target with no backend to query (external, Kafka, or a stand-in): waits until
+        a SUT drain at least two aggregate windows after the generators stopped shows every
+        sink's `buffer.batches` at 0 and its `retrying` at 0 or never set, bounded at
+        `SINK_DRAIN_BOUND_S`. Two windows let
         `aggregate` flush the last lines the generators sent; a sink's queue then empties once
         its last send is accepted. Reads the newest `SINK_DRAIN_TAIL_LINES` of the SUT's
         stdout, which a run in progress hasn't collected yet. The phase records each sink's

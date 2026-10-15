@@ -207,7 +207,7 @@ for = "45s"
   W7b any service a `compose` override adds. W3 adds `kill`, on the SUT only:
   the lines a killed generator sent after its last telemetry drain reach the SUT with no G
   behind them, and `ledger.wire` would net them against real loss. W7a adds `mark` and `exit`
-  (below).
+  (below). W9a adds `respond`, on a stand-in only (below).
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -307,14 +307,51 @@ for = "1m30s"
 - Neither may appear in a `[random]` schedule, which draws faults; an expected event happens
   at a time the scenario's own config sets.
 
+**Responds and classes (W9a)** script a stand-in target's answers ("Stand-in targets"):
+
+```toml
+[[step]]
+at = "0s"
+action = "respond"        # sets the stand-in's answer for the step's span
+on = "standin"            # a service with the role standin
+status = 400              # 100 to 599; or answer = "reset"
+body = "out of order sample"   # optional, with status only: the response body
+apply = false             # optional: store the write anyway (true) or not (false); by default
+                          # the stand-in stores what it answers 2xx
+class = "rejected"        # optional: the fault class the sink must read
+for = "20s"
+```
+
+- A `respond`'s apply POSTs `{step, status | answer, body, apply}` to the stand-in's control
+  port, and its revert POSTs `{}`, which restores the default answer. A non-200 from the control
+  port is the record's `rc` 1, so `timeline` FAILs it and the step has no window.
+- A `respond` sets one of `status`, an integer from 100 to 599, and `answer`, which is
+  `reset`: the stand-in reads the whole request, then closes the connection with an RST and no
+  response. `body` is a string, with `status` only. `apply` is true or false. None of the four
+  is allowed on another action.
+- `class`, one of `clean`, `ambiguous`, `rejected`, or `refused`, names the class the sink must
+  read the step's answers as
+  ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md)). It is allowed on a `respond` and
+  on a `stop`, whose connect failures are `clean`; `ledger.standin` judges it (§6).
+- With the role map, a `respond`, or a `stop` with a `class`, is on a `standin` service. A
+  `respond` never affects UDP ingress and always affects egress.
+- A `respond` can't appear in a `[random]` schedule, whose faults take no status or answer.
+- W9b adds `series_errors = N`, for a stand-in target with `shape = "datadog"` only, on a
+  `respond` with a `2xx` `status` and no `body`: the answer's body is the series route's
+  `errors` list naming N series dropped, which the checks take to be the request's first N.
+  Under that shape every `respond` other than a `2xx` needs a `class`, and a `2xx` takes none.
+  The step's `class` is the harness's only copy of `datadog_out`'s response-class table, so the
+  loader checks that one is there, not which one it is; `ledger.standin` judges it against the
+  sink.
+
 **`sut_script` (W7a)**, an optional `[ledger]` key, names a `lua` component between the
 listener and `aggregate`, and adds the script hop to the ledger ("The ledger and identities").
 
 **Compose overrides, service roles, and sinks (W7b).** Every compose service carries a
-`soak.role` label: `sut`, `generator`, `backend`, or `broker` (a Kafka target's broker; see
-"Kafka targets"). The harness knows a service by its role, never its name, and keeps one SUT,
-`logit`. The base stack's generator is `generator`; from W8b an override can add more (see
-"Sources"). A scenario adds services with an optional top-level key naming an override file
+`soak.role` label: `sut`, `generator`, `backend`, `broker` (a Kafka target's broker; see
+"Kafka targets"), or `standin` (W9a, a stand-in target's destination; see "Stand-in
+targets"). The harness knows a service by its role, never its name, and keeps one SUT, `logit`.
+The base stack's generator is `generator`; from W8b an override can add more (see "Sources"). A scenario adds services with an optional top-level key naming an override file
 beside `scenario.toml`:
 
 ```toml
@@ -343,6 +380,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 - `load()` checks every rule above that needs no service list. The rest need the merged
   compose file, which only the driver reads (`docker compose config`, §3): every step's `on`
   and every random fault's is a service of the stack, a `kill` or `exit` is on the role `sut`,
+  a `respond`, or a `stop` with a `class`, is on the role `standin` (W9a),
   every `[[expect]]` service runs `logit`, every sink's `backend` has the role `backend`, the
   stack has one `sut` named `logit` and at least one `generator`, every source's `service` has
   the role `generator` and every `generator` has a source (W8b), and no service lacks a known
@@ -463,7 +501,8 @@ rss_slope = { logit = "FAIL" }   # row id -> service -> PASS | WARN | FAIL
   hour or more; a shorter `--duration` FAILs the row as `expected FAIL, got WARN`.
 
 A scenario may name an external target in a `[target]` table (W5); see "External targets". It
-may instead name a local Kafka broker as its target; see "Kafka targets".
+may instead name a local Kafka broker as its target; see "Kafka targets", or a scripted stand-in
+destination (W9a); see "Stand-in targets".
 
 ### 3. Compose (W1a)
 
@@ -480,6 +519,7 @@ service (W4; see "The driver loop and end sequence" for the arithmetic), and
 | `logit` (the SUT, role `sut`) | `depends_on: [victoria-metrics]`, not required from W5, when `victoria-metrics` moved to the compose profile `local` the driver enables for a local target only; `environment:` passes each variable an external target may list (`DD_API_KEY`), empty when unset |
 | `generator` (role `generator`) | `depends_on: {logit: {condition: service_healthy}}`. An override can add more generators (W8b), each with `extends` from this one and its own config volume |
 | `kafka` (role `broker`) | `apache/kafka:4.2.0`, a single-node KRaft broker in the compose profile `kafka`, which the driver enables for a Kafka target only; one partition per topic, topics created on first use, a `kafka-broker-api-versions.sh` health check the SUT's optional `depends_on` waits for. No published port: the driver reads the topic through `docker exec` |
+| `standin` (role `standin`, W9a) | `python:3.13.16-alpine3.24` running `tools/soak/standin/standin.py`, mounted read-only, in the compose profile `standin`, which the driver enables for a stand-in target only. Its data port, 8080, isn't published; its control port is, `ports: ["127.0.0.1::8081"]`, which the driver re-reads after any start of the service, as a backend's. A health check against the control port's `/health`, which the SUT's optional `depends_on` waits for. Its stdout is the record |
 
 Each service's role is its `soak.role` label (W7b). A scenario's `compose` override is passed
 after the base file, `-f compose.yaml -f <override>`, on every `compose` call, and copied into
@@ -826,7 +866,11 @@ The rows:
   couldn't read back, counts the gap like any other drop, but FAILs the life and group it falls
   in whatever the gap, with the reason named: neither happens against a healthy backend, and
   under cumulative temporality a later total can hide the rejected batch's increments, leaving
-  a gap of 0. The stderr `drain complete` line's `batches_dropped` counts shutdown drops only,
+  a gap of 0. A stand-in told to reject (W9a) isn't a healthy backend: a `rejected` drop at
+  the sink whose drain falls inside a `respond` step with `class = "rejected"`, from its apply
+  to one `aggregate` interval plus `recovery_bound` after its revert, counts the gap and is
+  named, `rejected 3 cued by c0s4, counted`, but doesn't FAIL; one outside every such window
+  still FAILs. The stderr `drain complete` line's `batches_dropped` counts shutdown drops only,
   process-wide, and never counts a gap; it only cross-checks telemetry's `shutdown` total. A
   killed life's gap passes inside its band (see "Which life a hop is judged in"); a SIGKILL
   counts no shutdown drops, but the life's drains can carry others, such as a queue's overflow
@@ -901,15 +945,21 @@ The rows:
   per egress group, each of which must be 0 or counted on its own, so a surplus at one sink
   can't net out loss at another. When an egress term is counted, it is shown as counted and the
   row judges the rest. A `rejected` or `disk_corrupt` drop in the final life's group FAILs the
-  row as it FAILs `ledger.egress`, named beside its term.
+  row as it FAILs `ledger.egress`, named beside its term, unless a cued step explains it (W9a).
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at each sink's own
-  telemetry; see "External targets".
+  telemetry; see "External targets". A Kafka target's sink is judged the same way, and so is a
+  `datadog` stand-in's (W9b), with what a `respond` step cued excused; a `remote_write` stand-in
+  target's `ledger.sent` SKIPs (W9a), because `ledger.standin` judges the sink against what the
+  stand-in recorded. See "Stand-in targets".
+- `ledger.standin` (W9a), for a stand-in target, else SKIP: the stand-in's record against the
+  sink; see "Stand-in targets".
 - `drops` (2026-10-13): every `logit.*.dropped` counter the SUT emitted that no row above
   judges. Under [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md) the name
   alone says a count is loss, so the row reads every such name rather than a list. It leaves
   out the terms the ledger balances (every `batches.dropped`, a node's `events.dropped` beside a
   batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B terms, and the
-  script's L_err) and, on an external or Kafka target, the sink's `records.dropped` and
+  script's L_err) and, on an external, Kafka, or `datadog` stand-in target, the sink's
+  `records.dropped` and
   `metrics.dropped`, which `ledger.sent` judges. A `rejected` or `disk_corrupt` reason FAILs;
   any other WARNs. On an external target `ledger.egress` SKIPs, so `ledger.sent` FAILs a
   `rejected` or `disk_corrupt` batch drop at a sink, and one at any other node stays in this
@@ -1046,12 +1096,19 @@ and a diagnostic, and "Telemetry"). This list is the canonical copy of its verdi
   `records.dropped{reason="rejected"}` also counts the series a `202` body names, so it quotes
   `request_rejected`, `series_rejected`, or both, whichever the sink logged. Under per-request
   verdicts a rejected request drops its records and the batch survives when another request
-  was accepted, so both the batch and the record counter are read.
+  was accepted, so both the batch and the record counter are read. On a `datadog` stand-in
+  target (W9b), a drop inside a `respond` step that explains it is counted as cued instead: a
+  `rejected` batch inside a step with `class = "rejected"`, an `oversize` record drop inside a
+  `413` step classed `rejected`, and a `rejected` record drop inside another step classed
+  `rejected` or a `series_errors` step, each through one aggregate interval and `recovery_bound` after the step. Outside every
+  matching step it FAILs. See "Stand-in targets".
 - On an external target, a batch dropped `disk_corrupt` (2026-10-13): FAIL, because
   `ledger.egress`, which FAILs it on a local or Kafka target, SKIPs there.
 - An `api_key_rejected` or `request_refused` line from the sink on stderr: FAIL, quoting the
   first. The sink reads that answer as `Refused` and holds its queue with no exit, so the run
-  can't deliver until the key or the endpoint is fixed.
+  can't deliver until the key or the endpoint is fixed. On a `datadog` stand-in target (W9b), a
+  line inside a step with `class = "refused"`, through the same widened window, is counted as
+  cued instead. See "Stand-in targets".
 - No `logit.output.requests` point, or none of class `2xx`: FAIL.
 - Any other counted drop (a batch's `overflow_*` or `shutdown` reason, a record's `stale`, `too_many_tags`, or other pre-send reason, the
   encoder's `metrics.skipped`, and its `metrics.dropped` for an encode fault): WARN.
@@ -1061,7 +1118,9 @@ and a diagnostic, and "Telemetry"). This list is the canonical copy of its verdi
   drain whose interval overlaps a fault window is the fault's retry; outside every one it
   WARNs with the count, because the destination has a floor of errors of its own.
 
-The row is a PASS whose detail starts with `SENT` when nothing above fires. `SENT` is a PASS
+On an external target, the row is a PASS whose detail starts with `SENT` when nothing above
+fires; on a Kafka or stand-in target the PASS doesn't, because the ledger goes on to the topic
+or the record. `SENT` is a PASS
 rather than a fifth status so `results.md` keeps PASS, WARN, FAIL, and SKIP and `worst()` needs
 no new rank. A `2xx` is the end of the evidence: the harness can't see a point the intake took
 and later discarded, nor tell an overwritten resend from a duplicate. `datadog_out` resends a
@@ -1149,6 +1208,140 @@ into response timeouts, `Ambiguous` attempts the broker deduplicates on the rese
 expectations: `batches.dropped` 0 through each fault, at least one `ambiguous` request through
 the pause, so `ledger.topic`'s no-duplicate verdict rests on resends, and `retrying` above 0
 during the stop and 0 after it.
+
+### 8c. Stand-in targets (W9a, W9b)
+
+A `[target]` table with `kind = "standin"` runs a scripted HTTP destination in place of
+VictoriaMetrics, so every row of a sink's response-class table
+([ADR `sink-fault-classes`](../adr/sink-fault-classes.md)) runs under load, on cue:
+
+```toml
+[target]
+kind = "standin"          # name defaults to "standin"
+shape = "remote_write"    # or "datadog" (W9b); "remote_write" by default
+
+[[ledger.sink]]           # one sink, with no backend or vm_selector
+id = "remote_write"
+```
+
+**httpbin, considered.** `httpbin`'s `/status/{code}` answers a status fixed by the URL, so
+changing the answer mid-run would mean changing the sink's endpoint and restarting the SUT; it
+keeps no record of what it received, can't store a write and then answer `5xx`, can't reset a
+connection, and decodes no request `Content-Encoding`. What it would contribute, "answer status
+N", is a line of `http.server`, and it would bring Flask and gunicorn into a harness that is
+stdlib-only.
+
+**The stand-in.** `tools/soak/standin/standin.py` is about 290 lines of stdlib Python run in a
+stock `python:3.13.16-alpine3.24` image, so `script/soak` builds nothing for it. Its data port
+takes the sink's writes on the shape's path (`--shape remote_write`: `/api/v1/write`, default
+answer `200`; `--shape datadog`, W9b: `/api/v2/series`, default answer `202`); a write to any
+other path answers `404`. Under `datadog`, a cue's `series_errors` makes a `2xx` answer's body
+the series route's `errors` list, protobuf field 1 (`repeated string`), with N entries; the
+stand-in decodes nothing, so the entries name series by their place in the request. Its control port takes the driver's
+cues and answers `/health`. It prints one JSON line per request to stdout: the time, path,
+`Content-Encoding`, the cue in force, how it answered (`status` or `reset`), whether it stored
+the write (`apply`, else whether the status is `2xx`), the cue's `series_errors` when it set one,
+and the raw body, base64. The driver's
+log capture collects that stdout with every other service's, so a `stop` and `start` of the
+stand-in keep one record, and `check` re-scores a run from it. SIGTERM lets each request in
+flight finish before the process exits, so a `stop` doesn't cut off an answer the record holds.
+
+**The schema.** The target takes an optional `name` (a slug) and `shape` (`remote_write` or
+`datadog`), and refuses `env` and `topic`; any other target refuses `shape`. It
+needs one `[[ledger.sink]]`, and only one, with no `backend` or `vm_selector`.
+`vm_every_window` is allowed, since V has an export's shape.
+The stack runs the `standin` profile in place of `local`, and the role map must hold the
+`standin` service. Faults on `standin` are known only for this target. A `respond` step (§2)
+sets the answer.
+
+**The driver.** It writes the target's `shape` to `compose.env` as `SOAK_STANDIN_SHAPE`, which
+compose.yaml passes to `--shape`. It reads the stand-in's published control port after `up` and
+waits for its `/health`, re-reads it after any revert of a fault on it, and POSTs each `respond` step's cue.
+Like a Kafka target's, the end sequence waits for the sink's queue to empty. It reads nothing
+back after the SUT stops: the record is in `logs/standin.stdout`.
+
+**V.** `soaklib/standin.py` decodes each stored request's body on the host. Under
+`remote_write` it's a Snappy block (a stdlib decoder, pinned against blocks `snap::raw` wrote, in
+`tools/soak/standin/snap-vectors.json`) holding a remote-write 1.0 `WriteRequest`. V is every
+stored sample, with a later write of one `(label set, timestamp)` replacing an earlier one, as a
+remote-write receiver overwrites. The result has the export's shape, so `ledger.egress`,
+`ledger.summary`, and, under `vm_every_window`, `ledger.windows` read it as they read
+VictoriaMetrics. Python's stdlib has no zstd before 3.14, so a `remote_write` sink sends Snappy.
+
+Under `datadog` (W9b) a body is a `MetricPayload`
+(`crates/logit-proto/proto/datadog/agent-payload/proto/metrics/agent_payload.proto`) under
+`datadog_out`'s default `gzip`, or `deflate` or none, decoded with the stdlib and a walker pinned
+against a body `datadog_out` sent (`tools/soak/standin/datadog-vectors.json`). The SUT's
+`aggregate` runs `temporality: delta`, so each point is one window's increment, and V is their
+sum, credited to the SUT life its timestamp falls in. Datadog documents no deduplication of a
+`count` point, and [ADR `delivery-semantics`](../adr/delivery-semantics.md) says a kind with no
+remedy is double-counted, so a resent point adds rather than overwrites. As for a Kafka topic, V
+counts each distinct copy of a `(series, timestamp, value)` once, so a duplicate can't cancel a
+loss of the same size, and a negative gap is a `surplus` that FAILs `ledger.egress`; a second
+value at one `(series, timestamp)` is summed and FAILs `ledger.standin`. A `series_errors`
+answer stores every series of its request but the first N, and the sink's `records.dropped`
+counts toward a positive gap, because those series are lost with no batch dropped.
+
+**`ledger.sent` against a `datadog` stand-in (W9b)** judges the sink by the verdicts in
+"External targets", so they run without a real org; that list says which refusals and drops a
+`respond` step's cue excuses. `drops` leaves the sink's `records.dropped` and `metrics.dropped`
+to it, as on an external target. Under `remote_write`, `ledger.sent` SKIPs.
+
+**`ledger.standin`** judges the record against the sink:
+
+- Every record line parses, and every body decodes. A resend that stored a different value for
+  a sample already stored FAILs; one that stored the same value is counted and reported.
+- Every sample of a write the stand-in answered `2xx` was stored. `ledger.egress` counts any
+  positive gap in a life with a batch drop, so on a stand-in run with `rejected` steps a black
+  hole passes it; this rule, not `ledger.egress`, is what catches one there.
+- Per SUT life, the record's requests by status class equal the sink's
+  `logit.output.requests{class}` for `2xx` to `5xx`; its resets are at most the sink's
+  `network_error`, which a connect failure also counts. A killed life's mismatch WARNs.
+- Every answer other than the default carries the cue of a `respond` step that applied
+  cleanly and falls inside its span, and every write went to the stand-in's path.
+- Each step with a `class` shows that class at the sink. `rejected`: a batch dropped `rejected`
+  from the step's apply to two `internal` intervals after its revert, and no `retrying` line in
+  the span. `clean`, `refused`, and `ambiguous`: the `retrying` line's class word, `send failed
+  (<class>): ...`, the only one in the span, and no drop; under `buffer.delivery: at_most_once`,
+  `ambiguous` drops the batch `ambiguous_at_most_once` instead, with no `retrying` line. The
+  write loop logs `retrying` on a held head's first failure and then once a minute, so a step's
+  span holds its first line. The row reads the stderr line rather than an `[[expect]]` because
+  the class appears nowhere in telemetry: `requests{class}` buckets the status, and `retrying`
+  is the same gauge for every held class.
+- Under `datadog` (W9b), also: per SUT life, the sink's `records.dropped{reason="rejected"}`
+  equals the series the `series_errors` answers named plus the points of the requests answered
+  under the cue of a step classed `rejected`, other than a `413`, and
+  `records.dropped{reason="oversize"}` the points of the `413` answers under such a step. The
+  expected class comes from the step alone; the harness keeps no copy of the sink's table to
+  check it against, so a step classed wrong FAILs its signature at the sink.
+  Each duplicate copy is reported per life with the amount the destination counted twice:
+  permitted under `at_least_once`, and a FAIL under `at_most_once`, or when the copy it repeats
+  was answered `2xx` in the same life, a point the sink saw accepted and resent.
+
+**The scenarios.**
+
+- `standin-remote-write`: `statsd-vm`'s generator and SUT, with `prometheus_out` sending
+  remote-write 1.0 under `compression: snappy` to the stand-in. Nineteen 20 s steps, 105 s apart,
+  walk the sink's sender-mode table: `503`, a `503` after storing the write (its resend stores
+  the same samples again), `429`, `400` with `out of order sample`, `400` with each
+  decompression prefix, `401`, `403`, `407`, `404`, `405`, `501`, `409`, `413`, `415`, `422`,
+  `302`, a reset, and a `stop` of the stand-in, each with its `class`. Under cumulative
+  temporality the next window's totals overwrite a rejected batch, so the egress gap stays 0.
+- `standin-at-most-once`: the same SUT with `buffer.delivery: at_most_once`; a `503` and a reset
+  drop `ambiguous_at_most_once`, a `401` holds, a `400` drops `rejected`.
+- `standin-datadog` (W9b): `statsd-datadog`'s generator and SUT, with `datadog_out` sending
+  series under `compression: gzip` to `endpoints: { api: http://standin:8080 }`. Sixteen 20 s
+  steps, 105 s apart: a `202` with `series_errors = 2`, then `400`, `401`, `403`, `404`, `405`,
+  `408`, `413`, `429`, `500`, `501`, a `503` after storing the write (its resend a duplicate),
+  `302`, `422`, a reset, and a `stop` of the stand-in, each but the first with its `class`.
+  Under delta temporality a rejected window is a counted gap.
+
+The black-hole control is a `2xx` the stand-in doesn't store (`status = 200`, `apply = false`).
+`ledger.standin` FAILs it wherever it falls. Under cumulative temporality the next stored totals
+overwrite a hole, so `ledger.egress` FAILs it as uncounted loss only when it holds the last
+samples and no drop in the life credits the gap (a self-test fixture), and a hole in the middle
+shows in `ledger.windows` under `vm_every_window` (a recorded by-hand run). It isn't a shipped
+scenario.
 
 ### 9. Not in this stack
 
@@ -1274,7 +1467,8 @@ where it needs them, and a small check extension.
    judged with that band plus a surplus band of up to one checkpoint interval of lines on top.
    Needs: a volume the writer and SUT share (the generator's `file_out` can write, G its count),
    the tail-side W, and that surplus band.
-10. **Deterministic destination errors.** A scripted HTTP stand-in answering `429`, `5xx`, `400`,
+10. **Deterministic destination errors (built in W9a, for `prometheus_out`, and W9b, for
+    `datadog_out`).** A scripted HTTP stand-in answering `429`, `5xx`, `400`,
     and `413` on cue and recording what it accepts, so every row of a sink's response-class table
     ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "Each sink attributes from
     everything its destination gives it") runs under load, and a Datadog-shaped one makes
@@ -1323,8 +1517,9 @@ that items 3, 7, and 11 need.
 | W8a | `soak/w8a` | `soak/w8a: counted drops of every reason, full-spool, slow-destination, and stop-during-outage soaks` | M | W7b |
 | W8b | `soak/w8b` | `soak/w8b: fan-in from two generators` | M | W8a |
 | W8c | `soak/w8c` | `soak/w8c: high-cardinality soaks, a slope reducer, and expected verdicts` | M | W8b |
-| W9 | `soak/w9` | `soak/w9: a scripted HTTP destination for every response class` | M | W8c |
-| W10 | `soak/w10` | `soak/w10: a native-hop soak between two logit processes` | M | W9 |
+| W9a | `soak/w9a` | `soak/w9a: a scripted HTTP stand-in for every remote-write response class` | M | W8c |
+| W9b | `soak/w9b` | `soak/w9b: a Datadog-shaped stand-in and ledger.sent against it` | M | W9a |
+| W10 | `soak/w10` | `soak/w10: a native-hop soak between two logit processes` | M | W9b |
 | W11 | `soak/w11` | `soak/w11: TCP-ingress and file-tailing soaks` | M | W10 |
 | W12 | `soak/w12` | `soak/w12: rolling-overlap, SIGHUP, and TLS-reload soaks` | M | W11 |
 
@@ -1394,13 +1589,21 @@ that items 3, 7, and 11 need.
 - **W8c**: item 6, a gauge `slope` reducer and a `run` window for `[[expect]]`, `rss_slope`
   and `fd_slope` judged per service, an `[expected]` verdict per row and per service, and the
   `cardinality` scenario.
-- **W9**: item 10, the scripted destination, and `ledger.sent` run against it.
+- **W9a**: item 10 for `prometheus_out`: the stand-in, the `respond` action and the `class` key,
+  the `standin` target, role, and profile, V from the stand-in's record, the `ledger.standin`
+  row, the cued `rejected` excusal, and the `standin-remote-write` and `standin-at-most-once`
+  scenarios ("Stand-in targets").
+- **W9b**: item 10 for `datadog_out`: a Datadog-shaped stand-in (`[target] shape = "datadog"`,
+  series v2, a `202` whose body names rejected series through `series_errors`), V as the stored
+  delta points' sum, `ledger.sent` and `drops` against it with cued refusals and drops excused,
+  duplicates reported per life as for a Kafka target, and the `standin-datadog` scenario
+  ("Stand-in targets").
 - **W10**: item 7, a second SUT service and the ledger one hop longer.
 - **W11**: items 8 and 9, per-line wire counters, a shared volume, and the replay surplus band.
 - **W12**: items 11 and 12, the namespace-holder service, per-instance totals, and the `signal`
   and certificate-rotation actions.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9 → W10 → W11 → W12, linear. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10 → W11 → W12, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
@@ -2682,6 +2885,223 @@ Overall PASS: every row passed but `ledger.windows`, which a Kafka target SKIPs,
   25,900 records back, matching the partition's end offset, 4 s after the SUT stopped.
 - **RSS slopes** were +1.5 MiB/h (SUT) and +1.1 MiB/h (generator), and file descriptors held at
   13 (SUT) and went from 12 to 11 (generator).
+
+### W9a: a scripted stand-in for every remote-write response class (2026-10-15)
+
+W9a adds the stand-in target, the `respond` action and `class` key, `ledger.standin`, and the
+cued `rejected` excusal, with `standin-remote-write` and `standin-at-most-once`. The runs used
+`logit:soak` `sha256:ac527cd4206d`, built from `847f57c8` (`main` at `8ea44976` plus W9a, which
+changes no Rust), `logit-soak-netem:local` `sha256:2396ab48f179`, and
+`python:3.13.16-alpine3.24` `sha256:2d9aefe2fef0`, on the development host (32 cores, Docker
+29.8.2). `standin-remote-write` ran at `df6a9f95`, which spaces its steps 105 s apart; the other
+two ran at `847f57c8`, beside a first `standin-remote-write` at 95 s spacing (`20261015T160441Z`),
+whose every row also passed, `progress` judging only 6% of the run.
+
+| Run | Scenario | Verdict |
+|---|---|---|
+| `20261015T163904Z` | `standin-remote-write` | every row PASS: each of the 19 steps read as its class, 10 batches dropped `rejected` (2 per rejected step), all cued, and Ab − V 0 |
+| `20261015T160610Z` | `standin-at-most-once` | every row PASS: the `503` and the reset each dropped 2 batches `ambiguous_at_most_once`, the `401` held, the `400` dropped 2 `rejected` |
+| `20261015T160615Z` | `standin-black-hole`, by hand | FAIL, as the control should: `ledger.windows` finds every series' 30 s hole; `ledger.egress` passes |
+
+`standin-remote-write`'s `results.md` table:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 38 apply/revert action(s) returned 0; 0 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 2 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 1 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 23 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 180 readiness sample(s) read ok outside fault windows; 0 start(s) or unpause(s) ready in time |
+| `progress` | PASS | 23 30s window(s) outside fault windows, judged per sink (standin target: no VictoriaMetrics): remote_write: deliveries in 23 of 23, no freshness samples; 660s of 2080s after warmup judged (32%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +0.2 (limit 64); 750s of 2080s after warmup judged (36%; WARN under 5%) \| logit PASS: MiB/h life 0 +1.8 (limit 64); 750s of 2080s after warmup judged (36%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +8) \| logit PASS: warmup median 11.5 -> end 11 (limit +8) |
+| `ledger.wire` | PASS | G 4,291,300 = W 4,291,300 + K 0 + wire 0 (by design: 0 in UDP-affecting windows, -14 steady, 14 at the end; steady loss judged 0, each run at 0 or more, against limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 4,291,300 vs E + B 4,291,300 (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E 4,291,300 == A 4,291,300 (listener to aggregate); A_sent 21,600 == S_in[remote_write] 21,600 (aggregate to remote_write) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 0: Ab 4,291,300 == A 4,291,300 (every event absorbed) |
+| `ledger.egress` | PASS | remote_write: life 0 (final): Ab 4,291,300 − V[remote_write] 4,291,300 = 0, ok; rejected 2 cued by c0s4, 2 cued by c0s13, 2 cued by c0s14, 2 cued by c0s16, 2 cued by c0s17, counted (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[remote_write] 0; wire G − (W + K) 0 over the run, by design |
+| `ledger.sent` | SKIP | standin target: ledger.egress and ledger.standin judge delivery against the stand-in's record |
+| `ledger.topic` | SKIP | standin target: no topic |
+| `ledger.standin` | PASS | 300 request(s) recorded, 213 stored, 36 cue(s); 700 resent sample(s) stored again with the same value; 19 classed step(s) (at_least_once); record, request classes, cues, and each step's class agree with the sink |
+| `identity.sink` | PASS | final life 0 at +2164s: remote_write: received 216 vs delivered 206 + dropped 10 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 19 of 19 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect.ambiguous-retries` | PASS | delta of logit.component.retries{component=remote_write} on logit, during c0s1: c0s1 (+60s, +80s]: 6 (over 4 drain(s)), want >= 1 |
+| `expect.rejected-drops` | PASS | delta of logit.component.batches.dropped{component=remote_write, reason=rejected} on logit, through c0s4: c0s4 (+375s, +440s]: 2 (over 13 drain(s)), want >= 1 |
+| `expect.refused-holds` | PASS | max of logit.component.retrying{component=remote_write} on logit, during c0s7: c0s7 (+690s, +710s]: 1 (1 sample(s) and the value in force at its start), want >= 1 |
+| `expect.refused-drops-nothing` | PASS | delta of logit.component.batches.dropped{component=remote_write} on logit, through c0s7: c0s7 (+690s, +755s]: 0 (over 13 drain(s)), want <= 0 |
+| `expect.clean-holds` | PASS | max of logit.component.retrying{component=remote_write} on logit, during c0s19: c0s19 (+1950s, +1970s]: 1 (1 sample(s) and the value in force at its start), want >= 1 |
+| `expect.retrying-clears` | PASS | last of logit.component.retrying{component=remote_write} on logit, after c0s19: c0s19 (+1970s, +2015s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
+
+`standin-at-most-once`'s:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 8 apply/revert action(s) returned 0; 0 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 2 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 0 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 7 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 55 readiness sample(s) read ok outside fault windows; 0 start(s) or unpause(s) ready in time |
+| `progress` | PASS | 5 30s window(s) outside fault windows, judged per sink (standin target: no VictoriaMetrics): remote_write: deliveries in 5 of 5, no freshness samples; 120s of 475s after warmup judged (25%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +0.5 (limit 64); 195s of 475s after warmup judged (41%; WARN under 5%) \| logit PASS: MiB/h life 0 -3.4 (limit 64); 195s of 475s after warmup judged (41%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 12 -> end 12 (limit +8) \| logit PASS: warmup median 11.5 -> end 12 (limit +8) |
+| `ledger.wire` | PASS | G 1,081,300 = W 1,081,300 + K 0 + wire 0 (by design: 0 in UDP-affecting windows, -34 steady, 34 at the end; steady loss judged 0, each run at 0 or more, against limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 1,081,300 vs E + B 1,081,300 (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E 1,081,300 == A 1,081,300 (listener to aggregate); A_sent 5,500 == S_in[remote_write] 5,500 (aggregate to remote_write) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 0: Ab 1,081,300 == A 1,081,300 (every event absorbed) |
+| `ledger.egress` | PASS | remote_write: life 0 (final): Ab 1,081,300 − V[remote_write] 1,081,300 = 0, ok; rejected 2 cued by c0s3, counted (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[remote_write] 0; wire G − (W + K) 0 over the run, by design |
+| `ledger.sent` | SKIP | standin target: ledger.egress and ledger.standin judge delivery against the stand-in's record |
+| `ledger.topic` | SKIP | standin target: no topic |
+| `ledger.standin` | PASS | 62 request(s) recorded, 49 stored, 8 cue(s); 0 resent sample(s) stored again with the same value; 4 classed step(s) (at_most_once); record, request classes, cues, and each step's class agree with the sink |
+| `identity.sink` | PASS | final life 0 at +559s: remote_write: received 55 vs delivered 49 + dropped 6 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 4 of 4 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect.ambiguous-drops` | PASS | delta of logit.component.batches.dropped{component=remote_write, reason=ambiguous_at_most_once} on logit, through c0s1: c0s1 (+60s, +125s]: 2 (over 13 drain(s)), want >= 1 |
+| `expect.ambiguous-never-retries` | PASS | delta of logit.component.retries{component=remote_write} on logit, through c0s1: c0s1 (+60s, +125s]: 0 (over 13 drain(s)), want <= 0 |
+| `expect.refused-holds` | PASS | max of logit.component.retrying{component=remote_write} on logit, during c0s2: c0s2 (+155s, +175s]: 1 (1 sample(s)), want >= 1 |
+
+The black-hole control ran from a scenario directory outside the repository, through
+`soak.py run <path>`: `standin-remote-write`'s configs, `[ledger] vm_every_window = true`, and one
+step, `respond` with `status = 200` and `apply = false` for 20 s. Its table:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 2 apply/revert action(s) returned 0; 0 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 2 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 0 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 0 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 36 readiness sample(s) read ok outside fault windows; 0 start(s) or unpause(s) ready in time |
+| `progress` | PASS | 5 30s window(s) outside fault windows, judged per sink (standin target: no VictoriaMetrics): remote_write: deliveries in 5 of 5, no freshness samples; 120s of 190s after warmup judged (63%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 -2.4 (limit 64); 120s of 190s after warmup judged (63%; WARN under 5%) \| logit PASS: MiB/h life 0 +32.1 (limit 64); 120s of 190s after warmup judged (63%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 12 (limit +8) \| logit PASS: warmup median 11.5 -> end 11 (limit +8) |
+| `ledger.wire` | PASS | G 511,300 = W 511,300 + K 0 + wire 0 (by design: 0 in UDP-affecting windows, 65 steady, -65 at the end; steady loss judged 65, each run at 0 or more, against limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 511,300 vs E + B 511,300 (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E 511,300 == A 511,300 (listener to aggregate); A_sent 2,700 == S_in[remote_write] 2,700 (aggregate to remote_write) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 0: Ab 511,300 == A 511,300 (every event absorbed) |
+| `ledger.egress` | PASS | remote_write: life 0 (final): Ab 511,300 − V[remote_write] 511,300 = 0, ok (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | FAIL | missing windows, 100 finding(s), first: remote_write soak_requests_0_total: life 0 gap 30s from +59s to +89s, windows emitted but not stored: window sent 2 batch(es) over 4 drain(s) from +67s to +87s (gaps <= 15s (1.5 x the 10s aggregate interval) or idle, with no window batches.sent from a + 7.5s to b - 2.5s (5s drains); a killed life's last sample within 11s (1.1 x) of the kill, a later life's first within 20s (2 x) of its start) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[remote_write] 0; wire G − (W + K) 0 over the run, by design |
+| `ledger.sent` | SKIP | standin target: ledger.egress and ledger.standin judge delivery against the stand-in's record |
+| `ledger.topic` | SKIP | standin target: no topic |
+| `ledger.standin` | PASS | 27 request(s) recorded, 25 stored, 2 cue(s); 0 resent sample(s) stored again with the same value; 0 classed step(s) (at_least_once); record, request classes, cues, and each step's class agree with the sink |
+| `identity.sink` | PASS | final life 0 at +274s: remote_write: received 27 vs delivered 27 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 1 of 1 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect` | SKIP | the scenario has no [[expect]] tables |
+
+What the runs showed about `logit` and the harness:
+
+- **`prometheus_out` reads every row of its table as documented, under load.** Each step's first
+  `retrying` line named the class its `class` key expected (`ambiguous` for `503`, `429`, and a
+  reset; `refused` for both decompression bodies, `401`, `403`, `404`, `405`, `407`, `415`, and
+  `501`; `clean` for the stopped stand-in), and each `rejected` step (`400` with `out of order
+  sample`, `409`, `413`, `422`, `302`) dropped its two windows with no retry.
+- **A stopped stand-in is a connect failure.** Docker's DNS stops answering for a stopped
+  container, and `reqwest` reports the failed lookup as a connect error (`client error
+  (Connect): dns error`), which the sink reads as `clean`. The sink counted 10
+  `network_error` requests against the record's 7 resets; the other 3 are those lookups, which
+  never reached the stand-in.
+- **A resend after a `5xx` stores the same samples.** The `503` with `apply = true` stored each
+  attempt, and the sink's 7 resends wrote 700 samples again, each with the value already stored.
+- **A rejected window costs a cumulative series nothing.** Each rejected step lost two windows,
+  and the next stored totals overwrote them, so Ab − V stayed 0; `ledger.egress` names the 10
+  drops as cued.
+- **A transient black hole is invisible to `ledger.egress` under cumulative temporality.** The
+  control's 20 s of `200`s that stored nothing left Ab − V at 0, because the next window's
+  totals overwrite the hole. `ledger.windows` caught it, with one finding per series. A
+  stand-in scenario that needs to see a lost window sets `vm_every_window`, which a scenario
+  with a `rejected` step can't, since a rejected window is lost too. `ledger.standin`'s check
+  that every sample answered `2xx` was stored, added after review, FAILs the same run when it is
+  re-scored: 200 samples, 2 windows of 100 series.
+- **Self-test**: 1,185 expectations, from 1,074 on `main`. Reverting the cued excusal in
+  `Ledger.fault_drops` FAILs four of them: a cued `rejected` drop then FAILs `ledger.egress` and
+  `ledger.summary`, and the drop past the step's window reads 3 batches instead of 1.
+
+### W9b: a Datadog-shaped stand-in for every `datadog_out` response class (2026-10-15)
+
+W9b adds the stand-in's `datadog` shape, `series_errors`, V as the stored delta points' sum with
+duplicates reported, and `ledger.sent` against a stand-in, with `standin-datadog`. Run
+`20261015T180002Z` used `logit:soak` `sha256:4bc148b6d2f5`, rebuilt by `script/soak` from the
+working tree at `45fdb280` plus W9b's harness changes (W9b changes no Rust, so the binary is
+W9a's), `logit-soak-netem:local` `sha256:ca9f9da8292d`, and `python:3.13.16-alpine3.24`
+`sha256:2d9aefe2fef0`, on the development host (32 cores, Docker 29.8.2). Its code is
+`19ec65f1`'s but for comments; `results.md` below is its re-score with `soak.py check` at
+`d71e2db4`, which orders `ledger.sent`'s cued drops by step and changes no verdict. Every row
+passed.
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 32 apply/revert action(s) returned 0; 0 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 2 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 1 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 19 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 156 readiness sample(s) read ok outside fault windows; 0 start(s) or unpause(s) ready in time |
+| `progress` | PASS | 20 30s window(s) outside fault windows, judged per sink (standin target: no VictoriaMetrics): datadog: deliveries in 20 of 20, no freshness samples; 570s of 1765s after warmup judged (32%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +0.0 (limit 64); 645s of 1765s after warmup judged (37%; WARN under 5%) \| logit PASS: MiB/h life 0 +0.8 (limit 64); 645s of 1765s after warmup judged (37%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 12 (limit +8) \| logit PASS: warmup median 11.5 -> end 12 (limit +8) |
+| `ledger.wire` | PASS | G 3,661,200 = W 3,661,200 + K 0 + wire 0 (by design: 0 in UDP-affecting windows, -87 steady, 87 at the end; steady loss judged 0, each run at 0 or more, against limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 3,661,200 vs E + B 3,661,200 (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E 3,661,200 == A 3,661,200 (listener to aggregate); A_sent 18,400 == S_in[datadog] 18,400 (aggregate to datadog) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 0: Ab 3,661,200 == A 3,661,200 (every event absorbed) |
+| `ledger.egress` | PASS | datadog: life 0 (final): Ab 3,661,200 − V[datadog] 3,500,400 = 160,800, counted (batches dropped: rejected 8; records dropped: oversize 200, rejected 604); rejected 2 cued by c0s2, 2 cued by c0s8, 2 cued by c0s13, 2 cued by c0s14, counted (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[datadog] 160,800 counted; wire G − (W + K) 0 over the run, by design |
+| `ledger.sent` | PASS | to standin: every batch received ended in an accepted response; datadog: requests 2xx 176, 3xx 2, 4xx 44, 5xx 20, network_error 10; records accepted 17,596; cued, excused: api_key_rejected line(s) 3 by c0s4; request_refused line(s) 3 by c0s3, 1 by c0s5, 1 by c0s6; batch(es) dropped rejected 2 by c0s2, 2 by c0s8, 2 by c0s13, 2 by c0s14; record(s) dropped oversize 200 by c0s8; record(s) dropped rejected 4 by c0s1, 200 by c0s2, 200 by c0s13, 200 by c0s14; datadog life 0 at +1849s: received 184 vs delivered 176 + dropped 8 + buffer.batches 0, gap 0 (one batch in flight allowed); ledger.egress and ledger.standin read the stand-in's record |
+| `ledger.topic` | SKIP | standin target: no topic |
+| `ledger.standin` | PASS | 248 request(s) recorded, 183 stored, 30 cue(s); 700 duplicate copies of stored points (life 0 700), 140,000 counted twice by the destination, reported; 4 series named by series_errors; 15 classed step(s) (at_least_once); record, request classes, cues, and each step's class agree with the sink |
+| `identity.sink` | PASS | final life 0 at +1849s: datadog: received 184 vs delivered 176 + dropped 8 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 16 of 16 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect.series-errors-drop-records` | PASS | delta of logit.output.records.dropped{component=datadog, reason=rejected} on logit, through c0s1: c0s1 (+60s, +125s]: 4 (over 13 drain(s)), want >= 1 |
+| `expect.series-errors-drop-no-batch` | PASS | delta of logit.component.batches.dropped{component=datadog} on logit, through c0s1: c0s1 (+60s, +125s]: 0 (over 13 drain(s)), want <= 0 |
+| `expect.rejected-drops` | PASS | delta of logit.component.batches.dropped{component=datadog, reason=rejected} on logit, through c0s2: c0s2 (+165s, +230s]: 2 (over 13 drain(s)), want >= 1 |
+| `expect.refused-holds` | PASS | max of logit.component.retrying{component=datadog} on logit, during c0s4: c0s4 (+375s, +395s]: 1 (1 sample(s) and the value in force at its start), want >= 1 |
+| `expect.refused-drops-nothing` | PASS | delta of logit.component.batches.dropped{component=datadog} on logit, through c0s4: c0s4 (+375s, +440s]: 0 (over 13 drain(s)), want <= 0 |
+| `expect.ambiguous-retries` | PASS | delta of logit.component.retries{component=datadog} on logit, during c0s7: c0s7 (+690s, +710s]: 6 (over 4 drain(s)), want >= 1 |
+| `expect.oversize-drops-records` | PASS | delta of logit.output.records.dropped{component=datadog, reason=oversize} on logit, through c0s8: c0s8 (+795s, +860s]: 200 (over 13 drain(s)), want >= 1 |
+| `expect.oversize-drops-batches` | PASS | delta of logit.component.batches.dropped{component=datadog, reason=rejected} on logit, through c0s8: c0s8 (+795s, +860s]: 2 (over 13 drain(s)), want >= 1 |
+| `expect.applied-5xx-retries` | PASS | delta of logit.component.retries{component=datadog} on logit, during c0s12: c0s12 (+1215s, +1235s]: 7 (over 4 drain(s)), want >= 1 |
+| `expect.clean-holds` | PASS | max of logit.component.retrying{component=datadog} on logit, during c0s16: c0s16 (+1635s, +1655s]: 1 (1 sample(s) and the value in force at its start), want >= 1 |
+| `expect.retrying-clears` | PASS | last of logit.component.retrying{component=datadog} on logit, after c0s16: c0s16 (+1655s, +1700s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
+
+What the run showed about `logit` and the harness:
+
+- **`datadog_out` reads every row of its table as documented, under load.** Each held step's
+  first `retrying` line named its class: `refused` for `401`, `403`, `404`, and `405`;
+  `ambiguous` for `408`, `429`, `500`, `501`, the `503`, and the reset; `clean` for the stopped
+  stand-in. Each `rejected` step (`400`, `413`, `302`, `422`) dropped its two windows with no
+  retry, and the `413` counted its 200 records `oversize`. The sink logged `api_key_rejected`
+  for the `403` and `request_refused` for the other refusals, all inside their steps.
+- **A `202` naming series counts them and drops no batch.** The `series_errors = 2` step's two
+  requests each named their first 2 series, and the sink counted 4 records dropped `rejected`
+  with no batch dropped.
+- **The egress gap is the cued loss, to the event.** Ab − V was 160,800: the 8 rejected windows
+  (4 steps, 2 windows each, 100 series at 200 increments) are 160,000, and the 4 named series
+  800.
+- **A resend after an applied `503` is stored again.** The `503` with `apply = true` stored 7
+  attempts of the held batch before the eighth was accepted, so the stand-in holds 700
+  duplicate copies, 140,000 increments a Datadog org would count twice. V counts each point
+  once, and `ledger.standin` reports the copies, as `at_least_once` permits.
+- **The sink counted 10 `network_error` requests against the record's 6 resets**; the other 4
+  were connect failures to the stopped stand-in, which never reached it.
+- **Self-test**: 1,286 expectations, from 1,187 at W9a. Each new rule was reverted in turn and
+  failed at least one expectation; the PR lists them.
 
 ## Verification
 
