@@ -33,7 +33,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-from .scenario import BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, STANDIN_ROLE, SUT_ROLE
+from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, STANDIN_ROLE, SUT_ROLE,
+                       SUT_SERVICE)
 
 NETEM_LIMIT = "100000"
 STOP_TIMEOUT_S = 30
@@ -61,7 +62,8 @@ class Action:
     revert: object
     # Whether the fault can lose UDP between a generator and the SUT, which the ledger's wire
     # row judges only outside such windows. A fault on a generator affects only that generator's
-    # own source; checks.py splits it per `[[ledger.source]]` by the step's `on`.
+    # own source; checks.py splits it per `[[ledger.source]]` by the step's `on`. Every source's
+    # listener is on `SUT_SERVICE`, so a fault on a further SUT service affects none.
     affects_udp_ingress: object
     # Whether the fault can delay or fail a SUT sink's delivery to a backend or a broker.
     affects_egress: object
@@ -206,6 +208,11 @@ def _on_sut(step, roles):
     return roles.get(step.on) == SUT_ROLE
 
 
+def _on_ingress_sut(step, roles):
+    """On the SUT service holding every source's listener."""
+    return _on_sut(step, roles) and step.on == SUT_SERVICE
+
+
 def _on_generator(step, roles):
     return roles.get(step.on) == GENERATOR_ROLE
 
@@ -214,8 +221,9 @@ def _on_sut_or_destination(step, roles):
     return roles.get(step.on) in (SUT_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE)
 
 
-def _lifecycle_on_sut_or_generator_partition(step, roles):
-    return _on_sut(step, roles) or (_on_generator(step, roles) and step.action == "partition")
+def _lifecycle_on_ingress_sut_or_generator_partition(step, roles):
+    return (_on_ingress_sut(step, roles)
+            or (_on_generator(step, roles) and step.action == "partition"))
 
 
 def _always(step, roles):
@@ -236,31 +244,31 @@ ACTIONS = {
     "pause": Action(
         apply=pause_apply,
         revert=pause_revert,
-        affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
+        affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
     ),
     "stop": Action(
         apply=stop_apply,
         revert=stop_revert,
-        affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
+        affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
     ),
     "kill": Action(
         apply=kill_apply,
         revert=stop_revert,
-        affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
+        affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
     ),
     "restart": Action(
         apply=restart_apply,
         revert=restart_revert,
-        affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
+        affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
     ),
     "partition": Action(
         apply=partition_apply,
         revert=partition_revert,
-        affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
+        affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
     ),
     # A mark on the SUT holds what it marks, such as a stalled script backing up into the UDP
@@ -268,13 +276,13 @@ ACTIONS = {
     "mark": Action(
         apply=no_op,
         revert=no_op,
-        affects_udp_ingress=_on_sut,
+        affects_udp_ingress=_on_ingress_sut,
         affects_egress=_on_sut_or_destination,
     ),
     "exit": Action(
         apply=no_op,
         revert=exit_revert,
-        affects_udp_ingress=_always,
+        affects_udp_ingress=_on_ingress_sut,
         affects_egress=_always,
     ),
     "respond": Action(

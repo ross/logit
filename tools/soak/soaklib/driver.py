@@ -32,8 +32,11 @@ needs at the code:
   against them (`scenario.service_problems()`) before anything starts. A run built with `roles=`
   skips the call; the self-test does that, so it can't reach Docker.
 - Every `generator` service, one per `[[ledger.source]]`, mounts the config `[configs]` names
-  under its service name, through its own `compose.env` variable (`scenario.config_env()`). The
-  end sequence stops every generator before it waits on the sinks.
+  under its service name, through its own `compose.env` variable (`scenario.config_env()`), as
+  does every SUT service after `logit` (`Scenario.suts`). The end sequence stops every generator
+  before it waits on the sinks, then each SUT service in chain order: an earlier one once each of
+  its sinks' queues is empty and nothing is in flight, the last, which holds the
+  `[[ledger.sink]]` sinks, once their stored totals hold or their queues are empty.
 - Every `backend` service has its own published port, re-read after any revert of a fault on
   it. Freshness is sampled per `[[ledger.sink]]`, the end sequence waits until every sink's stored
   total holds, and each sink's export lands in `vm-export/<sink>.jsonl`.
@@ -220,7 +223,7 @@ class Run:
             f"{scenario_mod.SUT_CONFIG_ENV}={self.scenario.config_path('sut')}\n"
             + "".join(f"{scenario_mod.config_env(service)}="
                       f"{self.scenario.config_path(service)}\n"
-                      for service in self.scenario.generators)
+                      for service in self.scenario.generators + self.scenario.suts[1:])
             + (f"{scenario_mod.STANDIN_SHAPE_ENV}={self.scenario.standin_shape}\n"
                if self.standin else "")
         )
@@ -595,16 +598,20 @@ class Run:
             self.phase("generator_stopped", service=service, rc=result.rc,
                        stderr=result.stderr.strip())
 
-        if self.has_vm:
-            self.wait_quiet()
-        else:
-            self.wait_sink_drained()
-
-        result = self.docker.run(["stop", "-t", str(SUT_STOP_T), self.ids["logit"]],
-                                 timeout=SUT_STOP_T + 15)
-        info = self.docker.inspect(self.ids["logit"]) or {}
-        self.phase("sut_stopped", rc=result.rc, stderr=result.stderr.strip(),
-                   exit_code=(info.get("State") or {}).get("ExitCode"))
+        suts = self.scenario.suts
+        for service in suts:
+            if service != suts[-1]:
+                self.wait_sink_drained(service, every_sink=True)
+            elif self.has_vm:
+                self.wait_quiet()
+            else:
+                self.wait_sink_drained(service)
+            result = self.docker.run(["stop", "-t", str(SUT_STOP_T), self.ids[service]],
+                                     timeout=SUT_STOP_T + 15)
+            info = self.docker.inspect(self.ids[service]) or {}
+            self.phase("sut_stopped", service=service, rc=result.rc,
+                       stderr=result.stderr.strip(),
+                       exit_code=(info.get("State") or {}).get("ExitCode"))
 
         if self.kafka:
             self.read_topic()
@@ -702,25 +709,29 @@ class Run:
                    bound_s=QUIET_BOUND_S)
 
     def aggregate_interval(self):
-        """The SUT config's `aggregate` window in seconds, or `DEFAULT_AGGREGATE_INTERVAL_S`."""
+        """The `aggregate` window of the SUT service holding `sut_aggregate`, in seconds, or
+        `DEFAULT_AGGREGATE_INTERVAL_S`."""
         try:
-            text = self.scenario.config_path("sut").read_text()
+            text = self.scenario.sut_config_path(self.scenario.sink_sut).read_text()
         except OSError:
             text = ""
         interval = checks.component_duration(
             text, self.scenario.ledger.get("sut_aggregate", ""), "interval")
         return interval or DEFAULT_AGGREGATE_INTERVAL_S
 
-    def wait_sink_drained(self):
-        """For a target with no backend to query (external, Kafka, or a stand-in): waits until
-        a SUT drain at least two aggregate windows after the generators stopped shows every
-        sink's `buffer.batches` at 0 and its `retrying` at 0 or never set, bounded at
-        `SINK_DRAIN_BOUND_S`. Two windows let
-        `aggregate` flush the last lines the generators sent; a sink's queue then empties once
-        its last send is accepted. Reads the newest `SINK_DRAIN_TAIL_LINES` of the SUT's
-        stdout, which a run in progress hasn't collected yet. The phase records each sink's
-        state under `sinks`."""
-        sinks = [sink["id"] for sink in self.scenario.sinks]
+    def wait_sink_drained(self, service=scenario_mod.SUT_SERVICE, every_sink=False):
+        """Waits until a drain of SUT `service` at least two aggregate windows after the wait
+        began shows each sink's `buffer.batches` at 0, and its `retrying` and
+        `logit.output.in_flight` (a `logit_out`'s frames not yet acknowledged) at 0 or never
+        set, bounded at `SINK_DRAIN_BOUND_S`. The sinks are the `[[ledger.sink]]` ids, or under
+        `every_sink` every component the drain reports a `buffer.batches` for, which an earlier
+        SUT in the chain is waited on with. For the last SUT this is the wait for a target with
+        no backend to query (external, Kafka, or a stand-in). Two windows let `aggregate` flush
+        the last lines the generators sent; a sink's queue then empties once its last send is
+        accepted. Reads the newest `SINK_DRAIN_TAIL_LINES` of the
+        service's stdout, which a run in progress hasn't collected yet. The phase names the
+        service and records each sink's state under `sinks`."""
+        sinks = None if every_sink else [sink["id"] for sink in self.scenario.sinks]
         stopped = _now()
         hold_s = 2 * self.aggregate_interval()
         deadline = stopped + SINK_DRAIN_BOUND_S
@@ -728,27 +739,33 @@ class Run:
         state = {}
         while _now() < deadline:
             polls += 1
-            result = self.docker.logs_tail(self.ids["logit"], SINK_DRAIN_TAIL_LINES,
+            result = self.docker.logs_tail(self.ids[service], SINK_DRAIN_TAIL_LINES,
                                            timeout=POLL_TIMEOUT_S)
             tel = telemetry.parse_ndjson(result.stdout.splitlines())
             newest = max(tel.drains, default=None)
+            names = sinks
+            if names is None:
+                names = sorted({point.attributes.get("component") for point in
+                                tel.matching("logit.component.buffer.batches")} - {None})
             state = {}
-            for sink in sinks:
+            for sink in names:
                 queued = tel.gauge_series("logit.component.buffer.batches", component=sink)
                 retrying = tel.gauge_series("logit.component.retrying", component=sink)
+                in_flight = tel.gauge_series("logit.output.in_flight", component=sink)
                 state[sink] = {"buffer_batches": queued[-1][1] if queued else None,
-                               "retrying": retrying[-1][1] if retrying else None}
+                               "retrying": retrying[-1][1] if retrying else None,
+                               "in_flight": in_flight[-1][1] if in_flight else None}
             if (newest is not None and newest >= stopped + hold_s
                     and all(one["buffer_batches"] == 0 and not one["retrying"]
-                            for one in state.values())):
-                self.phase("sink_drained", held=True, hold_s=hold_s, polls=polls,
-                           waited_s=round(_now() - stopped, 3), newest_drain=newest,
-                           sinks=state)
+                            and not one["in_flight"] for one in state.values())):
+                self.phase("sink_drained", service=service, held=True, hold_s=hold_s,
+                           polls=polls, waited_s=round(_now() - stopped, 3),
+                           newest_drain=newest, sinks=state)
                 return
             time.sleep(2)
-        self.phase("sink_drained", held=False, hold_s=hold_s, polls=polls,
+        self.phase("sink_drained", service=service, held=False, hold_s=hold_s, polls=polls,
                    bound_s=SINK_DRAIN_BOUND_S, sinks=state)
-        self.say(f"a sink's queue didn't empty within {SINK_DRAIN_BOUND_S}s: {state}")
+        self.say(f"a {service} sink's queue didn't empty within {SINK_DRAIN_BOUND_S}s: {state}")
 
     def teardown(self):
         try:

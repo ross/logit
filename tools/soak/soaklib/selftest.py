@@ -4636,8 +4636,10 @@ def _source_rules(root):
              "`service` must name a generator service", "a service that isn't a slug")
     _refused(path, mutate(lambda r: r["ledger"]["source"].append(dict(lines))),
              "configs: missing `generator-lines`", "a source whose generator has no config")
-    _refused(path, mutate(lambda r: r["configs"].update({"generator-lines": "x.yaml"})),
-             "configs: unknown key `generator-lines`", "a config for no source")
+    _refused(path, mutate(lambda r: r["configs"].update(
+        {"generator-lines": "logit-generator.yaml"})),
+             "the stack needs the sut services logit and the [configs] keys generator-lines, "
+             "and has logit", "a config for no source, read as a further SUT the stack lacks")
     _refused(path, mutate(lambda r: second(r, sut_transforms=["parse", "lines"])),
              "`sut_transforms` repeats a component or names a listener",
              "a transform that is a listener")
@@ -4751,7 +4753,7 @@ def _fanin_driver(root):
     run.t0 = 0.0
     run.has_vm = False
     run.inspect_all = lambda: None
-    run.wait_sink_drained = lambda: None
+    run.wait_sink_drained = lambda *args, **kwargs: None
     real_print = driver._print
     driver._print = lambda text, stream=None: None
     try:
