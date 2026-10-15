@@ -52,6 +52,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import standin as standin_mod
+
 # The compose label naming a service's role, and the roles. A `sut` and a `generator` run
 # `logit`; a `backend` stores what a sink delivers and answers the checks' queries; a `broker`
 # is a Kafka target's broker, which the driver reads the topic back from; a `standin` is a stand-in
@@ -94,8 +96,9 @@ EXPECTED_EVENT_ACTIONS = ("mark", "exit")
 READY_WORDS = ("starting", "stalled", "draining", "degraded")
 # A `respond` step's keys. It sets the stand-in's answer for its span: a `status` (with an
 # optional `body`) or `answer = "reset"`, and `apply`, whether the stand-in stores the write it
-# answers that way (by default, when the status is 2xx).
-RESPOND_KEYS = ("status", "body", "apply", "answer")
+# answers that way (by default, when the status is 2xx). Under the `datadog` shape a 2xx can
+# carry `series_errors`, the number of the request's series its body names as dropped.
+RESPOND_KEYS = ("status", "body", "apply", "answer", "series_errors")
 RESPOND_ANSWERS = ("reset",)
 # The sink fault classes a step's `class` may name (docs/adr/sink-fault-classes.md), which the
 # checks read the SUT's telemetry and self-log against. `class` is for a `respond`, and for a
@@ -120,7 +123,11 @@ EXTERNAL_TARGET = "external"
 KAFKA_TARGET = "kafka"
 STANDIN_TARGET = "standin"
 TARGET_KINDS = (LOCAL_TARGET, EXTERNAL_TARGET, KAFKA_TARGET, STANDIN_TARGET)
-TARGET_KEYS = {"kind", "name", "env", "topic"}
+TARGET_KEYS = {"kind", "name", "env", "topic", "shape"}
+# A stand-in target's shapes (standin/standin.py's `--shape`): the destination it plays.
+STANDIN_SHAPES = standin_mod.SHAPES
+STANDIN_DEFAULT_SHAPE = standin_mod.REMOTE_WRITE
+DATADOG_SHAPE = standin_mod.DATADOG
 # Kafka's legal topic names (`Topic.validate`): ASCII letters, digits, `.`, `_`, and `-`, up to
 # 249 characters.
 _TOPIC_NAME = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
@@ -279,6 +286,7 @@ class StepSpec:
     body: object = None
     apply: object = None
     answer: object = None
+    series_errors: object = None
     fault_class: object = None
 
 
@@ -286,7 +294,7 @@ class StepSpec:
 # scenario key.
 STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", "status"),
                ("body", "body"), ("apply", "apply"), ("answer", "answer"),
-               ("fault_class", "class"))
+               ("series_errors", "series_errors"), ("fault_class", "class"))
 
 
 @dataclass
@@ -342,6 +350,7 @@ class Step:
     body: object = None
     apply: object = None
     answer: object = None
+    series_errors: object = None
     fault_class: object = None
 
     def expected(self):
@@ -427,6 +436,11 @@ class Scenario:
     @property
     def standin(self):
         return self.target.get("kind") == STANDIN_TARGET
+
+    @property
+    def standin_shape(self):
+        """A stand-in target's shape, or None for any other target."""
+        return self.target.get("shape") if self.standin else None
 
     @property
     def has_vm(self):
@@ -630,7 +644,7 @@ def from_dict(raw, path):
             ready=raw_step.get("ready"), code=raw_step.get("code"), key=raw_step.get("key"),
             status=raw_step.get("status"), body=raw_step.get("body"),
             apply=raw_step.get("apply"), answer=raw_step.get("answer"),
-            fault_class=raw_step.get("class"),
+            series_errors=raw_step.get("series_errors"), fault_class=raw_step.get("class"),
         ))
         if "for" not in raw_step:
             problems.append(f"{where}: every fault needs `for`, so its revert is scheduled with it")
@@ -719,10 +733,12 @@ def _parse_expected(table, problems):
 
 
 def target_json(target):
-    """The resolved scenario's `target`: `{kind, name, env}`, plus `topic` for Kafka."""
+    """The resolved scenario's `target`: `{kind, name, env}`, plus `topic` for Kafka and
+    `shape` for a stand-in."""
     out = {"kind": target["kind"], "name": target["name"], "env": list(target["env"])}
-    if "topic" in target:
-        out["topic"] = target["topic"]
+    for key in ("topic", "shape"):
+        if key in target:
+            out[key] = target[key]
     return out
 
 
@@ -864,6 +880,9 @@ def _source_problems(ledger):
 
 # The compose variable holding the absolute path of the SUT's config, set in `compose.env`.
 SUT_CONFIG_ENV = "SOAK_SUT_CONFIG"
+# The compose variable holding a stand-in target's shape, set in `compose.env`; compose.yaml
+# passes it to standin.py's `--shape`.
+STANDIN_SHAPE_ENV = "SOAK_STANDIN_SHAPE"
 
 
 def config_env(service):
@@ -874,12 +893,13 @@ def config_env(service):
 
 
 def _parse_target(table, problems):
-    """The `[target]` table as `{kind, name, env}`, plus `topic` for Kafka, appending to
-    `problems` what breaks its rules: an unknown key or kind; for an external target, a `name`
-    that isn't a slug, an `env` that isn't a list of distinct variable names compose.yaml
-    passes, or a `topic`; for a Kafka target, a missing or illegal `topic`, a `name` that isn't
-    a slug, or an `env`; for a stand-in target, a `name` that isn't a slug, an `env`, or a
-    `topic`; and for the local target, any `name`, `env`, or `topic`."""
+    """The `[target]` table as `{kind, name, env}`, plus `topic` for Kafka and `shape` for a
+    stand-in, appending to `problems` what breaks its rules: an unknown key or kind; for an
+    external target, a `name` that isn't a slug, an `env` that isn't a list of distinct variable
+    names compose.yaml passes, or a `topic`; for a Kafka target, a missing or illegal `topic`, a
+    `name` that isn't a slug, or an `env`; for a stand-in target, a `name` that isn't a slug, an
+    `env`, a `topic`, or a `shape` outside `STANDIN_SHAPES`; for the local target, any `name`,
+    `env`, or `topic`; and a `shape` on any target but a stand-in."""
     local = {"kind": LOCAL_TARGET, "name": LOCAL_TARGET, "env": []}
     if not isinstance(table, dict):
         problems.append("`target` must be a table, written [target]")
@@ -891,12 +911,19 @@ def _parse_target(table, problems):
         problems.append(f"target.kind must be {LOCAL_TARGET!r}, {EXTERNAL_TARGET!r}, "
                         f"{KAFKA_TARGET!r}, or {STANDIN_TARGET!r}, got {kind!r}")
         return local
+    if kind != STANDIN_TARGET and "shape" in table:
+        problems.append("target.shape is for a standin target")
     if kind == LOCAL_TARGET:
         for key in sorted({"name", "env", "topic"} & set(table)):
             problems.append(f"target.{key} is for an external or kafka target; the local "
                             f"target is {LOCAL_TARGET}")
         return local
     if kind == STANDIN_TARGET:
+        shape = table.get("shape", STANDIN_DEFAULT_SHAPE)
+        if shape not in STANDIN_SHAPES:
+            problems.append(f"target.shape must be one of {', '.join(STANDIN_SHAPES)}, got "
+                            f"{shape!r}")
+            shape = STANDIN_DEFAULT_SHAPE
         if "env" in table:
             problems.append("target.env is for an external target; the standin target runs "
                             "inside the stack and needs no credentials")
@@ -906,7 +933,7 @@ def _parse_target(table, problems):
         if not isinstance(name, str) or not _TARGET_NAME.match(name):
             problems.append("target.name must be lowercase letters, digits, `_`, or `-`")
             name = STANDIN_TARGET
-        return {"kind": kind, "name": name, "env": []}
+        return {"kind": kind, "name": name, "env": [], "shape": shape}
     if kind == KAFKA_TARGET:
         if "env" in table:
             problems.append("target.env is for an external target; the kafka target runs "
@@ -1143,7 +1170,7 @@ def validate(scenario, duration=None, seed=None):
                 hint = "; reverts are scheduled from a fault's `for`, never written as steps"
             problems.append(f"{where}: unknown action `{spec.action}`{hint}")
         problems += _expected_event_problems(spec, where)
-        problems += _respond_problems(spec, where)
+        problems += _respond_problems(spec, where, scenario.target.get("shape"))
         if spec.for_ <= 0:
             problems.append(f"{where}: `for` must be longer than 0s")
         if spec.action == "netem":
@@ -1241,12 +1268,15 @@ def _expected_event_problems(spec, where):
     return problems
 
 
-def _respond_problems(spec, where):
+def _respond_problems(spec, where, shape=None):
     """What a step breaks of the `respond` rules: one of `status` (an integer from 100 to
     599) and `answer` (one of `RESPOND_ANSWERS`), `body` a string with `status` only, `apply`
-    true or false, none of them on another action; and `class` one of `FAULT_CLASSES`, on a
-    `respond` or a `stop` only. Whether a `respond`'s or a classed `stop`'s `on` is a stand-in
-    needs the role map: `service_problems()`."""
+    true or false, `series_errors` a positive integer with a 2xx `status` and no `body` under
+    the `datadog` shape only, none of them on another action; and `class` one of
+    `FAULT_CLASSES`, on a `respond` or a `stop` only, and under the `datadog` shape the class
+    `datadog_out` reads the respond's answer as (`standin.datadog_fault_class`), with none on a
+    2xx. Whether a `respond`'s or a classed `stop`'s `on` is a stand-in needs the role map:
+    `service_problems()`."""
     problems = []
     if spec.action == "respond":
         has_status, has_answer = spec.status is not None, spec.answer is not None
@@ -1263,6 +1293,29 @@ def _respond_problems(spec, where):
             problems.append(f"{where}: `body` is a string, and goes with `status` only")
         if spec.apply is not None and not isinstance(spec.apply, bool):
             problems.append(f"{where}: `apply` must be true or false")
+        if spec.series_errors is not None:
+            count = spec.series_errors
+            if shape != DATADOG_SHAPE:
+                problems.append(f"{where}: `series_errors` is for a standin target with shape "
+                                f"{DATADOG_SHAPE!r}")
+            if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+                problems.append(f"{where}: `series_errors` must be a positive integer, got "
+                                f"{count!r}")
+            if spec.body is not None:
+                problems.append(f"{where}: `series_errors` writes the body, so it takes no "
+                                "`body`")
+            if not (isinstance(spec.status, int) and not isinstance(spec.status, bool)
+                    and 200 <= spec.status < 300):
+                problems.append(f"{where}: `series_errors` goes with a 2xx `status`")
+        if shape == DATADOG_SHAPE and spec.fault_class in FAULT_CLASSES:
+            want = standin_mod.datadog_fault_class({"status": spec.status,
+                                                    "answer": spec.answer})
+            if want is None:
+                problems.append(f"{where}: a 2xx isn't a fault, so it takes no `class`")
+            elif spec.fault_class != want:
+                problems.append(f"{where}: datadog_out reads "
+                                f"{spec.status if spec.answer is None else spec.answer} as "
+                                f"{want}, not {spec.fault_class}")
     else:
         for name in RESPOND_KEYS:
             if getattr(spec, name) is not None:
@@ -1596,7 +1649,7 @@ def expand(scenario, duration=None, seed=None):
                     action=spec.action, on=spec.on, args=spec.args, start=start, end=end,
                     ready=spec.ready, code=spec.code, key=spec.key, status=spec.status,
                     body=spec.body, apply=spec.apply, answer=spec.answer,
-                    fault_class=spec.fault_class,
+                    series_errors=spec.series_errors, fault_class=spec.fault_class,
                 ))
         cycle += 1
     steps.sort(key=lambda s: (s.start, s.spec_index))

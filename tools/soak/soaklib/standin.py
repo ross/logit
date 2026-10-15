@@ -6,23 +6,48 @@ it answered (with the raw body, base64), `cue` for each cue it took, and `ready`
 around a life. Decoding happens here, on the host, so `check` re-scores a run from the record
 alone.
 
-A `remote_write` body is a Snappy **block** (never framed) holding a `prometheus.WriteRequest`
-(1.0): `timeseries` is field 1; a `TimeSeries` has `labels` (1) and `samples` (2); a `Label` has
-`name` (1) and `value` (2); a `Sample` has `value` (1, a double) and `timestamp` (2, an int64 of
-milliseconds). Every other field, `metadata` included, is skipped by wire type.
+Two shapes, each the stand-in's `--shape` and a scenario's `[target] shape`:
 
-V is what the stand-in stored: every sample of every request it marked `stored`, in record
-order, with a later write of one `(label set, timestamp)` replacing an earlier one, as a
-remote-write receiver overwrites. The result has `/api/v1/export`'s shape, so `vm.totals_by_life`
-reads it as it reads VictoriaMetrics.
+- `remote_write`: a body is a Snappy **block** (never framed) holding a `prometheus.WriteRequest`
+  (1.0): `timeseries` is field 1; a `TimeSeries` has `labels` (1) and `samples` (2); a `Label`
+  has `name` (1) and `value` (2); a `Sample` has `value` (1, a double) and `timestamp` (2, an
+  int64 of milliseconds). V is every sample of every request the stand-in marked `stored`, in
+  record order, with a later write of one `(label set, timestamp)` replacing an earlier one, as a
+  remote-write receiver overwrites (`stored_series`).
+- `datadog`: a body is the series route's `MetricPayload`
+  (`crates/logit-proto/proto/datadog/agent-payload/proto/metrics/agent_payload.proto`), under
+  `Content-Encoding` `gzip`, `deflate` (zlib), or none: `series` is field 1; a `MetricSeries` has
+  `resources` (1), `metric` (2), `tags` (3, repeated string), `points` (4), `type` (5), and
+  `interval` (8); a `Resource` has `type` (1) and `name` (2); a `MetricPoint` has `value` (1, a
+  double) and `timestamp` (2, an int64 of seconds). Datadog documents no deduplication of a
+  `count` point, so a resend is stored again and adds: V is the sum of every stored point, each
+  copy of one `(series, timestamp, value)` past the first counted as a duplicate rather than
+  summed, as `topic.py` does for a Kafka record, so a duplicate can't cancel a loss of the same
+  size (`stored_counts`). A `2xx` with `series_errors` N stored every series of its request but
+  the first N.
+
+Every other field, `metadata` included, is skipped by wire type. V has `/api/v1/export`'s shape,
+timestamps in milliseconds, so `ledger.windows` reads it as it reads VictoriaMetrics.
 """
 
 import base64
+import gzip
 import json
 import math
 import struct
+import zlib
+from dataclasses import dataclass, field
 
+REMOTE_WRITE, DATADOG = "remote_write", "datadog"
+SHAPES = (REMOTE_WRITE, DATADOG)
 REMOTE_WRITE_PATH = "/api/v1/write"
+DATADOG_SERIES_PATH = "/api/v2/series"
+# Each shape's write path and the status it answers with no cue; standin/standin.py's
+# DEFAULT_PATH and DEFAULT_STATUS.
+PATHS = {REMOTE_WRITE: REMOTE_WRITE_PATH, DATADOG: DATADOG_SERIES_PATH}
+DEFAULT_STATUS = {REMOTE_WRITE: 200, DATADOG: 202}
+# `MetricPayload.MetricType`'s names.
+DATADOG_TYPES = {0: "unspecified", 1: "count", 2: "rate", 3: "gauge"}
 
 
 class DecodeError(Exception):
@@ -222,16 +247,133 @@ def read_record(text):
     return requests, cues, unparsed
 
 
-def decode_body(request):
-    """The series of one request line's body, raising `DecodeError` for a body that isn't a
-    Snappy-compressed `WriteRequest`."""
+def metric_payload(data):
+    """`[{metric, tags, resources, points, type, interval}]` from an uncompressed
+    `MetricPayload`, one per `MetricSeries` in body order: `tags` a list of strings,
+    `resources` a list of `(type, name)`, `points` a list of `(timestamp_s, value)`, `type` a
+    `DATADOG_TYPES` name."""
+    series = []
+    for number, wire, value in _fields(data):
+        if number != 1 or wire != 2:
+            continue
+        one = {"metric": "", "tags": [], "resources": [], "points": [], "type": "unspecified",
+               "interval": 0}
+        for inner, inner_wire, item in _fields(value):
+            if inner == 1 and inner_wire == 2:
+                kind = name = ""
+                for part_number, part_wire, part in _fields(item):
+                    if part_number == 1 and part_wire == 2:
+                        kind = part.decode()
+                    elif part_number == 2 and part_wire == 2:
+                        name = part.decode()
+                one["resources"].append((kind, name))
+            elif inner == 2 and inner_wire == 2:
+                one["metric"] = item.decode()
+            elif inner == 3 and inner_wire == 2:
+                one["tags"].append(item.decode())
+            elif inner == 4 and inner_wire == 2:
+                point_value, stamp = 0.0, 0
+                for part_number, part_wire, part in _fields(item):
+                    if part_number == 1 and part_wire == 1:
+                        point_value = struct.unpack("<d", part)[0]
+                    elif part_number == 2 and part_wire == 0:
+                        stamp = _int64(part)
+                one["points"].append((stamp, point_value))
+            elif inner == 5 and inner_wire == 0:
+                one["type"] = DATADOG_TYPES.get(item, str(item))
+            elif inner == 8 and inner_wire == 0:
+                one["interval"] = _int64(item)
+        series.append(one)
+    return series
+
+
+def encode_metric_payload(series):
+    """The inverse of `metric_payload`, for fixtures, with no `type` or `interval` written when
+    it is the default."""
+    def varint(n):
+        out = bytearray()
+        n &= (1 << 64) - 1
+        while True:
+            out.append((n & 0x7F) | (0x80 if n > 0x7F else 0))
+            n >>= 7
+            if not n:
+                return bytes(out)
+
+    def field_bytes(number, payload):
+        return varint(number << 3 | 2) + varint(len(payload)) + payload
+
+    codes = {name: code for code, name in DATADOG_TYPES.items()}
+    out = bytearray()
+    for one in series:
+        body = bytearray()
+        for kind, name in one.get("resources", []):
+            body += field_bytes(1, field_bytes(1, kind.encode()) + field_bytes(2, name.encode()))
+        body += field_bytes(2, one["metric"].encode())
+        for tag in one.get("tags", []):
+            body += field_bytes(3, tag.encode())
+        for stamp, value in one.get("points", []):
+            body += field_bytes(4, varint(1 << 3 | 1) + struct.pack("<d", value)
+                                + varint(2 << 3 | 0) + varint(stamp))
+        code = codes.get(one.get("type", "unspecified"), 0)
+        if code:
+            body += varint(5 << 3 | 0) + varint(code)
+        if one.get("interval"):
+            body += varint(8 << 3 | 0) + varint(one["interval"])
+        out += field_bytes(1, bytes(body))
+    return bytes(out)
+
+
+def datadog_labels(one):
+    """A `metric_payload` series as an export's `metric` labels: its name, type, tags, and
+    resources, which together name the series a point belongs to."""
+    return {"__name__": one["metric"], "type": one["type"],
+            "tags": ",".join(sorted(one["tags"])),
+            "resources": ",".join(f"{kind}:{name}" for kind, name in sorted(one["resources"]))}
+
+
+def decompress(raw, encoding):
+    """A `datadog_out` body as sent under `Content-Encoding` `encoding`: gzip, deflate (zlib, as
+    Datadog means it), or none."""
     try:
-        raw = base64.b64decode(request.get("body_b64") or "", validate=True)
+        if encoding == "gzip":
+            return gzip.decompress(raw)
+        if encoding == "deflate":
+            return zlib.decompress(raw)
+    except (OSError, EOFError, zlib.error) as err:
+        raise DecodeError(f"{encoding}: {err}") from None
+    if encoding in (None, "", "identity"):
+        return raw
+    raise DecodeError(f"Content-Encoding {encoding!r}, not gzip, deflate, or none")
+
+
+def _raw_body(request):
+    try:
+        return base64.b64decode(request.get("body_b64") or "", validate=True)
     except ValueError as err:
         raise DecodeError(f"body_b64: {err}") from None
+
+
+def decode_body(request, shape=REMOTE_WRITE):
+    """The series of one request line's body as `[(labels, [(timestamp_ms, value)])]`, raising
+    `DecodeError` for a body that isn't the shape's: a Snappy-compressed `WriteRequest` for
+    `remote_write`, a `MetricPayload` under gzip, deflate, or no compression for `datadog`."""
+    raw = _raw_body(request)
+    if shape == DATADOG:
+        decoded = metric_payload(decompress(raw, request.get("content_encoding")))
+        return [(datadog_labels(one), [(stamp * 1000, value) for stamp, value in one["points"]])
+                for one in decoded]
     if request.get("content_encoding") != "snappy":
         raise DecodeError(f"Content-Encoding {request.get('content_encoding')!r}, not snappy")
     return write_request(snappy_decompress(raw))
+
+
+def named_series(request, decoded):
+    """How many series of a request's decoded body a `series_errors` answer named: its first N,
+    or all of them when the body holds fewer. 0 for any other answer."""
+    count = request.get("series_errors")
+    if status_class(request) != "2xx" or not isinstance(count, int) or count < 1:
+        return 0
+    return min(count, len(decoded))
 
 
 def series_key(labels):
@@ -278,10 +420,70 @@ def stored_series(requests):
     return series, rewrites, conflicts, undecodable
 
 
-def acknowledged_unstored(requests, series):
+@dataclass
+class Counts:
+    """What a `datadog` stand-in stored (`stored_counts`): `series` export-shaped, each
+    `(series, timestamp)`'s value the sum of its distinct copies; `points` one `(timestamp_s,
+    value)` per distinct copy, V's terms; `duplicates` one `(series key, timestamp_ms, value,
+    first seq, copy seq)` per copy of a point already stored; `conflicts` one `(series key,
+    timestamp_ms, first value, later value)` per point stored again with another value;
+    `undecodable` one `(seq, reason)` per stored body that doesn't decode; and `named` one
+    `(seq, count, t)` per `series_errors` answer: the series it named and when it was answered,
+    epoch seconds."""
+
+    series: list = field(default_factory=list)
+    points: list = field(default_factory=list)
+    duplicates: list = field(default_factory=list)
+    conflicts: list = field(default_factory=list)
+    undecodable: list = field(default_factory=list)
+    named: list = field(default_factory=list)
+
+
+def stored_counts(requests):
+    """A `datadog` stand-in's record as `Counts`, over the stored requests in record order. A
+    `series_errors` answer's first N series aren't stored."""
+    counts = Counts()
+    by_series = {}
+    first = {}
+    for request in requests:
+        if not request.get("stored"):
+            continue
+        try:
+            decoded = decode_body(request, DATADOG)
+        except DecodeError as err:
+            counts.undecodable.append((request.get("seq"), str(err)))
+            continue
+        named = named_series(request, decoded)
+        if named:
+            counts.named.append((request.get("seq"), named, request.get("t")))
+        for labels, samples in decoded[named:]:
+            key = series_key(labels)
+            points = by_series.setdefault(key, {})
+            for stamp, value in samples:
+                seen = first.setdefault((key, stamp), [])
+                same = next((seq for kept, seq in seen if kept == value
+                             or (math.isnan(kept) and math.isnan(value))), None)
+                if same is not None:
+                    counts.duplicates.append((key, stamp, value, same, request.get("seq")))
+                    continue
+                if seen:
+                    counts.conflicts.append((key, stamp, seen[0][0], value))
+                seen.append((value, request.get("seq")))
+                points[stamp] = points.get(stamp, 0.0) + value
+                counts.points.append((stamp / 1000, value))
+    for key, points in sorted(by_series.items()):
+        stamps = sorted(points)
+        counts.series.append({"metric": dict(key), "timestamps": stamps,
+                              "values": [points[stamp] for stamp in stamps]})
+    return counts
+
+
+def acknowledged_unstored(requests, series, shape=REMOTE_WRITE):
     """`(series key, timestamp)` for each sample of a request the stand-in answered `2xx` that
-    `series` (from `stored_series`) doesn't hold: a write the sink saw accepted that the
-    destination never kept. A body that doesn't decode is left to the caller."""
+    `series` (from `stored_series` or `stored_counts`) doesn't hold: a write the sink saw
+    accepted that the destination never kept. The series a `series_errors` answer named are
+    left out, since the sink saw them dropped, as is a body that doesn't decode, which the
+    caller judges."""
     stored = {(series_key(one["metric"]), stamp) for one in series
               for stamp in one["timestamps"]}
     missing = []
@@ -289,13 +491,39 @@ def acknowledged_unstored(requests, series):
         if status_class(request) != "2xx":
             continue
         try:
-            decoded = decode_body(request)
+            decoded = decode_body(request, shape)
         except DecodeError:
             continue
-        for labels, samples in decoded:
+        for labels, samples in decoded[named_series(request, decoded):]:
             key = series_key(labels)
             missing += [(key, stamp) for stamp, _ in samples if (key, stamp) not in stored]
     return missing
+
+
+def datadog_fault_class(request):
+    """The fault class `datadog_out` reads a request's answer as (crates/logit-outputs/src/
+    datadog.rs, "Faults, retries, and duplicate safety"'s table): None for a `2xx`; `ambiguous`
+    for `408`, `429`, any `5xx` (`501` included), and a reset; `refused` for `401`, `403`,
+    `404`, `405`, and `407`; `rejected` for `400`, `413`, and any other `3xx` or `4xx`. A
+    connect failure is `clean` and never reaches the record."""
+    if request.get("answer") == "reset":
+        return "ambiguous"
+    status = request.get("status")
+    if not isinstance(status, int) or 200 <= status < 300:
+        return None
+    if status in (408, 429) or 500 <= status <= 599:
+        return "ambiguous"
+    if status in (401, 403, 404, 405, 407):
+        return "refused"
+    return "rejected"
+
+
+def points_in(request, shape):
+    """The points in a request's body, or 0 when it doesn't decode."""
+    try:
+        return sum(len(samples) for _, samples in decode_body(request, shape))
+    except DecodeError:
+        return 0
 
 
 def status_class(request):

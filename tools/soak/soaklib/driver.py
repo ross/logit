@@ -51,6 +51,7 @@ needs at the code:
 - A stand-in target (`[target] kind = "standin"`) runs the `standin` compose profile, the scripted
   destination with the role `standin`, in place of `local`. Its control port is published like a
   backend's and re-read after any revert of a fault on it; a `respond` step POSTs its cue there.
+  `compose.env` carries its `[target] shape` for standin.py's `--shape`.
   The end sequence waits for the sink's queue to empty, as for a Kafka target. Its record is its
   stdout, which the log capture collects with every other service's.
 
@@ -220,6 +221,8 @@ class Run:
             + "".join(f"{scenario_mod.config_env(service)}="
                       f"{self.scenario.config_path(service)}\n"
                       for service in self.scenario.generators)
+            + (f"{scenario_mod.STANDIN_SHAPE_ENV}={self.scenario.standin_shape}\n"
+               if self.standin else "")
         )
         shutil.copy(self.scenario.path, self.run_dir / "scenario.toml")
         # The checks read the SUT's `receive:` limits from this copy.

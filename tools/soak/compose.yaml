@@ -94,14 +94,16 @@ services:
 
   # The scripted HTTP destination, a stock Python image running standin/standin.py (stdlib
   # only). The SUT writes to its data port, 8080, unpublished; the driver cues it on its control
-  # port, 8081. Its stdout is the record the checks read, so it rotates as `logit`'s logs do. A
+  # port, 8081. Its shape is the scenario's `[target] shape`, which the driver writes to
+  # compose.env. Its stdout is the record the checks read, so it rotates as `logit`'s logs do. A
   # `stop` and `start` keep the container, and with it the one log.
   standin:
     image: python:3.13.16-alpine3.24
     profiles: [standin]
     labels: { soak.role: standin }
     restart: "no"
-    command: ["python", "-u", "/standin/standin.py", "--shape", "remote_write"]
+    command: ["python", "-u", "/standin/standin.py", "--shape",
+              "${SOAK_STANDIN_SHAPE:-remote_write}"]
     volumes: ["./standin:/standin:ro,z"]
     ports: ["127.0.0.1::8081"]
     healthcheck:

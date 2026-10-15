@@ -4,11 +4,16 @@ told it to, and prints one JSON line per request to stdout, the record the check
 Stdlib only; compose runs it in a stock Python image. It serves two ports:
 
 - The data port (`--data-port`) takes the sink's writes on `--path`. With no cue it answers the
-  shape's default (`200` for `remote_write`) with an empty body; a request to any other path
-  answers `404`, so a misconfigured endpoint can't pass for a stored write.
+  shape's default with an empty body: `200` on `/api/v1/write` for `remote_write`, `202` on
+  `/api/v2/series` for `datadog`. A request to any other path answers `404`, so a
+  misconfigured endpoint can't pass for a stored write.
 - The control port (`--control-port`) takes `POST /cue` from the driver: a JSON object with
   `step`, and either `status` (with an optional `body`) or `answer: "reset"`, and an optional
-  `apply`. An empty object restores the default. `GET /health` answers `OK`.
+  `apply`. Under the `datadog` shape a `2xx` status can carry `series_errors`, N: the answer's
+  body is then the series route's `errors` list, protobuf field 1 (`repeated string`), with N
+  entries, which `datadog_out` counts as N series the intake dropped. The stand-in doesn't
+  decode the request, so the entries name series by their place in it; the checks take them to
+  be its first N series. An empty object restores the default. `GET /health` answers `OK`.
 
 Each request line records the raw body (`body_b64`) and whether the write counts as stored:
 `apply` when the cue sets it, else whether the answer is `2xx`. A `reset` reads the whole
@@ -32,8 +37,10 @@ import sys
 import threading
 import time
 
-DEFAULT_STATUS = {"remote_write": 200}
-DEFAULT_PATH = {"remote_write": "/api/v1/write"}
+DEFAULT_STATUS = {"remote_write": 200, "datadog": 202}
+DEFAULT_PATH = {"remote_write": "/api/v1/write", "datadog": "/api/v2/series"}
+# The cue key only the `datadog` shape takes.
+DATADOG_SHAPE = "datadog"
 # How long a keep-alive connection may sit idle before its thread lets it go, which bounds a
 # SIGTERM's wait for the threads.
 IDLE_TIMEOUT_S = 5
@@ -63,13 +70,13 @@ class State:
             return dict(self.cue), self.seq
 
 
-def cue_problems(cue):
+def cue_problems(cue, shape="remote_write"):
     if not isinstance(cue, dict):
         return ["a cue is a JSON object"]
     if not cue:
         return []
     problems = []
-    unknown = set(cue) - {"step", "status", "body", "answer", "apply"}
+    unknown = set(cue) - {"step", "status", "body", "answer", "apply", "series_errors"}
     if unknown:
         problems.append(f"unknown keys {sorted(unknown)}")
     if not isinstance(cue.get("step"), str) or not cue.get("step"):
@@ -86,7 +93,39 @@ def cue_problems(cue):
         problems.append("`body` is a string, with `status` only")
     if "apply" in cue and not isinstance(cue["apply"], bool):
         problems.append("`apply` must be true or false")
+    if "series_errors" in cue:
+        count = cue["series_errors"]
+        if shape != DATADOG_SHAPE:
+            problems.append(f"`series_errors` is for the {DATADOG_SHAPE} shape")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            problems.append("`series_errors` must be a positive integer")
+        if "body" in cue:
+            problems.append("`series_errors` writes the body, so it takes no `body`")
+        status = cue.get("status")
+        if not (isinstance(status, int) and not isinstance(status, bool)
+                and 200 <= status < 300):
+            problems.append("`series_errors` goes with a 2xx `status`")
     return problems
+
+
+def _varint(n):
+    out = bytearray()
+    while True:
+        out.append((n & 0x7F) | (0x80 if n > 0x7F else 0))
+        n >>= 7
+        if not n:
+            return bytes(out)
+
+
+def series_errors_body(count):
+    """A series `2xx` body naming `count` dropped series: field 1, `repeated string`, one entry
+    each, worded as the intake words a validation drop."""
+    out = bytearray()
+    for index in range(1, count + 1):
+        entry = (f"Payload validation failed: series {index} of this request was dropped by "
+                 "the soak stand-in (series_errors)").encode()
+        out += _varint(1 << 3 | 2) + _varint(len(entry)) + entry
+    return bytes(out)
 
 
 def data_handler(state):
@@ -118,15 +157,21 @@ def data_handler(state):
                 status = cue.get("status", DEFAULT_STATUS[state.shape])
                 stored = cue.get("apply", 200 <= status < 300)
                 record.update(answer="status", status=status, stored=bool(stored))
-                self._answer(status, cue.get("body", ""))
+                if "series_errors" in cue:
+                    record["series_errors"] = cue["series_errors"]
+                    self._answer(status, series_errors_body(cue["series_errors"]),
+                                 "application/x-protobuf")
+                else:
+                    self._answer(status, cue.get("body", "").encode())
             if state.stopping:
                 self.close_connection = True
             emit(record)
 
-        def _answer(self, status, text):
-            payload = text.encode()
+        def _answer(self, status, payload, content_type="text/plain; charset=utf-8"):
+            if isinstance(payload, str):
+                payload = payload.encode()
             self.send_response(status)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -185,7 +230,7 @@ def control_handler(state):
             except ValueError as err:
                 self._reply(400, {"error": f"not JSON: {err}"})
                 return
-            problems = cue_problems(cue)
+            problems = cue_problems(cue, state.shape)
             if problems:
                 self._reply(400, {"error": "; ".join(problems)})
                 return
