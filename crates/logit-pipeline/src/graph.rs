@@ -3562,6 +3562,22 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 89: `influxdb_out`'s `bucket` and `default_bucket`
+    // (`docs/adr/influxdb-line-protocol-relay.md`). A configured `bucket` sends every batch
+    // there, so a `default_bucket` beside it would never be read.
+    for (id, component) in &components {
+        if let ComponentKind::InfluxDbOut { bucket: Some(_), default_bucket: Some(_), .. } =
+            &component.kind
+        {
+            anyhow::bail!(
+                "component '{id}': influxdb_out sets both 'bucket' and 'default_bucket' -- \
+                 'bucket' sends every batch to one bucket, so 'default_bucket' would never be \
+                 used; keep 'bucket' for one fixed bucket, or 'default_bucket' to follow the \
+                 bucket each batch carries"
+            );
+        }
+    }
+
     // Rule 70: `splunk_hec_out` (`docs/adr/splunk-hec-relay.md`). The sink appends `/event` and
     // `/ack` to `endpoint`, so a URL already naming a route would post to
     // `/services/collector/event/event`, and one with a query or fragment would bury the route
@@ -4948,8 +4964,9 @@ mod tests {
     fn sink() -> ComponentKind {
         ComponentKind::InfluxDbOut {
             url: "http://localhost:8086".to_string(),
-            org: "org".to_string(),
-            bucket: "bucket".to_string(),
+            org: Some("org".to_string()),
+            bucket: Some("bucket".to_string()),
+            default_bucket: None,
             token: "TOKEN".to_string(),
         }
     }
@@ -7358,6 +7375,30 @@ mod tests {
                 ("out", vec!["in"], sink()),
             ]))
             .expect("an influxdb_in with a bind and non-empty tokens (or none) is valid");
+        }
+    }
+
+    /// Rule 89: `bucket` and `default_bucket` together; each alone, or neither, is valid.
+    #[test]
+    fn an_influxdb_out_with_both_bucket_and_default_bucket_is_rejected() {
+        let with = |bucket: Option<&str>, default_bucket: Option<&str>| {
+            let mut kind = sink();
+            if let ComponentKind::InfluxDbOut { bucket: b, default_bucket: d, .. } = &mut kind {
+                *b = bucket.map(String::from);
+                *d = default_bucket.map(String::from);
+            }
+            resolve(cfg(vec![
+                ("in", vec![], influxdb_in("0.0.0.0:8086", vec![])),
+                ("out", vec!["in"], kind),
+            ]))
+        };
+        let Err(err) = with(Some("a"), Some("b")) else { panic!("both set is an error") };
+        let err = format!("{err:#}");
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("both 'bucket' and 'default_bucket'"), "got: {err}");
+        assert!(!err.contains("TOKEN"), "the config isn't printed: {err}");
+        for (bucket, default_bucket) in [(Some("a"), None), (None, Some("b")), (None, None)] {
+            with(bucket, default_bucket).expect("one bucket setting, or none, is valid");
         }
     }
 

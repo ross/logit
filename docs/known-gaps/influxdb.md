@@ -14,18 +14,44 @@ the decoder differs from `influxd`.
   `/api/v2/delete`, and the v1 `/query` have no handler.
   - **Consequence:** a dashboard or client that reads back through `logit` gets `404`.
   - **Workaround:** query the destination directly.
-- **`org` and `bucket` are carried, not routed.** `influxdb_in` records `org`, `orgID`, and
-  `bucket` as the private resource attributes `_logit.influxdb.org`, `_logit.influxdb.org_id`, and
-  `_logit.influxdb.bucket`. `influxdb_out` writes to the one org and bucket in its own config and
-  ignores them.
-  - **Consequence:** two producers writing to different buckets through one `influxdb_in` land in
-    the one bucket `influxdb_out` names.
-  - **Workaround:** a `route` on `_logit.influxdb.bucket` into one `influxdb_out` per destination.
+- **A carried bucket's or org's `403` or `404` drops the batch rather than holding it.** With no
+  `bucket:` configured, `influxdb_out` writes each batch to the bucket `influxdb_in` received it
+  for, and with no `org:`, to the client's org. It reads a `403` or `404` as `Rejected` when the
+  bucket or org it could concern was carried, so a bucket a client names that doesn't exist or
+  that the relay's token can't write doesn't hold every other bucket's batches behind it
+  ([ADR `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md)'s "Amendment:
+  `influxdb_out` follows the carried destination (2026-10-15)").
+  - **Consequence:** a transient `403` or `404`, such as a write to a bucket that's still being
+    created or a token whose grant is being widened, loses those batches, counted
+    `batches.dropped{reason="rejected"}`. `bucket:` alone doesn't prevent this: the client's org
+    is still forwarded, and a `403` or any `404` drops, a missing `bucket:` included, because
+    InfluxDB 2.x looks the bucket up inside that org.
+  - **Workaround:** create buckets and grant the relay's token before producers write to them, or
+    configure both `bucket:` and `org:`, where a `403` or `404` holds and retries.
+  - **Revisit trigger:** a deployment that needs a missing bucket held. That needs a queue per
+    destination in place of `write_loop`'s single-head FIFO.
+- **A relay's token decides which buckets a client reaches.** With no `bucket:` or no `org:`
+  configured, any client `influxdb_in` accepts can write to any bucket the relay's token can
+  write: a forwarded org picks among same-named buckets. `tokens:`
+  admits a client without binding its token to a bucket. On InfluxDB 2.x a bucket ID isn't
+  confined by the org sent beside it: 2.7.12 wrote a point to org B's bucket for a token scoped to
+  org A, sent with `org=A` and that bucket's ID.
+  - **Consequence:** a relay with an all-access token lets every accepted client write to every
+    bucket, in any org a forwarded bucket ID names.
+  - **Workaround:** give the relay a token scoped to the buckets its producers may use, or
+    configure both `bucket:` and `org:`.
+- **InfluxDB 3 Core creates a database for any bucket it doesn't know.** 3.8.0 Core answers `204`
+  to a write naming an unknown bucket and creates a database of that name, and it ignores `org`
+  and `orgID`.
+  - **Consequence:** in carried mode, a client's typo in its bucket becomes a new database at the
+    destination rather than a counted drop at `influxdb_out`.
+  - **Workaround:** set `bucket:`, which is enough here because InfluxDB 3 ignores the org, or
+    check the destination's database list.
 - **A destination fault never reaches the producer.** `influxdb_in` answers `204` once the batch
   is in every downstream inbox, before `influxdb_out` writes it. A `422` for a field type
-  conflict (`Rejected`, the batch drops), a `404` for a missing bucket, and a `401` for the sink's
-  token (both `Refused`, the sink retries and holds its queue) are faults at the sink, so the
-  producer sees none of them
+  conflict (`Rejected`, the batch drops), a `404` for a missing bucket (`Refused`, the sink
+  retries and holds its queue, or `Rejected` when the bucket or org came from the client), and a `401` for
+  the sink's token (`Refused`) are faults at the sink, so the producer sees none of them
   ([ADR `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md)'s "Destination
   faults never reach the producer").
   - **Consequence:** a producer with a wrong bucket or a changed field type believes its writes

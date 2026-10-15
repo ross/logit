@@ -1,12 +1,15 @@
 ---
 created: 2026-10-13
-updated: 2026-10-13
+updated: 2026-10-15
 ---
 
 # InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write
 
 ## Status
-Accepted
+Accepted. Superseded in part on 2026-10-15 by "Amendment: `influxdb_out` follows the carried
+destination (2026-10-15)", below: `influxdb_out` writes to the org and bucket a batch carries
+unless its config fixes them, and reads a `403` or `404` about a carried bucket or org as
+`Rejected`.
 
 ## Context
 
@@ -128,7 +131,9 @@ doesn't match the prefix, or isn't a scalar kind, takes the path below, counted
 record name as the measurement, and a `value=` field, now typed.
 
 `influxdb_out` keeps its configured `org` and `bucket`. It doesn't read `_logit.influxdb.org` or
-`_logit.influxdb.bucket` to choose a destination.
+`_logit.influxdb.bucket` to choose a destination. [Superseded by "Amendment: `influxdb_out`
+follows the carried destination (2026-10-15)": with no `bucket:` configured, `influxdb_out`
+writes each batch to the org and bucket it carries.]
 
 Other sinks see the decoded shape. A record named `cpu.usage_user` reaches `prometheus_out` as
 `cpu_usage_user` after sanitizing, the name Telegraf's own Prometheus output uses. The measurement
@@ -181,6 +186,10 @@ no status the producer sees:
 - a `404` for a missing bucket or org is `Refused`;
 - a `401` or `403` for the sink's token is `Refused`.
 
+[Superseded in part by "Amendment: `influxdb_out` follows the carried destination
+(2026-10-15)": a `403` or `404` about a bucket or org that came from the batch is `Rejected` and
+drops that batch.]
+
 A producer writing through `logit` therefore never learns that its bucket doesn't exist or that a
 field changed type. An operator watches `influxdb_out`'s `batches.dropped{reason="rejected"}` and
 `logit.component.retrying` instead. `influx/w3` records this in `docs/known-gaps/influxdb.md` and in
@@ -203,6 +212,10 @@ order; this table keeps the rows whose fault class is the decision:
 | `tokens:` set, and the token is missing or unknown | `401` `unauthorized` | `Refused` |
 | over `max_request_bytes` | `413` | `Rejected` |
 | busy past the listener's bound, or a closed downstream consumer | `503` `unavailable`, `Retry-After: 1` | `Ambiguous` |
+
+[Superseded in part by "Amendment: `influxdb_out` follows the carried destination (2026-10-15)":
+an `influxdb_out` reads the `404` row as `Rejected` when the bucket or org came from the
+batch.]
 
 ### The codec lives in `logit-proto`
 
@@ -334,7 +347,9 @@ list; this section summarizes it. Each deviation is a choice or a consequence of
 - **Regroup points by org and bucket** across requests, or route `influxdb_out` by the carrier.
   Rejected: one request already names one pair, so one request is one batch with nothing to
   regroup. Routing a sink by a resource attribute is a `route` and `target` job
-  ([ADR `target-components`](target-components.md)), not a sink field.
+  ([ADR `target-components`](target-components.md)), not a sink field. [The second half is
+  superseded by "Amendment: `influxdb_out` follows the carried destination (2026-10-15)": a
+  `route` needs every bucket listed in advance.]
 - **Skip and count a bad line, forward the rest.** Rejected: InfluxDB rejects the whole write on a
   parse error, so a relay that forwarded the good lines would store data a direct write wouldn't,
   and a producer that retried the `400` would duplicate whatever `logit` had already forwarded.
@@ -367,7 +382,9 @@ list; this section summarizes it. Each deviation is a choice or a consequence of
   from other protocols (`SetMembers`, `ExponentialHistogram`, `unit`, `description`, exemplars, a
   sketch leaving as `count`/`sum`/`p50`/`p90`/`p99`, and the rest), string fields leaking as tags
   at other sinks, a string-only point skipped at other sinks, the v1 `/write` route, no query or
-  delete API, org and bucket not routed, and destination faults not reaching the producer.
+  delete API, org and bucket not routed, and destination faults not reaching the producer. [The
+  org and bucket row is replaced by the gaps that "Amendment: `influxdb_out` follows the carried
+  destination (2026-10-15)" lists.]
 - The pair's evidence is a recorded Telegraf corpus and a probe of a real `influxd`, listed in the
   plan's "Verification".
 
@@ -379,3 +396,118 @@ leak as tags or labels at other sinks and no `remove` is needed ahead of one. `i
 stays public. The decoder's reserved tag prefix narrows from `influxdb.` to `influxdb.field.`,
 beside the private `_logit.` guard, so a wire tag such as `influxdb.host` now decodes as an
 ordinary tag. The sections above describe the amended form.
+
+## Amendment: `influxdb_out` follows the carried destination (2026-10-15)
+
+`influxdb_out` writes each batch to the org and bucket `influxdb_in` carried on its resource,
+unless its own config fixes them. This reverses "Egress, with and without the carrier"'s last
+paragraph and the second half of the "Regroup points by org and bucket" alternative. A `route` on
+`_logit.influxdb.bucket` into one `influxdb_out` per bucket works, but only for the buckets the
+operator lists in advance. In practice that list is error-prone: a bucket a client starts using
+after the config was written lands wherever the router sends unrouted events.
+
+`crates/logit-outputs/src/influxdb.rs`'s module doc is the canonical statement of how the sink
+resolves a destination ("Destination resolution") and of its response classes ("Response
+classes"). This amendment records the decisions and the evidence behind them.
+
+### Destination
+
+- **Bucket.** With `bucket:` set, the sink runs in fixed mode: every batch goes to that bucket and
+  the carrier is ignored, as before. With `bucket:` absent, it runs in carried mode: a batch goes
+  to its `_logit.influxdb.bucket`, else to `default_bucket:`. Setting both is a validation error.
+  In carried mode, a batch with no carrier and no `default_bucket:` is dropped, counted under
+  reason `no_bucket`.
+- **Org.** A configured `org:` is sent as `org=` alone, never beside a carried `orgID`. InfluxDB
+  2.7 lets `orgID` win when a request sends both (rows 5a to 5d below), so forwarding the client's
+  `orgID` would defeat the operator's override. With no `org:`, the sink forwards what the client
+  sent: `org`, `orgID`, or both. With neither, it sends no org parameter. InfluxDB 3 Core ignores
+  the org, and InfluxDB 2.x answers `400`.
+
+### Fault classes
+
+A `403` or `404` is `Rejected` only when a value it could concern came from the batch's carrier:
+the batch drops, counted `batches.dropped{reason="rejected"}`, and batches for other buckets keep
+flowing.
+
+- A `404` that names a bucket is `Rejected` when the bucket or the org was carried, because
+  InfluxDB 2.x looks a bucket name up inside the org the request names: a configured bucket
+  missing from a carried org is that org's doing. A `404` that names an org is `Rejected` when
+  the org was carried.
+- A `403` (`insufficient permissions for write`) names neither, and on 2.7.12 both a bucket outside
+  the token's scope and an org the token doesn't reach produce it (rows 8 and 10a below). So a
+  `403`, like a `404` whose body names neither, is `Rejected` when the bucket or the org was
+  carried.
+- Otherwise the answer is `Refused` and holds the queue: the bucket came from `bucket:` or
+  `default_bucket:` and the org from `org:`, so it's the operator's config, and every batch that
+  uses it gets the same answer. That includes no org at all, which InfluxDB 2.x answers `400`
+  first.
+- A `401` is always `Refused`, because it's about the sink's own token.
+
+`org:` overrides independently of `bucket:`. With `bucket:` set and no `org:`, the client's org is
+still forwarded, and a `403` or any `404` is `Rejected`. Only with both `bucket:` and
+`org:` configured does the sink keep the original table, where `401`, `403`, and `404` are all
+`Refused`. The module doc's "Response classes" has the row for each body.
+
+The reason is the queue. `write_loop` holds one head at a time in FIFO order, and a `Refused` head
+retries with no budget ([ADR `sink-fault-classes`](sink-fault-classes.md)). When a client picks
+the bucket, a bucket that doesn't exist, or that the relay's token can't write, would hold every
+other bucket's batches behind it indefinitely. One misconfigured producer would stop the relay for
+every producer. `splunk_hec_out` already makes this call for HEC code 7, an index carried on the
+batch as `com.splunk.index`, and `otlp_out` reads a `401`, `403`, or `404` as `Rejected` for one
+signal. Both are rows in that ADR's list of sinks that depart from the status-only default.
+
+### Alternative: hold only the failing bucket
+
+Holding only the failing bucket's batches, and letting the others pass, would keep a transient
+`403` or `404` lossless, such as a write to a bucket that's being created. It needs a keyed queue
+per destination in a sink whose `write_loop` is a single-head FIFO, and the "Order is kept"
+section of [ADR `sink-fault-classes`](sink-fault-classes.md) rules out letting later batches pass
+a held one. That's out of scope here; `docs/known-gaps/influxdb.md` records it as a gap.
+
+### Trust
+
+Any client `influxdb_in` accepts can write to any bucket the relay's token can reach. `tokens:`
+admits a client but doesn't bind its token to a bucket, so scope the relay's token to the buckets
+its producers may use. On InfluxDB 2.7.12 a bucket ID crosses orgs: a token for org A writing with
+`org=A` and the ID of a bucket in org B got `204`, and the point landed in org B (row x6 below),
+so even an org-scoped token doesn't confine a relay that forwards a client's bucket ID.
+
+### Verified responses
+
+Checked on 2026-10-15 against `influxdb:2.7.12`
+(`sha256:b8d940ca9376f85118260f5b6bd236b8a00b1749c3350c5578d4cde8e27f31f2`) and
+`influxdb:3.8.0-core`
+(`sha256:13a654390eccd4b238895b458e1b4a796ada2365123a034df9037cf7a4f4af5d`), with a write-only
+token scoped to one bucket, an all-access token for one org, and the operator token:
+
+| Row | Server | Request | Answer | Carried mode |
+|---|---|---|---|---|
+| 2 | 2.7.12 | unknown bucket | `404` `bucket "<name>" not found` | `Rejected` if the bucket or the org was carried |
+| 3, 4b | 2.7.12 | unknown org name, or unknown `orgID` | `404` `organization name "<name>" not found`, or `organization not found` | `Rejected` if the org was carried |
+| 5a–5d | 2.7.12 | `org` and `orgID` naming different orgs | no error; `orgID` wins | — |
+| 7a–7c | 2.7.12 | neither `org` nor `orgID`, any token | `400` `Please provide either orgID or org`; the token never implies an org | `Rejected` |
+| 8, 10a, 11 | 2.7.12 | a bucket that exists but the token can't write: another org's, out of a scoped token's reach, or read-only | `403` `insufficient permissions for write` | `Rejected` if the bucket or the org was carried |
+| 10b | 2.7.12 | a scoped token, an unknown bucket | `404`, not `403`, so a bucket's existence is visible | `Rejected` if the bucket or the org was carried |
+| 12a, 12b | 2.7.12 | an invalid or missing token | `401` `unauthorized access` | `Refused` |
+| x6 | 2.7.12 | an all-access token for org A, `org=A`, the ID of a bucket in org B | `204`; the point lands in org B | — |
+| x7 | 2.7.12 | a bucket name in the wrong case | `404`; names are case-sensitive | `Rejected` if the bucket or the org was carried |
+| a1, a2 | 3.8.0 Core | unknown bucket | `204`; a database of that name is created | — |
+| b1, b3 | 3.8.0 Core | any `org` or `orgID`, bogus included | ignored | — |
+| c1–c3 | 3.8.0 Core, auth on | an invalid or missing token | `401` `{"error": "the request was not authenticated"}` | `Refused` |
+
+Because InfluxDB 3 Core creates a database for any bucket it doesn't know, a client's typo there
+becomes a new database rather than a counted drop.
+
+### Consequences of the amendment
+
+- `influxdb_out`'s `org` and `bucket` become optional, beside a new optional `default_bucket`. An
+  existing config with `bucket:` set behaves as before.
+- An operator's own mistake still holds in carried mode, and `logit.component.retrying` reads
+  `1`: a missing `default_bucket:` is `Refused` unless the org was carried, and a wrong `org:` is
+  `Refused` on its `404`, and on a `403` unless the bucket was carried. Configure both `bucket:` and `org:` to hold on every `403` and `404`.
+- In carried mode with no `org:` against InfluxDB 2.x, a batch that didn't come from `influxdb_in`
+  carries no org and draws a `400`, which is `Rejected`. Set `org:` when such a source feeds the
+  sink.
+- `docs/known-gaps/influxdb.md` replaces "`org` and `bucket` are carried, not routed" with the gaps
+  above: a transient `403` or `404` drops rather than holds, the trust boundary, and InfluxDB 3
+  Core's auto-created databases.

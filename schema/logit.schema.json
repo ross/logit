@@ -2674,25 +2674,41 @@
           "description": "InfluxDB 2.x line protocol over HTTP, with bounded output retry.",
           "type": "object",
           "required": [
-            "bucket",
-            "org",
             "token",
             "type",
             "url"
           ],
           "properties": {
             "bucket": {
-              "type": "string"
+              "description": "The bucket every write goes to. When absent, each batch goes to the bucket an `influxdb_in` upstream received it for, else to `default_bucket`, so one `influxdb_out` relays to as many buckets as its senders name. Setting this and `default_bucket` together is an error.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "buffer": true,
+            "default_bucket": {
+              "description": "The bucket for a batch that names none when `bucket` is absent: anything not received by an `influxdb_in`. With neither set, such a batch is dropped and counted.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "org": {
-              "type": "string"
+              "description": "The organization name sent with every write. When set, it replaces any organization an `influxdb_in` upstream received, by name or by ID. When absent, the sink forwards the organization `influxdb_in` received, and sends none for an event that came from anywhere else: InfluxDB 3 ignores it, while InfluxDB 2.x refuses a write without one.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "receive": true,
             "sources": true,
             "targets": true,
             "token": {
-              "description": "The API token. A plain string: write `!env INFLUXDB_TOKEN` to pull it from the environment rather than inlining it. `!env` works on `url`/`org`/`bucket` too.",
+              "description": "The API token. A plain string: write `!env INFLUXDB_TOKEN` to pull it from the environment rather than inlining it. `!env` works on `url`, `org`, and `bucket` too.",
               "type": "string"
             },
             "type": {

@@ -19,7 +19,7 @@ still open.
 | [statsd.md](statsd.md) | `statsd_in` and `statsd_out` |
 | [datadog.md](datadog.md) | `datadog_in`, `datadog_out`, `datadog_trace_in`, and `datadog_trace_out` |
 | [splunk.md](splunk.md) | `splunk_hec_in` and `splunk_hec_out` |
-| [influxdb.md](influxdb.md) | `influxdb_in` and `influxdb_out`: unsupported routes, and faults the producer never sees |
+| [influxdb.md](influxdb.md) | `influxdb_in` and `influxdb_out`: unsupported routes, faults the producer never sees, and what a carried bucket costs |
 | [kafka.md](kafka.md) | `kafka_out` |
 | [syslog.md](syslog.md) | `syslog_in` and `syslog_out` |
 | [otlp.md](otlp.md) | `otlp_in` and `otlp_out` |
