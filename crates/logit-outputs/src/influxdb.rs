@@ -56,11 +56,13 @@
 //!   bucket. `splunk_hec_out` reads a code 7 for a carried index the same way
 //!   ([`crate::splunk`], "Response classes").
 //!
-//! A `404`'s `message` names the bucket or the org. A `403` names neither: a bucket outside the
-//! token's scope and an org the token doesn't reach both produce it, so it's `Rejected` when
-//! either was carried. A `401` is the token's, so
-//! every batch gets it. With both `bucket:` and `org:` configured, no value is carried, so every
-//! `403` and `404` is `Refused`. The bodies quoted are InfluxDB 2.7.12's, verified against it and
+//! A `404`'s `message` names the bucket or the org. InfluxDB 2.x looks a bucket name up inside
+//! the org the request names, so a `404` naming the bucket is `Rejected` when either the bucket
+//! or the org was carried: a configured bucket missing from a carried org is that org's doing. A
+//! `404` naming the org is `Rejected` only when the org was carried. A `403` names neither: a
+//! bucket outside the token's scope and an org the token doesn't reach both produce it, so it's
+//! `Rejected` when either was carried. A `401` is the token's, so every batch gets it. With both
+//! `bucket:` and `org:` configured, no value is carried, so every `403` and `404` is `Refused`. The bodies quoted are InfluxDB 2.7.12's, verified against it and
 //! InfluxDB 3.8.0 Core.
 //!
 //! | Response | Class | Why | Evidence |
@@ -71,8 +73,8 @@
 //! | `401` `unauthorized` (`unauthorized access`; InfluxDB 3: `{"error": "the request was not authenticated"}`) | `Refused` | a missing or unknown token: every batch gets it, in both modes | [write API](https://docs.influxdata.com/influxdb/v2/api/write/), verified against InfluxDB 2.7.12 and 3.8.0 Core |
 //! | `403` `forbidden` (`insufficient permissions for write`), bucket from `bucket:` or `default_bucket:` and org from `org:` or none | `Refused` | the token can't write the operator's bucket (a token scoped to another bucket or org, or a read-only one): every batch sent there gets it | `checkBucketWritePermissions` in [`http/write_handler.go`](https://github.com/influxdata/influxdb/blob/master/http/write_handler.go), verified against InfluxDB 2.7.12 |
 //! | `403` `forbidden`, bucket or org carried | `Rejected` | the token can't write this batch's bucket, or doesn't reach its org (an all-access token for another org); a batch naming another may land | verified against InfluxDB 2.7.12 |
-//! | `404` `not found` (`bucket "<name>" not found`, or `bucket not found` for an empty name), bucket from `bucket:` or `default_bucket:` | `Refused` | the operator's bucket doesn't exist: every batch sent there gets it until the operator creates it | [write API](https://docs.influxdata.com/influxdb/v2/api/write/), `decodeWriteRequest` in [`http/write_handler.go`](https://github.com/influxdata/influxdb/blob/master/http/write_handler.go), verified against InfluxDB 2.7.12 |
-//! | `404` `not found` naming the bucket, bucket carried | `Rejected` | this batch's bucket doesn't exist; a batch naming another may land. InfluxDB 3 creates a missing database instead of answering `404` | verified against InfluxDB 2.7.12 and 3.8.0 Core |
+//! | `404` `not found` (`bucket "<name>" not found`, or `bucket not found` for an empty name), bucket from `bucket:` or `default_bucket:` and org from `org:` or none | `Refused` | the operator's bucket doesn't exist: every batch sent there gets it until the operator creates it | [write API](https://docs.influxdata.com/influxdb/v2/api/write/), `decodeWriteRequest` in [`http/write_handler.go`](https://github.com/influxdata/influxdb/blob/master/http/write_handler.go), verified against InfluxDB 2.7.12 |
+//! | `404` `not found` naming the bucket, bucket or org carried | `Rejected` | this batch's bucket doesn't exist, or doesn't exist in this batch's org; a batch naming another may land. InfluxDB 3 creates a missing database instead of answering `404` | verified against InfluxDB 2.7.12 and 3.8.0 Core |
 //! | `404` `not found` (`organization name "<name>" not found`, or `organization not found` for an `orgID`), org from `org:` | `Refused` | the operator's org doesn't exist: every batch gets it | `decodeWriteRequest` in [`http/write_handler.go`](https://github.com/influxdata/influxdb/blob/master/http/write_handler.go), verified against InfluxDB 2.7.12 |
 //! | `404` `not found` naming the org, org carried | `Rejected` | this batch's org doesn't exist; a batch naming another may land | verified against InfluxDB 2.7.12 |
 //! | `404` with any other body, bucket or org carried | `Rejected` | the body names neither, and holding would wedge the sink on a value one sender chose | -- |
@@ -140,13 +142,14 @@ struct WriteParams<'a> {
 impl WriteParams<'_> {
     /// The class of a non-2xx answer to a write with these parameters (the module doc's
     /// "Response classes"). A `403` or `404` is the batch's own, `Rejected`, only when the value
-    /// it names came from the batch's carriers; one naming a configured value hits every batch,
-    /// so it holds, as [`crate::http::classify_status`] reads it.
+    /// it names, or the org a bucket is looked up in, came from the batch's carriers; one naming
+    /// only configured values hits every batch, so it holds, as
+    /// [`crate::http::classify_status`] reads it.
     fn classify(&self, status: reqwest::StatusCode, body: &str) -> Fault {
         let carried = match status.as_u16() {
             403 => self.bucket_carried || self.org_carried,
             404 => match NotFound::of(body) {
-                NotFound::Bucket => self.bucket_carried,
+                NotFound::Bucket => self.bucket_carried || self.org_carried,
                 NotFound::Org => self.org_carried,
                 NotFound::Other => self.bucket_carried || self.org_carried,
             },
@@ -1220,8 +1223,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_403_for_a_carried_bucket_is_rejected() {
+        let destination = Destination::Carried { default_bucket: None };
         let response = influx_error("403 Forbidden", FORBIDDEN);
-        assert_eq!(carried_class_of(response).await, Fault::Rejected);
+        let fault = class_under(Some("ops"), destination, all_carriers(), response).await;
+        assert_eq!(fault, Fault::Rejected);
     }
 
     /// A `404` whose body names neither, with a value carried, doesn't hold the queue.
@@ -1259,6 +1264,16 @@ mod tests {
     async fn a_403_for_a_carried_org_beside_a_configured_bucket_is_rejected() {
         let batch = carried_batch(&[(RESOURCE_ATTR_ORG, Value::str("acme"))]);
         let response = influx_error("403 Forbidden", FORBIDDEN);
+        let fault = class_under(None, Destination::Fixed("fixed".into()), batch, response).await;
+        assert_eq!(fault, Fault::Rejected);
+    }
+
+    /// InfluxDB 2.x looks the bucket up inside the request's org, so a configured bucket missing
+    /// from a carried org is the batch's.
+    #[tokio::test]
+    async fn a_404_for_a_configured_bucket_in_a_carried_org_is_rejected() {
+        let batch = carried_batch(&[(RESOURCE_ATTR_ORG, Value::str("acme"))]);
+        let response = influx_error("404 Not Found", BUCKET_NOT_FOUND);
         let fault = class_under(None, Destination::Fixed("fixed".into()), batch, response).await;
         assert_eq!(fault, Fault::Rejected);
     }

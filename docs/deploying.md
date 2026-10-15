@@ -3249,7 +3249,8 @@ it costs:
   other producer. A bucket that's still being created loses what's written to it until it exists.
   When both came from config (`bucket:` or `default_bucket:`, and `org:`), the same answers hold
   the queue and retry, because every batch gets them. `bucket:` alone isn't enough: without
-  `org:`, the client's org is still forwarded. To hold on every `403` and `404`, configure both.
+  `org:`, the client's org is still forwarded, and InfluxDB 2.x looks the bucket up inside it, so
+  a `404` for the configured bucket drops too. To hold on every `403` and `404`, configure both.
 - Any client `influxdb_in` accepts can write to any bucket the relay's token can write, because
   `tokens:` doesn't tie a client to a bucket. Scope the relay's token to the producers' buckets,
   or configure both `bucket:` and `org:`.

@@ -429,19 +429,22 @@ A `403` or `404` is `Rejected` only when a value it could concern came from the 
 the batch drops, counted `batches.dropped{reason="rejected"}`, and batches for other buckets keep
 flowing.
 
-- A `404` that names a bucket is `Rejected` when the bucket was carried, and one that names an org
-  is `Rejected` when the org was carried.
+- A `404` that names a bucket is `Rejected` when the bucket or the org was carried, because
+  InfluxDB 2.x looks a bucket name up inside the org the request names: a configured bucket
+  missing from a carried org is that org's doing. A `404` that names an org is `Rejected` when
+  the org was carried.
 - A `403` (`insufficient permissions for write`) names neither, and on 2.7.12 both a bucket outside
   the token's scope and an org the token doesn't reach produce it (rows 8 and 10a below). So a
   `403`, like a `404` whose body names neither, is `Rejected` when the bucket or the org was
   carried.
 - Otherwise the answer is `Refused` and holds the queue: the bucket came from `bucket:` or
   `default_bucket:` and the org from `org:`, so it's the operator's config, and every batch that
-  uses it gets the same answer.
+  uses it gets the same answer. That includes no org at all, which InfluxDB 2.x answers `400`
+  first.
 - A `401` is always `Refused`, because it's about the sink's own token.
 
 `org:` overrides independently of `bucket:`. With `bucket:` set and no `org:`, the client's org is
-still forwarded, and a `403` or a `404` naming that org is `Rejected`. Only with both `bucket:` and
+still forwarded, and a `403` or any `404` is `Rejected`. Only with both `bucket:` and
 `org:` configured does the sink keep the original table, where `401`, `403`, and `404` are all
 `Refused`. The module doc's "Response classes" has the row for each body.
 
@@ -479,15 +482,15 @@ token scoped to one bucket, an all-access token for one org, and the operator to
 
 | Row | Server | Request | Answer | Carried mode |
 |---|---|---|---|---|
-| 2 | 2.7.12 | unknown bucket | `404` `bucket "<name>" not found` | `Rejected` if the bucket was carried |
+| 2 | 2.7.12 | unknown bucket | `404` `bucket "<name>" not found` | `Rejected` if the bucket or the org was carried |
 | 3, 4b | 2.7.12 | unknown org name, or unknown `orgID` | `404` `organization name "<name>" not found`, or `organization not found` | `Rejected` if the org was carried |
 | 5a–5d | 2.7.12 | `org` and `orgID` naming different orgs | no error; `orgID` wins | — |
 | 7a–7c | 2.7.12 | neither `org` nor `orgID`, any token | `400` `Please provide either orgID or org`; the token never implies an org | `Rejected` |
 | 8, 10a, 11 | 2.7.12 | a bucket that exists but the token can't write: another org's, out of a scoped token's reach, or read-only | `403` `insufficient permissions for write` | `Rejected` if the bucket or the org was carried |
-| 10b | 2.7.12 | a scoped token, an unknown bucket | `404`, not `403`, so a bucket's existence is visible | `Rejected` if the bucket was carried |
+| 10b | 2.7.12 | a scoped token, an unknown bucket | `404`, not `403`, so a bucket's existence is visible | `Rejected` if the bucket or the org was carried |
 | 12a, 12b | 2.7.12 | an invalid or missing token | `401` `unauthorized access` | `Refused` |
 | x6 | 2.7.12 | an all-access token for org A, `org=A`, the ID of a bucket in org B | `204`; the point lands in org B | — |
-| x7 | 2.7.12 | a bucket name in the wrong case | `404`; names are case-sensitive | `Rejected` if the bucket was carried |
+| x7 | 2.7.12 | a bucket name in the wrong case | `404`; names are case-sensitive | `Rejected` if the bucket or the org was carried |
 | a1, a2 | 3.8.0 Core | unknown bucket | `204`; a database of that name is created | — |
 | b1, b3 | 3.8.0 Core | any `org` or `orgID`, bogus included | ignored | — |
 | c1–c3 | 3.8.0 Core, auth on | an invalid or missing token | `401` `{"error": "the request was not authenticated"}` | `Refused` |
@@ -499,9 +502,9 @@ becomes a new database rather than a counted drop.
 
 - `influxdb_out`'s `org` and `bucket` become optional, beside a new optional `default_bucket`. An
   existing config with `bucket:` set behaves as before.
-- An operator's own mistake still holds in carried mode: a wrong `org:` or `default_bucket:` is
-  `Refused`, and `logit.component.retrying` reads `1`, unless the other value of the pair was
-  carried. Configure both `bucket:` and `org:` to hold on every `403` and `404`.
+- An operator's own mistake still holds in carried mode, and `logit.component.retrying` reads
+  `1`: a missing `default_bucket:` is `Refused` unless the org was carried, and a wrong `org:` is
+  `Refused` on its `404`, and on a `403` unless the bucket was carried. Configure both `bucket:` and `org:` to hold on every `403` and `404`.
 - In carried mode with no `org:` against InfluxDB 2.x, a batch that didn't come from `influxdb_in`
   carries no org and draws a `400`, which is `Rejected`. Set `org:` when such a source feeds the
   sink.

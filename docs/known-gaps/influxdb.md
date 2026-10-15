@@ -24,7 +24,8 @@ the decoder differs from `influxd`.
   - **Consequence:** a transient `403` or `404`, such as a write to a bucket that's still being
     created or a token whose grant is being widened, loses those batches, counted
     `batches.dropped{reason="rejected"}`. `bucket:` alone doesn't prevent this: the client's org
-    is still forwarded, and a `403` or `404` naming it drops.
+    is still forwarded, and a `403` or any `404` drops, a missing `bucket:` included, because
+    InfluxDB 2.x looks the bucket up inside that org.
   - **Workaround:** create buckets and grant the relay's token before producers write to them, or
     configure both `bucket:` and `org:`, where a `403` or `404` holds and retries.
   - **Revisit trigger:** a deployment that needs a missing bucket held. That needs a queue per
