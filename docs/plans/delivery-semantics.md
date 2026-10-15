@@ -150,7 +150,8 @@ Per [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequ
 - **Identity independence.** Verify that `random_id_bytes` gives independent identities across
   processes.
 - [x] Measure the native relay on the perf VM before and after. Done 2026-10-02
-  ([`docs/design/performance.md`](../design/performance.md) §1's native-relay ladder): the
+  ([`docs/design/performance.md`](../design/performance.md) §1's native-relay ladder, as of
+  `201bb5a7`): the
   delivery stack's sender identity and sequence trailer cost nothing measurable. `native-relay` reads
   1.378 µs/event at `4e08c49e`, 1.365 after W3, and 1.350 after W4 through W6 (`958b93e7`), and
   the later steps are the send window, encode-once, and named acks.

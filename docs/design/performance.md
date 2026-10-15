@@ -30,26 +30,31 @@ checkout's; see the ADR's "Multiple sources, one VM" section.
 > **Unless a sub-section says otherwise, every number here was taken on the disposable perf VM**
 > (`docs/adr/disposable-azure-perf-vm.md`), not the dev laptop: `Standard_F8as_v6`, 8 dedicated
 > AMD EPYC 9V74 (Genoa) cores, SMT off, 32 GiB, Debian GNU/Linux 13 (trixie), kernel
-> `6.12.111+deb13-cloud-amd64`, image version `0.20261001.2618`, `westus2`, inside the dev container
-> (`rustc 1.98.1 (48a229cea 2026-09-01)`), `release` profile, on 2026-10-02. The measured binary
-> ("M") is `main` at `d1521c5f90078371f2e4247fdcf6c42698140a59`. The harness ran from
-> `ccd76db2535eedff69cd2a9c0652e8dd15d54fdf` (`--harness-ref perf/boxstate-fields`), so every
-> results file records `box_state`; the `tail` phase ran from `34bf7ec66f155aa5440f115e8f6536bb25228c0a`,
-> which predates those fields, so its files carry an empty `box_state`. THP was `always` with
-> `defrag` `madvise`, `net.core.rmem_max` 16777216, and `rmem_default` 212992. The `udp-verify`,
-> `udp-knee`, `groups-sweep`, and `tail` phases ran while an orphaned harness sampler polled
-> `/proc`; §7 says what that touches.
+> `6.12.111+deb13-cloud-amd64`, image version `0.20261001.2618`, `westus2`, on 2026-10-15. Every
+> binary was built in the dev container (`rustc 1.98.1 (48a229cea 2026-09-01)`), `release` profile
+> (fat LTO, `codegen-units = 1`). The measured binary ("M") is `main` at
+> `8ea4497664281535fa4401cc60871a590ee07e2f`. THP was `always` with `defrag` `madvise`,
+> `net.core.rmem_max` 16777216, and `rmem_default` 212992.
 >
-> - **The checkout was clean, and every binary came from `script/vm build`.** M's sha256 is
->   `bfb9e359a9bcedcdf8b631925beb3d1a82297f550fa90e00be4bd4d8bacdc9d0`. The previous baseline,
->   `4e08c49ef421` ("B0"), was rebuilt on this box; its sha256
->   `95b811af37e42061cfa938fe9a0cfa093475a01de1428292909a558d6644df63` matches the 2026-09-28
->   sidecar. Every run pointed `--logit-bin` at a stashed binary, and all 227 results files carry
->   `git.dirty: false`.
-> - **B0 reproduced the 2026-09-28 numbers before anything else ran.** The `repro` gate measured
->   `passthrough` at 0.329 µs/event (recorded 0.327), `json-parse` at 0.917 (0.920), and
->   `native-relay` at 1.389 (1.389), each inside its spread, so B0 and M share a box class and the
->   comparison below is B0 against M from this session.
+> - **Three binaries ran in one sitting.** B0 is `d1521c5f9007`, the 2026-10-02 session's M, rebuilt
+>   byte for byte: its sha256, `bfb9e359a9bcedcdf8b631925beb3d1a82297f550fa90e00be4bd4d8bacdc9d0`,
+>   matches that session's. D- is `edc446d9ce5a` (sha256 `142a8043e148…`), `main` immediately before
+>   the typed-`MetricValue` merge (#677, `41ccfbc4`), and M's sha256 is `38fc8f863574…`. B0 to D- is
+>   everything since 2026-10-02 except the data-model change; D- to M is that change and the five
+>   merges after it.
+> - **Each binary was measured by a `logit-perf` built from a matching commit.** The harness
+>   decodes a binary's own native telemetry dump, and three merges changed what it must read: #677
+>   and #683 changed the native record encoding, and #678 (`edc446d9`) renamed
+>   `logit.input.kernel.drops` to `logit.input.kernel.dropped`. A harness on the wrong side of
+>   either fails to decode the dump or reads zero kernel drops. B0 and four of the bisect binaries
+>   ran under the harness at `5da5ab8cc146`, the newest commit before the rename; every other
+>   binary ran under its own commit. All 277 results files carry `git.dirty: false` and the
+>   sha256 of the binary they name.
+> - **B0 reproduced the 2026-10-02 numbers before anything else ran.** The `repro` gate measured
+>   `passthrough` at 0.332 µs/event (recorded 0.332), `json-parse` at 0.903 (0.907), and
+>   `native-relay` at 0.851 (0.868), each within 2%, so this session's box compares with the
+>   2026-10-02 one. The harness ran through a plain `docker run` of the dev image, not `docker
+>   compose run`; the gate covers that change too.
 > - **Machine facts are restated here, not trusted from the JSON.** The JSON's `hostname` is the dev
 >   container's hostname inside the VM, and `cpu_model`/`nproc` are read from `/proc/cpuinfo`/`nproc`
 >   *inside* that container.
@@ -61,13 +66,11 @@ checkout's; see the ADR's "Multiple sources, one VM" section.
 >   its numbers through 2026-09-14. Its heterogeneous Zen 5/5c cores made an unpinned run
 >   bimodal by roughly 2×, and the same commit measured 90 minutes apart on battery drifted CPU
 >   µs/event by ~23% (the ADR's "Context" section).
-> - **The code changed since the previous VM baseline; the box class did not.** The merges between
->   2026-09-28 (`4e08c49ef421`) and `d1521c5f` that touch measured paths include the render
->   redesign (#435), the process sampler (#441), the sink send-path stack (#457), the `tailbk`
->   stack (#447), the delivery-semantics stack, the send window (flow/w3 and w4), the native-hop
->   encode-once change (#478), and named cumulative acks (#487). §1's "What moved since
->   2026-09-28" sub-section says which rows moved and, where known, why. Read any other row as
->   *current*.
+> - **Some sub-sections are from earlier sessions, and say so.** The `native-relay` 10 ms round
+>   trip, the immediate-purge RSS table, the `aggregate-groups` group sweep, and the flamegraph
+>   shares in "Reading the rows" are from 2026-10-02, measured on `d1521c5f` (this session's B0).
+>   §1's "What moved since 2026-10-02" says which rows moved since then and, where known, why.
+>   Read any other row as *current*.
 
 The two retired laptop runs this table carried before: 2026-09-14 on a quiet, battery-powered
 laptop (`fecbd9337010f95d722e89946e1a3e3aa43c007b`,
@@ -207,196 +210,232 @@ Their first numbers are in §1, under "`tail_in`: before and after the read-path
 ## 1. Results: all nineteen scenarios, median of 5
 
 `script/perf run --scenario NAME --repeat 5 --profile release --no-build --logit-bin
-perf/bins/d1521c5f9007/logit --label suite_m`, solo on the VM (see the preamble), once per scenario.
-B0 ran the same command against `perf/bins/4e08c49ef421/logit` (`--label suite_b0`), interleaved by
-scenario with the arm order flipping every other scenario so neither side always ran second. One
-throwaway `--repeat 1` of `passthrough` ran first and is excluded. Rows follow `script/perf list`'s
-alphabetical order. `count` is each scenario's committed `generate_in.count`. Most counts give the
-5–10 s of wall per repeat that `docs/plans/load-test-harness.md` targets; the two `buffered*` rows,
-`aggregate-groups`, and `native-relay` (2.93 s) run shorter. **events/s (min–max)** is the spread of
-the same five repeats the median came from; the noise sub-section after the readings explains what
-a wide range means.
+perf/bins/8ea449766428/logit --label suite_m`, solo on the VM (see the preamble), once per
+scenario. B0 and D- ran the same command against their own binaries (`--label suite_b0`,
+`suite_dm`), each through its own harness, interleaved by scenario with the arm order rotated so
+no binary always ran first. One throwaway `--repeat 1` of `passthrough` per binary ran first and
+is excluded. Rows follow `script/perf list`'s alphabetical order. `count` is each scenario's
+committed `generate_in.count`. Most counts give the 5–10 s of wall per repeat that
+`docs/plans/load-test-harness.md` targets; the two `buffered*` rows, `aggregate-groups`, and
+`native-relay` (3.34 s) run shorter. **events/s (min–max)** is the spread of the same five repeats
+the median came from; the noise sub-section after the readings explains what a wide range means.
 
 | Scenario | Count | events/s | events/s (min–max) | CPU µs/event | Peak RSS | Wall |
 |---|---:|---:|---:|---:|---:|---:|
-| `aggregate` | 20M | 3,006,997 | 2,970,278 – 3,009,881 | 0.335 | 69.3 MiB | 6.65 s |
-| `aggregate-groups` | 5M | 3,498,087 | 3,451,370 – 3,532,793 | 0.290 | 71.1 MiB | 1.43 s |
-| `buffered` | 1.2M | 742,262 | 735,879 – 787,888 | 1.698 | 78.7 MiB | 1.62 s |
-| `buffered-small-segments` | 1.2M | 736,586 | 735,713 – 750,003 | 1.727 | 77.8 MiB | 1.63 s |
-| `encode-human-devnull` | 8M | 1,513,474 | 1,501,075 – 1,521,123 | 1.027 | 250.3 MiB | 5.29 s |
-| `encode-json-devnull` | 8M | 1,597,907 | 1,560,550 – 1,604,111 | 0.995 | 233.3 MiB | 5.01 s |
-| `encode-native-devnull` | 10M | 1,722,464 | 1,712,064 – 1,728,582 | 0.950 | 245.6 MiB | 5.81 s |
-| `fanout` | 25M | 2,573,405 | 2,568,794 – 2,618,982 | 0.651 | 46.9 MiB | 9.71 s |
-| `json-parse` | 19M | 2,108,946 | 2,105,618 – 2,114,011 | 0.907 | 104.4 MiB | 9.01 s |
-| `json-parse-access-log` | 3M | 371,524 | 370,693 – 373,742 | 3.251 | 60.9 MiB | 8.07 s |
-| `json-parse-app-log` | 9M | 977,086 | 975,037 – 980,292 | 1.448 | 64.1 MiB | 9.21 s |
-| `json-parse-nested-log` | 4.5M | 552,240 | 550,413 – 553,232 | 2.322 | 66.7 MiB | 8.15 s |
-| `json-parse-x3` | 9.5M | 1,427,964 | 1,416,408 – 1,455,032 | 2.501 | 80.6 MiB | 6.65 s |
-| `logfmt-parse` | 9.5M | 1,866,551 | 1,861,846 – 1,877,403 | 0.931 | 73.5 MiB | 5.09 s |
-| `lua` | 4M | 560,714 | 555,360 – 564,548 | 2.078 | 67.5 MiB | 7.13 s |
-| `native-relay` | 7M | 2,390,117 | 2,365,026 – 2,435,922 | 0.868 | 317.0 MiB | 2.93 s |
-| `native-relay-window1` | 7M | 1,201,447 | 1,195,434 – 1,209,318 | 1.186 | 250.7 MiB | 5.83 s |
-| `passthrough` | 25M | 3,724,063 | 3,705,277 – 3,761,297 | 0.332 | 67.3 MiB | 6.71 s |
-| `route` | 25M | 3,341,299 | 3,323,020 – 3,353,641 | 0.687 | 101.6 MiB | 7.48 s |
+| `aggregate` | 20M | 3,018,713 | 3,011,387 – 3,024,637 | 0.333 | 75.3 MiB | 6.63 s |
+| `aggregate-groups` | 5M | 3,512,860 | 3,501,890 – 3,537,603 | 0.289 | 74.1 MiB | 1.42 s |
+| `buffered` | 1.2M | 855,395 | 838,508 – 877,610 | 1.749 | 83.9 MiB | 1.40 s |
+| `buffered-small-segments` | 1.2M | 574,048 | 563,230 – 592,173 | 1.799 | 84.8 MiB | 2.09 s |
+| `encode-human-devnull` | 8M | 1,766,727 | 1,762,650 – 1,796,825 | 0.937 | 277.5 MiB | 4.53 s |
+| `encode-json-devnull` | 8M | 1,874,470 | 1,853,113 – 1,891,191 | 0.906 | 290.9 MiB | 4.27 s |
+| `encode-native-devnull` | 10M | 1,670,591 | 1,632,219 – 1,700,130 | 0.969 | 281.7 MiB | 5.99 s |
+| `fanout` | 25M | 2,538,467 | 2,532,792 – 2,552,633 | 0.655 | 57.0 MiB | 9.85 s |
+| `json-parse` | 19M | 2,312,290 | 2,305,868 – 2,314,321 | 0.886 | 143.2 MiB | 8.22 s |
+| `json-parse-access-log` | 3M | 403,951 | 403,906 – 404,580 | 3.056 | 67.5 MiB | 7.43 s |
+| `json-parse-app-log` | 9M | 1,092,546 | 1,087,831 – 1,100,152 | 1.338 | 68.7 MiB | 8.24 s |
+| `json-parse-nested-log` | 4.5M | 567,222 | 566,170 – 573,085 | 2.284 | 71.4 MiB | 7.93 s |
+| `json-parse-x3` | 9.5M | 1,602,827 | 1,594,326 – 1,611,829 | 2.276 | 92.1 MiB | 5.93 s |
+| `logfmt-parse` | 9.5M | 1,841,890 | 1,834,281 – 1,845,766 | 0.953 | 82.2 MiB | 5.16 s |
+| `lua` | 4M | 572,670 | 557,911 – 575,454 | 2.062 | 71.9 MiB | 6.98 s |
+| `native-relay` | 7M | 2,096,558 | 1,951,033 – 2,448,736 | 0.947 | 360.0 MiB | 3.34 s |
+| `native-relay-window1` | 7M | 1,200,035 | 1,194,359 – 1,207,438 | 1.181 | 233.0 MiB | 5.83 s |
+| `passthrough` | 25M | 3,643,712 | 3,604,570 – 3,658,264 | 0.338 | 74.2 MiB | 6.86 s |
+| `route` | 25M | 3,255,327 | 3,243,646 – 3,258,637 | 0.716 | 116.6 MiB | 7.68 s |
 
-`encode-json-devnull` is the first row for `format: json` ([ADR
-`stream-json-format`](../adr/stream-json-format.md)), and `native-relay-window1` is `native-relay`
-at `window: 1`. B0 can't run either: `format: json` doesn't exist at `4e08c49ef421`, and the
-`window:` field arrives with the send window.
+`native-relay`'s CPU number depends on the build as much as on the code; read it with
+"`native-relay` is code-layout-sensitive" below.
 
-On the same box, the render rows read:
+The 2026-10-02 session measured the block render on the same box:
 
 | Scenario | Binary | CPU µs/event | events/s | Peak RSS |
 |---|---|---:|---:|---:|
 | `encode-human-devnull` | `7cd52931` (before the block render) | 1.039 | 1,481,161 | 237.7 MiB |
 | `encode-human-devnull` | `af557d90` (the block render, #435) | 1.025 | 1,516,289 | 252.7 MiB |
-| `encode-human-devnull` | M | 1.030 | 1,503,156 | 244.8 MiB |
+| `encode-human-devnull` | `d1521c5f` | 1.030 | 1,503,156 | 244.8 MiB |
 | `encode-json-devnull` | `af557d90` | 0.993 | 1,605,728 | 231.3 MiB |
-| `encode-json-devnull` | M | 0.993 | 1,603,613 | 236.7 MiB |
+| `encode-json-devnull` | `d1521c5f` | 0.993 | 1,603,613 | 236.7 MiB |
 
 Each cell is the median of six pooled repeats. The block render didn't slow the human encoder: it's
 1.4% cheaper than the render before it, and the six-repeat ranges don't overlap (1.034–1.043 before,
-1.022–1.033 after). On M, `format: json` costs 3.6% less CPU per event than the human render and
-4.5% more than `encode-native-devnull` (0.950 in the suite).
+1.022–1.033 after). On this session's M, `format: json` costs 3.3% less CPU per event than the
+human render and 6.5% less than `format: native` (0.969).
 
 ### `tail_in`: before and after the read-path fix
 
-These rows were measured at 5,000,000 lines of 314 B on average (1,503.2 MiB) per repeat for
-both scenarios; `tail` now ships at 12M lines (§0), so a rerun of it takes longer. "Before"
-is M's own binary (sha256 `bfb9e359…`, built from the scenario branch `38997c80`, which changes
-only the harness). "After" is `34bf7ec6` (sha256 `65633d93814e…`), which reuses one read buffer per
-`Tailer`, splits lines with `memchr`, and keeps its per-pass `Vec`s. Two passes of five repeats
-each, with the before/after order reversed on the second pass, pool into 10 repeats per cell.
+B0 predates the `tail_in` read-path fix (`34bf7ec6`, merged with #494), which reuses one read
+buffer per `Tailer`, splits lines with `memchr`, and keeps its per-pass `Vec`s; D- and M carry it.
+`tail` reads 12M lines and `tail-rotate` 5M, each in two passes of five repeats with the binary
+order reversed on the second pass, pooled into 10 repeats per cell.
 
 | Scenario | Binary | events/s | CPU µs/event (min–max) | Peak RSS | Wall |
 |---|---|---:|---:|---:|---:|
-| `tail` | before | 1,279,387 | 0.780 (0.771 – 0.787) | 61.5 MiB | 3.91 – 4.01 s |
-| `tail` | after | 2,076,121 | 0.478 (0.472 – 0.487) | 62.3 MiB | 2.41 – 2.51 s |
-| `tail-rotate` | before | 594,369 | 0.813 (0.808 – 0.828) | 65.1 MiB | 8.31 – 8.52 s |
-| `tail-rotate` | after | 733,974 | 0.510 (0.508 – 0.513) | 64.2 MiB | 6.81 – 7.01 s |
+| `tail` | B0 | 1,288,226 | 0.790 (0.785 – 0.798) | 62.7 MiB | 9.32 s |
+| `tail` | D- | 2,138,523 | 0.481 (0.473 – 0.485) | 63.8 MiB | 5.61 s |
+| `tail` | M | 2,101,818 | 0.484 (0.479 – 0.492) | 63.6 MiB | 5.71 s |
+| `tail-rotate` | B0 | 469,159 | 0.834 (0.818 – 0.838) | 68.2 MiB | 10.66 s |
+| `tail-rotate` | D- | 507,162 | 0.516 (0.508 – 0.524) | 65.4 MiB | 9.86 s |
+| `tail-rotate` | M | 552,038 | 0.516 (0.508 – 0.522) | 64.8 MiB | 9.11 s |
 
-CPU µs/event falls 38.7% on `tail` and 37.3% on `tail-rotate`, and the ranges don't overlap. Peak
-RSS is flat. `tail`'s wall time, 2.4–4.0 s, was under the 5–10 s target at 5M lines, which is why
-its count was raised to 12M; `tail-rotate` is inside the target. The `tail*` self-checks held on every
-repeat: each run read all 5,000,000 lines, and the harness counted them through the telemetry leg
-([§0](#file-scenarios-tail-ends-on-a-delivered-count-not-a-log-line)). These files carry an empty
-`box_state`, as the preamble says.
+CPU µs/event falls 38.7% on `tail` and 38.1% on `tail-rotate` from B0 to M, all of it before D-,
+and the ranges don't overlap. The 2026-10-02 session measured the same fix at 38.7% and 37.3% on
+5M-line files. Peak RSS is flat. `tail-rotate`'s events/s is a poor signal: its repeats span
+499,367–733,977 on M, because the rotation's timing against the sink's delivered count varies,
+while its CPU range stays within 3%. The `tail*` self-checks held on every repeat
+([§0](#file-scenarios-tail-ends-on-a-delivered-count-not-a-log-line)).
 
-### What moved since 2026-09-28
+### What moved since 2026-10-02
 
-B0 (`4e08c49ef421`) and M ran on the same box in one sitting, so the table compares them directly
-rather than against the 2026-09-28 file. Seventeen scenarios have a row in both. Δ is CPU
-µs/event, `+` = slower; Δ events/s has `+` = faster. Bold marks a delta past `compare --threshold
-5`.
+B0, D-, and M ran on the same box in one sitting, so the table compares them directly rather than
+against the 2026-10-02 file. Δ is CPU µs/event, `+` = slower; Δ events/s has `+` = faster. Bold
+marks a delta past `compare --threshold 5`.
 
-| Scenario | B0 | M | Δ CPU | Δ events/s |
-|---|---:|---:|---:|---:|
-| `aggregate` | 0.326 | 0.335 | +2.47% | −2.34% |
-| `aggregate-groups` | 0.282 | 0.290 | +2.70% | −3.01% |
-| `buffered` | 1.706 | 1.698 | −0.47% | **−8.91%** |
-| `buffered-small-segments` | 1.735 | 1.727 | −0.48% | +1.16% |
-| `encode-human-devnull` | 1.035 | 1.027 | −0.69% | +1.00% |
-| `encode-native-devnull` | 0.957 | 0.950 | −0.73% | +1.06% |
-| `fanout` | 0.642 | 0.651 | +1.34% | −0.69% |
-| `json-parse` | 0.915 | 0.907 | −0.88% | −1.52% |
-| `json-parse-access-log` | 3.223 | 3.251 | +0.88% | −0.67% |
-| `json-parse-app-log` | 1.412 | 1.448 | +2.52% | −2.47% |
-| `json-parse-nested-log` | 2.309 | 2.322 | +0.54% | +0.04% |
-| `json-parse-x3` | 2.466 | 2.501 | +1.42% | −1.11% |
-| `logfmt-parse` | 1.005 | 0.931 | **−7.34%** | **+15.33%** |
-| `lua` | 2.119 | 2.078 | −1.95% | +1.63% |
-| `native-relay` | 1.380 | 0.868 | **−37.09%** | **+145.10%** |
-| `passthrough` | 0.330 | 0.332 | +0.60% | −0.26% |
-| `route` | 0.700 | 0.687 | −1.90% | +2.11% |
+| Scenario | B0 | D- | M | Δ B0 → D- | Δ D- → M | Δ B0 → M | Δ events/s, B0 → M |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `aggregate` | 0.335 | 0.334 | 0.333 | −0.40% | −0.17% | −0.56% | +0.76% |
+| `aggregate-groups` | 0.290 | 0.291 | 0.289 | +0.48% | −0.82% | −0.34% | +0.29% |
+| `buffered` | 1.732 | 1.740 | 1.749 | +0.45% | +0.51% | +0.96% | +1.70% |
+| `buffered-small-segments` | 1.776 | 1.796 | 1.799 | +1.14% | +0.19% | +1.33% | −3.19% |
+| `encode-human-devnull` | 1.052 | 0.944 | 0.937 | **−10.27%** | −0.75% | **−10.94%** | **+22.14%** |
+| `encode-json-devnull` | 1.001 | 0.905 | 0.906 | **−9.55%** | +0.09% | **−9.48%** | **+20.53%** |
+| `encode-native-devnull` | 0.957 | 0.971 | 0.969 | +1.40% | −0.21% | +1.19% | −0.76% |
+| `fanout` | 0.649 | 0.651 | 0.655 | +0.34% | +0.60% | +0.95% | −1.35% |
+| `json-parse` | 0.907 | 0.879 | 0.886 | −3.12% | +0.81% | −2.34% | **+9.74%** |
+| `json-parse-access-log` | 3.296 | 3.069 | 3.056 | **−6.88%** | −0.41% | **−7.25%** | **+10.10%** |
+| `json-parse-app-log` | 1.452 | 1.323 | 1.338 | **−8.86%** | +1.12% | **−7.84%** | **+12.45%** |
+| `json-parse-nested-log` | 2.353 | 2.261 | 2.284 | −3.90% | +1.00% | −2.94% | +4.45% |
+| `json-parse-x3` | 2.476 | 2.255 | 2.276 | **−8.91%** | +0.91% | **−8.08%** | **+10.54%** |
+| `logfmt-parse` | 0.930 | 0.948 | 0.953 | +1.90% | +0.51% | +2.42% | −1.71% |
+| `lua` | 2.052 | 2.085 | 2.062 | +1.61% | −1.09% | +0.51% | +0.28% |
+| `native-relay` | 0.862 | 0.902 | 0.947 | +4.67% | **+5.01%** | **+9.92%** | **−11.55%** |
+| `native-relay-window1` | 1.173 | 1.162 | 1.181 | −0.96% | +1.70% | +0.72% | −0.54% |
+| `passthrough` | 0.331 | 0.336 | 0.338 | +1.48% | +0.70% | +2.19% | −2.14% |
+| `route` | 0.683 | 0.709 | 0.716 | +3.75% | +1.05% | +4.83% | −2.09% |
 
-`script/perf compare --threshold 5` over the pooled files flags one row, `buffered` events/s. It
-also warns on `startup_s` (not gated) for `aggregate` +5.3%, `fanout` +9.6%, `json-parse` +9.6%, and
-`route` +10.7%. The three bold rows were bisected over the first-parent merges between the two
-binaries, each built by `script/vm build`, in two interleaved rounds of `--repeat 3` (median of 6):
+`script/perf compare --threshold 5` over the pooled files flags one row on each of the three
+pairs, `native-relay`.
+The bold rows were bisected over first-parent merges, each built by `script/vm build`: B0, #516's
+first parent (`421c0b64`), #516 (`cd734386`), D-, the data-model merge D (`41ccfbc4`), and M, in
+two interleaved rounds of `--repeat 3` (median of 6; 12 for `native-relay`):
 
-| Binary | Merge | `native-relay` | `native-relay-window1` | `json-parse-x3` | `logfmt-parse` |
-|---|---|---:|---:|---:|---:|
-| B0 | `4e08c49e`, the 2026-09-28 baseline | 1.378 | n/a | 2.467 | 1.005 |
-| R- | `7cd52931`, before the render redesign | 1.393 | n/a | 2.247 | 1.003 |
-| R | `af557d90`, render redesign (#435) | 1.386 | n/a | 2.248 | 1.003 |
-| P | `846547e1`, process sampler (#441) | 1.392 | n/a | 2.264 | 1.006 |
-| S | `d47a99b6`, sink send-path stack (#457) | 1.389 | n/a | 2.444 | 0.926 |
-| D3 | `d349f9cb`, delivery-semantics W3 | 1.365 | n/a | 2.453 | 0.931 |
-| D6 | `958b93e7`, delivery-semantics W4–W6 | 1.350 | n/a | 2.456 | 0.927 |
-| F4 | `99615d2c`, send window (flow/w4) | 1.176 | 1.371 | 2.465 | 0.924 |
-| N | `844be079`, native-hop encode-once (#478) | 1.030 | 1.241 | 2.484 | 0.931 |
-| C- | `efd50c1e`, `main` before named acks | 0.958 | 1.150 | 2.474 | 0.931 |
-| M | `d1521c5f`, named acks (#487) | 0.858 | 1.177 | 2.502 | 0.934 |
+| Scenario | B0 | #516^1 | #516 | D- | D | M |
+|---|---:|---:|---:|---:|---:|---:|
+| `encode-human-devnull` | 1.043 | 1.037 | 1.052 | 0.943 | 0.943 | 0.940 |
+| `encode-json-devnull` | 1.001 | 1.011 | 1.020 | 0.900 | 0.909 | 0.905 |
+| `json-parse` | 0.908 | 0.899 | 0.872 | 0.882 | 0.876 | 0.885 |
+| `json-parse-access-log` | 3.294 | 3.247 | 3.072 | 3.068 | 3.025 | 3.063 |
+| `json-parse-app-log` | 1.451 | 1.420 | 1.349 | 1.323 | 1.319 | 1.339 |
+| `json-parse-nested-log` | 2.348 | 2.310 | 2.274 | 2.262 | 2.253 | 2.282 |
+| `json-parse-x3` | 2.484 | 2.445 | 2.247 | 2.245 | 2.284 | 2.294 |
+| `native-relay` | 0.849 | 0.847 | 0.869 | 0.921 | 0.906 | 0.966 |
 
-CPU µs/event, pooled median of six repeats (twelve for `native-relay` on M). The ladder phases ran
-separately from the suite, so their cells differ from the table above in the third decimal.
+CPU µs/event, pooled median. The ladder ran separately from the suite, so its cells differ from the
+table above in the third decimal.
 
-- **`native-relay` −37.1% (1.380 → 0.868; 975,141 → 2,390,117 events/s).** B0 through D6 sit at
-  1.350–1.393 µs/event; D3 (−1.7%) and D6 (−1.1%) are the only steps over 1%. Then four steps:
-  - **F4, the send window: −12.9%** (1.350 → 1.176). At F4, `window: 1` costs 1.371 µs/event and
-    988,553 events/s against `window: 32`'s 1.176 and 1,451,784.
-  - **N, encode-once: −12.4%** (1.176 → 1.030). `window: 1` falls with it, −9.5% (1.371 → 1.241).
-  - **C-: −7.0%** (1.030 → 0.958), and `window: 1` −7.4% (1.241 → 1.150). The only production
-    change between N and C- is `FrameReadError::Malformed { reason, err }`, which runs on the
-    error path only, so this step is unattributed. The saving is all user time (0.780 → 0.695
-    µs/event at window 32, 0.890 → 0.798 at window 1) and system time is flat, which points at
-    codegen. A pinned flamegraph pair of N against C- would confirm it.
-  - **M, named acks: −10.4%** (0.958 → 0.858), at window 32 only.
-- **`native-relay-window1` reads +2.3% from C- to M** (1.150 → 1.177 µs/event; 1,259,807 →
-  1,205,667 events/s), where nothing coalesces at window 1 and the plan expected flat. The six
-  repeats on each side don't overlap (1.148–1.155 against 1.172–1.183). It's under the 5% gate and
-  stays a note, not a lead. The suite's single M row reads 1.186.
-- **`json-parse-x3`: #421 restored it, and #457 put it back, by code layout.** B0 2.467 → R-
-  2.247 (−8.9%) is #421's `#[cold]` retry fix. It holds through R and P (2.248, 2.264). Then
-  **S rises +8.0% to 2.444** and stays there to M's 2.502, so `json-parse-x3` on M is not the
-  restored number; it's B0's. The `cpu-clock` flamegraph pair at P and S (999 Hz, the same two
-  binaries) shows half the earlier signature: `insert_sym` moves fully out of line, but
-  `parse_object` stacks hold (49.5% → 45.8% of samples). At P, one `AttrMap::insert_sym` frame
-  is inlined into `JsonParser::process` (6.94% of samples inclusive, `SmallVec::insert` inlined
-  with it) beside an out-of-line call (3.81%). At S every `insert_sym` sample sits in the
-  out-of-line call: out-of-line time 3.81% → 16.33%, total `insert_sym` time 10.75% → 16.33%,
-  self 9.65% → 14.95%. That is what the profile showed, not what the compiler did. A laptop
-  disassembly of release builds of P and `main` (byte-identical to the VM's binaries) finds
-  `JsonParser::process`, `parse_object`, the `deserialize_map` visitor, and the `insert_sym`
-  copy that `json` calls identical instruction for instruction, with `warn_throttled` and
-  `insert_sym` out-of-line calls in both. Only code addresses moved, so the profile's
-  inline-frame difference reflects layout and symbolization, not codegen. The layout is the
-  cause, and #457 doesn't change the code that runs. Forcing `insert_sym`'s loop onto one
-  64-byte line (`-C llvm-args=-align-loops=64`, +4.6% `.text`) didn't recover `json-parse-x3`
-  (+1.1%, inside noise, while P stayed −2.4% in the same runs), so the loop's cache-line
-  position alone isn't it. The same layout move makes `json-parse-x3` 2–6% slower and
-  `logfmt-parse` 6–9% faster depending on clock; those laptop figures are provisional (battery,
-  `powersave`). There's no source-level fix.
-  [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md) tracks it.
-- **`logfmt-parse` −7.9% at the same merge, S** (1.006 → 0.926; 1,626,122 → 1,879,855 events/s),
-  flat after. In the same pair, `Logfmt::process` self time falls 14.99% → 6.42% (inclusive
-  57.81% → 52.26%), and `KeyCache::get_or_intern` becomes a separate callee at 4.07%. This is
-  the other side of the same layout move: it trades against `json-parse-x3`, and the profile
-  differences carry the same caveat.
-- **`json-parse` is −0.9% against this B0** (0.915 → 0.907) and also 0.917 → 0.900 in the ladder.
-  The earlier "+1.4% residual" against 2026-09-20 can't be read here, because B0 already carries
-  it. The X1 flamegraph pair at #298 (`c860842c`) against its parent (`e82ff890`) moves no json
-  self-time frame by more than 0.4 points of samples (`insert_sym` self 11.19% → 11.30%, `JsonParser::process`
-  inclusive 48.69% → 47.95%), and #298 changes nothing on the parse path. The +2.3% step stays
-  unattributed, most likely LTO code layout. `attribute` can't decode those two older binaries'
-  dumps ("bad distribution blob: Version"), so the pair has only flamegraph shares, not a per-node
-  breakdown.
-- **`buffered` events/s −8.9% is noise.** CPU µs/event is 1.695–1.710 on all eleven ladder
-  binaries, while B0's own five repeats span 718,192–823,165 events/s (14%) against M's
-  735,879–787,888. `compare`'s "regressed" label is that spread.
-- **`aggregate*` +2.5–3.7%, under the gate and in one direction.** `aggregate` +2.47%,
-  `aggregate-groups` +2.70%, and `json-parse-app-log` +2.52% in the suite. The G sweep below shows
-  +3.1% to +3.7% on `aggregate-groups` at every G, outside the repeat ranges. Nothing here
-  attributes it.
-- **Peak RSS.** `json-parse` reads +11.8% (93.5 → 104.4 MiB) in the suite, but the ladder's pooled
-  `json-parse` RSS runs 99.9–109.0 MiB across all eleven binaries with no step, so it's run-to-run
-  range. `native-relay` is +34% in the suite (236.1 → 317.0 MiB), while the pooled ladder reads
-  B0 235.0, F4 273.4, N 344.3, C- 369.1, M 287.7: wide, and not monotonic. Under purge ("Peak
-  RSS" below) M reads 129.8 MiB, the `encode-*` level; with no B0 purge run, the 236.1 → 317.0 MiB
-  rise stays unattributed.
+- **The data-model change is neutral.** D- to M, which carries typed `MetricValue` ([ADR
+  `typed-metric-scalar`](../adr/typed-metric-scalar.md)) and the private `_logit.` namespace, moves
+  every row by less than 2% except `native-relay`, and D to M on the ladder agrees. On the second
+  ladder in the next sub-section, the data-model merge itself reads −0.2% against D- on
+  `native-relay`; the +5.0% arrives in later steps that track code layout, not the change.
+- **The `json-parse` family is 2.3–8.1% cheaper, at #516.** On the ladder, #516 takes
+  `json-parse-x3` from 2.445 to 2.247 (−8.1%), `json-parse-access-log` −5.4%, `json-parse-app-log`
+  −5.0%, and `json-parse` −3.1%, and nothing after it moves them back. #516 adds per-consumer
+  inbox telemetry and changes only `crates/logit-pipeline/src/fanout.rs` and `runtime.rs`; nothing
+  on the parse path. The step is unattributed. Two observations bound it: events/s rises more than
+  CPU falls (`json-parse` +9.7% events/s against −2.3% CPU), so part of the gain is likely in how
+  the generator and the transform overlap, not in the transform's own cost; and `json-parse-x3` is
+  back at 2.247, the level #421 restored and #457 lost to code layout
+  (`docs/known-gaps/transforms.md`), while `logfmt-parse`, which #457's layout move made 7.9%
+  faster, stays where it was (0.930 → 0.953).
+- **`encode-human-devnull` and `encode-json-devnull` are 10.9% and 9.5% cheaper**, with events/s
+  up 22.1% and 20.5%. The step lies between #516 and D-; the first round has no binary between
+  them, and the second round measured `native-relay` only.
+  The likeliest candidate is #528, which rewrote `logit_core::time` (ADR `jiff-for-calendar-time`),
+  the RFC 3339 formatting both renders use and the native encoder doesn't: `encode-native-devnull`
+  is flat (+1.2%). That's an inference; nothing measured #528 on these scenarios.
+- **`tail` and `tail-rotate` are 38.7% and 38.1% cheaper**, from the read-path fix; the table is
+  under "`tail_in`: before and after the read-path fix" above.
+- **`native-relay` reads +9.9% (0.862 → 0.947; 2,370,351 → 2,096,558 events/s).** A second bisect
+  round over 15 builds finds no merge that causes it; the next sub-section has the ladder and how
+  to read the number.
+- **`route` +4.8%, under the gate and in one direction.** +3.75% B0 to D-, +1.05% D- to M; its
+  five-repeat ranges don't overlap B0's (0.683–0.703 against 0.705–0.725 on M). `passthrough`
+  (+2.2%) and `logfmt-parse` (+2.4%) move the same way, less. Nothing here attributes them.
+- **Peak RSS rises on 18 of 19 rows at default decay**, by up to 19% B0 to M, most of it B0 to D-
+  (`json-parse` 120.8 → 143.2 MiB, `encode-json-devnull` 250.2 → 290.9 MiB). This session ran no
+  immediate-purge pass, so how much of it is live data and how much is jemalloc retention isn't
+  known; "Peak RSS" below says why the two differ.
 - **Everything else is inside ±2%** on CPU, which is inside this box's repeat spread.
 
+### `native-relay` is code-layout-sensitive
+
+`native-relay`'s CPU µs/event moves 5–10% between neighbouring builds whose diff never touches the
+code it runs. A single before/after pair can't attribute a `native-relay` move smaller than about
+8%, and a pair that shows one is more likely measuring the build than the change.
+
+A second bisect round measured 15 first-parent merges from #516 to M, 20 runs per binary: four
+rounds of `--repeat 5`, the binary order rotated each round and reversed on alternate rounds.
+
+| Binary | Merge | CPU µs/event | Run-to-run sd | events/s | Step |
+|---|---|---:|---:|---:|---:|
+| `cd734386` | #516, inbox telemetry | 0.857 | 1.8% | 2,410,552 | |
+| `27b70693` | #528, `timestamp` W3 | 0.867 | 2.3% | 2,357,428 | +1.1% |
+| `54ee6468` | #543, `peer` W4 | 0.902 | 2.5% | 2,207,306 | +4.1% |
+| `cb00cf7b` | #572, `reuse` W5 | 0.947 | 2.7% | 2,060,251 | +4.9% |
+| `bc95bae7` | #596, UDP decode burst fix | 0.889 | 1.8% | 2,259,031 | **−6.1%** |
+| `8883aaad` | #626, `untrusted` W14 | 0.918 | 4.4% | 2,162,517 | +3.2% |
+| `0adf9b21` | #645, `lastdrain` W3 | 0.915 | 1.9% | 2,159,791 | −0.3% |
+| `5da5ab8c` | #653, `ksasl` W3 | 0.916 | 2.0% | 2,178,911 | +0.1% |
+| `edc446d9` | #678, D- | 0.912 | 2.6% | 2,185,939 | −0.4% |
+| `41ccfbc4` | #677, D, typed `MetricValue` | 0.911 | 1.5% | 2,172,313 | −0.2% |
+| `8000ea84` | #680 | 0.927 | 2.2% | 2,160,753 | +1.8% |
+| `5d7451e9` | #683 | 0.939 | 1.9% | 2,090,308 | +1.3% |
+| `e1d494f3` | #693, `priv` W3 | 0.992 | 2.6% | 1,937,277 | **+5.7%** |
+| `82fe29fe` | #697, `ident` W2 | 0.898 | 2.7% | 2,207,371 | **−9.5%** |
+| `8ea44976` | #702, M | 0.968 | 1.8% | 2,004,820 | **+7.8%** |
+
+CPU µs/event and events/s are pooled medians; sd is the standard deviation of single-run CPU
+µs/event as a percentage of its mean. B0 read 0.849 on the first round (12 runs).
+
+- **The ladder isn't monotonic.** #693 → #697 → M reads 0.992 → 0.898 → 0.968, and #702, the last
+  step, changes only Datadog code that `native-relay` never runs. #572 → #596 falls 6.1% after two
+  rises. Across the 15 builds the reading spans 0.857–0.992.
+- **The #697 and M binaries differ only in layout.** All 27,088 functions are present in both, and
+  four, all Datadog code, differ in size. About 60% of the named functions sit 336–576 bytes
+  further along in M, and half sit at a different offset modulo 64, so their cache-line alignment
+  changed.
+- **Flamegraphs don't separate the two builds either.** Three `cpu-clock` captures of each, at 999
+  Hz on the measured release binaries, alternating: two of M's three match #697's mean sample
+  total within about 2%, and the third is 9% higher, with about two thirds of the excess in
+  jemalloc's realloc path, page faults, and kernel scheduling and lock frames.
+- **The underlying drift since B0 is modest.** The builds from #543 to D read 0.889–0.947, against
+  B0's 0.849–0.862. A change of a few percent between 2026-10-02 and M is likely; the suite's +9.9%
+  includes M's build landing high.
+- **Single runs are noisy.** A single run's CPU µs/event has an sd of 1.5–4.4% across these builds
+  (1.2–3.6% on the first round), and events/s about twice that. Twenty runs per binary put a
+  binary's median within about ±1%; the spread between builds is wider than that.
+- **The VM can't say why.** It has no PMU (`perf stat -e cycles` reports `<not supported>`), so
+  there are no cache-miss or front-end counters, only `cpu-clock` sampling.
+
+**To read a `native-relay` move**, measure the change against two or three baseline builds with the
+same behavior and different layout (its parent and the nearest neighbouring merges), 20 runs each,
+interleaved. Treat a move as the change's only when it clears the spread between those baselines.
+The same rule fits any scenario whose ladder shows layout steps (`json-parse-x3` and
+`logfmt-parse` have done so; `docs/known-gaps/transforms.md`).
+
+The same captures show where `native-relay`'s CPU goes. Leaf frames in jemalloc's entry points
+(`malloc`, `realloc`, `sdallocx`, and the arena realloc paths) and in `BytesMut`/`RawVec` growth
+are 20.6% of samples across all six captures (20.4% on M, 20.8% on #697). Attributed to the
+innermost `logit` frame above them, 61.2% of that sits under `logit_proto::native::encode_events`,
+14.8% under `native::value::write_value`, and 6.1% under `write_attr_map`: the native encoder's
+scratch buffers and copies, about 17% of the scenario's CPU. The rest is the generator
+(`generate::Field::render` 4.8%), dropping decoded events and batches (`SmallVec` and
+`Arc<EventBatch>` drops, 7.2%), and the decoder (`decode_hop_body` 2.1%).
+[`docs/plans/native-encode-allocations.md`](../plans/native-encode-allocations.md) plans the fix.
+
 ### `native-relay` under a 10 ms round trip, and the coalescing sweep
+
+This sub-section is from the 2026-10-02 session. Its M is `d1521c5f` (this session's B0) and its
+C- is `efd50c1e`, `main` before named acks; the 2026-10-15 session didn't re-run it.
 
 Named acks ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md)) make `logit_in` send
 one `Ack` per run of up to `ACK_COALESCE_MAX` (32) frames. On the laptop that cost a few points
@@ -444,17 +483,18 @@ coalesced `Ack`, not from the cap. On loopback at window 32 the variants don't s
 ### Reading the rows
 
 The readings below cross-reference each `perf/scenarios/*.yaml`'s own comments. **The top-line
-numbers are all from the 2026-10-02 session.** The flamegraph shares below come from `cpu-clock`
-captures of M (`script/perf flamegraph`, 999 Hz, `--folded` kept for `perf/folded_share.py`), as the
-share of samples whose stack contains a frame with the named substring in its name. They replace the
-laptop-era shares (2026-09-14, busy laptop), which were not carried forward. `attribute` has run on
-the VM for `json-parse`, `aggregate`, and `buffered`, and for `fanout` and `route` (§2).
+numbers are from the 2026-10-15 session.** The flamegraph shares below come from the 2026-10-02
+session's `cpu-clock` captures of `d1521c5f` (`script/perf flamegraph`, 999 Hz, `--folded` kept for
+`perf/folded_share.py`), as the share of samples whose stack contains a frame with the named
+substring in its name; the `native-relay` shares are this session's, in the sub-section above.
+`attribute` has run on the VM for `json-parse`, `aggregate`, and `buffered`, and for `fanout` and
+`route` (§2).
 
-- **`passthrough`** (0.332 µs/event) is the runtime floor every other scenario is read against:
+- **`passthrough`** (0.338 µs/event) is the runtime floor every other scenario is read against:
   scheduling, the `Fanout` channel hop, layer-2 telemetry, and no parsing or encoding. Most of it
   is the generator, not the delivery path: 76.2% of the capture's samples sit under a `generate`
   frame, and `SinkQueue` admission is 0.14%.
-- **`fanout`** (0.651 µs/event) and **`route`** (0.687 µs/event) generate `passthrough`'s exact
+- **`fanout`** (0.655 µs/event) and **`route`** (0.716 µs/event) generate `passthrough`'s exact
   event at its exact count (25M, shared by design so the three differ only in topology), and each
   costs more per generated event: `fanout` for two extra sinks' `Arc`-clone-plus-delivery-hop cost,
   `route` for the router's per-event work (`route_batch`'s `AttrMap::get_sym` plus a linear scan of
@@ -462,66 +502,63 @@ the VM for `json-parse`, `aggregate`, and `buffered`, and for `fanout` and `rout
   (fan-out is cheaper per delivery than routing once). The generator's share falls as the graph
   grows: 57.7% of `fanout`'s samples and 41.8% of `route`'s sit under a `generate` frame, and
   `route_batch` is 15.8% of `route`. `SinkQueue` admission is 0.05% and 0.11%.
-- **`json-parse`** (0.907 µs/event) and **`lua`** (2.078 µs/event) are no longer close to tied.
+- **`json-parse`** (0.886 µs/event) and **`lua`** (2.062 µs/event) are no longer close to tied.
   `json-parse` dropped sharply from the laptop's 2.054 µs/event because of the interner key-cache
   and in-place `Transform::process` work (`docs/adr/in-place-transform-process.md`). `lua`'s LuaJIT
   round trip had no equivalent optimization, so the gap between a `lua` stage and a native
   transform that [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md#transforms-predicates-and-sampling)
   documents holds by a larger factor now.
-  `json-parse-x3` (2.501 µs/event, three parallel parsers sharing the interner) sits above `lua`,
+  `json-parse-x3` (2.276 µs/event, three parallel parsers sharing the interner) sits above `lua`,
   consistent with its purpose: showing shared-interner contention, not a single parse.
-- **`json-parse-app-log`** (1.448 µs/event at 12 attributes), **`json-parse-nested-log`** (2.322 at
-  10, four of them nested maps), and **`json-parse-access-log`** (3.251 at 30) are three widths of
-  the same `json` parse. Read them against `json-parse` (0.907 at 6). Against §9's 2026-09-24
-  `main`, nested-log and access-log are within 1.3% and app-log is +4.4% (1.387 → 1.448).
-- **`encode-human-devnull`**, **`encode-json-devnull`**, and **`encode-native-devnull`** (1.027,
-  0.995, and 0.950 µs/event): the native encoder is still cheaper than the two text renders on the
-  same event stream, as `docs/design/wire-protocol.md` predicts (dictionary-first framing beats
-  formatting text), and `format: json` is the cheaper of the two text forms. The laptop showed the
-  same human-to-native shape (1.330 vs 1.180 µs/event).
-- **`native-relay`** (0.868 µs/event, 2,390,117 events/s) is the full encode → loopback TCP →
+- **`json-parse-app-log`** (1.338 µs/event at 12 attributes), **`json-parse-nested-log`** (2.284 at
+  10, four of them nested maps), and **`json-parse-access-log`** (3.056 at 30) are three widths of
+  the same `json` parse. Read them against `json-parse` (0.886 at 6).
+- **`encode-human-devnull`**, **`encode-json-devnull`**, and **`encode-native-devnull`** (0.937,
+  0.906, and 0.969 µs/event) run the same event stream into `/dev/null`. The native encoder is now
+  the most expensive of the three: the two text renders got about 10% cheaper since 2026-10-02 and
+  the native encoder didn't move. `docs/design/wire-protocol.md`'s expectation that
+  dictionary-first framing beats formatting text holds for the bytes written, not for this
+  encoder's CPU, which goes largely to scratch buffers and copies (the `native-relay` sub-section
+  above). The laptop showed native cheaper than human (1.180 vs 1.330 µs/event).
+- **`native-relay`** (0.947 µs/event, 2,096,558 events/s) is the full encode → loopback TCP →
   decode → ack round trip in one process at the default `window: 32`, and `native-relay-window1`
-  (1.186 µs/event, 1,201,447 events/s) is the same graph with one frame in flight. At window 32 it
-  lands below `json-parse` and the three `encode-*-devnull` rows and above `passthrough`, `fanout`,
+  (1.181 µs/event, 1,200,035 events/s) is the same graph with one frame in flight. At window 32 it
+  lands near `json-parse` and the three `encode-*-devnull` rows and above `passthrough`, `fanout`,
   and `route`. Read it against its own history, not the `encode-*` rows, which go through a
-  different sink path. The window, encode-once, and named acks account for the fall from 1.380
-  µs/event at B0, step by step in §1's ladder. At the ladder's F4 binary, `window: 32` costs 1.176
-  µs/event and runs 1,451,784 events/s against `window: 1`'s 1.371 and 988,553. Peak RSS at window
-  32 is the sink queue's `max_bytes` bound plus allocator retention, as the "Peak RSS" sub-section
-  reads it.
-- **`aggregate`** (0.335 µs/event) costs nearly as little as `passthrough` despite sketching a
+  different sink path, and read any move with "`native-relay` is code-layout-sensitive" above. The
+  send window, encode-once (#478), and named acks (#487) took it from 1.380 µs/event in
+  September to 0.868 on 2026-10-02. Peak RSS at window 32 is the sink queue's `max_bytes` bound plus
+  allocator retention, as the "Peak RSS" sub-section reads it.
+- **`aggregate`** (0.333 µs/event) costs nearly as little as `passthrough` despite sketching a
   1000-series distribution on a 1 s flush tick. §2 shows why: almost all of it is one node's
-  `DdSketch::add`, and the flush cost is amortized over ~6 ticks (the median repeat took 6.65 s).
+  `DdSketch::add`, and the flush cost is amortized over ~6 ticks (the median repeat took 6.63 s).
   On the laptop it was the noisiest scenario; on the VM its spread stays within a few percent
   (next sub-section).
-- **`aggregate-groups`** (0.290 µs/event) runs 1000 `(resource, scope)` groups at 100 events per
+- **`aggregate-groups`** (0.289 µs/event) runs 1000 `(resource, scope)` groups at 100 events per
   batch. It costs less than `aggregate`'s 1000-series sketching because each event carries one
   gauge into one series per group. This is the row
   [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s "The groups bound"
-  section waited on. It is flat in the group count: temporary copies of the scenario at G = 1, 100,
-  and 1000 distinct resources, five repeats each on B0 and M, read
+  section waited on. It is flat in the group count: on 2026-10-02, temporary copies of the scenario
+  at G = 1, 100, and 1000 distinct resources, five repeats each on `4e08c49e` and `d1521c5f`, read
 
-  | Groups | B0 CPU µs/event | M CPU µs/event | B0 peak RSS | M peak RSS |
+  | Groups | `4e08c49e` CPU µs/event | `d1521c5f` CPU µs/event | `4e08c49e` peak RSS | `d1521c5f` peak RSS |
   |---:|---:|---:|---:|---:|
   | 1 | 0.276 | 0.286 | 53.8 MiB | 56.7 MiB |
   | 100 | 0.278 | 0.288 | 58.1 MiB | 59.6 MiB |
   | 1000 | 0.282 | 0.291 | 71.0 MiB | 71.0 MiB |
 
-  Going from G = 1 to G = 1000 costs +2.2% on B0 and +1.7% on M. M is +3.1% to +3.7% against B0 at
-  every G, outside the repeat ranges (B0 0.275–0.287, M 0.284–0.302), which matches the suite's
-  `aggregate-groups` +2.70% and `aggregate` +2.47%. The copies lived on the VM only and were
-  deleted afterwards, because `perf/scenarios/` is globbed by `validate`.
-- **`buffered`** (742,262 events/s): §3 resolved its wide run-to-run swings. They were the harness's
-  own un-cleared spool, fixed by W8 (#165). The laptop-era table carried `1,087,248` events/s here, a
-  quiet-machine median of three repeats; §3's dedicated VM `--repeat 5` pass is the better read of
-  this scenario's steady-state spread. On this session's ladder its CPU µs/event reads 1.695–1.710
-  on all eleven binaries while its events/s wanders 717,275–833,615, so read the CPU column.
-- **`buffered-small-segments`** (1.727 µs/event, 736,586 events/s) is `buffered` with 1 MiB
+  Going from G = 1 to G = 1000 costs +2.2% on `4e08c49e` and +1.7% on `d1521c5f`. The copies lived
+  on the VM only and were deleted afterwards, because `perf/scenarios/` is globbed by `validate`.
+- **`buffered`** (1.749 µs/event, 855,395 events/s): §3 resolved its wide run-to-run swings. They
+  were the harness's own un-cleared spool, fixed by W8 (#165). Its events/s still spreads: across
+  this session's fifteen repeats on three binaries it spans 825,613–877,610 while CPU µs/event stays
+  within 1.722–1.758, so read the CPU column.
+- **`buffered-small-segments`** (1.799 µs/event, 574,048 events/s) is `buffered` with 1 MiB
   segments, so it rolls about 70 times per run. §3's "Segment rolls" sub-section has the
   before/after.
-- **`tail`** (0.478 µs/event, 2,076,121 events/s) and **`tail-rotate`** (0.510, 733,974) are `tail_in`'s read
-  path with nothing parsed, read against their own before-column in "`tail_in`: before and after the
-  read-path fix" above, not against the generated rows.
+- **`tail`** (0.484 µs/event, 2,101,818 events/s) and **`tail-rotate`** (0.516, 552,038) are
+  `tail_in`'s read path with nothing parsed, read against their own history in "`tail_in`: before
+  and after the read-path fix" above, not against the generated rows.
 
 ### Noise: `aggregate`'s laptop-era spread does not reproduce on the VM
 
@@ -549,7 +586,8 @@ on a decay schedule (`dirty_decay_ms` = 10 s by default), not at `free`. A 5–1
 reports a peak RSS that includes most of what it freed along the way, not just its high-water mark
 of live data. To separate the two, run the suite twice: once as-is, and once with
 `_RJEM_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0`, which purges at `free` and makes peak RSS a
-close proxy for peak live data. The 2026-10-02 session ran both on M, five repeats per scenario:
+close proxy for peak live data. The 2026-10-02 session ran both on `d1521c5f` (this session's B0),
+five repeats per scenario; the 2026-10-15 session ran no purge pass:
 
 | Scenario | RSS, default decay | RSS, immediate purge | Δ RSS | CPU µs/event, default | CPU µs/event, purge |
 |---|---:|---:|---:|---:|---:|
@@ -587,11 +625,11 @@ Three findings:
   `route` from 101.6 to 55.9, `json-parse-x3` from 80.6 to 59.5, `passthrough` from 67.3 to 54.1,
   and `lua` from 67.5 to 58.6. `fanout` is the control: it retains nothing (one shared batch, freed
   once), and its RSS doesn't fall (46.9 → 49.2 MiB).
-- **`native-relay`'s default-decay rise stays unattributed.** Its suite RSS rose from 236.1 MiB at
-  B0 to 317.0 MiB at M. Under purge M reads 129.8 MiB, the `encode-*` level, but the session ran
-  no purge on B0, so there is no reading to compare the rise against. `json-parse` is a cleaner
-  case, because it compares M with itself: 104.4 MiB at default decay against a purge floor of
-  68.0 MiB leaves about 36 MiB of allocator retention.
+- **`native-relay`'s default-decay RSS moves with retention, not live data.** Under purge it
+  reads 129.8 MiB, the `encode-*` level, while its default-decay reading has run 236.1–385.9 MiB
+  across builds and sessions. `json-parse` is a cleaner case, because it compares one binary with
+  itself: 104.4 MiB at default decay against a purge floor of 68.0 MiB leaves about 36 MiB of
+  allocator retention.
 
 **The purge took effect this time.** The 2026-09-20 `suite-purge` never did: `script/perf run`'s
 `run()` helper (`script/common.sh`) invokes `docker compose run` with only one explicit `-e
@@ -627,11 +665,12 @@ three sinks, none of which records process time, so its dump shows none; `gen` s
 blocked in send. `route`'s `split` node is 100% of measured process time: 3.66 s over 25M
 events, about 0.146 µs/event, with `gen` blocked 0.48 s in send.
 
-`attribute` on `json-parse` at M (2026-10-02) puts `parsed` (`json`) at 8.4409 s of 10.4534 s Σ
-process time (81%), against 79% above. Its output can't be produced for older binaries: a
-`logit-perf` built from the current checkout can't decode a binary's native dump from before the
-dump format changed (`bad distribution blob: Version`), so the `c860842c`/`e82ff890` pair in §1 has
-flamegraph shares only.
+`attribute` on `json-parse` at `d1521c5f` (2026-10-02) puts `parsed` (`json`) at 8.4409 s of
+10.4534 s Σ process time (81%), against 79% above. A `logit-perf` built from one checkout can't
+decode a native dump from a binary on the other side of a dump format change (`bad distribution
+blob: Version`, or `metric kind 1 had trailing bytes` across #677), so a per-node breakdown across
+such a change needs a harness built at each binary's own commit, as the 2026-10-15 session ran
+(see the preamble).
 
 ### `json-parse`
 
@@ -1264,45 +1303,50 @@ rates sit inside the 1–5% calibration band, so the `drain/*` queue changes did
 knee. CPU per event isn't compared with the knee-scale tables above, because those ran at w2's
 knee, a different operating point.
 
-#### 2026-10-02 regression check: B0 against M
+#### 2026-10-15 regression check: B0, D-, and M
 
-`4e08c49ef421` (B0) and `d1521c5f9007` (M) at the shipped rates, `--repeat 5`, `--pin-sender 0,1
---pin-child 2,3`, two passes interleaved in B0, M / M, B0 order. Each cell lists pass A, then pass B.
+B0 (`d1521c5f9007`), D- (`edc446d9ce5a`), and M (`8ea449766428`) at the shipped rates, `--repeat
+5`, `--pin-sender 0,1 --pin-child 2,3`, two passes in B0, D-, M / M, D-, B0 order. Each cell lists
+pass A, then pass B.
 
 | Scenario | Binary | CPU µs/event | events/s | Kernel drop | `fill` |
 |---|---|---:|---:|---:|---:|
-| `udp-statsd` | B0 | 0.838 / 0.836 | 1,416,178 / 1,416,112 | 3.26% / 3.33% | 55.8 / 54.8 |
-| `udp-statsd` | M | 0.842 / 0.843 | 1,419,281 / 1,406,948 | 3.09% / 3.85% | 55.2 / 54.4 |
-| `udp-statsd-small` | B0 | 2.888 / 2.887 | 540,778 / 543,066 | 0.00% / 0.00% | 7.1 / 7.1 |
-| `udp-statsd-small` | M | 2.888 / 2.886 | 541,007 / 543,194 | 0.00% / 0.00% | 7.1 / 7.2 |
-| `udp-statsd-packed` | B0 | 0.938 / 0.899 | 1,370,826 / 1,372,613 | 4.99% / 4.86% | 59.3 / 57.7 |
-| `udp-statsd-packed` | M | 0.881 / 0.893 | 1,382,948 / 1,382,706 | 4.15% / 4.17% | 57.0 / 56.1 |
+| `udp-statsd` | B0 | 0.875 / 0.853 | 1,408,304 / 1,413,662 | 3.82% / 3.53% | 53.6 / 54.6 |
+| `udp-statsd` | D- | 0.854 / 0.877 | 1,399,446 / 1,399,788 | 4.44% / 4.45% | 54.3 / 54.0 |
+| `udp-statsd` | M | 0.881 / 0.842 | 1,397,098 / 1,394,262 | 4.59% / 4.77% | 53.8 / 54.3 |
+| `udp-statsd-small` | B0 | 2.442 / 2.452 | 656,186 / 652,093 | 0.00% / 0.00% | 14.6 / 14.1 |
+| `udp-statsd-small` | D- | 2.454 / 2.449 | 651,414 / 652,410 | 0.00% / 0.00% | 16.6 / 16.5 |
+| `udp-statsd-small` | M | 2.456 / 2.453 | 650,213 / 650,457 | 0.00% / 0.00% | 16.1 / 15.5 |
+| `udp-statsd-packed` | B0 | 0.906 / 0.892 | 1,373,102 / 1,371,447 | 4.83% / 4.94% | 56.5 / 57.5 |
+| `udp-statsd-packed` | D- | 0.941 / 0.905 | 1,353,502 / 1,357,715 | 6.19% / 5.90% | 55.0 / 57.5 |
+| `udp-statsd-packed` | M | 0.897 / 0.946 | 1,352,335 / 1,353,358 | 6.27% / 6.20% | 59.0 / 55.5 |
 
-B0 and M are indistinguishable: drops stay in the 1–5% calibration band (`-small` reads 0.00%, as in
-the 2026-09-28 check), and control drift between a binary's two passes is at most 0.77 drop points
-and 1.43% on CPU, except `udp-statsd-packed` on B0 at −4.21%. All 24 files, which include the
-`--verify` and half-scale runs, passed their self-checks (`sent == received + kernel_dropped`, the
-sampler reported, no decode diagnostics), and `--verify` delivered every event with zero drops on
-both binaries: 11,074,692 for `udp-statsd`, 5,000,000 for `-small`, and 10,788,160 for `-packed`.
-The knee didn't move, so no capacity bisect ran; the per-binary capacity and THP results above
-stand.
-
-B0's kernel drop here is 0.7–1.0 points above the 2026-09-28 check's (2.53% for `udp-statsd`,
-3.95% for `-packed`). Ordinary box drift fits that, and so does the orphaned sampler described
-next.
-
-**These phases ran with an orphaned sampler polling `/proc`.** The `purge` phase's check that
-`_RJEM_MALLOC_CONF` reached the child left a polling loop (`pgrep`, then a read of
-`/proc/<pid>/environ`, every 0.3 s) running after the phase ended. It ran from about 23:14 to 23:45
-UTC, across `udp-verify`, `udp-knee`, `groups-sweep`, and `tail`. Both binaries ran inside the same
-window in each phase, so a B0-against-M comparison within a phase stands; the effect on any
-absolute number is expected to be negligible, and nothing here measured it.
-
-**`udp-statsd-small` at `--verify`'s 0.25× read 5.483 µs/event on M against 2.637 on B0** (one
-repeat each, 190,000 datagrams/s, delivery exact on both). The same scenario at 1.0× and 0.5×
-shows no gap (2.888 on both at 1.0×, 3.465 and 3.464 at 0.5×). It is unexplained. Treat it as one
-more instance of the `-small` CPU number being unreadable (see "Reading the numbers"), not a
-regression.
+- **Kernel drops rose 0.6–1.4 points from B0 to D-**, on both passes: `udp-statsd` 3.82/3.53% →
+  4.44/4.45%, `udp-statsd-packed` 4.83/4.94% → 6.19/5.90%. D- to M adds at most 0.32 points. A
+  binary's drift between its two passes is at most 0.29 points, so the rise is outside drift.
+  `udp-statsd-packed` now sits slightly above the 1–5% calibration band. No bisect covered the UDP
+  scenarios. The merges between B0 and D- that touch the UDP path include #543 (`peer` W4, sender
+  addresses on the shared drivers), #596 (a UDP decode-burst fix), and the move of `StatsdDecoder`
+  into `logit-proto` (#626); which one, if any, moved the knee is unmeasured. #543 grew the shared
+  UDP driver's `Datagram` from 40 to 80 bytes, half of it an `Option<Sender>` that every datagram
+  carries even with `peer:` off ([`memory.md`](memory.md) §5, "Listeners bound undecoded bytes
+  too"). Whether every datagram should pay for that field is an open question, and this drop rise
+  is one measurement that bears on it, still unbisected.
+- **CPU per event doesn't separate the binaries.** Drift between a binary's two passes runs up to
+  5.5% (M on `udp-statsd-packed`, 0.897 → 0.946), wider than any difference between binaries.
+- **`udp-statsd-small` is sender-bound.** At its shipped 760,000 datagrams/s it delivers about
+  650,000 events/s with zero drops on every binary, so the sender, not `logit`, sets the rate. The
+  same B0 binary delivered about 542,000 at a `fill` of 7.1 on 2026-10-02 and 652,000–656,000 at
+  14.1–14.6 here, at 2.44–2.45 µs/event against 2.89; the box or the harness's sender changed, not
+  `logit`.
+- **The self-checks held.** All 36 files (knee, half scale, and `--verify`) passed (`sent ==
+  received + kernel_dropped`, the sampler reported, no decode diagnostics). `--verify` delivered
+  every event with zero drops on all three binaries: 11,074,692 for `udp-statsd`, 5,000,000 for
+  `-small`, and 10,788,160 for `-packed`. At half scale (pass A only) every binary dropped nothing.
+- **`udp-statsd-small`'s `--verify` CPU stays unreadable.** One repeat each at 190,000
+  datagrams/s read 3.608 (B0), 2.289 (D-), and 3.777 (M) µs/event with exact delivery. The
+  2026-10-02 session saw the same scenario read 2.637 and 5.483 on two binaries. It is the `-small`
+  CPU number's usual noise (see "Reading the numbers"), not a regression.
 
 ### Reading the numbers
 

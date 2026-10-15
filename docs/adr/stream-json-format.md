@@ -1,6 +1,6 @@
 ---
 created: 2026-09-28
-updated: 2026-10-13
+updated: 2026-10-15
 ---
 
 # `stdio_out`/`file_out` gain `format: json`, and every machine reader of the text render moves to it
@@ -78,7 +78,8 @@ module doc is the canonical grammar. The rules it follows:
 - `crates/logit-bench/tests/allocations.rs` pins `stdio_json_encode_100_events`, and
   `docs/design/memory.md` records it. `perf/scenarios/encode-json-devnull.yaml` measures it:
   0.995 µs/event in the 2026-10-02 suite, between `encode-human-devnull` (1.027) and
-  `encode-native-devnull` (0.950) (`docs/design/performance.md` §1).
+  `encode-native-devnull` (0.950), and 0.906 in the 2026-10-15 suite, the cheapest of the three
+  (0.937 and 0.969) (`docs/design/performance.md` §1).
 - The five readers, their embedded self-test fixtures, and the capture configs under
   `tools/shape-survey/configs/`, `tools/splunk-interop/`, and `tools/victoria-interop/` are on
   `format: json`. A change to `ndjson.rs`'s grammar is mirrored there; the module doc names them.

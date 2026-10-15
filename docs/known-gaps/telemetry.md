@@ -185,12 +185,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `--logit-bin` from before a format change fails with `decoding frame 0 ... bad distribution blob:
   Version`. **Workaround:** to compare a per-node breakdown across a format change, build a harness
   from each binary's own commit, or fall back to flamegraph shares.
-- **`native-relay` fell 7.0% between `844be079` and `efd50c1e` with no production change on its
-  path.** The only difference is `FrameReadError::Malformed { reason, err }`, which runs on the
-  error path. The saving is all user time (0.780 → 0.695 µs/event at `window: 32`, 0.890 → 0.798
-  at `window: 1`) and system time is flat, which points at codegen. It's unattributed, and it
-  favors the code. Confirming it needs a pinned flamegraph pair of the two binaries
-  ([performance.md](../design/performance.md) §1, "What moved since 2026-09-28").
+- **`native-relay` moves 5–10% between builds with no change on its path.** Over 15 neighbouring
+  merges its CPU µs/event spans 0.857–0.992 and isn't monotonic: #693 → #697 → #702 reads 0.992 →
+  0.898 → 0.968, and #702 changes only Datadog code. The #697 and #702 binaries differ in function
+  addresses, not in the functions themselves. The same shape explains an earlier 7.0% fall between
+  `844be079` and `efd50c1e`, whose only difference runs on an error path.
+  - **Consequence:** one before/after pair can't attribute a `native-relay` move under about 8%,
+    and the VM has no PMU to say which cache or front-end effect is at work.
+  - **Workaround:** measure a change against two or three neighbouring builds, 20 runs each
+    ([performance.md](../design/performance.md) §1, "`native-relay` is code-layout-sensitive").
 - **When and how the load-test harness runs in the development process is undecided.** Nightly,
   manually triggered, a PR gate on a `compare --threshold` regression, or another cadence is open
   ([ADR `load-test-harness`](../adr/load-test-harness.md)'s "Open question" section). The harness
