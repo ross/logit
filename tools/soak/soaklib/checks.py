@@ -2588,11 +2588,13 @@ def _sent_one(data, led, sink, flag, lines):
         return (f"{status_text}: {first.key} at {data.offset(first.ts)}: {first.message[:300]}")
 
     cued = []
+    starts = {fault.step: fault.start for fault in data.faults}
 
     def note_cued(what, excused):
         if excused:
-            cued.append(f"{what} " + ", ".join(f"{_n(n)} by {step}"
-                                               for step, n in sorted(excused.items())))
+            order = sorted(excused, key=lambda step: (starts.get(step, 0), step))
+            cued.append(f"{what} " + ", ".join(f"{_n(excused[step])} by {step}"
+                                               for step in order))
 
     for key in REFUSAL_KEYS:
         excused, outside = {}, []
