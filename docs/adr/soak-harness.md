@@ -261,3 +261,22 @@ sink's table in the harness was considered and not kept: it checked the scenario
 never against `logit`, and could drift from the Rust table unnoticed. A class change in a sink
 updates its stand-in scenario's steps instead.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Stand-in targets", has the rules.
+
+## Amendment: several SUT services, each scored on its own lives (2026-10-15)
+
+A scenario can run more than one `logit` under test, so the native hop can be soaked between two
+processes. Both keep the role `sut`; no new role was added, because the watchdog, the kill rules,
+and the readiness probes already apply to every `sut` service alike. `logit` stays the ingress
+SUT, which every generator sends to, and a further SUT service is declared by a `[configs]` key
+of its own, which the stack must run as a `sut` service. A separate table naming the SUTs was
+considered and not used: each needs a config anyway, and a `[configs]` key is already how a
+generator is declared.
+
+Process lives are per service. Each SUT's lives come from its own telemetry, cross-checked
+against the starts the timeline gives that service, and a kill on one ends a life of that
+service alone. The listener symbols are read on the ingress SUT's lives and everything from
+`aggregate` on on the lives of the service holding it, with V split on those. A row that equates
+the two sides in one life can't be judged across two processes until the ledger names the hop
+between them, so it SKIPs then. The end sequence stops the SUT services in chain order, each
+only once what it holds has been forwarded.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Several SUT services", has the rules.

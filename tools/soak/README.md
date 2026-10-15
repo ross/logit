@@ -40,7 +40,7 @@ scripted stand-in in its place for a stand-in target (see [Stand-in targets](#st
 | Service | Image | `soak.role` |
 |---|---|---|
 | `victoria-metrics` | `victoriametrics/victoria-metrics:v1.152.0` | `backend`: `-retentionPeriod=100y`, published on an ephemeral loopback port the driver queries; in the compose profile `local`, which the driver enables for a local target only |
-| `logit` | `logit:soak`, built from the current tree | `sut`: the system under test (SUT), with the scenario's `configs.sut` |
+| `logit` | `logit:soak`, built from the current tree | `sut`: the system under test (SUT), with the scenario's `configs.sut`. Every generator sends to it. An override can add further SUT services; see [Several SUT services](#several-sut-services) |
 | `generator` | `logit:soak` | `generator`: a load source, a second `logit` with the scenario's `configs.generator`. An override can add more, each with the config `[configs]` names under its service name and its own `[[ledger.source]]` |
 | `kafka` | `apache/kafka:4.2.0` | `broker`: a single-node KRaft broker, one partition per topic, for a Kafka target only (the compose profile `kafka`); the driver reads its topic back through `docker exec` |
 | `standin` | `python:3.13.16-alpine3.24`, running `standin/standin.py` | `standin`: a scripted HTTP destination, for a stand-in target only (the compose profile `standin`); it answers as `respond` steps cue it on its published control port, and its stdout is the record of every request |
@@ -65,7 +65,7 @@ override's own directory. Before it starts anything, the driver reads the merged
 the self-test can't run compose, so they check a scenario with no override against the base
 roles only.
 
-Both `logit` services run `logit --log-format json run`, so stdout carries the `internal`
+Every `logit` service runs `logit --log-format json run`, so stdout carries the `internal`
 telemetry as NDJSON and stderr the JSON self-log. Their configs pass `logit validate`:
 `script/validate`, the `every_shipped_config_loads_and_validates` test, and every `run` cover
 `scenarios/*/logit-*.yaml`.
@@ -187,6 +187,45 @@ Three scenarios run a sink against a scripted stand-in in place of VictoriaMetri
 | `standin-at-most-once` | 8 minutes 55 seconds | the same sink under `buffer.delivery: at_most_once`: a `503` and a reset drop the batch, a `401` holds it, a `400` drops it |
 | `standin-datadog` | 30 minutes 25 seconds | `datadog_out` (series, gzip, delta counts) through every row of its response-class table: sixteen 20 s steps, 105 s apart, from a `202` whose body names two series dropped, through `400`, `401`, `403`, `404`, `405`, `408`, `413`, `429`, `500`, `501`, a `503` after storing (its resend a duplicate), `302`, and `422`, to a connection reset and a stop of the stand-in |
 
+### Several SUT services
+
+A scenario can run a second `logit` under test, such as the far end of a native hop. `logit`
+stays the ingress SUT, the one every generator sends to and every `[[ledger.source]]` listener is
+in. A further SUT service is declared by a `[configs]` key of its own, one that is neither `sut`
+nor a source's `service`, and added by the override as a service of that name with the role
+`sut`, mounting the config from its own variable, `SOAK_<SERVICE>_CONFIG`:
+
+```toml
+[configs]
+sut = "logit-sut.yaml"
+collector = "logit-collector.yaml"   # a further SUT service
+generator = "logit-generator.yaml"
+```
+
+```yaml
+services:
+  collector:
+    extends: { file: compose.yaml, service: logit }
+    labels: { soak.role: sut }
+    volumes: ["${SOAK_COLLECTOR_CONFIG:?set by script/soak}:/config.yaml:ro,z"]
+  logit:
+    depends_on: { collector: { condition: service_healthy } }
+```
+
+The SUT services form a chain, `logit` first and then each further one in `[configs]` order;
+the last holds `sut_aggregate`, every `[[ledger.sink]]`, and a `sut_script`. A `sut` service the
+scenario doesn't declare is refused, and so is a declared one the stack doesn't run. A `kill` or
+an `exit` may name any SUT service, and a fault on a further one never counts as affecting UDP
+ingress. At the end the driver stops the SUT services in chain order: before an earlier one, it
+waits for every sink that service reports to empty with no `logit_out` frame in flight; before
+the last, it waits on the scenario's sinks as for one SUT. Each service's process lives are its
+own: the listener rows are judged on `logit`'s, the rows from `aggregate` on on the last
+service's, and `drops` reads every SUT. The ledger across two services, a native hop, isn't
+built yet, so `ledger.script`, `ledger.egress`, and `ledger.summary` `SKIP` when the listeners
+and `aggregate` are in different services, `ledger.edge` judges only the edges out of
+`aggregate`, and `ledger.intake` only the final life's balance. No shipped scenario runs two
+SUTs yet.
+
 ### Faults
 
 | Action | What it does | Revert |
@@ -194,11 +233,11 @@ Three scenarios run a sink against a scripted stand-in in place of VictoriaMetri
 | `netem` | a one-shot `logit-soak-netem:local` container in the target's network namespace sets a root `tc netem` qdisc with the step's `args` | the same container clears it |
 | `pause` | `docker pause` | `docker unpause` |
 | `stop` | `docker stop -t 30` | `docker start` |
-| `kill` | `docker kill -s KILL`, on `logit` only: no shutdown signal, so no final telemetry drain, no shutdown drops, and exit code 137. A killed generator's last sends would reach the SUT with no count behind them | `docker start` |
+| `kill` | `docker kill -s KILL`, on a SUT service only: no shutdown signal, so no final telemetry drain, no shutdown drops, and exit code 137. A killed generator's last sends would reach the SUT with no count behind them | `docker start` |
 | `restart` | `docker restart -t 30` | none |
 | `partition` | `docker network disconnect` from every network | `docker network connect`, passing back each alias recorded before the disconnect |
 | `mark` | nothing: it marks a window for an event the SUT's own config causes, such as a stalled script. An optional `ready` names a readiness word the SUT must report inside it | nothing |
-| `exit` | nothing: on `logit` only, it names an exit the SUT makes on its own inside the window, with the `code` it leaves and the `key` of the ERROR line that explains it | `docker start` if the container has exited |
+| `exit` | nothing: on a SUT service only, it names an exit the SUT makes on its own inside the window, with the `code` it leaves and the `key` of the ERROR line that explains it | `docker start` if the container has exited |
 | `respond` | on a stand-in only: POSTs the step's cue to its control port, so it answers `status` (with an optional `body`) or `answer = "reset"`, storing the write when `apply` says to or, by default, when the status is `2xx`. Under the `datadog` shape a `2xx` can carry `series_errors = N`, a body naming the request's first N series dropped | an empty cue, which restores the default answer |
 
 A `mark`, `exit`, or `respond` window is a fault window like any other, so the checks excuse
@@ -438,7 +477,8 @@ scenario with a `rejected` step can't set it.
 4. At the end it reverts active faults, stops every generator, waits until every sink's stored
    total holds across two aggregate windows, stops the SUT (expecting exit 0), and exports each
    sink's series from its backend. For an external target it waits for every SUT sink's queue
-   to empty instead, and exports nothing.
+   to empty instead, and exports nothing. With several SUT services it stops each in chain
+   order, as [Several SUT services](#several-sut-services) describes.
 5. It collects the rest of each service's stdout and stderr separately with `docker logs`, and
    its final `docker inspect`, then tears the project down (`down -v --remove-orphans`) unless `--keep`.
    This step runs on every exit but SIGKILL: SIGINT (Ctrl-C), SIGTERM, and SIGHUP each stop the

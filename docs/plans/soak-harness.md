@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-11
+updated: 2026-10-15
 ---
 
 # Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger
@@ -246,8 +246,8 @@ for the table:
 
 - `seed` is an integer 0 or more; `gap` and each `for` are `{ min, max }` durations with min at
   most max, and `for.min` above 0; `weight` is a number above 0; actions and services are known,
-  and `kill` is on `logit` only; a netem template has `args`, none of them a clear, and no other
-  action has `args`; unknown keys are refused.
+  and `kill` is on a `sut` service only; a netem template has `args`, none of them a clear, and
+  no other action has `args`; unknown keys are refused.
 - `gap.min` is at least `recovery_bound + 2 x progress_window`, so every fault's recovery is
   followed by at least two judged progress windows, and `cooldown` is at least `gap.min`, for the
   last fault.
@@ -266,7 +266,7 @@ holds every 8- and 24-hour schedule it draws to that.
 the same readiness probe a `stop`'s revert gets. The process gets no shutdown signal, so it
 writes no final `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line,
 and Docker records exit code 137. `validate()` treats it as a `stop`: it holds the container's
-namespace, so no netem on that container during it, it is UDP-affecting on the SUT, and it may
+namespace, so no netem on that container during it, it is UDP-affecting on `logit`, and it may
 not overlap another fault on its container. The watchdog accepts the exit inside a scheduled
 `kill` with code 137 only, and counts the revert as a start for `timeline`, `restarts`, `ready`,
 and the lives cross-check. The ledger pays for it: up to one `internal` interval of the killed
@@ -287,7 +287,7 @@ for = "2m30s"
 [[step]]
 at = "2m50s"
 action = "exit"           # an exit the SUT makes on its own inside the window
-on = "logit"              # logit only
+on = "logit"              # a sut service only
 code = 2                  # the exit code it leaves
 key = "memory_limit_exceeded"   # the self-log key of the ERROR line that explains it
 for = "1m30s"
@@ -301,7 +301,8 @@ for = "1m30s"
 - An `exit`'s apply makes no Docker call either. Its revert runs `docker start` when the
   container has exited, and records `started`; only a revert that started it is a start, with a
   readiness probe and a new SUT life. `code` and `key` are required on an `exit` and refused
-  elsewhere, and an `exit` is on `logit` only. The process can end at any point in the window,
+  elsewhere, and an `exit` is on a `sut` service only (`logit` before W10a). It is UDP-affecting
+  on `logit` alone. The process can end at any point in the window,
   so a netem on its container may not overlap it. While an `exit` is open the driver's fail-fast
   accepts `running` or `exited`. "The checks" has its rules in `exit`, `self_log`, and `ready`.
 - Neither may appear in a `[random]` schedule, which draws faults; an expected event happens
@@ -350,7 +351,8 @@ listener and `aggregate`, and adds the script hop to the ledger ("The ledger and
 **Compose overrides, service roles, and sinks (W7b).** Every compose service carries a
 `soak.role` label: `sut`, `generator`, `backend`, `broker` (a Kafka target's broker; see
 "Kafka targets"), or `standin` (W9a, a stand-in target's destination; see "Stand-in
-targets"). The harness knows a service by its role, never its name, and keeps one SUT, `logit`.
+targets"). The harness knows a service by its role, never its name. Its ingress SUT is `logit`,
+and from W10a an override can add further SUT services (see "Several SUT services").
 The base stack's generator is `generator`; from W8b an override can add more (see "Sources"). A scenario adds services with an optional top-level key naming an override file
 beside `scenario.toml`:
 
@@ -382,7 +384,8 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
   and every random fault's is a service of the stack, a `kill` or `exit` is on the role `sut`,
   a `respond`, or a `stop` with a `class`, is on the role `standin` (W9a),
   every `[[expect]]` service runs `logit`, every sink's `backend` has the role `backend`, the
-  stack has one `sut` named `logit` and at least one `generator`, every source's `service` has
+  stack's `sut` services are `logit` and each further one `[configs]` names (W10a), and none
+  other, with at least one `generator`, every source's `service` has
   the role `generator` and every `generator` has a source (W8b), and no service lacks a known
   role. The driver checks them in `prepare()`, before `up`. `list` and the self-test
   can't run compose, so they pass the base role map (`scenario.BASE_ROLES`) for a scenario with
@@ -420,8 +423,9 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   a `sut_listener` no other source names. Unknown keys are refused. A `service` whose compose
   variable is `SOAK_SUT_CONFIG` or another source's (`generator-lines` and `generator_lines`
   share one) is refused.
-- `[configs]` has `sut` and one key per source's `service`, and no other. The driver writes each
-  generator's absolute config path into `compose.env` under `scenario.config_env(service)`:
+- `[configs]` has `sut` and one key per source's `service`; any other key names a further SUT
+  service (W10a, "Several SUT services" below). The driver writes each generator's absolute
+  config path into `compose.env` under `scenario.config_env(service)`:
   `SOAK_GENERATOR_CONFIG` for `generator`, `SOAK_GENERATOR_LINES_CONFIG` for
   `generator-lines`. An override's generator mounts its own variable at `/config.yaml`.
 - `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct, none
@@ -432,6 +436,45 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
   stack has a source, because a generator with none would put datagrams into a listener with no
   G behind them.
+
+**Several SUT services (W10a).** The stack can run more than one `logit` under test, such as a
+second one at the far end of a native hop. `logit` stays the ingress SUT: every generator sends
+to it, every source's `sut_listener` is one of its components, and its config is `[configs]
+sut`. A further SUT service is declared by a `[configs]` key of its own, which is neither `sut`
+nor a source's `service`, and run by a compose service of that name labeled `soak.role: sut`,
+which the scenario's override adds:
+
+```toml
+compose = "compose.override.yaml"   # adds collector, labeled soak.role: sut
+
+[configs]
+sut = "logit-sut.yaml"              # logit, the ingress SUT
+collector = "logit-collector.yaml"  # a further SUT service, mounted from SOAK_COLLECTOR_CONFIG
+generator = "logit-generator.yaml"
+```
+
+```yaml
+services:
+  collector:
+    extends: { file: compose.yaml, service: logit }
+    labels: { soak.role: sut }
+    volumes: ["${SOAK_COLLECTOR_CONFIG:?set by script/soak}:/config.yaml:ro,z"]
+  logit:
+    depends_on: { collector: { condition: service_healthy } }
+```
+
+- The SUT services form a chain: `logit`, then each further one in the order `[configs]` lists
+  it (`Scenario.suts`, recorded in `scenario.resolved.json` as `suts`). The chain's last service
+  holds `sut_aggregate`, every `[[ledger.sink]]`, and a `sut_script`.
+- A further SUT's key is a slug, isn't `logit`, and has a compose variable,
+  `scenario.config_env(service)`, that no source and no other SUT service shares. With the role
+  map, the stack's `sut` services are `logit` and those keys, so a `sut` service the scenario
+  doesn't declare is refused, as is a declared one the stack doesn't run as a `sut`.
+- A `kill` or an `exit` may name any SUT service. A fault on a further SUT service never affects
+  UDP ingress (§4), since no generator sends to it.
+- W10b adds the ledger across the chain, `[[ledger.hop]]`; until a hop names the two ends,
+  the rows that equate a listener's symbols with `aggregate`'s in one life SKIP when the two are
+  in different services (§6).
 
 **`vm_every_window` (W3)**, an optional `[ledger]` key, turns on `ledger.windows`: every series
 has a sample in every `aggregate` window of every SUT life that `aggregate` emitted. Set it only
@@ -516,7 +559,7 @@ service (W4; see "The driver loop and end sequence" for the arithmetic), and
 | Service | Image and settings |
 |---|---|
 | `victoria-metrics` (role `backend`) | `victoriametrics/victoria-metrics:v1.152.0`, `-retentionPeriod=100y`, `ports: ["127.0.0.1::8428"]`, so the host driver polls freshness every 30 s and dumps the final export with no checker container. The driver re-reads the port after any start of this service |
-| `logit` (the SUT, role `sut`) | `depends_on: [victoria-metrics]`, not required from W5, when `victoria-metrics` moved to the compose profile `local` the driver enables for a local target only; `environment:` passes each variable an external target may list (`DD_API_KEY`), empty when unset |
+| `logit` (the ingress SUT, role `sut`; an override can add more, §2's "Several SUT services") | `depends_on: [victoria-metrics]`, not required from W5, when `victoria-metrics` moved to the compose profile `local` the driver enables for a local target only; `environment:` passes each variable an external target may list (`DD_API_KEY`), empty when unset |
 | `generator` (role `generator`) | `depends_on: {logit: {condition: service_healthy}}`. An override can add more generators (W8b), each with `extends` from this one and its own config volume |
 | `kafka` (role `broker`) | `apache/kafka:4.2.0`, a single-node KRaft broker in the compose profile `kafka`, which the driver enables for a Kafka target only; one partition per topic, topics created on first use, a `kafka-broker-api-versions.sh` health check the SUT's optional `depends_on` waits for. No published port: the driver reads the topic through `docker exec` |
 | `standin` (role `standin`, W9a) | `python:3.13.16-alpine3.24` running `tools/soak/standin/standin.py`, mounted read-only, in the compose profile `standin`, which the driver enables for a stand-in target only. Its data port, 8080, isn't published; its control port is, `ports: ["127.0.0.1::8081"]`, which the driver re-reads after any start of the service, as a backend's. A health check against the control port's `/health`, which the SUT's optional `depends_on` waits for. Its stdout is the record |
@@ -531,10 +574,11 @@ it can reach Docker. An override that adds a service with `extends` names the ba
 `file: compose.yaml`: compose resolves the path against the project directory, the first
 file's, not the override's own.
 
-Configs mount from absolute paths in `compose.env` (`SOAK_SUT_CONFIG`, and one variable per
-generator, `SOAK_GENERATOR_CONFIG` for `generator`; §2's "Sources"), which the driver passes
-with `--env-file`, because `sudo` strips the
-environment. `up -d --wait --wait-timeout 120` waits on the image's `logit ready` `HEALTHCHECK`.
+Configs mount from absolute paths in `compose.env` (`SOAK_SUT_CONFIG`, one variable per
+generator, `SOAK_GENERATOR_CONFIG` for `generator`, §2's "Sources", and one per further SUT
+service, `SOAK_COLLECTOR_CONFIG` for `collector`, §2's "Several SUT services"), which the
+driver passes with `--env-file`, because `sudo` strips the environment.
+`up -d --wait --wait-timeout 120` waits on the image's `logit ready` `HEALTHCHECK`.
 Nothing in a container writes to the run directory in W1, so it needs no `chmod 777`.
 
 Collection uses `docker logs <id> >svc.stdout 2>svc.stderr`, not `docker compose logs`, which
@@ -556,6 +600,7 @@ A root qdisc on a container's default-route interface shapes that container's eg
 |---|---|
 | `logit` | the SUT's remote-write to VictoriaMetrics, not the statsd arriving at it |
 | a `generator` | its own UDP into the SUT, and no other generator's |
+| a further SUT service (W10a) | its own sends, never UDP ingress, which only `logit` takes |
 | a `backend` | its responses |
 
 Each container has one peer in this scenario, so there is no `tc filter`. Per-peer `u32` filters
@@ -619,7 +664,11 @@ ticket with `${DOCKER} version` first.
    total holds across two aggregate windows (90 s bound); `docker stop -t 60` the SUT, expecting
    exit 0; call each backend's `/internal/force_flush`; write each sink's
    `vm-export/<sink>.jsonl` from its backend's `/api/v1/export` with `match[]=<vm_selector>`
-   and `start=0`.
+   and `start=0`. With several SUT services (W10a), each stops in chain order, one
+   `sut_stopped` phase naming each: before an earlier one stops, the driver waits until a drain
+   of its own stdout, two aggregate windows after the wait began, shows every sink it reports
+   with `buffer.batches` 0, and `retrying` and `logit.output.in_flight` 0 or never set (120 s
+   bound, a `sink_drained` phase naming the service); the last waits as above, on its sinks.
 5. Collect: the last `docker logs` chunk per service, from its cursor to the end, into
    `.stdout` and `.stderr`, and `inspect/<svc>.json`.
    Then `compose down -v --remove-orphans`, unless `--keep`. A `try`/`finally` makes SIGINT still
@@ -637,7 +686,15 @@ A check reports PASS, WARN, or FAIL; WARN is for a trend a short run can't settl
 `telemetry.py` mirrors the NDJSON grammar in `crates/logit-outputs/src/ndjson.rs`, whose module
 doc gains `tools/soak/` in its list of readers. Counters (`kind: sum`, delta) sum per **process
 life**, split where `logit.process.uptime` decreases, with the number of lives cross-checked
-against the timeline. Gauges are series.
+against the timeline. Gauges are series. With several SUT services (W10a) each has its own lives,
+cross-checked against the starts the timeline gives that service, and its own killed lives: the
+listener symbols (W, K, D, B, E, X) are read on the ingress SUT's lives, and everything from
+`aggregate` on (A, Ab, the sinks, V split per life, `ledger.windows`, `ledger.replay`,
+`identity.sink`, `progress`, `recovery`, `ledger.sent`) on the lives of the service holding
+`aggregate`, from its own telemetry and stderr. `drops` reads every SUT service and names it.
+Until W10b's hop ledger, a row that equates the two sides in one life, `ledger.script`,
+`ledger.egress`, and `ledger.summary`, SKIPs when they are different services, `ledger.edge`
+judges only the edges out of `aggregate`, and `ledger.intake` the final life's balance.
 
 A "fault window" below is a fault's span plus `recovery_bound` after it. A fault whose apply
 returned nonzero has none, so nothing after it is excused.
@@ -822,7 +879,8 @@ The rows:
   W + K, with its own generator's batch as the tolerance, its own end allowance, and its own
   datagram precondition. A fault on a generator is UDP-affecting for that generator's source
   only, so its window excuses nothing on another source's wire; a UDP-affecting fault on any
-  service that isn't a generator, such as any `logit` stop, excuses every source. One detail
+  service that isn't a generator, such as any `logit` stop, excuses every source; a fault on a
+  further SUT service (W10a) is never UDP-affecting. One detail
   line per source; the worst status wins.
 - `ledger.intake`: W − D == E + B, for the final life, per listener from W8b, one detail line
   each, a listener off its balance first.
@@ -1444,7 +1502,8 @@ where it needs them, and a small check extension.
    [ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), "4. The handshake carries
    identities out and marks back". Faults on A or the link judge zero surplus; a restart of B
    forgets its marks, so its resend is judged within the send window. Rows: the ledger one hop
-   longer, `ledger.replay` on A. Needs: a second SUT service, with `kill` on it.
+   longer, `ledger.replay` on A. Needs: a second SUT service, with `kill` on it (built in W10a,
+   §2's "Several SUT services"), and the hop ledger (W10b).
 8. **TCP ingress.** `syslog_in` or `lines_in` over TCP, or `statsd_in` with `transport: tcp`, from
    the generator's TCP sinks. A stalled SUT backs up into the sender
    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md), "No receive queue on
@@ -1519,8 +1578,9 @@ that items 3, 7, and 11 need.
 | W8c | `soak/w8c` | `soak/w8c: high-cardinality soaks, a slope reducer, and expected verdicts` | M | W8b |
 | W9a | `soak/w9a` | `soak/w9a: a scripted HTTP stand-in for every remote-write response class` | M | W8c |
 | W9b | `soak/w9b` | `soak/w9b: a Datadog-shaped stand-in and ledger.sent against it` | M | W9a |
-| W10 | `soak/w10` | `soak/w10: a native-hop soak between two logit processes` | M | W9b |
-| W11 | `soak/w11` | `soak/w11: TCP-ingress and file-tailing soaks` | M | W10 |
+| W10a | `soak/w10a` | `soak/w10a: several SUT services, each scored on its own lives` | M | W9b |
+| W10b | `soak/w10b` | `soak/w10b: a native-hop soak between two logit processes` | M | W10a |
+| W11 | `soak/w11` | `soak/w11: TCP-ingress and file-tailing soaks` | M | W10b |
 | W12 | `soak/w12` | `soak/w12: rolling-overlap, SIGHUP, and TLS-reload soaks` | M | W11 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
@@ -1598,12 +1658,19 @@ that items 3, 7, and 11 need.
   delta points' sum, `ledger.sent` and `drops` against it with cued refusals and drops excused,
   duplicates reported per life as for a Kafka target, and the `standin-datadog` scenario
   ("Stand-in targets").
-- **W10**: item 7, a second SUT service and the ledger one hop longer.
+- **W10a**: the first half of item 7, a second SUT service: further SUT services declared by
+  their own `[configs]` keys (§2's "Several SUT services"), a config variable each, the end
+  sequence stopping each in chain order, each service's lives, kills, and stderr read on their
+  own, the rows from `aggregate` on judged on the lives of the service holding it, UDP
+  attribution on the ingress SUT alone, and self-test fixtures for each. No scenario runs two
+  SUTs yet.
+- **W10b**: the rest of item 7, the ledger one hop longer: `[[ledger.hop]]`, the rows joining
+  the two services, and the `native-hop` scenario.
 - **W11**: items 8 and 9, per-line wire counters, a shared volume, and the replay surplus band.
 - **W12**: items 11 and 12, the namespace-holder service, per-instance totals, and the `signal`
   and certificate-rotation actions.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10 → W11 → W12, linear. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11 → W12, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
