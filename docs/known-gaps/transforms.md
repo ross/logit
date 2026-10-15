@@ -343,22 +343,27 @@ Entry format and the other areas: [the known-gaps index](README.md).
     {key="invalid_utf8"}`, but the original bytes don't survive.
   - **Workaround:** `docs/http-access-logs.md` tells nginx users to log `$request_uri`, never
     `$uri`, which removes the decoded-path source but not a client's own non-ASCII header bytes.
-- **`json-parse-x3` runs about 8% slower than its best, from code layout, with no source-level
-  fix.** At #457 (`d47a99b6`) it rose 2.264 → 2.444 µs/event on the perf VM, and `main` reads
-  2.502. A disassembly finds `JsonParser::process`, `parse_object`, the `deserialize_map` visitor,
-  and `insert_sym` identical instruction for instruction across that merge; only code addresses
-  moved.
+- **`json-parse-x3` and `logfmt-parse` move 5–9% with code layout, with no source-level
+  handle.** At #457 (`d47a99b6`) `json-parse-x3` rose 2.264 → 2.444 µs/event on the perf VM and
+  `logfmt-parse` fell 7.9%. A disassembly finds `JsonParser::process`, `parse_object`, the
+  `deserialize_map` visitor, and `insert_sym` identical instruction for instruction across that
+  merge; only code addresses moved. At #516 (`cd734386`), which changes nothing on the parse path,
+  `json-parse-x3` fell back to 2.247, unattributed, and `main` reads 2.276; `logfmt-parse` didn't
+  move back (0.930 → 0.953).
   - Aligning `insert_sym`'s loop to a 64-byte line (`-C llvm-args=-align-loops=64`, +4.6%
-    `.text`) didn't recover it. The same layout move makes `logfmt-parse` −7.9% faster, so the two
-    trade against each other.
-  - Single-parser `json-parse` moves less (+1.8%), because contention on the shared interner
-    dominates `x3`'s stage cost.
+    `.text`) didn't recover `json-parse-x3` at #457.
   - Also open: `json-parse`'s unattributed +2.3% step at #298 (`c860842c`), whose diff has no
     parse-path change and whose flamegraph pair moves no json frame by more than 0.4 points, so
     most likely LTO layout.
+  - **Consequence:** a single before/after pair can't attribute a move of this size on these
+    scenarios. Measure a change against two or three neighbouring builds, as
+    [performance.md](../design/performance.md) §1's "`native-relay` is code-layout-sensitive"
+    describes.
 
-  Measurements and flamegraph numbers are in [performance.md](../design/performance.md) §1, "What
-  moved since 2026-09-28". **Revisit trigger:** a later change moves either.
+  Measurements are in [performance.md](../design/performance.md) §1, "What moved since
+  2026-10-02". The #457 flamegraph and disassembly evidence is in its "What moved since 2026-09-28"
+  section as of `201bb5a7`.
+  **Revisit trigger:** a later change moves either by more than its neighbouring builds do.
 
 ## Lua
 
