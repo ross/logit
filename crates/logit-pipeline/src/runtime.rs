@@ -3070,6 +3070,7 @@ mod tests {
                     org: Some("org".to_string()),
                     bucket: Some("bucket".to_string()),
                     default_bucket: None,
+                    default_org: None,
                     token: "TOKEN".to_string(),
                 },
             },
@@ -3178,6 +3179,7 @@ mod tests {
                     org: Some("org".to_string()),
                     bucket: Some("bucket".to_string()),
                     default_bucket: None,
+                    default_org: None,
                     token: "TOKEN".to_string(),
                 },
             },
@@ -3411,6 +3413,7 @@ mod tests {
             org: Some("org".to_string()),
             bucket: Some("bucket".to_string()),
             default_bucket: None,
+            default_org: None,
             token: "TOKEN".to_string(),
         }
     }
@@ -3522,6 +3525,7 @@ mod tests {
                     org: Some("org".to_string()),
                     bucket: Some("bucket".to_string()),
                     default_bucket: None,
+                    default_org: None,
                     token: "TOKEN".to_string(),
                 },
             },

@@ -17,9 +17,13 @@
 //! - **`org`**: a configured `org:` is sent as `org=` alone, in both modes. A carried `orgID` is
 //!   never sent beside it, because InfluxDB 2.7 reads `orgID` over `org` when a request has both,
 //!   which would defeat the override. With no `org:`, the carried values are forwarded: `org=`
-//!   from the carried name and `orgID=` from the carried ID, both when both were carried. With
-//!   none, the request names no organization: InfluxDB 3 ignores it, and InfluxDB 2.x answers
-//!   `400` `Please provide either orgID or org`, the `400` row below.
+//!   from the carried name and `orgID=` from the carried ID, both when both were carried. A batch
+//!   that carries neither is sent with `org=` from `default_org:`. With none of these, the request
+//!   names no organization: InfluxDB 3 ignores it, and InfluxDB 2.x answers `400`
+//!   `Please provide either orgID or org`, the `400` row below. Unlike a missing bucket, the sink
+//!   sends that batch: the `400` is `Rejected`, and `write_loop` counts the drop as
+//!   `logit.component.batches.dropped{reason="rejected"}`. Configuring both `org:` and
+//!   `default_org:` is a graph error.
 //!
 //! The reference `Encoder` sink: [`InfluxLineEncoder`] (`logit_proto::influxdb::encode`, whose
 //! module doc and its parent's "Encode" section are the mapping) renders one opaque body per
@@ -49,8 +53,9 @@
 //! a `403` or `404` naming a carried value. Which value a `403` or `404` names, and where that
 //! value came from for this batch (see "Destination resolution"), decides its class:
 //!
-//! - A value from the config (`bucket:`, `default_bucket:`, or `org:`) is the operator's, and
-//!   every batch that uses it gets the same answer, so it's `Refused` and holds the queue.
+//! - A value from the config (`bucket:`, `default_bucket:`, `org:`, or `default_org:`) is the
+//!   operator's, and every batch that uses it gets the same answer, so it's `Refused` and holds
+//!   the queue.
 //! - A value carried on the batch came from a relay's sender, so a missing or forbidden one is
 //!   that batch's fault: it's `Rejected`, and holding on it would wedge the sink on one stray
 //!   bucket. `splunk_hec_out` reads a code 7 for a carried index the same way
@@ -61,21 +66,22 @@
 //! or the org was carried: a configured bucket missing from a carried org is that org's doing. A
 //! `404` naming the org is `Rejected` only when the org was carried. A `403` names neither: a
 //! bucket outside the token's scope and an org the token doesn't reach both produce it, so it's
-//! `Rejected` when either was carried. A `401` is the token's, so every batch gets it. With both
-//! `bucket:` and `org:` configured, no value is carried, so every `403` and `404` is `Refused`. The bodies quoted are InfluxDB 2.7.12's, verified against it and
-//! InfluxDB 3.8.0 Core.
+//! `Rejected` when either was carried. A `401` is the token's, so every batch gets it. A batch
+//! that carries no value, which is every batch when both `bucket:` and `org:` are configured,
+//! reads every `403` and `404` as `Refused`. The bodies quoted are InfluxDB 2.7.12's, verified
+//! against it and InfluxDB 3.8.0 Core.
 //!
 //! | Response | Class | Why | Evidence |
 //! |---|---|---|---|
 //! | `204` | `Ok` | every point written (OSS) or queued (Cloud) | [write API](https://docs.influxdata.com/influxdb/v2/api/write/) |
 //! | `400` `invalid` (`unable to parse '<line>': <reason>`) | `Rejected` | malformed line protocol: "all data rejected", and a resend parses the same | [troubleshoot writes](https://docs.influxdata.com/influxdb/v2/write-data/troubleshoot/) |
-//! | `400` `invalid` (`Please provide either orgID or org`) | `Rejected` | InfluxDB 2.x with no `org:` configured and none carried; a resend names none either | verified against InfluxDB 2.7.12 |
+//! | `400` `invalid` (`Please provide either orgID or org`) | `Rejected` | InfluxDB 2.x with no `org:` or `default_org:` configured and none carried; a resend names none either | verified against InfluxDB 2.7.12 |
 //! | `401` `unauthorized` (`unauthorized access`; InfluxDB 3: `{"error": "the request was not authenticated"}`) | `Refused` | a missing or unknown token: every batch gets it, in both modes | [write API](https://docs.influxdata.com/influxdb/v2/api/write/), verified against InfluxDB 2.7.12 and 3.8.0 Core |
-//! | `403` `forbidden` (`insufficient permissions for write`), bucket from `bucket:` or `default_bucket:` and org from `org:` or none | `Refused` | the token can't write the operator's bucket (a token scoped to another bucket or org, or a read-only one): every batch sent there gets it | `checkBucketWritePermissions` in [`http/write_handler.go`](https://github.com/influxdata/influxdb/blob/master/http/write_handler.go), verified against InfluxDB 2.7.12 |
+//! | `403` `forbidden` (`insufficient permissions for write`), bucket from `bucket:` or `default_bucket:` and org from `org:`, `default_org:`, or none | `Refused` | the token can't write the operator's bucket (a token scoped to another bucket or org, or a read-only one): every batch sent there gets it | `checkBucketWritePermissions` in [`http/write_handler.go`](https://github.com/influxdata/influxdb/blob/master/http/write_handler.go), verified against InfluxDB 2.7.12 |
 //! | `403` `forbidden`, bucket or org carried | `Rejected` | the token can't write this batch's bucket, or doesn't reach its org (an all-access token for another org); a batch naming another may land | verified against InfluxDB 2.7.12 |
-//! | `404` `not found` (`bucket "<name>" not found`, or `bucket not found` for an empty name), bucket from `bucket:` or `default_bucket:` and org from `org:` or none | `Refused` | the operator's bucket doesn't exist: every batch sent there gets it until the operator creates it | [write API](https://docs.influxdata.com/influxdb/v2/api/write/), `decodeWriteRequest` in [`http/write_handler.go`](https://github.com/influxdata/influxdb/blob/master/http/write_handler.go), verified against InfluxDB 2.7.12 |
+//! | `404` `not found` (`bucket "<name>" not found`, or `bucket not found` for an empty name), bucket from `bucket:` or `default_bucket:` and org from `org:`, `default_org:`, or none | `Refused` | the operator's bucket doesn't exist: every batch sent there gets it until the operator creates it | [write API](https://docs.influxdata.com/influxdb/v2/api/write/), `decodeWriteRequest` in [`http/write_handler.go`](https://github.com/influxdata/influxdb/blob/master/http/write_handler.go), verified against InfluxDB 2.7.12 |
 //! | `404` `not found` naming the bucket, bucket or org carried | `Rejected` | this batch's bucket doesn't exist, or doesn't exist in this batch's org; a batch naming another may land. InfluxDB 3 creates a missing database instead of answering `404` | verified against InfluxDB 2.7.12 and 3.8.0 Core |
-//! | `404` `not found` (`organization name "<name>" not found`, or `organization not found` for an `orgID`), org from `org:` | `Refused` | the operator's org doesn't exist: every batch gets it | `decodeWriteRequest` in [`http/write_handler.go`](https://github.com/influxdata/influxdb/blob/master/http/write_handler.go), verified against InfluxDB 2.7.12 |
+//! | `404` `not found` (`organization name "<name>" not found`, or `organization not found` for an `orgID`), org from `org:` or `default_org:` | `Refused` | the operator's org doesn't exist: every batch gets it | `decodeWriteRequest` in [`http/write_handler.go`](https://github.com/influxdata/influxdb/blob/master/http/write_handler.go), verified against InfluxDB 2.7.12 |
 //! | `404` `not found` naming the org, org carried | `Rejected` | this batch's org doesn't exist; a batch naming another may land | verified against InfluxDB 2.7.12 |
 //! | `404` with any other body, bucket or org carried | `Rejected` | the body names neither, and holding would wedge the sink on a value one sender chose | -- |
 //! | `404` with any other body, nothing carried | `Refused` | every value came from the config | [`crate::http::classify_status`] |
@@ -126,6 +132,26 @@ impl Destination {
     }
 }
 
+/// Where a batch's organization comes from (the module doc's "Destination resolution").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Organization {
+    /// A configured `org:`: sent as `org=` alone, and a carried org or org ID is ignored.
+    Fixed(String),
+    /// No `org:`: the batch's carried org and org ID, else `default_org`, else none.
+    Carried { default_org: Option<String> },
+}
+
+impl Organization {
+    /// The organization a config's `org:` and `default_org:` describe. Graph validation rejects
+    /// both set; were they, `org` would win.
+    pub fn from_config(org: Option<String>, default_org: Option<String>) -> Self {
+        match org {
+            Some(org) => Organization::Fixed(org),
+            None => Organization::Carried { default_org },
+        }
+    }
+}
+
 /// One batch's resolved `/api/v2/write` query parameters, borrowed from the config and the batch
 /// resource.
 #[derive(Debug, PartialEq, Eq)]
@@ -135,7 +161,7 @@ struct WriteParams<'a> {
     bucket: &'a str,
     /// Whether `bucket` came from the batch's carrier, not `bucket:` or `default_bucket:`.
     bucket_carried: bool,
-    /// Whether `org`/`org_id` came from the batch's carriers, not `org:`.
+    /// Whether `org`/`org_id` came from the batch's carriers, not `org:` or `default_org:`.
     org_carried: bool,
 }
 
@@ -207,8 +233,7 @@ fn carried<'a>(resource: &'a Resource, key: &str) -> Option<&'a str> {
 
 pub struct InfluxDbOutput {
     url: String,
-    /// The configured `org:`, which replaces any carried organization.
-    org: Option<String>,
+    organization: Organization,
     destination: Destination,
     token: String,
     client: reqwest::Client,
@@ -227,10 +252,15 @@ pub struct InfluxDbOutput {
 }
 
 impl InfluxDbOutput {
-    pub fn new(url: String, org: Option<String>, destination: Destination, token: String) -> Self {
+    pub fn new(
+        url: String,
+        organization: Organization,
+        destination: Destination,
+        token: String,
+    ) -> Self {
         Self {
             url,
-            org,
+            organization,
             destination,
             token,
             client: crate::http::build_client(DEFAULT_TIMEOUT, None),
@@ -270,7 +300,7 @@ impl InfluxDbOutput {
     /// `logit-pipeline`'s writer (`docs/adr/buffered-sink-delivery.md`). This classifies the
     /// outcome and attaches it as `.context(fault)`.
     async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let Some(params) = resolve(self.org.as_deref(), &self.destination, &batch.resource) else {
+        let Some(params) = resolve(&self.organization, &self.destination, &batch.resource) else {
             let metrics: usize = batch.events.iter().map(|event| event.metrics.len()).sum();
             if metrics > 0 {
                 self.telemetry.count(
@@ -356,7 +386,7 @@ impl InfluxDbOutput {
 /// One batch's query parameters (the module doc's "Destination resolution"), or `None` for a
 /// carried-mode batch with no bucket carried and no `default_bucket`.
 fn resolve<'a>(
-    org: Option<&'a str>,
+    organization: &'a Organization,
     destination: &'a Destination,
     resource: &'a Resource,
 ) -> Option<WriteParams<'a>> {
@@ -367,12 +397,13 @@ fn resolve<'a>(
             None => (default_bucket.as_deref()?, false),
         },
     };
-    let (org, org_id, org_carried) = match org {
-        Some(org) => (Some(org), None, false),
-        None => {
-            let (org, org_id) =
-                (carried(resource, RESOURCE_ATTR_ORG), carried(resource, RESOURCE_ATTR_ORG_ID));
-            (org, org_id, org.is_some() || org_id.is_some())
+    let (org, org_id, org_carried) = match organization {
+        Organization::Fixed(org) => (Some(org.as_str()), None, false),
+        Organization::Carried { default_org } => {
+            match (carried(resource, RESOURCE_ATTR_ORG), carried(resource, RESOURCE_ATTR_ORG_ID)) {
+                (None, None) => (default_org.as_deref(), None, false),
+                (org, org_id) => (org, org_id, true),
+            }
         }
     };
     Some(WriteParams { org, org_id, bucket, bucket_carried, org_carried })
@@ -569,7 +600,7 @@ mod tests {
     async fn output_against(addr: std::net::SocketAddr) -> InfluxDbOutput {
         InfluxDbOutput::new(
             format!("http://{addr}"),
-            Some("org".into()),
+            Organization::Fixed("org".into()),
             Destination::Fixed("bucket".into()),
             "token".into(),
         )
@@ -829,7 +860,7 @@ mod tests {
         let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
         let mut output = InfluxDbOutput::new(
             "http://127.0.0.1:1".to_string(),
-            Some("org".into()),
+            Organization::Fixed("org".into()),
             Destination::Fixed("bucket".into()),
             "token".into(),
         )
@@ -871,7 +902,7 @@ mod tests {
         let mut probe = TelemetryProbe::new();
         let mut output = InfluxDbOutput::new(
             "http://127.0.0.1:1".to_string(),
-            Some("org".into()),
+            Organization::Fixed("org".into()),
             Destination::Fixed("bucket".into()),
             "token".into(),
         )
@@ -1062,18 +1093,25 @@ mod tests {
     }
 
     /// The request target `send` writes `batch` to, against a server answering `204`.
-    async fn target_of(org: Option<&str>, destination: Destination, batch: EventBatch) -> String {
+    async fn target_of(org: Organization, destination: Destination, batch: EventBatch) -> String {
         let (addr, count, targets) = recording_server(vec![RESP_204]).await;
-        let mut output = InfluxDbOutput::new(
-            format!("http://{addr}"),
-            org.map(String::from),
-            destination,
-            "token".into(),
-        );
+        let mut output =
+            InfluxDbOutput::new(format!("http://{addr}"), org, destination, "token".into());
         output.send(&batch).await.expect("a 204 should succeed");
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "one request");
         let targets = targets.lock().unwrap();
         targets.first().cloned().expect("the request target was recorded")
+    }
+
+    /// No `org:` and no `default_org:`: the batch's carried org, else none.
+    const NO_ORG: Organization = Organization::Carried { default_org: None };
+
+    fn fixed_org(org: &str) -> Organization {
+        Organization::Fixed(org.into())
+    }
+
+    fn default_org(org: &str) -> Organization {
+        Organization::Carried { default_org: Some(org.into()) }
     }
 
     const ALL_CARRIERS: [(&str, &str); 3] = [
@@ -1089,7 +1127,7 @@ mod tests {
     #[tokio::test]
     async fn carried_mode_forwards_the_carried_bucket_org_and_org_id() {
         let target =
-            target_of(None, Destination::Carried { default_bucket: None }, all_carriers()).await;
+            target_of(NO_ORG, Destination::Carried { default_bucket: None }, all_carriers()).await;
         assert_eq!(
             target,
             "/api/v2/write?org=acme&orgID=0123456789abcdef&bucket=metrics&precision=ns"
@@ -1100,9 +1138,12 @@ mod tests {
     /// would defeat it.
     #[tokio::test]
     async fn a_configured_org_replaces_a_carried_org_and_org_id() {
-        let target =
-            target_of(Some("ops"), Destination::Carried { default_bucket: None }, all_carriers())
-                .await;
+        let target = target_of(
+            fixed_org("ops"),
+            Destination::Carried { default_bucket: None },
+            all_carriers(),
+        )
+        .await;
         assert_eq!(target, "/api/v2/write?org=ops&bucket=metrics&precision=ns");
     }
 
@@ -1112,15 +1153,50 @@ mod tests {
             (RESOURCE_ATTR_ORG, Value::str("acme")),
             (RESOURCE_ATTR_BUCKET, Value::str("metrics")),
         ]);
-        let target = target_of(None, Destination::Fixed("fixed".into()), batch).await;
+        let target = target_of(NO_ORG, Destination::Fixed("fixed".into()), batch).await;
         assert_eq!(target, "/api/v2/write?org=acme&bucket=fixed&precision=ns");
     }
 
     #[tokio::test]
     async fn a_batch_with_no_carrier_goes_to_the_default_bucket_with_no_org() {
         let destination = Destination::Carried { default_bucket: Some("fallback".into()) };
-        let target = target_of(None, destination, one_metric_batch()).await;
+        let target = target_of(NO_ORG, destination, one_metric_batch()).await;
         assert_eq!(target, "/api/v2/write?bucket=fallback&precision=ns");
+    }
+
+    #[tokio::test]
+    async fn a_batch_with_no_carrier_goes_to_the_default_org() {
+        let destination = Destination::Carried { default_bucket: Some("fallback".into()) };
+        let target = target_of(default_org("ops"), destination, one_metric_batch()).await;
+        assert_eq!(target, "/api/v2/write?org=ops&bucket=fallback&precision=ns");
+    }
+
+    #[tokio::test]
+    async fn a_carried_org_wins_over_the_default_org() {
+        let batch = carried_batch(&[(RESOURCE_ATTR_ORG, Value::str("acme"))]);
+        let target = target_of(default_org("ops"), Destination::Fixed("b".into()), batch).await;
+        assert_eq!(target, "/api/v2/write?org=acme&bucket=b&precision=ns");
+    }
+
+    /// A carried `orgID` names the org on its own, so `default_org` isn't sent beside it.
+    #[tokio::test]
+    async fn a_carried_org_id_alone_wins_over_the_default_org() {
+        let batch = carried_batch(&[(RESOURCE_ATTR_ORG_ID, Value::str("0123456789abcdef"))]);
+        let target = target_of(default_org("ops"), Destination::Fixed("b".into()), batch).await;
+        assert_eq!(target, "/api/v2/write?orgID=0123456789abcdef&bucket=b&precision=ns");
+    }
+
+    #[tokio::test]
+    async fn a_configured_org_wins_over_everything_carried() {
+        let destination = Destination::Carried { default_bucket: None };
+        let target = target_of(fixed_org("ops"), destination, all_carriers()).await;
+        assert_eq!(target, "/api/v2/write?org=ops&bucket=metrics&precision=ns");
+    }
+
+    #[tokio::test]
+    async fn no_org_configured_or_carried_sends_no_org_parameter() {
+        let target = target_of(NO_ORG, Destination::Fixed("b".into()), one_metric_batch()).await;
+        assert_eq!(target, "/api/v2/write?bucket=b&precision=ns");
     }
 
     /// A carrier that isn't a string, or is empty, reads as absent.
@@ -1131,7 +1207,7 @@ mod tests {
             (RESOURCE_ATTR_ORG_ID, Value::Bool(true)),
         ]);
         let destination = Destination::Carried { default_bucket: Some("fallback".into()) };
-        let target = target_of(Some("ops"), destination, batch).await;
+        let target = target_of(fixed_org("ops"), destination, batch).await;
         assert_eq!(target, "/api/v2/write?org=ops&bucket=fallback&precision=ns");
     }
 
@@ -1143,7 +1219,7 @@ mod tests {
             (RESOURCE_ATTR_ORG_ID, Value::str("0123456789abcdef")),
         ]);
         let destination = Destination::Carried { default_bucket: Some("fallback".into()) };
-        let target = target_of(None, destination, batch).await;
+        let target = target_of(NO_ORG, destination, batch).await;
         assert_eq!(target, "/api/v2/write?orgID=0123456789abcdef&bucket=fallback&precision=ns");
     }
 
@@ -1158,7 +1234,7 @@ mod tests {
         let telemetry = probe.telemetry("out", "influxdb_out", "sink");
         let mut output = InfluxDbOutput::new(
             format!("http://{addr}"),
-            Some("ops".into()),
+            fixed_org("ops"),
             Destination::Carried { default_bucket: None },
             "token".into(),
         )
@@ -1179,18 +1255,14 @@ mod tests {
 
     /// The class `send` reads from one canned answer to `batch` under `org` and `destination`.
     async fn class_under(
-        org: Option<&str>,
+        org: Organization,
         destination: Destination,
         batch: EventBatch,
         response: &'static str,
     ) -> Fault {
         let (addr, count) = canned_server(vec![response]).await;
-        let mut output = InfluxDbOutput::new(
-            format!("http://{addr}"),
-            org.map(String::from),
-            destination,
-            "token".into(),
-        );
+        let mut output =
+            InfluxDbOutput::new(format!("http://{addr}"), org, destination, "token".into());
         let err = output.send(&batch).await.expect_err("a non-2xx fails send");
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "one attempt");
         logit_pipeline::classify(&err)
@@ -1198,7 +1270,7 @@ mod tests {
 
     /// The class of one canned answer to a batch whose bucket, org, and orgID are all carried.
     async fn carried_class_of(response: &'static str) -> Fault {
-        class_under(None, Destination::Carried { default_bucket: None }, all_carriers(), response)
+        class_under(NO_ORG, Destination::Carried { default_bucket: None }, all_carriers(), response)
             .await
     }
 
@@ -1225,7 +1297,7 @@ mod tests {
     async fn a_403_for_a_carried_bucket_is_rejected() {
         let destination = Destination::Carried { default_bucket: None };
         let response = influx_error("403 Forbidden", FORBIDDEN);
-        let fault = class_under(Some("ops"), destination, all_carriers(), response).await;
+        let fault = class_under(fixed_org("ops"), destination, all_carriers(), response).await;
         assert_eq!(fault, Fault::Rejected);
     }
 
@@ -1241,7 +1313,7 @@ mod tests {
     async fn a_404_for_a_configured_org_beside_a_carried_bucket_is_refused() {
         let destination = Destination::Carried { default_bucket: None };
         let response = influx_error("404 Not Found", ORG_NOT_FOUND);
-        let fault = class_under(Some("ops"), destination, all_carriers(), response).await;
+        let fault = class_under(fixed_org("ops"), destination, all_carriers(), response).await;
         assert_eq!(fault, Fault::Refused);
     }
 
@@ -1253,8 +1325,38 @@ mod tests {
         for (status, body) in [("404 Not Found", BUCKET_NOT_FOUND), ("403 Forbidden", FORBIDDEN)] {
             let destination = Destination::Carried { default_bucket: Some("fallback".into()) };
             let response = influx_error(status, body);
-            let fault = class_under(Some("ops"), destination, batch(), response).await;
+            let fault = class_under(fixed_org("ops"), destination, batch(), response).await;
             assert_eq!(fault, Fault::Refused, "{status}");
+        }
+    }
+
+    /// `default_org` is the operator's org, so a fault that could concern it holds as a
+    /// configured one does. The bucket is configured, so nothing in the request was carried.
+    #[tokio::test]
+    async fn a_404_or_403_under_the_default_org_is_refused() {
+        let answers = [
+            ("404 Not Found", ORG_NOT_FOUND),
+            ("404 Not Found", BUCKET_NOT_FOUND),
+            ("403 Forbidden", FORBIDDEN),
+        ];
+        for (status, body) in answers {
+            let destination = Destination::Fixed("fixed".into());
+            let response = influx_error(status, body);
+            let fault =
+                class_under(default_org("ops"), destination, one_metric_batch(), response).await;
+            assert_eq!(fault, Fault::Refused, "{status} {body}");
+        }
+    }
+
+    /// A carried org wins over `default_org`, so a fault that could concern it is the batch's.
+    #[tokio::test]
+    async fn a_404_or_403_for_a_carried_org_beside_a_default_org_is_rejected() {
+        let batch = || carried_batch(&[(RESOURCE_ATTR_ORG, Value::str("acme"))]);
+        for (status, body) in [("404 Not Found", ORG_NOT_FOUND), ("403 Forbidden", FORBIDDEN)] {
+            let destination = Destination::Fixed("fixed".into());
+            let response = influx_error(status, body);
+            let fault = class_under(default_org("ops"), destination, batch(), response).await;
+            assert_eq!(fault, Fault::Rejected, "{status}");
         }
     }
 
@@ -1264,7 +1366,7 @@ mod tests {
     async fn a_403_for_a_carried_org_beside_a_configured_bucket_is_rejected() {
         let batch = carried_batch(&[(RESOURCE_ATTR_ORG, Value::str("acme"))]);
         let response = influx_error("403 Forbidden", FORBIDDEN);
-        let fault = class_under(None, Destination::Fixed("fixed".into()), batch, response).await;
+        let fault = class_under(NO_ORG, Destination::Fixed("fixed".into()), batch, response).await;
         assert_eq!(fault, Fault::Rejected);
     }
 
@@ -1274,7 +1376,7 @@ mod tests {
     async fn a_404_for_a_configured_bucket_in_a_carried_org_is_rejected() {
         let batch = carried_batch(&[(RESOURCE_ATTR_ORG, Value::str("acme"))]);
         let response = influx_error("404 Not Found", BUCKET_NOT_FOUND);
-        let fault = class_under(None, Destination::Fixed("fixed".into()), batch, response).await;
+        let fault = class_under(NO_ORG, Destination::Fixed("fixed".into()), batch, response).await;
         assert_eq!(fault, Fault::Rejected);
     }
 

@@ -3237,27 +3237,32 @@ components:
     url: https://influxdb.example.com:8086
     token: !env INFLUXDB_RELAY_TOKEN
     default_bucket: other   # for a batch no influxdb_in received; omit to drop those, counted
+    default_org: example    # for a batch no influxdb_in received; omit to send no org
     # org: example          # replaces the client's org or orgID; omit to forward the client's
 ```
 
-With `bucket:` set instead, every batch goes to that bucket and the client's is ignored. Setting
-`bucket:` and `default_bucket:` together is an error. Before choosing the carried form, know what
-it costs:
+With `bucket:` set instead, every batch goes to that bucket and the client's is ignored. With
+`org:` set instead of `default_org:`, every batch goes to that org, the client's included. Setting
+`bucket:` and `default_bucket:` together is an error, and so is `org:` with `default_org:`. Before
+choosing the carried form, know what it costs:
 
 - A `403` or `404` drops that batch, counted `batches.dropped{reason="rejected"}`, when the
   bucket or the org came from the client, so one producer's missing bucket doesn't stop every
   other producer. A bucket that's still being created loses what's written to it until it exists.
-  When both came from config (`bucket:` or `default_bucket:`, and `org:`), the same answers hold
-  the queue and retry, because every batch gets them. `bucket:` alone isn't enough: without
-  `org:`, the client's org is still forwarded, and InfluxDB 2.x looks the bucket up inside it, so
-  a `404` for the configured bucket drops too. To hold on every `403` and `404`, configure both.
+  When both came from config (`bucket:` or `default_bucket:`, and `org:` or `default_org:`), the
+  same answers hold the queue and retry, because every batch gets them. `bucket:` alone isn't
+  enough: without `org:`, the client's org is still forwarded, and InfluxDB 2.x looks the bucket
+  up inside it, so a `404` for the configured bucket drops too. `default_org:` doesn't change
+  that, because the client's org wins over it. To hold on every `403` and `404`, configure both
+  `bucket:` and `org:`.
 - Any client `influxdb_in` accepts can write to any bucket the relay's token can write, because
   `tokens:` doesn't tie a client to a bucket. Scope the relay's token to the producers' buckets,
   or configure both `bucket:` and `org:`.
   InfluxDB 2.x doesn't confine a bucket ID to the org sent with it, so a client that names a
   bucket by ID can reach another org through an org-scoped token.
-- Without `org:`, a batch that didn't come from `influxdb_in` carries no org, and InfluxDB 2.x
-  answers that write `400`, which drops it. InfluxDB 3 ignores the org.
+- Without `org:` or `default_org:`, a batch that didn't come from `influxdb_in` carries no org,
+  and InfluxDB 2.x answers that write `400`, which drops it. Set `default_org:` when such a source,
+  an `internal` component for example, shares the sink. InfluxDB 3 ignores the org.
 - InfluxDB 3 Core creates a database for any bucket it doesn't know, so a client's typo becomes a
   new database.
 

@@ -176,8 +176,8 @@ and in an amendment to the sink's own record:
   classes (2026-10-04)").
 - `influxdb_out`: a `403` or `404` is `Rejected` when the bucket or org it could concern came
   from the batch's carrier, because the batch chose it; with both from config (`bucket:` or
-  `default_bucket:`, and `org:`) it stays `Refused` (`crates/logit-outputs/src/influxdb.rs`,
-  "Response classes";
+  `default_bucket:`, and `org:` or `default_org:`) it stays `Refused`
+  (`crates/logit-outputs/src/influxdb.rs`, "Response classes";
   [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md), "Amendment:
   `influxdb_out` follows the carried destination (2026-10-15)").
 - `otlp_out`: an HTTP `401`, `403`, `404`, or `501` names one signal and is `Rejected`, and a

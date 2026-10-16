@@ -130,6 +130,7 @@ fn graph_and_topology(disk_dir: std::path::PathBuf) -> (graph::Graph, DiskQueueC
                 org: Some("org".to_string()),
                 bucket: Some("bucket".to_string()),
                 default_bucket: None,
+                default_org: None,
                 token: "TOKEN".to_string(),
             },
         },

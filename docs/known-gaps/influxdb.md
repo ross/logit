@@ -16,16 +16,18 @@ the decoder differs from `influxd`.
   - **Workaround:** query the destination directly.
 - **A carried bucket's or org's `403` or `404` drops the batch rather than holding it.** With no
   `bucket:` configured, `influxdb_out` writes each batch to the bucket `influxdb_in` received it
-  for, and with no `org:`, to the client's org. It reads a `403` or `404` as `Rejected` when the
-  bucket or org it could concern was carried, so a bucket a client names that doesn't exist or
-  that the relay's token can't write doesn't hold every other bucket's batches behind it
+  for, and with no `org:`, to the client's org, else to `default_org:`. It reads a `403` or `404`
+  as `Rejected` when the bucket or org it could concern was carried, so a bucket a client names
+  that doesn't exist or that the relay's token can't write doesn't hold every other bucket's
+  batches behind it
   ([ADR `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md)'s "Amendment:
   `influxdb_out` follows the carried destination (2026-10-15)").
   - **Consequence:** a transient `403` or `404`, such as a write to a bucket that's still being
     created or a token whose grant is being widened, loses those batches, counted
     `batches.dropped{reason="rejected"}`. `bucket:` alone doesn't prevent this: the client's org
     is still forwarded, and a `403` or any `404` drops, a missing `bucket:` included, because
-    InfluxDB 2.x looks the bucket up inside that org.
+    InfluxDB 2.x looks the bucket up inside that org. Nor does `default_org:`, because a carried
+    org wins over it; only a batch that carries no org is held.
   - **Workaround:** create buckets and grant the relay's token before producers write to them, or
     configure both `bucket:` and `org:`, where a `403` or `404` holds and retries.
   - **Revisit trigger:** a deployment that needs a missing bucket held. That needs a queue per
