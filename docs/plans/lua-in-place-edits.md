@@ -260,6 +260,12 @@ is run with its change reverted to show it fails, and the PR body says so. Each 
 **Done when:** `prusa.lua` has no `to_table()` or `Event.new`, `prusa_example.rs` passes with no
 edit, every pre-existing `lua:` pin is unchanged, and `script/cibuild` passes.
 
+### Status (2026-10-16)
+
+All five workstreams are built as a linear stack of PRs, each targeting its parent: W0 #727, W1 #728,
+W2 #729, W3 #730, and W4 (this closeout) on `lmut/w4` targeting `lmut/w3`. `examples/prusa/prusa.lua`
+edits its event in place and `crates/logit-cli/tests/prusa_example.rs` passes unchanged.
+
 ## Open risks
 
 - The `pairs` wrapper's cost, measured in W3: about 13 ns per `pairs` call on a table, and a call
