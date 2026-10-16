@@ -329,3 +329,19 @@ Reporting every TCP-affecting window, as UDP's are, would leave unjudged the cla
 `tcp-ingress` scenario exists to make, that TCP ingress loses nothing a reset doesn't explain.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "The ledger and identities", has the
 symbols per wire, and its `ledger.wire` row the rules.
+
+## Amendment: a file wire's writer and tailer share a directory in the run directory (2026-10-15)
+
+A `file` wire's writer and the SUT that tails it need a directory both can write and read, and
+the harness needs the writer's files after the run, to count G outside both processes. The
+driver creates `<run>/shared` with mode 0777, because the image's unprivileged user has a uid
+the host doesn't know, and the scenario's override mounts it into both. This reverses "nothing
+in a container writes to the run directory" for these scenarios only. The alternatives were a
+named volume, which compose removes with the stack and leaves nothing to count, and the
+writer's own telemetry alone, which is the count the shared directory exists to check. A file
+wire is judged on the run's W − G against a replay band per SUT life, not per drain interval,
+because a tailer reads behind its writer: a kill replays what was read after the last checkpoint
+and loses the counts of the last drain interval, and a clean stop splits a line held
+unterminated ([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md)). The band belongs on the
+wire and on `ledger.summary`'s end-to-end bound, not on the killed life's egress band, which is
+read from `aggregate`'s window.

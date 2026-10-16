@@ -588,7 +588,12 @@ generator, `SOAK_GENERATOR_CONFIG` for `generator`, §2's "Sources", and one per
 service, `SOAK_COLLECTOR_CONFIG` for `collector`, §2's "Several SUT services"), which the
 driver passes with `--env-file`, because `sudo` strips the environment.
 `up -d --wait --wait-timeout 120` waits on the image's `logit ready` `HEALTHCHECK`.
-Nothing in a container writes to the run directory in W1, so it needs no `chmod 777`.
+Nothing in a container writes to the run directory in W1, so it needs no `chmod 777`. From
+W11b a scenario with a `file` wire is the exception: the driver creates `<run>/shared` with mode
+0777, since the image's unprivileged `logit` user has a uid the host doesn't know, names its
+absolute path in `compose.env` as `SOAK_SHARED_DIR`, and the scenario's override mounts it
+`:z` at `/shared` in the writer and the SUT. The writer's files stay in the run directory, the
+evidence the end sequence counts G from.
 
 Collection uses `docker logs <id> >svc.stdout 2>svc.stderr`, not `docker compose logs`, which
 merges the two streams. `docker logs` spans every life of a container that is stopped and started
@@ -673,7 +678,10 @@ ticket with `${DOCKER} version` first.
    - **Fail fast:** a `logit` container leaving `running`, or a `StartedAt` change, with no step
      behind it ends the timeline at once. The end sequence and collection still run. Inside an
      `exit` step (W7a) the container may be `running` or `exited`.
-4. End (for an external target, W5, see "External targets"): revert active faults; `docker stop -t 30` every generator; wait until every sink's stored
+4. End (for an external target, W5, see "External targets"): revert active faults; `docker stop -t 30` every generator; with a `file` wire (W11b), count the
+   newline-terminated lines in every file of `<run>/shared` (phase `shared_counted`) and wait,
+   up to 180 s, until the tailers' W, read from a log chunk the driver captures every 5 s,
+   reaches that count or holds for four reads (phase `tail_caught_up`); wait until every sink's stored
    total holds across two aggregate windows (90 s bound); `docker stop -t 60` the SUT, expecting
    exit 0; call each backend's `/internal/force_flush`; write each sink's
    `vm-export/<sink>.jsonl` from its backend's `/api/v1/export` with `match[]=<vm_selector>`
@@ -782,7 +790,9 @@ F, the lines the listener's framer dropped before W counted them
 (`logit.input.frames.dropped`, reasons in the table below), is counted wire loss; only `undecodable`, counted after `input.frames`, stays in B. A TCP listener
 has no receive queue, so R holds no queue term for it. On a file wire (W11b) G is the writer
 `file_out`'s `logit.component.events.delivered`, since `file_out` counts no `output.messages`,
-W is `logit.input.lines{component=<tail_in>}`, and K and D are 0. `kill_band` and `recovery`
+W is `logit.input.lines{component=<tail_in>}`, K and D are 0, and F is the tailer's
+`logit.input.frames.dropped` under `oversize` (a line past `max_line_bytes`, never counted in W)
+and `truncated` (a held partial discarded when its file was truncated). `kill_band` and `recovery`
 read the wire's W; `_end_to_end` and `ledger.summary` also subtract F.
 
 From W7b the ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`,
@@ -922,10 +932,33 @@ The rows:
   above G, may not exceed one generator batch per `ambiguous_at_most_once` drop the generator
   counted inside it, plus one per edge. A write that failed partway leaves whole lines the SUT
   reads, and under `statsd_out`'s `at_most_once` posture the generator drops that batch and
-  never counts it in G. A partition's label carries the address before and after it. On a file
-  wire (W11b) only a lifecycle fault or an `exit` of the ingress SUT affects the wire, and every
-  window is reported. The detail names the generator's counted loss by reason
-  (`overflow_newest`, `ambiguous_at_most_once`) beside the gap; none of it is in G.
+  never counts it in G. A partition's label carries the address before and after it. The detail
+  names the generator's counted loss by reason (`overflow_newest`, `ambiguous_at_most_once`)
+  beside the gap; none of it is in G.
+
+  On a file wire (W11b) only a lifecycle fault or an `exit` of the ingress SUT affects the wire.
+  A tailer reads behind its writer, so a drain interval's gap is lag, not loss: every run of
+  drain intervals is reported, and the row judges the run's W + F − G against a **replay band**
+  summed over the ingress SUT's lives (`Ledger.replay_band`):
+  - a killed life: above, rate × `checkpoint_interval` (the lines read after the last
+    checkpoint, which the restart reads again) plus one 64 KiB read's lines for each of two
+    files, the writer's active file and the one it rotated away inside that interval (a fully
+    read file replays nothing, and rotations tens of seconds apart leave at most one inside an
+    interval of seconds); below, rate × the life's drain interval, the counts a SIGKILL never
+    exports. The rate is the life's `input.lines` over its last drain interval, the line size
+    the shared directory's bytes over its lines;
+  - a life a stop, restart, or `exit` ended: up to one line above per file open at its last
+    drain (`logit.input.files.open`), the unterminated line shutdown emits and the restart reads
+    again as its remainder (docs/known-gaps/tailing.md, "`tail_in` splits a line held
+    unterminated at a clean stop into two events"); nothing replays, since shutdown writes a
+    final checkpoint;
+  - the final life adds nothing: the end sequence waits until the tailers have read what the
+    writer wrote (§5).
+
+  G must also equal the lines the driver counted in the shared directory at the end
+  (`shared_counted`), else the row FAILs its precondition. `ledger.summary`'s end-to-end bound
+  runs for a file wire too, with the band's upper edge added to its limit, since a replayed line
+  is absorbed and stored again.
 - `ledger.intake`: W − D == E + B, for the final life, per listener from W8b, one detail line
   each, a listener off its balance first. A TCP listener's F never reached W, so it's
   `ledger.wire`'s, and `drops` leaves it out.
