@@ -213,6 +213,8 @@ for = "45s"
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
 - A scenario has `cycle` with `[[step]]` tables or a `[random]` table (W4), never both.
   `--seed` is refused for a fixed schedule, because no seed changes it.
+- `max_duration` (W11b), optional, is the longest run a scenario's thresholds and configs
+  hold. A `--duration` past it is refused, and so is a scenario whose own `duration` is.
 
 **Random schedules (W4).** A `[random]` table replaces `cycle` and `[[step]]`:
 
@@ -805,7 +807,7 @@ and takes the worst status; `report.py` is unchanged.
 | G | per source (W8b), its generator's `logit.output.messages{component=<generator_sink>}`; precondition: equals that sink's `logit.output.datagrams` |
 | W | per listener (W8b), SUT `logit.input.datagrams{component=<sut_listener>}` |
 | K | per listener, SUT `logit.input.kernel.dropped` |
-| F | per listener, on a TCP wire (W11a) only, else 0: SUT `logit.input.frames.dropped` under the framer's reasons, `truncated`, `oversize`, `drained`, and `malformed` |
+| F | per listener, SUT `logit.input.frames.dropped`: on a TCP wire (W11a) under the framer's reasons, `truncated`, `oversize`, `drained`, and `malformed`; on a file wire (W11b) under `oversize` and `truncated`; else 0 |
 | D | per listener, SUT `logit.component.datagrams.dropped` under every reason, from telemetry; the listener's stderr shutdown lines only cross-check its `shutdown` part, and a killed life counts none |
 | B | per listener, SUT `logit.input.messages.dropped{reason=malformed}` plus `logit.input.frames.dropped{reason=undecodable}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a line the decoder refused, a datagram it refused whole, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule |
 | E | per listener, SUT `logit.component.events.sent{component=<sut_listener>}` |
@@ -946,7 +948,9 @@ The rows:
     read file replays nothing, and rotations tens of seconds apart leave at most one inside an
     interval of seconds); below, rate × the life's drain interval, the counts a SIGKILL never
     exports. The rate is the life's `input.lines` over its last drain interval, the line size
-    the shared directory's bytes over its lines;
+    the shared directory's bytes over its lines. A killed life with one drain has no drain
+    interval, and its last checkpoint can be the previous life's, so its allowance above is that
+    drain's W, all of which can replay, plus the same reads, and 0 below;
   - a life a stop, restart, or `exit` ended: up to one line above per file open at its last
     drain (`logit.input.files.open`), the unterminated line shutdown emits and the restart reads
     again as its remainder (docs/known-gaps/tailing.md, "`tail_in` splits a line held
@@ -1723,8 +1727,10 @@ where it needs them, and a small check extension.
    `generator` service, `generate_in → file_out` with `format: json`. `file_out` rotates by
    renaming the active file to `app.log.rotating`, shifting each `app.log.N` to `N + 1`, removing
    `app.log.{max_files − 1}`, and renaming the staged file to `app.log.1`; `max_files` counts the
-   active file. The scenario keeps every file (`max_files: 100`), so nothing unread is deleted and
-   the harness can count every line at the end. `file_out` counts no `output.messages`, so G is
+   active file. The scenario keeps every file (`max_files: 100`, about 74 minutes of files), so
+   nothing unread is deleted and the harness can count every line at the end. Its
+   `max_duration` of 25 minutes holds that, and holds the descriptor growth below inside
+   `fd_growth`. `file_out` counts no `output.messages`, so G is
    its `logit.component.events.delivered` (§6's file wire), held to the lines the driver counts
    across the shared directory, a G from outside both processes. The SUT tails
    `paths: ["/shared/app.log*"]`, a glob that matches the rotated names, so a renamed file is

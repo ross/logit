@@ -218,7 +218,11 @@ stops it, restarts it, and kills it for 30 s and then for 150 s, across several 
 `ledger.wire` judges the run's W − G against a replay band per SUT life, and the end sequence
 counts the writer's lines in the shared directory before it waits for the tailer to read them.
 Its expectations assert that rotations are seen and that no resume is rejected and no
-checkpoint fails. The writer's files stay in the run directory, about 80 MB of them.
+checkpoint fails. The writer's files stay in the run directory, about 80 MB of them. Its
+`max_duration` is 25 minutes, and a longer `--duration` is refused: the tailer holds every
+rotated file open, about one descriptor more every 44 s, which passes `fd_growth`'s 40 at about
+30 minutes, and from about 74 minutes `file_out` deletes the oldest file, whose lines the end
+count then misses.
 
 ### Several SUT services
 
@@ -615,7 +619,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `progress` | a SUT sink delivers nothing in a `progress_window` outside fault windows with work queued (a hang), a `logit` container's telemetry goes quiet, or a sink's newest stored sample is 30 s old (a local target only); a sink still retrying past `recovery_bound` `WARN`s, and so do windows covering under 5% of the run after warmup |
 | `rss_slope` | a `logit` service's resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead, and so do slopes covering under 5% of the run after warmup. Each service is judged on its own line, and `[expected]` can set its verdict (see [Expected verdicts](#expected-verdicts)) |
 | `fd_slope` | a `logit` service's open file descriptors end, or sit after a recovery, more than `fd_growth` above the warmup median. Each service is judged on its own line, and `[expected]` can set its verdict |
-| `ledger.wire` | for any source, its generator's lines minus what its listener read, what the kernel dropped, and what its framer dropped, counted (G − (W + K + F)), exceeds `wire_loss_outside_faults` outside the reported fault windows that affect its wire, with one generator batch of tolerance per window edge, each judged run counting at 0 or more; or, on UDP, its generator's sink counts messages and datagrams apart, and on TCP it counts any datagram. On UDP that loss is by design and every affecting window is reported: netem on a generator, and a lifecycle fault or partition of the SUT or of a generator. On TCP only a stop, kill, restart, or `exit`, and a partition that moved the container's address, are reported; every other TCP-affecting window (netem on the SUT, a pause, a partition that kept the address) is judged, and a surplus in it beyond one generator batch per `ambiguous_at_most_once` drop the generator counted there, plus one per edge, FAILs. Netem on a TCP generator affects nothing and is judged as steady state. The detail lists the gap per source and per run of drain intervals, and the generator's own counted loss beside it |
+| `ledger.wire` | for a UDP or TCP source, its generator's lines minus what its listener read, what the kernel dropped, and what its framer dropped, counted (G − (W + K + F)), exceeds `wire_loss_outside_faults` outside the reported fault windows that affect its wire, with one generator batch of tolerance per window edge, each judged run counting at 0 or more; or, on UDP, its generator's sink counts messages and datagrams apart, and on TCP it counts any datagram. On UDP that loss is by design and every affecting window is reported: netem on a generator, and a lifecycle fault or partition of the SUT or of a generator. On TCP only a stop, kill, restart, or `exit`, and a partition that moved the container's address, are reported; every other TCP-affecting window (netem on the SUT, a pause, a partition that kept the address) is judged, and a surplus in it beyond one generator batch per `ambiguous_at_most_once` drop the generator counted there, plus one per edge, FAILs. Netem on a TCP generator affects nothing and is judged as steady state. A file source is judged otherwise: its run's W + F − G against a replay band per SUT life, and G against the lines counted in the shared directory (the plan's §6 `ledger.wire` row). The detail lists the gap per source and per run of drain intervals, and the generator's own counted loss beside it |
 | `ledger.intake` | for any listener, the final SUT life's lines read minus dropped differ from the events sent plus bad lines (B: `messages.dropped{reason="malformed"}`, `frames.dropped{reason="undecodable"}`, and on UDP `lines_in`'s oversize lines); or an earlier life's read-but-unabsorbed residual summed over the listeners (W − D − B − X − Ab, X being the listeners' own counted event drops) falls outside [0, R], R being each UDP listener's receive queue plus 2 batches per listener, 65 more batches for each node between it and `aggregate`, and 65 for `aggregate` |
 | `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listeners' summed events sent (or, with `sut_script`, the script's) differ from those `aggregate` received; a node in a source's `sut_transforms` received a different number from those sent to it, or sent a different number from those it received; a sink received a different number of events from those sent to it (under `copy` `aggregate`'s events sent, which a fan-out counts once per batch, and under `route` its target's); or `aggregate` received a different number from those it absorbed |
 | `ledger.script` | with `[ledger] sut_script` only, else SKIP: in the final SUT life, the listener's events sent differ from those the script received, those it received from those it emitted, discarded (`events.discarded`), and lost to an error (`events.dropped{reason="script_error"}`), or those it sent from those it emitted plus those `flush()` returned |
@@ -744,6 +748,9 @@ for = { min = "60s", max = "3m" }
   draws.
 
 ## Long runs
+
+A scenario that sets `max_duration` refuses a longer `--duration`, because its thresholds or
+configs hold only that long; `tail-rotate`'s is 25 minutes.
 
 To run for hours, keep the driver alive when the terminal closes: a closed terminal sends
 SIGHUP, which ends the schedule, collects, and tears down, so an unprotected 8-hour run stops at
