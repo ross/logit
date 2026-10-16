@@ -234,18 +234,18 @@ fn a_gap_in_the_sequence_counts_the_missed_datagrams() {
 }
 
 #[test]
-fn an_unsupported_version_is_forwarded_unchanged_and_counted() {
+fn an_unsupported_version_is_discarded_and_counted_as_dropped() {
     let mut probe = TelemetryProbe::new();
     let w = worker(&probe);
     let (resource, event) = decode(
         b"<14>1 - 10:9c:70:2d:d5:c4 buddy - - - msg=1,tm=5,v=9 cpu_usage v=73i 0\n",
         RECEIVED_AT,
     );
-    let original = event.clone();
-    let (after, out) = run_script(&w, resource.clone(), event);
-    assert_eq!(out, original);
-    assert!(Arc::ptr_eq(&after, &resource), "no bucket for a datagram the script didn't rewrite");
-    assert_eq!(probe.sum("prusa.datagrams.skipped", &[("reason", "version")]), 1.0);
+    w.set_resource(&resource);
+    let outcome = w.process(event).expect("process() should succeed");
+    assert!(matches!(outcome, ProcessOutcome::Drop), "the datagram should not reach line_protocol");
+    assert!(w.take_resource().is_none(), "no bucket for a datagram the script dropped");
+    assert_eq!(probe.sum("prusa.datagrams.dropped", &[("reason", "version")]), 1.0);
 }
 
 #[test]

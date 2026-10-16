@@ -35,8 +35,8 @@ needs no special handling.
 
 The script also follows Prusa's own collector: a lone field named `v` becomes `value`, a point
 whose `value` is NaN is skipped, and a format-3 point tagged `_seq` is skipped. Formats 2, 3, and
-4 are supported. A datagram in any other format passes through unchanged and is counted
-`prusa.datagrams.skipped{reason="version"}`.
+4 are supported. A datagram in any other format is dropped and counted
+`prusa.datagrams.dropped{reason="version"}`, because its offsets have no known unit.
 
 ## Run it
 
@@ -83,5 +83,5 @@ The script counts through `logit`'s internal telemetry, which an `internal` comp
 |---|---|
 | `prusa.datagrams.missed{mac_address}` | datagrams lost between two that arrived, from a step of 2 to 9 in the sequence number |
 | `prusa.datagrams.resync{mac_address}` | a jump of 10 or more, or a step back, in the sequence number: a reboot or firmware restart |
-| `prusa.datagrams.skipped{reason="version"}` | a datagram in a format the script doesn't support, passed through unchanged |
+| `prusa.datagrams.dropped{reason="version"}` | a datagram in a format the script doesn't support, dropped with its points; nonzero means the firmware sends a format this script needs to learn |
 | `prusa.points.skipped{reason}` | a point skipped as Prusa's collector skips it: `nan` or `seq` |

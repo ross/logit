@@ -129,8 +129,10 @@ is stateless, doesn't drift, and survives a reboot with no special case.
 
 The script also:
 
-- Parses and strips the `msg=N,tm=T,v=V` header, and leaves an unknown `v` untouched for
-  `line_protocol` to count.
+- Parses and strips the `msg=N,tm=T,v=V` header. A datagram with an unknown `v` is dropped and
+  counted `prusa.datagrams.dropped{reason="version"}`, because its offsets have no known unit and
+  `line_protocol` would parse its header as a point. A message with no header, or from an app other
+  than `buddy`, passes through unchanged.
 - Rewrites each line's trailing offset to absolute nanoseconds, in `v=4` (µs), `v=3` (ms), and
   `v=2` (ms, cumulative).
 - Renames a lone `v` field to `value`, as Prusa's collector does.
@@ -210,6 +212,6 @@ fixture's own lines:
 - The batch resource carries `_logit.influxdb.bucket = "prusa"` past `line_protocol`.
 
 The same file checks that consecutive datagrams `msg=920` and `msg=921` count no gap, that a jump
-to `msg=925` counts four missed datagrams, that an unsupported format version passes through and
-is counted, and that a non-Buddy syslog event passes through unchanged. With the anchoring
+to `msg=925` counts four missed datagrams, that a datagram in an unsupported format version is
+discarded and counted `prusa.datagrams.dropped`, and that a non-Buddy syslog event passes through unchanged. With the anchoring
 subtraction removed from the script, the first test fails on its first point.

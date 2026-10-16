@@ -108,8 +108,10 @@ function process(event)
   end
   local unit_ns = UNIT_NS[version]
   if unit_ns == nil then
-    telemetry.count("prusa.datagrams.skipped", 1, {reason = "version"})
-    return event
+    -- Without the version, the offsets have no unit and the header can't be told from a point,
+    -- so line_protocol would write nonsense. The datagram's points are lost: count it as loss.
+    telemetry.count("prusa.datagrams.dropped", 1, {reason = "version"})
+    return nil
   end
   track_sequence(mac, msg)
 
