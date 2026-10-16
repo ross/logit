@@ -626,14 +626,15 @@ the operator-facing account of all of this.
 
 ### Demo, examples, and fixtures
 
-- **`examples/`** is user-facing: one directory per example holding a `logit.yaml`, the
-  `graph.svg` rendered from it, and any script the config loads (`examples/lua/process.lua`),
-  indexed by `examples/README.md`. Its comments are written for someone adopting `logit`: no ADR
-  paths, rule numbers, or history. `every_shipped_config_loads_and_validates` covers
-  `examples/*/logit.yaml` but never loads a `lua_file`, so `crates/logit-cli/tests/lua_example.rs`
-  runs `examples/lua/process.lua` through the real `logfmt` transform and a `ScriptWorker`. Re-render
-  `graph.svg` whenever its `logit.yaml` changes. `demo/graph-renderer` is the image with `dot`,
-  since neither the host nor `Dockerfile.dev` has graphviz:
+- **`examples/`** is user-facing: one directory per example holding one or more configs (a
+  `logit.yaml`, or one file per node, as `examples/forwarding/` does), the `.svg` graph rendered
+  from each, and any script a config loads (`examples/lua/process.lua`), indexed by
+  `examples/README.md`. Its comments are written for someone adopting `logit`: no ADR paths, rule
+  numbers, or history. `every_shipped_config_loads_and_validates` covers `examples/*/*.yaml` but
+  never loads a `lua_file`, so `crates/logit-cli/tests/lua_example.rs` runs
+  `examples/lua/process.lua` through the real `logfmt` transform and a `ScriptWorker`. Re-render a
+  config's graph whenever the config changes. `demo/graph-renderer` is the image with `dot`, since
+  neither the host nor `Dockerfile.dev` has graphviz:
 
   ```sh
   sudo docker build -q -t logit-graph-renderer demo/graph-renderer

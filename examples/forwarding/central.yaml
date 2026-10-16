@@ -1,0 +1,156 @@
+# The central half of a forwarding pair: this `logit` receives what every edge.yaml forwards over
+# the native transport, windows the metrics once, and delivers each signal to its backend.
+#
+#   edges ==native, TLS==> remote_in --> metrics -> cumulative_10s -> VictoriaMetrics
+#                                    --> logs    -> Loki
+#                                    --> traces  -> Tempo
+#
+# Check it with `logit validate central.yaml` and draw it with
+# `logit graph central.yaml | dot -Tsvg > central.svg`. docs/deploying.md's "Operating a pair"
+# says how to start, stop, and upgrade the two together.
+
+hostname: central
+
+# /readyz and /healthz for a container or Kubernetes probe. No TLS and no auth: keep this port
+# off public networks.
+admin:
+  bind: 0.0.0.0:9600
+
+components:
+  # --- Input ---------------------------------------------------------------------------------
+
+  remote_in:
+    type: logit_in
+    bind: 0.0.0.0:5140
+    tls:
+      cert_file: /etc/logit/tls/server.pem
+      key_file: /etc/logit/tls/server.key
+      # Requires each edge to present a certificate this CA signed (mutual TLS). Omit it for
+      # server-only TLS, and drop the edges' client certificates to match.
+      client_ca_file: /etc/logit/tls/ca.pem
+
+  # --- Signal gates --------------------------------------------------------------------------
+
+  # An edge's `internal` telemetry arrives here as ordinary events and rides these gates with
+  # everything else. A signal no gate takes is discarded without a warning, so add its gate here
+  # before an edge starts sending it.
+  metrics:
+    type: keep_signals
+    sources: [remote_in]
+    signals: [metrics]
+
+  logs:
+    type: keep_signals
+    sources: [remote_in]
+    signals: [logs]
+
+  traces:
+    type: keep_signals
+    sources: [remote_in]
+    signals: [traces]
+
+  # --- Window --------------------------------------------------------------------------------
+
+  # The edges forward raw, so the window is applied once, here. Prometheus remote write takes
+  # running totals, not per-window increments.
+  cumulative_10s:
+    type: aggregate
+    sources: [metrics]
+    interval: 10s
+    temporality: cumulative
+
+  # --- Backends ------------------------------------------------------------------------------
+  #
+  # The backends share an input, so each one spools to disk: while one is down, its spool takes
+  # the backlog instead of stopping `remote_in`, which the other backends read from. Put
+  # /var/lib/logit on a persistent volume, writable by the user logit runs as.
+
+  # VictoriaMetrics' remote write: Prometheus remote write 1.0, compressed with zstd.
+  victoria_out:
+    type: prometheus_out
+    sources: [cumulative_10s]
+    endpoint: http://victoriametrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/victoria_out
+
+  loki_out:
+    type: otlp_out
+    sources: [logs]
+    protocol: http
+    endpoint: http://loki:3100/otlp
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/loki_out
+
+  tempo_out:
+    type: otlp_out
+    sources: [traces]
+    protocol: grpc
+    endpoint: tempo:4317
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/tempo_out
+
+  # --- Self-telemetry ------------------------------------------------------------------------
+  #
+  # This node's own telemetry goes to the same backends through sinks of its own. Sharing the
+  # data sinks would put `self` on the data path, and it would stop draining last at shutdown,
+  # losing the shutdown-time counts it exists to export.
+
+  # The same rate as the edges, so every forwarded trace stays whole.
+  self:
+    type: internal
+    interval: 10s
+    span_sample_rate: 0.1
+
+  # The same gates as the data path: `aggregate` passes a log or span event through, so without
+  # this gate `self`'s spans and logs would reach the metrics sink and be skipped there.
+  self_metrics:
+    type: keep_signals
+    sources: [self]
+    signals: [metrics]
+
+  self_cumulative_10s:
+    type: aggregate
+    sources: [self_metrics]
+    interval: 10s
+    temporality: cumulative
+
+  self_logs:
+    type: keep_signals
+    sources: [self]
+    signals: [logs]
+
+  self_traces:
+    type: keep_signals
+    sources: [self]
+    signals: [traces]
+
+  # Best-effort: a stalled backend sheds this node's oldest telemetry instead of spooling it.
+  self_victoria_out:
+    type: prometheus_out
+    sources: [self_cumulative_10s]
+    endpoint: http://victoriametrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    buffer:
+      overflow: drop_oldest
+
+  self_loki_out:
+    type: otlp_out
+    sources: [self_logs]
+    protocol: http
+    endpoint: http://loki:3100/otlp
+    buffer:
+      overflow: drop_oldest
+
+  self_tempo_out:
+    type: otlp_out
+    sources: [self_traces]
+    protocol: grpc
+    endpoint: tempo:4317
+    buffer:
+      overflow: drop_oldest

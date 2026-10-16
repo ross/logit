@@ -1,6 +1,6 @@
 #!/bin/bash
 # Usage: script/validate
-# Runs `logit validate` over every shipped config: demo/logit.yaml, examples/*/logit.yaml,
+# Runs `logit validate` over every shipped config: demo/logit.yaml, examples/*/*.yaml,
 # fixtures/*.yaml, perf/scenarios/*.yaml, tools/shape-survey/configs/*.yaml,
 # tools/victoria-interop/logit-*.yaml, tools/splunk-interop/logit-*.yaml,
 # tools/kafka-interop/logit-*.yaml, and tools/soak/scenarios/*/logit-*.yaml (those directories'
@@ -46,7 +46,7 @@ fi
 cargo build --quiet -p logit-cli
 LOGIT_BIN="${CARGO_TARGET_DIR:-${ROOT}/target}/debug/logit"
 
-for config in demo/logit.yaml examples/*/logit.yaml fixtures/*.yaml perf/scenarios/*.yaml \
+for config in demo/logit.yaml examples/*/*.yaml fixtures/*.yaml perf/scenarios/*.yaml \
     tools/shape-survey/configs/*.yaml tools/victoria-interop/logit-*.yaml \
     tools/splunk-interop/logit-*.yaml tools/kafka-interop/logit-*.yaml \
     tools/soak/scenarios/*/logit-*.yaml; do
