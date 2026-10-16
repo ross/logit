@@ -1825,8 +1825,10 @@ class Ledger:
         rate × its drain interval below, the rate being its lines over its last drain
         interval. A killed life with one drain has no drain interval, and its last checkpoint can
         be the previous life's, so its allowance above is that drain's W, all of which can
-        replay, plus the same reads, and 0 below. A life a stop, restart, or `exit` ended emits each file's unterminated line
-        at shutdown and the rest of it after the restart, one line more per file it had open
+        replay, plus the same reads; below, that drain's W stands in for one drain interval of
+        reads a checkpoint after the drain committed and the kill never exported. A life a
+        stop, restart, or `exit` ended emits each file's unterminated line at shutdown and the
+        rest of it after the restart, one line more per file it had open
         (`logit.input.files.open` at its last drain), above (docs/known-gaps/tailing.md's
         split-line entry). The final life adds nothing."""
         inn = self.inn
@@ -1855,12 +1857,15 @@ class Ledger:
                 chunks = chunk_lines * TAIL_REPLAY_FILES * len(listeners)
                 if len(drains) == 1:
                     # No drain interval to take a rate from, and every line the life read can
-                    # be after its last checkpoint, so all of its one drain's W can replay.
-                    below, above = 0, last + chunks
-                    lines.append(f"life {life} (killed): [0, +{_n(above)}]: one drain, so its "
-                                 f"W of {_n(last)} lines can all replay, plus "
+                    # be after its last checkpoint, so all of its one drain's W can replay. A
+                    # checkpoint between the drain and the kill can instead commit reads the
+                    # kill never exported; the drain's W, about one drain interval of reading,
+                    # bounds those below.
+                    below, above = last, last + chunks
+                    lines.append(f"life {life} (killed): [-{_n(below)}, +{_n(above)}]: one "
+                                 f"drain, so its W of {_n(last)} lines can all replay, plus "
                                  f"{TAIL_REPLAY_FILES} file(s) x one 64 KiB read of "
-                                 f"{_n(chunk_lines)} lines above")
+                                 f"{_n(chunk_lines)} lines above, and its W below")
                 else:
                     below = round(rate * interval)
                     above = round(rate * checkpoint) + chunks

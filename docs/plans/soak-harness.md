@@ -950,7 +950,8 @@ The rows:
     exports. The rate is the life's `input.lines` over its last drain interval, the line size
     the shared directory's bytes over its lines. A killed life with one drain has no drain
     interval, and its last checkpoint can be the previous life's, so its allowance above is that
-    drain's W, all of which can replay, plus the same reads, and 0 below;
+    drain's W, all of which can replay, plus the same reads, and that W below, about one drain
+    interval of reads a checkpoint after the drain committed and the kill never exported;
   - a life a stop, restart, or `exit` ended: up to one line above per file open at its last
     drain (`logit.input.files.open`), the unterminated line shutdown emits and the restart reads
     again as its remainder (docs/known-gaps/tailing.md, "`tail_in` splits a line held

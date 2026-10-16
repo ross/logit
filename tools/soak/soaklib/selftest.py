@@ -5361,14 +5361,22 @@ def _file_ledger():
         # all of that drain's 1,000 lines can replay, plus the two files' reads.
         young = killed("file-kill-one-drain", 2_381, no_drains=(134, 200))
         expect(young["ledger.wire"].status == checks.PASS
-               and "against the replay band [0, 2,381]" in young["ledger.wire"].detail
-               and any("life 1 (killed): [0, +2,380]: one drain, so its W of 1,000 lines can "
-                       "all replay" in line for line in young["ledger.wire"].lines),
+               and "against the replay band [-1,000, 2,381]" in young["ledger.wire"].detail
+               and any("life 1 (killed): [-1,000, +2,380]: one drain, so its W of 1,000 lines "
+                       "can all replay" in line for line in young["ledger.wire"].lines),
                f"a killed life with one drain may replay all of its W, got "
                f"{young['ledger.wire']} {young['ledger.wire'].lines}")
         young_over = killed("file-kill-one-drain-over", 2_382, no_drains=(134, 200))
         expect(young_over["ledger.wire"].status == checks.FAIL,
                f"a replay past a one-drain life's W FAILs, got {young_over['ledger.wire']}")
+        # A checkpoint after that drain can commit up to about one drain's reads the kill
+        # never exported: a shortfall of the drain's W passes, one line more FAILs.
+        young_short = killed("file-kill-one-drain-short", -1_000, no_drains=(134, 200))
+        expect(young_short["ledger.wire"].status == checks.PASS,
+               f"a one-drain life may fall short by its W, got {young_short['ledger.wire']}")
+        young_lost = killed("file-kill-one-drain-lost", -1_001, no_drains=(134, 200))
+        expect(young_lost["ledger.wire"].status == checks.FAIL,
+               f"a shortfall past a one-drain life's W FAILs, got {young_lost['ledger.wire']}")
 
     # The driver's line count: newlines only, every file, a partial write left out.
     with tempfile.TemporaryDirectory() as tmp:
