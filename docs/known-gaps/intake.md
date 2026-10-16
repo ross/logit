@@ -209,19 +209,24 @@ Entry format and the other areas: [the known-gaps index](README.md).
     the new one starts, as a DaemonSet's default rolling update (`maxSurge: 0`) does.
     `reuse_port` is refused on a multicast `bind:`, because there's nothing for it to share
     ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)).
-- **`0c0b4c34` raised UDP intake's kernel drops, and the cause isn't identified.** On the
-  desktop, at rate scales that put the 2026-10-02 binary at 3–5% drops, the commit that brought
-  the loss vocabulary to UDP intake added 2.1 points of drop on `udp-statsd` and 2.4 on
-  `udp-statsd-packed`, cost 2.5–2.6% of events/s, and added 1.5–2.0% CPU per event
-  ([`performance.md`](../design/performance.md) §7, "Desktop bisect of the B0 → D- rise"). Its
-  diff adds no telemetry call per datagram on a well-formed load: `read_loop` still counts once per
-  `recvmmsg(2)` call. Part of the step is code layout: #678's merge reads 1.4–1.7 points below
-  `0c0b4c34` with no further change to the UDP path.
+- **UDP intake's drop headroom depends on code layout.** On the desktop, at rate scales that put
+  the 2026-10-02 binary at 3–5% drops, `0c0b4c34` (the commit that brought the loss vocabulary to
+  UDP intake) added 2.1 points of drop on `udp-statsd` and 2.4 on `udp-statsd-packed`, cost
+  2.5–2.6% of events/s, and added 1.5–2.0% CPU per event
+  ([`performance.md`](../design/performance.md) §7, "Desktop bisect of the B0 → D- rise"). The
+  cause is code layout, not work: instructions per event didn't change, and the `bytes` crate's
+  refcounting functions moving in `.text` raised pipeline-restart redirects by about 60% in the
+  decode task. #678's merge reads 1.4–1.7 points below `0c0b4c34` with no further change to the UDP
+  path, and rebuilding with 64-byte function alignment removes the step ("Profile of the
+  `0c0b4c34` step", same section). Which predictor structure is involved is inferred, not
+  measured.
   - **Consequence:** a listener near its knee drops more of a burst than it did before #678,
-    about a 2% loss of read headroom.
-  - **Revisit:** a `perf` profile of `8c07211b` against `0c0b4c34` on `udp-statsd` separates the
-    read path's own cost from layout. Until it shows a cost on that path, there's nothing to fix
-    in it.
+    about a 2% loss of read headroom, and any build can land on either side of a layout step.
+  - **To close:** measure `-C llvm-args=-align-all-functions=6` on the perf VM across every
+    scenario family. It's a release-profile change, so it needs that data before adoption
+    ([ADR `release-build-profile`](../adr/release-build-profile.md)). It may also bear on
+    `native-relay`'s build-to-build swing ("`native-relay` is code-layout-sensitive",
+    `performance.md` §1).
 
 ## TLS and connection lifecycle
 
