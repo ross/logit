@@ -76,8 +76,9 @@ pub const DEFAULT_SPAN_SAMPLE_RATE: f64 = 0.1;
 /// Whether to keep `trace_id`'s spans at `rate`, deterministically, like OTel's
 /// `TraceIdRatioBased`.
 ///
-/// Every node, and every `logit` process in a split-collection topology, reaches the same verdict
-/// with nothing propagated. The low 8 bytes, big-endian, go straight into
+/// Every node, and every `logit` process in a split-collection topology at the same `rate`,
+/// reaches the same verdict with nothing propagated; a process at a different rate reaches its
+/// own (`docs/adr/native-hop-trace-context.md`). The low 8 bytes, big-endian, go straight into
 /// [`crate::sampling::keep`] with no hash: these are `logit`'s own random pipeline trace ids,
 /// never an application's. The `sample` transform hashes its key instead, so the two reach
 /// different verdicts for the same 16 bytes (`docs/adr/consistent-sampling-component.md`).
@@ -245,6 +246,13 @@ impl Telemetry {
         self.buf.is_some()
     }
 
+    /// Whether [`Telemetry::span`] would record a span for `trace_id`: the verdict it reaches for
+    /// this trace, so a caller can decide before it has a span to open. The native hop writes its
+    /// trace field only for a trace this process records. A disabled handle samples nothing.
+    pub fn samples_trace(&self, trace_id: &[u8; 16]) -> bool {
+        self.buf.as_ref().is_some_and(|b| trace_is_sampled(trace_id, b.span_sample_rate))
+    }
+
     /// Opens a span for this component's visit to one unit of work (per node kind, see
     /// `docs/adr/internal-span-emission-and-deterministic-sampling.md`).
     ///
@@ -263,7 +271,7 @@ impl Telemetry {
         parent_span_id: Option<[u8; 8]>,
     ) -> SpanGuard {
         let Some(buf) = &self.buf else { return SpanGuard::disabled() };
-        if !trace_is_sampled(&trace_id, buf.span_sample_rate) {
+        if !self.samples_trace(&trace_id) {
             return SpanGuard::disabled();
         }
         SpanGuard {
@@ -1385,6 +1393,49 @@ mod tests {
         assert!(trace_is_sampled(&id(0, u64::MAX), 1.5));
         assert!(!trace_is_sampled(&id(0, 0), 0.0));
         assert!(!trace_is_sampled(&id(0, 0), -1.0));
+    }
+
+    fn id_from(high: u64, low: u64) -> [u8; 16] {
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&high.to_be_bytes());
+        id[8..].copy_from_slice(&low.to_be_bytes());
+        id
+    }
+
+    #[test]
+    fn a_disabled_handle_samples_no_trace() {
+        assert!(!Telemetry::default().samples_trace(&id_from(0, u64::MAX)));
+    }
+
+    #[test]
+    fn samples_trace_keeps_everything_at_one_and_nothing_at_zero() {
+        let keep_all = Registry::with_span_sampling(1.0).telemetry_for("c", "kind", "role");
+        assert!(keep_all.samples_trace(&id_from(0, u64::MAX)));
+        let keep_none = Registry::with_span_sampling(0.0).telemetry_for("c", "kind", "role");
+        assert!(!keep_none.samples_trace(&id_from(0, 0)));
+    }
+
+    #[test]
+    fn samples_trace_splits_at_the_half_rate_threshold() {
+        let half = Registry::with_span_sampling(0.5).telemetry_for("c", "kind", "role");
+        assert!(half.samples_trace(&id_from(0, 0x7FFF_FFFF_FFFF_FFFF)));
+        assert!(!half.samples_trace(&id_from(0, 0x8000_0000_0000_0000)));
+    }
+
+    #[test]
+    fn samples_trace_agrees_with_span() {
+        for id in [
+            id_from(0, 0x7FFF_FFFF_FFFF_FFFF),
+            id_from(0, 0x8000_0000_0000_0000),
+            id_from(u64::MAX, 0x7FFF_FFFF_FFFF_FFFF),
+            id_from(u64::MAX, 0x8000_0000_0000_0000),
+        ] {
+            let registry = Registry::with_span_sampling(0.5);
+            let telemetry = registry.telemetry_for("c", "kind", "role");
+            drop(telemetry.span("process", SpanKind::Internal, id, span_id(1), None));
+            let recorded = find_span_event(&registry.drain(0)).is_some();
+            assert_eq!(telemetry.samples_trace(&id), recorded, "trace id {id:?}");
+        }
     }
 
     #[test]

@@ -170,8 +170,8 @@ pub enum ComponentKind {
     // and came back once keyed, cross-process consistency turned out to be the part `lua` can't
     // express.
 
-    InfluxDbOut { url: String, org: Option<String>, bucket: Option<String>,
-                  default_bucket: Option<String>, token: String },
+    InfluxDbOut { url: String, org: Option<String>, default_org: Option<String>,
+                  bucket: Option<String>, default_bucket: Option<String>, token: String },
     OtlpOut { endpoint: String },
     LogitOut { endpoint: String },
     // A named destination a router directs events into (docs/adr/target-components.md). No
@@ -401,6 +401,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 87. A `has_stale`/`drop_stale` with a `max_age` or a `max_ahead` of `0s`.
 88. A top-level `hostname` that is empty or only whitespace.
 89. An `influxdb_out` that sets both `bucket` and `default_bucket`.
+90. An `influxdb_out` that sets both `org` and `default_org`.
 70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL, carries a query
     or fragment, or ends in a HEC route rather than the `/services/collector` base, an empty or
     whitespace-padded `token`, `timeout: 0s`, an `ack_timeout` without `ack: true` or of `0s`, a
@@ -626,6 +627,7 @@ the 1-to-1 versus *n*-to-1 distinction between a node's per-batch processing and
 | Node kind | Context of what it emits | Span recorded |
 |---|---|---|
 | A listener's own batches | Always a fresh root. `Input::run` never receives a `Delivered` (arity rules out a `sources` entry pointing at a listener), so there's no parent to inherit. | `SpanKind::Producer`, in `Fanout::send`/`send_blocking` |
+| `logit_in`'s relayed batches | A child of the trace context the hop frame carried, when it carried one; else a fresh root. A sending `logit_out` carries the context its batch arrived under, and only for a trace its own process sampled ([ADR `native-hop-trace-context`](../adr/native-hop-trace-context.md)). It's the one listener with a parent, as `stamp_relayed` is the one exception to provenance's stamping rule below. | `SpanKind::Producer`, in `Fanout::send_relayed` |
 | `Transform::process`/`ScriptWorker::process` (the non-flush path) | A [`TraceContext::child`] of the one incoming batch that produced it: 1-to-1, unambiguous. | `SpanKind::Internal`, in `run_transform`/`run_lua` |
 | `Transform::flush`/Lua's timer-driven `flush()` | A fresh root, deliberately. A flush is *n*-to-1 (however many batches arrived since the last tick), with no single correct parent. This is a tracked gap, not an approximation; see ADR `trace-context-propagation-on-delivered`'s "What this doesn't do." One root covers *every* resource group a flush emits, not one root per group (ADR `internal-span-emission-and-deterministic-sampling`). | `SpanKind::Internal`, in `run_flush`/`run_lua`'s `flush_now` |
 | `run_output` | Borrows the incoming `Delivered` without unwrapping it (`Output::send(&EventBatch)`, [ADR `arc-eventbatch-copy-on-write`](../adr/arc-eventbatch-copy-on-write.md)), so the context is there to read. There's nothing downstream to propagate *to*: the sink span mints `ctx.child()` as its own identity and discards it (ADR `internal-span-emission-and-deterministic-sampling`). | `SpanKind::Client`, in `write_loop` |
@@ -638,6 +640,9 @@ Mechanically:
   can record its own span around that context.
 - `Fanout::send_with_context`/`send_blocking_with_context` mint a child of a given parent, record
   no span of their own, and are defined in terms of `send_with_own_context`.
+- `Fanout::send_relayed` takes an optional parent, the context `logit_in` decoded from the hop
+  frame. With one, it sends under `parent.child()` and parents its `Producer` span on it; without
+  one, it mints a root as `send` does.
 - `Delivered::context()` is a cheap `&self` accessor. Read it *before* `unwrap_batch`, which
   consumes the batch and discards the context. Returning the context from `unwrap_batch` would
   force every caller, most of which propagate nothing, to thread an unused value through.
@@ -688,7 +693,8 @@ previous = Some(self.component)              // rewritten on every send
 (`or`, not overwrite) only what the wire didn't carry, so a `logit_out` peer's own
 `origin`/`previous` survive the hop untouched. That is what lets a split-collection deployment
 read as one graph across `logit_out -> logit_in`. See the ADR for the wire-format decision
-(the `CODEC_HOP_BATCH` trailer) this relies on.
+(the `CODEC_HOP_BATCH` trailer) this relies on. The same trailer also carries an optional trace
+context, which `send_relayed` continues (see "Trace context propagation" above).
 
 ### Cancellation points
 

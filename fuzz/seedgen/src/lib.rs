@@ -26,7 +26,9 @@ use logit_proto::native::control::{
     Ack, AckStatus, ControlMessage, Hello, HelloAck, Reject, ACK_REJECTED_DECODE_BUDGET,
 };
 use logit_proto::native::varint::write_uvarint;
-use logit_proto::native::{encode_batch, encode_hop_batch, SeqId, CODEC_BATCH, CODEC_HOP_BATCH};
+use logit_proto::native::{
+    encode_batch, encode_hop_batch, HopTrace, SeqId, CODEC_BATCH, CODEC_HOP_BATCH,
+};
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{decompress_bounded, Encoding};
 use logit_proto::prometheus::remote_write::{self, Version};
@@ -105,7 +107,10 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         let provenance =
             Provenance { origin: Some(intern("seed_in")), previous: Some(intern("seed_enrich")) };
         let seq = SeqId { id: *b"seed-sender-id16", seq: 1 + i as u64 };
-        let hop = encode_hop_batch(batch, provenance, seq);
+        // Alternate the trace field so both trailer shapes seed the fuzz target.
+        let trace = (i % 2 == 0)
+            .then(|| HopTrace { trace_id: *b"seed-trace-id-16", span_id: *b"seed-spn" });
+        let hop = encode_hop_batch(batch, provenance, trace, seq);
         for (codec, payload, shape) in
             [(CODEC_BATCH, &bare, "batch"), (CODEC_HOP_BATCH, &hop, "hop")]
         {
@@ -130,6 +135,13 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
             with_prefix(&[id, &[0]].concat(), &bare),
         );
         add("native_hop_batch", format!("{name}-bad-prefix-id15"), id[..15].to_vec());
+        // A tag-5 trace field of 23 bytes, one short of the 24 it must carry.
+        let mut bad_trace = Vec::new();
+        bad_trace.extend_from_slice(&[id, &[1]].concat());
+        bad_trace.extend_from_slice(&bare);
+        bad_trace.extend_from_slice(&[25, 5, 23]);
+        bad_trace.extend_from_slice(&[0; 23]);
+        add("native_hop_batch", format!("{name}-bad-trace-len"), bad_trace);
         add("native_hop_batch", format!("{name}-bad-prefix-seq-truncated"), [id, &[0x81]].concat());
     }
 

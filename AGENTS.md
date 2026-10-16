@@ -106,7 +106,7 @@ Sinks live in `crates/logit-outputs`.
 
 | Kind | Code | What it does | Decision record |
 |---|---|---|---|
-| `influxdb_out` | `crates/logit-outputs/src/influxdb.rs` | InfluxDB 2.x line protocol over the write API, to its configured `bucket:` and `org:`, each else the one `influxdb_in` carried (the bucket else `default_bucket:`); a `403`/`404` drops the batch when a carried value could be at fault | [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md), [ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md), [ADR `influxdb-line-protocol-relay`](docs/adr/influxdb-line-protocol-relay.md) |
+| `influxdb_out` | `crates/logit-outputs/src/influxdb.rs` | InfluxDB 2.x line protocol over the write API, to its configured `bucket:` and `org:`, each else the one `influxdb_in` carried, else `default_bucket:` and `default_org:`; a `403`/`404` drops the batch when a carried value could be at fault | [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md), [ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md), [ADR `influxdb-line-protocol-relay`](docs/adr/influxdb-line-protocol-relay.md) |
 | `stdio_out` | `crates/logit-outputs/src/stdio.rs`, render in `human.rs` | an exhaustive, sectioned text block per event (default, `message: escaped \| multiline`), `format: json` (one object per event per line, `ndjson.rs`, what every harness reader consumes), or `format: native`; its file target is `file_out` with an empty rotation policy | [ADR `human-render-block-format`](docs/adr/human-render-block-format.md), [ADR `stream-json-format`](docs/adr/stream-json-format.md), [ADR `file-output-native-format`](docs/adr/file-output-native-format.md) |
 | `file_out` | `crates/logit-outputs/src/file.rs` | rotating file sink sharing `stdio_out`'s implementation | [ADR `rotating-file-output`](docs/adr/rotating-file-output.md) |
 | `syslog_out` | `crates/logit-outputs/src/syslog.rs` | RFC 3164/5424 over UDP, TCP, or TLS (RFC 5425) | [ADR `syslog-output`](docs/adr/syslog-output.md) |
@@ -498,8 +498,8 @@ Per pair:
   CRC-32C and optional lz4. A four-arm bake-off against `rkyv`, `postcard`, and OTLP itself
   decided it ([ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md)).
 - **Two payload shapes**: `CODEC_BATCH` is a bare batch, the file format; `CODEC_HOP_BATCH` is a
-  required sender identity and sequence, a batch, and a trailer of provenance, what the hop sends
-  and the spool records. A hop payload without a complete pair is malformed
+  required sender identity and sequence, a batch, and a trailer of provenance and an optional trace
+  context, what the hop sends and the spool records. A hop payload without a complete pair is malformed
   ([ADR `native-hop-no-compatibility`](docs/adr/native-hop-no-compatibility.md)); the pair leads
   so `logit_in` answers a frame it can't take with a rejected `Ack` naming it and keeps the
   connection ([ADR `native-hop-ack-status`](docs/adr/native-hop-ack-status.md)).
@@ -552,8 +552,10 @@ Per pair:
 - **Trace propagation**: every `Delivered` (one `Fanout` edge's channel payload) carries a real
   `TraceContext`, propagated as a child of its parent for the two node kinds with an unambiguous
   one to propagate: `Transform::process`/`ScriptWorker::process`'s non-flush path, and
-  `run_output`. See
-  [ADR `trace-context-propagation-on-delivered`](docs/adr/trace-context-propagation-on-delivered.md)
+  `run_output`. `logit_in` is the one listener that inherits one: it continues the trace a hop
+  frame carries, which `logit_out` sends only for a trace its own process sampled. See
+  [ADR `trace-context-propagation-on-delivered`](docs/adr/trace-context-propagation-on-delivered.md),
+  [ADR `native-hop-trace-context`](docs/adr/native-hop-trace-context.md),
   and [pipeline-graph.md](docs/design/pipeline-graph.md)'s "Trace context propagation" section.
 - **Internal telemetry**: `internal` drains `logit_core::telemetry`'s per-component buffers into
   ordinary events on its own `interval`
@@ -567,12 +569,16 @@ Per pair:
   "Amendment: internal drains last").
 - **Internal spans**: every node visit (a listener's send, a transform's process/flush, a sink's
   deliver) mints exactly one real `SpanRecord` from that context. Spans are deterministically
-  sampled on `trace_id` (`span_sample_rate`, default `0.1`, `1.0` in the demo), so every `logit`
-  process in a split-collection topology reaches the same keep/drop verdict independently with no
-  propagated bit. See
+  sampled on `trace_id` (`span_sample_rate`, default `0.1`, `1.0` in the demo), so processes at the
+  same `span_sample_rate` that share a trace id reach the same keep/drop verdict independently with
+  no propagated bit. A native hop shares the trace id: `logit_out` carries a sampled batch's context
+  in the hop trailer, so one trace spans both processes when the receiver's rate is at or above the
+  sender's ([ADR `native-hop-trace-context`](docs/adr/native-hop-trace-context.md)). See
   [ADR `internal-span-emission-and-deterministic-sampling`](docs/adr/internal-span-emission-and-deterministic-sampling.md)
   and `internal-telemetry.md`'s "Spans" section. `docs/known-gaps/telemetry.md`'s internal-spans
-  entry tracks what's still open: the listener span's window, and Lua `flush()`'s link-less root.
+  entry tracks what's still open, including the listener span's window, Lua `flush()`'s link-less
+  root, `logit_in`'s span not marking its parent as remote, and a span recorded after the sender's
+  last drain leaving the receiver's span a dangling parent.
 
 ### Operator surface
 
@@ -620,14 +626,15 @@ the operator-facing account of all of this.
 
 ### Demo, examples, and fixtures
 
-- **`examples/`** is user-facing: one directory per example holding a `logit.yaml`, the
-  `graph.svg` rendered from it, and any script the config loads (`examples/lua/process.lua`),
-  indexed by `examples/README.md`. Its comments are written for someone adopting `logit`: no ADR
-  paths, rule numbers, or history. `every_shipped_config_loads_and_validates` covers
-  `examples/*/logit.yaml` but never loads a `lua_file`, so `crates/logit-cli/tests/lua_example.rs`
-  runs `examples/lua/process.lua` through the real `logfmt` transform and a `ScriptWorker`. Re-render
-  `graph.svg` whenever its `logit.yaml` changes. `demo/graph-renderer` is the image with `dot`,
-  since neither the host nor `Dockerfile.dev` has graphviz:
+- **`examples/`** is user-facing: one directory per example holding one or more configs (a
+  `logit.yaml`, or one file per node, as `examples/forwarding/` does), the `.svg` graph rendered
+  from each, and any script a config loads (`examples/lua/process.lua`), indexed by
+  `examples/README.md`. Its comments are written for someone adopting `logit`: no ADR paths, rule
+  numbers, or history. `every_shipped_config_loads_and_validates` covers `examples/*/*.yaml` but
+  never loads a `lua_file`, so `crates/logit-cli/tests/lua_example.rs` runs
+  `examples/lua/process.lua` through the real `logfmt` transform and a `ScriptWorker`. Re-render a
+  config's graph whenever the config changes. `demo/graph-renderer` is the image with `dot`, since
+  neither the host nor `Dockerfile.dev` has graphviz:
 
   ```sh
   sudo docker build -q -t logit-graph-renderer demo/graph-renderer

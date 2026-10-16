@@ -174,11 +174,18 @@ the emission is sent under:
 | Node | `trace_id` | `span_id` | `parent_span_id` | `SpanKind` | Recorded in | Window measured |
 |---|---|---|---|---|---|---|
 | Listener | fresh root | that root's | none | `Producer` | `Fanout::send`/`send_blocking` | the `send` call only |
+| `logit_in` | inherited from the hop frame, else a fresh root | `parent.child()`'s, else the root's | the sender's carried span, else none | `Producer` | `Fanout::send_relayed` | the `send` call only |
 | `Transform::process` | inherited | `parent.child()`, minted in `run_transform` | incoming | `Internal` | `run_transform` | `process_batch` + send |
 | Lua `process` | inherited | same, minted in `run_lua` | incoming | `Internal` | `run_lua` | `process()` + blocking send |
 | `Transform::flush` | fresh root | that root's | none | `Internal` | `run_flush` | `flush()` + every group's send |
 | Lua `flush()` | fresh root | that root's | none | `Internal` | `run_lua`'s `flush_now` | `flush()` + send |
 | `run_output` | inherited | `ctx.child()`, minted then discarded | incoming | `Client` | `write_loop` | the whole `deliver_with_retry` |
+
+`logit_in` is the one listener that can inherit a parent: a hop frame carries the context its
+batch arrived at the sending `logit_out` under, when the sender sampled that trace
+([ADR `native-hop-trace-context`](../adr/native-hop-trace-context.md)). Its span is then a sibling
+of the sender's `logit_out deliver` span, both children of the span of the node that fed
+`logit_out`.
 
 A fan-out (one batch, several downstream consumers) records exactly one span. It's one
 `send_with_own_context` call by one node, and each of the *N* consumers mints its own child later,
@@ -215,6 +222,21 @@ computes the same keep/drop verdict independently from `trace_id` alone. A kept 
 *every* hop and a dropped one is dropped at every hop, with no propagated bit and no extra bytes on
 `TraceContext`/`Delivered`. It has the same shape as OTel's `TraceIdRatioBased` sampler: the top 53
 bits of the low 8 `trace_id` bytes (`f64`'s exact-integer range) compared against `rate`.
+
+Across processes the verdicts agree only once the processes share a `trace_id` and a
+`span_sample_rate`. Across a native hop the `trace_id` is shared: `logit_out` carries a batch's
+context only for a trace its own process sampled, and `logit_in` continues it. A receiver never
+records a span whose parent the sender dropped. The threshold is monotone in the rate, so what
+crosses a hop whole depends on the two rates:
+
+- **The receiver's rate at or above the sender's**: every trace the sender kept continues whole
+  on the receiver.
+- **The receiver's rate below the sender's**: the receiver continues only the traces that also
+  pass at its own rate, and the rest end at the sender.
+
+At any rates, the receiver roots its own trace for each batch the sender didn't sample and rolls
+its own rate on it, so it records spans for more of its traffic than its rate suggests: about 19%
+of batches at `0.1` on both sides, not 10%.
 
 The rate lives on `Registry` (`Registry::with_span_sampling(rate)`) and is process-wide; graph
 rule 13 already guarantees at most one `internal` component. It's copied into each

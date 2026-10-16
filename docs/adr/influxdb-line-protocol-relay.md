@@ -10,6 +10,8 @@ Accepted. Superseded in part on 2026-10-15 by "Amendment: `influxdb_out` follows
 destination (2026-10-15)", below: `influxdb_out` writes to the org and bucket a batch carries
 unless its config fixes them, and reads a `403` or `404` about a carried bucket or org as
 `Rejected`.
+Amended the same day by "Amendment: `influxdb_out`'s `default_org:` (2026-10-15)", which gives a
+batch that carries no org a configured fallback.
 
 ## Context
 
@@ -511,3 +513,31 @@ becomes a new database rather than a counted drop.
 - `docs/known-gaps/influxdb.md` replaces "`org` and `bucket` are carried, not routed" with the gaps
   above: a transient `403` or `404` drops rather than holds, the trust boundary, and InfluxDB 3
   Core's auto-created databases.
+
+## Amendment: `influxdb_out`'s `default_org:` (2026-10-15)
+
+`influxdb_out` gains `default_org:`, the org-side twin of `default_bucket:`. The amendment above
+left a batch that carries no org, such as an `internal` component's metrics or any path with no
+`influxdb_in` upstream, two choices against InfluxDB 2.x: draw a `400`, or set `org:`, which also
+overrides every carried org on the same sink. With `default_org:`, those batches and relayed ones
+share one sink, each relayed batch keeping its client's org.
+
+The sink resolves a batch's org in this order:
+
+1. `org:`, sent as `org=` alone, as before.
+2. The carried `org` and `orgID`, forwarded as before, both when both were carried. A carried
+   `orgID` alone wins over `default_org:` and is sent without an `org=` beside it, because
+   InfluxDB 2.7 reads `orgID` over `org` when a request has both.
+3. `default_org:`, sent as `org=`.
+4. Nothing, as before: InfluxDB 3 Core ignores the absence, and InfluxDB 2.x answers `400`, which
+   is `Rejected`.
+
+Setting `org:` and `default_org:` together is a validation error, as `bucket:` with
+`default_bucket:` is: `org:` would win for every batch, so the default would never be read.
+
+A `default_org:` value is the operator's config, like `org:` and `default_bucket:`. A `403` or
+`404` that could concern it is `Refused` and holds the queue; only a carried org makes the
+org-related rows `Rejected`. The module doc's "Response classes" has the rows.
+
+The amendment above advised setting `org:` when a source that carries no org feeds the sink in
+carried mode; `default_org:` is now the setting for that case, and `org:` stays the override.
