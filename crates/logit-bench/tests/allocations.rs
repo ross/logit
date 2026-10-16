@@ -2138,8 +2138,8 @@ fn fan_out_plus_two_has_attributes_for_the_same_split() {
         fanout.send(warm).await;
         let a = unwrap_delivered(rx_a.recv().await.expect("a should receive"));
         let b = unwrap_delivered(rx_b.recv().await.expect("b should receive"));
-        drop(process_batch(&mut host_filter, a, &telemetry));
-        drop(process_batch(&mut app_filter, b, &telemetry));
+        drop(process_batch(&mut host_filter, a, &mut Vec::new(), &telemetry));
+        drop(process_batch(&mut app_filter, b, &mut Vec::new(), &telemetry));
     });
 
     let batch = fixtures::nginx_batch_alternating_stream(64);
@@ -2150,8 +2150,8 @@ fn fan_out_plus_two_has_attributes_for_the_same_split() {
             // ordering as `fanout_send_two_consumers_costs_one_clone_plus_one_arc`.
             let a = unwrap_delivered(rx_a.recv().await.expect("a should receive"));
             let b = unwrap_delivered(rx_b.recv().await.expect("b should receive"));
-            let host_out = process_batch(&mut host_filter, a, &telemetry);
-            let app_out = process_batch(&mut app_filter, b, &telemetry);
+            let host_out = process_batch(&mut host_filter, a, &mut Vec::new(), &telemetry);
+            let app_out = process_batch(&mut app_filter, b, &mut Vec::new(), &telemetry);
             (host_out, app_out)
         })
     });
@@ -2486,10 +2486,10 @@ fn process_batch_through_keep() {
     let mut keep = fixtures::keep();
     let telemetry = Telemetry::default();
     let warm = fixtures::nginx_batch(1);
-    drop(process_batch(&mut keep, warm, &telemetry));
+    drop(process_batch(&mut keep, warm, &mut Vec::new(), &telemetry));
 
     let batch = fixtures::nginx_batch(1);
-    let (out, stats) = measure(|| process_batch(&mut keep, batch, &telemetry));
+    let (out, stats) = measure(|| process_batch(&mut keep, batch, &mut Vec::new(), &telemetry));
     let out = out.expect("keep forwards events, never fully absorbs");
     assert_eq!(out.events.len(), 1);
     expect_allocs("runtime: process_batch through keep, telemetry disabled", stats, 0);
@@ -2502,10 +2502,10 @@ fn process_batch_through_set_attributes_only() {
     let mut set = fixtures::set_attributes();
     let telemetry = Telemetry::default();
     let warm = fixtures::nginx_batch(1);
-    drop(process_batch(&mut set, warm, &telemetry));
+    drop(process_batch(&mut set, warm, &mut Vec::new(), &telemetry));
 
     let batch = fixtures::nginx_batch(1);
-    let (out, stats) = measure(|| process_batch(&mut set, batch, &telemetry));
+    let (out, stats) = measure(|| process_batch(&mut set, batch, &mut Vec::new(), &telemetry));
     let out = out.expect("set forwards events, never absorbs");
     assert_eq!(out.events.len(), 1);
     expect_allocs("runtime: process_batch through set (attributes only)", stats, 0);
@@ -2528,10 +2528,11 @@ fn trace_context_lifts_a_valid_trace_id() {
         scope: None,
         events: vec![event_with_trace_id.clone()],
     };
-    drop(process_batch(&mut trace_context, warm, &telemetry));
+    drop(process_batch(&mut trace_context, warm, &mut Vec::new(), &telemetry));
 
     let batch = EventBatch { resource, scope: None, events: vec![event_with_trace_id] };
-    let (out, stats) = measure(|| process_batch(&mut trace_context, batch, &telemetry));
+    let (out, stats) =
+        measure(|| process_batch(&mut trace_context, batch, &mut Vec::new(), &telemetry));
     let out = out.expect("trace_context forwards events, never absorbs");
     assert!(out.events[0].log.as_ref().unwrap().trace.is_some(), "the lift should have succeeded");
     expect_allocs("transform: trace_context, lifting a valid trace_id", stats, 0);
@@ -2585,10 +2586,11 @@ fn trace_context_mints_a_span_from_the_convention() {
     let traced = fixtures::nginx_traced_event();
     let telemetry = Telemetry::default();
     let warm = EventBatch { resource: resource.clone(), scope: None, events: vec![traced.clone()] };
-    drop(process_batch(&mut trace_context, warm, &telemetry));
+    drop(process_batch(&mut trace_context, warm, &mut Vec::new(), &telemetry));
 
     let batch = EventBatch { resource, scope: None, events: vec![traced] };
-    let (out, stats) = measure(|| process_batch(&mut trace_context, batch, &telemetry));
+    let (out, stats) =
+        measure(|| process_batch(&mut trace_context, batch, &mut Vec::new(), &telemetry));
     let out = out.expect("trace_context forwards events, never absorbs");
     let event = &out.events[0];
     let span = event.span.as_ref().expect("the span lift should have succeeded");
@@ -2703,10 +2705,10 @@ fn process_batch_through_has_attributes() {
     let mut has = fixtures::has_attributes();
     let telemetry = Telemetry::default();
     let warm = fixtures::nginx_batch(1);
-    drop(process_batch(&mut has, warm, &telemetry));
+    drop(process_batch(&mut has, warm, &mut Vec::new(), &telemetry));
 
     let batch = fixtures::nginx_batch(1);
-    let (out, stats) = measure(|| process_batch(&mut has, batch, &telemetry));
+    let (out, stats) = measure(|| process_batch(&mut has, batch, &mut Vec::new(), &telemetry));
     let out = out.expect("the fixture's status should match, so this forwards");
     assert_eq!(out.events.len(), 1);
     expect_allocs("runtime: process_batch through has_attributes", stats, 0);
@@ -2720,10 +2722,11 @@ fn process_batch_through_has_attributes_dropping_every_event() {
     let mut drop_attrs = fixtures::drop_attributes();
     let telemetry = Telemetry::default();
     let warm = fixtures::nginx_batch(1);
-    drop(process_batch(&mut drop_attrs, warm, &telemetry));
+    drop(process_batch(&mut drop_attrs, warm, &mut Vec::new(), &telemetry));
 
     let batch = fixtures::nginx_batch(1);
-    let (out, stats) = measure(|| process_batch(&mut drop_attrs, batch, &telemetry));
+    let (out, stats) =
+        measure(|| process_batch(&mut drop_attrs, batch, &mut Vec::new(), &telemetry));
     assert!(out.is_none(), "the fixture's status should match, so every event is dropped");
     expect_allocs("runtime: process_batch through drop_attributes, dropping every event", stats, 0);
 }
@@ -2741,10 +2744,10 @@ fn process_batch_fully_absorbed() {
         scope: None,
         events: vec![fixtures::statsd_event()],
     };
-    drop(process_batch(&mut agg, warm, &telemetry));
+    drop(process_batch(&mut agg, warm, &mut Vec::new(), &telemetry));
 
     let batch = EventBatch { resource, scope: None, events: vec![fixtures::statsd_event()] };
-    let (out, stats) = measure(|| process_batch(&mut agg, batch, &telemetry));
+    let (out, stats) = measure(|| process_batch(&mut agg, batch, &mut Vec::new(), &telemetry));
     assert!(out.is_none(), "a batch with nothing left to forward should not be forwarded");
     expect_allocs("runtime: process_batch, fully absorbed (aggregate)", stats, 0);
 }
@@ -2759,10 +2762,10 @@ fn process_batch_with_live_telemetry() {
     let registry = Registry::new();
     let telemetry = registry.telemetry_for("keep", "keep", "transform");
     let warm = fixtures::nginx_batch(1);
-    drop(process_batch(&mut keep, warm, &telemetry));
+    drop(process_batch(&mut keep, warm, &mut Vec::new(), &telemetry));
 
     let batch = fixtures::nginx_batch(1);
-    let (out, stats) = measure(|| process_batch(&mut keep, batch, &telemetry));
+    let (out, stats) = measure(|| process_batch(&mut keep, batch, &mut Vec::new(), &telemetry));
     let out = out.expect("keep forwards events, never fully absorbs");
     assert_eq!(out.events.len(), 1);
     expect_allocs("runtime: process_batch through keep, telemetry live (steady state)", stats, 0);
@@ -2778,11 +2781,11 @@ fn process_batch_first_call_after_a_drain() {
     let registry = Registry::new();
     let telemetry = registry.telemetry_for("keep", "keep", "transform");
     let warm = fixtures::nginx_batch(1);
-    drop(process_batch(&mut keep, warm, &telemetry));
+    drop(process_batch(&mut keep, warm, &mut Vec::new(), &telemetry));
     registry.drain(0); // what `internal`'s tick does: empties the ComponentBuffer's map
 
     let batch = fixtures::nginx_batch(1);
-    let (out, stats) = measure(|| process_batch(&mut keep, batch, &telemetry));
+    let (out, stats) = measure(|| process_batch(&mut keep, batch, &mut Vec::new(), &telemetry));
     let out = out.expect("keep forwards events, never fully absorbs");
     assert_eq!(out.events.len(), 1);
     expect_allocs("runtime: process_batch, first call after an internal drain", stats, 2);

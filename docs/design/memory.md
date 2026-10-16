@@ -546,7 +546,7 @@ so both, plus `unwrap_batch`, are measured in `crates/logit-bench/tests/allocati
 
 | Path | allocs | Notes |
 |---|---:|---|
-| `process_batch` through `keep`, telemetry disabled | **0** | nothing at all — `1 → 0` when `Transform::process` went in place ([ADR `in-place-transform-process`](../adr/in-place-transform-process.md), §8 item 14): `process_batch` is a `Vec::retain_mut` over the batch's own `events` now, so there is no `out` `Vec` to collect survivors into |
+| `process_batch` through `keep`, telemetry disabled | **0** | nothing at all — `1 → 0` when `Transform::process` went in place ([ADR `in-place-transform-process`](../adr/in-place-transform-process.md), §8 item 14): `process_batch` is a `Vec::retain_mut` over the batch's own `events` now, so there is no `out` `Vec` to collect survivors into. The `emitted` scratch ([ADR `transform-fan-out`](../adr/transform-fan-out.md)) stays empty with no capacity for a transform that never pushes, and appending it is a no-op |
 | `process_batch` through `set` (attributes only) | **0** | identical to `keep` — `Transform::map_resource`'s default `None` return costs nothing beyond the call itself (`crates/logit-pipeline/src/transform.rs`) |
 | `set.map_resource`, cached (same input `Arc`) | **0** | the one-entry `Arc::ptr_eq` cache (`crates/logit-transforms/src/set.rs`) hits |
 | `set.map_resource`, cache miss (distinct input `Arc`) | **1** | `Arc::new(Resource { .. })` only — cloning/inserting into the fixture's empty, inline `AttrMap` never touches the heap |
@@ -930,8 +930,11 @@ Two properties held through all of this:
 
 A separate change removed more per-hop cost: `Transform::process(&mut self, &Arc<Resource>, &mut
 Event) -> bool` plus `Vec::retain_mut` in `process_batch` saves one 864-byte `Event` memcpy per node
-hop and one `Vec` allocation per batch per node. The trait already couldn't emit more than one event
-per input, so a bool says everything the `Option<Event>` return did. See
+hop and one `Vec` allocation per batch per node. A bool says everything the `Option<Event>` return
+did, because that return could only hand back the event it was given. Fan-out goes through
+`Transform::process_into`'s `emitted` scratch instead, which the node keeps across batches and
+which allocates only when a transform pushes onto it
+([ADR `transform-fan-out`](../adr/transform-fan-out.md)). See
 [ADR `in-place-transform-process`](../adr/in-place-transform-process.md) and §8 item 14; the
 `process_batch` rows in §2's "Runtime" table are the result.
 

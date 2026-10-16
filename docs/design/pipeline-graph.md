@@ -611,6 +611,15 @@ incoming batch before any event reaches `process`. It lets a transform substitut
 resource (`logit-transforms::Set` was the first implementer); see
 [ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
 
+A native transform can also turn one event into several. The runtime calls
+`Transform::process_into`, whose default forwards to `process`. Its bool forwards or discards the
+event in place, as `process`'s does, and every event it pushes onto `emitted` is forwarded
+whatever the bool says. `process_batch` appends those children after the batch's surviving
+events, in emission order, so they leave in the parent's batch under its resource, scope, and
+trace context, with no extra inbox send. A batch whose parents were all discarded still goes out
+if it emitted anything. A child carries no route mark, unlike a Lua `return {a, b}`, because a
+native transform has no `targets:`. See [ADR `transform-fan-out`](../adr/transform-fan-out.md).
+
 ### Trace context propagation
 
 Every `Delivered` (the channel payload one `Fanout` edge carries, `crates/logit-pipeline/src/fanout.rs`)

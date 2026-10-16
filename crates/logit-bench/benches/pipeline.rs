@@ -796,9 +796,9 @@ mod survey_batch {
     fn process_batch_100_access_logs(bencher: Bencher) {
         let mut keep = fixtures::keep();
         let telemetry = Telemetry::default();
-        bencher
-            .with_inputs(|| wide_batch(100))
-            .bench_local_values(|batch| process_batch(&mut keep, batch, &telemetry));
+        bencher.with_inputs(|| wide_batch(100)).bench_local_values(|batch| {
+            process_batch(&mut keep, batch, &mut Vec::new(), &telemetry)
+        });
     }
 
     /// `route_batch`'s partition-and-move pass over the same 100 wide events: one
@@ -866,9 +866,9 @@ mod runtime {
     fn process_batch_through_keep(bencher: Bencher) {
         let mut keep = fixtures::keep();
         let telemetry = Telemetry::default();
-        bencher
-            .with_inputs(|| fixtures::nginx_batch(1))
-            .bench_local_values(|batch| process_batch(&mut keep, batch, &telemetry));
+        bencher.with_inputs(|| fixtures::nginx_batch(1)).bench_local_values(|batch| {
+            process_batch(&mut keep, batch, &mut Vec::new(), &telemetry)
+        });
     }
 
     /// One consumer, the common case (every listener's first hop, every interior edge of a linear
