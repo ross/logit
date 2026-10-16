@@ -254,7 +254,8 @@ exemplar value only.
 `lua-in-place-edits`](lua-in-place-edits.md), the follow-up this ADR's Decision and Consequences
 named. A write parses through this constructor's parsers for the same `log` keys, so it accepts
 what a `log` table accepts and refuses with the same message under an `event.log.<field>` label
-instead of `Event.new: log.<field>`; every `Event.new` message is unchanged. Two `nil` rules
+instead of `Event.new: log.<field>`, except that `body_format`'s messages don't offer `nil`; every
+`Event.new` message is unchanged. Two `nil` rules
 differ from the constructor's: `body_format = nil` is an error where an absent key defaults to
 `raw`, and `message = nil` is a no-op on a log whose message is already `Null`. A script that
 changes a log field no longer needs `Event.new(event:to_table())`.

@@ -31,7 +31,7 @@ enumerates them.
 
 - **Log fields.** `event.log.message`, `severity`, and `body_format` accept what `Event.new`'s
   `log` table accepts, through the same parsers, and refuse with the same message under an
-  `event.log` prefix. `severity = nil` clears the field. `body_format = nil` errors, because an
+  `event.log` prefix, except that `body_format`'s messages don't offer `nil`. `severity = nil` clears the field. `body_format = nil` errors, because an
   in-place write is explicit, where `Event.new` defaults an absent `body_format` to `raw`.
   `message = nil` errors, but the no-op check runs first, so writing back a `Null` message (the
   OTLP logs decoder's body-less log) is not an error. The three writes are independent: a
