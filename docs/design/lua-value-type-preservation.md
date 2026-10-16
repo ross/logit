@@ -75,6 +75,10 @@ the assignment is a no-op. If not, conversion proceeds.
 | `Null` | `Nil` | always |
 | anything else, including `Table` | — | `false` (see "Known residual gaps") |
 
+The `Null`/`Nil` row never keeps an attribute: each attribute proxy's `__newindex` deletes the key
+on a `nil` write before it runs this check
+([ADR `lua-in-place-edits`](../adr/lua-in-place-edits.md)).
+
 `lua_value_matches` is deliberately cheap and self-contained: it never constructs a new `Value`
 and never calls back into Lua (no `Table` traversal, no metamethods). It has to be, because
 `AttrsProxy::__newindex` runs it while holding a short immutable borrow of the event. If the check

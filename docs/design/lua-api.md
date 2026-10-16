@@ -9,7 +9,7 @@ What a script can reach:
 | Surface | Access | Section |
 |---|---|---|
 | `event.timestamp` | read/write, a decimal-nanos string | "Timestamps are strings" |
-| `event.attributes` | read/write per key | same |
+| `event.attributes` | read/write per key; `= nil` deletes the key | same |
 | `event.has_log`, `event.has_metrics`, `event.has_span` | read-only booleans | same |
 | `event:to_table()`, `event:clone()` | methods | "No `__pairs`: use `event:to_table()`", "Exposure: a proxy, not a converted table" |
 | `event:to(id)` | method, marks an event for a target | "Routing to a target" |
@@ -495,8 +495,10 @@ end
 
 Read and write with `resource["key"]`, exactly like `event.attributes["key"]`. To enumerate every
 key, use `resource:to_table()`: there is no `__pairs` under LuaJIT, for the same reason
-`event.attributes` needs `event:to_table()`. Assigning `nil` stores a null value; it doesn't
-remove the key. Lua can't delete a resource attribute, the same rule `event.attributes` follows.
+`event.attributes` needs `event:to_table()`. Assigning `nil` deletes the key, the same rule
+`event.attributes` and `scope.attributes` follow
+([ADR `lua-in-place-edits`](../adr/lua-in-place-edits.md)). Deleting a key the resource doesn't
+carry changes nothing.
 
 **Per batch, not per event.** A write inside `process()` applies to the whole outgoing batch,
 including events already processed earlier in the same batch. For a per-event identity, use
@@ -527,8 +529,8 @@ which also explains why this is a graph component rather than a per-input config
 **`schema_url` and `dropped_attributes_count` mirror OTLP's own `Resource` fields**
 ([`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)):
 
-- `schema_url` is read/write, a string or `nil`. Assigning `nil` clears it, the same "`nil` means
-  removal for this one field" exception `event.log.trace_id` below has.
+- `schema_url` is read/write, a string or `nil`. Assigning `nil` clears it, as `nil` deletes an
+  attribute.
 - `dropped_attributes_count` is read-only. It is OTLP's count of attributes a *producer* dropped
   before the resource reached `logit`, which a Lua write can't meaningfully change.
   `resource.dropped_attributes_count = 5` raises `resource.dropped_attributes_count is read-only`,
@@ -563,7 +565,7 @@ end
 | `version` | string | read/write -- same |
 | `schema_url` | string or `nil` | read/write -- `nil` clears it |
 | `dropped_attributes_count` | integer | read-only |
-| `attributes` | sub-object, open map | read/write per key -- same `__index`/`__newindex` shape as `event.attributes` |
+| `attributes` | sub-object, open map | read/write per key -- same `__index`/`__newindex` shape as `event.attributes`; `= nil` deletes the key |
 
 **`scope`'s attributes live under `scope.attributes`, not directly on `scope[key]`.** This differs
 from `resource`, where `resource["service.name"]` indexes the attribute map directly and there is

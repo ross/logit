@@ -119,6 +119,25 @@ impl UserData for ResourceProxy {
                     }
                     _ => {}
                 }
+                // `nil` deletes, as in `crate::proxy::AttrsProxy::__newindex`. The copy-on-write
+                // runs only for a present key, so deleting an absent key leaves `take` empty.
+                if matches!(value, LuaValue::Nil) {
+                    let mut state = this.0.borrow_mut();
+                    let present = match &state.modified {
+                        Some(r) => r.attributes.get(key).is_some(),
+                        None => state.base.attributes.get(key).is_some(),
+                    };
+                    if present {
+                        ensure_modified(&mut state);
+                        state
+                            .modified
+                            .as_mut()
+                            .expect("ensure_modified set Some above")
+                            .attributes
+                            .remove(key);
+                    }
+                    return Ok(());
+                }
                 // Same no-op check and borrow ordering as `crate::proxy::AttrsProxy::__newindex`:
                 // conversion reads raw and runs no metamethod; the borrow is still released first.
                 let is_noop = {
@@ -271,6 +290,52 @@ mod tests {
         lua.load(r#"resource["service.name"] = resource["service.name"]"#).exec().unwrap();
 
         assert!(take(&state).is_none(), "an identity assignment must not count as a write");
+    }
+
+    #[test]
+    fn a_nil_write_deletes_an_attribute_and_take_commits_the_rest() {
+        let lua = Lua::new();
+        let state = install(&lua).unwrap();
+        set(&state, &resource(&[("a", "1"), ("b", "2"), ("c", "3")]));
+
+        lua.load(r#"resource["b"] = nil; seen = resource["b"]"#).exec().unwrap();
+        assert!(lua.globals().get::<_, LuaValue>("seen").unwrap().is_nil());
+
+        let committed = take(&state).expect("a delete must report Some");
+        assert!(committed.attributes.get("b").is_none());
+        assert_eq!(committed.attributes.len(), 2);
+        let keys: Vec<&str> =
+            committed.attributes.iter().map(|(k, _)| logit_core::interner::resolve(k)).collect();
+        assert_eq!(keys, ["a", "c"]);
+        assert_eq!(committed.attributes.get("a"), Some(&Value::str("1")));
+        assert_eq!(committed.attributes.get("c"), Some(&Value::str("3")));
+    }
+
+    #[test]
+    fn a_nil_write_deletes_a_null_attribute() {
+        let lua = Lua::new();
+        let state = install(&lua).unwrap();
+        let mut attrs = AttrMap::new();
+        attrs.insert("n", Value::Null);
+        attrs.insert("k", "v");
+        set(&state, &Arc::new(Resource { attributes: attrs, ..Default::default() }));
+
+        lua.load(r#"resource["n"] = resource["n"]"#).exec().unwrap();
+
+        let committed = take(&state).expect("deleting a Null must report Some");
+        assert!(committed.attributes.get("n").is_none());
+        assert_eq!(committed.attributes.len(), 1);
+    }
+
+    #[test]
+    fn a_nil_write_of_an_absent_key_is_a_no_op_and_take_stays_none() {
+        let lua = Lua::new();
+        let state = install(&lua).unwrap();
+        set(&state, &resource(&[("a", "1")]));
+
+        lua.load(r#"resource["missing"] = nil"#).exec().unwrap();
+
+        assert!(take(&state).is_none(), "deleting an absent key must not count as a write");
     }
 
     #[test]

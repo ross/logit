@@ -420,6 +420,12 @@ impl UserData for AttrsProxy {
             MetaMethod::NewIndex,
             |_, this, (key, value): (mlua::String, LuaValue)| {
                 let key = key.to_str()?;
+                // `nil` deletes, and the check precedes the no-op check below: `lua_value_matches`
+                // treats `nil` as matching a stored `Null`, which would keep the key.
+                if matches!(value, LuaValue::Nil) {
+                    this.0.borrow_mut().attributes.remove(key);
+                    return Ok(());
+                }
                 // If `value` is what `value_to_lua` gave for the current content, keep the stored
                 // `Value`, so its variant (`Bytes` vs. `Str`, `U64` vs. `I64`) survives
                 // `event.attributes.x = event.attributes.x` (`lua_value_matches`). Conversion
@@ -1794,6 +1800,67 @@ pub(crate) mod tests {
         );
         let out = emitted(w.process(log_event()).unwrap());
         assert_eq!(out.log.unwrap().event_name, None);
+    }
+
+    fn attrs_event() -> Event {
+        let mut attrs = AttrMap::new();
+        attrs.insert("a", "1");
+        attrs.insert("host", "web-1");
+        attrs.insert("n", Value::Null);
+        attrs.insert("z", "26");
+        Event::log(1, attrs, log_record_with_everything())
+    }
+
+    #[test]
+    fn attribute_nil_write_deletes_the_key_and_keeps_order() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.host = nil
+                return event
+            end
+            "#,
+        );
+        let before = attrs_event();
+        let mut expected: Vec<&str> = before.attributes.iter().map(|(k, _)| resolve(k)).collect();
+        expected.retain(|k| *k != "host");
+        let out = emitted(w.process(before).unwrap());
+        assert!(out.attributes.get("host").is_none());
+        let keys: Vec<&str> = out.attributes.iter().map(|(k, _)| resolve(k)).collect();
+        assert_eq!(keys, expected);
+        assert_eq!(out.attributes.get("a"), Some(&Value::str("1")));
+        assert_eq!(out.attributes.get("z"), Some(&Value::str("26")));
+    }
+
+    #[test]
+    fn attribute_nil_write_deletes_a_null_attribute() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.n = event.attributes.n
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(attrs_event()).unwrap());
+        assert!(out.attributes.get("n").is_none(), "a read-back write of a Null deletes it");
+        assert_eq!(out.attributes.len(), 3);
+    }
+
+    #[test]
+    fn attribute_nil_write_of_an_absent_key_is_a_no_op() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.missing = nil
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(attrs_event()).unwrap());
+        assert_eq!(out.attributes.len(), 4);
+        assert!(out.attributes.get("missing").is_none());
+        assert_eq!(out.attributes.get("n"), Some(&Value::Null));
     }
 
     #[test]

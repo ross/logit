@@ -3790,6 +3790,26 @@ fn lua_process_one_event_constructing_a_span_event() {
     expect_allocs("lua: Event.new span event from a literal table", stats, 14);
 }
 
+/// `event.attributes.host = nil`: deleting an attribute in place.
+///
+/// 8, each piece isolated against a narrower script:
+///
+/// - **4** for any call, **+1** for the `Box` on the way out, **+3** for creating and caching the
+///   `AttrsProxy` on the event's first `event.attributes` access: the same 8 as a script that only
+///   reads an attribute.
+/// - **+0** for the delete: `AttrMap::remove` looks the key up without interning it and shifts the
+///   sorted entries down, and the removed value's drop frees rather than allocates.
+#[test]
+fn lua_process_one_event_deleting_an_attribute() {
+    let worker = ScriptWorker::new(fixtures::LUA_ATTR_DELETE_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
+    expect_allocs("lua: delete an attribute with = nil", stats, 8);
+}
+
 // ---------------------------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------------------------

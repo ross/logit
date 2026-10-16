@@ -691,8 +691,8 @@ So the pipeline renames instead:
 1. `json` decodes the object.
 2. `flatten` dot-joins it: `request.method`, and `request.headers.User-Agent.0`, since every header
    value is an array.
-3. A `lua` stage moves each field onto its canonical name. Writing `nil` stores a null, which
-   `http_access` treats as absent and a later `keep` removes.
+3. A `lua` stage moves each field onto its canonical name. Writing `nil` deletes the key, so
+   the old name no longer reaches `http_access`.
 
 A `lua` stage is needed because `logit` has no native rename component: `set` only stamps
 constants, and the old `rename` kind was retired in favour of Lua

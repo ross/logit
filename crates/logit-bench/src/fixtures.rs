@@ -1096,6 +1096,16 @@ function process(event)
 end
 "#;
 
+/// Deletes the `host` attribute with `= nil` on every call: an in-place removal
+/// (`docs/adr/lua-in-place-edits.md`; `tests/allocations.rs`'s
+/// `lua_process_one_event_deleting_an_attribute`).
+pub const LUA_ATTR_DELETE_SCRIPT: &str = r#"
+function process(event)
+  event.attributes.host = nil
+  return event
+end
+"#;
+
 /// Writes a `resource` attribute on every call: a script stamping a resource identity
 /// (`crates/logit-script/src/resource.rs`, `docs/adr/operator-declared-resource-attributes.md`;
 /// `tests/allocations.rs`'s `lua_process_one_event_writing_resource`).

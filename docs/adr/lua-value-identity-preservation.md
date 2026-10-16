@@ -108,3 +108,13 @@ thing a script can actually observe or act on through the string/number surface.
   `crates/logit-script/src/lib.rs`) for the same reason as the cross-key gap above.
 - No new dependency, no new userdata type, no change to what a script observes when it prints,
   concatenates, or compares an attribute — only to what variant survives an unmodified round-trip.
+
+## Amendment (2026-10-16): a `nil` write deletes, including a read-back write of a `Null`
+
+[ADR `lua-in-place-edits`](lua-in-place-edits.md) makes `nil` delete the key on `event.attributes`,
+`resource`, and `scope.attributes`. Each `__newindex` checks for `nil` before the no-op check, so
+the `Null`/`Nil` match in `lua_value_matches` no longer keeps a `Null` attribute. A `Null`
+attribute reads as `nil`, so `event.attributes.x = event.attributes.x` on one now removes the key
+where this decision kept it. Every other variant's read-back write is still a no-op and keeps its
+variant. A script can't write `Value::Null`; `docs/known-gaps/transforms.md`'s Lua section records
+both consequences.

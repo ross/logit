@@ -375,6 +375,19 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **To close:** an in-place write path would share the constructor's parsers. It's a small
     follow-up, not designed yet, the same posture as in-place
     `event.log.message`/`severity`/`body_format` writes.
+- **A script can't write `Value::Null`.** A `nil` assigned to `event.attributes`, `resource`, or
+  `scope.attributes` deletes the key ([ADR `lua-in-place-edits`](../adr/lua-in-place-edits.md)).
+  Two sinks render a `Null` differently from an absent key: `syslog_out` writes a `Null`
+  `syslog.timestamp` as RFC 5424's nil `-`, and the JSON formats write `null`. No shipped config
+  or example needs either.
+  - **To close:** a separate way to write `Null`, such as a global function (a proxy method would
+    shadow an attribute of its name), if a need shows up.
+- **A `Null` attribute doesn't survive a read-back write.** A `Null` attribute reads as `nil`, so
+  Lua can't tell writing back what it read from deleting. `a.x = a.x`, or
+  `for k, v in pairs(a) do a[k] = f(v) end` where `f(nil)` is `nil`, deletes an attribute a decoder
+  stored as `Null` (a JSON `null`, a syslog nil timestamp). The unmodified-write no-op in [ADR
+  `lua-value-identity-preservation`](../adr/lua-value-identity-preservation.md) no longer covers
+  it.
 - **A Lua `flush()` emission is never attributed to the batches that fed it.** `flush()` runs in
   a root context ([ADR `lua-flush-root-context`](../adr/lua-flush-root-context.md)), and there's no
   accumulator for the runtime to inspect, unlike `Transform::flush`'s linking (see "Internal
