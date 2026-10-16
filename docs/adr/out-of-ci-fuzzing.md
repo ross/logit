@@ -403,8 +403,11 @@ The InfluxDB line-protocol codec adds one more:
 
 - `influxdb_line`: a whole write body through `InfluxDecoder::decode_body`, the first byte
   choosing the `precision`, with an all-or-nothing oracle against the body's lines parsed one at
-  a time and a second-generation encode/decode fixed point. Its seeds are the Telegraf-shaped
-  body in `crates/logit-proto/tests/support/influxdb_lines.rs` and constructed lines.
+  a time and a second-generation encode/decode fixed point. The same body also goes through
+  `InfluxDecoder::decode_skipping`, the `line_protocol` transform's path, with an oracle that it
+  skips each bad line in order, decodes the rest, and on a good body matches `decode_body`. Its
+  seeds are the Telegraf-shaped body in `crates/logit-proto/tests/support/influxdb_lines.rs` and
+  constructed lines.
 
 `prom_remote_write` also gains a structured mode, which builds a request from its input so the
 symbol-table rules are reachable, and a fixed-point oracle on every input.
