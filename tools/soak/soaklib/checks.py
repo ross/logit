@@ -2489,6 +2489,15 @@ def _last_interval(tel, name, component, life):
     return round(rate * statistics.median(gaps)), rate
 
 
+def _last_rate(tel, name, component, life):
+    """A counter's per-second rate over the last drain interval of a life it moved in."""
+    drains = tel.life_drains(life)
+    by_ts = {ts: v for ts, v, point_life in tel.counter_points(name, component=component)
+             if point_life == life}
+    return next((by_ts[b] / (b - a) for a, b in reversed(list(zip(drains, drains[1:])))
+                 if b > a and by_ts.get(b)), 0.0)
+
+
 def _cumulative(tel, name, component, minus=None):
     """A function of time: a counter's running total across every life, interpolated linearly
     between its drains and held flat between lives, less `minus`'s, if named."""
@@ -2815,11 +2824,13 @@ def check_ledger_replay(data):
     Across a hop, the ingress SUT's hop sink is judged for its own killed lives too. The
     listener feeds it directly, so its queue keeps growing between the last drain and the kill,
     and the far side may take some of it; its spool commits a frame once the far side
-    acknowledges it and persists that every `checkpoint_interval`, so frames delivered since the
-    last persist replay again. With the rates over the life's last drain interval and t the time
-    from its last drain to the `docker kill`'s return, replayed − queued is in
-    [−(delivered rate × t) − 1, received rate × t + delivered rate × the checkpoint interval
-    + 1]."""
+    acknowledges it and persists the cursor on a commit once `checkpoint_interval` has passed
+    since the last persist, so up to one interval of commits before the last persist stays
+    unpersisted, even while nothing is delivered, and replays again. With the rates over the
+    life's last drain interval, t the time from its last drain to the `docker kill`'s return,
+    and the delivered rate over the last drain interval that delivered anything, replayed −
+    queued is in [−(delivered rate × t) − 1, received rate × t + that last delivered rate × the
+    checkpoint interval + 1]."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.replay", led)
     if skipped:
@@ -2846,13 +2857,15 @@ def check_ledger_replay(data):
         if service is not None:
             _, sent = _last_interval(sut, "logit.component.batches.delivered", sink, life)
             _, took = _last_interval(sut, "logit.component.batches.received", sink, life)
+            last = _last_rate(sut, "logit.component.batches.delivered", sink, life)
             done = led.inn.killed_done.get(life) or led.inn.killed_at[life]
             after = max(0.0, done - drains[-1]) if drains else 0.0
             low = -math.ceil(sent * after) - 1
-            high = math.ceil(took * after + sent * led.hop_checkpoint) + 1
+            high = math.ceil(took * after + last * led.hop_checkpoint) + 1
             band = (f", band [{_n(low)}, {_n(high)}]: {took:,.1f} batches/s received and "
                     f"{sent:,.1f} delivered over its last drain interval, {after:.1f}s from "
-                    f"its last drain to the kill, a {led.hop_checkpoint:g}s checkpoint")
+                    f"its last drain to the kill, and a {led.hop_checkpoint:g}s checkpoint of "
+                    f"its last {last:,.1f} delivered/s")
         ok = low <= replayed - queued <= high
         status = worst([status, PASS if ok else FAIL])
         where = f"{service} " if service is not None else ""
