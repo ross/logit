@@ -295,8 +295,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     the manual never says so. With the comma form, HAProxy emitted raw binary CBOR in the syslog
     MSG both to a plain UDP `log` target and to a `ring` with `server ... log-proto octet-count`.
     Over TCP octet-counting that MSG reaches `logit` intact, because `syslog_in` decodes a
-    non-UTF-8 MSG as a `Value::Bytes`; over UDP it needs `framing: datagram` (one message per datagram), which `syslog_in`
-    has ([syslog known gaps](syslog.md)'s binary-MSG entry).
+    non-UTF-8 MSG as a `Value::Bytes`; over UDP it needs `framing: datagram` (one message per
+    datagram), which `syslog_in` has ([syslog known gaps](syslog.md)'s binary-MSG entry).
   - **Wire shape**, should anything decode it: an indefinite-length map (`BF … FF`) with definite
     text keys; *untyped* string items such as `%HM` come out as indefinite-length *chunked* text
     strings (`7F 63 'GET' FF`), `:str`-typed ones as definite strings; `:sint` non-negatives are
