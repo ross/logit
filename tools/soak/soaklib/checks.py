@@ -1188,6 +1188,12 @@ class SutLives:
             if record.get("event") == "apply" and record.get("action") == "kill"
             and record.get("on") == service and not record.get("rc")}
         self.killed = sorted(self.killed_at)
+        # When each of those kills' `docker kill` returned: the signal lands before then.
+        self.killed_done = {
+            vm.life_at(self.life_starts, record["started_at"]): record.get("finished_at")
+            for record in data.timeline
+            if record.get("event") == "apply" and record.get("action") == "kill"
+            and record.get("on") == service and not record.get("rc")}
 
 
 class Ledger:
@@ -2520,10 +2526,11 @@ def check_ledger_hop(data):
     marks, and a pause leaves frames in an ended connection that a resend races
     (docs/known-gaps/native-hop.md), each up to one send window of frames below 0. Any other
     gap FAILs, as a surplus below the allowance or uncounted loss above it. Resends, resumed
-    frames, and reconnects are shown beside it, and each fault's share of the gap over its
-    span and `recovery_bound` is reported, from both sides' running totals, which drain out
-    of phase, so a share errs by up to a drain interval of each. A run with no hop has no
-    row."""
+    frames, and reconnects are shown beside it. The lines report the running gap at each
+    fault's start, the hop's backlog plus any surplus so far, from both sides' running totals,
+    which drain out of phase, so each errs by up to a drain interval of each. A surplus can't be
+    told from a backlog while one is in flight, so no fault's share of the gap is judged. A run
+    with no hop has no row."""
     if not data.ledger.get("hop"):
         return []
     led = _ledger(data)
@@ -2563,11 +2570,13 @@ def check_ledger_hop(data):
                           minus="logit.component.events.dropped")
     taken_by = _cumulative(led.sut, "logit.component.events.sent", listener)
     lines = []
-    for fault in data.faults:
-        end = min(fault.end + data.recovery_bound, data.end)
-        share = (sent_by(end) - sent_by(fault.start)) - (taken_by(end) - taken_by(fault.start))
-        lines.append(f"{fault.step} {fault.action} on {fault.on} [{data.offset(fault.start)}, "
-                     f"{data.offset(end)}]: gap share {_n(round(share))}")
+    for fault in sorted(data.faults, key=lambda f: f.start):
+        held = sent_by(fault.start) - taken_by(fault.start)
+        lines.append(f"at {fault.step} {fault.action} on {fault.on} "
+                     f"({data.offset(fault.start)}): {_n(round(held))} not yet forwarded")
+    if data.end:
+        lines.append(f"at the end sequence ({data.offset(data.end)}): "
+                     f"{_n(round(sent_by(data.end) - taken_by(data.end)))} not yet forwarded")
     totals = (f"ΣS_hop {_n(received)} − hop dropped {_n(dropped)} − ΣE_B {_n(forwarded)} = "
               f"{_n(gap)}")
     allowed = (f"allowance [{_n(low)}, {_n(high)}]: " + "; ".join(allowances)
@@ -2803,12 +2812,14 @@ def check_ledger_replay(data):
     batch in flight allowed. What a kill leaves queued comes back only through a disk spool's
     replay at open, so a short replay is lost windows `identity.sink` balances away.
 
-    Across a hop, the ingress SUT's hop sink is judged for its own killed lives too. Its spool
-    commits a frame once the far side acknowledges it and persists that every
-    `checkpoint_interval`, so frames delivered since the last checkpoint replay again:
-    replayed − queued is in [−1, the life's delivered-batch rate over its last drain interval
-    × (one drain interval + one checkpoint interval)], which is exact, as above, when the far
-    side was down and nothing was delivered."""
+    Across a hop, the ingress SUT's hop sink is judged for its own killed lives too. The
+    listener feeds it directly, so its queue keeps growing between the last drain and the kill,
+    and the far side may take some of it; its spool commits a frame once the far side
+    acknowledges it and persists that every `checkpoint_interval`, so frames delivered since the
+    last persist replay again. With the rates over the life's last drain interval and t the time
+    from its last drain to the `docker kill`'s return, replayed − queued is in
+    [−(delivered rate × t) − 1, received rate × t + delivered rate × the checkpoint interval
+    + 1]."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.replay", led)
     if skipped:
@@ -2833,12 +2844,15 @@ def check_ledger_replay(data):
             if point_life == life + 1 and nxt and ts == nxt[0])
         low, high, band = -1, 1, ""
         if service is not None:
-            gaps = [b - a for a, b in zip(drains, drains[1:])]
-            _, rate = _last_interval(sut, "logit.component.batches.delivered", sink, life)
-            high = math.ceil(rate * ((statistics.median(gaps) if gaps else 0.0)
-                                     + led.hop_checkpoint))
-            band = (f", band [-1, {_n(high)}]: {rate:,.1f} batches/s delivered over its last "
-                    f"drain interval x (that interval + the {led.hop_checkpoint:g}s checkpoint)")
+            _, sent = _last_interval(sut, "logit.component.batches.delivered", sink, life)
+            _, took = _last_interval(sut, "logit.component.batches.received", sink, life)
+            done = led.inn.killed_done.get(life) or led.inn.killed_at[life]
+            after = max(0.0, done - drains[-1]) if drains else 0.0
+            low = -math.ceil(sent * after) - 1
+            high = math.ceil(took * after + sent * led.hop_checkpoint) + 1
+            band = (f", band [{_n(low)}, {_n(high)}]: {took:,.1f} batches/s received and "
+                    f"{sent:,.1f} delivered over its last drain interval, {after:.1f}s from "
+                    f"its last drain to the kill, a {led.hop_checkpoint:g}s checkpoint")
         ok = low <= replayed - queued <= high
         status = worst([status, PASS if ok else FAIL])
         where = f"{service} " if service is not None else ""

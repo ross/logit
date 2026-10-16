@@ -5338,7 +5338,7 @@ def _two_sut_checks():
                f"lines a killed logit life took after its last drain pass, got "
                f"{lost['ledger.hop']}")
         expect("logit hop: life 1's first drain replayed 3 vs killed life 0's last-drain "
-               "buffer.batches 3, band [-1, 12]: 2.0 batches/s delivered"
+               "buffer.batches 3, band [-12, 14]: 2.0 batches/s received and 2.0 delivered"
                in killed["ledger.replay"].detail,
                f"ledger.replay judges the hop sink's replay within its band, got "
                f"{killed['ledger.replay']}")

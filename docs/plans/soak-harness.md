@@ -1463,12 +1463,15 @@ the other.
   run is at most G less every counted loss (K, D, B, X, the hop's drops, and X_B). A duplicate
   forwarded across the hop adds the same increments to E_B, A, Ab, and V, so every per-life term
   balances around it; this bound and `ledger.hop` are what see it.
-- `ledger.replay` for the hop sink, for each killed `logit` life followed by another: its spool
-  commits a frame once `collector` acknowledges it and persists that every
-  `checkpoint_interval` (1 s by default), so the frames delivered since the last persist replay
-  again: replayed − queued is in [−1, the life's delivered batches per second over its last
-  drain interval × (that interval + the checkpoint interval)]. With `collector` down nothing is
-  delivered and the band is the single-SUT one.
+- `ledger.replay` for the hop sink, for each killed `logit` life followed by another. Unlike a
+  sink behind `aggregate`, which gains one batch a window, the hop sink is fed by the listener,
+  so its queue keeps growing between the last drain and the kill, and `collector` may take some
+  of it. Its spool commits a frame once `collector` acknowledges it and persists that every
+  `checkpoint_interval` (1 s by default), so frames delivered since the last persist replay
+  again. With the received and delivered batch rates over the life's last drain interval, and t
+  from its last drain to the `docker kill`'s return, replayed − queued is in
+  [−(delivered × t) − 1, received × t + delivered × the checkpoint interval + 1]. With
+  `collector` down nothing is delivered, but the queue still grows by up to received × t.
 - `identity.sink` judges the hop sink too, at `logit`'s final life's last quiet drain;
   `recovery` judges each side's sinks on its own drains, the hop sink against the listeners'
   datagrams and `collector`'s sinks against E_B; `drops` keys every term on its service and
