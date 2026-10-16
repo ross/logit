@@ -222,9 +222,9 @@ One copy of each rule, in `docs/design/lua-api.md`, which every other mention po
 
 - `docs/design/lua-value-type-preservation.md`: its statement about what `to_table().attributes`
   enumerates, which a `pairs` loop now also does.
-- `docs/design/lua-api.md`, including its statements at L78 and L497 (found by grep for the
-  current wording): the surface table, the "No `__pairs`" section (rewritten around the
-  `pairs` wrapper), the resource section's "Assigning `nil` stores a null value" and `schema_url`'s
+- `docs/design/lua-api.md`: the "Typed record access" bullet that lists `event.log`'s read-only
+  fields, the surface table, the "No `__pairs`" section (rewritten around the
+  `pairs` wrapper), the "Reading and writing `resource`" section's "Assigning `nil` stores a null value" and `schema_url`'s
   "exception" wording, the `event.log` table and its "read-only for now" paragraph, and the
   `to_table()`/`Event.new` rewrite example, which becomes the in-place form.
 - `docs/http-access-logs.md`: the `nil` recipe, reworded to say the script deletes the key. Its Caddy config has no `keep` stage.
