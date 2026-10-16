@@ -258,6 +258,25 @@ def _rules(root):
            f"faults.ACTIONS and scenario.ACTION_NAMES name the same actions, got "
            f"{sorted(faults.ACTIONS)} vs {sorted(scenario.ACTION_NAMES)}")
     _refused(path, mutate(drop_for), "every fault needs `for`", "a step without for")
+    # `max_duration` refuses a --duration past it, and a scenario whose own duration is.
+    capped = mutate(lambda r: r.update(max_duration="20m"))
+    _refused(path, capped, "duration 20m1s is longer than the scenario's max_duration 20m",
+             "a --duration past max_duration", duration=1201)
+    _refused(path, mutate(lambda r: r.update(max_duration="10m")),
+             "duration 16m is longer than the scenario's max_duration 10m",
+             "a scenario's own duration past its max_duration")
+    _refused(path, mutate(lambda r: r.update(max_duration="soon")),
+             "scenario.max_duration: not a duration", "a max_duration that isn't a duration")
+    try:
+        loaded = scenario.from_dict(copy.deepcopy(capped), path)
+        scenario.validate(loaded, duration=1200)
+        expect(loaded.max_duration == 1200, "max_duration loads as seconds")
+    except scenario.ScenarioError as err:
+        expect(False, f"a --duration at max_duration is refused: {err.problems}")
+    tail = scenario.load(root / "scenarios" / "tail-rotate" / "scenario.toml")
+    expect(tail.max_duration is not None and tail.max_duration >= tail.duration,
+           f"tail-rotate caps --duration at its retention and fd_growth, got "
+           f"{tail.max_duration}")
     _refused(path, mutate(overlap), "two faults overlap on generator", "overlapping faults")
     _refused(path, mutate(netem_in_stop), "netem on victoria-metrics during its stop",
              "netem during a stop")
@@ -5309,8 +5328,8 @@ def _file_ledger():
         # A killed life at 200 lines/s, 5 s drains, and a 5 s checkpoint_interval: below, 1,000
         # lost counts; above, 1,000 lines plus two files x 690 lines a 64 KiB read holds at 95
         # bytes a line; the stopped life adds one split.
-        def killed(name, w_minus_g):
-            run_dir = _kill_run(tmp, name, every_window=False)
+        def killed(name, w_minus_g, no_drains=None):
+            run_dir = _kill_run(tmp, name, every_window=False, no_drains=no_drains)
             return {r.id: r for r in checks.run_all(_as_file_wire(run_dir,
                                                                   w_minus_g=w_minus_g))}
 
@@ -5330,11 +5349,26 @@ def _file_ledger():
         shorter = killed("file-kill-lost", -1_001)
         expect(shorter["ledger.wire"].status == checks.FAIL,
                f"loss past a killed life's band FAILs, got {shorter['ledger.wire']}")
-        # V holds the replayed lines too, so it exceeds G less counted loss by up to the band.
+        # V holds the replayed lines too, so it exceeds G less counted loss by up to the band,
+        # and the bound's label names the band.
         expect(edge["ledger.summary"].status == checks.PASS
-               and "plus the replay band's 2,381" in edge["ledger.summary"].detail,
+               and "plus the replay band's 2,381" in edge["ledger.summary"].detail
+               and "<= G − counted + replay " in edge["ledger.summary"].detail,
                f"the end-to-end bound adds the band's upper edge, got "
                f"{edge['ledger.summary'].detail}")
+
+        # A killed life with one drain, at +200, has no drain interval to take a rate from:
+        # all of that drain's 1,000 lines can replay, plus the two files' reads.
+        young = killed("file-kill-one-drain", 2_381, no_drains=(134, 200))
+        expect(young["ledger.wire"].status == checks.PASS
+               and "against the replay band [0, 2,381]" in young["ledger.wire"].detail
+               and any("life 1 (killed): [0, +2,380]: one drain, so its W of 1,000 lines can "
+                       "all replay" in line for line in young["ledger.wire"].lines),
+               f"a killed life with one drain may replay all of its W, got "
+               f"{young['ledger.wire']} {young['ledger.wire'].lines}")
+        young_over = killed("file-kill-one-drain-over", 2_382, no_drains=(134, 200))
+        expect(young_over["ledger.wire"].status == checks.FAIL,
+               f"a replay past a one-drain life's W FAILs, got {young_over['ledger.wire']}")
 
     # The driver's line count: newlines only, every file, a partial write left out.
     with tempfile.TemporaryDirectory() as tmp:
@@ -5991,13 +6025,13 @@ def _two_sut_checks():
         partial = tcp_hop("two-tcp-partial", 100, ambiguous_at=150)
         expect(partial["ledger.summary"].status == checks.PASS
                and "end to end over the run, G 60,000 less counted loss 0 and a partial-frame "
-               "allowance 100: sink: V 60,100 <= G − counted 60,100"
+               "allowance 100: sink: V 60,100 <= G − counted + partial 60,100"
                in partial["ledger.summary"].detail,
                f"one ambiguous drop on a TCP source allows one batch of surplus end to end, "
                f"got {partial['ledger.summary']}")
         beyond_partial = tcp_hop("two-tcp-partial-beyond", 101, ambiguous_at=150)
         expect(beyond_partial["ledger.summary"].status == checks.FAIL
-               and "sink: V 60,101 > G − counted 60,100, a surplus of 1"
+               and "sink: V 60,101 > G − counted + partial 60,100, a surplus of 1"
                in beyond_partial["ledger.summary"].detail,
                f"a surplus past the ambiguous allowance FAILs, got "
                f"{beyond_partial['ledger.summary']}")

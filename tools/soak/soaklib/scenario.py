@@ -115,8 +115,8 @@ CLASSED_ACTIONS = ("respond", "stop")
 NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart", "exit")
 
 TOP_LEVEL_KEYS = {
-    "name", "description", "duration", "warmup", "cooldown", "recovery_bound", "cycle",
-    "configs", "ledger", "thresholds", "step", "expect", "random", "target", "compose",
+    "name", "description", "duration", "max_duration", "warmup", "cooldown", "recovery_bound",
+    "cycle", "configs", "ledger", "thresholds", "step", "expect", "random", "target", "compose",
     "expected",
 }
 # The local target, the default; the kind with no backend query; and the local Kafka broker,
@@ -457,6 +457,8 @@ class Scenario:
     compose: object = None
     # `[expected]`: `{row id: {service: verdict}}`.
     expected: dict = field(default_factory=dict)
+    # `max_duration`: the longest run the scenario's thresholds and configs hold, or None.
+    max_duration: object = None
 
     @property
     def external(self):
@@ -619,6 +621,7 @@ def from_dict(raw, path):
     name = need(raw, "name", "scenario") or ""
     description = raw.get("description", "")
     duration = dur(raw, "duration", "scenario")
+    max_duration = dur(raw, "max_duration", "scenario") if "max_duration" in raw else None
     warmup = dur(raw, "warmup", "scenario")
     cooldown = dur(raw, "cooldown", "scenario")
     recovery_bound = dur(raw, "recovery_bound", "scenario")
@@ -772,6 +775,7 @@ def from_dict(raw, path):
         cooldown=cooldown, recovery_bound=recovery_bound, cycle=cycle, configs=configs,
         ledger=ledger, thresholds=thresholds, steps=steps, expectations=expectations,
         random=random_spec, target=target, compose=compose, expected=expected,
+        max_duration=max_duration,
     )
     if problems:
         raise ScenarioError(problems)
@@ -1465,6 +1469,12 @@ def validate(scenario, duration=None, seed=None):
         problems.append(
             f"duration {format_duration(run_duration)} leaves no time between warmup "
             f"{format_duration(scenario.warmup)} and cooldown {format_duration(scenario.cooldown)}"
+        )
+    if scenario.max_duration is not None and run_duration > scenario.max_duration:
+        problems.append(
+            f"duration {format_duration(run_duration)} is longer than the scenario's "
+            f"max_duration {format_duration(scenario.max_duration)}, the longest run its "
+            "thresholds and configs hold"
         )
     if duration is None and scenario.steps and scenario.warmup + scenario.cycle > quiet_end:
         problems.append(

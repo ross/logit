@@ -1823,7 +1823,9 @@ class Ledger:
         the counts of those it read after its last drain: at most rate × `checkpoint_interval`
         plus one 64 KiB read's lines per file it can replay (`TAIL_REPLAY_FILES`) above, and
         rate × its drain interval below, the rate being its lines over its last drain
-        interval. A life a stop, restart, or `exit` ended emits each file's unterminated line
+        interval. A killed life with one drain has no drain interval, and its last checkpoint can
+        be the previous life's, so its allowance above is that drain's W, all of which can
+        replay, plus the same reads, and 0 below. A life a stop, restart, or `exit` ended emits each file's unterminated line
         at shutdown and the rest of it after the restart, one line more per file it had open
         (`logit.input.files.open` at its last drain), above (docs/known-gaps/tailing.md's
         split-line entry). The final life adds nothing."""
@@ -1850,15 +1852,25 @@ class Ledger:
                 checkpoint = max((component_duration(text, listener, "checkpoint_interval")
                                   or DEFAULT_TAIL_CHECKPOINT_INTERVAL_S)
                                  for listener in listeners)
-                below = round(rate * interval)
-                above = (round(rate * checkpoint)
-                         + chunk_lines * TAIL_REPLAY_FILES * len(listeners))
+                chunks = chunk_lines * TAIL_REPLAY_FILES * len(listeners)
+                if len(drains) == 1:
+                    # No drain interval to take a rate from, and every line the life read can
+                    # be after its last checkpoint, so all of its one drain's W can replay.
+                    below, above = 0, last + chunks
+                    lines.append(f"life {life} (killed): [0, +{_n(above)}]: one drain, so its "
+                                 f"W of {_n(last)} lines can all replay, plus "
+                                 f"{TAIL_REPLAY_FILES} file(s) x one 64 KiB read of "
+                                 f"{_n(chunk_lines)} lines above")
+                else:
+                    below = round(rate * interval)
+                    above = round(rate * checkpoint) + chunks
+                    lines.append(f"life {life} (killed): [-{_n(below)}, +{_n(above)}]: "
+                                 f"{rate:,.0f} lines/s x a {interval:g}s drain interval below; "
+                                 f"x a {checkpoint:g}s checkpoint_interval plus "
+                                 f"{TAIL_REPLAY_FILES} file(s) x one 64 KiB read of "
+                                 f"{_n(chunk_lines)} lines above")
                 low -= below
                 high += above
-                lines.append(f"life {life} (killed): [-{_n(below)}, +{_n(above)}]: {rate:,.0f} "
-                             f"lines/s x a {interval:g}s drain interval below; x a "
-                             f"{checkpoint:g}s checkpoint_interval plus {TAIL_REPLAY_FILES} "
-                             f"file(s) x one 64 KiB read of {_n(chunk_lines)} lines above")
             else:
                 files = 0
                 for listener in listeners:
@@ -2779,15 +2791,17 @@ def _end_to_end(data, led):
              if source_wire(source) == FILE_WIRE]
     replay = led.replay_band(files)[1] if files else 0
     limit = led.G - counted + partial + replay
+    bound = ("G − counted" + (" + partial" if partial else "")
+             + (" + replay" if files else ""))
     status, parts = PASS, []
     for label, sinks in led.egress_groups():
         total = sum(led.V_total.get(sink, 0) for sink in sinks)
         if total > limit:
             status = FAIL
-            parts.append(f"{label}: V {_n(total)} > G − counted {_n(limit)}, a surplus of "
+            parts.append(f"{label}: V {_n(total)} > {bound} {_n(limit)}, a surplus of "
                          f"{_n(total - limit)}")
         else:
-            parts.append(f"{label}: V {_n(total)} <= G − counted {_n(limit)}")
+            parts.append(f"{label}: V {_n(total)} <= {bound} {_n(limit)}")
     return status, ("end to end over the run, G " + _n(led.G) + " less counted loss "
                     + _n(counted) + (f" and a partial-frame allowance {_n(partial)}"
                                      if partial else "")

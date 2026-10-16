@@ -14,8 +14,9 @@ components:
     sources: [load]
     path: /shared/app.log
     format: json
-    # About 40 s of lines per file. `max_files` keeps every file the run writes, so the tailer
-    # never loses an unread one and the harness can count every line at the end.
+    # About 44 s of lines per file. `max_files` keeps about 74 minutes of files, every file a
+    # run up to the scenario's `max_duration` writes, so the tailer never loses an unread one
+    # and the harness can count every line at the end.
     rotate: { max_bytes: 4MiB, max_files: 100 }
   self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
   telemetry: { type: stdio_out, sources: [self], format: json }

@@ -1,13 +1,18 @@
 # A writer's rotating file tailed by `logit` through a directory the two share, out to
 # VictoriaMetrics from a disk spool, under a pause, a stop, a restart, and two kills of the SUT.
-# The writer rotates about every 44 s and keeps every file, so nothing unread is deleted. A
-# kill replays what the tailer read after its last checkpoint, and a stop splits the line it
-# held unterminated, both inside `ledger.wire`'s replay band. The schema is
-# docs/plans/soak-harness.md's "The scenario schema".
+# The writer rotates about every 44 s and keeps every file a run up to `max_duration` writes, so
+# nothing unread is deleted. A kill replays what the tailer read after its last checkpoint, and
+# a stop splits the line it held unterminated, both inside `ledger.wire`'s replay band. The
+# schema is docs/plans/soak-harness.md's "The scenario schema".
 
 name = "tail-rotate"
 description = "writer -> file_out (rotating) -> tail_in -> json -> aggregate 10s cumulative -> prometheus_out RW1 zstd (disk spool) -> VictoriaMetrics"
 duration = "13m45s"       # warmup + one cycle + cooldown; --duration overrides
+# The writer rotates about every 44 s and the tailer holds every file open, so the SUT gains
+# about one descriptor per rotation: 25 minutes is about 34 rotations, inside fd_growth's 40,
+# and two whole cycles. It's far inside the writer's retention: max_files 100 x 4 MiB lasts
+# about 74 minutes before file_out deletes a file the end count would miss.
+max_duration = "25m"
 warmup = "60s"            # no faults: baseline rate, RSS, fds
 cooldown = "120s"         # no faults at the end; >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
@@ -40,7 +45,8 @@ vm_selector = '{__name__="soak_lines_total"}'
 progress_window = "30s"
 rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
 # The wildcard matches every rotated name, and the writer keeps every file, so the tailer holds
-# each one open at its end: about one more descriptor per rotation, some 20 over the run.
+# each one open at its end: about one more descriptor per rotation, some 20 over the default
+# run and some 34 at `max_duration`.
 fd_growth = 40
 
 # The tailer stops reading; the writer doesn't, so it catches up after.
