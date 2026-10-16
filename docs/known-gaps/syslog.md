@@ -50,6 +50,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   (`crates/logit-proto/src/syslog/decode.rs`) splits on `\n` before parsing, which cuts a binary
   payload at any `0x0A` byte (see the HAProxy "CBOR" entry under
   [HTTP access logs](transforms.md#http-access-logs-nginx-haproxy-and-http_access)).
+  - **Workaround:** `framing: datagram` on `transport: udp`, for a sender that sends one message
+    per datagram. `SyslogInput::udp_datagram` turns line splitting off, so a `0x0A` inside the MSG
+    survives. The default, `framing: lines`, still splits
+    ([ADR `syslog-udp-datagram-framing`](../adr/syslog-udp-datagram-framing.md)).
   - **Workaround:** `transport: tcp`. `SyslogInput::tcp` turns line splitting off
     (`SyslogDecoder::with_line_splitting(false)`), and the octet-counting `Framer`
     (`logit_proto::framing`) that `logit-inputs::tcp::TcpListener` drives delimits by declared

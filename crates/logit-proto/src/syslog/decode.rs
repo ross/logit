@@ -58,11 +58,12 @@ impl SyslogDecoder {
         self
     }
 
-    /// Whether [`Decoder::decode_into`] splits its input on `\n` (the default, for UDP) or treats
-    /// it as one message (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+    /// Whether [`Decoder::decode_into`] splits its input on `\n` (the default, `framing: lines` on
+    /// UDP) or treats it as one message (`docs/adr/syslog-tcp-ingress-and-tls.md`).
     ///
     /// Off is for a transport that already delimits messages, such as `syslog_in`'s TCP arm and its
-    /// RFC 6587 [`crate::framing::Framer`]. Splitting there would be wrong: an octet-counted MSG
+    /// RFC 6587 [`crate::framing::Framer`], and for UDP under `framing: datagram`
+    /// (`docs/adr/syslog-udp-datagram-framing.md`). Splitting there would be wrong: an octet-counted MSG
     /// may contain `\n`, and re-splitting would turn one multiline message into half-messages, most
     /// of them missing a PRI and dropped as `bad_line`.
     pub fn with_line_splitting(mut self, line_splitting: bool) -> Self {

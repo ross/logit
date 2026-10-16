@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-11
+updated: 2026-10-16
 ---
 
 # `syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS
@@ -403,3 +403,10 @@ stalled on backpressure is never mistaken for a silent one. See
 [`docs/deploying.md`'s "`idle_timeout` on a TCP listener"](../deploying.md#idle_timeout-on-a-tcp-listener)
 for the operator-facing account, including the recommendation to enable it wherever consistent
 traffic is expected.
+
+## Amendment: `framing:` exists, for UDP only (2026-10-16)
+
+"Framing is auto-detected per connection, not configured" still holds for TCP. A TCP connection's
+framing stays detected from its first byte, and `framing:` under `transport: tcp` is a config
+error. `syslog_in` now has a `framing: lines | datagram` field that applies to `transport: udp`
+only. See [ADR `syslog-udp-datagram-framing`](syslog-udp-datagram-framing.md).

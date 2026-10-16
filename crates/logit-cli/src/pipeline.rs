@@ -614,6 +614,7 @@ fn build_spec(
         SyslogIn {
             bind,
             transport,
+            framing,
             tls,
             handshake_timeout,
             idle_timeout,
@@ -623,9 +624,16 @@ fn build_spec(
             reuse_port,
         } => {
             let mut input = match transport {
-                logit_config::SyslogTransport::Udp => {
-                    SyslogInput::new(bind.clone()).with_receive(receive_config(&component.receive))
+                // Rule 91 rejects `framing:` under TCP.
+                logit_config::SyslogTransport::Udp => match framing {
+                    Some(logit_config::SyslogFraming::Datagram) => {
+                        SyslogInput::udp_datagram(bind.clone())
+                    }
+                    Some(logit_config::SyslogFraming::Lines) | None => {
+                        SyslogInput::new(bind.clone())
+                    }
                 }
+                .with_receive(receive_config(&component.receive)),
                 logit_config::SyslogTransport::Tcp => SyslogInput::tcp(bind.clone())
                     .with_tcp_receive(tcp_receive_config(&component.receive)),
             }
@@ -3788,6 +3796,7 @@ mod tests {
             kind: ComponentKind::SyslogIn {
                 bind: "127.0.0.1:0".to_string(),
                 transport,
+                framing: None,
                 tls,
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
@@ -3971,6 +3980,7 @@ mod tests {
             kind: ComponentKind::SyslogIn {
                 bind: addr.clone(),
                 transport: logit_config::SyslogTransport::Tcp,
+                framing: None,
                 tls: None,
                 handshake_timeout: Duration::from_millis(50),
                 idle_timeout: None,
@@ -4163,6 +4173,7 @@ mod tests {
         let kind = ComponentKind::SyslogIn {
             bind: addr.clone(),
             transport: logit_config::SyslogTransport::Tcp,
+            framing: None,
             tls: None,
             handshake_timeout: logit_config::default_handshake_timeout(),
             idle_timeout: None,
@@ -4298,6 +4309,7 @@ mod tests {
             kind: ComponentKind::SyslogIn {
                 bind: addr.clone(),
                 transport: logit_config::SyslogTransport::Tcp,
+                framing: None,
                 tls: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),

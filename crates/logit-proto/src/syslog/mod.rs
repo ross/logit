@@ -8,7 +8,8 @@
 //! [ADR `syslog-output`](../../../../docs/adr/syslog-output.md)). It never sees a peer: the
 //! sender attributes `syslog_in` can add are stamped after decode. It reads one message per `\n`
 //! by default; [`SyslogDecoder::with_line_splitting`] turns that off for a transport whose framer
-//! already delimits messages, since an octet-counted MSG may contain `\n`.
+//! already delimits messages, since an octet-counted MSG may contain `\n`, and for UDP under
+//! `framing: datagram`, where one datagram is one message.
 //!
 //! ## Dialect disambiguation
 //!

@@ -402,6 +402,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 88. A top-level `hostname` that is empty or only whitespace.
 89. An `influxdb_out` that sets both `bucket` and `default_bucket`.
 90. An `influxdb_out` that sets both `org` and `default_org`.
+91. A `syslog_in` `framing` set to any value, `lines` included, under `transport: tcp`.
 70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL, carries a query
     or fragment, or ends in a HEC route rather than the `/services/collector` base, an empty or
     whitespace-padded `token`, `timeout: 0s`, an `ack_timeout` without `ack: true` or of `0s`, a
