@@ -86,6 +86,18 @@ each source's datagram precondition, an imbalance on one listener FAILing named,
 summed E against A, a source's transforms judged hop by hop, `lines_in`'s oversize drops in B,
 R per listener from its own `receive:`, and `recovery` against the summed rate.
 
+For a source's `wire`, it covers the key and its load-time check against the SUT config's
+listener `type:` and `transport:` (a mismatch either way, a listener the config lacks, a
+transport with no wire, `lines_in`'s TCP default, and a comment ignored), the fault predicates
+per wire, each TCP window judged or reported, a partition recording its addresses through a
+fake Docker and the checks reading them, the driver recording every wire's flag, and a TCP
+run: W from `input.frames`, the reversed datagram precondition, R with no receive queue, a
+framer's counted drop as wire loss kept out of `drops`, the same lines uncounted FAILing, a
+generator netem judged on TCP but not on UDP, a SUT netem judged, a judged window's surplus
+against its ambiguous drops, a partition judged or reported by its address, `recovery` and a
+killed life's band reading the frames, and a source naming `wire = "udp"` scoring as one
+naming none.
+
 For two SUT services, it covers a further SUT declared by its own `[configs]` key and the
 `[[ledger.hop]]` joining it to `logit` (the chain they make, their config variable, and each
 rule the keys, the hop, and the role map are held to), the fault predicates, under which only
@@ -4788,6 +4800,392 @@ def _fanin_driver(root):
 TWO_SUT_ROLES = {**scenario.BASE_ROLES, "collector": "sut"}
 
 
+def _tcp_run(tmp, name, sut_edit=None, gen_edit=None, datagrams=False, wire="tcp",
+             timeline_extra=(), **kwargs):
+    """`_ledger_run`'s two-life run directory with its one source on a TCP wire: the listener
+    counts `logit.input.frames` in place of datagrams and no datagram drop, so life 0's
+    residual is the 30 that reach V after its last drain, the generator counts
+    no `output.datagrams` unless `datagrams`, and the stop over `STOP` is TCP-affecting, as the
+    driver records it. `sut_edit(record)` and `gen_edit(record)` may change or drop (return
+    None) each SUT and generator telemetry record. `wire` is the source's `wire`, or None for a
+    source that names none."""
+    kwargs.setdefault("life0_extra", 30)
+    run_dir = _ledger_run(tmp, name, shutdown_drops=0, timeline_extra=timeline_extra, **kwargs)
+    out = []
+    for line in (run_dir / "logs" / "logit.stdout").read_text().splitlines():
+        record = json.loads(line)
+        metric = record["metrics"][0]
+        if metric["name"] == "logit.input.datagrams":
+            metric["name"] = "logit.input.frames"
+        record = sut_edit(record) if sut_edit else record
+        out += [json.dumps(one) for one in (record if isinstance(record, list) else [record])
+                if one is not None]
+    (run_dir / "logs" / "logit.stdout").write_text("\n".join(out) + "\n")
+    gen = []
+    for line in (run_dir / "logs" / "generator.stdout").read_text().splitlines():
+        record = json.loads(line)
+        if record["metrics"][0]["name"] == "logit.output.datagrams" and not datagrams:
+            continue
+        record = gen_edit(record) if gen_edit else record
+        gen += [json.dumps(one) for one in (record if isinstance(record, list) else [record])
+                if one is not None]
+    (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
+    timeline = []
+    for line in (run_dir / "timeline.jsonl").read_text().splitlines():
+        record = json.loads(line)
+        if record.get("step") == "c0s1":
+            record["affects_tcp_ingress"] = True
+        timeline.append(json.dumps(record))
+    (run_dir / "timeline.jsonl").write_text("\n".join(timeline) + "\n")
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    source = dict(resolved["ledger"]["source"][0])
+    if wire is None:
+        source.pop("wire", None)
+    else:
+        source["wire"] = wire
+    resolved["ledger"]["source"] = [source]
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    return run_dir
+
+
+def _fault_pair(step, action, on, start, end, udp=False, tcp=False, **extra):
+    """An apply and a revert of `action` on `on`, recorded with its per-wire ingress flags;
+    `extra` goes on the apply, and a partition's `ips_after` on the revert."""
+    after = {"ips_after": extra.pop("ips_after")} if "ips_after" in extra else {}
+    flags = {"affects_udp_ingress": udp, "affects_tcp_ingress": tcp,
+             "affects_file_ingress": False}
+    return (_action("apply", step, action, on, start, **flags, **extra),
+            _action("revert", step, action, on, end - 1, end, **flags, **after))
+
+
+def _tcp_ledger():
+    """The ledger on a TCP source: W from `input.frames`, F from the framer's counted drops,
+    the `output.datagrams` precondition reversed, R with no receive queue, the wire judged
+    through netem on the generator and reported through a stop, a judged window's surplus
+    against its ambiguous drops, a partition judged or reported by its address, and `recovery`
+    reading the frames; and a source naming `wire = "udp"` scored as one naming none."""
+
+    def ambiguous(offset, batches):
+        stamp = _stamp(T0 + offset)
+
+        def edit(record):
+            if (record["metrics"][0]["name"] == "logit.component.events.sent"
+                    and record["timestamp"] == stamp):
+                return [record, json.loads(_line(
+                    stamp, "logit.component.batches.dropped", "sum", batches, component="out",
+                    attrs={"reason": "ambiguous_at_most_once"}))]
+            return record
+        return edit
+
+    def flat(edit):
+        """A `gen_edit` that may return a list of records, written one per line."""
+        def wrapped(record):
+            return edit(record)
+        return wrapped
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            return {r.id: r for r in checks.run_all(_tcp_run(tmp, name, **kwargs))}
+
+        clean = results("tcp-clean")
+        for row in ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.egress",
+                    "ledger.summary", "recovery", "drops"):
+            expect(clean[row].status == checks.PASS,
+                   f"{row} PASSes the balanced TCP fixture, got {clean[row]}")
+        wire = clean["ledger.wire"].detail
+        expect(wire.startswith("G 60,000 = W 54,030 + K 0 + counted 0 + gap 5,970 (6,000 in "
+                               "reported windows, 0 in judged TCP-affecting windows, -30 "
+                               "steady"),
+               f"a TCP source's W is its listener's input.frames, and a stop's loss is "
+               f"reported, got {wire}")
+        expect(any("fault (c0s1 stop on logit)" in line for line in clean["ledger.wire"].lines)
+               and any("steady (no TCP-affecting fault)" in line
+                       for line in clean["ledger.wire"].lines),
+               f"a TCP source's windows are TCP-affecting, got {clean['ledger.wire'].lines}")
+        expect("R 67,000 = 0 + 2 x 1,000 + 65 x 1,000" in clean["ledger.intake"].detail,
+               f"a TCP listener has no receive queue in R, got {clean['ledger.intake'].detail}")
+        expect("F 0" in clean["ledger.summary"].detail
+               and "wire G − (W + K + F) 5,970 over the run, F 0 counted"
+               in clean["ledger.summary"].detail,
+               f"ledger.summary shows F on a TCP source, got {clean['ledger.summary'].detail}")
+
+        # The generator's sink counted datagrams: it isn't sending over TCP.
+        udp_sink = results("tcp-datagrams", datagrams=True)
+        expect(udp_sink["ledger.wire"].status == checks.FAIL
+               and "precondition: generator output.datagrams 60,000 isn't 0"
+               in udp_sink["ledger.wire"].detail,
+               f"a TCP source FAILs a generator counting datagrams, got {udp_sink['ledger.wire']}")
+
+        # 400 more lines sent at +60 that the framer dropped are counted wire loss, F, not
+        # steady loss; the same lines with no count are lost.
+        def sent_more(record):
+            if (record["metrics"][0]["name"] == "logit.output.messages"
+                    and record["timestamp"] == _stamp(T0 + 60)):
+                record["metrics"][0]["value"] += 400
+            return record
+
+        def truncated(record):
+            if (record["metrics"][0]["name"] == "logit.input.frames"
+                    and record["timestamp"] == _stamp(T0 + 60)):
+                return [record, json.loads(_line(
+                    record["timestamp"], "logit.input.frames.dropped", "sum", 400,
+                    component="in", attrs={"reason": "truncated"}))]
+            return record
+
+        framed = results("tcp-truncated", sut_edit=truncated, gen_edit=sent_more)
+        expect(framed["ledger.wire"].status == checks.PASS
+               and "counted 400 (truncated 400)" in framed["ledger.wire"].detail,
+               f"a framer's truncated drop is counted wire loss, got {framed['ledger.wire']}")
+        expect(framed["drops"].status == checks.PASS
+               and framed["ledger.intake"].status == checks.PASS,
+               f"F stays out of drops and of the intake balance, got {framed['drops']}, "
+               f"{framed['ledger.intake']}")
+        lost = results("tcp-lost", gen_edit=sent_more)
+        expect(lost["ledger.wire"].status == checks.FAIL
+               and lost["ledger.wire"].detail.startswith(
+                   "370 lost outside reported TCP windows"),
+               f"lines lost uncounted on a TCP wire FAIL, got {lost['ledger.wire']}")
+
+        # Netem on the generator: UDP loss by design, but TCP retransmits, so it's judged.
+        gen_netem = _fault_pair("x1", "netem", "generator", 52, 62, udp=True)
+        on_udp = {r.id: r for r in checks.run_all(_ledger_run(
+            tmp, "udp-gen-netem", steady_loss=400, timeline_extra=gen_netem))}
+        expect(on_udp["ledger.wire"].status == checks.PASS,
+               f"UDP loss inside a generator netem passes, got {on_udp['ledger.wire']}")
+        on_tcp = results("tcp-gen-netem", steady_loss=400, timeline_extra=gen_netem)
+        expect(on_tcp["ledger.wire"].status == checks.FAIL
+               and on_tcp["ledger.wire"].detail.startswith("370 lost outside reported TCP"),
+               f"TCP loss inside a generator netem FAILs, got {on_tcp['ledger.wire']}")
+
+        # Netem on the SUT carries the ACKs: TCP-affecting and judged, never UDP-affecting.
+        sut_netem = _fault_pair("x1", "netem", "logit", 52, 62, tcp=True)
+        judged = results("tcp-sut-netem", steady_loss=1000, timeline_extra=sut_netem)
+        lines = judged["ledger.wire"].lines
+        expect(judged["ledger.wire"].status == checks.FAIL
+               and any("judged (x1 netem on logit)" in line for line in lines),
+               f"TCP loss inside a SUT netem is judged, got {judged['ledger.wire']}")
+
+        # A judged window's surplus: a write that failed partway left whole lines the generator
+        # never counted, one batch per ambiguous drop.
+        late = _fault_pair("x1", "netem", "logit", 200, 210, tcp=True)
+        over = results("tcp-surplus", steady_surplus=350, timeline_extra=late)
+        expect(over["ledger.wire"].status == checks.FAIL
+               and "W + counted exceeds G by 350, over the 200 its 0 ambiguous drop(s) and 2 "
+               "edge(s) allow" in over["ledger.wire"].detail,
+               f"a surplus past a judged window's edges FAILs, got {over['ledger.wire']}")
+        allowed = results("tcp-surplus-ambiguous", steady_surplus=350, timeline_extra=late,
+                          gen_edit=ambiguous(230, 2))
+        expect(allowed["ledger.wire"].status == checks.PASS
+               and "surplus allowed 400 (2 ambiguous drop(s) + 2 edge(s), x one 100-line "
+               "batch)" in "\n".join(allowed["ledger.wire"].lines)
+               and "ambiguous_at_most_once 2" in allowed["ledger.wire"].detail,
+               f"two ambiguous drops allow two batches of surplus, got {allowed['ledger.wire']}")
+
+        # A partition: judged when the SUT kept its address, reported when the reconnect moved
+        # it, and reported when no address was recorded after it.
+        kept = _fault_pair("x1", "partition", "logit", 52, 62, udp=True, tcp=True,
+                           ips={"soak": "172.18.0.3"}, ips_after={"soak": "172.18.0.3"})
+        same = results("tcp-partition-kept", steady_loss=1000, timeline_extra=kept)
+        expect(same["ledger.wire"].status == checks.FAIL
+               and any("judged (x1 partition on logit (IP 172.18.0.3 kept))" in line
+                       for line in same["ledger.wire"].lines),
+               f"a partition that kept the address is judged, got {same['ledger.wire']}")
+        moved = _fault_pair("x1", "partition", "logit", 52, 62, udp=True, tcp=True,
+                            ips={"soak": "172.18.0.3"}, ips_after={"soak": "172.18.0.5"})
+        away = results("tcp-partition-moved", steady_loss=1000, timeline_extra=moved)
+        expect(away["ledger.wire"].status == checks.PASS
+               and any("fault (x1 partition on logit (IP 172.18.0.3 -> 172.18.0.5))" in line
+                       for line in away["ledger.wire"].lines),
+               f"a partition that moved the address is reported, got {away['ledger.wire']}")
+        unknown = _fault_pair("x1", "partition", "logit", 52, 62, udp=True, tcp=True,
+                              ips={"soak": "172.18.0.3"})
+        blind = results("tcp-partition-unknown", steady_loss=1000, timeline_extra=unknown)
+        expect(blind["ledger.wire"].status == checks.PASS
+               and "IP 172.18.0.3 -> unknown" in "\n".join(blind["ledger.wire"].lines),
+               f"a partition with no address after it is reported, got {blind['ledger.wire']}")
+
+        # Recovery reads the frames: half the frames after the stop is half the rate.
+        def half(record):
+            stamp = record["timestamp"]
+            if (record["metrics"][0]["name"] == "logit.input.frames"
+                    and _stamp(T0 + 135) <= stamp <= _stamp(T0 + 180)):
+                record["metrics"][0]["value"] //= 2
+            return record
+        slow = results("tcp-recovery", sut_edit=half)
+        expect(slow["recovery"].status == checks.FAIL
+               and "is 50% of the warmup rate" in slow["recovery"].detail,
+               f"recovery judges a TCP listener's frames, got {slow['recovery']}")
+
+        # A killed life's band reads its ingest rate from the frames.
+        kill_dir = _kill_run(tmp, "tcp-kill")
+        stdout = kill_dir / "logs" / "logit.stdout"
+        stdout.write_text(stdout.read_text().replace('"logit.input.datagrams"',
+                                                     '"logit.input.frames"'))
+        resolved_path = kill_dir / "scenario.resolved.json"
+        resolved = json.loads(resolved_path.read_text())
+        resolved["ledger"]["source"] = [{**resolved["ledger"]["source"][0], "wire": "tcp"}]
+        resolved_path.write_text(json.dumps(resolved))
+        killed = {r.id: r for r in checks.run_all(kill_dir)}
+        expect(killed["ledger.egress"].status == checks.PASS
+               and "band [-1,000, 3,000]: ingest 200/s" in killed["ledger.egress"].detail,
+               f"a killed TCP life's band reads the frames' rate, got {killed['ledger.egress']}")
+
+        # A source naming `wire = "udp"` scores as one naming none.
+        named = {r.id: (r.status, r.detail) for r in checks.run_all(
+            _ledger_run(tmp, "udp-named", steady_loss=400, timeline_extra=gen_netem))}
+        resolved_path = Path(tmp) / "udp-named" / "scenario.resolved.json"
+        resolved = json.loads(resolved_path.read_text())
+        resolved["ledger"]["source"][0]["wire"] = "udp"
+        resolved_path.write_text(json.dumps(resolved))
+        renamed = {r.id: (r.status, r.detail)
+                   for r in checks.run_all(Path(tmp) / "udp-named")}
+        expect(named == renamed, "a source naming wire udp scores as one naming none")
+
+
+def _tcp_rules(root):
+    """The `wire` key and its load-time cross-check against the SUT config, the fault
+    predicates per wire, a partition recording its addresses, the driver recording every
+    wire's flag, and the shipped tcp-ingress scenario."""
+    path, raw = _base(root)
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    def with_config(text, wire, listener="statsd"):
+        """`load()`'s problems for statsd-vm with its SUT config replaced by `text` and its
+        source's `wire` set, None for no `wire` key."""
+        with tempfile.TemporaryDirectory() as tmp:
+            scenario_path = Path(tmp) / "scenario.toml"
+            changed = copy.deepcopy(raw)
+            for key, name in changed["configs"].items():
+                (Path(tmp) / name).write_text(
+                    text if key == "sut" else (path.parent / name).read_text())
+            changed["ledger"]["source"][0]["sut_listener"] = listener
+            if wire is not None:
+                changed["ledger"]["source"][0]["wire"] = wire
+            try:
+                scenario.from_dict(changed, scenario_path)
+                return []
+            except scenario.ScenarioError as err:
+                return err.problems
+
+    _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(wire="sctp")),
+             "ledger.source 1: `wire` must be one of udp, tcp, file", "an unknown wire")
+    _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(wire="tcp")),
+             "ledger.source 1: `wire` is tcp, but `sut_listener` 'statsd' is a statsd_in with "
+             "no transport:, a udp listener", "a TCP source on a UDP listener")
+    tcp_config = "components:\n  statsd:\n    type: statsd_in\n    transport: tcp  # lines\n"
+    problems = with_config(tcp_config, None)
+    expect(any("`wire` is udp, but `sut_listener` 'statsd' is a statsd_in over tcp, a tcp "
+               "listener" in p for p in problems),
+           f"a source naming no wire on a TCP listener is refused, got {problems}")
+    expect(with_config(tcp_config, "tcp") == [],
+           f"a TCP source on a TCP listener loads, got {with_config(tcp_config, 'tcp')}")
+    flow = "components:\n  statsd: { type: statsd_in, transport: udp, bind: 0.0.0.0:8125 }\n"
+    expect(with_config(flow, "udp") == [] and with_config(flow, None) == [],
+           "a flow-style UDP listener loads with wire udp or none")
+    lines_tcp = "components:\n  lines: { type: lines_in, bind: 0.0.0.0:5514 }  # transport: udp\n"
+    problems = with_config(lines_tcp, None, listener="lines")
+    expect(any("is a lines_in with no transport:, a tcp listener" in p for p in problems),
+           f"lines_in with no transport is TCP, and a comment isn't read, got {problems}")
+    problems = with_config(tcp_config, "tcp", listener="missing")
+    expect(any("`sut_listener` 'missing' isn't a component of the SUT config" in p
+               for p in problems),
+           f"a listener the SUT config lacks is refused, got {problems}")
+    unix = "components:\n  statsd: { type: statsd_in, transport: unix_stream, bind: /s }\n"
+    problems = with_config(unix, "tcp")
+    expect(any("is a statsd_in over unix_stream, which the ledger has no wire for" in p
+               for p in problems),
+           f"a transport with no wire is refused, got {problems}")
+    tailed = "components:\n  statsd: { type: tail_in, paths: [/shared/app.log] }\n"
+    expect(with_config(tailed, "file") == [],
+           f"a tail_in source loads with wire file, got {with_config(tailed, 'file')}")
+
+    # The fault predicates per wire.
+    roles = scenario.BASE_ROLES
+    for action, on, udp, tcp, file in (
+            ("netem", "generator", True, False, False),
+            ("netem", "logit", False, True, False),
+            ("pause", "logit", True, True, True),
+            ("pause", "generator", False, True, False),
+            ("stop", "generator", False, True, False),
+            ("partition", "generator", True, True, False),
+            ("partition", "logit", True, True, False),
+            ("kill", "logit", True, True, True),
+            ("netem", "victoria-metrics", False, False, False),
+            ("stop", "victoria-metrics", False, False, False)):
+        step = scenario.Step("c0s1", 0, 0, action, on, "", 0, 1)
+        got = tuple(faults.ACTIONS[action].affects(wire, step, roles)
+                    for wire in ("udp", "tcp", "file"))
+        expect(got == (udp, tcp, file),
+               f"{action} on {on} affects (udp, tcp, file) {got}, expected {(udp, tcp, file)}")
+    for action, on, how in (("stop", "logit", "fault"), ("kill", "logit", "fault"),
+                            ("pause", "logit", "judged"), ("netem", "logit", "judged"),
+                            ("pause", "generator", "judged")):
+        fault = checks.Fault("x", action, on, 0, 1, affects_udp_ingress=True,
+                             affects_egress=False, affects_tcp_ingress=True)
+        expect(checks.wire_judgment(fault, "tcp") == how
+               and checks.wire_judgment(fault, "udp") == "fault",
+               f"a {action} on {on} is {checks.wire_judgment(fault, 'tcp')} on TCP")
+
+    # A partition records the addresses before its disconnect and after its reconnect.
+    class Networks:
+        def __init__(self):
+            self.address = "172.18.0.3"
+            self.calls = []
+
+        def inspect(self, container, timeout=None):
+            return {"NetworkSettings": {"Networks": {"soak": {
+                "Aliases": ["logit"], "IPAddress": self.address}}}}
+
+        def run(self, argv, timeout=None):
+            self.calls.append(argv)
+            if argv[:2] == ["network", "connect"]:
+                self.address = "172.18.0.5"
+            return docker.Result(0, "", "")
+
+    fake = Networks()
+    ctx = faults.Context(docker=fake, ids={"logit": "abc"}, netem_image="netem")
+    step = scenario.Step("c0s7", 6, 0, "partition", "logit", "", 0, 45)
+    applied = faults.partition_apply(ctx, step)
+    reverted = faults.partition_revert(ctx, step)
+    expect(applied["ips"] == {"soak": "172.18.0.3"}
+           and reverted["ips_after"] == {"soak": "172.18.0.5"}
+           and ["network", "connect", "--alias", "logit", "soak", "abc"] in fake.calls,
+           f"a partition records its addresses either side, got {applied}, {reverted}")
+    with tempfile.TemporaryDirectory() as tmp:
+        timeline = [_phase("start", 0, t0=T0),
+                    {**_action("apply", "c0s7", "partition", "logit", 10), **applied},
+                    {**_action("revert", "c0s7", "partition", "logit", 55), **reverted}]
+        data = checks.RunData(_run_dir(tmp, "partition-ips", timeline))
+        fault = data.faults[0]
+        expect(fault.ip_text() == "IP 172.18.0.3 -> 172.18.0.5",
+               f"the checks read a partition's addresses, got {fault.ip_text()!r}")
+
+    # The driver records each wire's flag on every action.
+    loaded = scenario.load(root / "scenarios" / "statsd-vm" / "scenario.toml")
+    run = driver.Run(root, loaded, 600, None, False, "/nonexistent", [], "logit:soak",
+                     roles=dict(roles))
+    run.timeline = _Records()
+    run.ctx = faults.Context(docker=None, ids={}, netem_image="netem")
+    run.t0 = 0.0
+    run.say = lambda text: None
+    run.after = lambda kind, step, result: None
+    run.act("apply", scenario.Step("c0s1", 0, 0, "mark", "logit", "", 0, 1))
+    record = run.timeline[-1]
+    expect(record.get("affects_udp_ingress") is True and record.get("affects_tcp_ingress") is True
+           and record.get("affects_file_ingress") is False,
+           f"the driver records every wire's flag, got {record}")
+
+    tcp = scenario.load(root / "scenarios" / "tcp-ingress" / "scenario.toml")
+    expect(tcp.sources[0].get("wire") == "tcp"
+           and [step.action for step in tcp.steps] == [
+               "netem", "netem", "netem", "pause", "stop", "kill", "partition", "pause"],
+           f"tcp-ingress names a TCP source and its eight faults, got {tcp.sources}")
+
+
 def _two_sut_dir(root, tmp, interval="7s"):
     """A copy of statsd-vm in `tmp` whose `[configs]` adds `collector`, a further SUT service,
     with its own config: statsd-vm's SUT config with `aggregate`'s window set to `interval`."""
@@ -6573,7 +6971,8 @@ def run(root, quiet=False):
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
                      _report, _expected_event_rules, _exit_driver, _ready_words, _exit_watchdog,
                      _script_ledger, _sink_ledger, _roles, _sink_rules, _driver_roles,
-                     _sources_ledger, _source_rules, _fanin_driver, _two_sut_rules,
+                     _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
+                     _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _per_service, _slope_edges,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
                      _standin_server, _respond_rules, _standin_driver, _standin_checks,
@@ -6583,7 +6982,7 @@ def run(root, quiet=False):
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
-                              _fanin_driver, _two_sut_rules, _two_sut_driver,
+                              _fanin_driver, _tcp_rules, _two_sut_rules, _two_sut_driver,
                               _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
                               _datadog_rules)
