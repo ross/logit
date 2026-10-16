@@ -45,7 +45,7 @@ use logit_outputs::datadog_trace::{
 };
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::graphite::{GraphiteOutput, Transport as GraphiteOutTransport};
-use logit_outputs::influxdb::{Destination, InfluxDbOutput};
+use logit_outputs::influxdb::{Destination, InfluxDbOutput, Organization};
 use logit_outputs::kafka::{
     KafkaAcks, KafkaCompression, KafkaOutput, KafkaSasl, KafkaSettings, OAuthToken, RecordFormat,
     RecordKey, RecordMode, SignalTopics,
@@ -1176,11 +1176,11 @@ fn build_spec(
             DropProvenanceTransform::new(origin.clone(), previous.clone()),
         )),
 
-        InfluxDbOut { url, org, bucket, default_bucket, token } => NodeSpec::Output(
+        InfluxDbOut { url, org, default_org, bucket, default_bucket, token } => NodeSpec::Output(
             Box::new(
                 InfluxDbOutput::new(
                     url.clone(),
-                    org.clone(),
+                    Organization::from_config(org.clone(), default_org.clone()),
                     Destination::from_config(bucket.clone(), default_bucket.clone()),
                     token.clone(),
                 )
@@ -2439,6 +2439,7 @@ mod tests {
                 org: Some("org".to_string()),
                 bucket: Some("bucket".to_string()),
                 default_bucket: None,
+                default_org: None,
                 token: "test-token".to_string(),
             },
         }
@@ -2660,6 +2661,7 @@ mod tests {
                 org: Some("org".to_string()),
                 bucket: Some("bucket".to_string()),
                 default_bucket: None,
+                default_org: None,
                 token: "test-token".to_string(),
             },
         };
@@ -4538,6 +4540,7 @@ mod tests {
                 org: Some("org".to_string()),
                 bucket: Some("bucket".to_string()),
                 default_bucket: None,
+                default_org: None,
                 token: "test-token".to_string(),
             },
         };
@@ -4588,6 +4591,7 @@ mod tests {
                 org: Some("org".to_string()),
                 bucket: Some("bucket".to_string()),
                 default_bucket: None,
+                default_org: None,
                 token: "test-token".to_string(),
             },
         };

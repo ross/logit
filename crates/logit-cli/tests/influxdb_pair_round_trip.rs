@@ -14,7 +14,7 @@
 use bytes::Bytes;
 use logit_core::{Event, EventBatch, MetricKind, MetricRecord, MetricValue, Resource, Value};
 use logit_inputs::influxdb::InfluxDbInput;
-use logit_outputs::influxdb::{Destination, InfluxDbOutput};
+use logit_outputs::influxdb::{Destination, InfluxDbOutput, Organization};
 use logit_pipeline::test_util::{assert_no_batch, recv_batch, TelemetryProbe};
 use logit_pipeline::{classify, Delivered, Fanout, Fault, Input, Output};
 use logit_proto::influxdb::{
@@ -60,7 +60,7 @@ fn sink(
 ) -> InfluxDbOutput {
     InfluxDbOutput::new(
         format!("http://{addr}"),
-        Some(org.into()),
+        Organization::Fixed(org.into()),
         Destination::Fixed(bucket.into()),
         token.into(),
     )
@@ -252,7 +252,7 @@ async fn a_carried_bucket_and_org_relay_through_one_sink() {
     let (back, mut back_rx) = listener(&probe).await;
     let mut out = InfluxDbOutput::new(
         format!("http://{back}"),
-        None,
+        Organization::Carried { default_org: None },
         Destination::Carried { default_bucket: None },
         TOKEN.into(),
     )

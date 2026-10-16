@@ -2944,10 +2944,15 @@ pub enum ComponentKind {
         url: String,
         /// The organization name sent with every write. When set, it replaces any organization an
         /// `influxdb_in` upstream received, by name or by ID. When absent, the sink forwards the
-        /// organization `influxdb_in` received, and sends none for an event that came from
-        /// anywhere else: InfluxDB 3 ignores it, while InfluxDB 2.x refuses a write without one.
+        /// organization `influxdb_in` received, else `default_org`. Setting this and
+        /// `default_org` together is an error.
         #[serde(default)]
         org: Option<String>,
+        /// The organization name for a batch that names none when `org` is absent: anything not
+        /// received by an `influxdb_in`. With neither set, such a write names no organization:
+        /// InfluxDB 3 ignores it, while InfluxDB 2.x refuses the write.
+        #[serde(default)]
+        default_org: Option<String>,
         /// The bucket every write goes to. When absent, each batch goes to the bucket an
         /// `influxdb_in` upstream received it for, else to `default_bucket`, so one `influxdb_out`
         /// relays to as many buckets as its senders name. Setting this and `default_bucket`
@@ -2959,7 +2964,7 @@ pub enum ComponentKind {
         #[serde(default)]
         default_bucket: Option<String>,
         /// The API token. A plain string: write `!env INFLUXDB_TOKEN` to pull it from the
-        /// environment rather than inlining it. `!env` works on `url`, `org`, and `bucket` too.
+        /// environment rather than inlining it. `!env` works on every other field too.
         token: String,
     },
     /// OTLP logs, metrics, and traces over OTLP/HTTP or OTLP/gRPC. TLS is selected by
@@ -7108,28 +7113,32 @@ mod tests {
         assert!(matches!(component.kind, ComponentKind::InfluxDbOut { .. }));
     }
 
-    /// `org`, `bucket`, and `default_bucket` are optional; `url` and `token` aren't.
+    /// `org`, `default_org`, `bucket`, and `default_bucket` are optional; `url` and `token`
+    /// aren't.
     #[test]
-    fn influxdb_out_org_and_buckets_are_optional() {
+    fn influxdb_out_orgs_and_buckets_are_optional() {
         let component: Component = serde_json::from_str(
             r#"{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
                 "token": "TOKEN"}"#,
         )
         .unwrap();
-        let ComponentKind::InfluxDbOut { org, bucket, default_bucket, .. } = component.kind else {
+        let ComponentKind::InfluxDbOut { org, default_org, bucket, default_bucket, .. } =
+            component.kind
+        else {
             panic!("expected an influxdb_out");
         };
-        assert_eq!((org, bucket, default_bucket), (None, None, None));
+        assert_eq!((org, default_org, bucket, default_bucket), (None, None, None, None));
 
         let component: Component = serde_json::from_str(
             r#"{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
-                "token": "TOKEN", "default_bucket": "fallback"}"#,
+                "token": "TOKEN", "default_bucket": "fallback", "default_org": "ops"}"#,
         )
         .unwrap();
-        let ComponentKind::InfluxDbOut { default_bucket, .. } = component.kind else {
+        let ComponentKind::InfluxDbOut { default_org, default_bucket, .. } = component.kind else {
             panic!("expected an influxdb_out");
         };
         assert_eq!(default_bucket.as_deref(), Some("fallback"));
+        assert_eq!(default_org.as_deref(), Some("ops"));
 
         let missing_token: Result<Component, _> = serde_json::from_str(
             r#"{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086"}"#,

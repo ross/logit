@@ -2696,8 +2696,16 @@
                 "null"
               ]
             },
+            "default_org": {
+              "description": "The organization name for a batch that names none when `org` is absent: anything not received by an `influxdb_in`. With neither set, such a write names no organization: InfluxDB 3 ignores it, while InfluxDB 2.x refuses the write.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "org": {
-              "description": "The organization name sent with every write. When set, it replaces any organization an `influxdb_in` upstream received, by name or by ID. When absent, the sink forwards the organization `influxdb_in` received, and sends none for an event that came from anywhere else: InfluxDB 3 ignores it, while InfluxDB 2.x refuses a write without one.",
+              "description": "The organization name sent with every write. When set, it replaces any organization an `influxdb_in` upstream received, by name or by ID. When absent, the sink forwards the organization `influxdb_in` received, else `default_org`. Setting this and `default_org` together is an error.",
               "default": null,
               "type": [
                 "string",
@@ -2708,7 +2716,7 @@
             "sources": true,
             "targets": true,
             "token": {
-              "description": "The API token. A plain string: write `!env INFLUXDB_TOKEN` to pull it from the environment rather than inlining it. `!env` works on `url`, `org`, and `bucket` too.",
+              "description": "The API token. A plain string: write `!env INFLUXDB_TOKEN` to pull it from the environment rather than inlining it. `!env` works on every other field too.",
               "type": "string"
             },
             "type": {
