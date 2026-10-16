@@ -43,6 +43,13 @@ enumerates them.
   runs. For the three attribute proxies it returns a stateless Rust iterator keyed by the last key
   seen; for a table it calls the original `pairs`; for other userdata it raises a type error at
   the caller's line. `next(proxy)` and `ipairs(proxy)` still raise.
+- **The loop's state is `{proxy, bound}`.** It holds the proxy userdata and never a clone of the
+  event's `Rc`, so `EventProxy::into_inner` keeps its no-clone path, and an iterator stashed past
+  its event's return gets the destructed-handle error. `bound` is the interning index of the
+  map's last key when `pairs` is called, and a step past it ends the loop. Without it, a loop that
+  adds a key each step never ends, because a key interned for the first time sorts after every
+  existing one; with it, such a key is never visited, and a key added mid-loop that isn't new to
+  the process, a string the process interned before, may be.
 
 ## Alternatives considered
 - **A separate delete function, keeping `= nil` as a `Null` write.** Rejected. A `nil` that

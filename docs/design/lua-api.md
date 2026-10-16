@@ -114,15 +114,20 @@ one of the three proxies the wrapper returns a Rust iterator; on a table it call
   ends a generic `for`, and `event.attributes[key] = nil` inside the loop deletes it.
 - **Deleting or overwriting the current key during the loop is safe**, as Lua's `next` contract
   allows for a table: each step seeks the first key after the last one it returned, whether or not
-  that key is still there. **Adding a key during the loop is undefined**, as for a table: the loop
-  may or may not reach it. Collect new keys and write them after the loop.
+  that key is still there.
+- **The loop always ends.** `pairs` bounds it at the last key the map holds when it's called, so a
+  loop that adds a key each step, such as a rename, still visits each original key once. A key
+  added during the loop is never visited if it's new to the process, a string the process has
+  never interned as any key or value, and may be visited if it isn't, so don't rely on either:
+  collect new keys and write them after the loop.
 - **`resource` and `scope.attributes` steps read the current state**, so a write earlier in the
   loop, to the key the loop is on or to a later one, is what a later step sees.
 - **`next(proxy)` and `ipairs(proxy)` still raise** `table expected, got userdata`. Only `pairs`
   is wrapped.
-- **`pairs` on anything else that isn't a table raises the original's error at the script's
-  line**: `script:12: bad argument #1 to 'pairs' (table expected, got userdata)` for `event`,
-  `event.log`, or `scope` itself, and `got number` for `pairs(42)`.
+- **`pairs` on any other value raises a type error at the script's line**:
+  `script:12: bad argument #1 to 'pairs' (table expected, got userdata)` for `event`, `event.log`,
+  or `scope` itself, and `got number` for `pairs(42)`. The message follows the original's, except
+  that `pairs()` with no argument says `got nil` where the original says `got no value`.
 - **A loop's handles are consumed with the event**, as every handle is: an iterator stashed for
   `flush()` fails with the "already returned/emitted elsewhere" error once the event is returned.
 
@@ -136,11 +141,15 @@ the field: `resource[key] = nil` on `schema_url` clears the field and on
 
 **What it costs.** The sandbox runs LuaJIT interpreted: it opens no `jit` library, so no traces
 compile. Measured there, the wrapper adds about 13 ns to each `pairs` call on a table and nothing
-to each step of the loop, and enumerating a proxy allocates nothing on the Rust side per step
-([memory.md](memory.md) §2). One cost is easy to miss: **a loop call site that has once seen a
-proxy runs plain-table loops about 60% slower from then on**, because LuaJIT rewrites that
-site's iteration bytecode from its table-specialized form to a generic iterator call, for good.
-In a hot path, don't share one helper loop between tables and proxies; give each its own loop.
+to each step of the loop. A loop over a proxy allocates one small state table per `pairs` call.
+Each step allocates what reading that value by key does: nothing more for a string, a small
+number, or a boolean beyond a Lua string LuaJIT hasn't interned yet; a decimal string for a
+`Timestamp` or an integer past 2^53; a table for an array or a map ([memory.md](memory.md) §2).
+
+One cost is easy to miss: **a loop call site that has once seen a proxy runs plain-table loops
+about 60% slower from then on**, because LuaJIT rewrites that site's iteration bytecode from its
+table-specialized form to a generic iterator call, for good. In a hot path, don't share one
+helper loop between tables and proxies; give each its own loop.
 
 ### `event:to_table()`: a detached copy
 
@@ -1387,11 +1396,13 @@ component id (`<unset>` for top-level code, which runs before the id is known).
 The sandbox is pinned by one test, `the_global_table_is_exactly_the_allowlist`
 (`crates/logit-script/src/lib.rs`), which holds the exact list. It builds a worker as the runtime
 does and requires `_G` to be Lua's base library, minus the removed loaders, environment functions,
-and `newproxy`, with `print` rerouted and `pairs` wrapped; the `math`, `string`, and `table`
+and `newproxy`, with `print` rerouted; the `math`, `string`, and `table`
 libraries; the seven `logit` globals this document describes, each a proxy or a table of Rust
 closures and none a route to the host; and the script's own `process`, and `flush` if it defines one. It also checks that the host
 and debugging libraries LuaJIT can load are absent. `collectgarbage` and `coroutine` stay: neither
-reaches the host, and each has an ordinary use in a transform script.
+reaches the host, and each has an ordinary use in a transform script. The test checks names
+only: `pairs` keeps its name but is the sandbox's wrapper, which the tests in
+`crates/logit-script/src/pairs.rs` cover.
 
 ## Limits and costs
 

@@ -150,16 +150,19 @@ end
 ```
 
 The iterator is stateless: one Rust function created at install, shared by every loop. Each step
-receives `(ud, last_key_string)`, resolves the key with `interner::lookup`, and seeks the first
-entry with a greater `Symbol`. That makes deleting or overwriting the current key during the loop
-safe, as Lua's `next` contract allows for tables, without snapshotting the keys. Adding a key
-during the loop is undefined, as it is for a Lua table; the doc says so.
+receives `({ud, bound}, last_key_string)`, resolves the key with `interner::lookup`, and seeks
+the first entry with a greater `Symbol`. That makes deleting or overwriting the current key during
+the loop safe, as Lua's `next` contract allows for tables, without snapshotting the keys. `bound`
+is the interning index of the map's last key when `pairs` is called, and a step past it ends the
+loop: a key interned for the first time sorts after every existing one, so a loop that adds a key
+each step would otherwise never end. A key added during the loop is never visited if it's new to
+the process, and may be visited if it was interned before; the doc says so.
 
 Constraints on the iterator:
 
 - It must not capture the event's `Rc`. `EventProxy::into_inner` does `Rc::try_unwrap` and
   `debug_assert`s that no clone exists, which is why `MetricProxy` holds a `Weak`. Keeping the
-  proxy userdata as the loop's state is enough.
+  proxy userdata in the loop's state is enough.
 - `resource` and `scope` steps re-read modified-else-base on each step, so a write earlier in the
   loop is seen.
 - `crates/logit-core/src/attrs.rs` gains a "first entry after `Option<Symbol>`" accessor
@@ -207,17 +210,18 @@ script author has to learn, for a loop every Lua author already writes.
 
 ### Allocation pins
 
-The counting allocator sees Rust allocations only. Lua strings allocate in LuaJIT's heap, so a
-key or value pushed to Lua is invisible to it. Every existing `lua:` pin in
-`crates/logit-bench/tests/allocations.rs` and `docs/design/memory.md` §2 stays: none of their scripts write a log field or assign `nil`, and the
-new arms format strings only on the error path. New rows, additive like the `Event.new` rows:
+mlua gives LuaJIT its allocator, so the counting allocator sees LuaJIT's allocations too, but
+LuaJIT interns strings: a key or value an earlier call already pushed costs nothing again. Every
+existing `lua:` pin in `crates/logit-bench/tests/allocations.rs` and `docs/design/memory.md` §2
+stays: none of their scripts write a log field or assign `nil`, and the new arms format strings
+only on the error path. New rows, additive like the `Event.new` rows:
 
 | Pin | Script | Expected |
 |---|---|---|
 | writing `event.log.message` | `event.log.message = "rewritten"` | the `LogProxy` creation plus one `Bytes` |
 | writing `event.log.severity` | `event.log.severity = "error"` | the `LogProxy` creation, nothing for the write |
 | deleting an attribute | `event.attributes.host = nil` | the `AttrsProxy` baseline, nothing for the delete |
-| iterating attributes | `for k, v in pairs(event.attributes) do end` | measured at 8, the `AttrsProxy` baseline: no step allocates, with 12 more attributes too |
+| iterating attributes | `for k, v in pairs(event.attributes) do end` | measured at 9: the `AttrsProxy` baseline plus the loop's `{proxy, bound}` state table, once per `pairs` call; no step allocates, with 12 more attributes too |
 
 The counts are measured, not derived; each PR sets them and the `memory.md` row in the same commit.
 
@@ -228,10 +232,10 @@ One copy of each rule, in `docs/design/lua-api.md`, which every other mention po
 - `docs/design/lua-value-type-preservation.md`: its statement about what `to_table().attributes`
   enumerates, which a `pairs` loop now also does.
 - `docs/design/lua-api.md`: the "Typed record access" bullet that lists `event.log`'s read-only
-  fields, the surface table, the "No `__pairs`" section (rewritten around the
-  `pairs` wrapper), the "Reading and writing `resource`" section's "Assigning `nil` stores a null value" and `schema_url`'s
-  "exception" wording, the `event.log` table and its "read-only for now" paragraph, and the
-  `to_table()`/`Event.new` rewrite example, which becomes the in-place form.
+  fields, the surface table, the "No `__pairs`" section (replaced by "Enumerating attributes with
+  `pairs`"), the "Reading and writing `resource`" section's "Assigning `nil` stores a null value"
+  and `schema_url`'s "exception" wording, the `event.log` table and its "read-only for now"
+  paragraph, and the `to_table()`/`Event.new` rewrite example, which becomes the in-place form.
 - `docs/http-access-logs.md`: the `nil` recipe, reworded to say the script deletes the key. Its Caddy config has no `keep` stage.
 - `docs/known-gaps/transforms.md`: drop the log-fields clause from the span entry, and add the two
   `Null` entries above.
