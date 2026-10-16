@@ -1,6 +1,6 @@
 ---
 created: 2026-08-30
-updated: 2026-08-30
+updated: 2026-10-16
 ---
 
 # `Event` carries a log, metrics, and a span at once, not one of the three
@@ -154,3 +154,9 @@ before this ADR.
 - Error handling in the InfluxDB encoder moved from the per-*event* loop to the per-*metric* loop: a
   `Set` metric or a `#`-prefixed measurement name sharing an event with an otherwise-good metric no
   longer takes that good metric down with it.
+
+## Amendment: a transform can emit extra events (2026-10-16)
+
+Splitting one event into several is no longer Lua-only. A native transform can emit extra events
+through `Transform::process_into` ([ADR `transform-fan-out`](transform-fan-out.md)), which
+`process_batch` appends to the same batch.
