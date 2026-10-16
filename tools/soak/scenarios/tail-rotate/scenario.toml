@@ -64,7 +64,7 @@ on = "logit"
 for = "30s"
 
 # A SIGKILL writes no final checkpoint: what was read after the last one replays. The longer
-# kill spans about four rotations, whose files the restarted tailer finds under their new
+# kill spans about three rotations, whose files the restarted tailer finds under their new
 # names.
 [[step]]
 at = "5m"

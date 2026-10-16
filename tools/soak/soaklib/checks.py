@@ -2298,7 +2298,16 @@ def _file_wire_one(data, led, source):
                      f"events.delivered is {_n(G)}")
     caught = data.phases.get("tail_caught_up") or {}
     low, high, band_lines = led.replay_band([listener])
+    runs = []
     for start, end, kind, label, g, wk, f in _wire_buckets(data, led, source):
+        if runs and runs[-1][2] == kind and runs[-1][3] == label:
+            runs[-1][1] = end
+            runs[-1][4] += g
+            runs[-1][5] += wk
+            runs[-1][6] += f
+        else:
+            runs.append([start, end, kind, label, g, wk, f])
+    for start, end, kind, label, g, wk, f in runs:
         lines.append(f"[{data.offset(start)}, {data.offset(end)}] {kind} ({label}): "
                      f"G {_n(round(g))}, W {_n(wk - f)}, counted {_n(f)}, gap "
                      f"{_n(round(g - wk))}")
