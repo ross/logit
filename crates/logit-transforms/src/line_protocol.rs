@@ -45,8 +45,9 @@
 //! | `logit.transform.tags.omitted{reason="reserved_prefix"}` | a tag key under `_logit.` or `influxdb.field.`, left off its point |
 //!
 //! Each bad line also reports the throttled diagnostic `parse_error`, with its 1-based line number
-//! and the parser's reason. It never quotes the line: a diagnostic is the process's own log, and
-//! the line is producer data.
+//! and the parser's reason. It doesn't quote the whole line, since a diagnostic is the process's
+//! own log and the line is producer data, but a reason can name the line's measurement, a key, or
+//! a number token, as influxd's own error text does.
 
 use logit_core::{Diagnostics, Event, Resource, Telemetry, Value};
 use logit_pipeline::Transform;

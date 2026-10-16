@@ -90,8 +90,9 @@ by what happened to its text:
   an empty row `csv` forwards untouched is counted `rows.skipped`.
 
 Either way, a throttled diagnostic `parse_error` names the 1-based line number and the parser's
-reason. It doesn't quote the line, because a diagnostic is the process's own log and the line is
-producer data.
+reason. It doesn't quote the whole line, because a diagnostic is the process's own log and the
+line is producer data, but a reason can name the line's measurement, a key, or a number token, as
+influxd's own error text does.
 
 **One construction path, shared with `influxdb_in`.** `logit_proto::influxdb` factors the event
 construction out of `InfluxDecoder::decode_body` so that both callers use it: building an event

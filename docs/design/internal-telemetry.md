@@ -1741,7 +1741,8 @@ text:
 A parent discarded after its points are emitted counts as
 `logit.component.events.discarded`, and its points count in `logit.component.events.sent`. Each
 bad line also reports the throttled `Diagnostics` key `parse_error`, naming the 1-based line number
-and the parser's reason, never the line's text.
+and the parser's reason. It doesn't quote the whole line, but a reason can name the line's
+measurement, a key, or a number token, as influxd's own error text does.
 
 ##### `http_access`
 
