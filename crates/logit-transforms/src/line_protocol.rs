@@ -41,7 +41,7 @@
 //! | Counter | When |
 //! |---|---|
 //! | `logit.transform.lines.dropped{reason="malformed"}` | a bad line in a message whose log doesn't go on: its text has left the pipeline, so it's loss |
-//! | `logit.transform.lines.unparsed{reason="malformed"}` | a bad line in a message whose log goes on (`keep_source: true`, or no point) |
+//! | `logit.transform.lines.skipped{reason="malformed"}` | a bad line in a message whose log goes on (`keep_source: true`, or no point) |
 //! | `logit.transform.tags.omitted{reason="reserved_prefix"}` | a tag key under `_logit.` or `influxdb.field.`, left off its point |
 //!
 //! Each bad line also reports the throttled diagnostic `parse_error`, with its 1-based line number
@@ -70,7 +70,7 @@ pub struct LineProtocol {
 #[derive(Default)]
 struct Tally {
     lines_dropped: usize,
-    lines_unparsed: usize,
+    lines_skipped: usize,
     tags_omitted: usize,
 }
 
@@ -134,7 +134,7 @@ impl Transform for LineProtocol {
         let log_goes_on = self.keep_source || !has_points;
         for (line, reason) in self.bad.drain(..) {
             if log_goes_on {
-                self.tally.lines_unparsed += 1;
+                self.tally.lines_skipped += 1;
             } else {
                 self.tally.lines_dropped += 1;
             }
@@ -155,7 +155,7 @@ impl Transform for LineProtocol {
         let tally = std::mem::take(&mut self.tally);
         let counts = [
             ("logit.transform.lines.dropped", "malformed", tally.lines_dropped),
-            ("logit.transform.lines.unparsed", "malformed", tally.lines_unparsed),
+            ("logit.transform.lines.skipped", "malformed", tally.lines_skipped),
             ("logit.transform.tags.omitted", "reserved_prefix", tally.tags_omitted),
         ];
         for (name, reason, count) in counts {
@@ -357,7 +357,7 @@ mod tests {
             "the lines around the bad one still parse"
         );
         assert_eq!(run.sum("logit.transform.lines.dropped", "malformed"), 1.0);
-        assert_eq!(run.sum("logit.transform.lines.unparsed", "malformed"), 0.0);
+        assert_eq!(run.sum("logit.transform.lines.skipped", "malformed"), 0.0);
         assert_eq!(run.diagnostics("parse_error"), 1.0);
     }
 
@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn under_keep_source_a_bad_line_is_unparsed_and_the_parent_goes_on_unchanged() {
+    fn under_keep_source_a_bad_line_is_skipped_and_the_parent_goes_on_unchanged() {
         let message = "a f=1i 1\nb f=\nc f=3i 3\n";
         let original = parent(message);
         let mut run = drive(Precision::Ns, true, vec![original.clone()]);
@@ -379,7 +379,7 @@ mod tests {
             run.events[1..].iter().map(measurement).collect::<Vec<_>>(),
             [Some("a"), Some("c")]
         );
-        assert_eq!(run.sum("logit.transform.lines.unparsed", "malformed"), 1.0);
+        assert_eq!(run.sum("logit.transform.lines.skipped", "malformed"), 1.0);
         assert_eq!(run.sum("logit.transform.lines.dropped", "malformed"), 0.0);
         assert_eq!(run.discarded(), 0.0);
     }
@@ -391,9 +391,9 @@ mod tests {
             let mut run = drive(Precision::Ns, keep_source, vec![original.clone()]);
             assert_eq!(run.events, [original], "keep_source: {keep_source}");
             assert_eq!(
-                run.sum("logit.transform.lines.unparsed", "malformed"),
+                run.sum("logit.transform.lines.skipped", "malformed"),
                 2.0,
-                "the log goes on, so its bad lines are unparsed, not dropped"
+                "the log goes on, so its bad lines are skipped, not dropped"
             );
             assert_eq!(run.sum("logit.transform.lines.dropped", "malformed"), 0.0);
             assert_eq!(run.discarded(), 0.0);
@@ -440,7 +440,7 @@ mod tests {
         let mut run = drive(Precision::Ns, false, input.clone());
         assert_eq!(run.events, input);
         assert_eq!(run.discarded(), 0.0);
-        assert!(!run.probe.poll().has("logit.transform.lines.unparsed", &[]));
+        assert!(!run.probe.poll().has("logit.transform.lines.skipped", &[]));
         assert!(!run.probe.poll().has("logit.transform.lines.dropped", &[]));
     }
 
