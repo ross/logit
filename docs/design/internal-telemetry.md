@@ -497,6 +497,7 @@ config asked for never uses the word:
 | `logit.component.events.discarded` | A filter, `sample`, `aggregate`, or Lua script removed an event because the config asked it to. | None. |
 | `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, sample value, or a metric record or span beside a log body) removed from a record that's still delivered. | `reason` where more than one cause exists. |
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
+| `*.unparsed` | Input a parser couldn't read, whose text still goes on in the record that carried it (`line_protocol`'s bad lines when the parent's log is forwarded). | `reason`. |
 | `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. | `reason`, `metric_kind`, or `field`. |
 | `*.evicted`, `*.untracked` | An entry left a bounded bookkeeping table. No data was lost. | `reason` where more than one cause exists. |
 | `logit.input.batches.deferred` | A listener answered busy (`503`). The client keeps the data and retries, so this is back-pressure, not loss. | None. |
@@ -1722,6 +1723,26 @@ recursion-depth wall refused, written back whole and unexpanded). Both are **unt
 is data the operator doesn't control, and tagging by it would mint an unbounded telemetry series
 from key-position data, the property `shape` is built to avoid. No `Diagnostics`: flattening an
 already-decoded value can't fail.
+
+##### `line_protocol`
+
+`crates/logit-transforms/src/line_protocol.rs`, whose module doc is the canonical copy;
+[ADR `line-protocol-transform`](../adr/line-protocol-transform.md).
+
+Three counters, emitted once per batch. A bad line (one that fails the grammar or whose timestamp
+is out of range) is skipped and counted under one of the first two, by what happened to its
+text:
+
+| Name | Meaning |
+|---|---|
+| `logit.transform.lines.dropped{reason="malformed"}` | a bad line in a message whose log doesn't go on: under the default `keep_source: false`, in a message with at least one good point. The line's text has left the pipeline, so it's loss |
+| `logit.transform.lines.unparsed{reason="malformed"}` | a bad line in a message whose log goes on, under `keep_source: true` or in a message with no good point. The text is still in the pipeline |
+| `logit.transform.tags.omitted{reason="reserved_prefix"}` | a tag left off a point because its key starts with `_logit.` or `influxdb.field.`, as `influxdb_in`'s `logit.input.tags.omitted` counts. The point is emitted |
+
+A parent discarded after its points are emitted counts as
+`logit.component.events.discarded`, and its points count in `logit.component.events.sent`. Each
+bad line also reports the throttled `Diagnostics` key `parse_error`, naming the 1-based line number
+and the parser's reason, never the line's text.
 
 ##### `http_access`
 

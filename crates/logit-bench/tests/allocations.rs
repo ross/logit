@@ -1300,6 +1300,31 @@ fn flatten_pino_http_event_cold_key_cache() {
     expect_allocs("flatten: pino-http shape, cold KeyCache (first event)", stats, 12);
 }
 
+// -- line_protocol (docs/adr/line-protocol-transform.md) ----------------------------------------
+
+/// One message of five points, `fixtures::LINE_PROTOCOL_MESSAGE`, through `process_into` on a warm
+/// transform with the node's scratch at its warm capacity, as the runtime holds it across batches.
+/// 11: 7 for the parsed lines' tag and field `Vec`s (a field `Vec` per line, a tag `Vec` per
+/// tagged line), 2 per message (the parsed lines and the event-to-line index of the merge), and 2
+/// for the multi-field points' `MetricList`s spilling past one record. Each child's copy of the
+/// parent's three attributes stays inline and clones no buffer, and every tag value, string field,
+/// and measurement is a slice of the message.
+#[test]
+fn line_protocol_five_point_message() {
+    let mut transform = fixtures::line_protocol();
+    let resource = fixtures::resource();
+    let mut emitted = Vec::new();
+    let mut warm = fixtures::line_protocol_event();
+    transform.process_into(&resource, &mut warm, &mut emitted);
+    emitted.clear();
+
+    let mut event = fixtures::line_protocol_event();
+    let (forwarded, stats) = measure(|| transform.process_into(&resource, &mut event, &mut emitted));
+    assert!(!forwarded, "the parent, with nothing left, is discarded");
+    assert_eq!(emitted.len(), 5, "or this measures the wrong thing");
+    expect_allocs("line_protocol: a five-point message", stats, 11);
+}
+
 // -- sample (docs/adr/consistent-sampling-component.md) -----------------------------------------
 //
 // Every `sample` path is free: the key and override names are interned once at construction,

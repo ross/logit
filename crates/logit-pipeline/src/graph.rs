@@ -413,6 +413,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Regex { .. }
         | Shape { .. }
         | Flatten { .. }
+        | LineProtocol { .. }
         | HttpAccess { .. }
         | Sample { .. }
         | Route { .. } => Role::Transform,
@@ -486,6 +487,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Regex { .. } => "regex",
         Shape { .. } => "shape",
         Flatten { .. } => "flatten",
+        LineProtocol { .. } => "line_protocol",
         HttpAccess { .. } => "http_access",
         Sample { .. } => "sample",
         Route { .. } => "route",
@@ -593,6 +595,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Regex { .. }
             | ComponentKind::Shape { .. }
             | ComponentKind::Flatten { .. }
+            | ComponentKind::LineProtocol { .. }
             | ComponentKind::HttpAccess { .. }
             | ComponentKind::Sample { .. }
             | ComponentKind::InfluxDbOut { .. }

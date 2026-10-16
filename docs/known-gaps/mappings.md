@@ -44,7 +44,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     sinks from `influxdb_in`: the private `_logit.influxdb.*` carriers never render there, and
     `influxdb.field.*` string fields do. The `decode` rows cover what `influxdb_in` refuses
     or drops that `influxd` accepts, or the reverse; the module doc's "Deviations from influxd"
-    is the full list. `docs/design/internal-telemetry.md`'s `influxdb_out` section lists every counter.
+    is the full list. The `line_protocol` transform decodes through the same code, but skips a
+    bad line instead of failing the message and counts under `logit.transform.`; its module doc
+    (`crates/logit-transforms/src/line_protocol.rs`) has the differences. `docs/design/internal-telemetry.md`'s `influxdb_out` section lists every counter.
 
   | Direction | Mapping | Counter | Why |
   |---|---|---|---|

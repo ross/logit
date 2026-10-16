@@ -2836,6 +2836,30 @@ pub enum ComponentKind {
         #[serde(default)]
         arrays: FlattenArrays,
     },
+    /// Parses a log message as InfluxDB line protocol and emits one event per point, in the shape
+    /// `influxdb_in` gives one: the measurement as `_logit.influxdb.measurement`, tags as
+    /// attributes, each numeric or boolean field as a gauge named `<measurement>.<field>`, and
+    /// each string field as the attribute `influxdb.field.<key>`. Points in one message with the
+    /// same measurement, tag set, and timestamp merge into one event.
+    ///
+    /// Each point's event starts from a copy of the parent's attributes, with the point's own
+    /// tags winning a collision, so every inherited attribute reaches `influxdb_out` as a tag;
+    /// place `keep` or `remove` to choose them. A point with no timestamp takes the parent's.
+    ///
+    /// A line that doesn't parse, or whose timestamp is out of range, is skipped and counted, and
+    /// the rest of the message is still parsed. An event with no log, or whose message isn't text
+    /// or bytes, passes through untouched, as does a message with no good point.
+    LineProtocol {
+        /// The unit of every timestamp in the message: `ns` (the default, as InfluxDB's write
+        /// API), `us`, `ms`, or `s`.
+        #[serde(default)]
+        precision: LineProtocolPrecision,
+        /// Also forward the parent event, log included, beside its points. Off by default: the
+        /// parent's log is removed once its points are emitted, and a parent left with no metric
+        /// or span is discarded.
+        #[serde(default)]
+        keep_source: bool,
+    },
     /// Normalizes a web server's access line, logged under raw OTel semconv attribute names, into
     /// its conformant form: composites (`http.request.line`, `url.original`) decomposed into
     /// whichever atomic fields are absent, numerics coerced to integers (`"000"` becomes `0`),
@@ -4142,6 +4166,21 @@ pub enum FlattenArrays {
     Index,
     /// Leave the array as a leaf, written back whole at its path.
     Skip,
+}
+
+/// `line_protocol`'s `precision` field: the unit of a line's timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LineProtocolPrecision {
+    /// Nanoseconds. The default.
+    #[default]
+    Ns,
+    /// Microseconds.
+    Us,
+    /// Milliseconds.
+    Ms,
+    /// Seconds.
+    S,
 }
 
 /// `bucket`'s `keep_source` default: keep the source attribute.
@@ -6551,6 +6590,38 @@ mod tests {
             }
             other => panic!("expected Flatten, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn line_protocol_component_defaults_to_ns_and_drops_the_source() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "line_protocol", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::LineProtocol { precision, keep_source } => {
+                assert_eq!(precision, LineProtocolPrecision::Ns);
+                assert!(!keep_source);
+            }
+            other => panic!("expected LineProtocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn line_protocol_component_deserializes_full_form_and_rejects_an_unknown_precision() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "line_protocol", "sources": ["in"], "precision": "ms", "keep_source": true}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::LineProtocol { precision, keep_source } => {
+                assert_eq!(precision, LineProtocolPrecision::Ms);
+                assert!(keep_source);
+            }
+            other => panic!("expected LineProtocol, got {other:?}"),
+        }
+        assert!(serde_json::from_str::<Component>(
+            r#"{"type": "line_protocol", "sources": ["in"], "precision": "h"}"#
+        )
+        .is_err());
     }
 
     #[test]

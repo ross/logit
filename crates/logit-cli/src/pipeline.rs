@@ -88,11 +88,11 @@ use logit_transforms::{
     HttpAccess as HttpAccessTransform, HttpAccessConfig, IdFormat as TraceIdFormatTransform,
     InvalidUtf8 as TransformInvalidUtf8, JsonParser, Keep as KeepTransform,
     KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform, Kv as KvTransform,
-    KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
-    Normalize as TransformNormalize, RegexParser, Remove as RemoveTransform,
-    Route as RouteTransform, Sample as SampleTransform, Scale as ScaleTransform,
-    Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform, SignalSet, SpanLift,
-    TimestampFormat as TimestampFormatTransform, TimestampResolver,
+    KvMetrics as KvMetricsTransform, LineProtocol as LineProtocolTransform,
+    Logfmt as LogfmtTransform, MatchMode as TransformMatchMode, Normalize as TransformNormalize,
+    RegexParser, Remove as RemoveTransform, Route as RouteTransform, Sample as SampleTransform,
+    Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform,
+    SignalSet, SpanLift, TimestampFormat as TimestampFormatTransform, TimestampResolver,
     TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
@@ -1119,6 +1119,11 @@ fn build_spec(
                     .with_telemetry(telemetry.clone()),
             ))
         }
+        LineProtocol { precision, keep_source } => NodeSpec::Transform(Box::new(
+            LineProtocolTransform::new(to_line_protocol_precision(*precision), *keep_source)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
+        )),
         Flatten { attributes, resource, arrays } => NodeSpec::Transform(Box::new(
             FlattenTransform::new(
                 to_flatten_fields(attributes),
@@ -2179,6 +2184,20 @@ fn to_bucket_fields(
             keep_source: spec.keep_source,
         })
         .collect()
+}
+
+/// `line_protocol`'s `precision` into the codec's own enum.
+fn to_line_protocol_precision(
+    precision: logit_config::LineProtocolPrecision,
+) -> logit_proto::influxdb::Precision {
+    use logit_config::LineProtocolPrecision as P;
+    use logit_proto::influxdb::Precision;
+    match precision {
+        P::Ns => Precision::Ns,
+        P::Us => Precision::Us,
+        P::Ms => Precision::Ms,
+        P::S => Precision::S,
+    }
 }
 
 /// `flatten`'s `FlattenFields` into the `logit_transforms::Fields` `Flatten::new` takes.
