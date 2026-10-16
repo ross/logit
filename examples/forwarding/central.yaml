@@ -49,6 +49,22 @@ components:
     sources: [remote_in]
     signals: [traces]
 
+  # If a backend needs the edges' self-telemetry treated differently (an InfluxDB org and bucket,
+  # say), split it once here, with no per-host list: every edge's `internal` carries
+  # `service.name: logit`. Point the gates' `sources` at `by_service`, which passes on everything
+  # it doesn't claim, and put the special handling downstream of `peer_self`. docs/deploying.md's
+  # "Operating a pair" has the whole recipe.
+  #
+  # by_service:
+  #   type: route
+  #   sources: [remote_in]
+  #   by: {resource: service.name}
+  #   routes:
+  #     logit: peer_self
+  #
+  # peer_self:
+  #   type: target
+
   # --- Window --------------------------------------------------------------------------------
 
   # The edges forward raw, so the window is applied once, here. Prometheus remote write takes

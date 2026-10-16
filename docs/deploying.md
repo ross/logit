@@ -4429,6 +4429,35 @@ so the receiver's data sinks deliver it with everything else. Give the receiver'
 separate sinks to the same backends: shared with the data sinks, its pipeline is no longer
 dedicated and doesn't drain last. `examples/forwarding/central.yaml` does both.
 
+**Split peers' self-telemetry by `service.name`, not by peer.** A `has_provenance` and a
+`drop_provenance` on each sender's `internal` id list every peer twice, and nothing catches a peer
+missing from one list. Every `internal` batch carries `service.name: logit` on its resource, and
+the resource crosses the hop, so one `route` claims every peer's self-telemetry:
+
+```yaml
+by_service:
+  type: route
+  sources: [remote_in]
+  by: {resource: service.name}
+  routes:
+    logit: peer_self          # every peer's internal, whatever its id or hostname
+
+peer_self:
+  type: target
+
+peer_self_bucket:             # whatever the backend needs: here, an InfluxDB org and bucket
+  type: set
+  sources: [peer_self]
+  resource:
+    _logit.influxdb.org: ops
+    _logit.influxdb.bucket: logit_self
+```
+
+The data path takes its `sources` from `by_service`, which passes on every event the route
+doesn't claim, so a peer's data and anything else flow through unchanged. An application that
+sends its own telemetry under `service.name: logit` is routed with the peers'. To tell peers
+apart instead, `by: {provenance: origin}` with each peer's `internal` id lists every peer once.
+
 **Keep `span_sample_rate` equal across the pair.** When both nodes run an `internal` component
 and export to the same tracing backend, a batch's internal spans on the receiving node join the
 sending node's trace for it, so the backend shows one trace across both hosts
