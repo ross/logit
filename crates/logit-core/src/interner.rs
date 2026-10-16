@@ -41,6 +41,12 @@ pub fn lookup(s: &str) -> Option<Symbol> {
     interner().get(s)
 }
 
+/// `sym`'s position in interning order, which `Symbol`'s `Ord` follows, as an integer for a
+/// caller that can't carry a `Symbol`, such as a Lua number.
+pub fn index(sym: Symbol) -> usize {
+    lasso::Key::into_usize(sym)
+}
+
 /// Count of distinct strings interned so far, process-wide. Never decreases (`ThreadedRodeo`
 /// never evicts, `docs/design/memory.md` §4); `internal` reports it as
 /// `logit.process.interner.strings`.

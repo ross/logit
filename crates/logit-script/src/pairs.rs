@@ -12,30 +12,39 @@
 //!   interpreted sandbox, and nothing per step. A call site that ever sees a proxy loses `ITERN`
 //!   for good, and its plain-table loops run about 60% slower.
 //! - **The iterator is stateless**: one Rust function, created here and shared by every loop. A
-//!   step receives `(proxy, last_key)`, resolves the key without interning it, and seeks the
-//!   first entry after it ([`logit_core::AttrMap::entry_after`]). Deleting or overwriting the
-//!   current key during the loop is safe; adding one is undefined, as for a Lua table.
-//! - **It holds no `Rc` to the event.** The loop's state is the proxy userdata itself, so
+//!   step receives `({proxy, bound}, last_key)`, resolves the key without interning it, and seeks
+//!   the first entry after it ([`logit_core::AttrMap::entry_after`]). Deleting or overwriting the
+//!   current key during the loop is safe.
+//! - **The loop is bounded when `pairs` is called**, at the interning index of the map's last key
+//!   ([`bound_of`]), so it always ends. A key added during the loop is never visited if it's new
+//!   to the process, and may be visited if it was interned before.
+//! - **It holds no `Rc` to the event.** The loop's state holds the proxy userdata, so
 //!   [`crate::EventProxy::into_inner`]'s `Rc::try_unwrap` still finds no clone, and a stashed
 //!   iterator used after the event is returned gets the destructed-handle error.
 
 use crate::{proxy, resource, scope};
-use logit_core::interner::{lookup, resolve};
+use logit_core::interner::{index, lookup, resolve};
 use logit_core::AttrMap;
 use mlua::{AnyUserData, Function, Lua, Value as LuaValue};
 
-/// Takes the original `pairs`, `type`, and `error`, the proxy test, and the iterator, so a script
-/// that reassigns any of those globals doesn't change what the wrapper does. `error(.., 2)` puts
-/// the caller's line on a refusal, as the original's own argument error does.
+/// Takes the original `pairs`, `type`, and `error`, the bound lookup, and the iterator, so a
+/// script that reassigns any of those globals doesn't change what the wrapper does.
+/// `error(.., 2)` puts the caller's line on a refusal, as the original's own argument error does.
+///
+/// `bound_of` returns `false` for a userdata that isn't an attribute proxy. The loop's state is
+/// `{proxy, bound}`, a Lua table, so it holds the proxy and never the event.
 const WRAPPER: &str = r#"
-local base_pairs, type, error, is_proxy, step = ...
+local base_pairs, type, error, bound_of, step = ...
 return function(t)
   local ty = type(t)
   if ty == "table" then
     return base_pairs(t)
   end
-  if ty == "userdata" and is_proxy(t) then
-    return step, t, nil
+  if ty == "userdata" then
+    local bound = bound_of(t)
+    if bound > -2 then
+      return step, {t, bound}, nil
+    end
   end
   error("bad argument #1 to 'pairs' (table expected, got " .. ty .. ")", 2)
 end
@@ -47,14 +56,12 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     let base_pairs: Function = globals.get("pairs")?;
     let type_fn: Function = globals.get("type")?;
     let error_fn: Function = globals.get("error")?;
-    let is_proxy = lua.create_function(|_, ud: AnyUserData| {
-        with_proxy_attrs(&ud, |_| Ok(())).map(|found| found.is_some())
-    })?;
+    let bound_of = lua.create_function(bound_of)?;
     let step = lua.create_function(step)?;
     let wrapper: Function = lua
         .load(WRAPPER)
         .set_name("=pairs")
-        .call((base_pairs, type_fn, error_fn, is_proxy, step))?;
+        .call((base_pairs, type_fn, error_fn, bound_of, step))?;
     globals.set("pairs", wrapper)
 }
 
@@ -76,13 +83,35 @@ fn with_proxy_attrs<R>(
     scope::with_attrs(ud, &mut call)
 }
 
-/// One step of a `pairs` loop over a proxy: the entry after `last`, or `nil` to end the loop. A
-/// `Null` value reads as `nil`, which a generic `for` passes through, because only a `nil` key
-/// ends it.
+/// The loop's bound: the interning index of the map's last key when `pairs` is called, `-1` for
+/// an empty map, or `false` if `ud` isn't an attribute proxy.
+///
+/// Without it, a loop that adds a key each step never ends: a key interned for the first time
+/// sorts after every existing one, so each step would find a new entry past the last. The
+/// copy-on-write copy of `resource` or `scope` keeps every key's `Symbol`, so the bound holds when
+/// a write mid-loop switches the step from the base to the copy.
+fn bound_of<'lua>(_: &'lua Lua, ud: AnyUserData<'lua>) -> mlua::Result<i64> {
+    Ok(match with_proxy_attrs(&ud, |attrs| Ok(attrs.last_key()))? {
+        None => -2,
+        Some(None) => -1,
+        Some(Some(last)) => index(last) as i64,
+    })
+}
+
+/// One step of a `pairs` loop over a proxy: the entry after `last`, or `nil` to end the loop once
+/// the next entry sorts past the bound. A `Null` value reads as `nil`, which a generic `for`
+/// passes through, because only a `nil` key ends it.
 fn step<'lua>(
     lua: &'lua Lua,
-    (ud, last): (AnyUserData<'lua>, Option<mlua::String<'lua>>),
+    (state, last): (LuaValue<'lua>, Option<mlua::String<'lua>>),
 ) -> mlua::Result<(LuaValue<'lua>, LuaValue<'lua>)> {
+    let LuaValue::Table(state) = state else {
+        return Err(mlua::Error::RuntimeError(
+            "the pairs iterator takes the state pairs returned with it".to_string(),
+        ));
+    };
+    let ud: AnyUserData = state.raw_get(1)?;
+    let bound: i64 = state.raw_get(2)?;
     let after = match &last {
         None => None,
         // A key the interner has never seen is in no map, and the iterator only ever hands back
@@ -93,11 +122,11 @@ fn step<'lua>(
         },
     };
     let entry = with_proxy_attrs(&ud, |attrs| match attrs.entry_after(after) {
-        Some((key, value)) => Ok((
+        Some((key, value)) if index(key) as i64 <= bound => Ok((
             LuaValue::String(lua.create_string(resolve(key))?),
             crate::value::value_to_lua(lua, value)?,
         )),
-        None => Ok((LuaValue::Nil, LuaValue::Nil)),
+        _ => Ok((LuaValue::Nil, LuaValue::Nil)),
     })?;
     entry.ok_or_else(|| {
         mlua::Error::RuntimeError(
@@ -143,7 +172,7 @@ mod tests {
     }
 
     /// Lists what a loop over `iterable` yields, as `k=v` joined by `,`, into the event's `seen`
-    /// attribute after the loop, since adding a key during one is undefined.
+    /// attribute after the loop, since a key added during one may or may not be visited.
     fn listing_script(iterable: &str) -> String {
         format!(
             r#"
@@ -253,6 +282,49 @@ mod tests {
         for (key, want) in [("a", "1!"), ("b", "2!"), ("c", "3!")] {
             assert_eq!(out.attributes.get(key).and_then(Value::as_str), Some(want), "{key}");
         }
+    }
+
+    /// A loop that adds a key each step ends: a key interned for the first time sorts after every
+    /// existing one, and the loop is bounded at the map's last key when `pairs` is called. The
+    /// guard turns an unbounded loop into a failure instead of a hang.
+    #[test]
+    fn a_rename_loop_adding_a_new_key_each_step_ends() {
+        let w = worker(
+            r#"
+            function process(event)
+                local a, steps = event.attributes, 0
+                for k, v in pairs(a) do
+                    steps = steps + 1
+                    if steps > 100 then
+                        error("the loop didn't end")
+                    end
+                    a["renamed." .. k] = v
+                    a[k] = nil
+                end
+                return event
+            end
+            "#,
+        );
+        let map = attrs(&[
+            ("rename_loop.a", Value::str("1")),
+            ("rename_loop.b", Value::str("2")),
+            ("rename_loop.c", Value::str("3")),
+        ]);
+        let out = emitted(w.process(log_event(map)).unwrap());
+        let mut keys: Vec<(&str, &str)> = out
+            .attributes
+            .iter()
+            .map(|(k, v)| (resolve(k), v.as_str().expect("a string value")))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                ("renamed.rename_loop.a", "1"),
+                ("renamed.rename_loop.b", "2"),
+                ("renamed.rename_loop.c", "3")
+            ]
+        );
     }
 
     /// A `Null` entry yields `(key, nil)` without ending the loop, and the loop can delete it.
@@ -448,8 +520,8 @@ mod tests {
             end
 
             function flush()
-                local step, proxy = stashed[1], stashed[2]
-                step(proxy, nil)
+                local step, state = stashed[1], stashed[2]
+                step(state, nil)
                 return {}
             end
             "#,

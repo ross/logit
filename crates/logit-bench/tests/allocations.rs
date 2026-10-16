@@ -3812,12 +3812,11 @@ fn lua_process_one_event_deleting_an_attribute() {
 
 /// `for k, v in pairs(event.attributes) do end`: enumerating attributes in place.
 ///
-/// 8, the same total as a script that only reads an attribute: **4** for any call, **+1** for the
-/// `Box` on the way out, **+3** for creating and caching the `AttrsProxy`, and **+0** for the loop.
-/// The wrapper is Lua, its proxy test and iterator are Rust functions created once per worker,
-/// and each step's key and value strings allocate in LuaJIT's heap, which this allocator doesn't
-/// see. The same script on this event with 12 more attributes also measures 8, so no step
-/// allocates.
+/// 9: **4** for any call, **+1** for the `Box` on the way out, **+3** for creating and caching the
+/// `AttrsProxy`, and **+1** for the loop's `{proxy, bound}` state table, which LuaJIT allocates
+/// through mlua's allocator once per `pairs` call. **+0** per step: LuaJIT interns strings, so
+/// each step's key and value reuse the strings the warm-up call made; a key or value new to the
+/// VM would allocate. The same script on this event with 12 more attributes also measures 9.
 #[test]
 fn lua_process_one_event_iterating_attributes() {
     let worker = ScriptWorker::new(fixtures::LUA_ATTR_PAIRS_SCRIPT).expect("script should load");
@@ -3826,7 +3825,7 @@ fn lua_process_one_event_iterating_attributes() {
     let event = fixtures::nginx_event();
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
     assert!(matches!(outcome, ProcessOutcome::Emit(..)));
-    expect_allocs("lua: iterate attributes with pairs", stats, 8);
+    expect_allocs("lua: iterate attributes with pairs", stats, 9);
 }
 
 /// `event.log.message = "rewritten"`: rewriting the log body in place
