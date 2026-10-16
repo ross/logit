@@ -7,7 +7,8 @@ updated: 2026-10-16
 
 ## Status
 
-W0 records the decisions: three ADRs and this plan. W1 to W4 build them.
+W0 records the decisions: three ADRs and this plan. W1 to W4 build them; W4 ships the example,
+and "Outcome" below says what its test proves.
 
 ## Goal
 
@@ -138,8 +139,9 @@ The script also:
 - Drops a `v=3` line tagged `_seq`, as Prusa's collector does.
 - Sets `mac_address` from `syslog.hostname` and removes the other `syslog.*` attributes, so the
   points carry the tags Prusa's collector writes.
-- Counts gaps in `msg` per printer through `telemetry`, untagged, from a Lua table keyed by
-  hostname. That table is the script's only state, and only the gap count depends on it.
+- Counts gaps in `msg` per printer through `telemetry`, tagged `mac_address`, from a Lua table
+  keyed by hostname. That table is the script's only state, and only the gap count depends on it.
+  The tag's cardinality is the number of printers.
 
 ## Workstreams
 
@@ -149,7 +151,7 @@ The script also:
 | W1 | `prusa/w1` | **`syslog_in` framing.** `framing:` in `ComponentKind::SyslogIn`, the graph rule, the UDP arm's decoder choice, `script/schema`; tests for a multi-line MSG, a binary MSG, the default split, and the TCP rejection; `docs/known-gaps/syslog.md`'s binary-MSG entry gains the workaround; AGENTS.md's `syslog_in` row | W0 |
 | W2 | `prusa/w2` | **Transform emit path.** `Transform::process_into`, the scratch in `run_transform` and `process_batch`; tests for order, children-only batches, discard counting, and unchanged allocation pins; `transform.rs`'s module doc and `pipeline-graph.md` | W1 |
 | W3 | `prusa/w3` | **`line_protocol`.** The shared construction path in `logit_proto::influxdb`, with `influxdb_in`'s tests unchanged; the transform, its config, registry arm, and schema; the fuzz target's skip mode; `internal-telemetry.md`'s counters; AGENTS.md's transforms table | W2 |
-| W4 | `prusa/w4` | **Prusa example.** `examples/prusa/` (config, `prusa.lua`, rendered graph, `examples/README.md` row); the captured datagram as a fixture; an end-to-end test that runs it through `syslog_in` with `framing: datagram`, the script, and `line_protocol` and asserts the points; operator docs; the whale deployment config | W3 |
+| W4 | `prusa/w4` | **Prusa example.** `examples/prusa/` (config, `prusa.lua`, rendered graph, its README as the operator docs, `examples/README.md` row); two captured datagrams as fixtures; `crates/logit-cli/tests/prusa_example.rs`, which runs them through `syslog_in`'s decoder with `framing: datagram`, the script, and `line_protocol` and asserts the points; the whale deployment config in the PR body | W3 |
 
 W2 doesn't need W1's code, but the stream lands linearly so each PR reviews against the one before
 it. Each branch is cut from its parent's branch, its PR targets that branch, and it retargets to
@@ -191,3 +193,23 @@ Every PR runs `script/cibuild`. W1 and W3 regenerate and commit `script/schema`.
   warning, which suggests the firmware emits them. The capture has none, and none with a NaN. W4
   leaves such lines to `line_protocol`'s `lines.dropped`. If a longer run shows them, the script
   drops and counts them itself, so `*.dropped` keeps meaning loss someone should look into.
+
+## Outcome
+
+W4's `crates/logit-cli/tests/prusa_example.rs` runs the first captured datagram (`msg=920`, 984
+bytes) through `SyslogDecoder::with_line_splitting(false)`, `examples/prusa/prusa.lua` in a real
+`ScriptWorker`, and `LineProtocol` through `process_batch`, and checks every point against the
+fixture's own lines:
+
+- 37 points in line order and no parent, none skipped or counted as a bad line.
+- Each point's measurement, `mac_address` set, and no `syslog.*` attribute left.
+- Each point's timestamp is the receipt time minus its distance from the newest offset, so
+  `esp_out` takes the receipt time and `ttemp_noz` (offset `-158`) lands 676,380 µs before it.
+- `v` renamed to `value` (`stp_stall.value` is the integer `1`), tags (`n`, `a`, `fan`), and typed
+  multi-field points (`heap.free`, `heap.total`, three `fan.*` gauges per fan).
+- The batch resource carries `_logit.influxdb.bucket = "prusa"` past `line_protocol`.
+
+The same file checks that consecutive datagrams `msg=920` and `msg=921` count no gap, that a jump
+to `msg=925` counts four missed datagrams, that an unsupported format version passes through and
+is counted, and that a non-Buddy syslog event passes through unchanged. With the anchoring
+subtraction removed from the script, the first test fails on its first point.

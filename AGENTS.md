@@ -633,7 +633,9 @@ the operator-facing account of all of this.
   `examples/README.md`. Its comments are written for someone adopting `logit`: no ADR paths, rule
   numbers, or history. `every_shipped_config_loads_and_validates` covers `examples/*/*.yaml` but
   never loads a `lua_file`, so `crates/logit-cli/tests/lua_example.rs` runs
-  `examples/lua/process.lua` through the real `logfmt` transform and a `ScriptWorker`. Re-render a
+  `examples/lua/process.lua` through the real `logfmt` transform and a `ScriptWorker`, and
+  `crates/logit-cli/tests/prusa_example.rs` runs a captured datagram through `syslog_in`'s
+  decoder, `examples/prusa/prusa.lua`, and the real `line_protocol` transform. Re-render a
   config's graph whenever the config changes. `demo/graph-renderer` is the image with `dot`, since
   neither the host nor `Dockerfile.dev` has graphviz:
 
