@@ -443,8 +443,7 @@ components:
   #   - `redis.role` is Redis's one-letter process role (`M` primary, `S` replica, `C` a forked
   #     child such as a background save, `X` sentinel).
   #   - `redis.level` is its one-character severity (`.` debug, `-` verbose, `*` notice,
-  #     `#` warning), kept as the raw character because `regex` has no mapping step and
-  #     `event.log.severity` is read-only from `lua` (docs/design/lua-api.md).
+  #     `#` warning), kept as the raw character because `regex` has no mapping step.
   # The level is namespaced rather than a bare `level` on purpose: Loki reads a `level`
   # structured-metadata key as the line's severity, and would show every notice line with a
   # `detected_level` of `*`. Redis's own timestamp is left unparsed, because `docker_in` already

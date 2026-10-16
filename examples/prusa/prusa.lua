@@ -167,19 +167,18 @@ function process(event)
     return nil
   end
 
-  -- `log.message` is read-only, so the event is rebuilt from a table copy. Every `syslog.*`
-  -- attribute would become an InfluxDB tag on every point, so only the MAC address stays.
-  local t = event:to_table()
-  for key in pairs(t.attributes) do
+  -- Every `syslog.*` attribute would become an InfluxDB tag on every point, so remove them and
+  -- keep only the MAC address.
+  for key in pairs(event.attributes) do
     if string.sub(key, 1, 7) == "syslog." then
-      t.attributes[key] = nil
+      event.attributes[key] = nil
     end
   end
-  t.attributes.mac_address = mac
-  t.log.message = table.concat(lines, "\n")
+  event.attributes.mac_address = mac
+  event.log.message = table.concat(lines, "\n")
 
   -- influxdb_out writes a batch to the bucket its resource names when the sink sets no `bucket:`.
   -- The resource is per batch, so this applies to every event in it.
   resource["_logit.influxdb.bucket"] = BUCKET
-  return Event.new(t)
+  return event
 end

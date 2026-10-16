@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-09-24
+updated: 2026-10-16
 ---
 
 # `LogRecord` gains a native application trace/span reference
@@ -180,3 +180,10 @@ Alternatives considered:
   reason, and because it would make which attribute won depend on what a line happened to carry.
 - **A separate `datadog_trace_context` kind.** Rejected: the lift, the skip reasons, the span block,
   and the consumed-attribute rule are identical; only the id grammar differs.
+
+## Amendment: `message`/`severity`/`body_format` are writable (2026-10-16)
+
+The concrete need this ADR waited for showed up in `examples/prusa/prusa.lua`, which rebuilt each
+event with `Event.new` to rewrite its log body. [ADR `lua-in-place-edits`](lua-in-place-edits.md)
+makes the three fields writable through `Event.new`'s parsers for the same keys; the trace
+fields' rules here are unchanged. `dropped_attributes_count` stays read-only.

@@ -5,7 +5,7 @@
 //!
 //! - [`EventProxy`]: the whole event.
 //! - `AttrsProxy`: `event.attributes`, an open map.
-//! - `LogProxy`: `event.log`, a fixed field set, mostly read-write.
+//! - `LogProxy`: `event.log`, a fixed field set, writable but for `dropped_attributes_count`.
 //! - `MetricsProxy`/`MetricProxy`: `event.metrics`, a 1-based array of records. Writable fields
 //!   are `name`, `unit`, `description`, `start_timestamp`, `value` on a `sum`/`gauge`, and a
 //!   `sum`'s `temporality`/`monotonic`.
@@ -14,6 +14,7 @@
 //! Every sub-proxy shares its parent's `Rc<RefCell<Event>>`, so a write through one is visible
 //! through all, matching Lua's reference semantics (`local e2 = event` aliases the event).
 
+use crate::construct::{enum_value, labeled_value};
 use crate::value::{
     attribute_error, attrmap_to_lua_table, exact_i64_to_lua, exact_u64_to_lua, lua_to_value,
     lua_value_matches, value_to_lua,
@@ -21,8 +22,8 @@ use crate::value::{
 use logit_core::interner::{intern, resolve};
 use logit_core::trace::{parse_span_id, parse_trace_id, to_hex};
 use logit_core::{
-    Event, Exemplar, LogRecord, MetricKind, MetricRecord, MetricValue, SpanEvent, SpanLink,
-    SpanRecord, Telemetry, Temporality, TraceRef,
+    BodyFormat, Event, Exemplar, LogRecord, MetricKind, MetricRecord, MetricValue, Severity,
+    SpanEvent, SpanLink, SpanRecord, Telemetry, Temporality, TraceRef,
 };
 use mlua::{
     AnyUserData, Lua, MetaMethod, RegistryKey, Table, UserData, UserDataMethods, Value as LuaValue,
@@ -369,9 +370,8 @@ impl UserData for EventProxy {
             Ok(this)
         });
 
-        // A plain Lua table, detached from the live event: how a script iterates attributes,
-        // since LuaJIT has no `__pairs`. Covers every payload field, and `Event.new` is its
-        // inverse (`crate::construct`).
+        // A plain Lua table, detached from the live event. Covers every payload field, and
+        // `Event.new` is its inverse (`crate::construct`).
         methods.add_method("to_table", |lua, this, ()| {
             let event = this.event.borrow();
             let table = lua.create_table()?;
@@ -420,6 +420,12 @@ impl UserData for AttrsProxy {
             MetaMethod::NewIndex,
             |_, this, (key, value): (mlua::String, LuaValue)| {
                 let key = key.to_str()?;
+                // `nil` deletes, and the check precedes the no-op check below: `lua_value_matches`
+                // treats `nil` as matching a stored `Null`, which would keep the key.
+                if matches!(value, LuaValue::Nil) {
+                    this.0.borrow_mut().attributes.remove(key);
+                    return Ok(());
+                }
                 // If `value` is what `value_to_lua` gave for the current content, keep the stored
                 // `Value`, so its variant (`Bytes` vs. `Str`, `U64` vs. `I64`) survives
                 // `event.attributes.x = event.attributes.x` (`lua_value_matches`). Conversion
@@ -441,17 +447,34 @@ impl UserData for AttrsProxy {
             },
         );
 
-        // No `__pairs`: mlua's `MetaMethod::Pairs` needs Lua 5.2+, not LuaJIT. A script
-        // enumerates `event:to_table().attributes` instead.
+        // No `__pairs`: mlua's `MetaMethod::Pairs` needs Lua 5.2+, not LuaJIT. The sandbox's
+        // `pairs` wrapper enumerates this proxy through `with_attrs` (`crate::pairs`).
+    }
+}
+
+/// Runs `f` on the attributes of `ud` if it's an `event.attributes` proxy, for `crate::pairs`;
+/// `Ok(None)` for any other userdata.
+///
+/// `ud.borrow` reports a torn-down proxy of any type as `UserDataDestructed`, which this returns
+/// as [`destructed_handle_error`]; mlua's own replacement metatable never sees the call, because
+/// the iterator is a Rust function and not a metamethod.
+pub(crate) fn with_attrs<R>(
+    ud: &AnyUserData,
+    f: impl FnOnce(&logit_core::AttrMap) -> mlua::Result<R>,
+) -> mlua::Result<Option<R>> {
+    match ud.borrow::<AttrsProxy>() {
+        Ok(proxy) => f(&proxy.0.borrow().attributes).map(Some),
+        Err(mlua::Error::UserDataDestructed) => Err(destructed_handle_error()),
+        Err(_) => Ok(None),
     }
 }
 
 /// The `event.log` sub-proxy: a fixed, typed field set over its parent's event.
 ///
-/// `trace_id`/`span_id`/`trace_flags` (`docs/adr/log-record-trace-context.md`), `event_name`, and
-/// `observed_timestamp` are writable; `message`/`severity`/`body_format` are read-only pending a
-/// design (`docs/design/lua-api.md`), and `dropped_attributes_count` is read-only. Construct only
-/// when `event.log.is_some()`: every accessor `.expect`s it.
+/// Every field but `dropped_attributes_count` is writable. `message`, `severity`, and
+/// `body_format` parse through `crate::construct`'s parsers for the same `log` keys, so a write
+/// accepts what `Event.new` does (`docs/adr/lua-in-place-edits.md`). Construct only when
+/// `event.log.is_some()`: every accessor `.expect`s it.
 struct LogProxy(Rc<RefCell<Event>>);
 
 impl LogProxy {
@@ -586,9 +609,51 @@ impl UserData for LogProxy {
                         trace.flags = flags;
                         Ok(())
                     }),
-                    "message" | "severity" | "body_format" => Err(mlua::Error::RuntimeError(
-                        format!("event.log.{key} is read-only for now"),
-                    )),
+                    "message" => {
+                        // The no-op check precedes the `nil` refusal: the OTLP logs decoder
+                        // stores a missing body as `Null`, which reads as `nil`, so writing a
+                        // body-less log's message back must not error. It also keeps a `Bytes`
+                        // message `Bytes` (`lua_value_matches`).
+                        if this.with_log(|log| lua_value_matches(&log.message, &value)) {
+                            return Ok(());
+                        }
+                        if matches!(value, LuaValue::Nil) {
+                            return Err(mlua::Error::RuntimeError(
+                                "event.log.message is required".to_string(),
+                            ));
+                        }
+                        // Converted with the borrow released, as an attribute write is.
+                        let message = labeled_value(value, || "event.log.message".to_string())?;
+                        this.with_log_mut(|log| log.message = message);
+                        Ok(())
+                    }
+                    "severity" => {
+                        let severity =
+                            enum_value(value, &Severity::NAMES, Severity::from_name, true, || {
+                                "event.log.severity".to_string()
+                            })?;
+                        this.with_log_mut(|log| log.severity = severity);
+                        Ok(())
+                    }
+                    // `nil` is an error, not `raw` as an absent key is in `Event.new`: a write
+                    // names the format it wants.
+                    "body_format" => {
+                        let body_format = enum_value(
+                            value,
+                            &BodyFormat::NAMES,
+                            BodyFormat::from_name,
+                            false,
+                            || "event.log.body_format".to_string(),
+                        )?
+                        .ok_or_else(|| {
+                            mlua::Error::RuntimeError(format!(
+                                "event.log.body_format must be one of {}, got nil",
+                                BodyFormat::NAMES.join(", ")
+                            ))
+                        })?;
+                        this.with_log_mut(|log| log.body_format = body_format);
+                        Ok(())
+                    }
                     "event_name" => this.with_log_mut(|log| match value {
                         LuaValue::Nil => {
                             log.event_name = None;
@@ -1564,16 +1629,22 @@ pub(crate) fn clarify_destructed_handle_use(err: mlua::Error) -> mlua::Error {
         }
     }
     if is_destructed_handle_use(&err) {
-        return mlua::Error::RuntimeError(
-            "this event, or a handle obtained from it (event.attributes, event.log, \
-             event.metrics[i], or event.span), was already returned/emitted elsewhere and can no \
-             longer be used -- an event handle, and any sub-handle obtained from it, are all \
-             consumed once the event is returned from process() or included in a flush() table; \
-             use event:clone() before returning if you need to keep using any of them afterward"
-                .to_string(),
-        );
+        return destructed_handle_error();
     }
     err
+}
+
+/// [`clarify_destructed_handle_use`]'s wording, also raised by `crate::pairs` on a torn-down
+/// handle.
+pub(crate) fn destructed_handle_error() -> mlua::Error {
+    mlua::Error::RuntimeError(
+        "this event, or a handle obtained from it (event.attributes, event.log, event.metrics[i], \
+         or event.span), was already returned/emitted elsewhere and can no longer be used -- an \
+         event handle, and any sub-handle obtained from it, are all consumed once the event is \
+         returned from process() or included in a flush() table; use event:clone() before \
+         returning if you need to keep using any of them afterward"
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -1796,6 +1867,67 @@ pub(crate) mod tests {
         assert_eq!(out.log.unwrap().event_name, None);
     }
 
+    fn attrs_event() -> Event {
+        let mut attrs = AttrMap::new();
+        attrs.insert("a", "1");
+        attrs.insert("host", "web-1");
+        attrs.insert("n", Value::Null);
+        attrs.insert("z", "26");
+        Event::log(1, attrs, log_record_with_everything())
+    }
+
+    #[test]
+    fn attribute_nil_write_deletes_the_key_and_keeps_order() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.host = nil
+                return event
+            end
+            "#,
+        );
+        let before = attrs_event();
+        let mut expected: Vec<&str> = before.attributes.iter().map(|(k, _)| resolve(k)).collect();
+        expected.retain(|k| *k != "host");
+        let out = emitted(w.process(before).unwrap());
+        assert!(out.attributes.get("host").is_none());
+        let keys: Vec<&str> = out.attributes.iter().map(|(k, _)| resolve(k)).collect();
+        assert_eq!(keys, expected);
+        assert_eq!(out.attributes.get("a"), Some(&Value::str("1")));
+        assert_eq!(out.attributes.get("z"), Some(&Value::str("26")));
+    }
+
+    #[test]
+    fn attribute_nil_write_deletes_a_null_attribute() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.n = event.attributes.n
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(attrs_event()).unwrap());
+        assert!(out.attributes.get("n").is_none(), "a read-back write of a Null deletes it");
+        assert_eq!(out.attributes.len(), 3);
+    }
+
+    #[test]
+    fn attribute_nil_write_of_an_absent_key_is_a_no_op() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.missing = nil
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(attrs_event()).unwrap());
+        assert_eq!(out.attributes.len(), 4);
+        assert!(out.attributes.get("missing").is_none());
+        assert_eq!(out.attributes.get("n"), Some(&Value::Null));
+    }
+
     #[test]
     fn log_observed_timestamp_round_trips_exactly_beyond_2_53() {
         let w = worker(
@@ -1857,6 +1989,146 @@ pub(crate) mod tests {
         );
         let err = process_err(&w, log_event());
         assert!(err.contains("event.log.dropped_attributes_count is read-only"), "{err}");
+    }
+
+    // -- event.log: message, severity, body_format writes -------------------------------------
+
+    /// `log_event()` with its log's `message` replaced.
+    fn log_event_with_message(message: Value) -> Event {
+        let mut record = log_record_with_everything();
+        record.message = message;
+        Event::log(1_700_000_000_000_000_000, AttrMap::new(), record)
+    }
+
+    /// The log `script`'s `process` emits for `event`.
+    fn written_log(script: &str, event: Event) -> LogRecord {
+        let w = worker(&format!("function process(event) {script} return event end"));
+        emitted(w.process(event).unwrap()).log.expect("the event keeps its log")
+    }
+
+    /// The refusal `script` raises from `process` on `log_event()`.
+    fn write_err(script: &str) -> String {
+        let w = worker(&format!("function process(event) {script} return event end"));
+        process_err(&w, log_event())
+    }
+
+    #[test]
+    fn log_message_write_accepts_what_event_new_accepts() {
+        let cases: [(&str, Value); 6] = [
+            (r#""rewritten""#, Value::str("rewritten")),
+            (r#""\xff\xfe""#, Value::Bytes(Bytes::from_static(b"\xff\xfe"))),
+            ("42", Value::I64(42)),
+            ("2.5", Value::F64(2.5)),
+            ("true", Value::Bool(true)),
+            ("{1, 2}", Value::Array(vec![Value::I64(1), Value::I64(2)])),
+        ];
+        for (lua, expected) in cases {
+            let log = written_log(&format!("event.log.message = {lua}"), log_event());
+            assert_eq!(log.message, expected, "event.log.message = {lua}");
+        }
+        let log = written_log(r#"event.log.message = {k = "v"}"#, log_event());
+        let Value::Map(map) = log.message else { panic!("expected a Map, got {:?}", log.message) };
+        assert_eq!(map.get("k").and_then(|v| v.as_str()), Some("v"));
+    }
+
+    #[test]
+    fn log_message_write_back_keeps_a_bytes_message_bytes() {
+        // Valid UTF-8, so only the no-op check keeps it `Bytes`: converting the string would
+        // give `Str`.
+        let bytes = Value::Bytes(Bytes::from_static(b"raw body"));
+        let log =
+            written_log("event.log.message = event.log.message", log_event_with_message(bytes));
+        assert_eq!(log.message, Value::Bytes(Bytes::from_static(b"raw body")));
+    }
+
+    #[test]
+    fn log_message_nil_write_back_on_a_null_message_is_a_no_op() {
+        let log = written_log(
+            "event.log.message = event.log.message",
+            log_event_with_message(Value::Null),
+        );
+        assert_eq!(log.message, Value::Null);
+        let log = written_log("event.log.message = nil", log_event_with_message(Value::Null));
+        assert_eq!(log.message, Value::Null);
+    }
+
+    #[test]
+    fn log_message_nil_write_is_refused() {
+        let err = write_err("event.log.message = nil");
+        assert!(err.contains("event.log.message is required"), "got: {err}");
+    }
+
+    #[test]
+    fn log_message_write_of_an_unconvertible_value_is_refused() {
+        let err = write_err("event.log.message = print");
+        assert!(err.contains("event.log.message can't be a Lua function"), "got: {err}");
+        let err = write_err("event.log.message = {f = print}");
+        assert!(
+            err.contains("event.log.message: can't use a Lua function as an event attribute value"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn log_message_write_leaves_body_format_alone() {
+        let log = written_log(r#"event.log.message = "{\"a\": 1}""#, log_event());
+        assert_eq!(log.message, Value::str(r#"{"a": 1}"#));
+        assert_eq!(log.body_format, BodyFormat::Json);
+        assert_eq!(log.severity, Some(Severity::Warn));
+    }
+
+    #[test]
+    fn log_severity_write_accepts_every_name_and_nil_clears_it() {
+        for name in Severity::NAMES {
+            let log = written_log(&format!("event.log.severity = \"{name}\""), log_event());
+            assert_eq!(log.severity.map(|s| s.as_str()), Some(name));
+        }
+        let log = written_log("event.log.severity = nil", log_event());
+        assert_eq!(log.severity, None);
+    }
+
+    #[test]
+    fn log_severity_write_refusals_name_the_field() {
+        let err = write_err(r#"event.log.severity = "warning""#);
+        assert!(
+            err.contains(
+                "event.log.severity must be one of trace, debug, info, warn, error, fatal (or \
+                 nil), got \"warning\""
+            ),
+            "got: {err}"
+        );
+        let err = write_err("event.log.severity = 3");
+        assert!(
+            err.contains("event.log.severity must be a string or nil, got integer"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn log_body_format_write_accepts_every_name_and_leaves_the_message_alone() {
+        for name in BodyFormat::NAMES {
+            let log = written_log(&format!("event.log.body_format = \"{name}\""), log_event());
+            assert_eq!(log.body_format.as_str(), name);
+            assert_eq!(log.message, Value::str("GET /widgets"));
+        }
+    }
+
+    #[test]
+    fn log_body_format_write_refusals_name_the_field() {
+        let err = write_err("event.log.body_format = nil");
+        assert!(
+            err.contains("event.log.body_format must be one of raw, json, structured, got nil"),
+            "got: {err}"
+        );
+        let err = write_err(r#"event.log.body_format = "text""#);
+        assert!(
+            err.contains(
+                "event.log.body_format must be one of raw, json, structured, got \"text\""
+            ),
+            "got: {err}"
+        );
+        let err = write_err("event.log.body_format = true");
+        assert!(err.contains("event.log.body_format must be a string, got boolean"), "got: {err}");
     }
 
     // -- event.metrics: shape -------------------------------------------------------------------

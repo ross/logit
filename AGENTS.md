@@ -128,7 +128,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 
 | Kind | What it does | Decision record |
 |---|---|---|
-| `lua`, `lua_file` | a user script, inline or from a `.lua` file path relative to the config file; an optional `interval` runs its `flush()`, and a `random` global mints trace ids, UUIDs, and ULIDs | [ADR `lua-flush-root-context`](docs/adr/lua-flush-root-context.md), [ADR `lua-event-constructor`](docs/adr/lua-event-constructor.md), [ADR `lua-random-ids`](docs/adr/lua-random-ids.md) |
+| `lua`, `lua_file` | a user script, inline or from a `.lua` file path relative to the config file; an optional `interval` runs its `flush()`, a `random` global mints trace ids, UUIDs, and ULIDs, and a script edits a log's message, severity, and body format and deletes attributes in place, with `pairs` enumerating them | [ADR `lua-flush-root-context`](docs/adr/lua-flush-root-context.md), [ADR `lua-event-constructor`](docs/adr/lua-event-constructor.md), [ADR `lua-in-place-edits`](docs/adr/lua-in-place-edits.md), [ADR `lua-random-ids`](docs/adr/lua-random-ids.md) |
 | `aggregate` | windowed aggregation into mergeable metric kinds | [ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) |
 | `json` | parses JSON into attributes | [ADR `json-parsing-into-attributes`](docs/adr/json-parsing-into-attributes.md) |
 | `csv` | delimiter-separated columns into attributes from a config-declared, positional schema; no header-row mode | [ADR `csv-positional-columns`](docs/adr/csv-positional-columns.md) |
@@ -175,7 +175,10 @@ Details an agent needs beyond the table:
   `event:to_table()`, with `flush(now)` supplying a flush-driven emission's timestamp. The Lua
   surface covers `event.metrics`, `event.span`, `scope`, and the log/resource fields. See
   [ADR `lua-flush-root-context`](docs/adr/lua-flush-root-context.md) for the root context a Lua
-  `flush()` runs in.
+  `flush()` runs in. A script edits a log's `message`, `severity`, and `body_format` in place,
+  assigns `nil` to delete an attribute, and loops over an attribute proxy with `pairs`, so it
+  needs `event:to_table()` and `Event.new` only to build a new structure
+  ([ADR `lua-in-place-edits`](docs/adr/lua-in-place-edits.md)).
 - **`json`**: `invalid_utf8: replace` retries a parse that failed on invalid UTF-8 (nginx's
   `escape=json` passes high bytes raw) on a lossy copy, on the failure path only.
 - **`regex`** replaced a `lua` component in `demo/logit.yaml`'s postgres tier.

@@ -1096,6 +1096,46 @@ function process(event)
 end
 "#;
 
+/// Deletes the `host` attribute with `= nil` on every call: an in-place removal
+/// (`docs/adr/lua-in-place-edits.md`; `tests/allocations.rs`'s
+/// `lua_process_one_event_deleting_an_attribute`).
+pub const LUA_ATTR_DELETE_SCRIPT: &str = r#"
+function process(event)
+  event.attributes.host = nil
+  return event
+end
+"#;
+
+/// Enumerates `event.attributes` with an empty `pairs` loop on every call: the sandbox's `pairs`
+/// wrapper and its iterator (`crates/logit-script/src/pairs.rs`; `tests/allocations.rs`'s
+/// `lua_process_one_event_iterating_attributes`).
+pub const LUA_ATTR_PAIRS_SCRIPT: &str = r#"
+function process(event)
+  for k, v in pairs(event.attributes) do
+  end
+  return event
+end
+"#;
+
+/// Rewrites the log body in place on every call (`crates/logit-script/src/proxy.rs`'s `LogProxy`,
+/// `docs/adr/lua-in-place-edits.md`; `tests/allocations.rs`'s
+/// `lua_process_one_event_writing_log_message`).
+pub const LUA_LOG_MESSAGE_WRITE_SCRIPT: &str = r#"
+function process(event)
+  event.log.message = "rewritten"
+  return event
+end
+"#;
+
+/// Sets the log severity in place on every call (`tests/allocations.rs`'s
+/// `lua_process_one_event_writing_log_severity`).
+pub const LUA_LOG_SEVERITY_WRITE_SCRIPT: &str = r#"
+function process(event)
+  event.log.severity = "error"
+  return event
+end
+"#;
+
 /// Writes a `resource` attribute on every call: a script stamping a resource identity
 /// (`crates/logit-script/src/resource.rs`, `docs/adr/operator-declared-resource-attributes.md`;
 /// `tests/allocations.rs`'s `lua_process_one_event_writing_resource`).

@@ -79,6 +79,22 @@ impl AttrMap {
         self.0.iter().map(|(k, v)| (*k, v))
     }
 
+    /// The first entry whose key sorts after `after` in [`AttrMap::iter`]'s order, or the first
+    /// entry for `None`. `after` needn't be present, so a caller stepping through the map by its
+    /// last key keeps its place when that key is removed between steps.
+    pub fn entry_after(&self, after: Option<Symbol>) -> Option<(Symbol, &Value)> {
+        let i = match after {
+            None => 0,
+            Some(after) => self.0.partition_point(|(k, _)| *k <= after),
+        };
+        self.0.get(i).map(|(k, v)| (*k, v))
+    }
+
+    /// The key that sorts last in [`AttrMap::iter`]'s order, or `None` for an empty map.
+    pub fn last_key(&self) -> Option<Symbol> {
+        self.0.last().map(|(k, _)| *k)
+    }
+
     /// Consumes the map, yielding owned pairs in [`AttrMap::iter`]'s order, so values move out
     /// rather than clone. A method rather than `IntoIterator`, which would expose the backing
     /// `SmallVec` as `IntoIter`.
@@ -198,6 +214,54 @@ mod tests {
         let expected: Vec<(Symbol, Value)> = map.iter().map(|(k, v)| (k, v.clone())).collect();
         let actual: Vec<(Symbol, Value)> = map.into_pairs().collect();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn stepping_by_entry_after_yields_iter_order() {
+        let mut map = AttrMap::new();
+        map.insert("host", "web-1");
+        map.insert("env", "prod");
+        map.insert("retries", 3_i64);
+
+        let mut stepped = Vec::new();
+        let mut last = None;
+        while let Some((k, v)) = map.entry_after(last) {
+            stepped.push((k, v.clone()));
+            last = Some(k);
+        }
+        let expected: Vec<(Symbol, Value)> = map.iter().map(|(k, v)| (k, v.clone())).collect();
+        assert_eq!(stepped, expected);
+        assert_eq!(AttrMap::new().entry_after(None), None);
+    }
+
+    /// `last_key` is the greatest key, and `interner::index` orders keys as `Symbol` does.
+    #[test]
+    fn last_key_is_the_greatest_and_index_follows_symbol_order() {
+        let mut map = AttrMap::new();
+        assert_eq!(map.last_key(), None);
+        map.insert("host", "web-1");
+        map.insert("env", "prod");
+        map.insert("retries", 3_i64);
+        let keys: Vec<Symbol> = map.iter().map(|(k, _)| k).collect();
+        assert_eq!(map.last_key(), keys.last().copied());
+        for pair in keys.windows(2) {
+            assert!(crate::interner::index(pair[0]) < crate::interner::index(pair[1]));
+        }
+    }
+
+    #[test]
+    fn entry_after_a_removed_key_seeks_the_next_one() {
+        let mut map = AttrMap::new();
+        map.insert("host", "web-1");
+        map.insert("env", "prod");
+        map.insert("retries", 3_i64);
+        let keys: Vec<Symbol> = map.iter().map(|(k, _)| k).collect();
+
+        map.remove_sym(keys[1]);
+        assert_eq!(map.entry_after(Some(keys[1])).map(|(k, _)| k), Some(keys[2]));
+        map.remove_sym(keys[2]);
+        assert_eq!(map.entry_after(Some(keys[2])), None);
+        assert_eq!(map.entry_after(Some(keys[0])), None);
     }
 
     #[test]

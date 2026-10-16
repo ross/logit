@@ -1139,22 +1139,35 @@ fn enum_field<T>(
     parse: fn(&str) -> Option<T>,
     optional: bool,
 ) -> mlua::Result<Option<T>> {
+    enum_value(value, names, parse, optional, || format!("Event.new: {}", dotted(path, key)))
+}
+
+/// [`enum_field`] under a caller-built label: `label` returns the start of the error message
+/// (`Event.new: log.severity`, `event.log.severity`) and runs only on the error path. The
+/// `event.log` proxy's writes share it, so a write accepts and refuses what `Event.new` does.
+pub(crate) fn enum_value<T>(
+    value: LuaValue,
+    names: &[&str],
+    parse: fn(&str) -> Option<T>,
+    optional: bool,
+    label: impl FnOnce() -> String,
+) -> mlua::Result<Option<T>> {
     match value {
         LuaValue::Nil => Ok(None),
         LuaValue::String(s) => {
             let s = s.to_string_lossy();
             parse(&s).map(Some).ok_or_else(|| {
                 runtime_error(format!(
-                    "Event.new: {} must be one of {}{}, got \"{s}\"",
-                    dotted(path, key),
+                    "{} must be one of {}{}, got \"{s}\"",
+                    label(),
                     names.join(", "),
                     if optional { " (or nil)" } else { "" }
                 ))
             })
         }
         other => Err(runtime_error(format!(
-            "Event.new: {} must be a string{}, got {}",
-            dotted(path, key),
+            "{} must be a string{}, got {}",
+            label(),
             if optional { " or nil" } else { "" },
             other.type_name()
         ))),
@@ -1266,19 +1279,24 @@ fn value_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Value> {
 /// A nested table's error (a bad value inside it, or nesting past `MAX_TABLE_DEPTH`) gets the
 /// `Event.new: <field>: ` prefix.
 fn value_at(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<Value> {
+    labeled_value(value, || format!("Event.new: {}", field()))
+}
+
+/// [`value_at`] under a caller-built label, the start of every error message (`Event.new:
+/// log.message`, `event.log.message`), built only on the error path. `nil` converts to `Null`, so
+/// a caller that requires a value checks for `nil` first.
+pub(crate) fn labeled_value(
+    value: LuaValue,
+    label: impl FnOnce() -> String,
+) -> mlua::Result<Value> {
     match value {
         LuaValue::Nil
         | LuaValue::Boolean(_)
         | LuaValue::Integer(_)
         | LuaValue::Number(_)
         | LuaValue::String(_) => lua_to_value(value),
-        LuaValue::Table(_) => lua_to_value(value)
-            .map_err(|err| prefixed_error(&format!("Event.new: {}", field()), err)),
-        other => Err(runtime_error(format!(
-            "Event.new: {} can't be a Lua {}",
-            field(),
-            other.type_name()
-        ))),
+        LuaValue::Table(_) => lua_to_value(value).map_err(|err| prefixed_error(&label(), err)),
+        other => Err(runtime_error(format!("{} can't be a Lua {}", label(), other.type_name()))),
     }
 }
 

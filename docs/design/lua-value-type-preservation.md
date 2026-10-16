@@ -47,8 +47,8 @@ treats `Value::Str` and `Value::Bytes` attributes differently: a `Str` becomes a
 and a `Bytes` is excluded from the write. So an **identity round-trip** through a script could
 silently flip an attribute from excluded to included as a tag, with no error and no signal to the
 script. Two ordinary patterns do this: `event.attributes.x = event.attributes.x`, and a generic
-enrichment stage that reads every attribute through `event:to_table().attributes` and copies it
-back while tagging the event.
+enrichment stage that reads every attribute, with `pairs(event.attributes)` or through
+`event:to_table().attributes`, and copies it back while tagging the event.
 
 ## The goal
 
@@ -74,6 +74,10 @@ the assignment is a no-op. If not, conversion proceeds.
 | `Bool(b)` | `Boolean(x)` | `b == x` |
 | `Null` | `Nil` | always |
 | anything else, including `Table` | — | `false` (see "Known residual gaps") |
+
+The `Null`/`Nil` row never keeps an attribute: each attribute proxy's `__newindex` deletes the key
+on a `nil` write before it runs this check
+([ADR `lua-in-place-edits`](../adr/lua-in-place-edits.md)).
 
 `lua_value_matches` is deliberately cheap and self-contained: it never constructs a new `Value`
 and never calls back into Lua (no `Table` traversal, no metamethods). It has to be, because
