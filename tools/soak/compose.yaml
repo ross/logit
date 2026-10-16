@@ -7,8 +7,8 @@
 #   SOAK_IMAGE             the `logit` release image tag (`logit:soak`)
 #   SOAK_SUT_CONFIG        absolute path of the scenario's `logit` config for the service `logit`
 #   SOAK_GENERATOR_CONFIG  absolute path of the scenario's config for the service `generator`,
-#                          and one such variable per generator an override adds
-#                          (scenario.py's `config_env()`)
+#                          and one such variable per generator or further SUT service an
+#                          override adds (scenario.py's `config_env()`)
 #
 # A scenario with an external target (`[target] kind = "external"`) gets a second `--env-file`:
 # a private plain copy of the variables its `[target] env` lists, taken from `SOAK_EXTERNAL_ENV`

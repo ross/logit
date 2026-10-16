@@ -32,11 +32,11 @@ the scripted stand-in destination, the `standin` service, in the same place: its
 no backend, `respond` steps tell it what to answer, and the ledger's V is what its record says it
 stored (docs/plans/soak-harness.md's "Stand-in targets").
 
-Services are known by role, from each compose service's `soak.role` label: `sut` (the `logit`
+Services are known by role, from each compose service's `soak.role` label: `sut` (a `logit`
 under test), `generator`, `backend`, `broker` (a Kafka target's broker), or `standin` (a
 stand-in target's destination). A scenario may add
-services with a `compose` override file, a second generator included, so the role map comes
-from the merged compose config,
+services with a `compose` override file, a second generator or a second SUT included, so the
+role map comes from the merged compose config,
 which only the driver can read (`docker compose config`). `load()` checks what needs no service
 list; `service_problems()` checks the rest against a role map: the driver's in `prepare()`
 before the stack starts, and `base_roles()` in `list` and the self-test.
@@ -63,8 +63,11 @@ SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE = "sut", "generator", "backe
 STANDIN_ROLE = "standin"
 ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE)
 LOGIT_ROLES = (SUT_ROLE, GENERATOR_ROLE)
-# The service the SUT runs as. Generators are any services with the role, each a
-# `[[ledger.source]]`: compose.yaml's `generator`, and any a scenario's override adds.
+# The ingress SUT: the service every generator sends to, whose config `[configs]` names under
+# `sut`. A scenario's override can add one more SUT service, named by its own `[configs]` key
+# and by the `[[ledger.hop]]`'s `to`, after `logit` in the chain (`Scenario.suts`); the last SUT
+# holds `sut_aggregate` and every `[[ledger.sink]]`. Generators are any services with the role,
+# each a `[[ledger.source]]`: compose.yaml's `generator`, and any a scenario's override adds.
 SUT_SERVICE = "logit"
 # The role map compose.yaml's labels give with the `local` profile, for what can't run
 # `docker compose config`: `list` and the self-test, which pins it to compose.yaml.
@@ -78,10 +81,10 @@ STANDIN_ROLES = {"standin": STANDIN_ROLE}
 # ACTIONS.
 ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "mark", "exit",
                 "respond")
-# Actions allowed on the SUT only, each with the reason. A `kill` exists to end a `logit` process
-# with no shutdown; on the generator, the lines it sent after its last telemetry drain reach the
-# SUT with no G behind them, and `ledger.wire` would net them against real loss. An `exit`
-# names a self-exit the SUT's own config causes, which the generator's config never does.
+# Actions allowed on a SUT service only, each with the reason. A `kill` exists to end a `logit`
+# process with no shutdown; on the generator, the lines it sent after its last telemetry drain
+# reach the SUT with no G behind them, and `ledger.wire` would net them against real loss. An
+# `exit` names a self-exit the SUT's own config causes, which the generator's config never does.
 SUT_ONLY_ACTIONS = {
     "kill": ("on the generator, the lines it sent after its last telemetry drain reach the SUT "
              "with no G behind them, so ledger.wire would net them against real loss"),
@@ -145,10 +148,14 @@ STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key", "class
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
 RANGE_KEYS = {"min", "max"}
-# `[configs]` names the SUT's config under `sut` and each generator's under its service name.
+# `[configs]` names the ingress SUT's config under `sut`, each generator's under its service
+# name, and each further SUT service's under its service name.
 SUT_CONFIG_KEY = "sut"
 LEDGER_KEYS = {"sut_aggregate", "sink", "source", "wire_loss_outside_faults"}
-OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script", "split"}
+OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script", "split", "hop"}
+# A `[[ledger.hop]]`: the native hop between two SUT services, `from`'s `logit_out` component
+# `sink` and `to`'s `logit_in` component `listener`. A scenario has at most one.
+HOP_KEYS = {"from", "sink", "to", "listener"}
 # The `[ledger]` keys a `[[ledger.source]]` table replaced, refused with a pointer to it.
 SOURCE_LEDGER_KEYS = ("generator_input", "generator_sink", "sut_listener")
 # A `[[ledger.source]]`: the generator service, its `generate_in` and UDP sink, the SUT listener
@@ -454,6 +461,11 @@ class Scenario:
         return list(self.ledger.get("sink") or [])
 
     @property
+    def hops(self):
+        """The `[[ledger.hop]]` tables, in order: none, or one."""
+        return list(self.ledger.get("hop") or [])
+
+    @property
     def sources(self):
         """The `[[ledger.source]]` tables, in order."""
         return list(self.ledger.get("source") or [])
@@ -462,6 +474,23 @@ class Scenario:
     def generators(self):
         """The generator services, one per `[[ledger.source]]`, in order."""
         return [source.get("service") for source in self.sources]
+
+    @property
+    def suts(self):
+        """The SUT services in chain order: `logit`, then each `[configs]` key that is neither
+        `sut` nor a generator's, in the order `[configs]` lists them."""
+        generators = set(self.generators)
+        return [SUT_SERVICE] + [key for key in self.configs
+                                if key != SUT_CONFIG_KEY and key not in generators]
+
+    @property
+    def sink_sut(self):
+        """The SUT service holding `sut_aggregate` and every `[[ledger.sink]]`: the chain's last."""
+        return self.suts[-1]
+
+    def sut_config_path(self, service):
+        """The config of SUT `service`: `[configs] sut` for `logit`, else its own key."""
+        return self.config_path(SUT_CONFIG_KEY if service == SUT_SERVICE else service)
 
     @property
     def split(self):
@@ -475,7 +504,8 @@ class Scenario:
         return self.path.parent
 
     def config_path(self, key):
-        """The config `[configs]` names under `key`: `sut`, or a generator's service name."""
+        """The config `[configs]` names under `key`: `sut`, or a generator's or a further SUT's
+        service name."""
         return (self.directory / self.configs[key]).resolve()
 
     def seed_for(self, seed=None):
@@ -503,6 +533,7 @@ class Scenario:
             "seed": seed,
             "random": None if self.random is None else self.random.to_json(),
             "configs": dict(self.configs),
+            "suts": self.suts,
             "compose": self.compose,
             "services": dict(services or {}),
             "target": target_json(self.target),
@@ -600,6 +631,11 @@ def from_dict(raw, path):
     if isinstance(ledger, dict) and isinstance(ledger.get("source"), list):
         config_keys |= {source.get("service") for source in ledger["source"]
                         if isinstance(source, dict) and isinstance(source.get("service"), str)}
+    # Every other `[configs]` key names a further SUT service; `service_problems()` checks that
+    # the stack runs it with the role `sut`.
+    extra_suts = ([key for key in configs if key not in config_keys]
+                  if isinstance(configs, dict) else [])
+    config_keys |= set(extra_suts)
     for table, keys, optional, where in (
         (configs, config_keys, set(), "configs"),
         (ledger, ledger_keys, ledger_optional, "ledger"),
@@ -628,6 +664,8 @@ def from_dict(raw, path):
     if isinstance(ledger, dict):
         problems += _sink_problems(ledger, target["kind"])
         problems += _source_problems(ledger)
+        problems += _extra_sut_problems(extra_suts, ledger)
+        problems += _hop_problems(ledger, extra_suts)
 
     steps = []
     for index, raw_step in enumerate(raw.get("step", [])):
@@ -878,7 +916,75 @@ def _source_problems(ledger):
     return problems
 
 
-# The compose variable holding the absolute path of the SUT's config, set in `compose.env`.
+def _hop_problems(ledger, extra_suts):
+    """What `[[ledger.hop]]` breaks: at most one table, of `HOP_KEYS` only, each a component id
+    or a service; `from` is `SUT_SERVICE` and `to` the one further SUT service `[configs]`
+    names; and no `sut_script` or `sut_transforms` beside it, whose rows judge a hop into
+    `aggregate` inside one process. Two SUT services need a hop, since the ledger can't join
+    them without one."""
+    hops = ledger.get("hop")
+    if hops is None:
+        if extra_suts:
+            return [f"configs: SUT services {SUT_SERVICE} and {', '.join(extra_suts)} need a "
+                    "[[ledger.hop]] naming the logit_out and logit_in between them"]
+        return []
+    if (not isinstance(hops, list) or len(hops) != 1
+            or not all(isinstance(hop, dict) for hop in hops)):
+        return ["ledger.hop must be one table, written [[ledger.hop]]; a scenario has at most "
+                "one hop"]
+    hop = hops[0]
+    problems = []
+    for key in sorted(set(hop) - HOP_KEYS):
+        problems.append(f"ledger.hop: unknown key `{key}`")
+    for key in sorted(HOP_KEYS - set(hop)):
+        problems.append(f"ledger.hop: missing `{key}`")
+    for key in ("sink", "listener"):
+        value = hop.get(key)
+        if key in hop and (not isinstance(value, str) or not _COMPONENT_ID.match(value)):
+            problems.append(f"ledger.hop: `{key}` must name a component id")
+    if "from" in hop and hop["from"] != SUT_SERVICE:
+        problems.append(f"ledger.hop: `from` must be {SUT_SERVICE}, the SUT the generators "
+                        "send to")
+    if "to" in hop and (len(extra_suts) != 1 or hop["to"] != extra_suts[0]):
+        problems.append("ledger.hop: `to` must be the one further SUT service [configs] names"
+                        + (f", {extra_suts[0]}" if len(extra_suts) == 1 else
+                           f"; it names {', '.join(extra_suts) or 'none'}"))
+    if ledger.get("sut_script") is not None:
+        problems.append("ledger.hop and ledger.sut_script can't be combined")
+    sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
+    if any(isinstance(source, dict) and "sut_transforms" in source for source in sources):
+        problems.append("ledger.hop and a source's `sut_transforms` can't be combined")
+    return problems
+
+
+def _extra_sut_problems(services, ledger):
+    """What the `[configs]` keys naming further SUT services break: each a slug, none `logit`,
+    whose config is `[configs] sut`, and none whose `config_env()` is `SUT_CONFIG_ENV`, a
+    source's, or another such key's."""
+    problems = []
+    sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
+    taken = {SUT_CONFIG_ENV} | {config_env(source["service"]) for source in sources
+                                if isinstance(source, dict)
+                                and isinstance(source.get("service"), str)
+                                and _SERVICE_NAME.match(source["service"])}
+    for service in services:
+        where = f"configs.{service}"
+        if service == SUT_SERVICE:
+            problems.append(f"{where}: the SUT {SUT_SERVICE}'s config is `{SUT_CONFIG_KEY}`")
+        elif not _SERVICE_NAME.match(service):
+            problems.append(f"{where}: a key other than `{SUT_CONFIG_KEY}` and the sources' "
+                            "services names a further SUT service: lowercase letters, digits, "
+                            "`_`, or `-`")
+        elif config_env(service) in taken:
+            problems.append(f"{where}: SUT service {service!r} would mount its config through "
+                            f"{config_env(service)}, which the SUT, a source, or another SUT "
+                            "service already uses")
+        else:
+            taken.add(config_env(service))
+    return problems
+
+
+# The compose variable holding the absolute path of `logit`'s config, set in `compose.env`.
 SUT_CONFIG_ENV = "SOAK_SUT_CONFIG"
 # The compose variable holding a stand-in target's shape, set in `compose.env`; compose.yaml
 # passes it to standin.py's `--shape`.
@@ -886,9 +992,10 @@ STANDIN_SHAPE_ENV = "SOAK_STANDIN_SHAPE"
 
 
 def config_env(service):
-    """The compose variable holding the absolute path of generator `service`'s config, set in
-    `compose.env`: `SOAK_GENERATOR_CONFIG` for `generator`, `SOAK_GENERATOR_LINES_CONFIG` for
-    `generator-lines`."""
+    """The compose variable holding the absolute path of `service`'s config, a generator's or a
+    further SUT's, set in `compose.env`: `SOAK_GENERATOR_CONFIG` for `generator`,
+    `SOAK_GENERATOR_LINES_CONFIG` for `generator-lines`, `SOAK_COLLECTOR_CONFIG` for
+    `collector`."""
     return "SOAK_" + re.sub(r"[^A-Z0-9]", "_", service.upper()) + "_CONFIG"
 
 
@@ -1517,7 +1624,7 @@ def base_roles(scenario):
 
 
 def logit_services(roles):
-    """The services that run `logit`, the SUT and every generator, sorted."""
+    """The services that run `logit`, every SUT service and every generator, sorted."""
     return sorted(name for name, role in roles.items() if role in LOGIT_ROLES)
 
 
@@ -1529,18 +1636,25 @@ def generators(roles):
     return sorted(name for name, role in roles.items() if role == GENERATOR_ROLE)
 
 
-def role_problems(roles):
-    """What a role map breaks: every service labeled with a known role, one SUT under the name
-    `SUT_SERVICE`, and at least one generator."""
+def role_problems(roles, suts=(SUT_SERVICE,)):
+    """What a role map breaks: every service labeled with a known role, the SUT services
+    `suts` (`Scenario.suts`: `SUT_SERVICE` and each further one `[configs]` names) and no other
+    with the role `sut`, and at least one generator."""
     problems = []
     for name, role in sorted(roles.items()):
         if role not in ROLES:
             problems.append(f"compose service {name}: label {ROLE_LABEL} must be one of "
                             f"{', '.join(ROLES)}, got {role!r}")
     holders = sorted(n for n, r in roles.items() if r == SUT_ROLE)
-    if holders != [SUT_SERVICE]:
-        problems.append(f"the stack needs one {SUT_ROLE} service, {SUT_SERVICE}, and has "
-                        f"{', '.join(holders) or 'none'}")
+    if holders != sorted(suts):
+        if list(suts) == [SUT_SERVICE]:
+            problems.append(f"the stack needs one {SUT_ROLE} service, {SUT_SERVICE}, and has "
+                            f"{', '.join(holders) or 'none'}; a further {SUT_ROLE} service "
+                            "needs its own [configs] key")
+        else:
+            problems.append(f"the stack needs the {SUT_ROLE} services {SUT_SERVICE} and the "
+                            f"[configs] keys {', '.join(suts[1:])}, and has "
+                            f"{', '.join(holders) or 'none'}")
     if not generators(roles):
         problems.append(f"the stack needs at least one {GENERATOR_ROLE} service, and has none")
     return problems
@@ -1549,12 +1663,12 @@ def role_problems(roles):
 def service_problems(scenario, roles):
     """Every rule that needs the stack's services, against `roles` (`{service: role}`): the
     role map's own rules; each step's and random fault's `on` a service of the stack, with a
-    `kill` or an `exit` on the SUT only, and a `respond`, or a `stop` with a `class`, on a
+    `kill` or an `exit` on a SUT service only, and a `respond`, or a `stop` with a `class`, on a
     stand-in only; each `[[expect]]` service one that runs `logit`; for a Kafka target, the
     broker `kafka`; for a stand-in target, the stand-in `standin`; each `[[ledger.source]]`
     service a generator, and every generator a source's; and each local sink's `backend` a
     backend service."""
-    problems = role_problems(roles)
+    problems = role_problems(roles, scenario.suts)
     no_backend = ("; an external target's stack runs no backend" if scenario.external else
                   "; a kafka target's stack runs the broker and no backend" if scenario.kafka
                   else "; a standin target's stack runs the stand-in and no backend"
@@ -1565,7 +1679,7 @@ def service_problems(scenario, roles):
             return [f"{where}: unknown service `{on}`{no_backend}"]
         if action in SUT_ONLY_ACTIONS and roles[on] != SUT_ROLE:
             why = f": {SUT_ONLY_ACTIONS[action]}" if reason else ""
-            return [f"{where}: {action} is for logit only{why}"]
+            return [f"{where}: {action} is for {' or '.join(scenario.suts)} only{why}"]
         if (action == "respond" or classed) and roles[on] != STANDIN_ROLE:
             what = "respond" if action == "respond" else f"`class` on a {action}"
             standins = sorted(n for n, r in roles.items() if r == STANDIN_ROLE)

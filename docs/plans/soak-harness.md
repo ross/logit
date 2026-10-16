@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-11
+updated: 2026-10-15
 ---
 
 # Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger
@@ -246,8 +246,8 @@ for the table:
 
 - `seed` is an integer 0 or more; `gap` and each `for` are `{ min, max }` durations with min at
   most max, and `for.min` above 0; `weight` is a number above 0; actions and services are known,
-  and `kill` is on `logit` only; a netem template has `args`, none of them a clear, and no other
-  action has `args`; unknown keys are refused.
+  and `kill` is on a `sut` service only; a netem template has `args`, none of them a clear, and
+  no other action has `args`; unknown keys are refused.
 - `gap.min` is at least `recovery_bound + 2 x progress_window`, so every fault's recovery is
   followed by at least two judged progress windows, and `cooldown` is at least `gap.min`, for the
   last fault.
@@ -266,7 +266,7 @@ holds every 8- and 24-hour schedule it draws to that.
 the same readiness probe a `stop`'s revert gets. The process gets no shutdown signal, so it
 writes no final `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line,
 and Docker records exit code 137. `validate()` treats it as a `stop`: it holds the container's
-namespace, so no netem on that container during it, it is UDP-affecting on the SUT, and it may
+namespace, so no netem on that container during it, it is UDP-affecting on `logit`, and it may
 not overlap another fault on its container. The watchdog accepts the exit inside a scheduled
 `kill` with code 137 only, and counts the revert as a start for `timeline`, `restarts`, `ready`,
 and the lives cross-check. The ledger pays for it: up to one `internal` interval of the killed
@@ -287,7 +287,7 @@ for = "2m30s"
 [[step]]
 at = "2m50s"
 action = "exit"           # an exit the SUT makes on its own inside the window
-on = "logit"              # logit only
+on = "logit"              # a sut service only
 code = 2                  # the exit code it leaves
 key = "memory_limit_exceeded"   # the self-log key of the ERROR line that explains it
 for = "1m30s"
@@ -301,7 +301,8 @@ for = "1m30s"
 - An `exit`'s apply makes no Docker call either. Its revert runs `docker start` when the
   container has exited, and records `started`; only a revert that started it is a start, with a
   readiness probe and a new SUT life. `code` and `key` are required on an `exit` and refused
-  elsewhere, and an `exit` is on `logit` only. The process can end at any point in the window,
+  elsewhere, and an `exit` is on a `sut` service only (`logit` before W10a). It is UDP-affecting
+  on `logit` alone. The process can end at any point in the window,
   so a netem on its container may not overlap it. While an `exit` is open the driver's fail-fast
   accepts `running` or `exited`. "The checks" has its rules in `exit`, `self_log`, and `ready`.
 - Neither may appear in a `[random]` schedule, which draws faults; an expected event happens
@@ -350,7 +351,8 @@ listener and `aggregate`, and adds the script hop to the ledger ("The ledger and
 **Compose overrides, service roles, and sinks (W7b).** Every compose service carries a
 `soak.role` label: `sut`, `generator`, `backend`, `broker` (a Kafka target's broker; see
 "Kafka targets"), or `standin` (W9a, a stand-in target's destination; see "Stand-in
-targets"). The harness knows a service by its role, never its name, and keeps one SUT, `logit`.
+targets"). The harness knows a service by its role, never its name. Its ingress SUT is `logit`,
+and from W10a an override can add further SUT services (see "Several SUT services").
 The base stack's generator is `generator`; from W8b an override can add more (see "Sources"). A scenario adds services with an optional top-level key naming an override file
 beside `scenario.toml`:
 
@@ -382,7 +384,8 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
   and every random fault's is a service of the stack, a `kill` or `exit` is on the role `sut`,
   a `respond`, or a `stop` with a `class`, is on the role `standin` (W9a),
   every `[[expect]]` service runs `logit`, every sink's `backend` has the role `backend`, the
-  stack has one `sut` named `logit` and at least one `generator`, every source's `service` has
+  stack's `sut` services are `logit` and each further one `[configs]` names (W10a), and none
+  other, with at least one `generator`, every source's `service` has
   the role `generator` and every `generator` has a source (W8b), and no service lacks a known
   role. The driver checks them in `prepare()`, before `up`. `list` and the self-test
   can't run compose, so they pass the base role map (`scenario.BASE_ROLES`) for a scenario with
@@ -420,8 +423,9 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   a `sut_listener` no other source names. Unknown keys are refused. A `service` whose compose
   variable is `SOAK_SUT_CONFIG` or another source's (`generator-lines` and `generator_lines`
   share one) is refused.
-- `[configs]` has `sut` and one key per source's `service`, and no other. The driver writes each
-  generator's absolute config path into `compose.env` under `scenario.config_env(service)`:
+- `[configs]` has `sut` and one key per source's `service`; any other key names a further SUT
+  service (W10a, "Several SUT services" below). The driver writes each generator's absolute
+  config path into `compose.env` under `scenario.config_env(service)`:
   `SOAK_GENERATOR_CONFIG` for `generator`, `SOAK_GENERATOR_LINES_CONFIG` for
   `generator-lines`. An override's generator mounts its own variable at `/config.yaml`.
 - `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct, none
@@ -432,6 +436,47 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
   stack has a source, because a generator with none would put datagrams into a listener with no
   G behind them.
+
+**Several SUT services (W10a).** The stack can run more than one `logit` under test, such as a
+second one at the far end of a native hop. `logit` stays the ingress SUT: every generator sends
+to it, every source's `sut_listener` is one of its components, and its config is `[configs]
+sut`. A further SUT service is declared by a `[configs]` key of its own, which is neither `sut`
+nor a source's `service`, and run by a compose service of that name labeled `soak.role: sut`,
+which the scenario's override adds:
+
+```toml
+compose = "compose.override.yaml"   # adds collector, labeled soak.role: sut
+
+[configs]
+sut = "logit-sut.yaml"              # logit, the ingress SUT
+collector = "logit-collector.yaml"  # a further SUT service, mounted from SOAK_COLLECTOR_CONFIG
+generator = "logit-generator.yaml"
+```
+
+```yaml
+services:
+  collector:
+    extends: { file: compose.yaml, service: logit }
+    labels: { soak.role: sut }
+    volumes: ["${SOAK_COLLECTOR_CONFIG:?set by script/soak}:/config.yaml:ro,z"]
+  logit:
+    depends_on: { collector: { condition: service_healthy } }
+```
+
+- The SUT services form a chain: `logit`, then each further one in the order `[configs]` lists
+  it (`Scenario.suts`, recorded in `scenario.resolved.json` as `suts`). The chain's last service
+  holds `sut_aggregate` and every `[[ledger.sink]]`.
+- From W10b a second SUT service needs a `[[ledger.hop]]` naming the native hop that joins it to
+  `logit`, and a scenario has at most one hop, so at most two SUT services ("The native hop
+  (W10b)" in §8d).
+- A further SUT's key is a slug, isn't `logit`, and has a compose variable,
+  `scenario.config_env(service)`, that no source and no other SUT service shares. With the role
+  map, the stack's `sut` services are `logit` and those keys, so a `sut` service the scenario
+  doesn't declare is refused, as is a declared one the stack doesn't run as a `sut`.
+- A `kill` or an `exit` may name any SUT service. A fault on a further SUT service never affects
+  UDP ingress (§4), since no generator sends to it.
+- The ledger across the two follows the hop (§8d). In W10a, before the hop ledger, the rows
+  that equate a listener's symbols with `aggregate`'s in one life SKIPped across two services.
 
 **`vm_every_window` (W3)**, an optional `[ledger]` key, turns on `ledger.windows`: every series
 has a sample in every `aggregate` window of every SUT life that `aggregate` emitted. Set it only
@@ -516,7 +561,7 @@ service (W4; see "The driver loop and end sequence" for the arithmetic), and
 | Service | Image and settings |
 |---|---|
 | `victoria-metrics` (role `backend`) | `victoriametrics/victoria-metrics:v1.152.0`, `-retentionPeriod=100y`, `ports: ["127.0.0.1::8428"]`, so the host driver polls freshness every 30 s and dumps the final export with no checker container. The driver re-reads the port after any start of this service |
-| `logit` (the SUT, role `sut`) | `depends_on: [victoria-metrics]`, not required from W5, when `victoria-metrics` moved to the compose profile `local` the driver enables for a local target only; `environment:` passes each variable an external target may list (`DD_API_KEY`), empty when unset |
+| `logit` (the ingress SUT, role `sut`; an override can add more, §2's "Several SUT services") | `depends_on: [victoria-metrics]`, not required from W5, when `victoria-metrics` moved to the compose profile `local` the driver enables for a local target only; `environment:` passes each variable an external target may list (`DD_API_KEY`), empty when unset |
 | `generator` (role `generator`) | `depends_on: {logit: {condition: service_healthy}}`. An override can add more generators (W8b), each with `extends` from this one and its own config volume |
 | `kafka` (role `broker`) | `apache/kafka:4.2.0`, a single-node KRaft broker in the compose profile `kafka`, which the driver enables for a Kafka target only; one partition per topic, topics created on first use, a `kafka-broker-api-versions.sh` health check the SUT's optional `depends_on` waits for. No published port: the driver reads the topic through `docker exec` |
 | `standin` (role `standin`, W9a) | `python:3.13.16-alpine3.24` running `tools/soak/standin/standin.py`, mounted read-only, in the compose profile `standin`, which the driver enables for a stand-in target only. Its data port, 8080, isn't published; its control port is, `ports: ["127.0.0.1::8081"]`, which the driver re-reads after any start of the service, as a backend's. A health check against the control port's `/health`, which the SUT's optional `depends_on` waits for. Its stdout is the record |
@@ -531,10 +576,11 @@ it can reach Docker. An override that adds a service with `extends` names the ba
 `file: compose.yaml`: compose resolves the path against the project directory, the first
 file's, not the override's own.
 
-Configs mount from absolute paths in `compose.env` (`SOAK_SUT_CONFIG`, and one variable per
-generator, `SOAK_GENERATOR_CONFIG` for `generator`; §2's "Sources"), which the driver passes
-with `--env-file`, because `sudo` strips the
-environment. `up -d --wait --wait-timeout 120` waits on the image's `logit ready` `HEALTHCHECK`.
+Configs mount from absolute paths in `compose.env` (`SOAK_SUT_CONFIG`, one variable per
+generator, `SOAK_GENERATOR_CONFIG` for `generator`, §2's "Sources", and one per further SUT
+service, `SOAK_COLLECTOR_CONFIG` for `collector`, §2's "Several SUT services"), which the
+driver passes with `--env-file`, because `sudo` strips the environment.
+`up -d --wait --wait-timeout 120` waits on the image's `logit ready` `HEALTHCHECK`.
 Nothing in a container writes to the run directory in W1, so it needs no `chmod 777`.
 
 Collection uses `docker logs <id> >svc.stdout 2>svc.stderr`, not `docker compose logs`, which
@@ -556,6 +602,7 @@ A root qdisc on a container's default-route interface shapes that container's eg
 |---|---|
 | `logit` | the SUT's remote-write to VictoriaMetrics, not the statsd arriving at it |
 | a `generator` | its own UDP into the SUT, and no other generator's |
+| a further SUT service (W10a) | its own sends, never UDP ingress, which only `logit` takes |
 | a `backend` | its responses |
 
 Each container has one peer in this scenario, so there is no `tc filter`. Per-peer `u32` filters
@@ -619,7 +666,12 @@ ticket with `${DOCKER} version` first.
    total holds across two aggregate windows (90 s bound); `docker stop -t 60` the SUT, expecting
    exit 0; call each backend's `/internal/force_flush`; write each sink's
    `vm-export/<sink>.jsonl` from its backend's `/api/v1/export` with `match[]=<vm_selector>`
-   and `start=0`.
+   and `start=0`. With several SUT services (W10a), each stops in chain order, one
+   `sut_stopped` phase naming each: before an earlier one stops, the driver waits until a drain
+   of its own stdout, two aggregate windows after the wait began, shows its `[[ledger.hop]]`
+   sink (W10b) with `buffer.batches` 0, and `retrying` and `logit.output.in_flight` 0 or never
+   set (120 s bound, a `sink_drained` phase naming the service); the last waits as above, on
+   its sinks.
 5. Collect: the last `docker logs` chunk per service, from its cursor to the end, into
    `.stdout` and `.stderr`, and `inspect/<svc>.json`.
    Then `compose down -v --remove-orphans`, unless `--keep`. A `try`/`finally` makes SIGINT still
@@ -637,7 +689,13 @@ A check reports PASS, WARN, or FAIL; WARN is for a trend a short run can't settl
 `telemetry.py` mirrors the NDJSON grammar in `crates/logit-outputs/src/ndjson.rs`, whose module
 doc gains `tools/soak/` in its list of readers. Counters (`kind: sum`, delta) sum per **process
 life**, split where `logit.process.uptime` decreases, with the number of lives cross-checked
-against the timeline. Gauges are series.
+against the timeline. Gauges are series. With several SUT services (W10a) each has its own lives,
+cross-checked against the starts the timeline gives that service, and its own killed lives: the
+listener symbols (W, K, D, B, E, X) are read on the ingress SUT's lives, and everything from
+`aggregate` on (A, Ab, the sinks, V split per life, `ledger.windows`, `ledger.replay`,
+`identity.sink`, `progress`, `recovery`, `ledger.sent`) on the lives of the service holding
+`aggregate`, from its own telemetry and stderr. `drops` reads every SUT service and names it.
+The two are joined by the native hop's ledger (W10b, §8d), never by pairing their lives.
 
 A "fault window" below is a fault's span plus `recovery_bound` after it. A fault whose apply
 returned nonzero has none, so nothing after it is excused.
@@ -793,9 +851,10 @@ push counts its datagrams as shutdown drops without logging a line.
   life by timestamp, not to the life that delivered them. `identity.sink` stays on the final
   life, whose shutdown is ordinary.
 
-The number of SUT lives in telemetry must equal 1 plus the timeline's SUT starts: each `revert`
-of a `stop` or a `kill` on `logit`, an end-sequence early one included, and each `apply` of a
-`restart`, with `rc` 0. An unpause doesn't start a life. A life shorter than `internal`'s interval leaves at most
+The number of lives in each SUT service's telemetry must equal 1 plus that service's own
+starts on the timeline: each `revert` of a `stop` or a `kill` on it, an end-sequence early one
+included, and each `apply` of a `restart` of it, with `rc` 0. A start on one SUT service doesn't
+count toward another's. An unpause doesn't start a life. A life shorter than `internal`'s interval leaves at most
 its shutdown uptime point, so the next life's first uptime isn't lower and the two merge; on a
 mismatch every ledger, `identity.sink`, and `recovery` row SKIPs with the reason. They also SKIP when the SUT's telemetry has no
 `logit.process.uptime` point.
@@ -822,7 +881,8 @@ The rows:
   W + K, with its own generator's batch as the tolerance, its own end allowance, and its own
   datagram precondition. A fault on a generator is UDP-affecting for that generator's source
   only, so its window excuses nothing on another source's wire; a UDP-affecting fault on any
-  service that isn't a generator, such as any `logit` stop, excuses every source. One detail
+  service that isn't a generator, such as any `logit` stop, excuses every source; a fault on a
+  further SUT service (W10a) is never UDP-affecting. One detail
   line per source; the worst status wins.
 - `ledger.intake`: W − D == E + B, for the final life, per listener from W8b, one detail line
   each, a listener off its balance first.
@@ -1343,6 +1403,109 @@ samples and no drop in the life credits the gap (a self-test fixture), and a hol
 shows in `ledger.windows` under `vm_every_window` (a recorded by-hand run). It isn't a shipped
 scenario.
 
+### 8d. The native hop (W10b)
+
+A scenario with two SUT services names the hop between them:
+
+```toml
+[[ledger.hop]]
+from = "logit"            # the SUT holding the logit_out: the ingress SUT
+sink = "hop"              # its logit_out component id
+to = "collector"          # the SUT holding the logit_in: the further SUT [configs] names
+listener = "hop"          # its logit_in component id
+```
+
+**The schema.** At most one `[[ledger.hop]]`, with the four keys and no other, `sink` and
+`listener` component ids, `from` `logit`, and `to` the one further SUT service `[configs]`
+names. Two SUT services with no hop are refused, and so is a hop beside `[ledger] sut_script` or
+a source's `sut_transforms`, whose rows judge a path into `aggregate` inside one process.
+
+**The driver.** Before it stops `logit`, the end sequence waits on the hop sink alone: its
+`buffer.batches` 0, and `retrying` and `logit.output.in_flight` 0 or never set, so everything it
+took has been acknowledged before `logit` stops. `collector` then stops as the last SUT does.
+
+**The symbols.** On `logit`'s lives, the hop sink's S_hop
+(`logit.component.events.received{component=<sink>}`), its counted drops
+(`logit.component.events.dropped`, every reason), and `logit.output.batches.resumed` and
+`logit.output.reconnects`. On `collector`'s lives, the `logit_in`'s E_B
+(`logit.component.events.sent{component=<listener>}`, the events of the frames it forwarded, and
+none of a resend it acknowledged under a mark), X_B (its `events.dropped`), and
+`logit.input.batches.resends`. E_B − X_B stands in for W − D − B − X on the far side: it feeds
+`aggregate` there. A frame's events are at most the largest events-over-batches of any hop sink
+drain, and a send window is the `logit_out`'s `window` (32 by default) frames of that many.
+
+**The rows.** Each side's rows run on its own lives; nothing pairs a life of one with a life of
+the other.
+
+- `ledger.wire` and `ledger.intake`'s balance, `logit`'s final life, as for one SUT.
+- `ledger.intake`'s earlier lives: `logit`'s W − D − B − X − S_hop in [0, R], since its hop
+  sink's inbox stands where `aggregate`'s would; `collector`'s E_B − X_B − Ab in [0, R_hop], 65
+  frames of the largest frame, `aggregate`'s inbox and its taken batch.
+- `ledger.edge`: ΣE == S_hop in `logit`'s final life, and E_B == A and each sink's edge in
+  `collector`'s.
+- `ledger.aggregate`, `ledger.egress`, `ledger.windows`, and `ledger.replay` for the sinks:
+  `collector`'s lives, with E_B − X_B − V for a stopped earlier life and the kill band's rate
+  read from E_B.
+- **`ledger.hop`**, on run totals: gap = ΣS_hop − Σ hop drops − ΣE_B. 0 passes. Each killed
+  `logit` life allows − its last drain interval of S_hop, which its telemetry may not have
+  counted though its spool forwards it, and + one frame: the hop sink counts a batch received
+  before it spools it, and a spooled batch survives a SIGKILL, so only the batch in hand can be
+  counted and lost. If `collector` restarted between that life's last delivering drain and the
+  next `logit` life's first, it also allows − the frames the killed life committed after its
+  last cursor persist (its commit rate, `_commit_rate`'s highest delivered rate over its last
+  three delivering drain intervals, × `checkpoint_interval`, plus one, in frames of the largest
+  frame): its spool replays them under their old identity, and the restarted `collector` has no
+  mark for them ([`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md), "The native hop
+  still forwards a duplicate after a `logit_in` restart"); a `collector` that kept its marks
+  acknowledges the replay as resends instead. Each killed `collector` life allows + its last
+  drain interval of E_B, which it forwarded but never exported, and − one send window of
+  frames: its marks are gone, so it forwards a resend of what it had forwarded and not
+  acknowledged. Each `pause` of `collector` allows − one send window: the resend can race the
+  frames an ended connection still holds
+  ([`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)). A partition or packet loss
+  allows nothing: the race needs a forward parked on a full inbox. Any other gap FAILs, below
+  the allowance as a surplus and above it as uncounted. A `rejected` or `disk_corrupt` batch
+  drop at the hop sink FAILs too. Resends, resumed frames, and reconnects are shown beside it,
+  and the row's lines give the running gap at each fault's start, the hop's backlog plus any
+  surplus so far, which can't be split by fault.
+- `ledger.summary`: W − D − E − B and E − S_hop in `logit`'s final life, E_B − A, A − Ab, and
+  each egress term in `collector`'s, with `ledger.hop` left to judge the hop. Beside them, one
+  bound end to end, which no kill or restart can loosen: each egress group's V over the whole
+  run is at most G less every counted loss (K, D, B, X, the hop's drops, and X_B). A duplicate
+  forwarded across the hop adds the same increments to E_B, A, Ab, and V, so every per-life term
+  balances around it; this bound and `ledger.hop` are what see it, the bound only once the
+  surplus exceeds the run's uncounted loss, the wire loss among it.
+- `ledger.replay` for the hop sink, for each killed `logit` life followed by another. Unlike a
+  sink behind `aggregate`, which gains one batch a window, the hop sink is fed by the listener,
+  so its queue keeps growing between the last drain and the kill, and `collector` may take some
+  of it. Its spool commits a frame once `collector` acknowledges it and persists the cursor on
+  a commit once `checkpoint_interval` (1 s by default) has passed since the last persist, so up
+  to one interval of commits stays unpersisted and replays, even after `collector` stopped and
+  commits stopped with it. With the received and delivered batch rates over the life's last
+  drain interval, its commit rate (the highest delivered rate over its last three drain
+  intervals that delivered anything, since delivery that stopped partway through an interval
+  averages low over it), and
+  t from its last drain to the `docker kill`'s return, replayed − queued is in
+  [−(delivered × t) − 1, received × t + the commit rate × the checkpoint interval + 1].
+  The first two `native-hop` runs found both terms: a kill inside `collector`'s stop replayed 55
+  batches over the queue, 50 it received in the 5 s before the kill and 5 committed before the
+  stop and never persisted.
+- `identity.sink` judges the hop sink too, at `logit`'s final life's last quiet drain;
+  `recovery` judges each side's sinks on its own drains, the hop sink against the listeners'
+  datagrams and `collector`'s sinks against E_B; `drops` keys every term on its service and
+  leaves out the hop sink's counted drops, which `ledger.hop` reads, and X_B.
+
+**The scenario.** `native-hop` (17 minutes: warmup 60 s, `recovery_bound` 60 s, a 14-minute
+cycle, cooldown 120 s) runs `logit` as `statsd_in → logit_out` (`window: 32`, `request_timeout:
+10s`, `buffer.disk`) and `collector` as `logit_in → aggregate` (10 s, cumulative,
+`series_retention: 360`) `→ prometheus_out` (remote-write 1.0, zstd, `buffer.disk`). Its steps:
+a netem delay on `logit` (200 ms ± 50 ms, 120 s) and then 10% loss (90 s), a 45 s partition of
+`collector`, a 30 s stop, a 30 s pause, and a 30 s kill of `collector`, a 30 s kill of `logit`
+with `collector` up, and a 30 s kill of `logit` inside a 90 s stop of `collector`. Its
+`[[expect]]` tables assert the replay after the first `logit` kill is deduplicated
+(`logit.input.batches.resends` above 0), `logit` reconnects after the `collector` kill, and the
+spool holds the hop's frames through the stop.
+
 ### 9. Not in this stack
 
 toxiproxy and TCP-level faults it alone can express; per-peer `tc filter` and `ifb` ingress
@@ -1442,9 +1605,15 @@ where it needs them, and a small check extension.
    surplus at B, not an overwrite in V. Proves [ADR `delivery-semantics`](../adr/delivery-semantics.md),
    "7. The native hop is effectively-once", and the resume in
    [ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), "4. The handshake carries
-   identities out and marks back". Faults on A or the link judge zero surplus; a restart of B
-   forgets its marks, so its resend is judged within the send window. Rows: the ledger one hop
-   longer, `ledger.replay` on A. Needs: a second SUT service, with `kill` on it.
+   identities out and marks back". Faults on A or the link judge zero surplus, and so does a
+   graceful `stop` or `restart` of B: `logit_in` writes the accepted `Ack` for every frame it
+   forwarded before it answers `GOING_AWAY`, so nothing it forwarded is resent. Only a `kill` of
+   B, which forgets its marks, or a `pause` long enough to end A's connection, whose frames a
+   resend then races, can forward a frame twice, and the send window bounds that surplus; and a
+   kill of A replays the frames its spool committed after its last cursor persist, which a B
+   restarted since, gracefully or not, forwards again.
+   Rows: the ledger one hop longer, `ledger.replay` on A. Built in W10a (a second SUT service,
+   §2's "Several SUT services") and W10b (the hop ledger and the `native-hop` scenario, §8d).
 8. **TCP ingress.** `syslog_in` or `lines_in` over TCP, or `statsd_in` with `transport: tcp`, from
    the generator's TCP sinks. A stalled SUT backs up into the sender
    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md), "No receive queue on
@@ -1519,8 +1688,9 @@ that items 3, 7, and 11 need.
 | W8c | `soak/w8c` | `soak/w8c: high-cardinality soaks, a slope reducer, and expected verdicts` | M | W8b |
 | W9a | `soak/w9a` | `soak/w9a: a scripted HTTP stand-in for every remote-write response class` | M | W8c |
 | W9b | `soak/w9b` | `soak/w9b: a Datadog-shaped stand-in and ledger.sent against it` | M | W9a |
-| W10 | `soak/w10` | `soak/w10: a native-hop soak between two logit processes` | M | W9b |
-| W11 | `soak/w11` | `soak/w11: TCP-ingress and file-tailing soaks` | M | W10 |
+| W10a | `soak/w10a` | `soak/w10a: several SUT services, each scored on its own lives` | M | W9b |
+| W10b | `soak/w10b` | `soak/w10b: a native-hop soak between two logit processes` | M | W10a |
+| W11 | `soak/w11` | `soak/w11: TCP-ingress and file-tailing soaks` | M | W10b |
 | W12 | `soak/w12` | `soak/w12: rolling-overlap, SIGHUP, and TLS-reload soaks` | M | W11 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
@@ -1598,12 +1768,22 @@ that items 3, 7, and 11 need.
   delta points' sum, `ledger.sent` and `drops` against it with cued refusals and drops excused,
   duplicates reported per life as for a Kafka target, and the `standin-datadog` scenario
   ("Stand-in targets").
-- **W10**: item 7, a second SUT service and the ledger one hop longer.
+- **W10a**: the first half of item 7, a second SUT service: further SUT services declared by
+  their own `[configs]` keys (§2's "Several SUT services"), a config variable each, the end
+  sequence stopping each in chain order, each service's lives, kills, and stderr read on their
+  own, the rows from `aggregate` on judged on the lives of the service holding it, UDP
+  attribution on the ingress SUT alone, and self-test fixtures for each. No scenario runs two
+  SUTs yet.
+- **W10b**: the rest of item 7, the ledger one hop longer (§8d): `[[ledger.hop]]` and its
+  rules, the end sequence waiting on the hop sink, each side's rows on its own lives, the
+  `ledger.hop` row, the end-to-end bound in `ledger.summary`, the hop sink's replay band,
+  identity, and recovery, `drops` keyed on service and component, the `native-hop` scenario,
+  and a run of it under "Findings".
 - **W11**: items 8 and 9, per-line wire counters, a shared volume, and the replay surplus band.
 - **W12**: items 11 and 12, the namespace-holder service, per-instance totals, and the `signal`
   and certificate-rotation actions.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10 → W11 → W12, linear. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11 → W12, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
@@ -3102,6 +3282,83 @@ What the run showed about `logit` and the harness:
   were connect failures to the stopped stand-in, which never reached it.
 - **Self-test**: 1,286 expectations, from 1,187 at W9a. Each new rule was reverted in turn and
   failed at least one expectation; the PR lists them.
+
+### W10b: the native hop (2026-10-15)
+
+W10b adds the hop ledger and `native-hop` (§8d). Every run used `logit:soak`
+`sha256:0592417ac86a`, built with `--no-cache` from `soak/w10b` (no Rust change from `main`
+at `e77a86fd`), `logit-soak-netem:local` `sha256:ca9f9da8292d`, and
+`victoriametrics/victoria-metrics:v1.152.0`, on the development host (32 cores, Docker 29.8.2).
+
+The first two runs, `20261015T234302Z` and `20261016T000317Z`, FAILed `ledger.replay` on the
+hop sink with every other row passing: the kill of `logit` inside `collector`'s stop replayed
+306 and 307 batches over a last-drain queue of 251 and 252, which the first band, exact with
+nothing delivered, read as 55 too many. Both were harness bugs. 50 of the 55 were the queue's
+growth in the 5 s between the last drain and the kill: unlike a sink behind `aggregate`, the
+hop sink is fed by the listener, at 10 batches a second. The other 5 were frames `collector`
+acknowledged in the last second before its stop: a spool persists its cursor on a commit once
+`checkpoint_interval` has passed, so when commits stop, up to an interval of them stays
+unpersisted and replays (`crates/logit-pipeline/src/disk_queue.rs`, `after_cursor_advance`).
+The band now covers both, and re-scoring both runs with `soak.py check` passes every row.
+
+The third run, `20261016T002412Z` at `c3050457`, passed every row. `results.md` below is its
+re-score with `soak.py check` after review tightened `ledger.hop`: a killed `logit` life
+allows one frame above 0 rather than its last drain interval, and its replay of unpersisted
+frames only when `collector` restarted before the replay, as it did before the second kill
+and not the first. Re-scored the same way, all three runs pass every row, with `ledger.hop`
+at −2,400, −2,600, and −2,400 inside allowances of about [−76,000, 11,500].
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 18 apply/revert action(s) returned 0; 6 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 8 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (3 kill(s)) |
+| `restarts` | PASS | 5 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 9 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 48 readiness sample(s) read ok outside fault windows; 6 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 3 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 3 of 3, 4 freshness sample(s); 60s of 960s after warmup judged (6%; WARN under 5%) |
+| `rss_slope` | PASS | collector PASS: MiB/h life 3 -137.9 (limit 64); 70s of 960s after warmup judged (7%; WARN under 5%) \| generator PASS: MiB/h life 0 +0.7 (limit 64); 95s of 960s after warmup judged (10%; WARN under 5%) \| logit PASS: MiB/h life 2 +25.1 (limit 64); 70s of 960s after warmup judged (7%; WARN under 5%) |
+| `fd_slope` | PASS | collector PASS: warmup median 16 -> end 16 (limit +8) \| generator PASS: warmup median 12 -> end 12 (limit +8) \| logit PASS: warmup median 15 -> end 15 (limit +8) |
+| `ledger.wire` | PASS | G 2,051,600 = W 2,040,000 + K 0 + wire 11,600 (by design: 11,718 in UDP-affecting windows, -121 steady, 3 at the end; steady loss judged 0, each run at 0 or more, against limit 500); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 2: W − D 390,100 vs E + B 390,100; logit life 0: W − D − B − X − S_hop 0 within [0, R]; logit life 1: W − D − B − X − S_hop 0 within [0, R]; collector life 0: E_B − X_B − Ab 0 within [0, R_hop]; collector life 1: E_B − X_B − Ab 0 within [0, R_hop]; collector life 2: E_B − X_B − Ab 0 within [0, R_hop] (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000; R_hop 48,925 = 65 x 753 events per frame) |
+| `ledger.edge` | PASS | logit final life 2: E 390,100 == S_hop[hop] 390,100 (listeners to hop); collector final life 3: E_B[hop] 451,100 == A 451,100 (hop to aggregate); collector final life 3: A_sent 1,400 == S_in[victoria_metrics] 1,400 (aggregate to victoria_metrics) |
+| `ledger.hop` | PASS | hop to hop: ΣS_hop 2,040,000 − hop dropped 0 − ΣE_B 2,042,400 = -2,400, within allowance (allowance [-77,207, 11,506]: logit life 0 killed: −9,999 (2,000/s over its last drain interval), +753 (the batch in hand); logit life 1 killed: −10,000 (2,000/s over its last drain interval), +753 (the batch in hand), −9,036 (its replay of frames committed after its last cursor persist, which collector, restarted at +885s, forwards again); collector life 1 killed: −24,086 (its marks lost), +10,000 (2,000/s over its last drain interval); c0s5 pause on collector: −24,086 (a resend racing an ended connection's frames)); resends 3 at collector, resumed 1 and reconnects 4 at logit; a send window is 32 frames of at most 753 events (24,086) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 3: Ab 451,100 == A 451,100 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: E_B − X_B − V 0 = residual 0 + Ab − V 0, ok; life 1 (killed): Ab 590,100 − V[victoria_metrics] 579,900 = 10,200, within band (band [-10,000, 30,001]: ingest 2,000/s over the last drain interval; below, the residual 0 plus one 4.99986s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual E_B − X_B − Ab 0 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 2: E_B − X_B − V 0 = residual 0 + Ab − V 0, ok; life 3 (final): Ab 451,100 − V[victoria_metrics] 451,100 = 0, ok (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | PASS | victoria_metrics: life 2's first drain replayed 0 vs killed life 1's last-drain buffer.batches 0; logit hop: life 1's first drain replayed 2 vs killed life 0's last-drain buffer.batches 1, band [-10, 20]: 10.0 batches/s received and 10.0 delivered over its last drain interval, 0.9s from its last drain to the kill, and a 1s checkpoint of its last delivering 10.0/s; logit hop: life 2's first drain replayed 305 vs killed life 1's last-drain buffer.batches 251, band [-1, 62]: 10.0 batches/s received and 0.0 delivered over its last drain interval, 5.0s from its last drain to the kill, and a 1s checkpoint of its last delivering 10.0/s (one batch in flight allowed) |
+| `ledger.summary` | PASS | logit final life 2, collector final life 3; the hop itself is ledger.hop's: uncounted 0 = W − D − E − B 0 + E − S_hop 0 + E_B − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K) 11,600 over the run, by design; end to end over the run, G 2,051,600 less counted loss 0: victoria_metrics: V 2,032,200 <= G − counted 2,051,600 |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | collector final life 3 at +1065s: victoria_metrics: received 14 vs delivered 14 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed); logit hop: final life 2 at +1045s: received 1,694 + replayed 305 + torn 0 vs delivered 1,999 + dropped 0 + buffer.batches 0, gap 0 |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 9 of 9 fault(s) judged at 1 sink(s), each recovered within recovery_bound 60s of its end; warmup rate 2,000/s |
+| `expect.replay-deduplicated` | PASS | delta of logit.input.batches.resends{component=hop} on collector, after c0s6: c0s6 (+630s, +690s]: 2 (over 12 drain(s)), want >= 1 |
+| `expect.reconnects-after-collector-kill` | PASS | delta of logit.output.reconnects{component=hop} on logit, through c0s7: c0s7 (+720s, +810s]: 1 (over 19 drain(s)), want >= 1 |
+| `expect.spool-holds-the-stop` | PASS | max of logit.component.buffer.batches{component=hop} on logit, during c0s4: c0s4 (+420s, +450s]: 293 (6 sample(s) and the value in force at its start), want >= 2 |
+
+- `ledger.hop` read a gap of −2,400 events, a surplus of about three frames, in this run, and
+  −2,400 and −2,600 in the first two. The surplus is within the allowance, but the run can't say
+  which fault forwarded it. The running gap (the row's lines) is the hop's backlog plus any
+  surplus so far, and each killed life's uncounted tail shifts it by up to 10,000 events, so it
+  can't be split by fault; it settled at −2,241 after the last fault. Two mechanisms fit: `collector`'s kill, which forgot its marks, and
+  `logit`'s replay, after its kill inside `collector`'s stop, of frames committed in the second
+  before the stop and never persisted, to a `collector` whose restart had forgotten their mark.
+  Both are `docs/known-gaps/native-hop.md`'s documented duplicates. An event-level reconciliation
+  would need a per-frame count at `logit_in` of frames forwarded above a restarted mark, which
+  `logit` doesn't export; this stops here rather than adding one.
+- `logit.input.batches.resends` was 3 (6 and 10 in the first two runs), all in `collector`'s
+  life after its kill, and `replay-deduplicated` saw 2 after the first `logit` kill:
+  `collector` acknowledged `logit`'s replay under the old sender identity without forwarding
+  it. `logit.output.batches.resumed` was 1 and `logit.output.reconnects` 4.
+- While `collector` was partitioned or stopped, the hop's backlog grew at the full 2,000 events
+  a second, to about 47,000 by the kill of `logit` inside the stop, and drained within
+  `recovery_bound` once `collector` returned; in the second run `recovery` read `collector`'s
+  ingest at 1,180% of the warmup rate after the partition while it did.
+- `progress` judged only 60 s of 960 after warmup, three 30 s windows: the schedule leaves
+  little steady state between faults and their 60 s recovery.
 
 ## Verification
 

@@ -86,6 +86,20 @@ each source's datagram precondition, an imbalance on one listener FAILing named,
 summed E against A, a source's transforms judged hop by hop, `lines_in`'s oversize drops in B,
 R per listener from its own `receive:`, and `recovery` against the summed rate.
 
+For two SUT services, it covers a further SUT declared by its own `[configs]` key and the
+`[[ledger.hop]]` joining it to `logit` (the chain they make, their config variable, and each
+rule the keys, the hop, and the role map are held to), the fault predicates, under which only
+`logit` can lose UDP, `compose.env`, the aggregate window read from the last SUT's config, the
+end sequence stopping each SUT in chain order with a phase each and waiting before `logit`
+stops until its hop sink is drained with no frame in flight, and a two-SUT run: a kill on either
+side making two lives there alone, a kill the telemetry doesn't show named for its service, the
+listener rows on `logit`'s lives and the rows from `aggregate` on on `collector`'s, fed by
+`logit_in`'s events sent, V split on `collector`'s lives, `ledger.hop` exact with no kill or
+pause and within its allowance for a killed side's tail and a send window of duplicates after a
+kill or a pause of `collector`, a counted hop drop, a rejected hop batch, `ledger.summary`'s
+end-to-end bound, the hop sink's replay band and identity, `recovery` on each side's own drains,
+`drops` keyed on service, and an end-sequence phase read for its own service.
+
 For a stand-in target, it covers the Snappy decoder against blocks `snap::raw` wrote
 (`standin/snap-vectors.json`) and the malformed blocks it refuses, the `WriteRequest` walker,
 V rebuilt from a record (a later write replacing an earlier one, a same-value resend counted, a
@@ -1730,7 +1744,11 @@ def _override_roles(loaded):
     service its override labels."""
     roles = scenario.base_roles(loaded)
     if loaded.compose is not None:
-        roles.update(_declared_roles(loaded.compose_path().read_text()))
+        # An override that only adds to a base service, as `depends_on` on `logit`, labels it
+        # through the base file; compose merges the two.
+        roles.update({name: role for name, role in
+                      _declared_roles(loaded.compose_path().read_text()).items()
+                      if role is not None or name not in roles})
     return roles
 
 
@@ -4636,8 +4654,10 @@ def _source_rules(root):
              "`service` must name a generator service", "a service that isn't a slug")
     _refused(path, mutate(lambda r: r["ledger"]["source"].append(dict(lines))),
              "configs: missing `generator-lines`", "a source whose generator has no config")
-    _refused(path, mutate(lambda r: r["configs"].update({"generator-lines": "x.yaml"})),
-             "configs: unknown key `generator-lines`", "a config for no source")
+    _refused(path, mutate(lambda r: r["configs"].update(
+        {"generator-lines": "logit-generator.yaml"})),
+             "configs: SUT services logit and generator-lines need a [[ledger.hop]]",
+             "a config for no source, read as a further SUT")
     _refused(path, mutate(lambda r: second(r, sut_transforms=["parse", "lines"])),
              "`sut_transforms` repeats a component or names a listener",
              "a transform that is a listener")
@@ -4751,7 +4771,7 @@ def _fanin_driver(root):
     run.t0 = 0.0
     run.has_vm = False
     run.inspect_all = lambda: None
-    run.wait_sink_drained = lambda: None
+    run.wait_sink_drained = lambda *args, **kwargs: None
     real_print = driver._print
     driver._print = lambda text, stream=None: None
     try:
@@ -4761,6 +4781,634 @@ def _fanin_driver(root):
     stopped = [call[-1] for call in run.docker.calls if call[0] == "stop"]
     expect(stopped == ["id-generator", "id-generator-lines", "id-logit"],
            f"the end sequence stops each generator, then the SUT, got {stopped}")
+
+
+# A second SUT service, `collector`, after `logit` in the chain: the role map an override adding
+# it would give.
+TWO_SUT_ROLES = {**scenario.BASE_ROLES, "collector": "sut"}
+
+
+def _two_sut_dir(root, tmp, interval="7s"):
+    """A copy of statsd-vm in `tmp` whose `[configs]` adds `collector`, a further SUT service,
+    with its own config: statsd-vm's SUT config with `aggregate`'s window set to `interval`."""
+    base = root / "scenarios" / "statsd-vm"
+    directory = Path(tmp) / "two-suts"
+    directory.mkdir()
+    text = (base / "scenario.toml").read_text()
+    marker = 'generator = "logit-generator.yaml"\n'
+    (directory / "scenario.toml").write_text(
+        text.replace(marker, marker + 'collector = "logit-collector.yaml"\n', 1)
+        + '\n[[ledger.hop]]\nfrom = "logit"\nsink = "hop"\nto = "collector"\n'
+          'listener = "hop"\n')
+    sut = (base / "logit-sut.yaml").read_text()
+    for name in ("logit-sut.yaml", "logit-generator.yaml"):
+        (directory / name).write_text((base / name).read_text())
+    (directory / "logit-collector.yaml").write_text(
+        sut.replace("interval: 10s", f"interval: {interval}", 1))
+    return directory / "scenario.toml"
+
+
+def _two_sut_rules(root):
+    """A further SUT service, declared by its own `[configs]` key and run by a service with the
+    role `sut`, and the `[[ledger.hop]]` joining it to `logit`: the chain it makes, every rule
+    `load()` and the role map hold them to, and the fault predicates, under which only `logit`,
+    which holds every source's listener, can lose UDP."""
+    path, raw = _base(root)
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    def with_hop(r, **hop):
+        """`r` with `collector` declared and a hop to it, `hop` overriding its keys."""
+        r["configs"]["collector"] = "logit-sut.yaml"
+        r["ledger"]["hop"] = [{**TWO_SUT_HOP, "listener": "hop", **hop}]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        two = scenario.load(_two_sut_dir(root, tmp))
+        expect(two.suts == ["logit", "collector"] and two.sink_sut == "collector"
+               and two.generators == ["generator"]
+               and two.sut_config_path("collector").name == "logit-collector.yaml"
+               and two.sut_config_path("logit").name == "logit-sut.yaml",
+               f"a further [configs] key is a SUT service after logit, got {two.suts}")
+        expect(two.to_json()["suts"] == ["logit", "collector"]
+               and two.to_json()["ledger"]["hop"] == [{"from": "logit", "sink": "hop",
+                                                       "to": "collector", "listener": "hop"}],
+               "the resolved scenario records the SUT chain and the hop")
+        expect(scenario.service_problems(two, TWO_SUT_ROLES) == [],
+               f"a stack running collector as a sut holds, got "
+               f"{scenario.service_problems(two, TWO_SUT_ROLES)}")
+        problems = scenario.service_problems(two, scenario.BASE_ROLES)
+        expect(any("the stack needs the sut services logit and the [configs] keys collector, "
+                   "and has logit" in p for p in problems),
+               f"a declared SUT the stack doesn't run is refused, got {problems}")
+        problems = scenario.service_problems(two, {**TWO_SUT_ROLES, "collector": "generator"})
+        expect(any("the [configs] keys collector, and has logit" in p for p in problems),
+               f"a declared SUT running as a generator is refused, got {problems}")
+        killed = mutate(with_hop)
+        killed["step"].append({"at": "11m10s", "action": "kill", "on": "collector",
+                               "for": "20s"})
+        loaded = scenario.from_dict(killed, path)
+        expect(scenario.service_problems(loaded, TWO_SUT_ROLES) == [],
+               "a kill on a declared second SUT is allowed")
+    _refused(path, raw, "one sut service, logit, and has collector, logit; a further sut "
+             "service needs its own [configs] key", "a second sut the scenario doesn't declare",
+             roles=TWO_SUT_ROLES)
+    _refused(path, mutate(lambda r: r["configs"].update(logit="logit-sut.yaml")),
+             "configs.logit: the SUT logit's config is `sut`", "a [configs] key for logit")
+    _refused(path, mutate(lambda r: r["configs"].update({"Col!": "logit-sut.yaml"})),
+             "configs.Col!: a key other than `sut`", "a SUT service that isn't a slug")
+    _refused(path, mutate(lambda r: r["configs"].update(
+        {"col-a": "logit-sut.yaml", "col_a": "logit-sut.yaml"})),
+             "configs.col_a: SUT service 'col_a' would mount its config through "
+             "SOAK_COL_A_CONFIG", "two SUT services sharing one compose variable")
+    _refused(path, mutate(lambda r: (r["ledger"]["source"].append(dict(LINES_SOURCE)),
+                                     r["configs"].update({"generator-lines": "logit-sut.yaml",
+                                                          "generator_lines": "logit-sut.yaml"}))),
+             "configs.generator_lines: SUT service 'generator_lines' would mount its config "
+             "through SOAK_GENERATOR_LINES_CONFIG", "a SUT service sharing a source's variable")
+    _refused(path, mutate(lambda r: r["configs"].update(collector="missing.yaml")),
+             "configs.collector: missing.yaml not found", "a SUT config that isn't there")
+    _refused(path, mutate(lambda r: (with_hop(r),
+                                     r["step"].append({"at": "11m10s", "action": "kill",
+                                                       "on": "generator", "for": "20s"}))),
+             "kill is for logit or collector only", "a kill on the generator beside two SUTs",
+             roles=TWO_SUT_ROLES)
+
+    _refused(path, mutate(lambda r: r["configs"].update(collector="logit-sut.yaml")),
+             "configs: SUT services logit and collector need a [[ledger.hop]]",
+             "two SUTs with no hop")
+    _refused(path, mutate(lambda r: (with_hop(r), r["ledger"]["hop"].append(dict(TWO_SUT_HOP)))),
+             "ledger.hop must be one table", "two hops")
+    _refused(path, mutate(lambda r: (with_hop(r), r["ledger"]["hop"][0].pop("listener"))),
+             "ledger.hop: missing `listener`", "a hop without its logit_in")
+    _refused(path, mutate(lambda r: with_hop(r, window=8)), "ledger.hop: unknown key `window`",
+             "an unknown hop key")
+    _refused(path, mutate(lambda r: with_hop(r, sink="a b")),
+             "ledger.hop: `sink` must name a component id", "a hop sink that isn't an id")
+    _refused(path, mutate(lambda r: with_hop(r, **{"from": "collector"})),
+             "ledger.hop: `from` must be logit", "a hop from the far SUT")
+    _refused(path, mutate(lambda r: with_hop(r, to="generator")),
+             "ledger.hop: `to` must be the one further SUT service [configs] names, collector",
+             "a hop to a service [configs] doesn't declare a SUT")
+    _refused(path, mutate(lambda r: r["ledger"].update(hop=[dict(TWO_SUT_HOP)])),
+             "`to` must be the one further SUT service [configs] names; it names none",
+             "a hop with one SUT")
+    _refused(path, mutate(lambda r: (with_hop(r), r["ledger"].update(sut_script="lua"))),
+             "ledger.hop and ledger.sut_script can't be combined", "a hop beside a script")
+    _refused(path, mutate(lambda r: (with_hop(r),
+                                     r["ledger"]["source"][0].update(sut_transforms=["x"]))),
+             "ledger.hop and a source's `sut_transforms` can't be combined",
+             "a hop beside a source's transforms")
+
+    for action in ("pause", "stop", "kill", "restart", "partition", "mark", "exit"):
+        for on, udp in (("logit", True), ("collector", False)):
+            step = scenario.Step("c0s1", 0, 0, action, on, "", 0, 1)
+            expect(faults.ACTIONS[action].affects_udp_ingress(step, TWO_SUT_ROLES) == udp
+                   and faults.ACTIONS[action].affects_egress(step, TWO_SUT_ROLES),
+                   f"a {action} on {on} affects UDP ingress: {udp}, and egress")
+
+
+class _ChainDocker:
+    """Records the end sequence's stops and the container each tail reads, on a fake clock."""
+
+    def __init__(self, clock, events, lines):
+        self.clock = clock
+        self.events = events
+        self.lines = lines
+
+    def run(self, args, timeout=None):
+        self.events.append(("stop", args[-1]) if args[0] == "stop" else tuple(args))
+        return docker.Result(0, "", "")
+
+    def inspect(self, container, timeout=None):
+        return {"State": {"ExitCode": 0}}
+
+    def logs_tail(self, container, lines, timeout=0):
+        self.events.append(("tail", container))
+        return docker.Result(0, "\n".join(self.lines(self.clock[0])) + "\n", "")
+
+
+def _two_sut_driver(root):
+    """The driver with two SUT services: `compose.env` sets the further SUT's config variable,
+    `aggregate_interval` reads the config of the SUT holding `aggregate`, and the end sequence
+    stops the generators, then each SUT in chain order, waiting before `logit` stops until every
+    sink it reports is drained with nothing in flight, and before `collector` stops on its
+    sinks' backends."""
+    with tempfile.TemporaryDirectory() as tmp:
+        two = scenario.load(_two_sut_dir(root, tmp))
+        run = driver.Run(root, two, two.duration, None, False, Path(tmp) / "out", [],
+                         "logit:soak", roles=TWO_SUT_ROLES)
+        run.prepare()
+        env = (run.run_dir / "compose.env").read_text()
+        resolved = json.loads((run.run_dir / "scenario.resolved.json").read_text())
+        expect(f"SOAK_COLLECTOR_CONFIG={two.config_path('collector')}\n" in env
+               and f"SOAK_SUT_CONFIG={two.config_path('sut')}\n" in env
+               and (run.run_dir / "configs" / "logit-collector.yaml").is_file()
+               and resolved["suts"] == ["logit", "collector"],
+               f"compose.env sets each SUT's config and the run copies both, got {env}")
+        for jsonl in (run.timeline, run.watchdog, run.stats, run.freshness, run.capture):
+            jsonl.close()
+        expect(run.aggregate_interval() == 7.0,
+               f"the wait reads collector's aggregate window, got {run.aggregate_interval()}")
+
+        def hop_lines(in_flight, sinks=("hop",)):
+            def lines(now):
+                out = []
+                for t in range(int(now) - 30, int(now) + 1, 5):
+                    stamp = _stamp(t)
+                    out.append(_line(stamp, "logit.process.uptime", "gauge", float(t - 900)))
+                    for sink in sinks:
+                        out.append(_line(stamp, "logit.component.buffer.batches", "gauge", 0,
+                                         component=sink))
+                    out.append(_line(stamp, "logit.output.in_flight", "gauge", in_flight(t),
+                                     component="hop"))
+                return out
+            return lines
+
+        def end(lines, has_vm=True):
+            clock = [1000.0]
+            events = []
+            seq = driver.Run(root, two, two.duration, None, False, tempfile.mkdtemp(dir=tmp),
+                             [], "logit:soak", roles=TWO_SUT_ROLES)
+            seq.run_dir.mkdir(parents=True)
+            seq.refresh_vm_base = lambda backend: None
+            seq.docker = _ChainDocker(clock, events, lines)
+            seq.ids = {name: f"id-{name}" for name in TWO_SUT_ROLES}
+            seq.timeline = _Records()
+            seq.t0 = 900.0
+            seq.has_vm = has_vm
+            seq.inspect_all = lambda: None
+            seq.wait_quiet = lambda: events.append(("quiet",))
+            reals = (driver._now, driver.time.sleep, driver._print, vm.force_flush,
+                     vm.export_raw)
+            driver._now = lambda: clock[0]
+            driver.time.sleep = lambda s: clock.__setitem__(0, clock[0] + s)
+            driver._print = lambda text, stream=None: None
+            vm.force_flush = lambda base: None
+            vm.export_raw = lambda base, selector, start, timeout=None: ""
+            try:
+                seq.end_sequence()
+            finally:
+                (driver._now, driver.time.sleep, driver._print, vm.force_flush,
+                 vm.export_raw) = reals
+            return events, seq.timeline
+
+        events, timeline = end(hop_lines(lambda t: 3 if t < 1040 else 0))
+        order = [e for e in events if e[0] in ("stop", "quiet")]
+        expect(order == [("stop", "id-generator"), ("stop", "id-logit"), ("quiet",),
+                         ("stop", "id-collector")],
+               f"generators, then logit, then collector once its backends are quiet, got "
+               f"{order}")
+        tails = {e[1] for e in events if e[0] == "tail"}
+        drained = [r for r in timeline if r.get("phase") == "sink_drained"]
+        stopped = [r.get("service") for r in timeline if r.get("phase") == "sut_stopped"]
+        expect(tails == {"id-logit"} and len(drained) == 1 and drained[0]["service"] == "logit"
+               and drained[0]["held"] and drained[0]["waited_s"] >= 40
+               and drained[0]["sinks"] == {"hop": {"buffer_batches": 0, "retrying": None,
+                                                   "in_flight": 0}},
+               f"logit stops once every sink it reports is empty with nothing in flight, got "
+               f"{tails} {drained}")
+        expect(stopped == ["logit", "collector"],
+               f"one sut_stopped phase per SUT service, in chain order, got {stopped}")
+        _, timeline = end(hop_lines(lambda t: 1))
+        drained = [r for r in timeline if r.get("phase") == "sink_drained"]
+        expect(not drained[0]["held"] and drained[0]["sinks"]["hop"]["in_flight"] == 1,
+               f"frames in flight never count as drained, got {drained}")
+        events, timeline = end(hop_lines(lambda t: 0, ("hop", "victoria_metrics")),
+                               has_vm=False)
+        order = [e for i, e in enumerate(events) if e[0] == "stop"
+                 or (e[0] == "tail" and events[i - 1] != e)]
+        drained = [(r["service"], sorted(r["sinks"])) for r in timeline
+                   if r.get("phase") == "sink_drained"]
+        expect(order == [("stop", "id-generator"), ("tail", "id-logit"), ("stop", "id-logit"),
+                         ("tail", "id-collector"), ("stop", "id-collector")]
+               and drained == [("logit", ["hop"]), ("collector", ["victoria_metrics"])],
+               f"with no backend, collector stops once its ledger sinks drain, read from its "
+               f"own stdout, got {order} {drained}")
+
+
+# Two SUT services: `logit` holds the listener `in` and a `hop` sink, `collector` holds
+# `window` and `sink`. A kill on collector over +203..+213 ends its life 0.
+TWO_SUT_KILL = (203, 213)
+TWO_SUT_HOP = {"from": "logit", "sink": "hop", "to": "collector", "listener": "hop_in"}
+TWO_SUT_HOP_CONFIG = "  hop: { type: logit_out, endpoint: collector:7400, window: 8 }\n"
+TWO_SUT_COLLECTOR_CONFIG = ("components:\n"
+                            "  window:\n"
+                            "    type: aggregate\n"
+                            "    interval: 10s\n")
+
+
+def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, short=0,
+                 hop_dropped=0, drops=(), pause=False, logit_lives=None, replayed=3,
+                 stalled=False, partial=False, collector_restart=False):
+    """A two-SUT run across a native hop: the generator and `logit` move `PER_DRAIN` lines per
+    5 s drain into `logit`'s one life, whose hop sink `hop` takes each drain's lines in 10
+    frames; `collector`'s `logit_in` `hop_in` forwards them into `window`, which delivers one
+    batch per drain to `sink`. The timeline holds a kill on `kill_on` (None for none) over
+    `TWO_SUT_KILL`, and `collector`'s telemetry shows `collector_lives` lives, 1 or 2. Its
+    killed life misses the two drains the kill spans and leaves 2 batches queued; its next life
+    forwards the 2,000 lines it missed in its first drain and replays the 2 batches. Its killed
+    life's V is one 1,000-line window short, inside its band. `extra` lines are forwarded,
+    absorbed, and stored once more in that first drain, a surplus across the hop, and `short`
+    lines fewer, with `hop_dropped` of them counted dropped at `logit`'s hop sink. `pause` adds
+    a pause on `collector` over +240..+250. A kill on `logit` gives it two lives, unless
+    `logit_lives` is 1, and nothing reaches it or crosses the hop while it is down; its killed
+    life leaves 3 hop batches queued, and its next life's first drain replays `replayed`; under
+    `stalled` its hop sink delivers nothing in its last two drains and leaves 23 queued; under
+    `partial` it delivers 2 of its last drain's 10 and leaves 11 queued. `collector_restart`
+    stops `collector` over the same span as that kill, a graceful restart.
+    `collector` counts one
+    `events.dropped{reason="stale"}` at `window`. `drops` adds a count of 1 for each `(service,
+    metric, component, reason)`, `service` being "logit" or "collector"."""
+    if logit_lives is None:
+        logit_lives = 2 if kill_on == "logit" else 1
+    down = range(TWO_SUT_KILL[0], TWO_SUT_KILL[1]) if kill_on == "logit" else range(0)
+    gen, ingress, egress = [], [], []
+    for offset in range(5, 301, 5):
+        stamp = _stamp(T0 + offset)
+        gen.append(_line(stamp, "logit.process.uptime", "gauge", float(offset)))
+        for metric in ("logit.output.messages", "logit.output.datagrams"):
+            gen.append(_line(stamp, metric, "sum", PER_DRAIN, component="out"))
+        gen.append(_line(stamp, "logit.component.events.sent", "sum", PER_DRAIN,
+                         component="load"))
+        gen.append(_line(stamp, "logit.component.batches.sent", "sum", PER_DRAIN // 100,
+                         component="load"))
+        if offset in down:
+            continue
+        # `logit` drains 2 s before the generator and `collector`, as an unrelated process does.
+        early = _stamp(T0 + offset - 2)
+        restarted = logit_lives == 2 and offset > TWO_SUT_KILL[1]
+        ingress.append(_line(early, "logit.process.uptime", "gauge",
+                             float(offset - 2 - (TWO_SUT_KILL[1] if restarted else 0))))
+        for metric, value, comp in (("logit.input.datagrams", PER_DRAIN, "in"),
+                                    ("logit.component.events.sent", PER_DRAIN, "in"),
+                                    ("logit.component.events.received", PER_DRAIN, "hop"),
+                                    ("logit.component.batches.received", 10, "hop"),
+                                    ("logit.component.batches.delivered",
+                                     0 if stalled and offset in (195, 200) else
+                                     2 if partial and offset == 200 else
+                                     10 + (replayed if restarted and offset == 215 else 0),
+                                     "hop")):
+            ingress.append(_line(early, metric, "sum", value, component=comp))
+        ingress.append(_line(early, "logit.component.receive.utilization", "gauge", 0,
+                             component="in"))
+        last = logit_lives == 2 and offset == max(o for o in range(5, TWO_SUT_KILL[0], 5))
+        queued = (23 if stalled else 11 if partial else 3) if last else 0
+        ingress.append(_line(early, "logit.component.buffer.batches", "gauge", queued,
+                             component="hop"))
+        if logit_lives == 2 and offset == TWO_SUT_KILL[1] + 2:
+            ingress.append(_line(early, "logit.component.buffer.disk.replayed", "sum",
+                                 replayed, component="hop"))
+    if hop_dropped:
+        ingress.append(_line(_stamp(T0 + 98), "logit.component.events.dropped", "sum",
+                             hop_dropped, component="hop", attrs={"reason": "overflow_oldest"}))
+    if collector_lives == 2:
+        lives = [(0, 0, range(5, TWO_SUT_KILL[0], 5)),
+                 (1, TWO_SUT_KILL[1], range(215, 321, 5))]
+    else:
+        lives = [(0, 0, range(5, 321, 5))]
+    for life, start, offsets in lives:
+        for offset in offsets:
+            stamp = _stamp(T0 + offset)
+            w = PER_DRAIN if offset <= 300 and offset not in down else 0
+            if life == 1 and offset == 215 and kill_on != "logit":
+                w += 2 * PER_DRAIN
+            if offset == (215 if collector_lives == 2 else 250):
+                w += extra
+            if offset == 100:
+                w -= short
+            egress.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
+            for metric, value, comp in (("logit.component.events.sent", w, "hop_in"),
+                                        ("logit.component.events.received", w, "window"),
+                                        ("logit.transform.metrics.absorbed", w, "window"),
+                                        ("logit.component.events.sent", 1, "window"),
+                                        ("logit.component.events.received", 1, "sink"),
+                                        ("logit.component.batches.received", 1, "sink"),
+                                        ("logit.component.batches.delivered",
+                                         1 + (2 if life == 1 and offset == 215 else 0),
+                                         "sink")):
+                egress.append(_line(stamp, metric, "sum", value, component=comp))
+            if life == 1 and offset == 215:
+                egress.append(_line(stamp, "logit.component.buffer.disk.replayed", "sum", 2,
+                                    component="sink"))
+                egress.append(_line(stamp, "logit.input.batches.resends", "sum", 3,
+                                    component="hop_in"))
+            queued = 2 if collector_lives == 2 and life == 0 and offset == offsets[-1] else 0
+            egress.append(_line(stamp, "logit.component.buffer.batches", "gauge", queued,
+                                component="sink"))
+            for metric in ("logit.component.buffer.utilization", "logit.component.retrying"):
+                egress.append(_line(stamp, metric, "gauge", 0, component="sink"))
+    egress.append(_line(_stamp(T0 + 100), "logit.component.events.dropped", "sum", 1,
+                        component="window", attrs={"reason": "stale"}))
+    for service, metric, component, reason in drops:
+        line = _line(_stamp(T0 + 150), metric, "sum", 1, component=component,
+                     attrs={"reason": reason})
+        (ingress if service == "logit" else egress).append(line)
+    timeline = [_phase("start", 0, t0=T0)]
+    if kill_on is not None:
+        timeline += [
+            _action("apply", "c0s1", "kill", kill_on, TWO_SUT_KILL[0], TWO_SUT_KILL[0] + 0.1,
+                    affects_udp_ingress=kill_on == "logit", affects_egress=True),
+            _action("revert", "c0s1", "kill", kill_on, TWO_SUT_KILL[1] - 1, TWO_SUT_KILL[1],
+                    affects_udp_ingress=kill_on == "logit", affects_egress=True),
+            _ready("c0s1", kill_on, TWO_SUT_KILL[1] + 1)]
+    if collector_restart:
+        timeline += [
+            _action("apply", "c0s3", "stop", "collector", TWO_SUT_KILL[0], TWO_SUT_KILL[0] + 0.1,
+                    affects_egress=True),
+            _action("revert", "c0s3", "stop", "collector", TWO_SUT_KILL[1] - 1, TWO_SUT_KILL[1],
+                    affects_egress=True),
+            _ready("c0s3", "collector", TWO_SUT_KILL[1] + 1)]
+    if pause:
+        timeline += [_action("apply", "c0s2", "pause", "collector", 240, 240.1,
+                             affects_egress=True),
+                     _action("revert", "c0s2", "pause", "collector", 249, 250,
+                             affects_egress=True)]
+    timeline += [_phase("end_begin", 300), _phase("sink_drained", 305, service="logit", held=True),
+                 _phase("sut_stopped", 310, service="logit"), _phase("end_end", 330)]
+    ledger = {**LEDGER, "sink": [{"id": "sink", "backend": "victoria-metrics",
+                                  "vm_selector": "{__name__=~\"x_[0-9]+_total\"}"}],
+              "hop": [TWO_SUT_HOP]}
+    run_dir = _run_dir(tmp, name, timeline, ingress, ledger=ledger,
+                       services=TWO_SUT_ROLES, suts=["logit", "collector"],
+                       configs={"sut": "logit-sut.yaml", "collector": "logit-collector.yaml"})
+    (run_dir / "configs").mkdir()
+    (run_dir / "configs" / "logit-sut.yaml").write_text(
+        KILL_SUT_CONFIG.split("  window:")[0] + TWO_SUT_HOP_CONFIG)
+    (run_dir / "configs" / "logit-collector.yaml").write_text(TWO_SUT_COLLECTOR_CONFIG)
+    (run_dir / "logs" / "collector.stdout").write_text("\n".join(egress) + "\n")
+    (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
+    # V: one series whose total restarts at collector's life 1: its killed life 0 one window
+    # short of the 40,000 it absorbed, inside its band, and life 1 all 20,000 it absorbed.
+    values, timestamps = [], []
+    segments = [(39000 - short, range(10, 201, 10)), (20000 + extra, range(220, 321, 10))]
+    if collector_lives == 1:
+        segments = [(60000 - (2 * PER_DRAIN if down else 0) + extra - short,
+                     range(10, 321, 10))]
+    for total, stamps in segments:
+        for i, s in enumerate(stamps):
+            values.append(total * (i + 1) // len(stamps))
+            timestamps.append(int((T0 + s) * 1000))
+    _write_export(run_dir, "sink", [{"metric": {"__name__": "x_0_total"}, "values": values,
+                                     "timestamps": timestamps}])
+    return run_dir
+
+
+def _two_sut_checks():
+    """The checks across a native hop: each service's lives come from its own telemetry and the
+    starts the timeline gives it, so a kill on `collector` makes two lives there and leaves
+    `logit` one; the listener rows judge `logit`'s final life and the rows from `aggregate` on
+    `collector`'s, fed by `logit_in`'s E_B, with V split on `collector`'s lives; `ledger.hop`
+    judges the hop on run totals, exact with no kill or pause, with a killed far side's tail and
+    one send window of surplus allowed, and a counted hop drop leaving the gap; `ledger.summary`
+    FAILs a surplus end to end; `progress`, `ledger.replay`, `identity.sink`, and `recovery`
+    read each sink in its own SUT; `drops` keys each term on its service; and the end
+    sequence's phases are read per service."""
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = _two_sut_run(tmp, "two-kill")
+        data = checks.RunData(run_dir)
+        led = checks.Ledger(data)
+        expect(led.problems == [] and led.across and led.inn.service == "logit"
+               and led.service == "collector",
+               f"two SUTs each read their own telemetry with no problem, got {led.problems}")
+        expect(led.inn.lives == [0] and led.inn.killed == []
+               and led.lives == [0, 1] and led.killed == [0]
+               and led.killed_at == {0: T0 + TWO_SUT_KILL[0]},
+               f"a kill on collector makes two collector lives and leaves logit one, got "
+               f"{led.inn.lives} {led.inn.killed} {led.lives} {led.killed_at}")
+        expect(led.V.get("sink") == {0: 39000, 1: 20000},
+               f"V splits on collector's lives, got {led.V.get('sink')}")
+        expect(led.R == 770 and led.interval == 10.0 and led.window == 8
+               and led.per_frame == 100 and led.R_hop == 6500,
+               f"R and the window read logit's config, the aggregate window collector's, and a "
+               f"frame carries 100 events, got {led.R} {led.interval} {led.window} "
+               f"{led.per_frame} {led.R_hop}")
+        rows = {r.id: r for r in checks.run_all(run_dir)}
+        for row in ("ledger.intake", "ledger.aggregate", "ledger.edge", "ledger.replay",
+                    "progress", "ledger.wire", "recovery", "ledger.hop", "ledger.egress",
+                    "ledger.summary", "identity.sink"):
+            expect(rows[row].status == checks.PASS, f"{row} PASSes two SUTs, got {rows[row]}")
+        detail = rows["ledger.intake"].detail
+        expect("final life 0: W − D 60,000 vs E + B 60,000" in detail
+               and "collector life 0: E_B − X_B − Ab 0 within [0, R_hop]" in detail,
+               f"ledger.intake judges logit's final life and collector's earlier one, got "
+               f"{detail}")
+        expect(rows["ledger.aggregate"].detail.startswith("final life 1: Ab 20,000 == A 20,000"),
+               f"ledger.aggregate judges collector's final life, got "
+               f"{rows['ledger.aggregate'].detail}")
+        detail = rows["ledger.edge"].detail
+        expect("logit final life 0: E 60,000 == S_hop[hop] 60,000" in detail
+               and "collector final life 1: E_B[hop_in] 20,000 == A 20,000" in detail
+               and "A_sent 22 == S_in[sink] 22 (aggregate to sink)" in detail,
+               f"ledger.edge judges each side in its own final life, got {detail}")
+        detail = rows["ledger.hop"].detail
+        expect("ΣS_hop 60,000 − hop dropped 0 − ΣE_B 60,000 = 0, ok" in detail
+               and "resends 3 at collector" in detail
+               and "collector life 0 killed: −800 (its marks lost), +1,000" in detail,
+               f"ledger.hop balances the hop on run totals, got {detail}")
+        detail = rows["ledger.egress"].detail
+        expect("life 0 (killed): Ab 40,000 − V[sink] 39,000 = 1,000, within band" in detail
+               and "life 1 (final): Ab 20,000 − V[sink] 20,000 = 0, ok" in detail,
+               f"ledger.egress judges collector's lives fed by the hop, got {detail}")
+        expect("end to end over the run, G 60,000 less counted loss 0: sink: V 59,000 <= G − "
+               "counted 60,000" in rows["ledger.summary"].detail,
+               f"ledger.summary bounds V end to end, got {rows['ledger.summary'].detail}")
+        expect("logit hop: final life 0" in rows["identity.sink"].detail
+               and "gap 0" in rows["identity.sink"].detail,
+               f"identity.sink judges the hop sink in logit, got {rows['identity.sink']}")
+        lines = "\n".join(rows["recovery"].lines)
+        expect("c0s1 (kill on collector): collector sink recovered at" in lines
+               and "c0s1 (kill on collector): logit hop recovered at" in lines
+               and "ingest 200/s (100%)" in lines,
+               f"recovery judges each SUT's sinks on its own drains, got {lines}")
+        expect("sink: life 1's first drain replayed 2 vs killed life 0's last-drain "
+               "buffer.batches 2" in rows["ledger.replay"].detail,
+               f"ledger.replay judges collector's killed life, got {rows['ledger.replay']}")
+        expect(rows["drops"].status == checks.WARN
+               and rows["drops"].lines == [
+                   "collector window: logit.component.events.dropped{reason=\"stale\"} 1"],
+               f"drops reads each SUT's counters and names the service, got {rows['drops']}")
+        expect(data.sut_phase("sink_drained", "collector") is None
+               and data.sut_phase("sink_drained", "logit")["held"],
+               "an end-sequence phase is read for its own SUT service")
+
+        def hop_row(name, **kwargs):
+            return {r.id: r for r in checks.run_all(_two_sut_run(tmp, name, **kwargs))}
+
+        within = hop_row("two-within", extra=500)
+        expect(within["ledger.hop"].status == checks.PASS
+               and "= -500, within allowance (allowance [-800, 1,000]"
+               in within["ledger.hop"].detail,
+               f"a surplus inside one send window after collector's kill passes, got "
+               f"{within['ledger.hop']}")
+        beyond = hop_row("two-beyond", extra=900)
+        expect(beyond["ledger.hop"].status == checks.FAIL
+               and "= -900, surplus" in beyond["ledger.hop"].detail,
+               f"a surplus past one send window FAILs, got {beyond['ledger.hop']}")
+        exact = hop_row("two-exact", kill_on=None, collector_lives=1, extra=1)
+        expect(exact["ledger.hop"].status == checks.FAIL
+               and "= -1, surplus (no kill or pause of either side, so 0)"
+               in exact["ledger.hop"].detail,
+               f"with no kill or pause the hop must balance, got {exact['ledger.hop']}")
+        expect(exact["ledger.summary"].status == checks.FAIL
+               and exact["ledger.summary"].detail.startswith(
+                   "end to end over the run, G 60,000 less counted loss 0: sink: V 60,001 > G "
+                   "− counted 60,000, a surplus of 1"),
+               f"ledger.summary FAILs a surplus end to end that every per-life term balances, "
+               f"got {exact['ledger.summary']}")
+        short = hop_row("two-short", kill_on=None, collector_lives=1, short=10)
+        expect(short["ledger.hop"].status == checks.FAIL
+               and "= 10, uncounted" in short["ledger.hop"].detail,
+               f"lines the hop lost uncounted FAIL, got {short['ledger.hop']}")
+        counted = hop_row("two-counted", kill_on=None, collector_lives=1, short=10,
+                          hop_dropped=10)
+        expect(counted["ledger.hop"].status == checks.PASS
+               and "hop dropped 10" in counted["ledger.hop"].detail,
+               f"a counted hop drop leaves the gap, got {counted['ledger.hop']}")
+        expect(counted["drops"].lines == [
+                   "collector window: logit.component.events.dropped{reason=\"stale\"} 1"],
+               f"drops leaves the hop sink's counted drops to ledger.hop, got "
+               f"{counted['drops'].lines}")
+        tail = hop_row("two-tail", short=500)
+        expect(tail["ledger.hop"].status == checks.PASS
+               and "= 500, within allowance" in tail["ledger.hop"].detail,
+               f"a killed collector life's uncounted tail passes, got {tail['ledger.hop']}")
+        paused = hop_row("two-paused", kill_on=None, collector_lives=1, extra=300,
+                         pause=True)
+        expect(paused["ledger.hop"].status == checks.PASS
+               and "c0s2 pause on collector: −800" in paused["ledger.hop"].detail,
+               f"a pause of collector allows one send window of surplus, got "
+               f"{paused['ledger.hop']}")
+        extra_drops = hop_row("two-drops", kill_on=None, collector_lives=1, drops=(
+            ("logit", "logit.component.batches.dropped", "hop", "rejected"),
+            ("logit", "logit.component.batches.dropped", "in", "closed_consumer"),
+            ("logit", "logit.component.datagrams.dropped", "in", "queue_full"),
+            ("collector", "logit.component.batches.dropped", "sink", "shutdown"),
+            ("collector", "logit.component.events.dropped", "hop_in", "closed_consumer"),
+            ("collector", "logit.component.events.dropped", "in", "closed_consumer")))
+        expect(extra_drops["ledger.hop"].status == checks.FAIL
+               and "FAIL: 1 batch(es) rejected by the destination"
+               in extra_drops["ledger.hop"].detail,
+               f"a rejected hop batch FAILs ledger.hop, got {extra_drops['ledger.hop']}")
+        expect(extra_drops["drops"].lines == [
+                   "logit in: logit.component.batches.dropped{reason=\"closed_consumer\"} 1",
+                   "collector in: logit.component.events.dropped{reason=\"closed_consumer\"} 1",
+                   "collector window: logit.component.events.dropped{reason=\"stale\"} 1"],
+               f"drops leaves out what ledger.hop, the ledger's listener terms, X_B, and "
+               f"ledger.egress judge, and keeps logit's own batch drop off the hop and a "
+               f"collector node that shares a listener's id, got {extra_drops['drops'].lines}")
+
+        killed = hop_row("two-logit-killed", kill_on="logit", collector_lives=1)
+        for row in ("ledger.hop", "ledger.replay", "ledger.intake", "ledger.edge",
+                    "identity.sink", "ledger.egress", "ledger.summary"):
+            expect(killed[row].status == checks.PASS,
+                   f"{row} PASSes a kill on logit, got {killed[row]}")
+        expect("logit life 0 killed: −1,000 (200/s over its last drain interval), +100 (the "
+               "batch in hand))" in killed["ledger.hop"].detail,
+               f"ledger.hop allows a killed logit life's tail below and one frame above, and "
+               f"no replay with collector up throughout, got {killed['ledger.hop']}")
+        lost = hop_row("two-logit-lost", kill_on="logit", collector_lives=1, short=500)
+        expect(lost["ledger.hop"].status == checks.FAIL
+               and "= 500, uncounted" in lost["ledger.hop"].detail,
+               f"more than one frame missing after a logit kill FAILs, got {lost['ledger.hop']}")
+        twice = hop_row("two-logit-twice", kill_on="logit", collector_lives=1, extra=1250)
+        expect(twice["ledger.hop"].status == checks.FAIL
+               and "= -1,250, surplus" in twice["ledger.hop"].detail,
+               f"a killed logit's replay forwarded again by a collector that kept its marks "
+               f"FAILs, got {twice['ledger.hop']}")
+        again = hop_row("two-logit-again", kill_on="logit", collector_restart=True, extra=1250)
+        expect(again["ledger.hop"].status == checks.PASS
+               and "= -1,250, within allowance (allowance [-1,300, 100]" in
+               again["ledger.hop"].detail
+               and "−300 (its replay of frames committed after its last cursor persist, which "
+               "collector, restarted at +213s, forwards again)" in again["ledger.hop"].detail,
+               f"a killed logit's replay forwarded again by a collector that restarted in "
+               f"between passes, got {again['ledger.hop']}")
+        lost = hop_row("two-logit-tail", kill_on="logit", collector_lives=1, extra=500)
+        expect(lost["ledger.hop"].status == checks.PASS
+               and "= -500, within allowance" in lost["ledger.hop"].detail,
+               f"lines a killed logit life took after its last drain pass, got "
+               f"{lost['ledger.hop']}")
+        expect("logit hop: life 1's first drain replayed 3 vs killed life 0's last-drain "
+               "buffer.batches 3, band [-12, 14]: 2.0 batches/s received and 2.0 delivered"
+               in killed["ledger.replay"].detail,
+               f"ledger.replay judges the hop sink's replay within its band, got "
+               f"{killed['ledger.replay']}")
+        late = hop_row("two-logit-late", kill_on="logit", collector_lives=1, replayed=10)
+        expect(late["ledger.replay"].status == checks.PASS,
+               f"frames delivered since the last checkpoint replay again, inside the band, got "
+               f"{late['ledger.replay']}")
+        stalled = hop_row("two-logit-stalled", kill_on="logit", collector_lives=1,
+                          replayed=36, stalled=True)
+        expect(stalled["ledger.replay"].status == checks.PASS
+               and "band [-1, 14]" in stalled["ledger.replay"].detail
+               and "its last delivering 2.0/s" in stalled["ledger.replay"].detail,
+               f"commits before a stalled hop's last checkpoint replay again, from its last "
+               f"delivering drain's rate, got {stalled['ledger.replay']}")
+        partial = hop_row("two-logit-partial", kill_on="logit", collector_lives=1,
+                          replayed=24, partial=True)
+        expect(partial["ledger.replay"].status == checks.PASS
+               and "band [-4, 14]" in partial["ledger.replay"].detail,
+               f"a drain interval whose delivery stopped partway doesn't understate the commits "
+               f"a replay repeats, got {partial['ledger.replay']}")
+        over = hop_row("two-logit-over", kill_on="logit", collector_lives=1, replayed=20)
+        expect(over["ledger.replay"].status == checks.FAIL
+               and "off by 17" in over["ledger.replay"].detail,
+               f"a hop replay past the band FAILs, got {over['ledger.replay']}")
+        on_logit = checks.Ledger(checks.RunData(
+            _two_sut_run(tmp, "two-kill-logit", kill_on="logit", collector_lives=1,
+                         logit_lives=1)))
+        expect(any("SUT logit telemetry shows 1 life/lives where logit.process.uptime "
+                   "decreases, but the timeline starts the service into 2" in p
+                   for p in on_logit.problems)
+               and not any("collector" in p for p in on_logit.problems),
+               f"a kill on logit counts logit's lives alone, got {on_logit.problems}")
+        short = checks.Ledger(checks.RunData(
+            _two_sut_run(tmp, "two-kill-short", collector_lives=1)))
+        expect(any("SUT collector telemetry shows 1 life/lives" in p for p in short.problems),
+               f"a kill on collector its telemetry doesn't show is named, got {short.problems}")
 
 
 def _standin_base(root):
@@ -5925,7 +6573,8 @@ def run(root, quiet=False):
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
                      _report, _expected_event_rules, _exit_driver, _ready_words, _exit_watchdog,
                      _script_ledger, _sink_ledger, _roles, _sink_rules, _driver_roles,
-                     _sources_ledger, _source_rules, _fanin_driver, _per_service, _slope_edges,
+                     _sources_ledger, _source_rules, _fanin_driver, _two_sut_rules,
+                     _two_sut_driver, _two_sut_checks, _per_service, _slope_edges,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
                      _standin_server, _respond_rules, _standin_driver, _standin_checks,
                      _class_signatures, _datadog_codec, _datadog_counts, _datadog_server,
@@ -5934,7 +6583,8 @@ def run(root, quiet=False):
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
-                              _fanin_driver, _expected_rules, _standin_codec, _standin_server,
+                              _fanin_driver, _two_sut_rules, _two_sut_driver,
+                              _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
                               _datadog_rules)
                 part(root) if part in takes_root else part()
