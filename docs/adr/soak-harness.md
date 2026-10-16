@@ -294,7 +294,9 @@ counts, and, for a kill or a pause of the receiving side, one send window of fra
 twice ([ADR `native-hop-named-acks`](native-hop-named-acks.md),
 [`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)). A graceful stop of the
 receiving side is judged exact, because `logit_in` acknowledges everything it forwarded before
-it closes.
+it closes, except that a killed sender's spool replays the frames it committed after its last
+cursor persist, which a receiving side restarted since forwards again, so each killed sender
+life is allowed that many frames too.
 
 A frame forwarded twice adds the same increments to every count after the hop and to V, so
 every per-life term on the receiving side balances around it. `ledger.summary` adds one bound no
