@@ -1,6 +1,6 @@
 ---
 created: 2026-09-15
-updated: 2026-10-13
+updated: 2026-10-16
 ---
 
 # `Event.new(t)`: Lua constructs events from the table shape `event:to_table()` already emits
@@ -247,3 +247,14 @@ An exemplar's value is a `logit_core::MetricValue` under [ADR
 `Event.new` takes the same optional `type` on an exemplar table, defaulting to `"f64"` and parsed
 by the rules in the typed metric values amendment above. The finiteness rule applies to an `f64`
 exemplar value only.
+
+## Amendment: in-place `event.log` writes (2026-10-16)
+
+`event.log.message`, `severity`, and `body_format` are writable in place under [ADR
+`lua-in-place-edits`](lua-in-place-edits.md), the follow-up this ADR's Decision and Consequences
+named. A write parses through this constructor's parsers for the same `log` keys, so it accepts
+what a `log` table accepts and refuses with the same message under an `event.log.<field>` label
+instead of `Event.new: log.<field>`; every `Event.new` message is unchanged. Two `nil` rules
+differ from the constructor's: `body_format = nil` is an error where an absent key defaults to
+`raw`, and `message = nil` is a no-op on a log whose message is already `Null`. A script that
+changes a log field no longer needs `Event.new(event:to_table())`.

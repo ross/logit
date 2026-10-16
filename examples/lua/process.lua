@@ -107,10 +107,10 @@ local function remember_user(name)
   end
 end
 
--- An alert is a new, short log line rather than a copy of the request line. The app sends every
--- line at one syslog priority and puts its level in the body, and a copy would keep that
--- priority: event.log.severity is read-only. A new event takes its own, which syslog_out turns
--- into the alert's PRI.
+-- An alert is a new, short log line rather than a copy of the request line: the request line
+-- still goes to the archive, and the alert carries only the fields someone paged needs. The app
+-- sends every line at one syslog priority and puts its level in the body, so the alert sets its
+-- own severity, which syslog_out turns into the alert's PRI.
 local function alert_for(event, route, status)
   local a = event.attributes
   local message = string.format("%s %s returned %d", a.method or "-", route, status)

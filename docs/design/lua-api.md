@@ -73,10 +73,9 @@ contract" below).
 
 **Typed record access.** Each payload has its own proxy:
 
-- `event.log` is read/write on its trace context (`trace_id`/`span_id`/`trace_flags`) and on
-  `event_name`/`observed_timestamp`, and read-only on
-  `message`/`severity`/`body_format`/`dropped_attributes_count`. See "Reading and writing
-  `event.log`" below.
+- `event.log` is read/write on every field but `dropped_attributes_count`: `message`,
+  `severity`, `body_format`, its trace context (`trace_id`/`span_id`/`trace_flags`),
+  `event_name`, and `observed_timestamp`. See "Reading and writing `event.log`" below.
 - `event.metrics` is an array-like proxy over the event's metric list. It is writable only on the
   fields a script can change without breaking a kind's invariants (a `sum`/`gauge`'s `value`, a
   `sum`'s `temporality`/`monotonic`) and read-only everywhere else. See "Reading and writing
@@ -621,9 +620,9 @@ end
 
 | Field | Access |
 |---|---|
+| `message`, `severity`, `body_format` | read/write |
 | `trace_id`, `span_id`, `trace_flags` | read/write |
 | `event_name`, `observed_timestamp` | read/write |
-| `message`, `severity`, `body_format` | read-only for now |
 | `dropped_attributes_count` | read-only |
 
 **Trace context.** `trace_id`/`span_id` are lowercase hex strings, `nil` when absent: 32
@@ -641,14 +640,29 @@ characters (16 bytes) and 16 characters (8 bytes), the same shape the `trace` gl
 - An invalid hex string, or a `trace_flags` outside `0..=255`, is a runtime error naming the
   field, the same strictness `event.timestamp`'s parse has.
 
-**`message`/`severity`/`body_format` are read-only for now.** Writing them waits on a concrete
-need; it isn't an oversight. Assigning to any of the three raises a "read-only for now" error.
+**`message`, `severity`, and `body_format`** are read/write. A write accepts what `Event.new`'s
+`log` table accepts for the same key ("Constructing events" below), through the same parsers, and
+a refusal names the field (`event.log.severity must be one of trace, debug, info, warn, error,
+fatal (or nil), got "warning"`). `nil` differs per field:
 
-- `message` reads as whatever `Value` the log body holds, most commonly a string.
+- `message` reads as whatever `Value` the log body holds, most commonly a string. A write takes
+  any value an attribute write takes: a string, number, boolean, or table, converted the same way.
+  Assigning `nil` raises `event.log.message is required`, because a log needs a message. Writing
+  back what you read is a no-op that keeps the stored type, as for an attribute: a bytes body
+  stays bytes even when it's valid UTF-8. On a log with no body, which the OTLP logs decoder
+  stores as a null that reads as `nil`, `event.log.message = event.log.message` isn't an error.
 - `severity` reads as a lowercase name
   (`"trace"`/`"debug"`/`"info"`/`"warn"`/`"error"`/`"fatal"`, matching `stdio_out`'s rendering),
-  or `nil` if the record carries none.
-- `body_format` reads as `"raw"`/`"json"`/`"structured"`.
+  or `nil` if the record carries none. Assigning `nil` clears it. On an event from `syslog_in`,
+  `syslog_out` writes the PRI from the private `_logit.syslog.severity` attribute, which outranks
+  `severity`, so a script that changes `severity` for `syslog_out` also deletes that attribute.
+- `body_format` reads as `"raw"`/`"json"`/`"structured"`. Assigning `nil` is an error, though
+  `Event.new` defaults an absent `body_format` to `"raw"`, because a write names the format it
+  wants.
+
+The fields are independent. Writing `message` doesn't change `body_format`, and writing
+`body_format` doesn't reparse the message, so a JSON string written into a `"structured"` log stays
+a string. Set both when a rewrite changes what the body is.
 
 **`event_name`, `observed_timestamp`, and `dropped_attributes_count`** are real `LogRecord` fields
 ([`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)).
@@ -882,9 +896,9 @@ The `Event` global, a table with one function, `new`, is installed on every work
 `Event.new` takes one table in exactly the shape `to_table()` returns (same keys, encodings, and
 nesting) and returns an ordinary event handle. You can mutate it, `clone()` it, mark it with
 `to()`, and return it from `process()` or include it in a `flush()` table, like any event a script
-was handed. `Event.new(event:to_table())` round-trips every lossless shape, so "rebuild this event
-with one field changed" is
-`local t = event:to_table(); t.log.severity = "error"; return Event.new(t)`.
+was handed. `Event.new(event:to_table())` round-trips every lossless shape. A field the proxy can
+write needs no rebuild, so `event.log.severity = "error"` changes one log field in place, and
+`Event.new` is for what the proxy can't write, such as a span.
 
 ```lua
 -- a stateful script minting a log line at each tick, with no incoming event to copy from

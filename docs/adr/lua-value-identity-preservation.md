@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-08-29
+updated: 2026-10-16
 ---
 
 # Preserving `Value` variant identity across a Lua round-trip
@@ -118,3 +118,9 @@ attribute reads as `nil`, so `event.attributes.x = event.attributes.x` on one no
 where this decision kept it. Every other variant's read-back write is still a no-op and keeps its
 variant. A script can't write `Value::Null`; `docs/known-gaps/transforms.md`'s Lua section records
 both consequences.
+
+The no-op rule also covers `event.log.message`, which the same ADR makes writable:
+`event.log.message = event.log.message` keeps a `Bytes` message `Bytes` and allocates nothing.
+There the no-op check runs *before* the `nil` refusal, the reverse of the attribute order, because
+a log can't lose its message: writing back a `Null` message, the OTLP logs decoder's body-less
+log, is a no-op rather than an error.

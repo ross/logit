@@ -244,9 +244,9 @@ its parent's branch, brought up to date with `git merge origin/main`.
 |---|---|---|---|
 | W0 | ADR `lua-in-place-edits` and this plan, with README rows. Docs only | `docs/adr/`, `docs/plans/` | — |
 | W1 | `= nil` deletes, on all three attribute proxies; `http-access-logs.md`; identity-ADR amendment; the two `Null` known-gaps entries | `proxy.rs`, `resource.rs`, `scope.rs`, `value.rs` | W0 |
-| W2 | `message`, `severity`, `body_format` writes through `construct.rs`'s parsers, which take an error prefix; two ADR amendments | `proxy.rs`, `construct.rs` | W1 |
+| W2 | `message`, `severity`, `body_format` writes through `construct.rs`'s parsers, which take an error prefix; `lua-api.md` rewrite example; two ADR amendments | `proxy.rs`, `construct.rs` | W1 |
 | W3 | the `pairs` wrapper and its iterator; the JIT check | sandbox setup, `proxy.rs`, `resource.rs`, `scope.rs`, `crates/logit-core/src/attrs.rs` | W2 |
-| W4 | `prusa.lua` in place; `lua-api.md` rewrite example; known-gaps; AGENTS.md's `lua` row; plan status | examples, docs | W3 |
+| W4 | `prusa.lua` in place; known-gaps; AGENTS.md's `lua` row; plan status | examples, docs | W3 |
 
 Each code PR adds its pins and its `memory.md` rows, its `lua-api.md` section, and tests in
 `crates/logit-script` for every arm, including each refusal's exact message. Each regression test

@@ -372,9 +372,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   calls `Event.new(event:to_table())` with the table edited
   ([ADR `lua-event-constructor`](../adr/lua-event-constructor.md)), paying a full table
   conversion.
-  - **To close:** an in-place write path would share the constructor's parsers. It's a small
-    follow-up, not designed yet, the same posture as in-place
-    `event.log.message`/`severity`/`body_format` writes.
+  - **To close:** an in-place write path would share the constructor's parsers, as the
+    `event.log` field writes do. It's a small follow-up, not designed yet.
 - **A script can't write `Value::Null`.** A `nil` assigned to `event.attributes`, `resource`, or
   `scope.attributes` deletes the key ([ADR `lua-in-place-edits`](../adr/lua-in-place-edits.md)).
   Two sinks render a `Null` differently from an absent key: `syslog_out` writes a `Null`
