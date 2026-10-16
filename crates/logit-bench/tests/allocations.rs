@@ -3561,8 +3561,10 @@ fn lua_process_one_event_reading_metric_len() {
 }
 
 /// A script reading `event.span.name` (`SpanProxy`): 8 = 4 (baseline) + 1 (`Box` on `Emit`) + 3
-/// (`SpanProxy` create-and-cache on first access). The name goes through `lua.create_string`,
-/// which allocates in LuaJIT's own heap, invisible to the counting allocator.
+/// (`SpanProxy` create-and-cache on first access). The name goes through `lua.create_string`, and
+/// mlua hands LuaJIT its allocator, so a new Lua string is counted; but LuaJIT interns strings,
+/// and the warm-up call's string for the same name is still live, so the read reuses it. A name
+/// the VM hasn't seen costs one more allocation (9).
 #[test]
 fn lua_process_one_event_reading_span_name() {
     let worker =

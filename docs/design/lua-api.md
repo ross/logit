@@ -117,9 +117,9 @@ one of the three proxies the wrapper returns a Rust iterator; on a table it call
   that key is still there.
 - **The loop always ends.** `pairs` bounds it at the last key the map holds when it's called, so a
   loop that adds a key each step, such as a rename, still visits each original key once. A key
-  added during the loop is never visited if no event in this process has used that name before,
-  and may be visited if one has, so don't rely on either: collect new keys and write them after
-  the loop.
+  added during the loop is never visited if it's new to the process, a string the process has
+  never interned as any key or value, and may be visited if it isn't, so don't rely on either:
+  collect new keys and write them after the loop.
 - **`resource` and `scope.attributes` steps read the current state**, so a write earlier in the
   loop, to the key the loop is on or to a later one, is what a later step sees.
 - **`next(proxy)` and `ipairs(proxy)` still raise** `table expected, got userdata`. Only `pairs`

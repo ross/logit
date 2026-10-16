@@ -31,7 +31,7 @@ use mlua::{AnyUserData, Function, Lua, Value as LuaValue};
 /// script that reassigns any of those globals doesn't change what the wrapper does.
 /// `error(.., 2)` puts the caller's line on a refusal, as the original's own argument error does.
 ///
-/// `bound_of` returns `false` for a userdata that isn't an attribute proxy. The loop's state is
+/// `bound_of` returns `-2` for a userdata that isn't an attribute proxy. The loop's state is
 /// `{proxy, bound}`, a Lua table, so it holds the proxy and never the event.
 const WRAPPER: &str = r#"
 local base_pairs, type, error, bound_of, step = ...
@@ -84,7 +84,7 @@ fn with_proxy_attrs<R>(
 }
 
 /// The loop's bound: the interning index of the map's last key when `pairs` is called, `-1` for
-/// an empty map, or `false` if `ud` isn't an attribute proxy.
+/// an empty map, or `-2` if `ud` isn't an attribute proxy.
 ///
 /// Without it, a loop that adds a key each step never ends: a key interned for the first time
 /// sorts after every existing one, so each step would find a new entry past the last. The

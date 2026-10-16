@@ -48,8 +48,8 @@ enumerates them.
   its event's return gets the destructed-handle error. `bound` is the interning index of the
   map's last key when `pairs` is called, and a step past it ends the loop. Without it, a loop that
   adds a key each step never ends, because a key interned for the first time sorts after every
-  existing one; with it, such a key is never visited, and a key added mid-loop that some event
-  interned before may be.
+  existing one; with it, such a key is never visited, and a key added mid-loop that isn't new to
+  the process, a string the process interned before, may be.
 
 ## Alternatives considered
 - **A separate delete function, keeping `= nil` as a `Null` write.** Rejected. A `nil` that
