@@ -177,8 +177,9 @@ specialization. A shared helper that loops over both tables and proxies pays thi
 Fixed-name shadowing: `pairs(resource)` and `pairs(scope.attributes)` can yield an attribute
 named like a fixed field or method (`schema_url`, `to_table`, `dropped_attributes_count`), because
 `__index` resolves those names first. Reading `resource[k]` for such a key returns the field, and
-`resource[k] = nil` on it hits the field (it clears `schema_url`, or raises), not the attribute.
-The doc says so.
+on `schema_url` the write clears the field, and on `dropped_attributes_count` it raises. A method
+name such as `to_table` has no write-side field, so `resource.to_table = nil` deletes an attribute
+of that name while reads still return the method. The doc says so.
 
 Risk to measure in W3, recorded in the PR body: loop timing for a plain table with and without the
 wrapper, a shared helper site that sees both tables and proxies, and a hot loop that calls `pairs`
