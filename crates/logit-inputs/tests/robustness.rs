@@ -150,7 +150,7 @@ async fn a_frame_body_is_held_once_at_peak() {
     let batch =
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] };
     let seq = native::SeqId { id: [1; 16], seq: 1 };
-    let payload = native::encode_hop_batch(&batch, logit_core::Provenance::default(), seq);
+    let payload = native::encode_hop_batch(&batch, logit_core::Provenance::default(), None, seq);
     let framed = frame::write_frame(native::CODEC_HOP_BATCH, Compression::None, &payload).unwrap();
     drop(payload);
     drop(batch);

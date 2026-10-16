@@ -221,16 +221,22 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
-        // One directory per example, each with a `logit.yaml`; a directory without one fails
-        // `load_with` below.
+        // One directory per example, each holding one or more `*.yaml` configs; a directory
+        // with none fails here.
         let examples_dir = root.join("examples");
-        configs.extend(
-            std::fs::read_dir(&examples_dir)
-                .unwrap_or_else(|err| panic!("reading {}: {err}", examples_dir.display()))
+        for dir in std::fs::read_dir(&examples_dir)
+            .unwrap_or_else(|err| panic!("reading {}: {err}", examples_dir.display()))
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+        {
+            let found: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap_or_else(|err| panic!("reading {}: {err}", dir.display()))
                 .map(|entry| entry.unwrap().path())
-                .filter(|path| path.is_dir())
-                .map(|dir| dir.join("logit.yaml")),
-        );
+                .filter(|path| path.extension().is_some_and(|extension| extension == "yaml"))
+                .collect();
+            assert!(!found.is_empty(), "{} holds no *.yaml config", dir.display());
+            configs.extend(found);
+        }
         // `perf/scenarios/`, `script/shape-survey`'s capture configs, `script/victoria-interop`'s,
         // `script/splunk-interop`'s, and `script/kafka-interop`'s leg configs, and `script/soak`'s
         // scenario configs run only out of CI, so a field rename must fail here, not on their next

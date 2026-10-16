@@ -4387,6 +4387,107 @@ reconnecting doesn't show as `connection_error` on the far end.
 order they arrive, so a batch slow to forward holds up the ones behind it, and `logit_in`'s shutdown
 grace, like the six HTTP listeners', is fixed at 5s with no `receive:`-shaped knob to change it.
 
+### Operating a pair
+
+[`examples/forwarding/`](../examples/forwarding/) is a complete pair to start from: an
+`edge.yaml` for each host and a `central.yaml` that delivers to VictoriaMetrics, Loki, and Tempo.
+The rules below apply to any chain of `logit_out` and `logit_in` nodes.
+
+**Start the receiver first, stop the senders first.** A `logit_out` whose peer is down holds its
+batches and retries, so a receiver that starts late costs nothing. A sender that stops while its
+receiver is up delivers its queue during its drain; one whose receiver already stopped can't, and
+loses its in-memory queue when its `buffer.shutdown_grace` ends (a `buffer.disk:` spool keeps it
+for the next start). Stopping the receiver loses whatever its own in-memory sinks still hold when
+their grace ends, and the senders never learn of it, because an `Ack` means the batch is in the
+receiver's inboxes, not delivered (`docs/known-gaps/native-hop.md`, "No end-to-end acknowledgment
+past the first hop"). In Compose, `depends_on: [central]` on each sender gives both orders.
+
+**Kill deadlines add up.** With `internal` on a
+[dedicated pipeline](#give-internal-a-dedicated-pipeline), exit takes the data drain
+(5 s with the default `shutdown_grace`) plus `internal`'s second stage (the larger of a fixed
+5 s and its sinks' `buffer.shutdown_grace`). That uses all of Docker's default 10 s
+`stop_grace_period`, with nothing to spare. Each node budgets its own deadline, and the receiver's
+data drain also delivers what the senders flushed into it before it stopped. In Compose:
+
+```yaml
+services:
+  central:
+    stop_grace_period: 20s
+```
+
+[Signal and restart behavior](#signal-and-restart-behavior) has the sizing rule for Kubernetes
+and systemd.
+
+**A receiver restart forwards resends again.** `logit_in` keeps its sender marks in memory, so
+after it restarts, every frame a sender resends is forwarded a second time
+(`docs/known-gaps/native-hop.md`, "The native hop still forwards a duplicate after a `logit_in`
+restart, an evicted sender, or a load balancer"). At-least-once delivery prefers the duplicate to
+a loss. To discard an old resend instead, put a `drop_stale` after `logit_in`.
+
+**A sender's `internal` telemetry arrives as data.** It comes in through `logit_in`, a listener,
+so the receiver's data sinks deliver it with everything else. Give the receiver's own `internal`
+separate sinks to the same backends: shared with the data sinks, its pipeline is no longer
+dedicated and doesn't drain last. `examples/forwarding/central.yaml` does both.
+
+**Split peers' self-telemetry by `service.name`, not by peer.** Unless every peer gives its
+`internal` the same id, as `examples/forwarding/edge.yaml` does, a `has_provenance` and a
+`drop_provenance` on each sender's `internal` id list every peer twice, and nothing catches a peer
+missing from one list. Every `internal` batch carries `service.name: logit` on its resource, and
+the resource crosses the hop, so one `route` claims every peer's self-telemetry whatever its id:
+
+```yaml
+by_service:
+  type: route
+  sources: [remote_in]
+  by: {resource: service.name}
+  routes:
+    logit: peer_self          # every peer's internal, whatever its id or hostname
+
+peer_self:
+  type: target
+
+peer_self_bucket:             # whatever the backend needs: here, an InfluxDB org and bucket
+  type: set
+  sources: [peer_self]
+  resource:
+    _logit.influxdb.org: ops
+    _logit.influxdb.bucket: logit_self
+```
+
+The data path takes its `sources` from `by_service`, which passes on every event the route
+doesn't claim, so a peer's data and anything else flow through unchanged. An application that
+sends its own telemetry under `service.name: logit` is routed with the peers'. To tell peers
+apart instead, `by: {provenance: origin}` with each peer's `internal` id lists every peer once.
+
+**Keep `span_sample_rate` equal across the pair.** When both nodes run an `internal` component
+and export to the same tracing backend, a batch's internal spans on the receiving node join the
+sending node's trace for it, so the backend shows one trace across both hosts
+([ADR `native-hop-trace-context`](adr/native-hop-trace-context.md)). The sending node carries a
+batch's trace only when its own `span_sample_rate` kept that trace, so the receiving node never
+records a span whose parent the sending node dropped. Set `span_sample_rate` the same on every
+node in a chain:
+
+- **A higher rate on the receiving node** keeps every forwarded trace whole and records more
+  traces of its own.
+- **A lower rate on the receiving node** cuts some forwarded traces off at the sender.
+- **A node with no `internal` component in the middle of a chain** carries no trace, so the next
+  node starts its own.
+
+The receiving node also starts a trace of its own for each batch the sender didn't sample, and
+samples those at its own rate, so it records spans for more of its traffic than its rate
+suggests: about 19% of batches at `0.1` on both nodes, not 10%.
+
+**Set `hostname:` in containers.** A sender's `internal` telemetry carries its `host.name`, and in
+a container the default is the container ID, which changes on every recreate and re-keys every
+`logit.*` series. See [Hostname](#hostname).
+
+**Deploy the receiver's config first.** `logit_in` acknowledges a batch once its consumers take
+it, and a signal gate such as `keep_signals` drops a payload it isn't configured for without a
+warning: an event left with nothing is counted `logit.component.events.discarded` on the gate, and
+a payload stripped from an event that keeps another is counted
+`logit.transform.payloads.stripped{signal}`. So when a sender starts forwarding a new signal,
+add the receiver's gate and sink for it before updating the sender.
+
 ## The nginx-side recipe
 
 This section covers the operational side of running `logit` against a real nginx. The schema
