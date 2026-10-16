@@ -39,8 +39,8 @@ use logit_proto::Decoder;
 use logit_transforms::{
     AggregateTemporality, Aggregator, Arrays, Bucket, BucketBound, BucketField, CsvParser,
     Distributions, Fields, Flatten, HttpAccess, HttpAccessConfig, JsonParser, Keep, KeepValues, Kv,
-    KvMetrics, LineProtocol, Logfmt, MetricSpec, Normalize, RegexParser, RouteRule, RouteSet, Sample,
-    SampleField, SampleKey, SampleMissing, SampleOverride, Set, Shape,
+    KvMetrics, LineProtocol, Logfmt, MetricSpec, Normalize, RegexParser, RouteRule, RouteSet,
+    Sample, SampleField, SampleKey, SampleMissing, SampleOverride, Set, Shape,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;

@@ -1319,7 +1319,8 @@ fn line_protocol_five_point_message() {
     emitted.clear();
 
     let mut event = fixtures::line_protocol_event();
-    let (forwarded, stats) = measure(|| transform.process_into(&resource, &mut event, &mut emitted));
+    let (forwarded, stats) =
+        measure(|| transform.process_into(&resource, &mut event, &mut emitted));
     assert!(!forwarded, "the parent, with nothing left, is discarded");
     assert_eq!(emitted.len(), 5, "or this measures the wrong thing");
     expect_allocs("line_protocol: a five-point message", stats, 11);
