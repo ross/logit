@@ -2489,13 +2489,27 @@ def _last_interval(tel, name, component, life):
     return round(rate * statistics.median(gaps)), rate
 
 
-def _last_rate(tel, name, component, life):
-    """A counter's per-second rate over the last drain interval of a life it moved in."""
+# How many of a life's last drain intervals that moved a counter `_commit_rate` reads.
+COMMIT_RATE_INTERVALS = 3
+
+
+def _commit_rate(tel, name, component, life):
+    """`(rate, last)`: the highest per-second rate a counter ran at over the last
+    `COMMIT_RATE_INTERVALS` drain intervals of a life it moved in, and the timestamp of the
+    last drain it moved in, or None. Delivery that stopped partway through the last interval
+    averages low over it, so an earlier, whole interval sets the rate."""
     drains = tel.life_drains(life)
     by_ts = {ts: v for ts, v, point_life in tel.counter_points(name, component=component)
              if point_life == life}
-    return next((by_ts[b] / (b - a) for a, b in reversed(list(zip(drains, drains[1:])))
-                 if b > a and by_ts.get(b)), 0.0)
+    moved = [(a, b) for a, b in zip(drains, drains[1:]) if b > a and by_ts.get(b)]
+    rate = max((by_ts[b] / (b - a) for a, b in moved[-COMMIT_RATE_INTERVALS:]), default=0.0)
+    return rate, (moved[-1][1] if moved else None)
+
+
+def _first_moved(tel, name, component, life):
+    """The first drain of a life a counter moved in, or None."""
+    return next((ts for ts, v, point_life in tel.counter_points(name, component=component)
+                 if point_life == life and v), None)
 
 
 def _cumulative(tel, name, component, minus=None):
@@ -2529,14 +2543,18 @@ def check_ledger_hop(data):
     received, less those it counted dropped, against the events the far SUT's `logit_in`
     forwarded, gap = ΣS_hop − Σhop dropped − ΣE_B. Lives can't be paired across the two
     processes, so the row judges the whole run, and 0 passes. A killed life on either side
-    loses up to one drain interval of its counts (`_last_interval`), in either direction for
-    the ingress SUT, whose hop sink spools what it received, and upward for the far SUT. A
-    killed ingress life's spool also replays the frames it committed in the checkpoint interval
-    before its last persist, which a far SUT that restarted since forwards again, so each
-    allows that many frames below 0. A kill or a pause of the far SUT can make it forward a
-    resend twice: a kill forgets its
-    marks, and a pause leaves frames in an ended connection that a resend races
-    (docs/known-gaps/native-hop.md), each up to one send window of frames below 0. Any other
+    loses up to one drain interval of its counts (`_last_interval`). For the ingress SUT that
+    lowers S_hop, so the gap may fall by that much; its hop sink counts a batch received before
+    it spools it, and a spooled batch survives the kill, so the gap may rise by only the one
+    batch in hand, one frame. For the far SUT it lowers E_B, so the gap may rise by that much.
+    A killed ingress life's spool also replays the frames it committed after its last cursor
+    persist, up to its commit rate (`_commit_rate`) × `checkpoint_interval`, which the far SUT
+    forwards again only if it restarted between that life's last delivery and the replay's,
+    forgetting their marks; then the gap may fall by that many frames too. A kill or a pause of
+    the far SUT can make it forward a resend twice: a kill forgets its marks, and a pause
+    leaves frames in an ended connection that a resend races (docs/known-gaps/native-hop.md),
+    each up to one send window of frames below 0. A partition or packet loss can't: the race
+    needs a forward parked on a full inbox. Any other
     gap FAILs, as a surplus below the allowance or uncounted loss above it. Resends, resumed
     frames, and reconnects are shown beside it. The lines report the running gap at each
     fault's start, the hop's backlog plus any surplus so far, from both sides' running totals,
@@ -2558,17 +2576,25 @@ def check_ledger_hop(data):
     race = round(led.window * led.per_frame)
     low = high = 0
     allowances = []
+    frame = round(led.per_frame)
     for life in inn.killed:
         tail, rate = _last_interval(led.ingress, "logit.component.events.received", sink, life)
-        # Its spool replays the frames it committed after its last cursor persist, which a
-        # `collector` that restarted since forwards again.
-        replay = round((math.ceil(_last_rate(led.ingress, "logit.component.batches.delivered",
-                                             sink, life) * led.hop_checkpoint) + 1)
-                       * led.per_frame)
-        low, high = low - tail - replay, high + tail
-        allowances.append(f"{inn.service} life {life} killed: ±{_n(tail)} ({rate:,.0f}/s over "
-                          f"its last drain interval), −{_n(replay)} (its replay of frames "
-                          "committed after its last checkpoint)")
+        low, high = low - tail, high + frame
+        text = (f"{inn.service} life {life} killed: −{_n(tail)} ({rate:,.0f}/s over its last "
+                f"drain interval), +{_n(frame)} (the batch in hand)")
+        commit, last = _commit_rate(led.ingress, "logit.component.batches.delivered", sink,
+                                    life)
+        replayed = (_first_moved(led.ingress, "logit.component.batches.delivered", sink,
+                                 life + 1) if life + 1 in inn.lives else None)
+        restarted = [start for start in out.life_starts[1:]
+                     if last is not None and replayed is not None and last < start <= replayed]
+        if restarted:
+            replay = (math.ceil(commit * led.hop_checkpoint) + 1) * frame
+            low -= replay
+            text += (f", −{_n(replay)} (its replay of frames committed after its last cursor "
+                     f"persist, which {out.service}, restarted at "
+                     f"{data.offset(restarted[0])}, forwards again)")
+        allowances.append(text)
     for life in out.killed:
         tail, rate = _last_interval(led.sut, "logit.component.events.sent", listener, life)
         low, high = low - race, high + tail
@@ -2837,9 +2863,9 @@ def check_ledger_replay(data):
     since the last persist, so up to one interval of commits before the last persist stays
     unpersisted, even while nothing is delivered, and replays again. With the rates over the
     life's last drain interval, t the time from its last drain to the `docker kill`'s return,
-    and the delivered rate over the last drain interval that delivered anything, replayed −
-    queued is in [−(delivered rate × t) − 1, received rate × t + that last delivered rate × the
-    checkpoint interval + 1]."""
+    and the highest delivered rate over its last few drain intervals that delivered anything
+    (`_commit_rate`), replayed − queued is in [−(delivered rate × t) − 1, received rate × t +
+    that commit rate × the checkpoint interval + 1]."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.replay", led)
     if skipped:
@@ -2866,7 +2892,7 @@ def check_ledger_replay(data):
         if service is not None:
             _, sent = _last_interval(sut, "logit.component.batches.delivered", sink, life)
             _, took = _last_interval(sut, "logit.component.batches.received", sink, life)
-            last = _last_rate(sut, "logit.component.batches.delivered", sink, life)
+            last, _ = _commit_rate(sut, "logit.component.batches.delivered", sink, life)
             done = led.inn.killed_done.get(life) or led.inn.killed_at[life]
             after = max(0.0, done - drains[-1]) if drains else 0.0
             low = -math.ceil(sent * after) - 1
@@ -2874,7 +2900,7 @@ def check_ledger_replay(data):
             band = (f", band [{_n(low)}, {_n(high)}]: {took:,.1f} batches/s received and "
                     f"{sent:,.1f} delivered over its last drain interval, {after:.1f}s from "
                     f"its last drain to the kill, and a {led.hop_checkpoint:g}s checkpoint of "
-                    f"its last {last:,.1f} delivered/s")
+                    f"its last delivering {last:,.1f}/s")
         ok = low <= replayed - queued <= high
         status = worst([status, PASS if ok else FAIL])
         where = f"{service} " if service is not None else ""
