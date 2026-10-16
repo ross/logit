@@ -1302,28 +1302,42 @@ fn flatten_pino_http_event_cold_key_cache() {
 
 // -- line_protocol (docs/adr/line-protocol-transform.md) ----------------------------------------
 
-/// One message of five points, `fixtures::LINE_PROTOCOL_MESSAGE`, through `process_into` on a warm
-/// transform with the node's scratch at its warm capacity, as the runtime holds it across batches.
-/// 11: 7 for the parsed lines' tag and field `Vec`s (a field `Vec` per line, a tag `Vec` per
-/// tagged line), 2 per message (the parsed lines and the event-to-line index of the merge), and 2
-/// for the multi-field points' `MetricList`s spilling past one record. Each child's copy of the
-/// parent's three attributes stays inline and clones no buffer, and every tag value, string field,
-/// and measurement is a slice of the message.
+/// One message of five points, `fixtures::LINE_PROTOCOL_MESSAGE`, through `process_batch`, as the
+/// node loop runs it, on a warm transform and with the node's scratch at its warm capacity. The
+/// batch is a fresh one-event `Vec`, as a listener builds it, so the append of the children into
+/// it has to grow it. Telemetry is disabled, as in `process_batch_through_keep`.
+///
+/// 11 allocations: 7 for the parsed lines' tag and field `Vec`s (a field `Vec` per line, a tag
+/// `Vec` per tagged line), 2 per message (the parsed lines and the event-to-line index of the
+/// merge), and 2 for the multi-field points' `MetricList`s spilling past one record. Each child's
+/// copy of the parent's three attributes stays inline and clones no buffer, and every tag value,
+/// string field, and measurement is a slice of the message. Growing the batch's `Vec` for the
+/// append is a realloc, not an allocation, so it shows in `reallocs` only.
 #[test]
 fn line_protocol_five_point_message() {
     let mut transform = fixtures::line_protocol();
-    let resource = fixtures::resource();
-    let mut emitted = Vec::new();
-    let mut warm = fixtures::line_protocol_event();
-    transform.process_into(&resource, &mut warm, &mut emitted);
-    emitted.clear();
+    let telemetry = Telemetry::default();
+    let batch =
+        |event| EventBatch { resource: fixtures::resource(), scope: None, events: vec![event] };
+    let mut scratch = Vec::new();
+    drop(process_batch(
+        &mut transform,
+        batch(fixtures::line_protocol_event()),
+        &mut scratch,
+        &telemetry,
+    ));
 
-    let mut event = fixtures::line_protocol_event();
-    let (forwarded, stats) =
-        measure(|| transform.process_into(&resource, &mut event, &mut emitted));
-    assert!(!forwarded, "the parent, with nothing left, is discarded");
-    assert_eq!(emitted.len(), 5, "or this measures the wrong thing");
-    expect_allocs("line_protocol: a five-point message", stats, 11);
+    let incoming = batch(fixtures::line_protocol_event());
+    let (out, stats) =
+        measure(|| process_batch(&mut transform, incoming, &mut scratch, &telemetry));
+    let out = out.expect("the points go out in the parent's batch");
+    assert_eq!(out.events.len(), 5, "the parent is discarded and its five points take its place");
+    assert!(scratch.is_empty(), "the append empties the scratch and keeps its capacity");
+    assert_eq!(
+        stats.reallocs, 3,
+        "the decode's two, plus the batch's Vec growing once for the append"
+    );
+    expect_allocs("line_protocol: a five-point message through process_batch", stats, 11);
 }
 
 // -- sample (docs/adr/consistent-sampling-component.md) -----------------------------------------

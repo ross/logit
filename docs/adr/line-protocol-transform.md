@@ -85,12 +85,14 @@ by what happened to its text:
 - `logit.transform.lines.dropped{reason="malformed"}` when the parent's log doesn't go on, the
   default for a message with at least one good point. The line's text has left the pipeline, so
   it's loss ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)).
-- `logit.transform.lines.unparsed{reason="malformed"}` when the parent's log goes on, under
-  `keep_source: true` or for a message with no good point. The text is still in the pipeline.
+- `logit.transform.lines.skipped{reason="malformed"}` when the parent's log goes on, under
+  `keep_source: true` or for a message with no good point. The text is still in the pipeline, as
+  an empty row `csv` forwards untouched is counted `rows.skipped`.
 
 Either way, a throttled diagnostic `parse_error` names the 1-based line number and the parser's
-reason. It doesn't quote the line, because a diagnostic is the process's own log and the line is
-producer data.
+reason. It doesn't quote the whole line, because a diagnostic is the process's own log and the
+line is producer data, but a reason can name the line's measurement, a key, or a number token, as
+influxd's own error text does.
 
 **One construction path, shared with `influxdb_in`.** `logit_proto::influxdb` factors the event
 construction out of `InfluxDecoder::decode_body` so that both callers use it: building an event
@@ -99,11 +101,14 @@ reserved-prefix tags. The caller supplies the base attributes (empty for `influx
 parent's for the transform), the timestamp for a point with none, and what a bad line does:
 
 - `decode_body` stays all or nothing. It parses every line first and builds nothing if one fails,
-  because an HTTP client can't resend half a request.
-- The transform skips a bad line and keeps going, because it has no client to answer.
+  because an HTTP client can't resend half a request. It emits its own counts under
+  `logit.input.`.
+- `decode_skipping`, the transform's path, skips a bad line and keeps going, because it has no
+  client to answer. It emits nothing: it reports each bad line to the caller, which decides
+  between `lines.dropped` and `lines.skipped` and counts under `logit.transform.`, along with the
+  reserved-prefix tags the decoder's per-call stats report.
 
-The counts come back in one stats struct, and each caller emits them under its own prefix,
-`logit.input.` or `logit.transform.`. A second copy of the mapping in `logit-transforms` is not
+A second copy of the mapping in `logit-transforms` is not
 allowed: the two would drift, and the module doc would describe only one of them.
 
 **Not `influxdb_in`.** The transform carries no `org`, `orgID`, or `bucket`, so `influxdb_out`
