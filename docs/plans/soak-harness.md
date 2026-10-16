@@ -779,12 +779,11 @@ is the same `output.messages`, which `statsd_out` counts only once a batch's wri
 with the precondition reversed: the sink counts no `output.datagrams`. W is
 `logit.input.frames{component=<sut_listener>}`, one per LF-terminated line, K and D are 0, and
 F, the lines the listener's framer dropped before W counted them
-(`logit.input.frames.dropped` with reason `truncated`, `oversize`, `drained`, or `malformed`), is
-counted wire loss; only `undecodable`, counted after `input.frames`, stays in B. A TCP listener
+(`logit.input.frames.dropped`, reasons in the table below), is counted wire loss; only `undecodable`, counted after `input.frames`, stays in B. A TCP listener
 has no receive queue, so R holds no queue term for it. On a file wire (W11b) G is the writer
 `file_out`'s `logit.component.events.delivered`, since `file_out` counts no `output.messages`,
-W is `logit.input.lines{component=<tail_in>}`, and K and D are 0. `kill_band`, `recovery`, and
-the end-to-end bound read the wire's W and F.
+W is `logit.input.lines{component=<tail_in>}`, and K and D are 0. `kill_band` and `recovery`
+read the wire's W; `_end_to_end` and `ledger.summary` also subtract F.
 
 From W7b the ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`,
 `identity.sink`, `recovery`, `ledger.edge`'s sink edges, `ledger.egress`, `ledger.windows`,
@@ -1664,10 +1663,12 @@ where it needs them, and a small check extension.
    stalled SUT backs up into the sender
    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md), "No receive queue on
    TCP -- the connection itself is the backpressure"): the SUT's kernel keeps ACKing until its
-   receive buffer fills, then the generator's write makes no progress for `connect_timeout`,
-   fails `Ambiguous`, and under `statsd_out`'s `at_most_once` posture drops the batch, counted
-   `ambiguous_at_most_once`, while its queue overflows, counted `overflow_newest`. A write that
-   failed partway leaves whole lines the SUT reads and G never counted, so a pause is counted
+   receive buffer fills, then the generator's write makes no progress for `connect_timeout`.
+   A first write that took nothing fails `Clean` and is retried; a write that took part of a
+   frame and then stalls fails `Ambiguous`
+   (`crates/logit-outputs/src/stream.rs`'s module table), and under `statsd_out`'s
+   `at_most_once` posture drops the batch, counted `ambiguous_at_most_once`. Meanwhile its queue
+   overflows, counted `overflow_newest`. A write that failed partway leaves whole lines the SUT reads and G never counted, so a pause is counted
    overflow and ambiguous drops plus a surplus of up to one batch per ambiguous drop. A 45 s
    partition produces no RST: with no send stall the connection survives and delivers; with one,
    the generator counts an ambiguous drop, and the abandoned socket's retransmits deliver what it

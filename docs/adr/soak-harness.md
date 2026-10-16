@@ -312,9 +312,8 @@ default, `tcp`, or `file`. The loader checks it against the listener's `type:` a
 in the SUT config, so a source is never scored in another wire's unit. The unit stays a line,
 and each wire has its own symbols. On TCP, G is still the generator sink's `output.messages`,
 which `statsd_out` counts only once a batch's write completes, and the sink must count no
-datagram. W is the listener's `input.frames`, one per line. The framer's own drops
-(`truncated`, `oversize`, `drained`, and `malformed`), lines W never counted, are F, counted
-wire loss. On a file wire G is the writer `file_out`'s `events.delivered` and W the tailer's
+datagram. W is the listener's `input.frames`, one per line. The framer's own drops,
+lines W never counted, are F, counted wire loss. On a file wire G is the writer `file_out`'s `events.delivered` and W the tailer's
 `input.lines`.
 
 TCP narrows what "uncounted by design" covers. TCP retransmits what netem drops, so netem on the
