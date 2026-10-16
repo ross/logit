@@ -303,6 +303,9 @@
 //!     a zero bound would call nearly every event stale (`docs/adr/stale-event-filtering.md`).
 //! 88. A top-level `hostname` that is empty or only whitespace: it would stamp a blank `host.name`
 //!     (`docs/adr/process-hostname.md`).
+//! 91. A `syslog_in` `framing` set to any value, `lines` included, under `transport: tcp`: TCP
+//!     framing is detected per connection, and the field chooses how a UDP datagram maps to
+//!     messages (`docs/adr/syslog-udp-datagram-framing.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -4182,6 +4185,21 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             anyhow::bail!(
                 "component '{id}': {kind_name} 'reuse_port' has no effect on the multicast group \
                  '{bind}' -- every member of a group already receives every datagram"
+            );
+        }
+    }
+
+    // Rule 91: `syslog_in`'s `framing:` is a UDP field. TCP framing is detected per connection, so
+    // any value there, `lines` too, could never take effect.
+    for (id, component) in &components {
+        if let ComponentKind::SyslogIn {
+            transport: SyslogTransport::Tcp, framing: Some(_), ..
+        } = &component.kind
+        {
+            anyhow::bail!(
+                "component '{id}': syslog_in 'framing' needs 'transport: udp' -- a TCP \
+                 connection's framing is detected from its first byte, so the field would never \
+                 take effect"
             );
         }
     }
@@ -10395,6 +10413,7 @@ mod tests {
             peer: false,
             reuse_port: false,
             proxy_protocol: false,
+            framing: None,
         }
     }
 
@@ -10413,6 +10432,27 @@ mod tests {
             peer: false,
             reuse_port: false,
             proxy_protocol: false,
+            framing: None,
+        }
+    }
+
+    /// Rule 91: `framing:` is a UDP field, so any value under TCP, `lines` included, is rejected
+    /// rather than ignored; both values are valid under UDP.
+    #[test]
+    fn rule_91_rejects_syslog_in_framing_under_tcp() {
+        let with = |transport: &str, framing: &str| {
+            let kind = listener_from_json(&format!(
+                r#"{{"type": "syslog_in", "bind": "127.0.0.1:0", "transport": "{transport}",
+                    "framing": "{framing}"}}"#
+            ));
+            resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+        };
+        for framing in ["lines", "datagram"] {
+            let Err(err) = with("tcp", framing) else { panic!("framing under tcp is an error") };
+            let err = format!("{err:#}");
+            assert!(err.contains("'in'"), "got: {err}");
+            assert!(err.contains("'framing' needs 'transport: udp'"), "got: {err}");
+            with("udp", framing).expect("framing under udp is valid");
         }
     }
 

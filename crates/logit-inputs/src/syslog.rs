@@ -31,9 +31,13 @@
 //! batch-assembly fields and `shutdown_grace` apply under TCP (graph rule 17).
 //!
 //! The decoder differs between the transports only in **line splitting**. A UDP datagram may carry
-//! several LF-separated messages, so the UDP arm splits on `\n`. A TCP frame is already one
-//! message, and an octet-counted one may contain `\n` as MSG content, so [`SyslogInput::tcp`] turns
+//! several LF-separated messages, so the UDP arm splits on `\n` by default (`framing: lines`). A
+//! sender whose single message has a multi-line or binary MSG needs `framing: datagram`
+//! ([`SyslogInput::udp_datagram`], `docs/adr/syslog-udp-datagram-framing.md`), which turns
+//! splitting off and reads the whole datagram as one message. A TCP frame is already one message,
+//! and an octet-counted one may contain `\n` as MSG content, so [`SyslogInput::tcp`] turns
 //! splitting off ([`SyslogDecoder::with_line_splitting`]) and the framer is the sole delimiter.
+//! Graph rule 91 rejects `framing:` under TCP.
 //!
 //! ## Telemetry and diagnostics
 //!
@@ -70,13 +74,27 @@ pub struct SyslogInput {
 }
 
 impl SyslogInput {
-    /// A UDP listener, the default transport, with line splitting on: one datagram may carry
-    /// several LF-separated messages.
+    /// A UDP listener, the default transport, with line splitting on (`framing: lines`): one
+    /// datagram may carry several LF-separated messages.
     pub fn new(bind: impl Into<String>) -> Self {
         Self {
             inner: Inner::Udp(UdpListener::new(
                 bind,
                 SyslogDecoder::new(Arc::new(Resource::default())),
+                UdpListenerConfig::default(),
+            )),
+        }
+    }
+
+    /// A UDP listener under `framing: datagram`: one datagram is one message, so line splitting is
+    /// off ([`SyslogDecoder::with_line_splitting`]) and a `\n` inside the MSG stays in it. A sender
+    /// that packs several messages into one datagram gets one event holding the rest of the
+    /// datagram as its MSG, with nothing counted as malformed.
+    pub fn udp_datagram(bind: impl Into<String>) -> Self {
+        Self {
+            inner: Inner::Udp(UdpListener::new(
+                bind,
+                SyslogDecoder::new(Arc::new(Resource::default())).with_line_splitting(false),
                 UdpListenerConfig::default(),
             )),
         }
@@ -317,6 +335,85 @@ mod tests {
         assert_eq!(attrs.get(PEER_ADDRESS).and_then(Value::as_str), Some("127.0.0.1"));
         assert_eq!(attrs.get(PEER_PORT), Some(&Value::I64(i64::from(port))));
         running.stop().await;
+    }
+
+    /// A real Prusa Buddy datagram: one RFC 5424 message with a nil TIMESTAMP and a MSG of 37
+    /// InfluxDB line-protocol lines.
+    const PRUSA_DATAGRAM: &[u8] = include_bytes!("../tests/fixtures/prusa-datagram-1.txt");
+
+    /// Sends [`PRUSA_DATAGRAM`] to a UDP listener built by `build`, with telemetry attached, and
+    /// returns the first batch's events and the telemetry probe.
+    async fn send_prusa_datagram(
+        build: fn(&'static str) -> SyslogInput,
+    ) -> (Vec<Event>, logit_pipeline::test_util::TelemetryProbe) {
+        use logit_pipeline::test_util::{fanout_channel, recv_events, spawn_input, TelemetryProbe};
+
+        let probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("syslog", "syslog_in", "input");
+        let mut input = build("127.0.0.1:0").with_telemetry(telemetry);
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("a bound UDP listener has an address");
+        let (fanout, mut rx) = fanout_channel(8);
+        let running = spawn_input(input, fanout).await;
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(PRUSA_DATAGRAM, addr).await.unwrap();
+        let events = recv_events(&mut rx, 1).await;
+        running.stop().await;
+        (events, probe)
+    }
+
+    /// `framing: datagram` keeps the whole 37-line MSG in one event.
+    #[tokio::test]
+    async fn udp_datagram_framing_keeps_a_multiline_msg_as_one_event() {
+        let (events, _probe) = send_prusa_datagram(SyslogInput::udp_datagram).await;
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            event.attributes.get("syslog.hostname").and_then(Value::as_str),
+            Some("10:9c:70:2d:d5:c4")
+        );
+        assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("buddy"));
+        // The datagram's trailing newline is the terminator, so 37 lines have 36 inside the MSG.
+        let message = message_str(event);
+        assert_eq!(message.matches('\n').count(), 36, "got: {message}");
+        assert!(message.starts_with("msg=920,tm=1730850936,v=4 ttemp_noz"), "got: {message}");
+        assert!(event.timestamp > 0, "a nil TIMESTAMP takes the receipt time");
+    }
+
+    /// A `0x0A` inside a binary MSG survives `framing: datagram`, and one trailing `\n` and the
+    /// `\r` before it are stripped.
+    #[tokio::test]
+    async fn udp_datagram_framing_keeps_a_newline_in_a_binary_msg() {
+        use logit_pipeline::test_util::{fanout_channel, recv_events, spawn_input};
+
+        let mut input = SyslogInput::udp_datagram("127.0.0.1:0");
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("a bound UDP listener has an address");
+        let (fanout, mut rx) = fanout_channel(8);
+        let running = spawn_input(input, fanout).await;
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"<134>1 - host app - - - \xff\x0a\xfe\r\n", addr).await.unwrap();
+
+        let events = recv_events(&mut rx, 1).await;
+        let message = &events[0].log.as_ref().expect("a log").message;
+        match message {
+            Value::Bytes(b) => assert_eq!(b.as_ref(), b"\xff\n\xfe"),
+            other => panic!("expected a bytes MSG, got {other:?}"),
+        }
+        running.stop().await;
+    }
+
+    /// The default splits the same datagram into 37 pieces, and the 36 after the first carry no
+    /// `<PRI>`.
+    #[tokio::test]
+    async fn udp_default_framing_splits_the_prusa_datagram_and_counts_the_rest_malformed() {
+        let (events, mut probe) = send_prusa_datagram(SyslogInput::new).await;
+        assert_eq!(events.len(), 1);
+        probe
+            .wait_for("36 malformed messages", |totals| {
+                totals.sum("logit.input.messages.dropped", &[("reason", "malformed")]) == 36.0
+            })
+            .await;
     }
 
     /// `with_diagnostics` reaches the UDP decoder as well as the driver, so `bad_line` reports
