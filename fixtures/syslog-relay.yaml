@@ -8,8 +8,9 @@
 #   sender (TCP) --> syslog_in --> syslog_out --> receiver (TCP)
 #
 # A TCP `syslog_in` auto-detects RFC 6587 framing per connection from its first byte (a digit
-# means octet-counting, anything else LF-delimited); there is no `framing:` field. `syslog_out`
-# over TCP always emits octet-counting, the one framing transparent to a newline inside a message.
+# means octet-counting, anything else LF-delimited). `framing:` (`lines` or `datagram`) is
+# UDP-only and rejected under TCP. `syslog_out` over TCP always emits octet-counting, the one
+# framing transparent to a newline inside a message.
 components:
   syslog_in:
     type: syslog_in
