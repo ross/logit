@@ -861,6 +861,21 @@ def _ndjson():
                             component="sink")
     expect(window == 5, f"counter over a window, got {window}")
 
+    # A `restart`: the old process's final drain at +60.07, the new one started at +60.26. The
+    # final drain is the old life's, though it falls within a second of the new life's start.
+    restart = "2026-10-08T12:01:%s"
+    lines = [
+        _line(restart % "00.000000000Z", "logit.process.uptime", "gauge", 55.0),
+        _line(restart % "00.070000000Z", "logit.process.uptime", "gauge", 55.07),
+        _line(restart % "00.070000000Z", "logit.input.lines", "sum", 4900, component="tail"),
+        _line(restart % "05.260000000Z", "logit.process.uptime", "gauge", 5.0),
+        _line(restart % "05.260000000Z", "logit.input.lines", "sum", 5000, component="tail"),
+    ]
+    tel = telemetry.parse_ndjson(lines)
+    by_life = tel.counter_by_life("logit.input.lines", component="tail")
+    expect(by_life == {0: 4900, 1: 5000},
+           f"a restart's old final drain stays in the old life, got {by_life}")
+
 
 def _stderr():
     cases = [
