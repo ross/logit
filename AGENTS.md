@@ -724,8 +724,10 @@ the operator-facing account of all of this.
   `lines_in` beside statsd, with one `[[ledger.source]]` per generator: the wire is judged per
   source and the intake per listener. `native-hop` adds a second SUT, `collector`, behind the
   native hop (`[[ledger.hop]]`), each SUT scored on its own process lives: `ledger.hop` judges
-  the hop on run totals, allowing a send window of duplicates only for a kill or a pause of
-  `collector`, and `ledger.summary` bounds V end to end by what the generators sent.
+  the hop on run totals, allowing duplicates only where a mechanism forwards them (a kill or a
+  pause of `collector`, and a killed `logit`'s spool replay to a `collector` that restarted
+  since; the plan's "The native hop (W10b)"), and `ledger.summary` bounds V end to end by what
+  the generators sent.
   `random-faults` draws its schedule from
   a seed (a `[random]` table; `--seed N` reproduces a run) and is meant for `--duration 8h`; the
   driver appends container logs in 5-minute chunks so a long run never reads a whole log at

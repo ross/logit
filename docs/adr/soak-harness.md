@@ -301,5 +301,6 @@ life is allowed that many frames too.
 A frame forwarded twice adds the same increments to every count after the hop and to V, so
 every per-life term on the receiving side balances around it. `ledger.summary` adds one bound no
 kill can loosen: V over the whole run is at most what the generators sent less every counted
-loss. A surplus anywhere past the hop breaks it.
+loss. A surplus past the hop breaks it once it exceeds the run's uncounted loss, the wire loss
+among it; `ledger.hop` judges a smaller one.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "The native hop (W10b)", has the rules.

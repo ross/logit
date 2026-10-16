@@ -1447,26 +1447,34 @@ the other.
   `collector`'s lives, with E_B − X_B − V for a stopped earlier life and the kill band's rate
   read from E_B.
 - **`ledger.hop`**, on run totals: gap = ΣS_hop − Σ hop drops − ΣE_B. 0 passes. Each killed
-  `logit` life allows ± its last drain interval of S_hop, which its telemetry may not have
-  counted though its spool forwards it, and − the frames it committed after its last cursor
-  persist (its last delivering drain's rate × `checkpoint_interval`, plus one, in frames of the
-  largest frame), which its spool replays and a `collector` that restarted since forwards again
-  ([`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md), "The native hop still
-  forwards a duplicate after a `logit_in` restart"). Each killed `collector` life allows + its last drain
-  interval of E_B, which it forwarded but never exported, and − one send window of frames: its
-  marks are gone, so it forwards a resend of what it had forwarded and not acknowledged. Each
-  `pause` of `collector` allows − one send window: the resend can race the frames an ended
-  connection still holds ([`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)). Any
-  other gap FAILs, below the allowance as a surplus and above it as uncounted. A `rejected` or
-  `disk_corrupt` batch drop at the hop sink FAILs too. Resends, resumed frames, and reconnects
-  are shown beside it, and each fault's share of the gap, from both sides' running totals
-  interpolated at its start and at its end plus `recovery_bound`, is listed in the row's lines.
+  `logit` life allows − its last drain interval of S_hop, which its telemetry may not have
+  counted though its spool forwards it, and + one frame: the hop sink counts a batch received
+  before it spools it, and a spooled batch survives a SIGKILL, so only the batch in hand can be
+  counted and lost. If `collector` restarted between that life's last delivering drain and the
+  next `logit` life's first, it also allows − the frames the killed life committed after its
+  last cursor persist (its commit rate, `_commit_rate`'s highest delivered rate over its last
+  three delivering drain intervals, × `checkpoint_interval`, plus one, in frames of the largest
+  frame): its spool replays them under their old identity, and the restarted `collector` has no
+  mark for them ([`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md), "The native hop
+  still forwards a duplicate after a `logit_in` restart"); a `collector` that kept its marks
+  acknowledges the replay as resends instead. Each killed `collector` life allows + its last
+  drain interval of E_B, which it forwarded but never exported, and − one send window of
+  frames: its marks are gone, so it forwards a resend of what it had forwarded and not
+  acknowledged. Each `pause` of `collector` allows − one send window: the resend can race the
+  frames an ended connection still holds
+  ([`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)). A partition or packet loss
+  allows nothing: the race needs a forward parked on a full inbox. Any other gap FAILs, below
+  the allowance as a surplus and above it as uncounted. A `rejected` or `disk_corrupt` batch
+  drop at the hop sink FAILs too. Resends, resumed frames, and reconnects are shown beside it,
+  and the row's lines give the running gap at each fault's start, the hop's backlog plus any
+  surplus so far, which can't be split by fault.
 - `ledger.summary`: W − D − E − B and E − S_hop in `logit`'s final life, E_B − A, A − Ab, and
   each egress term in `collector`'s, with `ledger.hop` left to judge the hop. Beside them, one
   bound end to end, which no kill or restart can loosen: each egress group's V over the whole
   run is at most G less every counted loss (K, D, B, X, the hop's drops, and X_B). A duplicate
   forwarded across the hop adds the same increments to E_B, A, Ab, and V, so every per-life term
-  balances around it; this bound and `ledger.hop` are what see it.
+  balances around it; this bound and `ledger.hop` are what see it, the bound only once the
+  surplus exceeds the run's uncounted loss, the wire loss among it.
 - `ledger.replay` for the hop sink, for each killed `logit` life followed by another. Unlike a
   sink behind `aggregate`, which gains one batch a window, the hop sink is fed by the listener,
   so its queue keeps growing between the last drain and the kill, and `collector` may take some
@@ -1474,9 +1482,11 @@ the other.
   a commit once `checkpoint_interval` (1 s by default) has passed since the last persist, so up
   to one interval of commits stays unpersisted and replays, even after `collector` stopped and
   commits stopped with it. With the received and delivered batch rates over the life's last
-  drain interval, the delivered rate over the last drain interval that delivered anything, and
+  drain interval, its commit rate (the highest delivered rate over its last three drain
+  intervals that delivered anything, since delivery that stopped partway through an interval
+  averages low over it), and
   t from its last drain to the `docker kill`'s return, replayed − queued is in
-  [−(delivered × t) − 1, received × t + that last delivered rate × the checkpoint interval + 1].
+  [−(delivered × t) − 1, received × t + the commit rate × the checkpoint interval + 1].
   The first two `native-hop` runs found both terms: a kill inside `collector`'s stop replayed 55
   batches over the queue, 50 it received in the 5 s before the kill and 5 committed before the
   stop and never persisted.
@@ -3292,8 +3302,11 @@ unpersisted and replays (`crates/logit-pipeline/src/disk_queue.rs`, `after_curso
 The band now covers both, and re-scoring both runs with `soak.py check` passes every row.
 
 The third run, `20261016T002412Z` at `c3050457`, passed every row. `results.md` below is its
-re-score with `soak.py check` after `ledger.hop` also came to allow a killed `logit` life's
-replay of those unpersisted frames, which changes no verdict.
+re-score with `soak.py check` after review tightened `ledger.hop`: a killed `logit` life
+allows one frame above 0 rather than its last drain interval, and its replay of unpersisted
+frames only when `collector` restarted before the replay, as it did before the second kill
+and not the first. Re-scored the same way, all three runs pass every row, with `ledger.hop`
+at −2,400, −2,600, and −2,400 inside allowances of about [−76,000, 11,500].
 
 | Check | Status | Detail |
 |---|---|---|
@@ -3309,12 +3322,12 @@ replay of those unpersisted frames, which changes no verdict.
 | `ledger.wire` | PASS | G 2,051,600 = W 2,040,000 + K 0 + wire 11,600 (by design: 11,718 in UDP-affecting windows, -121 steady, 3 at the end; steady loss judged 0, each run at 0 or more, against limit 500); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
 | `ledger.intake` | PASS | final life 2: W − D 390,100 vs E + B 390,100; logit life 0: W − D − B − X − S_hop 0 within [0, R]; logit life 1: W − D − B − X − S_hop 0 within [0, R]; collector life 0: E_B − X_B − Ab 0 within [0, R_hop]; collector life 1: E_B − X_B − Ab 0 within [0, R_hop]; collector life 2: E_B − X_B − Ab 0 within [0, R_hop] (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000; R_hop 48,925 = 65 x 753 events per frame) |
 | `ledger.edge` | PASS | logit final life 2: E 390,100 == S_hop[hop] 390,100 (listeners to hop); collector final life 3: E_B[hop] 451,100 == A 451,100 (hop to aggregate); collector final life 3: A_sent 1,400 == S_in[victoria_metrics] 1,400 (aggregate to victoria_metrics) |
-| `ledger.hop` | PASS | hop to hop: ΣS_hop 2,040,000 − hop dropped 0 − ΣE_B 2,042,400 = -2,400, within allowance (allowance [-85,483, 29,999]: logit life 0 killed: ±9,999 (2,000/s over its last drain interval), −8,280 (its replay of frames committed after its last checkpoint); logit life 1 killed: ±10,000 (2,000/s over its last drain interval), −9,032 (its replay of frames committed after its last checkpoint); collector life 1 killed: −24,086 (its marks lost), +10,000 (2,000/s over its last drain interval); c0s5 pause on collector: −24,086 (a resend racing an ended connection's frames)); resends 3 at collector, resumed 1 and reconnects 4 at logit; a send window is 32 frames of at most 753 events (24,086) |
+| `ledger.hop` | PASS | hop to hop: ΣS_hop 2,040,000 − hop dropped 0 − ΣE_B 2,042,400 = -2,400, within allowance (allowance [-77,207, 11,506]: logit life 0 killed: −9,999 (2,000/s over its last drain interval), +753 (the batch in hand); logit life 1 killed: −10,000 (2,000/s over its last drain interval), +753 (the batch in hand), −9,036 (its replay of frames committed after its last cursor persist, which collector, restarted at +885s, forwards again); collector life 1 killed: −24,086 (its marks lost), +10,000 (2,000/s over its last drain interval); c0s5 pause on collector: −24,086 (a resend racing an ended connection's frames)); resends 3 at collector, resumed 1 and reconnects 4 at logit; a send window is 32 frames of at most 753 events (24,086) |
 | `ledger.script` | SKIP | no [ledger] sut_script |
 | `ledger.aggregate` | PASS | final life 3: Ab 451,100 == A 451,100 (every event absorbed) |
 | `ledger.egress` | PASS | victoria_metrics: life 0: E_B − X_B − V 0 = residual 0 + Ab − V 0, ok; life 1 (killed): Ab 590,100 − V[victoria_metrics] 579,900 = 10,200, within band (band [-10,000, 30,001]: ingest 2,000/s over the last drain interval; below, the residual 0 plus one 4.99986s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual E_B − X_B − Ab 0 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 2: E_B − X_B − V 0 = residual 0 + Ab − V 0, ok; life 3 (final): Ab 451,100 − V[victoria_metrics] 451,100 = 0, ok (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
 | `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
-| `ledger.replay` | PASS | victoria_metrics: life 2's first drain replayed 0 vs killed life 1's last-drain buffer.batches 0; logit hop: life 1's first drain replayed 2 vs killed life 0's last-drain buffer.batches 1, band [-10, 20]: 10.0 batches/s received and 10.0 delivered over its last drain interval, 0.9s from its last drain to the kill, and a 1s checkpoint of its last 10.0 delivered/s; logit hop: life 2's first drain replayed 305 vs killed life 1's last-drain buffer.batches 251, band [-1, 62]: 10.0 batches/s received and 0.0 delivered over its last drain interval, 5.0s from its last drain to the kill, and a 1s checkpoint of its last 10.0 delivered/s (one batch in flight allowed) |
+| `ledger.replay` | PASS | victoria_metrics: life 2's first drain replayed 0 vs killed life 1's last-drain buffer.batches 0; logit hop: life 1's first drain replayed 2 vs killed life 0's last-drain buffer.batches 1, band [-10, 20]: 10.0 batches/s received and 10.0 delivered over its last drain interval, 0.9s from its last drain to the kill, and a 1s checkpoint of its last delivering 10.0/s; logit hop: life 2's first drain replayed 305 vs killed life 1's last-drain buffer.batches 251, band [-1, 62]: 10.0 batches/s received and 0.0 delivered over its last drain interval, 5.0s from its last drain to the kill, and a 1s checkpoint of its last delivering 10.0/s (one batch in flight allowed) |
 | `ledger.summary` | PASS | logit final life 2, collector final life 3; the hop itself is ledger.hop's: uncounted 0 = W − D − E − B 0 + E − S_hop 0 + E_B − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K) 11,600 over the run, by design; end to end over the run, G 2,051,600 less counted loss 0: victoria_metrics: V 2,032,200 <= G − counted 2,051,600 |
 | `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
 | `ledger.topic` | SKIP | victoria-metrics target: no topic |
