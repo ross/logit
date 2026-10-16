@@ -577,7 +577,8 @@ Per pair:
   [ADR `internal-span-emission-and-deterministic-sampling`](docs/adr/internal-span-emission-and-deterministic-sampling.md)
   and `internal-telemetry.md`'s "Spans" section. `docs/known-gaps/telemetry.md`'s internal-spans
   entry tracks what's still open, including the listener span's window, Lua `flush()`'s link-less
-  root, and `logit_in`'s span not marking its parent as remote.
+  root, `logit_in`'s span not marking its parent as remote, and a span recorded after the sender's
+  last drain leaving the receiver's span a dangling parent.
 
 ### Operator surface
 
