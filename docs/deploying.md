@@ -4429,10 +4429,11 @@ so the receiver's data sinks deliver it with everything else. Give the receiver'
 separate sinks to the same backends: shared with the data sinks, its pipeline is no longer
 dedicated and doesn't drain last. `examples/forwarding/central.yaml` does both.
 
-**Split peers' self-telemetry by `service.name`, not by peer.** A `has_provenance` and a
+**Split peers' self-telemetry by `service.name`, not by peer.** Unless every peer gives its
+`internal` the same id, as `examples/forwarding/edge.yaml` does, a `has_provenance` and a
 `drop_provenance` on each sender's `internal` id list every peer twice, and nothing catches a peer
 missing from one list. Every `internal` batch carries `service.name: logit` on its resource, and
-the resource crosses the hop, so one `route` claims every peer's self-telemetry:
+the resource crosses the hop, so one `route` claims every peer's self-telemetry whatever its id:
 
 ```yaml
 by_service:

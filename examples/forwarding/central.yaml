@@ -50,7 +50,7 @@ components:
     signals: [traces]
 
   # If a backend needs the edges' self-telemetry treated differently (an InfluxDB org and bucket,
-  # say), split it once here, with no per-host list: every edge's `internal` carries
+  # say), split it once here, whatever each edge names its `internal`: every `internal` carries
   # `service.name: logit`. Point the gates' `sources` at `by_service`, which passes on everything
   # it doesn't claim, and put the special handling downstream of `peer_self`. docs/deploying.md's
   # "Operating a pair" has the whole recipe.
