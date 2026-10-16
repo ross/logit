@@ -81,8 +81,9 @@ pub trait Output {
     /// never between its retries or resubmissions: the place a sink resets per-batch state. A
     /// sink that saves the value for `send` sees the same one on every attempt at the batch. `BatchContext` is the trace/span id plus
     /// which component created and last handled the batch
-    /// (`docs/adr/batch-provenance-on-delivered.md`); `logit_out` threads it across the wire, and
-    /// a sink with encode-side counters arms its once-per-batch accounting here
+    /// (`docs/adr/batch-provenance-on-delivered.md`); `logit_out` carries its provenance and,
+    /// when its own process samples the trace, its `trace` across the wire
+    /// (`docs/adr/native-hop-trace-context.md`), and a sink with encode-side counters arms its once-per-batch accounting here
     /// (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 2). A caller outside the
     /// runtime that never calls it gets every `send` counted. Default no-op, so a type that
     /// implements `Output` by delegating to another must forward this too, or the inner sink's

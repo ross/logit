@@ -1,14 +1,14 @@
 //! `logit_out -> logit_in` over real sockets (ADR `native-transport-handshake-and-ack`): a
 //! [`LogitInput`] bound on an ephemeral port in-process, a [`LogitOutput`] pointed at it, and an
 //! exact whole-batch equality check on what leaves the far end's [`Fanout`]. Also covers lz4, TLS
-//! and mutual TLS, provenance crossing the wire, and how a refused connect and a wrong CA are
+//! and mutual TLS, provenance and the trace context crossing the wire, and how a refused connect and a wrong CA are
 //! classified. Lives in `logit-cli` for the same reason `otlp_round_trip.rs` does.
 
 use bytes::Bytes;
-use logit_core::{AttrMap, Event, EventBatch, Resource};
+use logit_core::{AttrMap, Event, EventBatch, Registry, Resource, Telemetry};
 use logit_inputs::logit::{LogitInput, TlsServerSettings};
 use logit_outputs::logit::{LogitOutput, TlsClientSettings};
-use logit_pipeline::{classify, Fanout, Fault, Input, Output};
+use logit_pipeline::{classify, BatchContext, Fanout, Fault, Input, Output, TraceContext};
 use logit_proto::frame::Compression;
 use logit_proto::statsd::StatsdDecoder;
 use logit_proto::Decoder;
@@ -81,38 +81,117 @@ fn assert_round_tripped(received: &[EventBatch], batch: &EventBatch) {
     assert_eq!(&received[0], batch, "native round-trip should be exact");
 }
 
-/// Like [`round_trip`], but the listener's `Fanout` carries a component id and `output` is primed
-/// with `provenance` before sending, so a test can observe the `logit_out -> logit_in` special
-/// case in `docs/adr/batch-provenance-on-delivered.md`.
-async fn round_trip_with_provenance(
+/// Like [`round_trip`], but the listener's `Fanout` carries a component id and
+/// `input_telemetry`, and `output` is primed with `ctx` before sending, so a test can observe
+/// what crosses the `logit_out -> logit_in` hop beside the batch: provenance
+/// (`docs/adr/batch-provenance-on-delivered.md`) and the trace context
+/// (`docs/adr/native-hop-trace-context.md`).
+async fn round_trip_with_context(
     mut input: LogitInput,
     input_component: &str,
     mut output: LogitOutput,
-    provenance: logit_core::Provenance,
+    ctx: BatchContext,
     batch: &EventBatch,
-) -> Vec<(EventBatch, logit_core::Provenance)> {
+    input_telemetry: Telemetry,
+) -> Vec<(EventBatch, BatchContext)> {
     let (tx, mut rx) = mpsc::channel(16);
-    let sink = Fanout::new(vec![tx]).with_component(input_component);
+    let sink =
+        Fanout::new(vec![tx]).with_component(input_component).with_telemetry(input_telemetry);
     tokio::spawn(async move {
         let _ = input.run(sink).await;
     });
 
-    output.observe_batch(
-        logit_pipeline::BatchContext {
-            trace: logit_pipeline::TraceContext::new_root(),
-            provenance,
-        },
-        ONE,
-    );
+    output.observe_batch(ctx, ONE);
     output.send(batch).await.expect("send should succeed against a live logit_in");
 
     // Every delivered batch is already queued, as in [`round_trip`].
     let mut received = Vec::new();
     while let Ok(delivered) = rx.try_recv() {
-        let provenance = delivered.provenance();
-        received.push((logit_pipeline::unwrap_batch(delivered), provenance));
+        let ctx = delivered.batch_context();
+        received.push((logit_pipeline::unwrap_batch(delivered), ctx));
     }
     received
+}
+
+/// [`round_trip_with_context`] under a fresh root and `provenance`, with no listener telemetry.
+async fn round_trip_with_provenance(
+    input: LogitInput,
+    input_component: &str,
+    output: LogitOutput,
+    provenance: logit_core::Provenance,
+    batch: &EventBatch,
+) -> Vec<(EventBatch, logit_core::Provenance)> {
+    let ctx = BatchContext { trace: TraceContext::new_root(), provenance };
+    round_trip_with_context(input, input_component, output, ctx, batch, Telemetry::default())
+        .await
+        .into_iter()
+        .map(|(batch, ctx)| (batch, ctx.provenance))
+        .collect()
+}
+
+/// The span records a registry drained.
+fn spans(registry: &Registry) -> Vec<logit_core::SpanRecord> {
+    registry.drain(0).into_iter().filter_map(|e| e.span).collect()
+}
+
+/// A sender that samples a batch's trace continues it through `logit_in`: the batch arrives in
+/// the same trace, and the receiver's span is parented on the context the sender observed. Two
+/// registries stand for the two processes (`docs/adr/native-hop-trace-context.md`).
+#[tokio::test]
+async fn a_sampled_senders_trace_continues_through_logit_in() {
+    let (addr, input) = bound_input(|input| input).await;
+    let sender = Registry::with_span_sampling(1.0);
+    let receiver = Registry::with_span_sampling(1.0);
+    let output =
+        LogitOutput::new(addr).with_telemetry(sender.telemetry_for("out", "logit_out", "sink"));
+    let sent = BatchContext::from(TraceContext::new_root());
+
+    let received = round_trip_with_context(
+        input,
+        "central_logit_in",
+        output,
+        sent,
+        &sample_batch(),
+        receiver.telemetry_for("central_logit_in", "logit_in", "listener"),
+    )
+    .await;
+
+    assert_eq!(received.len(), 1);
+    let (_batch, ctx) = &received[0];
+    assert_eq!(ctx.trace.trace_id, sent.trace.trace_id, "the sender's trace continues");
+    let spans = spans(&receiver);
+    assert_eq!(spans.len(), 1, "the receiver records one send span");
+    assert_eq!(spans[0].trace_id, sent.trace.trace_id);
+    assert_eq!(spans[0].parent_span_id, Some(sent.trace.span_id));
+    assert_eq!(spans[0].span_id, ctx.trace.span_id);
+}
+
+/// A sender that records no spans writes no trace context, so `logit_in` roots a trace of its
+/// own rather than parent on a span that was never recorded.
+#[tokio::test]
+async fn a_sender_without_telemetry_leaves_logit_in_to_root_its_own() {
+    let (addr, input) = bound_input(|input| input).await;
+    let receiver = Registry::with_span_sampling(1.0);
+    let output = LogitOutput::new(addr);
+    let sent = BatchContext::from(TraceContext::new_root());
+
+    let received = round_trip_with_context(
+        input,
+        "central_logit_in",
+        output,
+        sent,
+        &sample_batch(),
+        receiver.telemetry_for("central_logit_in", "logit_in", "listener"),
+    )
+    .await;
+
+    assert_eq!(received.len(), 1);
+    let (_batch, ctx) = &received[0];
+    assert_ne!(ctx.trace.trace_id, sent.trace.trace_id);
+    let spans = spans(&receiver);
+    assert_eq!(spans.len(), 1, "the receiver records one send span");
+    assert_eq!(spans[0].parent_span_id, None);
+    assert_eq!(spans[0].trace_id, ctx.trace.trace_id);
 }
 
 /// A batch's `origin` (a remote listener) and `previous` (the remote node that fed `logit_out`)

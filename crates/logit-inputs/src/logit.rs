@@ -2,7 +2,12 @@
 //! connection protocol, `docs/adr/native-transport-handshake-and-ack.md`). Accepts many TCP
 //! (optionally TLS) connections. Each speaks a `Hello`/`HelloAck` version/codec/compression
 //! handshake (`logit_proto::native::control`), then loops: one native frame in, one
-//! `Fanout::send`, and one `Ack` out per run of frames.
+//! `Fanout::send_relayed`, and one `Ack` out per run of frames.
+//!
+//! **Trace context** (`docs/adr/native-hop-trace-context.md`). A frame's trailer may carry the
+//! sender's trace context, which `logit_out` writes only for a trace its own process records spans
+//! for. When it does, this listener's `send` span and the context it sends downstream are a child
+//! of it, so the trace continues across the hop; a frame without one starts a fresh root.
 //!
 //! **Send window.** A peer may have several frames in flight
 //! (`docs/adr/native-hop-send-window.md`). `HelloAck` answers the smaller of the `Hello`'s window
@@ -171,7 +176,7 @@ use crate::Input;
 use bytes::{Bytes, BytesMut};
 use logit_core::{Diagnostics, Telemetry};
 use logit_pipeline::listen::BindOptions;
-use logit_pipeline::Fanout;
+use logit_pipeline::{Fanout, TraceContext};
 use logit_proto::frame::{self, Compression, FrameHeader};
 use logit_proto::native::{self, control};
 use logit_proto::CodecError;
@@ -815,7 +820,7 @@ async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
         // A fresh budget per frame, scaled to the cap this peer's frames arrive under.
         let budget = native::DecodeBudget::for_frame_cap(max_frame_bytes);
-        let (batch, provenance) = match native::decode_hop_body(&mut payload, &budget) {
+        let (batch, provenance, trace) = match native::decode_hop_body(&mut payload, &budget) {
             Ok(decoded) => decoded,
             // A body past its budget, or one that doesn't decode, fails the same way on every
             // resend: refused by name, and the connection goes on.
@@ -882,7 +887,9 @@ async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
             // batch. It backfills an `origin` or `previous` the frame didn't carry and passes the
             // peer's own through untouched (`docs/adr/batch-provenance-on-delivered.md`). The
             // sender pair names this hop only and stays here; a relay's own store numbers the next.
-            if !sink.send_relayed(batch, provenance).await {
+            // The frame's trace context, when it carries one, is this listener's span's parent
+            // (`docs/adr/native-hop-trace-context.md`).
+            if !sink.send_relayed(batch, provenance, trace.map(TraceContext::from)).await {
                 telemetry.count(
                     "logit.input.batches.dropped",
                     1.0,
@@ -1730,7 +1737,7 @@ mod tests {
     /// `batch` as one hop data frame with no provenance, under [`next_seq`], and that pair.
     fn hop_frame(batch: &EventBatch, compression: Compression) -> (Bytes, native::SeqId) {
         let seq = next_seq();
-        let payload = native::encode_hop_batch(batch, Provenance::default(), seq);
+        let payload = native::encode_hop_batch(batch, Provenance::default(), None, seq);
         (frame::write_frame(native::CODEC_HOP_BATCH, compression, &payload).unwrap(), seq)
     }
 
@@ -1765,7 +1772,19 @@ mod tests {
         seq: native::SeqId,
         compression: Compression,
     ) {
-        let payload = native::encode_hop_batch(batch, provenance, seq);
+        send_data_frame_traced(stream, batch, provenance, None, seq, compression).await;
+    }
+
+    /// [`send_data_frame_seq`] with `trace` in the trailer.
+    async fn send_data_frame_traced(
+        stream: &mut TcpStream,
+        batch: &EventBatch,
+        provenance: Provenance,
+        trace: Option<native::HopTrace>,
+        seq: native::SeqId,
+        compression: Compression,
+    ) {
+        let payload = native::encode_hop_batch(batch, provenance, trace, seq);
         send_payload(stream, &payload, compression).await;
     }
 
@@ -1910,6 +1929,34 @@ mod tests {
         let provenance = delivered.provenance();
         assert_eq!(provenance.origin_str(), Some("remote_listener"));
         assert_eq!(provenance.previous_str(), Some("remote_enrich"));
+    }
+
+    /// A client's trace context parents what this listener sends downstream: same trace, a span
+    /// of its own (`docs/adr/native-hop-trace-context.md`).
+    #[tokio::test]
+    async fn a_clients_trace_context_parents_the_relayed_batch() {
+        let (addr, input) = bound_input().await;
+        let (sink, mut rx) = fanout_into_channel_with_component("logit_in_test", 16);
+        let mut input = input;
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = hop_client(&addr).await;
+        let sent = native::HopTrace { trace_id: [0xab; 16], span_id: [0xcd; 8] };
+        let seq = next_seq();
+        send_data_frame_traced(
+            &mut client,
+            &sample_batch(),
+            Provenance::default(),
+            Some(sent),
+            seq,
+            Compression::None,
+        )
+        .await;
+        read_ack(&mut client, seq).await;
+
+        let context = recv_delivered(&mut rx).await.context();
+        assert_eq!(context.trace_id, sent.trace_id, "the sender's trace continues");
+        assert_ne!(context.span_id, sent.span_id, "this hop mints a span of its own");
     }
 
     /// A frame with no provenance gets this listener's id backfilled into both fields.
@@ -2221,6 +2268,35 @@ mod tests {
         assert_eq!(probe.sum("logit.input.batches.dropped", &[("reason", "rejected")]), 1.0);
     }
 
+    /// A trace field of any length but 24 bytes is malformed: refused by name as
+    /// `Ack{rejected(malformed)}`, and the connection carries the next frame.
+    #[tokio::test]
+    async fn a_trace_field_of_the_wrong_length_is_refused_by_name() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
+        let mut client = hop_client(&addr).await;
+
+        let refused = sid(25, 1);
+        let mut payload =
+            native::encode_hop_batch(&batch_marked(1), Provenance::default(), None, refused)
+                .to_vec();
+        assert_eq!(payload.pop(), Some(0), "an empty trailer ends in its zero length");
+        // A 25-byte trailer: tag 5 declaring 23 bytes, and 23 bytes.
+        payload.extend_from_slice(&[25, 5, 23]);
+        payload.extend_from_slice(&[9; 23]);
+        send_payload(&mut client, &payload, Compression::None).await;
+        read_rejected(
+            read_control_response(&mut client).await,
+            refused,
+            control::ACK_REJECTED_MALFORMED,
+        );
+
+        send_acked(&mut client, 2, sid(25, 2)).await;
+        assert_eq!(recv_mark(&mut rx).await, 2);
+        assert!(rx.try_recv().is_err(), "the refused frame is never forwarded");
+        assert_eq!(probe.sum("logit.proto.errors", &[("reason", "malformed")]), 1.0);
+    }
+
     /// A frame past `max_frame_bytes` within its compressed bound is read whole, refused by name
     /// as `Ack{rejected(too_large)}` from its prefix alone, and the connection goes on: an lz4
     /// frame that compresses far under the cap, and an uncompressed one inside lz4's slack over
@@ -2280,7 +2356,7 @@ mod tests {
         let mut bytes = frames_of(&[sid(24, 1), sid(24, 2)]);
         let refused = sid(24, 3);
         let payload =
-            native::encode_hop_batch(&budget_busting_batch(), Provenance::default(), refused);
+            native::encode_hop_batch(&budget_busting_batch(), Provenance::default(), None, refused);
         bytes.extend_from_slice(
             &frame::write_frame(native::CODEC_HOP_BATCH, Compression::None, &payload).unwrap(),
         );
@@ -3348,7 +3424,8 @@ mod tests {
             // The largest sequence is the longest uvarint, so a real one encodes no longer.
             let widest = native::SeqId { id: [0; 16], seq: u64::MAX };
             let encoded =
-                native::encode_hop_batch(&batch_with(len), Provenance::default(), widest).len();
+                native::encode_hop_batch(&batch_with(len), Provenance::default(), None, widest)
+                    .len();
             if encoded <= target {
                 return batch_with(len);
             }
@@ -3946,6 +4023,7 @@ mod tests {
             let payload = native::encode_hop_batch(
                 &batch_marked(seq.seq as i64),
                 Provenance::default(),
+                None,
                 *seq,
             );
             framed.extend_from_slice(

@@ -4,7 +4,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## Internal telemetry and self-logging
 
-- **Internal spans have five open residuals.** Emission, sampling, and OTLP export are built
+- **Internal spans have six open residuals.** Emission, sampling, and OTLP export are built
   ([internal-telemetry.md](../design/internal-telemetry.md)'s "Spans",
   [ADR `trace-context-propagation-on-delivered`](../adr/trace-context-propagation-on-delivered.md),
   [ADR `internal-span-emission-and-deterministic-sampling`](../adr/internal-span-emission-and-deterministic-sampling.md)).
@@ -33,6 +33,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
      [ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md)'s `span:` block.
      It's extra stack for one panel, not a `logit`-side gap. Whether `logit` should compute a
      service graph itself as a component is unexplored.
+  6. **`logit_in`'s span doesn't mark its parent as remote.** When a hop frame carries a trace
+     context, `logit_in`'s span continues it but leaves the OTLP `Span.flags` remote-parent bits
+     (`CONTEXT_HAS_IS_REMOTE`, `CONTEXT_IS_REMOTE`) unset, so a backend can't tell that the parent
+     span lives in another process. `Telemetry::span` has no flags input
+     ([ADR `native-hop-trace-context`](../adr/native-hop-trace-context.md)).
 
 - **`host_metrics` isn't built.** Facts about the machine (CPU, disks, NICs) are a different kind
   of source than `internal`: read from the OS rather than `logit`'s own counters, with their own

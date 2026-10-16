@@ -85,7 +85,7 @@ payload_hop   := id[16] | uvarint(seq)
                | dict | resource attrs | uvarint(event_count) | events...
                | uvarint(trailer_len) | trailer_bytes[trailer_len]
 trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*
-                 -- tag 1 = origin, tag 2 = previous
+                 -- tag 1 = origin, tag 2 = previous, tag 5 = trace context
 ```
 
 The prefix is the sender identity, 16 bytes, and the sequence, a uvarint from 1
@@ -101,7 +101,17 @@ most recently handled it (`docs/design/pipeline-graph.md`'s "Provenance propagat
 [ADR `batch-provenance-on-delivered`](../adr/batch-provenance-on-delivered.md)). A field of any
 tag that overruns the trailer or the 4096-byte field cap fails the decode. An empty provenance
 field writes no entry, and a tag this reader doesn't know is skipped by its length, which keeps a
-torn spool write from poisoning the walk.
+torn spool write from poisoning the walk. Tags 3 and 4 are retired and skipped that way.
+
+Tag 5 is the batch's trace context, `trace_id[16] | span_id[8]`, read as `HopTrace`
+([ADR `native-hop-trace-context`](../adr/native-hop-trace-context.md)). It's optional, and
+`logit_out` writes it only when its own process sampled that trace for internal spans
+(`Telemetry::samples_trace`), so a sender with no `internal` component never writes it. The value
+is the context the batch arrived at `logit_out` under, not the sink's own `deliver` span, so it's
+the same on every attempt. `logit_in` sends the batch downstream as a child of it. A tag-5 field
+whose length isn't 24 is malformed. Any 24-byte value decodes, zeros included, and a repeated tag
+keeps its last value, as tags 1 and 2 do. The `buffer.disk:` spool never writes tag 5, because a
+record's prefix already holds the context, and `parse_record` ignores one it finds.
 
 `encode_hop_batch`/`decode_hop_batch` call `encode_batch`/`decode_batch` and add the prefix and
 the trailer around them. The bare encoding itself is not stable across releases: ADR `metrics-model-v2`
@@ -114,7 +124,7 @@ the trailer boundary decode as "no provenance" instead of failing. That breaks t
 truncation-safety invariant: every proper prefix of a valid encoding must fail to decode, pinned
 by `crates/logit-proto/tests/robustness.rs`'s `assert_every_truncation_fails_cleanly`. Trailer
 values are inline, not dictionary-indexed, because `origin`/`previous` are at most two strings per
-batch with nothing for a dictionary to amortize.
+batch with nothing for a dictionary to amortize; the trace context is a fixed 24 bytes.
 
 The hop negotiates one codec. `logit_out` offers `Hello.codecs = [CODEC_HOP_BATCH]`, and
 `logit_in` answers a `Hello` that doesn't offer it with `Reject{NO_COMMON_CODEC}`; there's no

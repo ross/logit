@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-04
+updated: 2026-10-15
 ---
 
 # Native hop: two payload shapes named by shape, every hop frame sequenced, and strict control messages
@@ -81,6 +81,8 @@ nothing else; and the hop negotiates one codec.
   the sender identity (tag 3), and the sequence (tag 4). It's what `logit_out` sends and what the
   disk spool records. [Superseded in part on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): the sender identity
   and sequence lead the payload, ahead of the batch; the trailer carries provenance only.]
+  [Amended on 2026-10-15 by [ADR `native-hop-trace-context`](native-hop-trace-context.md): the trailer also carries an
+  optional trace context as tag 5.]
 - The byte values don't change. `encode_batch`/`decode_batch` keep their names;
   `encode_batch_v2`/`decode_batch_v2` become `encode_hop_batch`/`decode_hop_batch`.
 - The trailer's length prefix stays mandatory, so a hop payload truncated at any byte still fails

@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-05
+updated: 2026-10-15
 ---
 
 # Native hop ack status: the sender pair leads the hop payload, and a rejected `Ack` settles one frame by name
@@ -72,7 +72,9 @@ trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*     -- tag 1 origin,
 - **`id` is 16 bytes and `seq` a uvarint of at least 1**, as before. A payload shorter than the
   pair, or a `seq` of 0, is `Malformed`.
 - **The trailer keeps provenance only.** Tags 3 and 4 are no longer written. An unknown tag is
-  still skipped, so a stray 3 or 4 is ignored, as any other unknown tag is.
+  still skipped, so a stray 3 or 4 is ignored, as any other unknown tag is. [Amended on
+  2026-10-15 by [ADR `native-hop-trace-context`](native-hop-trace-context.md): the trailer also carries an optional
+  24-byte trace context as tag 5.]
 - **The trailer length stays mandatory**, so no proper prefix of a hop payload decodes.
 - **`read_hop_prefix` reads the pair alone** and `decode_hop_body` reads the rest;
   `decode_hop_batch` is the two together. `logit_in` calls them separately.

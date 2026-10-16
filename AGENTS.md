@@ -498,8 +498,8 @@ Per pair:
   CRC-32C and optional lz4. A four-arm bake-off against `rkyv`, `postcard`, and OTLP itself
   decided it ([ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md)).
 - **Two payload shapes**: `CODEC_BATCH` is a bare batch, the file format; `CODEC_HOP_BATCH` is a
-  required sender identity and sequence, a batch, and a trailer of provenance, what the hop sends
-  and the spool records. A hop payload without a complete pair is malformed
+  required sender identity and sequence, a batch, and a trailer of provenance and an optional trace
+  context, what the hop sends and the spool records. A hop payload without a complete pair is malformed
   ([ADR `native-hop-no-compatibility`](docs/adr/native-hop-no-compatibility.md)); the pair leads
   so `logit_in` answers a frame it can't take with a rejected `Ack` naming it and keeps the
   connection ([ADR `native-hop-ack-status`](docs/adr/native-hop-ack-status.md)).
@@ -552,8 +552,10 @@ Per pair:
 - **Trace propagation**: every `Delivered` (one `Fanout` edge's channel payload) carries a real
   `TraceContext`, propagated as a child of its parent for the two node kinds with an unambiguous
   one to propagate: `Transform::process`/`ScriptWorker::process`'s non-flush path, and
-  `run_output`. See
-  [ADR `trace-context-propagation-on-delivered`](docs/adr/trace-context-propagation-on-delivered.md)
+  `run_output`. `logit_in` is the one listener that inherits one: it continues the trace a hop
+  frame carries, which `logit_out` sends only for a trace its own process sampled. See
+  [ADR `trace-context-propagation-on-delivered`](docs/adr/trace-context-propagation-on-delivered.md),
+  [ADR `native-hop-trace-context`](docs/adr/native-hop-trace-context.md),
   and [pipeline-graph.md](docs/design/pipeline-graph.md)'s "Trace context propagation" section.
 - **Internal telemetry**: `internal` drains `logit_core::telemetry`'s per-component buffers into
   ordinary events on its own `interval`
@@ -567,12 +569,15 @@ Per pair:
   "Amendment: internal drains last").
 - **Internal spans**: every node visit (a listener's send, a transform's process/flush, a sink's
   deliver) mints exactly one real `SpanRecord` from that context. Spans are deterministically
-  sampled on `trace_id` (`span_sample_rate`, default `0.1`, `1.0` in the demo), so every `logit`
-  process in a split-collection topology reaches the same keep/drop verdict independently with no
-  propagated bit. See
+  sampled on `trace_id` (`span_sample_rate`, default `0.1`, `1.0` in the demo), so processes that
+  share a trace id reach the same keep/drop verdict independently with no propagated bit. A native
+  hop shares it: `logit_out` carries a sampled batch's context in the hop trailer, so one trace
+  spans both processes when the receiver's rate is at or above the sender's
+  ([ADR `native-hop-trace-context`](docs/adr/native-hop-trace-context.md)). See
   [ADR `internal-span-emission-and-deterministic-sampling`](docs/adr/internal-span-emission-and-deterministic-sampling.md)
   and `internal-telemetry.md`'s "Spans" section. `docs/known-gaps/telemetry.md`'s internal-spans
-  entry tracks what's still open: the listener span's window, and Lua `flush()`'s link-less root.
+  entry tracks what's still open, including the listener span's window, Lua `flush()`'s link-less
+  root, and `logit_in`'s span not marking its parent as remote.
 
 ### Operator surface
 

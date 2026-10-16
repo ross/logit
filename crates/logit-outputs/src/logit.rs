@@ -84,6 +84,13 @@
 //! leaves no identities: the next connection resends every frame, and `logit_in` recognizes each
 //! by its mark.
 //!
+//! **Trace context** (`docs/adr/native-hop-trace-context.md`). A frame's trailer carries the
+//! batch's incoming trace context, the one `observe_batch` or `submit` receives, not the
+//! `deliver` span's: a windowed batch is submitted before that span exists. It is written only
+//! when this process records spans for the trace (`Telemetry::samples_trace`), so `logit_in`
+//! never parents its span on one this process dropped; the spool's records carry none, and every
+//! attempt encodes the field afresh.
+//!
 //! **Close.** `Output::flush`, called once after the last batch, shuts the pooled connection
 //! down, which under TLS sends `close_notify`. A connection dropped after a failed or cancelled
 //! attempt closes without one, which `logit_in` reads as a close when it falls between frames.
@@ -110,10 +117,10 @@
 use crate::Output;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
-use logit_core::{Diagnostics, EventBatch, Provenance, Telemetry};
+use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::{BatchContext, Fault, HeadOnly, SeqId};
 use logit_proto::frame::{self, Compression};
-use logit_proto::native::{self, control};
+use logit_proto::native::{self, control, HopTrace};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::time::Duration;
@@ -291,9 +298,10 @@ pub struct LogitOutput {
     /// Set by the first handshake that passes validation, so only later ones count as
     /// `logit.output.reconnects`.
     has_connected_once: bool,
-    /// The next batch's provenance, set by `Output::observe_batch` once per batch and carried in
-    /// the hop payload's trailer (`docs/adr/batch-provenance-on-delivered.md`).
-    pending_provenance: Provenance,
+    /// The next batch's context, set by `Output::observe_batch` once per batch: its provenance,
+    /// and its trace context when sampled, ride in the hop payload's trailer
+    /// (`docs/adr/batch-provenance-on-delivered.md`, `docs/adr/native-hop-trace-context.md`).
+    pending_ctx: BatchContext,
     /// The next batch's sender identity and sequence from the sink's store, set by
     /// `Output::observe_batch`. Every attempt at one batch carries the same pair; cleared once an
     /// attempt succeeds, so a `send` without its own `observe_batch` fails rather than go out
@@ -319,7 +327,7 @@ impl LogitOutput {
             telemetry: Telemetry::default(),
             stream: None,
             has_connected_once: false,
-            pending_provenance: Provenance::default(),
+            pending_ctx: BatchContext::default(),
             pending_seq: None,
             resend_senders: Vec::new(),
         }
@@ -580,7 +588,12 @@ impl LogitOutput {
 
         // Encoded once per attempt, and with nothing to resend before touching the network, so
         // an oversized batch never connects.
-        let payload = native::encode_hop_batch(batch, ctx.provenance, seq);
+        // The trace field is written only for a trace this process records spans for, so the
+        // receiver never parents on a span the sender dropped
+        // (`docs/adr/native-hop-trace-context.md`).
+        let trace =
+            self.telemetry.samples_trace(&ctx.trace.trace_id).then(|| HopTrace::from(ctx.trace));
+        let payload = native::encode_hop_batch(batch, ctx.provenance, trace, seq);
         if payload.len() as u64 > frame::MAX_SANE_UNCOMPRESSED_LEN as u64 {
             self.warn_at_head(format!(
                 "batch encodes to {} bytes, over the {}-byte sanity cap -- dropping it \
@@ -791,23 +804,21 @@ fn reject_in_place_of_ack(reject: control::Reject) -> anyhow::Error {
 
 #[async_trait::async_trait]
 impl Output for LogitOutput {
-    /// Records `ctx.provenance` and `seq` for `send`. `write_loop` calls this once per batch,
-    /// before its first attempt, so every attempt at one batch carries the same provenance and
-    /// the same pair. A successful attempt clears the pair; a direct caller observes once per
-    /// batch it sends.
+    /// Records `ctx` and `seq` for `send`. `write_loop` calls this once per batch, before its
+    /// first attempt, so every attempt at one batch carries the same context and the same pair. A
+    /// successful attempt clears the pair; a direct caller observes once per batch it sends.
     fn observe_batch(&mut self, ctx: BatchContext, seq: SeqId) {
-        self.pending_provenance = ctx.provenance;
+        self.pending_ctx = ctx;
         self.pending_seq = Some(seq);
     }
 
-    /// `submit` with the pending provenance and pair and nothing in flight, then `await_ack`. A
+    /// `submit` with the pending context and pair and nothing in flight, then `await_ack`. A
     /// `send` with no pair pending is a caller bug: every batch is observed before it's sent.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let Some(seq) = self.pending_seq else {
             anyhow::bail!("logit_out: send before observe_batch, so the batch has no sequence");
         };
-        let ctx = BatchContext { provenance: self.pending_provenance, ..BatchContext::default() };
-        self.submit(batch, ctx, seq).await?;
+        self.submit(batch, self.pending_ctx, seq).await?;
         self.await_ack().await?;
         self.pending_seq = None;
         Ok(())
@@ -952,7 +963,7 @@ mod tests {
         testdata_dir, tls_client_connector, tls_pair, tls_pair_without_tickets, FakeStream, TapIo,
         WriteStep,
     };
-    use logit_core::{AttrMap, Event, LogRecord, Resource, Severity, Value};
+    use logit_core::{AttrMap, Event, LogRecord, Provenance, Resource, Severity, Value};
     use logit_inputs::logit::{LogitInput, TlsServerSettings};
     use logit_inputs::Input;
     use logit_pipeline::test_util::{TelemetryProbe, RECV_TIMEOUT};
@@ -1451,7 +1462,7 @@ mod tests {
             let mut body = vec![0u8; h.compressed_len as usize];
             stream.read_exact(&mut body).await.unwrap();
             let mut payload = Bytes::from(body);
-            let (_batch, provenance, seq) =
+            let (_batch, provenance, _trace, seq) =
                 native::decode_hop_batch(&mut payload, &Default::default()).unwrap();
 
             write_control(&mut stream, &ack_for(seq)).await.unwrap();
@@ -1476,6 +1487,96 @@ mod tests {
         assert_eq!(provenance.previous_str(), Some("logit_out_test_previous"));
         assert_eq!(seq, SeqId { id: [7; 16], seq: 5 });
         assert_eq!(output.pending_seq, None, "an acked attempt clears the pair");
+    }
+
+    /// The trace field of the one frame `output` sends for a batch observed under `ctx`, over a
+    /// handshaken in-memory connection.
+    async fn sent_trace(mut output: LogitOutput, ctx: BatchContext) -> Option<HopTrace> {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        output.stream = Some(conn_over(client));
+        output.observe_batch(ctx, SeqId { id: [3; 16], seq: 1 });
+        let batch = sample_batch();
+        let peer = async {
+            let (body, ack) = read_data_frame_named(&mut server).await;
+            write_control(&mut server, &ack).await.unwrap();
+            body
+        };
+        let (sent, body) = tokio::join!(output.send(&batch), peer);
+        sent.expect("send should succeed");
+        let (_, _, trace, _) =
+            native::decode_hop_batch(&mut Bytes::from(body), &Default::default()).unwrap();
+        trace
+    }
+
+    /// A sink whose process samples the batch's trace writes the batch's incoming context into
+    /// the frame (`docs/adr/native-hop-trace-context.md`).
+    #[tokio::test]
+    async fn a_sampled_batch_carries_its_incoming_trace_context() {
+        let registry = logit_core::Registry::with_span_sampling(1.0);
+        let output = LogitOutput::new("127.0.0.1:1").with_telemetry(registry.telemetry_for(
+            "out",
+            "logit_out",
+            "sink",
+        ));
+        let observed = BatchContext::from(logit_pipeline::TraceContext::new_root());
+
+        let trace = sent_trace(output, observed).await;
+
+        assert_eq!(trace, Some(HopTrace::from(observed.trace)));
+    }
+
+    /// A sink with no telemetry records no spans, so it writes no trace field.
+    #[tokio::test]
+    async fn a_sink_without_telemetry_writes_no_trace_context() {
+        let output = LogitOutput::new("127.0.0.1:1");
+        let observed = BatchContext::from(logit_pipeline::TraceContext::new_root());
+
+        assert_eq!(sent_trace(output, observed).await, None);
+    }
+
+    /// A sink whose process drops the trace's spans writes no trace field, so `logit_in` never
+    /// parents on a span that was never recorded.
+    #[tokio::test]
+    async fn a_sink_sampling_nothing_writes_no_trace_context() {
+        let registry = logit_core::Registry::with_span_sampling(0.0);
+        let output = LogitOutput::new("127.0.0.1:1").with_telemetry(registry.telemetry_for(
+            "out",
+            "logit_out",
+            "sink",
+        ));
+        let observed = BatchContext::from(logit_pipeline::TraceContext::new_root());
+
+        assert_eq!(sent_trace(output, observed).await, None);
+    }
+
+    /// Batches submitted into a window, the second with the first in flight, each carry the
+    /// context `submit` was given, as `send` carries `observe_batch`'s.
+    #[tokio::test]
+    async fn a_windowed_submit_carries_each_batchs_incoming_trace_context() {
+        let registry = logit_core::Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("out", "logit_out", "sink");
+        let mut output = LogitOutput::new("127.0.0.1:1").with_telemetry(telemetry.clone());
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        output.stream = Some(conn_with(client, 8, telemetry));
+        let ctxs = [
+            BatchContext::from(logit_pipeline::TraceContext::new_root()),
+            BatchContext::from(logit_pipeline::TraceContext::new_root()),
+        ];
+        let batch = sample_batch();
+
+        for (n, ctx) in ctxs.iter().enumerate() {
+            output
+                .submit(&batch, *ctx, SeqId { id: [4; 16], seq: n as u64 + 1 })
+                .await
+                .expect("submit should write the frame");
+        }
+
+        for ctx in ctxs {
+            let (body, _) = read_data_frame_named(&mut server).await;
+            let (_, _, trace, _) =
+                native::decode_hop_batch(&mut Bytes::from(body), &Default::default()).unwrap();
+            assert_eq!(trace, Some(HopTrace::from(ctx.trace)));
+        }
     }
 
     /// A spool that loses its cursor in a crash replays a batch `logit_in` already forwarded,
@@ -2112,7 +2213,7 @@ mod tests {
 
         for which in ["first", "resent"] {
             let mut payload = Bytes::from(frames_rx.recv().await.unwrap());
-            let (_batch, _provenance, seq) =
+            let (_batch, _provenance, _trace, seq) =
                 native::decode_hop_batch(&mut payload, &Default::default()).unwrap();
             assert_eq!(seq, pair, "the {which} frame");
         }
@@ -2296,7 +2397,7 @@ mod tests {
         let mut full = BytesMut::from(&header[..]);
         full.extend_from_slice(body);
         let (_, mut payload) = frame::read_frame_with_header(&mut full.freeze()).unwrap();
-        let (_, _, seq) = native::decode_hop_batch(&mut payload, &Default::default()).unwrap();
+        let (_, _, _, seq) = native::decode_hop_batch(&mut payload, &Default::default()).unwrap();
         ack_for(seq)
     }
 

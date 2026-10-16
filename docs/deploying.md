@@ -4334,6 +4334,24 @@ answers this way; it points at something else on the port.
 error, including a TLS peer that went away without `close_notify`. So a `logit_out` restarting or
 reconnecting doesn't show as `connection_error` on the far end.
 
+**Internal spans across the hop.** When both nodes run an `internal` component and export to
+the same tracing backend, a batch's internal spans on the central node join the edge node's trace
+for it, so the backend shows one trace across both hosts
+([ADR `native-hop-trace-context`](adr/native-hop-trace-context.md)). The edge node carries a
+batch's trace only when its own `span_sample_rate` kept that trace, so the central node never
+records a span whose parent the edge node dropped. Set `span_sample_rate` the same on every node
+in a chain:
+
+- **A higher rate on the receiving node** keeps every forwarded trace whole and records more
+  traces of its own.
+- **A lower rate on the receiving node** cuts some forwarded traces off at the sender.
+- **A node with no `internal` component in the middle of a chain** carries no trace, so the next
+  node starts its own.
+
+The receiving node also starts a trace of its own for each batch the sender didn't sample, and
+samples those at its own rate, so it records spans for more of its traffic than its rate
+suggests: about 19% of batches at `0.1` on both nodes, not 10%.
+
 **What to watch.**
 
 - `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/`rejected`/`refused`, one per `Ack`
