@@ -127,8 +127,9 @@ receiver's:
 
 No cell yields a receiver span whose parent the sender never recorded, so a backend never shows a
 cross-host trace as "root span not yet received", provided both processes export to the same
-backend. One dangling-parent case remains, and it already exists within one process: a spool
-replay after a crash whose upstream span never drained.
+backend and the sender exports the parent. It doesn't export a span recorded after its last
+drain: one in `internal`'s final batch at shutdown, or before a crash. A frame sent in that
+window leaves the receiver's span with a dangling parent, as a spool replay after a crash does.
 
 The cost: the receiver records spans for more of its traffic than its rate suggests. At `0.1` on
 both sides it records about 19% of batches, not 10%, because each batch the sender dropped gets a

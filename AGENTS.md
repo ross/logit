@@ -569,11 +569,11 @@ Per pair:
   "Amendment: internal drains last").
 - **Internal spans**: every node visit (a listener's send, a transform's process/flush, a sink's
   deliver) mints exactly one real `SpanRecord` from that context. Spans are deterministically
-  sampled on `trace_id` (`span_sample_rate`, default `0.1`, `1.0` in the demo), so processes that
-  share a trace id reach the same keep/drop verdict independently with no propagated bit. A native
-  hop shares it: `logit_out` carries a sampled batch's context in the hop trailer, so one trace
-  spans both processes when the receiver's rate is at or above the sender's
-  ([ADR `native-hop-trace-context`](docs/adr/native-hop-trace-context.md)). See
+  sampled on `trace_id` (`span_sample_rate`, default `0.1`, `1.0` in the demo), so processes at the
+  same `span_sample_rate` that share a trace id reach the same keep/drop verdict independently with
+  no propagated bit. A native hop shares the trace id: `logit_out` carries a sampled batch's context
+  in the hop trailer, so one trace spans both processes when the receiver's rate is at or above the
+  sender's ([ADR `native-hop-trace-context`](docs/adr/native-hop-trace-context.md)). See
   [ADR `internal-span-emission-and-deterministic-sampling`](docs/adr/internal-span-emission-and-deterministic-sampling.md)
   and `internal-telemetry.md`'s "Spans" section. `docs/known-gaps/telemetry.md`'s internal-spans
   entry tracks what's still open, including the listener span's window, Lua `flush()`'s link-less

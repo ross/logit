@@ -37,7 +37,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
      context, `logit_in`'s span continues it but leaves the OTLP `Span.flags` remote-parent bits
      (`CONTEXT_HAS_IS_REMOTE`, `CONTEXT_IS_REMOTE`) unset, so a backend can't tell that the parent
      span lives in another process. `Telemetry::span` has no flags input
-     ([ADR `native-hop-trace-context`](../adr/native-hop-trace-context.md)).
+     ([ADR `native-hop-trace-context`](../adr/native-hop-trace-context.md)). A span the sender
+     records after its last drain (`internal`'s final batch at shutdown, or before a crash) is
+     never exported, and a frame sent in that window leaves the receiver's `logit_in` span with a
+     dangling parent.
 
 - **`host_metrics` isn't built.** Facts about the machine (CPU, disks, NICs) are a different kind
   of source than `internal`: read from the OS rather than `logit`'s own counters, with their own

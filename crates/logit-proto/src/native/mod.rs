@@ -72,8 +72,8 @@ pub const HOP_PREFIX_MAX_LEN: usize = 16 + 10;
 
 const TRAILER_TAG_ORIGIN: u8 = 1;
 const TRAILER_TAG_PREVIOUS: u8 = 2;
-/// The [`HopTrace`] field: 16 bytes of trace id then 8 of span id. Tags 3 and 4 are retired (they
-/// once carried the sender pair) and a reader still skips them as unknown.
+/// The [`HopTrace`] field: 16 bytes of trace id then 8 of span id. Tags 3 and 4 are retired,
+/// and a reader skips them as unknown.
 const TRAILER_TAG_TRACE: u8 = 5;
 
 /// The length of a [`TRAILER_TAG_TRACE`] field's value.

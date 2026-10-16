@@ -192,10 +192,11 @@ topology (`docs/OVERVIEW.md`) — reaches the same keep/drop verdict independent
 propagation and no extra bytes on `TraceContext`/`Delivered`**: a kept trace is kept at every hop,
 a dropped one dropped at every hop, without any node ever telling another its answer. Same shape as
 OTel's `TraceIdRatioBased` sampler. [Amended on 2026-10-15 by
-[ADR `native-hop-trace-context`](native-hop-trace-context.md): across processes the verdict agrees only once they share a
-`trace_id`. A native hop shares it by carrying the batch's context in the hop trailer, and
-`logit_out` carries it only when its own process sampled the trace, so a receiver never records a
-span whose parent the sender dropped. The hop carries a context, not a verdict, so
+[ADR `native-hop-trace-context`](native-hop-trace-context.md): across processes the verdict
+agrees only once they share a `trace_id` and a `span_sample_rate`. A native hop shares the
+`trace_id` by carrying the batch's context in the hop trailer, and `logit_out` carries it only
+when its own process sampled the trace, so a receiver never records a span whose parent the
+sender dropped. The hop carries a context, not a verdict, so
 `TraceContext` and `Delivered` still gain no bit.]
 
 ```rust

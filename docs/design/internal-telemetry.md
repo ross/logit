@@ -223,10 +223,11 @@ computes the same keep/drop verdict independently from `trace_id` alone. A kept 
 `TraceContext`/`Delivered`. It has the same shape as OTel's `TraceIdRatioBased` sampler: the top 53
 bits of the low 8 `trace_id` bytes (`f64`'s exact-integer range) compared against `rate`.
 
-Across processes the verdicts agree only once the processes share a `trace_id`. Across a native
-hop they do: `logit_out` carries a batch's context only for a trace its own process sampled, and
-`logit_in` continues it. A receiver never records a span whose parent the sender dropped. The
-threshold is monotone in the rate, so what crosses a hop whole depends on the two rates:
+Across processes the verdicts agree only once the processes share a `trace_id` and a
+`span_sample_rate`. Across a native hop the `trace_id` is shared: `logit_out` carries a batch's
+context only for a trace its own process sampled, and `logit_in` continues it. A receiver never
+records a span whose parent the sender dropped. The threshold is monotone in the rate, so what
+crosses a hop whole depends on the two rates:
 
 - **The receiver's rate at or above the sender's**: every trace the sender kept continues whole
   on the receiver.
