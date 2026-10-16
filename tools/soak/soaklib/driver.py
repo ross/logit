@@ -436,7 +436,8 @@ class Run:
             "event": kind, "step": step.id, "action": step.action, "on": step.on,
             "args": step.args, "planned_offset": step.end if kind == "revert" else step.start,
             "started_at": started, "offset": self.offset(started),
-            "affects_udp_ingress": bool(action.affects_udp_ingress(step, self.roles)),
+            **{key: action.affects(wire, step, self.roles)
+               for wire, key in faults.INGRESS_KEYS.items()},
             "affects_egress": bool(action.affects_egress(step, self.roles)),
             **step.expected(),
         }

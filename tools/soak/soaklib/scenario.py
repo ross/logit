@@ -158,11 +158,26 @@ OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script", "split", "hop"}
 HOP_KEYS = {"from", "sink", "to", "listener"}
 # The `[ledger]` keys a `[[ledger.source]]` table replaced, refused with a pointer to it.
 SOURCE_LEDGER_KEYS = ("generator_input", "generator_sink", "sut_listener")
-# A `[[ledger.source]]`: the generator service, its `generate_in` and UDP sink, the SUT listener
-# its datagrams reach, and, optionally, the transforms between that listener and `aggregate`,
-# each of which must forward every event it receives.
+# A `[[ledger.source]]`: the generator service, its `generate_in` and sink, the SUT listener its
+# lines reach, and, optionally, the wire they cross and the transforms between that listener
+# and `aggregate`, each of which must forward every event it receives.
 SOURCE_KEYS = {"service", "generator_input", "generator_sink", "sut_listener"}
-OPTIONAL_SOURCE_KEYS = {"sut_transforms"}
+OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire"}
+# The wires a source's lines can cross into the SUT, each with its own ledger symbols
+# (checks.py's `WIRES`): datagrams, a TCP stream of LF-terminated lines, or a file the SUT tails.
+WIRES = ("udp", "tcp", "file")
+DEFAULT_WIRE = "udp"
+# Each listener kind the ledger can follow: the wire it takes with no `transport:`, and the
+# wire each `transport:` value it accepts gives. A kind or transport missing here has no wire.
+LISTENER_WIRES = {
+    "statsd_in": ("udp", {"udp": "udp", "tcp": "tcp"}),
+    "syslog_in": ("udp", {"udp": "udp", "tcp": "tcp"}),
+    "lines_in": ("tcp", {"udp": "udp", "tcp": "tcp"}),
+    "graphite_in": ("tcp", {"udp": "udp", "tcp": "tcp"}),
+    "collectd_in": ("udp", {}),
+    "tail_in": ("file", {}),
+    "docker_in": ("file", {}),
+}
 # A generator's service name, which also names its config's compose variable
 # (`config_env()`), so it is a slug.
 _SERVICE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -192,6 +207,9 @@ VERDICTS = ("PASS", "WARN", "FAIL")
 METRIC_KINDS = {
     "logit.input.datagrams": "sum",
     "logit.input.kernel.dropped": "sum",
+    "logit.input.frames": "sum",
+    "logit.input.frames.dropped": "sum",
+    "logit.input.connections.closed": "sum",
     "logit.component.datagrams.dropped": "sum",
     "logit.component.batches.dropped": "sum",
     "logit.component.batches.delivered": "sum",
@@ -664,6 +682,9 @@ def from_dict(raw, path):
     if isinstance(ledger, dict):
         problems += _sink_problems(ledger, target["kind"])
         problems += _source_problems(ledger)
+        sut_config = configs.get(SUT_CONFIG_KEY) if isinstance(configs, dict) else None
+        if isinstance(sut_config, str) and (path.parent / sut_config).is_file():
+            problems += _wire_problems(ledger, (path.parent / sut_config).read_text())
         problems += _extra_sut_problems(extra_suts, ledger)
         problems += _hop_problems(ledger, extra_suts)
 
@@ -840,6 +861,69 @@ def _sink_problems(ledger, kind):
     return problems
 
 
+def component_blocks(text, component):
+    """Each `<component>:` line's text in a YAML config, block or flow style: the rest of the
+    line and every deeper-indented line after it."""
+    lines = (text or "").splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(rf"^(\s*){re.escape(component)}\s*:(.*)$", line)
+        if not match:
+            continue
+        indent = len(match.group(1))
+        block = [match.group(2)]
+        for following in lines[index + 1:]:
+            if following.strip() and len(following) - len(following.lstrip()) <= indent:
+                break
+            block.append(following)
+        yield "\n".join(block)
+
+
+def listener_wire(text, component):
+    """`(wire, kind, transport)` for SUT listener `component` in config `text`: the wire its
+    `type:` and `transport:` give (`LISTENER_WIRES`), or None for a kind or transport the ledger
+    has no wire for; `(None, None, None)` when no block of `component` names a `type:`. Comments
+    are ignored."""
+    for block in component_blocks(text, component):
+        body = "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in block.splitlines())
+        kind = re.search(r"\btype\s*:\s*[\"']?([a-z_]+)", body)
+        if not kind:
+            continue
+        found = re.search(r"\btransport\s*:\s*[\"']?([a-z_]+)", body)
+        transport = found.group(1) if found else None
+        default, by_transport = LISTENER_WIRES.get(kind.group(1), (None, {}))
+        wire = default if transport is None else by_transport.get(transport)
+        return wire, kind.group(1), transport
+    return None, None, None
+
+
+def _wire_problems(ledger, sut_text):
+    """What each `[[ledger.source]]`'s `wire` breaks against the SUT config `sut_text`: its
+    `sut_listener` must be a component there, of a kind and transport `LISTENER_WIRES` gives a
+    wire for, and that wire must be the source's own, `udp` when it names none."""
+    sources = ledger.get("source")
+    if not isinstance(sources, list):
+        return []
+    problems = []
+    for index, source in enumerate(sources):
+        listener = source.get("sut_listener") if isinstance(source, dict) else None
+        if not isinstance(listener, str) or not _COMPONENT_ID.match(listener):
+            continue
+        where = f"ledger.source {index + 1}"
+        declared = source.get("wire", DEFAULT_WIRE)
+        wire, kind, transport = listener_wire(sut_text, listener)
+        over = f"over {transport}" if transport else "with no transport:"
+        if kind is None:
+            problems.append(f"{where}: `sut_listener` {listener!r} isn't a component of the "
+                            "SUT config")
+        elif wire is None:
+            problems.append(f"{where}: `sut_listener` {listener!r} is a {kind} {over}, which "
+                            "the ledger has no wire for")
+        elif declared in WIRES and wire != declared:
+            problems.append(f"{where}: `wire` is {declared}, but `sut_listener` {listener!r} "
+                            f"is a {kind} {over}, a {wire} listener")
+    return problems
+
+
 def _source_problems(ledger):
     """What the `[[ledger.source]]` tables break: at least one, each a table of known keys with
     every required key a component id, a distinct generator `service` that is a slug whose
@@ -881,6 +965,8 @@ def _source_problems(ledger):
             value = source.get(key)
             if key in source and (not isinstance(value, str) or not _COMPONENT_ID.match(value)):
                 problems.append(f"{where}: `{key}` must name a component id")
+        if "wire" in source and source["wire"] not in WIRES:
+            problems.append(f"{where}: `wire` must be one of {', '.join(WIRES)}")
         listener = source.get("sut_listener")
         if isinstance(listener, str) and _COMPONENT_ID.match(listener):
             if listener in listeners:
@@ -1723,7 +1809,7 @@ def service_problems(scenario, roles):
     for service in generators(roles):
         if service not in sourced:
             problems.append(f"generator service {service} has no [[ledger.source]], so the "
-                            "ledger would read its datagrams with no G behind them")
+                            "ledger would read its lines with no G behind them")
     for index, sink in enumerate(scenario.sinks):
         backend = sink.get("backend")
         if backend is not None and roles.get(backend) != BACKEND_ROLE:
