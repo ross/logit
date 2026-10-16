@@ -448,8 +448,25 @@ impl UserData for AttrsProxy {
             },
         );
 
-        // No `__pairs`: mlua's `MetaMethod::Pairs` needs Lua 5.2+, not LuaJIT. A script
-        // enumerates `event:to_table().attributes` instead.
+        // No `__pairs`: mlua's `MetaMethod::Pairs` needs Lua 5.2+, not LuaJIT. The sandbox's
+        // `pairs` wrapper enumerates this proxy through `with_attrs` (`crate::pairs`).
+    }
+}
+
+/// Runs `f` on the attributes of `ud` if it's an `event.attributes` proxy, for `crate::pairs`;
+/// `Ok(None)` for any other userdata.
+///
+/// `ud.borrow` reports a torn-down proxy of any type as `UserDataDestructed`, which this returns
+/// as [`destructed_handle_error`]; mlua's own replacement metatable never sees the call, because
+/// the iterator is a Rust function and not a metamethod.
+pub(crate) fn with_attrs<R>(
+    ud: &AnyUserData,
+    f: impl FnOnce(&logit_core::AttrMap) -> mlua::Result<R>,
+) -> mlua::Result<Option<R>> {
+    match ud.borrow::<AttrsProxy>() {
+        Ok(proxy) => f(&proxy.0.borrow().attributes).map(Some),
+        Err(mlua::Error::UserDataDestructed) => Err(destructed_handle_error()),
+        Err(_) => Ok(None),
     }
 }
 
@@ -1613,16 +1630,22 @@ pub(crate) fn clarify_destructed_handle_use(err: mlua::Error) -> mlua::Error {
         }
     }
     if is_destructed_handle_use(&err) {
-        return mlua::Error::RuntimeError(
-            "this event, or a handle obtained from it (event.attributes, event.log, \
-             event.metrics[i], or event.span), was already returned/emitted elsewhere and can no \
-             longer be used -- an event handle, and any sub-handle obtained from it, are all \
-             consumed once the event is returned from process() or included in a flush() table; \
-             use event:clone() before returning if you need to keep using any of them afterward"
-                .to_string(),
-        );
+        return destructed_handle_error();
     }
     err
+}
+
+/// [`clarify_destructed_handle_use`]'s wording, also raised by `crate::pairs` on a torn-down
+/// handle.
+pub(crate) fn destructed_handle_error() -> mlua::Error {
+    mlua::Error::RuntimeError(
+        "this event, or a handle obtained from it (event.attributes, event.log, event.metrics[i], \
+         or event.span), was already returned/emitted elsewhere and can no longer be used -- an \
+         event handle, and any sub-handle obtained from it, are all consumed once the event is \
+         returned from process() or included in a flush() table; use event:clone() before \
+         returning if you need to keep using any of them afterward"
+            .to_string(),
+    )
 }
 
 #[cfg(test)]

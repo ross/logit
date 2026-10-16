@@ -13,8 +13,8 @@
 use crate::value::{
     attribute_error, attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua,
 };
-use logit_core::Resource;
-use mlua::{Lua, MetaMethod, UserData, UserDataMethods, Value as LuaValue};
+use logit_core::{AttrMap, Resource};
+use mlua::{AnyUserData, Lua, MetaMethod, UserData, UserDataMethods, Value as LuaValue};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -165,8 +165,8 @@ impl UserData for ResourceProxy {
             },
         );
 
-        // LuaJIT has no `__pairs`, so `resource:to_table()` is how a script enumerates. It
-        // returns attributes only; `schema_url`/`dropped_attributes_count` are read by name.
+        // A snapshot of the attributes only; `schema_url`/`dropped_attributes_count` are read by
+        // name. `pairs(resource)` enumerates the live attributes through `with_attrs`.
         methods.add_method("to_table", |lua, this, ()| {
             let state = this.0.borrow();
             match &state.modified {
@@ -175,6 +175,21 @@ impl UserData for ResourceProxy {
             }
         });
     }
+}
+
+/// Runs `f` on the attributes `resource` reads now, modified-else-base, if `ud` is the `resource`
+/// global's userdata, for `crate::pairs`; `Ok(None)` for any other userdata.
+pub(crate) fn with_attrs<R>(
+    ud: &AnyUserData,
+    f: impl FnOnce(&AttrMap) -> mlua::Result<R>,
+) -> mlua::Result<Option<R>> {
+    let Ok(proxy) = ud.borrow::<ResourceProxy>() else { return Ok(None) };
+    let state = proxy.0.borrow();
+    match &state.modified {
+        Some(r) => f(&r.attributes),
+        None => f(&state.base.attributes),
+    }
+    .map(Some)
 }
 
 /// Clones `state.base` into `state.modified` on the first write since the last [`set`].

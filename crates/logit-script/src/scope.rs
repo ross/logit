@@ -18,8 +18,10 @@ use crate::value::{
     attribute_error, attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua,
 };
 use bytes::Bytes;
-use logit_core::Scope;
-use mlua::{Lua, MetaMethod, RegistryKey, UserData, UserDataMethods, Value as LuaValue};
+use logit_core::{AttrMap, Scope};
+use mlua::{
+    AnyUserData, Lua, MetaMethod, RegistryKey, UserData, UserDataMethods, Value as LuaValue,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -214,7 +216,8 @@ impl UserData for ScopeProxy {
             },
         );
 
-        // LuaJIT has no `__pairs`, so `scope:to_table()` is how a script enumerates.
+        // A snapshot; `pairs(scope.attributes)` enumerates the live attributes through
+        // `with_attrs`.
         methods.add_method("to_table", |lua, this, ()| {
             let state = this.state.borrow();
             let table = lua.create_table()?;
@@ -319,6 +322,23 @@ impl UserData for ScopeAttrsProxy {
             }
         });
     }
+}
+
+/// Runs `f` on the attributes `scope.attributes` reads now, modified-else-base, empty for a batch
+/// with no scope, if `ud` is that sub-userdata, for `crate::pairs`; `Ok(None)` for any other
+/// userdata.
+pub(crate) fn with_attrs<R>(
+    ud: &AnyUserData,
+    f: impl FnOnce(&AttrMap) -> mlua::Result<R>,
+) -> mlua::Result<Option<R>> {
+    let Ok(proxy) = ud.borrow::<ScopeAttrsProxy>() else { return Ok(None) };
+    let state = proxy.0.borrow();
+    match (&state.modified, &state.base) {
+        (Some(s), _) => f(&s.attributes),
+        (None, Some(b)) => f(&b.attributes),
+        (None, None) => f(&AttrMap::new()),
+    }
+    .map(Some)
 }
 
 /// `lua_to_value` with its error text relabeled for a `scope` attribute write, as

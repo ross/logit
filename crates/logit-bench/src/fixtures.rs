@@ -1106,6 +1106,17 @@ function process(event)
 end
 "#;
 
+/// Enumerates `event.attributes` with an empty `pairs` loop on every call: the sandbox's `pairs`
+/// wrapper and its iterator (`crates/logit-script/src/pairs.rs`; `tests/allocations.rs`'s
+/// `lua_process_one_event_iterating_attributes`).
+pub const LUA_ATTR_PAIRS_SCRIPT: &str = r#"
+function process(event)
+  for k, v in pairs(event.attributes) do
+  end
+  return event
+end
+"#;
+
 /// Rewrites the log body in place on every call (`crates/logit-script/src/proxy.rs`'s `LogProxy`,
 /// `docs/adr/lua-in-place-edits.md`; `tests/allocations.rs`'s
 /// `lua_process_one_event_writing_log_message`).

@@ -16,6 +16,7 @@ use std::sync::Arc;
 mod construct;
 mod heartbeat;
 mod memory;
+mod pairs;
 mod print;
 mod provenance;
 mod proxy;
@@ -150,6 +151,7 @@ impl ScriptWorker {
         let provenance_state = provenance::install(&lua)?;
         print::install(&lua, provenance_state.clone())?;
         random::install(&lua)?;
+        pairs::install(&lua)?;
         // `Event.new` reads the targets cell at call time, so a later `with_targets` still takes
         // effect; an `Event.new` at top level, during `.exec()`, sees the empty table
         // (`docs/design/lua-api.md` says so).
