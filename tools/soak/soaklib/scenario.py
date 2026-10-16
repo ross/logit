@@ -167,6 +167,10 @@ OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire"}
 # (checks.py's `WIRES`): datagrams, a TCP stream of LF-terminated lines, or a file the SUT tails.
 WIRES = ("udp", "tcp", "file")
 DEFAULT_WIRE = "udp"
+FILE_WIRE = "file"
+# A file wire's writer: the only generator sink whose G is `events.delivered` (checks.py's
+# `WIRES`), since it counts no `output.messages`.
+FILE_WRITER_KIND = "file_out"
 # Each listener kind the ledger can follow: the wire it takes with no `transport:`, and the
 # wire each `transport:` value it accepts gives. A kind or transport missing here has no wire.
 LISTENER_WIRES = {
@@ -210,6 +214,10 @@ METRIC_KINDS = {
     "logit.input.frames": "sum",
     "logit.input.frames.dropped": "sum",
     "logit.input.connections.closed": "sum",
+    "logit.input.lines": "sum",
+    "logit.input.files.rotated": "sum",
+    "logit.input.files.resume_rejected": "sum",
+    "logit.input.checkpoint.errors": "sum",
     "logit.component.datagrams.dropped": "sum",
     "logit.component.batches.dropped": "sum",
     "logit.component.batches.delivered": "sum",
@@ -489,6 +497,12 @@ class Scenario:
         return list(self.ledger.get("source") or [])
 
     @property
+    def file_sources(self):
+        """The `[[ledger.source]]` tables whose `wire` is `file`, which the driver gives a
+        shared directory and waits on at the end."""
+        return [source for source in self.sources if source.get("wire") == FILE_WIRE]
+
+    @property
     def generators(self):
         """The generator services, one per `[[ledger.source]]`, in order."""
         return [source.get("service") for source in self.sources]
@@ -685,6 +699,7 @@ def from_dict(raw, path):
         sut_config = configs.get(SUT_CONFIG_KEY) if isinstance(configs, dict) else None
         if isinstance(sut_config, str) and (path.parent / sut_config).is_file():
             problems += _wire_problems(ledger, (path.parent / sut_config).read_text())
+        problems += _writer_problems(ledger, configs, path.parent)
         problems += _extra_sut_problems(extra_suts, ledger)
         problems += _hop_problems(ledger, extra_suts)
 
@@ -924,6 +939,41 @@ def _wire_problems(ledger, sut_text):
     return problems
 
 
+def _writer_problems(ledger, configs, directory):
+    """What a source's `generator_sink` breaks against its generator's config: on a `file`
+    wire it must be a `file_out`, and on any other wire it must not be, because the two read G
+    from different counters."""
+    sources = ledger.get("source")
+    if not isinstance(sources, list) or not isinstance(configs, dict):
+        return []
+    problems = []
+    for index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            continue
+        service, sink = source.get("service"), source.get("generator_sink")
+        name = configs.get(service) if isinstance(service, str) else None
+        if (not isinstance(name, str) or not isinstance(sink, str)
+                or not (directory / name).is_file()):
+            continue
+        kind = None
+        for block in component_blocks((directory / name).read_text(), sink):
+            body = "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in block.splitlines())
+            found = re.search(r"\btype\s*:\s*[\"']?([a-z_]+)", body)
+            if found:
+                kind = found.group(1)
+                break
+        where = f"ledger.source {index + 1}"
+        wire = source.get("wire", DEFAULT_WIRE)
+        if wire == FILE_WIRE and kind != FILE_WRITER_KIND:
+            problems.append(f"{where}: a file wire's `generator_sink` must be a "
+                            f"{FILE_WRITER_KIND}, and {sink!r} is "
+                            + (f"a {kind}" if kind else "no component of its config"))
+        elif wire != FILE_WIRE and kind == FILE_WRITER_KIND:
+            problems.append(f"{where}: `generator_sink` {sink!r} is a {FILE_WRITER_KIND}, "
+                            "which only a file wire reads")
+    return problems
+
+
 def _source_problems(ledger):
     """What the `[[ledger.source]]` tables break: at least one, each a table of known keys with
     every required key a component id, a distinct generator `service` that is a slug whose
@@ -1075,6 +1125,10 @@ SUT_CONFIG_ENV = "SOAK_SUT_CONFIG"
 # The compose variable holding a stand-in target's shape, set in `compose.env`; compose.yaml
 # passes it to standin.py's `--shape`.
 STANDIN_SHAPE_ENV = "SOAK_STANDIN_SHAPE"
+# A file wire's shared directory, `<run>/shared`, and the compose variable holding its path,
+# which a scenario's override mounts into the writer and the SUT.
+SHARED_DIR = "shared"
+SHARED_DIR_ENV = "SOAK_SHARED_DIR"
 
 
 def config_env(service):

@@ -5100,8 +5100,11 @@ def _tcp_rules(root):
                for p in problems),
            f"a transport with no wire is refused, got {problems}")
     tailed = "components:\n  statsd: { type: tail_in, paths: [/shared/app.log] }\n"
-    expect(with_config(tailed, "file") == [],
-           f"a tail_in source loads with wire file, got {with_config(tailed, 'file')}")
+    problems = with_config(tailed, "file")
+    expect(problems == ["ledger.source 1: a file wire's `generator_sink` must be a file_out, "
+                        "and 'statsd' is a statsd_out"],
+           f"a tail_in source takes wire file, and its writer must be a file_out, got "
+           f"{problems}")
 
     # The fault predicates per wire.
     roles = scenario.BASE_ROLES

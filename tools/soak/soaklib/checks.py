@@ -73,7 +73,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import collect, faults, standin, telemetry, topic, vm
-from .scenario import (DEFAULT_WIRE, EXPECT_REDUCERS, EXTERNAL_TARGET, GENERATOR_ROLE,
+from .scenario import (DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET, GENERATOR_ROLE,
                        KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, RUN_WINDOW, STANDIN_ROLE,
                        STANDIN_TARGET, SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE,
                        component_blocks, config_env, parse_duration)
@@ -1173,9 +1173,21 @@ WIRES = {
                 "logit.input.kernel.dropped", (), ("undecodable", "oversize")),
     "tcp": Wire("TCP", "logit.output.messages", "logit.input.frames", None,
                 ("truncated", "oversize", "drained", "malformed"), ("undecodable",)),
-    "file": Wire("file", "logit.component.events.delivered", "logit.input.lines", None, (),
-                 ("undecodable",)),
+    "file": Wire("file", "logit.component.events.delivered", "logit.input.lines", None,
+                 ("oversize", "truncated"), ()),
 }
+# A file wire's tailer reads at most this much of one file per read, so a kill can replay up to
+# one read's lines per file past its last checkpoint (docs/known-gaps/tailing.md, "The tail
+# driver notices shutdown only between two files' reads").
+TAIL_READ_CHUNK_BYTES = 64 * 1024
+# `tail_in`'s `checkpoint_interval` when the config names none (crates/logit-config,
+# `TailOptions`).
+DEFAULT_TAIL_CHECKPOINT_INTERVAL_S = 5.0
+# The files a killed life can replay a read's lines of: the writer's active file, and the file
+# it rotated away inside the life's last checkpoint interval, since a rotation every few tens of
+# seconds leaves at most one inside an interval of a few seconds. A fully read rotated file
+# replays nothing.
+TAIL_REPLAY_FILES = 2
 # On a TCP wire the actions that end a SUT or generator process, or a partition that moved an
 # address, can lose lines the generator counted as sent: what sat in either side's socket buffers
 # when the connection reset. Their windows are reported, not judged. Every other TCP-affecting
@@ -1803,6 +1815,61 @@ class Ledger:
                 f"kill plus one drain interval of queue growth after the last drain")
         return low, high, text
 
+    def replay_band(self, listeners):
+        """`(low, high, lines)`: the range a file wire's W − G may take over the run, summed per
+        ingress SUT life, for the tailers `listeners`, with one line per life that widens it.
+
+        A killed life replays the lines its tailers read after their last checkpoint and loses
+        the counts of those it read after its last drain: at most rate × `checkpoint_interval`
+        plus one 64 KiB read's lines per file it can replay (`TAIL_REPLAY_FILES`) above, and
+        rate × its drain interval below, the rate being its lines over its last drain
+        interval. A life a stop, restart, or `exit` ended emits each file's unterminated line
+        at shutdown and the rest of it after the restart, one line more per file it had open
+        (`logit.input.files.open` at its last drain), above (docs/known-gaps/tailing.md's
+        split-line entry). The final life adds nothing."""
+        inn = self.inn
+        text = self._sut_config_text(inn.service)
+        counted = self.data.phases.get("shared_counted") or {}
+        line_bytes = (counted.get("bytes", 0) / counted["lines"]
+                      if counted.get("lines") else 0.0)
+        chunk_lines = round(TAIL_READ_CHUNK_BYTES / line_bytes) if line_bytes else 0
+        low = high = 0
+        lines = []
+        for life in inn.lives:
+            if life == inn.final:
+                continue
+            if life in inn.killed:
+                drains = self.ingress.life_drains(life)
+                gaps = [b - a for a, b in zip(drains, drains[1:])]
+                interval = statistics.median(gaps) if gaps else 0.0
+                last = sum(v for listener in listeners
+                           for ts, v, point_life in self.ingress.counter_points(
+                               self.wires[listener].w, component=listener)
+                           if point_life == life and drains and ts == drains[-1])
+                rate = last / gaps[-1] if gaps and gaps[-1] > 0 else 0.0
+                checkpoint = max((component_duration(text, listener, "checkpoint_interval")
+                                  or DEFAULT_TAIL_CHECKPOINT_INTERVAL_S)
+                                 for listener in listeners)
+                below = round(rate * interval)
+                above = (round(rate * checkpoint)
+                         + chunk_lines * TAIL_REPLAY_FILES * len(listeners))
+                low -= below
+                high += above
+                lines.append(f"life {life} (killed): [-{_n(below)}, +{_n(above)}]: {rate:,.0f} "
+                             f"lines/s x a {interval:g}s drain interval below; x a "
+                             f"{checkpoint:g}s checkpoint_interval plus {TAIL_REPLAY_FILES} "
+                             f"file(s) x one 64 KiB read of {_n(chunk_lines)} lines above")
+            else:
+                files = 0
+                for listener in listeners:
+                    series = [v for ts, v, point_life in self.ingress.gauge_series(
+                        "logit.input.files.open", component=listener) if point_life == life]
+                    files += int(series[-1]) if series else 1
+                high += files
+                lines.append(f"life {life} (stopped): [0, +{files}]: one split line per file "
+                             f"open at its last drain")
+        return low, high, lines
+
     def egress(self, life, sinks):
         """`(status, verdict, gap)` for one life's egress to `sinks`, whose V is summed (one
         sink under `copy`, all under `route`): `ok`, `counted`, `within band`, `surplus`, or
@@ -2085,6 +2152,8 @@ def _wire_one(data, led, source):
     wire_name = source_wire(source)
     wire = WIRES[wire_name]
     udp = wire_name == DEFAULT_WIRE
+    if wire_name == FILE_WIRE:
+        return _file_wire_one(data, led, source)
     stats = led.gen_stats[service]
     status = PASS
     lines = []
@@ -2192,6 +2261,55 @@ def _wire_one(data, led, source):
                   f"{_n(stats['dropped_events'])} event(s) in {_n(stats['dropped_batches'])} "
                   f"batch(es)" + (f" ({_reasons(stats['dropped_by'])})"
                                   if stats["dropped_by"] else ""))
+    if status != PASS:
+        detail = f"{lines[0]}; {detail}"
+    return status, detail, lines
+
+
+def _file_wire_one(data, led, source):
+    """`(status, detail, lines)` of `ledger.wire` for a file source. A tailer reads behind its
+    writer, so a drain interval's gap is lag, not loss: the runs are reported, and the row
+    judges the run's W + F − G against `Ledger.replay_band`. G must equal the lines the driver
+    counted in the shared directory at the end (`shared_counted`), and the end sequence's wait
+    for the tailers (`tail_caught_up`) is reported beside it."""
+    service, listener = source.get("service"), source.get("sut_listener")
+    stats = led.gen_stats[service]
+    status = PASS
+    lines = []
+    W = sum(led.per[listener]["W"].values())
+    F = sum(led.per[listener]["F"].values())
+    G = stats["G"]
+    counted = data.phases.get("shared_counted")
+    if counted is None:
+        status = FAIL
+        lines.append("precondition: no shared_counted phase, so G has no count from the "
+                     "shared directory to hold it to")
+    elif counted.get("lines") != G:
+        status = FAIL
+        lines.append(f"precondition: the shared directory holds {_n(counted.get('lines', 0))} "
+                     f"line(s) in {_n(counted.get('files', 0))} file(s), but the writer's "
+                     f"events.delivered is {_n(G)}")
+    caught = data.phases.get("tail_caught_up") or {}
+    low, high, band_lines = led.replay_band([listener])
+    for start, end, kind, label, g, wk, f in _wire_buckets(data, led, source):
+        lines.append(f"[{data.offset(start)}, {data.offset(end)}] {kind} ({label}): "
+                     f"G {_n(round(g))}, W {_n(wk - f)}, counted {_n(f)}, gap "
+                     f"{_n(round(g - wk))}")
+    lines += band_lines
+    over = W + F - G
+    if not low <= over <= high:
+        status = FAIL
+        what = "uncounted loss" if over < low else "surplus"
+        lines.insert(0, f"W + F − G {_n(over)} is {what}, outside the replay band "
+                        f"[{_n(low)}, {_n(high)}]")
+    wait = ("" if not caught else
+            f"; the tailers {'reached G' if caught.get('reached') else 'stopped short'} at the "
+            f"end with W {_n(caught.get('w') or 0)}")
+    detail = (f"G {_n(G)} (shared directory: "
+              + (f"{_n(counted.get('lines', 0))} lines in {_n(counted.get('files', 0))} files"
+                 if counted else "uncounted")
+              + f") vs W {_n(W)} + counted {_n(F)}: W + F − G {_n(over)} against the replay band "
+              f"[{_n(low)}, {_n(high)}]" + wait)
     if status != PASS:
         detail = f"{lines[0]}; {detail}"
     return status, detail, lines
@@ -2603,6 +2721,7 @@ def check_ledger_summary(data):
                 f" over the run, F {_n(sum(led.F.values()))} counted; ledger.wire judges the "
                 "rest")
     status = PASS if judged == 0 and not uncounted_egress and not faults else FAIL
+    bound_text = ""
     lines = _per_life_lines(led)
     lead = f"final life {life}"
     if led.hop is not None:
@@ -2612,23 +2731,34 @@ def check_ledger_summary(data):
         bound_status, bound_text = _end_to_end(data, led)
         status = worst([status, bound_status])
         wire += f"; {bound_text}"
+    if led.hop is None and any(source_wire(source) == FILE_WIRE for source in led.sources):
+        bound_status, bound_text = _end_to_end(data, led)
+        status = worst([status, bound_status])
+        wire += f"; {bound_text}"
     detail = f"{lead}: uncounted {_n(judged)} = " + " + ".join(shown) + counted_script + wire
-    if (status == FAIL and led.hop is not None and judged == 0 and not uncounted_egress
-            and not faults):
+    if (status == FAIL and (led.hop is not None or bound_text) and judged == 0
+            and not uncounted_egress and not faults):
         detail = f"{bound_text}; {detail}"
     return Result("ledger.summary", status, detail, lines)
 
 
 def _end_to_end(data, led):
-    """`(status, text)`: across a hop, each egress group's V over the whole run against what
-    the generators sent less every counted loss on the way (K, D, B, X, the hop sink's drops,
-    and X_B; on a TCP wire F too). A kill on either side shifts lives but never adds increments,
+    """`(status, text)`: across a hop or from a file wire, each egress group's V over the whole
+    run against what the generators sent less every counted loss on the way (K, D, B, X, the
+    hop sink's drops, and X_B; on a TCP or file wire F too), plus a file wire's replay band's
+    upper edge. A kill on either side shifts lives but never adds increments,
     so V above that is a surplus whatever was killed; V below it is the per-life rows' to
     judge."""
     counted = sum(sum(getattr(led, symbol).values())
                   for symbol in ("K", "F", "D_tel", "B", "X"))
-    counted += sum(led.hop_dropped.values()) + sum(led.X_B.values())
-    limit = led.G - counted
+    if led.hop is not None:
+        counted += sum(led.hop_dropped.values()) + sum(led.X_B.values())
+    # A file wire's tailers replay lines after a kill and split one line per file at a stop,
+    # so V may exceed G by the replay band's upper edge.
+    files = [source.get("sut_listener") for source in led.sources
+             if source_wire(source) == FILE_WIRE]
+    replay = led.replay_band(files)[1] if files else 0
+    limit = led.G - counted + replay
     status, parts = PASS, []
     for label, sinks in led.egress_groups():
         total = sum(led.V_total.get(sink, 0) for sink in sinks)
@@ -2639,7 +2769,8 @@ def _end_to_end(data, led):
         else:
             parts.append(f"{label}: V {_n(total)} <= G − counted {_n(limit)}")
     return status, ("end to end over the run, G " + _n(led.G) + " less counted loss "
-                    + _n(counted) + ": " + "; ".join(parts))
+                    + _n(counted) + (f" plus the replay band's {_n(replay)}" if files else "")
+                    + ": " + "; ".join(parts))
 
 
 def _last_interval(tel, name, component, life):
