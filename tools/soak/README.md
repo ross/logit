@@ -208,6 +208,18 @@ then never reaches the generator. Its expectations assert the generator's overfl
 ambiguous drops around the SUT's pause, an idle close around the generator's, and none under
 the netem delay.
 
+`tail-rotate` (13 minutes 45 seconds) has the generator write 1,000 log lines a second with
+`file_out` (`format: json`) into a file rotated about every 44 s, keeping every file, in
+`<run>/shared`, which the driver creates and the scenario's override mounts into the writer and
+the SUT. The SUT tails `/shared/app.log*` with `tail_in` (`read_from: beginning`, a checkpoint
+in its own filesystem) through `json` and a count chain into `aggregate` and a disk-spooled
+sink, its source declared `wire = "file"`. Its 10.75-minute cycle pauses the SUT for 60 s,
+stops it, restarts it, and kills it for 30 s and then for 150 s, across several rotations.
+`ledger.wire` judges the run's W − G against a replay band per SUT life, and the end sequence
+counts the writer's lines in the shared directory before it waits for the tailer to read them.
+Its expectations assert that rotations are seen and that no resume is rejected and no
+checkpoint fails. The writer's files stay in the run directory, about 80 MB of them.
+
 ### Several SUT services
 
 A scenario can run a second `logit` under test, at the far end of a native hop. `logit`
@@ -546,7 +558,11 @@ checks the wire against the listener's `type:` and `transport:` in the SUT confi
 has its own symbols: G is the generator sink's `output.messages` (a `file_out`'s
 `events.delivered` on a file wire), W the listener's `input.datagrams`, `input.frames`, or
 `input.lines`, and on TCP F counts the lines the listener's framer dropped before W counted them
-(`frames.dropped`), counted wire loss. `ledger.wire` judges each source on its own, against the fault windows of its own
+(`frames.dropped`), counted wire loss. A file wire is judged differently, because a tailer reads behind its writer: the run's
+W − G against a replay band summed over the SUT's lives, a killed life's replay after its last
+checkpoint and its unexported last drain interval, and a stopped life's split line per open
+file, with G held to the lines the driver counts in the shared directory at the end.
+`ledger.wire` judges each source on its own, against the fault windows of its own
 generator and of every service that isn't a generator that affect its wire, and
 `ledger.intake` judges each listener's final life; each reports a line per source or listener
 and takes the worst status.

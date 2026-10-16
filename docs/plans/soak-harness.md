@@ -1716,35 +1716,41 @@ where it needs them, and a small check extension.
    (the product already counts per line, `input.frames`), per-wire fault attribution, and a
    partition's addresses. Built as `tcp-ingress`, with an override capping each end's TCP
    buffers so a 30 s pause stalls a write (see "Findings").
-9. **File tailing (W11b).** `tail_in` behind a rotating writer, with `pause`, `stop`, `restart`,
-   and `kill` on the SUT. Proves checkpoint resume
+9. **File tailing (built in W11b).** `tail_in` behind a rotating writer, with `pause`, `stop`,
+   `restart`, and `kill` on the SUT. Proves checkpoint resume
    ([ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md),
    "Checkpoints: optional, written on an interval, only when dirty"). The writer is a
-   `generator` service, `generate_in → file_out` with `format: json`, rotating on a `rotate`
-   sized so `max_files` never deletes a file the tailer hasn't read (never `max_files: 1`).
-   `file_out` counts no `output.messages`, so G is its `logit.component.events.delivered` (§6's
-   file wire), and the harness also counts the lines across `app.log*` at the end, a G from
-   outside both processes. The SUT tails `paths: ["/shared/app.log*"]`, a glob that matches the
-   rotated names, with `read_from: beginning` and a `checkpoint_path` that survives a stop and a
-   kill (`checkpoint_interval: 5s`), then `json` and `fanin`'s count chain into `aggregate` and a
-   `prometheus_out` with `buffer.disk:`. W is `logit.input.lines`, which the product already
-   counts per line. Both mount a directory the driver creates, `<run>/shared` with mode 0777,
-   named by `SOAK_SHARED_DIR` in `compose.env` and mounted `:z`, which reverses the ADR's
-   "nothing in a container writes to the run directory" (an amendment records it). A replay is
-   at-least-once (ADR `delivery-semantics`, "10. A replaying input is at-least-once up to the
-   in-memory queues"): a checkpoint advances once lines reach the downstream inboxes, so a kill
-   loses the checkpointed lines still in memory (the inboxes, `aggregate`'s open window, and the
-   sink's memory queue) and replays the lines since the last checkpoint. The replay's surplus is
-   in W, so it belongs on `ledger.wire` and on `ledger.summary`'s end-to-end bound, not on the
-   killed life's egress band, which §6 bounds from `aggregate`'s window and stays as written,
-   with its rate read from `input.lines`: per killed life, ΣW − G lies in [−rate × drain
-   interval, rate × `checkpoint_interval` + one 64 KiB chunk's lines per file]. A clean stop or
-   restart may add one W per file, the partial line the split held (a known gap), with the
-   `json` errors it causes shown. A file wire's fault windows are the SUT's lifecycle faults
-   only. Rows: `ledger.wire` with that band, `[[expect]]` on `logit.input.files.rotated` above 0,
-   `logit.input.files.resume_rejected` at 0, and `logit.input.checkpoint.errors` at 0. W11b builds it as
-   `tail-rotate`: 1,000 lines a second rotating about every 40 s, a 60 s pause, a 30 s stop, a
-   restart, a 30 s kill across a rotation, and a 150 s kill across about four.
+   `generator` service, `generate_in → file_out` with `format: json`. `file_out` rotates by
+   renaming the active file to `app.log.rotating`, shifting each `app.log.N` to `N + 1`, removing
+   `app.log.{max_files − 1}`, and renaming the staged file to `app.log.1`; `max_files` counts the
+   active file. The scenario keeps every file (`max_files: 100`), so nothing unread is deleted and
+   the harness can count every line at the end. `file_out` counts no `output.messages`, so G is
+   its `logit.component.events.delivered` (§6's file wire), held to the lines the driver counts
+   across the shared directory, a G from outside both processes. The SUT tails
+   `paths: ["/shared/app.log*"]`, a glob that matches the rotated names, so a renamed file is
+   rebound by inode and read to its end; it matches `app.log.rotating` too, which is harmless,
+   since that is the same inode. It runs `read_from: beginning`, a `checkpoint_path` in its own
+   filesystem (`/var/lib/logit`, which a stop and a kill keep), and `checkpoint_interval: 5s`,
+   then `json` and `fanin`'s count chain into `aggregate` and a `prometheus_out` with
+   `buffer.disk:`. W is `logit.input.lines`, which the product already counts per line. Both
+   mount `<run>/shared` (§3). A replay is at-least-once (ADR `delivery-semantics`, "10. A
+   replaying input is at-least-once up to the in-memory queues"): a checkpoint covers only lines
+   already in a downstream inbox, so a kill replays what was read after the last checkpoint. A
+   clean stop doesn't read to the end of its files: shutdown emits each file's held unterminated
+   line, flushes, and writes a final checkpoint, so nothing replays but the split line, which a
+   64 KiB read ending mid-line holds as often as a writer caught mid-line does. The replay's
+   surplus is in W, so it belongs on `ledger.wire` and on `ledger.summary`'s end-to-end bound,
+   not on the killed life's egress band, which §6 bounds from `aggregate`'s window and stays as
+   written, with its rate read from `input.lines`; §6's `ledger.wire` row has the band. A file
+   wire's fault windows are the SUT's lifecycle faults only. `logit.input.files.rotated` counts
+   every renamed name a scan finds, so one rotation of `file_out`'s cascade counts once per file
+   it renamed: an `[[expect]]` can ask only that it's above 0. Rows: `ledger.wire` with the band,
+   and `[[expect]]` on `logit.input.files.rotated` above 0, `logit.input.files.resume_rejected`
+   at 0, and `logit.input.checkpoint.errors` at 0. A tailer keeps every file its pattern still
+   matches open at its end, so with every file kept its descriptors grow by about one per
+   rotation, and the scenario's `fd_growth` allows for it. Built as `tail-rotate`: 1,000 lines a
+   second rotating about every 44 s, a 60 s pause, a 30 s stop, a restart, a 30 s kill, and a
+   150 s kill across about three rotations.
 10. **Deterministic destination errors (built in W9a, for `prometheus_out`, and W9b, for
     `datadog_out`).** A scripted HTTP stand-in answering `429`, `5xx`, `400`,
     and `413` on cue and recording what it accepts, so every row of a sink's response-class table
@@ -3550,6 +3556,76 @@ head (`3c1ab0f1b2ea`). The final run is `perf/results/soak/20261016T020310Z`, ex
   median on both services.
 - Re-scoring every earlier run directory (52, the three `native-hop` runs among them) with this
   branch's harness gives `results.md`, `results.json`, and exit codes identical to `origin/main`'s.
+
+### W11b: file tailing (2026-10-15)
+
+`tail-rotate` ran twice on the development host (`sailfish`), against `logit:soak` built with
+`--no-cache` after `origin/main`'s head (`3c1ab0f1b2ea`). The final run is
+`perf/results/soak/20261016T025252Z`, from `soak/w11b` at `f369b3c8` with no modified path,
+exit 0, shown here as `check` re-scores it at the branch's head, which merges the file wire's
+drain-interval rows into runs:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 10 apply/revert action(s) returned 0; 5 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 5 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (2 kill(s)) |
+| `restarts` | PASS | 4 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 0 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 59 readiness sample(s) read ok outside fault windows; 5 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 6 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 6 of 6, 7 freshness sample(s); 150s of 765s after warmup judged (20%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 -0.4 (limit 64); 215s of 765s after warmup judged (28%; WARN under 5%) \| logit PASS: MiB/h life 4 -1033.2 (limit 64); 175s of 765s after warmup judged (23%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +40) \| logit PASS: warmup median 16 -> end 34 (limit +40) |
+| `ledger.wire` | PASS | G 830,700 (shared directory: 830,700 lines in 19 files) vs W 830,500 + counted 0: W + F − G -200 against the replay band [-9,999, 12,776]; the tailers stopped short at the end with W 830,500 |
+| `ledger.intake` | PASS | final life 4: W − D 379,900 vs E + B 379,900; life 0: W − D − B − X − Ab 0 within [0, R]; life 1: W − D − B − X − Ab 0 within [0, R]; life 2: W − D − B − X − Ab 100 within [0, R]; life 3: W − D − B − X − Ab 100 within [0, R] (R 327,000 = 0 + 262 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 4: E[tail] 379,900 == T_in[parse] 379,900 (into parse); T_in[parse] 379,900 == T_out[parse] 379,900 (parse forwards every event); T_out[parse] 379,900 == T_in[labels] 379,900 (into labels); T_in[labels] 379,900 == T_out[labels] 379,900 (labels forwards every event); T_out[labels] 379,900 == T_in[count] 379,900 (into count); T_in[count] 379,900 == T_out[count] 379,900 (count forwards every event); T_out[count] 379,900 == T_in[metrics_only] 379,900 (into metrics_only); T_in[metrics_only] 379,900 == T_out[metrics_only] 379,900 (metrics_only forwards every event); Σ(sent into aggregate) 379,900 == A 379,900 (listeners to aggregate); A_sent 23 == S_in[victoria_metrics] 23 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 4: Ab 379,900 == A 379,900 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 1: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 2 (killed): Ab 85,100 − V[victoria_metrics] 80,100 = 5,000, within band (band [-5,099, 14,998]: ingest 1,000/s over the last drain interval; below, the residual 100 plus one 4.99971s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − Ab 100 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 3 (killed): Ab 89,700 − V[victoria_metrics] 84,700 = 5,000, within band (band [-5,100, 15,000]: ingest 1,000/s over the last drain interval; below, the residual 100 plus one 4.99982s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − Ab 100 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 4 (final): Ab 379,900 − V[victoria_metrics] 379,900 = 0, ok (split copy; R 327,000 = 0 + 262 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | PASS | 1 series over 1 sink(s) x 5 life/lives, widest gap 10.001s (gaps <= 15s (1.5 x the 10s aggregate interval) or idle, with no window batches.sent from a + 7.5s to b - 2.5s (5s drains); a killed life's last sample within 11s (1.1 x) of the kill, a later life's first within 20s (2 x) of its start; 1 idle gap(s) excused: life 0 +59s to +120s (60.629s, 1 series), window sent 0 batch(es) over 0 drain(s) from +67s to +118s) |
+| `ledger.replay` | PASS | victoria_metrics: life 3's first drain replayed 0 vs killed life 2's last-drain buffer.batches 0; victoria_metrics: life 4's first drain replayed 0 vs killed life 3's last-drain buffer.batches 0 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 4: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K + F) 200 over the run, F 0 counted; ledger.wire judges the rest; end to end over the run, G 830,700 less counted loss 0 plus the replay band's 12,776: victoria_metrics: V 820,300 <= G − counted 843,476 |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 4 at +865s: victoria_metrics: received 23 vs delivered 23 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 5 of 5 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 1,000/s |
+| `expect.files-rotated` | PASS | delta of logit.input.files.rotated{component=tail} on logit, run: run (+60s, +825s]: 130 (over 109 drain(s)), want >= 1 |
+| `expect.no-resume-rejected` | PASS | delta of logit.input.files.resume_rejected{component=tail} on logit, run: run (+60s, +825s]: 0 (over 109 drain(s)), want <= 0 |
+| `expect.no-checkpoint-errors` | PASS | delta of logit.input.checkpoint.errors{component=tail} on logit, run: run (+60s, +825s]: 0 (over 109 drain(s)), want <= 0 |
+
+- **The first run, `20261016T023523Z`, FAILed `ledger.egress` on a harness bug.** The restarted
+  life read W − D − B − X − V of −4,900. A `docker restart` started the next process 0.2 s after
+  the old one's final drain (+270.07 s against a start of +270.26 s), and `telemetry.py` placed a
+  drain in the newest life that started at most 1 s after it, so the old life's final drain, with
+  its close-time counts, landed in the new life while V placed the same flush in the old one by
+  timestamp. A point at a drain now takes that drain's life from the uptime sequence. No earlier
+  run had a restart that fast, and every one re-scores identically; the first run re-scores to
+  PASS.
+- **The wire: G 830,700 lines in 19 files, W 830,500.** The shared directory's count equals the
+  writer's `events.delivered`. W − G is −200, inside the band [−9,999, 12,776]. Each kill's window
+  shows about 100 lines fewer in W than G (109 and 101): the killed life never exported its last
+  drain interval of counts, about 5,000 lines, and the restart re-read about as many from its
+  last checkpoint, since drains and checkpoints both run every 5 s. No replay surplus showed
+  beyond that offset, and the end sequence's wait stopped with W 200 short, held.
+- **A clean stop and a restart split no line.** `json` reported no parse failure, and the stop's
+  and the restart's windows gap by −55 and −2, inside drain-interval interpolation. The band
+  allowed 5 and 7 split lines for the files open at those stops.
+- **The 150 s kill spanned three rotations** (the writer rotated at +485 s, +525 s, and +570 s).
+  The restarted tailer resumed every checkpointed inode under its new name, read the three new
+  files from their start, and read 159,900 lines in its first drain: no `resume_rejected`, no
+  checkpoint error, nothing lost. The 30 s kill fell between two rotations.
+- **`files.rotated` counted 130 against the writer's 18 rotations**, because each scan counts
+  every renamed name in `file_out`'s cascade.
+- **The tailer kept every file open.** `logit.input.files.open` rose with each rotation to 19,
+  and the SUT's descriptors from 16 at warmup to 34 at the end, inside the scenario's
+  `fd_growth` of 40. `tail_in` closes a file only when no pattern matches it any more or a new
+  inode takes its path; under a pattern that matches every rotated name and a writer that keeps
+  every file, nothing closes one.
+- The pause bunched the SUT's drains at the unpause, and the tailer read 61,083 lines in the
+  first drain interval after it: a drain interval's G − W on a file wire is lag, which is why
+  only the run's total is judged.
 
 ## Verification
 
