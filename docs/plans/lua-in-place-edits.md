@@ -53,7 +53,8 @@ deferred them "once a concrete need for writing them shows up". Prusa is that ne
 
 `LogProxy::__newindex` gains three arms, each reusing `crates/logit-script/src/construct.rs`'s
 parser for the same field, so a write accepts what `Event.new`'s `log` table accepts and refuses
-with the same message (prefixed `event.log` instead of `Event.new: log`):
+with the same message (prefixed `event.log` instead of `Event.new: log`), except that
+`body_format`'s messages don't offer `nil`:
 
 | Field | Accepts | `nil` | Allocation per write |
 |---|---|---|---|

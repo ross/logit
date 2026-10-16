@@ -653,9 +653,13 @@ fatal (or nil), got "warning"`). `nil` differs per field:
   stores as a null that reads as `nil`, `event.log.message = event.log.message` isn't an error.
 - `severity` reads as a lowercase name
   (`"trace"`/`"debug"`/`"info"`/`"warn"`/`"error"`/`"fatal"`, matching `stdio_out`'s rendering),
-  or `nil` if the record carries none. Assigning `nil` clears it. On an event from `syslog_in`,
-  `syslog_out` writes the PRI from the private `_logit.syslog.severity` attribute, which outranks
-  `severity`, so a script that changes `severity` for `syslog_out` also deletes that attribute.
+  or `nil` if the record carries none. Assigning `nil` clears it. A protocol's own sink prefers the
+  raw severity carrier its input stamped over `severity` (`syslog_out` reads
+  `_logit.syslog.severity`, `otlp_out` the `_logit.otel.severity_*` pair; see
+  `docs/design/data-model.md`'s "Well-known attribute names"). `collectd_out`
+  writes a notification's severity only from `_logit.collectd.severity`, and `statsd_out` never
+  derives one from `severity`. So a script that changes `severity` for one of these sinks also
+  deletes or rewrites that sink's carrier.
 - `body_format` reads as `"raw"`/`"json"`/`"structured"`. Assigning `nil` is an error, though
   `Event.new` defaults an absent `body_format` to `"raw"`, because a write names the format it
   wants.
