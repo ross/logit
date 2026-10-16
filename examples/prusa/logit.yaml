@@ -18,8 +18,11 @@ components:
 
   # Strips the header, gives every point an absolute timestamp, tags it with the printer's MAC
   # address, and names the bucket. Points renamed or skipped here follow Prusa's own collector.
+  # `jit: true` turns on LuaJIT's compiler, which speeds up a script that parses and loops in
+  # plain Lua, as this one does. It's off by default.
   prusa:
     type: lua_file
+    jit: true
     sources: [printer_in]
     lua_file: prusa.lua
 

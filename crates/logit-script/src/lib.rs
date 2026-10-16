@@ -52,6 +52,29 @@ fn sandbox_libs() -> StdLib {
     StdLib::TABLE | StdLib::STRING | StdLib::MATH
 }
 
+/// `sandbox_libs`, plus LuaJIT's `jit` library when the component sets `jit: true`. Opening that
+/// library is what turns the trace compiler on: `luaopen_jit` is the only code that sets LuaJIT's
+/// on flag and its default optimization parameters, so a VM without it runs interpreted. Calling
+/// `luaJIT_setmode` instead would turn the compiler on with every parameter zeroed. See
+/// `docs/adr/lua-jit-opt-in.md`.
+fn vm_libs(jit: bool) -> StdLib {
+    match jit {
+        true => sandbox_libs() | StdLib::JIT,
+        false => sandbox_libs(),
+    }
+}
+
+/// Removes the `jit` global [`vm_libs`] opens, so a script can't turn the compiler off, flush its
+/// traces, or attach a trace handler.
+///
+/// The global is the only copy a script can reach. `luaopen_jit` also stores the library in the
+/// registry's `_LOADED` table, but nothing in the sandbox reads the registry or that table: no
+/// `debug`, `package`, or `require` (`sandbox_libs`), and no `getfenv`
+/// (`remove_unsandboxed_base_globals`).
+fn remove_jit_global(lua: &Lua) -> mlua::Result<()> {
+    lua.globals().set("jit", LuaValue::Nil)
+}
+
 /// Removes the base-library globals that escape the sandbox; `sandbox_libs` can't, because no
 /// `StdLib` flag gates the base library.
 ///
@@ -138,8 +161,19 @@ impl ScriptWorker {
     ///
     /// `process`/`flush` are resolved once, here, so a script that reassigns `_G.process` or
     /// `_G.flush` later changes nothing that runs (`docs/design/lua-api.md` says so).
+    ///
+    /// The script runs interpreted; [`ScriptWorker::new_with_jit`] can turn the compiler on.
     pub fn new(source: &str) -> Result<Self, ScriptError> {
-        let lua = Lua::new_with(sandbox_libs(), LuaOptions::new())?;
+        Self::new_with_jit(source, false)
+    }
+
+    /// [`ScriptWorker::new`], with LuaJIT's trace compiler on when `jit` is true (see
+    /// [`vm_libs`]). The component's `jit:` option.
+    pub fn new_with_jit(source: &str, jit: bool) -> Result<Self, ScriptError> {
+        let lua = Lua::new_with(vm_libs(jit), LuaOptions::new())?;
+        if jit {
+            remove_jit_global(&lua)?;
+        }
         remove_unsandboxed_base_globals(&lua)?;
         // Every unconditional global is installed before `.exec()`: top-level code runs once,
         // there, and a top-level alias (`local ctx = trace`) would otherwise capture `nil` for
@@ -1665,12 +1699,18 @@ mod tests {
         assert_global_is_nil("setfenv");
     }
 
-    /// Every global a script can see, pinned: a new global, or one a LuaJIT or mlua upgrade
-    /// brings in, fails this test rather than widening the sandbox unnoticed. The worker is built
-    /// as `run_lua` builds it, so `telemetry` is present.
+    /// Every global a script can see, pinned, with the compiler off and on: a new global, or one
+    /// a LuaJIT or mlua upgrade brings in, fails this test rather than widening the sandbox
+    /// unnoticed. The worker is built as `run_lua` builds it, so `telemetry` is present.
     #[test]
     fn the_global_table_is_exactly_the_allowlist() {
-        let w = ScriptWorker::new("function process(event) return event end")
+        for jit in [false, true] {
+            assert_globals_are_the_allowlist(jit);
+        }
+    }
+
+    fn assert_globals_are_the_allowlist(jit: bool) {
+        let w = ScriptWorker::new_with_jit("function process(event) return event end", jit)
             .expect("script should load")
             .with_telemetry(Telemetry::default())
             .expect("installing telemetry should not fail")
@@ -1719,7 +1759,7 @@ mod tests {
             "unpack",
             "xpcall",
         ];
-        assert_eq!(names, expected);
+        assert_eq!(names, expected, "jit: {jit}");
 
         for absent in [
             "bit", "debug", "ffi", "io", "jit", "module", "newproxy", "os", "package", "require",
@@ -1727,9 +1767,110 @@ mod tests {
         ] {
             assert!(
                 w.lua.globals().get::<_, LuaValue>(absent).unwrap().is_nil(),
-                "expected global '{absent}' to be nil"
+                "expected global '{absent}' to be nil, jit: {jit}"
             );
         }
+    }
+
+    /// How many times an every-1000-instructions count hook fires during a 10M-iteration
+    /// arithmetic loop. Interpreted, the loop runs 20M bytecodes, so the hook fires about 20,000
+    /// times. A compiled trace never checks the hook, so with the compiler on it fires only
+    /// while the loop warms up, before LuaJIT records a trace.
+    fn hook_fires_in_a_hot_loop(w: &ScriptWorker) -> u64 {
+        let fired = Rc::new(std::cell::Cell::new(0u64));
+        let counter = fired.clone();
+        w.lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
+            counter.set(counter.get() + 1);
+            Ok(())
+        });
+        let sum: f64 =
+            w.lua.load("local x = 0 for i = 1, 1e7 do x = x + i end return x").eval().unwrap();
+        w.lua.remove_hook();
+        assert_eq!(sum, 50_000_005_000_000.0);
+        fired.get()
+    }
+
+    #[test]
+    fn jit_true_turns_the_trace_compiler_on() {
+        let fired =
+            hook_fires_in_a_hot_loop(&ScriptWorker::new_with_jit(PASSTHROUGH, true).unwrap());
+        assert!(fired < 100, "a compiled loop should skip the hook, fired {fired} times");
+    }
+
+    #[test]
+    fn jit_false_leaves_the_script_interpreted() {
+        for w in [
+            ScriptWorker::new(PASSTHROUGH).unwrap(),
+            ScriptWorker::new_with_jit(PASSTHROUGH, false).unwrap(),
+        ] {
+            let fired = hook_fires_in_a_hot_loop(&w);
+            assert!(fired > 10_000, "an interpreted loop should run the hook, fired {fired} times");
+        }
+    }
+
+    const PASSTHROUGH: &str = "function process(event) return event end";
+
+    /// Whether the worker's VM still runs code after a failed call.
+    fn vm_still_runs(w: &ScriptWorker) -> bool {
+        w.lua.load("local s = 0 for i = 1, 1e6 do s = s + i end return s").eval::<f64>().is_ok()
+    }
+
+    #[test]
+    fn an_error_raised_in_a_compiled_loop_fails_the_call_cleanly() {
+        // A Lua `error`, an error from a Rust callback, and one from a proxy metamethod, each
+        // raised halfway through a loop LuaJIT has compiled by then.
+        let cases = [
+            ("error(\"boom at \" .. i)", "script:6: boom at 5000000"),
+            ("Event.new(5)", "Event.new(t) takes a table, got integer"),
+            ("event.attributes.bad = function() end", "can't use a Lua function"),
+        ];
+        for (raise, want) in cases {
+            let source = format!(
+                r#"
+                function process(event)
+                    local s = 0
+                    for i = 1, 1e7 do
+                        s = s + i % 7
+                        if i == 5000000 then {raise} end
+                    end
+                    return event
+                end
+                "#
+            );
+            let w = ScriptWorker::new_with_jit(&source, true).unwrap();
+            let err = process_err(&w, counter_event("hits", 1.0));
+            assert!(err.contains(want), "{raise}: got {err}");
+            assert!(vm_still_runs(&w), "{raise}: the VM should survive the error");
+        }
+    }
+
+    #[test]
+    fn a_max_memory_trip_in_a_compiled_loop_fails_the_call_cleanly() {
+        const MIB: usize = 1024 * 1024;
+        // The table work compiles; the `Event.new` every 1000 iterations is the in-call check.
+        let w = ScriptWorker::new_with_jit(
+            r#"
+            kept = {}
+            function process(event)
+                for i = 1, 1e7 do
+                    kept[#kept + 1] = {i, i + 1, tostring(i)}
+                    if i % 1000 == 0 then Event.new{timestamp = "1"} end
+                end
+                return event
+            end
+            "#,
+            true,
+        )
+        .unwrap();
+        w.set_memory_cap(Some(4 * MIB));
+        let err = process_err(&w, counter_event("hits", 1.0));
+        assert!(err.contains("Event.new: over max_memory ("), "got: {err}");
+        assert!(err.contains(&format!("> {})", 4 * MIB)), "got: {err}");
+        // The tables it kept are still live: the post-call verdict sees the VM over the cap.
+        w.reset_memory_trip();
+        let verdict = w.collect_until_under(4 * MIB, 8).unwrap();
+        assert!(verdict.used > 4 * MIB, "{verdict:?}");
+        assert!(vm_still_runs(&w), "the VM should survive the trip");
     }
 
     /// Collects rendered `tracing` output.
