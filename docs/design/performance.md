@@ -1389,6 +1389,13 @@ base for each step. Drop cells give the range of the three round medians, then t
   syslog, and statsd codecs and sinks, which moves code the UDP path doesn't run. This is the
   pattern "`native-relay` is code-layout-sensitive" (§1) records, and a profile of `8c07211b`,
   `0c0b4c34`, and D- confirmed it (next subsection).
+- **The earlier interval didn't resolve to a commit.** From `54ee6468` (#543) to `91608a41` (#596's
+  first parent), builds read in two modes on `-packed`, a `fill` near 16 at about 3% drops or near
+  55 at 5–7%, and one `54ee6468` binary changed mode between measurement blocks. Near its knee the
+  receiver is bistable, and this data doesn't implicate #543, #596, or #626 individually. So it
+  says nothing about `Datagram`'s 80-byte footprint either way: whether every datagram should
+  carry #543's 40-byte `Option<Sender>` with `peer:` off stays an open question
+  ([`memory.md`](memory.md) §5, "Listeners bound undecoded bytes too").
 
 #### Profile of the `0c0b4c34` step
 
@@ -1398,7 +1405,7 @@ repeat index. One round was discarded because another build was running; each ro
 conditions. Raw captures aren't committed.
 
 - **No added work.** Instructions per event read −0.06% at the control (user space −0.00%) and
-  stayed within ±0.5% at load. Cycles per event rose 1.4–2.0% and IPC fell 1.4–2.3%. Branch-miss,
+  stayed within ±0.5% at load. Cycles per event rose 1.6–1.9% and IPC fell 1.4–2.3%. Branch-miss,
   L1i, iTLB, and L1d rates were flat, and the op-cache share improved, so it isn't a front-end or
   i-cache problem.
 - **The extra cycles are pipeline restarts.** Zen 5's `bp_redirects.resync` ran at 0.45 per 1,000
@@ -1429,14 +1436,6 @@ conditions. Raw captures aren't committed.
   `native-relay`'s build-to-build swing ("`native-relay` is code-layout-sensitive", §1), where
   functions moved to a different offset modulo 64 between neighbouring builds
   ([known gap](../known-gaps/intake.md#udp-intake)).
-
-- **The earlier interval didn't resolve to a commit.** From `54ee6468` (#543) to `91608a41` (#596's
-  first parent), builds read in two modes on `-packed`, a `fill` near 16 at about 3% drops or near
-  55 at 5–7%, and one `54ee6468` binary changed mode between measurement blocks. Near its knee the
-  receiver is bistable, and this data doesn't implicate #543, #596, or #626 individually. So it
-  says nothing about `Datagram`'s 80-byte footprint either way: whether every datagram should
-  carry #543's 40-byte `Option<Sender>` with `peer:` off stays an open question
-  ([`memory.md`](memory.md) §5, "Listeners bound undecoded bytes too").
 
 ### Reading the numbers
 

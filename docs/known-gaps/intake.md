@@ -212,7 +212,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **UDP intake's drop headroom depends on code layout.** On the desktop, at rate scales that put
   the 2026-10-02 binary at 3–5% drops, `0c0b4c34` (the commit that brought the loss vocabulary to
   UDP intake) added 2.1 points of drop on `udp-statsd` and 2.4 on `udp-statsd-packed`, cost
-  2.5–2.6% of events/s, and added 1.4–2.0% cycles per event
+  2.5–2.6% of events/s, and added 1.5–2.0% CPU per event
   ([`performance.md`](../design/performance.md) §7, "Desktop bisect of the B0 → D- rise"). The
   cause is code layout, not work: instructions per event didn't change, and the `bytes` crate's
   refcounting functions moving in `.text` raised pipeline-restart redirects by about 60% in the
