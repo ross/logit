@@ -286,7 +286,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   problem the design doesn't have.
 - **HAProxy's native CBOR log output (`%{+cbor}o` / `%{+cbor,+bin}o`) is a closed door, not a "not
   now"; don't reopen it without new evidence.** It would cost a second decoder to build and
-  maintain and a `syslog_in` framing knob, for a ~15% wire saving and no parse-time win. Measured
+  maintain, for a ~15% wire saving and no parse-time win. Measured
   against real HAProxy 3.0.27 output with a throwaway decoder:
   - **Binary CBOR is reachable on both transports, once the flags are spelled right.** HAProxy's
     log-format options are comma-separated: `%{+cbor,+bin}o`. `%{+cbor+bin}o` applies only the
@@ -295,8 +295,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     the manual never says so. With the comma form, HAProxy emitted raw binary CBOR in the syslog
     MSG both to a plain UDP `log` target and to a `ring` with `server ... log-proto octet-count`.
     Over TCP octet-counting that MSG reaches `logit` intact, because `syslog_in` decodes a
-    non-UTF-8 MSG as a `Value::Bytes`; over UDP it would need a `syslog_in` opt-out of newline
-    splitting.
+    non-UTF-8 MSG as a `Value::Bytes`; over UDP it needs `framing: datagram` (one message per
+    datagram), which `syslog_in` has ([syslog known gaps](syslog.md)'s binary-MSG entry).
   - **Wire shape**, should anything decode it: an indefinite-length map (`BF … FF`) with definite
     text keys; *untyped* string items such as `%HM` come out as indefinite-length *chunked* text
     strings (`7F 63 'GET' FF`), `:str`-typed ones as definite strings; `:sint` non-negatives are

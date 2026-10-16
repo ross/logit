@@ -1480,8 +1480,12 @@ pub enum ComponentKind {
     /// latched for that connection's life: an ASCII digit means RFC 6587 octet-counting
     /// (`MSG-LEN SP MSG`, what `syslog_out` emits, and the only framing that can carry a message
     /// containing a newline); anything else means LF-delimited framing (rsyslog's `omfwd`
-    /// default). There is no `framing:` field. A frame over 64 KiB, or a malformed octet count,
-    /// closes that one connection.
+    /// default). `framing:` doesn't apply to TCP and is rejected there. A frame over 64 KiB, or a
+    /// malformed octet count, closes that one connection.
+    ///
+    /// Under `transport: udp`, `framing:` chooses how a datagram maps to messages. `lines` (the
+    /// default) splits it on newlines, one message per line. `datagram` reads the whole datagram
+    /// as one message.
     ///
     /// `tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS
     /// listener. It applies to `transport: tcp` only (RFC 5425); `tls:` under `transport: udp` is
@@ -1496,6 +1500,16 @@ pub enum ComponentKind {
         bind: String,
         #[serde(default)]
         transport: SyslogTransport,
+        /// How a UDP datagram maps to messages. `lines` (the default) splits a datagram on
+        /// `\n` and parses each line as its own message, for senders that pack several messages
+        /// into one datagram, such as nginx's `syslog:` writer. `datagram` makes one datagram
+        /// one message and keeps every `\n` in its MSG, for a sender whose MSG spans lines or
+        /// carries binary bytes. Under `datagram`, a sender that packs several messages into one
+        /// datagram yields one event whose MSG holds the rest, with nothing counted as
+        /// malformed. `transport: udp` only: any value under `transport: tcp`, including
+        /// `lines`, is rejected.
+        #[serde(default)]
+        framing: Option<SyslogFraming>,
         /// Terminates TLS on this listener when present; plaintext when omitted. Requires
         /// `transport: tcp`.
         #[serde(default)]
@@ -4467,6 +4481,17 @@ pub enum SyslogTransport {
     Tcp,
 }
 
+/// How `syslog_in` maps a UDP datagram to messages. See the `framing` field.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SyslogFraming {
+    /// Split the datagram on `\n`; each line is a message.
+    #[default]
+    Lines,
+    /// The whole datagram is one message.
+    Datagram,
+}
+
 /// Which syslog dialect `syslog_out` emits. `rfc5424` is the default.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -7222,6 +7247,7 @@ mod tests {
             ComponentKind::SyslogIn {
                 bind,
                 transport,
+                framing,
                 tls,
                 handshake_timeout,
                 idle_timeout,
@@ -7230,6 +7256,7 @@ mod tests {
                 proxy_protocol,
                 reuse_port,
             } => {
+                assert_eq!(framing, None, "unset unless asked for");
                 assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
