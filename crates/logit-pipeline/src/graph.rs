@@ -3578,6 +3578,22 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 90: `influxdb_out`'s `org` and `default_org`
+    // (`docs/adr/influxdb-line-protocol-relay.md`), rule 89's org-side twin. A configured `org`
+    // is sent with every batch, so a `default_org` beside it would never be read.
+    for (id, component) in &components {
+        if let ComponentKind::InfluxDbOut { org: Some(_), default_org: Some(_), .. } =
+            &component.kind
+        {
+            anyhow::bail!(
+                "component '{id}': influxdb_out sets both 'org' and 'default_org' -- 'org' \
+                 sends every batch to one organization, so 'default_org' would never be used; \
+                 keep 'org' for one fixed organization, or 'default_org' to follow the \
+                 organization each batch carries"
+            );
+        }
+    }
+
     // Rule 70: `splunk_hec_out` (`docs/adr/splunk-hec-relay.md`). The sink appends `/event` and
     // `/ack` to `endpoint`, so a URL already naming a route would post to
     // `/services/collector/event/event`, and one with a query or fragment would bury the route
@@ -4967,6 +4983,7 @@ mod tests {
             org: Some("org".to_string()),
             bucket: Some("bucket".to_string()),
             default_bucket: None,
+            default_org: None,
             token: "TOKEN".to_string(),
         }
     }
@@ -7399,6 +7416,30 @@ mod tests {
         assert!(!err.contains("TOKEN"), "the config isn't printed: {err}");
         for (bucket, default_bucket) in [(Some("a"), None), (None, Some("b")), (None, None)] {
             with(bucket, default_bucket).expect("one bucket setting, or none, is valid");
+        }
+    }
+
+    /// Rule 90: `org` and `default_org` together; each alone, or neither, is valid.
+    #[test]
+    fn an_influxdb_out_with_both_org_and_default_org_is_rejected() {
+        let with = |org: Option<&str>, default_org: Option<&str>| {
+            let mut kind = sink();
+            if let ComponentKind::InfluxDbOut { org: o, default_org: d, .. } = &mut kind {
+                *o = org.map(String::from);
+                *d = default_org.map(String::from);
+            }
+            resolve(cfg(vec![
+                ("in", vec![], influxdb_in("0.0.0.0:8086", vec![])),
+                ("out", vec!["in"], kind),
+            ]))
+        };
+        let Err(err) = with(Some("a"), Some("b")) else { panic!("both set is an error") };
+        let err = format!("{err:#}");
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("both 'org' and 'default_org'"), "got: {err}");
+        assert!(!err.contains("TOKEN"), "the config isn't printed: {err}");
+        for (org, default_org) in [(Some("a"), None), (None, Some("b")), (None, None)] {
+            with(org, default_org).expect("one org setting, or none, is valid");
         }
     }
 

@@ -1475,7 +1475,10 @@ pub(crate) async fn write_loop(
 
         // The sink span, the only one that carries `SpanStatus::Error` and a fault tag
         // (`docs/adr/internal-span-emission-and-deterministic-sampling.md`). Its `child()` context
-        // is its own identity and goes nowhere else: a sink has nothing downstream to propagate to.
+        // is its own identity and goes nowhere else. `logit_out` carries the batch's incoming
+        // `ctx.trace` across the wire instead, not this span's: a windowed batch is observed and
+        // submitted before it is head, before this span exists
+        // (`docs/adr/native-hop-trace-context.md`).
         let span_ctx = ctx.trace.child();
         let mut span = telemetry.span(
             "deliver",
@@ -3067,6 +3070,7 @@ mod tests {
                     org: Some("org".to_string()),
                     bucket: Some("bucket".to_string()),
                     default_bucket: None,
+                    default_org: None,
                     token: "TOKEN".to_string(),
                 },
             },
@@ -3175,6 +3179,7 @@ mod tests {
                     org: Some("org".to_string()),
                     bucket: Some("bucket".to_string()),
                     default_bucket: None,
+                    default_org: None,
                     token: "TOKEN".to_string(),
                 },
             },
@@ -3408,6 +3413,7 @@ mod tests {
             org: Some("org".to_string()),
             bucket: Some("bucket".to_string()),
             default_bucket: None,
+            default_org: None,
             token: "TOKEN".to_string(),
         }
     }
@@ -3519,6 +3525,7 @@ mod tests {
                     org: Some("org".to_string()),
                     bucket: Some("bucket".to_string()),
                     default_bucket: None,
+                    default_org: None,
                     token: "TOKEN".to_string(),
                 },
             },

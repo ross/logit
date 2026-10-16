@@ -53,8 +53,8 @@ components:
     type: influxdb_out
     sources: [influx_in]
     url: http://influxdb:8086
-    # Replaces the client's org or orgID. Omit it to forward the client's; InfluxDB 2.x refuses a
-    # write that names no org.
+    # Replaces the client's org or orgID. Omit it to forward the client's, with `default_org:`
+    # for a batch no `influxdb_in` received; InfluxDB 2.x refuses a write that names no org.
     org: logit
     # With no `bucket:`, a batch goes to the bucket its client named, and this is the bucket for a
     # batch no `influxdb_in` received. A client's bucket that doesn't exist, or that the token

@@ -1,0 +1,72 @@
+# The per-host half of a forwarding pair: this `logit` collects on each host and forwards
+# everything, unaggregated, to a central `logit` over the native transport. central.yaml
+# receives it, windows the metrics once, and delivers to the backends.
+#
+#   statsd, syslog --> edge (this file) ==native, TLS==> central --> VictoriaMetrics, Loki, Tempo
+#
+# Check it with `logit validate edge.yaml` and draw it with
+# `logit graph edge.yaml | dot -Tsvg > edge.svg`. docs/deploying.md's "Operating a pair" says how
+# to start, stop, and upgrade the two together.
+
+# In a container, the default hostname is the container ID, which changes on every recreate and
+# tags every `logit.*` series this node sends. Set a stable name.
+hostname: edge-1
+
+# /readyz and /healthz for a container or Kubernetes probe. No TLS and no auth: keep this port
+# off public networks.
+admin:
+  bind: 0.0.0.0:9600
+
+components:
+  # --- Inputs --------------------------------------------------------------------------------
+
+  # statsd and DogStatsD on one port.
+  statsd_in:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:5140
+
+  # --- Forwarding ----------------------------------------------------------------------------
+
+  # Forwards raw: the metrics window is applied once, on central. `endpoint` has no scheme, so
+  # the presence of `tls:` is what turns TLS on.
+  central_out:
+    type: logit_out
+    sources: [statsd_in, syslog_in]
+    endpoint: central.internal:5140
+    tls:
+      ca_file: /etc/logit/tls/ca.pem
+      # This node's certificate, which central's `client_ca_file` requires (mutual TLS).
+      cert_file: /etc/logit/tls/client.pem
+      key_file: /etc/logit/tls/client.key
+    # A disk spool rides out a central outage or restart, and replays on the next start. Put
+    # /var/lib/logit on a persistent volume, writable by the user logit runs as.
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/central_out
+
+  # --- Self-telemetry ------------------------------------------------------------------------
+
+  # Set the same rate on central: a receiver at or above the sender's rate keeps every forwarded
+  # trace whole.
+  self:
+    type: internal
+    interval: 10s
+    span_sample_rate: 0.1
+
+  # A sink of its own, so `self` shares no node with the data path. That makes `self` drain last
+  # at shutdown and export the shutdown-time counts. Central receives these as ordinary events.
+  self_out:
+    type: logit_out
+    sources: [self]
+    endpoint: central.internal:5140
+    tls:
+      ca_file: /etc/logit/tls/ca.pem
+      cert_file: /etc/logit/tls/client.pem
+      key_file: /etc/logit/tls/client.key
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/self_out
