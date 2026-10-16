@@ -2146,6 +2146,15 @@ def check_ledger_wire(data):
     return Result("ledger.wire", worst(statuses), " | ".join(details), lines)
 
 
+def _ambiguous_drops(led, source):
+    """`[(timestamp, count)]` of a source's generator sink's `ambiguous_at_most_once` batch
+    drops. Each leaves up to one generator batch of whole lines in W that G doesn't count, so
+    `ledger.wire` and `_end_to_end` allow that much surplus per drop on a TCP wire."""
+    return [(ts, v) for ts, v, _ in led.gens[source.get("service")].counter_points(
+        "logit.component.batches.dropped", component=source.get("generator_sink"),
+        reason=AMBIGUOUS_DROP)]
+
+
 def _wire_one(data, led, source):
     """`(status, detail, lines)` of `ledger.wire` for one source."""
     service, listener = source.get("service"), source.get("sut_listener")
@@ -2183,9 +2192,7 @@ def _wire_one(data, led, source):
             runs.append([start, end, kind, label, g, wk, f])
     sums = {"fault": 0.0, "judged": 0.0, "steady": 0.0, "end": 0.0}
     batch = stats["batch"]
-    ambiguous = [(ts, v) for ts, v, _ in led.gens[service].counter_points(
-        "logit.component.batches.dropped", component=source.get("generator_sink"),
-        reason=AMBIGUOUS_DROP)]
+    ambiguous = _ambiguous_drops(led, source)
     # Each steady or judged run counts at 0 when W + K + F exceeds G in it, so a surplus in one
     # run can't net out loss in another.
     steady_lost = 0.0
@@ -2745,32 +2752,37 @@ def check_ledger_summary(data):
 def _end_to_end(data, led):
     """`(status, text)`: across a hop or from a file wire, each egress group's V over the whole
     run against what the generators sent less every counted loss on the way (K, D, B, X, the
-    hop sink's drops, and X_B; on a TCP or file wire F too), plus a file wire's replay band's
-    upper edge. A kill on either side shifts lives but never adds increments,
-    so V above that is a surplus whatever was killed; V below it is the per-life rows' to
-    judge."""
+    hop sink's drops, and X_B; on a TCP or file wire F too), plus on a TCP wire one generator
+    batch per ambiguous drop, as `ledger.wire` allows, and on a file wire the replay band's
+    upper edge. A kill on either side shifts lives but never adds increments, so V above that
+    is a surplus whatever was killed; V below it is the per-life rows' to judge."""
     counted = sum(sum(getattr(led, symbol).values())
                   for symbol in ("K", "F", "D_tel", "B", "X"))
     if led.hop is not None:
         counted += sum(led.hop_dropped.values()) + sum(led.X_B.values())
+    partial = sum(sum(v for _, v in _ambiguous_drops(led, source))
+                  * led.gen_stats[source.get("service")]["batch"]
+                  for source in led.sources
+                  if source_wire(source) == "tcp" and source.get("service") in led.gens)
     # A file wire's tailers replay lines after a kill and split one line per file at a stop,
     # so V may exceed G by the replay band's upper edge.
     files = [source.get("sut_listener") for source in led.sources
              if source_wire(source) == FILE_WIRE]
     replay = led.replay_band(files)[1] if files else 0
-    limit = led.G - counted + replay
-    bound = "G − counted + replay" if files else "G − counted"
+    limit = led.G - counted + partial + replay
     status, parts = PASS, []
     for label, sinks in led.egress_groups():
         total = sum(led.V_total.get(sink, 0) for sink in sinks)
         if total > limit:
             status = FAIL
-            parts.append(f"{label}: V {_n(total)} > {bound} {_n(limit)}, a surplus of "
+            parts.append(f"{label}: V {_n(total)} > G − counted {_n(limit)}, a surplus of "
                          f"{_n(total - limit)}")
         else:
-            parts.append(f"{label}: V {_n(total)} <= {bound} {_n(limit)}")
+            parts.append(f"{label}: V {_n(total)} <= G − counted {_n(limit)}")
     return status, ("end to end over the run, G " + _n(led.G) + " less counted loss "
-                    + _n(counted) + (f" plus the replay band's {_n(replay)}" if files else "")
+                    + _n(counted) + (f" and a partial-frame allowance {_n(partial)}"
+                                     if partial else "")
+                    + (f" plus the replay band's {_n(replay)}" if files else "")
                     + ": " + "; ".join(parts))
 
 

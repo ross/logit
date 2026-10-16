@@ -546,8 +546,7 @@ checks the wire against the listener's `type:` and `transport:` in the SUT confi
 has its own symbols: G is the generator sink's `output.messages` (a `file_out`'s
 `events.delivered` on a file wire), W the listener's `input.datagrams`, `input.frames`, or
 `input.lines`, and on TCP F counts the lines the listener's framer dropped before W counted them
-(`frames.dropped` with reason `truncated`, `oversize`, `drained`, or `malformed`), counted wire
-loss. `ledger.wire` judges each source on its own, against the fault windows of its own
+(`frames.dropped`), counted wire loss. `ledger.wire` judges each source on its own, against the fault windows of its own
 generator and of every service that isn't a generator that affect its wire, and
 `ledger.intake` judges each listener's final life; each reports a line per source or listener
 and takes the worst status.

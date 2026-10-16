@@ -730,9 +730,9 @@ the operator-facing account of all of this.
   the generators sent.
   `tcp-ingress` sends statsd over TCP, its source declared `wire = "tcp"` and checked at load
   against the listener's `transport:`: W is `input.frames`, the framer's drops are counted wire
-  loss, the generator's netem is judged at 0 because TCP retransmits, and only a stop, a kill,
-  or a partition that moved the SUT's address is reported; every other TCP fault window is
-  judged, with one batch of surplus per ambiguous drop the generator counted.
+  loss, and the generator's netem is judged at 0 because TCP retransmits. A process-ending
+  fault, or a partition that moved or didn't record the SUT's address, is reported; every other
+  TCP window is judged with a surplus allowance (the plan's `ledger.wire` row).
   `random-faults` draws its schedule from
   a seed (a `[random]` table; `--seed N` reproduces a run) and is meant for `--duration 8h`; the
   driver appends container logs in 5-minute chunks so a long run never reads a whole log at

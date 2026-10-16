@@ -5826,6 +5826,45 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
     return run_dir
 
 
+def _tcp_hop_run(tmp, name, extra, ambiguous_at=None):
+    """`_two_sut_run`'s unkilled one-life hop run with its one source on a TCP wire: `logit`
+    counts `input.frames` in place of datagrams, the generator counts no `output.datagrams`,
+    `extra` lines reach V as surplus, and one `ambiguous_at_most_once` batch drop is counted on
+    the generator's sink at that offset when `ambiguous_at` is set."""
+    run_dir = _two_sut_run(tmp, name, kill_on=None, collector_lives=1, extra=extra)
+
+    def rewrite(path, edit):
+        out = []
+        for line in path.read_text().splitlines():
+            record = json.loads(line)
+            for one in edit(record):
+                out.append(json.dumps(one))
+        path.write_text("\n".join(out) + "\n")
+
+    def sut(record):
+        if record["metrics"][0]["name"] == "logit.input.datagrams":
+            record["metrics"][0]["name"] = "logit.input.frames"
+        return [record]
+
+    def gen(record):
+        name = record["metrics"][0]["name"]
+        if name == "logit.output.datagrams":
+            return []
+        if (name == "logit.component.events.sent" and ambiguous_at is not None
+                and record["timestamp"] == _stamp(T0 + ambiguous_at)):
+            return [record, json.loads(_line(
+                record["timestamp"], "logit.component.batches.dropped", "sum", 1,
+                component="out", attrs={"reason": "ambiguous_at_most_once"}))]
+        return [record]
+
+    rewrite(run_dir / "logs" / "logit.stdout", sut)
+    rewrite(run_dir / "logs" / "generator.stdout", gen)
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    resolved["ledger"]["source"] = [{**resolved["ledger"]["source"][0], "wire": "tcp"}]
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    return run_dir
+
+
 def _two_sut_checks():
     """The checks across a native hop: each service's lives come from its own telemetry and the
     starts the timeline gives it, so a kill on `collector` makes two lives there and leaves
@@ -5928,6 +5967,26 @@ def _two_sut_checks():
                    "− counted 60,000, a surplus of 1"),
                f"ledger.summary FAILs a surplus end to end that every per-life term balances, "
                f"got {exact['ledger.summary']}")
+        # A write that failed partway leaves whole lines in V that G doesn't count: one
+        # generator batch per ambiguous drop on a TCP wire, none on UDP.
+        def tcp_hop(name, extra, ambiguous_at=None):
+            return {r.id: r for r in checks.run_all(
+                _tcp_hop_run(tmp, name, extra, ambiguous_at))}
+
+        partial = tcp_hop("two-tcp-partial", 100, ambiguous_at=150)
+        expect(partial["ledger.summary"].status == checks.PASS
+               and "end to end over the run, G 60,000 less counted loss 0 and a partial-frame "
+               "allowance 100: sink: V 60,100 <= G − counted 60,100"
+               in partial["ledger.summary"].detail,
+               f"one ambiguous drop on a TCP source allows one batch of surplus end to end, "
+               f"got {partial['ledger.summary']}")
+        beyond_partial = tcp_hop("two-tcp-partial-beyond", 101, ambiguous_at=150)
+        expect(beyond_partial["ledger.summary"].status == checks.FAIL
+               and "sink: V 60,101 > G − counted 60,100, a surplus of 1"
+               in beyond_partial["ledger.summary"].detail,
+               f"a surplus past the ambiguous allowance FAILs, got "
+               f"{beyond_partial['ledger.summary']}")
+
         short = hop_row("two-short", kill_on=None, collector_lives=1, short=10)
         expect(short["ledger.hop"].status == checks.FAIL
                and "= 10, uncounted" in short["ledger.hop"].detail,

@@ -63,8 +63,9 @@ args = "loss 30%"
 for = "90s"
 
 # The SUT's kernel keeps ACKing until its receive buffer fills, then the generator's write
-# stalls past connect_timeout, fails ambiguous, and its queue overflows: judged. The override's
-# buffer caps make that happen inside 30 s.
+# stalls past connect_timeout and its queue overflows: judged. A write that took part of a frame
+# fails ambiguous and is counted dropped; one that took nothing fails clean and is retried. The
+# override's buffer caps make the stall happen inside 30 s.
 [[step]]
 at = "8m"
 action = "pause"
