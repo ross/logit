@@ -1326,8 +1326,8 @@ pass A, then pass B.
   binary's drift between its two passes is at most 0.29 points, so the rise is outside drift.
   `udp-statsd-packed` now sits slightly above the 1–5% calibration band. A bisect on the desktop
   ("Desktop bisect of the B0 → D- rise", below) finds one clean step, at `0c0b4c34`, the commit
-  in #678's stack that brought the loss vocabulary to UDP intake, and part of that step is code
-  layout. The rest of the rise didn't resolve to a commit.
+  in #678's stack that brought the loss vocabulary to UDP intake, and a profile attributes that step
+  to code layout. The rest of the rise didn't resolve to a commit.
 - **CPU per event doesn't separate the binaries.** Drift between a binary's two passes runs up to
   5.5% (M on `udp-statsd-packed`, 0.897 → 0.946), wider than any difference between binaries.
 - **`udp-statsd-small` is sender-bound.** At its shipped 760,000 datagrams/s it delivers about
@@ -1383,14 +1383,53 @@ base for each step. Drop cells give the range of the three round medians, then t
   datagram, and these loads send none. `StatsdDecoder` gains a `Telemetry` field, and it and
   `decode_loop` count `logit.input.messages.dropped` and `logit.input.frames.dropped` only on a
   decode error, which fails a harness run.
-- **Part of the step is code layout.** D- reads 1.4–1.7 points below `0c0b4c34`, and its round
-  medians overlap the base's, though nothing between `df3f3fbb` and D- touches the UDP driver,
-  the statsd decoder, `logit-core`, or the node runtime. `0c0b4c34` also rewrites the graphite,
-  collectd, syslog, and statsd codecs and sinks, which moves code the UDP path doesn't run. This
-  is the pattern "`native-relay` is code-layout-sensitive" (§1) records. How much of the step is
-  the read path's own cost is open; a `perf` profile of `8c07211b` against `0c0b4c34` on
-  `udp-statsd` is the measurement that would separate the two
+- **The step is code layout.** D- reads 1.4–1.7 points below `0c0b4c34`, and its round medians
+  overlap the base's, though nothing between `df3f3fbb` and D- touches the UDP driver, the statsd
+  decoder, `logit-core`, or the node runtime. `0c0b4c34` also rewrites the graphite, collectd,
+  syslog, and statsd codecs and sinks, which moves code the UDP path doesn't run. This is the
+  pattern "`native-relay` is code-layout-sensitive" (§1) records, and a profile of `8c07211b`,
+  `0c0b4c34`, and D- confirmed it (next subsection).
+
+#### Profile of the `0c0b4c34` step
+
+Same desktop, rate scales, and pinning as the bisect, plus a no-drop control at scale 1.0.
+`perf stat` was attached to the pinned `logit` child, with interleaved rounds paired by round and
+repeat index. One round was discarded because another build was running; each round records its
+conditions. Raw captures aren't committed.
+
+- **No added work.** Instructions per event read −0.06% at the control (user space −0.00%) and
+  stayed within ±0.5% at load. Cycles per event rose 1.4–2.0% and IPC fell 1.4–2.3%. Branch-miss,
+  L1i, iTLB, and L1d rates were flat, and the op-cache share improved, so it isn't a front-end or
+  i-cache problem.
+- **The extra cycles are pipeline restarts.** Zen 5's `bp_redirects.resync` ran at 0.45 per 1,000
+  cycles on the base, 0.72 on `0c0b4c34` (+56–63%), and 0.46 on D-. Sampling that event, the extra
+  flushes land on the instructions after `lock inc` and `lock dec` in the `bytes` crate's
+  refcounting: `shared_clone` went from about 5.6% to 27.9% of all flushes on `udp-statsd`, and
+  `shared_drop` and `promotable_even_clone` are also among them. Those functions are
+  byte-identical machine code in both binaries once addresses are stripped; their region of
+  `.text` moved +0x80 in the step and −0x210 in D-. Which Zen 5 predictor structure is involved is
+  inferred, not measured.
+- **The cost is in the decode task.** `decode_loop` (`StatsdDecoder::decode_into` and the
+  batching under it) holds about 82% of the child's cycles and the whole increase. `read_loop` and
+  the sink don't change, so the read-path additions and the decoder's error-only `Telemetry`
+  field cost nothing measurable.
+- **Aligning functions removes it.** Rebuilding both commits with
+  `RUSTFLAGS="-C llvm-args=-align-all-functions=6"` (64-byte alignment, no source change):
+
+  | Comparison | Cycles/event, `udp-statsd` / `-packed` | Drop points |
+  |---|---:|---:|
+  | `0c0b4c34` aligned vs as shipped | −2.6% / −2.8% | −3.0 / −2.4 |
+  | `0c0b4c34` aligned vs base aligned | −0.8% / −1.4% | −0.9 / −0.9 |
+  | base aligned vs base as shipped | within ±0.8% | about neutral |
+
+  Flushes returned to the base level. The aligned binary is 1.7% larger (23.94 to 24.34 MB).
+- **Remaining follow-up.** 64-byte function alignment is a candidate to measure, not a change to
+  adopt: it alters the release profile, so it needs perf VM data across every scenario family
+  first ([ADR `release-build-profile`](../adr/release-build-profile.md)). It may also bear on
+  `native-relay`'s build-to-build swing ("`native-relay` is code-layout-sensitive", §1), where
+  functions moved to a different offset modulo 64 between neighbouring builds
   ([known gap](../known-gaps/intake.md#udp-intake)).
+
 - **The earlier interval didn't resolve to a commit.** From `54ee6468` (#543) to `91608a41` (#596's
   first parent), builds read in two modes on `-packed`, a `fill` near 16 at about 3% drops or near
   55 at 5–7%, and one `54ee6468` binary changed mode between measurement blocks. Near its knee the
