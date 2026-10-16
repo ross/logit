@@ -1514,7 +1514,9 @@ the other.
 - `ledger.summary`: W − D − E − B and E − S_hop in `logit`'s final life, E_B − A, A − Ab, and
   each egress term in `collector`'s, with `ledger.hop` left to judge the hop. Beside them, one
   bound end to end, which no kill or restart can loosen: each egress group's V over the whole
-  run is at most G less every counted loss (K, D, B, X, the hop's drops, and X_B). A duplicate
+  run is at most G less every counted loss (K, D, B, X, the hop's drops, and X_B, and on a TCP
+  wire F), plus one generator batch per `ambiguous_at_most_once` drop of a TCP source, the
+  partial-frame surplus `ledger.wire` allows. A duplicate
   forwarded across the hop adds the same increments to E_B, A, Ab, and V, so every per-life term
   balances around it; this bound and `ledger.hop` are what see it, the bound only once the
   surplus exceeds the run's uncounted loss, the wire loss among it.
