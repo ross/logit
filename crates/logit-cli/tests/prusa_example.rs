@@ -19,8 +19,10 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-/// The first datagram's receipt time in the capture, `1792167827.7678285`, in nanoseconds.
-const RECEIVED_AT: i64 = 1_792_167_827_767_828_500;
+/// A receipt time for the first datagram. Its sub-second part, 100 µs, is less than the
+/// datagram's span of 676,380 µs, so anchoring every point but the newest crosses a second
+/// boundary, the case a decimal-string timestamp gets wrong if the borrow is.
+const RECEIVED_AT: i64 = 1_792_167_828_000_100_000;
 
 /// `msg=920`, 984 bytes, 37 points.
 const DATAGRAM_1: &[u8] = include_bytes!("fixtures/prusa-datagram-1.txt");
@@ -66,8 +68,25 @@ fn run_script(w: &ScriptWorker, resource: Arc<Resource>, event: Event) -> (Arc<R
     (w.take_resource().unwrap_or(resource), event)
 }
 
-fn message(event: &Event) -> &str {
-    event.log.as_ref().expect("event should carry a log").message.as_str().expect("UTF-8")
+/// Runs the script's output through `line_protocol` as the `points` node, reporting to `probe`.
+fn line_protocol(probe: &TelemetryProbe, resource: Arc<Resource>, event: Event) -> EventBatch {
+    let telemetry = probe.telemetry("points", "line_protocol", "transform");
+    let mut transform = LineProtocol::new(Precision::Ns, false).with_telemetry(telemetry.clone());
+    let batch = EventBatch { resource, scope: None, events: vec![event] };
+    process_batch(&mut transform, batch, &mut Vec::new(), &telemetry)
+        .expect("line_protocol should emit the points")
+}
+
+/// One datagram through the decoder, the script, and `line_protocol`, received at `RECEIVED_AT`.
+fn pipeline(w: &ScriptWorker, probe: &TelemetryProbe, datagram: &'static [u8]) -> Vec<Event> {
+    let (resource, event) = decode(datagram, RECEIVED_AT);
+    let (resource, rewritten) = run_script(w, resource, event);
+    line_protocol(probe, resource, rewritten).events
+}
+
+/// Each child's measurement and timestamp, for comparing a whole datagram at once.
+fn measured_at(events: &[Event]) -> Vec<(&str, i64)> {
+    events.iter().map(|e| (attr(e, "_logit.influxdb.measurement").unwrap(), e.timestamp)).collect()
 }
 
 fn attr<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
@@ -127,13 +146,8 @@ fn a_datagram_becomes_one_anchored_point_per_line() {
         Some("prusa"),
         "the script should name the bucket on the batch resource"
     );
-    assert!(!message(&rewritten).contains("msg="), "the header should be stripped");
 
-    let transform_telemetry = probe.telemetry("points", "line_protocol", "transform");
-    let mut transform = LineProtocol::new(Precision::Ns, false);
-    let batch = EventBatch { resource, scope: None, events: vec![rewritten] };
-    let out = process_batch(&mut transform, batch, &mut Vec::new(), &transform_telemetry)
-        .expect("line_protocol should emit the points");
+    let out = line_protocol(&probe, resource, rewritten);
     assert_eq!(
         out.resource.attributes.get("_logit.influxdb.bucket").and_then(Value::as_str),
         Some("prusa")
@@ -143,8 +157,13 @@ fn a_datagram_becomes_one_anchored_point_per_line() {
         1.0,
         "the datagram's own event should be discarded once its points are out"
     );
-    assert_eq!(probe.sum("logit.transform.lines.dropped", &[]), 0.0);
+    assert_eq!(
+        probe.sum("logit.transform.lines.dropped", &[]),
+        0.0,
+        "every rewritten line should parse as a point"
+    );
     assert_eq!(probe.sum("logit.transform.lines.skipped", &[]), 0.0);
+    assert_eq!(probe.sum("prusa.points.skipped", &[]), 0.0);
 
     let expected = fixture_points();
     assert_eq!(expected.len(), 37);
@@ -262,4 +281,72 @@ fn a_non_buddy_syslog_event_passes_through_unchanged() {
     };
     assert_eq!(out, original);
     assert!(w.take_resource().is_none(), "the script should leave the resource alone");
+}
+
+#[test]
+fn a_v3_datagram_counts_milliseconds_and_skips_seq_points() {
+    let mut probe = TelemetryProbe::new();
+    let w = worker(&probe);
+    let points = pipeline(
+        &w,
+        &probe,
+        b"<14>1 - 10:9c:70:2d:d5:c4 buddy - - - msg=1,tm=5000,v=3 cpu_usage v=73i 10\n\
+          rec,_seq=4 v=1i 20\n\
+          temp_bed v=19.5 40\n",
+    );
+    assert_eq!(
+        measured_at(&points),
+        [("cpu_usage", RECEIVED_AT - 30_000_000), ("temp_bed", RECEIVED_AT)]
+    );
+    assert_eq!(probe.sum("prusa.points.skipped", &[("reason", "seq")]), 1.0);
+}
+
+#[test]
+fn a_v2_datagram_sums_each_offset_onto_the_one_before() {
+    let probe = TelemetryProbe::new();
+    let w = worker(&probe);
+    // Offsets -5, 15, and 20 ms relative to the previous point are -5, 10, and 30 ms from `tm`.
+    let points = pipeline(
+        &w,
+        &probe,
+        b"<14>1 - 10:9c:70:2d:d5:c4 buddy - - - msg=1,tm=5000,v=2 a v=1i -5\n\
+          b v=2i 15\n\
+          c v=3i 20\n",
+    );
+    assert_eq!(
+        measured_at(&points),
+        [("a", RECEIVED_AT - 35_000_000), ("b", RECEIVED_AT - 20_000_000), ("c", RECEIVED_AT)]
+    );
+}
+
+#[test]
+fn a_nan_value_is_skipped_and_counted() {
+    let mut probe = TelemetryProbe::new();
+    let w = worker(&probe);
+    let points = pipeline(
+        &w,
+        &probe,
+        b"<14>1 - 10:9c:70:2d:d5:c4 buddy - - - msg=1,tm=5000,v=4 x value=nan 10\n\
+          y v=NaN 20\n\
+          z v=1i 30\n",
+    );
+    assert_eq!(measured_at(&points), [("z", RECEIVED_AT)]);
+    assert_eq!(probe.sum("prusa.points.skipped", &[("reason", "nan")]), 2.0);
+    assert_eq!(probe.sum("logit.transform.lines.dropped", &[]), 0.0);
+}
+
+#[test]
+fn only_a_lone_v_field_is_renamed_to_value() {
+    let probe = TelemetryProbe::new();
+    let w = worker(&probe);
+    let points = pipeline(
+        &w,
+        &probe,
+        b"<14>1 - 10:9c:70:2d:d5:c4 buddy - - - msg=1,tm=5000,v=4 fw_version v=\"7.0.0+16903\" 0\n\
+          pair v=1i,w=2i 5\n",
+    );
+    assert_eq!(measured_at(&points), [("fw_version", RECEIVED_AT - 5_000), ("pair", RECEIVED_AT)]);
+    assert_eq!(attr(&points[0], "influxdb.field.value"), Some("7.0.0+16903"));
+    assert_eq!(gauge(&points[1], "pair.v"), MetricValue::I64(1));
+    assert_eq!(gauge(&points[1], "pair.w"), MetricValue::I64(2));
 }

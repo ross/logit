@@ -199,11 +199,12 @@ Every PR runs `script/cibuild`. W1 and W3 regenerate and commit `script/schema`.
 ## Outcome
 
 W4's `crates/logit-cli/tests/prusa_example.rs` runs the first captured datagram (`msg=920`, 984
-bytes) through `SyslogDecoder::with_line_splitting(false)`, `examples/prusa/prusa.lua` in a real
+bytes), received 100 µs past a whole second so anchoring crosses a second boundary, through `SyslogDecoder::with_line_splitting(false)`, `examples/prusa/prusa.lua` in a real
 `ScriptWorker`, and `LineProtocol` through `process_batch`, and checks every point against the
 fixture's own lines:
 
-- 37 points in line order and no parent, none skipped or counted as a bad line.
+- 37 points in line order and no parent, none skipped by the script or counted as a bad line by
+  `line_protocol`.
 - Each point's measurement, `mac_address` set, and no `syslog.*` attribute left.
 - Each point's timestamp is the receipt time minus its distance from the newest offset, so
   `esp_out` takes the receipt time and `ttemp_noz` (offset `-158`) lands 676,380 µs before it.
@@ -211,7 +212,16 @@ fixture's own lines:
   multi-field points (`heap.free`, `heap.total`, three `fan.*` gauges per fan).
 - The batch resource carries `_logit.influxdb.bucket = "prusa"` past `line_protocol`.
 
-The same file checks that consecutive datagrams `msg=920` and `msg=921` count no gap, that a jump
-to `msg=925` counts four missed datagrams, that a datagram in an unsupported format version is
-discarded and counted `prusa.datagrams.dropped`, and that a non-Buddy syslog event passes through unchanged. With the anchoring
-subtraction removed from the script, the first test fails on its first point.
+The same file checks, with synthetic datagrams where no capture has the case:
+
+- `msg=920` then `msg=921` counts no gap, and a jump to `msg=925` counts four missed datagrams.
+- A `v=3` body anchors in milliseconds and skips a `_seq` point, counted.
+- A `v=2` body sums each offset onto the one before.
+- A NaN `value` is skipped and counted, and only a lone `v` field, a string one included, becomes
+  `value`.
+- A datagram in an unsupported format version is discarded and counted `prusa.datagrams.dropped`.
+- A non-Buddy syslog event passes through unchanged.
+
+Each of these faults in the script fails the first test: removing the anchoring subtraction (its first point's
+timestamp), leaving the header on the body (`line_protocol` drops the first line), and skipping the
+seconds borrow (`line_protocol` drops 36 lines with malformed timestamps).
