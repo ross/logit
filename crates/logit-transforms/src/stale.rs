@@ -445,7 +445,7 @@ mod tests {
             } else {
                 Box::new(has(Some(MAX_AHEAD)).with_telemetry(telemetry.clone()))
             };
-            process_batch(&mut *t, mixed_batch(), &telemetry);
+            process_batch(&mut *t, mixed_batch(), &mut Vec::new(), &telemetry);
             let events = registry.drain(0);
             assert_eq!(
                 counter(&events, "logit.transform.stale.exceeded", Some(("bound", "max_age"))),
@@ -471,7 +471,7 @@ mod tests {
         let telemetry = registry.telemetry_for("filter", "drop_stale", "transform");
         let mut d = drop_(None).with_telemetry(telemetry.clone());
         let batch = EventBatch { resource: resource(), scope: None, events: vec![log_at(NOW)] };
-        process_batch(&mut d, batch, &telemetry);
+        process_batch(&mut d, batch, &mut Vec::new(), &telemetry);
         let events = registry.drain(0);
         assert_eq!(counter(&events, "logit.transform.stale.exceeded", None), None);
         assert_eq!(counter(&events, "logit.transform.stale.unjudged", None), None);
@@ -487,7 +487,8 @@ mod tests {
             scope: None,
             events: vec![log_at(NOW), log_at(NOW - secs(1000))],
         };
-        let out = process_batch(&mut d, batch, &telemetry).expect("the fresh event survives");
+        let out = process_batch(&mut d, batch, &mut Vec::new(), &telemetry)
+            .expect("the fresh event survives");
         assert_eq!(out.events.len(), 1);
 
         let events = registry.drain(0);
@@ -527,8 +528,10 @@ mod tests {
         let t_has = registry.telemetry_for("h", "has_stale", "transform");
         let mut d = DropStale::new(max_age, max_ahead).with_clock(|| NOW);
         let mut h = HasStale::new(max_age, max_ahead).with_clock(|| NOW);
-        let kept = process_batch(&mut d, mixed_batch(), &t_drop).map_or(0, |b| b.events.len());
-        let archived = process_batch(&mut h, mixed_batch(), &t_has).map_or(0, |b| b.events.len());
+        let kept = process_batch(&mut d, mixed_batch(), &mut Vec::new(), &t_drop)
+            .map_or(0, |b| b.events.len());
+        let archived = process_batch(&mut h, mixed_batch(), &mut Vec::new(), &t_has)
+            .map_or(0, |b| b.events.len());
         assert_eq!(kept + archived, 5);
         assert_eq!((kept, archived), (2, 3));
     }

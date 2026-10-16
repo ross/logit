@@ -1,0 +1,40 @@
+# Metrics from Prusa printers on Buddy firmware, written to InfluxDB 2.x. Each printer sends one
+# syslog datagram about every half second, holding a short header and about 37 InfluxDB
+# line-protocol points timed relative to the printer's boot. README.md, beside this file, has the
+# format and how to point a printer here.
+#
+#   printer -> printer_in :5141/udp -> prusa -> points -> influx_out
+#
+# `logit validate logit.yaml` checks this file but doesn't load prusa.lua; `logit run` loads it
+# and fails at startup if it doesn't compile.
+
+components:
+  # One datagram is one message. The default, `framing: lines`, would split the datagram on
+  # every newline and drop each point after the first as a malformed syslog message.
+  printer_in:
+    type: syslog_in
+    bind: 0.0.0.0:5141
+    framing: datagram
+
+  # Strips the header, gives every point an absolute timestamp, tags it with the printer's MAC
+  # address, and names the bucket. Points renamed or skipped here follow Prusa's own collector.
+  prusa:
+    type: lua_file
+    sources: [printer_in]
+    lua_file: prusa.lua
+
+  # One event per point: the measurement, its tags, and one gauge per numeric field. The script
+  # writes nanosecond timestamps, the default `precision`.
+  points:
+    type: line_protocol
+    sources: [prusa]
+
+  # No `bucket:` here, so each batch goes to the bucket the script names, `prusa` unless you edit
+  # it. Create that bucket first: InfluxDB refuses a write to a bucket that doesn't exist, and the
+  # batch is dropped and counted.
+  influx_out:
+    type: influxdb_out
+    sources: [points]
+    url: http://localhost:8086
+    org: home
+    token: !env INFLUXDB_TOKEN

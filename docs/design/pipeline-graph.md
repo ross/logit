@@ -188,7 +188,7 @@ collide, so the rule stays predictable when a protocol gains its second side lat
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
 `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `keep_values`, `bucket`,
-`logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`, and any future
+`logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`, and any future
 native transform — take no suffix, because a transform has only one direction.
 
 **`interval` is a per-kind field.** `lua`/`lua_file` carry an optional flush interval
@@ -233,7 +233,7 @@ literal argument string.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, `kafka_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -402,6 +402,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 88. A top-level `hostname` that is empty or only whitespace.
 89. An `influxdb_out` that sets both `bucket` and `default_bucket`.
 90. An `influxdb_out` that sets both `org` and `default_org`.
+91. A `syslog_in` `framing` set to any value, `lines` included, under `transport: tcp`.
 70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL, carries a query
     or fragment, or ends in a HEC route rather than the `/services/collector` base, an empty or
     whitespace-padded `token`, `timeout: 0s`, an `ack_timeout` without `ack: true` or of `0s`, a
@@ -610,6 +611,15 @@ Besides `process`, `Transform` has a second per-batch hook, `map_resource`, call
 incoming batch before any event reaches `process`. It lets a transform substitute the batch's
 resource (`logit-transforms::Set` was the first implementer); see
 [ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
+
+A native transform can also turn one event into several. The runtime calls
+`Transform::process_into`, whose default forwards to `process`. Its bool forwards or discards the
+event in place, as `process`'s does, and every event it pushes onto `emitted` is forwarded
+whatever the bool says. `process_batch` appends those children after the batch's surviving
+events, in emission order, so they leave in the parent's batch under its resource, scope, and
+trace context, with no extra inbox send. A batch whose parents were all discarded still goes out
+if it emitted anything. A child carries no route mark, unlike a Lua `return {a, b}`, because a
+native transform has no `targets:`. See [ADR `transform-fan-out`](../adr/transform-fan-out.md).
 
 ### Trace context propagation
 

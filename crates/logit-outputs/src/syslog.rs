@@ -103,7 +103,7 @@
 //! ## Injection safety
 //!
 //! `syslog_in` and Grafana Alloy's `loki.source.syslog` UDP listener both split a datagram into
-//! lines on `\n`, so an embedded newline in a relayed message forges a second, attacker-controlled
+//! lines on `\n` by default, so an embedded newline in a relayed message forges a second, attacker-controlled
 //! message at the receiver (its own PRI, hostname, and app name, i.e. a fabricated Loki stream).
 //! [`sanitize_msg`] escapes `\n`/`\r`/NUL and every other C0 control character and DEL in the
 //! rendered message on every transport, so the wire bytes don't depend on the transport. On TCP,

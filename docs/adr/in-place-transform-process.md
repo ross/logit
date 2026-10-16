@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-10-13
+updated: 2026-10-16
 ---
 
 # `Transform::process` transforms in place: `&mut Event -> bool`, not `Event -> Option<Event>`
@@ -255,3 +255,10 @@ that drift.
 Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the length `retain_mut` removed is counted as `logit.component.events.discarded`
 (untagged, only when nonzero) instead of `events.dropped{reason="absorbed"}`. The allocation pins
 are unchanged.
+
+## Amendment: a transform can emit extra events (2026-10-16)
+
+[ADR `transform-fan-out`](transform-fan-out.md) adds `Transform::process_into`, which defaults to
+`process` and lets a transform push extra events that `process_batch` appends to the same batch.
+`process` keeps this ADR's in-place contract, and a transform that never pushes still allocates
+nothing per batch.

@@ -1710,6 +1710,10 @@ async fn run_transform(
 ) -> anyhow::Result<()> {
     let mut next_flush =
         transform.flush_interval().map(|interval| tokio::time::Instant::now() + interval);
+    // `process_into`'s `emitted`, kept for the node's life so a fan-out transform reuses its
+    // capacity. Empty with no capacity until a transform first pushes, so it allocates nothing
+    // for one that never does.
+    let mut emitted: Vec<Event> = Vec::new();
 
     loop {
         if let Some(deadline) = next_flush {
@@ -1764,22 +1768,27 @@ async fn run_transform(
             Some(parent.trace.span_id),
         );
         let batch = unwrap_batch(batch);
-        if let Some(out) = process_batch(&mut *transform, batch, &telemetry) {
+        if let Some(out) = process_batch(&mut *transform, batch, &mut emitted, &telemetry) {
             span.events(out.events.len() as u64);
             fanout.send_with_own_context(out, ctx).await;
         }
     }
 }
 
-/// The per-batch body of `run_transform`: telemetry accounting plus `Transform::process` over
-/// every event in place, dropping what it absorbs. `Vec::retain_mut` over the batch's own
+/// The per-batch body of `run_transform`: telemetry accounting plus `Transform::process_into`
+/// over every event in place, dropping what it absorbs. `Vec::retain_mut` over the batch's own
 /// `events`, so a forwarded event never moves and the survivors need no new allocation.
+///
+/// `emitted` is the node's scratch, kept across batches and empty between them. What the
+/// transform pushes onto it is appended after the survivors, which empties it and keeps its
+/// capacity (`docs/adr/transform-fan-out.md`).
 ///
 /// `pub` so `crates/logit-bench/tests/allocations.rs` can measure the real path
 /// (`docs/design/memory.md` §7).
 pub fn process_batch(
     transform: &mut (dyn Transform + Send),
     batch: EventBatch,
+    emitted: &mut Vec<Event>,
     telemetry: &Telemetry,
 ) -> Option<EventBatch> {
     telemetry.count("logit.component.batches.received", 1.0, &[]);
@@ -1795,15 +1804,19 @@ pub fn process_batch(
 
     let process_timer = telemetry.timer("logit.component.process.duration");
     let before = events.len();
-    events.retain_mut(|event| transform.process(&resource, event));
+    events.retain_mut(|event| transform.process_into(&resource, event, emitted));
     // Inside the timer: work a transform defers to `end_batch` is still this node's per-batch
     // cost (`docs/design/internal-telemetry.md`).
     transform.end_batch();
     drop(process_timer);
+    // Before the append, so only parents `process_into` returned `false` for count.
     let discarded = (before - events.len()) as u64;
     if discarded > 0 {
         telemetry.count("logit.component.events.discarded", discarded as f64, &[]);
     }
+    // A no-op on an empty `emitted`. After it, a batch whose parents were all discarded still
+    // goes out if it emitted anything.
+    events.append(emitted);
     if events.is_empty() {
         None
     } else {
@@ -3265,7 +3278,8 @@ mod tests {
         };
         let telemetry = Registry::new().telemetry_for("x", "x", "x");
 
-        let out = process_batch(&mut transform, batch, &telemetry).expect("one event should pass");
+        let out = process_batch(&mut transform, batch, &mut Vec::new(), &telemetry)
+            .expect("one event should pass");
         assert!(
             Arc::ptr_eq(&out.resource, &replacement),
             "the outgoing batch must carry map_resource's substituted Arc"
@@ -3284,8 +3298,143 @@ mod tests {
         };
         let telemetry = Registry::new().telemetry_for("x", "x", "x");
 
-        let out = process_batch(&mut transform, batch, &telemetry).expect("one event should pass");
+        let out = process_batch(&mut transform, batch, &mut Vec::new(), &telemetry)
+            .expect("one event should pass");
         assert!(Arc::ptr_eq(&out.resource, &resource), "the default map_resource must be a no-op");
+    }
+
+    /// Emits `children` events per parent through `process_into`, each stamped
+    /// `parent.timestamp * 100 + k + 1`, and forwards the parents whose timestamp `keep` accepts.
+    struct FanOutTransform {
+        children: i64,
+        keep: fn(i64) -> bool,
+    }
+
+    impl Transform for FanOutTransform {
+        fn process(&mut self, _resource: &Arc<Resource>, _event: &mut Event) -> bool {
+            unreachable!("the runtime calls process_into")
+        }
+
+        fn process_into(
+            &mut self,
+            _resource: &Arc<Resource>,
+            event: &mut Event,
+            emitted: &mut Vec<Event>,
+        ) -> bool {
+            for k in 0..self.children {
+                emitted.push(Event::empty(event.timestamp * 100 + k + 1, AttrMap::new()));
+            }
+            (self.keep)(event.timestamp)
+        }
+    }
+
+    fn timestamped_batch(timestamps: &[i64]) -> EventBatch {
+        EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: Some(Arc::new(Scope::default())),
+            events: timestamps.iter().map(|&ts| Event::empty(ts, AttrMap::new())).collect(),
+        }
+    }
+
+    fn timestamps(batch: &EventBatch) -> Vec<i64> {
+        batch.events.iter().map(|e| e.timestamp).collect()
+    }
+
+    /// Every parent discarded: the batch is the children alone, in emission order, and only the
+    /// parents count as discarded.
+    #[test]
+    fn process_batch_sends_only_the_children_of_parents_it_discards() {
+        let mut transform = FanOutTransform { children: 2, keep: |_| false };
+        let probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("fan", "x", "transform");
+        let mut emitted = Vec::new();
+
+        let out =
+            process_batch(&mut transform, timestamped_batch(&[1, 2, 3]), &mut emitted, &telemetry)
+                .expect("a batch whose parents emitted children must still be sent");
+
+        assert_eq!(timestamps(&out), [101, 102, 201, 202, 301, 302]);
+        assert!(emitted.is_empty(), "the scratch must be empty between batches");
+        assert!(emitted.capacity() > 0, "the scratch keeps its capacity for the next batch");
+        let totals = Totals::of(probe.registry().drain(0));
+        assert_eq!(totals.sum("logit.component.events.received", &[]), 3.0);
+        assert_eq!(totals.sum("logit.component.events.discarded", &[]), 3.0);
+    }
+
+    /// Forwarded parents keep their slots, and every child follows them in emission order.
+    #[test]
+    fn process_batch_puts_children_after_the_surviving_parents() {
+        let mut transform = FanOutTransform { children: 2, keep: |ts| ts % 2 == 0 };
+        let probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("fan", "x", "transform");
+
+        let out = process_batch(
+            &mut transform,
+            timestamped_batch(&[1, 2, 3, 4]),
+            &mut Vec::new(),
+            &telemetry,
+        )
+        .expect("survivors and children");
+
+        assert_eq!(timestamps(&out), [2, 4, 101, 102, 201, 202, 301, 302, 401, 402]);
+        let totals = Totals::of(probe.registry().drain(0));
+        assert_eq!(totals.sum("logit.component.events.discarded", &[]), 2.0);
+    }
+
+    /// One emitting parent among discarded ones is enough to send a batch.
+    #[test]
+    fn process_batch_sends_a_batch_when_one_discarded_parent_emitted() {
+        let mut transform = FanOutTransform { children: 0, keep: |_| false };
+        let telemetry = Registry::new().telemetry_for("fan", "x", "transform");
+        assert!(
+            process_batch(&mut transform, timestamped_batch(&[1, 2]), &mut Vec::new(), &telemetry)
+                .is_none(),
+            "nothing forwarded and nothing emitted sends nothing"
+        );
+
+        struct OneChild;
+        impl Transform for OneChild {
+            fn process(&mut self, _resource: &Arc<Resource>, _event: &mut Event) -> bool {
+                unreachable!("the runtime calls process_into")
+            }
+            fn process_into(
+                &mut self,
+                _resource: &Arc<Resource>,
+                event: &mut Event,
+                emitted: &mut Vec<Event>,
+            ) -> bool {
+                if event.timestamp == 2 {
+                    emitted.push(Event::empty(7, AttrMap::new()));
+                }
+                false
+            }
+        }
+        let out = process_batch(
+            &mut OneChild,
+            timestamped_batch(&[1, 2, 3]),
+            &mut Vec::new(),
+            &telemetry,
+        )
+        .expect("the one child must be sent");
+        assert_eq!(timestamps(&out), [7]);
+    }
+
+    /// A transform that only overrides `process` leaves the scratch unallocated and the batch as
+    /// it would be with no emit path.
+    #[test]
+    fn process_batch_through_a_non_emitting_transform_leaves_the_scratch_untouched() {
+        let mut transform = MutatingTransform;
+        let telemetry = Registry::new().telemetry_for("t", "x", "transform");
+        let mut emitted = Vec::new();
+
+        let out =
+            process_batch(&mut transform, timestamped_batch(&[1, 2]), &mut emitted, &telemetry)
+                .expect("both forwarded");
+
+        assert_eq!(timestamps(&out), [1, 2]);
+        assert!(out.events.iter().all(|e| e.metrics.len() == 1), "each event mutated once");
+        assert!(emitted.is_empty());
+        assert_eq!(emitted.capacity(), 0, "nothing pushed, nothing allocated");
     }
 
     /// Branch isolation (`docs/adr/multi-payload-events.md`) through a real two-branch fan-out.
@@ -11215,6 +11364,53 @@ mod tests {
             received.span_id, parent.span_id,
             "the emission is its own hop -- it should mint a fresh span id, not reuse the parent's"
         );
+    }
+
+    /// A fan-out node's children leave in the parent's one `Delivered`, under its resource and
+    /// scope, and count in `events.sent` but not `events.received`.
+    #[tokio::test]
+    async fn run_transform_sends_children_in_the_parents_batch_and_counts_them_as_sent() {
+        let probe = TelemetryProbe::with_registry(Registry::with_span_sampling(1.0));
+        let telemetry = probe.telemetry("fan", "x", "transform");
+        let (in_tx, in_rx) = mpsc::channel(1);
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let fanout = Fanout::new(vec![out_tx]).with_telemetry(telemetry.clone());
+        let transform: Box<dyn Transform + Send> =
+            Box::new(FanOutTransform { children: 3, keep: |_| false });
+
+        let batch = timestamped_batch(&[1, 2]);
+        let (resource, scope) = (batch.resource.clone(), batch.scope.clone());
+        in_tx
+            .send(Delivered::Owned(batch, TraceContext::new_root().into()))
+            .await
+            .expect("inbox should accept");
+        drop(in_tx);
+
+        run_transform(transform, in_rx, fanout, telemetry)
+            .await
+            .expect("should complete without error");
+
+        let out = crate::test_util::recv_batch(&mut out_rx).await;
+        assert_eq!(timestamps(&out), [101, 102, 103, 201, 202, 203]);
+        assert!(Arc::ptr_eq(&out.resource, &resource), "children share the batch's resource");
+        assert!(
+            Arc::ptr_eq(out.scope.as_ref().expect("scope"), scope.as_ref().expect("scope")),
+            "children share the batch's scope"
+        );
+        assert!(out_rx.recv().await.is_none(), "one batch in, one Delivered out");
+        let drained = probe.registry().drain(0);
+        let span = span_events(&drained)
+            .find(|e| span_op(e) == Some("process"))
+            .expect("a process span should be recorded");
+        assert_eq!(
+            span.attributes.get("events"),
+            Some(&logit_core::Value::I64(6)),
+            "the process span records the outgoing count"
+        );
+        let totals = Totals::of(drained);
+        assert_eq!(totals.sum("logit.component.events.received", &[]), 2.0);
+        assert_eq!(totals.sum("logit.component.events.discarded", &[]), 2.0);
+        assert_eq!(totals.sum("logit.component.events.sent", &[]), 6.0);
     }
 
     /// A flush mints a fresh root, not the context of either absorbed batch.

@@ -39,8 +39,8 @@ use logit_proto::Decoder;
 use logit_transforms::{
     AggregateTemporality, Aggregator, Arrays, Bucket, BucketBound, BucketField, CsvParser,
     Distributions, Fields, Flatten, HttpAccess, HttpAccessConfig, JsonParser, Keep, KeepValues, Kv,
-    KvMetrics, Logfmt, MetricSpec, Normalize, RegexParser, RouteRule, RouteSet, Sample,
-    SampleField, SampleKey, SampleMissing, SampleOverride, Set, Shape,
+    KvMetrics, LineProtocol, Logfmt, MetricSpec, Normalize, RegexParser, RouteRule, RouteSet,
+    Sample, SampleField, SampleKey, SampleMissing, SampleOverride, Set, Shape,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -621,6 +621,48 @@ pub fn shape() -> Shape {
 /// `tests/allocations.rs`'s `flatten_*` measurements.
 pub fn flatten() -> Flatten {
     Flatten::new(Fields::All, Fields::None, Arrays::Index)
+}
+
+/// Line protocol as a Prusa Buddy firmware metrics datagram carries it: the four points of
+/// `docs/plans/prusa-metrics.md`'s captured datagram excerpt, plus that plan's string-field
+/// example, with each boot-relative timestamp rewritten to absolute nanoseconds and the header
+/// line removed, as the plan's Lua stage does before `line_protocol`. One point per shape: a
+/// tagged integer, a one-field point, two multi-field points (two integers, three floats), and a
+/// string field.
+pub const LINE_PROTOCOL_MESSAGE: &str = "ttemp_noz,n=0,a=1 value=0i 1792167827767000000\n\
+     stp_stall v=1i 1792167827806000000\n\
+     heap free=61088i,total=79012i 1792167827896000000\n\
+     fan,fan=print state=0,pwm=0,measured=0 1792167828270000000\n\
+     fw_version v=\"7.0.0+16903\" 1792167828270000001\n";
+
+/// A log event carrying [`LINE_PROTOCOL_MESSAGE`] and three of the attributes `syslog_in` stamps
+/// on that datagram, which every point inherits. The message and the string attributes slice
+/// static buffers, as `syslog_in`'s slice the datagram, so a child's copy of them is a refcount.
+/// A `Bytes` built from a `String` would instead allocate once on its first clone.
+pub fn line_protocol_event() -> Event {
+    let mut attributes = AttrMap::new();
+    attributes.insert("syslog.hostname", Value::Str(Bytes::from_static(b"10:9c:70:2d:d5:c4")));
+    attributes.insert("syslog.appname", Value::Str(Bytes::from_static(b"buddy")));
+    attributes.insert("syslog.facility", Value::U64(1));
+    Event::log(
+        1_792_167_830_000_000_000,
+        attributes,
+        LogRecord {
+            message: Value::Str(Bytes::from_static(LINE_PROTOCOL_MESSAGE.as_bytes())),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
+    )
+}
+
+/// A `line_protocol` at its defaults (`precision: ns`, `keep_source: false`), for
+/// `tests/allocations.rs`'s `line_protocol_*` measurement.
+pub fn line_protocol() -> LineProtocol {
+    LineProtocol::new(logit_proto::influxdb::Precision::Ns, false)
 }
 
 /// A `sample` keyed on `trace_id` at `rate: 0.5`, `fixtures/sample-traces.yaml`'s shape, for

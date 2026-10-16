@@ -63,6 +63,14 @@
 //! `logit`, and one under `influxdb.field.` would read back as a string field. Any other tag
 //! under `influxdb.` is an ordinary tag.
 //!
+//! **The `line_protocol` transform** builds its events through the same path
+//! ([`InfluxDecoder::decode_skipping`]), so this table is its mapping too, with four differences:
+//! each event starts from a copy of the parent event's attributes, a point with no timestamp
+//! takes the parent's timestamp untruncated, a bad line is skipped rather than failing the
+//! message, and the counters are under `logit.transform.`. There are no `org`, `orgID`, or
+//! `bucket` attributes. The transform's module doc
+//! (`crates/logit-transforms/src/line_protocol.rs`) has its per-line rules and counters.
+//!
 //! A tag value, string value, or measurement that unescaping left unchanged is a zero-copy slice
 //! of the body; one that changed is a copy. `_time` and `_value` arrive as ordinary tags: influxd
 //! accepts them at write and its Flux reads then fail on them.

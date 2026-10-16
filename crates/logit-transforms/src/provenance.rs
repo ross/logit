@@ -297,9 +297,9 @@ mod tests {
             || EventBatch { resource: default_resource(), scope: None, events: vec![event()] };
 
         has.observe_provenance(provenance(Some("nginx_in"), None));
-        assert!(process_batch(&mut has, batch(), &telemetry).is_some());
+        assert!(process_batch(&mut has, batch(), &mut Vec::new(), &telemetry).is_some());
         has.observe_provenance(provenance(Some("syslog_in"), None));
-        assert!(process_batch(&mut has, batch(), &telemetry).is_none());
+        assert!(process_batch(&mut has, batch(), &mut Vec::new(), &telemetry).is_none());
 
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.component.events.discarded"), Some(1.0));

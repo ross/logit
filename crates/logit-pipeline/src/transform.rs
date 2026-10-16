@@ -3,7 +3,8 @@
 //! OS thread (`docs/design/pipeline-graph.md`'s "Node kinds and the transform trait question").
 //!
 //! `process` is per-event on purpose: it matches `aggregate`'s accumulation contract (one event
-//! in, absorbed or forwarded). Everything per-batch goes through the `observe_*`/`map_resource`/
+//! in, absorbed or forwarded), and `process_into` lets one event also emit others into the same
+//! batch (`docs/adr/transform-fan-out.md`). Everything per-batch goes through the `observe_*`/`map_resource`/
 //! `end_batch` hooks, so the per-event hot path never widens for one implementer's needs.
 
 use crate::fanout::TraceContext;
@@ -30,12 +31,33 @@ pub trait Transform: Send {
     ///
     /// Borrows the event, as [`crate::Router::route`] does: `Event` is 864 bytes
     /// (`crates/logit-core/tests/type_sizes.rs`), and an owned `Event -> Option<Event>` shape
-    /// would memcpy one per event per node hop. [`crate::runtime::process_batch`] drives this
-    /// with `Vec::retain_mut`, so a forwarded event is never moved.
+    /// would memcpy one per event per node hop. [`crate::runtime::process_batch`] drives this,
+    /// through [`Transform::process_into`], with `Vec::retain_mut`, so a forwarded event is never
+    /// moved.
     ///
     /// An absorbing transform moves the payload it wants out with `std::mem::take` (`aggregate`
     /// takes `event.metrics` this way) and leaves the drained shell for the caller to drop.
     fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool;
+
+    /// [`Transform::process`] with an emit path, and the only one of the two the runtime calls.
+    /// The return value means what `process`'s does: `true` forwards `event`, `false` discards
+    /// it. Every event pushed onto `emitted` is forwarded whatever the bool says, after the
+    /// batch's surviving events, in emission order across the batch, with the batch's resource
+    /// and scope. A native transform has no `targets:`, so a pushed event carries no route mark
+    /// and goes to the node's ordinary edge (`docs/adr/transform-fan-out.md`).
+    ///
+    /// `emitted` is the node's scratch, empty on entry to each batch. Push onto it; don't
+    /// reorder or remove what an earlier call in the same batch pushed. The default forwards to
+    /// `process` and pushes nothing, which allocates nothing.
+    fn process_into(
+        &mut self,
+        resource: &Arc<Resource>,
+        event: &mut Event,
+        emitted: &mut Vec<Event>,
+    ) -> bool {
+        let _ = emitted;
+        self.process(resource, event)
+    }
 
     /// Called once per incoming batch, before any of its events reach `process`. A transform
     /// whose emission spans several batches (`aggregate`) records which batch contributed to what

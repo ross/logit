@@ -1480,8 +1480,12 @@ pub enum ComponentKind {
     /// latched for that connection's life: an ASCII digit means RFC 6587 octet-counting
     /// (`MSG-LEN SP MSG`, what `syslog_out` emits, and the only framing that can carry a message
     /// containing a newline); anything else means LF-delimited framing (rsyslog's `omfwd`
-    /// default). There is no `framing:` field. A frame over 64 KiB, or a malformed octet count,
-    /// closes that one connection.
+    /// default). `framing:` doesn't apply to TCP and is rejected there. A frame over 64 KiB, or a
+    /// malformed octet count, closes that one connection.
+    ///
+    /// Under `transport: udp`, `framing:` chooses how a datagram maps to messages. `lines` (the
+    /// default) splits it on newlines, one message per line. `datagram` reads the whole datagram
+    /// as one message.
     ///
     /// `tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS
     /// listener. It applies to `transport: tcp` only (RFC 5425); `tls:` under `transport: udp` is
@@ -1496,6 +1500,16 @@ pub enum ComponentKind {
         bind: String,
         #[serde(default)]
         transport: SyslogTransport,
+        /// How a UDP datagram maps to messages. `lines` (the default) splits a datagram on
+        /// `\n` and parses each line as its own message, for senders that pack several messages
+        /// into one datagram, such as nginx's `syslog:` writer. `datagram` makes one datagram
+        /// one message and keeps every `\n` in its MSG, for a sender whose MSG spans lines or
+        /// carries binary bytes. Under `datagram`, a sender that packs several messages into one
+        /// datagram yields one event whose MSG holds the rest, with nothing counted as
+        /// malformed. `transport: udp` only: any value under `transport: tcp`, including
+        /// `lines`, is rejected.
+        #[serde(default)]
+        framing: Option<SyslogFraming>,
         /// Terminates TLS on this listener when present; plaintext when omitted. Requires
         /// `transport: tcp`.
         #[serde(default)]
@@ -2836,6 +2850,30 @@ pub enum ComponentKind {
         #[serde(default)]
         arrays: FlattenArrays,
     },
+    /// Parses a log message as InfluxDB line protocol and emits one event per point, in the shape
+    /// `influxdb_in` gives one: the measurement as `_logit.influxdb.measurement`, tags as
+    /// attributes, each numeric or boolean field as a gauge named `<measurement>.<field>`, and
+    /// each string field as the attribute `influxdb.field.<key>`. Points in one message with the
+    /// same measurement, tag set, and timestamp merge into one event.
+    ///
+    /// Each point's event starts from a copy of the parent's attributes, with the point's own
+    /// tags winning a collision, so every inherited attribute reaches `influxdb_out` as a tag;
+    /// place `keep` or `remove` to choose them. A point with no timestamp takes the parent's.
+    ///
+    /// A line that doesn't parse, or whose timestamp is out of range, is skipped and counted, and
+    /// the rest of the message is still parsed. An event with no log, or whose message isn't text
+    /// or bytes, passes through untouched, as does a message with no good point.
+    LineProtocol {
+        /// The unit of every timestamp in the message: `ns` (the default, as InfluxDB's write
+        /// API), `us`, `ms`, or `s`.
+        #[serde(default)]
+        precision: LineProtocolPrecision,
+        /// Also forward the parent event, log included, beside its points. Off by default: the
+        /// parent's log is removed once its points are emitted, and a parent left with no metric
+        /// or span is discarded.
+        #[serde(default)]
+        keep_source: bool,
+    },
     /// Normalizes a web server's access line, logged under raw OTel semconv attribute names, into
     /// its conformant form: composites (`http.request.line`, `url.original`) decomposed into
     /// whichever atomic fields are absent, numerics coerced to integers (`"000"` becomes `0`),
@@ -4144,6 +4182,21 @@ pub enum FlattenArrays {
     Skip,
 }
 
+/// `line_protocol`'s `precision` field: the unit of a line's timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LineProtocolPrecision {
+    /// Nanoseconds. The default.
+    #[default]
+    Ns,
+    /// Microseconds.
+    Us,
+    /// Milliseconds.
+    Ms,
+    /// Seconds.
+    S,
+}
+
 /// `bucket`'s `keep_source` default: keep the source attribute.
 fn default_bucket_keep_source() -> bool {
     true
@@ -4465,6 +4518,17 @@ pub enum SyslogTransport {
     #[default]
     Udp,
     Tcp,
+}
+
+/// How `syslog_in` maps a UDP datagram to messages. See the `framing` field.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SyslogFraming {
+    /// Split the datagram on `\n`; each line is a message.
+    #[default]
+    Lines,
+    /// The whole datagram is one message.
+    Datagram,
 }
 
 /// Which syslog dialect `syslog_out` emits. `rfc5424` is the default.
@@ -6554,6 +6618,38 @@ mod tests {
     }
 
     #[test]
+    fn line_protocol_component_defaults_to_ns_and_drops_the_source() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "line_protocol", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::LineProtocol { precision, keep_source } => {
+                assert_eq!(precision, LineProtocolPrecision::Ns);
+                assert!(!keep_source);
+            }
+            other => panic!("expected LineProtocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn line_protocol_component_deserializes_full_form_and_rejects_an_unknown_precision() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "line_protocol", "sources": ["in"], "precision": "ms", "keep_source": true}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::LineProtocol { precision, keep_source } => {
+                assert_eq!(precision, LineProtocolPrecision::Ms);
+                assert!(keep_source);
+            }
+            other => panic!("expected LineProtocol, got {other:?}"),
+        }
+        assert!(serde_json::from_str::<Component>(
+            r#"{"type": "line_protocol", "sources": ["in"], "precision": "h"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn timestamp_component_deserializes_full_form() {
         let component: Component = serde_json::from_str(
             r#"{"type": "timestamp", "sources": ["in"], "from": "syslog.timestamp",
@@ -7222,6 +7318,7 @@ mod tests {
             ComponentKind::SyslogIn {
                 bind,
                 transport,
+                framing,
                 tls,
                 handshake_timeout,
                 idle_timeout,
@@ -7230,6 +7327,7 @@ mod tests {
                 proxy_protocol,
                 reuse_port,
             } => {
+                assert_eq!(framing, None, "unset unless asked for");
                 assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");

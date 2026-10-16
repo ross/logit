@@ -333,7 +333,7 @@ mod tests {
             events: vec![span_event(), metric_event()],
         };
 
-        let out = process_batch(&mut has_signal, batch, &telemetry);
+        let out = process_batch(&mut has_signal, batch, &mut Vec::new(), &telemetry);
 
         assert_eq!(out.map(|b| b.events.len()), Some(1));
         let events = registry.drain(0);

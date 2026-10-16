@@ -88,11 +88,11 @@ use logit_transforms::{
     HttpAccess as HttpAccessTransform, HttpAccessConfig, IdFormat as TraceIdFormatTransform,
     InvalidUtf8 as TransformInvalidUtf8, JsonParser, Keep as KeepTransform,
     KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform, Kv as KvTransform,
-    KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
-    Normalize as TransformNormalize, RegexParser, Remove as RemoveTransform,
-    Route as RouteTransform, Sample as SampleTransform, Scale as ScaleTransform,
-    Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform, SignalSet, SpanLift,
-    TimestampFormat as TimestampFormatTransform, TimestampResolver,
+    KvMetrics as KvMetricsTransform, LineProtocol as LineProtocolTransform,
+    Logfmt as LogfmtTransform, MatchMode as TransformMatchMode, Normalize as TransformNormalize,
+    RegexParser, Remove as RemoveTransform, Route as RouteTransform, Sample as SampleTransform,
+    Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform,
+    SignalSet, SpanLift, TimestampFormat as TimestampFormatTransform, TimestampResolver,
     TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
@@ -614,6 +614,7 @@ fn build_spec(
         SyslogIn {
             bind,
             transport,
+            framing,
             tls,
             handshake_timeout,
             idle_timeout,
@@ -623,9 +624,16 @@ fn build_spec(
             reuse_port,
         } => {
             let mut input = match transport {
-                logit_config::SyslogTransport::Udp => {
-                    SyslogInput::new(bind.clone()).with_receive(receive_config(&component.receive))
+                // Rule 91 rejects `framing:` under TCP.
+                logit_config::SyslogTransport::Udp => match framing {
+                    Some(logit_config::SyslogFraming::Datagram) => {
+                        SyslogInput::udp_datagram(bind.clone())
+                    }
+                    Some(logit_config::SyslogFraming::Lines) | None => {
+                        SyslogInput::new(bind.clone())
+                    }
                 }
+                .with_receive(receive_config(&component.receive)),
                 logit_config::SyslogTransport::Tcp => SyslogInput::tcp(bind.clone())
                     .with_tcp_receive(tcp_receive_config(&component.receive)),
             }
@@ -1119,6 +1127,11 @@ fn build_spec(
                     .with_telemetry(telemetry.clone()),
             ))
         }
+        LineProtocol { precision, keep_source } => NodeSpec::Transform(Box::new(
+            LineProtocolTransform::new(to_line_protocol_precision(*precision), *keep_source)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
+        )),
         Flatten { attributes, resource, arrays } => NodeSpec::Transform(Box::new(
             FlattenTransform::new(
                 to_flatten_fields(attributes),
@@ -2179,6 +2192,20 @@ fn to_bucket_fields(
             keep_source: spec.keep_source,
         })
         .collect()
+}
+
+/// `line_protocol`'s `precision` into the codec's own enum.
+fn to_line_protocol_precision(
+    precision: logit_config::LineProtocolPrecision,
+) -> logit_proto::influxdb::Precision {
+    use logit_config::LineProtocolPrecision as P;
+    use logit_proto::influxdb::Precision;
+    match precision {
+        P::Ns => Precision::Ns,
+        P::Us => Precision::Us,
+        P::Ms => Precision::Ms,
+        P::S => Precision::S,
+    }
 }
 
 /// `flatten`'s `FlattenFields` into the `logit_transforms::Fields` `Flatten::new` takes.
@@ -3769,6 +3796,7 @@ mod tests {
             kind: ComponentKind::SyslogIn {
                 bind: "127.0.0.1:0".to_string(),
                 transport,
+                framing: None,
                 tls,
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
@@ -3952,6 +3980,7 @@ mod tests {
             kind: ComponentKind::SyslogIn {
                 bind: addr.clone(),
                 transport: logit_config::SyslogTransport::Tcp,
+                framing: None,
                 tls: None,
                 handshake_timeout: Duration::from_millis(50),
                 idle_timeout: None,
@@ -4144,6 +4173,7 @@ mod tests {
         let kind = ComponentKind::SyslogIn {
             bind: addr.clone(),
             transport: logit_config::SyslogTransport::Tcp,
+            framing: None,
             tls: None,
             handshake_timeout: logit_config::default_handshake_timeout(),
             idle_timeout: None,
@@ -4279,6 +4309,7 @@ mod tests {
             kind: ComponentKind::SyslogIn {
                 bind: addr.clone(),
                 transport: logit_config::SyslogTransport::Tcp,
+                framing: None,
                 tls: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),

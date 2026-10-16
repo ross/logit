@@ -269,6 +269,7 @@ line.
 | `flatten` an already-flat event | **0** | the phase-1 scan selects nothing -- no scratch buffer touched, no `Symbol` interned, no `Value` moved ([ADR `flatten-transform`](../adr/flatten-transform.md)) |
 | `flatten` pino-http shape (8 attrs, 2 nested `req`/`res`), warm `KeyCache` | **1** | six flat attributes survive untouched plus the eight leaves `req`/`res` expand into -- 14 total, spilling `AttrMap`'s 8-slot inline capacity once. One allocation, not one per inserted entry: `SmallVec`'s first over-capacity push grows straight to 16 slots, which the rest of this event's inserts fit inside |
 | `flatten` pino-http shape, cold `KeyCache` (first event of its shape in the component) | **12** | the warm case's spill, one `Box<str>` copy per distinct path this shape mints (eight: `req.method`, `req.headers.host`, ...) as each `KeyCache` miss stores its key, and the first growth of the component's scratch buffers (`pending`, `path`, the cache's `Vec`). The paths are already in the process-wide interner (a sibling `flatten` saw the shape first), so the count excludes the interner's own growth: a new key can grow one of its `DashMap` shards, and which shard it lands in follows the per-process hash seed and the host's core count, so a first-in-process intern of these eight paths costs one more allocation in some processes (164 of 20,000 seeds on a 24-thread host) and none in the rest. This is the cost `docs/design/data-shapes.md`'s pino-http finding says this shape pays "again" on every event, until its own component's `KeyCache` has seen every path once |
+| `line_protocol` a five-point message (`fixtures::LINE_PROTOCOL_MESSAGE`) through `process_batch`, warm transform and scratch | **11** | + 3 reallocs. The decode `influxdb_in` pays, built by the same code: 7 are the parsed lines' tag and field `Vec`s (a field `Vec` per line, a tag `Vec` per tagged line), 2 per message (the parsed lines, the merge's event-to-line index), and 2 are the multi-field points' `MetricList`s spilling past one record. Each child's copy of the parent's attributes stays inside `AttrMap`'s inline slots and clones no buffer, since the parent's strings slice a shared buffer as `syslog_in`'s do; a child whose inherited and own attributes pass eight adds one spill. The children are pushed onto the node's scratch, which keeps its capacity across batches, and `process_batch` then appends them to the incoming batch's own `Vec`. A listener's one-event batch has to grow for that, which is the third realloc, not an allocation ([ADR `transform-fan-out`](../adr/transform-fan-out.md), [ADR `line-protocol-transform`](../adr/line-protocol-transform.md)) |
 | `sample` `key: trace_id` on a span event | **0** | the 16 id bytes hex-encoded into a stack array, one XXH64 over them ([ADR `consistent-sampling-component`](../adr/consistent-sampling-component.md)); the key name was interned at construction and the decision tally is plain integers emitted once per batch |
 | `sample` `key: {attribute: status}` on an `I64` value | **0** | the decimal text is formatted straight into the streaming hasher through `fmt::Write` (`logit_core::sampling`'s `KeyHasher`) -- no intermediate `String`, the reason numeric canonicalization costs nothing |
 | `sample` with no key (random draw) | **0** | a per-instance counter mixed with the seed through the same hash -- no RNG, nothing to allocate |
@@ -546,7 +547,7 @@ so both, plus `unwrap_batch`, are measured in `crates/logit-bench/tests/allocati
 
 | Path | allocs | Notes |
 |---|---:|---|
-| `process_batch` through `keep`, telemetry disabled | **0** | nothing at all — `1 → 0` when `Transform::process` went in place ([ADR `in-place-transform-process`](../adr/in-place-transform-process.md), §8 item 14): `process_batch` is a `Vec::retain_mut` over the batch's own `events` now, so there is no `out` `Vec` to collect survivors into |
+| `process_batch` through `keep`, telemetry disabled | **0** | nothing at all — `1 → 0` when `Transform::process` went in place ([ADR `in-place-transform-process`](../adr/in-place-transform-process.md), §8 item 14): `process_batch` is a `Vec::retain_mut` over the batch's own `events` now, so there is no `out` `Vec` to collect survivors into. The `emitted` scratch ([ADR `transform-fan-out`](../adr/transform-fan-out.md)) stays empty with no capacity for a transform that never pushes, and appending it is a no-op |
 | `process_batch` through `set` (attributes only) | **0** | identical to `keep` — `Transform::map_resource`'s default `None` return costs nothing beyond the call itself (`crates/logit-pipeline/src/transform.rs`) |
 | `set.map_resource`, cached (same input `Arc`) | **0** | the one-entry `Arc::ptr_eq` cache (`crates/logit-transforms/src/set.rs`) hits |
 | `set.map_resource`, cache miss (distinct input `Arc`) | **1** | `Arc::new(Resource { .. })` only — cloning/inserting into the fixture's empty, inline `AttrMap` never touches the heap |
@@ -930,8 +931,11 @@ Two properties held through all of this:
 
 A separate change removed more per-hop cost: `Transform::process(&mut self, &Arc<Resource>, &mut
 Event) -> bool` plus `Vec::retain_mut` in `process_batch` saves one 864-byte `Event` memcpy per node
-hop and one `Vec` allocation per batch per node. The trait already couldn't emit more than one event
-per input, so a bool says everything the `Option<Event>` return did. See
+hop and one `Vec` allocation per batch per node. A bool says everything the `Option<Event>` return
+did, because that return could only hand back the event it was given. Fan-out goes through
+`Transform::process_into`'s `emitted` scratch instead, which the node keeps across batches and
+which allocates only when a transform pushes onto it
+([ADR `transform-fan-out`](../adr/transform-fan-out.md)). See
 [ADR `in-place-transform-process`](../adr/in-place-transform-process.md) and §8 item 14; the
 `process_batch` rows in §2's "Runtime" table are the result.
 

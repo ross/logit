@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-10-16
 ---
 
 # `shape`: an observer component that turns each event into measurements of its own shape
@@ -146,3 +146,10 @@ wire's grouping for `otlp_in` and `prometheus_in`, which bypass the accumulator.
 - `shape`'s output vocabulary (`logit.shape.*`, the `signal`/`source`/`tap` tags) is now something
   dashboards and the survey's capture harness depend on; renaming a metric is a breaking change to
   them, pre-release or not.
+
+## Amendment: a transform can emit extra events (2026-10-16)
+
+A native transform can now emit extra events through `Transform::process_into`
+([ADR `transform-fan-out`](transform-fan-out.md)), so "never two" no longer holds for every
+transform. `process` still forwards or discards the one event it's given, and `shape` emits no
+extra events.

@@ -1,6 +1,6 @@
-//! One `/api/v2/write` body through `InfluxDecoder::decode_body`, as `influxdb_in` hands it over.
-//! The first byte picks the `precision` (`0` ns, `1` us, `2` ms, `3` s, modulo 4); the rest is the
-//! body.
+//! One `/api/v2/write` body through `InfluxDecoder::decode_body`, as `influxdb_in` hands it over,
+//! and through `InfluxDecoder::decode_skipping`, as the `line_protocol` transform does. The first
+//! byte picks the `precision` (`0` ns, `1` us, `2` ms, `3` s, modulo 4); the rest is the body.
 //!
 //! Oracles, each over every input:
 //! - all or nothing: the body decodes if and only if every logical line from `line::lines`
@@ -9,6 +9,9 @@
 //!   decodes, or fails, as a body of its own;
 //! - merging: the body is one event per distinct measurement, tag set, and timestamp among its
 //!   points, and no more events than points;
+//! - skipping: `decode_skipping` hands over every bad line, in order, appends one event per
+//!   distinct series and time among the good lines after what `out` already held, leaves that
+//!   untouched, and on a body with no bad line appends the events `decode_body` makes;
 //! - the model: every event carries `_logit.influxdb.measurement` as a `Str`; every attribute is
 //!   a `Str`; every metric is a `Gauge` named `<measurement>.<field>`; no tag under the private
 //!   `_logit.` prefix survives, and the measurement carrier is the one private key;
@@ -22,7 +25,7 @@
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use logit_core::interner::resolve;
-use logit_core::{subslice, EventBatch, MetricKind, Resource, Value};
+use logit_core::{subslice, AttrMap, Event, EventBatch, MetricKind, Resource, Value};
 use logit_proto::influxdb::encode::InfluxLineEncoder;
 use logit_proto::influxdb::line::{self, MAX_TIMESTAMP_NS, MIN_TIMESTAMP_NS};
 use logit_proto::influxdb::{InfluxDecoder, Precision, ATTR_MEASUREMENT};
@@ -62,6 +65,7 @@ fuzz_target!(|data: &[u8]| {
     // What each line makes alone: the first failure, and every point's series and time.
     let arrival = precision.truncate(RECEIVED_AT);
     let mut first_bad = None;
+    let mut bad_lines = Vec::new();
     let mut points = 0usize;
     let mut series = HashSet::new();
     for (number, raw) in line::lines(body) {
@@ -85,6 +89,7 @@ fuzz_target!(|data: &[u8]| {
         }
         match parsed {
             Err(reason) => {
+                bad_lines.push(number);
                 first_bad.get_or_insert((number, reason));
             }
             Ok(Some((parsed, ts))) => {
@@ -95,6 +100,26 @@ fuzz_target!(|data: &[u8]| {
             }
             Ok(None) => {}
         }
+    }
+
+    // An event already in `out`, as an earlier message's child is in the transform's scratch: a
+    // point of the same series and time must not merge into it.
+    let earlier = Event::empty(arrival, AttrMap::new());
+    let mut out = vec![earlier.clone()];
+    let mut skipped = Vec::new();
+    InfluxDecoder::new().decode_skipping(
+        &shared,
+        precision,
+        arrival,
+        &AttrMap::new(),
+        &mut out,
+        |err| skipped.push(err.line),
+    );
+    assert_eq!(skipped, bad_lines, "skipping: every bad line, in order");
+    assert_eq!(out[0], earlier, "skipping: an earlier event is untouched");
+    assert_eq!(out.len() - 1, series.len(), "skipping: one event per good series and time");
+    if let Ok(batch) = &whole {
+        assert_eq!(out[1..], batch.events[..], "skipping: a good body decodes as decode_body's");
     }
 
     let batch = match (whole, first_bad) {

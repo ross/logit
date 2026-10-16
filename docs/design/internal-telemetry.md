@@ -571,7 +571,7 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.batches.received` / `.events.received` | count | `run_transform`, `run_output`, `run_lua`, `run_router`. For `run_output`, this includes every batch its shutdown sweep takes from the inbox |
 | `logit.component.batches.delivered` / `.events.delivered` | count | `write_loop`, once per batch `Output::send` delivered. At shutdown a sink's `batches.received` equals `batches.delivered` plus `batches.dropped` under every reason plus what a disk spool still holds, and the same for events |
 | `logit.component.process.duration` | timing | `run_transform`, `run_lua`, `run_router` (whole batch — for a router this spans `route_batch`'s partition, not any one destination's send) |
-| `logit.component.events.discarded` | count | `Transform::process` returned `false`, or a Lua `process()` returned `nil` (`ProcessOutcome::Drop`): an event the config removed by design. Untagged, and recorded only when nonzero |
+| `logit.component.events.discarded` | count | `Transform::process_into` returned `false` for an incoming event, or a Lua `process()` returned `nil` (`ProcessOutcome::Drop`): an event the config removed by design. Untagged, and recorded only when nonzero |
 | `logit.component.events.dropped{reason="script_error"}` | count | `run_lua`, one per event whose `process()` call raised an error: that event is lost. Counted beside `errors{reason="process"}` |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
 | `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window` |
@@ -585,6 +585,13 @@ receive and processing side from their own loops, which already see every batch 
 The last three rows are Lua-specific (recorded in `run_lua`, not shared with
 `run_transform`/`run_output`), because only a Lua node has a VM to sample or a script return value
 to classify. Every other row applies uniformly across component kinds.
+
+**A fan-out transform's `events.sent` can exceed its `events.received`**, as a `lua` node's can.
+`events.received` counts the batch as it arrived, `events.discarded` counts only the incoming
+events `process_into` returned `false` for, and `events.sent` and the `"process"` span count what
+left, children included. There's no `events.emitted` counter for a native transform; over one
+interval its children are `events.sent − (events.received − events.discarded)`
+([ADR `transform-fan-out`](../adr/transform-fan-out.md)).
 
 **A Lua node's watcher adds two diagnostic keys and no metric**
 ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)). `watch_lua_thread`
@@ -1715,6 +1722,27 @@ recursion-depth wall refused, written back whole and unexpanded). Both are **unt
 is data the operator doesn't control, and tagging by it would mint an unbounded telemetry series
 from key-position data, the property `shape` is built to avoid. No `Diagnostics`: flattening an
 already-decoded value can't fail.
+
+##### `line_protocol`
+
+`crates/logit-transforms/src/line_protocol.rs`, whose module doc is the canonical copy;
+[ADR `line-protocol-transform`](../adr/line-protocol-transform.md).
+
+Three counters, emitted once per batch. A bad line (one that fails the grammar or whose timestamp
+is out of range) is skipped and counted under one of the first two, by what happened to its
+text:
+
+| Name | Meaning |
+|---|---|
+| `logit.transform.lines.dropped{reason="malformed"}` | a bad line in a message whose log doesn't go on: under the default `keep_source: false`, in a message with at least one good point. The line's text has left the pipeline, so it's loss |
+| `logit.transform.lines.skipped{reason="malformed"}` | a bad line in a message whose log goes on, under `keep_source: true` or in a message with no good point. The text is still in the pipeline |
+| `logit.transform.tags.omitted{reason="reserved_prefix"}` | a tag left off a point because its key starts with `_logit.` or `influxdb.field.`, as `influxdb_in`'s `logit.input.tags.omitted` counts. The point is emitted |
+
+A parent discarded after its points are emitted counts as
+`logit.component.events.discarded`, and its points count in `logit.component.events.sent`. Each
+bad line also reports the throttled `Diagnostics` key `parse_error`, naming the 1-based line number
+and the parser's reason. It doesn't quote the whole line, but a reason can name the line's
+measurement, a key, or a number token, as influxd's own error text does.
 
 ##### `http_access`
 

@@ -1,9 +1,14 @@
-//! Decoding one `/api/v2/write` body into one [`EventBatch`]: the decode half of [`super`]'s
-//! module doc, which is the spec for everything here.
+//! Decoding line protocol into events: the decode half of [`super`]'s module doc, which is the
+//! spec for everything here. One construction path serves two callers, so the mapping has one
+//! copy:
 //!
-//! **All or nothing.** Every line is parsed before any event is built, and the first bad line
-//! fails the body, as influxd rejects a write with a parse error (probe row 13.1). Nothing is
-//! counted for a failed body: none of it was taken.
+//! - [`InfluxDecoder::decode_body`], `influxdb_in`'s, is **all or nothing**. Every line is parsed
+//!   before any event is built, and the first bad line fails the body, as influxd rejects a write
+//!   with a parse error (probe row 13.1). Nothing is counted for a failed body: none of it was
+//!   taken.
+//! - [`InfluxDecoder::decode_skipping`], the `line_protocol` transform's, skips a bad line and
+//!   decodes the rest, starts each event from the caller's base attributes, and counts nothing
+//!   itself. `crates/logit-transforms/src/line_protocol.rs`'s module doc has its rules.
 //!
 //! **Merging.** Points sharing a measurement, tag set, and timestamp are one point at influxd, so
 //! they merge into one event, field by field, the later value winning and a new field appended.
@@ -102,7 +107,8 @@ impl InfluxDecoder {
     }
 
     /// Decodes a whole write body into one batch under `resource`, or fails on the first line
-    /// that doesn't parse, with nothing decoded.
+    /// that doesn't parse, with nothing decoded. `influxdb_in`'s path, so it counts
+    /// reserved-prefix tags as `logit.input.tags.omitted`.
     ///
     /// `received_at` is the request's arrival in Unix nanoseconds; a point with no timestamp gets
     /// it truncated to `precision`, one instant for every such point in the body (probe row 10.5).
@@ -113,61 +119,15 @@ impl InfluxDecoder {
         received_at: i64,
         resource: Arc<Resource>,
     ) -> Result<EventBatch, LineError> {
-        self.stats = DecodeStats::default();
-        let arrival = precision.truncate(received_at);
-
-        let mut parsed: Vec<(Line<'_>, i64)> = Vec::new();
-        for (number, raw) in lines(&body) {
-            let fail = |reason| {
-                let start = raw.iter().position(|b| !matches!(b, b' ' | b'\t' | 0)).unwrap_or(0);
-                LineError { line: number, text: subslice::share(&body, &raw[start..]), reason }
-            };
-            let Some(line) = parse_line(raw).map_err(fail)? else { continue };
-            let timestamp = match line.timestamp {
-                None => arrival,
-                Some(t) => match precision.scale_to_ns(t) {
-                    Some(ns) if (MIN_TIMESTAMP_NS..=MAX_TIMESTAMP_NS).contains(&ns) => ns,
-                    _ => {
-                        return Err(fail(
-                            "time outside range -9223372036854775806 - 9223372036854775806".into(),
-                        ))
-                    }
-                },
-            };
-            parsed.push((line, timestamp));
-        }
-        self.stats.points = parsed.len();
-
-        self.index.clear();
-        self.chain.clear();
-        let mut events: Vec<Event> = Vec::with_capacity(parsed.len());
-        // Per event, the line that opened it: the series key the chain compares against.
-        let mut opened_by: Vec<u32> = Vec::with_capacity(parsed.len());
-        for (at, (line, timestamp)) in parsed.iter().enumerate() {
-            let hash = self.hasher.hash_one((&line.measurement, &line.tags, timestamp));
-            let mut cursor = self.index.get(&hash).copied().unwrap_or(END_OF_CHAIN);
-            while cursor != END_OF_CHAIN {
-                let (first, first_ts) = &parsed[opened_by[cursor as usize] as usize];
-                if first_ts == timestamp
-                    && first.measurement == line.measurement
-                    && first.tags == line.tags
-                {
-                    break;
-                }
-                cursor = self.chain[cursor as usize];
-            }
-            if cursor == END_OF_CHAIN {
-                let event = self.open_event(&body, line, *timestamp);
-                let id = events.len() as u32;
-                events.push(event);
-                opened_by.push(at as u32);
-                self.chain.push(self.index.insert(hash, id).unwrap_or(END_OF_CHAIN));
-            } else {
-                self.stats.merged += 1;
-                self.merge_into(&body, &mut events[cursor as usize], line);
-            }
-        }
-
+        let mut events = Vec::new();
+        self.decode_points(
+            &body,
+            precision,
+            precision.truncate(received_at),
+            None,
+            &mut events,
+            Err,
+        )?;
         if self.stats.tags_omitted_reserved_prefix > 0 {
             self.telemetry.count(
                 "logit.input.tags.omitted",
@@ -179,10 +139,122 @@ impl InfluxDecoder {
         Ok(EventBatch { resource, scope: None, events })
     }
 
-    /// The first point of a series and timestamp: tags, the measurement carrier, string fields,
-    /// and one `Gauge` per other field in wire order.
-    fn open_event(&mut self, body: &Bytes, line: &Line<'_>, timestamp: i64) -> Event {
-        let mut attributes = AttrMap::new();
+    /// Decodes `body` as [`InfluxDecoder::decode_body`] does, except that a bad line is handed to
+    /// `skipped`, in line order, and the rest of the body is still decoded. The `line_protocol`
+    /// transform's path.
+    ///
+    /// Appends one event per point, after merging, to `out`, and merges only among the events
+    /// this call appends. Each event starts from a copy of `base`, with the point's tags,
+    /// measurement carrier, and string fields written over it. A point with no timestamp takes
+    /// `default_timestamp` as is. Nothing is counted to telemetry: [`InfluxDecoder::stats`]
+    /// holds this call's counts for the caller to report under its own prefix.
+    pub fn decode_skipping(
+        &mut self,
+        body: &Bytes,
+        precision: Precision,
+        default_timestamp: i64,
+        base: &AttrMap,
+        out: &mut Vec<Event>,
+        mut skipped: impl FnMut(LineError),
+    ) {
+        let on_bad = |error| {
+            skipped(error);
+            Ok(())
+        };
+        let decoded =
+            self.decode_points(body, precision, default_timestamp, Some(base), out, on_bad);
+        debug_assert!(decoded.is_ok(), "a skipping decode never fails");
+    }
+
+    /// The construction path both callers share. Every line is parsed before any event is built,
+    /// and `on_bad` decides what a bad line does: `Err` fails the call with nothing appended,
+    /// `Ok` skips the line.
+    fn decode_points(
+        &mut self,
+        body: &Bytes,
+        precision: Precision,
+        default_timestamp: i64,
+        base: Option<&AttrMap>,
+        out: &mut Vec<Event>,
+        mut on_bad: impl FnMut(LineError) -> Result<(), LineError>,
+    ) -> Result<(), LineError> {
+        self.stats = DecodeStats::default();
+
+        let mut parsed: Vec<(Line<'_>, i64)> = Vec::new();
+        for (number, raw) in lines(body) {
+            let fail = |reason| {
+                let start = raw.iter().position(|b| !matches!(b, b' ' | b'\t' | 0)).unwrap_or(0);
+                LineError { line: number, text: subslice::share(body, &raw[start..]), reason }
+            };
+            let line = match parse_line(raw) {
+                Ok(Some(line)) => line,
+                Ok(None) => continue,
+                Err(reason) => {
+                    on_bad(fail(reason))?;
+                    continue;
+                }
+            };
+            let timestamp = match line.timestamp {
+                None => default_timestamp,
+                Some(t) => match precision.scale_to_ns(t) {
+                    Some(ns) if (MIN_TIMESTAMP_NS..=MAX_TIMESTAMP_NS).contains(&ns) => ns,
+                    _ => {
+                        on_bad(fail(
+                            "time outside range -9223372036854775806 - 9223372036854775806".into(),
+                        ))?;
+                        continue;
+                    }
+                },
+            };
+            parsed.push((line, timestamp));
+        }
+        self.stats.points = parsed.len();
+
+        self.index.clear();
+        self.chain.clear();
+        // Ids in the index and the chain count from `first`, so a merge never reaches an event an
+        // earlier call appended to `out`.
+        let first = out.len();
+        out.reserve(parsed.len());
+        // Per event, the line that opened it: the series key the chain compares against.
+        let mut opened_by: Vec<u32> = Vec::with_capacity(parsed.len());
+        for (at, (line, timestamp)) in parsed.iter().enumerate() {
+            let hash = self.hasher.hash_one((&line.measurement, &line.tags, timestamp));
+            let mut cursor = self.index.get(&hash).copied().unwrap_or(END_OF_CHAIN);
+            while cursor != END_OF_CHAIN {
+                let (opener, opener_ts) = &parsed[opened_by[cursor as usize] as usize];
+                if opener_ts == timestamp
+                    && opener.measurement == line.measurement
+                    && opener.tags == line.tags
+                {
+                    break;
+                }
+                cursor = self.chain[cursor as usize];
+            }
+            if cursor == END_OF_CHAIN {
+                let event = self.open_event(body, base, line, *timestamp);
+                let id = (out.len() - first) as u32;
+                out.push(event);
+                opened_by.push(at as u32);
+                self.chain.push(self.index.insert(hash, id).unwrap_or(END_OF_CHAIN));
+            } else {
+                self.stats.merged += 1;
+                self.merge_into(body, &mut out[first + cursor as usize], line);
+            }
+        }
+        Ok(())
+    }
+
+    /// The first point of a series and timestamp: a copy of `base`, then the tags, the
+    /// measurement carrier, string fields, and one `Gauge` per other field in wire order.
+    fn open_event(
+        &mut self,
+        body: &Bytes,
+        base: Option<&AttrMap>,
+        line: &Line<'_>,
+        timestamp: i64,
+    ) -> Event {
+        let mut attributes = base.cloned().unwrap_or_default();
         for (key, value) in &line.tags {
             if key.starts_with(FIELD_ATTR_PREFIX) || is_private(key) {
                 self.stats.tags_omitted_reserved_prefix += 1;
@@ -582,5 +654,96 @@ mod tests {
             decoder.stats(),
             DecodeStats { points: 3, merged: 1, tags_omitted_reserved_prefix: 0 }
         );
+    }
+
+    /// Runs `decode_skipping` over `body` into `out`, returning the bad lines' numbers and reasons.
+    fn skipping(
+        decoder: &mut InfluxDecoder,
+        body: &'static str,
+        base: &AttrMap,
+        out: &mut Vec<Event>,
+    ) -> Vec<(usize, String)> {
+        let mut bad = Vec::new();
+        decoder.decode_skipping(
+            &Bytes::from_static(body.as_bytes()),
+            Precision::Ms,
+            RECEIVED_AT,
+            base,
+            out,
+            |error| bad.push((error.line, error.reason.into_owned())),
+        );
+        bad
+    }
+
+    #[test]
+    fn skipping_hands_over_each_bad_line_in_order_and_decodes_the_rest() {
+        let mut out = Vec::new();
+        let bad = skipping(
+            &mut InfluxDecoder::new(),
+            "a f=1i 1\nb f=\nc f=3i 3\nd f=1i 9223372036855\n# c\ne g",
+            &AttrMap::new(),
+            &mut out,
+        );
+        assert_eq!(
+            bad,
+            [
+                (2, "missing field value".to_string()),
+                (4, "time outside range -9223372036854775806 - 9223372036854775806".to_string()),
+                (6, "invalid field format".to_string()),
+            ]
+        );
+        assert_eq!(
+            out.iter().map(|e| str_attr(e, ATTR_MEASUREMENT)).collect::<Vec<_>>(),
+            [Some("a"), Some("c")]
+        );
+        assert_eq!(out[1].timestamp, 3_000_000, "scaled by precision");
+    }
+
+    #[test]
+    fn skipping_starts_each_event_from_the_base_and_lets_the_point_win() {
+        let mut base = AttrMap::new();
+        base.insert("host", Value::str("parent"));
+        base.insert("t", Value::str("parent"));
+        base.insert(ATTR_MEASUREMENT, Value::str("parent"));
+        let mut out = Vec::new();
+        skipping(&mut InfluxDecoder::new(), "m,t=1 f=1i,s=\"x\"\n", &base, &mut out);
+        let e = &out[0];
+        assert_eq!(str_attr(e, "host"), Some("parent"));
+        assert_eq!(str_attr(e, "t"), Some("1"));
+        assert_eq!(str_attr(e, ATTR_MEASUREMENT), Some("m"));
+        assert_eq!(str_attr(e, "influxdb.field.s"), Some("x"));
+        assert_eq!(e.timestamp, RECEIVED_AT, "the default timestamp, not truncated");
+    }
+
+    #[test]
+    fn skipping_merges_only_among_the_events_it_appends() {
+        let mut decoder = InfluxDecoder::new();
+        let mut out = Vec::new();
+        skipping(&mut decoder, "m x=1i 5", &AttrMap::new(), &mut out);
+        skipping(&mut decoder, "m y=2i 5\nm z=3i 5", &AttrMap::new(), &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(metrics(&out[0]), [("m.x", g(MetricValue::I64(1)))]);
+        assert_eq!(
+            metrics(&out[1]),
+            [("m.y", g(MetricValue::I64(2))), ("m.z", g(MetricValue::I64(3)))]
+        );
+        assert_eq!(
+            decoder.stats(),
+            DecodeStats { points: 2, merged: 1, tags_omitted_reserved_prefix: 0 }
+        );
+    }
+
+    #[test]
+    fn skipping_counts_reserved_tags_in_its_stats_and_nothing_to_telemetry() {
+        let registry = Registry::new();
+        let mut decoder = InfluxDecoder::new().with_telemetry(registry.telemetry_for(
+            "points",
+            "line_protocol",
+            "transform",
+        ));
+        let mut out = Vec::new();
+        skipping(&mut decoder, "m,_logit.x=1 f=1i 1\nbad", &AttrMap::new(), &mut out);
+        assert_eq!(decoder.stats().tags_omitted_reserved_prefix, 1);
+        assert!(registry.drain(0).is_empty(), "the caller counts under its own prefix");
     }
 }
