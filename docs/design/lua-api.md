@@ -139,16 +139,18 @@ the field: `resource[key] = nil` on `schema_url` clears the field and on
 `resource.to_table = nil` deletes an attribute named `to_table`, while a read of
 `resource.to_table` still returns the method.
 
-**What it costs.** The sandbox runs LuaJIT interpreted: it opens no `jit` library, so no traces
-compile. Measured there, the wrapper adds about 13 ns to each `pairs` call on a table and nothing
-to each step of the loop. A loop over a proxy allocates one small state table per `pairs` call.
+**What it costs.** A script runs LuaJIT interpreted unless its component sets `jit: true` (see
+"Config shape" below). Measured interpreted, the wrapper adds about 13 ns to each `pairs` call on
+a table and nothing to each step of the loop. With the JIT on, it costs nothing measurable on a
+table loop. A loop over a proxy allocates one small state table per `pairs` call.
 Each step allocates what reading that value by key does: nothing more for a string, a small
 number, or a boolean beyond a Lua string LuaJIT hasn't interned yet; a decimal string for a
 `Timestamp` or an integer past 2^53; a table for an array or a map ([memory.md](memory.md) §2).
 
 One cost is easy to miss: **a loop call site that has once seen a proxy runs plain-table loops
-about 60% slower from then on**, because LuaJIT rewrites that site's iteration bytecode from its
-table-specialized form to a generic iterator call, for good. In a hot path, don't share one
+about 60% slower from then on**, or about 4x slower than a tables-only site with `jit: true`,
+because LuaJIT rewrites that site's iteration bytecode from its table-specialized form to a
+generic iterator call, for good. In a hot path, don't share one
 helper loop between tables and proxies; give each its own loop.
 
 ### `event:to_table()`: a detached copy
@@ -1327,6 +1329,15 @@ either kind of component.
 the process (exit code 2), logging `memory_limit_exceeded`. Omitted means no limit; config
 validation rejects `0`. "Limits and costs" below says what the cap bounds and how to size it.
 
+**`jit`** is optional, `false` by default, and turns on LuaJIT's trace compiler for the
+component's VM; without it the script runs interpreted. It helps a script that spends its time in
+plain Lua (loops, table work, arithmetic, string building) and gains little for attribute access
+and `string` pattern matching, which call into C either way and run at the same speed. A compiled
+VM uses about 70 KB more memory, some of it on the heap `max_memory` counts, and maps its machine
+code, up to 512 KB per VM, outside that heap, where `max_memory` doesn't count it. Errors and
+`max_memory` trips behave the same either way. [ADR `lua-jit-opt-in`](../adr/lua-jit-opt-in.md)
+has the measurements.
+
 **`targets:`** is optional and lists the `target` components this one may direct events into:
 what `event:to(id)` resolves against ("Routing to a target" above). It sits beside `sources:` on
 the component, not among the `script:`/`lua_file:` fields. A non-empty `targets:` is legal only on
@@ -1388,6 +1399,12 @@ any file this process can read. `remove_unsandboxed_base_globals`
   while `logit` is allocating inside a proxy call can crash the process
   ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)).
 
+**Under `jit: true`, the VM also opens LuaJIT's `jit` library**, the only code that turns the
+compiler on, and then sets the `jit` global to `nil`, so a script can't turn the compiler off,
+flush its traces, or attach a trace handler. The library's other copy, in the registry's
+`_LOADED` table, is out of reach: nothing in the sandbox reads the registry or that table (no
+`debug`, `package`, `require`, or `getfenv`).
+
 **`print` writes to `logit`'s own log, never stdout**, where it would corrupt a `stdio_out`
 writing there. Each argument goes through the script's `tostring` (so `__tostring` works), the
 results are tab-joined, and the line is logged at `info` as `print: <line>`, tagged with the
@@ -1395,7 +1412,7 @@ component id (`<unset>` for top-level code, which runs before the id is known).
 
 The sandbox is pinned by one test, `the_global_table_is_exactly_the_allowlist`
 (`crates/logit-script/src/lib.rs`), which holds the exact list. It builds a worker as the runtime
-does and requires `_G` to be Lua's base library, minus the removed loaders, environment functions,
+does, once with the JIT off and once on, and requires `_G` to be Lua's base library, minus the removed loaders, environment functions,
 and `newproxy`, with `print` rerouted; the `math`, `string`, and `table`
 libraries; the seven `logit` globals this document describes, each a proxy or a table of Rust
 closures and none a route to the host; and the script's own `process`, and `flush` if it defines one. It also checks that the host
@@ -1415,9 +1432,12 @@ mechanism is at the citation, not restated here.
 - **Table depth.** A script-built table converts at most 128 levels deep; a table nested past
   that, a self-referencing one included, is a clear conversion error rather than a stack overflow.
   See `MAX_TABLE_DEPTH`'s doc (`crates/logit-script/src/value.rs`).
-- **No time limit.** LuaJIT's compiled traces skip a count hook unless the runtime is built with
-  `LUAJIT_ENABLE_CHECKHOOK` (this build isn't), so a hook would be both slow and unreliable. See
-  [ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md).
+- **No time limit.** No count hook bounds a script. Interpreted, the default, one would bound
+  every loop at a measured 0.4% to 13.6% more CPU per event; the stall heartbeat below surfaces a
+  hang without that cost. Under `jit: true`, LuaJIT's compiled traces skip a count hook, because
+  this build doesn't set `LUAJIT_ENABLE_CHECKHOOK`, so no hook could bound a compiled loop. See
+  [ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)'s amendment and
+  [ADR `lua-jit-opt-in`](../adr/lua-jit-opt-in.md).
 - **Stall detection and the bounded wedge.** A per-call heartbeat drives `script_stalled`/
   `script_resumed` diagnostics and a `503 stalled` `/readyz`; once shutdown begins, a node whose
   heartbeat stays busy past its grace has its channels revoked rather than left to hang the

@@ -396,9 +396,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** a script that wants that relationship tracks contributing contexts itself
     inside `process()`.
 - **A script has no time bound, and its memory bound is opt-in.** No instruction or time hook is
-  used, by design: LuaJIT's compiled traces skip a count hook unless the runtime is built with
-  `LUAJIT_ENABLE_CHECKHOOK`, so a hook would be both slow and unreliable ([ADR
-  `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)).
+  used, by design ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md) and its
+  amendment). A script runs interpreted unless its component sets `jit: true`; interpreted, a
+  count hook would bound every loop for 0.4% to 13.6% more CPU per event, as measured. Under `jit: true`,
+  LuaJIT's compiled traces skip a count hook, because this build doesn't set
+  `LUAJIT_ENABLE_CHECKHOOK`, so no hook could bound a compiled loop
+  ([ADR `lua-jit-opt-in`](../adr/lua-jit-opt-in.md)).
 
   What bounds a script instead:
   - The table-depth cap (`MAX_TABLE_DEPTH`, 128) and raw table reads.
@@ -431,6 +434,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
     Rust), so a script that hoards events shows in process RSS long before it trips the cap. A cap
     under about twice the working set forces a full collection on most batches; the verdict is
     rate-limited to one a second, so that costs latency, not a failure.
+  - Under `jit: true`, `max_memory` doesn't count the compiled machine code, which LuaJIT maps
+    outside the Lua heap, up to 512 KB per VM. The trace data the compiler keeps on the heap,
+    about 45 KB per VM as measured, does count
+    ([ADR `lua-jit-opt-in`](../adr/lua-jit-opt-in.md)).
 - **A batch sent into a revoked Lua inbox after `REVOKE_DRAIN_TIMEOUT` is lost uncounted.**
   `revoke_lua_io`, run when the watcher revokes a wedged node or when the Lua thread's loop fails,
   closes the inbox and counts each batch it still receives as `batches.dropped{reason="shutdown"}`

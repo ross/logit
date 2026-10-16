@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-10-03
+updated: 2026-10-16
 ---
 
 # Lua scripts: stall detection, a progress-based wedge check, opt-in `max_memory`, and a table-depth cap
@@ -52,7 +52,8 @@ sources, found:
   `RefCell` panic, caught and silently lost, instead.
 - The sandbox exposes `coroutine` (registered by `luaopen_base` itself), `print` (writes to
   process stdout, which corrupts `stdio_out` on stdout and is fatal under `format: native`),
-  `collectgarbage`, `newproxy`, and `gcinfo`. No test enumerates `_G`. `bit`, `jit`, `debug`,
+  `collectgarbage`, `newproxy`, and `gcinfo`. No test enumerated `_G` (`luab/w2` added
+  `the_global_table_is_exactly_the_allowlist`). `bit`, `jit`, `debug`,
   `package`, `ffi`, `os`, and `io` are absent.
 - LuaJIT's compiled traces never check a count hook unless the runtime is built with
   `LUAJIT_ENABLE_CHECKHOOK`, which this project's build does not set, and interpreted code pays a
@@ -227,7 +228,8 @@ sources, found:
 
 ## Alternatives considered
 
-- **A count or time hook.** Rejected. LuaJIT's compiled traces never check a hook unless the
+- **A count or time hook.** Rejected. **Amended 2026-10-16:** see the amendment below for which
+  half of this reasoning holds by default. LuaJIT's compiled traces never check a hook unless the
   runtime is built with `LUAJIT_ENABLE_CHECKHOOK` (off here), so a hot loop would compile straight
   past it; interpreted code would pay a per-instruction dispatch cost for a bound that only catches
   the case where JIT compilation fails to kick in. Neither trade is worth taking for an accidental
@@ -367,7 +369,7 @@ Filled in as each workstream lands.
   rule 71, pinned by `crates/logit-config`'s `lua_max_memory_parses_a_byte_count_string` and
   `lua_file_max_memory_is_optional`, `graph.rs`'s `a_lua_max_memory_of_zero_is_rejected` and
   `a_lua_max_memory_validates`, and `logit-cli`'s
-  `build_spec_carries_max_memory_into_the_lua_runtime_config`; `crates/logit-script/src/memory.rs`'s
+  `build_spec_carries_max_memory_and_jit_into_the_lua_runtime_config`; `crates/logit-script/src/memory.rs`'s
   `collect_until_under_keeps_collecting_while_a_pass_frees_enough`,
   `collect_until_under_stops_once_a_pass_frees_little`,
   `a_retaining_event_new_loop_trips_the_in_call_check`,
@@ -389,3 +391,21 @@ Filled in as each workstream lands.
   `telemetry.rs`'s existing `a_disabled_telemetry_handle_never_touches_the_interner_even_with_dynamic_looking_input`
   and `a_disabled_handle_never_reads_the_lua_argument_as_a_str_either`. CORE-19 reviewed, no
   findings — the asymmetry with the unguarded feeders is a decision, not a gap.
+
+## Amendment: the sandbox runs interpreted unless a component sets `jit: true` (2026-10-16)
+
+The context and the rejected count hook above reason about compiled traces, but the sandbox never
+opened LuaJIT's `jit` library, so no trace compiled: every script ran in the interpreter.
+[ADR `lua-jit-opt-in`](lua-jit-opt-in.md) keeps that as the default and adds an opt-in
+`jit: true` per `lua`/`lua_file` component.
+
+- **Compiled traces skip a count hook only under `jit: true`.** Measured there, LuaJIT compiled a
+  pure-Lua loop under a hook and the trace never checked it, so `while true do x = x + 1 end`
+  ran on uninterrupted.
+- **With the JIT off, the default, a count hook would bound every loop.** It would cost 0.4% to
+  2.2% more CPU per event on light scripts and 9.2% to 13.6% on Lua-heavy ones, a cost set by the
+  hook dispatch mode rather than how often the hook fires. Those numbers come from a developer
+  machine, not the perf VM, and are in [ADR `lua-jit-opt-in`](lua-jit-opt-in.md)'s Context.
+- **The decision not to add a hook stands.** The heartbeat already surfaces an accidental hang
+  without slowing the VM, and a hook couldn't bound a `jit: true` component's compiled loops.
+- `the_global_table_is_exactly_the_allowlist` now checks the global set with the JIT off and on.
