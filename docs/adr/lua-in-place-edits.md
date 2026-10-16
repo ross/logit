@@ -55,12 +55,16 @@ enumerates them.
 - **A proxy method such as `attributes:keys()` or `:remove(k)`.** Rejected. mlua resolves methods
   before `__index`, so a method shadows an attribute of the same name. `resource:to_table()`
   already has that problem.
-- **A Rust `pairs`.** Rejected. A C or Rust function called at loop entry is not yet implemented
-  in LuaJIT's recorder (`recff_nyi`), so it would stop plain-table loops compiling. A Lua wrapper
-  returns the builtin `next` for tables, which the loop specialization recognizes.
-- **A separate global such as `attributes_of(proxy)`.** Not chosen first, because it is one more
-  name to learn for a loop every Lua author already writes. It is the fallback if W3's
-  measurement shows the wrapper slows plain-table loops.
+- **A Rust `pairs`.** Rejected. With the JIT on, a C or Rust function called at loop entry is not
+  yet implemented in LuaJIT's recorder (`recff_nyi`), so it would stop plain-table loops
+  compiling. The sandbox runs interpreted today (see the amendment below), where a Rust `pairs`
+  would put mlua's callback boundary on every table's loop; that cost wasn't measured. A Lua
+  wrapper returns the builtin `next` for a table, which keeps the loop's table-specialized
+  bytecode (`ITERN`) in either mode.
+- **A separate global such as `attributes_of(proxy)`.** Not taken, because it is one more name to
+  learn for a loop every Lua author already writes. It was the fallback had the wrapper slowed
+  plain-table loops; the measurement in the amendment below found a per-call cost, not a per-step
+  one, and kept the wrapper.
 
 ## Consequences
 - **No `Value::Null` from Lua.** `syslog_out` renders a `Null` `syslog.timestamp` as `-`, and
@@ -72,8 +76,9 @@ enumerates them.
   no-op rule kept it. The iterator yields such an entry as `(key, nil)`, so a prefix loop still
   finds it. [ADR `lua-value-identity-preservation`](lua-value-identity-preservation.md) gets an
   amendment.
-- **A call site that sees a proxy loses the `ITERN` specialization** for good, though it still
-  records. A helper shared by tables and proxies pays this.
+- **A call site that sees a proxy loses the `ITERN` specialization** for good, and runs
+  plain-table loops through a generic iterator call from then on. A helper shared by tables and
+  proxies pays this, measured in the amendment below.
 - **`pairs(resource)` can yield a name that is also a fixed field or method** (`schema_url`,
   `to_table`, `dropped_attributes_count`). Writing `nil` to a field name clears the field or
   raises; a method name has no write-side field, so `resource.to_table = nil` deletes the
@@ -82,3 +87,28 @@ enumerates them.
   there is no compatibility path.
 - The two earlier ADRs get a dated amendment with the code that lands the writes, not with this
   record.
+
+## Amendment: the wrapper's measured cost (2026-10-16)
+
+The wrapper stays, and the `attributes_of(proxy)` fallback isn't taken.
+
+The sandbox runs LuaJIT interpreted: `sandbox_libs()` opens no `jit` library, so `luaopen_jit`,
+the only code that sets the JIT's on flag, never runs, and no traces compile. Timings match a VM
+that loads the library and calls `jit.off()`, on every case below. The JIT's effect on the
+sandbox is outside this record.
+
+Measured in that VM, a release build pinned to one core, with a fresh VM per run, the median of
+11 runs:
+
+| Loop | Original `pairs` | Wrapper |
+|---|---|---|
+| a 1,000-key table, 20,000 times | 48.59 ms | 48.73 ms (+0.3%) |
+| `pairs` on a 5-key table, 2,000,000 times | 36.81 ms | 62.96 ms (+71%) |
+| a shared helper loop, tables only, 2,000,000 calls | 50.71 ms | 73.59 ms (+45%) |
+| the same helper after one call on a proxy | | 118.17 ms (+61% over tables only) |
+
+So the wrapper costs about 13 ns per `pairs` call on a table and nothing per step; a bare
+`return P(t)` wrapper costs about 5 ns, the floor for any Lua wrapper. The type check and the
+argument error at the caller's line account for the rest, and they're kept. A call site that has
+seen a proxy runs plain-table loops about 60% slower afterward, which the design doc tells a script
+author to avoid in a hot path. With the JIT on, the wrapper measured no difference on any case.

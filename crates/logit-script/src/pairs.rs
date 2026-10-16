@@ -6,10 +6,11 @@
 //! Installed in [`crate::ScriptWorker::new`] before the script's source runs, so a top-level
 //! `local pairs = pairs` captures the wrapper (`crate::trace`'s module doc has the reason).
 //!
-//! - **The wrapper is Lua, not Rust.** LuaJIT's recorder doesn't compile a call to a C function
-//!   at loop entry, so a Rust `pairs` would stop every `for k, v in pairs(t)` loop compiling.
-//!   For a table the wrapper tail-calls the original, which returns the builtin `next`, so the
-//!   loop keeps its `ITERN` specialization. A call site that ever sees a proxy loses it for good.
+//! - **The wrapper is Lua, not Rust.** For a table it tail-calls the original, which returns the
+//!   builtin `next`, so the loop keeps its `ITERN` specialization; with the JIT on, a Rust `pairs`
+//!   would also stop the loop compiling. It costs about 13 ns per call on a table in the
+//!   interpreted sandbox, and nothing per step. A call site that ever sees a proxy loses `ITERN`
+//!   for good, and its plain-table loops run about 60% slower.
 //! - **The iterator is stateless**: one Rust function, created here and shared by every loop. A
 //!   step receives `(proxy, last_key)`, resolves the key without interning it, and seeks the
 //!   first entry after it ([`logit_core::AttrMap::entry_after`]). Deleting or overwriting the

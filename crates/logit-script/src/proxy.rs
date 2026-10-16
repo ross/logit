@@ -370,9 +370,8 @@ impl UserData for EventProxy {
             Ok(this)
         });
 
-        // A plain Lua table, detached from the live event: how a script iterates attributes,
-        // since LuaJIT has no `__pairs`. Covers every payload field, and `Event.new` is its
-        // inverse (`crate::construct`).
+        // A plain Lua table, detached from the live event. Covers every payload field, and
+        // `Event.new` is its inverse (`crate::construct`).
         methods.add_method("to_table", |lua, this, ()| {
             let event = this.event.borrow();
             let table = lua.create_table()?;

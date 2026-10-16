@@ -47,8 +47,8 @@ treats `Value::Str` and `Value::Bytes` attributes differently: a `Str` becomes a
 and a `Bytes` is excluded from the write. So an **identity round-trip** through a script could
 silently flip an attribute from excluded to included as a tag, with no error and no signal to the
 script. Two ordinary patterns do this: `event.attributes.x = event.attributes.x`, and a generic
-enrichment stage that reads every attribute through `event:to_table().attributes` and copies it
-back while tagging the event.
+enrichment stage that reads every attribute, with `pairs(event.attributes)` or through
+`event:to_table().attributes`, and copies it back while tagging the event.
 
 ## The goal
 

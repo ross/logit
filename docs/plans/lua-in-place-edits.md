@@ -12,7 +12,7 @@ updated: 2026-10-16
 | Deletion | `= nil` deletes the key, on `event.attributes`, `resource`, and `scope.attributes`. No separate delete function; one can be added later if a need for writing `Value::Null` shows up. |
 | Writing `Value::Null` | Not possible from Lua, a recorded gap (see "`= nil` deletes an attribute"). |
 | Identity write of a `Null` attribute | `a.x = a.x` reads `nil` and deletes the key. |
-| Enumeration | A Lua `pairs` wrapper installed into `_G` before the script runs, over a stateless Rust iterator; measured for its JIT effect in W3. |
+| Enumeration | A Lua `pairs` wrapper installed into `_G` before the script runs, over a stateless Rust iterator. W3 measured it at about 13 ns per `pairs` call on a table and nothing per step, and kept it (ADR's amendment). |
 
 ## Goal
 
@@ -165,15 +165,17 @@ Constraints on the iterator:
 - `crates/logit-core/src/attrs.rs` gains a "first entry after `Option<Symbol>`" accessor
   (`partition_point`), which W3 uses for the seek.
 
-Why the wrapper is Lua and not a Rust function: LuaJIT's recorder treats a C function called at
-loop entry as not yet implemented (`recff_c` goes to `recff_nyi` in `lj_ffrecord.c`), so a Rust
-`pairs` would stop `for k, v in pairs(t)` compiling for plain tables. A Lua wrapper keeps the
-loop compiling: `predict_next` keys on the call-site name `pairs`, and `BC_ISNEXT` checks at run
-time for the builtin `next`, a table, and `nil`, which the original `pairs` still returns.
+Why the wrapper is Lua and not a Rust function: a table's loop keeps its specialized bytecode.
+`predict_next` keys on the call-site name `pairs`, and `BC_ISNEXT` checks at run time for the
+builtin `next`, a table, and `nil`, which the original `pairs` still returns. With the JIT on, a
+Rust `pairs` would also stop plain-table loops compiling, because LuaJIT's recorder treats a C
+function called at loop entry as not yet implemented (`recff_c` goes to `recff_nyi` in
+`lj_ffrecord.c`). The sandbox runs interpreted, though (W3's measurement below), so today the
+specialization is the interpreter's `ITERN` and not a trace.
 
 Caveat, recorded in the doc: a call site that ever sees a proxy despecializes to `ITERC`
-permanently for that site. It still records, through `recff_next`, but without the `ITERN`
-specialization. A shared helper that loops over both tables and proxies pays this.
+permanently for that site, and its plain-table loops go through a generic iterator call. A shared
+helper that loops over both tables and proxies pays this.
 
 Fixed-name shadowing: `pairs(resource)` and `pairs(scope.attributes)` can yield an attribute
 named like a fixed field or method (`schema_url`, `to_table`, `dropped_attributes_count`), because
@@ -182,11 +184,12 @@ on `schema_url` the write clears the field, and on `dropped_attributes_count` it
 name such as `to_table` has no write-side field, so `resource.to_table = nil` deletes an attribute
 of that name while reads still return the method. The doc says so.
 
-Risk to measure in W3, recorded in the PR body: loop timing for a plain table with and without the
-wrapper, a shared helper site that sees both tables and proxies, and a hot loop that calls `pairs`
-repeatedly. The fallback, if plain-table loops slow, is a separate global such as
-`attributes_of(proxy)`: it leaves `pairs` alone but is one more name a script author has to learn,
-for a loop every Lua author already writes.
+W3 measured the wrapper (ADR `lua-in-place-edits`'s amendment has the table). The sandbox opens
+no `jit` library, so it runs LuaJIT interpreted. There, a plain-table loop's steps cost the same
+with the wrapper, each `pairs` call on a table costs about 13 ns more, and a call site that has
+seen a proxy runs plain-table loops about 60% slower. The wrapper stays. The fallback, a separate
+global such as `attributes_of(proxy)`, wasn't taken: it leaves `pairs` alone but is one more name a
+script author has to learn, for a loop every Lua author already writes.
 
 ### `prusa.lua` after
 
@@ -214,7 +217,7 @@ new arms format strings only on the error path. New rows, additive like the `Eve
 | writing `event.log.message` | `event.log.message = "rewritten"` | the `LogProxy` creation plus one `Bytes` |
 | writing `event.log.severity` | `event.log.severity = "error"` | the `LogProxy` creation, nothing for the write |
 | deleting an attribute | `event.attributes.host = nil` | the `AttrsProxy` baseline, nothing for the delete |
-| iterating attributes | `for k, v in pairs(event.attributes) do end` | the proxy creation, plus mlua's per-call Rust-callback allocation per step (about one); no closure |
+| iterating attributes | `for k, v in pairs(event.attributes) do end` | measured at 8, the `AttrsProxy` baseline: no step allocates, with 12 more attributes too |
 
 The counts are measured, not derived; each PR sets them and the `memory.md` row in the same commit.
 
@@ -259,9 +262,9 @@ edit, every pre-existing `lua:` pin is unchanged, and `script/cibuild` passes.
 
 ## Open risks
 
-- The `pairs` wrapper's JIT effect, including the permanent `ITERC` despecialization of a call site
-  that sees a proxy (W3 measures it). If plain-table loops slow down, fall back to the separate
-  global.
+- The `pairs` wrapper's cost, measured in W3: about 13 ns per `pairs` call on a table, and a call
+  site that has seen a proxy runs plain-table loops about 60% slower for good. Accepted;
+  `docs/design/lua-api.md` tells a script author not to share one hot loop between the two.
 - A script that relied on `= nil` keeping a key present, for a sink that renders `Null`, changes
   output. No shipped config or example does; logit is pre-release, so there's no compatibility
   path.

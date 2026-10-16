@@ -9,9 +9,9 @@ What a script can reach:
 | Surface | Access | Section |
 |---|---|---|
 | `event.timestamp` | read/write, a decimal-nanos string | "Timestamps are strings" |
-| `event.attributes` | read/write per key; `= nil` deletes the key | same |
+| `event.attributes` | read/write per key; `= nil` deletes the key; `pairs` enumerates it | same, "Enumerating attributes with `pairs`" |
 | `event.has_log`, `event.has_metrics`, `event.has_span` | read-only booleans | same |
-| `event:to_table()`, `event:clone()` | methods | "No `__pairs`: use `event:to_table()`", "Exposure: a proxy, not a converted table" |
+| `event:to_table()`, `event:clone()` | methods | "`event:to_table()`: a detached copy", "Exposure: a proxy, not a converted table" |
 | `event:to(id)` | method, marks an event for a target | "Routing to a target" |
 | `event.log` | some fields read/write | "Reading and writing `event.log`" |
 | `event.metrics` | some fields read/write | "Reading and writing `event.metrics`" |
@@ -89,13 +89,63 @@ contract" below).
 `timestamp`/`attributes`/`log`, every constructible metric kind, and a `span` with its `events`
 and `links`. See "Constructing events" below.
 
-### No `__pairs`: use `event:to_table()`
+### Enumerating attributes with `pairs`
 
-LuaJIT has Lua 5.1 semantics, and `mlua::MetaMethod::Pairs` requires Lua 5.2+, so the proxy
-can't be iterated with `pairs()`. `event:to_table()` is the escape hatch: a real, disconnected Lua
-table for anything the proxy doesn't expose directly, including full attribute iteration
-(`for k, v in pairs(event:to_table().attributes) do ... end`, native `pairs()` on a real table),
-building new structures, and debug logging. Its keys:
+**`pairs` enumerates `event.attributes`, `resource`, and `scope.attributes` in place**, with the
+ordinary loop:
+
+```lua
+for key, value in pairs(event.attributes) do
+  if string.sub(key, 1, 7) == "syslog." then
+    event.attributes[key] = nil
+  end
+end
+```
+
+LuaJIT has Lua 5.1 semantics, so a userdata has no `__pairs` metamethod. The sandbox instead
+replaces the `pairs` global with a Lua wrapper before the script's chunk runs
+(`crates/logit-script/src/pairs.rs`), so a top-level `local pairs = pairs` captures the wrapper. On
+one of the three proxies the wrapper returns a Rust iterator; on a table it calls the original
+`pairs`, so a table's loop behaves as before. What the loop does:
+
+- **Keys come in the attribute map's order**, the order interning gave the keys, not alphabetical
+  or insertion order, the same order `to_table()` copies them in.
+- **A `Null` attribute yields `(key, nil)`.** The loop doesn't end there, because only a `nil` key
+  ends a generic `for`, and `event.attributes[key] = nil` inside the loop deletes it.
+- **Deleting or overwriting the current key during the loop is safe**, as Lua's `next` contract
+  allows for a table: each step seeks the first key after the last one it returned, whether or not
+  that key is still there. **Adding a key during the loop is undefined**, as for a table: the loop
+  may or may not reach it. Collect new keys and write them after the loop.
+- **`resource` and `scope.attributes` steps read the current state**, so a write earlier in the
+  loop, to the key the loop is on or to a later one, is what a later step sees.
+- **`next(proxy)` and `ipairs(proxy)` still raise** `table expected, got userdata`. Only `pairs`
+  is wrapped.
+- **`pairs` on anything else that isn't a table raises the original's error at the script's
+  line**: `script:12: bad argument #1 to 'pairs' (table expected, got userdata)` for `event`,
+  `event.log`, or `scope` itself, and `got number` for `pairs(42)`.
+- **A loop's handles are consumed with the event**, as every handle is: an iterator stashed for
+  `flush()` fails with the "already returned/emitted elsewhere" error once the event is returned.
+
+`pairs(resource)` and `pairs(scope.attributes)` also yield an attribute whose name a fixed field
+or method shadows (see "A named field takes precedence over an attribute of the same name"
+below). For such a key, `resource[key]` reads the field, not the attribute, and a write goes to
+the field: `resource[key] = nil` on `schema_url` clears the field and on
+`dropped_attributes_count` raises. A method name has no write-side field, so
+`resource.to_table = nil` deletes an attribute named `to_table`, while a read of
+`resource.to_table` still returns the method.
+
+**What it costs.** The sandbox runs LuaJIT interpreted: it opens no `jit` library, so no traces
+compile. Measured there, the wrapper adds about 13 ns to each `pairs` call on a table and nothing
+to each step of the loop, and enumerating a proxy allocates nothing on the Rust side per step
+([memory.md](memory.md) §2). One cost is easy to miss: **a loop call site that has once seen a
+proxy runs plain-table loops about 60% slower from then on**, because LuaJIT rewrites that
+site's iteration bytecode from its table-specialized form to a generic iterator call, for good.
+In a hot path, don't share one helper loop between tables and proxies; give each its own loop.
+
+### `event:to_table()`: a detached copy
+
+`event:to_table()` returns a real, disconnected Lua table for what the proxies don't do in place:
+building new structures, debug logging, and the `Event.new(event:to_table())` rebuild. Its keys:
 
 - `timestamp` and `attributes`.
 - `log`: a table (see "Reading and writing `event.log`" below), or `nil`.
@@ -128,7 +178,7 @@ take the string branch.
 **Variant identity survives an unmodified round-trip, via a no-op-assignment rule, not a tagged
 value.** A plain Lua string or number can't carry which `Value` variant it came from. Without this
 rule, an identity round-trip (`event.attributes.x = event.attributes.x`, or the ordinary pattern
-of reading every attribute through `to_table()` and copying it back while tagging the event)
+of a `pairs` loop that reads every attribute and writes it back while tagging the event)
 would change a value's variant without changing its content. That has real consequences:
 `logit-outputs::influxdb`'s tag handling treats `Bytes` and `Str` differently.
 
@@ -493,9 +543,9 @@ end
 ```
 
 Read and write with `resource["key"]`, exactly like `event.attributes["key"]`. To enumerate every
-key, use `resource:to_table()`: there is no `__pairs` under LuaJIT, for the same reason
-`event.attributes` needs `event:to_table()`. Assigning `nil` deletes the key, the same rule
-`event.attributes` and `scope.attributes` follow
+key, loop with `pairs(resource)`, as with `event.attributes` (see "Enumerating attributes with
+`pairs`"); `resource:to_table()` is a detached snapshot. Assigning `nil` deletes the key, the same
+rule `event.attributes` and `scope.attributes` follow
 ([ADR `lua-in-place-edits`](../adr/lua-in-place-edits.md)). Deleting a key the resource doesn't
 carry changes nothing.
 
@@ -538,10 +588,10 @@ which also explains why this is a graph component rather than a per-input config
 **A named field takes precedence over an attribute of the same name.** `resource["schema_url"]`
 and `resource["dropped_attributes_count"]` always resolve to the fields above, never to an
 attribute keyed `schema_url`/`dropped_attributes_count`. Such an attribute still appears in
-`resource:to_table()` (a flat attribute snapshot: `resource:to_table()["schema_url"]`); it just
-isn't reachable through `resource[...]` indexing. `event`'s own fixed fields (`timestamp`,
-`attributes`, `log`, ...) make the same trade against a same-named attribute. This is documented,
-not guarded against.
+`pairs(resource)` and in `resource:to_table()` (a flat attribute snapshot:
+`resource:to_table()["schema_url"]`); it isn't reachable through `resource[...]` indexing.
+`event`'s own fixed fields (`timestamp`, `attributes`, `log`, ...) make the same trade against a
+same-named attribute. This is documented, not guarded against.
 
 ## Reading and writing `scope`
 
@@ -598,9 +648,10 @@ batch's, and a `scope` write inside `flush()` is the only way a flush-driven emi
 a `resource` write, on both the per-batch and the `flush()` path. See
 [ADR `lua-flush-root-context`](../adr/lua-flush-root-context.md).
 
-`scope:to_table()` is the enumeration escape hatch, as `resource:to_table()` is, but its shape
-differs. `resource:to_table()` is the flat attribute map; `scope:to_table()` returns the named
-fields with the attributes nested:
+`pairs(scope.attributes)` enumerates the attributes in place, as `pairs(resource)` does.
+`scope:to_table()` is a detached snapshot, as `resource:to_table()` is, but its shape differs.
+`resource:to_table()` is the flat attribute map; `scope:to_table()` returns the named fields with
+the attributes nested:
 `{name=, version=, schema_url=, attributes={...}, dropped_attributes_count=}`, with `schema_url`
 present only when set.
 
@@ -1336,9 +1387,9 @@ component id (`<unset>` for top-level code, which runs before the id is known).
 The sandbox is pinned by one test, `the_global_table_is_exactly_the_allowlist`
 (`crates/logit-script/src/lib.rs`), which holds the exact list. It builds a worker as the runtime
 does and requires `_G` to be Lua's base library, minus the removed loaders, environment functions,
-and `newproxy`, with `print` rerouted; the `math`, `string`, and `table` libraries; the seven `logit`
-globals this document describes, each a proxy or a table of Rust closures and none a route to the
-host; and the script's own `process`, and `flush` if it defines one. It also checks that the host
+and `newproxy`, with `print` rerouted and `pairs` wrapped; the `math`, `string`, and `table`
+libraries; the seven `logit` globals this document describes, each a proxy or a table of Rust
+closures and none a route to the host; and the script's own `process`, and `flush` if it defines one. It also checks that the host
 and debugging libraries LuaJIT can load are absent. `collectgarbage` and `coroutine` stay: neither
 reaches the host, and each has an ordinary use in a transform script.
 

@@ -382,10 +382,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **To close:** a separate way to write `Null`, such as a global function (a proxy method would
     shadow an attribute of its name), if a need shows up.
 - **A `Null` attribute doesn't survive a read-back write.** A `Null` attribute reads as `nil`, so
-  Lua can't tell writing back what it read from deleting. `a.x = a.x` deletes an attribute a
-  decoder stored as `Null` (a JSON `null`, a syslog nil timestamp). The unmodified-write no-op in
-  [ADR `lua-value-identity-preservation`](../adr/lua-value-identity-preservation.md) no longer
-  covers it.
+  Lua can't tell writing back what it read from deleting. `a.x = a.x`, or
+  `for k, v in pairs(a) do a[k] = f(v) end` where `f(nil)` is `nil`, deletes an attribute a decoder
+  stored as `Null` (a JSON `null`, a syslog nil timestamp). The unmodified-write no-op in [ADR
+  `lua-value-identity-preservation`](../adr/lua-value-identity-preservation.md) no longer covers
+  it.
   - **To avoid it:** skip a key whose read value is `nil` before writing it back.
 - **A Lua `flush()` emission is never attributed to the batches that fed it.** `flush()` runs in
   a root context ([ADR `lua-flush-root-context`](../adr/lua-flush-root-context.md)), and there's no
