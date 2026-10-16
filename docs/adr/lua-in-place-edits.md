@@ -75,8 +75,9 @@ enumerates them.
 - **A call site that sees a proxy loses the `ITERN` specialization** for good, though it still
   records. A helper shared by tables and proxies pays this.
 - **`pairs(resource)` can yield a name that is also a fixed field or method** (`schema_url`,
-  `to_table`, `dropped_attributes_count`), and `resource[k] = nil` on it hits the field. The
-  design doc says so.
+  `to_table`, `dropped_attributes_count`). Writing `nil` to a field name clears the field or
+  raises; a method name has no write-side field, so `resource.to_table = nil` deletes the
+  attribute. The design doc says so.
 - A script that relied on `= nil` keeping a key present changes output. Logit is pre-release, so
   there is no compatibility path.
 - The two earlier ADRs get a dated amendment with the code that lands the writes, not with this
