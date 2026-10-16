@@ -1466,12 +1466,16 @@ the other.
 - `ledger.replay` for the hop sink, for each killed `logit` life followed by another. Unlike a
   sink behind `aggregate`, which gains one batch a window, the hop sink is fed by the listener,
   so its queue keeps growing between the last drain and the kill, and `collector` may take some
-  of it. Its spool commits a frame once `collector` acknowledges it and persists that every
-  `checkpoint_interval` (1 s by default), so frames delivered since the last persist replay
-  again. With the received and delivered batch rates over the life's last drain interval, and t
-  from its last drain to the `docker kill`'s return, replayed − queued is in
-  [−(delivered × t) − 1, received × t + delivered × the checkpoint interval + 1]. With
-  `collector` down nothing is delivered, but the queue still grows by up to received × t.
+  of it. Its spool commits a frame once `collector` acknowledges it and persists the cursor on
+  a commit once `checkpoint_interval` (1 s by default) has passed since the last persist, so up
+  to one interval of commits stays unpersisted and replays, even after `collector` stopped and
+  commits stopped with it. With the received and delivered batch rates over the life's last
+  drain interval, the delivered rate over the last drain interval that delivered anything, and
+  t from its last drain to the `docker kill`'s return, replayed − queued is in
+  [−(delivered × t) − 1, received × t + that last delivered rate × the checkpoint interval + 1].
+  The first two `native-hop` runs found both terms: a kill inside `collector`'s stop replayed 55
+  batches over the queue, 50 it received in the 5 s before the kill and 5 committed before the
+  stop and never persisted.
 - `identity.sink` judges the hop sink too, at `logit`'s final life's last quiet drain;
   `recovery` judges each side's sinks on its own drains, the hop sink against the listeners'
   datagrams and `collector`'s sinks against E_B; `drops` keys every term on its service and
