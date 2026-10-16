@@ -4971,7 +4971,7 @@ mod tests {
     }
 
     fn lua() -> ComponentKind {
-        ComponentKind::Lua { script: "".to_string(), interval: None, max_memory: None }
+        ComponentKind::Lua { script: "".to_string(), interval: None, max_memory: None, jit: false }
     }
 
     fn json() -> ComponentKind {
@@ -14860,11 +14860,16 @@ mod tests {
     // ---- rule 71: lua / lua_file max_memory ------------------------------------------------
 
     fn lua_with_max_memory(max_memory: Option<u64>) -> ComponentKind {
-        ComponentKind::Lua { script: String::new(), interval: None, max_memory }
+        ComponentKind::Lua { script: String::new(), interval: None, max_memory, jit: false }
     }
 
     fn lua_file_with_max_memory(max_memory: Option<u64>) -> ComponentKind {
-        ComponentKind::LuaFile { lua_file: "x.lua".to_string(), interval: None, max_memory }
+        ComponentKind::LuaFile {
+            lua_file: "x.lua".to_string(),
+            interval: None,
+            max_memory,
+            jit: false,
+        }
     }
 
     /// Rule 71: an empty VM already holds more than `0` bytes.

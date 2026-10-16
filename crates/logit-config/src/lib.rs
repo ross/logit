@@ -2317,9 +2317,23 @@ pub enum ComponentKind {
         #[serde(default, with = "human_bytes::option")]
         #[schemars(with = "Option<String>")]
         max_memory: Option<u64>,
+        /// Turns on LuaJIT's trace compiler for this component's Lua VM. Off by default: the
+        /// script runs interpreted.
+        ///
+        /// It helps a script that spends its time in plain Lua: loops, table work, arithmetic,
+        /// and string building. It gains little for reading and writing event attributes or for
+        /// `string` pattern matching (`match`, `gmatch`, `gsub`), which run at the same speed
+        /// either way.
+        ///
+        /// Each VM uses about 70 KB more memory, some of it counted by `max_memory`. The compiled
+        /// machine code, up to 512 KB per VM, is outside the Lua heap and `max_memory` doesn't
+        /// count it. A loop that never returns is still caught only by the component's stall
+        /// detection.
+        #[serde(default)]
+        jit: bool,
     },
-    /// A `.lua` file path, relative to the config file. Takes the same `interval` and
-    /// `max_memory` as `lua`.
+    /// A `.lua` file path, relative to the config file. Takes the same `interval`, `max_memory`,
+    /// and `jit` as `lua`.
     LuaFile {
         lua_file: String,
         #[serde(default, with = "humantime_serde_duration::option")]
@@ -2328,6 +2342,8 @@ pub enum ComponentKind {
         #[serde(default, with = "human_bytes::option")]
         #[schemars(with = "Option<String>")]
         max_memory: Option<u64>,
+        #[serde(default)]
+        jit: bool,
     },
     /// The windowed aggregator (counters, gauges, sets, distributions). Flushes every `interval`;
     /// `0s` is rejected.
@@ -5669,10 +5685,11 @@ mod tests {
                 .unwrap();
         assert_eq!(component.sources, vec!["in".to_string()]);
         match component.kind {
-            ComponentKind::Lua { script, interval, max_memory } => {
+            ComponentKind::Lua { script, interval, max_memory, jit } => {
                 assert_eq!(script, "return event");
                 assert_eq!(interval, None);
                 assert_eq!(max_memory, None);
+                assert!(!jit, "jit defaults to off");
             }
             other => panic!("expected Lua, got {other:?}"),
         }
@@ -5699,10 +5716,11 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::LuaFile { lua_file, interval, max_memory } => {
+            ComponentKind::LuaFile { lua_file, interval, max_memory, jit } => {
                 assert_eq!(lua_file, "x.lua");
                 assert_eq!(interval, Some(Duration::from_secs(60)));
                 assert_eq!(max_memory, None);
+                assert!(!jit, "jit defaults to off");
             }
             other => panic!("expected LuaFile, got {other:?}"),
         }
@@ -5724,6 +5742,24 @@ mod tests {
         let bare: Result<Component, _> =
             serde_json::from_str(r#"{"type": "lua", "script": "x", "max_memory": 1024}"#);
         assert!(bare.is_err(), "a bare integer max_memory should be rejected");
+    }
+
+    #[test]
+    fn lua_and_lua_file_take_a_jit_bool() {
+        let lua: Component =
+            serde_json::from_str(r#"{"type": "lua", "script": "x", "jit": true}"#).unwrap();
+        assert!(matches!(lua.kind, ComponentKind::Lua { jit: true, .. }), "{:?}", lua.kind);
+        let file: Component =
+            serde_json::from_str(r#"{"type": "lua_file", "lua_file": "x.lua", "jit": true}"#)
+                .unwrap();
+        assert!(matches!(file.kind, ComponentKind::LuaFile { jit: true, .. }), "{:?}", file.kind);
+        let off: Component =
+            serde_json::from_str(r#"{"type": "lua", "script": "x", "jit": false}"#).unwrap();
+        assert!(matches!(off.kind, ComponentKind::Lua { jit: false, .. }), "{:?}", off.kind);
+        // A boolean, not a mode string.
+        let string: Result<Component, _> =
+            serde_json::from_str(r#"{"type": "lua", "script": "x", "jit": "on"}"#);
+        assert!(string.is_err(), "a string jit should be rejected");
     }
 
     #[test]
@@ -8764,6 +8800,7 @@ mod tests {
                 script: "x".to_string(),
                 interval: Some(Duration::from_secs(30)),
                 max_memory: None,
+                jit: false,
             },
         };
         let json = serde_json::to_string(&original).unwrap();
