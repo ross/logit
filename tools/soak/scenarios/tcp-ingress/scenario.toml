@@ -1,9 +1,9 @@
 # A generated statsd stream into `logit` over TCP and out to VictoriaMetrics, under network and
 # lifecycle faults on both ends of the connection. TCP retransmits what netem drops, so loss on
 # the generator's link is judged at 0; a stall of the SUT backs up into the generator, whose
-# counted overflow and ambiguous drops stay out of G; a stop or kill of the SUT resets the
-# connection and loses what sat in its socket buffers, which `ledger.wire` reports. The schema
-# is docs/plans/soak-harness.md's "The scenario schema".
+# counted overflow and ambiguous drops stay out of G; a stop or kill of the SUT can reset the
+# connection with lines in its socket buffers, so `ledger.wire` reports those windows. The
+# schema is docs/plans/soak-harness.md's "The scenario schema".
 
 name = "tcp-ingress"
 description = "generator -> statsd_in (TCP) -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics"
@@ -12,6 +12,7 @@ warmup = "60s"            # no faults: baseline rate, RSS, fds
 cooldown = "120s"         # no faults at the end; >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
 cycle = "17m30s"          # >= last recovery (16m30s) + 2 x progress_window
+compose = "compose.override.yaml"   # caps both ends' TCP socket buffers
 
 [configs]
 sut = "logit-sut.yaml"
@@ -62,14 +63,15 @@ args = "loss 30%"
 for = "90s"
 
 # The SUT's kernel keeps ACKing until its receive buffer fills, then the generator's write
-# stalls past connect_timeout, fails ambiguous, and its queue overflows: judged.
+# stalls past connect_timeout, fails ambiguous, and its queue overflows: judged. The override's
+# buffer caps make that happen inside 30 s.
 [[step]]
 at = "8m"
 action = "pause"
 on = "logit"
 for = "30s"
 
-# A stop or kill resets the connection: reported.
+# A stop or kill can reset the connection with lines in its buffers: reported.
 [[step]]
 at = "9m30s"
 action = "stop"

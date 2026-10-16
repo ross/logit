@@ -1,0 +1,13 @@
+# Caps the socket buffers on each end of the TCP connection, in each container's own network
+# namespace. The host's defaults (`tcp_rmem` up to 32 MiB) hold minutes of this scenario's
+# 42 KB/s, so a 30 s pause of the SUT never reached the generator: its writes all completed and
+# nothing backed up. With about 10 s held between the two buffers, a pause stalls the
+# generator's write past `connect_timeout` and its queue overflows, as on a host with smaller
+# buffers or a faster sender.
+services:
+  logit:
+    sysctls:
+      net.ipv4.tcp_rmem: "4096 65536 262144"
+  generator:
+    sysctls:
+      net.ipv4.tcp_wmem: "4096 16384 262144"

@@ -15,8 +15,8 @@ components:
     endpoint: logit:8125
     transport: tcp                  # output.messages counts a batch once its write completes
     format: statsd
-    # 200 batches is 10 s of load, so a 30 s stall of the SUT overflows it and the loss is
-    # counted here; never stall generate_in.
-    buffer: { max_batches: 200, overflow: drop_newest, retry_max_delay: 1s }
+    # 50 batches is 2.5 s of load, so a write stalled for connect_timeout (5 s) overflows it and
+    # the loss is counted here; never stall generate_in.
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
   self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
   telemetry: { type: stdio_out, sources: [self], format: json }
