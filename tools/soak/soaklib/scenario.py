@@ -66,8 +66,8 @@ LOGIT_ROLES = (SUT_ROLE, GENERATOR_ROLE)
 # The ingress SUT: the service every generator sends to, whose config `[configs]` names under
 # `sut`. A scenario's override can add one more SUT service, named by its own `[configs]` key
 # and by the `[[ledger.hop]]`'s `to`, after `logit` in the chain (`Scenario.suts`); the last SUT
-# holds `sut_aggregate` and every `[[ledger.sink]]`. Generators are any services with the role, each a
-# `[[ledger.source]]`: compose.yaml's `generator`, and any a scenario's override adds.
+# holds `sut_aggregate` and every `[[ledger.sink]]`. Generators are any services with the role,
+# each a `[[ledger.source]]`: compose.yaml's `generator`, and any a scenario's override adds.
 SUT_SERVICE = "logit"
 # The role map compose.yaml's labels give with the `local` profile, for what can't run
 # `docker compose config`: `list` and the self-test, which pins it to compose.yaml.

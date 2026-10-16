@@ -2531,7 +2531,10 @@ def check_ledger_hop(data):
     processes, so the row judges the whole run, and 0 passes. A killed life on either side
     loses up to one drain interval of its counts (`_last_interval`), in either direction for
     the ingress SUT, whose hop sink spools what it received, and upward for the far SUT. A
-    kill or a pause of the far SUT can make it forward a resend twice: a kill forgets its
+    killed ingress life's spool also replays the frames it committed in the checkpoint interval
+    before its last persist, which a far SUT that restarted since forwards again, so each
+    allows that many frames below 0. A kill or a pause of the far SUT can make it forward a
+    resend twice: a kill forgets its
     marks, and a pause leaves frames in an ended connection that a resend races
     (docs/known-gaps/native-hop.md), each up to one send window of frames below 0. Any other
     gap FAILs, as a surplus below the allowance or uncounted loss above it. Resends, resumed
@@ -2557,9 +2560,15 @@ def check_ledger_hop(data):
     allowances = []
     for life in inn.killed:
         tail, rate = _last_interval(led.ingress, "logit.component.events.received", sink, life)
-        low, high = low - tail, high + tail
+        # Its spool replays the frames it committed after its last cursor persist, which a
+        # `collector` that restarted since forwards again.
+        replay = round((math.ceil(_last_rate(led.ingress, "logit.component.batches.delivered",
+                                             sink, life) * led.hop_checkpoint) + 1)
+                       * led.per_frame)
+        low, high = low - tail - replay, high + tail
         allowances.append(f"{inn.service} life {life} killed: ±{_n(tail)} ({rate:,.0f}/s over "
-                          "its last drain interval)")
+                          f"its last drain interval), −{_n(replay)} (its replay of frames "
+                          "committed after its last checkpoint)")
     for life in out.killed:
         tail, rate = _last_interval(led.sut, "logit.component.events.sent", listener, life)
         low, high = low - race, high + tail
@@ -3922,8 +3931,8 @@ CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_intake,
     check_ledger_edge, check_ledger_hop, check_ledger_script, check_ledger_aggregate,
-    check_ledger_egress, check_ledger_windows, check_ledger_replay, check_ledger_summary, check_ledger_sent,
-    check_ledger_topic, check_ledger_standin, check_identity_sink, check_drops, check_recovery,
+    check_ledger_egress, check_ledger_windows, check_ledger_replay, check_ledger_summary,
+    check_ledger_sent, check_ledger_topic, check_ledger_standin, check_identity_sink, check_drops, check_recovery,
     check_expect,
 )
 

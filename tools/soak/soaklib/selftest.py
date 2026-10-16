@@ -5269,7 +5269,8 @@ def _two_sut_checks():
 
         within = hop_row("two-within", extra=500)
         expect(within["ledger.hop"].status == checks.PASS
-               and "= -500, within allowance (allowance [-800, 1,000]" in within["ledger.hop"].detail,
+               and "= -500, within allowance (allowance [-800, 1,000]"
+               in within["ledger.hop"].detail,
                f"a surplus inside one send window after collector's kill passes, got "
                f"{within['ledger.hop']}")
         beyond = hop_row("two-beyond", extra=900)
@@ -5334,8 +5335,16 @@ def _two_sut_checks():
                     "identity.sink", "ledger.egress", "ledger.summary"):
             expect(killed[row].status == checks.PASS,
                    f"{row} PASSes a kill on logit, got {killed[row]}")
-        expect("logit life 0 killed: ±1,000" in killed["ledger.hop"].detail,
+        expect("logit life 0 killed: ±1,000 (200/s over its last drain interval), −300 (its "
+               "replay of frames committed after its last checkpoint)"
+               in killed["ledger.hop"].detail,
                f"ledger.hop names a killed logit life's tail, got {killed['ledger.hop']}")
+        twice = hop_row("two-logit-twice", kill_on="logit", collector_lives=1, extra=1250)
+        expect(twice["ledger.hop"].status == checks.PASS
+               and "= -1,250, within allowance (allowance [-1,300, 1,000]"
+               in twice["ledger.hop"].detail,
+               f"a killed logit's replay of unpersisted commits, forwarded again, passes, got "
+               f"{twice['ledger.hop']}")
         lost = hop_row("two-logit-tail", kill_on="logit", collector_lives=1, extra=500)
         expect(lost["ledger.hop"].status == checks.PASS
                and "= -500, within allowance" in lost["ledger.hop"].detail,
