@@ -86,6 +86,18 @@ each source's datagram precondition, an imbalance on one listener FAILing named,
 summed E against A, a source's transforms judged hop by hop, `lines_in`'s oversize drops in B,
 R per listener from its own `receive:`, and `recovery` against the summed rate.
 
+For a source's `wire`, it covers the key and its load-time check against the SUT config's
+listener `type:` and `transport:` (a mismatch either way, a listener the config lacks, a
+transport with no wire, `lines_in`'s TCP default, and a comment ignored), the fault predicates
+per wire, each TCP window judged or reported, a partition recording its addresses through a
+fake Docker and the checks reading them, the driver recording every wire's flag, and a TCP
+run: W from `input.frames`, the reversed datagram precondition, R with no receive queue, a
+framer's counted drop as wire loss kept out of `drops`, the same lines uncounted FAILing, a
+generator netem judged on TCP but not on UDP, a SUT netem judged, a judged window's surplus
+against its ambiguous drops, a partition judged or reported by its address, `recovery` and a
+killed life's band reading the frames, and a source naming `wire = "udp"` scoring as one
+naming none.
+
 For two SUT services, it covers a further SUT declared by its own `[configs]` key and the
 `[[ledger.hop]]` joining it to `logit` (the chain they make, their config variable, and each
 rule the keys, the hop, and the role map are held to), the fault predicates, under which only
@@ -131,6 +143,7 @@ import gzip
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -245,6 +258,25 @@ def _rules(root):
            f"faults.ACTIONS and scenario.ACTION_NAMES name the same actions, got "
            f"{sorted(faults.ACTIONS)} vs {sorted(scenario.ACTION_NAMES)}")
     _refused(path, mutate(drop_for), "every fault needs `for`", "a step without for")
+    # `max_duration` refuses a --duration past it, and a scenario whose own duration is.
+    capped = mutate(lambda r: r.update(max_duration="20m"))
+    _refused(path, capped, "duration 20m1s is longer than the scenario's max_duration 20m",
+             "a --duration past max_duration", duration=1201)
+    _refused(path, mutate(lambda r: r.update(max_duration="10m")),
+             "duration 16m is longer than the scenario's max_duration 10m",
+             "a scenario's own duration past its max_duration")
+    _refused(path, mutate(lambda r: r.update(max_duration="soon")),
+             "scenario.max_duration: not a duration", "a max_duration that isn't a duration")
+    try:
+        loaded = scenario.from_dict(copy.deepcopy(capped), path)
+        scenario.validate(loaded, duration=1200)
+        expect(loaded.max_duration == 1200, "max_duration loads as seconds")
+    except scenario.ScenarioError as err:
+        expect(False, f"a --duration at max_duration is refused: {err.problems}")
+    tail = scenario.load(root / "scenarios" / "tail-rotate" / "scenario.toml")
+    expect(tail.max_duration is not None and tail.max_duration >= tail.duration,
+           f"tail-rotate caps --duration at its retention and fd_growth, got "
+           f"{tail.max_duration}")
     _refused(path, mutate(overlap), "two faults overlap on generator", "overlapping faults")
     _refused(path, mutate(netem_in_stop), "netem on victoria-metrics during its stop",
              "netem during a stop")
@@ -847,6 +879,21 @@ def _ndjson():
     window = tel.counter_in("logit.component.batches.delivered", base, base + 20,
                             component="sink")
     expect(window == 5, f"counter over a window, got {window}")
+
+    # A `restart`: the old process's final drain at +60.07, the new one started at +60.26. The
+    # final drain is the old life's, though it falls within a second of the new life's start.
+    restart = "2026-10-08T12:01:%s"
+    lines = [
+        _line(restart % "00.000000000Z", "logit.process.uptime", "gauge", 55.0),
+        _line(restart % "00.070000000Z", "logit.process.uptime", "gauge", 55.07),
+        _line(restart % "00.070000000Z", "logit.input.lines", "sum", 4900, component="tail"),
+        _line(restart % "05.260000000Z", "logit.process.uptime", "gauge", 5.0),
+        _line(restart % "05.260000000Z", "logit.input.lines", "sum", 5000, component="tail"),
+    ]
+    tel = telemetry.parse_ndjson(lines)
+    by_life = tel.counter_by_life("logit.input.lines", component="tail")
+    expect(by_life == {0: 4900, 1: 5000},
+           f"a restart's old final drain stays in the old life, got {by_life}")
 
 
 def _stderr():
@@ -4788,6 +4835,646 @@ def _fanin_driver(root):
 TWO_SUT_ROLES = {**scenario.BASE_ROLES, "collector": "sut"}
 
 
+def _tcp_run(tmp, name, sut_edit=None, gen_edit=None, datagrams=False, wire="tcp",
+             timeline_extra=(), **kwargs):
+    """`_ledger_run`'s two-life run directory with its one source on a TCP wire: the listener
+    counts `logit.input.frames` in place of datagrams and no datagram drop, so life 0's
+    residual is the 30 that reach V after its last drain, the generator counts
+    no `output.datagrams` unless `datagrams`, and the stop over `STOP` is TCP-affecting, as the
+    driver records it. `sut_edit(record)` and `gen_edit(record)` may change or drop (return
+    None) each SUT and generator telemetry record. `wire` is the source's `wire`, or None for a
+    source that names none."""
+    kwargs.setdefault("life0_extra", 30)
+    run_dir = _ledger_run(tmp, name, shutdown_drops=0, timeline_extra=timeline_extra, **kwargs)
+    out = []
+    for line in (run_dir / "logs" / "logit.stdout").read_text().splitlines():
+        record = json.loads(line)
+        metric = record["metrics"][0]
+        if metric["name"] == "logit.input.datagrams":
+            metric["name"] = "logit.input.frames"
+        record = sut_edit(record) if sut_edit else record
+        out += [json.dumps(one) for one in (record if isinstance(record, list) else [record])
+                if one is not None]
+    (run_dir / "logs" / "logit.stdout").write_text("\n".join(out) + "\n")
+    gen = []
+    for line in (run_dir / "logs" / "generator.stdout").read_text().splitlines():
+        record = json.loads(line)
+        if record["metrics"][0]["name"] == "logit.output.datagrams" and not datagrams:
+            continue
+        record = gen_edit(record) if gen_edit else record
+        gen += [json.dumps(one) for one in (record if isinstance(record, list) else [record])
+                if one is not None]
+    (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
+    timeline = []
+    for line in (run_dir / "timeline.jsonl").read_text().splitlines():
+        record = json.loads(line)
+        if record.get("step") == "c0s1":
+            record["affects_tcp_ingress"] = True
+        timeline.append(json.dumps(record))
+    (run_dir / "timeline.jsonl").write_text("\n".join(timeline) + "\n")
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    source = dict(resolved["ledger"]["source"][0])
+    if wire is None:
+        source.pop("wire", None)
+    else:
+        source["wire"] = wire
+    resolved["ledger"]["source"] = [source]
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    return run_dir
+
+
+def _fault_pair(step, action, on, start, end, udp=False, tcp=False, **extra):
+    """An apply and a revert of `action` on `on`, recorded with its per-wire ingress flags;
+    `extra` goes on the apply, and a partition's `ips_after` on the revert."""
+    after = {"ips_after": extra.pop("ips_after")} if "ips_after" in extra else {}
+    flags = {"affects_udp_ingress": udp, "affects_tcp_ingress": tcp,
+             "affects_file_ingress": False}
+    return (_action("apply", step, action, on, start, **flags, **extra),
+            _action("revert", step, action, on, end - 1, end, **flags, **after))
+
+
+def _tcp_ledger():
+    """The ledger on a TCP source: W from `input.frames`, F from the framer's counted drops,
+    the `output.datagrams` precondition reversed, R with no receive queue, the wire judged
+    through netem on the generator and reported through a stop, a judged window's surplus
+    against its ambiguous drops, a partition judged or reported by its address, and `recovery`
+    reading the frames; and a source naming `wire = "udp"` scored as one naming none."""
+
+    def ambiguous(offset, batches):
+        stamp = _stamp(T0 + offset)
+
+        def edit(record):
+            if (record["metrics"][0]["name"] == "logit.component.events.sent"
+                    and record["timestamp"] == stamp):
+                return [record, json.loads(_line(
+                    stamp, "logit.component.batches.dropped", "sum", batches, component="out",
+                    attrs={"reason": "ambiguous_at_most_once"}))]
+            return record
+        return edit
+
+    def flat(edit):
+        """A `gen_edit` that may return a list of records, written one per line."""
+        def wrapped(record):
+            return edit(record)
+        return wrapped
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            return {r.id: r for r in checks.run_all(_tcp_run(tmp, name, **kwargs))}
+
+        clean = results("tcp-clean")
+        for row in ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.egress",
+                    "ledger.summary", "recovery", "drops"):
+            expect(clean[row].status == checks.PASS,
+                   f"{row} PASSes the balanced TCP fixture, got {clean[row]}")
+        wire = clean["ledger.wire"].detail
+        expect(wire.startswith("G 60,000 = W 54,030 + K 0 + counted 0 + gap 5,970 (6,000 in "
+                               "reported windows, 0 in judged TCP-affecting windows, -30 "
+                               "steady"),
+               f"a TCP source's W is its listener's input.frames, and a stop's loss is "
+               f"reported, got {wire}")
+        expect(any("fault (c0s1 stop on logit)" in line for line in clean["ledger.wire"].lines)
+               and any("steady (no TCP-affecting fault)" in line
+                       for line in clean["ledger.wire"].lines),
+               f"a TCP source's windows are TCP-affecting, got {clean['ledger.wire'].lines}")
+        expect("R 67,000 = 0 + 2 x 1,000 + 65 x 1,000" in clean["ledger.intake"].detail,
+               f"a TCP listener has no receive queue in R, got {clean['ledger.intake'].detail}")
+        expect("F 0" in clean["ledger.summary"].detail
+               and "wire G − (W + K + F) 5,970 over the run, F 0 counted"
+               in clean["ledger.summary"].detail,
+               f"ledger.summary shows F on a TCP source, got {clean['ledger.summary'].detail}")
+
+        # The generator's sink counted datagrams: it isn't sending over TCP.
+        udp_sink = results("tcp-datagrams", datagrams=True)
+        expect(udp_sink["ledger.wire"].status == checks.FAIL
+               and "precondition: generator output.datagrams 60,000 isn't 0"
+               in udp_sink["ledger.wire"].detail,
+               f"a TCP source FAILs a generator counting datagrams, got {udp_sink['ledger.wire']}")
+
+        # 400 more lines sent at +60 that the framer dropped are counted wire loss, F, not
+        # steady loss; the same lines with no count are lost.
+        def sent_more(record):
+            if (record["metrics"][0]["name"] == "logit.output.messages"
+                    and record["timestamp"] == _stamp(T0 + 60)):
+                record["metrics"][0]["value"] += 400
+            return record
+
+        def truncated(record):
+            if (record["metrics"][0]["name"] == "logit.input.frames"
+                    and record["timestamp"] == _stamp(T0 + 60)):
+                return [record, json.loads(_line(
+                    record["timestamp"], "logit.input.frames.dropped", "sum", 400,
+                    component="in", attrs={"reason": "truncated"}))]
+            return record
+
+        framed = results("tcp-truncated", sut_edit=truncated, gen_edit=sent_more)
+        expect(framed["ledger.wire"].status == checks.PASS
+               and "counted 400 (truncated 400)" in framed["ledger.wire"].detail,
+               f"a framer's truncated drop is counted wire loss, got {framed['ledger.wire']}")
+        expect(framed["drops"].status == checks.PASS
+               and framed["ledger.intake"].status == checks.PASS,
+               f"F stays out of drops and of the intake balance, got {framed['drops']}, "
+               f"{framed['ledger.intake']}")
+        lost = results("tcp-lost", gen_edit=sent_more)
+        expect(lost["ledger.wire"].status == checks.FAIL
+               and lost["ledger.wire"].detail.startswith(
+                   "370 lost outside reported TCP windows"),
+               f"lines lost uncounted on a TCP wire FAIL, got {lost['ledger.wire']}")
+
+        # Netem on the generator: UDP loss by design, but TCP retransmits, so it's judged.
+        gen_netem = _fault_pair("x1", "netem", "generator", 52, 62, udp=True)
+        on_udp = {r.id: r for r in checks.run_all(_ledger_run(
+            tmp, "udp-gen-netem", steady_loss=400, timeline_extra=gen_netem))}
+        expect(on_udp["ledger.wire"].status == checks.PASS,
+               f"UDP loss inside a generator netem passes, got {on_udp['ledger.wire']}")
+        on_tcp = results("tcp-gen-netem", steady_loss=400, timeline_extra=gen_netem)
+        expect(on_tcp["ledger.wire"].status == checks.FAIL
+               and on_tcp["ledger.wire"].detail.startswith("370 lost outside reported TCP"),
+               f"TCP loss inside a generator netem FAILs, got {on_tcp['ledger.wire']}")
+
+        # Netem on the SUT carries the ACKs: TCP-affecting and judged, never UDP-affecting.
+        sut_netem = _fault_pair("x1", "netem", "logit", 52, 62, tcp=True)
+        judged = results("tcp-sut-netem", steady_loss=1000, timeline_extra=sut_netem)
+        lines = judged["ledger.wire"].lines
+        expect(judged["ledger.wire"].status == checks.FAIL
+               and any("judged (x1 netem on logit)" in line for line in lines),
+               f"TCP loss inside a SUT netem is judged, got {judged['ledger.wire']}")
+
+        # A judged window's surplus: a write that failed partway left whole lines the generator
+        # never counted, one batch per ambiguous drop.
+        late = _fault_pair("x1", "netem", "logit", 200, 210, tcp=True)
+        over = results("tcp-surplus", steady_surplus=350, timeline_extra=late)
+        expect(over["ledger.wire"].status == checks.FAIL
+               and "W + counted exceeds G by 350, over the 200 its 0 ambiguous drop(s) and 2 "
+               "edge(s) allow" in over["ledger.wire"].detail,
+               f"a surplus past a judged window's edges FAILs, got {over['ledger.wire']}")
+        allowed = results("tcp-surplus-ambiguous", steady_surplus=350, timeline_extra=late,
+                          gen_edit=ambiguous(230, 2))
+        expect(allowed["ledger.wire"].status == checks.PASS
+               and "surplus allowed 400 (2 ambiguous drop(s) + 2 edge(s), x one 100-line "
+               "batch)" in "\n".join(allowed["ledger.wire"].lines)
+               and "ambiguous_at_most_once 2" in allowed["ledger.wire"].detail,
+               f"two ambiguous drops allow two batches of surplus, got {allowed['ledger.wire']}")
+
+        # A partition: judged when the SUT kept its address, reported when the reconnect moved
+        # it, and reported when no address was recorded after it.
+        kept = _fault_pair("x1", "partition", "logit", 52, 62, udp=True, tcp=True,
+                           ips={"soak": "172.18.0.3"}, ips_after={"soak": "172.18.0.3"})
+        same = results("tcp-partition-kept", steady_loss=1000, timeline_extra=kept)
+        expect(same["ledger.wire"].status == checks.FAIL
+               and any("judged (x1 partition on logit (IP 172.18.0.3 kept))" in line
+                       for line in same["ledger.wire"].lines),
+               f"a partition that kept the address is judged, got {same['ledger.wire']}")
+        moved = _fault_pair("x1", "partition", "logit", 52, 62, udp=True, tcp=True,
+                            ips={"soak": "172.18.0.3"}, ips_after={"soak": "172.18.0.5"})
+        away = results("tcp-partition-moved", steady_loss=1000, timeline_extra=moved)
+        expect(away["ledger.wire"].status == checks.PASS
+               and any("fault (x1 partition on logit (IP 172.18.0.3 -> 172.18.0.5))" in line
+                       for line in away["ledger.wire"].lines),
+               f"a partition that moved the address is reported, got {away['ledger.wire']}")
+        unknown = _fault_pair("x1", "partition", "logit", 52, 62, udp=True, tcp=True,
+                              ips={"soak": "172.18.0.3"})
+        blind = results("tcp-partition-unknown", steady_loss=1000, timeline_extra=unknown)
+        expect(blind["ledger.wire"].status == checks.PASS
+               and "IP 172.18.0.3 -> unknown" in "\n".join(blind["ledger.wire"].lines),
+               f"a partition with no address after it is reported, got {blind['ledger.wire']}")
+
+        # Recovery reads the frames: half the frames after the stop is half the rate.
+        def half(record):
+            stamp = record["timestamp"]
+            if (record["metrics"][0]["name"] == "logit.input.frames"
+                    and _stamp(T0 + 135) <= stamp <= _stamp(T0 + 180)):
+                record["metrics"][0]["value"] //= 2
+            return record
+        slow = results("tcp-recovery", sut_edit=half)
+        expect(slow["recovery"].status == checks.FAIL
+               and "is 50% of the warmup rate" in slow["recovery"].detail,
+               f"recovery judges a TCP listener's frames, got {slow['recovery']}")
+
+        # A killed life's band reads its ingest rate from the frames.
+        kill_dir = _kill_run(tmp, "tcp-kill")
+        stdout = kill_dir / "logs" / "logit.stdout"
+        stdout.write_text(stdout.read_text().replace('"logit.input.datagrams"',
+                                                     '"logit.input.frames"'))
+        resolved_path = kill_dir / "scenario.resolved.json"
+        resolved = json.loads(resolved_path.read_text())
+        resolved["ledger"]["source"] = [{**resolved["ledger"]["source"][0], "wire": "tcp"}]
+        resolved_path.write_text(json.dumps(resolved))
+        killed = {r.id: r for r in checks.run_all(kill_dir)}
+        expect(killed["ledger.egress"].status == checks.PASS
+               and "band [-1,000, 3,000]: ingest 200/s" in killed["ledger.egress"].detail,
+               f"a killed TCP life's band reads the frames' rate, got {killed['ledger.egress']}")
+
+        # A source naming `wire = "udp"` scores as one naming none.
+        named = {r.id: (r.status, r.detail) for r in checks.run_all(
+            _ledger_run(tmp, "udp-named", steady_loss=400, timeline_extra=gen_netem))}
+        resolved_path = Path(tmp) / "udp-named" / "scenario.resolved.json"
+        resolved = json.loads(resolved_path.read_text())
+        resolved["ledger"]["source"][0]["wire"] = "udp"
+        resolved_path.write_text(json.dumps(resolved))
+        renamed = {r.id: (r.status, r.detail)
+                   for r in checks.run_all(Path(tmp) / "udp-named")}
+        expect(named == renamed, "a source naming wire udp scores as one naming none")
+
+
+def _tcp_rules(root):
+    """The `wire` key and its load-time cross-check against the SUT config, the fault
+    predicates per wire, a partition recording its addresses, the driver recording every
+    wire's flag, and the shipped tcp-ingress scenario."""
+    path, raw = _base(root)
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    def with_config(text, wire, listener="statsd"):
+        """`load()`'s problems for statsd-vm with its SUT config replaced by `text` and its
+        source's `wire` set, None for no `wire` key."""
+        with tempfile.TemporaryDirectory() as tmp:
+            scenario_path = Path(tmp) / "scenario.toml"
+            changed = copy.deepcopy(raw)
+            for key, name in changed["configs"].items():
+                (Path(tmp) / name).write_text(
+                    text if key == "sut" else (path.parent / name).read_text())
+            changed["ledger"]["source"][0]["sut_listener"] = listener
+            if wire is not None:
+                changed["ledger"]["source"][0]["wire"] = wire
+            try:
+                scenario.from_dict(changed, scenario_path)
+                return []
+            except scenario.ScenarioError as err:
+                return err.problems
+
+    _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(wire="sctp")),
+             "ledger.source 1: `wire` must be one of udp, tcp, file", "an unknown wire")
+    _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(wire="tcp")),
+             "ledger.source 1: `wire` is tcp, but `sut_listener` 'statsd' is a statsd_in with "
+             "no transport:, a udp listener", "a TCP source on a UDP listener")
+    tcp_config = "components:\n  statsd:\n    type: statsd_in\n    transport: tcp  # lines\n"
+    problems = with_config(tcp_config, None)
+    expect(any("`wire` is udp, but `sut_listener` 'statsd' is a statsd_in over tcp, a tcp "
+               "listener" in p for p in problems),
+           f"a source naming no wire on a TCP listener is refused, got {problems}")
+    expect(with_config(tcp_config, "tcp") == [],
+           f"a TCP source on a TCP listener loads, got {with_config(tcp_config, 'tcp')}")
+    flow = "components:\n  statsd: { type: statsd_in, transport: udp, bind: 0.0.0.0:8125 }\n"
+    expect(with_config(flow, "udp") == [] and with_config(flow, None) == [],
+           "a flow-style UDP listener loads with wire udp or none")
+    lines_tcp = "components:\n  lines: { type: lines_in, bind: 0.0.0.0:5514 }  # transport: udp\n"
+    problems = with_config(lines_tcp, None, listener="lines")
+    expect(any("is a lines_in with no transport:, a tcp listener" in p for p in problems),
+           f"lines_in with no transport is TCP, and a comment isn't read, got {problems}")
+    problems = with_config(tcp_config, "tcp", listener="missing")
+    expect(any("`sut_listener` 'missing' isn't a component of the SUT config" in p
+               for p in problems),
+           f"a listener the SUT config lacks is refused, got {problems}")
+    unix = "components:\n  statsd: { type: statsd_in, transport: unix_stream, bind: /s }\n"
+    problems = with_config(unix, "tcp")
+    expect(any("is a statsd_in over unix_stream, which the ledger has no wire for" in p
+               for p in problems),
+           f"a transport with no wire is refused, got {problems}")
+    tailed = "components:\n  statsd: { type: tail_in, paths: [/shared/app.log] }\n"
+    problems = with_config(tailed, "file")
+    expect(problems == ["ledger.source 1: a file wire's `generator_sink` must be a file_out, "
+                        "and 'statsd' is a statsd_out"],
+           f"a tail_in source takes wire file, and its writer must be a file_out, got "
+           f"{problems}")
+
+    # The fault predicates per wire.
+    roles = scenario.BASE_ROLES
+    for action, on, udp, tcp, file in (
+            ("netem", "generator", True, False, False),
+            ("netem", "logit", False, True, False),
+            ("pause", "logit", True, True, True),
+            ("pause", "generator", False, True, False),
+            ("stop", "generator", False, True, False),
+            ("partition", "generator", True, True, False),
+            ("partition", "logit", True, True, False),
+            ("kill", "logit", True, True, True),
+            ("netem", "victoria-metrics", False, False, False),
+            ("stop", "victoria-metrics", False, False, False)):
+        step = scenario.Step("c0s1", 0, 0, action, on, "", 0, 1)
+        got = tuple(faults.ACTIONS[action].affects(wire, step, roles)
+                    for wire in ("udp", "tcp", "file"))
+        expect(got == (udp, tcp, file),
+               f"{action} on {on} affects (udp, tcp, file) {got}, expected {(udp, tcp, file)}")
+    for action, on, how in (("stop", "logit", "fault"), ("kill", "logit", "fault"),
+                            ("pause", "logit", "judged"), ("netem", "logit", "judged"),
+                            ("pause", "generator", "judged")):
+        fault = checks.Fault("x", action, on, 0, 1, affects_udp_ingress=True,
+                             affects_egress=False, affects_tcp_ingress=True)
+        expect(checks.wire_judgment(fault, "tcp") == how
+               and checks.wire_judgment(fault, "udp") == "fault",
+               f"a {action} on {on} is {checks.wire_judgment(fault, 'tcp')} on TCP")
+
+    # A partition records the addresses before its disconnect and after its reconnect.
+    class Networks:
+        def __init__(self):
+            self.address = "172.18.0.3"
+            self.calls = []
+
+        def inspect(self, container, timeout=None):
+            return {"NetworkSettings": {"Networks": {"soak": {
+                "Aliases": ["logit"], "IPAddress": self.address}}}}
+
+        def run(self, argv, timeout=None):
+            self.calls.append(argv)
+            if argv[:2] == ["network", "connect"]:
+                self.address = "172.18.0.5"
+            return docker.Result(0, "", "")
+
+    fake = Networks()
+    ctx = faults.Context(docker=fake, ids={"logit": "abc"}, netem_image="netem")
+    step = scenario.Step("c0s7", 6, 0, "partition", "logit", "", 0, 45)
+    applied = faults.partition_apply(ctx, step)
+    reverted = faults.partition_revert(ctx, step)
+    expect(applied["ips"] == {"soak": "172.18.0.3"}
+           and reverted["ips_after"] == {"soak": "172.18.0.5"}
+           and ["network", "connect", "--alias", "logit", "soak", "abc"] in fake.calls,
+           f"a partition records its addresses either side, got {applied}, {reverted}")
+    with tempfile.TemporaryDirectory() as tmp:
+        timeline = [_phase("start", 0, t0=T0),
+                    {**_action("apply", "c0s7", "partition", "logit", 10), **applied},
+                    {**_action("revert", "c0s7", "partition", "logit", 55), **reverted}]
+        data = checks.RunData(_run_dir(tmp, "partition-ips", timeline))
+        fault = data.faults[0]
+        expect(fault.ip_text() == "IP 172.18.0.3 -> 172.18.0.5",
+               f"the checks read a partition's addresses, got {fault.ip_text()!r}")
+
+    # The driver records each wire's flag on every action.
+    loaded = scenario.load(root / "scenarios" / "statsd-vm" / "scenario.toml")
+    run = driver.Run(root, loaded, 600, None, False, "/nonexistent", [], "logit:soak",
+                     roles=dict(roles))
+    run.timeline = _Records()
+    run.ctx = faults.Context(docker=None, ids={}, netem_image="netem")
+    run.t0 = 0.0
+    run.say = lambda text: None
+    run.after = lambda kind, step, result: None
+    run.act("apply", scenario.Step("c0s1", 0, 0, "mark", "logit", "", 0, 1))
+    record = run.timeline[-1]
+    expect(record.get("affects_udp_ingress") is True and record.get("affects_tcp_ingress") is True
+           and record.get("affects_file_ingress") is False,
+           f"the driver records every wire's flag, got {record}")
+
+    tcp = scenario.load(root / "scenarios" / "tcp-ingress" / "scenario.toml")
+    expect(tcp.sources[0].get("wire") == "tcp"
+           and [step.action for step in tcp.steps] == [
+               "netem", "netem", "netem", "pause", "stop", "kill", "partition", "pause"],
+           f"tcp-ingress names a TCP source and its eight faults, got {tcp.sources}")
+
+
+def _as_file_wire(run_dir, w_minus_g=0, counted=True, line_bytes=95, files_open=None):
+    """Turns a ledger fixture into a file-wire run in place: the listener's datagrams become
+    `logit.input.lines`, the generator's `output.messages` its `file_out`'s
+    `logit.component.events.delivered`, set so the run's W − G is `w_minus_g`, and the source
+    names `wire = "file"`. `counted` records the driver's `shared_counted` phase with G's lines
+    at `line_bytes` each (a dict replaces it). `files_open` is `{offset: n}` of
+    `logit.input.files.open` gauges written for the listener `in`."""
+    stdout = run_dir / "logs" / "logit.stdout"
+    out, w = [], 0
+    for line in stdout.read_text().splitlines():
+        record = json.loads(line)
+        if record["metrics"][0]["name"] == "logit.input.datagrams":
+            record["metrics"][0]["name"] = "logit.input.lines"
+            w += record["metrics"][0]["value"]
+        out.append(json.dumps(record))
+    for offset, n in (files_open or {}).items():
+        out.append(_line(_stamp(T0 + offset), "logit.input.files.open", "gauge", n,
+                         component="in"))
+    stdout.write_text("\n".join(out) + "\n")
+    g = w - w_minus_g
+    gen_path = run_dir / "logs" / "generator.stdout"
+    gen, first = [], True
+    for line in gen_path.read_text().splitlines():
+        record = json.loads(line)
+        name = record["metrics"][0]["name"]
+        if name == "logit.output.datagrams":
+            continue
+        if name == "logit.output.messages":
+            record["metrics"][0]["name"] = "logit.component.events.delivered"
+            record["metrics"][0]["value"] = 0
+            if first:
+                record["metrics"][0]["value"] = g
+                first = False
+        gen.append(json.dumps(record))
+    gen_path.write_text("\n".join(gen) + "\n")
+    if counted:
+        phase = (counted if isinstance(counted, dict)
+                 else {"files": 3, "lines": g, "bytes": g * line_bytes})
+        with open(run_dir / "timeline.jsonl", "a") as timeline:
+            timeline.write(json.dumps(_phase("shared_counted", 301, **phase)) + "\n")
+            timeline.write(json.dumps(_phase("tail_caught_up", 302, reached=True, w=w, g=g,
+                                             reads=2)) + "\n")
+    resolved_path = run_dir / "scenario.resolved.json"
+    resolved = json.loads(resolved_path.read_text())
+    resolved["ledger"]["source"] = [{**resolved["ledger"]["source"][0], "wire": "file"}]
+    resolved_path.write_text(json.dumps(resolved))
+    return run_dir
+
+
+def _file_ledger():
+    """The ledger on a file source: W from `input.lines` and G from the writer's
+    `events.delivered`, held to the shared directory's count; the run's W − G judged against
+    the replay band, a stopped life's split lines one per open file, and a killed life's
+    replay above and lost counts below; and `ledger.summary`'s end-to-end bound widened by the
+    band's upper edge."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def stopped(name, **kwargs):
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=30)
+            return {r.id: r for r in checks.run_all(_as_file_wire(run_dir, **kwargs))}
+
+        clean = stopped("file-clean")
+        for row in ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.egress",
+                    "ledger.summary", "drops"):
+            expect(clean[row].status == checks.PASS,
+                   f"{row} PASSes the balanced file-wire fixture, got {clean[row]}")
+        wire = clean["ledger.wire"].detail
+        expect(wire.startswith("G 54,030 (shared directory: 54,030 lines in 3 files) vs W "
+                               "54,030 + counted 0: W + F − G 0 against the replay band [0, 1]")
+               and "the tailers reached G" in wire,
+               f"a file source reads input.lines and events.delivered, got {wire}")
+        expect(any("life 0 (stopped): [0, +1]" in line for line in clean["ledger.wire"].lines),
+               f"a stopped life allows one split line per file, got {clean['ledger.wire'].lines}")
+        split = stopped("file-split", w_minus_g=1)
+        expect(split["ledger.wire"].status == checks.PASS,
+               f"one split line at a stop is inside the band, got {split['ledger.wire']}")
+        over = stopped("file-surplus", w_minus_g=2)
+        expect(over["ledger.wire"].status == checks.FAIL
+               and over["ledger.wire"].detail.startswith(
+                   "W + F − G 2 is surplus, outside the replay band [0, 1]"),
+               f"a surplus past the band FAILs, got {over['ledger.wire']}")
+        wider = stopped("file-files-open", w_minus_g=3, files_open={100: 3})
+        expect(wider["ledger.wire"].status == checks.PASS
+               and "[0, 3]" in wider["ledger.wire"].detail,
+               f"a stopped life with three files open allows three splits, got "
+               f"{wider['ledger.wire']}")
+        lost = stopped("file-lost", w_minus_g=-1)
+        expect(lost["ledger.wire"].status == checks.FAIL
+               and lost["ledger.wire"].detail.startswith(
+                   "W + F − G -1 is uncounted loss, outside the replay band [0, 1]"),
+               f"a line never read FAILs, got {lost['ledger.wire']}")
+        missing = stopped("file-uncounted", counted=False)
+        expect(missing["ledger.wire"].status == checks.FAIL
+               and "precondition: no shared_counted phase" in missing["ledger.wire"].detail,
+               f"a run with no shared count FAILs, got {missing['ledger.wire']}")
+        mismatch = stopped("file-mismatch", counted={"files": 3, "lines": 54_000,
+                                                     "bytes": 5_130_000})
+        expect(mismatch["ledger.wire"].status == checks.FAIL
+               and "the shared directory holds 54,000 line(s) in 3 file(s), but the writer's "
+               "events.delivered is 54,030" in mismatch["ledger.wire"].detail,
+               f"G short of the shared directory's count FAILs, got {mismatch['ledger.wire']}")
+
+        # A killed life at 200 lines/s, 5 s drains, and a 5 s checkpoint_interval: below, 1,000
+        # lost counts; above, 1,000 lines plus two files x 690 lines a 64 KiB read holds at 95
+        # bytes a line; the stopped life adds one split.
+        def killed(name, w_minus_g, no_drains=None):
+            run_dir = _kill_run(tmp, name, every_window=False, no_drains=no_drains)
+            return {r.id: r for r in checks.run_all(_as_file_wire(run_dir,
+                                                                  w_minus_g=w_minus_g))}
+
+        edge = killed("file-kill-high", 2_381)
+        lines = "\n".join(edge["ledger.wire"].lines)
+        expect(edge["ledger.wire"].status == checks.PASS
+               and "against the replay band [-1,000, 2,381]" in edge["ledger.wire"].detail
+               and "life 1 (killed): [-1,000, +2,380]: 200 lines/s x a 5s drain interval below"
+               in lines and "2 file(s) x one 64 KiB read of 690 lines above" in lines,
+               f"a killed life's replay band, got {edge['ledger.wire']}")
+        past = killed("file-kill-over", 2_382)
+        expect(past["ledger.wire"].status == checks.FAIL,
+               f"a replay past the band FAILs, got {past['ledger.wire']}")
+        short = killed("file-kill-low", -1_000)
+        expect(short["ledger.wire"].status == checks.PASS,
+               f"a killed life's lost counts inside the band pass, got {short['ledger.wire']}")
+        shorter = killed("file-kill-lost", -1_001)
+        expect(shorter["ledger.wire"].status == checks.FAIL,
+               f"loss past a killed life's band FAILs, got {shorter['ledger.wire']}")
+        # V holds the replayed lines too, so it exceeds G less counted loss by up to the band,
+        # and the bound's label names the band.
+        expect(edge["ledger.summary"].status == checks.PASS
+               and "plus the replay band's 2,381" in edge["ledger.summary"].detail
+               and "<= G − counted + replay " in edge["ledger.summary"].detail,
+               f"the end-to-end bound adds the band's upper edge, got "
+               f"{edge['ledger.summary'].detail}")
+
+        # A killed life with one drain, at +200, has no drain interval to take a rate from:
+        # all of that drain's 1,000 lines can replay, plus the two files' reads.
+        young = killed("file-kill-one-drain", 2_381, no_drains=(134, 200))
+        expect(young["ledger.wire"].status == checks.PASS
+               and "against the replay band [-1,000, 2,381]" in young["ledger.wire"].detail
+               and any("life 1 (killed): [-1,000, +2,380]: one drain, so its W of 1,000 lines "
+                       "can all replay" in line for line in young["ledger.wire"].lines),
+               f"a killed life with one drain may replay all of its W, got "
+               f"{young['ledger.wire']} {young['ledger.wire'].lines}")
+        young_over = killed("file-kill-one-drain-over", 2_382, no_drains=(134, 200))
+        expect(young_over["ledger.wire"].status == checks.FAIL,
+               f"a replay past a one-drain life's W FAILs, got {young_over['ledger.wire']}")
+        # A checkpoint after that drain can commit up to about one drain's reads the kill
+        # never exported: a shortfall of the drain's W passes, one line more FAILs.
+        young_short = killed("file-kill-one-drain-short", -1_000, no_drains=(134, 200))
+        expect(young_short["ledger.wire"].status == checks.PASS,
+               f"a one-drain life may fall short by its W, got {young_short['ledger.wire']}")
+        young_lost = killed("file-kill-one-drain-lost", -1_001, no_drains=(134, 200))
+        expect(young_lost["ledger.wire"].status == checks.FAIL,
+               f"a shortfall past a one-drain life's W FAILs, got {young_lost['ledger.wire']}")
+
+    # The driver's line count: newlines only, every file, a partial write left out.
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "app.log").write_text("a\nb\nc")
+        (Path(tmp) / "app.log.1").write_text("d\ne\n")
+        counted = collect.count_lines(tmp)
+        expect(counted == {"files": 2, "lines": 4, "bytes": 9},
+               f"count_lines counts newlines across every file, got {counted}")
+
+
+def _file_rules(root):
+    """A file wire's writer must be a `file_out`, and only a file wire's may be; the driver's
+    shared directory and its compose variable; and its wait for the tailers, which ends when W
+    reaches the shared count or stops growing."""
+    tail = scenario.load(root / "scenarios" / "tail-rotate" / "scenario.toml")
+    expect([source["wire"] for source in tail.file_sources] == ["file"],
+           f"tail-rotate's one source is a file wire, got {tail.file_sources}")
+    with tempfile.TemporaryDirectory() as tmp:
+        tail_dir = Path(tmp) / "tail-rotate"
+        shutil.copytree(root / "scenarios" / "tail-rotate", tail_dir)
+        config = tail_dir / "logit-generator.yaml"
+        config.write_text(config.read_text().replace("type: file_out", "type: stdio_out"))
+        try:
+            scenario.load(tail_dir / "scenario.toml")
+            expect(False, "a file wire whose writer isn't a file_out loads")
+        except scenario.ScenarioError as err:
+            expect(any("a file wire's `generator_sink` must be a file_out, and 'file' is a "
+                       "stdio_out" in p for p in err.problems),
+                   f"a file wire's writer must be a file_out, got {err.problems}")
+        config.write_text(config.read_text().replace("type: stdio_out", "type: file_out"))
+        toml = tail_dir / "scenario.toml"
+        toml.write_text(toml.read_text().replace('wire = "file"', ""))
+        try:
+            scenario.load(toml)
+            expect(False, "a file_out writer on a source with no wire loads")
+        except scenario.ScenarioError as err:
+            expect(any("`generator_sink` 'file' is a file_out, which only a file wire reads"
+                       in p for p in err.problems),
+                   f"a file_out writer needs a file wire, got {err.problems}")
+
+        run = driver.Run(root, tail, tail.duration, None, False, tmp, [], "logit:soak",
+                         roles=_override_roles(tail))
+        run.prepare()
+        shared = run.run_dir / "shared"
+        env = (run.run_dir / "compose.env").read_text()
+        expect(shared.is_dir() and (shared.stat().st_mode & 0o777) == 0o777
+               and f"SOAK_SHARED_DIR={shared.resolve()}\n" in env,
+               f"prepare() makes a 0777 shared directory and names it, got {env}")
+        override = tail.compose_path().read_text()
+        expect(override.count("${SOAK_SHARED_DIR:?") == 2,
+               "tail-rotate's override mounts the shared directory into both services")
+
+        # The wait: W read from captured chunks reaches the shared count, or stops growing.
+        (shared / "app.log").write_text("x\n" * 10)
+        stdout = run.run_dir / "logs" / "logit.stdout"
+
+        class Capture:
+            def __init__(self, deltas):
+                self.deltas = list(deltas)
+                self.offset = 0
+
+            def chunk(self, ids):
+                delta = self.deltas.pop(0) if self.deltas else 0
+                self.offset += 5
+                with open(stdout, "a") as out:
+                    out.write(_line(_stamp(T0 + self.offset), "logit.process.uptime", "gauge",
+                                    float(self.offset)) + "\n")
+                    out.write(_line(_stamp(T0 + self.offset), "logit.input.lines", "sum",
+                                    delta, component="tail") + "\n")
+
+        clock = [1000.0]
+        reals = (driver._now, driver.time.sleep)
+        driver._now = lambda: clock[0]
+        driver.time.sleep = lambda s: clock.__setitem__(0, clock[0] + s)
+        try:
+            run.ids = {"logit": "a"}
+            run.t0 = clock[0]
+            run.timeline = _Records()
+            run.capture = Capture([4, 4, 2])
+            run.wait_tailed()
+            reached = run.timeline[-1]
+            stdout.write_text("")
+            run.timeline = _Records()
+            run.capture = Capture([4, 3])
+            run.wait_tailed()
+            held = run.timeline[-1]
+        finally:
+            driver._now, driver.time.sleep = reals
+        expect(run.timeline[0]["phase"] == "shared_counted"
+               and run.timeline[0]["lines"] == 10 and run.timeline[0]["files"] == 1,
+               f"the wait counts the shared lines first, got {run.timeline[0]}")
+        expect(reached["phase"] == "tail_caught_up" and reached["reached"] is True
+               and reached["w"] == 10 and reached["reads"] == 3,
+               f"the wait ends once W reaches the shared count, got {reached}")
+        expect(held["reached"] is False and held.get("held") is True and held["w"] == 7,
+               f"the wait ends once W holds short of it, got {held}")
+
+
 def _two_sut_dir(root, tmp, interval="7s"):
     """A copy of statsd-vm in `tmp` whose `[configs]` adds `collector`, a further SUT service,
     with its own config: statsd-vm's SUT config with `aggregate`'s window set to `interval`."""
@@ -5196,6 +5883,45 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
     return run_dir
 
 
+def _tcp_hop_run(tmp, name, extra, ambiguous_at=None):
+    """`_two_sut_run`'s unkilled one-life hop run with its one source on a TCP wire: `logit`
+    counts `input.frames` in place of datagrams, the generator counts no `output.datagrams`,
+    `extra` lines reach V as surplus, and one `ambiguous_at_most_once` batch drop is counted on
+    the generator's sink at that offset when `ambiguous_at` is set."""
+    run_dir = _two_sut_run(tmp, name, kill_on=None, collector_lives=1, extra=extra)
+
+    def rewrite(path, edit):
+        out = []
+        for line in path.read_text().splitlines():
+            record = json.loads(line)
+            for one in edit(record):
+                out.append(json.dumps(one))
+        path.write_text("\n".join(out) + "\n")
+
+    def sut(record):
+        if record["metrics"][0]["name"] == "logit.input.datagrams":
+            record["metrics"][0]["name"] = "logit.input.frames"
+        return [record]
+
+    def gen(record):
+        name = record["metrics"][0]["name"]
+        if name == "logit.output.datagrams":
+            return []
+        if (name == "logit.component.events.sent" and ambiguous_at is not None
+                and record["timestamp"] == _stamp(T0 + ambiguous_at)):
+            return [record, json.loads(_line(
+                record["timestamp"], "logit.component.batches.dropped", "sum", 1,
+                component="out", attrs={"reason": "ambiguous_at_most_once"}))]
+        return [record]
+
+    rewrite(run_dir / "logs" / "logit.stdout", sut)
+    rewrite(run_dir / "logs" / "generator.stdout", gen)
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    resolved["ledger"]["source"] = [{**resolved["ledger"]["source"][0], "wire": "tcp"}]
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    return run_dir
+
+
 def _two_sut_checks():
     """The checks across a native hop: each service's lives come from its own telemetry and the
     starts the timeline gives it, so a kill on `collector` makes two lives there and leaves
@@ -5298,6 +6024,26 @@ def _two_sut_checks():
                    "− counted 60,000, a surplus of 1"),
                f"ledger.summary FAILs a surplus end to end that every per-life term balances, "
                f"got {exact['ledger.summary']}")
+        # A write that failed partway leaves whole lines in V that G doesn't count: one
+        # generator batch per ambiguous drop on a TCP wire, none on UDP.
+        def tcp_hop(name, extra, ambiguous_at=None):
+            return {r.id: r for r in checks.run_all(
+                _tcp_hop_run(tmp, name, extra, ambiguous_at))}
+
+        partial = tcp_hop("two-tcp-partial", 100, ambiguous_at=150)
+        expect(partial["ledger.summary"].status == checks.PASS
+               and "end to end over the run, G 60,000 less counted loss 0 and a partial-frame "
+               "allowance 100: sink: V 60,100 <= G − counted + partial 60,100"
+               in partial["ledger.summary"].detail,
+               f"one ambiguous drop on a TCP source allows one batch of surplus end to end, "
+               f"got {partial['ledger.summary']}")
+        beyond_partial = tcp_hop("two-tcp-partial-beyond", 101, ambiguous_at=150)
+        expect(beyond_partial["ledger.summary"].status == checks.FAIL
+               and "sink: V 60,101 > G − counted + partial 60,100, a surplus of 1"
+               in beyond_partial["ledger.summary"].detail,
+               f"a surplus past the ambiguous allowance FAILs, got "
+               f"{beyond_partial['ledger.summary']}")
+
         short = hop_row("two-short", kill_on=None, collector_lives=1, short=10)
         expect(short["ledger.hop"].status == checks.FAIL
                and "= 10, uncounted" in short["ledger.hop"].detail,
@@ -6573,7 +7319,9 @@ def run(root, quiet=False):
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
                      _report, _expected_event_rules, _exit_driver, _ready_words, _exit_watchdog,
                      _script_ledger, _sink_ledger, _roles, _sink_rules, _driver_roles,
-                     _sources_ledger, _source_rules, _fanin_driver, _two_sut_rules,
+                     _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
+                     _file_ledger, _file_rules,
+                     _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _per_service, _slope_edges,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
                      _standin_server, _respond_rules, _standin_driver, _standin_checks,
@@ -6583,7 +7331,8 @@ def run(root, quiet=False):
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
-                              _fanin_driver, _two_sut_rules, _two_sut_driver,
+                              _fanin_driver, _tcp_rules, _file_rules, _two_sut_rules,
+                              _two_sut_driver,
                               _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
                               _datadog_rules)

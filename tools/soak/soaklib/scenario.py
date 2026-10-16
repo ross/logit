@@ -115,8 +115,8 @@ CLASSED_ACTIONS = ("respond", "stop")
 NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart", "exit")
 
 TOP_LEVEL_KEYS = {
-    "name", "description", "duration", "warmup", "cooldown", "recovery_bound", "cycle",
-    "configs", "ledger", "thresholds", "step", "expect", "random", "target", "compose",
+    "name", "description", "duration", "max_duration", "warmup", "cooldown", "recovery_bound",
+    "cycle", "configs", "ledger", "thresholds", "step", "expect", "random", "target", "compose",
     "expected",
 }
 # The local target, the default; the kind with no backend query; and the local Kafka broker,
@@ -158,11 +158,30 @@ OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script", "split", "hop"}
 HOP_KEYS = {"from", "sink", "to", "listener"}
 # The `[ledger]` keys a `[[ledger.source]]` table replaced, refused with a pointer to it.
 SOURCE_LEDGER_KEYS = ("generator_input", "generator_sink", "sut_listener")
-# A `[[ledger.source]]`: the generator service, its `generate_in` and UDP sink, the SUT listener
-# its datagrams reach, and, optionally, the transforms between that listener and `aggregate`,
-# each of which must forward every event it receives.
+# A `[[ledger.source]]`: the generator service, its `generate_in` and sink, the SUT listener its
+# lines reach, and, optionally, the wire they cross and the transforms between that listener
+# and `aggregate`, each of which must forward every event it receives.
 SOURCE_KEYS = {"service", "generator_input", "generator_sink", "sut_listener"}
-OPTIONAL_SOURCE_KEYS = {"sut_transforms"}
+OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire"}
+# The wires a source's lines can cross into the SUT, each with its own ledger symbols
+# (checks.py's `WIRES`): datagrams, a TCP stream of LF-terminated lines, or a file the SUT tails.
+WIRES = ("udp", "tcp", "file")
+DEFAULT_WIRE = "udp"
+FILE_WIRE = "file"
+# A file wire's writer: the only generator sink whose G is `events.delivered` (checks.py's
+# `WIRES`), since it counts no `output.messages`.
+FILE_WRITER_KIND = "file_out"
+# Each listener kind the ledger can follow: the wire it takes with no `transport:`, and the
+# wire each `transport:` value it accepts gives. A kind or transport missing here has no wire.
+LISTENER_WIRES = {
+    "statsd_in": ("udp", {"udp": "udp", "tcp": "tcp"}),
+    "syslog_in": ("udp", {"udp": "udp", "tcp": "tcp"}),
+    "lines_in": ("tcp", {"udp": "udp", "tcp": "tcp"}),
+    "graphite_in": ("tcp", {"udp": "udp", "tcp": "tcp"}),
+    "collectd_in": ("udp", {}),
+    "tail_in": ("file", {}),
+    "docker_in": ("file", {}),
+}
 # A generator's service name, which also names its config's compose variable
 # (`config_env()`), so it is a slug.
 _SERVICE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -192,6 +211,13 @@ VERDICTS = ("PASS", "WARN", "FAIL")
 METRIC_KINDS = {
     "logit.input.datagrams": "sum",
     "logit.input.kernel.dropped": "sum",
+    "logit.input.frames": "sum",
+    "logit.input.frames.dropped": "sum",
+    "logit.input.connections.closed": "sum",
+    "logit.input.lines": "sum",
+    "logit.input.files.rotated": "sum",
+    "logit.input.files.resume_rejected": "sum",
+    "logit.input.checkpoint.errors": "sum",
     "logit.component.datagrams.dropped": "sum",
     "logit.component.batches.dropped": "sum",
     "logit.component.batches.delivered": "sum",
@@ -431,6 +457,8 @@ class Scenario:
     compose: object = None
     # `[expected]`: `{row id: {service: verdict}}`.
     expected: dict = field(default_factory=dict)
+    # `max_duration`: the longest run the scenario's thresholds and configs hold, or None.
+    max_duration: object = None
 
     @property
     def external(self):
@@ -469,6 +497,12 @@ class Scenario:
     def sources(self):
         """The `[[ledger.source]]` tables, in order."""
         return list(self.ledger.get("source") or [])
+
+    @property
+    def file_sources(self):
+        """The `[[ledger.source]]` tables whose `wire` is `file`, which the driver gives a
+        shared directory and waits on at the end."""
+        return [source for source in self.sources if source.get("wire") == FILE_WIRE]
 
     @property
     def generators(self):
@@ -587,6 +621,7 @@ def from_dict(raw, path):
     name = need(raw, "name", "scenario") or ""
     description = raw.get("description", "")
     duration = dur(raw, "duration", "scenario")
+    max_duration = dur(raw, "max_duration", "scenario") if "max_duration" in raw else None
     warmup = dur(raw, "warmup", "scenario")
     cooldown = dur(raw, "cooldown", "scenario")
     recovery_bound = dur(raw, "recovery_bound", "scenario")
@@ -664,6 +699,10 @@ def from_dict(raw, path):
     if isinstance(ledger, dict):
         problems += _sink_problems(ledger, target["kind"])
         problems += _source_problems(ledger)
+        sut_config = configs.get(SUT_CONFIG_KEY) if isinstance(configs, dict) else None
+        if isinstance(sut_config, str) and (path.parent / sut_config).is_file():
+            problems += _wire_problems(ledger, (path.parent / sut_config).read_text())
+        problems += _writer_problems(ledger, configs, path.parent)
         problems += _extra_sut_problems(extra_suts, ledger)
         problems += _hop_problems(ledger, extra_suts)
 
@@ -736,6 +775,7 @@ def from_dict(raw, path):
         cooldown=cooldown, recovery_bound=recovery_bound, cycle=cycle, configs=configs,
         ledger=ledger, thresholds=thresholds, steps=steps, expectations=expectations,
         random=random_spec, target=target, compose=compose, expected=expected,
+        max_duration=max_duration,
     )
     if problems:
         raise ScenarioError(problems)
@@ -840,6 +880,104 @@ def _sink_problems(ledger, kind):
     return problems
 
 
+def component_blocks(text, component):
+    """Each `<component>:` line's text in a YAML config, block or flow style: the rest of the
+    line and every deeper-indented line after it."""
+    lines = (text or "").splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(rf"^(\s*){re.escape(component)}\s*:(.*)$", line)
+        if not match:
+            continue
+        indent = len(match.group(1))
+        block = [match.group(2)]
+        for following in lines[index + 1:]:
+            if following.strip() and len(following) - len(following.lstrip()) <= indent:
+                break
+            block.append(following)
+        yield "\n".join(block)
+
+
+def listener_wire(text, component):
+    """`(wire, kind, transport)` for SUT listener `component` in config `text`: the wire its
+    `type:` and `transport:` give (`LISTENER_WIRES`), or None for a kind or transport the ledger
+    has no wire for; `(None, None, None)` when no block of `component` names a `type:`. Comments
+    are ignored."""
+    for block in component_blocks(text, component):
+        body = "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in block.splitlines())
+        kind = re.search(r"\btype\s*:\s*[\"']?([a-z_]+)", body)
+        if not kind:
+            continue
+        found = re.search(r"\btransport\s*:\s*[\"']?([a-z_]+)", body)
+        transport = found.group(1) if found else None
+        default, by_transport = LISTENER_WIRES.get(kind.group(1), (None, {}))
+        wire = default if transport is None else by_transport.get(transport)
+        return wire, kind.group(1), transport
+    return None, None, None
+
+
+def _wire_problems(ledger, sut_text):
+    """What each `[[ledger.source]]`'s `wire` breaks against the SUT config `sut_text`: its
+    `sut_listener` must be a component there, of a kind and transport `LISTENER_WIRES` gives a
+    wire for, and that wire must be the source's own, `udp` when it names none."""
+    sources = ledger.get("source")
+    if not isinstance(sources, list):
+        return []
+    problems = []
+    for index, source in enumerate(sources):
+        listener = source.get("sut_listener") if isinstance(source, dict) else None
+        if not isinstance(listener, str) or not _COMPONENT_ID.match(listener):
+            continue
+        where = f"ledger.source {index + 1}"
+        declared = source.get("wire", DEFAULT_WIRE)
+        wire, kind, transport = listener_wire(sut_text, listener)
+        over = f"over {transport}" if transport else "with no transport:"
+        if kind is None:
+            problems.append(f"{where}: `sut_listener` {listener!r} isn't a component of the "
+                            "SUT config")
+        elif wire is None:
+            problems.append(f"{where}: `sut_listener` {listener!r} is a {kind} {over}, which "
+                            "the ledger has no wire for")
+        elif declared in WIRES and wire != declared:
+            problems.append(f"{where}: `wire` is {declared}, but `sut_listener` {listener!r} "
+                            f"is a {kind} {over}, a {wire} listener")
+    return problems
+
+
+def _writer_problems(ledger, configs, directory):
+    """What a source's `generator_sink` breaks against its generator's config: on a `file`
+    wire it must be a `file_out`, and on any other wire it must not be, because the two read G
+    from different counters."""
+    sources = ledger.get("source")
+    if not isinstance(sources, list) or not isinstance(configs, dict):
+        return []
+    problems = []
+    for index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            continue
+        service, sink = source.get("service"), source.get("generator_sink")
+        name = configs.get(service) if isinstance(service, str) else None
+        if (not isinstance(name, str) or not isinstance(sink, str)
+                or not (directory / name).is_file()):
+            continue
+        kind = None
+        for block in component_blocks((directory / name).read_text(), sink):
+            body = "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in block.splitlines())
+            found = re.search(r"\btype\s*:\s*[\"']?([a-z_]+)", body)
+            if found:
+                kind = found.group(1)
+                break
+        where = f"ledger.source {index + 1}"
+        wire = source.get("wire", DEFAULT_WIRE)
+        if wire == FILE_WIRE and kind != FILE_WRITER_KIND:
+            problems.append(f"{where}: a file wire's `generator_sink` must be a "
+                            f"{FILE_WRITER_KIND}, and {sink!r} is "
+                            + (f"a {kind}" if kind else "no component of its config"))
+        elif wire != FILE_WIRE and kind == FILE_WRITER_KIND:
+            problems.append(f"{where}: `generator_sink` {sink!r} is a {FILE_WRITER_KIND}, "
+                            "which only a file wire reads")
+    return problems
+
+
 def _source_problems(ledger):
     """What the `[[ledger.source]]` tables break: at least one, each a table of known keys with
     every required key a component id, a distinct generator `service` that is a slug whose
@@ -881,6 +1019,8 @@ def _source_problems(ledger):
             value = source.get(key)
             if key in source and (not isinstance(value, str) or not _COMPONENT_ID.match(value)):
                 problems.append(f"{where}: `{key}` must name a component id")
+        if "wire" in source and source["wire"] not in WIRES:
+            problems.append(f"{where}: `wire` must be one of {', '.join(WIRES)}")
         listener = source.get("sut_listener")
         if isinstance(listener, str) and _COMPONENT_ID.match(listener):
             if listener in listeners:
@@ -989,6 +1129,10 @@ SUT_CONFIG_ENV = "SOAK_SUT_CONFIG"
 # The compose variable holding a stand-in target's shape, set in `compose.env`; compose.yaml
 # passes it to standin.py's `--shape`.
 STANDIN_SHAPE_ENV = "SOAK_STANDIN_SHAPE"
+# A file wire's shared directory, `<run>/shared`, and the compose variable holding its path,
+# which a scenario's override mounts into the writer and the SUT.
+SHARED_DIR = "shared"
+SHARED_DIR_ENV = "SOAK_SHARED_DIR"
 
 
 def config_env(service):
@@ -1325,6 +1469,12 @@ def validate(scenario, duration=None, seed=None):
         problems.append(
             f"duration {format_duration(run_duration)} leaves no time between warmup "
             f"{format_duration(scenario.warmup)} and cooldown {format_duration(scenario.cooldown)}"
+        )
+    if scenario.max_duration is not None and run_duration > scenario.max_duration:
+        problems.append(
+            f"duration {format_duration(run_duration)} is longer than the scenario's "
+            f"max_duration {format_duration(scenario.max_duration)}, the longest run its "
+            "thresholds and configs hold"
         )
     if duration is None and scenario.steps and scenario.warmup + scenario.cycle > quiet_end:
         problems.append(
@@ -1723,7 +1873,7 @@ def service_problems(scenario, roles):
     for service in generators(roles):
         if service not in sourced:
             problems.append(f"generator service {service} has no [[ledger.source]], so the "
-                            "ledger would read its datagrams with no G behind them")
+                            "ledger would read its lines with no G behind them")
     for index, sink in enumerate(scenario.sinks):
         backend = sink.get("backend")
         if backend is not None and roles.get(backend) != BACKEND_ROLE:

@@ -216,3 +216,22 @@ def service_inspect(run_dir, docker, ids):
         if config.get("Env"):
             config["Env"] = [f"{entry.partition('=')[0]}=<redacted>" for entry in config["Env"]]
         (out / f"{service}.json").write_text(json.dumps(info, indent=2, sort_keys=True) + "\n")
+
+
+def count_lines(directory):
+    """`{files, lines, bytes}` over every regular file in `directory`: a file wire's writer's
+    lines, counted outside both processes. A line is a newline; a write the writer never
+    finished leaves no newline, so it isn't one."""
+    files = lines = size = 0
+    for path in sorted(Path(directory).iterdir()) if Path(directory).is_dir() else ():
+        if not path.is_file():
+            continue
+        files += 1
+        with open(path, "rb") as handle:
+            while True:
+                block = handle.read(1 << 20)
+                if not block:
+                    break
+                lines += block.count(b"\n")
+                size += len(block)
+    return {"files": files, "lines": lines, "bytes": size}

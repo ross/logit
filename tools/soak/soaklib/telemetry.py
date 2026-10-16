@@ -197,18 +197,26 @@ def assign_lives(telemetry):
     )
     starts = []
     previous = None
+    # The life each drain's uptime point is in: every point of a drain shares its timestamp.
+    life_of_drain = {}
     for ts, uptime in uptimes:
         if previous is None or uptime < previous:
             starts.append(ts - uptime)
         previous = uptime
+        life_of_drain.setdefault(ts, len(starts) - 1)
     telemetry.life_starts = starts
     telemetry.drains = sorted({ts for ts, _ in uptimes})
-    # A drain's timestamp can precede `ts - uptime` by the uptime's rounding, so a point
-    # belongs to the newest life that started at most 1 s after it.
+    # A point at a drain is in that drain's life. A `restart` can start the next process
+    # within a second of the old one's final drain, so the old drain can't be placed by
+    # comparing its timestamp with the new life's start. A point at no drain belongs to the
+    # newest life that started at most 1 s after it, since a drain's timestamp can precede
+    # `ts - uptime` by the uptime's rounding.
     shifted = [start - 1.0 for start in starts]
     ordered = all(a <= b for a, b in zip(shifted, shifted[1:]))
     for point in telemetry.points:
-        if ordered:
+        if point.ts in life_of_drain:
+            point.life = life_of_drain[point.ts]
+        elif ordered:
             point.life = max(0, bisect.bisect_right(shifted, point.ts) - 1)
         else:
             point.life = max((i for i, s in enumerate(shifted) if point.ts >= s), default=0)

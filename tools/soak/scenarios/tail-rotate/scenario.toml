@@ -1,0 +1,112 @@
+# A writer's rotating file tailed by `logit` through a directory the two share, out to
+# VictoriaMetrics from a disk spool, under a pause, a stop, a restart, and two kills of the SUT.
+# The writer rotates about every 44 s and keeps every file a run up to `max_duration` writes, so
+# nothing unread is deleted. A kill replays what the tailer read after its last checkpoint, and
+# a stop splits the line it held unterminated, both inside `ledger.wire`'s replay band. The
+# schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "tail-rotate"
+description = "writer -> file_out (rotating) -> tail_in -> json -> aggregate 10s cumulative -> prometheus_out RW1 zstd (disk spool) -> VictoriaMetrics"
+duration = "13m45s"       # warmup + one cycle + cooldown; --duration overrides
+# The writer rotates about every 44 s and the tailer holds every file open, so the SUT gains
+# about one descriptor per rotation: 25 minutes is about 34 rotations, inside fd_growth's 40,
+# and two whole cycles. It's far inside the writer's retention: max_files 100 x 4 MiB lasts
+# about 74 minutes before file_out deletes a file the end count would miss.
+max_duration = "25m"
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "10m45s"          # >= last recovery (9m45s) + 2 x progress_window
+compose = "compose.override.yaml"   # mounts the shared directory into the writer and the SUT
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+vm_every_window = true    # one series, written in every window the tailer reads in
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "file"   # a file_out: G is its events.delivered
+sut_listener = "tail"
+wire = "file"             # W is input.lines; judged against the replay band
+sut_transforms = ["parse", "labels", "count", "metrics_only"]   # tail to aggregate, in order
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__="soak_lines_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+# The wildcard matches every rotated name, and the writer keeps every file, so the tailer holds
+# each one open at its end: about one more descriptor per rotation, some 20 over the default
+# run and some 34 at `max_duration`.
+fd_growth = 40
+
+# The tailer stops reading; the writer doesn't, so it catches up after.
+[[step]]
+at = "0s"
+action = "pause"
+on = "logit"
+for = "60s"
+
+# A clean stop writes a final checkpoint: nothing replays, and a line held unterminated splits.
+[[step]]
+at = "2m"
+action = "stop"
+on = "logit"
+for = "30s"
+
+[[step]]
+at = "3m30s"
+action = "restart"
+on = "logit"
+for = "30s"
+
+# A SIGKILL writes no final checkpoint: what was read after the last one replays. The longer
+# kill spans about three rotations, whose files the restarted tailer finds under their new
+# names.
+[[step]]
+at = "5m"
+action = "kill"
+on = "logit"
+for = "30s"
+
+[[step]]
+at = "6m30s"
+action = "kill"
+on = "logit"
+for = "150s"
+
+[[expect]]
+name = "files-rotated"
+service = "logit"
+metric = "logit.input.files.rotated"
+component = "tail"
+window = "run"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "no-resume-rejected"
+service = "logit"
+metric = "logit.input.files.resume_rejected"
+component = "tail"
+window = "run"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-checkpoint-errors"
+service = "logit"
+metric = "logit.input.checkpoint.errors"
+component = "tail"
+window = "run"
+reduce = "delta"
+max = 0

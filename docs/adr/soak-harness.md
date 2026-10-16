@@ -304,3 +304,44 @@ kill can loosen: V over the whole run is at most what the generators sent less e
 loss. A surplus past the hop breaks it once it exceeds the run's uncounted loss, the wire loss
 among it; `ledger.hop` judges a smaller one.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "The native hop (W10b)", has the rules.
+
+## Amendment: each source has a wire, and TCP is judged where nothing resets it (2026-10-15)
+
+The load source no longer has to send UDP. A `[[ledger.source]]` names its `wire`: `udp`, the
+default, `tcp`, or `file`. The loader checks it against the listener's `type:` and `transport:`
+in the SUT config, so a source is never scored in another wire's unit. The unit stays a line,
+and each wire has its own symbols. On TCP, G is still the generator sink's `output.messages`,
+which `statsd_out` counts only once a batch's write completes, and the sink must count no
+datagram. W is the listener's `input.frames`, one per line. The framer's own drops,
+lines W never counted, are F, counted wire loss. On a file wire G is the writer `file_out`'s `events.delivered` and W the tailer's
+`input.lines`.
+
+TCP narrows what "uncounted by design" covers. TCP retransmits what netem drops, so netem on the
+generator is judged at 0, not excused. A fault window is reported, not judged, only when the
+fault can reset the connection with lines in its socket buffers: a stop, kill, restart, or
+`exit`, or a partition after which Docker gave the container another address, so the driver
+records the address on each side of every partition. Every other window that can affect a TCP
+wire (netem on the SUT, whose egress carries the ACKs, a pause, a partition that kept the
+address) is judged with steady state's limit and edge tolerance, plus a surplus of one generator
+batch per `ambiguous_at_most_once` drop counted in it: a write that failed partway leaves whole
+lines the SUT reads, and `statsd_out`'s `at_most_once` posture drops the batch, uncounted in G.
+Reporting every TCP-affecting window, as UDP's are, would leave unjudged the claim the
+`tcp-ingress` scenario exists to make, that TCP ingress loses nothing a reset doesn't explain.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "The ledger and identities", has the
+symbols per wire, and its `ledger.wire` row the rules.
+
+## Amendment: a file wire's writer and tailer share a directory in the run directory (2026-10-15)
+
+A `file` wire's writer and the SUT that tails it need a directory both can write and read, and
+the harness needs the writer's files after the run, to count G outside both processes. The
+driver creates `<run>/shared` with mode 0777, because the image's unprivileged user has a uid
+the host doesn't know, and the scenario's override mounts it into both. This reverses "nothing
+in a container writes to the run directory" for these scenarios only. The alternatives were a
+named volume, which compose removes with the stack and leaves nothing to count, and the
+writer's own telemetry alone, which is the count the shared directory exists to check. A file
+wire is judged on the run's W − G against a replay band per SUT life, not per drain interval,
+because a tailer reads behind its writer: a kill replays what was read after the last checkpoint
+and loses the counts of the last drain interval, and a clean stop splits a line held
+unterminated ([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md)). The band belongs on the
+wire and on `ledger.summary`'s end-to-end bound, not on the killed life's egress band, which is
+read from `aggregate`'s window.

@@ -213,6 +213,8 @@ for = "45s"
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
 - A scenario has `cycle` with `[[step]]` tables or a `[random]` table (W4), never both.
   `--seed` is refused for a fixed schedule, because no seed changes it.
+- `max_duration` (W11b), optional, is the longest run a scenario's thresholds and configs
+  hold. A `--duration` past it is refused, and so is a scenario whose own `duration` is.
 
 **Random schedules (W4).** A `[random]` table replaces `cycle` and `[[step]]`:
 
@@ -392,7 +394,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
   no override, and the self-test reads a shipped override's labels itself.
 
 **Sources (W8b).** Each `[[ledger.source]]` is one generator and the SUT listener its
-datagrams reach. They replace W1's scalar `[ledger]` keys `generator_input`, `generator_sink`,
+lines reach, over the source's wire (W11a). They replace W1's scalar `[ledger]` keys `generator_input`, `generator_sink`,
 and `sut_listener`, which `load()` now refuses with a pointer to the table. `[configs]` names the
 SUT's config under `sut` and each generator's under its service name:
 
@@ -407,8 +409,8 @@ generator-lines = "logit-generator-lines.yaml"
 [[ledger.source]]
 service = "generator"     # a service with the role generator
 generator_input = "load"  # its generate_in
-generator_sink = "statsd" # its UDP sink, whose output.messages is G
-sut_listener = "statsd"   # the SUT listener its datagrams reach
+generator_sink = "statsd" # its sink, whose output.messages is G
+sut_listener = "statsd"   # the SUT listener its lines reach
 
 [[ledger.source]]
 service = "generator-lines"
@@ -428,13 +430,20 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   config path into `compose.env` under `scenario.config_env(service)`:
   `SOAK_GENERATOR_CONFIG` for `generator`, `SOAK_GENERATOR_LINES_CONFIG` for
   `generator-lines`. An override's generator mounts its own variable at `/config.yaml`.
+- `wire`, optional (W11a), is `udp` (the default), `tcp`, or `file`: what the source's lines
+  cross into the SUT, which picks the ledger's symbols for it (§6). `load()` reads the SUT
+  config and checks the source's `sut_listener` against it: a component of a kind and
+  `transport:` the ledger has a wire for (`scenario.LISTENER_WIRES`: `statsd_in` and `syslog_in`
+  UDP unless `transport: tcp`, `lines_in` and `graphite_in` TCP unless `transport: udp`,
+  `collectd_in` UDP, `tail_in` and `docker_in` file), whose wire is the source's. A listener the
+  config lacks, a kind or transport with no wire (a Unix socket), and a mismatch are refused.
 - `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct, none
   of them a listener, and none on another source's list. Each must forward every event it
   receives, which `ledger.edge` judges hop by hop, and each adds an inbox and a batch to R ("The
   ledger and identities"). It can't be combined with `[ledger] sut_script`, whose hop
   `ledger.script` judges from every listener's E.
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
-  stack has a source, because a generator with none would put datagrams into a listener with no
+  stack has a source, because a generator with none would put lines into a listener with no
   G behind them.
 
 **Several SUT services (W10a).** The stack can run more than one `logit` under test, such as a
@@ -581,7 +590,12 @@ generator, `SOAK_GENERATOR_CONFIG` for `generator`, §2's "Sources", and one per
 service, `SOAK_COLLECTOR_CONFIG` for `collector`, §2's "Several SUT services"), which the
 driver passes with `--env-file`, because `sudo` strips the environment.
 `up -d --wait --wait-timeout 120` waits on the image's `logit ready` `HEALTHCHECK`.
-Nothing in a container writes to the run directory in W1, so it needs no `chmod 777`.
+Nothing in a container writes to the run directory in W1, so it needs no `chmod 777`. From
+W11b a scenario with a `file` wire is the exception: the driver creates `<run>/shared` with mode
+0777, since the image's unprivileged `logit` user has a uid the host doesn't know, names its
+absolute path in `compose.env` as `SOAK_SHARED_DIR`, and the scenario's override mounts it
+`:z` at `/shared` in the writer and the SUT. The writer's files stay in the run directory, the
+evidence the end sequence counts G from.
 
 Collection uses `docker logs <id> >svc.stdout 2>svc.stderr`, not `docker compose logs`, which
 merges the two streams. `docker logs` spans every life of a container that is stopped and started
@@ -600,8 +614,8 @@ A root qdisc on a container's default-route interface shapes that container's eg
 
 | `on =` | What it impairs |
 |---|---|
-| `logit` | the SUT's remote-write to VictoriaMetrics, not the statsd arriving at it |
-| a `generator` | its own UDP into the SUT, and no other generator's |
+| `logit` | the SUT's remote-write to VictoriaMetrics, not the statsd arriving at it; on a TCP source (W11a), the ACKs it sends the generator |
+| a `generator` | its own UDP into the SUT, and no other generator's; on a TCP source, segments TCP retransmits |
 | a further SUT service (W10a) | its own sends, never UDP ingress, which only `logit` takes |
 | a `backend` | its responses |
 
@@ -610,6 +624,10 @@ and `ifb` ingress shaping wait for a scenario that needs them.
 
 A `partition` records the container's network `Aliases` before the disconnect and passes them
 back with `--alias` on the reconnect, because `docker network connect` drops the service alias.
+From W11a it also records the container's address on each network before the disconnect
+(`ips`) and after the reconnect (`ips_after`). Docker may assign another on the reconnect, and a
+TCP peer's retransmits reach the container only at the address it had; there is no static
+address, and `ledger.wire` says which happened.
 
 ### 5. The driver loop and end sequence (W1a)
 
@@ -662,7 +680,10 @@ ticket with `${DOCKER} version` first.
    - **Fail fast:** a `logit` container leaving `running`, or a `StartedAt` change, with no step
      behind it ends the timeline at once. The end sequence and collection still run. Inside an
      `exit` step (W7a) the container may be `running` or `exited`.
-4. End (for an external target, W5, see "External targets"): revert active faults; `docker stop -t 30` every generator; wait until every sink's stored
+4. End (for an external target, W5, see "External targets"): revert active faults; `docker stop -t 30` every generator; with a `file` wire (W11b), count the
+   newline-terminated lines in every file of `<run>/shared` (phase `shared_counted`) and wait,
+   up to 180 s, until the tailers' W, read from a log chunk the driver captures every 5 s,
+   reaches that count or holds for four reads (phase `tail_caught_up`); wait until every sink's stored
    total holds across two aggregate windows (90 s bound); `docker stop -t 60` the SUT, expecting
    exit 0; call each backend's `/internal/force_flush`; write each sink's
    `vm-export/<sink>.jsonl` from its backend's `/api/v1/export` with `match[]=<vm_selector>`
@@ -751,8 +772,8 @@ returned nonzero has none, so nothing after it is excused.
   interns grows beside it, and one verdict for both would say nothing about the SUT. A
   scenario's `[expected]` table can set a service's verdict (§2, "Expected verdicts").
 
-**The ledger and identities (W1b).** One unit runs through the ledger: a datagram is one line is
-one event is one increment.
+**The ledger and identities (W1b).** One unit runs through the ledger: a line is one event is
+one increment, and on a UDP wire one datagram.
 
 From W8b the ledger also follows each `[[ledger.source]]`, a generator and its SUT listener.
 The listener symbols W, K, D, B, E, and X are kept per listener and summed over the listeners;
@@ -760,8 +781,21 @@ G is per source. `ledger.wire` judges each source and `ledger.intake` each liste
 detail line per source or listener and the worst status. From the edge into `aggregate` on,
 every row reads the sums, because the sources' events merge there: `ledger.edge` judges ΣE
 against A, and the residual, `ledger.egress`, `ledger.summary`, the kill band, and `recovery`
-read summed symbols. Both legs of a fan-in run in one unit, a datagram that is one line, one
-event, and one increment, so the sums are of one unit.
+read summed symbols. Both legs of a fan-in run in one unit, a line that is one event and one
+increment, so the sums are of one unit.
+
+From W11a each source's `wire` picks its symbols. The table gives the UDP ones. On a TCP wire G
+is the same `output.messages`, which `statsd_out` counts only once a batch's write completed,
+with the precondition reversed: the sink counts no `output.datagrams`. W is
+`logit.input.frames{component=<sut_listener>}`, one per LF-terminated line, K and D are 0, and
+F, the lines the listener's framer dropped before W counted them
+(`logit.input.frames.dropped`, reasons in the table below), is counted wire loss; only `undecodable`, counted after `input.frames`, stays in B. A TCP listener
+has no receive queue, so R holds no queue term for it. On a file wire (W11b) G is the writer
+`file_out`'s `logit.component.events.delivered`, since `file_out` counts no `output.messages`,
+W is `logit.input.lines{component=<tail_in>}`, K and D are 0, and F is the tailer's
+`logit.input.frames.dropped` under `oversize` (a line past `max_line_bytes`, never counted in W)
+and `truncated` (a held partial discarded when its file was truncated). `kill_band` and `recovery`
+read the wire's W; `_end_to_end` and `ledger.summary` also subtract F.
 
 From W7b the ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`,
 `identity.sink`, `recovery`, `ledger.edge`'s sink edges, `ledger.egress`, `ledger.windows`,
@@ -773,6 +807,7 @@ and takes the worst status; `report.py` is unchanged.
 | G | per source (W8b), its generator's `logit.output.messages{component=<generator_sink>}`; precondition: equals that sink's `logit.output.datagrams` |
 | W | per listener (W8b), SUT `logit.input.datagrams{component=<sut_listener>}` |
 | K | per listener, SUT `logit.input.kernel.dropped` |
+| F | per listener, SUT `logit.input.frames.dropped`: on a TCP wire (W11a) under the framer's reasons, `truncated`, `oversize`, `drained`, and `malformed`; on a file wire (W11b) under `oversize` and `truncated`; else 0 |
 | D | per listener, SUT `logit.component.datagrams.dropped` under every reason, from telemetry; the listener's stderr shutdown lines only cross-check its `shutdown` part, and a killed life counts none |
 | B | per listener, SUT `logit.input.messages.dropped{reason=malformed}` plus `logit.input.frames.dropped{reason=undecodable}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a line the decoder refused, a datagram it refused whole, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule |
 | E | per listener, SUT `logit.component.events.sent{component=<sut_listener>}` |
@@ -788,7 +823,9 @@ and takes the worst status; `report.py` is unchanged.
 The generator sets `max_packet_bytes: "32"`, so one datagram carries one line of about 20 bytes,
 and G uses `output.messages` (what the kernel took), not `events.sent`. A `syslog_out` over UDP
 sends one message per datagram, with no packing to bound, and counts both (W8b). While the SUT is down,
-`statsd_out`'s per-batch name resolution fails `Clean` and nothing is sent.
+`statsd_out`'s per-batch name resolution fails `Clean` and nothing is sent. Over TCP (W11a)
+`statsd_out` writes each batch as one frame and counts its lines in `output.messages` only once
+the write completes, so a batch dropped `ambiguous_at_most_once` is counted there and never in G.
 
 **Which life a hop is judged in.** Every SUT config gives `internal` a dedicated pipeline, so
 its final drain runs after every data node has exited
@@ -861,7 +898,7 @@ mismatch every ledger, `identity.sink`, and `recovery` row SKIPs with the reason
 
 The rows:
 
-- `ledger.wire` is G − (W + K). This loss is uncounted **by design**: UDP on the network, netem
+- `ledger.wire` is G − (W + K + F), F being 0 on UDP. On UDP this loss is uncounted **by design**: UDP on the network, netem
   drops, and the kernel receive queue at socket close
   ([`docs/known-gaps/intake.md`](../known-gaps/intake.md), "UDP intake"). It is reported,
   bucketed by drain timestamp, and fails only when the loss outside UDP-affecting windows (netem
@@ -884,8 +921,52 @@ The rows:
   service that isn't a generator, such as any `logit` stop, excuses every source; a fault on a
   further SUT service (W10a) is never UDP-affecting. One detail
   line per source; the worst status wins.
+
+  On a TCP wire (W11a) a fault is TCP-affecting when it's a lifecycle fault (`pause`, `stop`,
+  `kill`, `restart`) or a `partition` of the ingress SUT or of a generator, a `mark` or an
+  `exit` on the ingress SUT, or netem on the ingress SUT, whose egress carries the ACKs. Netem on
+  the generator isn't: TCP retransmits what it delays or drops, so its window is judged as steady
+  state. Of the TCP-affecting windows only those that can reset the connection with lines in its
+  socket buffers are reported and not judged: a `stop`, `kill`, `restart`, or `exit`, and a
+  `partition` whose record shows the container's address changed or doesn't show the address
+  after it (`checks.wire_judgment`). Every other TCP-affecting window is **judged**: its loss
+  counts with steady state's, against the same limit and edge tolerance, and its surplus, W + F
+  above G, may not exceed one generator batch per `ambiguous_at_most_once` drop the generator
+  counted inside it, plus one per edge. A write that failed partway leaves whole lines the SUT
+  reads, and under `statsd_out`'s `at_most_once` posture the generator drops that batch and
+  never counts it in G. A partition's label carries the address before and after it. The detail
+  names the generator's counted loss by reason (`overflow_newest`, `ambiguous_at_most_once`)
+  beside the gap; none of it is in G.
+
+  On a file wire (W11b) only a lifecycle fault or an `exit` of the ingress SUT affects the wire.
+  A tailer reads behind its writer, so a drain interval's gap is lag, not loss: every run of
+  drain intervals is reported, and the row judges the run's W + F − G against a **replay band**
+  summed over the ingress SUT's lives (`Ledger.replay_band`):
+  - a killed life: above, rate × `checkpoint_interval` (the lines read after the last
+    checkpoint, which the restart reads again) plus one 64 KiB read's lines for each of two
+    files, the writer's active file and the one it rotated away inside that interval (a fully
+    read file replays nothing, and rotations tens of seconds apart leave at most one inside an
+    interval of seconds); below, rate × the life's drain interval, the counts a SIGKILL never
+    exports. The rate is the life's `input.lines` over its last drain interval, the line size
+    the shared directory's bytes over its lines. A killed life with one drain has no drain
+    interval, and its last checkpoint can be the previous life's, so its allowance above is that
+    drain's W, all of which can replay, plus the same reads, and that W below, about one drain
+    interval of reads a checkpoint after the drain committed and the kill never exported;
+  - a life a stop, restart, or `exit` ended: up to one line above per file open at its last
+    drain (`logit.input.files.open`), the unterminated line shutdown emits and the restart reads
+    again as its remainder (docs/known-gaps/tailing.md, "`tail_in` splits a line held
+    unterminated at a clean stop into two events"); nothing replays, since shutdown writes a
+    final checkpoint;
+  - the final life adds nothing: the end sequence waits until the tailers have read what the
+    writer wrote (§5).
+
+  G must also equal the lines the driver counted in the shared directory at the end
+  (`shared_counted`), else the row FAILs its precondition. `ledger.summary`'s end-to-end bound
+  runs for a file wire too, with the band's upper edge added to its limit, since a replayed line
+  is absorbed and stored again.
 - `ledger.intake`: W − D == E + B, for the final life, per listener from W8b, one detail line
-  each, a listener off its balance first.
+  each, a listener off its balance first. A TCP listener's F never reached W, so it's
+  `ledger.wire`'s, and `drops` leaves it out.
 - `ledger.edge`: E == A, a single-consumer edge, for the final life; from W8b ΣE == A, E summed
   over the listeners, which every source's events reach. A source's `sut_transforms` (W8b) are
   judged hop by hop: its listener's E == T_in[first node], T_in == T_out at every node (each
@@ -987,7 +1068,7 @@ The rows:
 - `recovery`, per fault and per sink: within `recovery_bound` of each fault's end, some SUT
   drain shows the sink's `retrying` at 0,
   `buffer.utilization` under 0.05, or under 1.0 with `buffer.batches` at most 1 (one batch in a
-  2-batch queue is half of it, and one that fills its queue isn't drained), `receive.utilization` under 0.05 at every listener, and an ingest rate over the drain
+  2-batch queue is half of it, and one that fills its queue isn't drained), `receive.utilization` under 0.05 at every UDP listener (a stream listener has no receive queue), and an ingest rate over the drain
   interval ending there of at least 95% of the warmup baseline. From W8b the ingest rate is
   summed over the listeners and the baseline over the generators, each generator's from its own
   warmup drains. Only intervals after the fault's
@@ -1017,7 +1098,7 @@ The rows:
   judges. Under [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md) the name
   alone says a count is loss, so the row reads every such name rather than a list. It leaves
   out the terms the ledger balances (every `batches.dropped`, a node's `events.dropped` beside a
-  batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B terms, and the
+  batch drop of the same reason, `bytes.dropped`, a listener's D, K, F, X, and B terms, and the
   script's L_err) and, on an external, Kafka, or `datadog` stand-in target, the sink's
   `records.dropped` and
   `metrics.dropped`, which `ledger.sent` judges. A `rejected` or `disk_corrupt` reason FAILs;
@@ -1471,7 +1552,9 @@ the other.
 - `ledger.summary`: W − D − E − B and E − S_hop in `logit`'s final life, E_B − A, A − Ab, and
   each egress term in `collector`'s, with `ledger.hop` left to judge the hop. Beside them, one
   bound end to end, which no kill or restart can loosen: each egress group's V over the whole
-  run is at most G less every counted loss (K, D, B, X, the hop's drops, and X_B). A duplicate
+  run is at most G less every counted loss (K, D, B, X, the hop's drops, and X_B, and on a TCP
+  wire F), plus one generator batch per `ambiguous_at_most_once` drop of a TCP source, the
+  partial-frame surplus `ledger.wire` allows. A duplicate
   forwarded across the hop adds the same increments to E_B, A, Ab, and V, so every per-life term
   balances around it; this bound and `ledger.hop` are what see it, the bound only once the
   surplus exceeds the run's uncounted loss, the wire loss among it.
@@ -1514,7 +1597,8 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
 ### 10. Next scenarios
 
 Every shipped scenario drives UDP datagrams into one `aggregate`: `statsd_in`, and from W8b in
-`fanin` `lines_in` beside it, on §3's base stack plus any services its `compose` override adds.
+`fanin` `lines_in` beside it, on §3's base stack plus any services its `compose` override adds;
+from W11a `tcp-ingress` drives TCP into `statsd_in` instead.
 `[ledger]` names one `[[ledger.source]]` per generator and its listener, and one
 `[[ledger.sink]]` per sink after `aggregate`. The scenarios below widen
 that, grouped by cost; the Workstreams table gives the landing order. Each states what it
@@ -1614,28 +1698,66 @@ where it needs them, and a small check extension.
    restarted since, gracefully or not, forwards again.
    Rows: the ledger one hop longer, `ledger.replay` on A. Built in W10a (a second SUT service,
    §2's "Several SUT services") and W10b (the hop ledger and the `native-hop` scenario, §8d).
-8. **TCP ingress.** `syslog_in` or `lines_in` over TCP, or `statsd_in` with `transport: tcp`, from
-   the generator's TCP sinks. A stalled SUT backs up into the sender
+8. **TCP ingress (built in W11a).** `statsd_in` with `transport: tcp` from the generator's
+   `statsd_out` over TCP; a `syslog_in` TCP source and a TCP reset counter are deferred. A
+   stalled SUT backs up into the sender
    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md), "No receive queue on
-   TCP -- the connection itself is the backpressure"), so a `pause` is the generator's counted
-   overflow, and a `partition` is a reset losing what sat in the socket buffers, uncounted on both
-   sides. Rows: `ledger.wire` judged zero outside resets, and idle closes
-   ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)) under `[[expect]]`.
-   Needs: per-line wire counters in place of datagram ones.
-9. **File tailing.** `tail_in` or `docker_in` behind a rotating writer, with `pause` and `kill` on
-   the SUT. Proves checkpoint resume
+   TCP -- the connection itself is the backpressure"): the SUT's kernel keeps ACKing until its
+   receive buffer fills, then the generator's write makes no progress for `connect_timeout`.
+   A first write that took nothing fails `Clean` and is retried; a write that took part of a
+   frame and then stalls fails `Ambiguous`
+   (`crates/logit-outputs/src/stream.rs`'s module table), and under `statsd_out`'s
+   `at_most_once` posture drops the batch, counted `ambiguous_at_most_once`. Meanwhile its queue
+   overflows, counted `overflow_newest`. A write that failed partway leaves whole lines the SUT reads and G never counted, so a pause is counted
+   overflow and ambiguous drops plus a surplus of up to one batch per ambiguous drop. A 45 s
+   partition produces no RST: with no send stall the connection survives and delivers; with one,
+   the generator counts an ambiguous drop, and the abandoned socket's retransmits deliver what it
+   held if the SUT kept its address. Uncounted loss can come only from an address change, or from
+   a stop or a kill, which can reset the connection with lines in its socket buffers. Rows:
+   `ledger.wire` judged at 0 outside those reported windows, with the surplus allowance in the
+   judged ones (§6), and `[[expect]]` on the generator's overflow and ambiguous drops around the
+   pause and on idle closes ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md))
+   around a generator pause past `idle_timeout`. Needs: a wire per source with its own symbols
+   (the product already counts per line, `input.frames`), per-wire fault attribution, and a
+   partition's addresses. Built as `tcp-ingress`, with an override capping each end's TCP
+   buffers so a 30 s pause stalls a write (see "Findings").
+9. **File tailing (built in W11b).** `tail_in` behind a rotating writer, with `pause`, `stop`,
+   `restart`, and `kill` on the SUT. Proves checkpoint resume
    ([ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md),
-   "Checkpoints: optional, written on an interval, only when dirty"). A replay is at-least-once
-   (ADR `delivery-semantics`, "10. A replaying input is at-least-once up to the in-memory
-   queues"): a checkpoint advances once lines reach the downstream inboxes, so a kill loses the
-   checkpointed lines still in memory (the inboxes, `aggregate`'s open window, and the sink's
-   memory queue) and replays the lines since the last checkpoint. The sink runs with
-   `buffer.disk:`, as `spool-kill-replay` does, so the sink's queue survives and §6's killed-life
-   band ("Which life a hop is judged in"), which covers `aggregate`'s window and not a sink
-   queue, applies as written, with the lines the tailer read standing in for W. A killed life is
-   judged with that band plus a surplus band of up to one checkpoint interval of lines on top.
-   Needs: a volume the writer and SUT share (the generator's `file_out` can write, G its count),
-   the tail-side W, and that surplus band.
+   "Checkpoints: optional, written on an interval, only when dirty"). The writer is a
+   `generator` service, `generate_in → file_out` with `format: json`. `file_out` rotates by
+   renaming the active file to `app.log.rotating`, shifting each `app.log.N` to `N + 1`, removing
+   `app.log.{max_files − 1}`, and renaming the staged file to `app.log.1`; `max_files` counts the
+   active file. The scenario keeps every file (`max_files: 100`, about 74 minutes of files), so
+   nothing unread is deleted and the harness can count every line at the end. Its
+   `max_duration` of 25 minutes holds that, and holds the descriptor growth below inside
+   `fd_growth`. `file_out` counts no `output.messages`, so G is
+   its `logit.component.events.delivered` (§6's file wire), held to the lines the driver counts
+   across the shared directory, a G from outside both processes. The SUT tails
+   `paths: ["/shared/app.log*"]`, a glob that matches the rotated names, so a renamed file is
+   rebound by inode and read to its end; it matches `app.log.rotating` too, which is harmless,
+   since that is the same inode. It runs `read_from: beginning`, a `checkpoint_path` in its own
+   filesystem (`/var/lib/logit`, which a stop and a kill keep), and `checkpoint_interval: 5s`,
+   then `json` and `fanin`'s count chain into `aggregate` and a `prometheus_out` with
+   `buffer.disk:`. W is `logit.input.lines`, which the product already counts per line. Both
+   mount `<run>/shared` (§3). A replay is at-least-once (ADR `delivery-semantics`, "10. A
+   replaying input is at-least-once up to the in-memory queues"): a checkpoint covers only lines
+   already in a downstream inbox, so a kill replays what was read after the last checkpoint. A
+   clean stop doesn't read to the end of its files: shutdown emits each file's held unterminated
+   line, flushes, and writes a final checkpoint, so nothing replays but the split line, which a
+   64 KiB read ending mid-line holds as often as a writer caught mid-line does. The replay's
+   surplus is in W, so it belongs on `ledger.wire` and on `ledger.summary`'s end-to-end bound,
+   not on the killed life's egress band, which §6 bounds from `aggregate`'s window and stays as
+   written, with its rate read from `input.lines`; §6's `ledger.wire` row has the band. A file
+   wire's fault windows are the SUT's lifecycle faults only. `logit.input.files.rotated` counts
+   every renamed name a scan finds, so one rotation of `file_out`'s cascade counts once per file
+   it renamed: an `[[expect]]` can ask only that it's above 0. Rows: `ledger.wire` with the band,
+   and `[[expect]]` on `logit.input.files.rotated` above 0, `logit.input.files.resume_rejected`
+   at 0, and `logit.input.checkpoint.errors` at 0. A tailer keeps every file its pattern still
+   matches open at its end, so with every file kept its descriptors grow by about one per
+   rotation, and the scenario's `fd_growth` allows for it. Built as `tail-rotate`: 1,000 lines a
+   second rotating about every 44 s, a 60 s pause, a 30 s stop, a restart, a 30 s kill, and a
+   150 s kill across about three rotations.
 10. **Deterministic destination errors (built in W9a, for `prometheus_out`, and W9b, for
     `datadog_out`).** A scripted HTTP stand-in answering `429`, `5xx`, `400`,
     and `413` on cue and recording what it accepts, so every row of a sink's response-class table
@@ -1690,8 +1812,9 @@ that items 3, 7, and 11 need.
 | W9b | `soak/w9b` | `soak/w9b: a Datadog-shaped stand-in and ledger.sent against it` | M | W9a |
 | W10a | `soak/w10a` | `soak/w10a: several SUT services, each scored on its own lives` | M | W9b |
 | W10b | `soak/w10b` | `soak/w10b: a native-hop soak between two logit processes` | M | W10a |
-| W11 | `soak/w11` | `soak/w11: TCP-ingress and file-tailing soaks` | M | W10b |
-| W12 | `soak/w12` | `soak/w12: rolling-overlap, SIGHUP, and TLS-reload soaks` | M | W11 |
+| W11a | `soak/w11a` | `soak/w11a: a TCP-ingress soak, with a wire per source` | M | W10b |
+| W11b | `soak/w11b` | `soak/w11b: a file-tailing soak, with a shared volume and the replay band` | M | W11a |
+| W12 | `soak/w12` | `soak/w12: rolling-overlap, SIGHUP, and TLS-reload soaks` | M | W11b |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -1779,11 +1902,19 @@ that items 3, 7, and 11 need.
   `ledger.hop` row, the end-to-end bound in `ledger.summary`, the hop sink's replay band,
   identity, and recovery, `drops` keyed on service and component, the `native-hop` scenario,
   and a run of it under "Findings".
-- **W11**: items 8 and 9, per-line wire counters, a shared volume, and the replay surplus band.
+- **W11a**: item 8: `[[ledger.source]] wire` (`udp`, `tcp`, or `file`) cross-checked at load
+  against the listener's kind and `transport:`, a symbol table per wire (§6; the `file` row's
+  symbols included), each hardcoded `logit.input.datagrams` read through the wire, fault
+  attribution per wire with the TCP windows judged or reported, the partition's addresses
+  before and after, self-test fixtures for each rule, and the `tcp-ingress` scenario with its
+  `[[expect]]` rows and a run under "Findings".
+- **W11b**: item 9: the `file` wire's scenario, `tail-rotate`, a shared directory the writer
+  and the SUT mount, the harness's own line count across `app.log*`, and the replay band on
+  `ledger.wire` and the end-to-end bound.
 - **W12**: items 11 and 12, the namespace-holder service, per-instance totals, and the `signal`
   and certificate-rotation actions.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11 → W12, linear. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
@@ -3359,6 +3490,149 @@ at −2,400, −2,600, and −2,400 inside allowances of about [−76,000, 11,50
   ingest at 1,180% of the warmup rate after the partition while it did.
 - `progress` judged only 60 s of 960 after warmup, three 30 s windows: the schedule leaves
   little steady state between faults and their 60 s recovery.
+
+### W11a: TCP ingress (2026-10-15)
+
+`tcp-ingress` ran twice from `soak/w11a` at `7bddbbc6`, the second run with the override and
+the generator's queue size the next commit adds, on the development host
+(`sailfish`, 32 cores, Linux 7.2.8), `logit:soak` built with `--no-cache` after `origin/main`'s
+head (`3c1ab0f1b2ea`). The final run is `perf/results/soak/20261016T020310Z`, exit 0:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 16 apply/revert action(s) returned 0; 4 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 4 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (1 kill(s)) |
+| `restarts` | PASS | 2 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 11 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 67 readiness sample(s) read ok outside fault windows; 4 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 6 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 6 of 6, 8 freshness sample(s); 150s of 1170s after warmup judged (13%; WARN under 5%) |
+| `rss_slope` | WARN | generator PASS: MiB/h life 0 +60.6 (limit 64); 245s of 1170s after warmup judged (21%; WARN under 5%) \| logit WARN: MiB/h life 0 +98.8, life 2 -3.3 (limit 64); 230s of 1170s after warmup judged (20%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +8) \| logit PASS: warmup median 13 -> end 13 (limit +8) |
+| `ledger.wire` | PASS | G 2,026,700 = W 2,017,076 + K 0 + counted 4 (truncated 4) + gap 9,620 (9,806 in reported windows, -182 in judged TCP-affecting windows, 72 steady, -76 at the end; loss judged 74, each run at 0 or more, against limit 2,100); the generator's counted loss, not in G: 444,600 event(s) in 4,446 batch(es) (ambiguous_at_most_once 4, overflow_newest 4,442) |
+| `ledger.intake` | PASS | final life 2: W − D 770,342 vs E + B 770,342; life 0: W − D − B − X − Ab 0 within [0, R]; life 1: W − D − B − X − Ab 0 within [0, R] (R 67,000 = 0 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 2: E 770,342 == A 770,342 (listener to aggregate); A_sent 3,700 == S_in[victoria_metrics] 3,700 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 2: Ab 770,342 == A 770,342 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 1 (killed): Ab 108,400 − V[victoria_metrics] 98,400 = 10,000, within band (band [-9,999, 29,997]: ingest 2,000/s over the last drain interval; below, the residual 0 plus one 4.99999s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − Ab 0 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 2 (final): Ab 770,342 − V[victoria_metrics] 770,342 = 0, ok (split copy; R 67,000 = 0 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | PASS | victoria_metrics: life 2's first drain replayed 0 vs killed life 1's last-drain buffer.batches 0 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 2: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K + F) 9,620 over the run, F 4 counted; ledger.wire judges the rest |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 2 at +1260s: victoria_metrics: received 37 vs delivered 37 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 8 of 8 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect.no-idle-close-under-delay` | PASS | delta of logit.input.connections.closed{component=statsd, reason=idle} on logit, through c0s1: c0s1 (+60s, +225s]: 0 (over 33 drain(s)), want <= 0 |
+| `expect.generator-overflows` | PASS | delta of logit.component.batches.dropped{component=statsd, reason=overflow_newest} on generator, through c0s4: c0s4 (+540s, +615s]: 153 (over 15 drain(s)), want >= 1 |
+| `expect.generator-ambiguous` | PASS | delta of logit.component.batches.dropped{component=statsd, reason=ambiguous_at_most_once} on generator, through c0s4: c0s4 (+540s, +615s]: 3 (over 15 drain(s)), want >= 1 |
+| `expect.idle-close` | PASS | delta of logit.input.connections.closed{component=statsd, reason=idle} on logit, through c0s8: c0s8 (+915s, +1050s]: 1 (over 27 drain(s)), want >= 1 |
+
+- **The first run, `20261016T013950Z`, FAILed `expect.generator-overflows` and
+  `expect.generator-ambiguous` with nothing lost.** The host's `net.ipv4.tcp_rmem` allows a
+  receive buffer of 32 MiB, and the generator's writes all completed through the SUT's 30 s
+  pause: 160,000 lines went into the socket buffers and W read every one after the unpause. A
+  scenario sized against the host default never stalls a write, so the scenario's override caps
+  `tcp_rmem` on `logit` and `tcp_wmem` on `generator` at 256 KiB, and the generator's queue at 50
+  batches. With them the pause stalled the write three times: 3 `ambiguous_at_most_once` drops,
+  153 batches `overflow_newest`, a surplus of 134 lines against an allowance of 500, and 3
+  partial lines counted `truncated`, with no uncounted loss.
+- **A graceful stop lost nothing in either run.** At the stop the generator's G was 1,180,900
+  (first run) and 1,138,200 plus the pause's 134-line surplus (final run), and the stopped life's
+  W equaled it: the listener read until its shutdown, and the generator's next write failed
+  `Clean` on a refused dial and stayed queued. No known-gaps entry is needed for
+  `ReadStep::Shutdown`'s undrained socket at this rate; the window stays reported.
+- **A kill's window shows 9,799 lines (9,779 in the first run) it can't split.** The killed
+  life's last drain was 5 s before the kill, and a SIGKILL loses up to one `internal` interval of
+  counters, about 9,700 lines at 2,000 a second, so the gap is mostly lines the killed process
+  read and never exported. The generator counted 900 lines in the drain after the kill, most
+  written before it, then failed `Clean`. What sat in the socket buffers at the kill is inside
+  that gap and below what telemetry can resolve.
+- **The partition kept the SUT's address** (172.28.0.3 before and after, both runs), so its
+  window was judged: one ambiguous drop, one partial line `truncated`, and a 45-line surplus
+  against an allowance of 300. The abandoned connection's retransmits delivered after the
+  reconnect, and the SUT read about 28,000 lines in the drain after it. No RST.
+- **Netem on the generator lost nothing**: both runs' steady windows, which include its 120 s
+  delay and 90 s of 10% loss, gap by at most 72 lines, under the edge tolerance; TCP retransmitted
+  every segment. 30% loss on the SUT's ACKs stalled nothing and dropped nothing.
+- **The generator's 90 s pause made one idle close** 60 s in, as `idle_timeout` sets, and the
+  generator redialed on its next write with nothing lost; none closed under the netem delay.
+- `rss_slope` WARNed on `logit`'s first life (+98.8 MiB/h over 230 s judged), as any growth
+  under an hour's run does; its final life read −3.3 MiB/h, and `fd_slope` ended at the warmup
+  median on both services.
+- Re-scoring every earlier run directory (52, the three `native-hop` runs among them) with this
+  branch's harness gives `results.md`, `results.json`, and exit codes identical to `origin/main`'s.
+
+### W11b: file tailing (2026-10-15)
+
+`tail-rotate` ran twice on the development host (`sailfish`), against `logit:soak` built with
+`--no-cache` after `origin/main`'s head (`3c1ab0f1b2ea`). The final run is
+`perf/results/soak/20261016T025252Z`, from `soak/w11b` at `f369b3c8` with no modified path,
+exit 0, shown here as `check` re-scores it at the branch's head, which merges the file wire's
+drain-interval rows into runs:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 10 apply/revert action(s) returned 0; 5 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 5 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (2 kill(s)) |
+| `restarts` | PASS | 4 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 0 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 59 readiness sample(s) read ok outside fault windows; 5 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 6 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 6 of 6, 7 freshness sample(s); 150s of 765s after warmup judged (20%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 -0.4 (limit 64); 215s of 765s after warmup judged (28%; WARN under 5%) \| logit PASS: MiB/h life 4 -1033.2 (limit 64); 175s of 765s after warmup judged (23%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +40) \| logit PASS: warmup median 16 -> end 34 (limit +40) |
+| `ledger.wire` | PASS | G 830,700 (shared directory: 830,700 lines in 19 files) vs W 830,500 + counted 0: W + F − G -200 against the replay band [-9,999, 12,776]; the tailers stopped short at the end with W 830,500 |
+| `ledger.intake` | PASS | final life 4: W − D 379,900 vs E + B 379,900; life 0: W − D − B − X − Ab 0 within [0, R]; life 1: W − D − B − X − Ab 0 within [0, R]; life 2: W − D − B − X − Ab 100 within [0, R]; life 3: W − D − B − X − Ab 100 within [0, R] (R 327,000 = 0 + 262 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 4: E[tail] 379,900 == T_in[parse] 379,900 (into parse); T_in[parse] 379,900 == T_out[parse] 379,900 (parse forwards every event); T_out[parse] 379,900 == T_in[labels] 379,900 (into labels); T_in[labels] 379,900 == T_out[labels] 379,900 (labels forwards every event); T_out[labels] 379,900 == T_in[count] 379,900 (into count); T_in[count] 379,900 == T_out[count] 379,900 (count forwards every event); T_out[count] 379,900 == T_in[metrics_only] 379,900 (into metrics_only); T_in[metrics_only] 379,900 == T_out[metrics_only] 379,900 (metrics_only forwards every event); Σ(sent into aggregate) 379,900 == A 379,900 (listeners to aggregate); A_sent 23 == S_in[victoria_metrics] 23 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 4: Ab 379,900 == A 379,900 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 1: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 2 (killed): Ab 85,100 − V[victoria_metrics] 80,100 = 5,000, within band (band [-5,099, 14,998]: ingest 1,000/s over the last drain interval; below, the residual 100 plus one 4.99971s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − Ab 100 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 3 (killed): Ab 89,700 − V[victoria_metrics] 84,700 = 5,000, within band (band [-5,100, 15,000]: ingest 1,000/s over the last drain interval; below, the residual 100 plus one 4.99982s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − Ab 100 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 4 (final): Ab 379,900 − V[victoria_metrics] 379,900 = 0, ok (split copy; R 327,000 = 0 + 262 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | PASS | 1 series over 1 sink(s) x 5 life/lives, widest gap 10.001s (gaps <= 15s (1.5 x the 10s aggregate interval) or idle, with no window batches.sent from a + 7.5s to b - 2.5s (5s drains); a killed life's last sample within 11s (1.1 x) of the kill, a later life's first within 20s (2 x) of its start; 1 idle gap(s) excused: life 0 +59s to +120s (60.629s, 1 series), window sent 0 batch(es) over 0 drain(s) from +67s to +118s) |
+| `ledger.replay` | PASS | victoria_metrics: life 3's first drain replayed 0 vs killed life 2's last-drain buffer.batches 0; victoria_metrics: life 4's first drain replayed 0 vs killed life 3's last-drain buffer.batches 0 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 4: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K + F) 200 over the run, F 0 counted; ledger.wire judges the rest; end to end over the run, G 830,700 less counted loss 0 plus the replay band's 12,776: victoria_metrics: V 820,300 <= G − counted 843,476 |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 4 at +865s: victoria_metrics: received 23 vs delivered 23 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 5 of 5 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 1,000/s |
+| `expect.files-rotated` | PASS | delta of logit.input.files.rotated{component=tail} on logit, run: run (+60s, +825s]: 130 (over 109 drain(s)), want >= 1 |
+| `expect.no-resume-rejected` | PASS | delta of logit.input.files.resume_rejected{component=tail} on logit, run: run (+60s, +825s]: 0 (over 109 drain(s)), want <= 0 |
+| `expect.no-checkpoint-errors` | PASS | delta of logit.input.checkpoint.errors{component=tail} on logit, run: run (+60s, +825s]: 0 (over 109 drain(s)), want <= 0 |
+
+- **The first run, `20261016T023523Z`, FAILed `ledger.egress` on a harness bug.** The restarted
+  life read W − D − B − X − V of −4,900. A `docker restart` started the next process 0.2 s after
+  the old one's final drain (+270.07 s against a start of +270.26 s), and `telemetry.py` placed a
+  drain in the newest life that started at most 1 s after it, so the old life's final drain, with
+  its close-time counts, landed in the new life while V placed the same flush in the old one by
+  timestamp. A point at a drain now takes that drain's life from the uptime sequence. No earlier
+  run had a restart that fast, and every one re-scores identically; the first run re-scores to
+  PASS.
+- **The wire: G 830,700 lines in 19 files, W 830,500.** The shared directory's count equals the
+  writer's `events.delivered`. W − G is −200, inside the band [−9,999, 12,776]. Each kill's window
+  shows about 100 lines fewer in W than G (109 and 101): the killed life never exported its last
+  drain interval of counts, about 5,000 lines, and the restart re-read about as many from its
+  last checkpoint, since drains and checkpoints both run every 5 s. No replay surplus showed
+  beyond that offset, and the end sequence's wait stopped with W 200 short, held.
+- **A clean stop and a restart split no line.** `json` reported no parse failure, and the stop's
+  and the restart's windows gap by −55 and −2, inside drain-interval interpolation. The band
+  allowed 5 and 7 split lines for the files open at those stops.
+- **The 150 s kill spanned three rotations** (the writer rotated at +485 s, +525 s, and +570 s).
+  The restarted tailer resumed every checkpointed inode under its new name, read the three new
+  files from their start, and read 159,900 lines in its first drain: no `resume_rejected`, no
+  checkpoint error, nothing lost. The 30 s kill fell between two rotations.
+- **`files.rotated` counted 130 against the writer's 18 rotations**, because each scan counts
+  every renamed name in `file_out`'s cascade.
+- **The tailer kept every file open.** `logit.input.files.open` rose with each rotation to 19,
+  and the SUT's descriptors from 16 at warmup to 34 at the end, inside the scenario's
+  `fd_growth` of 40. `tail_in` closes a file only when no pattern matches it any more or a new
+  inode takes its path; under a pattern that matches every rotated name and a writer that keeps
+  every file, nothing closes one.
+- The pause bunched the SUT's drains at the unpause, and the tailer read 61,083 lines in the
+  first drain interval after it: a drain interval's G − W on a file wire is lag, which is why
+  only the run's total is judged.
 
 ## Verification
 

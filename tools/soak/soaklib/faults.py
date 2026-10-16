@@ -14,7 +14,10 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   never drops. A delay plus a post-outage burst can queue more than netem's default 1,000
   packets, and a drop there would read as a fault the step didn't ask for.
 - `docker network connect` drops a container's aliases, so a partition records them before the
-  disconnect and passes each back with `--alias`.
+  disconnect and passes each back with `--alias`. It also records the container's IP address on
+  each network before the disconnect (`ips`) and after the reconnect (`ips_after`): a TCP peer's
+  retransmits after a partition reach the container only at the address it had, and the
+  reconnect may assign another.
 - A `kill` is `docker kill -s KILL`: the process gets no shutdown signal, so it writes no final
   `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line, and the container
   exits with `KILL_EXIT_CODE`. Its revert is a `docker start`, as a `stop`'s is. The container is
@@ -37,6 +40,9 @@ from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, STANDIN_ROLE, 
                        SUT_SERVICE)
 
 NETEM_LIMIT = "100000"
+# The timeline key recording, per `[[ledger.source]]` wire, whether a step can affect it.
+INGRESS_KEYS = {"udp": "affects_udp_ingress", "tcp": "affects_tcp_ingress",
+                "file": "affects_file_ingress"}
 STOP_TIMEOUT_S = 30
 # 128 + SIGKILL: the exit code Docker records for a container a `kill` ended.
 KILL_EXIT_CODE = 137
@@ -67,6 +73,16 @@ class Action:
     affects_udp_ingress: object
     # Whether the fault can delay or fail a SUT sink's delivery to a backend or a broker.
     affects_egress: object
+    # The same as `affects_udp_ingress` for a source whose `wire` is `tcp` or `file`
+    # (`INGRESS_KEYS`). Netem on a TCP generator affects nothing: TCP retransmits what netem
+    # drops, so the wire row judges that loss at 0. Netem on the SUT does affect it, because the
+    # SUT's egress carries the ACKs.
+    affects_tcp_ingress: object
+    affects_file_ingress: object
+
+    def affects(self, wire, step, roles):
+        """Whether the fault can lose lines on a `wire` source's way into the SUT."""
+        return bool(getattr(self, INGRESS_KEYS[wire])(step, roles))
 
 
 def _record(result, **extra):
@@ -171,12 +187,19 @@ def exit_revert(ctx, step):
     return _record(ctx.docker.run(["start", ctx.ids[step.on]]), started=True, status=status)
 
 
+def _ips(info):
+    """`{network: IP address}` from a container's `docker inspect`."""
+    networks = ((info or {}).get("NetworkSettings") or {}).get("Networks") or {}
+    return {name: net.get("IPAddress") or "" for name, net in networks.items()}
+
+
 def partition_apply(ctx, step):
     container = ctx.ids[step.on]
     info = ctx.docker.inspect(container) or {}
     networks = (info.get("NetworkSettings") or {}).get("Networks") or {}
     saved = {name: list(net.get("Aliases") or []) for name, net in networks.items()}
     ctx.state[step.id] = saved
+    ips = _ips(info)
     rcs, errors = [], []
     for name in saved:
         result = ctx.docker.run(["network", "disconnect", name, container])
@@ -185,7 +208,7 @@ def partition_apply(ctx, step):
             errors.append(result.stderr.strip())
     rc = 0 if saved and all(rc == 0 for rc in rcs) else (max(rcs) if rcs else 1)
     stderr = "\n".join(errors) if saved else "no networks to disconnect"
-    return {"rc": rc, "stderr": stderr, "networks": saved}
+    return {"rc": rc, "stderr": stderr, "networks": saved, "ips": ips}
 
 
 def partition_revert(ctx, step):
@@ -201,7 +224,8 @@ def partition_revert(ctx, step):
         if result.stderr.strip():
             errors.append(result.stderr.strip())
     rc = 0 if saved and all(rc == 0 for rc in rcs) else (max(rcs) if rcs else 1)
-    return {"rc": rc, "stderr": "\n".join(errors), "networks": saved}
+    return {"rc": rc, "stderr": "\n".join(errors), "networks": saved,
+            "ips_after": _ips(ctx.docker.inspect(container))}
 
 
 def _on_sut(step, roles):
@@ -226,6 +250,10 @@ def _lifecycle_on_ingress_sut_or_generator_partition(step, roles):
             or (_on_generator(step, roles) and step.action == "partition"))
 
 
+def _on_ingress_sut_or_generator(step, roles):
+    return _on_ingress_sut(step, roles) or _on_generator(step, roles)
+
+
 def _always(step, roles):
     return True
 
@@ -240,36 +268,48 @@ ACTIONS = {
         revert=netem_revert,
         affects_udp_ingress=_on_generator,
         affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_on_ingress_sut,
+        affects_file_ingress=_never,
     ),
     "pause": Action(
         apply=pause_apply,
         revert=pause_revert,
         affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_on_ingress_sut_or_generator,
+        affects_file_ingress=_on_ingress_sut,
     ),
     "stop": Action(
         apply=stop_apply,
         revert=stop_revert,
         affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_on_ingress_sut_or_generator,
+        affects_file_ingress=_on_ingress_sut,
     ),
     "kill": Action(
         apply=kill_apply,
         revert=stop_revert,
         affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_on_ingress_sut_or_generator,
+        affects_file_ingress=_on_ingress_sut,
     ),
     "restart": Action(
         apply=restart_apply,
         revert=restart_revert,
         affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_on_ingress_sut_or_generator,
+        affects_file_ingress=_on_ingress_sut,
     ),
     "partition": Action(
         apply=partition_apply,
         revert=partition_revert,
         affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_on_ingress_sut_or_generator,
+        affects_file_ingress=_never,
     ),
     # A mark on the SUT holds what it marks, such as a stalled script backing up into the UDP
     # receive queue.
@@ -278,18 +318,24 @@ ACTIONS = {
         revert=no_op,
         affects_udp_ingress=_on_ingress_sut,
         affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_on_ingress_sut,
+        affects_file_ingress=_never,
     ),
     "exit": Action(
         apply=no_op,
         revert=exit_revert,
         affects_udp_ingress=_on_ingress_sut,
         affects_egress=_always,
+        affects_tcp_ingress=_on_ingress_sut,
+        affects_file_ingress=_on_ingress_sut,
     ),
     "respond": Action(
         apply=respond_apply,
         revert=respond_revert,
         affects_udp_ingress=_never,
         affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_never,
+        affects_file_ingress=_never,
     ),
 }
 

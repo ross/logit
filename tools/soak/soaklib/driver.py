@@ -57,6 +57,12 @@ needs at the code:
   `compose.env` carries its `[target] shape` for standin.py's `--shape`.
   The end sequence waits for the sink's queue to empty, as for a Kafka target. Its record is its
   stdout, which the log capture collects with every other service's.
+- A scenario with a `file` wire gets `<run>/shared`, mode 0777 so the image's unprivileged
+  user, whatever its uid, can write it, named by `SOAK_SHARED_DIR` in `compose.env`; its
+  override mounts it into the writer and the SUT. The end sequence stops the writer, counts the
+  lines in every file there (`shared_counted`, the G the checks hold telemetry's against), and
+  waits until the tailers' W reaches that count or stops growing (`tail_caught_up`), reading W
+  from a log chunk it captures for the purpose, before it waits on the sinks.
 
 Every time in `timeline.jsonl`, `watchdog.jsonl`, `stats.ndjson`, and `vm-freshness.jsonl` is
 epoch seconds (`t`, `started_at`, `finished_at`), with `offset` measured from the timeline's zero:
@@ -97,6 +103,12 @@ SUT_STOP_T = 60
 # stdout each poll reads, several drains of `internal` lines.
 SINK_DRAIN_BOUND_S = 120
 SINK_DRAIN_TAIL_LINES = 400
+# How long the end sequence waits for a file wire's tailers to read what the writer wrote, how
+# often it reads W, and how many reads in a row with W unchanged mean the tailers are done: a
+# killed life's last drain interval of counts is never exported, so W can stop short of G.
+TAIL_CATCHUP_BOUND_S = 180
+TAIL_CATCHUP_EVERY_S = 5
+TAIL_STALL_READS = 4
 DEFAULT_AGGREGATE_INTERVAL_S = checks.DEFAULT_AGGREGATE_INTERVAL_S
 # The compose profile holding the backends, enabled for a local target only, and the one holding
 # the `kafka` broker, enabled for a Kafka target only.
@@ -226,6 +238,8 @@ class Run:
                       for service in self.scenario.generators + self.scenario.suts[1:])
             + (f"{scenario_mod.STANDIN_SHAPE_ENV}={self.scenario.standin_shape}\n"
                if self.standin else "")
+            + (f"{scenario_mod.SHARED_DIR_ENV}={self.make_shared_dir()}\n"
+               if self.scenario.file_sources else "")
         )
         shutil.copy(self.scenario.path, self.run_dir / "scenario.toml")
         # The checks read the SUT's `receive:` limits from this copy.
@@ -258,6 +272,14 @@ class Run:
         self.stats = collect.Jsonl(self.run_dir / "stats.ndjson")
         self.freshness = collect.Jsonl(self.run_dir / "vm-freshness.jsonl")
         self.capture = collect.LogCapture(self.run_dir, self.docker)
+
+    def make_shared_dir(self):
+        """Creates `<run>/shared` for a file wire's writer and tailer and returns its path. The
+        chmod follows the mkdir because the umask narrows the mode `mkdir` is given."""
+        shared = self.run_dir / scenario_mod.SHARED_DIR
+        shared.mkdir()
+        os.chmod(shared, 0o777)
+        return shared.resolve()
 
     def resolve_roles(self):
         """`{service: role}` from the merged compose config, raising `ScenarioError` when compose
@@ -436,7 +458,8 @@ class Run:
             "event": kind, "step": step.id, "action": step.action, "on": step.on,
             "args": step.args, "planned_offset": step.end if kind == "revert" else step.start,
             "started_at": started, "offset": self.offset(started),
-            "affects_udp_ingress": bool(action.affects_udp_ingress(step, self.roles)),
+            **{key: action.affects(wire, step, self.roles)
+               for wire, key in faults.INGRESS_KEYS.items()},
             "affects_egress": bool(action.affects_egress(step, self.roles)),
             **step.expected(),
         }
@@ -598,6 +621,7 @@ class Run:
             self.phase("generator_stopped", service=service, rc=result.rc,
                        stderr=result.stderr.strip())
 
+        self.wait_tailed()
         suts = self.scenario.suts
         for service in suts:
             if service != suts[-1]:
@@ -708,6 +732,41 @@ class Run:
             time.sleep(2)
         self.phase("quiet", held=False, totals=last_totals, hold_s=hold_s, polls=polls,
                    bound_s=QUIET_BOUND_S)
+
+    def wait_tailed(self):
+        """For a file wire: counts the lines the writer left in `<run>/shared`
+        (`collect.count_lines`, phase `shared_counted`), then waits, bounded at
+        `TAIL_CATCHUP_BOUND_S`, until the tailing listeners' W summed over every life reaches
+        that count or holds for `TAIL_STALL_READS` reads (phase `tail_caught_up`). Each read
+        captures a log chunk of the ingress SUT, so W is read from the whole of its stdout."""
+        sources = self.scenario.file_sources
+        if not sources:
+            return
+        counted = collect.count_lines(self.run_dir / scenario_mod.SHARED_DIR)
+        self.phase("shared_counted", **counted)
+        listeners = [source["sut_listener"] for source in sources]
+        service = scenario_mod.SUT_SERVICE
+        deadline = _now() + TAIL_CATCHUP_BOUND_S
+        last, unchanged, reads, w = None, 0, 0, None
+        while _now() < deadline:
+            reads += 1
+            self.capture.chunk({service: self.ids[service]})
+            tel = telemetry.read_ndjson(self.run_dir / "logs" / f"{service}.stdout")
+            w = sum(sum(tel.counter_by_life("logit.input.lines", component=listener).values())
+                    for listener in listeners)
+            if w >= counted["lines"]:
+                self.phase("tail_caught_up", reached=True, w=w, g=counted["lines"],
+                           reads=reads)
+                return
+            unchanged = unchanged + 1 if w == last else 0
+            last = w
+            if unchanged >= TAIL_STALL_READS - 1:
+                self.phase("tail_caught_up", reached=False, held=True, w=w,
+                           g=counted["lines"], reads=reads)
+                return
+            time.sleep(TAIL_CATCHUP_EVERY_S)
+        self.phase("tail_caught_up", reached=False, held=False, w=w, g=counted["lines"],
+                   reads=reads, bound_s=TAIL_CATCHUP_BOUND_S)
 
     def aggregate_interval(self):
         """The `aggregate` window of the SUT service holding `sut_aggregate`, in seconds, or
