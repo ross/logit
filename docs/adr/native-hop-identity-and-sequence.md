@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-05
+updated: 2026-10-15
 ---
 
 # Native hop identity and sequence: a per-store sender identity and sequence on every hop frame, and a high-water mark at `logit_in`
@@ -87,7 +87,9 @@ mark per sender identity, in a table bounded by its connection cap.
 - **Two new trailer tags.** Tag 3 is the sender identity, 16 bytes. Tag 4 is the sequence, a
   uvarint whose first value is 1. Both ride in every data frame's trailer, per frame.
   [Superseded on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): the identity, then the sequence as a uvarint,
-  lead the hop payload ahead of the batch; the trailer keeps provenance only.]
+  lead the hop payload ahead of the batch; the trailer keeps provenance only.] [Amended on
+  2026-10-15 by [ADR `native-hop-trace-context`](native-hop-trace-context.md): the trailer also carries an optional
+  trace context as tag 5.]
 - **The handshake carries no identity.** `Hello` and `HelloAck` are unchanged.
 - **The unsequenced rule.** A frame or spool record without a complete, well-formed pair is
   unsequenced, and `logit_in` forwards it. That covers a v1 codec frame, a v2 frame written

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-10-13
+updated: 2026-10-15
 ---
 
 # Internal span emission, one span per node-visit, and deterministic-on-`trace_id` sampling
@@ -63,6 +63,12 @@ only remaining caller of `send`/`send_blocking`**, which is what makes "one call
 | `Transform::flush` | fresh root | that root's | none | `Internal` | `run_flush` | `flush()` + every group's send |
 | Lua `flush()` | fresh root | that root's | none | `Internal` | `run_lua`'s `flush_now` | `flush()` + send |
 | `run_output` | inherited | `ctx.child()`, minted then discarded | incoming | `Client` | `write_loop` | the whole `deliver_with_retry` |
+
+[Amended on 2026-10-15 by [ADR `native-hop-trace-context`](native-hop-trace-context.md): `logit_in` is the one listener
+that can inherit a parent. For a batch whose hop frame carries a trace context, its span takes
+that context's `trace_id`, its `span_id` is `parent.child()`'s, and its `parent_span_id` is the
+sender's; it's recorded in `Fanout::send_relayed`, still `Producer`, around the `send` call only.
+A batch without one gets the listener row's fresh root.]
 
 A fan-out (one batch, several downstream consumers) does not multiply spans: a fan-out is one
 `send_with_own_context` call by one node producing one context, so the node records one span and
@@ -185,7 +191,13 @@ Deterministic on `trace_id`, so every node — and every `logit` process in a sp
 topology (`docs/OVERVIEW.md`) — reaches the same keep/drop verdict independently, with **no
 propagation and no extra bytes on `TraceContext`/`Delivered`**: a kept trace is kept at every hop,
 a dropped one dropped at every hop, without any node ever telling another its answer. Same shape as
-OTel's `TraceIdRatioBased` sampler:
+OTel's `TraceIdRatioBased` sampler. [Amended on 2026-10-15 by
+[ADR `native-hop-trace-context`](native-hop-trace-context.md): across processes the verdict
+agrees only once they share a `trace_id` and a `span_sample_rate`. A native hop shares the
+`trace_id` by carrying the batch's context in the hop trailer, and `logit_out` carries it only
+when its own process sampled the trace, so a receiver never records a span whose parent the
+sender dropped. The hop carries a context, not a verdict, so
+`TraceContext` and `Delivered` still gain no bit.]
 
 ```rust
 pub fn trace_is_sampled(trace_id: &[u8; 16], rate: f64) -> bool {

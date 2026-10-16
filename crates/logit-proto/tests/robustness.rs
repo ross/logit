@@ -489,6 +489,14 @@ fn sample_provenance() -> Provenance {
     }
 }
 
+/// Distinct non-zero bytes, so a swapped or shifted id changes the encoding.
+fn sample_trace() -> native::HopTrace {
+    native::HopTrace {
+        trace_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        span_id: [17, 18, 19, 20, 21, 22, 23, 24],
+    }
+}
+
 /// A multi-byte sequence, so truncation and bit flips land inside its uvarint too.
 fn sample_seq() -> native::SeqId {
     native::SeqId { id: *b"robustness-send!", seq: 1_000_000 }
@@ -496,7 +504,12 @@ fn sample_seq() -> native::SeqId {
 
 #[test]
 fn decode_hop_batch_survives_every_single_byte_truncation() {
-    let payload = native::encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq());
+    let payload = native::encode_hop_batch(
+        &sample_batch(),
+        sample_provenance(),
+        Some(sample_trace()),
+        sample_seq(),
+    );
     assert_every_truncation_fails_cleanly(&payload, |bytes| {
         native::decode_hop_batch(bytes, &DecodeBudget::default()).is_err()
     });
@@ -504,7 +517,12 @@ fn decode_hop_batch_survives_every_single_byte_truncation() {
 
 #[test]
 fn decode_hop_batch_survives_seeded_bit_flips() {
-    let payload = native::encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq());
+    let payload = native::encode_hop_batch(
+        &sample_batch(),
+        sample_provenance(),
+        Some(sample_trace()),
+        sample_seq(),
+    );
     assert_bit_flips_never_panic(&payload, 5000, |bytes| {
         native::decode_hop_batch(bytes, &DecodeBudget::default()).is_ok()
     });
@@ -514,7 +532,8 @@ fn decode_hop_batch_survives_seeded_bit_flips() {
 /// the whole pair fails.
 #[test]
 fn read_hop_prefix_survives_every_single_byte_truncation() {
-    let payload = native::encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq());
+    let payload =
+        native::encode_hop_batch(&sample_batch(), sample_provenance(), None, sample_seq());
     let prefix_len = 16 + 3; // a 3-byte uvarint for 1_000_000
     assert_every_truncation_fails_cleanly(&payload[..prefix_len], |bytes| {
         native::read_hop_prefix(bytes).is_err()
@@ -523,7 +542,8 @@ fn read_hop_prefix_survives_every_single_byte_truncation() {
 
 #[test]
 fn read_frame_prefix_survives_truncation_and_bit_flips() {
-    let payload = native::encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq());
+    let payload =
+        native::encode_hop_batch(&sample_batch(), sample_provenance(), None, sample_seq());
     for compression in [Compression::None, Compression::Lz4] {
         let framed = frame::write_frame(native::CODEC_HOP_BATCH, compression, &payload).unwrap();
         assert_every_truncation_fails_cleanly(&framed, |bytes| {
@@ -2722,8 +2742,13 @@ fn a_batch_with_bytes_after_its_last_event_is_malformed() {
     bare.extend_from_slice(b"junk");
     assert_malformed(decode_bare(&bare), "trailing bytes", "bare");
 
-    let mut hop =
-        native::encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq()).to_vec();
+    let mut hop = native::encode_hop_batch(
+        &sample_batch(),
+        sample_provenance(),
+        Some(sample_trace()),
+        sample_seq(),
+    )
+    .to_vec();
     hop.extend_from_slice(b"junk");
     assert_malformed(
         native::decode_hop_batch(&mut Bytes::from(hop), &DecodeBudget::default()),
@@ -2740,11 +2765,16 @@ fn encode_then_decode_then_encode_is_byte_identical() {
     let decoded = decode_bare(&bare).unwrap();
     assert_eq!(native::encode_batch(&decoded), bare);
 
-    let hop = native::encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq());
-    let (decoded, provenance, seq) =
+    let hop = native::encode_hop_batch(
+        &sample_batch(),
+        sample_provenance(),
+        Some(sample_trace()),
+        sample_seq(),
+    );
+    let (decoded, provenance, trace, seq) =
         native::decode_hop_batch(&mut hop.clone(), &DecodeBudget::default()).unwrap();
     assert_eq!(seq, sample_seq());
-    assert_eq!(native::encode_hop_batch(&decoded, provenance, seq), hop);
+    assert_eq!(native::encode_hop_batch(&decoded, provenance, trace, seq), hop);
 }
 
 /// `write_frame` refuses what `read_frame` would refuse, so no writer can emit a frame over the

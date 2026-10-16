@@ -4267,12 +4267,14 @@ fn native_decode_one_event() {
 
 /// The provenance and sender pair `logit_out` and `logit_in` pins carry, interned before any
 /// measurement.
-fn hop_trailer() -> (logit_core::Provenance, logit_proto::native::SeqId) {
+fn hop_trailer(
+) -> (logit_core::Provenance, Option<logit_proto::native::HopTrace>, logit_proto::native::SeqId) {
     let provenance = logit_core::Provenance {
         origin: Some(logit_core::interner::intern("alloc_nginx_in")),
         previous: Some(logit_core::interner::intern("alloc_enrich")),
     };
-    (provenance, logit_proto::native::SeqId { id: [7; 16], seq: 1_000 })
+    let trace = logit_proto::native::HopTrace { trace_id: [3; 16], span_id: [5; 8] };
+    (provenance, Some(trace), logit_proto::native::SeqId { id: [7; 16], seq: 1_000 })
 }
 
 /// `logit_out`'s encode+frame step through the primitives it calls (`native::encode_hop_batch`,
@@ -4282,8 +4284,8 @@ fn hop_trailer() -> (logit_core::Provenance, logit_proto::native::SeqId) {
 #[test]
 fn logit_out_encode_and_frame_one_batch() {
     let batch = fixtures::nginx_batch(1);
-    let (provenance, seq) = hop_trailer();
-    let warm_payload = logit_proto::native::encode_hop_batch(&batch, provenance, seq);
+    let (provenance, trace, seq) = hop_trailer();
+    let warm_payload = logit_proto::native::encode_hop_batch(&batch, provenance, trace, seq);
     drop(logit_proto::frame::write_frame_with_flags(
         logit_proto::native::CODEC_HOP_BATCH,
         logit_proto::frame::Compression::None,
@@ -4292,7 +4294,7 @@ fn logit_out_encode_and_frame_one_batch() {
     ));
 
     let (framed, stats) = measure(|| {
-        let payload = logit_proto::native::encode_hop_batch(&batch, provenance, seq);
+        let payload = logit_proto::native::encode_hop_batch(&batch, provenance, trace, seq);
         logit_proto::frame::write_frame_with_flags(
             logit_proto::native::CODEC_HOP_BATCH,
             logit_proto::frame::Compression::None,
@@ -4314,8 +4316,8 @@ fn logit_out_encode_and_frame_one_batch() {
 #[test]
 fn logit_in_read_and_decode_one_batch() {
     let batch = fixtures::nginx_batch(1);
-    let (provenance, seq) = hop_trailer();
-    let payload = logit_proto::native::encode_hop_batch(&batch, provenance, seq);
+    let (provenance, trace, seq) = hop_trailer();
+    let payload = logit_proto::native::encode_hop_batch(&batch, provenance, trace, seq);
     let framed = logit_proto::frame::write_frame(
         logit_proto::native::CODEC_HOP_BATCH,
         logit_proto::frame::Compression::None,

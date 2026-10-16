@@ -71,8 +71,11 @@ use tokio::sync::mpsc::error::TrySendError;
 /// `ScriptWorker::process`) produces a `child`. A flush (`Transform::flush`, Lua's timer-driven
 /// `flush()`) is built from however many batches arrived since the last tick, has no single
 /// parent, and mints a [`TraceContext::new_root`]
-/// (`docs/adr/trace-context-propagation-on-delivered.md`). `docs/known-gaps/telemetry.md`'s
-/// internal-spans entry names what is still open.
+/// (`docs/adr/trace-context-propagation-on-delivered.md`). Listeners mint a root too, except
+/// `logit_in`: the one listener that can inherit a parent, from the trace context a sending
+/// `logit_out` wrote into the frame ([`Fanout::send_relayed`],
+/// `docs/adr/native-hop-trace-context.md`). `docs/known-gaps/telemetry.md`'s internal-spans entry
+/// names what is still open.
 ///
 /// `Default` is the all-zero context, for tests and benches that build a `Delivered` directly;
 /// `Fanout` never uses it.
@@ -80,6 +83,18 @@ use tokio::sync::mpsc::error::TrySendError;
 pub struct TraceContext {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
+}
+
+impl From<logit_proto::native::HopTrace> for TraceContext {
+    fn from(t: logit_proto::native::HopTrace) -> Self {
+        TraceContext { trace_id: t.trace_id, span_id: t.span_id }
+    }
+}
+
+impl From<TraceContext> for logit_proto::native::HopTrace {
+    fn from(t: TraceContext) -> Self {
+        logit_proto::native::HopTrace { trace_id: t.trace_id, span_id: t.span_id }
+    }
 }
 
 impl TraceContext {
@@ -93,6 +108,14 @@ impl TraceContext {
     /// `trace_id`, fresh `span_id`.
     pub fn child(&self) -> Self {
         TraceContext { trace_id: self.trace_id, span_id: random_id_bytes() }
+    }
+}
+
+/// The context [`Fanout::send_relayed`] sends downstream, and its span's parent span id.
+fn relayed_context(parent: Option<TraceContext>) -> (TraceContext, Option<[u8; 8]>) {
+    match parent {
+        Some(p) => (p.child(), Some(p.span_id)),
+        None => (TraceContext::new_root(), None),
     }
 }
 
@@ -431,13 +454,26 @@ impl Fanout {
         Ok(taken)
     }
 
-    /// `logit_in`'s send: [`Fanout::send`] (a fresh root and a listener span), stamped with
-    /// [`Fanout::stamp_relayed`]'s back-fill rule so a peer's relayed `origin`/`previous` survive.
-    /// See `docs/design/wire-protocol.md`'s `logit_out`/`logit_in` section.
-    pub async fn send_relayed(&self, batch: EventBatch, provenance: Provenance) -> bool {
-        let trace = TraceContext::new_root();
-        let mut span =
-            self.telemetry.span("send", SpanKind::Producer, trace.trace_id, trace.span_id, None);
+    /// `logit_in`'s send: a listener span, stamped with [`Fanout::stamp_relayed`]'s back-fill
+    /// rule so a peer's relayed `origin`/`previous` survive. The context sent downstream is a
+    /// [`TraceContext::child`] of `parent`, the sender's context, when the frame carried one, and
+    /// the span is parented on it; with no `parent` it is a fresh root, as [`Fanout::send`] mints.
+    /// See `docs/design/wire-protocol.md`'s `logit_out`/`logit_in` section and
+    /// `docs/adr/native-hop-trace-context.md`.
+    pub async fn send_relayed(
+        &self,
+        batch: EventBatch,
+        provenance: Provenance,
+        parent: Option<TraceContext>,
+    ) -> bool {
+        let (trace, parent_span) = relayed_context(parent);
+        let mut span = self.telemetry.span(
+            "send",
+            SpanKind::Producer,
+            trace.trace_id,
+            trace.span_id,
+            parent_span,
+        );
         span.events(batch.events.len() as u64);
         let ctx = self.stamp_relayed(BatchContext { trace, provenance });
         self.deliver(batch, ctx).await
@@ -498,10 +534,20 @@ impl Fanout {
 
     /// The `blocking_send` equivalent of [`Fanout::send_relayed`]. No shipped component calls it
     /// (`logit_in` is a tokio task); it completes the blocking/async pairing.
-    pub fn send_relayed_blocking(&self, batch: EventBatch, provenance: Provenance) -> bool {
-        let trace = TraceContext::new_root();
-        let mut span =
-            self.telemetry.span("send", SpanKind::Producer, trace.trace_id, trace.span_id, None);
+    pub fn send_relayed_blocking(
+        &self,
+        batch: EventBatch,
+        provenance: Provenance,
+        parent: Option<TraceContext>,
+    ) -> bool {
+        let (trace, parent_span) = relayed_context(parent);
+        let mut span = self.telemetry.span(
+            "send",
+            SpanKind::Producer,
+            trace.trace_id,
+            trace.span_id,
+            parent_span,
+        );
         span.events(batch.events.len() as u64);
         let ctx = self.stamp_relayed(BatchContext { trace, provenance });
         self.deliver_blocking(batch, ctx)
@@ -1210,7 +1256,7 @@ mod tests {
             previous: Some(logit_core::interner::intern("remote_enrich")),
         };
 
-        fanout.send_relayed(batch(1), from_wire).await;
+        fanout.send_relayed(batch(1), from_wire, None).await;
 
         let provenance = rx.recv().await.expect("should receive").provenance();
         assert_eq!(provenance, from_wire);
@@ -1222,10 +1268,85 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let fanout = Fanout::new(vec![tx]).with_component("logit_in");
 
-        fanout.send_relayed(batch(1), logit_core::Provenance::default()).await;
+        fanout.send_relayed(batch(1), logit_core::Provenance::default(), None).await;
 
         let provenance = rx.recv().await.expect("should receive").provenance();
         assert_eq!(provenance.origin_str(), Some("logit_in"));
         assert_eq!(provenance.previous_str(), Some("logit_in"));
+    }
+
+    /// The one `send` span a live registry recorded.
+    fn only_send_span(registry: &Registry) -> logit_core::SpanRecord {
+        let events = registry.drain(0);
+        let mut spans = events.iter().filter_map(|e| e.span.as_ref());
+        let span = spans.next().expect("a send span").clone();
+        assert!(spans.next().is_none(), "one send, one span");
+        span
+    }
+
+    /// Under a parent from the wire, `send_relayed` sends a child of it and records its span as
+    /// that child, parented on the sender's span.
+    #[tokio::test]
+    async fn send_relayed_under_a_parent_delivers_a_child_and_records_a_span_parented_on_it() {
+        let registry = Registry::with_span_sampling(1.0);
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx])
+            .with_component("logit_in")
+            .with_telemetry(registry.telemetry_for("logit_in", "logit_in", "listener"));
+        let parent = TraceContext::new_root();
+
+        fanout.send_relayed(batch(1), logit_core::Provenance::default(), Some(parent)).await;
+
+        let sent = rx.recv().await.expect("should receive").context();
+        assert_eq!(sent.trace_id, parent.trace_id, "the sender's trace continues");
+        assert_ne!(sent.span_id, parent.span_id, "a child mints its own span id");
+        let span = only_send_span(&registry);
+        assert_eq!(span.trace_id, parent.trace_id);
+        assert_eq!(span.parent_span_id, Some(parent.span_id));
+        assert_eq!(span.span_id, sent.span_id, "the span is the context sent downstream");
+    }
+
+    /// With no parent from the wire, `send_relayed` roots a trace of its own.
+    #[tokio::test]
+    async fn send_relayed_with_no_parent_mints_a_root() {
+        let registry = Registry::with_span_sampling(1.0);
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx])
+            .with_component("logit_in")
+            .with_telemetry(registry.telemetry_for("logit_in", "logit_in", "listener"));
+        let unrelated = TraceContext::new_root();
+
+        fanout.send_relayed(batch(1), logit_core::Provenance::default(), None).await;
+
+        let sent = rx.recv().await.expect("should receive").context();
+        assert_ne!(sent.trace_id, unrelated.trace_id);
+        let span = only_send_span(&registry);
+        assert_eq!(span.trace_id, sent.trace_id);
+        assert_eq!(span.parent_span_id, None);
+    }
+
+    /// The blocking twin of the parent test above.
+    #[tokio::test]
+    async fn send_relayed_blocking_under_a_parent_delivers_a_child_and_records_a_span_parented_on_it(
+    ) {
+        let registry = Registry::with_span_sampling(1.0);
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx])
+            .with_component("logit_in")
+            .with_telemetry(registry.telemetry_for("logit_in", "logit_in", "listener"));
+        let parent = TraceContext::new_root();
+
+        let send = tokio::task::spawn_blocking(move || {
+            fanout.send_relayed_blocking(batch(1), logit_core::Provenance::default(), Some(parent))
+        });
+        assert!(send.await.expect("blocking send task"), "the consumer took the batch");
+
+        let sent = rx.recv().await.expect("should receive").context();
+        assert_eq!(sent.trace_id, parent.trace_id);
+        assert_ne!(sent.span_id, parent.span_id);
+        let span = only_send_span(&registry);
+        assert_eq!(span.trace_id, parent.trace_id);
+        assert_eq!(span.parent_span_id, Some(parent.span_id));
+        assert_eq!(span.span_id, sent.span_id);
     }
 }

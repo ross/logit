@@ -21,7 +21,9 @@
 //! unversioned, see `CONTEXT_LEN`) followed by one `logit_proto::frame` native frame under
 //! `CODEC_HOP_BATCH`: the native-hop sender identity and sequence the store numbered it with
 //! (`docs/adr/native-hop-identity-and-sequence.md`, decision 3), the batch, then a trailer with
-//! its [`logit_core::Provenance`]. A replayed record goes out under the pair it was written with,
+//! its [`logit_core::Provenance`]. The trailer carries no trace field: the record's context lives
+//! in the 24-byte prefix alone (`docs/adr/native-hop-trace-context.md`). A replayed record goes
+//! out under the pair it was written with,
 //! never the reopened store's. A record whose payload doesn't open with a complete pair, a batch
 //! first with the pair as trailer tags 3 and 4 among them, doesn't parse and is skipped as
 //! corrupt (`docs/adr/native-hop-ack-status.md`).
@@ -189,7 +191,9 @@ fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, SeqId, usi
             native::CODEC_HOP_BATCH
         )));
     }
-    let (batch, provenance, seq) = native::decode_hop_batch(&mut payload, &budget)?;
+    // The prefix is the record's context; a trace field in the trailer, which `push` never
+    // writes, is ignored.
+    let (batch, provenance, _trace, seq) = native::decode_hop_batch(&mut payload, &budget)?;
     let consumed_frame = before - rest.len();
     let ctx = BatchContext { trace, provenance };
     Ok((ctx, Arc::new(batch), seq, CONTEXT_LEN + consumed_frame))
@@ -964,7 +968,9 @@ impl DiskQueue {
         let seq = self.numbering.next();
         let (batch, ctx) = item;
 
-        let payload = native::encode_hop_batch(&batch, ctx.provenance, seq);
+        // No trace field: the record prefix holds the context, and `logit_out` re-encodes the
+        // frame under its own sampling gate on every attempt.
+        let payload = native::encode_hop_batch(&batch, ctx.provenance, None, seq);
         // `write_frame` fails for a payload over `MAX_SANE_UNCOMPRESSED_LEN` and for
         // `Compression::Zstd`, which `logit_config::Compression` (where `disk.compression` comes
         // from) cannot express, so a failure here is an oversize batch.
@@ -1929,7 +1935,7 @@ pub(crate) mod test_support {
         batch: &logit_core::EventBatch,
         provenance: logit_core::Provenance,
     ) -> u64 {
-        let payload = native::encode_hop_batch(batch, provenance, SEQ_ONE);
+        let payload = native::encode_hop_batch(batch, provenance, None, SEQ_ONE);
         let framed =
             frame::write_frame(native::CODEC_HOP_BATCH, frame::Compression::None, &payload)
                 .expect("None compression never fails");
@@ -1993,7 +1999,7 @@ pub(crate) mod test_support {
     /// The on-disk bytes `DiskQueue::push` writes for one record, for hand-built segment files.
     /// Carries a sequence of 1, so its length matches a pushed record's for sequences 1..=127.
     pub(crate) fn raw_record(batch: &EventBatch, ctx: BatchContext) -> Vec<u8> {
-        let payload = native::encode_hop_batch(batch, ctx.provenance, SEQ_ONE);
+        let payload = native::encode_hop_batch(batch, ctx.provenance, None, SEQ_ONE);
         raw_frame_record(ctx.trace, native::CODEC_HOP_BATCH, &payload)
     }
 
@@ -2069,6 +2075,54 @@ mod tests {
 
         let (_peeked, peeked_ctx, _) = q.peek().await.expect("should peek the pushed batch");
         assert_eq!(peeked_ctx, sent, "trace and provenance should both come back unchanged");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `push` writes no trace field into the frame: the record prefix holds the context
+    /// (`docs/adr/native-hop-trace-context.md`).
+    #[tokio::test]
+    async fn a_spooled_frame_carries_no_trace_tag() {
+        let dir = scratch_dir("no-trace-tag");
+        let q = open(dir.clone());
+        let sent = ctx();
+
+        q.push((batch("a"), sent)).await;
+
+        let seqs = list_segments(&dir).unwrap();
+        let bytes = std::fs::read(segment_path(&dir, seqs[0])).unwrap();
+        assert_eq!(decode_context(&bytes[..CONTEXT_LEN]), sent.trace, "the prefix holds it");
+        let mut rest = Bytes::copy_from_slice(&bytes[CONTEXT_LEN..]);
+        let (codec, mut payload) = frame::read_frame(&mut rest).unwrap();
+        assert_eq!(codec, native::CODEC_HOP_BATCH);
+        let (_, _, trace, _) =
+            native::decode_hop_batch(&mut payload, &native::DecodeBudget::unlimited()).unwrap();
+        assert_eq!(trace, None, "the spooled frame carries no trace field");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A record whose frame carries a trace field reads back under its prefix's context.
+    #[tokio::test]
+    async fn the_record_prefix_wins_over_a_trailer_trace() {
+        let dir = scratch_dir("prefix-wins");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = TraceContext::new_root();
+        let other = TraceContext::new_root();
+        let payload = native::encode_hop_batch(
+            &batch("a"),
+            Provenance::default(),
+            Some(other.into()),
+            SEQ_ONE,
+        );
+        std::fs::write(
+            segment_path(&dir, 0),
+            raw_frame_record(prefix, native::CODEC_HOP_BATCH, &payload),
+        )
+        .unwrap();
+        let q = open(dir.clone());
+
+        let (peeked, peeked_ctx, _) = q.peek().await.expect("the record parses");
+        assert_eq!(marker_of(&peeked), "a");
+        assert_eq!(peeked_ctx.trace, prefix);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3346,7 +3400,8 @@ mod tests {
         // just past A's end, backed up by `CONTEXT_LEN`, lands inside A, and a record parses
         // there: the last bytes of A plus the filler as its context, then the real frame.
         let a = raw_record(&batch("a"), ctx());
-        let payload = native::encode_hop_batch(&batch("phantom"), Provenance::default(), SEQ_ONE);
+        let payload =
+            native::encode_hop_batch(&batch("phantom"), Provenance::default(), None, SEQ_ONE);
         let bare_frame =
             frame::write_frame(native::CODEC_HOP_BATCH, Compression::None, &payload).unwrap();
         for filler in 1..CONTEXT_LEN {
@@ -3798,7 +3853,8 @@ mod tests {
                 logit_config::Compression::None => Compression::None,
                 logit_config::Compression::Lz4 => Compression::Lz4,
             };
-            let payload = native::encode_hop_batch(&batch("x"), Provenance::default(), SEQ_ONE);
+            let payload =
+                native::encode_hop_batch(&batch("x"), Provenance::default(), None, SEQ_ONE);
             frame::write_frame(native::CODEC_HOP_BATCH, compression, &payload)
                 .unwrap_or_else(|err| panic!("{configured:?} must encode: {err}"));
 
