@@ -2759,15 +2759,16 @@ def _end_to_end(data, led):
              if source_wire(source) == FILE_WIRE]
     replay = led.replay_band(files)[1] if files else 0
     limit = led.G - counted + replay
+    bound = "G − counted + replay" if files else "G − counted"
     status, parts = PASS, []
     for label, sinks in led.egress_groups():
         total = sum(led.V_total.get(sink, 0) for sink in sinks)
         if total > limit:
             status = FAIL
-            parts.append(f"{label}: V {_n(total)} > G − counted {_n(limit)}, a surplus of "
+            parts.append(f"{label}: V {_n(total)} > {bound} {_n(limit)}, a surplus of "
                          f"{_n(total - limit)}")
         else:
-            parts.append(f"{label}: V {_n(total)} <= G − counted {_n(limit)}")
+            parts.append(f"{label}: V {_n(total)} <= {bound} {_n(limit)}")
     return status, ("end to end over the run, G " + _n(led.G) + " less counted loss "
                     + _n(counted) + (f" plus the replay band's {_n(replay)}" if files else "")
                     + ": " + "; ".join(parts))

@@ -143,6 +143,7 @@ import gzip
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -5189,6 +5190,234 @@ def _tcp_rules(root):
            f"tcp-ingress names a TCP source and its eight faults, got {tcp.sources}")
 
 
+def _as_file_wire(run_dir, w_minus_g=0, counted=True, line_bytes=95, files_open=None):
+    """Turns a ledger fixture into a file-wire run in place: the listener's datagrams become
+    `logit.input.lines`, the generator's `output.messages` its `file_out`'s
+    `logit.component.events.delivered`, set so the run's W − G is `w_minus_g`, and the source
+    names `wire = "file"`. `counted` records the driver's `shared_counted` phase with G's lines
+    at `line_bytes` each (a dict replaces it). `files_open` is `{offset: n}` of
+    `logit.input.files.open` gauges written for the listener `in`."""
+    stdout = run_dir / "logs" / "logit.stdout"
+    out, w = [], 0
+    for line in stdout.read_text().splitlines():
+        record = json.loads(line)
+        if record["metrics"][0]["name"] == "logit.input.datagrams":
+            record["metrics"][0]["name"] = "logit.input.lines"
+            w += record["metrics"][0]["value"]
+        out.append(json.dumps(record))
+    for offset, n in (files_open or {}).items():
+        out.append(_line(_stamp(T0 + offset), "logit.input.files.open", "gauge", n,
+                         component="in"))
+    stdout.write_text("\n".join(out) + "\n")
+    g = w - w_minus_g
+    gen_path = run_dir / "logs" / "generator.stdout"
+    gen, first = [], True
+    for line in gen_path.read_text().splitlines():
+        record = json.loads(line)
+        name = record["metrics"][0]["name"]
+        if name == "logit.output.datagrams":
+            continue
+        if name == "logit.output.messages":
+            record["metrics"][0]["name"] = "logit.component.events.delivered"
+            record["metrics"][0]["value"] = 0
+            if first:
+                record["metrics"][0]["value"] = g
+                first = False
+        gen.append(json.dumps(record))
+    gen_path.write_text("\n".join(gen) + "\n")
+    if counted:
+        phase = (counted if isinstance(counted, dict)
+                 else {"files": 3, "lines": g, "bytes": g * line_bytes})
+        with open(run_dir / "timeline.jsonl", "a") as timeline:
+            timeline.write(json.dumps(_phase("shared_counted", 301, **phase)) + "\n")
+            timeline.write(json.dumps(_phase("tail_caught_up", 302, reached=True, w=w, g=g,
+                                             reads=2)) + "\n")
+    resolved_path = run_dir / "scenario.resolved.json"
+    resolved = json.loads(resolved_path.read_text())
+    resolved["ledger"]["source"] = [{**resolved["ledger"]["source"][0], "wire": "file"}]
+    resolved_path.write_text(json.dumps(resolved))
+    return run_dir
+
+
+def _file_ledger():
+    """The ledger on a file source: W from `input.lines` and G from the writer's
+    `events.delivered`, held to the shared directory's count; the run's W − G judged against
+    the replay band, a stopped life's split lines one per open file, and a killed life's
+    replay above and lost counts below; and `ledger.summary`'s end-to-end bound widened by the
+    band's upper edge."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def stopped(name, **kwargs):
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=30)
+            return {r.id: r for r in checks.run_all(_as_file_wire(run_dir, **kwargs))}
+
+        clean = stopped("file-clean")
+        for row in ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.egress",
+                    "ledger.summary", "drops"):
+            expect(clean[row].status == checks.PASS,
+                   f"{row} PASSes the balanced file-wire fixture, got {clean[row]}")
+        wire = clean["ledger.wire"].detail
+        expect(wire.startswith("G 54,030 (shared directory: 54,030 lines in 3 files) vs W "
+                               "54,030 + counted 0: W + F − G 0 against the replay band [0, 1]")
+               and "the tailers reached G" in wire,
+               f"a file source reads input.lines and events.delivered, got {wire}")
+        expect(any("life 0 (stopped): [0, +1]" in line for line in clean["ledger.wire"].lines),
+               f"a stopped life allows one split line per file, got {clean['ledger.wire'].lines}")
+        split = stopped("file-split", w_minus_g=1)
+        expect(split["ledger.wire"].status == checks.PASS,
+               f"one split line at a stop is inside the band, got {split['ledger.wire']}")
+        over = stopped("file-surplus", w_minus_g=2)
+        expect(over["ledger.wire"].status == checks.FAIL
+               and over["ledger.wire"].detail.startswith(
+                   "W + F − G 2 is surplus, outside the replay band [0, 1]"),
+               f"a surplus past the band FAILs, got {over['ledger.wire']}")
+        wider = stopped("file-files-open", w_minus_g=3, files_open={100: 3})
+        expect(wider["ledger.wire"].status == checks.PASS
+               and "[0, 3]" in wider["ledger.wire"].detail,
+               f"a stopped life with three files open allows three splits, got "
+               f"{wider['ledger.wire']}")
+        lost = stopped("file-lost", w_minus_g=-1)
+        expect(lost["ledger.wire"].status == checks.FAIL
+               and lost["ledger.wire"].detail.startswith(
+                   "W + F − G -1 is uncounted loss, outside the replay band [0, 1]"),
+               f"a line never read FAILs, got {lost['ledger.wire']}")
+        missing = stopped("file-uncounted", counted=False)
+        expect(missing["ledger.wire"].status == checks.FAIL
+               and "precondition: no shared_counted phase" in missing["ledger.wire"].detail,
+               f"a run with no shared count FAILs, got {missing['ledger.wire']}")
+        mismatch = stopped("file-mismatch", counted={"files": 3, "lines": 54_000,
+                                                     "bytes": 5_130_000})
+        expect(mismatch["ledger.wire"].status == checks.FAIL
+               and "the shared directory holds 54,000 line(s) in 3 file(s), but the writer's "
+               "events.delivered is 54,030" in mismatch["ledger.wire"].detail,
+               f"G short of the shared directory's count FAILs, got {mismatch['ledger.wire']}")
+
+        # A killed life at 200 lines/s, 5 s drains, and a 5 s checkpoint_interval: below, 1,000
+        # lost counts; above, 1,000 lines plus two files x 690 lines a 64 KiB read holds at 95
+        # bytes a line; the stopped life adds one split.
+        def killed(name, w_minus_g):
+            run_dir = _kill_run(tmp, name, every_window=False)
+            return {r.id: r for r in checks.run_all(_as_file_wire(run_dir,
+                                                                  w_minus_g=w_minus_g))}
+
+        edge = killed("file-kill-high", 2_381)
+        lines = "\n".join(edge["ledger.wire"].lines)
+        expect(edge["ledger.wire"].status == checks.PASS
+               and "against the replay band [-1,000, 2,381]" in edge["ledger.wire"].detail
+               and "life 1 (killed): [-1,000, +2,380]: 200 lines/s x a 5s drain interval below"
+               in lines and "2 file(s) x one 64 KiB read of 690 lines above" in lines,
+               f"a killed life's replay band, got {edge['ledger.wire']}")
+        past = killed("file-kill-over", 2_382)
+        expect(past["ledger.wire"].status == checks.FAIL,
+               f"a replay past the band FAILs, got {past['ledger.wire']}")
+        short = killed("file-kill-low", -1_000)
+        expect(short["ledger.wire"].status == checks.PASS,
+               f"a killed life's lost counts inside the band pass, got {short['ledger.wire']}")
+        shorter = killed("file-kill-lost", -1_001)
+        expect(shorter["ledger.wire"].status == checks.FAIL,
+               f"loss past a killed life's band FAILs, got {shorter['ledger.wire']}")
+        # V holds the replayed lines too, so it exceeds G less counted loss by up to the band.
+        expect(edge["ledger.summary"].status == checks.PASS
+               and "plus the replay band's 2,381" in edge["ledger.summary"].detail,
+               f"the end-to-end bound adds the band's upper edge, got "
+               f"{edge['ledger.summary'].detail}")
+
+    # The driver's line count: newlines only, every file, a partial write left out.
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "app.log").write_text("a\nb\nc")
+        (Path(tmp) / "app.log.1").write_text("d\ne\n")
+        counted = collect.count_lines(tmp)
+        expect(counted == {"files": 2, "lines": 4, "bytes": 9},
+               f"count_lines counts newlines across every file, got {counted}")
+
+
+def _file_rules(root):
+    """A file wire's writer must be a `file_out`, and only a file wire's may be; the driver's
+    shared directory and its compose variable; and its wait for the tailers, which ends when W
+    reaches the shared count or stops growing."""
+    tail = scenario.load(root / "scenarios" / "tail-rotate" / "scenario.toml")
+    expect([source["wire"] for source in tail.file_sources] == ["file"],
+           f"tail-rotate's one source is a file wire, got {tail.file_sources}")
+    with tempfile.TemporaryDirectory() as tmp:
+        tail_dir = Path(tmp) / "tail-rotate"
+        shutil.copytree(root / "scenarios" / "tail-rotate", tail_dir)
+        config = tail_dir / "logit-generator.yaml"
+        config.write_text(config.read_text().replace("type: file_out", "type: stdio_out"))
+        try:
+            scenario.load(tail_dir / "scenario.toml")
+            expect(False, "a file wire whose writer isn't a file_out loads")
+        except scenario.ScenarioError as err:
+            expect(any("a file wire's `generator_sink` must be a file_out, and 'file' is a "
+                       "stdio_out" in p for p in err.problems),
+                   f"a file wire's writer must be a file_out, got {err.problems}")
+        config.write_text(config.read_text().replace("type: stdio_out", "type: file_out"))
+        toml = tail_dir / "scenario.toml"
+        toml.write_text(toml.read_text().replace('wire = "file"', ""))
+        try:
+            scenario.load(toml)
+            expect(False, "a file_out writer on a source with no wire loads")
+        except scenario.ScenarioError as err:
+            expect(any("`generator_sink` 'file' is a file_out, which only a file wire reads"
+                       in p for p in err.problems),
+                   f"a file_out writer needs a file wire, got {err.problems}")
+
+        run = driver.Run(root, tail, tail.duration, None, False, tmp, [], "logit:soak",
+                         roles=_override_roles(tail))
+        run.prepare()
+        shared = run.run_dir / "shared"
+        env = (run.run_dir / "compose.env").read_text()
+        expect(shared.is_dir() and (shared.stat().st_mode & 0o777) == 0o777
+               and f"SOAK_SHARED_DIR={shared.resolve()}\n" in env,
+               f"prepare() makes a 0777 shared directory and names it, got {env}")
+        override = tail.compose_path().read_text()
+        expect(override.count("${SOAK_SHARED_DIR:?") == 2,
+               "tail-rotate's override mounts the shared directory into both services")
+
+        # The wait: W read from captured chunks reaches the shared count, or stops growing.
+        (shared / "app.log").write_text("x\n" * 10)
+        stdout = run.run_dir / "logs" / "logit.stdout"
+
+        class Capture:
+            def __init__(self, deltas):
+                self.deltas = list(deltas)
+                self.offset = 0
+
+            def chunk(self, ids):
+                delta = self.deltas.pop(0) if self.deltas else 0
+                self.offset += 5
+                with open(stdout, "a") as out:
+                    out.write(_line(_stamp(T0 + self.offset), "logit.process.uptime", "gauge",
+                                    float(self.offset)) + "\n")
+                    out.write(_line(_stamp(T0 + self.offset), "logit.input.lines", "sum",
+                                    delta, component="tail") + "\n")
+
+        clock = [1000.0]
+        reals = (driver._now, driver.time.sleep)
+        driver._now = lambda: clock[0]
+        driver.time.sleep = lambda s: clock.__setitem__(0, clock[0] + s)
+        try:
+            run.ids = {"logit": "a"}
+            run.t0 = clock[0]
+            run.timeline = _Records()
+            run.capture = Capture([4, 4, 2])
+            run.wait_tailed()
+            reached = run.timeline[-1]
+            stdout.write_text("")
+            run.timeline = _Records()
+            run.capture = Capture([4, 3])
+            run.wait_tailed()
+            held = run.timeline[-1]
+        finally:
+            driver._now, driver.time.sleep = reals
+        expect(run.timeline[0]["phase"] == "shared_counted"
+               and run.timeline[0]["lines"] == 10 and run.timeline[0]["files"] == 1,
+               f"the wait counts the shared lines first, got {run.timeline[0]}")
+        expect(reached["phase"] == "tail_caught_up" and reached["reached"] is True
+               and reached["w"] == 10 and reached["reads"] == 3,
+               f"the wait ends once W reaches the shared count, got {reached}")
+        expect(held["reached"] is False and held.get("held") is True and held["w"] == 7,
+               f"the wait ends once W holds short of it, got {held}")
+
+
 def _two_sut_dir(root, tmp, interval="7s"):
     """A copy of statsd-vm in `tmp` whose `[configs]` adds `collector`, a further SUT service,
     with its own config: statsd-vm's SUT config with `aggregate`'s window set to `interval`."""
@@ -6975,6 +7204,7 @@ def run(root, quiet=False):
                      _report, _expected_event_rules, _exit_driver, _ready_words, _exit_watchdog,
                      _script_ledger, _sink_ledger, _roles, _sink_rules, _driver_roles,
                      _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
+                     _file_ledger, _file_rules,
                      _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _per_service, _slope_edges,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
@@ -6985,7 +7215,8 @@ def run(root, quiet=False):
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
-                              _fanin_driver, _tcp_rules, _two_sut_rules, _two_sut_driver,
+                              _fanin_driver, _tcp_rules, _file_rules, _two_sut_rules,
+                              _two_sut_driver,
                               _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
                               _datadog_rules)
