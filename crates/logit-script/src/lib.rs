@@ -1247,22 +1247,6 @@ mod tests {
     }
 
     #[test]
-    fn assigning_to_message_severity_or_body_format_reports_read_only() {
-        for field in ["message", "severity", "body_format"] {
-            let w = worker(&format!(
-                r#"
-                function process(event)
-                    event.log.{field} = "x"
-                    return event
-                end
-                "#
-            ));
-            let err = process_err(&w, log_and_counter_event("hits", 1.0));
-            assert!(err.contains("read-only"), "field {field}, got: {err}");
-        }
-    }
-
-    #[test]
     fn an_unknown_field_on_event_dot_log_is_a_clear_error() {
         let w = worker(
             r#"

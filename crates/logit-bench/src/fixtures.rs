@@ -1106,6 +1106,25 @@ function process(event)
 end
 "#;
 
+/// Rewrites the log body in place on every call (`crates/logit-script/src/proxy.rs`'s `LogProxy`,
+/// `docs/adr/lua-in-place-edits.md`; `tests/allocations.rs`'s
+/// `lua_process_one_event_writing_log_message`).
+pub const LUA_LOG_MESSAGE_WRITE_SCRIPT: &str = r#"
+function process(event)
+  event.log.message = "rewritten"
+  return event
+end
+"#;
+
+/// Sets the log severity in place on every call (`tests/allocations.rs`'s
+/// `lua_process_one_event_writing_log_severity`).
+pub const LUA_LOG_SEVERITY_WRITE_SCRIPT: &str = r#"
+function process(event)
+  event.log.severity = "error"
+  return event
+end
+"#;
+
 /// Writes a `resource` attribute on every call: a script stamping a resource identity
 /// (`crates/logit-script/src/resource.rs`, `docs/adr/operator-declared-resource-attributes.md`;
 /// `tests/allocations.rs`'s `lua_process_one_event_writing_resource`).

@@ -20,7 +20,7 @@
 use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
 use logit_core::subslice::within;
-use logit_core::{AttrMap, EventBatch, Registry, Resource, Telemetry, TraceRef, Value};
+use logit_core::{AttrMap, EventBatch, Registry, Resource, Severity, Telemetry, TraceRef, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::kafka::{KafkaEncoder, RecordFormat, RecordKey, RecordMode};
 use logit_outputs::statsd::{Format as StatsdFormat, StatsdEncoder};
@@ -3808,6 +3808,44 @@ fn lua_process_one_event_deleting_an_attribute() {
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
     assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs("lua: delete an attribute with = nil", stats, 8);
+}
+
+/// `event.log.message = "rewritten"`: rewriting the log body in place
+/// (`docs/adr/lua-in-place-edits.md`).
+///
+/// 9: **4** for any call, **+1** for the `Box` on the way out, **+3** for creating and caching
+/// the `LogProxy` on the first `event.log` access, and **+1** for `lua_to_value`'s
+/// `Bytes::copy_from_slice` of the string. The old message's drop frees rather than allocates.
+/// [`lua_process_one_event_writing_log_severity`] is the same script with no `Bytes`, at 8.
+#[test]
+fn lua_process_one_event_writing_log_message() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_LOG_MESSAGE_WRITE_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    let ProcessOutcome::Emit(event, _) = outcome else { panic!("expected Emit") };
+    assert_eq!(event.log.as_ref().expect("a log").message, Value::str("rewritten"));
+    expect_allocs("lua: process 1 event, writing event.log.message", stats, 9);
+}
+
+/// `event.log.severity = "error"`: setting the log severity in place.
+///
+/// 8: **4** for any call, **+1** for the `Box`, **+3** for the `LogProxy`'s create-and-cache, and
+/// **+0** for the write: `Severity::from_name` matches a borrowed `str`, and the label closure
+/// that builds a refusal's message runs only on the error path.
+#[test]
+fn lua_process_one_event_writing_log_severity() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_LOG_SEVERITY_WRITE_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    let ProcessOutcome::Emit(event, _) = outcome else { panic!("expected Emit") };
+    assert_eq!(event.log.as_ref().expect("a log").severity, Some(Severity::Error));
+    expect_allocs("lua: process 1 event, writing event.log.severity", stats, 8);
 }
 
 // ---------------------------------------------------------------------------------------------
