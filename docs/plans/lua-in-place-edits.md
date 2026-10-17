@@ -173,8 +173,9 @@ Why the wrapper is Lua and not a Rust function: a table's loop keeps its special
 builtin `next`, a table, and `nil`, which the original `pairs` still returns. With the JIT on, a
 Rust `pairs` would also stop plain-table loops compiling, because LuaJIT's recorder treats a C
 function called at loop entry as not yet implemented (`recff_c` goes to `recff_nyi` in
-`lj_ffrecord.c`). The sandbox runs interpreted, though (W3's measurement below), so today the
-specialization is the interpreter's `ITERN` and not a trace.
+`lj_ffrecord.c`). The sandbox runs interpreted unless a component sets `jit: true` (W3's
+measurement below, and ADR `lua-jit-opt-in`), so by default the specialization is the
+interpreter's `ITERN` and not a trace.
 
 Caveat, recorded in the doc: a call site that ever sees a proxy despecializes to `ITERC`
 permanently for that site, and its plain-table loops go through a generic iterator call. A shared
@@ -187,8 +188,8 @@ on `schema_url` the write clears the field, and on `dropped_attributes_count` it
 name such as `to_table` has no write-side field, so `resource.to_table = nil` deletes an attribute
 of that name while reads still return the method. The doc says so.
 
-W3 measured the wrapper (ADR `lua-in-place-edits`'s amendment has the table). The sandbox opens
-no `jit` library, so it runs LuaJIT interpreted. There, a plain-table loop's steps cost the same
+W3 measured the wrapper (ADR `lua-in-place-edits`'s amendment has the table). By default the
+sandbox opens no `jit` library, so it runs LuaJIT interpreted. There, a plain-table loop's steps cost the same
 with the wrapper, each `pairs` call on a table costs about 13 ns more, and a call site that has
 seen a proxy runs plain-table loops about 60% slower. The wrapper stays. The fallback, a separate
 global such as `attributes_of(proxy)`, wasn't taken: it leaves `pairs` alone but is one more name a
