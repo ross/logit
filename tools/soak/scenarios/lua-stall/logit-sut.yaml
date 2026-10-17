@@ -8,8 +8,9 @@ components:
   # `Event.new` in it, so the heartbeat stops advancing: the node reads stalled after 10 s and
   # `/readyz` answers `503 stalled` until the loop ends. The sandbox has no clock, so the loop is
   # an iteration count: 1e10 took 31.5 s in the logit:soak image on the development host
-  # (2026-10-11), about 21 s of `stalled`, two or three HEALTHCHECK samples. The loop runs once
-  # per process life.
+  # (2026-10-11), about 21 s of `stalled`, two or three HEALTHCHECK samples, and 78 s on the
+  # development host on 2026-10-17, which still ends inside the `mark`. The loop runs once per
+  # process life.
   enrich:
     type: lua
     sources: [statsd]

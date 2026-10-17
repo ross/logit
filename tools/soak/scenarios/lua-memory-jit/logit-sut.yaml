@@ -1,0 +1,41 @@
+# The system under test in `script/soak`'s lua-memory-jit scenario: lua-memory's SUT with
+# LuaJIT's trace compiler on, whose VM outgrows its `max_memory`. Its `internal` telemetry goes
+# to stdout as NDJSON for the harness to read; `script/soak` runs it with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  # From the 480,000th event, about 4 minutes in at 2,000 lines a second, the script keeps a
+  # 1 KB string per event, about 2 MB a second. The VM passes 64 MiB about 32 s later
+  # (measured in the logit:soak image on the development host, 2026-10-11): the check after a
+  # batch logs `memory_limit_exceeded`, readiness reads `degraded`, the run drains as on a
+  # SIGTERM, and the process exits 2. A restarted process starts counting from 0, so it reaches
+  # the 480,000th event only after the scenario ends.
+  enrich:
+    type: lua
+    sources: [statsd]
+    max_memory: "64MiB"
+    jit: true
+    script: |
+      local seen = 0
+      local kept = {}
+      function process(event)
+        seen = seen + 1
+        if seen >= 480000 then
+          kept[#kept + 1] = string.rep("x", 1000) .. seen
+        end
+        return event
+      end
+  window:
+    type: aggregate
+    sources: [enrich]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

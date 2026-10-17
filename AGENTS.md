@@ -739,9 +739,11 @@ the operator-facing account of all of this.
   `buffer.disk:` spool is replayed by the next process. `lua-path`, `lua-stall`, and `lua-memory`
   put a `lua` stage in the path (`[ledger] sut_script`): a rewrite with script drops and errors,
   a busy loop that `/readyz` reads as `stalled` inside a `mark` step, and a `max_memory` exit 2
-  inside an `exit` step that restarts the SUT. `fanout-copy`, `fanout-block`, and `route-split`
-  give the SUT two sinks, each to its own VictoriaMetrics from a scenario's `compose =` override
-  file, with one `[[ledger.sink]]` per sink: a fan-out where each backend holds a full copy
+  inside an `exit` step that restarts the SUT. `lua-path-jit`, `lua-stall-jit`, and
+  `lua-memory-jit` run the same three under `jit: true`, the first rewriting in place.
+  `fanout-copy`, `fanout-block`, and `route-split` give the SUT two sinks, each to its own
+  VictoriaMetrics from a scenario's `compose =` override file, with one `[[ledger.sink]]` per
+  sink: a fan-out where each backend holds a full copy
   (`split = "copy"`), a fan-out whose blocked sink stalls the healthy one through the shared
   send, and a `route` on a DogStatsD tag whose backends' totals add up (`split = "route"`). The
   harness knows each compose service by its `soak.role` label (`sut`, `generator`, `backend`,
@@ -752,7 +754,8 @@ the operator-facing account of all of this.
   the hop on run totals, allowing duplicates only where a mechanism forwards them (a kill or a
   pause of `collector`, and a killed `logit`'s spool replay to a `collector` that restarted
   since; the plan's "The native hop (W10b)"), and `ledger.summary` bounds V end to end by what
-  the generators sent.
+  the generators sent. `native-hop-spans` is `native-hop` with every internal span kept on both
+  SUTs.
   `tcp-ingress` sends statsd over TCP, its source declared `wire = "tcp"` and checked at load
   against the listener's `transport:`: W is `input.frames`, the framer's drops are counted wire
   loss, and the generator's netem is judged at 0 because TCP retransmits. A process-ending
