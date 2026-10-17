@@ -110,7 +110,9 @@ module doc:
    event.
 8. A log's `TraceRef` lives on the log record, so a metrics or span part doesn't carry it. A
    `sample` with `key: trace_id` downstream reads a metrics part as missing the key and applies its
-   `missing:` verdict. The private `_logit.*` carriers are attributes and reach every part.
+   `missing:` verdict. To give a log, its metrics, and its span one verdict, place the `sample`
+   ahead of `route_signals`, where it keeps or drops the whole event. The private `_logit.*`
+   carriers are attributes and reach every part.
 
 A batch whose every event goes to one target stays on the move path either way.
 
