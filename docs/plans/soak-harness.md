@@ -3917,6 +3917,47 @@ What the runs showed:
   `drop_newest` batches, counted, while its sends had no listener. Nothing in the generator runs
   Lua, so the compiler isn't the cause; `lua-memory`'s recorded W7a run didn't show it.
 
+### W12b: rolling overlap (2026-10-17)
+
+`rolling-overlap` ran twice on the development host (`trout`, 24 cores, 64 GB, Linux 7.2.9,
+Docker 29.8.2), against `logit:soak` `sha256:75c60bba2ff8` built from `soak/w12b` after the
+merge of `soak/w12a`, beside other soak scenarios. The final run is
+`perf/results/soak/20261017T202637Z`, from `soak/w12b` at `e0236ed4` with no modified path,
+exit 0:
+
+| Check | Status | Detail |
+
+- **The first run, `20261017T173458Z`, FAILed `progress` because the host slept, not because
+  of `logit`.** Its schedule ran, and every fault had recovered by +945 s. Then the laptop
+  suspended (`systemd-sleep`, 10:54:54 to 13:15:40 local), 162 s into the cooldown, freezing the
+  driver and every container for 2 h 21 min. On resume the loop was past its duration and ran
+  the end sequence at once; every wait in it stayed inside its bound, though `quiet` ran its full
+  90 s, since no sample was newer than the export's 300 s lookback. `progress` then read the
+  sleep as 30-second windows with nothing delivered. Every other row passed, `ledger.overlap`
+  among them: a gap of 5 against an allowance of 15. The driver now records a `stalled` phase
+  when its tick runs more than 120 s late, and `run` FAILs it, reading it from the watchdog's gap
+  for an older run like this one: re-scored, the first run's `run` reads `stalled: the driver's
+  tick ran 8,508s late from +1120s`. The second run, `20261017T201857Z`, was stopped 3 minutes
+  in to keep the host to two soaks at once, and the third, above, ran under
+  `systemd-inhibit --what=sleep:idle`.
+- **A swap lost nothing.** In the final run G and Σ(W + K + F) both read 2,293,600, and in the
+  first they differed by 5. Every close's final `receive_buffer.used.bytes` read 0 but one, the
+  first run's last stop of `logit-b`, at 4,800 bytes, about 6 datagrams at a truesize of 768
+  bytes. That fits that run's gap of 5: the reader was keeping up, and the closing socket held
+  a few datagrams when its read loop stopped. Each stop's own gap, read from interpolated drain
+  intervals, ranged from −87 to +78, the out-of-phase interpolation error the row reports
+  without judging.
+- **The kernel moved every flow and dropped none.** Each instance read every drain while the
+  other was down (`expect.logit-b-carries-c0s1` and `expect.logit-carries-c0s2`, at least
+  5,000 lines a drain), and neither counted a kernel drop over the run. The eight flows split
+  1,177,000 to 1,116,600 over the run, and unevenly from life to life: `logit-b`'s final life
+  read 240,200, `logit`'s 605,500.
+- **Each instance's own ledger balanced**, every life of every instance at 0, with V split by
+  the `soak_instance` label. `logit`, stopped inside VictoriaMetrics' stop, replayed 4 spooled
+  batches into its next life, which `identity.sink` balanced.
+- `recovery` judged 6 of 7 faults; `c0s5`, `logit`'s stop inside VictoriaMetrics' stop, had no
+  drain interval clear of the other fault.
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
