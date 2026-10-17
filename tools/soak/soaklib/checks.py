@@ -28,7 +28,9 @@ The ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`, `iden
 `recovery`, `ledger.egress`, `ledger.windows`, `ledger.replay`, `ledger.sent`) keeps its id,
 reports one line per sink, and takes the worst status. Under `split = "copy"` each sink holds a
 full copy of `aggregate`'s output, so each sink's V is judged alone; under `split = "route"` the
-sinks' V add up to it, so the egress gap is judged on their sum.
+sinks' V add up to it, so the egress gap is judged on their sum. That holds because `load()`
+refuses `split = "route"` over a `route` that can send one event to several targets (a
+list-valued `routes:` value or `by: signal`), so each event reaches one sink.
 
 The ledger also follows each `[[ledger.source]]`, a generator and the SUT listener it reaches
 over the source's `wire` (`WIRES`), which names the counters each symbol reads.
@@ -1664,7 +1666,8 @@ class Ledger:
 
     def egress_groups(self):
         """`[(label, sinks)]`, each judged as one egress: under `copy` each sink alone, under
-        `route` all of them, whose V add up to what `aggregate` absorbed."""
+        `route` all of them, whose V add up to what `aggregate` absorbed. The sum is sound because
+        `load()` refuses a router that can deliver one event to several sinks."""
         if self.split == "route":
             return [(" + ".join(self.sinks), list(self.sinks))]
         return [(sink, [sink]) for sink in self.sinks]
