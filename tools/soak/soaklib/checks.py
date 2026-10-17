@@ -84,7 +84,8 @@ from . import collect, faults, standin, telemetry, topic, vm
 from .scenario import (DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET, GENERATOR_ROLE,
                        KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, RUN_WINDOW, STANDIN_ROLE,
                        STANDIN_TARGET, SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE,
-                       component_blocks, config_env, parse_duration, source_ids)
+                       component_blocks, config_env, parse_duration, source_ids,
+                       source_pairs)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
@@ -1564,13 +1565,15 @@ class Ledger:
                     if isinstance(point.value, (int, float)) and point.value:
                         reason = point.attributes.get("reason", "?")
                         dropped_by[reason] = dropped_by.get(reason, 0) + point.value
-            # A generator with several inputs sends a batch from each in about the same tick,
-            # so its batch, the wire's edge tolerance, is their batches summed.
-            batch = 0.0
+            # Each input's batch. A generator with several inputs sends a batch from each in
+            # about the same tick, so its batch, the wire's edge tolerance, is their sum; a
+            # sink's own batch is its paired input's (`source_pairs()`).
+            input_batch = {}
             for load in source_ids(source, "generator_input"):
                 sent = total("logit.component.events.sent", [load])
                 batches = total("logit.component.batches.sent", [load])
-                batch += sent / batches if batches else 0.0
+                input_batch[load] = sent / batches if batches else 0.0
+            batch = sum(input_batch.values())
             self.gen_stats[service] = {
                 "G": total(self.wires[source.get("sut_listener")].g, sinks),
                 "dropped_by": dropped_by,
@@ -1578,6 +1581,8 @@ class Ledger:
                 "dropped_events": total("logit.component.events.dropped", sinks),
                 "dropped_batches": total("logit.component.batches.dropped", sinks),
                 "batch": batch,
+                "sink_batch": {sink: input_batch.get(load, 0.0)
+                               for load, sink in source_pairs(source)},
             }
         self.G = sum(stats["G"] for stats in self.gen_stats.values())
 
@@ -2614,14 +2619,15 @@ def _wire_one(data, led, source, instances=None):
 
 def _end_allowance(led, source):
     """How far a source's G may fall short of W + K at the end: a send each generator sink
-    cancels at shutdown loses its counts, up to that sink's last `buffer.batches` plus one
-    batch."""
+    cancels at shutdown loses its counts, up to that sink's last `buffer.batches` plus one, each
+    a batch of the input that feeds it."""
     gen = led.gens[source.get("service")]
-    queued = 0
+    sizes = led.gen_stats[source.get("service")]["sink_batch"]
+    allowed = 0.0
     for sink in source_ids(source, "generator_sink"):
         series = gen.gauge_series("logit.component.buffer.batches", component=sink)
-        queued += (series[-1][1] if series else 0) + 1
-    return queued * led.gen_stats[source.get("service")]["batch"]
+        allowed += ((series[-1][1] if series else 0) + 1) * sizes.get(sink, 0.0)
+    return allowed
 
 
 def _file_wire_one(data, led, source):

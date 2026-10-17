@@ -421,8 +421,8 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
 ```
 
 - A scenario lists one or more sources. Each names all four keys, each a component id (from
-  W12b `generator_input` and `generator_sink` may each list several, whose counts sum, one sink
-  per UDP flow), with a
+  W12b `generator_input` and `generator_sink` may both list components, as many of each, each
+  input feeding the sink at its position, one sink per UDP flow; their counts sum), with a
   `service` that is a slug (lowercase letters, digits, `_`, and `-`) no other source names and
   a `sut_listener` no other source names. Unknown keys are refused. A `service` whose compose
   variable is `SOAK_SUT_CONFIG` or another source's (`generator-lines` and `generator_lines`
@@ -1624,8 +1624,10 @@ and the generators send to the holder's name. The instances share an address, so
 admin endpoint on a Unix socket and sets `LOGIT_ADMIN` to it, which the image's `HEALTHCHECK`
 and the driver's readiness probe, `logit ready` with no `--admin`, both read. A generator needs
 several flows for the kernel to spread them: a UDP sink sends from one socket, so one sink is one
-flow, and `generator_input` and `generator_sink` may each list several components, whose counts
-sum.
+flow, and `generator_input` and `generator_sink` may both list components, as many of each, each
+input feeding the sink at its position; their counts sum. The wire's edge tolerance is the inputs'
+batches summed, since each sends a batch in about the same tick, and the end allowance weights
+each sink's last queue plus one by its own input's batch.
 
 **The schema.** `[overlap]` has the three keys and no other; `instances` lists two or more
 distinct services, `logit` first, none the holder; `label` is a Prometheus label name. With the

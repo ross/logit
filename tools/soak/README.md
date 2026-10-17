@@ -323,8 +323,8 @@ source names, a `shutdown.delay` that with the drain fits `docker stop -t 30`, a
 `socket:` and no `bind:` (the driver probes `logit ready` through the container's
 `LOGIT_ADMIN`), and a `set` stamping `label` that each source's `sut_transforms` lists. The
 generators send to the holder's name, over UDP only. A generator needs several flows to spread:
-`generator_input` and `generator_sink` may each list several components, one sink per flow,
-whose counts sum. Only `netem` and `partition` go on the holder, neither on an instance, and two
+`generator_input` and `generator_sink` may both list components, as many of each, each input
+feeding the sink at its position, one sink per flow; their counts sum. Only `netem` and `partition` go on the holder, neither on an instance, and two
 instances may not be held (paused, stopped, killed, restarted, or exited) at once. At the end the
 driver waits once on the backends' totals, then stops each instance.
 
@@ -646,7 +646,7 @@ generator-lines = "logit-generator-lines.yaml"
 [[ledger.source]]         # one per generator
 service = "generator-lines"                     # a service with soak.role generator
 generator_input = "load"                        # its generate_in
-generator_sink = "syslog"                       # its sink, G's source; a list sums several
+generator_sink = "syslog"                       # its sink, G's source; see "Rolling overlap" for lists
 sut_listener = "lines"                          # the SUT listener it reaches
 wire = "udp"                                    # optional: udp (the default), tcp, or file
 sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional: nodes to aggregate

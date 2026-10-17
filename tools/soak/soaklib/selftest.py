@@ -7475,6 +7475,12 @@ def _overlap_rules(root):
     refused(lambda r: r["ledger"]["source"][0].update(generator_sink=["statsd_0", "statsd_0"]),
             "`generator_sink` must name a component id or list distinct ones",
             "a repeated generator_sink")
+    refused(lambda r: r["ledger"]["source"][0].update(generator_sink=["statsd_0", "statsd_1"]),
+            "`generator_input` and `generator_sink` list the same number of components",
+            "eight inputs paired with two sinks")
+    refused(lambda r: r["ledger"]["source"][0].update(generator_input="load_0"),
+            "`generator_input` and `generator_sink` list the same number of components",
+            "one input beside a list of sinks")
     refused(step(at="4m", action="netem", on="logit", args="delay 10ms"),
             "an instance shares sut-net's network namespace, so put netem on sut-net",
             "netem on an instance")
@@ -7646,14 +7652,16 @@ OVERLAP_SUT_CONFIG = ("admin: { socket: /tmp/admin.sock }\n"
                       "    interval: 10s\n")
 
 
-def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, stall=False):
+def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, stall=False,
+                 end_extra=0):
     """A two-instance run: the generator's two inputs and sinks send `PER_DRAIN` lines per 5 s
     drain from +5 to +300, `logit` reads 600 of them a drain and `logit-b` 400, until `logit`
     stops over `STOP` (or `action`, a kill), when `logit-b` reads all 1,000 a drain, `loss`
     fewer in its first drain after the stop, what the close discarded. `logit`'s last drain
     before the stop samples `used` bytes in its receive queue. Each instance stamps its series
     with its name; `unlabeled` adds a series with no label. Under `stall`, `logit-b` delivers
-    nothing from +95 to +180 with a batch queued."""
+    nothing from +95 to +180 with a batch queued. `end_extra` lines reach `logit-b` at +310,
+    after the generator stops, a surplus over G at the end."""
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -7713,6 +7721,8 @@ def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, s
             a_rows.append((offset, 1, STOP[1], w, 1, 0, 0))
             w_a[1] += w
         w = (400 if not down else 1000 - (loss if offset == 105 else 0)) if sending else 0
+        if offset == 310:
+            w += end_extra
         stalled = stall and 95 <= offset <= 180
         b_rows.append((offset, 0, -1, w, 0 if stalled else 1, 1 if stalled else 0, 0))
         w_b += w
@@ -7839,6 +7849,18 @@ def _overlap_checks():
                    "sink: 1 series whose soak_instance names no instance")
                and "x_0_total" in unlabeled["ledger.egress"].detail,
                f"a series missing the label FAILs, got {unlabeled['ledger.egress']}")
+        # Each sink's last queue plus one batch, at its own input's 100-line batch: 200 lines
+        # below 0 at the end, not the 400 the two inputs' summed batch would give.
+        surplus = {r.id: r for r in checks.run_all(_overlap_run(tmp, "end-surplus",
+                                                                end_extra=300))}
+        expect(surplus["ledger.overlap"].status == checks.FAIL
+               and "= -300, a surplus, past the end allowance 200"
+               in surplus["ledger.overlap"].detail,
+               f"a surplus at the end past each sink's own batch FAILs, got "
+               f"{surplus['ledger.overlap']}")
+        expect(surplus["ledger.wire"].status == checks.FAIL
+               and "over the end allowance 200" in surplus["ledger.wire"].detail,
+               f"ledger.wire FAILs the same surplus, got {surplus['ledger.wire']}")
         stalled = {r.id: r for r in checks.run_all(_overlap_run(tmp, "stalled", stall=True))}
         expect(stalled["progress"].status == checks.FAIL
                and "no sink deliveries in [+120s, +150s): logit-b: hang" in
