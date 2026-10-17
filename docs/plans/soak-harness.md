@@ -3920,6 +3920,78 @@ drain-interval rows into runs:
   existed FAILed both rows on the missing files; at the branch's head the run re-scores as
   above.
 
+### W12d: TLS reload (2026-10-17)
+
+`tls-reload` ran once on the development host (`trout`), against `logit:soak` built from
+`soak/w12d` at `894e5364` with no modified path, and a netem image rebuilt with `openssl` and
+`certs.sh`. The run is `perf/results/soak/20261017T204712Z`, exit 0, every row PASS or SKIP:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 30 apply/revert action(s) returned 0; 1 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 2 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 2 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 3 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON, 1 tls_reload_failed line(s) inside broken rotations |
+| `ready` | PASS | 143 readiness sample(s) read ok outside fault windows; 1 start(s) or unpause(s) ready in time, slowest ready 0.2s |
+| `progress` | PASS | 22 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 22 of 22, 22 freshness sample(s); 630s of 870s after warmup judged (72%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +0.6 (limit 64); 645s of 870s after warmup judged (74%; WARN under 5%) \| logit PASS: MiB/h life 0 +21.0, life 1 +5.4 (limit 64); 645s of 870s after warmup judged (74%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +8) \| logit PASS: warmup median 13 -> end 13 (limit +8) |
+| `ledger.wire` | PASS | G 1,869,200 = W 1,869,200 + K 0 + counted 0 + gap 0 (-74 in reported windows, 0 in judged TCP-affecting windows, 82 steady, -8 at the end; loss judged 84, each run at 0 or more, against limit 300); the generator's counted loss, not in G: 3,100 event(s) in 31 batch(es) (overflow_newest 31) |
+| `ledger.intake` | PASS | final life 1: W − D 1,377,300 vs E + B 1,377,300; life 0: W − D − B − X − Ab 0 within [0, R] (R 67,000 = 0 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 1: E 1,377,300 == A 1,377,300 (listener to aggregate); A_sent 6,900 == S_in[victoria_metrics] 6,900 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 1: Ab 1,377,300 == A 1,377,300 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 1 (final): Ab 1,377,300 − V[victoria_metrics] 1,377,300 = 0, ok (split copy; R 67,000 = 0 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 1: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K + F) 0 over the run, F 0 counted; ledger.wire judges the rest |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 1 at +950s: victoria_metrics: received 69 vs delivered 69 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 2 of 2 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served.c0s3` | PASS | logit:8125 served statsd serial A65314DC0EBDF8D2, notAfter 1794948508; want c0s1's gen 2, serial A65314DC0EBDF8D2, notAfter 1794948508 |
+| `tls.served.c0s8` | PASS | logit:8125 served statsd serial A65314DC0EBDF8D2, notAfter 1794948508; want c0s1's gen 2, serial A65314DC0EBDF8D2, notAfter 1794948508, still in force after broken c0s6 |
+| `tls.served.c0s11` | PASS | logit:8125 served statsd serial 4A464C057819C968, notAfter 1795121728; want c0s9's gen 4, serial 4A464C057819C968, notAfter 1795121728, still in force after broken c0s6 |
+| `tls.served.c0s15` | PASS | logit:8125 served statsd serial C578081A2CA1DC67, notAfter 1795208268; want c0s13's gen 5, serial C578081A2CA1DC67, notAfter 1795208268, still in force after broken c0s6 |
+| `expect.server-reload-1` | PASS | delta of logit.tls.reloads{component=statsd, outcome=reloaded} on logit, through 2: c0s2 (+70s, +125s]: 1 (over 11 drain(s)), want >= 1 and <= 1 |
+| `expect.server-expiry-rises-1` | PASS | rise of logit.tls.certificate.not_after{component=statsd, side=server} on logit, through 2: c0s2 (+70s, +125s]: 86,474 (11 sample(s) and the value in force at its start), want >= 86400 |
+| `expect.server-reload-2` | PASS | delta of logit.tls.reloads{component=statsd, outcome=reloaded} on logit, through 10: c0s10 (+490s, +545s]: 1 (over 11 drain(s)), want >= 1 and <= 1 |
+| `expect.server-expiry-rises-2` | PASS | rise of logit.tls.certificate.not_after{component=statsd, side=server} on logit, through 10: c0s10 (+490s, +545s]: 173,220 (11 sample(s) and the value in force at its start), want >= 86400 |
+| `expect.server-reload-backend-stopped` | PASS | delta of logit.tls.reloads{component=statsd, outcome=reloaded} on logit, through 14: c0s14 (+630s, +685s]: 1 (over 11 drain(s)), want >= 1 and <= 1 |
+| `expect.server-expiry-rises-backend-stopped` | PASS | rise of logit.tls.certificate.not_after{component=statsd, side=server} on logit, through 14: c0s14 (+630s, +685s]: 86,540 (11 sample(s) and the value in force at its start), want >= 86400 |
+| `expect.broken-reload-fails` | PASS | delta of logit.tls.reloads{component=statsd, outcome=failed} on logit, through 7: c0s7 (+370s, +425s]: 1 (over 11 drain(s)), want >= 1 and <= 1 |
+| `expect.broken-reloads-nothing` | PASS | delta of logit.tls.reloads{component=statsd, outcome=reloaded} on logit, through 7: c0s7 (+370s, +425s]: 0 (over 11 drain(s)), want <= 0 |
+| `expect.broken-expiry-holds` | PASS | rise of logit.tls.certificate.not_after{component=statsd, side=server} on logit, through 7: c0s7 (+370s, +425s]: 0 (11 sample(s) and the value in force at its start), want >= 0 and <= 0 |
+| `expect.server-reloads-total` | PASS | delta of logit.tls.reloads{component=statsd, outcome=reloaded} on logit, run: run (+60s, +930s]: 3 (over 174 drain(s)), want >= 3 and <= 3 |
+| `expect.server-failures-total` | PASS | delta of logit.tls.reloads{component=statsd, outcome=failed} on logit, run: run (+60s, +930s]: 1 (over 174 drain(s)), want >= 1 and <= 1 |
+| `expect.client-reload` | PASS | delta of logit.tls.reloads{component=statsd, outcome=reloaded} on generator, through 4: c0s4 (+180s, +265s]: 1 (over 17 drain(s)), want >= 1 and <= 1 |
+| `expect.client-expiry-rises` | PASS | rise of logit.tls.certificate.not_after{component=statsd, side=client} on generator, through 4: c0s4 (+180s, +265s]: 86,594 (17 sample(s) and the value in force at its start), want >= 86400 |
+| `expect.lines-after-restart` | PASS | min_delta of logit.input.frames{component=statsd} on logit, after 5: c0s5 (+270s, +315s]: 10,000 (smallest of 9 drain(s)), want >= 1 |
+| `expect.no-connection-errors` | PASS | delta of logit.component.diagnostics{component=statsd, key=connection_error} on logit, run: run (+60s, +930s]: 0 (over 174 drain(s)), want <= 0 |
+
+- **Each SIGHUP reloaded within a millisecond.** `docker kill -s HUP` took 97 ms to 105 ms, and
+  `tls_reloaded` (or, for the broken rotation, `tls_reload_failed`) followed `reopen signal
+  received` by 0.3 ms to 0.8 ms. Every probe 15 s later read the generation the rotation issued,
+  and the one after the broken rotation read the generation before it.
+- **The broken rotation cost nothing but the counted failure.** The reload counted
+  `outcome="failed"` once and logged one WARN keyed `tls_reload_failed`, which `self_log` excused
+  inside the rotation; `not_after` held, and the next good rotation reloaded as usual.
+- **The generator's poll reloaded its client certificate 3.5 s after the rotation**, inside its
+  10 s `tls_reload_interval`, with no signal, and its `not_after{side="client"}` rose by a day.
+  After the SUT's restart a minute later it handshook again with the new certificate: the SUT
+  read 10,000 lines or more in every drain of the recovery window, and counted no
+  `connection_error` all run, the four probes' handshakes included.
+- **The restart lost nothing on the wire.** The generator counted 31 batches `overflow_newest`
+  while the SUT was down, outside G; W equaled G over the run.
+- The SUT's reopen generation restarts at 1 in a new process life, so `reopen signal received`
+  reads generation 1 twice in its stderr.
+- The run started before the host was told not to sleep; a `systemd-inhibit --what=sleep:idle`
+  lock was held from about 9 minutes in to the end, and the timeline shows no gap.
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
