@@ -359,7 +359,8 @@ batch's class is the failed signal's own:
 - A mixed batch to a backend that takes only some signals delivers each accepted signal once,
   however often another signal is retried. `docs/known-gaps/otlp.md`'s per-batch-verdict entry is
   closed, and `demo/logit.yaml`'s `trace_only` gate is a noise filter rather than a correctness
-  requirement.
+  requirement. [2026-10-16: the gate is gone; `self_by_signal`, a `route_signals`, gives
+  `self_tempo_out` only spans.]
 - Every attempt still encodes every signal, the settled ones included: the encoder returns all
   signals at once, and its counters are already gated per batch.
 - Under `at_most_once`, `logit.component.events.dropped{reason="ambiguous_at_most_once"}` counts

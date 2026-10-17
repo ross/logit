@@ -3763,14 +3763,13 @@ Runnable configs:
 [`fixtures/victoriametrics-otlp.yaml`](../fixtures/victoriametrics-otlp.yaml), and
 [`fixtures/victoriametrics-vmagent-receive.yaml`](../fixtures/victoriametrics-vmagent-receive.yaml).
 
-**Run one `otlp_out` per product, each behind a `keep_signals`.** One `otlp_out` posts every signal
+**Run one `otlp_out` per product, each behind a `route_signals`.** One `otlp_out` posts every signal
 it carries to one host, and a product answers a signal it doesn't ingest with a `404`, which `otlp_out` reads as `rejected`
 for that signal. `otlp_out` counts that signal's records `records.dropped{reason="rejected"}`,
 warns, and still sends the other signals once, but the request is wasted on every batch. Split the
-flow with a `route` with `by: signal`, which sends each event to the target of every signal it
-carries without copying it, and keep a `keep_signals` (or `has_signal`) behind each target when an
-event can carry more than one signal, because the route delivers such an event whole to each
-matching target. `fixtures/victoriametrics-otlp.yaml` does both.
+flow with a `route_signals`, which sends each signal to its own target and gives each target only
+that target's signals' payloads, with no gate behind it
+([ADR `route-signals`](adr/route-signals.md)). `fixtures/victoriametrics-otlp.yaml` does this.
 
 **Put `aggregate` with `temporality: cumulative` ahead of metrics bound for VictoriaMetrics.**
 VictoriaMetrics keeps no temporality. A delta `Sum` sent over OTLP is stored as its raw
@@ -4490,12 +4489,11 @@ a container the default is the container ID, which changes on every recreate and
 `logit.*` series. See [Hostname](#hostname).
 
 **Deploy the receiver's config first.** `logit_in` acknowledges a batch once its consumers take
-it, and a signal router such as `central.yaml`'s `by_signal` sends a signal it has no route for to
-its `discard` sink without a warning. So when a sender starts forwarding a new signal, add the
-receiver's route and sink for it before updating the sender. A `keep_signals` gate behind a
-target drops a payload it isn't configured for without a warning too: an event left with nothing
-is counted `logit.component.events.discarded` on the gate, and a payload stripped from an event
-that keeps another is counted `logit.transform.payloads.stripped{signal}`.
+it, and a signal router such as `central.yaml`'s `by_signal` discards a signal it has no route for,
+counted `logit.component.events.discarded` or `logit.transform.payloads.stripped{signal}`, without
+a warning. So when a sender starts forwarding a new signal, add the receiver's route and sink for
+it before updating the sender. A `keep_signals` gate drops a payload it isn't configured for
+without a warning too, with the same two counters.
 
 ## The nginx-side recipe
 

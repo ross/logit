@@ -16,6 +16,7 @@ use crate::output::{classify, is_head_only, is_retryable, DeliveryPosture, Fault
 use crate::queue::{SinkQueue, SinkQueueConfig};
 use crate::queue::{SinkStore, SinkStoreConfig, StoreItem};
 use crate::readiness::{NodeState, Phase};
+use crate::route_signals::{route_signals_batch, SignalRoutes};
 use crate::router::{Destinations, Router, RouterScratch};
 use crate::{Edge, Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
 use anyhow::Context;
@@ -64,6 +65,11 @@ pub enum NodeSpec {
     /// outbound `Fanout` ([`Destinations::FORWARD`]), to the slot-ordered target `Fanout`s the
     /// runtime clones in from `ResolvedComponent::targets`, or to several of them at once.
     Router(Box<dyn Router + Send>),
+    /// A `route_signals` node (`docs/adr/route-signals.md`): sends each signal an event carries to
+    /// its target, splitting the event under `strip: true`. Not a [`NodeSpec::Router`], since a
+    /// router never mutates an event. It has no ordinary consumers, so it sends to the
+    /// slot-ordered target `Fanout`s alone.
+    RouteSignals(SignalRoutes),
     /// A `target`: nothing is spawned for it, and it holds nothing.
     ///
     /// The variant exists so the registry stays one spec per component (a missing spec is a
@@ -420,6 +426,15 @@ pub async fn run_with_options(
                 // routers directing at one target fan in there like `sources:` fan-in.
                 let routes = resolve_target_fanouts(&id, &component.targets, &target_fanouts);
                 let handle = tasks.spawn(run_router(router, inbox, fanout, routes, node_telemetry));
+                node_ids.insert(handle.id(), id.clone());
+                stages.spawned(&id, &waiting_tx);
+                readiness.set_node(&id, NodeState::Running);
+            }
+            NodeSpec::RouteSignals(routes) => {
+                // Its own `Fanout` has no consumers (rule 92), so only the targets are kept.
+                drop(fanout);
+                let targets = resolve_target_fanouts(&id, &component.targets, &target_fanouts);
+                let handle = tasks.spawn(run_route_signals(routes, inbox, targets, node_telemetry));
                 node_ids.insert(handle.id(), id.clone());
                 stages.spawned(&id, &waiting_tx);
                 readiness.set_node(&id, NodeState::Running);
@@ -1901,6 +1916,52 @@ async fn run_router(
     Ok(())
 }
 
+/// A `route_signals` node's loop: [`run_router`]'s shape, with
+/// [`crate::route_signals_batch`] for the partition and no ordinary edge. One child context and
+/// one `"process"` span per incoming batch, whose `events` counts every part sent.
+async fn run_route_signals(
+    routes: SignalRoutes,
+    mut inbox: mpsc::Receiver<Delivered>,
+    targets: Vec<Fanout>,
+    telemetry: Telemetry,
+) -> anyhow::Result<()> {
+    let mut scratch = RouterScratch::new(targets.len());
+
+    while let Some(batch) = inbox.recv().await {
+        sample_inbox_depth(&inbox, &telemetry);
+        let parent = batch.batch_context();
+        let ctx = BatchContext { trace: parent.trace.child(), provenance: parent.provenance };
+        let mut span = telemetry.span(
+            "process",
+            SpanKind::Internal,
+            ctx.trace.trace_id,
+            ctx.trace.span_id,
+            Some(parent.trace.span_id),
+        );
+        let batch = unwrap_batch(batch);
+        let partitions = route_signals_batch(&routes, &mut scratch, batch, &telemetry);
+        span.events(partitions.iter().map(|(_, batch)| batch.events.len() as u64).sum());
+
+        for (slot, out) in partitions {
+            // Slot n + 1 is target n. Slot 0 is never marked: the table has no `Forward`.
+            let Some(destination) = slot.checked_sub(1).and_then(|n| targets.get(n)) else {
+                debug_assert!(
+                    false,
+                    "route_signals marked slot {slot}, which it has no Fanout for"
+                );
+                continue;
+            };
+            match out {
+                Partition::Owned(batch) => destination.send_with_own_context(batch, ctx).await,
+                Partition::Shared(batch) => {
+                    destination.send_shared_with_own_context(batch, ctx).await
+                }
+            };
+        }
+    }
+    Ok(())
+}
+
 /// One destination's share of a routed batch, from [`route_batch`]. Derefs to the batch, so a
 /// caller that only reads it doesn't match on the variant.
 pub enum Partition {
@@ -2004,23 +2065,7 @@ pub fn route_batch(
         }
     }
 
-    // Pass 2: count.
-    let mut copies = 0usize;
-    for mark in &scratch.marks {
-        copies += mark.len() - 1;
-        for slot in mark.slots() {
-            scratch.counts[slot] += 1;
-        }
-    }
-
-    // Pass 3: reserve exactly, and only where something is going.
-    let mut used = 0usize;
-    for (dest, count) in scratch.dests.iter_mut().zip(&scratch.counts) {
-        if *count > 0 {
-            dest.reserve_exact(*count);
-            used += 1;
-        }
-    }
+    let (copies, used) = count_and_reserve(scratch);
 
     // Pass 4: move. A router never absorbs (`crate::router`: no drop), and `checked_mark` left
     // every mark non-empty.
@@ -2036,6 +2081,43 @@ pub fn route_batch(
         telemetry.count("logit.component.events.copied", copies as f64, &[]);
     }
 
+    take_partitions(scratch, used, &resource, &scope)
+}
+
+/// Passes 2 and 3 of [`route_batch`] and [`crate::route_signals_batch`]: counts each slot's
+/// events from `scratch.marks` into `scratch.counts`, then `reserve_exact`s each destination that
+/// receives any. Returns the deliveries past each event's first (`events.copied`) and how many
+/// destinations are used. An empty mark (an event `route_signals` discards) counts nowhere.
+pub(crate) fn count_and_reserve(scratch: &mut RouterScratch) -> (usize, usize) {
+    // Pass 2: count.
+    let mut copies = 0usize;
+    for mark in &scratch.marks {
+        copies += mark.len().saturating_sub(1);
+        for slot in mark.slots() {
+            scratch.counts[slot] += 1;
+        }
+    }
+
+    // Pass 3: reserve exactly, and only where something is going.
+    let mut used = 0usize;
+    for (dest, count) in scratch.dests.iter_mut().zip(&scratch.counts) {
+        if *count > 0 {
+            dest.reserve_exact(*count);
+            used += 1;
+        }
+    }
+    (copies, used)
+}
+
+/// The owned partitions a move pass filled: one per non-empty `scratch.dests` entry, in slot
+/// order, each sharing `resource` and `scope`. `used` sizes the returned `Vec`, its one
+/// allocation.
+pub(crate) fn take_partitions(
+    scratch: &mut RouterScratch,
+    used: usize,
+    resource: &Arc<Resource>,
+    scope: &Option<Arc<Scope>>,
+) -> Vec<(usize, Partition)> {
     let mut out = Vec::with_capacity(used);
     for (slot, dest) in scratch.dests.iter_mut().enumerate() {
         if dest.is_empty() {
@@ -2080,8 +2162,9 @@ fn checked_mark(mark: Destinations, slots: usize) -> Destinations {
     }
 }
 
-/// The slot-ordered target `Fanout`s one routing node (`NodeSpec::Router`, or `NodeSpec::Lua`
-/// with `targets:`) owns, cloned from [`run_with_telemetry`]'s pre-spawn map.
+/// The slot-ordered target `Fanout`s one routing node (`NodeSpec::Router`,
+/// `NodeSpec::RouteSignals`, or `NodeSpec::Lua` with `targets:`) owns, cloned from
+/// [`run_with_telemetry`]'s pre-spawn map.
 ///
 /// Slot order is `ResolvedComponent::targets`' order, derived only in `graph::targets_of`, so
 /// [`Destinations::target`]`(n)` and the n-th id in a Lua component's `targets:` name the same
@@ -12726,6 +12809,100 @@ mod tests {
         assert!(
             scratch.dests.iter().all(|dest| dest.is_empty() && dest.capacity() == 0),
             "the scratch must come back empty and capacity-free for the next batch"
+        );
+    }
+
+    /// A `route_signals` node with no ordinary consumer sends a log-and-metrics event's log to one
+    /// target and its metrics to the other, and discards an event carrying neither.
+    #[tokio::test]
+    async fn a_route_signals_node_splits_a_mixed_event_across_its_targets() {
+        let routes = SignalRoutes::new(
+            &logit_config::SignalTargets {
+                logs: Some("l".to_string()),
+                metrics: Some("m".to_string()),
+                traces: None,
+            },
+            true,
+            &["l".to_string(), "m".to_string()],
+        );
+        let g = routed_graph(vec![
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                    idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
+                    peer: false,
+                    reuse_port: false,
+                    proxy_protocol: false,
+                    socket_mode: None,
+                },
+            ),
+            (
+                "by_signal",
+                vec!["in"],
+                vec!["l", "m"],
+                ComponentKind::RouteSignals {
+                    signals: logit_config::SignalTargets::default(),
+                    strip: true,
+                },
+            ),
+            ("l", vec![], vec![], ComponentKind::Target {}),
+            ("m", vec![], vec![], ComponentKind::Target {}),
+            ("sink_l", vec!["l"], vec![], influxdb_out()),
+            ("sink_m", vec!["m"], vec![], influxdb_out()),
+        ]);
+        let mut mixed = tagged_event("mixed", Some("x"));
+        mixed.log = Some(logit_core::LogRecord {
+            message: logit_core::Value::str("hello"),
+            severity: None,
+            body_format: logit_core::BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        });
+        let mut empty = tagged_event("empty", Some("y"));
+        empty.metrics.clear();
+        let batch = one_batch(vec![mixed, empty, tagged_event("metric", Some("z"))]);
+
+        let (tx_l, rx_l) = std::sync::mpsc::channel();
+        let (tx_m, rx_m) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert("by_signal".to_string(), NodeSpec::RouteSignals(routes));
+        specs.insert("sink_l".to_string(), recording_sink(tx_l));
+        specs.insert("sink_m".to_string(), recording_sink(tx_m));
+
+        tokio::time::timeout(Duration::from_secs(5), run(g, specs))
+            .await
+            .expect("run should return once the only input finishes")
+            .expect("run should complete without error");
+
+        let drain =
+            |rx: std::sync::mpsc::Receiver<EventBatch>| -> Vec<(Option<String>, bool, bool)> {
+                rx.try_iter()
+                    .flat_map(|batch| batch.events)
+                    .map(|e| {
+                        (stream_tag(&e).map(String::from), e.log.is_some(), !e.metrics.is_empty())
+                    })
+                    .collect()
+            };
+        assert_eq!(drain(rx_l), vec![(Some("x".to_string()), true, false)]);
+        assert_eq!(
+            drain(rx_m),
+            vec![(Some("x".to_string()), false, true), (Some("z".to_string()), false, true)]
         );
     }
 

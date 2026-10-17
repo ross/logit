@@ -102,8 +102,8 @@ direct one event to several destinations. See the amendment at the end.] Two rou
   no wider than theirs: no operators, no boolean algebra. `routing-by-condition-is-lua`'s core
   holding is unchanged -- anything needing an operator is still a `lua` component. [2026-10-11: a
   numeric range is now `bucket` plus an equality match on `route`
-  ([ADR `bucket-transform`](bucket-transform.md)).] [2026-10-16: `by: signal` joins the four
-  forms, and a `routes:` value may be a list of target ids. See the amendment at the end.]
+  ([ADR `bucket-transform`](bucket-transform.md)).] [2026-10-16: a `routes:` value may be a list of target ids. See the amendment at the end.
+  A `by: signal` form was added the same day and moved to `route_signals`.]
 - **`lua`/`lua_file`**, with a `targets: [..]` list on the component and a new handle method,
   `event:to("target_id")`. The mark rides on the handle, so `return event` and `return {a, b}` are
   unchanged and each event carries its own destination; an unmarked event is unrouted;
@@ -288,6 +288,10 @@ or a non-empty list of them, and `route` gains `by: signal`. An event goes whole
 destination its mark names and is never split into per-signal copies; only an event bound for
 more than one destination pays for a copy.
 
+[2026-10-16: `by: signal` was removed the same day. `route_signals`
+([ADR `route-signals`](route-signals.md)) replaced it, so this amendment's `by: signal` text
+below is history. The list-valued `routes:` text stands.]
+
 ### Context
 
 Configs that send each signal somewhere different fan one source into two or three
@@ -336,26 +340,26 @@ first-match in `routes:` key order for `by: {provenance: ..}`, `{attribute: ..}`
 `{resource: ..}`, so two keys that both match one value never union; a list is the only way one
 value reaches several targets.
 
-**`by: signal`** is a unit form. Its `routes:` keys are `logs`, `metrics`, and `traces`, the
-names `has_signal`'s `signals:` takes, and any other key fails validation. An event's mark is the
-union, over each signal it carries, of that signal's targets, where a carried signal with no
-route contributes `Forward`. So a log-and-metrics event with only `logs` routed reaches the logs
-target and the router's ordinary consumers, and no payload drops out of the else-branch. An event
-carrying no signal goes to `Forward`; `has_signal` would drop it, but a router never drops. A sink
-that must see one signal alone (Tempo behind `otlp_out`, say) keeps a `keep_signals` in front of
-it, which has one consumer and costs no clone. `route` resolves all eight carried-signal
-combinations to a mark once, at construction.
+**`by: signal`** [removed; see the `route_signals` amendment below] is a unit form. Its `routes:`
+keys are `logs`, `metrics`, and `traces`, the names `has_signal`'s `signals:` takes, and any other
+key fails validation. An event's mark is the union, over each signal it carries, of that signal's
+targets, where a carried signal with no route contributes `Forward`. So a log-and-metrics event with
+only `logs` routed reaches the logs target and the router's ordinary consumers, and no payload drops
+out of the else-branch. An event carrying no signal goes to `Forward`; `has_signal` would drop it,
+but a router never drops. A sink that must see one signal alone (Tempo behind `otlp_out`, say) keeps
+a `keep_signals` in front of it, which has one consumer and costs no clone. `route` resolves all
+eight carried-signal combinations to a mark once, at construction.
 
-**No component may read two destinations one event can reach together.** Rule 51 rejects a
-component whose `sources:` lists two targets of one `routes:` list, or, under `by: signal`, any
-two of that route's targets, since a mixed event can reach all of them. The route itself joins
-that set only when some signal has no route: with all three routed, only an event with no
-payload reaches the route's own consumers, and it reaches nothing else. Such a component would
-receive the event once per destination. An ordinary diamond (`in -> [a, b] -> c`) stays legal:
-there, each branch is a component the operator placed and `c` lists both by choice, receiving
-every batch twice. A router's copy is invisible in the config, so `c`'s doubled count would have
-no line explaining it. Reconvergence further downstream (`a -> x`, `b -> x`, `x -> c`) is not
-checked and is listed in `docs/known-gaps/runtime.md`.
+**No component may read two destinations one event can reach together.** Rule 51 rejects a component
+whose `sources:` lists two targets of one `routes:` list, or, under `by: signal` [removed], any two
+of that route's targets, since a mixed event can reach all of them. The route itself joined that set
+only when some signal had no route: with all three routed, only an event with no payload reaches the
+route's own consumers, and it reaches nothing else. Such a component would receive the event once
+per destination. An ordinary diamond (`in -> [a, b] -> c`) stays legal: there, each branch is a
+component the operator placed and `c` lists both by choice, receiving every batch twice. A router's
+copy is invisible in the config, so `c`'s doubled count would have no line explaining it.
+Reconvergence further downstream (`a -> x`, `b -> x`, `x -> c`) is not checked and is listed in
+`docs/known-gaps/runtime.md`.
 
 **Telemetry.** Each copy counts as `logit.component.events.sent` on the destination that sent it,
 so a target's volume stays what its consumers received. The router adds
@@ -366,12 +370,13 @@ counts what reached destinations, not deep clones, and is never `*.dropped` or
 **The router invariant becomes "every event leaves at least once, once to each destination its
 mark names".** A router still never mutates or absorbs an event. The soak harness's
 `split = "route"` ledger assumes the sinks' totals add up, so it refuses a `route` with a list
-value or `by: signal`.
+value.
 
 ### Alternatives considered
 
 - **Per-signal copies** (`keep_signals` on each branch). Rejected above: it splits what a sink may
-  want together and clones every mixed event.
+  want together and clones every mixed event. [2026-10-16: superseded for `route_signals`, which
+  splits by moving payloads. See the `route_signals` amendment below.]
 - **Union across matching keys** for the value-keyed forms. Two keys match one value only through
   `has_attributes`' coercion (`"500"` and `"500.0"`), so a union would make the coercion decide
   where an event goes. A list says it in one place.
@@ -392,7 +397,28 @@ value or `by: signal`.
 - `logit_pipeline::Destinations` replaces `Destination`; `route_batch` returns a `Partition`
   (owned or shared) per destination; `Fanout::send_shared_with_own_context` sends an `Arc` already
   shared by several destinations. `logit_config::RouteTargets` is the `routes:` value, and
-  `RouteBy::Signal` the new form. Schema regenerated.
+  `RouteBy::Signal` the new form (since removed). Schema regenerated.
 - `crates/logit-bench/tests/allocations.rs` pins the shared path at 2 and a mixed batch at its
   clones' cost, beside the unchanged single-destination rows.
 - The shipped `has_signal`/`keep_signals` fan-outs that fed several gates from one source now use `route`, for example `examples/forwarding/central.yaml`.
+
+## Amendment (2026-10-16): `route_signals` splits per signal
+
+[ADR `route-signals`](route-signals.md) adds `route_signals`, a third kind that fills targets. It
+sends each signal an event carries to that signal's target and, by default, splits a mixed event
+into one part per target: the payloads move, and only the attributes are cloned for each extra
+part.
+
+- **The "Per-signal copies" alternative above is superseded for `route_signals`.** It was rejected
+  as a whole-event copy per branch plus a copy-on-write `keep_signals` gate. A split pays one
+  attribute clone per extra part and no gate, and the operator chooses it per component with
+  `strip:`. `route` still forwards a mixed event whole.
+- **Rule 50 doesn't apply to `route_signals`.** It has no ordinary edge: rule 92 keeps it out of
+  every `sources:`, and an event carrying no listed signal is discarded and counted
+  `logit.component.events.discarded`, because the `signals:` map names which events are kept.
+- **`route by: signal` is removed.** The `route_signals` kind took over its job, and the shipped
+  configs that used it moved to `route_signals`. `route` keeps list-valued `routes:` values, the
+  shared-`Arc` path, `logit.component.events.copied`, and rule 51's reconvergence clause for
+  lists; the mask table moved to `logit_pipeline::signal_masks`, which `route_signals` uses.
+- **`route_signals` isn't a `Router`.** A router still never mutates or absorbs an event; the new
+  kind has its own node arm and shares the partition code.

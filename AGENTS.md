@@ -152,7 +152,8 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `has_stale`, `drop_stale` | forward, or discard, an event older than `max_age` or, with `max_ahead` set, stamped further ahead of the wall clock; exact complements, so `drop_stale` keeps a replayed backlog out of `aggregate` and `has_stale` archives it | [ADR `stale-event-filtering`](docs/adr/stale-event-filtering.md) |
 | `sample` | consistent, keyed sampling | [ADR `consistent-sampling-component`](docs/adr/consistent-sampling-component.md) |
 | `shape` | an observer that measures each event's shape | [ADR `shape-observer-component`](docs/adr/shape-observer-component.md) |
-| `route`, `target` | native equality-only router (or `by: signal`), and the named destinations it fills; one event may go whole to several | [ADR `target-components`](docs/adr/target-components.md) |
+| `route`, `target` | native equality-only router, and the named destinations it fills; one event may go whole to several | [ADR `target-components`](docs/adr/target-components.md) |
+| `route_signals` | sends each signal an event carries to that signal's target, by default splitting a mixed event into one part per target; no ordinary consumers, and an event carrying no listed signal is discarded | [ADR `route-signals`](docs/adr/route-signals.md) |
 
 Details an agent needs beyond the table:
 
@@ -243,11 +244,18 @@ Details an agent needs beyond the table:
   structural costs the central-collector split-apart topology had no better answer for: a filter
   chain paid by every branch, and the deep clone an all-mutating fan-out can't avoid. A router
   needs an ordinary consumer for the events no target claims (graph rule 50); `null_out` is how a
-  config discards them on purpose. A `routes:` value may list several targets, and `by: signal`
-  sends a mixed-signal event to every carried signal's target; either way the event goes whole to
-  each, moved when it has one destination, shared or cloned when it has several, and counted in
+  config discards them by name. A `routes:` value may list several targets; the event goes whole
+  to each, moved when it has one destination, shared or cloned when it has several, and counted in
   `logit.component.events.copied`. A router never splits an event per signal, and rule 51 keeps a
-  component from reading two destinations one event can reach together.
+  component from reading two targets of one list.
+- **`route_signals`** splits per signal where a router can't: under `strip: true` (the default)
+  each target receives one part holding only its own signals' payloads, moved out of the event,
+  with a clone of its attributes, and unlisted signals are stripped. It isn't a `Router` (a router
+  never mutates), so it has its own node arm, `run_route_signals`, sharing `route_batch`'s
+  partition passes. Graph rule 92 keeps it out of every `sources:` and exempts it from rule 7: an
+  event carrying no listed signal counts `events.discarded`, never `*.dropped`, and needs no
+  `null_out`. A component may read several of its targets under `strip: true`, receiving one
+  event per part; under `strip: false` rule 92 rejects that, as rule 51 does for a `route` list.
 - **`generate_in`**: `event:` templates via `logit_core::template`, with `{seq}`/`{seq%N}`
   placeholders. `generate_in` ships unconditionally but exists only to drive the load-test
   harness (see [Harnesses](#harnesses)), whose sink end is `null_out`.
@@ -1094,7 +1102,7 @@ crates/
   logit-config      YAML config types + generated JSON Schema
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering, framing (the stream `Framer` every TCP listener frames with), statsd (statsd_in's decoder), syslog (syslog_in's decoder), message (the json, csv, logfmt, and kv parse cores the transforms wrap), influxdb (the InfluxDB line-protocol codec: lexer, decoder, encoder, error body)
-  logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
+  logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, route_signals (the `route_signals` node's partition), sockstat (per-socket kernel counters)
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target; the listener), syslog (the listener), graphite, lines (lines_in), collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), influxdb (influxdb_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), splunk (splunk_hec_out), kafka (kafka_out), logit (logit_out), null_out (discard sink)
                     shared drivers: `stream` (the pooled TCP, TLS, and Unix-stream send of statsd, syslog, and graphite), `datagram` (the packer and UDP/Unix-datagram send of statsd, syslog, graphite, and collectd), `accounting` (`BatchAccounting`, the once-per-batch encode-side counting gate; ADR `sink-send-path-and-attempt-accounting`)

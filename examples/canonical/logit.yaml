@@ -5,8 +5,8 @@
 #   syslog senders    -> syslog_in     :5140/udp  (nginx access logs take their own branch)
 #   OTel SDKs         -> otlp_grpc_in  :4317, otlp_http_in :4318
 #
-# One router sends each other input's events to the target of every signal they carry, three
-# gates (metrics, logs, traces) keep one signal each, and each backend reads the gates it wants:
+# A signal router gives each backend only the signals it wants, and each backend reads the
+# targets it needs:
 #
 #   metrics -> Datadog (per-window deltas) and VictoriaMetrics (running totals)
 #   logs    -> Datadog and Loki
@@ -48,7 +48,7 @@ components:
   # --- nginx access logs ---------------------------------------------------------------------
 
   # nginx's `access_log syslog:server=<logit>:5140` tags its lines `nginx`; those go through the
-  # branch below, and every other syslog line goes to the `logs` gate unchanged. nginx must log
+  # branch below, and every other syslog line goes to `by_signal` unchanged. nginx must log
   # the `access_semconv` JSON format from docs/http-access-logs.md.
   by_app:
     type: route
@@ -111,18 +111,46 @@ components:
         field: http.response.body.size
         unit: By
 
+  # Splits each nginx line, which carries a log, metrics, and a span, into one event per signal.
+  # Each part keeps a copy of the line's attributes.
+  nginx_by_signal:
+    type: route_signals
+    sources: [nginx_metrics]
+    signals:
+      metrics: nginx_metric_events
+      logs: nginx_log_events
+      traces: nginx_trace_events
+
+  nginx_metric_events:
+    type: target
+
+  nginx_log_events:
+    type: target
+
+  nginx_trace_events:
+    type: target
+
+  # Metric tags: only these low-cardinality attributes. `service.name` is on the resource, which
+  # `keep` leaves alone.
+  nginx_series:
+    type: keep
+    sources: [nginx_metric_events]
+    fields:
+      - http.request.method
+      - http.response.status_code
+      - http.route
+
   # --- Signal routing ------------------------------------------------------------------------
 
-  # The router sends an event to the target of every signal it carries, so an event is moved,
-  # not copied, unless it carries signals bound for different gates. `by_app` passes on every
-  # syslog line except nginx's. Those arrive from the end of their branch instead, parsed and
-  # carrying their trace ids and service name, so a log line, its span, and its metrics line up
-  # in each backend. DogStatsD events arrive as logs.
+  # The router gives each target only its own signal: an event carrying signals bound for
+  # different targets is split into one event per target. `by_app` passes on every syslog line
+  # except nginx's. Those arrive from `nginx_by_signal` instead, parsed and carrying their trace
+  # ids and service name, so a log line, its span, and its metrics line up in each backend.
+  # DogStatsD events arrive as logs. A signal not listed here is discarded and counted.
   by_signal:
-    type: route
+    type: route_signals
     sources: [by_app, dogstatsd_in, otlp_grpc_in, otlp_http_in]
-    by: signal
-    routes:
+    signals:
       metrics: metric_events
       logs: log_events
       traces: trace_events
@@ -136,50 +164,13 @@ components:
   trace_events:
     type: target
 
-  # An nginx line carries a log, metrics, and a span in one event, so every event belongs to all
-  # three gates and a router would copy it as a fan-out does. It feeds them directly.
-  #
-  # Metric tags: only these low-cardinality attributes. `service.name` is on the resource, which
-  # `keep` leaves alone.
-  nginx_series:
-    type: keep
-    sources: [nginx_metrics]
-    fields:
-      - http.request.method
-      - http.response.status_code
-      - http.route
-
-  # An event with no signal, or a signal with no route, ends here.
-  discard:
-    type: null_out
-    sources: [by_signal]
-
-  # --- Signal gates --------------------------------------------------------------------------
-
-  # A routed event reaches a gate whole, including the signals it carries for other gates. Each
-  # gate clears those, so a backend receives only its own signal.
-  metrics:
-    type: keep_signals
-    sources: [metric_events, nginx_series]
-    signals: [metrics]
-
-  logs:
-    type: keep_signals
-    sources: [log_events, nginx_metrics]
-    signals: [logs]
-
-  traces:
-    type: keep_signals
-    sources: [trace_events, nginx_metrics]
-    signals: [traces]
-
   # --- Windows -------------------------------------------------------------------------------
 
   # Datadog takes each window's increment and skips a running total, and has no histogram form,
   # so an OTel SDK's histograms reach VictoriaMetrics only.
   delta_10s:
     type: aggregate
-    sources: [metrics]
+    sources: [metric_events, nginx_series]
     interval: 10s
 
   # Prometheus remote write takes running totals and skips a per-window increment. A counter an
@@ -188,7 +179,7 @@ components:
   # the SDK to send it to Datadog too.
   cumulative_10s:
     type: aggregate
-    sources: [metrics]
+    sources: [metric_events, nginx_series]
     interval: 10s
     temporality: cumulative
 
@@ -203,10 +194,10 @@ components:
 
   # Datadog reads `host.name` from each event and its resource. Anything without one goes out
   # under logit's own hostname, which suits a per-host logit; on a central one, stamp each
-  # sender's host with a `set` ahead of the gates.
+  # sender's host with a `set` ahead of the signal routers.
   datadog_out:
     type: datadog_out
-    sources: [logs, delta_10s]
+    sources: [log_events, nginx_log_events, delta_10s]
     api_key: !env DD_API_KEY
     # site: datadoghq.eu     # default datadoghq.com; use your organization's site
     buffer: # a disk spool; see the note under "Backends"
@@ -217,7 +208,7 @@ components:
   # OTLP intake instead. Use the same site as `datadog_out`: https://otlp.<site>.
   datadog_traces_out:
     type: otlp_out
-    sources: [traces]
+    sources: [trace_events, nginx_trace_events]
     protocol: http
     endpoint: https://otlp.datadoghq.com
     headers:
@@ -239,7 +230,7 @@ components:
 
   tempo_out:
     type: otlp_out
-    sources: [traces]
+    sources: [trace_events, nginx_trace_events]
     protocol: grpc
     endpoint: tempo:4317
     buffer: # a disk spool; see the note under "Backends"
@@ -248,7 +239,7 @@ components:
 
   loki_out:
     type: otlp_out
-    sources: [logs]
+    sources: [log_events, nginx_log_events]
     protocol: http
     endpoint: http://loki:3100/otlp
     buffer: # a disk spool; see the note under "Backends"

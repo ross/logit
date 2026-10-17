@@ -100,7 +100,7 @@ DOT format. [examples/](examples) has complete starting configs, each with a ren
 | Parsers | `json`, `csv`, `logfmt`, `kv`, `regex`, `http_access`, `line_protocol` (one event per InfluxDB line-protocol point in a log message) |
 | Reshaping | `set`, `remove`, `keep`, `keep_values`, `flatten`, `scale`, `bucket`, `kv_metrics`, `trace_context`, `timestamp` |
 | Filtering and sampling | `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `sample` |
-| Aggregation and routing | `aggregate`, `route`, `target` |
+| Aggregation and routing | `aggregate`, `route`, `route_signals`, `target` |
 | Scripting | `lua`, `lua_file` |
 | Observation | `shape` |
 | Outputs | `influxdb_out`, `otlp_out`, `prometheus_out` (exposition or remote-write), `datadog_out` (Datadog's intake API), `datadog_trace_out` (a Datadog Agent's APM API), `splunk_hec_out` (Splunk's HTTP Event Collector), `kafka_out` (a Kafka topic), `statsd_out`, `syslog_out`, `collectd_out`, `graphite_out`, `logit_out`, `stdio_out`, `file_out`, `null_out` |

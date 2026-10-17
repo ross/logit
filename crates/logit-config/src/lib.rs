@@ -563,17 +563,6 @@ pub enum Signal {
     Traces,
 }
 
-impl Signal {
-    /// The signal a config string names, by the same names `signals:` deserializes (`logs`,
-    /// `metrics`, `traces`), for a key that arrives as a map key rather than a typed value
-    /// (`route`'s `routes:` under `by: signal`).
-    pub fn from_name(name: &str) -> Option<Signal> {
-        use serde::de::{value::StrDeserializer, IntoDeserializer};
-        let name: StrDeserializer<'_, serde::de::value::Error> = name.into_deserializer();
-        Signal::deserialize(name).ok()
-    }
-}
-
 /// `has_signal`'s matching rule. `any_of` forwards an event carrying at least one listed signal,
 /// untouched, even if it also carries an unlisted one. `only` also requires the event carry
 /// nothing outside `signals`: a mixed event with an unlisted signal is dropped, not trimmed
@@ -587,18 +576,13 @@ pub enum MatchMode {
 }
 
 /// What one `route` reads from each event. Written `by: {provenance: origin}`, `by: {attribute:
-/// stream}`, `by: {resource: service.name}`, or `by: signal`.
+/// stream}`, or `by: {resource: service.name}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteBy {
     Provenance(ProvenanceField),
     Attribute(String),
     Resource(String),
-    /// The signals the event carries. `routes:` keys are `logs`, `metrics`, and `traces`. An
-    /// event goes to the targets of every signal it carries, whole, never split per signal; a
-    /// carried signal with no route sends it to this component's ordinary consumers as well. An
-    /// event that carries no signal goes to the ordinary consumers.
-    Signal,
 }
 
 /// One `routes:` value: a target id, or a non-empty list of target ids that each receive a copy
@@ -678,6 +662,41 @@ impl JsonSchema for RouteTargets {
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         RouteTargetsSchema::json_schema(generator)
     }
+}
+
+/// `route_signals`' `signals:`: the one target each signal goes to. At least one must be set, and
+/// each set id must name a `target` component. Two signals may name the same target. A signal
+/// left unset is stripped under `strip: true`; under `strip: false` it rides along on an event
+/// that also carries a listed signal. An event carrying only unset signals is discarded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SignalTargets {
+    /// The target for log records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<String>,
+    /// The target for metric records. An event's metric records always travel together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<String>,
+    /// The target for spans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traces: Option<String>,
+}
+
+impl SignalTargets {
+    /// Each signal with its target id, in `logs`, `metrics`, `traces` order.
+    pub fn iter(&self) -> impl Iterator<Item = (Signal, Option<&str>)> {
+        [
+            (Signal::Logs, self.logs.as_deref()),
+            (Signal::Metrics, self.metrics.as_deref()),
+            (Signal::Traces, self.traces.as_deref()),
+        ]
+        .into_iter()
+    }
+}
+
+/// `route_signals`' `strip` default: each target receives only its own signals' payloads.
+fn default_route_signals_strip() -> bool {
+    true
 }
 
 /// Which half of a batch's provenance a `route` switches on: `origin` is the component that
@@ -2856,9 +2875,30 @@ pub enum ComponentKind {
         /// event. Several values may name one target. The router's edges derive from these
         /// values, so there is no separate `targets:` list. Must be non-empty, with no empty key,
         /// value, or list, no target repeated within one list, and at most 63 distinct targets;
-        /// every id must name a `target` component. Under `by: signal`, the keys are `logs`,
-        /// `metrics`, and `traces`.
+        /// every id must name a `target` component.
         routes: std::collections::BTreeMap<String, RouteTargets>,
+    },
+    /// Sends each signal an event carries to that signal's target: logs to one, metrics to
+    /// another, spans to a third, or any two to one target. An event carrying none of the listed
+    /// signals is discarded. This component has no ordinary consumers: no component may list it
+    /// in `sources:`; read its targets instead.
+    ///
+    /// With `strip: true` (the default), an event carrying signals bound for different targets
+    /// is split: each target receives one event holding only its own signals' payloads, with the
+    /// original's timestamp and a copy of its attributes. A signal `signals:` leaves out is
+    /// stripped. Each part past the first counts as
+    /// `logit.component.events.copied`. A component may read several of these targets; it
+    /// receives one event per part. To keep two signals on one event, send both to one target.
+    ///
+    /// With `strip: false`, each target receives the whole event, unlisted signals included, and
+    /// no component may list two of these targets in `sources:`, since it would receive one event
+    /// twice.
+    RouteSignals {
+        signals: SignalTargets,
+        /// Whether each target receives only its own signals' payloads (`true`, the default) or
+        /// the whole event (`false`).
+        #[serde(default = "default_route_signals_strip")]
+        strip: bool,
     },
     /// Parses a log record's message as logfmt (`level=info msg="hello world" dur=3ms`), merging
     /// the resulting key/values into the event's attributes. Additive, and a failed parse passes
@@ -9595,6 +9635,49 @@ mod tests {
             ComponentKind::Target {} => {}
             other => panic!("expected Target, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn route_signals_deserializes_with_strip_defaulting_to_true() {
+        let component: Component = serde_json::from_str(
+            r#"{
+                "type": "route_signals",
+                "sources": ["in"],
+                "signals": {"metrics": "metric_events", "logs": "log_events"}
+            }"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::RouteSignals { signals, strip } => {
+                assert!(strip, "strip defaults to true");
+                assert_eq!(
+                    signals,
+                    SignalTargets {
+                        logs: Some("log_events".to_string()),
+                        metrics: Some("metric_events".to_string()),
+                        traces: None,
+                    }
+                );
+            }
+            other => panic!("expected RouteSignals, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_signals_rejects_a_key_that_is_not_a_signal() {
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "route_signals", "sources": ["in"], "signals": {"spans": "t"}}"#,
+        )
+        .expect_err("`signals:` takes logs, metrics, and traces only");
+        assert!(err.to_string().contains("unknown field `spans`"), "got: {err}");
+    }
+
+    #[test]
+    fn route_signals_rejects_a_list_value() {
+        serde_json::from_str::<Component>(
+            r#"{"type": "route_signals", "sources": ["in"], "signals": {"logs": ["a", "b"]}}"#,
+        )
+        .expect_err("a signal names one target");
     }
 
     #[test]

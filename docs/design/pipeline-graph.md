@@ -153,6 +153,10 @@ pub enum ComponentKind {
     // (docs/adr/target-components.md). An unrouted event goes to this component's ordinary
     // consumers, which it must have (a null_out to discard them).
     Route { by: RouteBy, routes: BTreeMap<String, RouteTargets> },
+    // Sends each signal an event carries to that signal's target, by default splitting a mixed
+    // event into one part per target; no ordinary consumers, and an event carrying no listed
+    // signal is discarded (docs/adr/route-signals.md).
+    RouteSignals { signals: SignalTargets, strip: bool },
     // Keeps a fraction of events by a hashed key (trace_id, an attribute, or a resource
     // attribute), so every event sharing a key gets the same verdict in every process;
     // `always_keep` pins flagged events through (docs/adr/consistent-sampling-component.md).
@@ -189,7 +193,7 @@ collide, so the rule stays predictable when a protocol gains its second side lat
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
 `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `keep_values`, `bucket`,
-`logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`, and any future
+`logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`, `route_signals`, and any future
 native transform — take no suffix, because a transform has only one direction.
 
 **`interval` is a per-kind field.** `lua`/`lua_file` carry an optional flush interval
@@ -234,7 +238,7 @@ literal argument string.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`, `route_signals`) | ≥1 required | required (≥1 consumer), except `route_signals`, which must have none (rule 92) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, `kafka_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -242,6 +246,10 @@ Rule 50 holds a *router* to rule 7's "≥1 consumer" with its own message. A rou
 consumers receive its *unrouted* events, so a router with none would lose them; an operator who
 wants them gone names a `null_out` as that consumer, so the discard shows in the graph
 ([ADR `target-components`](../adr/target-components.md)).
+
+Rule 92 inverts that for `route_signals`: nothing may list it in `sources:`, because it sends
+every event to its targets and discards an event carrying none of its listed signals. Its
+`signals:` map is where the discard shows ([ADR `route-signals`](../adr/route-signals.md)).
 
 Role is never derived from topology ("no sources → listener", "nothing reads it → sink"). ADR
 `component-graph-configuration` rejected that because a typo'd source reference would silently
@@ -286,16 +294,34 @@ filters.
 
 A `routes:` value may be a list (`host: [host_stream, archive]`), which sends a matching event to
 every listed target. Matching is first-match in key order, so a list is the only way one value
-reaches several targets. Under `by: signal` the keys are `logs`, `metrics`, and `traces`, and an
-event goes to the targets of every signal it carries, plus the router's own consumers for a
-carried signal with no route. The event is never split: each destination receives it whole, and
-an event bound for several destinations is copied to each, counted as
-`logit.component.events.copied`. Rule 51 keeps one component from reading two destinations one
-event can reach together, since it would receive that event twice. A `target` has no fields and no `sources:`. A router points at it, and downstream
+reaches several targets. The event is never split: each destination receives it whole, and an
+event bound for several destinations is copied to each, counted as
+`logit.component.events.copied`. Rule 51 keeps one component from reading two targets of one
+list, since it would receive that event twice. A `target` has no fields and no `sources:`. A router points at it, and downstream
 components read it like any other source (for example, `windowed: {sources: [host_stream]}`).
 `lua`/`lua_file` is the other router kind: it picks a target per event with `event:to("id")`
 instead of an equality table (see `docs/design/lua-api.md`'s "Routing to a target."). A complete,
 runnable version of the config above is `fixtures/fan-out-central.yaml`.
+
+`route_signals` fills targets by signal and has no ordinary consumers
+([ADR `route-signals`](../adr/route-signals.md)):
+
+```yaml
+  by_signal:
+    type: route_signals
+    sources: [remote_in]
+    signals:                 # signal -> target id; two signals may share one
+      logs: log_events
+      metrics: metric_events
+      traces: log_events
+```
+
+Under `strip: true`, the default, a mixed event is split: each target receives one event holding
+only its own signals' payloads, with the original's timestamp and a copy of its attributes. A
+signal `signals:` leaves out is stripped, and an event carrying none of the listed signals is
+discarded. A component may read several of its targets, receiving one event per part; to keep two
+signals on one event, send both to one target. Under `strip: false` each target receives the
+whole event, and rule 92 keeps one component from reading two of its targets.
 
 ## Validation
 
@@ -375,10 +401,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 50. A router (`route`, or `lua`/`lua_file` with `targets:`) with no ordinary consumer. Name a
     `null_out` as its consumer to discard the events no target claims.
 51. A `route` with no `routes:`, an empty key or value, an empty list, a target repeated within
-    one list, a `by: signal` key other than `logs`/`metrics`/`traces`, more than 63 distinct
-    targets, or an empty `by:` key; or a component whose `sources:` lists two destinations of one
-    `route` that one event can reach together: two targets of one list, or any two of a
-    `by: signal` route's targets, plus the route itself when some signal has no route.
+    one list, more than 63 distinct targets, or an empty `by:` key; or a component whose
+    `sources:` lists two targets of one `route` list.
 52. An inconsistent `statsd_out` `tls:`, or one under `transport: udp`.
 53. A `0s` `idle_timeout`, or any `idle_timeout` on a UDP listener.
 54. A `keep_values` with nothing configured, an empty name or `allow`, a non-finite literal, a
@@ -457,6 +481,9 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `max_request_bytes` of `0`, `timeout: 0s`, or a bad `tls`.
 86. An `influxdb_in` with an empty `bind`, a `tokens` entry that is empty or has surrounding
     whitespace, or a `max_request_bytes` of `0`.
+92. A `route_signals` listed in any component's `sources:` (it has no ordinary edge, so rule 7
+    doesn't ask it for a consumer), one with no `signals:` entry set or an empty target id, or,
+    under `strip: false`, a component whose `sources:` lists two of its targets.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
@@ -520,6 +547,13 @@ component is one that appears in several `sources` lists, with nothing to specia
   to each destination as one shared `Arc`. One incoming batch is one hop however many ways it
   forks, the same rule ordinary fan-out follows. Rule 50 gives every router an ordinary consumer,
   so its forward partition always has a destination.
+- **A `route_signals` is a router without the forward edge** (`run_route_signals`). It holds only
+  its target `Fanout`s, marks each event by the signals it carries, and partitions with
+  `route_signals_batch`, which shares `route_batch`'s count, reserve, and partition-assembly
+  passes. Under `strip: true` its move pass splits a mixed event, moving each target's payloads
+  into a part with a clone of the attributes, and an event carrying no listed signal is discarded
+  there and counted `events.discarded`. It isn't a `Router`, since a router never mutates an event
+  ([ADR `route-signals`](../adr/route-signals.md)).
 - **Shutdown cascades by channel closure** from listeners toward sinks. A node whose inbox closes
   drains it and exits, which drops its `Fanout`'s senders and closes its consumers' inboxes in
   turn. With `shutdown.delay` set and the process `Ready` at the signal, the runtime's shutdown
@@ -584,11 +618,12 @@ refused calls is not progress.
 
 Everything else runs as an ordinary tokio task: listeners, sinks, native `Send` transforms
 (`logit-transforms::Aggregator` and every other native transform in that crate), and **native
-`Router`s** (`route`, [ADR `target-components`](../adr/target-components.md)). A `Router` is `Send`
-for the same reason a `Transform` is, and `run_router` is `run_transform` minus the flush-deadline
-race. A `target` runs as nothing at all (see "Runtime model"). A **Lua router** (a `lua`/`lua_file`
-component with `targets:`) is still one OS thread: it partitions each batch by the `event:to(..)`
-mark its script set and sends one batch per destination from that thread.
+`Router`s** (`route`, [ADR `target-components`](../adr/target-components.md)), and
+`route_signals`. A `Router` is `Send` for the same reason a `Transform` is, and `run_router` is
+`run_transform` minus the flush-deadline race. A `target` runs as nothing at all (see "Runtime
+model"). A **Lua router** (a `lua`/`lua_file` component with `targets:`) is still one OS thread:
+it partitions each batch by the `event:to(..)` mark its script set and sends one batch per
+destination from that thread.
 
 **Fusing a linear run of adjacent Lua nodes back onto one thread** would save a thread and a
 channel hop per hop. It isn't built: thread count is bounded by config size (at most one per

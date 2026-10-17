@@ -5167,16 +5167,21 @@ def _tcp_rules(root):
                 "routes: { \"0\": [tier_a, tier_b] } }\n"
     block_list = "components:\n  split:\n    type: route\n    by: { attribute: shard }\n" \
                  "    routes:\n      \"0\":\n        - tier_a\n        - tier_b\n"
-    by_signal = "components:\n  split:\n    type: route\n    by: signal\n" \
-                "    routes: { logs: tier_a, metrics: tier_b }\n"
-    for name, text in (("a flow list", flow_list), ("a block list", block_list),
-                       ("by: signal", by_signal)):
+    for name, text in (("a flow list", flow_list), ("a block list", block_list)):
         problems = route_problems(text)
         expect(len(problems) == 1 and "route 'split'" in problems[0]
                and "use split = \"copy\" or one target per value" in problems[0],
                f"{name} under split = route is refused, got {problems}")
         expect(route_problems(text, split="copy") == [],
                f"{name} loads under split = copy, got {route_problems(text, split='copy')}")
+
+    by_signals = "components:\n  split:\n    type: route_signals\n" \
+                 "    signals: { logs: tier_a, metrics: tier_b }\n"
+    problems = route_problems(by_signals)
+    expect(len(problems) == 1 and "route_signals 'split'" in problems[0],
+           f"a route_signals under split = route is refused, got {problems}")
+    copied = route_problems(by_signals, split="copy")
+    expect(copied == [], f"a route_signals loads under split = copy, got {copied}")
 
     # The fault predicates per wire.
     roles = scenario.BASE_ROLES

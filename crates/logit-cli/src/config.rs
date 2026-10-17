@@ -451,10 +451,9 @@ components:
         }
     }
 
-    /// `route`'s `routes:` values read as a target id or a list of them, and `by: signal` as a
-    /// bare string, through YAML.
+    /// `route`'s `routes:` values read as a target id or a list of them, through YAML.
     #[test]
-    fn route_targets_and_by_signal_read_through_the_real_yaml_path() {
+    fn route_targets_read_through_the_real_yaml_path() {
         let yaml = r#"
 components:
   in:
@@ -463,7 +462,7 @@ components:
   split:
     type: route
     sources: [in]
-    by: signal
+    by: {attribute: stream}
     routes:
       logs: [logs_stream, archive]
       traces: traces_stream
@@ -471,7 +470,7 @@ components:
         let config = parse(yaml, &env(&[])).expect("should parse");
         match &config.components["split"].kind {
             logit_config::ComponentKind::Route { by, routes } => {
-                assert_eq!(by, &logit_config::RouteBy::Signal);
+                assert_eq!(by, &logit_config::RouteBy::Attribute("stream".into()));
                 assert_eq!(
                     routes["logs"],
                     logit_config::RouteTargets(vec!["logs_stream".into(), "archive".into()])
@@ -479,6 +478,34 @@ components:
                 assert_eq!(routes["traces"], "traces_stream".into());
             }
             other => panic!("expected Route, got {other:?}"),
+        }
+    }
+
+    /// `route_signals`' `signals:` map and its `strip` default read through YAML.
+    #[test]
+    fn route_signals_reads_through_the_real_yaml_path() {
+        let yaml = r#"
+components:
+  in:
+    type: otlp_in
+    bind: 127.0.0.1:4318
+  by_signal:
+    type: route_signals
+    sources: [in]
+    signals:
+      metrics: metric_events
+      logs: log_events
+      traces: log_events
+"#;
+        let config = parse(yaml, &env(&[])).expect("should parse");
+        match &config.components["by_signal"].kind {
+            logit_config::ComponentKind::RouteSignals { signals, strip } => {
+                assert!(*strip);
+                assert_eq!(signals.logs.as_deref(), Some("log_events"));
+                assert_eq!(signals.metrics.as_deref(), Some("metric_events"));
+                assert_eq!(signals.traces.as_deref(), Some("log_events"));
+            }
+            other => panic!("expected RouteSignals, got {other:?}"),
         }
     }
 

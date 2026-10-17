@@ -363,9 +363,9 @@ mark and sends one batch per destination that received any, all under the same t
 the same `process` span. Downstream of a target, `provenance.previous` is the **target's** id, not
 this component's (`docs/design/pipeline-graph.md`); `provenance.origin` is unchanged.
 
-To route on an equality check or on the signals an event carries, use the native `route`
-component instead: it covers `{attribute: ..}`/`{resource: ..}`/`{provenance: ..}` equality and
-`by: signal` with no VM in the path. Use a `lua`
+To route on an equality check, use the native `route` component instead: it covers
+`{attribute: ..}`/`{resource: ..}`/`{provenance: ..}` equality with no VM in the path, and
+`route_signals` routes by the signals an event carries. Use a `lua`
 router when the decision needs something `route`'s deliberately narrow `by:` can't express.
 
 ## Emitting telemetry from a script

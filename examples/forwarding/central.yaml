@@ -1,9 +1,11 @@
 # The central half of a forwarding pair: this `logit` receives what every edge.yaml forwards over
 # the native transport, windows the metrics once, and delivers each signal to its backend.
 #
-#   edges ==native, TLS==> remote_in -> by_signal --> metrics -> cumulative_10s -> VictoriaMetrics
-#                                                 --> logs    -> Loki
-#                                                 --> traces  -> Tempo
+#   edges ==native, TLS==> remote_in -> by_signal
+#
+#   by_signal --> metric_events -> cumulative_10s -> VictoriaMetrics
+#             --> log_events    -> Loki
+#             --> trace_events  -> Tempo
 #
 # Check it with `logit validate central.yaml` and draw it with
 # `logit graph central.yaml | dot -Tsvg > central.svg`. docs/deploying.md's "Operating a pair"
@@ -31,16 +33,16 @@ components:
 
   # --- Signal routing ------------------------------------------------------------------------
 
-  # One router sends each event to the target of every signal it carries, so an event is moved,
-  # not copied, unless it carries signals bound for different backends. An edge's `internal`
-  # telemetry arrives here as ordinary events and takes the same route as everything else. An
-  # event with no signal, or a signal with no route, goes to `discard`, so add a route here
-  # before an edge starts sending a new signal.
+  # One router gives each backend only its own signal. An event carrying several signals is split
+  # into one event per target, each holding only that target's payloads and a copy of the
+  # original's attributes, so Loki never receives a metric point and Tempo never receives a log.
+  # An edge's `internal` telemetry arrives here as ordinary events and takes the same route as
+  # everything else. A signal `signals:` doesn't list is discarded and counted, so add a route
+  # here before an edge starts sending a new signal.
   by_signal:
-    type: route
+    type: route_signals
     sources: [remote_in]
-    by: signal
-    routes:
+    signals:
       metrics: metric_events
       logs: log_events
       traces: trace_events
@@ -53,28 +55,6 @@ components:
 
   trace_events:
     type: target
-
-  discard:
-    type: null_out
-    sources: [by_signal]
-
-  # An event that carries several signals reaches every matching target whole. These gates keep
-  # each backend's input to its own signal, so Loki never receives a metric point and Tempo never
-  # receives a log. Each gate has one consumer, so none costs a copy.
-  metrics:
-    type: keep_signals
-    sources: [metric_events]
-    signals: [metrics]
-
-  logs:
-    type: keep_signals
-    sources: [log_events]
-    signals: [logs]
-
-  traces:
-    type: keep_signals
-    sources: [trace_events]
-    signals: [traces]
 
   # If a backend needs the edges' self-telemetry treated differently (an InfluxDB org and bucket,
   # say), split it once here, whatever each edge names its `internal`: every `internal` carries
@@ -98,7 +78,7 @@ components:
   # running totals, not per-window increments.
   cumulative_10s:
     type: aggregate
-    sources: [metrics]
+    sources: [metric_events]
     interval: 10s
     temporality: cumulative
 
@@ -121,7 +101,7 @@ components:
 
   loki_out:
     type: otlp_out
-    sources: [logs]
+    sources: [log_events]
     protocol: http
     endpoint: http://loki:3100/otlp
     buffer:
@@ -130,7 +110,7 @@ components:
 
   tempo_out:
     type: otlp_out
-    sources: [traces]
+    sources: [trace_events]
     protocol: grpc
     endpoint: tempo:4317
     buffer:
@@ -150,13 +130,12 @@ components:
     span_sample_rate: 0.1
 
   # `internal` emits each metric, log, and span as its own event, so each target below receives
-  # one signal and no gate is needed. The metrics get their own branch because `aggregate`
-  # passes a log or span event through.
+  # one signal. The metrics get their own branch because `aggregate` passes a log or span event
+  # through.
   self_by_signal:
-    type: route
+    type: route_signals
     sources: [self]
-    by: signal
-    routes:
+    signals:
       metrics: self_metric_events
       logs: self_log_events
       traces: self_trace_events
@@ -169,10 +148,6 @@ components:
 
   self_trace_events:
     type: target
-
-  self_discard:
-    type: null_out
-    sources: [self_by_signal]
 
   self_cumulative_10s:
     type: aggregate

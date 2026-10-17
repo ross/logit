@@ -949,7 +949,7 @@ which allocates only when a transform pushes onto it
 batch besides `Fanout`'s unconditional fan-out: a `Router` node (`route`, or `lua`/`lua_file` with
 `targets:`) moves each event into one of `1 + targets.len()` destination buffers in one pass over
 the batch (`crate::runtime::route_batch`, `crates/logit-pipeline/src/router.rs`), then sends every
-non-empty one under a single child `BatchContext`. An event a `route` list or `by: signal` marks
+non-empty one under a single child `BatchContext`. An event a `route` list marks
 for several destinations is cloned into each but the last. The rule this buys, as exact counts
 (`crates/logit-bench/tests/allocations.rs`'s `// Routing` section; the first three rows have zero
 per-event allocations and one `reserve_exact` per used destination):
@@ -977,8 +977,24 @@ destination nothing was routed to**: 1 for the returned partition list itself
 paid again every batch, by design — that's the whole partition cost, and it's an integer, not a
 logarithm.
 
-Against that, the shape a router replaces — an N-way `Fanout` plus N `has_attributes` filters, each
-scanning the *whole* batch to keep its own slice — costs `fan_out_plus_two_has_attributes_for_the_
+`route_signals` ([ADR `route-signals`](../adr/route-signals.md)) runs the same passes in
+`route_signals_batch`, with a move pass that can split an event:
+
+| Shape (`route_signals`, 64 events, targets `a`/`b`) | Allocations |
+|---|---:|
+| Metric-only (`statsd_batch`), `metrics` to `a`: every event moved into one target | **2** |
+| Log and metrics (`nginx_batch`), `logs` to `a`, `metrics` to `b`, `strip: true`: 3 + 64 attribute clones | **67** |
+| The same with `strip: false`: one mark for the batch, one shared `Arc` | **2** |
+| Metric-only, only `logs` listed: every event stripped and discarded | **0** |
+
+**A split pays one `AttrMap` clone per extra part and nothing for its payloads**, which move. The
+part for the highest slot is the original event, keeping its own attribute and `MetricList`
+allocations; for this fixture the log part's clone is the spilled `AttrMap`, 1 allocation, where
+§3's whole-event clone is 2. A batch with every event discarded allocates nothing: the returned
+`Vec` has no capacity and no target is reserved.
+
+Against the `route` rows, the shape a router replaces — an N-way `Fanout` plus N
+`has_attributes` filters, each scanning the *whole* batch to keep its own slice — costs `fan_out_plus_two_has_attributes_for_the_
 same_split`'s **194** for the identical 64-event, 2-way `stream: host`/`stream: app` split: 1
 `Arc::new` (`Fanout::deliver`'s once-per-send wrap) + 193 for the forced `EventBatch` deep clone
 that a fan-out with no `Output` branch always pays (1 for the clone's own `Vec<Event>`, plus 64 × 3

@@ -1,8 +1,7 @@
 //! `route`: native equality-only routing, one of `docs/adr/target-components.md`'s two router
 //! kinds (`lua`'s `event:to(..)` is the other). `by:` names one key to read per event (the
-//! batch's provenance `origin`/`previous`, an event attribute, a resource attribute, or the
-//! signals the event carries), and `routes:` maps each value of it to a target id or a list of
-//! them. An absent key, or a value no route names, is `Destinations::FORWARD`: it goes to the
+//! batch's provenance `origin`/`previous`, an event attribute, or a resource attribute), and
+//! `routes:` maps each value of it to a target id or a list of them. An absent key, or a value no route names, is `Destinations::FORWARD`: it goes to the
 //! router's own consumers, which graph rule 50 requires (a `null_out` among them when the operator
 //! wants those events discarded).
 //!
@@ -15,13 +14,6 @@
 //!
 //! **A list is the only way one value reaches several targets.** Matching is first-match over
 //! `routes:` in key order, so two keys that both match one value never union.
-//!
-//! **`Signal` is not first-match: it unions.** An event's mark is the union, over each signal it
-//! carries, of that signal's targets, with `Forward` for a carried signal no route names, so a
-//! log-and-metrics event with only `logs` routed reaches the logs target and the router's own
-//! consumers, whole both times. An event carrying no signal is `Forward`, where `has_signal`
-//! would drop it: a router never drops. All eight carried-signal combinations are resolved in
-//! [`Route::new`], so the per-event path is three presence checks and an index.
 //!
 //! **`Origin`/`Previous` compare interned `Symbol`s,** with provenance cached from
 //! `observe_provenance` as `has_provenance` does.
@@ -38,11 +30,10 @@
 //! anything more is a `lua` component with `targets:` (`docs/adr/routing-by-condition-is-lua.md`).
 //!
 //! **No layer-3 telemetry, and so no `Telemetry` field.** The runtime's `run_router`/`route_batch`
-//! already count batches and events on every destination's `Fanout`, and the copies a list or a
-//! mixed-signal event makes.
+//! already count batches and events on every destination's `Fanout`, and the copies a list makes.
 
 use crate::value_matches;
-use logit_config::{ProvenanceField, RouteBy, RouteTargets, Signal};
+use logit_config::{ProvenanceField, RouteBy, RouteTargets};
 use logit_core::interner::{intern, Symbol};
 use logit_core::{Event, Provenance, Resource, Value};
 use logit_pipeline::{Destinations, Router};
@@ -55,8 +46,6 @@ enum By {
     Previous(Vec<(Symbol, Destinations)>),
     Attribute(Symbol, Vec<(Value, Destinations)>),
     Resource(Symbol, Vec<(Value, Destinations)>),
-    /// Indexed by [`signal_index`] of the signals an event carries.
-    Signal([Destinations; 8]),
 }
 
 /// The native `route` component; see the module doc.
@@ -70,9 +59,9 @@ pub struct Route {
 impl Route {
     /// Resolves every `routes` id to its slot in `targets` (`ResolvedComponent::targets`).
     ///
-    /// Panics if an id isn't in `targets`, if there are more than
-    /// [`Destinations::MAX_TARGETS`], or if a `by: signal` key names no signal, all of which
-    /// graph rules 48/51 rule out for a resolved graph.
+    /// Panics if an id isn't in `targets` or if there are more than
+    /// [`Destinations::MAX_TARGETS`], both of which graph rules 48/51 rule out for a resolved
+    /// graph.
     pub fn new(by: RouteBy, routes: &BTreeMap<String, RouteTargets>, targets: &[String]) -> Self {
         assert!(
             targets.len() <= Destinations::MAX_TARGETS,
@@ -112,38 +101,9 @@ impl Route {
                     .map(|(value, ids)| (Value::str(value.clone()), mark_of(ids)))
                     .collect(),
             ),
-            RouteBy::Signal => {
-                let mut per_signal = [Destinations::FORWARD; 3];
-                for (key, ids) in routes {
-                    let signal = Signal::from_name(key).unwrap_or_else(|| {
-                        panic!("route key '{key}' is not a signal -- rule 51 should have caught it")
-                    });
-                    let bit = match signal {
-                        Signal::Logs => 0,
-                        Signal::Metrics => 1,
-                        Signal::Traces => 2,
-                    };
-                    per_signal[bit] = mark_of(ids);
-                }
-                let mut masks = [Destinations::FORWARD; 8];
-                for (carried, mask) in masks.iter_mut().enumerate().skip(1) {
-                    *mask = (0..3)
-                        .filter(|bit| carried & (1 << bit) != 0)
-                        .fold(Destinations::NONE, |mark, bit| mark | per_signal[bit]);
-                }
-                By::Signal(masks)
-            }
         };
         Self { by, provenance: Provenance::default() }
     }
-}
-
-/// The index into `By::Signal`'s masks for an event: bit 0 a log, bit 1 metrics, bit 2 a span
-/// (`traces`), the bits [`Route::new`] fills `per_signal` by.
-fn signal_index(event: &Event) -> usize {
-    usize::from(event.log.is_some())
-        | usize::from(!event.metrics.is_empty()) << 1
-        | usize::from(event.span.is_some()) << 2
 }
 
 impl Router for Route {
@@ -169,7 +129,6 @@ impl Router for Route {
                 Some(actual) => by_value(routes, actual),
                 None => Destinations::FORWARD,
             },
-            By::Signal(masks) => masks[signal_index(event)],
         }
     }
 }
@@ -484,78 +443,5 @@ mod tests {
             route.route(&default_resource(), &event()),
             Destinations::target(0) | Destinations::target(1)
         );
-    }
-
-    // -- Signal -----------------------------------------------------------------------------
-
-    fn metric_record() -> logit_core::MetricRecord {
-        logit_core::MetricRecord::new(intern("m"), logit_core::MetricKind::counter(1.0))
-    }
-
-    fn span_record() -> logit_core::SpanRecord {
-        use logit_core::{SpanKind, SpanRecord, SpanStatus};
-        SpanRecord {
-            trace_id: [0; 16],
-            span_id: [0; 8],
-            parent_span_id: None,
-            name: Value::str("op"),
-            kind: SpanKind::Internal,
-            status: SpanStatus::Unset,
-            events: Vec::new(),
-            links: Vec::new(),
-            end_timestamp: 0,
-            flags: 0,
-            ext: None,
-        }
-    }
-
-    fn by_signal(pairs: &[(&str, &str)], ids: &[&str]) -> Route {
-        Route::new(RouteBy::Signal, &routes(pairs), &targets(ids))
-    }
-
-    #[test]
-    fn by_signal_routes_a_single_signal_event_to_its_target() {
-        let mut route =
-            by_signal(&[("logs", "l"), ("metrics", "m"), ("traces", "t")], &["l", "m", "t"]);
-        assert_eq!(route.route(&default_resource(), &event()), Destinations::target(0));
-        let metric = Event::metric(0, AttrMap::new(), metric_record());
-        assert_eq!(route.route(&default_resource(), &metric), Destinations::target(1));
-        let span = Event::span(0, AttrMap::new(), span_record());
-        assert_eq!(route.route(&default_resource(), &span), Destinations::target(2));
-    }
-
-    #[test]
-    fn by_signal_sends_a_mixed_event_to_every_carried_signals_target() {
-        let mut route =
-            by_signal(&[("logs", "l"), ("metrics", "m"), ("traces", "t")], &["l", "m", "t"]);
-        let mut mixed = event();
-        mixed.metrics.push(metric_record());
-        mixed.span = Some(span_record());
-        assert_eq!(
-            route.route(&default_resource(), &mixed),
-            Destinations::target(0) | Destinations::target(1) | Destinations::target(2)
-        );
-    }
-
-    #[test]
-    fn by_signal_also_forwards_a_mixed_event_whose_other_signal_has_no_route() {
-        let mut route = by_signal(&[("logs", "l")], &["l"]);
-        let mut mixed = event();
-        mixed.metrics.push(metric_record());
-        assert_eq!(
-            route.route(&default_resource(), &mixed),
-            Destinations::target(0) | Destinations::FORWARD,
-            "the metrics payload must not drop out of the else-branch"
-        );
-        let metric = Event::metric(0, AttrMap::new(), metric_record());
-        assert_eq!(route.route(&default_resource(), &metric), Destinations::FORWARD);
-    }
-
-    #[test]
-    fn by_signal_forwards_an_event_with_no_payload() {
-        let mut route = by_signal(&[("logs", "l")], &["l"]);
-        let mut empty = event();
-        empty.log = None;
-        assert_eq!(route.route(&default_resource(), &empty), Destinations::FORWARD);
     }
 }

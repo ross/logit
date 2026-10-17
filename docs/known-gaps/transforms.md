@@ -16,9 +16,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     attribute, and an equality component gates on it
     ([ADR `bucket-transform`](../adr/bucket-transform.md)).
   - Destination selection (splitting one flow into named streams): `route` (equality on
-    provenance/attribute/resource, or by the signals an event carries, to one target or a list)
-    and `target` components (ADR [`target-components`](../adr/target-components.md)); `lua` can
-    also route with `event:to`.
+    provenance/attribute/resource, to one target or a list), `route_signals` (by the signals an
+    event carries), and `target` components (ADR
+    [`target-components`](../adr/target-components.md)); `lua` can also route with `event:to`.
   - Sampling: `sample`
     ([ADR `consistent-sampling-component`](../adr/consistent-sampling-component.md)), because a
     `lua` component can't express keyed, cross-process-consistent sampling.

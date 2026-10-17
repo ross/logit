@@ -29,6 +29,7 @@ pub mod queue;
 #[cfg(test)]
 mod queue_stress;
 pub mod readiness;
+pub mod route_signals;
 pub mod router;
 pub mod runtime;
 /// Per-socket kernel counters (`SO_MEMINFO`, `TCP_INFO`) read off a raw fd. Not re-exported flat:
@@ -50,7 +51,8 @@ pub use queue::{
     SinkQueueConfig, SinkStore, SinkStoreConfig, StoreItem, SINK_QUEUE_METRICS,
 };
 pub use readiness::{NodeState, Phase, PipelineState, Readiness};
-pub use router::{Destinations, Router, RouterScratch};
+pub use route_signals::{route_signals_batch, SignalRoutes};
+pub use router::{signal_index, signal_masks, Destinations, Router, RouterScratch};
 pub use runtime::{
     process_batch, route_batch, run, run_with_options, run_with_shutdown, run_with_telemetry,
     send_batch, unwrap_batch, LuaRuntimeConfig, NodeSpec, Partition, RetryConfig, RunError,

@@ -2345,7 +2345,7 @@
             },
             "receive": true,
             "routes": {
-              "description": "Value to a target id, or to a list of target ids that each receive a copy of a matching event. Several values may name one target. The router's edges derive from these values, so there is no separate `targets:` list. Must be non-empty, with no empty key, value, or list, no target repeated within one list, and at most 63 distinct targets; every id must name a `target` component. Under `by: signal`, the keys are `logs`, `metrics`, and `traces`.",
+              "description": "Value to a target id, or to a list of target ids that each receive a copy of a matching event. Several values may name one target. The router's edges derive from these values, so there is no separate `targets:` list. Must be non-empty, with no empty key, value, or list, no target repeated within one list, and at most 63 distinct targets; every id must name a `target` component.",
               "type": "object",
               "additionalProperties": {
                 "$ref": "#/definitions/RouteTargets"
@@ -2357,6 +2357,35 @@
               "type": "string",
               "enum": [
                 "route"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Sends each signal an event carries to that signal's target: logs to one, metrics to another, spans to a third, or any two to one target. An event carrying none of the listed signals is discarded. This component has no ordinary consumers: no component may list it in `sources:`; read its targets instead.\n\nWith `strip: true` (the default), an event carrying signals bound for different targets is split: each target receives one event holding only its own signals' payloads, with the original's timestamp and a copy of its attributes. A signal `signals:` leaves out is stripped. Each part past the first counts as `logit.component.events.copied`. A component may read several of these targets; it receives one event per part. To keep two signals on one event, send both to one target.\n\nWith `strip: false`, each target receives the whole event, unlisted signals included, and no component may list two of these targets in `sources:`, since it would receive one event twice.",
+          "type": "object",
+          "required": [
+            "signals",
+            "type"
+          ],
+          "properties": {
+            "buffer": true,
+            "receive": true,
+            "signals": {
+              "$ref": "#/definitions/SignalTargets"
+            },
+            "sources": true,
+            "strip": {
+              "description": "Whether each target receives only its own signals' payloads (`true`, the default) or the whole event (`false`).",
+              "default": true,
+              "type": "boolean"
+            },
+            "targets": true,
+            "type": {
+              "type": "string",
+              "enum": [
+                "route_signals"
               ]
             }
           },
@@ -5291,7 +5320,7 @@
       ]
     },
     "RouteBy": {
-      "description": "What one `route` reads from each event. Written `by: {provenance: origin}`, `by: {attribute: stream}`, `by: {resource: service.name}`, or `by: signal`.",
+      "description": "What one `route` reads from each event. Written `by: {provenance: origin}`, `by: {attribute: stream}`, or `by: {resource: service.name}`.",
       "oneOf": [
         {
           "type": "object",
@@ -5328,13 +5357,6 @@
             }
           },
           "additionalProperties": false
-        },
-        {
-          "description": "The signals the event carries. `routes:` keys are `logs`, `metrics`, and `traces`. An event goes to the targets of every signal it carries, whole, never split per signal; a carried signal with no route sends it to this component's ordinary consumers as well. An event that carries no signal goes to the ordinary consumers.",
-          "type": "string",
-          "enum": [
-            "signal"
-          ]
         }
       ]
     },
@@ -5528,6 +5550,34 @@
         "metrics",
         "traces"
       ]
+    },
+    "SignalTargets": {
+      "description": "`route_signals`' `signals:`: the one target each signal goes to. At least one must be set, and each set id must name a `target` component. Two signals may name the same target. A signal left unset is stripped under `strip: true`; under `strip: false` it rides along on an event that also carries a listed signal. An event carrying only unset signals is discarded.",
+      "type": "object",
+      "properties": {
+        "logs": {
+          "description": "The target for log records.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metrics": {
+          "description": "The target for metric records. An event's metric records always travel together.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "traces": {
+          "description": "The target for spans.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "SocketMode": {
       "type": "string",

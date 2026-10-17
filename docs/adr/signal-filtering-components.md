@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-10-13
+updated: 2026-10-16
 ---
 
 # Signal filtering is two transform components, not a sink field
@@ -136,3 +136,13 @@ that returns `false`, so the count is precise for filters as well as `aggregate`
 `logit.transform.events.filtered` is removed: it duplicated `events.discarded`. `has_signal` records
 nothing of its own. `keep_signals` and `drop_signals` keep
 `logit.transform.payloads.stripped{signal}`, because the event survives a strip.
+
+## Amendment: `route_signals` (2026-10-16)
+
+[ADR `route-signals`](route-signals.md) adds `route_signals`, which sends each signal an event
+carries to its own target and, under `strip: true`, gives each target only its own signals'
+payloads. A config that fanned one source into a `keep_signals` per signal-specific sink can use
+one `route_signals` instead. It counts what it strips and discards with the counters the filters
+use: `logit.transform.payloads.stripped{signal}` and `logit.component.events.discarded`. The three
+filters are unchanged and remain the answer for one signal-specific sink, or a filter on one
+branch.

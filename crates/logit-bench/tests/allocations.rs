@@ -28,8 +28,8 @@ use logit_outputs::stdio::{EventDump, Format};
 use logit_outputs::syslog::{Format as SyslogFormat, SyslogEncoder};
 use logit_pipeline::runtime::{drain_inbox, route_batch, InHand, Partition};
 use logit_pipeline::{
-    process_batch, send_batch, unwrap_batch, BatchContext, Delivered, Fanout, RouterScratch,
-    SinkQueue, SinkQueueConfig, SinkStore, Transform,
+    process_batch, route_signals_batch, send_batch, unwrap_batch, BatchContext, Delivered, Fanout,
+    RouterScratch, SinkQueue, SinkQueueConfig, SinkStore, Transform,
 };
 use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf};
 use logit_script::{ProcessOutcome, ScriptWorker};
@@ -2198,6 +2198,102 @@ fn route_batch_mixed_marks_clone_only_the_multi_target_events() {
         out.iter().map(|(slot, batch)| (*slot, batch.events.len())).collect();
     assert_eq!(sizes, vec![(1, 32), (2, 64)]);
     expect_allocs("route_batch: 64 events, 32 marked for 2 targets (mixed)", stats, 99);
+}
+
+/// A `route_signals` table over targets `a` and `b`.
+fn signal_routes(
+    logs: Option<&str>,
+    metrics: Option<&str>,
+    strip: bool,
+) -> logit_pipeline::SignalRoutes {
+    logit_pipeline::SignalRoutes::new(
+        &logit_config::SignalTargets {
+            logs: logs.map(String::from),
+            metrics: metrics.map(String::from),
+            traces: None,
+        },
+        strip,
+        &["a".to_string(), "b".to_string()],
+    )
+}
+
+/// `route_signals` over a metric-only batch with `metrics` routed: every event is moved whole
+/// into one target, as `route_batch` moves a single-destination batch. `1 + 1 = 2`: the returned
+/// `Vec` and one `reserve_exact`.
+#[test]
+fn route_signals_batch_single_signal_moves_into_one_target() {
+    let routes = signal_routes(None, Some("a"), true);
+    let telemetry = Telemetry::default();
+    let mut scratch = RouterScratch::new(routes.targets());
+
+    drop(route_signals_batch(&routes, &mut scratch, fixtures::statsd_batch(64), &telemetry));
+
+    let batch = fixtures::statsd_batch(64);
+    let (out, stats) = measure(|| route_signals_batch(&routes, &mut scratch, batch, &telemetry));
+    assert!(matches!(out.as_slice(), [(1, Partition::Owned(b))] if b.events.len() == 64));
+    expect_allocs("route_signals_batch: 64 metric-only events, strip, 1 target", stats, 2);
+}
+
+/// `strip: true` over the nginx shape (a log and four metric records per event), `logs` to `a`
+/// and `metrics` to `b`: each event becomes two parts. 67:
+///
+/// - **3**: the returned `Vec` plus one `reserve_exact` per target.
+/// - **64**: one spilled-`AttrMap` clone per event for the part that isn't the original. The
+///   payloads move; the metrics part keeps the original's `MetricList` allocation, and the log
+///   part's empty `MetricList` is inline.
+///
+/// Against the same split as a fan-out into two `keep_signals` gates, the per-event cost is one
+/// attribute clone instead of [`clone_one_event`]'s two.
+#[test]
+fn route_signals_batch_log_and_metrics_split_into_two_targets() {
+    let routes = signal_routes(Some("a"), Some("b"), true);
+    let telemetry = Telemetry::default();
+    let mut scratch = RouterScratch::new(routes.targets());
+
+    drop(route_signals_batch(&routes, &mut scratch, fixtures::nginx_batch(64), &telemetry));
+
+    let batch = fixtures::nginx_batch(64);
+    let (out, stats) = measure(|| route_signals_batch(&routes, &mut scratch, batch, &telemetry));
+    let sizes: Vec<(usize, usize)> =
+        out.iter().map(|(slot, batch)| (*slot, batch.events.len())).collect();
+    assert_eq!(sizes, vec![(1, 64), (2, 64)]);
+    expect_allocs("route_signals_batch: 64 log+metrics events, strip, split to 2", stats, 67);
+}
+
+/// `strip: false` with the same table: every event carries both signals, so one mark names both
+/// targets and the batch goes out whole behind one `Arc`, `route_batch`'s shared path. 2: the
+/// returned `Vec` and the `Arc::new`.
+#[test]
+fn route_signals_batch_unstripped_uniform_batch_shares_one_arc() {
+    let routes = signal_routes(Some("a"), Some("b"), false);
+    let telemetry = Telemetry::default();
+    let mut scratch = RouterScratch::new(routes.targets());
+
+    drop(route_signals_batch(&routes, &mut scratch, fixtures::nginx_batch(64), &telemetry));
+
+    let batch = fixtures::nginx_batch(64);
+    let (out, stats) = measure(|| route_signals_batch(&routes, &mut scratch, batch, &telemetry));
+    assert!(
+        matches!(out.as_slice(), [(1, Partition::Shared(_)), (2, Partition::Shared(_))]),
+        "both targets should share the one batch"
+    );
+    expect_allocs("route_signals_batch: 64 log+metrics events, no strip, shared", stats, 2);
+}
+
+/// A metric-only batch with only `logs` routed: every event is stripped to nothing and
+/// discarded. 0: the returned `Vec` has no capacity to allocate, and no target is reserved.
+#[test]
+fn route_signals_batch_with_every_event_discarded_allocates_nothing() {
+    let routes = signal_routes(Some("a"), None, true);
+    let telemetry = Telemetry::default();
+    let mut scratch = RouterScratch::new(routes.targets());
+
+    drop(route_signals_batch(&routes, &mut scratch, fixtures::statsd_batch(64), &telemetry));
+
+    let batch = fixtures::statsd_batch(64);
+    let (out, stats) = measure(|| route_signals_batch(&routes, &mut scratch, batch, &telemetry));
+    assert!(out.is_empty());
+    expect_allocs("route_signals_batch: 64 metric-only events, all discarded", stats, 0);
 }
 
 /// The comparison the ADR cites (`docs/adr/target-components.md`'s "Two costs are structural to
