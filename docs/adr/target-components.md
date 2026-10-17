@@ -411,6 +411,6 @@ part.
   `strip:`. `route` still forwards a mixed event whole.
 - **Rule 50 doesn't apply to `route_signals`.** It has no ordinary edge: rule 92 keeps it out of
   every `sources:`, and an event carrying no listed signal is discarded and counted
-  `logit.component.events.discarded`, because the `signals:` map names what's kept.
+  `logit.component.events.discarded`, because the `signals:` map names which events are kept.
 - **`route_signals` isn't a `Router`.** A router still never mutates or absorbs an event; the new
   kind has its own node arm and shares the partition code.

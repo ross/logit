@@ -682,7 +682,8 @@ impl JsonSchema for RouteTargets {
 
 /// `route_signals`' `signals:`: the one target each signal goes to. At least one must be set, and
 /// each set id must name a `target` component. Two signals may name the same target. A signal
-/// left unset is discarded.
+/// left unset is stripped under `strip: true`; under `strip: false` it rides along on an event
+/// that also carries a listed signal. An event carrying only unset signals is discarded.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SignalTargets {
@@ -2895,14 +2896,14 @@ pub enum ComponentKind {
         routes: std::collections::BTreeMap<String, RouteTargets>,
     },
     /// Sends each signal an event carries to that signal's target: logs to one, metrics to
-    /// another, spans to a third, or any two to one target. A signal `signals:` leaves out is
-    /// discarded, and an event carrying none of the listed signals is discarded, as
-    /// `keep_signals` discards what it isn't given. This component has no ordinary consumers: no
-    /// component may list it in `sources:`; read its targets instead.
+    /// another, spans to a third, or any two to one target. An event carrying none of the listed
+    /// signals is discarded. This component has no ordinary consumers: no component may list it
+    /// in `sources:`; read its targets instead.
     ///
     /// With `strip: true` (the default), an event carrying signals bound for different targets
     /// is split: each target receives one event holding only its own signals' payloads, with the
-    /// original's timestamp and a copy of its attributes, and each part past the first counts as
+    /// original's timestamp and a copy of its attributes. A signal `signals:` leaves out is
+    /// stripped. Each part past the first counts as
     /// `logit.component.events.copied`. A component may read several of these targets; it
     /// receives one event per part. To keep two signals on one event, send both to one target.
     ///
