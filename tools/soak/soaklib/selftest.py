@@ -882,6 +882,66 @@ def _deadlines():
            "a poll's next deadline is the next multiple of its period")
 
 
+def _stalled(root):
+    """A tick that runs far late, as across a host suspend, records a `stalled` phase, and
+    `run` FAILs it; a slow action's lateness, under `STALL_S`, doesn't."""
+    loaded = scenario.load(root / "scenarios" / "statsd-vm" / "scenario.toml")
+
+    def loop(jump):
+        run = driver.Run(root, loaded, 5.0, None, False, "/nonexistent", [], "logit:soak",
+                         roles=scenario.BASE_ROLES)
+        run.steps = []
+        run.t0 = 1000.0
+        run.timeline = _Records()
+        clock = [1000.0]
+        for name in ("poll_ready", "inspect_all", "sample_stats", "sample_freshness"):
+            setattr(run, name, lambda: None)
+        reals = (driver._now, driver.time.sleep, driver._print)
+        driver._now = lambda: clock[0]
+
+        def sleep(seconds):
+            clock[0] += seconds + (jump if clock[0] == 1002.0 else 0)
+
+        driver.time.sleep = sleep
+        driver._print = lambda text, stream=None: None
+        try:
+            run.loop()
+        finally:
+            driver._now, driver.time.sleep, driver._print = reals
+        return [r for r in run.timeline if r.get("phase") == "stalled"]
+
+    stalled = loop(8000.0)
+    expect(len(stalled) == 1 and stalled[0]["late_s"] == 8000.0 and stalled[0]["since"] == 3,
+           f"a tick 8,000 s late records a stalled phase, got {stalled}")
+    expect(loop(driver.STALL_S - 1) == [],
+           f"a tick under STALL_S late records none, got {loop(driver.STALL_S - 1)}")
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = _run_dir(tmp, "stalled", [_phase("start", 0, t0=T0),
+                                            _phase("stalled", 1183, late_s=8445.6, since=1182),
+                                            _phase("end_begin", 9628), _phase("end_end", 9730)])
+        result = _status(run_dir, checks.check_run)
+        expect(result.status == checks.FAIL
+               and "stalled: the driver's tick ran 8,446s late from +1182s" in result.detail,
+               f"run FAILs a stalled driver, got {result}")
+        polls = [{"t": T0 + offset, "offset": offset, "svc": "logit"}
+                 for offset in list(range(0, 1121, 5)) + [9628]]
+        old = _run_dir(tmp, "stalled-old", [_phase("start", 0, t0=T0),
+                                            _phase("end_begin", 9628), _phase("end_end", 9730)])
+        (old / "watchdog.jsonl").write_text("".join(json.dumps(r) + "\n" for r in polls))
+        result = _status(old, checks.check_run)
+        expect(result.status == checks.FAIL
+               and "stalled: the driver's tick ran 8,508s late from +1120s" in result.detail,
+               f"run reads a stall from the watchdog's gap in an older run, got {result}")
+        # A driver that records stalls is read by its phase alone: one slow iteration leaves a
+        # watchdog gap and no phase, and isn't a stall.
+        new = _run_dir(tmp, "stalled-new", [_phase("start", 0, t0=T0, marks_stalls=True),
+                                            _phase("end_begin", 9628), _phase("end_end", 9730)])
+        (new / "watchdog.jsonl").write_text("".join(json.dumps(r) + "\n" for r in polls))
+        result = _status(new, checks.check_run)
+        expect(result.status == checks.PASS,
+               f"a run whose driver records stalls is read by the phase alone, got {result}")
+
+
 def _ndjson():
     stamp = "2026-10-08T12:00:%02d.123456789Z"
     lines = [
@@ -7448,6 +7508,12 @@ def _overlap_rules(root):
     refused(lambda r: r["ledger"]["source"][0].update(generator_sink=["statsd_0", "statsd_0"]),
             "`generator_sink` must name a component id or list distinct ones",
             "a repeated generator_sink")
+    refused(lambda r: r["ledger"]["source"][0].update(generator_sink=["statsd_0", "statsd_1"]),
+            "`generator_input` and `generator_sink` list the same number of components",
+            "eight inputs paired with two sinks")
+    refused(lambda r: r["ledger"]["source"][0].update(generator_input="load_0"),
+            "`generator_input` and `generator_sink` list the same number of components",
+            "one input beside a list of sinks")
     refused(step(at="4m", action="netem", on="logit", args="delay 10ms"),
             "an instance shares sut-net's network namespace, so put netem on sut-net",
             "netem on an instance")
@@ -7619,14 +7685,16 @@ OVERLAP_SUT_CONFIG = ("admin: { socket: /tmp/admin.sock }\n"
                       "    interval: 10s\n")
 
 
-def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, stall=False):
+def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, stall=False,
+                 end_extra=0):
     """A two-instance run: the generator's two inputs and sinks send `PER_DRAIN` lines per 5 s
     drain from +5 to +300, `logit` reads 600 of them a drain and `logit-b` 400, until `logit`
     stops over `STOP` (or `action`, a kill), when `logit-b` reads all 1,000 a drain, `loss`
     fewer in its first drain after the stop, what the close discarded. `logit`'s last drain
     before the stop samples `used` bytes in its receive queue. Each instance stamps its series
     with its name; `unlabeled` adds a series with no label. Under `stall`, `logit-b` delivers
-    nothing from +95 to +180 with a batch queued."""
+    nothing from +95 to +180 with a batch queued. `end_extra` lines reach `logit-b` at +310,
+    after the generator stops, a surplus over G at the end."""
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -7686,6 +7754,8 @@ def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, s
             a_rows.append((offset, 1, STOP[1], w, 1, 0, 0))
             w_a[1] += w
         w = (400 if not down else 1000 - (loss if offset == 105 else 0)) if sending else 0
+        if offset == 310:
+            w += end_extra
         stalled = stall and 95 <= offset <= 180
         b_rows.append((offset, 0, -1, w, 0 if stalled else 1, 1 if stalled else 0, 0))
         w_b += w
@@ -7812,6 +7882,18 @@ def _overlap_checks():
                    "sink: 1 series whose soak_instance names no instance")
                and "x_0_total" in unlabeled["ledger.egress"].detail,
                f"a series missing the label FAILs, got {unlabeled['ledger.egress']}")
+        # Each sink's last queue plus one batch, at its own input's 100-line batch: 200 lines
+        # below 0 at the end, not the 400 the two inputs' summed batch would give.
+        surplus = {r.id: r for r in checks.run_all(_overlap_run(tmp, "end-surplus",
+                                                                end_extra=300))}
+        expect(surplus["ledger.overlap"].status == checks.FAIL
+               and "= -300, a surplus, past the end allowance 200"
+               in surplus["ledger.overlap"].detail,
+               f"a surplus at the end past each sink's own batch FAILs, got "
+               f"{surplus['ledger.overlap']}")
+        expect(surplus["ledger.wire"].status == checks.FAIL
+               and "over the end allowance 200" in surplus["ledger.wire"].detail,
+               f"ledger.wire FAILs the same surplus, got {surplus['ledger.wire']}")
         stalled = {r.id: r for r in checks.run_all(_overlap_run(tmp, "stalled", stall=True))}
         expect(stalled["progress"].status == checks.FAIL
                and "no sink deliveries in [+120s, +150s): logit-b: hang" in
@@ -8635,7 +8717,7 @@ def run(root, quiet=False):
     os.environ["DOCKER"] = _NO_DAEMON
     try:
         for part in (_isolated, _durations, _rules, _expect_rules, _expand, _random,
-                     _log_capture, _signals, _deadlines, _hung_inspect, _inspect_redacted,
+                     _log_capture, _signals, _deadlines, _stalled, _hung_inspect, _inspect_redacted,
                      _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks,
                      _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
@@ -8654,6 +8736,7 @@ def run(root, quiet=False):
                      _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
+                              _stalled,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
                               _fanin_driver, _tcp_rules, _file_rules, _two_sut_rules,

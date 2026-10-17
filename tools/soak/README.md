@@ -109,14 +109,18 @@ keep, because the driver never recreates a container.
 minutes, one at a time, with 2 to 4 minutes of quiet between them. Over 8 hours that is about 113
 faults, and about half the run is judged steady state.
 
-Three scenarios put a `lua` stage between the listener and `aggregate`, with
-`[ledger] sut_script` naming it, so `ledger.script` balances the script's hop:
+Six scenarios put a `lua` stage between the listener and `aggregate`, with
+`[ledger] sut_script` naming it, so `ledger.script` balances the script's hop. Each `-jit`
+scenario is the one before it with LuaJIT's trace compiler on (`jit: true`):
 
 | Scenario | Length | What it drives |
 |---|---|---|
 | `lua-path` | 16 minutes | `statsd-vm`'s schedule through a script that rewrites every event, drops every 53rd, fails on every 97th, and returns one rollup event from `flush()` each window; its expectations assert all three outcomes |
 | `lua-stall` | 8 minutes | a busy loop of about 30 s on the 360,000th event: the node reads stalled, `/readyz` answers `503 stalled`, the receive queue fills and evicts, and the script resumes on its own. A `mark` with `ready = "stalled"` covers it |
 | `lua-memory` | 8 minutes 10 seconds | from the 480,000th event the script keeps 1 KB per event until the VM passes `max_memory: 64MiB`: the SUT logs `memory_limit_exceeded`, drains, and exits 2 inside an `exit` step, whose revert starts it again. The run ends before the second life reaches that event |
+| `lua-path-jit` | 16 minutes | `lua-path` under the compiler, rewriting in place: two attribute writes, a `pairs` loop over the attribute proxy, and an `= nil` delete |
+| `lua-stall-jit` | 8 minutes | `lua-stall` under the compiler: the compiled loop runs about 35 s and still reads `stalled`, since stall detection doesn't depend on a hook |
+| `lua-memory-jit` | 8 minutes 10 seconds | `lua-memory` under the compiler: the kept strings are on the Lua heap, which `max_memory` counts either way, so the SUT still exits 2 |
 
 Three scenarios give the SUT two sinks of one kind, each to its own VictoriaMetrics, with one
 `[[ledger.sink]]` table per sink:
@@ -155,9 +159,9 @@ effect with `[[expect]]` tables:
 | `slow-destination` | 7 minutes 45 seconds | the sink's `timeout` is 2 s. A 3 s netem delay on VictoriaMetrics makes it apply each write whose response arrives late, then a 2 kbit rate limit on the SUT's egress makes a request unable to finish. Each counts `network_error` and a retry, and nothing drops |
 | `fanout-stop-outage` | 6 minutes 15 seconds | `fanout-copy`'s two sinks, with the second's queue at 4 batches under `drop_oldest`. VictoriaMetrics B is stopped 150 s and the SUT is stopped for 30 s, 60 s in, so the second sink's queued batches drop at shutdown and are counted while the first sink drops nothing |
 
-The stall and the memory cap depend on the host's speed: `lua-stall`'s loop count and
-`lua-memory`'s event count are calibrated on the development host, and the comments in their
-`logit-sut.yaml` give the timings. On a much slower or faster host the event falls outside its
+The stall and the memory cap depend on the host's speed: the `lua-stall` scenarios' loop count
+and the `lua-memory` scenarios' event count are calibrated on the development host, and the
+comments in their `logit-sut.yaml` give the timings. On a much slower or faster host the event falls outside its
 step's window, and `ready` or `exit` FAILs.
 
 `statsd-datadog` (14 minutes) sends `statsd-vm`'s stream, renamed `logit.soak.requests_0` to
@@ -187,12 +191,13 @@ Three scenarios run a sink against a scripted stand-in in place of VictoriaMetri
 | `standin-at-most-once` | 8 minutes 55 seconds | the same sink under `buffer.delivery: at_most_once`: a `503` and a reset drop the batch, a `401` holds it, a `400` drops it |
 | `standin-datadog` | 30 minutes 25 seconds | `datadog_out` (series, gzip, delta counts) through every row of its response-class table: sixteen 20 s steps, 105 s apart, from a `202` whose body names two series dropped, through `400`, `401`, `403`, `404`, `405`, `408`, `413`, `429`, `500`, `501`, a `503` after storing (its resend a duplicate), `302`, and `422`, to a connection reset and a stop of the stand-in |
 
-`native-hop` runs a second `logit` under test, `collector`, at the far end of the native hop (see
-[Several SUT services](#several-sut-services)):
+Two scenarios run a second `logit` under test, `collector`, at the far end of the native hop
+(see [Several SUT services](#several-sut-services)):
 
 | Scenario | Length | What it drives |
 |---|---|---|
 | `native-hop` | 17 minutes | `logit` takes statsd and forwards it with `logit_out` from a disk spool to `collector`'s `logit_in`, which aggregates into VictoriaMetrics: a netem delay and then 10% loss on `logit`'s sends, a partition, a stop, a pause, and a kill of `collector`, a kill of `logit` with `collector` up, and a kill of `logit` inside a stop of `collector`. `ledger.hop` judges the hop; its expectations assert the replay after the first `logit` kill is deduplicated, `logit` reconnects after the `collector` kill, and the spool holds the hop through the stop |
+| `native-hop-spans` | 17 minutes | `native-hop` with `span_sample_rate: 1.0` on both SUTs, so internal spans and the hop frame's trace context run under the same faults. The spans go to stdout beside the metrics, where the NDJSON reader skips them; its expectations add that each SUT emitted spans. A backlog flushed in one drain can pass the 512 spans `internal` buffers per component, and those dropped are counted `logit.internal.spans.dropped{reason="buffer_full"}`, which `drops` reports as WARN |
 
 `rolling-overlap` (19 minutes) runs two instances of one SUT, `logit` and `logit-b`, on one UDP
 port under `reuse_port`, in the network namespace of a holder, `sut-net` (see
@@ -352,8 +357,8 @@ source names, a `shutdown.delay` that with the drain fits `docker stop -t 30`, a
 `socket:` and no `bind:` (the driver probes `logit ready` through the container's
 `LOGIT_ADMIN`), and a `set` stamping `label` that each source's `sut_transforms` lists. The
 generators send to the holder's name, over UDP only. A generator needs several flows to spread:
-`generator_input` and `generator_sink` may each list several components, one sink per flow,
-whose counts sum. Only `netem` and `partition` go on the holder, neither on an instance, and two
+`generator_input` and `generator_sink` may both list components, as many of each, each input
+feeding the sink at its position, one sink per flow; their counts sum. Only `netem` and `partition` go on the holder, neither on an instance, and two
 instances may not be held (paused, stopped, killed, restarted, or exited) at once. At the end the
 driver waits once on the backends' totals, then stops each instance.
 
@@ -741,7 +746,7 @@ generator-lines = "logit-generator-lines.yaml"
 [[ledger.source]]         # one per generator
 service = "generator-lines"                     # a service with soak.role generator
 generator_input = "load"                        # its generate_in
-generator_sink = "syslog"                       # its sink, G's source; a list sums several
+generator_sink = "syslog"                       # its sink, G's source; see "Rolling overlap" for lists
 sut_listener = "lines"                          # the SUT listener it reaches
 wire = "udp"                                    # optional: udp (the default), tcp, or file
 sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional: nodes to aggregate
@@ -771,7 +776,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 
 | Check | `FAIL`s when |
 |---|---|
-| `run` | the driver aborted, hit an error, or was interrupted, or the timeline lacks its `start` or `end_end` phase |
+| `run` | the driver aborted, hit an error, or was interrupted, its tick ran more than 120 s late (`stalled`, as when the host sleeps), or the timeline lacks its `start` or `end_end` phase |
 | `timeline` | a fault's apply or revert returned nonzero, the schedule failed fast, or a start or unpause of a `logit` service has no readiness probe; a fault whose apply failed gets no window |
 | `exit` | a `logit` container exits outside a scheduled stop, restart, kill, or `exit` step, or with a code other than the one that action leaves (0, 137 for a kill, the step's `code` for an `exit`); an `exit` step sees no exit; or any container is OOM-killed |
 | `restarts` | a container starts with no scheduled start or restart behind it: the revert of a `stop` or `kill`, an `exit` revert that started it, or a `restart` |
@@ -785,7 +790,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `ledger.intake` | for any listener, the final SUT life's lines read minus dropped differ from the events sent plus bad lines (B: `messages.dropped{reason="malformed"}`, `frames.dropped{reason="undecodable"}`, and on UDP `lines_in`'s oversize lines); or an earlier life's read-but-unabsorbed residual summed over the listeners (W − D − B − X − Ab, X being the listeners' own counted event drops) falls outside [0, R], R being each UDP listener's receive queue plus 2 batches per listener, 65 more batches for each node between it and `aggregate`, and 65 for `aggregate` |
 | `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listeners' summed events sent (or, with `sut_script`, the script's) differ from those `aggregate` received; a node in a source's `sut_transforms` received a different number from those sent to it, or sent a different number from those it received; a sink received a different number of events from those sent to it (under `copy` `aggregate`'s events sent, which a fan-out counts once per batch, and under `route` its target's); or `aggregate` received a different number from those it absorbed |
 | `ledger.script` | with `[ledger] sut_script` only, else SKIP: in the final SUT life, the listener's events sent differ from those the script received, those it received from those it emitted, discarded (`events.discarded`), and lost to an error (`events.dropped{reason="script_error"}`), or those it sent from those it emitted plus those `flush()` returned |
-| `ledger.egress` | for each sink under `copy`, or for the sinks' sum under `route`: the final SUT life's absorbed increments minus the backend's reset-aware total (Ab − V), or a stopped earlier life's lines read minus dropped, bad lines, the listener's counted event drops, and that total (W − D − B − X − V), is nonzero (SKIP on an external target; on a Kafka target V is the topic's distinct records, and a negative gap is a surplus), other than a positive gap in a life whose telemetry counts a batch `batches.dropped` under any reason at a node that can explain it: any node but a sink outside the group, so under `copy` another sink's drop doesn't count a sink's gap, while one at the sink or upstream of the fan-out does (every reason counts; see "The ledger and identities" in the plan's [6. The checks](../../docs/plans/soak-harness.md#6-the-checks-w1a-w1b)); a `rejected` or `disk_corrupt` batch counts the gap but FAILs the life whatever its size, unless a `respond` step that expects `rejected` explains it; a killed life's Ab − V falls outside its band (below, a surplus: the residual plus one drain interval of ingest; above, uncounted: one aggregate interval plus one drain interval of ingest), with the residual the kill lost reported beside it; or a sink's export matched no series. With a script, its `flush()` events leave Ab, its counted drops and errors leave a stopped life's gap, which the final drain exports because `internal` drains last. A series without one segment per SUT life `WARN`s |
+| `ledger.egress` | for each sink under `copy`, or for the sinks' sum under `route`: the final SUT life's absorbed increments minus the backend's reset-aware total (Ab − V), or a stopped earlier life's lines read minus dropped, bad lines, the listener's counted event drops, and that total (W − D − B − X − V), is nonzero (SKIP on an external target; on a Kafka target V is the topic's distinct records, and a negative gap is a surplus), other than a positive gap in a life whose telemetry counts a batch `batches.dropped` under any reason at a node that can explain it: any node but a sink outside the group, so under `copy` another sink's drop doesn't count a sink's gap, while one at the sink or upstream of the fan-out does (every reason counts; see "The ledger and identities" in the plan's [6. The checks](../../docs/plans/soak-harness.md#6-the-checks-w1a-w1b)); a `rejected` or `disk_corrupt` batch counts the gap but FAILs the life whatever its size, unless a `respond` step that expects `rejected` explains it; a killed life's Ab − V falls outside its band (below, a surplus: the residual plus one drain interval of ingest; above, uncounted: one aggregate interval plus one drain interval of ingest), with the residual the kill lost reported beside it; or a sink's export matched no series. With a script, its `flush()` events leave Ab, its counted drops and errors leave a stopped life's gap, which the final drain exports because `internal` drains last. A series without one segment per SUT life `WARN`s. Under `[overlap]` that is a known `WARN`: an instance the kernel hashes no flow to in a life writes no series in it, which with `rolling-overlap`'s eight flows happens about once in 256 rejoins; a series whose label names no instance `FAIL`s |
 | `ledger.windows` | under `[ledger] vm_every_window = true` only, and SKIPs on an external or Kafka target: a series in a SUT life has two samples more than 1.5 aggregate intervals apart, a killed life's last sample is more than 1.1 intervals before the kill, or a later life's first is more than 2 intervals after its start. The interval comes from the SUT config. A wider gap is excused as idle when the `sut_aggregate` component's `batches.sent` is 0 over the drains from a + (interval + p) / 2 to b − (interval − p) / 2, p being the drain period: no window was emitted, so none was lost. A pause, with no drains at all, counts 0. Any batch there FAILs the gap as windows emitted but not stored, whatever fault was running |
 | `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight; across a native hop, a killed `logit`'s hop sink replays outside a band set by its received and delivered batch rates over its last drain interval, the time from that drain to the kill, and its spool's `checkpoint_interval` |
 | `ledger.hop` | across a native hop only, else no row: over the run, the hop sink's events received, less its counted drops, minus the `logit_in`'s events forwarded isn't 0, beyond the allowance a kill or a pause earns: below, a killed side's last drain interval of counts, one send window of frames for a kill or a pause of the receiving side, and a killed `logit`'s spool replay of the frames it committed after its last cursor persist, when the receiving side restarted between that life's last delivery and the replay; above, a killed `logit`'s one batch in hand and a killed receiving side's last drain interval of counts. The plan's "The native hop (W10b)" has the rules. A `rejected` or `disk_corrupt` batch drop at the hop sink FAILs too |

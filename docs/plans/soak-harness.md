@@ -34,8 +34,8 @@ Non-goals:
   them.
 
 Stream key **`soak`**: branches `soak/w0`, `soak/w1a`, `soak/w1b`, then `soak/w2` through
-`soak/w12`, a linear stack. PR stack only: nothing is merged by this workstream; Ross directs
-merging.
+`soak/w12d`, a linear stack, with `soak/w13` to `soak/w15` planned after it. PR stack only:
+nothing is merged by this workstream; Ross directs merging.
 
 Settled with Ross (2026-10-08): faults are an iproute2 image with `NET_ADMIN` applying `tc netem`
 inside a target container's network namespace, plus Docker lifecycle actions (`pause`, `stop`,
@@ -516,8 +516,8 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
 ```
 
 - A scenario lists one or more sources. Each names all four keys, each a component id (from
-  W12b `generator_input` and `generator_sink` may each list several, whose counts sum, one sink
-  per UDP flow), with a
+  W12b `generator_input` and `generator_sink` may both list components, as many of each, each
+  input feeding the sink at its position, one sink per UDP flow; their counts sum), with a
   `service` that is a slug (lowercase letters, digits, `_`, and `-`) no other source names and
   a `sut_listener` no other source names. Unknown keys are refused. A `service` whose compose
   variable is `SOAK_SUT_CONFIG` or another source's (`generator-lines` and `generator_lines`
@@ -536,7 +536,8 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   config lacks, a kind or transport with no wire (a Unix socket), and a mismatch are refused.
 - `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct, none
   of them a listener, and none on another source's list. Each must forward every event it
-  receives, which `ledger.edge` judges hop by hop, and each adds an inbox and a batch to R ("The
+  receives, which `ledger.edge` judges hop by hop (§10's item 13 will admit a node that emits
+  several events per event or discards some), and each adds an inbox and a batch to R ("The
   ledger and identities"). It can't be combined with `[ledger] sut_script`, whose hop
   `ledger.script` judges from every listener's E.
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
@@ -827,7 +828,10 @@ returned nonzero has none, so nothing after it is excused.
 
 - `run`: the timeline has `start` and `end_end`, and no `aborted`, `error`, or `interrupted`
   phase. An interrupted run FAILs so its `results.md` can't read as a pass; the driver still
-  exits 130 for it.
+  exits 130 for it. From W12b a run also FAILs as `stalled` when the driver's 1 s tick ran more
+  than 120 s late, past anything the loop does, as when the host sleeps: nothing was scheduled
+  or polled in that span. The driver records a `stalled` phase; for an older run directory the
+  row reads the same from a gap in `watchdog.jsonl`.
 - `timeline`: every apply and revert returned 0, the schedule didn't fail fast, and every
   start or unpause of a `logit` service has a `ready` record. An early revert in the end
   sequence isn't probed, so it needs none.
@@ -1739,8 +1743,10 @@ and the generators send to the holder's name. The instances share an address, so
 admin endpoint on a Unix socket and sets `LOGIT_ADMIN` to it, which the image's `HEALTHCHECK`
 and the driver's readiness probe, `logit ready` with no `--admin`, both read. A generator needs
 several flows for the kernel to spread them: a UDP sink sends from one socket, so one sink is one
-flow, and `generator_input` and `generator_sink` may each list several components, whose counts
-sum.
+flow, and `generator_input` and `generator_sink` may both list components, as many of each, each
+input feeding the sink at its position; their counts sum. The wire's edge tolerance is the inputs'
+batches summed, since each sends a batch in about the same tick, and the end allowance weights
+each sink's last queue plus one by its own input's batch.
 
 **The schema.** `[overlap]` has the three keys and no other; `instances` lists two or more
 distinct services, `logit` first, none the holder; `label` is a Prometheus label name. With the
@@ -1812,7 +1818,8 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
 
 Every shipped scenario drives UDP datagrams into one `aggregate`: `statsd_in`, and from W8b in
 `fanin` `lines_in` beside it, on §3's base stack plus any services its `compose` override adds;
-from W11a `tcp-ingress` drives TCP into `statsd_in` instead.
+from W11a `tcp-ingress` drives TCP into `statsd_in` instead, and from W11b `tail-rotate` tails
+files.
 `[ledger]` names one `[[ledger.source]]` per generator and its listener, and one
 `[[ledger.sink]]` per sink after `aggregate`. The scenarios below widen
 that, grouped by cost; the Workstreams table gives the landing order. Each states what it
@@ -1841,6 +1848,15 @@ where it needs them, and a small check extension.
    Rows: `ledger.script` and the script terms in the ledger (§6); `ready` judging the status
    word; `exit` and `self_log` judging the expected exit. Built with `[ledger] sut_script`, the
    `mark` and `exit` actions (§2), and readiness scored from `health_log` (§6).
+
+   W12a adds each under LuaJIT's trace compiler ([ADR `lua-jit-opt-in`](../adr/lua-jit-opt-in.md)),
+   with no harness change: `lua-path-jit` rewrites in place
+   ([ADR `lua-in-place-edits`](../adr/lua-in-place-edits.md)), with two attribute writes, a
+   `pairs` loop over the attribute proxy, and an `= nil` delete, and no log message to write,
+   since a statsd event carries none; `lua-stall-jit` and `lua-memory-jit` keep their verdicts.
+   The compiler adds no count hook, so a compiled loop is caught only by stall detection, as an
+   interpreted one is, and the kept strings are on the Lua heap, which `max_memory` counts with
+   the compiler on; only compiled machine code is outside it.
 2. **Two sinks of one kind, failing independently (built in W7b).** `aggregate` fans out to two
    `prometheus_out`, each with its own VictoriaMetrics; faults on one leg, then both overlapping;
    then the same split through `route` and two `target`s
@@ -1912,6 +1928,14 @@ where it needs them, and a small check extension.
    restarted since, gracefully or not, forwards again.
    Rows: the ledger one hop longer, `ledger.replay` on A. Built in W10a (a second SUT service,
    §2's "Several SUT services") and W10b (the hop ledger and the `native-hop` scenario, §8d).
+   Every shipped SUT config set `span_sample_rate: 0.0` until W12a, so neither internal span
+   emission nor the hop frame's trace context
+   ([ADR `native-hop-trace-context`](../adr/native-hop-trace-context.md)) ran under faults.
+   W12a adds `native-hop-spans`, `native-hop` at `1.0` on both SUTs. The spans reach each SUT's
+   NDJSON stdout as events with no `metrics`, which `telemetry.py` skips, so the ledger reads
+   the same points; `[[expect]]` rows on `logit.internal.spans.emitted` show both sides record
+   spans. A backlog flushed in one drain passes `internal`'s span buffer, which drops and counts
+   the excess, so `drops` WARNs ("Findings", "W12a").
 8. **TCP ingress (built in W11a).** `statsd_in` with `transport: tcp` from the generator's
    `statsd_out` over TCP; a `syslog_in` TCP source and a TCP reset counter are deferred. A
    stalled SUT backs up into the sender
@@ -1984,28 +2008,120 @@ where it needs them, and a small check extension.
 
 **Operational.**
 
-11. **Rolling overlap.** Two SUTs on `reuse_port` with `shutdown.delay`, swapped mid-run
-    ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md),
-    "What an overlap means for the data"). Rows: zero uncounted loss; wire loss at the swap within
-    the old socket's queue at close. Needs: a namespace-holder service both SUTs join, because a
-    SUT owning the namespace takes the port with it when it stops; and a per-instance attribute
-    with V summed across instances, because two processes writing one cumulative series overwrite
-    each other.
+11. **Rolling overlap (built in W12b).** Two SUTs on `reuse_port` with `shutdown.delay`, swapped
+    mid-run ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md),
+    "What an overlap means for the data"). Rows: zero uncounted loss in each instance's own
+    lives; the run's wire loss within what the instances' socket closes could discard, each close's
+    last `receive_buffer.used.bytes` converted to datagrams at a floor of 512 B each and judged on
+    run totals (`ledger.overlap`). Built with an `[overlap]` table in place of a hop, a
+    namespace holder with the role `netns` that the instances join, because a SUT owning the
+    namespace takes the port with it when it stops; an `admin.socket` on each instance, reached
+    through `LOGIT_ADMIN`; list-valued `generator_input` and `generator_sink`, because
+    `reuse_port` hashes a flow to one socket and one `statsd_out` sink is one flow; and a `set`
+    stamping each instance's name, so V splits by instance, because two processes writing one
+    cumulative series overwrite each other. Built as `rolling-overlap` (§8e).
 12. **SIGHUP and TLS reload.** A TLS listener and sink, signalled and rotated during faults
     ([ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md), "Trigger: a content poll,
-    and SIGHUP"). Rows: `[[expect]]` on `logit.tls.reloads{outcome="reloaded"}` and
-    `logit.tls.certificate.not_after`, and the ledger at zero across reconnects. The harness's
-    telemetry stream is a stdout `stdio_out`, which ignores SIGHUP, so it's expected to run
-    unaffected; a separate row covers the reopen with a SUT `stdio_out` file target on a
-    mounted volume, whose path a rename moves aside before the signal and whose next batch
-    lands in a fresh file. Needs: a `signal` action and a certificate-rotation action writing
-    into a mounted directory. W12c builds the SIGHUP half: the `signal` and `rename` actions,
-    `file.reopen`, and the `sighup` scenario. W12d builds the TLS half: a private CA per run,
-    the `rotate` and `probe` actions, `tls.served`, the `rise` reducer, and the `tls-reload`
-    scenario, whose generator presents a rotated client certificate that its poll reloads and a
-    SUT restart makes it present, and whose SUT reloads a rotated server certificate on each
-    SIGHUP and keeps the previous one through a broken rotation. VictoriaMetrics stays on plain
-    HTTP: it doesn't verify a client certificate, so a TLS leg there would test no rotation.
+    and SIGHUP"), in two halves:
+    - **SIGHUP and reopen (W12c).** The harness's telemetry stream is a stdout `stdio_out`,
+      which ignores SIGHUP, so it's expected to run unaffected. A separate row covers the
+      reopen with a SUT `stdio_out` writing to a file target (`/shared/archive.log`,
+      `format: json`), whose path a rename moves aside before the signal and whose next batch
+      lands in a fresh file. Not `file_out`: `FileOut.path`'s doc leaves its file to
+      `rotate:` and points a file renamed from outside at `stdio_out`, since `file_out`'s own
+      `.1` retention collides with an external rename. Built as the `signal` and `rename`
+      actions, `file.reopen`, and the `sighup` scenario.
+    - **TLS reload (built in W12d).** A private CA per run, a TLS listener and sink, and
+      rotations during faults. The SUT runs `tls_reload_interval: 0s`, so every reload comes
+      from a SIGHUP and is attributable to one. The certificates mount as a directory, because a
+      single-file bind mount keeps the old inode and hides a rotation. Rows: `[[expect]]` on
+      `logit.tls.reloads{outcome="reloaded"}` and `logit.tls.certificate.not_after`, which is
+      absolute and so needs the `rise` reducer, relative to its value before the step;
+      `tls.served`, matching a probe's served serial to the generation in force; and the ledger
+      at zero across reconnects. No leg to VictoriaMetrics over TLS: its open-source build
+      doesn't verify client certificates. Built as the `[tls]` table, the `rotate` and `probe`
+      actions, and the `tls-reload` scenario, whose generator presents a rotated client
+      certificate that its poll reloads and a SUT restart makes it present, and whose SUT
+      reloads a rotated server certificate on each SIGHUP and keeps the previous one through a
+      broken rotation.
+
+**Later additions.** Items 13 to 18 cover what merged after the items above were written, on
+2026-10-09.
+
+13. **Fan-out and discarding transforms in the ledger.** `line_protocol` (63fd8238) emits one
+    event per point through `Transform::process_into`, so its `events.sent` can exceed its
+    `events.received`, and `drop_stale` and `has_stale` (e3a2649b) discard. Today `ledger.edge`
+    requires T_in == T_out at every `sut_transforms` node, so neither can be in a scenario's
+    path. The product won't add a counter: [ADR `transform-fan-out`](../adr/transform-fan-out.md),
+    "Telemetry stays as it is", gives a node's children as `events.sent − (events.received −
+    events.discarded)`, and the harness will own that arithmetic. A `fan_out = k` per transform
+    in `[ledger]` will switch its hop to that count, judged with no tolerance against
+    k × parents − the lines it dropped, `logit.transform.lines.dropped{reason="malformed"}`.
+    - **The generator.** Points of one message with the same measurement, tag set, and
+      timestamp merge into one event (`crates/logit-transforms/src/line_protocol.rs`'s module
+      doc), so each of a message's k points will carry its own tag value, and none merge.
+      `syslog_out` can't carry such a message: it escapes every newline in MSG as `\n` on every
+      transport (`crates/logit-outputs/src/syslog.rs`, "Injection safety"), and `line_protocol`
+      reads that as one line. So the generator will put k lines in one OTLP log body,
+      `otlp_out` over HTTP into `otlp_in`, which carries the body unchanged, and the source will
+      need item 14's `http` wire. `syslog_in`'s `framing: datagram` (fdd5b039) stays unsoaked
+      until a sender can write a multi-line datagram.
+    - **Topology.** `otlp_in → line_protocol → count chain → aggregate → prometheus_out`.
+    - **Faults.** `statsd-vm`'s schedule, plus a backend stop under `overflow: block` with
+      `rss_slope` watched: an inbox's bound counts batches, not events, and each batch past
+      `line_protocol` holds k times the events.
+    - **A discarding variant.** `tail-rotate` with `timestamp` and `drop_stale` after `json`,
+      and a SUT stop longer than `max_age`, so the lines read after the restart are stale and
+      discarded, with an `[[expect]]` on `drop_stale`'s `events.discarded`.
+    - Rows: `ledger.edge` with the fan-out and discard terms, then the rows as written. Needs:
+      `fan_out` and the discard term per `sut_transforms` node, with self-test fixtures.
+14. **HTTP ingress, starting with `influxdb_in` (41ccfbc4).** Generator `influxdb_out` → SUT
+    `influxdb_in` → `aggregate` → `prometheus_out`. Proves that a listener answering `503` when
+    busy loses nothing it doesn't count, across the SUT's own faults. A `wire = "http"` source
+    will have its own symbols: W per point, from the listener's `events.sent`, since
+    `influxdb_in` counts requests, not points; a `503` and `logit.input.batches.deferred` are a
+    retry the producer makes, not loss; and a client's resend of a request the SUT took before
+    the answer was lost is a surplus, given an allowance as a TCP window's is. Faults: a backend
+    stop under `overflow: block`, which backs up into `503`s; netem on the SUT's egress, which
+    carries the responses; and a SUT `stop`, `restart`, and `kill`. Rows: `ledger.wire` with
+    the surplus allowance, `ledger.intake`, and `[[expect]]` on deferred batches during the
+    stop. The same wire will later cover `otlp_in`, `datadog_in`, `splunk_hec_in`, and
+    `prometheus_in`'s remote-write receiver. Needs: the `http` wire and its listener table
+    rows, and self-test fixtures.
+15. **Multi-destination `route` and `route_signals` (81b0befa, 4b86ccc7).** Today
+    `scenario.py`'s `_route_problems` refuses a list-valued `routes:` and any `route_signals`
+    under `split = "route"`, because one event can reach several sinks and their V no longer
+    add up. A third split mode will take each sink's expected V from its target's own
+    `events.sent`, with the router balanced as received + copied − discarded
+    (`logit.component.events.copied`, `events.discarded`). Scenario: `generate_in` sending mixed
+    log and metric events → `route_signals` → two targets, each into its own `aggregate` and
+    backend, with one backend stopped. Rows: `ledger.edge` through the router, and
+    `ledger.egress` per sink from its target. Needs: the split mode, a per-target `aggregate`
+    in `[[ledger.sink]]`, and self-test fixtures.
+16. **Kafka SASL re-authentication and token refresh over hours (5da5ab8c), and an
+    `otlp_proto` topic (2969c24e).** A `kafka-broker-restart` variant with SCRAM or
+    OAUTHBEARER, a short `connections.max.reauth.ms` on the broker, and short-lived tokens from
+    `tools/kafka-interop`'s `mock-oauth2-server`, run for hours: each reauthentication ends a
+    connection (`crates/logit-outputs/src/kafka/conn.rs`'s module doc), so the run exercises
+    reconnects at a steady rate. Rows: `ledger.topic`, `fd_slope`, and duplicates per life.
+17. **`influxdb_out`'s response-class table on a stand-in (ffe33654, b93cb23a).** W9's stand-in
+    design with InfluxDB's shape, cueing the `403` and `404` rows that split on whether the
+    bucket or org was carried or configured: `Rejected` for a carried value, `Refused` for the
+    operator's (`crates/logit-outputs/src/influxdb.rs`'s module doc). Two runs: one with the
+    sink's `bucket:` and `org:` set, one carrying them from `influxdb_in`. Rows: `ledger.standin`
+    and `[[expect]]` per class.
+18. **`tail_in` descriptors over hours under a deleting rotation.** `tail-rotate` with a small
+    `max_files`, run for hours. A matched rotated file stays open until the writer deletes it
+    ([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md)), so the open count should stay at
+    about `max_files`, and `fd_slope` flat is the pass. Needs: `ledger.wire`'s end count across
+    the shared directory replaced by the writer's `events.delivered` alone, since deleted files
+    can't be counted at the end, and the scenario's `max_duration` lifted.
+
+Two follow-ups have no item yet. An overlap of TCP listeners, item 11 over `transport: tcp`,
+will need `net.ipv4.tcp_migrate_req`, without which the connections still in the old socket's
+accept queue at its close are reset rather than moved to the new one. A CA rotation, item 12's
+TLS half carried further, will rotate to a bundle of the old and new CAs, then to a leaf the new
+CA signed.
 
 **Items 1 and 2 land first, as two stacked PRs, W7a and W7b.** Both touch code the harness has
 never driven, and item 2 forces the compose override, the service list, and the per-sink ledger
@@ -2034,7 +2150,13 @@ that items 3, 7, and 11 need.
 | W10b | `soak/w10b` | `soak/w10b: a native-hop soak between two logit processes` | M | W10a |
 | W11a | `soak/w11a` | `soak/w11a: a TCP-ingress soak, with a wire per source` | M | W10b |
 | W11b | `soak/w11b` | `soak/w11b: a file-tailing soak, with a shared volume and the replay band` | M | W11a |
-| W12 | `soak/w12` | `soak/w12: rolling-overlap, SIGHUP, and TLS-reload soaks` | M | W11b |
+| W12a | `soak/w12a` | `soak/w12a: plan for W13 onward, a tail_in fd gap, and span and Lua-JIT soak variants` | S | W11b |
+| W12b | `soak/w12b` | `soak/w12b: a rolling-overlap soak, a namespace holder, and per-instance totals` | M | W12a |
+| W12c | `soak/w12c` | `soak/w12c: a SIGHUP soak, with a signal action and a stdio_out reopen check` | M | W12b |
+| W12d | `soak/w12d` | `soak/w12d: a TLS-reload soak, with a private CA and a rotate action` | M | W12c |
+| W13 | `soak/w13` | `soak/w13: fan-out and discarding transforms in the ledger` | M | W14 |
+| W14 | `soak/w14` | `soak/w14: an HTTP-ingress soak into influxdb_in, with an http wire` | M | W12d |
+| W15 | `soak/w15` | `soak/w15: multi-destination route and route_signals soaks, with a target split` | M | W13 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -2131,10 +2253,23 @@ that items 3, 7, and 11 need.
 - **W11b**: item 9: the `file` wire's scenario, `tail-rotate`, a shared directory the writer
   and the SUT mount, the harness's own line count across `app.log*`, and the replay band on
   `ledger.wire` and the end-to-end bound.
-- **W12**: items 11 and 12, the namespace-holder service, per-instance totals, and the `signal`
-  and certificate-rotation actions.
+- **W12a**: §10's items 13 to 18 and these rows; the `docs/known-gaps/tailing.md` entry for the
+  descriptors a matching glob keeps open; and four variants with no harness change:
+  `native-hop-spans` (item 7 with every internal span kept) and `lua-path-jit`, `lua-stall-jit`,
+  and `lua-memory-jit` (item 1 under `jit: true`), each run recorded under "Findings".
+- **W12b**: item 11, the namespace-holder service and per-instance totals.
+- **W12c**: item 12's SIGHUP half, the `signal` action and the `stdio_out` reopen row.
+- **W12d**: item 12's TLS half: a private CA per run, the `[tls]` table, the `rotate` and `probe`
+  actions, `tls.served`, the `rise` reducer, the broken-rotation excusal in `self_log`, and the
+  `tls-reload` scenario.
+- **W13**: item 13, `fan_out` and a discard term per transform in `ledger.edge`. Its fan-out
+  generator sends over OTLP/HTTP, so it lands after W14's `http` wire.
+- **W14**: item 14, the `http` wire, with `influxdb_in` as its first listener.
+- **W15**: item 15, a third `split` mode for multi-destination `route` and `route_signals`.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12, linear. Each PR is based on and targets its
+Items 16 to 18, and §10's follow-ups to items 11 and 12, have no workstream yet.
+
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13 → W15, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
@@ -3854,10 +3989,138 @@ drain-interval rows into runs:
   first drain interval after it: a drain interval's G − W on a file wire is lag, which is why
   only the run's total is judged.
 
+### W12a: spans across the native hop, and Lua under the trace compiler (2026-10-17)
+
+Every run used `logit:soak` `sha256:99edd881460f`, built with `--no-cache` from `origin/main` at
+`4b86ccc7` (W12a changes no Rust but a doc comment), and `logit-soak-netem:local`
+`sha256:25de6298bd24`, on the development host. The scenarios ran two at a time from `soak/w12a`'s
+working tree, at their own durations. No run found a harness bug or a `logit` defect.
+
+| Run | Scenario | Verdict |
+|---|---|---|
+| `20261017T165556Z` | `native-hop-spans` | WARN: `drops` (spans past the buffer) and `rss_slope` on `collector`; every other row PASS |
+| `20261017T165602Z` | `lua-path-jit` | every row PASS |
+| `20261017T171456Z` | `lua-stall-jit` | every row PASS |
+| `20261017T171459Z` | `lua-memory-jit` | WARN: `rss_slope` on `generator`; every other row PASS |
+
+What the runs showed:
+
+- **Spans cost the ledger nothing.** `native-hop-spans` passed every `native-hop` row: the hop's
+  `ledger.hop` at −4,000 inside [−77,036, 11,495], both replays in band, and no uncounted loss.
+  Each SUT's stdout carried about 19,000 span events, which `telemetry.py` skipped, and
+  `logit.internal.spans.emitted` counted 17,595 on `logit` and 17,004 on `collector`.
+- **The hop carries the trace.** Of `collector`'s 9,087 `logit_in send` spans, 9,026 name a
+  parent span recorded in `logit`'s stdout. The other 61 name spans `logit` never exported:
+  dropped from its buffer, or in a killed life's last drain interval.
+- **A backlog drops spans, counted.** `internal` buffers at most 512 spans per component between
+  drains (`docs/design/internal-telemetry.md`, "Spans"). Two drains passed it on both sides: the
+  one right after the 200 ms netem delay was reverted, and the one where the hop drained after
+  `collector`'s 90 s stop. `logit`'s `hop` counted
+  `logit.internal.spans.dropped{reason="buffer_full"}` 644, and `collector`'s `hop` and `window`
+  624 and 626. `drops` reports a nonzero `*.dropped` outside the ledger as WARN, and `[expected]`
+  takes only `rss_slope` and `fd_slope`, so the scenario WARNs by design.
+- **`collector`'s `rss_slope` WARN is a short fit.** +69.0 MiB/h over its final life's 65 s, the
+  only judged span long enough; `logit`'s final life fit −135.3 MiB/h over the same span.
+- **`lua-path-jit` balances the script hop under the compiler.** E 646,255 == L_in ==
+  L_emit 627,525 + L_drop 12,193 + L_err 6,537, and L_sent == L_emit + L_flush 34. L_err is every
+  97th event not also a 53rd one, so the `pairs` check in the script never failed: each loop
+  found both written attributes, and every series in VictoriaMetrics carries `stage` alone, so
+  each `= nil` delete held.
+- **A compiled loop still reads stalled.** In `lua-stall-jit`, the loop on the 360,000th event
+  read `stalled` three times from +185 s, `script_stalled` counted once, the receive queue
+  filled and evicted 48,000 datagrams, counted as `overflow_oldest`, and the script recovered with
+  no error. Stall detection reads a heartbeat, not a hook, so the compiler doesn't change it.
+- **The loop is calibrated for the compiler.** In the image on the development host, 1e10
+  iterations took 35 s compiled and 78 s interpreted, measured from the first event's output of
+  a one-node config. `lua-stall`'s own comment had 31.5 s interpreted on 2026-10-11, so the host
+  ran it more than twice as slowly this time; its stall still ends inside its `mark`, and its
+  comment now gives both.
+- **`max_memory` still trips under the compiler.** In `lua-memory-jit` the VM held 70,046,127
+  bytes and the SUT exited 2 at +267 s inside the `exit` step, started again, and every ledger row
+  passed with no script loss.
+- **The generator's RSS rose while the SUT was down.** In `lua-memory-jit`, the generator's
+  resident memory went from 18 to 86 MiB through the SUT's exit window and stayed near 78 MiB for
+  about 40 s after it, which the fit over its judged spans read as +199.5 MiB/h. It held 370
+  `drop_newest` batches, counted, while its sends had no listener. Nothing in the generator runs
+  Lua, so the compiler isn't the cause; `lua-memory`'s recorded W7a run didn't show it.
+
+### W12b: rolling overlap (2026-10-17)
+
+`rolling-overlap` ran three times on the development host (`trout`, 24 cores, 64 GB, Linux
+7.2.9, Docker 29.8.2), one of them stopped early, against `logit:soak` `sha256:75c60bba2ff8`
+built from `soak/w12b` after the merge of `soak/w12a`, beside other soak scenarios. The final
+run is `perf/results/soak/20261017T202637Z`, from `soak/w12b` at `e0236ed4` with no modified
+path, exit 0, shown here as `check` re-scores it at the branch's head, whose end allowance
+weights each generator sink by its own input's batch:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 14 apply/revert action(s) returned 0; 5 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 7 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 6 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 4 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 136 readiness sample(s) read ok outside fault windows; 5 start(s) or unpause(s) ready in time, slowest ready 0.2s |
+| `progress` | PASS | 26 30s window(s) outside fault windows but an instance's own hold, judged per sink on the instances running through each (0 with none running skipped), each freshness sample under 30s: victoria_metrics: deliveries in 26 of 26, 26 freshness sample(s); 750s of 1080s after warmup judged (69%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +1.8 (limit 64); 360s of 1080s after warmup judged (33%; WARN under 5%) \| logit PASS: MiB/h life 1 +7.1, life 2 +7.9 (limit 64); 340s of 1080s after warmup judged (31%; WARN under 5%) \| logit-b PASS: MiB/h life 1 +8.7, life 3 +5.1 (limit 64); 260s of 1080s after warmup judged (24%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 26 -> end 26 (limit +8) \| logit PASS: warmup median 15 -> end 15 (limit +8) \| logit-b PASS: warmup median 15 -> end 15 (limit +8) |
+| `ledger.wire` | PASS | G 2,293,600 = W 2,293,600 + K 0 + wire 0 (by design: -127 in UDP-affecting windows, 117 steady, 10 at the end; steady loss judged 246, each run at 0 or more, against limit 2,200); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es); W by instance: logit 1,177,000, logit-b 1,116,600 |
+| `ledger.overlap` | PASS | G 2,293,600 − Σ(W + K + F) 2,293,600 (logit 1,177,000, logit-b 1,116,600) = 0, within [-200, 5]: 5 close(s) of an instance's socket, each at most ceil(used / 512) + 1 datagrams, loose by up to a quarter of its SO_RCVBUF; below, the generators' end allowance |
+| `ledger.intake` | PASS | logit: final life 2: W − D 605,500 vs E + B 605,500; life 0: W − D − B − X − Ab 0 within [0, R]; life 1: W − D − B − X − Ab 0 within [0, R] (R 142,000 = 10,000 + 67 x 1,000 + 65 x 1,000) \| logit-b: final life 3: W − D 240,200 vs E + B 240,200; life 0: W − D − B − X − Ab 0 within [0, R]; life 1: W − D − B − X − Ab 0 within [0, R]; life 2: W − D − B − X − Ab 0 within [0, R] (R 142,000 = 10,000 + 67 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | logit: final life 2: E[statsd] 605,500 == T_in[instance] 605,500 (into instance); T_in[instance] 605,500 == T_out[instance] 605,500 (instance forwards every event); Σ(sent into aggregate) 605,500 == A 605,500 (listeners to aggregate); A_sent 5,575 == S_in[victoria_metrics] 5,575 (aggregate to victoria_metrics) \| logit-b: final life 3: E[statsd] 240,200 == T_in[instance] 240,200 (into instance); T_in[instance] 240,200 == T_out[instance] 240,200 (instance forwards every event); Σ(sent into aggregate) 240,200 == A 240,200 (listeners to aggregate); A_sent 2,475 == S_in[victoria_metrics] 2,475 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | logit: no [ledger] sut_script \| logit-b: no [ledger] sut_script |
+| `ledger.aggregate` | PASS | logit: final life 2: Ab 605,500 == A 605,500 (every event absorbed) \| logit-b: final life 3: Ab 240,200 == A 240,200 (every event absorbed) |
+| `ledger.egress` | PASS | logit: victoria_metrics: life 0: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 1: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 2 (final): Ab 605,500 − V[victoria_metrics] 605,500 = 0, ok (split copy; R 142,000 = 10,000 + 67 x 1,000 + 65 x 1,000) \| logit-b: victoria_metrics: life 0: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 1: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 2: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 3 (final): Ab 240,200 − V[victoria_metrics] 240,200 = 0, ok (split copy; R 142,000 = 10,000 + 67 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | logit: not enabled ([ledger] vm_every_window) \| logit-b: not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | logit: no killed life followed by another \| logit-b: no killed life followed by another |
+| `ledger.summary` | PASS | logit: final life 2: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0 \| logit-b: final life 3: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − Σ(W + K + F) 0 over the run, ledger.overlap's; end to end over the run, G 2,293,600 less the instances' counted loss 0: victoria_metrics: ΣV 2,293,600 <= G − counted 2,293,600 |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | logit: final life 2 at +1175s: victoria_metrics: received 56 + replayed 4 vs delivered 60 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) \| logit-b: final life 3 at +1180s: victoria_metrics: received 25 vs delivered 25 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | logit: no *.dropped count outside the ledger and the sink rows \| logit-b: no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 6 of 7 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect.logit-b-carries-c0s1` | PASS | min_delta of logit.input.datagrams{component=statsd} on logit-b, during c0s1: c0s1 (+60s, +120s]: 5,000 (smallest of 12 drain(s)), want >= 1 |
+| `expect.logit-carries-c0s2` | PASS | min_delta of logit.input.datagrams{component=statsd} on logit, during c0s2: c0s2 (+210s, +270s]: 5,000 (smallest of 13 drain(s)), want >= 1 |
+| `expect.logit-kernel-drops` | PASS | delta of logit.input.kernel.dropped{component=statsd} on logit, run: run (+60s, +1140s]: 0 (over 201 drain(s)), want <= 0 |
+| `expect.logit-b-kernel-drops` | PASS | delta of logit.input.kernel.dropped{component=statsd} on logit-b, run: run (+60s, +1140s]: 0 (over 194 drain(s)), want <= 0 |
+
+- **The first run, `20261017T173458Z`, FAILed `progress` because the host slept, not because
+  of `logit`.** Its schedule ran, and every fault had recovered by +945 s. From +1120 s, about
+  100 s into the cooldown, the laptop froze the driver and every container on its way to a
+  suspend (`systemd-sleep` suspended at 10:54:54 local, +1182 s, and resumed at 13:15:40), for
+  2 h 22 min. On resume the loop was past its duration and ran
+  the end sequence at once; every wait in it stayed inside its bound, though `quiet` ran its full
+  90 s, since no sample was newer than the export's 300 s lookback. `progress` then read the
+  sleep as 30-second windows with nothing delivered. Every other row passed, `ledger.overlap`
+  among them: a gap of 5 against an allowance of 15. The driver now records a `stalled` phase
+  when its tick runs more than 120 s late, and `run` FAILs it, reading it from the watchdog's gap
+  for an older run like this one: re-scored, the first run's `run` reads `stalled: the driver's
+  tick ran 8,508s late from +1120s`. The second run, `20261017T201857Z`, was stopped 3 minutes
+  in to keep the host to two soaks at once, and the third, above, ran under
+  `systemd-inhibit --what=sleep:idle`.
+- **A swap lost nothing.** In the final run G and Σ(W + K + F) both read 2,293,600, and in the
+  first they differed by 5. Every close's final `receive_buffer.used.bytes` read 0 but one, the
+  first run's last stop of `logit-b`, at 4,800 bytes, about 6 datagrams at a truesize of 768
+  bytes. That fits that run's gap of 5: the reader was keeping up, and the closing socket held
+  a few datagrams when its read loop stopped. Each stop's own gap, read from interpolated drain
+  intervals, ranged from −87 to +78, the out-of-phase interpolation error the row reports
+  without judging.
+- **The kernel moved every flow and dropped none.** Each instance read every drain while the
+  other was down (`expect.logit-b-carries-c0s1` and `expect.logit-carries-c0s2`, at least
+  5,000 lines a drain), and neither counted a kernel drop over the run. The eight flows split
+  1,177,000 to 1,116,600 over the run, and unevenly from life to life: `logit-b`'s final life
+  read 240,200, `logit`'s 605,500.
+- **Each instance's own ledger balanced**, every life of every instance at 0, with V split by
+  the `soak_instance` label. `logit`, stopped inside VictoriaMetrics' stop, replayed 4 spooled
+  batches into its next life, which `identity.sink` balanced.
+- `recovery` judged 6 of 7 faults; `c0s5`, `logit`'s stop inside VictoriaMetrics' stop, had no
+  drain interval clear of the other fault.
+
 ### W12c: SIGHUP and reopen (2026-10-17)
 
 `sighup` ran once on the development host (`sailfish`), against `logit:soak` built from
-`soak/w12c` at `082443e0`, which holds `soak/w12b`'s head. The run is
+`soak/w12c` at `082443e0`, which then held `soak/w12b`'s head. The run is
 `perf/results/soak/20261017T173412Z`, exit 0, every row PASS or SKIP:
 
 | Check | Status | Detail |
@@ -4066,3 +4329,6 @@ drain-interval rows into runs:
   and the `statsd-vm` and `fanin` controls are recorded under "Findings", `cardinality` and
   `statsd-vm` every row PASS; two `fanin` runs WARN on a generator's RSS after a partition,
   which the W8b harness scores the same.
+- **W12a** changes no harness code: the self-test passes (1,478 expectations), and the four new
+  scenarios pass `self-test` validation, the shipped-config test, and `script/validate`. Met:
+  a run of each is recorded under "Findings", every ledger row PASS.

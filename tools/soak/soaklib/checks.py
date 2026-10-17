@@ -89,7 +89,7 @@ from .scenario import (DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET
                        KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS, RUN_WINDOW,
                        SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET, SUT_CONFIG_ENV,
                        SUT_CONFIG_KEY, SUT_SERVICE, component_blocks, config_env,
-                       parse_duration, source_ids, stdio_shared_targets)
+                       parse_duration, source_ids, source_pairs, stdio_shared_targets)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
@@ -130,6 +130,9 @@ SLOPE_MIN_SPAN_S = 60
 COVERAGE_MIN_SHARE = 0.05
 # Phases that mean the driver didn't run the schedule to its end sequence.
 RUN_FAIL_PHASES = ("aborted", "error", "interrupted")
+# How late the driver's tick may run before the run is `stalled` (driver.py's `STALL_S`).
+STALL_S = 120
+POLL_SLACK_S = 5
 
 
 @dataclass
@@ -475,7 +478,8 @@ class RunData:
 
 def check_run(data):
     """FAILs a run the driver didn't take from `start` through `end_end`: aborted, errored,
-    interrupted, or missing either phase. The driver still exits 130 when interrupted."""
+    interrupted, stalled (its tick ran far late, as across a host suspend), or missing either
+    phase. The driver still exits 130 when interrupted."""
     lines = []
     for name in RUN_FAIL_PHASES:
         record = data.phases.get(name)
@@ -487,6 +491,19 @@ def check_run(data):
             reason = reason[0]
         lines.append(f"{name} at {data.offset(record.get('t'))}" + (f": {reason[:300]}"
                                                                      if reason else ""))
+    stalls = [(record.get("since", 0), record.get("late_s", 0)) for record in data.timeline
+              if record.get("event") == "phase" and record.get("phase") == "stalled"]
+    if not stalls and data.t0 is not None and not data.phases.get("start", {}).get(
+            "marks_stalls"):
+        # A run directory from before the driver recorded the phase: the watchdog's 5 s
+        # inspections stop for the span. The end sequence inspects once as it begins.
+        polled = sorted({r["t"] for r in data.watchdog
+                         if r.get("t") and r["t"] <= data.end + POLL_SLACK_S})
+        stalls = [(a - data.t0, b - a) for a, b in zip(polled, polled[1:])
+                  if b - a > STALL_S]
+    for since, late in stalls:
+        lines.append(f"stalled: the driver's tick ran {late:,.0f}s late from +{since:.0f}s, as "
+                     "when the host sleeps; nothing was scheduled or polled in that span")
     lines += [f"no {name} phase" for name in ("start", "end_end") if name not in data.phases]
     if lines:
         return Result("run", FAIL, "; ".join(lines), lines)
@@ -1603,13 +1620,15 @@ class Ledger:
                     if isinstance(point.value, (int, float)) and point.value:
                         reason = point.attributes.get("reason", "?")
                         dropped_by[reason] = dropped_by.get(reason, 0) + point.value
-            # A generator with several inputs sends a batch from each in about the same tick,
-            # so its batch, the wire's edge tolerance, is their batches summed.
-            batch = 0.0
+            # Each input's batch. A generator with several inputs sends a batch from each in
+            # about the same tick, so its batch, the wire's edge tolerance, is their sum; a
+            # sink's own batch is its paired input's (`source_pairs()`).
+            input_batch = {}
             for load in source_ids(source, "generator_input"):
                 sent = total("logit.component.events.sent", [load])
                 batches = total("logit.component.batches.sent", [load])
-                batch += sent / batches if batches else 0.0
+                input_batch[load] = sent / batches if batches else 0.0
+            batch = sum(input_batch.values())
             self.gen_stats[service] = {
                 "G": total(self.wires[source.get("sut_listener")].g, sinks),
                 "dropped_by": dropped_by,
@@ -1617,6 +1636,8 @@ class Ledger:
                 "dropped_events": total("logit.component.events.dropped", sinks),
                 "dropped_batches": total("logit.component.batches.dropped", sinks),
                 "batch": batch,
+                "sink_batch": {sink: input_batch.get(load, 0.0)
+                               for load, sink in source_pairs(source)},
             }
         self.G = sum(stats["G"] for stats in self.gen_stats.values())
 
@@ -2653,14 +2674,15 @@ def _wire_one(data, led, source, instances=None):
 
 def _end_allowance(led, source):
     """How far a source's G may fall short of W + K at the end: a send each generator sink
-    cancels at shutdown loses its counts, up to that sink's last `buffer.batches` plus one
-    batch."""
+    cancels at shutdown loses its counts, up to that sink's last `buffer.batches` plus one, each
+    a batch of the input that feeds it."""
     gen = led.gens[source.get("service")]
-    queued = 0
+    sizes = led.gen_stats[source.get("service")]["sink_batch"]
+    allowed = 0.0
     for sink in source_ids(source, "generator_sink"):
         series = gen.gauge_series("logit.component.buffer.batches", component=sink)
-        queued += (series[-1][1] if series else 0) + 1
-    return queued * led.gen_stats[source.get("service")]["batch"]
+        allowed += ((series[-1][1] if series else 0) + 1) * sizes.get(sink, 0.0)
+    return allowed
 
 
 def _file_wire_one(data, led, source):

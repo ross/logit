@@ -103,6 +103,9 @@ SLOW_POLL_EVERY_S = 30
 # rates; tools/soak/README.md's "Long runs" has the arithmetic.
 LOG_CHUNK_EVERY_S = 300
 POLL_TIMEOUT_S = 15
+# How late the 1 s tick may run before the run is marked `stalled`: past the slowest thing the
+# loop does, a `docker stop` at its timeout (`STOP_TIMEOUT_S` + 15 s) or a log chunk's 60 s.
+STALL_S = checks.STALL_S
 READY_BOUND_S = 60
 FRESHNESS_LOOKBACK_S = 120
 QUIET_BOUND_S = 90
@@ -445,7 +448,8 @@ class Run:
             info = self.docker.inspect(self.ids[service]) or {}
             self.started_at[service] = (info.get("State") or {}).get("StartedAt")
         self.t0 = _now()
-        self.phase("start", t0=self.t0, ids=dict(self.ids))
+        # `marks_stalls` tells the checks this driver records a late tick as a `stalled` phase.
+        self.phase("start", t0=self.t0, ids=dict(self.ids), marks_stalls=True)
         seed = "" if self.seed is None else f", seed {self.seed}"
         self.say(f"stack up; {len(self.steps)} fault(s) over "
                  f"{scenario_mod.format_duration(self.duration)}{seed}")
@@ -478,6 +482,11 @@ class Run:
         while True:
             now = _now()
             offset = now - self.t0
+            if offset - tick > STALL_S:
+                # Nothing in the loop takes this long: the host slept or the driver was
+                # stopped, and neither the schedule nor the polls ran meanwhile.
+                self.phase("stalled", late_s=round(offset - tick, 3), since=tick)
+                self.say(f"the tick ran {offset - tick:.0f}s late; the run can't be judged")
             if offset >= self.duration:
                 break
             while queue and queue[0][0] <= offset:
