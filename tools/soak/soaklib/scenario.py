@@ -33,8 +33,9 @@ no backend, `respond` steps tell it what to answer, and the ledger's V is what i
 stored (docs/plans/soak-harness.md's "Stand-in targets").
 
 Services are known by role, from each compose service's `soak.role` label: `sut` (a `logit`
-under test), `generator`, `backend`, `broker` (a Kafka target's broker), or `standin` (a
-stand-in target's destination). A scenario may add
+under test), `generator`, `backend`, `broker` (a Kafka target's broker), `standin` (a
+stand-in target's destination), or `netns` (a rolling overlap's namespace holder). A scenario may
+add
 services with a `compose` override file, a second generator or a second SUT included, so the
 role map comes from the merged compose config,
 which only the driver can read (`docker compose config`). `load()` checks what needs no service
@@ -61,7 +62,11 @@ from . import standin as standin_mod
 ROLE_LABEL = "soak.role"
 SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE = "sut", "generator", "backend", "broker"
 STANDIN_ROLE = "standin"
-ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE)
+# A rolling overlap's namespace holder (`[overlap] holder`): a container that runs nothing but
+# owns the network namespace its `instances` join, so a stopped instance doesn't take the port's
+# address with it.
+NETNS_ROLE = "netns"
+ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE, NETNS_ROLE)
 LOGIT_ROLES = (SUT_ROLE, GENERATOR_ROLE)
 # The ingress SUT: the service every generator sends to, whose config `[configs]` names under
 # `sut`. A scenario's override can add one more SUT service, named by its own `[configs]` key
@@ -117,7 +122,7 @@ NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart", "exit")
 TOP_LEVEL_KEYS = {
     "name", "description", "duration", "max_duration", "warmup", "cooldown", "recovery_bound",
     "cycle", "configs", "ledger", "thresholds", "step", "expect", "random", "target", "compose",
-    "expected",
+    "expected", "overlap",
 }
 # The local target, the default; the kind with no backend query; and the local Kafka broker,
 # whose kind is also its service name.
@@ -160,8 +165,11 @@ HOP_KEYS = {"from", "sink", "to", "listener"}
 SOURCE_LEDGER_KEYS = ("generator_input", "generator_sink", "sut_listener")
 # A `[[ledger.source]]`: the generator service, its `generate_in` and sink, the SUT listener its
 # lines reach, and, optionally, the wire they cross and the transforms between that listener
-# and `aggregate`, each of which must forward every event it receives.
+# and `aggregate`, each of which must forward every event it receives. `generator_input` and
+# `generator_sink` may each list several components, whose counts sum (`source_ids()`): a
+# generator that sends several UDP flows has one sink per flow.
 SOURCE_KEYS = {"service", "generator_input", "generator_sink", "sut_listener"}
+LISTED_SOURCE_KEYS = ("generator_input", "generator_sink")
 OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire"}
 # The wires a source's lines can cross into the SUT, each with its own ledger symbols
 # (checks.py's `WIRES`): datagrams, a TCP stream of LF-terminated lines, or a file the SUT tails.
@@ -182,6 +190,26 @@ LISTENER_WIRES = {
     "tail_in": ("file", {}),
     "docker_in": ("file", {}),
 }
+# `[overlap]`: two or more SUT services, `instances`, each running the whole pipeline on one
+# shared UDP port under `reuse_port`, in the network namespace of the `holder` service, each
+# stamping its own name as the attribute `label` on every event ahead of `aggregate`, so V splits
+# by instance (docs/plans/soak-harness.md's "Rolling overlap (W12b)").
+OVERLAP_KEYS = {"holder", "instances", "label"}
+# A Prometheus label name, which the label becomes on the backend.
+_LABEL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# The actions allowed on the holder, and refused on an instance: an instance shares the holder's
+# namespace, so a netem or a partition of it is one of the holder, and a lifecycle fault of the
+# holder would take every instance's network away at once.
+HOLDER_ACTIONS = ("netem", "partition")
+# The actions that hold an instance's port or process, which may not overlap across instances:
+# with every instance held at once nothing reads the port.
+INSTANCE_HOLD_ACTIONS = ("pause", "stop", "kill", "restart", "exit")
+# `docker stop -t` for a step's stop or restart (faults.py), which an overlap instance's
+# `shutdown.delay` plus its drain must fit inside, or Docker kills it mid-drain.
+STOP_TIMEOUT_S = 30
+# The drain after `shutdown.delay`: the listeners' default 5 s `shutdown_grace` and a dedicated
+# `internal` pipeline's 5 s second stage (docs/deploying.md's "Signal and restart behavior").
+OVERLAP_DRAIN_S = 10
 # A generator's service name, which also names its config's compose variable
 # (`config_env()`), so it is a slug.
 _SERVICE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -459,6 +487,8 @@ class Scenario:
     expected: dict = field(default_factory=dict)
     # `max_duration`: the longest run the scenario's thresholds and configs hold, or None.
     max_duration: object = None
+    # `[overlap]`: `{holder, instances, label}`, or None.
+    overlap: object = None
 
     @property
     def external(self):
@@ -510,21 +540,30 @@ class Scenario:
         return [source.get("service") for source in self.sources]
 
     @property
-    def suts(self):
-        """The SUT services in chain order: `logit`, then each `[configs]` key that is neither
-        `sut` nor a generator's, in the order `[configs]` lists them."""
+    def extra_suts(self):
+        """The `[configs]` keys that are neither `sut` nor a generator's: further SUT services,
+        or overlap instances with a config of their own."""
         generators = set(self.generators)
-        return [SUT_SERVICE] + [key for key in self.configs
-                                if key != SUT_CONFIG_KEY and key not in generators]
+        return [key for key in self.configs if key != SUT_CONFIG_KEY and key not in generators]
+
+    @property
+    def suts(self):
+        """The SUT services: under `[overlap]` its `instances`, each a whole pipeline; else in
+        chain order, `logit`, then each further SUT `[configs]` names, in its order."""
+        if self.overlap is not None:
+            return list(self.overlap["instances"])
+        return [SUT_SERVICE] + self.extra_suts
 
     @property
     def sink_sut(self):
-        """The SUT service holding `sut_aggregate` and every `[[ledger.sink]]`: the chain's last."""
+        """The SUT service holding `sut_aggregate` and every `[[ledger.sink]]`: the chain's last.
+        Every overlap instance holds them."""
         return self.suts[-1]
 
     def sut_config_path(self, service):
-        """The config of SUT `service`: `[configs] sut` for `logit`, else its own key."""
-        return self.config_path(SUT_CONFIG_KEY if service == SUT_SERVICE else service)
+        """The config of SUT `service`: `[configs] sut` for `logit` and for an overlap instance
+        with no key of its own, else its own key."""
+        return self.config_path(service if service in self.extra_suts else SUT_CONFIG_KEY)
 
     @property
     def split(self):
@@ -568,6 +607,8 @@ class Scenario:
             "random": None if self.random is None else self.random.to_json(),
             "configs": dict(self.configs),
             "suts": self.suts,
+            "overlap": None if self.overlap is None else {
+                **self.overlap, "instances": list(self.overlap["instances"])},
             "compose": self.compose,
             "services": dict(services or {}),
             "target": target_json(self.target),
@@ -696,6 +737,7 @@ def from_dict(raw, path):
             compose = None
         elif not (path.parent / compose).is_file():
             problems.append(f"compose: {compose} not found beside {path.name}")
+    overlap = _parse_overlap(raw["overlap"], problems) if "overlap" in raw else None
     if isinstance(ledger, dict):
         problems += _sink_problems(ledger, target["kind"])
         problems += _source_problems(ledger)
@@ -706,7 +748,10 @@ def from_dict(raw, path):
             problems += _route_problems(ledger, sut_text)
         problems += _writer_problems(ledger, configs, path.parent)
         problems += _extra_sut_problems(extra_suts, ledger)
-        problems += _hop_problems(ledger, extra_suts)
+        if overlap is None:
+            problems += _hop_problems(ledger, extra_suts)
+        elif isinstance(configs, dict):
+            problems += _overlap_problems(overlap, ledger, configs, extra_suts, path.parent)
 
     steps = []
     for index, raw_step in enumerate(raw.get("step", [])):
@@ -777,7 +822,7 @@ def from_dict(raw, path):
         cooldown=cooldown, recovery_bound=recovery_bound, cycle=cycle, configs=configs,
         ledger=ledger, thresholds=thresholds, steps=steps, expectations=expectations,
         random=random_spec, target=target, compose=compose, expected=expected,
-        max_duration=max_duration,
+        max_duration=max_duration, overlap=overlap,
     )
     if problems:
         raise ScenarioError(problems)
@@ -1020,6 +1065,13 @@ def _wire_problems(ledger, sut_text):
     return problems
 
 
+def source_ids(source, key):
+    """A `[[ledger.source]]` key's component ids as a list: `generator_input` and
+    `generator_sink` may name one or list several."""
+    value = source.get(key)
+    return list(value) if isinstance(value, list) else [value]
+
+
 def _writer_problems(ledger, configs, directory):
     """What a source's `generator_sink` breaks against its generator's config: on a `file`
     wire it must be a `file_out`, and on any other wire it must not be, because the two read G
@@ -1031,27 +1083,30 @@ def _writer_problems(ledger, configs, directory):
     for index, source in enumerate(sources):
         if not isinstance(source, dict):
             continue
-        service, sink = source.get("service"), source.get("generator_sink")
+        service = source.get("service")
         name = configs.get(service) if isinstance(service, str) else None
-        if (not isinstance(name, str) or not isinstance(sink, str)
+        sinks = source_ids(source, "generator_sink")
+        if (not isinstance(name, str) or not all(isinstance(sink, str) for sink in sinks)
                 or not (directory / name).is_file()):
             continue
-        kind = None
-        for block in component_blocks((directory / name).read_text(), sink):
-            body = "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in block.splitlines())
-            found = re.search(r"\btype\s*:\s*[\"']?([a-z_]+)", body)
-            if found:
-                kind = found.group(1)
-                break
-        where = f"ledger.source {index + 1}"
-        wire = source.get("wire", DEFAULT_WIRE)
-        if wire == FILE_WIRE and kind != FILE_WRITER_KIND:
-            problems.append(f"{where}: a file wire's `generator_sink` must be a "
-                            f"{FILE_WRITER_KIND}, and {sink!r} is "
-                            + (f"a {kind}" if kind else "no component of its config"))
-        elif wire != FILE_WIRE and kind == FILE_WRITER_KIND:
-            problems.append(f"{where}: `generator_sink` {sink!r} is a {FILE_WRITER_KIND}, "
-                            "which only a file wire reads")
+        text = (directory / name).read_text()
+        for sink in sinks:
+            kind = None
+            for block in component_blocks(text, sink):
+                body = "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in block.splitlines())
+                found = re.search(r"\btype\s*:\s*[\"']?([a-z_]+)", body)
+                if found:
+                    kind = found.group(1)
+                    break
+            where = f"ledger.source {index + 1}"
+            wire = source.get("wire", DEFAULT_WIRE)
+            if wire == FILE_WIRE and kind != FILE_WRITER_KIND:
+                problems.append(f"{where}: a file wire's `generator_sink` must be a "
+                                f"{FILE_WRITER_KIND}, and {sink!r} is "
+                                + (f"a {kind}" if kind else "no component of its config"))
+            elif wire != FILE_WIRE and kind == FILE_WRITER_KIND:
+                problems.append(f"{where}: `generator_sink` {sink!r} is a {FILE_WRITER_KIND}, "
+                                "which only a file wire reads")
     return problems
 
 
@@ -1094,7 +1149,14 @@ def _source_problems(ledger):
                 services.append(service)
         for key in ("generator_input", "generator_sink", "sut_listener"):
             value = source.get(key)
-            if key in source and (not isinstance(value, str) or not _COMPONENT_ID.match(value)):
+            if key in LISTED_SOURCE_KEYS and isinstance(value, list):
+                if (not value or len(set(map(str, value))) != len(value)
+                        or not all(isinstance(v, str) and _COMPONENT_ID.match(v)
+                                   for v in value)):
+                    problems.append(f"{where}: `{key}` must name a component id or list "
+                                    "distinct ones")
+            elif key in source and (not isinstance(value, str)
+                                    or not _COMPONENT_ID.match(value)):
                 problems.append(f"{where}: `{key}` must name a component id")
         if "wire" in source and source["wire"] not in WIRES:
             problems.append(f"{where}: `wire` must be one of {', '.join(WIRES)}")
@@ -1171,6 +1233,171 @@ def _hop_problems(ledger, extra_suts):
     sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
     if any(isinstance(source, dict) and "sut_transforms" in source for source in sources):
         problems.append("ledger.hop and a source's `sut_transforms` can't be combined")
+    return problems
+
+
+def _parse_overlap(table, problems):
+    """The `[overlap]` table as `{holder, instances, label}`, appending to `problems` what breaks
+    its own rules: the three keys and no other; `holder` a service slug; `instances` two or more
+    distinct service slugs, `logit` first, none the holder; and `label` a Prometheus label name.
+    `_overlap_problems()` checks it against the ledger and the configs, `validate()` against the
+    steps, and `service_problems()` against the stack."""
+    if not isinstance(table, dict):
+        problems.append("`overlap` must be a table, written [overlap]")
+        return None
+    for key in sorted(set(table) - OVERLAP_KEYS):
+        problems.append(f"overlap: unknown key `{key}`")
+    for key in sorted(OVERLAP_KEYS - set(table)):
+        problems.append(f"overlap: missing `{key}`")
+    holder, instances, label = table.get("holder"), table.get("instances"), table.get("label")
+    if "holder" in table and (not isinstance(holder, str) or not _SERVICE_NAME.match(holder)):
+        problems.append("overlap.holder must name the namespace holder's service: lowercase "
+                        "letters, digits, `_`, or `-`")
+    if "instances" in table:
+        if (not isinstance(instances, list) or len(instances) < 2
+                or not all(isinstance(i, str) and _SERVICE_NAME.match(i) for i in instances)
+                or len(set(instances)) != len(instances)):
+            problems.append("overlap.instances must list two or more distinct SUT services, such "
+                            f"as [\"{SUT_SERVICE}\", \"{SUT_SERVICE}-b\"]")
+            instances = None
+        elif instances[0] != SUT_SERVICE:
+            problems.append(f"overlap.instances must start with {SUT_SERVICE}, the SUT every "
+                            "[[ledger.source]] names")
+        elif holder in instances:
+            problems.append("overlap.holder can't be an instance: a stopped instance would take "
+                            "the namespace with it")
+    if "label" in table and (not isinstance(label, str) or not _LABEL_NAME.match(label)):
+        problems.append("overlap.label must be a Prometheus label name, such as \"soak_instance\"")
+    return {"holder": holder, "instances": list(instances or []), "label": label}
+
+
+def _yaml_seconds(text):
+    """The first duration in `text` after a `delay:` key, in seconds, or None."""
+    found = re.search(r"\bdelay\s*:\s*[\"']?([0-9][0-9a-z.]*)", text or "")
+    if not found:
+        return None
+    try:
+        return parse_duration(found.group(1))
+    except ValueError:
+        return None
+
+
+def _uncommented(text):
+    return "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in (text or "").splitlines())
+
+
+def _overlap_problems(overlap, ledger, configs, extra_suts, directory):
+    """What `[overlap]` breaks against the ledger and the configs. No `[[ledger.hop]]`, since
+    every instance runs the whole pipeline; every source on a `udp` wire, the one the ledger
+    judges an overlap on; a `[configs]` key other than `sut` and the generators only for an
+    instance, which then runs its own config, else `sut`'s. Each instance's config sets
+    `reuse_port: true` on every source's listener, a `shutdown.delay` above 0 that with the drain
+    fits `docker stop`'s timeout, and `admin.socket` with no `admin.bind`, whose port the
+    instances would share; it has a `set` component stamping `label`, which every source's
+    `sut_transforms` lists; and two configs differ only in the lines that set `label`."""
+    problems = []
+    if ledger.get("hop") is not None:
+        problems.append("[overlap] and [[ledger.hop]] can't be combined: every overlap instance "
+                        "runs the whole pipeline")
+    instances = overlap.get("instances") or []
+    label = overlap.get("label")
+    for service in extra_suts:
+        if service not in instances[1:]:
+            problems.append(f"configs.{service}: under [overlap] a key other than `sut` and the "
+                            "sources' services names an instance's own config, and "
+                            f"{service!r} isn't one of overlap.instances after {SUT_SERVICE}")
+    sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
+    for index, source in enumerate(sources):
+        if isinstance(source, dict) and source.get("wire", DEFAULT_WIRE) != DEFAULT_WIRE:
+            problems.append(f"ledger.source {index + 1}: under [overlap] a source's wire is udp, "
+                            "the one whose loss at an instance's close ledger.overlap bounds")
+    texts = {}
+    for instance in instances:
+        name = configs.get(instance if instance in extra_suts else SUT_CONFIG_KEY)
+        if isinstance(name, str) and (directory / name).is_file():
+            texts.setdefault(name, (instance, _uncommented((directory / name).read_text())))
+    if not isinstance(label, str):
+        return problems
+    for name, (instance, text) in texts.items():
+        where = f"overlap: {name} ({instance})"
+        for index, source in enumerate(sources):
+            listener = source.get("sut_listener") if isinstance(source, dict) else None
+            if not isinstance(listener, str):
+                continue
+            if not any(re.search(r"\breuse_port\s*:\s*true\b", block)
+                       for block in component_blocks(text, listener)):
+                problems.append(f"{where}: listener {listener!r} needs `reuse_port: true`, or "
+                                "the second instance's bind fails")
+        delay = next((_yaml_seconds(block) for block in component_blocks(text, "shutdown")
+                      if _yaml_seconds(block) is not None), None)
+        if not delay:
+            problems.append(f"{where}: needs a `shutdown.delay` above 0s, so a stopping instance "
+                            "keeps reading while its flows move")
+        elif delay + OVERLAP_DRAIN_S >= STOP_TIMEOUT_S:
+            problems.append(f"{where}: `shutdown.delay` {format_duration(delay)} plus the "
+                            f"{OVERLAP_DRAIN_S}s drain must be under docker stop's "
+                            f"{STOP_TIMEOUT_S}s, or Docker kills the instance mid-drain")
+        admin = "\n".join(component_blocks(text, "admin"))
+        if not re.search(r"\bsocket\s*:", admin) or re.search(r"\bbind\s*:", admin):
+            problems.append(f"{where}: admin needs `socket:` and no `bind:`; on a shared port a "
+                            "probe could reach the other instance")
+        setters = [component for component, body in _route_blocks(text, "set")
+                   if re.search(rf"(^|[\s{{,]){re.escape(label)}\s*:", body)]
+        if not setters:
+            problems.append(f"{where}: no `set` component stamps {label!r}, so V can't be split "
+                            "by instance")
+        for index, source in enumerate(sources):
+            chain = source.get("sut_transforms") if isinstance(source, dict) else None
+            if setters and not (isinstance(chain, list) and set(chain) & set(setters)):
+                problems.append(f"ledger.source {index + 1}: `sut_transforms` must list the set "
+                                f"component stamping {label!r} ({', '.join(setters)}), so "
+                                "ledger.edge judges it")
+    others = list(texts.items())
+    for name, (_, text) in others[1:]:
+        first_name, (_, first) = others[0]
+
+        def kept(body):
+            return [line.rstrip() for line in body.splitlines()
+                    if line.strip() and not re.search(rf"\b{re.escape(label)}\s*:", line)]
+
+        if kept(first) != kept(text):
+            problems.append(f"overlap: {name} and {first_name} differ in more than the lines "
+                            f"setting {label!r}; overlap instances run the same config")
+    return problems
+
+
+def _overlap_step_problems(scenario):
+    """What the steps break of `[overlap]`'s rules: on the holder only `netem` and `partition`,
+    on an instance neither, and no two `INSTANCE_HOLD_ACTIONS` steps on different instances
+    overlapping, since with every instance held nothing reads the port. A `[random]` fault on
+    the holder or an instance is held to the first two; its draws never overlap."""
+    overlap = scenario.overlap
+    if overlap is None:
+        return []
+    holder, instances = overlap.get("holder"), set(overlap.get("instances") or [])
+    problems = []
+    entries = [(f"step {spec.index + 1} ({spec.action} on {spec.on})", spec.action, spec.on)
+               for spec in scenario.steps]
+    if scenario.random is not None:
+        entries += [(f"random.fault {t.index + 1} ({t.action} on {t.on})", t.action, t.on)
+                    for t in scenario.random.faults]
+    for where, action, on in entries:
+        if on == holder and action not in HOLDER_ACTIONS:
+            problems.append(f"{where}: the holder takes {' and '.join(HOLDER_ACTIONS)} only; "
+                            "any other fault on it takes every instance's network away")
+        elif on in instances and action in HOLDER_ACTIONS:
+            problems.append(f"{where}: an instance shares {holder}'s network namespace, so put "
+                            f"{action} on {holder}")
+    held = sorted((spec for spec in scenario.steps
+                   if spec.on in instances and spec.action in INSTANCE_HOLD_ACTIONS),
+                  key=lambda spec: spec.at)
+    for i, first in enumerate(held):
+        for second in held[i + 1:]:
+            if second.on != first.on and second.at < first.at + first.for_:
+                problems.append(f"steps {first.index + 1} and {second.index + 1}: "
+                                f"{first.action} on {first.on} and {second.action} on "
+                                f"{second.on} overlap; with every instance held nothing reads "
+                                "the port")
     return problems
 
 
@@ -1539,6 +1766,7 @@ def validate(scenario, duration=None, seed=None):
                         )
 
     problems += _expect_problems(scenario, duration)
+    problems += _overlap_step_problems(scenario)
 
     run_duration = scenario.duration if duration is None else duration
     quiet_end = run_duration - scenario.cooldown
@@ -1836,6 +2064,14 @@ def roles_from_config(text):
             for name, spec in services.items()}
 
 
+def network_modes_from_config(text):
+    """`{service: network_mode}` from `docker compose config --format json`'s output, for each
+    service that sets one."""
+    services = json.loads(text).get("services") or {}
+    return {name: (spec or {}).get("network_mode") for name, spec in services.items()
+            if (spec or {}).get("network_mode")}
+
+
 def base_roles(scenario):
     """`BASE_ROLES` as the driver would resolve it for `scenario` with no override: without the
     backends, which the `local` profile holds, for any target but the local one, with
@@ -1863,11 +2099,19 @@ def generators(roles):
     return sorted(name for name, role in roles.items() if role == GENERATOR_ROLE)
 
 
-def role_problems(roles, suts=(SUT_SERVICE,)):
+def role_problems(roles, suts=(SUT_SERVICE,), holder=None):
     """What a role map breaks: every service labeled with a known role, the SUT services
-    `suts` (`Scenario.suts`: `SUT_SERVICE` and each further one `[configs]` names) and no other
-    with the role `sut`, and at least one generator."""
+    `suts` (`Scenario.suts`: `SUT_SERVICE` and each further one `[configs]` names, or the
+    overlap's instances) and no other with the role `sut`, at least one generator, and the
+    `[overlap]` `holder` and no other service with the role `netns`."""
     problems = []
+    netns = sorted(n for n, r in roles.items() if r == NETNS_ROLE)
+    if holder is None and netns:
+        problems.append(f"compose service {', '.join(netns)}: the {NETNS_ROLE} role is an "
+                        "[overlap] holder's, and the scenario has no [overlap]")
+    elif holder is not None and netns != [holder]:
+        problems.append(f"overlap.holder {holder} must be the stack's one {NETNS_ROLE} service, "
+                        f"and the stack's are {', '.join(netns) or 'none'}")
     for name, role in sorted(roles.items()):
         if role not in ROLES:
             problems.append(f"compose service {name}: label {ROLE_LABEL} must be one of "
@@ -1887,15 +2131,24 @@ def role_problems(roles, suts=(SUT_SERVICE,)):
     return problems
 
 
-def service_problems(scenario, roles):
+def service_problems(scenario, roles, modes=None):
     """Every rule that needs the stack's services, against `roles` (`{service: role}`): the
     role map's own rules; each step's and random fault's `on` a service of the stack, with a
     `kill` or an `exit` on a SUT service only, and a `respond`, or a `stop` with a `class`, on a
     stand-in only; each `[[expect]]` service one that runs `logit`; for a Kafka target, the
     broker `kafka`; for a stand-in target, the stand-in `standin`; each `[[ledger.source]]`
     service a generator, and every generator a source's; and each local sink's `backend` a
-    backend service."""
-    problems = role_problems(roles, scenario.suts)
+    backend service. With `modes`, `{service: network_mode}` from the merged compose config, each
+    overlap instance is in its holder's namespace."""
+    problems = role_problems(roles, scenario.suts,
+                             None if scenario.overlap is None else scenario.overlap["holder"])
+    if scenario.overlap is not None and modes is not None:
+        want = f"service:{scenario.overlap['holder']}"
+        for instance in scenario.overlap["instances"]:
+            if modes.get(instance) != want:
+                problems.append(f"overlap instance {instance} needs network_mode \"{want}\", so "
+                                f"it shares the holder's address, and has "
+                                f"{modes.get(instance) or 'none'}")
     no_backend = ("; an external target's stack runs no backend" if scenario.external else
                   "; a kafka target's stack runs the broker and no backend" if scenario.kafka
                   else "; a standin target's stack runs the stand-in and no backend"
@@ -1960,9 +2213,9 @@ def service_problems(scenario, roles):
     return problems
 
 
-def check_services(scenario, roles):
+def check_services(scenario, roles, modes=None):
     """Raises `ScenarioError` listing every `service_problems()` rule broken."""
-    problems = service_problems(scenario, roles)
+    problems = service_problems(scenario, roles, modes)
     if problems:
         raise ScenarioError(problems)
 

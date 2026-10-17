@@ -1,0 +1,33 @@
+# rolling-overlap's stack, merged onto tools/soak/compose.yaml: a namespace holder, `sut-net`,
+# and two instances of the SUT, `logit` and `logit-b`, in its network namespace. A SUT that owned
+# the namespace would take the address with it when it stopped, so the holder owns it and runs
+# nothing: the netem image, asleep, killed at once by a stop. Both instances run SOAK_SUT_CONFIG
+# and bind 8125 with `reuse_port`; `SOAK_INSTANCE` stamps each one's series, and `LOGIT_ADMIN`
+# points `logit ready`, the image HEALTHCHECK's and the driver's probe, at the instance's own
+# admin socket. `extends.file` resolves against the project directory, the base file's.
+services:
+  sut-net:
+    image: logit-soak-netem:local
+    entrypoint: ["sleep", "infinity"]
+    labels: { soak.role: netns }
+    stop_signal: SIGKILL
+    restart: "no"
+  logit:
+    network_mode: "service:sut-net"
+    depends_on:
+      sut-net: { condition: service_started }
+    environment:
+      LOGIT_ADMIN: unix:/tmp/admin.sock
+      SOAK_INSTANCE: logit
+  logit-b:
+    extends: { file: compose.yaml, service: logit }
+    labels: { soak.role: sut }
+    network_mode: "service:sut-net"
+    depends_on:
+      sut-net: { condition: service_started }
+    environment:
+      LOGIT_ADMIN: unix:/tmp/admin.sock
+      SOAK_INSTANCE: logit-b
+  generator:
+    depends_on:
+      logit-b: { condition: service_healthy }

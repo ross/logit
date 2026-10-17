@@ -63,6 +63,10 @@ needs at the code:
   lines in every file there (`shared_counted`, the G the checks hold telemetry's against), and
   waits until the tailers' W reaches that count or stops growing (`tail_caught_up`), reading W
   from a log chunk it captures for the purpose, before it waits on the sinks.
+- Under `[overlap]` the instances share their holder's network namespace, so `prepare()` also
+  reads each service's `network_mode` from compose and checks each instance is in the holder's.
+  Each instance runs the whole pipeline, so the end sequence waits once on every sink's stored
+  total, which holds all of them, and then stops each instance.
 
 Every time in `timeline.jsonl`, `watchdog.jsonl`, `stats.ndjson`, and `vm-freshness.jsonl` is
 epoch seconds (`t`, `started_at`, `finished_at`), with `offset` measured from the timeline's zero:
@@ -85,7 +89,6 @@ NETEM_IMAGE = "logit-soak-netem:local"
 VM_IMAGE = "victoriametrics/victoria-metrics:v1.152.0"
 KAFKA_IMAGE = "apache/kafka:4.2.0"
 STANDIN_IMAGE = "python:3.13.16-alpine3.24"
-ADMIN = "http://127.0.0.1:9600"
 
 INSPECT_EVERY_S = 5
 SLOW_POLL_EVERY_S = 30
@@ -211,6 +214,9 @@ class Run:
         self.ids = {}
         # `{service: role}`: given (the self-test), else resolved from compose in `prepare()`.
         self.roles = None if roles is None else dict(roles)
+        # `{service: network_mode}` from compose, resolved with the roles; None when the roles
+        # were given.
+        self.modes = None
         # Each backend's base URL, by service, and each stand-in's control URL.
         self.vm_base = {}
         self.standin_base = {}
@@ -235,7 +241,7 @@ class Run:
             f"{scenario_mod.SUT_CONFIG_ENV}={self.scenario.config_path('sut')}\n"
             + "".join(f"{scenario_mod.config_env(service)}="
                       f"{self.scenario.config_path(service)}\n"
-                      for service in self.scenario.generators + self.scenario.suts[1:])
+                      for service in self.scenario.generators + self.scenario.extra_suts)
             + (f"{scenario_mod.STANDIN_SHAPE_ENV}={self.scenario.standin_shape}\n"
                if self.standin else "")
             + (f"{scenario_mod.SHARED_DIR_ENV}={self.make_shared_dir()}\n"
@@ -260,7 +266,7 @@ class Run:
         self.docker = Docker(self.project, compose_files, env_files, profiles)
         if self.roles is None:
             self.roles = self.resolve_roles()
-        scenario_mod.check_services(self.scenario, self.roles)
+        scenario_mod.check_services(self.scenario, self.roles, self.modes)
         resolved = self.scenario.to_json(self.duration, self.seed, services=self.roles)
         (self.run_dir / "scenario.resolved.json").write_text(
             json.dumps(resolved, indent=2, sort_keys=True) + "\n"
@@ -289,6 +295,7 @@ class Run:
             raise scenario_mod.ScenarioError([
                 f"docker compose config failed (rc {result.rc}): {result.stderr.strip()[-500:]}"])
         try:
+            self.modes = scenario_mod.network_modes_from_config(result.stdout)
             return scenario_mod.roles_from_config(result.stdout)
         except ValueError as err:
             raise scenario_mod.ScenarioError([f"docker compose config: {err}"]) from None
@@ -520,8 +527,10 @@ class Run:
         for service, pending in list(self.pending_ready.items()):
             if service in self.paused or service in self.down:
                 continue
-            result = self.docker.exec_(self.ids[service], ["logit", "ready", "--admin", ADMIN],
-                                       timeout=15)
+            # With no `--admin`, `logit ready` probes the container's own `LOGIT_ADMIN`, else
+            # http://127.0.0.1:9600, as the image's HEALTHCHECK does: an overlap instance serves
+            # its admin endpoint on a Unix socket, since the instances share one address.
+            result = self.docker.exec_(self.ids[service], ["logit", "ready"], timeout=15)
             now = _now()
             waited = now - pending["since"]
             if result.ok or waited > READY_BOUND_S:
@@ -622,7 +631,15 @@ class Run:
                        stderr=result.stderr.strip())
 
         self.wait_tailed()
-        suts = self.scenario.suts
+        if self.scenario.overlap is not None:
+            self.stop_instances(self.scenario.suts)
+        else:
+            self.stop_chain(self.scenario.suts)
+        self.finish_end_sequence()
+
+    def stop_chain(self, suts):
+        """Stops each SUT service in chain order: an earlier one once its `[[ledger.hop]]` sink
+        is drained, the last once its sinks' stored totals hold or their queues are empty."""
         for service in suts:
             if service != suts[-1]:
                 self.wait_sink_drained(service, sinks=[hop["sink"] for hop in self.scenario.hops
@@ -631,13 +648,30 @@ class Run:
                 self.wait_quiet()
             else:
                 self.wait_sink_drained(service)
-            result = self.docker.run(["stop", "-t", str(SUT_STOP_T), self.ids[service]],
-                                     timeout=SUT_STOP_T + 15)
-            info = self.docker.inspect(self.ids[service]) or {}
-            self.phase("sut_stopped", service=service, rc=result.rc,
-                       stderr=result.stderr.strip(),
-                       exit_code=(info.get("State") or {}).get("ExitCode"))
+            self.stop_sut(service)
 
+    def stop_sut(self, service):
+        result = self.docker.run(["stop", "-t", str(SUT_STOP_T), self.ids[service]],
+                                 timeout=SUT_STOP_T + 15)
+        info = self.docker.inspect(self.ids[service]) or {}
+        self.phase("sut_stopped", service=service, rc=result.rc,
+                   stderr=result.stderr.strip(),
+                   exit_code=(info.get("State") or {}).get("ExitCode"))
+
+    def stop_instances(self, instances):
+        """A rolling overlap's end: every instance runs the whole pipeline and every sink's
+        backend holds all of them, so one wait covers the instances together, the stored totals
+        holding (or, with no backend, each instance's sinks drained), and then each instance
+        stops, with nothing left arriving to move between them."""
+        if self.has_vm:
+            self.wait_quiet()
+        else:
+            for service in instances:
+                self.wait_sink_drained(service)
+        for service in instances:
+            self.stop_sut(service)
+
+    def finish_end_sequence(self):
         if self.kafka:
             self.read_topic()
         if not self.has_vm:

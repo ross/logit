@@ -37,6 +37,9 @@ export SPLUNK_INTEROP_HEC_INSECURE="${SPLUNK_INTEROP_HEC_INSECURE:-false}"
 # tools/kafka-interop/logit-oauth-*.yaml's fixed OAUTHBEARER token, which script/kafka-interop
 # fetches from its token server.
 export KAFKA_INTEROP_OAUTH_TOKEN="${KAFKA_INTEROP_OAUTH_TOKEN:-logit-dev-token}"
+# tools/soak/scenarios/rolling-overlap/logit-sut.yaml's instance name, which each overlap
+# instance's compose service sets to its own name.
+export SOAK_INSTANCE="${SOAK_INSTANCE:-logit}"
 
 if ! in_project_environment; then
     run ./script/validate "$@"

@@ -131,6 +131,16 @@ reported under `at_least_once` and FAILing under `at_most_once` or after a 2xx, 
 `series_errors` and rejected-step reconciliation against `records.dropped`, and `ledger.sent`
 and `drops` with cued and uncued refusals and drops.
 
+For a rolling overlap, it covers every `[overlap]` rule (the table's own, against the ledger and
+each instance's config, the steps on the holder and on the instances, the role map and each
+instance's network mode, and list-valued generator keys), the fault predicates with a holder,
+the driver (`compose.env`, the network modes compose reports, readiness through the container's
+own `LOGIT_ADMIN`, and the end sequence's one wait before each instance stops), and a
+two-instance run: a clean swap passing every row, each instance judged on its own lives and
+labeled series, a loss at the close within its bound passing and one past it FAILing, a kill
+reported and not judged, a series with no instance's label FAILing `ledger.egress`, and a stall
+of the one instance running FAILing `progress`.
+
 No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
 suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
 a slip in a part's own stand-ins included, gets rc 127 from `Docker.run`'s `OSError` instead of
@@ -7330,6 +7340,461 @@ def _datadog_checks():
                f"{rows['ledger.standin']}")
 
 
+# A rolling overlap: two instances, `logit` and `logit-b`, in `sut-net`'s namespace.
+OVERLAP = {"holder": "sut-net", "instances": ["logit", "logit-b"], "label": "soak_instance"}
+OVERLAP_ROLES = {**scenario.BASE_ROLES, "logit-b": "sut", "sut-net": "netns"}
+OVERLAP_MODES = {"logit": "service:sut-net", "logit-b": "service:sut-net"}
+
+
+def _overlap_dir(root, tmp, name="overlap", sut_edit=None, own_b=None):
+    """A copy of rolling-overlap in `tmp/name`, its SUT config passed through `sut_edit`, and
+    with `own_b`, a config of logit-b's own, `logit-sut-b.yaml`, named in `[configs]`."""
+    base = root / "scenarios" / "rolling-overlap"
+    directory = Path(tmp) / name
+    directory.mkdir()
+    for path in base.iterdir():
+        (directory / path.name).write_text(path.read_text())
+    sut = (base / "logit-sut.yaml").read_text()
+    if sut_edit is not None:
+        (directory / "logit-sut.yaml").write_text(sut_edit(sut))
+    if own_b is not None:
+        (directory / "logit-sut-b.yaml").write_text(own_b(sut))
+        text = (directory / "scenario.toml").read_text()
+        marker = 'generator = "logit-generator.yaml"\n'
+        (directory / "scenario.toml").write_text(
+            text.replace(marker, marker + 'logit-b = "logit-sut-b.yaml"\n', 1))
+    return directory / "scenario.toml"
+
+
+def _overlap_rules(root):
+    """`[overlap]`'s rules: the table's own, against the ledger and each instance's config, the
+    steps on the holder and on the instances, the role map and each instance's network_mode,
+    list-valued generator keys, and the fault predicates, under which every instance is an
+    ingress SUT and the holder's netem and partition reach every instance."""
+    path = root / "scenarios" / "rolling-overlap" / "scenario.toml"
+    raw = tomllib.loads(path.read_text())
+    loaded = scenario.load(path)
+    expect(loaded.suts == ["logit", "logit-b"] and loaded.extra_suts == []
+           and loaded.sut_config_path("logit-b").name == "logit-sut.yaml"
+           and loaded.to_json()["overlap"] == OVERLAP
+           and loaded.to_json()["suts"] == ["logit", "logit-b"],
+           f"the overlap's instances are its SUT services, sharing sut's config, got "
+           f"{loaded.suts} {loaded.extra_suts}")
+    expect(scenario.service_problems(loaded, OVERLAP_ROLES, OVERLAP_MODES) == [],
+           f"the overlap's stack holds, got "
+           f"{scenario.service_problems(loaded, OVERLAP_ROLES, OVERLAP_MODES)}")
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    def step(**fields):
+        return lambda r: r["step"].append({"for": "20s", **fields})
+
+    def refused(edit, needle, what, roles=OVERLAP_ROLES):
+        _refused(path, mutate(edit), needle, what, roles=roles)
+
+    refused(lambda r: r["overlap"].update(extra=1), "overlap: unknown key `extra`",
+            "an unknown overlap key")
+    refused(lambda r: r["overlap"].pop("label"), "overlap: missing `label`", "no label")
+    refused(lambda r: r["overlap"].update(label="soak-instance"),
+            "overlap.label must be a Prometheus label name", "a label that isn't a label name")
+    refused(lambda r: r["overlap"].update(instances=["logit"]),
+            "overlap.instances must list two or more distinct", "one instance")
+    refused(lambda r: r["overlap"].update(instances=["logit", "logit"]),
+            "overlap.instances must list two or more distinct", "a repeated instance")
+    refused(lambda r: r["overlap"].update(instances=["logit-b", "logit"]),
+            "overlap.instances must start with logit", "logit not first")
+    refused(lambda r: r["overlap"].update(holder="logit-b"),
+            "overlap.holder can't be an instance", "the holder an instance")
+    refused(lambda r: r["ledger"].update(hop=[dict(TWO_SUT_HOP)]),
+            "[overlap] and [[ledger.hop]] can't be combined", "an overlap beside a hop")
+    refused(lambda r: r["configs"].update(collector="logit-sut.yaml"),
+            "configs.collector: under [overlap]", "a further SUT that isn't an instance")
+    refused(lambda r: r["ledger"]["source"][0].update(wire="tcp"),
+            "under [overlap] a source's wire is udp", "an overlap on a TCP wire")
+    refused(lambda r: r["ledger"]["source"][0].update(sut_transforms=["other"]),
+            "`sut_transforms` must list the set component stamping 'soak_instance' (instance)",
+            "the label's set off the source's transforms")
+    refused(lambda r: r["ledger"]["source"][0].update(generator_input=[]),
+            "`generator_input` must name a component id or list distinct ones",
+            "an empty generator_input list")
+    refused(lambda r: r["ledger"]["source"][0].update(generator_sink=["statsd_0", "statsd_0"]),
+            "`generator_sink` must name a component id or list distinct ones",
+            "a repeated generator_sink")
+    refused(step(at="4m", action="netem", on="logit", args="delay 10ms"),
+            "an instance shares sut-net's network namespace, so put netem on sut-net",
+            "netem on an instance")
+    refused(step(at="4m", action="partition", on="logit-b"),
+            "so put partition on sut-net", "a partition of an instance")
+    refused(step(at="4m", action="stop", on="sut-net"),
+            "the holder takes netem and partition only", "a stop of the holder")
+    refused(step(at="20s", action="pause", on="logit-b"),
+            "stop on logit and pause on logit-b overlap; with every instance held",
+            "lifecycle faults on two instances overlapping")
+    accepted = mutate(lambda r: (r["step"].append({"at": "4m", "action": "partition",
+                                                   "on": "sut-net", "for": "20s"}),
+                                 r["step"].append({"at": "4m30s", "action": "kill",
+                                                   "on": "logit", "for": "20s"})))
+    try:
+        loaded_kill = scenario.from_dict(accepted, path)
+        expect(scenario.service_problems(loaded_kill, OVERLAP_ROLES, OVERLAP_MODES) == [],
+               "a partition of the holder and a kill of an instance are allowed")
+    except scenario.ScenarioError as err:
+        expect(False, f"a holder partition and an instance kill are refused: {err.problems}")
+    refused(lambda r: None, "overlap.holder sut-net must be the stack's one netns service, and "
+            "the stack's are none", "a holder the stack doesn't run as netns",
+            roles={**OVERLAP_ROLES, "sut-net": "backend"})
+    problems = scenario.service_problems(loaded, OVERLAP_ROLES,
+                                         {**OVERLAP_MODES, "logit-b": "bridge"})
+    expect(any("overlap instance logit-b needs network_mode \"service:sut-net\"" in p
+               for p in problems),
+           f"an instance outside the holder's namespace is refused, got {problems}")
+    statsd_path, statsd_raw = _base(root)
+    _refused(statsd_path, statsd_raw, "the netns role is an [overlap] holder's",
+             "a netns service with no [overlap]", roles={**scenario.BASE_ROLES, "ns": "netns"})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def config_refused(name, needle, what, **kwargs):
+            try:
+                scenario.load(_overlap_dir(root, tmp, name, **kwargs))
+                expect(False, f"{what}: accepted")
+            except scenario.ScenarioError as err:
+                expect(any(needle in p for p in err.problems),
+                       f"{what}: expected {needle!r}, got {err.problems}")
+
+        config_refused("no-reuse", "listener 'statsd' needs `reuse_port: true`",
+                       "a listener without reuse_port",
+                       sut_edit=lambda t: t.replace(", reuse_port: true", ""))
+        config_refused("no-delay", "needs a `shutdown.delay` above 0s", "no shutdown delay",
+                       sut_edit=lambda t: t.replace("shutdown: { delay: 5s }\n", ""))
+        config_refused("long-delay", "`shutdown.delay` 25s plus the 10s drain must be under "
+                       "docker stop's 30s", "a delay past docker stop's timeout",
+                       sut_edit=lambda t: t.replace("delay: 5s", "delay: 25s"))
+        config_refused("admin-bind", "admin needs `socket:` and no `bind:`",
+                       "an admin port on the shared address",
+                       sut_edit=lambda t: t.replace("{ socket: /tmp/admin.sock }",
+                                                    "{ bind: 127.0.0.1:9600 }"))
+        config_refused("no-set", "no `set` component stamps 'soak_instance'", "no label setter",
+                       sut_edit=lambda t: t.replace("soak_instance:", "other_label:"))
+        config_refused("b-differs", "overlap: logit-sut-b.yaml and logit-sut.yaml differ in "
+                       "more than the lines setting 'soak_instance'",
+                       "an instance config that differs past its label",
+                       own_b=lambda t: t.replace("interval: 10s", "interval: 5s"))
+        own = scenario.load(_overlap_dir(
+            root, tmp, "b-own", own_b=lambda t: t.replace("!env SOAK_INSTANCE", "logit-b")))
+        expect(own.extra_suts == ["logit-b"] and own.suts == ["logit", "logit-b"]
+               and own.sut_config_path("logit-b").name == "logit-sut-b.yaml",
+               f"an instance may run its own config differing in its label alone, got "
+               f"{own.extra_suts}")
+
+    for action, on, udp, tcp, egress in (
+            ("stop", "logit-b", True, True, True), ("kill", "logit-b", True, True, True),
+            ("pause", "logit", True, True, True), ("netem", "sut-net", False, True, True),
+            ("partition", "sut-net", True, True, True)):
+        one = scenario.Step("c0s1", 0, 0, action, on, "", 0, 1)
+        got = (faults.ACTIONS[action].affects_udp_ingress(one, OVERLAP_ROLES),
+               faults.ACTIONS[action].affects_tcp_ingress(one, OVERLAP_ROLES),
+               faults.ACTIONS[action].affects_egress(one, OVERLAP_ROLES))
+        expect(tuple(map(bool, got)) == (udp, tcp, egress),
+               f"a {action} on {on} under an overlap affects UDP {udp}, TCP {tcp}, egress "
+               f"{egress}, got {got}")
+    one = scenario.Step("c0s1", 0, 0, "stop", "collector", "", 0, 1)
+    expect(not faults.ACTIONS["stop"].affects_udp_ingress(one, TWO_SUT_ROLES),
+           "with no holder a further SUT still affects no UDP ingress")
+
+
+def _overlap_driver(root):
+    """The driver under `[overlap]`: `compose.env` has no variable for an instance sharing
+    sut's config, the resolved scenario records the overlap, compose's network modes are read
+    beside the roles, readiness is probed with the container's own `LOGIT_ADMIN`, and the end
+    sequence waits once on the backends' totals and then stops each instance."""
+    loaded = scenario.load(root / "scenarios" / "rolling-overlap" / "scenario.toml")
+    with tempfile.TemporaryDirectory() as tmp:
+        run = driver.Run(root, loaded, loaded.duration, None, False, Path(tmp) / "out", [],
+                         "logit:soak", roles=OVERLAP_ROLES)
+        run.prepare()
+        env = (run.run_dir / "compose.env").read_text()
+        resolved = json.loads((run.run_dir / "scenario.resolved.json").read_text())
+        expect("SOAK_LOGIT_B_CONFIG" not in env and resolved["overlap"] == OVERLAP
+               and resolved["suts"] == ["logit", "logit-b"],
+               f"compose.env and the resolved scenario under an overlap, got {env} "
+               f"{resolved.get('overlap')}")
+        for jsonl in (run.timeline, run.watchdog, run.stats, run.freshness, run.capture):
+            jsonl.close()
+
+        resolver = driver.Run(root, loaded, loaded.duration, None, False, "/nonexistent", [],
+                              "logit:soak")
+        text = json.dumps({"services": {name: {"labels": {"soak.role": role},
+                                               **({"network_mode": OVERLAP_MODES[name]}
+                                                  if name in OVERLAP_MODES else {})}
+                                        for name, role in OVERLAP_ROLES.items()}})
+        resolver.docker = _ConfigDocker(docker.Result(0, text, ""))
+        expect(resolver.resolve_roles() == OVERLAP_ROLES and resolver.modes == OVERLAP_MODES,
+               f"resolve_roles reads the network modes too, got {resolver.modes}")
+
+        class Execs:
+            def __init__(self):
+                self.argv = []
+
+            def exec_(self, container, argv, timeout=None):
+                self.argv.append(argv)
+                return docker.Result(0, "ok", "")
+
+        probe = driver.Run(root, loaded, loaded.duration, None, False, "/nonexistent", [],
+                           "logit:soak", roles=OVERLAP_ROLES)
+        probe.docker = Execs()
+        probe.ids = {"logit-b": "id-b"}
+        probe.timeline = _Records()
+        probe.t0 = 0.0
+        probe.pending_ready = {"logit-b": {"since": driver._now(), "step": "c0s2",
+                                           "why": "start"}}
+        real_print = driver._print
+        driver._print = lambda text, stream=None: None
+        try:
+            probe.poll_ready()
+        finally:
+            driver._print = real_print
+        expect(probe.docker.argv == [["logit", "ready"]] and probe.timeline[-1]["ok"],
+               f"readiness is probed with the container's LOGIT_ADMIN, got {probe.docker.argv}")
+
+        events = []
+        seq = driver.Run(root, loaded, loaded.duration, None, False, tempfile.mkdtemp(dir=tmp),
+                         [], "logit:soak", roles=OVERLAP_ROLES)
+        seq.run_dir.mkdir(parents=True)
+        seq.docker = _ChainDocker([1000.0], events, lambda now: [])
+        seq.ids = {name: f"id-{name}" for name in OVERLAP_ROLES}
+        seq.timeline = _Records()
+        seq.t0 = 900.0
+        seq.inspect_all = lambda: None
+        seq.wait_quiet = lambda: events.append(("quiet",))
+        seq.refresh_vm_base = lambda backend: None
+        reals = (driver._print, vm.force_flush, vm.export_raw)
+        driver._print = lambda text, stream=None: None
+        vm.force_flush = lambda base: None
+        vm.export_raw = lambda base, selector, start, timeout=None: ""
+        try:
+            seq.end_sequence()
+        finally:
+            driver._print, vm.force_flush, vm.export_raw = reals
+        order = [e for e in events if e[0] in ("stop", "quiet")]
+        stopped = [r.get("service") for r in seq.timeline if r.get("phase") == "sut_stopped"]
+        expect(order == [("stop", "id-generator"), ("quiet",), ("stop", "id-logit"),
+                         ("stop", "id-logit-b")] and stopped == ["logit", "logit-b"],
+               f"the generators, one wait on the backends, then each instance, got {order}")
+
+
+# The overlap fixture: logit stopped (or killed) over `STOP`; each instance drains every 5 s.
+OVERLAP_SUT_CONFIG = ("admin: { socket: /tmp/admin.sock }\n"
+                      "components:\n"
+                      "  statsd: { type: statsd_in, reuse_port: true }\n"
+                      "  window:\n"
+                      "    type: aggregate\n"
+                      "    interval: 10s\n")
+
+
+def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, stall=False):
+    """A two-instance run: the generator's two inputs and sinks send `PER_DRAIN` lines per 5 s
+    drain from +5 to +300, `logit` reads 600 of them a drain and `logit-b` 400, until `logit`
+    stops over `STOP` (or `action`, a kill), when `logit-b` reads all 1,000 a drain, `loss`
+    fewer in its first drain after the stop, what the close discarded. `logit`'s last drain
+    before the stop samples `used` bytes in its receive queue. Each instance stamps its series
+    with its name; `unlabeled` adds a series with no label. Under `stall`, `logit-b` delivers
+    nothing from +95 to +180 with a batch queued."""
+    gen = []
+    for offset in range(5, 301, 5):
+        stamp = _stamp(T0 + offset)
+        gen.append(_line(stamp, "logit.process.uptime", "gauge", float(offset)))
+        for index in (0, 1):
+            for metric in ("logit.output.messages", "logit.output.datagrams"):
+                gen.append(_line(stamp, metric, "sum", PER_DRAIN // 2, component=f"out_{index}"))
+            gen.append(_line(stamp, "logit.component.events.sent", "sum", PER_DRAIN // 2,
+                             component=f"load_{index}"))
+            gen.append(_line(stamp, "logit.component.batches.sent", "sum", PER_DRAIN // 200,
+                             component=f"load_{index}"))
+            gen.append(_line(stamp, "logit.component.buffer.batches", "gauge", 0,
+                             component=f"out_{index}"))
+
+    def instance(rows):
+        """NDJSON for one instance from `[(offset, life, life_start, w, delivered, queued,
+        used)]`."""
+        out = []
+        for offset, life, start, w, delivered, queued, sampled in rows:
+            stamp = _stamp(T0 + offset)
+            out.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
+            for metric, value, comp in (("logit.input.datagrams", w, "statsd"),
+                                        ("logit.component.events.sent", w, "statsd"),
+                                        ("logit.component.events.received", w, "instance"),
+                                        ("logit.component.events.sent", w, "instance"),
+                                        ("logit.component.events.received", w, "window"),
+                                        ("logit.transform.metrics.absorbed", w, "window"),
+                                        ("logit.component.events.sent", 1, "window"),
+                                        ("logit.component.events.received", 1, "sink"),
+                                        ("logit.component.batches.received", 1, "sink"),
+                                        ("logit.component.batches.delivered", delivered,
+                                         "sink")):
+                out.append(_line(stamp, metric, "sum", value, component=comp))
+            for metric, value, comp in (("logit.component.buffer.batches", queued, "sink"),
+                                        ("logit.component.buffer.utilization", 0, "sink"),
+                                        ("logit.component.retrying", 0, "sink"),
+                                        ("logit.component.receive.utilization", 0, "statsd"),
+                                        ("logit.input.receive_buffer.used.bytes", sampled,
+                                         "statsd"),
+                                        ("logit.input.receive_buffer.bytes", 212992,
+                                         "statsd")):
+                out.append(_line(stamp, metric, "gauge", value, component=comp))
+        return out
+
+    a_rows, b_rows = [], []
+    w_a = {0: 0, 1: 0}
+    w_b = 0
+    for offset in range(5, 321, 5):
+        sending = offset <= 300
+        down = STOP[0] < offset <= STOP[1] + 4
+        if offset <= STOP[0]:
+            w = 600 if sending else 0
+            a_rows.append((offset, 0, -1, w, 1, 0, used if offset == 100 else 0))
+            w_a[0] += w
+        elif not down:
+            w = 600 if sending else 0
+            a_rows.append((offset, 1, STOP[1], w, 1, 0, 0))
+            w_a[1] += w
+        w = (400 if not down else 1000 - (loss if offset == 105 else 0)) if sending else 0
+        stalled = stall and 95 <= offset <= 180
+        b_rows.append((offset, 0, -1, w, 0 if stalled else 1, 1 if stalled else 0, 0))
+        w_b += w
+    a_stdout = instance(a_rows)
+    timeline = [_phase("start", 0, t0=T0),
+                _action("apply", "c0s1", action, "logit", STOP[0], affects_udp_ingress=True,
+                        affects_egress=True),
+                _action("revert", "c0s1", action, "logit", STOP[1] - 1, STOP[1],
+                        affects_udp_ingress=True, affects_egress=True),
+                _ready("c0s1", "logit", STOP[1] + 1),
+                _phase("end_begin", 300), _phase("quiet", 305, held=True),
+                _phase("sut_stopped", 325, service="logit"),
+                _phase("sut_stopped", 326, service="logit-b"), _phase("end_end", 330)]
+    ledger = {**LEDGER, "source": [{"service": "generator",
+                                    "generator_input": ["load_0", "load_1"],
+                                    "generator_sink": ["out_0", "out_1"],
+                                    "sut_listener": "statsd", "sut_transforms": ["instance"]}],
+              "sink": [{"id": "sink", "backend": "victoria-metrics",
+                        "vm_selector": "{__name__=~\"x_[0-9]+_total\"}"}]}
+    run_dir = _run_dir(tmp, name, timeline, a_stdout, ledger=ledger, services=OVERLAP_ROLES,
+                       suts=["logit", "logit-b"], overlap=OVERLAP,
+                       configs={"sut": "logit-sut.yaml"})
+    (run_dir / "configs").mkdir()
+    (run_dir / "configs" / "logit-sut.yaml").write_text(OVERLAP_SUT_CONFIG)
+    (run_dir / "logs" / "logit-b.stdout").write_text("\n".join(instance(b_rows)) + "\n")
+    (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
+
+    def series(instance_name, segments):
+        values, stamps = [], []
+        for total, offsets in segments:
+            for i, s in enumerate(offsets):
+                values.append(total * (i + 1) // len(offsets))
+                stamps.append(int((T0 + s) * 1000))
+        labels = {"__name__": "x_0_total"}
+        if instance_name is not None:
+            labels["soak_instance"] = instance_name
+        return {"metric": labels, "values": values, "timestamps": stamps}
+
+    export = [series("logit", [(w_a[0], (50, 100)), (w_a[1], (200, 300))]),
+              series("logit-b", [(w_b, (50, 100, 200, 300))])]
+    if unlabeled:
+        export.append(series(None, [(10, (50, 100))]))
+    _write_export(run_dir, "sink", export)
+    return run_dir
+
+
+def _overlap_checks():
+    """The checks over a two-instance run: each per-life row on each instance's own lives and
+    labeled series, `ledger.wire` and `recovery` on the instances' summed ingest, and
+    `ledger.overlap` judging the run's gap against the close's bound: a clean swap passes, a
+    loss within the bound passes and one past it FAILs, a kill is reported and not judged, a
+    series with no instance's label FAILs `ledger.egress`, and a stall of the only instance
+    running FAILs `progress`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        rows = {r.id: r for r in checks.run_all(_overlap_run(tmp, "clean"))}
+        for row in ("ledger.wire", "ledger.overlap", "ledger.intake", "ledger.edge",
+                    "ledger.aggregate", "ledger.egress", "ledger.summary", "identity.sink",
+                    "progress", "recovery", "drops"):
+            expect(row in rows and rows[row].status == checks.PASS,
+                   f"{row} PASSes a clean swap, got {rows.get(row)}")
+        expect("ledger.hop" not in rows, "an overlap run has no ledger.hop row")
+        detail = rows["ledger.overlap"].detail
+        expect(detail.startswith("G 60,000 − Σ(W + K + F) 60,000 (logit 31,800, logit-b "
+                                 "28,200) = 0, within [-")
+               and ", 5]: 1 close(s)" in detail,
+               f"ledger.overlap sums both instances against the generators' two sinks, got "
+               f"{detail}")
+        lines = "\n".join(rows["ledger.overlap"].lines)
+        expect("c0s1 stop on logit at +101s, life 0: gap 0 in the drain intervals across it "
+               "(reported); last logit.input.receive_buffer.used.bytes 2,048 -> at most 5 "
+               "datagram(s) discarded (loose by up to 104" in lines,
+               f"ledger.overlap reports each stop's own numbers, got {lines}")
+        detail = rows["ledger.egress"].detail
+        expect("logit: sink: life 0: W − D − B − X − V 0" in detail
+               and "life 1 (final): Ab 19,800 − V[sink] 19,800 = 0, ok" in detail
+               and "logit-b: sink: life 0 (final): Ab 28,200 − V[sink] 28,200 = 0, ok" in detail,
+               f"ledger.egress judges each instance against its labeled series, got {detail}")
+        expect("logit: final life 1: W − D 19,800 vs E + B 19,800" in rows["ledger.intake"].detail
+               and "logit-b: final life 0: W − D 28,200" in rows["ledger.intake"].detail,
+               f"ledger.intake judges each instance's own final life, got "
+               f"{rows['ledger.intake'].detail}")
+        expect("end to end over the run, G 60,000 less the instances' counted loss 0: sink: ΣV "
+               "60,000 <= G − counted 60,000" in rows["ledger.summary"].detail
+               and "wire G − Σ(W + K + F) 0 over the run" in rows["ledger.summary"].detail,
+               f"ledger.summary bounds V summed over the instances, got "
+               f"{rows['ledger.summary'].detail}")
+        expect("W by instance: logit 31,800, logit-b 28,200" in rows["ledger.wire"].detail,
+               f"ledger.wire reads both instances, got {rows['ledger.wire'].detail}")
+        lines = "\n".join(rows["recovery"].lines)
+        expect("c0s1 (stop on logit): logit sink recovered at" in lines
+               and "c0s1 (stop on logit): logit-b sink recovered at" in lines
+               and "ingest 200/s (100%)" in lines,
+               f"recovery judges each instance on its own drains against the summed ingest, "
+               f"got {lines}")
+        expect("on the instances running through each" in rows["progress"].detail,
+               f"progress judges the instances running, got {rows['progress'].detail}")
+        led = checks.Ledger(checks.instance_view(checks.RunData(_overlap_run(tmp, "view")),
+                                                 "logit-b"))
+        expect(led.problems == [] and led.service == "logit-b" and led.lives == [0]
+               and led.gen_stats["generator"]["G"] == 60000
+               and led.gen_stats["generator"]["batch"] == 200,
+               f"an instance's view reads its own lives and the generator's summed sinks, got "
+               f"{led.problems} {led.lives} {led.gen_stats}")
+
+        within = {r.id: r for r in checks.run_all(_overlap_run(tmp, "within", loss=5))}
+        expect(within["ledger.overlap"].status == checks.PASS
+               and "= 5, within [-" in within["ledger.overlap"].detail
+               and within["ledger.wire"].status == checks.PASS,
+               f"a loss at the close within its bound passes, got {within['ledger.overlap']}")
+        over = {r.id: r for r in checks.run_all(_overlap_run(tmp, "over", loss=6))}
+        expect(over["ledger.overlap"].status == checks.FAIL
+               and "= 6, uncounted, over the closes' 5" in over["ledger.overlap"].detail,
+               f"a loss past the close's bound FAILs, got {over['ledger.overlap']}")
+        killed = {r.id: r for r in checks.run_all(_overlap_run(tmp, "killed", loss=50,
+                                                               action="kill"))}
+        expect(killed["ledger.overlap"].status == checks.SKIP
+               and "reported, not judged: c0s1 kill on logit" in killed["ledger.overlap"].detail
+               and "= 50" in killed["ledger.overlap"].detail,
+               f"a kill of an instance is reported, not judged, got {killed['ledger.overlap']}")
+        unlabeled = {r.id: r for r in checks.run_all(_overlap_run(tmp, "unlabeled",
+                                                                  unlabeled=True))}
+        expect(unlabeled["ledger.egress"].status == checks.FAIL
+               and unlabeled["ledger.egress"].detail.startswith(
+                   "sink: 1 series whose soak_instance names no instance")
+               and "x_0_total" in unlabeled["ledger.egress"].detail,
+               f"a series missing the label FAILs, got {unlabeled['ledger.egress']}")
+        stalled = {r.id: r for r in checks.run_all(_overlap_run(tmp, "stalled", stall=True))}
+        expect(stalled["progress"].status == checks.FAIL
+               and "no sink deliveries in [+120s, +150s): logit-b: hang" in
+               stalled["progress"].detail,
+               f"a stall of the instance running while the other is stopped FAILs, got "
+               f"{stalled['progress']}")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -7368,7 +7833,8 @@ def run(root, quiet=False):
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
                      _standin_server, _respond_rules, _standin_driver, _standin_checks,
                      _class_signatures, _datadog_codec, _datadog_counts, _datadog_server,
-                     _datadog_rules, _datadog_checks, _shipped):
+                     _datadog_rules, _datadog_checks, _overlap_rules, _overlap_driver,
+                     _overlap_checks, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
@@ -7377,7 +7843,7 @@ def run(root, quiet=False):
                               _two_sut_driver,
                               _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
-                              _datadog_rules)
+                              _datadog_rules, _overlap_rules, _overlap_driver)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")
