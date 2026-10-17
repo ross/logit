@@ -1,0 +1,13 @@
+# native-hop-spans' far SUT, merged onto tools/soak/compose.yaml: the base `logit` service under the
+# name `collector`, with its own config, which the driver sets in SOAK_COLLECTOR_CONFIG
+# (`scenario.config_env()`). `extends.file` resolves against the project directory, the base
+# file's, not this file's. Compose merges `volumes` by mount target, so this `/config.yaml`
+# replaces the base service's. `logit` connects to it, so it starts first.
+services:
+  collector:
+    extends: { file: compose.yaml, service: logit }
+    labels: { soak.role: sut }
+    volumes: ["${SOAK_COLLECTOR_CONFIG:?set by script/soak}:/config.yaml:ro,z"]
+  logit:
+    depends_on:
+      collector: { condition: service_healthy }

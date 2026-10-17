@@ -176,8 +176,9 @@ SOURCE_LEDGER_KEYS = ("generator_input", "generator_sink", "sut_listener")
 # A `[[ledger.source]]`: the generator service, its `generate_in` and sink, the SUT listener its
 # lines reach, and, optionally, the wire they cross and the transforms between that listener
 # and `aggregate`, each of which must forward every event it receives. `generator_input` and
-# `generator_sink` may each list several components, whose counts sum (`source_ids()`): a
-# generator that sends several UDP flows has one sink per flow.
+# `generator_sink` may both list components, as many of each, whose counts sum (`source_ids()`),
+# each input feeding the sink at its position (`source_pairs()`): a generator that sends several
+# UDP flows has one input and one sink per flow.
 SOURCE_KEYS = {"service", "generator_input", "generator_sink", "sut_listener"}
 LISTED_SOURCE_KEYS = ("generator_input", "generator_sink")
 OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire"}
@@ -1098,6 +1099,12 @@ def source_ids(source, key):
     return list(value) if isinstance(value, list) else [value]
 
 
+def source_pairs(source):
+    """`[(generator_input, generator_sink)]`: each sink with the input that feeds it, by position
+    when both keys list components, which `load()` holds to one length."""
+    return list(zip(source_ids(source, "generator_input"), source_ids(source, "generator_sink")))
+
+
 def _writer_problems(ledger, configs, directory):
     """What a source's `generator_sink` breaks against its generator's config: on a `file`
     wire it must be a `file_out`, and on any other wire it must not be, because the two read G
@@ -1186,6 +1193,12 @@ def _source_problems(ledger):
                 problems.append(f"{where}: `{key}` must name a component id")
         if "wire" in source and source["wire"] not in WIRES:
             problems.append(f"{where}: `wire` must be one of {', '.join(WIRES)}")
+        listed = [isinstance(source.get(key), list) for key in LISTED_SOURCE_KEYS]
+        if any(listed) and not (all(listed) and len(source["generator_input"])
+                                == len(source["generator_sink"])):
+            problems.append(f"{where}: `generator_input` and `generator_sink` list the same "
+                            "number of components, each input paired with the sink at its "
+                            "position, or each names one")
         listener = source.get("sut_listener")
         if isinstance(listener, str) and _COMPONENT_ID.match(listener):
             if listener in listeners:
