@@ -152,12 +152,10 @@
 //!     Checked with 7, under its own message naming the `null_out` fix
 //!     (`docs/adr/target-components.md`).
 //! 51. A `route` with no `routes:`, an empty key or value, an empty list or a target repeated
-//!     within one list, a `by: signal` key other than `logs`/`metrics`/`traces`, more than 63
-//!     distinct targets (the `Destinations` bitset's width), or an empty `by:` attribute/resource
-//!     key. Runs before 48, so an empty value isn't reported as an unknown target. After 48, its
-//!     reconvergence clause rejects a component listing two destinations one event can reach
-//!     together (two targets of one list, or any two of a `by: signal` route's targets, and the
-//!     route itself when some signal has no route): that component would receive the event twice.
+//!     within one list, more than 63 distinct targets (the `Destinations` bitset's width), or an
+//!     empty `by:` attribute/resource key. Runs before 48, so an empty value isn't reported as an unknown target. After 48, its
+//!     reconvergence clause rejects a component listing two targets of one list: that component
+//!     would receive the event twice.
 //! 52. A `statsd_out` `tls:` failing 44's three checks, messages verbatim
 //!     (`docs/adr/statsd-output.md`). Sink TLS rules are one per sink (24/34/44/52), since each
 //!     also checks its own block.
@@ -1032,16 +1030,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     );
                 }
             }
-            if matches!(by, logit_config::RouteBy::Signal) {
-                if let Some(key) =
-                    routes.keys().find(|key| logit_config::Signal::from_name(key).is_none())
-                {
-                    anyhow::bail!(
-                        "component '{id}': '{key}' is not a signal -- under 'by: signal' the \
-                         'routes' keys are logs, metrics, and traces"
-                    );
-                }
-            }
             let distinct = targets_of(component).len();
             if distinct > crate::Destinations::MAX_TARGETS {
                 anyhow::bail!(
@@ -1053,7 +1041,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             let by_key = match by {
                 logit_config::RouteBy::Attribute(key) => Some(("attribute", key)),
                 logit_config::RouteBy::Resource(key) => Some(("resource", key)),
-                logit_config::RouteBy::Provenance(_) | logit_config::RouteBy::Signal => None,
+                logit_config::RouteBy::Provenance(_) => None,
             };
             if let Some((field, key)) = by_key {
                 if key.is_empty() {
@@ -1124,26 +1112,16 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // that event, so the consumer receives it twice, a double count with no config line saying so.
     // An ordinary diamond (`in -> [a, b] -> c`) is legal because each branch is a component the
     // operator placed and `c` lists both by choice; here the copy is the router's and invisible.
-    // Co-marked sets: each `routes:` list, and under `by: signal` every target, plus the router
-    // itself when some signal has no route (a log-and-metrics event can reach both signals'
-    // targets and, for an unrouted signal, the router's own consumers). With every signal routed,
-    // only a payload-less event reaches the router's edge, and it reaches nothing else.
+    // Co-marked sets: each `routes:` list.
     // Reconvergence further downstream (`a -> x`, `b -> x`) is not
     // checked (`docs/known-gaps/runtime.md`).
     for (id, component) in &components {
-        let ComponentKind::Route { by, routes } = &component.kind else { continue };
-        let mut groups: Vec<Vec<&str>> = routes
+        let ComponentKind::Route { routes, .. } = &component.kind else { continue };
+        let groups: Vec<Vec<&str>> = routes
             .values()
             .filter(|targets| targets.0.len() > 1)
             .map(|targets| targets.ids().collect())
             .collect();
-        if matches!(by, logit_config::RouteBy::Signal) {
-            let mut all = targets_of(component);
-            if ["logs", "metrics", "traces"].iter().any(|signal| !routes.contains_key(*signal)) {
-                all.push(id.as_str());
-            }
-            groups.push(all);
-        }
         for (consumer, c) in &components {
             for group in &groups {
                 let both: Vec<&str> = c
@@ -10132,39 +10110,6 @@ mod tests {
         assert!(err.contains("route value 'host' lists target 't' more than once"), "got: {err}");
     }
 
-    #[test]
-    fn a_route_by_signal_accepts_only_signal_names_as_keys() {
-        let err = expect_err(cfg_with_targets(vec![
-            ("in", vec![], vec![], listener()),
-            ("r", vec!["in"], vec![], route(logit_config::RouteBy::Signal, &[("log", "t")])),
-            ("t", vec![], vec![], target()),
-            ("out", vec!["t"], vec![], sink()),
-            ("rest", vec!["r"], vec![], null_out()),
-        ]));
-        assert!(err.contains("'log' is not a signal"), "got: {err}");
-
-        resolve(cfg_with_targets(vec![
-            ("in", vec![], vec![], listener()),
-            (
-                "r",
-                vec!["in"],
-                vec![],
-                route(
-                    logit_config::RouteBy::Signal,
-                    &[("logs", "l"), ("metrics", "m"), ("traces", "t")],
-                ),
-            ),
-            ("l", vec![], vec![], target()),
-            ("m", vec![], vec![], target()),
-            ("t", vec![], vec![], target()),
-            ("l_out", vec!["l"], vec![], sink()),
-            ("m_out", vec!["m"], vec![], sink()),
-            ("t_out", vec!["t"], vec![], sink()),
-            ("rest", vec!["r"], vec![], null_out()),
-        ]))
-        .expect("logs, metrics, and traces are the signal keys");
-    }
-
     /// `Destinations` is a `u64` with slot 0 for `Forward`, so 63 targets is the most a mark can
     /// name.
     #[test]
@@ -10234,49 +10179,6 @@ mod tests {
             ("rest", vec!["r"], vec![], null_out()),
         ]))
         .expect("first-match routing never marks one event for both a and b");
-    }
-
-    /// With every signal routed, only an event with no payload reaches the router's own edge, and
-    /// it reaches nothing else, so a consumer may read the route and one of its targets.
-    #[test]
-    fn a_consumer_of_a_fully_routed_signal_route_and_one_of_its_targets_resolves() {
-        resolve(cfg_with_targets(vec![
-            ("in", vec![], vec![], listener()),
-            (
-                "r",
-                vec!["in"],
-                vec![],
-                route(
-                    logit_config::RouteBy::Signal,
-                    &[("logs", "l"), ("metrics", "m"), ("traces", "t")],
-                ),
-            ),
-            ("l", vec![], vec![], target()),
-            ("m", vec![], vec![], target()),
-            ("t", vec![], vec![], target()),
-            ("m_out", vec!["m"], vec![], sink()),
-            ("t_out", vec!["t"], vec![], sink()),
-            ("both", vec!["r", "l"], vec![], sink()),
-        ]))
-        .expect("the router's own edge is never co-marked when every signal is routed");
-    }
-
-    /// Under `by: signal` a mixed event can reach any of the route's destinations, the router's
-    /// own edge included.
-    #[test]
-    fn a_consumer_of_a_signal_route_and_one_of_its_targets_is_rejected() {
-        let err = expect_err(cfg_with_targets(vec![
-            ("in", vec![], vec![], listener()),
-            ("r", vec!["in"], vec![], route(logit_config::RouteBy::Signal, &[("logs", "l")])),
-            ("l", vec![], vec![], target()),
-            ("l_out", vec!["l"], vec![], sink()),
-            ("both", vec!["r", "l"], vec![], sink()),
-        ]));
-        assert!(
-            err.contains("component 'both' lists 'l' and 'r' in its sources")
-                || err.contains("component 'both' lists 'r' and 'l' in its sources"),
-            "got: {err}"
-        );
     }
 
     fn route_signals(

@@ -563,17 +563,6 @@ pub enum Signal {
     Traces,
 }
 
-impl Signal {
-    /// The signal a config string names, by the same names `signals:` deserializes (`logs`,
-    /// `metrics`, `traces`), for a key that arrives as a map key rather than a typed value
-    /// (`route`'s `routes:` under `by: signal`).
-    pub fn from_name(name: &str) -> Option<Signal> {
-        use serde::de::{value::StrDeserializer, IntoDeserializer};
-        let name: StrDeserializer<'_, serde::de::value::Error> = name.into_deserializer();
-        Signal::deserialize(name).ok()
-    }
-}
-
 /// `has_signal`'s matching rule. `any_of` forwards an event carrying at least one listed signal,
 /// untouched, even if it also carries an unlisted one. `only` also requires the event carry
 /// nothing outside `signals`: a mixed event with an unlisted signal is dropped, not trimmed
@@ -587,18 +576,13 @@ pub enum MatchMode {
 }
 
 /// What one `route` reads from each event. Written `by: {provenance: origin}`, `by: {attribute:
-/// stream}`, `by: {resource: service.name}`, or `by: signal`.
+/// stream}`, or `by: {resource: service.name}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteBy {
     Provenance(ProvenanceField),
     Attribute(String),
     Resource(String),
-    /// The signals the event carries. `routes:` keys are `logs`, `metrics`, and `traces`. An
-    /// event goes to the targets of every signal it carries, whole, never split per signal; a
-    /// carried signal with no route sends it to this component's ordinary consumers as well. An
-    /// event that carries no signal goes to the ordinary consumers.
-    Signal,
 }
 
 /// One `routes:` value: a target id, or a non-empty list of target ids that each receive a copy
@@ -2890,8 +2874,7 @@ pub enum ComponentKind {
         /// event. Several values may name one target. The router's edges derive from these
         /// values, so there is no separate `targets:` list. Must be non-empty, with no empty key,
         /// value, or list, no target repeated within one list, and at most 63 distinct targets;
-        /// every id must name a `target` component. Under `by: signal`, the keys are `logs`,
-        /// `metrics`, and `traces`.
+        /// every id must name a `target` component.
         routes: std::collections::BTreeMap<String, RouteTargets>,
     },
     /// Sends each signal an event carries to that signal's target: logs to one, metrics to

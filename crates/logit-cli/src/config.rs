@@ -451,10 +451,9 @@ components:
         }
     }
 
-    /// `route`'s `routes:` values read as a target id or a list of them, and `by: signal` as a
-    /// bare string, through YAML.
+    /// `route`'s `routes:` values read as a target id or a list of them, through YAML.
     #[test]
-    fn route_targets_and_by_signal_read_through_the_real_yaml_path() {
+    fn route_targets_read_through_the_real_yaml_path() {
         let yaml = r#"
 components:
   in:
@@ -463,7 +462,7 @@ components:
   split:
     type: route
     sources: [in]
-    by: signal
+    by: {attribute: stream}
     routes:
       logs: [logs_stream, archive]
       traces: traces_stream
@@ -471,7 +470,7 @@ components:
         let config = parse(yaml, &env(&[])).expect("should parse");
         match &config.components["split"].kind {
             logit_config::ComponentKind::Route { by, routes } => {
-                assert_eq!(by, &logit_config::RouteBy::Signal);
+                assert_eq!(by, &logit_config::RouteBy::Attribute("stream".into()));
                 assert_eq!(
                     routes["logs"],
                     logit_config::RouteTargets(vec!["logs_stream".into(), "archive".into()])

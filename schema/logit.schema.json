@@ -2345,7 +2345,7 @@
             },
             "receive": true,
             "routes": {
-              "description": "Value to a target id, or to a list of target ids that each receive a copy of a matching event. Several values may name one target. The router's edges derive from these values, so there is no separate `targets:` list. Must be non-empty, with no empty key, value, or list, no target repeated within one list, and at most 63 distinct targets; every id must name a `target` component. Under `by: signal`, the keys are `logs`, `metrics`, and `traces`.",
+              "description": "Value to a target id, or to a list of target ids that each receive a copy of a matching event. Several values may name one target. The router's edges derive from these values, so there is no separate `targets:` list. Must be non-empty, with no empty key, value, or list, no target repeated within one list, and at most 63 distinct targets; every id must name a `target` component.",
               "type": "object",
               "additionalProperties": {
                 "$ref": "#/definitions/RouteTargets"
@@ -5320,7 +5320,7 @@
       ]
     },
     "RouteBy": {
-      "description": "What one `route` reads from each event. Written `by: {provenance: origin}`, `by: {attribute: stream}`, `by: {resource: service.name}`, or `by: signal`.",
+      "description": "What one `route` reads from each event. Written `by: {provenance: origin}`, `by: {attribute: stream}`, or `by: {resource: service.name}`.",
       "oneOf": [
         {
           "type": "object",
@@ -5357,13 +5357,6 @@
             }
           },
           "additionalProperties": false
-        },
-        {
-          "description": "The signals the event carries. `routes:` keys are `logs`, `metrics`, and `traces`. An event goes to the targets of every signal it carries, whole, never split per signal; a carried signal with no route sends it to this component's ordinary consumers as well. An event that carries no signal goes to the ordinary consumers.",
-          "type": "string",
-          "enum": [
-            "signal"
-          ]
         }
       ]
     },
