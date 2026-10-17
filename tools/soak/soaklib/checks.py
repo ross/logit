@@ -30,7 +30,8 @@ reports one line per sink, and takes the worst status. Under `split = "copy"` ea
 full copy of `aggregate`'s output, so each sink's V is judged alone; under `split = "route"` the
 sinks' V add up to it, so the egress gap is judged on their sum. That holds because `load()`
 refuses `split = "route"` over a `route` that can send one event to several targets (a
-list-valued `routes:` value or `by: signal`), so each event reaches one sink.
+list-valued `routes:` value or `by: signal`) and over any `route_signals`, so each event reaches
+one sink.
 
 The ledger also follows each `[[ledger.source]]`, a generator and the SUT listener it reaches
 over the source's `wire` (`WIRES`), which names the counters each symbol reads.

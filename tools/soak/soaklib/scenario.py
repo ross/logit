@@ -917,12 +917,12 @@ def listener_wire(text, component):
     return None, None, None
 
 
-def _route_blocks(text):
-    """`(id, body)` for each `type: route` component in config `text`, comments removed: the
+def _route_blocks(text, kind="route"):
+    """`(id, body)` for each `type: <kind>` component in config `text`, comments removed: the
     component's own header line and every deeper-indented line after it."""
     lines = [re.sub(r"(^|\s)#.*$", "", line) for line in (text or "").splitlines()]
     for index, line in enumerate(lines):
-        if not re.search(r"\btype\s*:\s*[\"']?route\b", line):
+        if not re.search(r"\btype\s*:\s*[\"']?" + re.escape(kind) + r"\b", line):
             continue
         indent = len(line) - len(line.lstrip())
         head = index
@@ -973,10 +973,15 @@ def _routes_value(body):
 def _route_problems(ledger, sut_text):
     """Under `split = "route"`, the sinks' V add up only if a router sends each event to one
     target. A `routes:` value that is a list, or `by: signal`, can deliver one event to several
-    sinks, so the SUT config's `route` components must use neither."""
+    sinks, so the SUT config's `route` components must use neither. A `route_signals` can send
+    parts of one event to several sinks under either `strip:` value, so it is refused outright."""
     if ledger.get("split", "copy") != "route":
         return []
     problems = []
+    for name, _ in _route_blocks(sut_text, "route_signals"):
+        problems.append(f"ledger.split = \"route\": route_signals {name!r} can deliver parts of "
+                        "one event to several sinks, so their totals don't add up; use "
+                        "split = \"copy\" or a route with one target per value")
     for name, body in _route_blocks(sut_text):
         listed = re.search(r"\[|^\s*-\s", _routes_value(body), re.M)
         by_signal = re.search(r"\bby\s*:\s*[\"']?signal\b", body)

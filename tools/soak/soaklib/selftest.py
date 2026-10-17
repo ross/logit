@@ -5178,6 +5178,14 @@ def _tcp_rules(root):
         expect(route_problems(text, split="copy") == [],
                f"{name} loads under split = copy, got {route_problems(text, split='copy')}")
 
+    by_signals = "components:\n  split:\n    type: route_signals\n" \
+                 "    signals: { logs: tier_a, metrics: tier_b }\n"
+    problems = route_problems(by_signals)
+    expect(len(problems) == 1 and "route_signals 'split'" in problems[0],
+           f"a route_signals under split = route is refused, got {problems}")
+    copied = route_problems(by_signals, split="copy")
+    expect(copied == [], f"a route_signals loads under split = copy, got {copied}")
+
     # The fault predicates per wire.
     roles = scenario.BASE_ROLES
     for action, on, udp, tcp, file in (
