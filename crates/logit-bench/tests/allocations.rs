@@ -26,7 +26,7 @@ use logit_outputs::kafka::{KafkaEncoder, RecordFormat, RecordKey, RecordMode};
 use logit_outputs::statsd::{Format as StatsdFormat, StatsdEncoder};
 use logit_outputs::stdio::{EventDump, Format};
 use logit_outputs::syslog::{Format as SyslogFormat, SyslogEncoder};
-use logit_pipeline::runtime::{drain_inbox, route_batch, InHand};
+use logit_pipeline::runtime::{drain_inbox, route_batch, InHand, Partition};
 use logit_pipeline::{
     process_batch, send_batch, unwrap_batch, BatchContext, Delivered, Fanout, RouterScratch,
     SinkQueue, SinkQueueConfig, SinkStore, Transform,
@@ -2064,12 +2064,9 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
 fn route_by_stream() -> logit_transforms::Route {
     logit_transforms::Route::new(
         logit_config::RouteBy::Attribute("stream".to_string()),
-        &[
-            ("host".to_string(), "host_stream".to_string()),
-            ("app".to_string(), "app_stream".to_string()),
-        ]
-        .into_iter()
-        .collect(),
+        &[("host".to_string(), "host_stream".into()), ("app".to_string(), "app_stream".into())]
+            .into_iter()
+            .collect(),
         &["host_stream".to_string(), "app_stream".to_string()],
     )
 }
@@ -2103,9 +2100,7 @@ fn route_batch_two_targets_costs_one_vec_per_used_destination() {
 fn route_batch_all_to_one_target_costs_two() {
     let mut route = logit_transforms::Route::new(
         logit_config::RouteBy::Attribute("stream".to_string()),
-        &[("host".to_string(), "t".to_string()), ("app".to_string(), "t".to_string())]
-            .into_iter()
-            .collect(),
+        &[("host".to_string(), "t".into()), ("app".to_string(), "t".into())].into_iter().collect(),
         &["t".to_string()],
     );
     let telemetry = Telemetry::default();
@@ -2128,7 +2123,7 @@ fn route_batch_all_to_one_target_costs_two() {
 fn route_batch_all_unrouted_costs_two() {
     let mut route = logit_transforms::Route::new(
         logit_config::RouteBy::Attribute("stream".to_string()),
-        &[("db".to_string(), "t".to_string())].into_iter().collect(),
+        &[("db".to_string(), "t".into())].into_iter().collect(),
         &["t".to_string()],
     );
     let telemetry = Telemetry::default();
@@ -2140,9 +2135,69 @@ fn route_batch_all_unrouted_costs_two() {
     let batch = fixtures::nginx_batch_alternating_stream(64);
     let (out, stats) = measure(|| route_batch(&mut route, &mut scratch, batch, &telemetry));
     assert_eq!(out.len(), 1, "only the Forward partition should be non-empty");
-    assert_eq!(out[0].0, 0, "slot 0 is Destination::Forward");
+    assert_eq!(out[0].0, 0, "slot 0 is Destinations::FORWARD");
     assert_eq!(out[0].1.events.len(), 64);
     expect_allocs("route_batch: 64 events, all unrouted (Forward only)", stats, 2);
+}
+
+/// A `route` over `fixtures::nginx_batch_alternating_stream` with each value naming the listed
+/// targets, both targets being `a` and `b`.
+fn route_by_stream_lists(host: &[&str], app: &[&str]) -> logit_transforms::Route {
+    let ids = |targets: &[&str]| {
+        logit_config::RouteTargets(targets.iter().map(|t| t.to_string()).collect())
+    };
+    logit_transforms::Route::new(
+        logit_config::RouteBy::Attribute("stream".to_string()),
+        &[("host".to_string(), ids(host)), ("app".to_string(), ids(app))].into_iter().collect(),
+        &["a".to_string(), "b".to_string()],
+    )
+}
+
+/// The shared path: every event's mark names both targets, so the incoming batch goes out whole
+/// behind one `Arc` both destinations hold. `2`: the returned `Vec` and the `Arc::new`. Nothing
+/// is reserved and no event is cloned, whatever the batch size.
+#[test]
+fn route_batch_one_mark_for_two_targets_shares_one_arc() {
+    let mut route = route_by_stream_lists(&["a", "b"], &["a", "b"]);
+    let telemetry = Telemetry::default();
+    let mut scratch = RouterScratch::new(2);
+
+    let warm = fixtures::nginx_batch_alternating_stream(64);
+    drop(route_batch(&mut route, &mut scratch, warm, &telemetry));
+
+    let batch = fixtures::nginx_batch_alternating_stream(64);
+    let (out, stats) = measure(|| route_batch(&mut route, &mut scratch, batch, &telemetry));
+    assert!(
+        matches!(out.as_slice(), [(1, Partition::Shared(_)), (2, Partition::Shared(_))]),
+        "both targets should share the one batch"
+    );
+    expect_allocs("route_batch: 64 events, one mark naming 2 targets (shared Arc)", stats, 2);
+}
+
+/// The mixed path: `host` events go to both targets, `app` events to `b` alone, so the 32 `host`
+/// events are each cloned into `a` and moved into `b`. 99:
+///
+/// - **3**: the returned `Vec` plus one `reserve_exact` per destination used, as in
+///   [`route_batch_two_targets_costs_one_vec_per_used_destination`].
+/// - **96**: 32 event clones × 3, the per-event clone cost
+///   [`fan_out_plus_two_has_attributes_for_the_same_split`] explains for this fixture.
+///
+/// The copies scale with the events marked for more than one target, never with the rest.
+#[test]
+fn route_batch_mixed_marks_clone_only_the_multi_target_events() {
+    let mut route = route_by_stream_lists(&["a", "b"], &["b"]);
+    let telemetry = Telemetry::default();
+    let mut scratch = RouterScratch::new(2);
+
+    let warm = fixtures::nginx_batch_alternating_stream(64);
+    drop(route_batch(&mut route, &mut scratch, warm, &telemetry));
+
+    let batch = fixtures::nginx_batch_alternating_stream(64);
+    let (out, stats) = measure(|| route_batch(&mut route, &mut scratch, batch, &telemetry));
+    let sizes: Vec<(usize, usize)> =
+        out.iter().map(|(slot, batch)| (*slot, batch.events.len())).collect();
+    assert_eq!(sizes, vec![(1, 32), (2, 64)]);
+    expect_allocs("route_batch: 64 events, 32 marked for 2 targets (mixed)", stats, 99);
 }
 
 /// The comparison the ADR cites (`docs/adr/target-components.md`'s "Two costs are structural to

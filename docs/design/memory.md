@@ -947,19 +947,29 @@ which allocates only when a transform pushes onto it
 
 [ADR `target-components`](../adr/target-components.md) gives the graph a second way to fork a
 batch besides `Fanout`'s unconditional fan-out: a `Router` node (`route`, or `lua`/`lua_file` with
-`targets:`) moves each event into exactly one of `1 + targets.len()` destination buffers in one
-pass over the batch (`crate::runtime::route_batch`, `crates/logit-pipeline/src/router.rs`), then
-sends every non-empty one under a single child `BatchContext`. The rule this buys, measured exactly
-(`crates/logit-bench/tests/allocations.rs`'s `// Routing` section, all zero per-event allocations,
-one `reserve_exact` per used destination):
+`targets:`) moves each event into one of `1 + targets.len()` destination buffers in one pass over
+the batch (`crate::runtime::route_batch`, `crates/logit-pipeline/src/router.rs`), then sends every
+non-empty one under a single child `BatchContext`. An event a `route` list or `by: signal` marks
+for several destinations is cloned into each but the last. The rule this buys, as exact counts
+(`crates/logit-bench/tests/allocations.rs`'s `// Routing` section; the first three rows have zero
+per-event allocations and one `reserve_exact` per used destination):
 
 | Shape (`route`, 64 events, `by: {attribute: stream}`) | Allocations |
 |---|---:|
 | 2 targets, evenly split (both used) | **3** |
 | All 64 to one target (many-to-one `routes:`) | **2** |
 | All 64 unrouted (no match — the router's own `Forward` edge) | **2** |
+| All 64 to both of 2 targets (one mark for the batch: one shared `Arc`) | **2** |
+| 32 to both of 2 targets, 32 to one (mixed marks: 3 + 32 event clones × 3) | **99** |
 
-**The rule is `1 + (destinations that received events)`, never per event and never for a
+**A mark shared by the whole batch costs 2 however many destinations it names**: the returned list
+and one `Arc::new` around the incoming batch, which every destination holds and sends as
+`Delivered::Shared`. A sink borrows it; a mutating consumer pays §3's copy-on-write clone only
+while another destination still holds it. **Mixed marks pay the event clones**, and only for the
+events bound for more than one destination; this fixture's per-event clone is 3, as below.
+
+**For events bound for one destination each, the rule is `1 + (destinations that received
+events)`, never per event and never for a
 destination nothing was routed to**: 1 for the returned partition list itself
 (`Vec::with_capacity(used)`), plus exactly one `reserve_exact` per non-empty destination —
 `RouterScratch`'s `marks`/`counts` buffers amortize to zero after warm-up, but each destination's

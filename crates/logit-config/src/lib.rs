@@ -563,6 +563,17 @@ pub enum Signal {
     Traces,
 }
 
+impl Signal {
+    /// The signal a config string names, by the same names `signals:` deserializes (`logs`,
+    /// `metrics`, `traces`), for a key that arrives as a map key rather than a typed value
+    /// (`route`'s `routes:` under `by: signal`).
+    pub fn from_name(name: &str) -> Option<Signal> {
+        use serde::de::{value::StrDeserializer, IntoDeserializer};
+        let name: StrDeserializer<'_, serde::de::value::Error> = name.into_deserializer();
+        Signal::deserialize(name).ok()
+    }
+}
+
 /// `has_signal`'s matching rule. `any_of` forwards an event carrying at least one listed signal,
 /// untouched, even if it also carries an unlisted one. `only` also requires the event carry
 /// nothing outside `signals`: a mixed event with an unlisted signal is dropped, not trimmed
@@ -576,13 +587,97 @@ pub enum MatchMode {
 }
 
 /// What one `route` reads from each event. Written `by: {provenance: origin}`, `by: {attribute:
-/// stream}`, or `by: {resource: service.name}`.
+/// stream}`, `by: {resource: service.name}`, or `by: signal`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteBy {
     Provenance(ProvenanceField),
     Attribute(String),
     Resource(String),
+    /// The signals the event carries. `routes:` keys are `logs`, `metrics`, and `traces`. An
+    /// event goes to the targets of every signal it carries, whole, never split per signal; a
+    /// carried signal with no route sends it to this component's ordinary consumers as well. An
+    /// event that carries no signal goes to the ordinary consumers.
+    Signal,
+}
+
+/// One `routes:` value: a target id, or a non-empty list of target ids that each receive a copy
+/// of a matching event. Written `host: host_stream` or `host: [host_stream, archive]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteTargets(pub Vec<String>);
+
+impl RouteTargets {
+    /// The target ids, in the order written.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+}
+
+impl From<&str> for RouteTargets {
+    fn from(id: &str) -> Self {
+        RouteTargets(vec![id.to_string()])
+    }
+}
+
+impl Serialize for RouteTargets {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0.as_slice() {
+            [one] => serializer.serialize_str(one),
+            many => many.serialize(serializer),
+        }
+    }
+}
+
+// Hand-rolled rather than `#[serde(untagged)]`, whose error names no expected shape.
+impl<'de> Deserialize<'de> for RouteTargets {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = RouteTargets;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a target id or a list of target ids")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, id: &str) -> Result<RouteTargets, E> {
+                Ok(RouteTargets(vec![id.to_string()]))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<RouteTargets, A::Error> {
+                let mut ids = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(id) = seq.next_element::<String>()? {
+                    ids.push(id);
+                }
+                Ok(RouteTargets(ids))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+// The schema `RouteTargets` publishes; its doc comment is the schema's description.
+/// A target id, or a non-empty list of target ids that each receive a copy of a matching event.
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum RouteTargetsSchema {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl JsonSchema for RouteTargets {
+    fn schema_name() -> String {
+        "RouteTargets".to_string()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        RouteTargetsSchema::json_schema(generator)
+    }
 }
 
 /// Which half of a batch's provenance a `route` switches on: `origin` is the component that
@@ -2730,17 +2825,24 @@ pub enum ComponentKind {
         #[schemars(with = "Option<String>")]
         max_ahead: Option<Duration>,
     },
-    /// Equality-only routing: one key read per event, one target per matching value. There is no
-    /// predicate language; use `lua` for a condition. An event whose key is absent, or whose
-    /// value no route names, is unrouted: it goes to this component's ordinary consumers, the
-    /// components that list it in `sources:`. A `route` must have at least one; to discard
-    /// unrouted events, list it in a `null_out`'s `sources:`.
+    /// Equality-only routing: one key read per event, which goes to the targets of the first
+    /// value it matches. There is no predicate language; use `lua` for a condition. An event whose key is
+    /// absent, or whose value no route names, is unrouted: it goes to this component's ordinary
+    /// consumers, the components that list it in `sources:`. A `route` must have at least one; to
+    /// discard unrouted events, list it in a `null_out`'s `sources:`.
+    ///
+    /// An event bound for several targets is copied to each, and its copies count as
+    /// `logit.component.events.copied`. No component may list two targets one event can reach
+    /// together in its `sources:`, since it would receive that event twice.
     Route {
         by: RouteBy,
-        /// Value to target id. Several values may name one target. The router's edges derive
-        /// from these values, so there is no separate `targets:` list. Must be non-empty, with no
-        /// empty key or value, and every value must name a `target` component.
-        routes: std::collections::BTreeMap<String, String>,
+        /// Value to a target id, or to a list of target ids that each receive a copy of a matching
+        /// event. Several values may name one target. The router's edges derive from these
+        /// values, so there is no separate `targets:` list. Must be non-empty, with no empty key,
+        /// value, or list, no target repeated within one list, and at most 63 distinct targets;
+        /// every id must name a `target` component. Under `by: signal`, the keys are `logs`,
+        /// `metrics`, and `traces`.
+        routes: std::collections::BTreeMap<String, RouteTargets>,
     },
     /// Parses a log record's message as logfmt (`level=info msg="hello world" dur=3ms`), merging
     /// the resulting key/values into the event's attributes. Additive, and a failed parse passes
@@ -9476,8 +9578,8 @@ mod tests {
                 assert_eq!(
                     routes,
                     std::collections::BTreeMap::from([
-                        ("host".to_string(), "host_stream".to_string()),
-                        ("app".to_string(), "app_stream".to_string()),
+                        ("host".to_string(), "host_stream".into()),
+                        ("app".to_string(), "app_stream".into()),
                     ])
                 );
             }

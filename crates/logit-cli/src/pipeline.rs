@@ -1640,7 +1640,7 @@ fn build_spec(
         // registry at one spec per component.
         Target {} => NodeSpec::Target,
 
-        // `Route::new` resolves each `routes:` value to a slot in `component.targets` once (rules
+        // `Route::new` resolves each `routes:` value to its slots in `component.targets` once (rules
         // 48 and 51 guarantee each resolves). No `with_telemetry`: `route` records no layer-3
         // points (`logit_transforms::route`'s module doc).
         Route { by, routes } => {
@@ -3120,8 +3120,8 @@ mod tests {
             kind: ComponentKind::Route {
                 by: logit_config::RouteBy::Attribute("stream".to_string()),
                 routes: [
-                    ("host".to_string(), "host_stream".to_string()),
-                    ("app".to_string(), "app_stream".to_string()),
+                    ("host".to_string(), "host_stream".into()),
+                    ("app".to_string(), "app_stream".into()),
                 ]
                 .into_iter()
                 .collect(),

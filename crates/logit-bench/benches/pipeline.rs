@@ -808,7 +808,7 @@ mod survey_batch {
     fn route_batch_100_access_logs(bencher: Bencher) {
         let mut router = logit_transforms::Route::new(
             logit_config::RouteBy::Attribute("backend_type".to_string()),
-            &[("client backend".to_string(), "backends".to_string())].into_iter().collect(),
+            &[("client backend".to_string(), "backends".into())].into_iter().collect(),
             &["backends".to_string()],
         );
         let mut scratch = RouterScratch::new(1);

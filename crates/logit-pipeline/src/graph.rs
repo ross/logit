@@ -149,8 +149,13 @@
 //!     consumers receive every event no target claims, so with none those events would vanish.
 //!     Checked with 7, under its own message naming the `null_out` fix
 //!     (`docs/adr/target-components.md`).
-//! 51. A `route` with no `routes:`, an empty key or value, or an empty `by:` attribute/resource
-//!     key. Runs before 48, so an empty value isn't reported as an unknown target.
+//! 51. A `route` with no `routes:`, an empty key or value, an empty list or a target repeated
+//!     within one list, a `by: signal` key other than `logs`/`metrics`/`traces`, more than 63
+//!     distinct targets (the `Destinations` bitset's width), or an empty `by:` attribute/resource
+//!     key. Runs before 48, so an empty value isn't reported as an unknown target. After 48, its
+//!     reconvergence clause rejects a component listing two destinations one event can reach
+//!     together (two targets of one list, or any two of a `by: signal` route's targets and the
+//!     route itself): that component would receive the event twice.
 //! 52. A `statsd_out` `tls:` failing 44's three checks, messages verbatim
 //!     (`docs/adr/statsd-output.md`). Sink TLS rules are one per sink (24/34/44/52), since each
 //!     also checks its own block.
@@ -514,18 +519,22 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
 }
 
 /// Every router -> target edge one component declares, with the route key that produced it (`None`
-/// for a `lua`/`lua_file` `targets:` entry, whose key is the script's `event:to("..")`). Keeps
-/// duplicates: this is the *edge* list, where [`targets_of`] is the slot list, so a `route` mapping
-/// two values onto one target appears here twice and there once. Any other kind has no edges; rule
+/// for a `lua`/`lua_file` `targets:` entry, whose key is the script's `event:to("..")`). A
+/// list-valued `routes:` value yields one edge per listed id. Keeps duplicates: this is the *edge*
+/// list, where [`targets_of`] is the slot list, so a `route` mapping two values onto one target
+/// appears here twice and there once. Any other kind has no edges; rule
 /// 47 rejects `targets:` on one.
 ///
 /// Public for the same reason as [`role`]: `logit graph` (`logit-cli`'s `dot.rs`) renders these
 /// edges off a raw `Config`.
 pub fn target_edges(component: &Component) -> Vec<(Option<&str>, &str)> {
     match &component.kind {
-        ComponentKind::Route { routes, .. } => {
-            routes.iter().map(|(key, target)| (Some(key.as_str()), target.as_str())).collect()
-        }
+        ComponentKind::Route { routes, .. } => routes
+            .iter()
+            .flat_map(|(key, targets)| {
+                targets.ids().map(move |target| (Some(key.as_str()), target))
+            })
+            .collect(),
         ComponentKind::Lua { .. } | ComponentKind::LuaFile { .. } => {
             component.targets.iter().map(|target| (None, target.as_str())).collect()
         }
@@ -534,7 +543,8 @@ pub fn target_edges(component: &Component) -> Vec<(Option<&str>, &str)> {
 }
 
 /// The slot-ordered, de-duplicated `target` ids one component directs events into: a `route`'s
-/// `routes:` values in key order (first occurrence wins), a `lua`/`lua_file`'s `targets:` as
+/// `routes:` values in key order, each list in its written order (first occurrence wins), a
+/// `lua`/`lua_file`'s `targets:` as
 /// written, nothing for any other kind. This order is what a router's slot index means downstream
 /// (the node runtime's `Vec<Fanout>`, a Lua worker's `event:to("..")` table), so it is derived here
 /// once (`docs/adr/target-components.md`).
@@ -956,16 +966,49 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      match a real value"
                 );
             }
-            if routes.values().any(|target| target.is_empty()) {
+            if routes.values().any(|targets| targets.ids().any(str::is_empty)) {
                 anyhow::bail!(
                     "component '{id}': a route 'routes' value must not be empty -- it could \
                      never name a real target"
                 );
             }
+            for (value, targets) in routes {
+                if targets.0.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': route value '{value}' names an empty list -- list at \
+                         least one target"
+                    );
+                }
+                let mut seen = std::collections::HashSet::new();
+                if let Some(repeat) = targets.ids().find(|target| !seen.insert(*target)) {
+                    anyhow::bail!(
+                        "component '{id}': route value '{value}' lists target '{repeat}' more \
+                         than once -- one event can reach a target only once"
+                    );
+                }
+            }
+            if matches!(by, logit_config::RouteBy::Signal) {
+                if let Some(key) =
+                    routes.keys().find(|key| logit_config::Signal::from_name(key).is_none())
+                {
+                    anyhow::bail!(
+                        "component '{id}': '{key}' is not a signal -- under 'by: signal' the \
+                         'routes' keys are logs, metrics, and traces"
+                    );
+                }
+            }
+            let distinct = targets_of(component).len();
+            if distinct > crate::Destinations::MAX_TARGETS {
+                anyhow::bail!(
+                    "component '{id}': a route can direct at most {} distinct targets, and this \
+                     one names {distinct} -- split it across two routes",
+                    crate::Destinations::MAX_TARGETS
+                );
+            }
             let by_key = match by {
                 logit_config::RouteBy::Attribute(key) => Some(("attribute", key)),
                 logit_config::RouteBy::Resource(key) => Some(("resource", key)),
-                logit_config::RouteBy::Provenance(_) => None,
+                logit_config::RouteBy::Provenance(_) | logit_config::RouteBy::Signal => None,
             };
             if let Some((field, key)) = by_key {
                 if key.is_empty() {
@@ -1007,6 +1050,46 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     "component '{id}' lists target '{target}' more than once -- two fanouts into \
                      the same target would deliver every routed batch to it twice"
                 );
+            }
+        }
+    }
+
+    // Rule 51's reconvergence clause: no component may list, in `sources:`, two destinations of
+    // one `route` that one event's mark can name together. Two co-marked destinations each send
+    // that event, so the consumer receives it twice, a double count with no config line saying so.
+    // An ordinary diamond (`in -> [a, b] -> c`) is legal because each branch is a component the
+    // operator placed and `c` lists both by choice; here the copy is the router's and invisible.
+    // Co-marked sets: each `routes:` list, and under `by: signal` every target plus the router
+    // itself (a log-and-metrics event can reach both signals' targets and, for an unrouted signal,
+    // the router's own consumers). Reconvergence further downstream (`a -> x`, `b -> x`) is not
+    // checked (`docs/known-gaps/runtime.md`).
+    for (id, component) in &components {
+        let ComponentKind::Route { by, routes } = &component.kind else { continue };
+        let mut groups: Vec<Vec<&str>> = routes
+            .values()
+            .filter(|targets| targets.0.len() > 1)
+            .map(|targets| targets.ids().collect())
+            .collect();
+        if matches!(by, logit_config::RouteBy::Signal) {
+            let mut all = targets_of(component);
+            all.push(id.as_str());
+            groups.push(all);
+        }
+        for (consumer, c) in &components {
+            for group in &groups {
+                let both: Vec<&str> = c
+                    .sources
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|source| group.contains(source))
+                    .collect();
+                if let [a, b, ..] = both.as_slice() {
+                    anyhow::bail!(
+                        "component '{consumer}' lists '{a}' and '{b}' in its sources, and route \
+                         '{id}' can send one event to both -- '{consumer}' would receive that \
+                         event twice; read one of them, or route that value to one target"
+                    );
+                }
             }
         }
     }
@@ -4944,7 +5027,23 @@ mod tests {
             by,
             routes: routes
                 .iter()
-                .map(|(value, target)| (value.to_string(), target.to_string()))
+                .map(|(value, target)| {
+                    (value.to_string(), logit_config::RouteTargets::from(*target))
+                })
+                .collect(),
+        }
+    }
+
+    /// [`route`] with a list of target ids per value.
+    fn route_lists(by: logit_config::RouteBy, routes: &[(&str, &[&str])]) -> ComponentKind {
+        ComponentKind::Route {
+            by,
+            routes: routes
+                .iter()
+                .map(|(value, targets)| {
+                    let ids = targets.iter().map(|t| t.to_string()).collect();
+                    (value.to_string(), logit_config::RouteTargets(ids))
+                })
                 .collect(),
         }
     }
@@ -9888,6 +9987,177 @@ mod tests {
             ("rest", vec!["r"], vec![], null_out()),
         ]));
         assert!(err.contains("'by: {attribute: ..}' key name must not be empty"), "got: {err}");
+    }
+
+    /// A list-valued `routes:` value is one edge per id, and its targets join the slot list in
+    /// written order, de-duplicated across values.
+    #[test]
+    fn a_list_valued_route_resolves_and_flattens_into_slots() {
+        let graph = resolve(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            (
+                "r",
+                vec!["in"],
+                vec![],
+                route_lists(by_attribute("stream"), &[("app", &["b"]), ("host", &["a", "b"])]),
+            ),
+            ("a", vec![], vec![], target()),
+            ("b", vec![], vec![], target()),
+            ("a_out", vec!["a"], vec![], sink()),
+            ("b_out", vec!["b"], vec![], sink()),
+            ("rest", vec!["r"], vec![], null_out()),
+        ]))
+        .expect("a list-valued route should resolve");
+        assert_eq!(graph.components["r"].targets, vec!["b".to_string(), "a".to_string()]);
+    }
+
+    #[test]
+    fn a_route_with_an_empty_list_is_rejected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec![], route_lists(by_attribute("stream"), &[("host", &[])])),
+            ("rest", vec!["r"], vec![], null_out()),
+        ]));
+        assert!(err.contains("route value 'host' names an empty list"), "got: {err}");
+    }
+
+    #[test]
+    fn a_route_list_repeating_a_target_is_rejected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            (
+                "r",
+                vec!["in"],
+                vec![],
+                route_lists(by_attribute("stream"), &[("host", &["t", "t"])]),
+            ),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t"], vec![], sink()),
+            ("rest", vec!["r"], vec![], null_out()),
+        ]));
+        assert!(err.contains("route value 'host' lists target 't' more than once"), "got: {err}");
+    }
+
+    #[test]
+    fn a_route_by_signal_accepts_only_signal_names_as_keys() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec![], route(logit_config::RouteBy::Signal, &[("log", "t")])),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t"], vec![], sink()),
+            ("rest", vec!["r"], vec![], null_out()),
+        ]));
+        assert!(err.contains("'log' is not a signal"), "got: {err}");
+
+        resolve(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            (
+                "r",
+                vec!["in"],
+                vec![],
+                route(
+                    logit_config::RouteBy::Signal,
+                    &[("logs", "l"), ("metrics", "m"), ("traces", "t")],
+                ),
+            ),
+            ("l", vec![], vec![], target()),
+            ("m", vec![], vec![], target()),
+            ("t", vec![], vec![], target()),
+            ("l_out", vec!["l"], vec![], sink()),
+            ("m_out", vec!["m"], vec![], sink()),
+            ("t_out", vec!["t"], vec![], sink()),
+            ("rest", vec!["r"], vec![], null_out()),
+        ]))
+        .expect("logs, metrics, and traces are the signal keys");
+    }
+
+    /// `Destinations` is a `u64` with slot 0 for `Forward`, so 63 targets is the most a mark can
+    /// name.
+    #[test]
+    fn a_route_over_63_distinct_targets_is_rejected() {
+        let config = |n: usize| {
+            let ids: Vec<String> = (0..n).map(|k| format!("t{k:02}")).collect();
+            let outs: Vec<String> = ids.iter().map(|id| format!("{id}_out")).collect();
+            let pairs: Vec<(&str, &str)> =
+                ids.iter().map(|id| (id.as_str(), id.as_str())).collect();
+            let mut components = vec![
+                ("in", vec![], vec![], listener()),
+                ("r", vec!["in"], vec![], route(by_attribute("stream"), &pairs)),
+                ("rest", vec!["r"], vec![], null_out()),
+            ];
+            for (id, out) in ids.iter().zip(&outs) {
+                components.push((id.as_str(), vec![], vec![], target()));
+                components.push((out.as_str(), vec![id.as_str()], vec![], sink()));
+            }
+            cfg_with_targets(components)
+        };
+        let err = expect_err(config(64));
+        assert!(err.contains("at most 63 distinct targets, and this one names 64"), "got: {err}");
+        resolve(config(63)).expect("63 targets is within the cap");
+    }
+
+    /// Rule 51's reconvergence clause: one event marked for both `a` and `b` would reach `both`
+    /// twice.
+    #[test]
+    fn a_consumer_of_two_targets_in_one_route_list_is_rejected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            (
+                "r",
+                vec!["in"],
+                vec![],
+                route_lists(by_attribute("stream"), &[("host", &["a", "b"])]),
+            ),
+            ("a", vec![], vec![], target()),
+            ("b", vec![], vec![], target()),
+            ("both", vec!["a", "b"], vec![], sink()),
+            ("rest", vec!["r"], vec![], null_out()),
+        ]));
+        assert!(
+            err.contains(
+                "component 'both' lists 'a' and 'b' in its sources, and route 'r' can send \
+                 one event to both"
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// Two single-target values are never co-marked, so one consumer may read both targets, as
+    /// it may read both branches of an ordinary diamond.
+    #[test]
+    fn a_consumer_of_two_single_value_targets_resolves() {
+        resolve(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            (
+                "r",
+                vec!["in"],
+                vec![],
+                route(by_attribute("stream"), &[("host", "a"), ("app", "b")]),
+            ),
+            ("a", vec![], vec![], target()),
+            ("b", vec![], vec![], target()),
+            ("both", vec!["a", "b"], vec![], sink()),
+            ("rest", vec!["r"], vec![], null_out()),
+        ]))
+        .expect("first-match routing never marks one event for both a and b");
+    }
+
+    /// Under `by: signal` a mixed event can reach any of the route's destinations, the router's
+    /// own edge included.
+    #[test]
+    fn a_consumer_of_a_signal_route_and_one_of_its_targets_is_rejected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec![], route(logit_config::RouteBy::Signal, &[("logs", "l")])),
+            ("l", vec![], vec![], target()),
+            ("l_out", vec!["l"], vec![], sink()),
+            ("both", vec!["r", "l"], vec![], sink()),
+        ]));
+        assert!(
+            err.contains("component 'both' lists 'l' and 'r' in its sources")
+                || err.contains("component 'both' lists 'r' and 'l' in its sources"),
+            "got: {err}"
+        );
     }
 
     /// Rule 5: router -> target edges count, so a loop closed through a target is a cycle.
