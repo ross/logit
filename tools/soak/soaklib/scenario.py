@@ -972,8 +972,8 @@ def _routes_value(body):
 
 def _route_problems(ledger, sut_text):
     """Under `split = "route"`, the sinks' V add up only if a router sends each event to one
-    target. A `routes:` value that is a list, or `by: signal`, can deliver one event to several
-    sinks, so the SUT config's `route` components must use neither. A `route_signals` can send
+    target. A `routes:` value that is a list can deliver one event to several
+    sinks, so the SUT config's `route` components must use none. A `route_signals` can send
     parts of one event to several sinks under either `strip:` value, so it is refused outright."""
     if ledger.get("split", "copy") != "route":
         return []
@@ -984,12 +984,11 @@ def _route_problems(ledger, sut_text):
                         "split = \"copy\" or a route with one target per value")
     for name, body in _route_blocks(sut_text):
         listed = re.search(r"\[|^\s*-\s", _routes_value(body), re.M)
-        by_signal = re.search(r"\bby\s*:\s*[\"']?signal\b", body)
-        if listed or by_signal:
-            what = "`by: signal`" if by_signal else "a list-valued `routes:` value"
-            problems.append(f"ledger.split = \"route\": route {name!r} uses {what}, which can "
-                            "deliver one event to several sinks, so their totals don't add up; "
-                            "use split = \"copy\" or one target per value")
+        if listed:
+            problems.append(f"ledger.split = \"route\": route {name!r} uses a list-valued "
+                            "`routes:` value, which can deliver one event to several sinks, so "
+                            "their totals don't add up; use split = \"copy\" or one target "
+                            "per value")
     return problems
 
 
