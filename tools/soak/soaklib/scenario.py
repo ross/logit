@@ -85,7 +85,7 @@ STANDIN_ROLES = {"standin": STANDIN_ROLE}
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
 ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "mark", "exit",
-                "respond")
+                "respond", "signal", "rename")
 # Actions allowed on a SUT service only, each with the reason. A `kill` exists to end a `logit`
 # process with no shutdown; on the generator, the lines it sent after its last telemetry drain
 # reach the SUT with no G behind them, and `ledger.wire` would net them against real loss. An
@@ -99,6 +99,16 @@ SUT_ONLY_ACTIONS = {
 # Docker call (an `exit`'s revert starts the container the event ended), so a `[random]`
 # schedule, which draws faults, can't hold them.
 EXPECTED_EVENT_ACTIONS = ("mark", "exit")
+# Actions that open no fault window: a `signal` sends a `logit` service a signal it handles
+# while it runs, and a `rename` moves a file aside in the run's shared directory, so neither
+# excuses anything a check judges (checks.py's `RunData.events`). A `signal` may start inside a
+# `rename` on its own service, and neither may overlap any other step on its service.
+NO_WINDOW_ACTIONS = ("signal", "rename")
+# The signals a `signal` step may send: SIGHUP, which a `logit` process answers by reopening
+# its file targets and by reloading its TLS material (docs/adr/signal-handling.md).
+SIGNALS = ("HUP",)
+# The directory a `rename` works in, inside the containers that mount `<run>/shared`.
+SHARED_MOUNT = "/shared"
 # The `/readyz` words a `mark`'s `ready` may name: every answer but `ok`
 # (crates/logit-cli/src/admin.rs, `readyz_wire`).
 READY_WORDS = ("starting", "stalled", "draining", "degraded")
@@ -148,8 +158,8 @@ VM_LEDGER_KEYS = {"vm_every_window"}
 _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PRIVATE_ENV_PREFIX = "soak-env-"
-STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key", "class",
-             *RESPOND_KEYS}
+STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key", "class", "signal",
+             "path", "to", *RESPOND_KEYS}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
 RANGE_KEYS = {"min", "max"}
@@ -262,6 +272,7 @@ METRIC_KINDS = {
     "logit.output.requests": "sum",
     "logit.output.records": "sum",
     "logit.output.records.dropped": "sum",
+    "logit.output.file.reopens": "sum",
     "logit.component.diagnostics": "sum",
     "logit.component.errors": "sum",
     "logit.component.events.dropped": "sum",
@@ -349,13 +360,18 @@ class StepSpec:
     answer: object = None
     series_errors: object = None
     fault_class: object = None
+    # A `signal`'s signal, and a `rename`'s file and new name in the shared directory.
+    signal: object = None
+    path: object = None
+    to: object = None
 
 
 # The `Step` fields `expected()` writes into its JSON and its timeline records, each under its
 # scenario key.
 STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", "status"),
                ("body", "body"), ("apply", "apply"), ("answer", "answer"),
-               ("series_errors", "series_errors"), ("fault_class", "class"))
+               ("series_errors", "series_errors"), ("fault_class", "class"),
+               ("signal", "signal"), ("path", "path"), ("to", "to"))
 
 
 @dataclass
@@ -413,6 +429,9 @@ class Step:
     answer: object = None
     series_errors: object = None
     fault_class: object = None
+    signal: object = None
+    path: object = None
+    to: object = None
 
     def expected(self):
         """The fields this step sets (`STEP_FIELDS`), for its JSON and its timeline records."""
@@ -533,6 +552,12 @@ class Scenario:
         """The `[[ledger.source]]` tables whose `wire` is `file`, which the driver gives a
         shared directory and waits on at the end."""
         return [source for source in self.sources if source.get("wire") == FILE_WIRE]
+
+    @property
+    def uses_shared_dir(self):
+        """Whether the run gets `<run>/shared`: for a file wire's writer and tailer, or for a
+        `rename` step's file."""
+        return bool(self.file_sources) or any(spec.action == "rename" for spec in self.steps)
 
     @property
     def generators(self):
@@ -769,6 +794,7 @@ def from_dict(raw, path):
             status=raw_step.get("status"), body=raw_step.get("body"),
             apply=raw_step.get("apply"), answer=raw_step.get("answer"),
             series_errors=raw_step.get("series_errors"), fault_class=raw_step.get("class"),
+            signal=raw_step.get("signal"), path=raw_step.get("path"), to=raw_step.get("to"),
         ))
         if "for" not in raw_step:
             problems.append(f"{where}: every fault needs `for`, so its revert is scheduled with it")
@@ -1726,6 +1752,7 @@ def validate(scenario, duration=None, seed=None):
             problems.append(f"{where}: unknown action `{spec.action}`{hint}")
         problems += _expected_event_problems(spec, where)
         problems += _respond_problems(spec, where, scenario.target.get("shape"))
+        problems += _signal_problems(spec, where)
         if spec.for_ <= 0:
             problems.append(f"{where}: `for` must be longer than 0s")
         if spec.action == "netem":
@@ -1754,7 +1781,15 @@ def validate(scenario, duration=None, seed=None):
             for second in specs[i + 1:]:
                 if second.at < first.at + first.for_:
                     pair = {first.action, second.action}
-                    if "netem" in pair and pair & set(NAMESPACE_FAULTS):
+                    if first.action == "rename" and second.action == "signal":
+                        continue
+                    if "signal" in pair and pair & set(INSTANCE_HOLD_ACTIONS):
+                        problems.append(
+                            f"steps {first.index + 1} and {second.index + 1}: signal on "
+                            f"{service} during its {(pair - {'signal'}).pop()}; the process "
+                            "may not be running to receive it"
+                        )
+                    elif "netem" in pair and pair & set(NAMESPACE_FAULTS):
                         problems.append(
                             f"steps {first.index + 1} and {second.index + 1}: netem on "
                             f"{service} during its {(pair - {'netem'}).pop()}"
@@ -1769,6 +1804,7 @@ def validate(scenario, duration=None, seed=None):
     problems += _overlap_step_problems(scenario)
 
     run_duration = scenario.duration if duration is None else duration
+    problems += _rename_problems(scenario, run_duration)
     quiet_end = run_duration - scenario.cooldown
     if quiet_end < scenario.warmup:
         problems.append(
@@ -1891,6 +1927,116 @@ def _respond_problems(spec, where, shape=None):
     return problems
 
 
+def _signal_problems(spec, where):
+    """What a step breaks of the `signal` and `rename` keys: `signal`, one of `SIGNALS`, required
+    on a `signal` and refused elsewhere; `path` and `to` required on a `rename` and refused
+    elsewhere. `_rename_problems()` checks a rename against its service's config."""
+    problems = []
+    if spec.action == "signal":
+        if spec.signal is None:
+            problems.append(f"{where}: signal needs `signal`, such as \"HUP\"")
+        elif spec.signal not in SIGNALS:
+            problems.append(f"{where}: `signal` must be one of {', '.join(SIGNALS)}, got "
+                            f"{spec.signal!r}")
+    elif spec.signal is not None:
+        problems.append(f"{where}: `signal` is for signal only")
+    if spec.action == "rename":
+        for name in ("path", "to"):
+            value = getattr(spec, name)
+            if value is None:
+                problems.append(f"{where}: rename needs `{name}`, a file name in "
+                                f"{SHARED_MOUNT}")
+            elif (not isinstance(value, str) or not value or "/" in value
+                  or value in (".", "..")):
+                problems.append(f"{where}: `{name}` must be a bare file name in "
+                                f"{SHARED_MOUNT}, with no `/`, got {value!r}")
+        if spec.path is not None and spec.path == spec.to:
+            problems.append(f"{where}: `to` must differ from `path`")
+    else:
+        for name in ("path", "to"):
+            if getattr(spec, name) is not None:
+                problems.append(f"{where}: `{name}` is for rename only")
+    return problems
+
+
+def stdio_shared_targets(text):
+    """`{file name: component id}` for each `stdio_out` in config `text` whose `target:` is a
+    file directly in `SHARED_MOUNT`."""
+    targets = {}
+    for component, body in _route_blocks(text, "stdio_out"):
+        found = re.search(r"\btarget\s*:\s*[\"']?([^\"'\s,}]+)", body)
+        if not found:
+            continue
+        head, _, name = found.group(1).rpartition("/")
+        if head == SHARED_MOUNT and name:
+            targets[name] = component
+    return targets
+
+
+def service_config_key(scenario, service):
+    """The `[configs]` key of `logit` service `service`'s config, or None for a service with
+    none."""
+    if service in scenario.configs and service != SUT_CONFIG_KEY:
+        return service
+    if service in scenario.suts:
+        return SUT_CONFIG_KEY
+    return None
+
+
+def _rename_problems(scenario, duration):
+    """What the `rename` steps break: each `path` a `stdio_out` target in `SHARED_MOUNT` in its
+    service's config, each `to` none of that config's targets there and distinct across
+    renames; a `signal` with `signal = "HUP"` on the same service starting inside each rename's
+    `for`, after its start, so the target reopens while the step holds; and each rename once
+    per run of `duration`, since a second cycle's rename would find its `to` taken."""
+    problems = []
+    renames = [spec for spec in scenario.steps if spec.action == "rename"]
+    seen_to = {}
+    for spec in renames:
+        where = f"step {spec.index + 1} (rename on {spec.on or '?'})"
+        key = service_config_key(scenario, spec.on)
+        text = ""
+        if key is None:
+            problems.append(f"{where}: {spec.on} has no config in [configs], so no stdio_out "
+                            "target to rename")
+        else:
+            try:
+                text = scenario.config_path(key).read_text()
+            except OSError:
+                text = ""
+        targets = stdio_shared_targets(text)
+        if key is not None and isinstance(spec.path, str) and spec.path not in targets:
+            problems.append(f"{where}: `path` {spec.path!r} isn't a stdio_out target in "
+                            f"{SHARED_MOUNT} in {spec.on}'s config; its targets there are "
+                            f"{', '.join(sorted(targets)) or 'none'}")
+        if isinstance(spec.to, str):
+            if spec.to in targets:
+                problems.append(f"{where}: `to` {spec.to!r} is a stdio_out target in "
+                                f"{spec.on}'s config, which would write into it again")
+            if spec.to in seen_to:
+                problems.append(f"{where}: `to` {spec.to!r} repeats step "
+                                f"{seen_to[spec.to] + 1}'s, and a rename onto it would replace "
+                                "that file")
+            else:
+                seen_to[spec.to] = spec.index
+        if not any(other.action == "signal" and other.on == spec.on
+                   and other.signal == "HUP" and spec.at < other.at < spec.at + spec.for_
+                   for other in scenario.steps):
+            problems.append(f"{where}: needs a signal = \"HUP\" step on {spec.on} starting "
+                            "inside its `for`, which makes the target reopen its path")
+    if renames and scenario.random is None and scenario.cycle > 0:
+        counts = {}
+        for step in expand(scenario, duration):
+            if step.action == "rename":
+                counts[step.spec_index] = counts.get(step.spec_index, 0) + 1
+        for index, count in sorted(counts.items()):
+            if count > 1:
+                problems.append(f"step {index + 1} (rename): runs {count} times in "
+                                f"{format_duration(duration)}, and a second rename would find "
+                                "its `to` taken; set max_duration to one cycle's run")
+    return problems
+
+
 def _random_problems(scenario, duration):
     """Every rule a `[random]` table breaks. `gap.min` must cover a fault's recovery and two
     progress windows, so each fault is followed by steady state the checks judge, and `cooldown`
@@ -1926,6 +2072,9 @@ def _random_problems(scenario, duration):
         if template.action == "respond":
             problems.append(f"{where}: respond takes a status or an answer, which a [random] "
                             "fault can't set; write it as a [[step]]")
+        if template.action in NO_WINDOW_ACTIONS:
+            problems.append(f"{where}: {template.action} opens no fault window and takes keys a "
+                            "[random] fault can't set; write it as a [[step]]")
         if template.for_min <= 0:
             problems.append(f"{where}: `for.min` must be longer than 0s")
         if template.for_min > template.for_max:
@@ -2157,6 +2306,9 @@ def service_problems(scenario, roles, modes=None):
     def on_problems(on, action, where, reason=True, classed=False):
         if on not in roles:
             return [f"{where}: unknown service `{on}`{no_backend}"]
+        if action in NO_WINDOW_ACTIONS and roles[on] not in LOGIT_ROLES:
+            return [f"{where}: {action} is for a service that runs logit; the stack's are "
+                    f"{', '.join(logit_services(roles))}"]
         if action in SUT_ONLY_ACTIONS and roles[on] != SUT_ROLE:
             why = f": {SUT_ONLY_ACTIONS[action]}" if reason else ""
             return [f"{where}: {action} is for {' or '.join(scenario.suts)} only{why}"]
@@ -2244,6 +2396,7 @@ def expand(scenario, duration=None, seed=None):
                     ready=spec.ready, code=spec.code, key=spec.key, status=spec.status,
                     body=spec.body, apply=spec.apply, answer=spec.answer,
                     series_errors=spec.series_errors, fault_class=spec.fault_class,
+                    signal=spec.signal, path=spec.path, to=spec.to,
                 ))
         cycle += 1
     steps.sort(key=lambda s: (s.start, s.spec_index))

@@ -57,12 +57,14 @@ needs at the code:
   `compose.env` carries its `[target] shape` for standin.py's `--shape`.
   The end sequence waits for the sink's queue to empty, as for a Kafka target. Its record is its
   stdout, which the log capture collects with every other service's.
-- A scenario with a `file` wire gets `<run>/shared`, mode 0777 so the image's unprivileged
-  user, whatever its uid, can write it, named by `SOAK_SHARED_DIR` in `compose.env`; its
-  override mounts it into the writer and the SUT. The end sequence stops the writer, counts the
-  lines in every file there (`shared_counted`, the G the checks hold telemetry's against), and
-  waits until the tailers' W reaches that count or stops growing (`tail_caught_up`), reading W
-  from a log chunk it captures for the purpose, before it waits on the sinks.
+- A scenario with a `file` wire or a `rename` step gets `<run>/shared`, mode 0777 so the
+  image's unprivileged user, whatever its uid, can write it, named by `SOAK_SHARED_DIR` in
+  `compose.env`; its override mounts it into the services that write or read there, and a
+  `rename` moves files inside it on the host. For a file wire the end sequence stops the writer,
+  counts the lines in every file there (`shared_counted`, the G the checks hold telemetry's
+  against), and waits until the tailers' W reaches that count or stops growing
+  (`tail_caught_up`), reading W from a log chunk it captures for the purpose, before it waits
+  on the sinks.
 - Under `[overlap]` the instances share their holder's network namespace, so `prepare()` also
   reads each service's `network_mode` from compose and checks each instance is in the holder's.
   Each instance runs the whole pipeline, so the end sequence waits once on every sink's stored
@@ -228,6 +230,8 @@ class Run:
         self.pending_ready = {}
         self.started_at = {}
         self.fail_fast = None
+        # `<run>/shared`, made in `prepare()` for a file wire or a `rename` step, else None.
+        self.shared_dir = None
 
     # ---- setup ---------------------------------------------------------------------------------
 
@@ -245,7 +249,7 @@ class Run:
             + (f"{scenario_mod.STANDIN_SHAPE_ENV}={self.scenario.standin_shape}\n"
                if self.standin else "")
             + (f"{scenario_mod.SHARED_DIR_ENV}={self.make_shared_dir()}\n"
-               if self.scenario.file_sources else "")
+               if self.scenario.uses_shared_dir else "")
         )
         shutil.copy(self.scenario.path, self.run_dir / "scenario.toml")
         # The checks read the SUT's `receive:` limits from this copy.
@@ -272,7 +276,7 @@ class Run:
             json.dumps(resolved, indent=2, sort_keys=True) + "\n"
         )
         self.ctx = faults.Context(docker=self.docker, ids=self.ids, netem_image=NETEM_IMAGE,
-                                  standin_base=self.standin_base)
+                                  standin_base=self.standin_base, shared_dir=self.shared_dir)
         self.timeline = collect.Jsonl(self.run_dir / "timeline.jsonl")
         self.watchdog = collect.Jsonl(self.run_dir / "watchdog.jsonl")
         self.stats = collect.Jsonl(self.run_dir / "stats.ndjson")
@@ -285,7 +289,8 @@ class Run:
         shared = self.run_dir / scenario_mod.SHARED_DIR
         shared.mkdir()
         os.chmod(shared, 0o777)
-        return shared.resolve()
+        self.shared_dir = shared.resolve()
+        return self.shared_dir
 
     def resolve_roles(self):
         """`{service: role}` from the merged compose config, raising `ScenarioError` when compose

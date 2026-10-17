@@ -29,6 +29,10 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   so a fault on it is a fault on every instance's network: netem on it shapes their egress, and
   a partition of it cuts their ingress too. Every instance is an ingress SUT, since the
   generators send to the address they share.
+- A `signal` is `docker kill -s <signal>` through the same CLI path as a `kill`, and a `rename`
+  is an `os.rename` on the host inside `<run>/shared`, which the containers mount. Neither can
+  lose data on any leg, so every `affects_*` predicate is false, and neither revert does
+  anything. A `rename` refuses to replace a file already at its `to`.
 - A `mark` and an `exit` name an event the SUT's own config causes, so neither apply makes a
   Docker call. An `exit`'s revert starts the container only when it has exited, and its record
   says whether it did (`started`): a revert that found the process still running starts no new
@@ -36,6 +40,7 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
 """
 
 import json
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -63,6 +68,8 @@ class Context:
     netem_image: str
     state: dict = field(default_factory=dict)
     standin_base: dict = field(default_factory=dict)
+    # `<run>/shared` on the host, for a `rename`; None when the run has none.
+    shared_dir: object = None
 
 
 @dataclass
@@ -140,6 +147,25 @@ def stop_revert(ctx, step):
 
 def kill_apply(ctx, step):
     return _record(ctx.docker.run(["kill", "-s", "KILL", ctx.ids[step.on]]))
+
+
+def signal_apply(ctx, step):
+    return _record(ctx.docker.run(["kill", "-s", step.signal, ctx.ids[step.on]]),
+                   signal=step.signal)
+
+
+def rename_apply(ctx, step):
+    if ctx.shared_dir is None:
+        return {"rc": 1, "stderr": "the run has no shared directory"}
+    source = os.path.join(ctx.shared_dir, step.path)
+    target = os.path.join(ctx.shared_dir, step.to)
+    if os.path.lexists(target):
+        return {"rc": 1, "stderr": f"{step.to} already exists in the shared directory"}
+    try:
+        os.rename(source, target)
+    except OSError as err:
+        return {"rc": 1, "stderr": str(err)}
+    return {"rc": 0, "stderr": "", "path": step.path, "to": step.to}
 
 
 def restart_apply(ctx, step):
@@ -348,6 +374,22 @@ ACTIONS = {
         revert=respond_revert,
         affects_udp_ingress=_never,
         affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_never,
+        affects_file_ingress=_never,
+    ),
+    "signal": Action(
+        apply=signal_apply,
+        revert=no_op,
+        affects_udp_ingress=_never,
+        affects_egress=_never,
+        affects_tcp_ingress=_never,
+        affects_file_ingress=_never,
+    ),
+    "rename": Action(
+        apply=rename_apply,
+        revert=no_op,
+        affects_udp_ingress=_never,
+        affects_egress=_never,
         affects_tcp_ingress=_never,
         affects_file_ingress=_never,
     ),

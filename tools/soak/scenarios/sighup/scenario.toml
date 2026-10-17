@@ -1,0 +1,204 @@
+# statsd-vm's stream with a second SUT sink off the ledger, `archive`, a stdio_out writing one
+# JSON line per statsd event into the shared directory, under SIGHUPs: in steady state, after a
+# rename moves archive.log aside (twice), during a VictoriaMetrics stop, and to the generator.
+# Each SIGHUP to `logit` makes `archive` reopen its path before its next write and count
+# `logit.output.file.reopens`; the stdout telemetry stream ignores it, so every steady-state row
+# judges straight through a signal, which opens no fault window. `file.reopen` judges each
+# rename. The schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "sighup"
+description = "generator -> statsd_in (UDP) -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics, and statsd_in -> stdio_out /shared/archive.log, under SIGHUPs and renames"
+duration = "14m30s"       # warmup + one cycle + cooldown; --duration overrides
+# A second cycle would rename archive.log onto archive.log.1 again, which the rename refuses.
+# About 2,000 lines a second of about 200 bytes each puts some 350 MB in <run>/shared.
+max_duration = "14m30s"
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "11m30s"          # >= last step's end (9m40s) + recovery_bound + 2 x progress_window
+compose = "compose.override.yaml"   # mounts the shared directory into the SUT
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # archive is off the ledger: a fan-out counts one send per batch
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# Step 1: a SIGHUP in steady state; archive reopens archive.log and appends.
+[[step]]
+at = "0s"
+action = "signal"
+on = "logit"
+signal = "HUP"
+for = "10s"
+
+# Step 2
+[[step]]
+at = "1m"
+action = "signal"
+on = "logit"
+signal = "HUP"
+for = "10s"
+
+# Steps 3 and 4: an external rotator's move, then its SIGHUP. Until the signal archive keeps
+# writing to the renamed file; its next batch after it opens a new archive.log.
+[[step]]
+at = "2m"
+action = "rename"
+on = "logit"
+path = "archive.log"
+to = "archive.log.1"
+for = "30s"
+
+[[step]]
+at = "2m10s"
+action = "signal"
+on = "logit"
+signal = "HUP"
+for = "10s"
+
+# Steps 5 and 6: a SIGHUP while the ledger's sink holds its queue behind a stopped backend.
+[[step]]
+at = "4m"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+[[step]]
+at = "4m30s"
+action = "signal"
+on = "logit"
+signal = "HUP"
+for = "10s"
+
+# Steps 7 and 8: the second rotation.
+[[step]]
+at = "7m"
+action = "rename"
+on = "logit"
+path = "archive.log"
+to = "archive.log.2"
+for = "30s"
+
+[[step]]
+at = "7m10s"
+action = "signal"
+on = "logit"
+signal = "HUP"
+for = "10s"
+
+# Step 9: a SIGHUP to the generator, whose one stdio_out is stdout; it keeps sending.
+[[step]]
+at = "8m30s"
+action = "signal"
+on = "generator"
+signal = "HUP"
+for = "10s"
+
+# Step 10
+[[step]]
+at = "9m30s"
+action = "signal"
+on = "logit"
+signal = "HUP"
+for = "10s"
+
+# Each SIGHUP to `logit` reopens `archive` once, at its next write.
+[[expect]]
+name = "reopen-steady-1"
+service = "logit"
+metric = "logit.output.file.reopens"
+component = "archive"
+step = 1
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "reopen-steady-2"
+service = "logit"
+metric = "logit.output.file.reopens"
+component = "archive"
+step = 2
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "reopen-rename-1"
+service = "logit"
+metric = "logit.output.file.reopens"
+component = "archive"
+step = 4
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "reopen-backend-stopped"
+service = "logit"
+metric = "logit.output.file.reopens"
+component = "archive"
+step = 6
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "reopen-rename-2"
+service = "logit"
+metric = "logit.output.file.reopens"
+component = "archive"
+step = 8
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "reopen-steady-3"
+service = "logit"
+metric = "logit.output.file.reopens"
+component = "archive"
+step = 10
+window = "through"
+reduce = "delta"
+min = 1
+
+# The generator has no file target, so its SIGHUP leaves its sends alone.
+[[expect]]
+name = "generator-keeps-sending"
+service = "generator"
+metric = "logit.output.messages"
+component = "statsd"
+step = 9
+window = "through"
+reduce = "min_delta"
+min = 1
+
+# A reopen never fails or drops a batch.
+[[expect]]
+name = "archive-never-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "archive"
+window = "run"
+reduce = "delta"
+max = 0

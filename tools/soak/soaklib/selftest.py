@@ -141,6 +141,16 @@ labeled series, a loss at the close within its bound passing and one past it FAI
 reported and not judged, a series with no instance's label FAILing `ledger.egress`, and a stall
 of the one instance running FAILing `progress`.
 
+For `signal` and `rename` steps, it covers every validation rule (the keys each takes, `HUP`
+only, on a service that runs `logit`, never inside that service's other steps, a rename's file a
+`stdio_out` target in `/shared` of its service's config with a SIGHUP starting inside it, once
+per run, and neither in a `[random]` schedule), the actions through a fake Docker and a
+temporary directory, that neither affects any leg, `prepare()` making the shared directory for a
+rename, and `file.reopen` over a synthetic run of two renames: both rows passing, a late line in
+the renamed file, an early line in the new one, a count off by one, and a missing new file each
+FAILing, a kill's count reported, neither step opening a fault window, a SIGHUP's info line
+leaving `self_log` alone, and an `[[expect]]` through a signal step.
+
 No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
 suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
 a slip in a part's own stand-ins included, gets rc 127 from `Docker.run`'s `OSError` instead of
@@ -4265,7 +4275,9 @@ def _kafka_rules(root):
     sut = compose.split("\n  logit:")[1].split("\n  generator:")[0]
     expect("kafka: { condition: service_healthy, required: false }" in sut,
            "the SUT waits for a healthy broker when its profile runs, and only then")
-    for action in faults.ACTIONS.values():
+    for name, action in faults.ACTIONS.items():
+        if name in scenario.NO_WINDOW_ACTIONS:
+            continue
         expect(action.affects_egress(scenario.Step(id="x", spec_index=0, cycle=0, action="stop",
                                                    on="kafka", args="", start=0, end=1), roles),
                "every fault on the broker affects the SUT's egress")
@@ -6442,6 +6454,8 @@ def _respond_rules(root):
     expect(applied.cue() == {"step": applied.id, "status": 503, "apply": True},
            f"`apply` travels in the cue, got {applied.cue()}")
     for name, action in faults.ACTIONS.items():
+        if name in scenario.NO_WINDOW_ACTIONS:
+            continue
         one = scenario.Step(id="x", spec_index=0, cycle=0, action=name, on="standin", args="",
                             start=0, end=1)
         expect(action.affects_egress(one, roles),
@@ -7795,6 +7809,323 @@ def _overlap_checks():
                f"{stalled['progress']}")
 
 
+def _sighup_base(root):
+    path = root / "scenarios" / "sighup" / "scenario.toml"
+    return path, tomllib.loads(path.read_text())
+
+
+def _signal_rules(root):
+    """Every `signal` and `rename` rule: the keys each takes and refuses, `signal = "HUP"` only,
+    on a service that runs `logit`, never inside that service's lifecycle faults, a rename's
+    file a stdio_out target in the shared directory of its service's config, its `to` neither a
+    target nor another rename's, a SIGHUP starting inside its `for`, once per run, and neither
+    in a `[random]` schedule; and `logit.output.file.reopens` read as a counter."""
+    path, base = _sighup_base(root)
+    loaded = scenario.load(path)
+    expect(loaded.uses_shared_dir and not loaded.file_sources,
+           "a rename gives the run a shared directory with no file wire")
+    expect(scenario.service_problems(loaded, _override_roles(loaded)) == [],
+           f"sighup passes its service rules, got "
+           f"{scenario.service_problems(loaded, _override_roles(loaded))}")
+    expect(scenario.stdio_shared_targets(loaded.config_path("sut").read_text())
+           == {"archive.log": "archive"},
+           "the SUT's stdio_out in /shared is found by its file name")
+
+    def mutate(edit):
+        raw = copy.deepcopy(base)
+        edit(raw)
+        return raw
+
+    def step(index, **fields):
+        def edit(raw):
+            raw["step"][index].update(fields)
+            for key in [k for k, v in fields.items() if v is None]:
+                del raw["step"][index][key]
+        return edit
+
+    def add(**fields):
+        return lambda raw: raw["step"].append(fields)
+
+    cases = [
+        (step(0, signal=None), "signal needs `signal`", "a signal with no signal"),
+        (step(0, signal="TERM"), "`signal` must be one of HUP", "a signal other than HUP"),
+        (step(0, path="x"), "`path` is for rename only", "path on a signal"),
+        (step(4, signal="HUP"), "`signal` is for signal only", "signal on a stop"),
+        (step(2, path=None), "rename needs `path`", "a rename with no path"),
+        (step(2, to="sub/archive.log.1"), "`to` must be a bare file name", "a to with a slash"),
+        (step(2, path=".."), "`path` must be a bare file name", "a path of .."),
+        (step(2, path="other.log"), "`path` 'other.log' isn't a stdio_out target",
+         "a rename of a file no stdio_out writes"),
+        (step(6, to="archive.log.1"), "repeats step 3's", "two renames onto one name"),
+        (step(2, args="x"), "`args` is for netem only", "args on a rename"),
+        (lambda raw: raw["step"].pop(3), "needs a signal = \"HUP\" step on logit",
+         "a rename with no SIGHUP inside it"),
+        (step(3, at="2m"), "needs a signal = \"HUP\" step on logit",
+         "a SIGHUP starting with its rename"),
+        (step(3, at="2m40s"), "needs a signal = \"HUP\" step on logit",
+         "a SIGHUP after its rename"),
+        (add(at="9m20s", action="stop", on="logit", **{"for": "30s"}),
+         "signal on logit during its stop", "a SIGHUP inside its service's stop"),
+        (add(at="2m20s", action="pause", on="logit", **{"for": "5s"}),
+         "two faults overlap on logit", "a pause inside a rename"),
+    ]
+    for edit, needle, what in cases:
+        _refused(path, mutate(edit), needle, what)
+    _refused(path, mutate(step(2, on="generator")), "isn't a stdio_out target in /shared in "
+             "generator's config", "a rename on a service with no such target")
+    _refused(path, mutate(step(2, on="victoria-metrics")), "victoria-metrics has no config",
+             "a rename on a service with no config")
+    _refused(path, mutate(step(0, on="victoria-metrics")), "signal is for a service that runs "
+             "logit", "a signal on a backend")
+    _refused(path, base, "runs 2 times", "a rename in a second cycle",
+             duration=scenario.parse_duration("26m"))
+    _refused(path, mutate(lambda raw: raw["expect"][0].update(reduce="max")),
+             "logit.output.file.reopens is a sum", "a gauge reducer on the reopen counter")
+    # The signal inside a rename, and a signal beside a fault on another service, both load.
+    expect(scenario.from_dict(copy.deepcopy(base), path).steps[3].signal == "HUP",
+           "a SIGHUP inside a rename on its own service loads")
+
+    random_path, random_raw = _random_base(root)
+    for action in ("signal", "rename"):
+        raw = copy.deepcopy(random_raw)
+        raw["random"]["fault"].append({"weight": 1, "action": action, "on": "logit",
+                                       "for": {"min": "10s", "max": "20s"}})
+        _refused(random_path, raw, f"{action} opens no fault window",
+                 f"a {action} in a [random] schedule")
+
+
+class _SignalDocker:
+    """Records each `run` call, as kill_apply's CLI path makes it."""
+
+    def __init__(self):
+        self.calls = []
+
+    def run(self, args, timeout=None):
+        self.calls.append(list(args))
+        return docker.Result(0, "", "")
+
+
+def _signal_actions():
+    """A `signal` sends `docker kill -s HUP` and its revert makes no call; a `rename` moves a
+    file in the shared directory and refuses a taken `to`, a missing file, and a run with no
+    shared directory; and neither affects any leg for any role."""
+    fake = _SignalDocker()
+    ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+    hup = scenario.Step("c0s1", 0, 0, "signal", "logit", "", 10.0, 20.0, signal="HUP")
+    result = faults.ACTIONS["signal"].apply(ctx, hup)
+    expect(fake.calls == [["kill", "-s", "HUP", "sut"]] and result["rc"] == 0
+           and result["signal"] == "HUP",
+           f"a signal is docker kill -s HUP, got {fake.calls} {result}")
+    expect(faults.ACTIONS["signal"].revert(ctx, hup) == {"rc": 0, "stderr": ""}
+           and len(fake.calls) == 1, "a signal's revert makes no Docker call")
+    rename = scenario.Step("c0s2", 1, 0, "rename", "logit", "", 10.0, 40.0, path="a.log",
+                           to="a.log.1")
+    expect(faults.ACTIONS["rename"].apply(ctx, rename)["rc"] == 1,
+           "a rename with no shared directory fails")
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx.shared_dir = Path(tmp)
+        (Path(tmp) / "a.log").write_text("one\n")
+        result = faults.ACTIONS["rename"].apply(ctx, rename)
+        expect(result["rc"] == 0 and (Path(tmp) / "a.log.1").read_text() == "one\n"
+               and not (Path(tmp) / "a.log").exists(),
+               f"a rename moves the file on the host, got {result}")
+        (Path(tmp) / "a.log").write_text("two\n")
+        result = faults.ACTIONS["rename"].apply(ctx, rename)
+        expect(result["rc"] == 1 and "already exists" in result["stderr"]
+               and (Path(tmp) / "a.log.1").read_text() == "one\n",
+               f"a rename never replaces its `to`, got {result}")
+        (Path(tmp) / "a.log").unlink()
+        (Path(tmp) / "a.log.1").unlink()
+        expect(faults.ACTIONS["rename"].apply(ctx, rename)["rc"] == 1,
+               "a rename of a missing file fails")
+        expect(faults.ACTIONS["rename"].revert(ctx, rename) == {"rc": 0, "stderr": ""},
+               "a rename's revert does nothing")
+    roles = {**scenario.BASE_ROLES, "kafka": "broker", "standin": "standin", "sut-net": "netns"}
+    for name in scenario.NO_WINDOW_ACTIONS:
+        action = faults.ACTIONS[name]
+        for on in roles:
+            one = scenario.Step("x", 0, 0, name, on, "", 0.0, 1.0)
+            expect(not action.affects_egress(one, roles)
+                   and not any(action.affects(wire, one, roles) for wire in faults.INGRESS_KEYS),
+                   f"a {name} on {on} affects no leg")
+    expect(not set(scenario.NO_WINDOW_ACTIONS) & set(faults.STARTS_ON_APPLY
+                                                      + faults.STARTS_ON_REVERT
+                                                      + faults.RESUMES_ON_REVERT),
+           "neither a signal nor a rename starts or resumes a container")
+
+
+def _sighup_driver(root):
+    """`prepare()` gives a scenario with a rename, and no file wire, the shared directory, its
+    compose variable, and the actions' context."""
+    path, _ = _sighup_base(root)
+    loaded = scenario.load(path)
+    with tempfile.TemporaryDirectory() as tmp:
+        run = driver.Run(root, loaded, loaded.duration, None, False, tmp, [], "logit:soak",
+                         roles=_override_roles(loaded))
+        run.prepare()
+        shared = run.run_dir / "shared"
+        env = (run.run_dir / "compose.env").read_text()
+        expect(shared.is_dir() and (shared.stat().st_mode & 0o777) == 0o777
+               and f"SOAK_SHARED_DIR={shared.resolve()}\n" in env
+               and run.ctx.shared_dir == shared.resolve(),
+               f"prepare() makes the shared directory for a rename, got {env} "
+               f"{run.ctx.shared_dir}")
+        override = loaded.compose_path().read_text()
+        expect(override.count("${SOAK_SHARED_DIR:?") == 1 and "\n  logit:" in override,
+               "sighup's override mounts the shared directory into the SUT")
+        renames = [s for s in run.steps if s.action == "rename"]
+        expect([(s.path, s.to) for s in renames]
+               == [("archive.log", "archive.log.1"), ("archive.log", "archive.log.2")]
+               and all(s.expected()["path"] == "archive.log" for s in renames),
+               f"each rename's names reach its step and its timeline fields, got {renames}")
+
+
+def _stamp9(t):
+    """An RFC 3339 UTC stamp with nine fractional digits, as `format: json` writes it."""
+    whole = int(t)
+    return (datetime.fromtimestamp(whole, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            + f".{round((t - whole) * 1e9):09d}Z")
+
+
+SIGHUP_SUT_CONFIG = ("components:\n"
+                     "  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }\n"
+                     "  archive:\n"
+                     "    type: stdio_out\n"
+                     "    sources: [statsd]\n"
+                     "    target: /shared/archive.log\n"
+                     "    format: json\n")
+
+
+def _reopen_run(tmp, name, late=False, early=False, extra=0, new_missing=False, kill=False,
+                stamp=None):
+    """A run directory for `file.reopen`: two renames of archive.log, c0s3 over [+100, +130]
+    with its SIGHUP c0s4 applied over [+110, +110.2], and c0s7 over [+200, +230] with c0s8 over
+    [+210, +210.2]. archive writes one line a second, each stamped 0.5 s before its write, from
+    +60 to +299, into archive.log.1 until the first SIGHUP, archive.log.2 until the second, and
+    archive.log after. `late` puts a line stamped +115 in archive.log.1, `early` one stamped
+    +105 in archive.log.2, `extra` adds to events.delivered, `new_missing` removes archive.log,
+    and `kill` adds a kill of the SUT at +250."""
+    run_dir = Path(tmp) / name
+    (run_dir / "configs").mkdir(parents=True)
+    (run_dir / "shared").mkdir()
+    (run_dir / "configs" / "logit-sut.yaml").write_text(SIGHUP_SUT_CONFIG)
+    stamp = stamp or _stamp9
+    files = {"archive.log.1": [], "archive.log.2": [], "archive.log": []}
+    for second in range(60, 300):
+        t = T0 + second - 0.5
+        name_of = ("archive.log.1" if second <= 110 else "archive.log.2" if second <= 210
+                   else "archive.log")
+        files[name_of].append(t)
+    if late:
+        files["archive.log.1"].append(T0 + 115)
+    if early:
+        files["archive.log.2"].insert(0, T0 + 105)
+    for file_name, stamps in files.items():
+        if new_missing and file_name == "archive.log":
+            continue
+        (run_dir / "shared" / file_name).write_text("".join(
+            '{"timestamp":"' + stamp(t) + '","metrics":[]}\n' for t in stamps))
+    total = sum(len(stamps) for stamps in files.values()) + extra
+    stdout = []
+    for offset in range(5, 301, 5):
+        ts = _stamp(T0 + offset)
+        stdout.append(_line(ts, "logit.process.uptime", "gauge", float(offset)))
+        if offset == 300:
+            stdout.append(_line(ts, "logit.component.events.delivered", "sum", total,
+                                component="archive"))
+        if offset in (115, 215):
+            stdout.append(_line(ts, "logit.output.file.reopens", "sum", 1,
+                                component="archive"))
+    timeline = [_phase("start", 0, t0=T0)]
+    steps = []
+    for step_id, action, start, end, extra_fields in (
+            ("c0s3", "rename", 100, 130, {"path": "archive.log", "to": "archive.log.1"}),
+            ("c0s4", "signal", 110, 120, {"signal": "HUP"}),
+            ("c0s7", "rename", 200, 230, {"path": "archive.log", "to": "archive.log.2"}),
+            ("c0s8", "signal", 210, 220, {"signal": "HUP"})):
+        timeline += [_action("apply", step_id, action, "logit", start, start + 0.2,
+                             **extra_fields),
+                     _action("revert", step_id, action, "logit", end, end + 0.01)]
+        steps.append({"id": step_id, "spec_index": int(step_id[3:]) - 1, "cycle": 0,
+                      "action": action, "on": "logit", "args": "", "start": start, "end": end,
+                      **extra_fields})
+    if kill:
+        timeline += [_action("apply", "c0s9", "kill", "logit", 250),
+                     _action("revert", "c0s9", "kill", "logit", 260)]
+    timeline += [_phase("end_begin", 300), _phase("end_end", 330)]
+    expectations = [{"name": "reopen", "service": "logit", "metric": "logit.output.file.reopens",
+                     "attrs": {"component": "archive"}, "step": 4, "window": "through",
+                     "reduce": "delta", "min": 1, "max": None}]
+    run_dir = _run_dir(tmp, name, timeline, stdout, configs={"sut": "logit-sut.yaml"},
+                       suts=["logit"], steps=steps, expect=expectations)
+    # What signals.rs logs on each SIGHUP, at info.
+    (run_dir / "logs" / "logit.stderr").write_text("".join(
+        f'{{"timestamp":"{_stamp(T0 + at)}","level":"INFO","fields":{{"message":"reopen signal '
+        f'received","generation":{n},"config_reloaded":false}},"target":"logit"}}\n'
+        for n, at in ((1, 110.1), (2, 210.1))))
+    return run_dir
+
+
+def _reopen_checks():
+    """`file.reopen` per rename: a clean run passing both rows, a late line in the renamed
+    file, an early line in the new one, a count off by one, and a missing new file each
+    FAILing, a kill's count reported; a signal and a rename opening no fault window; and an
+    `[[expect]]` through a signal step, and a SIGHUP's info line in `self_log`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        data = checks.RunData(_reopen_run(tmp, "clean"))
+        expect(not data.faults and sorted(f.step for f in data.events)
+               == ["c0s3", "c0s4", "c0s7", "c0s8"],
+               f"a signal and a rename open no fault window, got {data.faults}")
+        rows = {r.id: r for r in checks.check_file_reopen(data)}
+        expect(set(rows) == {"file.reopen.c0s3", "file.reopen.c0s7"}
+               and all(r.status == checks.PASS for r in rows.values())
+               and "lines in archive.log.1, archive.log.2, archive.log: 240, archive's "
+                   "events.delivered over logit's lives: 240" in rows["file.reopen.c0s3"].detail,
+               f"a clean run passes each rename, got {rows}")
+        micro = {r.id: r for r in checks.check_file_reopen(checks.RunData(
+            _reopen_run(tmp, "micro", stamp=_stamp)))}
+        expect(all(r.status == checks.PASS for r in micro.values()),
+               f"six fractional digits parse as nine do, got {micro}")
+        self_log = checks.check_self_log(data)
+        expect(self_log.status == checks.PASS and len(data.stderr["logit"]) == 2,
+               f"a SIGHUP's info line leaves self_log alone, got {self_log}")
+        expect(checks.check_expect(data)[0].status == checks.PASS,
+               f"an [[expect]] through a signal step reads its window, got "
+               f"{checks.check_expect(data)}")
+        late = {r.id: r for r in checks.check_file_reopen(checks.RunData(
+            _reopen_run(tmp, "late", late=True)))}
+        expect(late["file.reopen.c0s3"].status == checks.FAIL
+               and "archive.log.1 has a line at +115s, 4.8s after c0s4's SIGHUP finished"
+                   in late["file.reopen.c0s3"].detail
+               and late["file.reopen.c0s7"].status == checks.PASS,
+               f"a line in the renamed file after the signal FAILs, got {late}")
+        early = {r.id: r for r in checks.check_file_reopen(checks.RunData(
+            _reopen_run(tmp, "early", early=True)))}
+        expect(early["file.reopen.c0s3"].status == checks.FAIL
+               and "archive.log.2 has a line at +105s, 5.0s before c0s4's SIGHUP started"
+                   in early["file.reopen.c0s3"].detail,
+               f"a line in the new file from before the signal FAILs, got {early}")
+        off = {r.id: r for r in checks.check_file_reopen(checks.RunData(
+            _reopen_run(tmp, "off", extra=1)))}
+        expect(all(r.status == checks.FAIL and "off by -1" in r.detail for r in off.values()),
+               f"lines short of events.delivered FAIL, got {off}")
+        missing = {r.id: r for r in checks.check_file_reopen(checks.RunData(
+            _reopen_run(tmp, "missing", new_missing=True)))}
+        expect(missing["file.reopen.c0s7"].status == checks.FAIL
+               and "the new file archive.log is missing" in missing["file.reopen.c0s7"].detail
+               and missing["file.reopen.c0s3"].status == checks.FAIL,
+               f"a missing new file FAILs, got {missing}")
+        killed = {r.id: r for r in checks.check_file_reopen(checks.RunData(
+            _reopen_run(tmp, "killed", extra=3, kill=True)))}
+        expect(all(r.status == checks.PASS and "reported, not judged: c0s9" in r.detail
+                   for r in killed.values()),
+               f"a killed life's count is reported, got {killed}")
+        none = checks.check_file_reopen(checks.RunData(_run_dir(tmp, "none",
+                                                                 [_phase("start", 0, t0=T0)])))
+        expect(len(none) == 1 and none[0].status == checks.SKIP,
+               f"a run with no rename SKIPs, got {none}")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -7834,7 +8165,8 @@ def run(root, quiet=False):
                      _standin_server, _respond_rules, _standin_driver, _standin_checks,
                      _class_signatures, _datadog_codec, _datadog_counts, _datadog_server,
                      _datadog_rules, _datadog_checks, _overlap_rules, _overlap_driver,
-                     _overlap_checks, _shipped):
+                     _overlap_checks, _signal_rules, _signal_actions, _sighup_driver,
+                     _reopen_checks, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
@@ -7843,7 +8175,8 @@ def run(root, quiet=False):
                               _two_sut_driver,
                               _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
-                              _datadog_rules, _overlap_rules, _overlap_driver)
+                              _datadog_rules, _overlap_rules, _overlap_driver,
+                              _signal_rules, _sighup_driver)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")

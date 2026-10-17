@@ -234,6 +234,21 @@ rotated file open, about one descriptor more every 44 s, which passes `fd_growth
 30 minutes, and from about 74 minutes `file_out` deletes the oldest file, whose lines the end
 count then misses.
 
+`sighup` (14 minutes 30 seconds) runs `statsd-vm`'s stream with a second SUT sink off the
+ledger, `archive`: a `stdio_out` writing one `format: json` line per statsd event, straight from
+the listener, to `/shared/archive.log` in `<run>/shared`, which the override mounts into the
+SUT. Its 11.5-minute cycle sends `logit` a SIGHUP three times in steady state, once 10 s after a
+`rename` moves `archive.log` to `archive.log.1`, once during a 90 s VictoriaMetrics stop, and
+once after a second rename to `archive.log.2`, and sends one to the generator. Each SIGHUP makes
+`archive` reopen its path before its next write; the stdout telemetry stream ignores it, so
+every steady-state row judges straight through the signals, which open no fault window.
+`file.reopen` judges each rename, and the expectations assert one reopen through each SIGHUP to
+`logit`, a generator that keeps sending through its own, and an `archive` that drops nothing.
+`archive` is best-effort (`overflow: drop_oldest`), so a stall there can't hold the listener the
+ledger follows. Its files stay in the run directory, about 350 MB of them, and its
+`max_duration` is its own duration, because a second cycle's rename would find
+`archive.log.1` taken.
+
 ### Several SUT services
 
 A scenario can run a second `logit` under test, at the far end of a native hop. `logit`
@@ -343,9 +358,14 @@ wire loss to what the instances' socket closes could discard. The plan's "Rollin
 | `mark` | nothing: it marks a window for an event the SUT's own config causes, such as a stalled script. An optional `ready` names a readiness word the SUT must report inside it | nothing |
 | `exit` | nothing: on a SUT service only, it names an exit the SUT makes on its own inside the window, with the `code` it leaves and the `key` of the ERROR line that explains it | `docker start` if the container has exited |
 | `respond` | on a stand-in only: POSTs the step's cue to its control port, so it answers `status` (with an optional `body`) or `answer = "reset"`, storing the write when `apply` says to or, by default, when the status is `2xx`. Under the `datadog` shape a `2xx` can carry `series_errors = N`, a body naming the request's first N series dropped | an empty cue, which restores the default answer |
+| `signal` | `docker kill -s HUP`, on a service that runs `logit`, with `signal = "HUP"`, the one signal it takes: the process reopens its file targets and reloads its TLS material | none |
+| `rename` | on the host, moves `path` to `to` inside `<run>/shared`, both bare names, refusing a `to` that exists. `path` is a `stdio_out` target in `/shared` in the config of the service the step is `on`, and a `signal` step on that service must start inside the rename's `for` | none |
 
 A `mark`, `exit`, or `respond` window is a fault window like any other, so the checks excuse
-what happens inside it. None of them can go in a `[random]` schedule. A `respond` or a `stop` of
+what happens inside it. A `signal` or `rename` window excuses nothing: neither can lose data, so
+every row judges straight through it, and only `[[expect]]` and `file.reopen` read it. A
+`signal` may start inside a `rename` on its own service, and no other step may overlap either on
+its service. None of these five can go in a `[random]` schedule. A `respond` or a `stop` of
 a stand-in may name the `class` the sink must read its answers as (`clean`, `ambiguous`,
 `rejected`, or `refused`), which `ledger.standin` judges. Under the `datadog` shape every
 `respond` other than a `2xx` must name one, because its class is the only statement of what the
@@ -696,6 +716,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `identity.sink` | at the final life's last drain before its final one, a sink's batches received, plus those a disk spool replayed at open and the one it counts dropped with a torn tail (`batches.dropped{reason="disk_torn"}`, a batch an earlier life received), differ from delivered + dropped + queued by more than one batch in flight |
 | `drops` | the SUT counts a `logit.*.dropped` no other row judges with a `rejected` or `disk_corrupt` reason; any other reason `WARN`s. The ledger's own terms (every `batches.dropped`, a node's `events.dropped` beside a batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B, and the script's `script_error`) and, on an external, Kafka, or `datadog` stand-in target, a sink's `records.dropped` and `metrics.dropped` stay with the rows that balance them, and so does a TCP listener's F, which `ledger.wire` judges, so each drop is counted once. On an external target, where `ledger.egress` SKIPs, a `rejected` or `disk_corrupt` batch drop at a sink is `ledger.sent`'s FAIL, and one at any other node stays in this row |
 | `recovery` | within `recovery_bound` of a fault's end, for any sink, no drain interval clear of other faults shows that sink not retrying, its buffer under 5% full or holding at most one batch, every UDP listener's receive queue under 5% full, and the listeners' summed ingest at 95% of the generators' summed warmup rate; a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN`, and so does a run where no fault had an eligible interval |
+| `file.reopen.<step>` | one row per `rename` step, else one `file.reopen` row that SKIPs: the rename or the SIGHUP inside it didn't apply; the renamed file is missing or has a line stamped more than 2 s after the signal's apply finished; the new file, the next rename's `to` or `path` after the last, is missing or has a line stamped more than 2 s before the signal started; or the lines in every file of the path's renames differ from the target's `events.delivered` over the service's lives, which a `kill` or an `exit` of it leaves reported, not judged. An empty new file `WARN`s. The plan's [6. The checks](../../docs/plans/soak-harness.md#6-the-checks-w1a-w1b) has the bounds |
 | `expect.<name>` | a scenario's own `[[expect]]` bound doesn't hold; see [Expectations](#expectations) |
 
 The plan's "The ledger and identities" defines each symbol. Every SUT config gives `internal` a

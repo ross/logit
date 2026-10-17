@@ -1,0 +1,29 @@
+# The system under test in `script/soak`'s sighup scenario: statsd-vm's SUT, plus `archive`, a
+# stdio_out file target in the shared directory that every statsd event reaches, one JSON line
+# each. A SIGHUP makes `archive` reopen its path before its next write; `telemetry`, on stdout,
+# ignores the signal. `archive` is off the loss ledger, which follows `window` to VictoriaMetrics.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  archive:
+    type: stdio_out
+    sources: [statsd]               # the listener's events, so each line has its receive time
+    target: /shared/archive.log     # the override mounts <run>/shared here
+    format: json
+    # Best-effort, so a stall here can't park the listener and the ledger behind it; a drop
+    # counts `batches.dropped`, which the `drops` row and an expectation read.
+    buffer: { overflow: drop_oldest }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

@@ -67,6 +67,9 @@ A rolling overlap (`[overlap]`) runs several instances of one pipeline on one sh
 rows about a process life judge each instance on its own lives, and the wire, `progress`,
 `recovery`, and `ledger.overlap` judge them together ("a rolling overlap" below).
 
+A `signal` or `rename` step opens no fault window (`RunData.events`): only `[[expect]]` and
+`file.reopen` read it, and every other row judges straight through it.
+
 `rss_slope` and `fd_slope` judge each `logit` service on its own line, and a scenario's
 `[expected]` table can set the verdict a service should get on either (`judge_services`).
 """
@@ -82,9 +85,10 @@ from pathlib import Path
 
 from . import collect, faults, standin, telemetry, topic, vm
 from .scenario import (DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET, GENERATOR_ROLE,
-                       KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, RUN_WINDOW, STANDIN_ROLE,
-                       STANDIN_TARGET, SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE,
-                       component_blocks, config_env, parse_duration, source_ids)
+                       KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS, RUN_WINDOW,
+                       SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET, SUT_CONFIG_ENV,
+                       SUT_CONFIG_KEY, SUT_SERVICE, component_blocks, config_env,
+                       parse_duration, source_ids, stdio_shared_targets)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
@@ -202,6 +206,12 @@ class Fault:
     # A partition's `{network: IP address}` before its disconnect and after its reconnect.
     ips: object = None
     ips_after: object = None
+    # A `signal`'s signal, and a `rename`'s file and new name; None elsewhere.
+    signal: object = None
+    path: object = None
+    to: object = None
+    # When the apply finished, which for a `signal` is when Docker had sent it.
+    applied: object = None
 
     def affects(self, wire):
         return bool(getattr(self, faults.INGRESS_KEYS[wire]))
@@ -281,8 +291,10 @@ class RunData:
         self.end = phases.get("end_begin", phases.get("fail_fast", {})).get("t") or last
 
         # A fault whose apply returned nonzero gets no window, so nothing after it is excused;
-        # `timeline` FAILs the action itself.
+        # `timeline` FAILs the action itself. A `signal` or a `rename` step opens no window, so
+        # it goes in `events`, which only `[[expect]]` and `file.reopen` read.
         self.faults = []
+        self.events = []
         applies = {}
         for record in self.timeline:
             if record.get("event") == "apply":
@@ -290,10 +302,10 @@ class RunData:
             elif record.get("event") == "revert" and record["step"] in applies:
                 apply = applies.pop(record["step"])
                 if not apply.get("rc"):
-                    self.faults.append(self._fault(apply, record["finished_at"], record))
+                    self._held(apply).append(self._fault(apply, record["finished_at"], record))
         for apply in applies.values():
             if not apply.get("rc"):
-                self.faults.append(self._fault(apply, self.end))
+                self._held(apply).append(self._fault(apply, self.end))
 
         self.telemetry = {}
         self.stderr = {}
@@ -339,6 +351,9 @@ class RunData:
             for sink in self.sinks:
                 self.vm_series[sink] = self.standin_store[0]
 
+    def _held(self, apply):
+        return self.events if apply.get("action") in NO_WINDOW_ACTIONS else self.faults
+
     @staticmethod
     def _fault(apply, end, revert=None):
         return Fault(
@@ -352,6 +367,8 @@ class RunData:
             affects_tcp_ingress=apply.get("affects_tcp_ingress", False),
             affects_file_ingress=apply.get("affects_file_ingress", False),
             ips=apply.get("ips"), ips_after=(revert or {}).get("ips_after"),
+            signal=apply.get("signal"), path=apply.get("path"), to=apply.get("to"),
+            applied=apply.get("finished_at"),
         )
 
     def offset(self, t):
@@ -4442,6 +4459,180 @@ def check_recovery(data):
     return Result("recovery", status, detail, lines)
 
 
+# ---- file reopens ---------------------------------------------------------------------------------
+#
+# A `rename` moves a `stdio_out` file target aside in `<run>/shared`, and a SIGHUP inside the step
+# makes the target reopen its path. The reopen is lazy: the target checks the reopen generation at
+# the top of each send (crates/logit-outputs/src/stdio.rs, "Reopen on SIGHUP"), so the first batch
+# after the signal opens the new file and every earlier batch is in the renamed one.
+
+# How far a line's timestamp may sit past the signal's end in the renamed file, or before its
+# start in the new one. A line's timestamp is when its listener read the datagram (statsd_in's
+# `received_at`), and stdio_out writes each batch as it arrives: statsd_in sends a batch at least
+# every 100 ms (`batch_flush_interval`), so a line reaches the file about 100 ms after it was
+# read. 2 s is 20 of those, for a loaded host, and far under the minutes between a scenario's
+# signals, so a target that missed the reopen is off by far more.
+REOPEN_TOLERANCE_S = 2.0
+_NDJSON_TIMESTAMP = re.compile(rb'^\{"timestamp":"([^"]+)"')
+
+
+def _service_config_text(data, service):
+    """The config text of `logit` service `service` from the run's `configs/` copy, or ""."""
+    configs = data.resolved.get("configs") or {}
+    key = (service if service in configs and service != SUT_CONFIG_KEY
+           else SUT_CONFIG_KEY if service in data.suts else None)
+    if key is None or key not in configs:
+        return ""
+    try:
+        return (data.run_dir / "configs" / configs[key]).read_text()
+    except OSError:
+        return ""
+
+
+def ndjson_file_lines(path):
+    """`{lines, first, last, unparsed}` for a `format: json` file: its newline-terminated lines,
+    the earliest and latest `timestamp` among them in epoch seconds (None with no lines), and how
+    many lines carry none. None when the file doesn't exist. Each whole second is parsed once,
+    since a file holds thousands of lines a second."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    lines = unparsed = 0
+    first = last = None
+    seconds = {}
+    with open(path, "rb") as handle:
+        for raw in handle:
+            if not raw.endswith(b"\n"):
+                continue
+            lines += 1
+            found = _NDJSON_TIMESTAMP.match(raw)
+            text = found.group(1).decode("ascii", "replace") if found else ""
+            whole, dot, rest = text.partition(".")
+            try:
+                if dot and rest.endswith("Z") and rest[:-1].isdigit():
+                    if whole not in seconds:
+                        seconds[whole] = telemetry.parse_rfc3339(whole + "Z")
+                    ts = seconds[whole] + int(rest[:-1]) / 10 ** len(rest[:-1])
+                else:
+                    ts = telemetry.parse_rfc3339(text)
+            except ValueError:
+                unparsed += 1
+                continue
+            first = ts if first is None or ts < first else first
+            last = ts if last is None or ts > last else last
+    return {"lines": lines, "first": first, "last": last, "unparsed": unparsed}
+
+
+def _reopen_count(data, service, path, names, files):
+    """`(status, line)` for the lines in every file of `path`'s renames against the target's
+    `events.delivered` summed over `service`'s lives."""
+    component = stdio_shared_targets(_service_config_text(data, service)).get(path)
+    written = sum(found["lines"] for found in files.values() if found)
+    tel = data.telemetry.get(service)
+    shown = f"lines in {', '.join(names)}: {_n(written)}"
+    if component is None:
+        return FAIL, f"{shown}; {service}'s config has no stdio_out at {SHARED_MOUNT}/{path}"
+    if tel is None:
+        return FAIL, f"{shown}; no {service} telemetry"
+    delivered = sum(tel.counter_by_life("logit.component.events.delivered",
+                                        component=component).values())
+    line = f"{shown}, {component}'s events.delivered over {service}'s lives: {_n(delivered)}"
+    if written == delivered:
+        return PASS, line
+    ended = [f.step for f in data.faults if f.on == service and f.action in ("kill", "exit")]
+    if ended:
+        return PASS, (f"{line} (reported, not judged: {', '.join(ended)} ended a life with no "
+                      "final drain)")
+    return FAIL, f"{line}, off by {_n(written - delivered)}"
+
+
+def check_file_reopen(data):
+    """One `file.reopen.<step>` row per `rename` step, else one `file.reopen` row that SKIPs.
+    A rename moves its target's file `path` to `to` and pairs with the first SIGHUP on its
+    service starting inside its window. The row FAILs when the rename or that SIGHUP never
+    applied; the renamed file is missing or has a line timestamped after the signal's apply
+    finished plus `REOPEN_TOLERANCE_S` (or, after an earlier rename of the same path, before that
+    rename's signal started less it); the new file, the next rename's `to` or `path` after the
+    last, is missing or has a line timestamped before the signal started less it; a line has no
+    timestamp; or the lines in every file of the path's renames differ from the target's
+    `events.delivered` summed over the service's lives, one line per event under
+    `format: json`. A kill or an `exit` of the service loses its last drain's counts, so the
+    count is then reported, not judged. A new file with no lines WARNs."""
+    renames = sorted((f for f in data.events if f.action == "rename"), key=lambda f: f.start)
+    failed = [r for r in data.timeline if r.get("event") == "apply"
+              and r.get("action") == "rename" and r.get("rc")]
+    if not renames and not failed:
+        return [Result("file.reopen", SKIP, "the scenario has no rename step")]
+    results = [Result(f"file.reopen.{r.get('step')}", FAIL,
+                      f"the rename of {r.get('path')} to {r.get('to')} on {r.get('on')} "
+                      f"returned rc {r.get('rc')}: {(r.get('stderr') or '')[:160]}")
+               for r in failed]
+    hups = sorted((f for f in data.events if f.action == "signal" and f.signal == "HUP"),
+                  key=lambda f: f.start)
+    chains = {}
+    for rename in renames:
+        chains.setdefault((rename.on, rename.path), []).append(rename)
+    for (service, path), chain in chains.items():
+        names = [rename.to for rename in chain] + [path]
+        files = {name: ndjson_file_lines(data.run_dir / SHARED_DIR / name) for name in names}
+        count = _reopen_count(data, service, path, names, files)
+        previous = None
+        for index, rename in enumerate(chain):
+            hup = next((f for f in hups if f.on == service
+                        and rename.start <= f.start <= rename.end), None)
+            new_name = names[index + 1]
+            old, new = files[rename.to], files[new_name]
+            status, problems, lines = count[0], [], [count[1]]
+            if count[0] == FAIL:
+                problems.append(count[1])
+            if hup is None:
+                problems.append(f"no SIGHUP on {service} applied inside {rename.step}")
+            if old is None:
+                problems.append(f"{rename.to} is missing")
+            elif hup is not None:
+                lines.append(f"{rename.to}: {_n(old['lines'])} line(s), the latest at "
+                             f"{data.offset(old['last'])}; {hup.step}'s SIGHUP finished at "
+                             f"{data.offset(hup.applied)}")
+                if old["last"] is not None and old["last"] > hup.applied + REOPEN_TOLERANCE_S:
+                    problems.append(f"{rename.to} has a line at {data.offset(old['last'])}, "
+                                    f"{old['last'] - hup.applied:.1f}s after {hup.step}'s "
+                                    f"SIGHUP finished, past the {REOPEN_TOLERANCE_S:g}s "
+                                    "tolerance")
+                if (previous is not None and old["first"] is not None
+                        and old["first"] < previous.start - REOPEN_TOLERANCE_S):
+                    problems.append(f"{rename.to} has a line at {data.offset(old['first'])}, "
+                                    f"{previous.start - old['first']:.1f}s before "
+                                    f"{previous.step}'s SIGHUP started")
+            if new is None:
+                problems.append(f"the new file {new_name} is missing: the target never reopened "
+                                "its path")
+            elif hup is not None:
+                lines.append(f"{new_name}: {_n(new['lines'])} line(s), the earliest at "
+                             f"{data.offset(new['first'])}; {hup.step}'s SIGHUP started at "
+                             f"{data.offset(hup.start)}")
+                if new["first"] is None:
+                    status = worst([status, WARN])
+                    lines.insert(0, f"the new file {new_name} has no lines")
+                elif new["first"] < hup.start - REOPEN_TOLERANCE_S:
+                    problems.append(f"{new_name} has a line at {data.offset(new['first'])}, "
+                                    f"{hup.start - new['first']:.1f}s before {hup.step}'s "
+                                    f"SIGHUP started, past the {REOPEN_TOLERANCE_S:g}s "
+                                    "tolerance")
+            for name, found in ((rename.to, old), (new_name, new)):
+                if found and found["unparsed"]:
+                    problems.append(f"{name}: {_n(found['unparsed'])} line(s) with no "
+                                    "timestamp")
+            previous = hup
+            if problems:
+                status = FAIL
+            who = f"{hup.step}'s" if hup else "no"
+            head = f"{service}: {path} -> {rename.to} with {who} SIGHUP"
+            shown = problems or lines
+            results.append(Result(f"file.reopen.{rename.step}", status,
+                                  f"{head}; {'; '.join(shown)}", problems + lines))
+    return results
+
+
 # ---- per-scenario expectations --------------------------------------------------------------------
 #
 # A scenario's `[[expect]]` tables, copied into `scenario.resolved.json`'s `expect`. The plan's
@@ -4542,7 +4733,7 @@ def _expect_occurrences(data, exp):
     scheduled = [s["id"] for s in data.resolved.get("steps", [])
                  if s.get("id") == step or (isinstance(step, int) and not isinstance(step, bool)
                                             and s.get("spec_index") == step - 1)]
-    faults = [f for f in data.faults if f.step in scheduled]
+    faults = [f for f in data.faults + data.events if f.step in scheduled]
     return scheduled, faults
 
 
@@ -4722,7 +4913,7 @@ CHECKS = (
     check_ledger_intake, check_ledger_edge, check_ledger_hop, check_ledger_script, check_ledger_aggregate,
     check_ledger_egress, check_ledger_windows, check_ledger_replay, check_ledger_summary,
     check_ledger_sent, check_ledger_topic, check_ledger_standin, check_identity_sink, check_drops, check_recovery,
-    check_expect,
+    check_file_reopen, check_expect,
 )
 
 
