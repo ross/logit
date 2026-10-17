@@ -1,9 +1,11 @@
 # The central half of a forwarding pair: this `logit` receives what every edge.yaml forwards over
 # the native transport, windows the metrics once, and delivers each signal to its backend.
 #
-#   edges ==native, TLS==> remote_in -> by_signal --> metrics -> cumulative_10s -> VictoriaMetrics
-#                                                 --> logs    -> Loki
-#                                                 --> traces  -> Tempo
+#   edges ==native, TLS==> remote_in -> by_signal
+#
+#   by_signal --> metric_events -> cumulative_10s -> VictoriaMetrics
+#             --> log_events    -> Loki
+#             --> trace_events  -> Tempo
 #
 # Check it with `logit validate central.yaml` and draw it with
 # `logit graph central.yaml | dot -Tsvg > central.svg`. docs/deploying.md's "Operating a pair"
