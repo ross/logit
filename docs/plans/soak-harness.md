@@ -198,7 +198,8 @@ for = "45s"
 
 - Every fault carries `for`, so its revert is scheduled with it. `netem clear` is a revert, never
   a step.
-- No two faults overlap on one container, except a `signal` inside a `rename` (W12c).
+- No two faults overlap on one container, except a `signal` inside a `rename` (W12c), and a
+  `signal` or a `probe` inside a `rotate` (W12d).
 - No netem on a container during its `stop`, `kill`, `pause`, `partition`, or `exit`, because the qdisc
   is lost with the namespace and `docker run --network container:<id>` needs a running target.
 - No fault ends inside `cooldown`, and `cooldown` is at least `recovery_bound`.
@@ -208,7 +209,7 @@ for = "45s"
   the lines a killed generator sent after its last telemetry drain reach the SUT with no G
   behind them, and `ledger.wire` would net them against real loss. W7a adds `mark` and `exit`
   (below). W9a adds `respond`, on a stand-in only (below). W12c adds `signal` and `rename`, on
-  a service that runs `logit` (below).
+  a service that runs `logit` (below), and W12d `rotate` and `probe` (below).
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -386,6 +387,61 @@ for = "10s"
   window, and `file.reopen` (§6) judges each rename.
 - Neither can appear in a `[random]` schedule, whose faults take no `signal`, `path`, or `to`.
 
+**Certificates and rotations (W12d)** drive TLS reload
+([ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md)): a `[tls]` table gives the run
+a private CA, a `rotate` step issues a certificate's next generation behind a `live` symlink, and
+a `probe` reads what a listener serves after the SIGHUP that reloads it.
+
+```toml
+[tls.cert.statsd]         # one table per certificate
+san = ["logit"]           # its DNS names; a probe verifies the first
+usage = "server"          # server or client
+
+[[step]]
+at = "0s"
+action = "rotate"         # issues gen N + 1 into <run>/tls and repoints statsd/live
+on = "logit"              # the service whose config reads /tls/statsd/live/
+cert = "statsd"
+days = 31                 # above 30 and every earlier rotation's
+broken = false            # optional: true writes a key that doesn't match
+for = "40s"
+
+[[step]]
+at = "25s"
+action = "probe"          # s_client in the service's network namespace
+on = "logit"
+cert = "statsd"           # a server certificate
+port = 8125
+for = "5s"
+```
+
+- `[tls]` takes `cert` only, one table or more. A certificate's name is a slug other than
+  `probe`, the probe's own client certificate; `san` is a non-empty list of DNS names; `usage`
+  is `server` or `client`. Unknown keys are refused.
+- Before the stack starts, `prepare()` runs `certs.sh` (`tools/soak/netem/certs.sh`, in the
+  netem image, as the host user) into `<run>/tls`: `init` makes the CA and the probe certificate,
+  and `issue` each certificate's first generation, `gen-1`, valid 30 days, recorded in the
+  timeline as the `tls_issued` phase. Keys are EC P-256 with v3 extensions, and every file is
+  0644, so the image's `logit` user reads it. Each generation is a directory, and `<name>/live`
+  is a relative symlink that `issue` repoints with one `rename(2)`, so a reader sees one
+  generation or the other. A certs.sh failure stops `prepare()`.
+- A `rotate`'s apply issues the next generation and records its `gen`, `serial`, and
+  `not_after`; a failed issue still uses its number up. `cert` and `days` are required, `days` a
+  whole number above 30 and above every earlier rotation of the certificate, so its `notAfter`
+  rises; `broken`, optional, writes a key that doesn't match the certificate, which a reload
+  refuses. The step's service must read `/tls/<cert>/live/` in its config. A rotation runs once
+  per run, since a second cycle's would name the same days, so a scenario with one sets
+  `max_duration` to one cycle's run.
+- A `probe`'s apply runs `openssl s_client` from the step's service's network namespace against
+  `127.0.0.1:<port>`, presenting the probe certificate, so a listener that requires one completes
+  the handshake and counts no `connection_error`. It records the served `serial` and `not_after`,
+  and `verified`, whether the chain verifies against the CA for the certificate's first DNS
+  name. `cert`, a `server` certificate, and `port` are required. A probe starts inside a
+  `rotate` of its certificate on its own service, after a `signal = "HUP"` step there that
+  starts inside the same rotate, because a listener reloads only on a SIGHUP or its poll.
+- Neither opens a fault window, and neither reverts anything. Neither can appear in a
+  `[random]` schedule.
+
 **`sut_script` (W7a)**, an optional `[ledger]` key, names a `lua` component between the
 listener and `aggregate`, and adds the script hop to the ledger ("The ledger and identities").
 
@@ -550,7 +606,7 @@ component = "victoria_metrics"          # optional; joins `attrs`
 attrs = { reason = "overflow_oldest" }  # optional attribute filters, all strings
 step = "c0s1"                           # an expanded step id, or a 1-based [[step]] index
 window = "during"                       # during | after | through | run (W8c, no step)
-reduce = "max"                          # delta | min_delta | max | min | last | slope (W8c)
+reduce = "max"                          # delta | min_delta | max | min | last | slope (W8c) | rise (W12d)
 min = 2                                 # min, max, or both
 ```
 
@@ -558,7 +614,7 @@ min = 2                                 # min, max, or both
 |---|---|
 | `step` | An expanded step id names one occurrence. An integer names that `[[step]]` table's occurrence in every cycle, and the row FAILs if any occurrence does. `window = "run"` takes none |
 | `window` | `during` is the fault's span, from its apply starting to its revert finishing; `after` is the `recovery_bound` after it; `through` is both, from the apply starting to `recovery_bound` after the revert finishes. Each is open at its start, because a drain's deltas cover the interval before its timestamp. A bound that must hold for the whole episode, such as a loss counter that must stay 0, reads `through`: a chain blocked behind a sink stays blocked until the sink's next retry after the revert, up to its `retry_max_delay` later, so `during` misses the tail. `run` (W8c) has no step: it runs from the end of warmup to the start of the end sequence, fault windows included |
-| `reduce` | For a counter (`kind: sum`): `delta` sums the window's drains, and `min_delta` is the smallest single drain, a drain with no point counting 0, because a loss counter isn't emitted while it's 0. For a gauge: `max`, `min`, and `last` over the window's samples and the value in force at its start, because `internal` exports a gauge only in a drain after it was set. The value in force comes only from the SUT life whose drains cover the window's start, so a value an earlier process set doesn't carry into the next; a life that hasn't set the gauge yet leaves it unset. `last` is the value in force at the window's end. `slope` (W8c) is the least-squares slope of the window's own samples, without the value in force, in the metric's unit per hour (`checks.slope()`, times 3,600). A restart resets a process gauge, so `slope` fits each SUT life on its own and judges each life's slope against the bounds; a fit across a restart would read the drop as a negative trend. A life needs `rss_slope`'s minimum, 6 samples spanning 60 s, and the row FAILs when no life in the window has it, as a counter's window with no drain does |
+| `reduce` | For a counter (`kind: sum`): `delta` sums the window's drains, and `min_delta` is the smallest single drain, a drain with no point counting 0, because a loss counter isn't emitted while it's 0. For a gauge: `max`, `min`, and `last` over the window's samples and the value in force at its start, because `internal` exports a gauge only in a drain after it was set. The value in force comes only from the SUT life whose drains cover the window's start, so a value an earlier process set doesn't carry into the next; a life that hasn't set the gauge yet leaves it unset. `last` is the value in force at the window's end. `slope` (W8c) is the least-squares slope of the window's own samples, without the value in force, in the metric's unit per hour (`checks.slope()`, times 3,600). A restart resets a process gauge, so `slope` fits each SUT life on its own and judges each life's slope against the bounds; a fit across a restart would read the drop as a negative trend. A life needs `rss_slope`'s minimum, 6 samples spanning 60 s, and the row FAILs when no life in the window has it, as a counter's window with no drain does. `rise` (W12d) is the value in force at the window's end less the one in force at its start, and the row FAILs with no value in force at the start |
 
 `validate()` refuses an unknown key, a missing field (`step` is required for every window but
 `run`, which refuses one), a `name` that isn't lowercase letters,
@@ -638,7 +694,9 @@ W11b a scenario with a `file` wire is the exception: the driver creates `<run>/s
 absolute path in `compose.env` as `SOAK_SHARED_DIR`, and the scenario's override mounts it
 `:z` at `/shared` in the writer and the SUT. The writer's files stay in the run directory, the
 evidence the end sequence counts G from. From W12c a scenario with a `rename` step gets the same
-directory, mounted into the service whose `stdio_out` writes there.
+directory, mounted into the service whose `stdio_out` writes there. From W12d a scenario with a
+`[tls]` table gets `<run>/tls`, named `SOAK_TLS_DIR`, which the override mounts `:ro,z` at `/tls`
+as a whole directory, so a repointed `live` symlink reaches every container that reads it.
 
 Collection uses `docker logs <id> >svc.stdout 2>svc.stderr`, not `docker compose logs`, which
 merges the two streams. `docker logs` spans every life of a container that is stopped and started
@@ -783,7 +841,9 @@ returned nonzero has none, so nothing after it is excused.
   the raw `thread '…' panicked at` text, which isn't JSON, so stderr is checked line by line.
   An ERROR line keyed `retrying` is expected inside a fault window and WARNs outside one. A
   WARN line keyed `send_failed`, or whose message is `degraded`, does the same. Any other
-  ERROR line FAILs. Inside an `exit` step's window (W7a), the `exiting` line with the step's
+  ERROR line FAILs. From W12d a `tls_reload_failed` line FAILs, except inside a `rotate` step
+  with `broken = true` on its service, from its apply to its revert. Inside an `exit` step's
+  window (W7a), the `exiting` line with the step's
   `code`, an ERROR line keyed the step's `key`, and the `Error: ` text line `main` prints right
   after that `exiting` line are expected; the step FAILs the row when either of the first two is
   missing.
@@ -1166,6 +1226,12 @@ The rows:
   `events.delivered` summed over the service's lives, one line per event under
   `format: json`. A `kill` or an `exit` of the service loses its last drain's counts, so the
   count is then reported, not judged. A new file with no lines WARNs.
+- `tls.served.<step>` (W12d), one row per `probe` step, else one `tls.served` row that SKIPs:
+  the generation in force for the probe's certificate is the latest rotation of it that started
+  before the probe and wasn't `broken`, else the first issue, because a failed reload keeps the
+  previous files. The row FAILs when the probe didn't apply, its served serial or `notAfter`
+  isn't that generation's, the served chain didn't verify against the run's CA, or the run has
+  no `tls_issued` phase.
 - `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
   window around one step, or over the whole run (W8c); see "The scenario schema".
 
@@ -1934,7 +2000,12 @@ where it needs them, and a small check extension.
     mounted volume, whose path a rename moves aside before the signal and whose next batch
     lands in a fresh file. Needs: a `signal` action and a certificate-rotation action writing
     into a mounted directory. W12c builds the SIGHUP half: the `signal` and `rename` actions,
-    `file.reopen`, and the `sighup` scenario.
+    `file.reopen`, and the `sighup` scenario. W12d builds the TLS half: a private CA per run,
+    the `rotate` and `probe` actions, `tls.served`, the `rise` reducer, and the `tls-reload`
+    scenario, whose generator presents a rotated client certificate that its poll reloads and a
+    SUT restart makes it present, and whose SUT reloads a rotated server certificate on each
+    SIGHUP and keeps the previous one through a broken rotation. VictoriaMetrics stays on plain
+    HTTP: it doesn't verify a client certificate, so a TLS leg there would test no rotation.
 
 **Items 1 and 2 land first, as two stacked PRs, W7a and W7b.** Both touch code the harness has
 never driven, and item 2 forces the compose override, the service list, and the per-sink ledger
