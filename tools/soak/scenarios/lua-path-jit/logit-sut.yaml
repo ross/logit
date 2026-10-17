@@ -1,0 +1,67 @@
+# The system under test in `script/soak`'s lua-path-jit scenario: lua-path's SUT with LuaJIT's
+# trace compiler on (`jit: true`) and a script that edits each event in place. Its `internal`
+# telemetry goes to stdout as NDJSON for the harness to read; `script/soak` runs it with
+# `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  # lua-path's outcomes, under the compiler: every event is rewritten, every 53rd discarded,
+  # and every 97th fails, so `ledger.script` sees all three. The rewrite edits in place: it
+  # writes two attributes, enumerates the proxy with `pairs`, and deletes one with `= nil`, so
+  # each series carries `stage` alone, as lua-path's do. A statsd event carries no log, so there
+  # is no message to write. A `pairs` loop that finds fewer than the two written attributes fails
+  # the event, which adds to `errors{reason="process"}` beyond every 97th. Neither period divides
+  # the generator's 100 names, so every series keeps samples in every life. `flush()` returns one
+  # event carrying one metric each window: the ledger subtracts `flush.events` from what
+  # `aggregate` absorbed, which holds only while each flush event carries one metric, and
+  # `soak_lua_seen` stays outside `vm_selector`.
+  enrich:
+    type: lua
+    sources: [statsd]
+    interval: 10s
+    jit: true
+    script: |
+      local seen = 0
+      function process(event)
+        seen = seen + 1
+        if seen % 53 == 0 then
+          return nil
+        end
+        if seen % 97 == 0 then
+          error("soak: every 97th event fails")
+        end
+        local attributes = event.attributes
+        attributes.stage = "lua"
+        attributes.scratch = seen
+        local found = 0
+        for key in pairs(attributes) do
+          if key == "stage" or key == "scratch" then
+            found = found + 1
+          end
+        end
+        attributes.scratch = nil
+        if found ~= 2 then
+          error("soak: pairs found " .. found .. " of 2 written attributes")
+        end
+        return event
+      end
+      function flush(now)
+        return {Event.new{
+          timestamp = now,
+          metrics = {{name = "soak_lua_seen", kind = "gauge", value = seen}},
+        }}
+      end
+  window:
+    type: aggregate
+    sources: [enrich]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

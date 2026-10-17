@@ -1,0 +1,45 @@
+# The system under test in `script/soak`'s lua-stall-jit scenario: lua-stall's SUT with LuaJIT's
+# trace compiler on. Its `internal` telemetry goes to stdout as NDJSON for the harness to read;
+# `script/soak` runs it with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  # The 360,000th event, about 3 minutes in at 2,000 lines a second, runs a loop with no
+  # `Event.new` in it, so the heartbeat stops advancing: the node reads stalled after 10 s and
+  # `/readyz` answers `503 stalled` until the loop ends. The sandbox has no clock, so the loop is
+  # an iteration count. Compiled, 1e10 took 35 s in the logit:soak image on the development host
+  # (2026-10-17), against 78 s interpreted there, so lua-stall's count holds about 25 s of
+  # `stalled`. The loop runs once per process life.
+  enrich:
+    type: lua
+    sources: [statsd]
+    jit: true
+    script: |
+      local seen = 0
+      -- The loop's result is kept in a global, so the JIT can't drop the loop as dead code.
+      spun = 0
+      function process(event)
+        seen = seen + 1
+        if seen == 360000 then
+          local x = 0
+          for i = 1, 10000000000 do
+            x = x + i % 7
+          end
+          spun = x
+        end
+        return event
+      end
+  window:
+    type: aggregate
+    sources: [enrich]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
