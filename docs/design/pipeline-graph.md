@@ -378,7 +378,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     one list, a `by: signal` key other than `logs`/`metrics`/`traces`, more than 63 distinct
     targets, or an empty `by:` key; or a component whose `sources:` lists two destinations of one
     `route` that one event can reach together: two targets of one list, or any two of a
-    `by: signal` route's targets and the route itself.
+    `by: signal` route's targets, plus the route itself when some signal has no route.
 52. An inconsistent `statsd_out` `tls:`, or one under `transport: udp`.
 53. A `0s` `idle_timeout`, or any `idle_timeout` on a UDP listener.
 54. A `keep_values` with nothing configured, an empty name or `allow`, a non-finite literal, a

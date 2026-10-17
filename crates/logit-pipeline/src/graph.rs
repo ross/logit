@@ -154,8 +154,8 @@
 //!     distinct targets (the `Destinations` bitset's width), or an empty `by:` attribute/resource
 //!     key. Runs before 48, so an empty value isn't reported as an unknown target. After 48, its
 //!     reconvergence clause rejects a component listing two destinations one event can reach
-//!     together (two targets of one list, or any two of a `by: signal` route's targets and the
-//!     route itself): that component would receive the event twice.
+//!     together (two targets of one list, or any two of a `by: signal` route's targets, and the
+//!     route itself when some signal has no route): that component would receive the event twice.
 //! 52. A `statsd_out` `tls:` failing 44's three checks, messages verbatim
 //!     (`docs/adr/statsd-output.md`). Sink TLS rules are one per sink (24/34/44/52), since each
 //!     also checks its own block.
@@ -1059,9 +1059,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // that event, so the consumer receives it twice, a double count with no config line saying so.
     // An ordinary diamond (`in -> [a, b] -> c`) is legal because each branch is a component the
     // operator placed and `c` lists both by choice; here the copy is the router's and invisible.
-    // Co-marked sets: each `routes:` list, and under `by: signal` every target plus the router
-    // itself (a log-and-metrics event can reach both signals' targets and, for an unrouted signal,
-    // the router's own consumers). Reconvergence further downstream (`a -> x`, `b -> x`) is not
+    // Co-marked sets: each `routes:` list, and under `by: signal` every target, plus the router
+    // itself when some signal has no route (a log-and-metrics event can reach both signals'
+    // targets and, for an unrouted signal, the router's own consumers). With every signal routed,
+    // only a payload-less event reaches the router's edge, and it reaches nothing else.
+    // Reconvergence further downstream (`a -> x`, `b -> x`) is not
     // checked (`docs/known-gaps/runtime.md`).
     for (id, component) in &components {
         let ComponentKind::Route { by, routes } = &component.kind else { continue };
@@ -1072,7 +1074,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             .collect();
         if matches!(by, logit_config::RouteBy::Signal) {
             let mut all = targets_of(component);
-            all.push(id.as_str());
+            if ["logs", "metrics", "traces"].iter().any(|signal| !routes.contains_key(*signal)) {
+                all.push(id.as_str());
+            }
             groups.push(all);
         }
         for (consumer, c) in &components {
@@ -10140,6 +10144,31 @@ mod tests {
             ("rest", vec!["r"], vec![], null_out()),
         ]))
         .expect("first-match routing never marks one event for both a and b");
+    }
+
+    /// With every signal routed, only an event with no payload reaches the router's own edge, and
+    /// it reaches nothing else, so a consumer may read the route and one of its targets.
+    #[test]
+    fn a_consumer_of_a_fully_routed_signal_route_and_one_of_its_targets_resolves() {
+        resolve(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            (
+                "r",
+                vec!["in"],
+                vec![],
+                route(
+                    logit_config::RouteBy::Signal,
+                    &[("logs", "l"), ("metrics", "m"), ("traces", "t")],
+                ),
+            ),
+            ("l", vec![], vec![], target()),
+            ("m", vec![], vec![], target()),
+            ("t", vec![], vec![], target()),
+            ("m_out", vec!["m"], vec![], sink()),
+            ("t_out", vec!["t"], vec![], sink()),
+            ("both", vec!["r", "l"], vec![], sink()),
+        ]))
+        .expect("the router's own edge is never co-marked when every signal is routed");
     }
 
     /// Under `by: signal` a mixed event can reach any of the route's destinations, the router's
