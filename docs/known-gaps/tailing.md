@@ -61,6 +61,22 @@ Entry format and the other areas: [the known-gaps index](README.md).
   removal. See [ADR
   `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md),
   decision 6.
+- **A rotated file stays open, read to its end, for as long as a pattern matches its new
+  name.** A scan that finds a tracked inode under another matched name rebinds it and keeps it
+  `Active`, so under `app.log*` each rename of `file_out`'s or logrotate's cascade moves the open
+  file to its next name. `tail_in` closes a file only once no pattern matches any of its names:
+  renamed out of every pattern, or removed. It reads the file to its end first and closes it one
+  `poll_interval` later (`crates/logit-inputs/src/tail/driver.rs`, `Tailer::open_tracked` and
+  `Tailer::reap_drained`).
+  - **Consequence:** one descriptor and one file watch per retained rotated file, shown in
+    `logit.input.files.open`. A rotator that deletes its oldest file (`file_out`'s `max_files`,
+    logrotate's `rotate`) bounds them at its retention. One that keeps every file grows them by
+    one per rotation, with no bound but the process's descriptor limit. The soak harness's
+    `tail-rotate`, keeping every file, saw the SUT's descriptors grow from 16 to 34 across 18
+    rotations (`docs/plans/soak-harness.md`, "W11b: file tailing").
+  - **Workaround:** bound the rotator's retention. A pattern that matches only the active name
+    (`app.log`) closes each rotated file once it's read, but loses the file's unread tail at a
+    stop or a crash (the entry above).
 - **Under a pattern that matches rotated names, `copytruncate` re-emits the whole file on every
   rotation, and `compress` tails `app.log.N.gz` as text.**
   - The copy `copytruncate` writes is a new inode, so `app.log*` reads it from `0`; a recorded run

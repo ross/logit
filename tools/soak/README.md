@@ -109,14 +109,18 @@ keep, because the driver never recreates a container.
 minutes, one at a time, with 2 to 4 minutes of quiet between them. Over 8 hours that is about 113
 faults, and about half the run is judged steady state.
 
-Three scenarios put a `lua` stage between the listener and `aggregate`, with
-`[ledger] sut_script` naming it, so `ledger.script` balances the script's hop:
+Six scenarios put a `lua` stage between the listener and `aggregate`, with
+`[ledger] sut_script` naming it, so `ledger.script` balances the script's hop. Each `-jit`
+scenario is the one before it with LuaJIT's trace compiler on (`jit: true`):
 
 | Scenario | Length | What it drives |
 |---|---|---|
 | `lua-path` | 16 minutes | `statsd-vm`'s schedule through a script that rewrites every event, drops every 53rd, fails on every 97th, and returns one rollup event from `flush()` each window; its expectations assert all three outcomes |
 | `lua-stall` | 8 minutes | a busy loop of about 30 s on the 360,000th event: the node reads stalled, `/readyz` answers `503 stalled`, the receive queue fills and evicts, and the script resumes on its own. A `mark` with `ready = "stalled"` covers it |
 | `lua-memory` | 8 minutes 10 seconds | from the 480,000th event the script keeps 1 KB per event until the VM passes `max_memory: 64MiB`: the SUT logs `memory_limit_exceeded`, drains, and exits 2 inside an `exit` step, whose revert starts it again. The run ends before the second life reaches that event |
+| `lua-path-jit` | 16 minutes | `lua-path` under the compiler, rewriting in place: two attribute writes, a `pairs` loop over the attribute proxy, and an `= nil` delete |
+| `lua-stall-jit` | 8 minutes | `lua-stall` under the compiler: the compiled loop runs about 35 s and still reads `stalled`, since stall detection doesn't depend on a hook |
+| `lua-memory-jit` | 8 minutes 10 seconds | `lua-memory` under the compiler: the kept strings are on the Lua heap, which `max_memory` counts either way, so the SUT still exits 2 |
 
 Three scenarios give the SUT two sinks of one kind, each to its own VictoriaMetrics, with one
 `[[ledger.sink]]` table per sink:
@@ -155,9 +159,9 @@ effect with `[[expect]]` tables:
 | `slow-destination` | 7 minutes 45 seconds | the sink's `timeout` is 2 s. A 3 s netem delay on VictoriaMetrics makes it apply each write whose response arrives late, then a 2 kbit rate limit on the SUT's egress makes a request unable to finish. Each counts `network_error` and a retry, and nothing drops |
 | `fanout-stop-outage` | 6 minutes 15 seconds | `fanout-copy`'s two sinks, with the second's queue at 4 batches under `drop_oldest`. VictoriaMetrics B is stopped 150 s and the SUT is stopped for 30 s, 60 s in, so the second sink's queued batches drop at shutdown and are counted while the first sink drops nothing |
 
-The stall and the memory cap depend on the host's speed: `lua-stall`'s loop count and
-`lua-memory`'s event count are calibrated on the development host, and the comments in their
-`logit-sut.yaml` give the timings. On a much slower or faster host the event falls outside its
+The stall and the memory cap depend on the host's speed: the `lua-stall` scenarios' loop count
+and the `lua-memory` scenarios' event count are calibrated on the development host, and the
+comments in their `logit-sut.yaml` give the timings. On a much slower or faster host the event falls outside its
 step's window, and `ready` or `exit` FAILs.
 
 `statsd-datadog` (14 minutes) sends `statsd-vm`'s stream, renamed `logit.soak.requests_0` to
@@ -187,12 +191,13 @@ Three scenarios run a sink against a scripted stand-in in place of VictoriaMetri
 | `standin-at-most-once` | 8 minutes 55 seconds | the same sink under `buffer.delivery: at_most_once`: a `503` and a reset drop the batch, a `401` holds it, a `400` drops it |
 | `standin-datadog` | 30 minutes 25 seconds | `datadog_out` (series, gzip, delta counts) through every row of its response-class table: sixteen 20 s steps, 105 s apart, from a `202` whose body names two series dropped, through `400`, `401`, `403`, `404`, `405`, `408`, `413`, `429`, `500`, `501`, a `503` after storing (its resend a duplicate), `302`, and `422`, to a connection reset and a stop of the stand-in |
 
-`native-hop` runs a second `logit` under test, `collector`, at the far end of the native hop (see
-[Several SUT services](#several-sut-services)):
+Two scenarios run a second `logit` under test, `collector`, at the far end of the native hop
+(see [Several SUT services](#several-sut-services)):
 
 | Scenario | Length | What it drives |
 |---|---|---|
 | `native-hop` | 17 minutes | `logit` takes statsd and forwards it with `logit_out` from a disk spool to `collector`'s `logit_in`, which aggregates into VictoriaMetrics: a netem delay and then 10% loss on `logit`'s sends, a partition, a stop, a pause, and a kill of `collector`, a kill of `logit` with `collector` up, and a kill of `logit` inside a stop of `collector`. `ledger.hop` judges the hop; its expectations assert the replay after the first `logit` kill is deduplicated, `logit` reconnects after the `collector` kill, and the spool holds the hop through the stop |
+| `native-hop-spans` | 17 minutes | `native-hop` with `span_sample_rate: 1.0` on both SUTs, so internal spans and the hop frame's trace context run under the same faults. The spans go to stdout beside the metrics, where the NDJSON reader skips them; its expectations add that each SUT emitted spans. A backlog flushed in one drain can pass the 512 spans `internal` buffers per component, and those dropped are counted `logit.internal.spans.dropped{reason="buffer_full"}`, which `drops` reports as WARN |
 
 `rolling-overlap` (19 minutes) runs two instances of one SUT, `logit` and `logit-b`, on one UDP
 port under `reuse_port`, in the network namespace of a holder, `sut-net` (see

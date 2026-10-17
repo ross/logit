@@ -308,8 +308,10 @@ impl FileTarget {
 
     /// `path.rotating`: holds the rotated file between [`FileTarget::rotate`]'s commit-point
     /// rename and [`FileTarget::promote_staged`]. An orphan from a kill in that window is promoted
-    /// on the next rotation. `tail_in`'s anchored wildcard never matches it, as with `.1`
-    /// (`docs/adr/file-tailing-and-docker-json-logs.md`, "Rotation and truncation").
+    /// on the next rotation. A `tail_in` pattern on the active name's suffix (`*.log`) never
+    /// matches it, as with `.1`; one that also matches rotated names (`app.log*`) does, and
+    /// follows the same inode it already tails (`docs/adr/file-tailing-and-docker-json-logs.md`,
+    /// "Rotation and truncation").
     fn staging_path(&self) -> PathBuf {
         let mut name = self.path.clone().into_os_string();
         name.push(".rotating");
