@@ -623,12 +623,13 @@ Graph rule 50 rejects a router (`route`, or `lua`/`lua_file` with `targets:`) th
 ordinary consumer, so every event no target claims reaches one. A config that discards those
 events names a `null_out` as that consumer, whose `events.received` counts them.
 
-**A router's `events.sent` can exceed its `events.received`.** An event sent to two
-destinations counts as `events.sent` on each (the router's own id for its forward edge, the
-target's id for a target), and the router's `"process"` span counts it twice. Over one interval,
-a router's `events.copied` is the sum of its destinations' `events.sent` less its
-`events.received` ([ADR `target-components`](../adr/target-components.md)'s 2026-10-16
-amendment).
+**A router's copies count once per destination.** An event sent to two destinations counts as
+`events.sent` on each: under the router's own id for its forward edge, and under the target's id
+for a target. The router's `"process"` span counts it twice too. Over one interval, a router's
+`events.received` plus its `events.copied` equals the events across the partitions it sent. A
+target's `events.sent` sums every router that directs at it, so the destinations' `events.sent`
+gives that total only when no other router feeds those targets
+([ADR `target-components`](../adr/target-components.md)'s 2026-10-16 amendment).
 
 **A `target` emits the layer-2 *producer* set and nothing else.** It has no task, no inbox, and no
 receive side: it's one `Fanout` carrying the target's own id and telemetry handle
