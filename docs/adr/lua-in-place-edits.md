@@ -64,7 +64,7 @@ enumerates them.
   already has that problem.
 - **A Rust `pairs`.** Rejected. With the JIT on, a C or Rust function called at loop entry is not
   yet implemented in LuaJIT's recorder (`recff_nyi`), so it would stop plain-table loops
-  compiling. The sandbox runs interpreted today (see the amendment below), where a Rust `pairs`
+  compiling. The sandbox runs interpreted by default (see the amendment below), where a Rust `pairs`
   would put mlua's callback boundary on every table's loop; that cost wasn't measured. A Lua
   wrapper returns the builtin `next` for a table, which keeps the loop's table-specialized
   bytecode (`ITERN`) in either mode.
@@ -99,10 +99,10 @@ enumerates them.
 
 The wrapper stays, and the `attributes_of(proxy)` fallback isn't taken.
 
-The sandbox runs LuaJIT interpreted: `sandbox_libs()` opens no `jit` library, so `luaopen_jit`,
-the only code that sets the JIT's on flag, never runs, and no traces compile. Timings match a VM
-that loads the library and calls `jit.off()`, on every case below. The JIT's effect on the
-sandbox is outside this record.
+The sandbox runs LuaJIT interpreted unless a component sets `jit: true`
+([ADR `lua-jit-opt-in`](lua-jit-opt-in.md)): by default `sandbox_libs()` opens no `jit` library,
+so `luaopen_jit`, the only code that sets the JIT's on flag, never runs, and no traces compile.
+Timings match a VM that loads the library and calls `jit.off()`, on every case below.
 
 Measured in that VM, a release build pinned to one core, with a fresh VM per run, the median of
 11 runs:
@@ -118,4 +118,6 @@ So the wrapper costs about 13 ns per `pairs` call on a table and nothing per ste
 `return P(t)` wrapper costs about 5 ns, the floor for any Lua wrapper. The type check and the
 argument error at the caller's line account for the rest, and they're kept. A call site that has
 seen a proxy runs plain-table loops about 60% slower afterward, which the design doc tells a script
-author to avoid in a hot path. With the JIT on, the wrapper measured no difference on any case.
+author to avoid in a hot path. With the JIT on, as under `jit: true`, the wrapper measured no
+difference on any case, and a call site that has seen a proxy runs plain-table loops about 4x
+slower than a tables-only one.

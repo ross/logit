@@ -455,6 +455,7 @@ pub async fn run_with_options(
                 let thread_dropped = shutdown_dropped_batches.clone();
                 let max_memory = runtime.max_memory;
                 let verdict_spacing = runtime.min_verdict_spacing;
+                let jit = runtime.jit;
                 std::thread::Builder::new()
                     .name(format!("logit-{id}"))
                     // Script recursion through C frames (a `string.gsub` callback a few hundred
@@ -465,6 +466,7 @@ pub async fn run_with_options(
                         run_lua(
                             thread_id,
                             script,
+                            jit,
                             interval,
                             targets,
                             ready_tx,
@@ -910,9 +912,9 @@ impl Default for WriteLoopConfig {
     }
 }
 
-/// A Lua node's stall and wedge thresholds, read by [`watch_lua_thread`], and its memory cap, read
-/// by [`run_lua_loop`] (`docs/adr/lua-runaway-script-bounds.md`). Only `max_memory` is
-/// config-exposed.
+/// A Lua node's stall and wedge thresholds, read by [`watch_lua_thread`], its memory cap, read
+/// by [`run_lua_loop`] (`docs/adr/lua-runaway-script-bounds.md`), and whether its VM compiles
+/// (`docs/adr/lua-jit-opt-in.md`). Only `max_memory` and `jit` are config-exposed.
 #[derive(Debug, Clone, Copy)]
 pub struct LuaRuntimeConfig {
     /// How long the thread may sit inside one `process()`/`flush()` with its [`Heartbeat`]
@@ -929,11 +931,14 @@ pub struct LuaRuntimeConfig {
     /// before that sink's `write_loop` stops draining.
     pub shutdown_grace: Duration,
     /// The component's `max_memory`: the VM bytes over which, after the full collections
-    /// [`MemoryVerdict`] runs, the node fails. `None` is no limit. The one config-exposed field.
+    /// [`MemoryVerdict`] runs, the node fails. `None` is no limit.
     pub max_memory: Option<usize>,
     /// The least time between two forced `max_memory` verdicts; the spacing is also at least ten
     /// times the last verdict's own duration. Not config-exposed.
     pub min_verdict_spacing: Duration,
+    /// The component's `jit`: whether the VM runs LuaJIT's trace compiler
+    /// (`ScriptWorker::new_with_jit`). `false` runs the script interpreted.
+    pub jit: bool,
 }
 
 impl Default for LuaRuntimeConfig {
@@ -943,6 +948,7 @@ impl Default for LuaRuntimeConfig {
             shutdown_grace: Duration::from_secs(2),
             max_memory: None,
             min_verdict_spacing: MIN_VERDICT_SPACING,
+            jit: false,
         }
     }
 }
@@ -2180,6 +2186,7 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 fn run_lua(
     id: String,
     script: String,
+    jit: bool,
     configured_interval: Option<Duration>,
     targets: Vec<String>,
     ready_tx: oneshot::Sender<Result<(), String>>,
@@ -2192,7 +2199,7 @@ fn run_lua(
     shutdown_dropped: Arc<AtomicU64>,
     runtime: tokio::runtime::Handle,
 ) {
-    let worker = match ScriptWorker::new(&script)
+    let worker = match ScriptWorker::new_with_jit(&script, jit)
         .and_then(|w| w.with_telemetry(telemetry.clone()))
         .map(|w| w.with_component(&id))
         .map(|w| w.with_targets(&targets))
@@ -3146,6 +3153,7 @@ mod tests {
                         .to_string(),
                     interval: None,
                     max_memory: None,
+                    jit: false,
                 },
             },
         );
@@ -4212,6 +4220,7 @@ mod tests {
                     script: "function process(event) return {event, event:clone()} end".to_string(),
                     interval: None,
                     max_memory: None,
+                    jit: false,
                 },
             },
         );
@@ -4359,6 +4368,7 @@ mod tests {
                     script: script.clone(),
                     interval: None,
                     max_memory: None,
+                    jit: false,
                 },
             },
         );
@@ -4469,6 +4479,7 @@ mod tests {
                     script: script.clone(),
                     interval: None,
                     max_memory: None,
+                    jit: false,
                 },
             },
         );
@@ -4590,6 +4601,7 @@ mod tests {
                     script: "function process(event) error('boom') end".to_string(),
                     interval: None,
                     max_memory: None,
+                    jit: false,
                 },
             },
         );
@@ -4706,6 +4718,7 @@ mod tests {
                     script: script.clone(),
                     interval: None,
                     max_memory: None,
+                    jit: false,
                 },
             },
         );
@@ -4796,7 +4809,12 @@ mod tests {
             "enrich".to_string(),
             plain_component(
                 vec!["in".to_string()],
-                ComponentKind::Lua { script: script.clone(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: script.clone(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
         );
         components
@@ -4902,6 +4920,7 @@ mod tests {
                     script: "function process(event) return event end".to_string(),
                     interval: Some(Duration::from_secs(3600)),
                     max_memory: None,
+                    jit: false,
                 },
             },
         );
@@ -9521,6 +9540,7 @@ mod tests {
                     script: "function process(event) return event end".to_string(),
                     interval: None,
                     max_memory: None,
+                    jit: false,
                 },
             ),
         );
@@ -9600,6 +9620,7 @@ mod tests {
                     script: "function process(event) return event end".to_string(),
                     interval: None,
                     max_memory: None,
+                    jit: false,
                 },
             ),
         );
@@ -9988,7 +10009,12 @@ mod tests {
             "enrich".to_string(),
             plain_component(
                 vec!["in".to_string()],
-                ComponentKind::Lua { script: script.to_string(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: script.to_string(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
         );
         components
@@ -10097,6 +10123,7 @@ mod tests {
                     script: SPIN_ON_SECOND_EVENT.to_string(),
                     interval: None,
                     max_memory: None,
+                    jit: false,
                 },
             ),
         );
@@ -10250,6 +10277,7 @@ mod tests {
                     script: script.to_string(),
                     interval: Some(Duration::from_secs(3600)),
                     max_memory: None,
+                    jit: false,
                 },
             ),
         );
@@ -10337,6 +10365,7 @@ mod tests {
                     script: SPIN_ON_SECOND_EVENT.to_string(),
                     interval: None,
                     max_memory: None,
+                    jit: false,
                 },
             ),
         );
@@ -10440,7 +10469,12 @@ mod tests {
             "enrich".to_string(),
             plain_component(
                 vec!["in".to_string()],
-                ComponentKind::Lua { script: script.to_string(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: script.to_string(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
         );
         components
@@ -10607,6 +10641,7 @@ mod tests {
                     script: script.to_string(),
                     interval,
                     max_memory: Some(max_memory as u64),
+                    jit: false,
                 },
             ),
         );
@@ -10940,7 +10975,12 @@ mod tests {
             "enrich".to_string(),
             plain_component(
                 vec!["in".to_string()],
-                ComponentKind::Lua { script: script.to_string(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: script.to_string(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
         );
         components
@@ -11196,14 +11236,24 @@ mod tests {
             "a_ok".to_string(),
             plain_component(
                 vec!["in".to_string()],
-                ComponentKind::Lua { script: good.to_string(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: good.to_string(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
         );
         components.insert(
             "b_bad".to_string(),
             plain_component(
                 vec!["a_ok".to_string()],
-                ComponentKind::Lua { script: bad.to_string(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: bad.to_string(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
         );
         components
@@ -11265,6 +11315,7 @@ mod tests {
                     script: script.to_string(),
                     interval: Some(Duration::from_millis(50)),
                     max_memory: None,
+                    jit: false,
                 },
             ),
         );
@@ -11971,7 +12022,12 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a", "b"],
-                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: String::new(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("b", vec![], vec![], ComponentKind::Target {}),
@@ -12065,7 +12121,12 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a", "b"],
-                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: String::new(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("b", vec![], vec![], ComponentKind::Target {}),
@@ -12163,7 +12224,12 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a"],
-                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: String::new(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("sink_a", vec!["a"], vec![], influxdb_out()),
@@ -12231,7 +12297,12 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a"],
-                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: String::new(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             (
@@ -12355,7 +12426,12 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a", "b"],
-                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: String::new(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("b", vec![], vec![], ComponentKind::Target {}),
@@ -12436,13 +12512,23 @@ mod tests {
                 "split_a",
                 vec!["in"],
                 vec!["shared"],
-                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: String::new(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
             (
                 "split_b",
                 vec!["in"],
                 vec!["shared"],
-                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: String::new(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
             ("shared", vec![], vec![], ComponentKind::Target {}),
             ("sink", vec!["shared"], vec![], influxdb_out()),
@@ -12703,6 +12789,7 @@ mod tests {
                     script: SPLIT_SCRIPT.to_string(),
                     interval: None,
                     max_memory: None,
+                    jit: false,
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -12801,6 +12888,7 @@ mod tests {
                     script: SPLIT_SCRIPT.to_string(),
                     interval: None,
                     max_memory: None,
+                    jit: false,
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -12882,7 +12970,12 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a"],
-                ComponentKind::Lua { script: script.to_string(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: script.to_string(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("sink_a", vec!["a"], vec![], influxdb_out()),
@@ -13018,6 +13111,7 @@ mod tests {
                     script: script.to_string(),
                     interval: Some(Duration::from_secs(3600)),
                     max_memory: None,
+                    jit: false,
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -13128,13 +13222,19 @@ mod tests {
                     script: script.to_string(),
                     interval: Some(Duration::from_secs(3600)),
                     max_memory: None,
+                    jit: false,
                 },
             ),
             (
                 "watcher",
                 vec!["windowed"],
                 vec![],
-                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: String::new(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
             ("out", vec!["watcher"], vec![], influxdb_out()),
         ]);
@@ -13368,6 +13468,7 @@ mod tests {
                     script: script.to_string(),
                     interval: Some(Duration::from_secs(3600)),
                     max_memory: None,
+                    jit: false,
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
