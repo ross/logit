@@ -110,8 +110,9 @@ minutes, one at a time, with 2 to 4 minutes of quiet between them. Over 8 hours 
 faults, and about half the run is judged steady state.
 
 Six scenarios put a `lua` stage between the listener and `aggregate`, with
-`[ledger] sut_script` naming it, so `ledger.script` balances the script's hop. Each `-jit`
-scenario is the one before it with LuaJIT's trace compiler on (`jit: true`):
+`[ledger] sut_script` naming it, so `ledger.script` balances the script's hop. A `-jit`
+scenario is the scenario of the same name without the suffix, with LuaJIT's trace compiler on
+(`jit: true`):
 
 | Scenario | Length | What it drives |
 |---|---|---|
@@ -197,7 +198,7 @@ Two scenarios run a second `logit` under test, `collector`, at the far end of th
 | Scenario | Length | What it drives |
 |---|---|---|
 | `native-hop` | 17 minutes | `logit` takes statsd and forwards it with `logit_out` from a disk spool to `collector`'s `logit_in`, which aggregates into VictoriaMetrics: a netem delay and then 10% loss on `logit`'s sends, a partition, a stop, a pause, and a kill of `collector`, a kill of `logit` with `collector` up, and a kill of `logit` inside a stop of `collector`. `ledger.hop` judges the hop; its expectations assert the replay after the first `logit` kill is deduplicated, `logit` reconnects after the `collector` kill, and the spool holds the hop through the stop |
-| `native-hop-spans` | 17 minutes | `native-hop` with `span_sample_rate: 1.0` on both SUTs, so internal spans and the hop frame's trace context run under the same faults. The spans go to stdout beside the metrics, where the NDJSON reader skips them; its expectations add that each SUT emitted spans. A backlog flushed in one drain can pass the 512 spans `internal` buffers per component, and those dropped are counted `logit.internal.spans.dropped{reason="buffer_full"}`, which `drops` reports as WARN |
+| `native-hop-spans` | 17 minutes | `native-hop` with `span_sample_rate` at the product's default, `0.1`, on both SUTs, so internal spans and the hop frame's trace context run under the same faults. The spans go to stdout beside the metrics, where the NDJSON reader skips them; its expectations add that each SUT emitted spans. `internal` buffers at most 512 spans per component between drains and counts the rest `logit.internal.spans.dropped{reason="buffer_full"}`, which `drops` judges like any other drop |
 
 `tcp-ingress` (20 minutes 30 seconds) is `statsd-vm`'s stream over one TCP connection:
 `statsd_out` with `transport: tcp` into `statsd_in` with `transport: tcp` and a 60 s

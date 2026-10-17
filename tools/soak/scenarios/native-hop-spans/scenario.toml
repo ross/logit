@@ -1,13 +1,14 @@
-# native-hop with every internal span kept on both SUTs (`span_sample_rate: 1.0`), so span
-# emission and the hop frame's trace context run under the same faults. Each SUT's spans go to
-# its stdout beside its metrics, where the harness's NDJSON reader skips them, since a span event
-# carries no metrics. A backlog flushed in one drain can pass `internal`'s 512 spans per
-# component, which it drops and counts `logit.internal.spans.dropped{reason="buffer_full"}`, so
-# `drops` can WARN. The schema is docs/plans/soak-harness.md's "The scenario schema";
-# `ledger.hop` is its "The native hop".
+# native-hop with internal spans on both SUTs at the product's default rate
+# (`span_sample_rate: 0.1`), so span emission and the hop frame's trace context run under the
+# same faults. Each SUT's spans go to its stdout beside its metrics, where the harness's NDJSON
+# reader skips them, since a span event carries no metrics. `internal` buffers at most 512 spans
+# per component between drains and counts the rest
+# `logit.internal.spans.dropped{reason="buffer_full"}`. At the default rate a backlog should
+# stay under that, so `drops` judges a span drop as it does any other. The schema is
+# docs/plans/soak-harness.md's "The scenario schema"; `ledger.hop` is its "The native hop".
 
 name = "native-hop-spans"
-description = "native-hop with span_sample_rate 1.0 on both SUTs: internal spans and the hop's trace context under faults"
+description = "native-hop with span_sample_rate 0.1 on both SUTs: internal spans and the hop's trace context under faults"
 duration = "17m"          # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "120s"         # >= recovery_bound

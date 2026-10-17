@@ -754,8 +754,8 @@ the operator-facing account of all of this.
   the hop on run totals, allowing duplicates only where a mechanism forwards them (a kill or a
   pause of `collector`, and a killed `logit`'s spool replay to a `collector` that restarted
   since; the plan's "The native hop (W10b)"), and `ledger.summary` bounds V end to end by what
-  the generators sent. `native-hop-spans` is `native-hop` with every internal span kept on both
-  SUTs.
+  the generators sent. `native-hop-spans` is `native-hop` with internal spans on at the default
+  rate on both SUTs.
   `tcp-ingress` sends statsd over TCP, its source declared `wire = "tcp"` and checked at load
   against the listener's `transport:`: W is `input.frames`, the framer's drops are counted wire
   loss, and the generator's netem is judged at 0 because TCP retransmits. A process-ending
