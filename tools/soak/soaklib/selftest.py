@@ -911,6 +911,14 @@ def _stalled(root):
         expect(result.status == checks.FAIL
                and "stalled: the driver's tick ran 8,508s late from +1120s" in result.detail,
                f"run reads a stall from the watchdog's gap in an older run, got {result}")
+        # A driver that records stalls is read by its phase alone: one slow iteration leaves a
+        # watchdog gap and no phase, and isn't a stall.
+        new = _run_dir(tmp, "stalled-new", [_phase("start", 0, t0=T0, marks_stalls=True),
+                                            _phase("end_begin", 9628), _phase("end_end", 9730)])
+        (new / "watchdog.jsonl").write_text("".join(json.dumps(r) + "\n" for r in polls))
+        result = _status(new, checks.check_run)
+        expect(result.status == checks.PASS,
+               f"a run whose driver records stalls is read by the phase alone, got {result}")
 
 
 def _ndjson():

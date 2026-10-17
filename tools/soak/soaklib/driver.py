@@ -398,7 +398,8 @@ class Run:
             info = self.docker.inspect(self.ids[service]) or {}
             self.started_at[service] = (info.get("State") or {}).get("StartedAt")
         self.t0 = _now()
-        self.phase("start", t0=self.t0, ids=dict(self.ids))
+        # `marks_stalls` tells the checks this driver records a late tick as a `stalled` phase.
+        self.phase("start", t0=self.t0, ids=dict(self.ids), marks_stalls=True)
         seed = "" if self.seed is None else f", seed {self.seed}"
         self.say(f"stack up; {len(self.steps)} fault(s) over "
                  f"{scenario_mod.format_duration(self.duration)}{seed}")

@@ -458,7 +458,8 @@ def check_run(data):
                                                                      if reason else ""))
     stalls = [(record.get("since", 0), record.get("late_s", 0)) for record in data.timeline
               if record.get("event") == "phase" and record.get("phase") == "stalled"]
-    if not stalls and data.t0 is not None:
+    if not stalls and data.t0 is not None and not data.phases.get("start", {}).get(
+            "marks_stalls"):
         # A run directory from before the driver recorded the phase: the watchdog's 5 s
         # inspections stop for the span. The end sequence inspects once as it begins.
         polled = sorted({r["t"] for r in data.watchdog
