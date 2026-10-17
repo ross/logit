@@ -65,6 +65,11 @@ needs at the code:
   against), and waits until the tailers' W reaches that count or stops growing
   (`tail_caught_up`), reading W from a log chunk it captures for the purpose, before it waits
   on the sinks.
+- A scenario with a `[tls]` table gets `<run>/tls`, named by `SOAK_TLS_DIR` in `compose.env`,
+  which its override mounts read-only at `/tls`. `prepare()` fills it before anything starts,
+  through the netem image's certs.sh run as the host user: a private CA, the probe's client
+  certificate, and each certificate's first generation behind its `live` symlink. A `rotate`
+  step issues the next generation, and a `probe` reads what a listener serves (faults.py).
 - Under `[overlap]` the instances share their holder's network namespace, so `prepare()` also
   reads each service's `network_mode` from compose and checks each instance is in the holder's.
   Each instance runs the whole pipeline, so the end sequence waits once on every sink's stored
@@ -232,6 +237,8 @@ class Run:
         self.fail_fast = None
         # `<run>/shared`, made in `prepare()` for a file wire or a `rename` step, else None.
         self.shared_dir = None
+        # `<run>/tls`, made in `prepare()` for a scenario with a `[tls]` table, else None.
+        self.tls_dir = None
 
     # ---- setup ---------------------------------------------------------------------------------
 
@@ -250,6 +257,8 @@ class Run:
                if self.standin else "")
             + (f"{scenario_mod.SHARED_DIR_ENV}={self.make_shared_dir()}\n"
                if self.scenario.uses_shared_dir else "")
+            + (f"{scenario_mod.TLS_DIR_ENV}={self.make_tls_dir()}\n"
+               if self.scenario.uses_tls_dir else "")
         )
         shutil.copy(self.scenario.path, self.run_dir / "scenario.toml")
         # The checks read the SUT's `receive:` limits from this copy.
@@ -276,12 +285,48 @@ class Run:
             json.dumps(resolved, indent=2, sort_keys=True) + "\n"
         )
         self.ctx = faults.Context(docker=self.docker, ids=self.ids, netem_image=NETEM_IMAGE,
-                                  standin_base=self.standin_base, shared_dir=self.shared_dir)
+                                  standin_base=self.standin_base, shared_dir=self.shared_dir,
+                                  tls_dir=self.tls_dir, tls_certs=dict(self.scenario.tls or {}),
+                                  user=f"{os.getuid()}:{os.getgid()}")
         self.timeline = collect.Jsonl(self.run_dir / "timeline.jsonl")
         self.watchdog = collect.Jsonl(self.run_dir / "watchdog.jsonl")
         self.stats = collect.Jsonl(self.run_dir / "stats.ndjson")
         self.freshness = collect.Jsonl(self.run_dir / "vm-freshness.jsonl")
         self.capture = collect.LogCapture(self.run_dir, self.docker)
+        if self.tls_dir is not None:
+            self.issue_tls()
+
+    def make_tls_dir(self):
+        """Creates `<run>/tls` for the private CA and the `[tls]` certificates and returns its
+        path. certs.sh writes it as the host user, so it needs no wider mode."""
+        tls = self.run_dir / scenario_mod.TLS_DIR
+        tls.mkdir()
+        self.tls_dir = tls.resolve()
+        return self.tls_dir
+
+    def issue_tls(self):
+        """Makes the run's CA and the probe's client certificate, then issues each `[tls]`
+        certificate's first generation, before anything starts: a config that reads one fails
+        its start without it. Records the first issues as the `tls_issued` phase, which
+        `tls.served` reads as the serial in force before any rotation. Raises `ScenarioError`
+        when certs.sh fails."""
+        issued = {}
+        calls = [("init", [], None)] + [
+            ("issue", faults.issue_args(name, 1, scenario_mod.TLS_INITIAL_DAYS, cert), name)
+            for name, cert in sorted(self.ctx.tls_certs.items())]
+        for command, args, name in calls:
+            result = self.docker.run_oneshot(faults.certs_argv(self.ctx, command, *args))
+            report = faults.cert_report(result)
+            if not result.ok or report is None:
+                shown = " ".join([command, *args])
+                raise scenario_mod.ScenarioError([
+                    f"certs.sh {shown} failed (rc {result.rc}): "
+                    f"{result.stderr.strip()[-500:]}; {NETEM_IMAGE} needs openssl and "
+                    "certs.sh, so rebuild it without SOAK_SKIP_IMAGE"])
+            if name is not None:
+                issued[name] = {"gen": 1, "days": scenario_mod.TLS_INITIAL_DAYS, **report}
+        self.ctx.state[faults.TLS_GEN_KEY] = {name: 1 for name in issued}
+        self.phase("tls_issued", certs=issued)
 
     def make_shared_dir(self):
         """Creates `<run>/shared` for a file wire's writer and tailer and returns its path. The

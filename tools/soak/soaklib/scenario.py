@@ -85,7 +85,7 @@ STANDIN_ROLES = {"standin": STANDIN_ROLE}
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
 ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "mark", "exit",
-                "respond", "signal", "rename")
+                "respond", "signal", "rename", "rotate", "probe")
 # Actions allowed on a SUT service only, each with the reason. A `kill` exists to end a `logit`
 # process with no shutdown; on the generator, the lines it sent after its last telemetry drain
 # reach the SUT with no G behind them, and `ledger.wire` would net them against real loss. An
@@ -100,15 +100,36 @@ SUT_ONLY_ACTIONS = {
 # schedule, which draws faults, can't hold them.
 EXPECTED_EVENT_ACTIONS = ("mark", "exit")
 # Actions that open no fault window: a `signal` sends a `logit` service a signal it handles
-# while it runs, and a `rename` moves a file aside in the run's shared directory, so neither
-# excuses anything a check judges (checks.py's `RunData.events`). A `signal` may start inside a
-# `rename` on its own service, and neither may overlap any other step on its service.
-NO_WINDOW_ACTIONS = ("signal", "rename")
+# while it runs, a `rename` moves a file aside in the run's shared directory, a `rotate` issues
+# a certificate into the run's TLS directory, and a `probe` handshakes with a listener, so none
+# excuses anything a check judges (checks.py's `RunData.events`). A `signal` or a `probe` may
+# start inside a `rename` or a `rotate` on its own service (`HOLDING_ACTIONS`), and no other
+# step may overlap one of these on its service.
+NO_WINDOW_ACTIONS = ("signal", "rename", "rotate", "probe")
+HOLDING_ACTIONS = ("rename", "rotate")
+HELD_ACTIONS = ("signal", "probe")
 # The signals a `signal` step may send: SIGHUP, which a `logit` process answers by reopening
 # its file targets and by reloading its TLS material (docs/adr/signal-handling.md).
 SIGNALS = ("HUP",)
 # The directory a `rename` works in, inside the containers that mount `<run>/shared`.
 SHARED_MOUNT = "/shared"
+# A scenario's `[tls]` table names the certificates the driver issues from a private CA into
+# `<run>/tls`, which an override mounts read-only at `TLS_MOUNT` and names by `TLS_DIR_ENV`. Each
+# `[tls.cert.<name>]` takes `san`, its DNS names, and `usage`, the extended key usage it's
+# issued for. Its files are `<TLS_MOUNT>/<name>/live/cert.pem` and `key.pem`, and the CA is
+# `<TLS_MOUNT>/ca.pem`. The first issue is valid for `TLS_INITIAL_DAYS`, and each `rotate` of a
+# certificate names more days than the one before it, so its `notAfter` rises.
+TLS_DIR = "tls"
+TLS_DIR_ENV = "SOAK_TLS_DIR"
+TLS_MOUNT = "/tls"
+TLS_KEYS = {"cert"}
+TLS_CERT_KEYS = {"san", "usage"}
+TLS_USAGES = ("server", "client")
+TLS_INITIAL_DAYS = 30
+# The probe's own client certificate, which `certs.sh init` issues, so its name is no
+# `[tls.cert]` table's.
+TLS_PROBE_CERT = "probe"
+_DNS_NAME = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$")
 # The `/readyz` words a `mark`'s `ready` may name: every answer but `ok`
 # (crates/logit-cli/src/admin.rs, `readyz_wire`).
 READY_WORDS = ("starting", "stalled", "draining", "degraded")
@@ -132,7 +153,7 @@ NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart", "exit")
 TOP_LEVEL_KEYS = {
     "name", "description", "duration", "max_duration", "warmup", "cooldown", "recovery_bound",
     "cycle", "configs", "ledger", "thresholds", "step", "expect", "random", "target", "compose",
-    "expected", "overlap",
+    "expected", "overlap", "tls",
 }
 # The local target, the default; the kind with no backend query; and the local Kafka broker,
 # whose kind is also its service name.
@@ -159,7 +180,7 @@ _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PRIVATE_ENV_PREFIX = "soak-env-"
 STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key", "class", "signal",
-             "path", "to", *RESPOND_KEYS}
+             "path", "to", "cert", "days", "broken", "port", *RESPOND_KEYS}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
 RANGE_KEYS = {"min", "max"}
@@ -238,7 +259,7 @@ EXPECT_WINDOWS = ("during", "after", "through", "run")
 RUN_WINDOW = "run"
 # Each reducer reads one metric kind: a counter (`sum`, a delta per drain) or a gauge.
 EXPECT_REDUCERS = {"delta": "sum", "min_delta": "sum", "max": "gauge", "min": "gauge",
-                   "last": "gauge", "slope": "gauge"}
+                   "last": "gauge", "slope": "gauge", "rise": "gauge"}
 # The rows an `[expected]` table may set a verdict on: the rows that judge each `logit` service
 # apart, so a verdict names a service. A ledger row's FAIL is loss, never expected.
 EXPECTED_ROWS = ("rss_slope", "fd_slope")
@@ -283,6 +304,8 @@ METRIC_KINDS = {
     "logit.process.interner.strings": "gauge",
     "logit.process.memory.resident.bytes": "gauge",
     "logit.transform.series.evicted": "sum",
+    "logit.tls.reloads": "sum",
+    "logit.tls.certificate.not_after": "gauge",
 }
 _EXPECT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _STEP_ID = re.compile(r"^c(\d+)s(\d+)$")
@@ -364,6 +387,12 @@ class StepSpec:
     signal: object = None
     path: object = None
     to: object = None
+    # A `rotate`'s certificate, days, and whether it's issued broken; a `probe`'s certificate
+    # and port.
+    cert: object = None
+    days: object = None
+    broken: object = None
+    port: object = None
 
 
 # The `Step` fields `expected()` writes into its JSON and its timeline records, each under its
@@ -371,7 +400,8 @@ class StepSpec:
 STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", "status"),
                ("body", "body"), ("apply", "apply"), ("answer", "answer"),
                ("series_errors", "series_errors"), ("fault_class", "class"),
-               ("signal", "signal"), ("path", "path"), ("to", "to"))
+               ("signal", "signal"), ("path", "path"), ("to", "to"), ("cert", "cert"),
+               ("days", "days"), ("broken", "broken"), ("port", "port"))
 
 
 @dataclass
@@ -432,6 +462,10 @@ class Step:
     signal: object = None
     path: object = None
     to: object = None
+    cert: object = None
+    days: object = None
+    broken: object = None
+    port: object = None
 
     def expected(self):
         """The fields this step sets (`STEP_FIELDS`), for its JSON and its timeline records."""
@@ -508,6 +542,8 @@ class Scenario:
     max_duration: object = None
     # `[overlap]`: `{holder, instances, label}`, or None.
     overlap: object = None
+    # `[tls]`'s certificates: `{name: {san, usage}}`, or None with no `[tls]` table.
+    tls: object = None
 
     @property
     def external(self):
@@ -558,6 +594,11 @@ class Scenario:
         """Whether the run gets `<run>/shared`: for a file wire's writer and tailer, or for a
         `rename` step's file."""
         return bool(self.file_sources) or any(spec.action == "rename" for spec in self.steps)
+
+    @property
+    def uses_tls_dir(self):
+        """Whether the run gets `<run>/tls`, a private CA and the `[tls]` certificates."""
+        return self.tls is not None
 
     @property
     def generators(self):
@@ -648,6 +689,9 @@ class Scenario:
             "steps": [step.to_json() for step in expand(self, duration, seed)],
             "expect": [e.to_json() for e in self.expectations],
             "expected": {row: dict(services) for row, services in self.expected.items()},
+            "tls": None if self.tls is None else {
+                name: {"san": list(cert["san"]), "usage": cert["usage"]}
+                for name, cert in self.tls.items()},
         }
 
 
@@ -795,6 +839,8 @@ def from_dict(raw, path):
             apply=raw_step.get("apply"), answer=raw_step.get("answer"),
             series_errors=raw_step.get("series_errors"), fault_class=raw_step.get("class"),
             signal=raw_step.get("signal"), path=raw_step.get("path"), to=raw_step.get("to"),
+            cert=raw_step.get("cert"), days=raw_step.get("days"), broken=raw_step.get("broken"),
+            port=raw_step.get("port"),
         ))
         if "for" not in raw_step:
             problems.append(f"{where}: every fault needs `for`, so its revert is scheduled with it")
@@ -842,18 +888,56 @@ def from_dict(raw, path):
         ))
 
     expected = _parse_expected(raw.get("expected", {}), problems)
+    tls = _parse_tls(raw["tls"], problems) if "tls" in raw else None
 
     scenario = Scenario(
         path=path, name=name, description=description, duration=duration, warmup=warmup,
         cooldown=cooldown, recovery_bound=recovery_bound, cycle=cycle, configs=configs,
         ledger=ledger, thresholds=thresholds, steps=steps, expectations=expectations,
         random=random_spec, target=target, compose=compose, expected=expected,
-        max_duration=max_duration, overlap=overlap,
+        max_duration=max_duration, overlap=overlap, tls=tls,
     )
     if problems:
         raise ScenarioError(problems)
     validate(scenario)
     return scenario
+
+
+def _parse_tls(table, problems):
+    """`{name: {san, usage}}` from `[tls]`: one `[tls.cert.<name>]` table or more, each name a
+    slug other than `TLS_PROBE_CERT`, `san` a non-empty list of DNS names, and `usage` one of
+    `TLS_USAGES`."""
+    if not isinstance(table, dict):
+        problems.append("`tls` must be a table, such as [tls.cert.statsd]")
+        return None
+    for key in sorted(set(table) - TLS_KEYS):
+        problems.append(f"tls: unknown key `{key}`")
+    certs = table.get("cert")
+    if not isinstance(certs, dict) or not certs:
+        problems.append("tls: needs one [tls.cert.<name>] table or more")
+        return None
+    parsed = {}
+    for name, cert in certs.items():
+        where = f"tls.cert.{name}"
+        if not _SERVICE_NAME.match(name) or name == TLS_PROBE_CERT:
+            problems.append(f"{where}: a certificate's name is lowercase letters, digits, `_`, "
+                            f"and `-`, and isn't `{TLS_PROBE_CERT}`, the probe's own")
+        if not isinstance(cert, dict):
+            problems.append(f"{where}: must be a table with `san` and `usage`")
+            continue
+        for key in sorted(set(cert) - TLS_CERT_KEYS):
+            problems.append(f"{where}: unknown key `{key}`")
+        san = cert.get("san")
+        if (not isinstance(san, list) or not san
+                or not all(isinstance(n, str) and _DNS_NAME.match(n) for n in san)):
+            problems.append(f"{where}: `san` must be a list of one DNS name or more, such as "
+                            "[\"logit\"]")
+            san = []
+        if cert.get("usage") not in TLS_USAGES:
+            problems.append(f"{where}: `usage` must be one of {', '.join(TLS_USAGES)}, got "
+                            f"{cert.get('usage')!r}")
+        parsed[name] = {"san": list(san), "usage": cert.get("usage")}
+    return parsed
 
 
 def _parse_expected(table, problems):
@@ -1753,6 +1837,7 @@ def validate(scenario, duration=None, seed=None):
         problems += _expected_event_problems(spec, where)
         problems += _respond_problems(spec, where, scenario.target.get("shape"))
         problems += _signal_problems(spec, where)
+        problems += _tls_step_problems(spec, where, scenario.tls)
         if spec.for_ <= 0:
             problems.append(f"{where}: `for` must be longer than 0s")
         if spec.action == "netem":
@@ -1781,12 +1866,14 @@ def validate(scenario, duration=None, seed=None):
             for second in specs[i + 1:]:
                 if second.at < first.at + first.for_:
                     pair = {first.action, second.action}
-                    if first.action == "rename" and second.action == "signal":
+                    if first.action in HOLDING_ACTIONS and second.action in HELD_ACTIONS:
                         continue
-                    if "signal" in pair and pair & set(INSTANCE_HOLD_ACTIONS):
+                    held = pair & set(HELD_ACTIONS)
+                    if held and pair & set(INSTANCE_HOLD_ACTIONS):
+                        what = sorted(held)[0]
                         problems.append(
-                            f"steps {first.index + 1} and {second.index + 1}: signal on "
-                            f"{service} during its {(pair - {'signal'}).pop()}; the process "
+                            f"steps {first.index + 1} and {second.index + 1}: {what} on "
+                            f"{service} during its {(pair - held).pop()}; the process "
                             "may not be running to receive it"
                         )
                     elif "netem" in pair and pair & set(NAMESPACE_FAULTS):
@@ -1805,6 +1892,7 @@ def validate(scenario, duration=None, seed=None):
 
     run_duration = scenario.duration if duration is None else duration
     problems += _rename_problems(scenario, run_duration)
+    problems += _rotate_problems(scenario, run_duration)
     quiet_end = run_duration - scenario.cooldown
     if quiet_end < scenario.warmup:
         problems.append(
@@ -2034,6 +2122,122 @@ def _rename_problems(scenario, duration):
                 problems.append(f"step {index + 1} (rename): runs {count} times in "
                                 f"{format_duration(duration)}, and a second rename would find "
                                 "its `to` taken; set max_duration to one cycle's run")
+    return problems
+
+
+def _tls_step_problems(spec, where, tls):
+    """What a step breaks of the `rotate` and `probe` keys: `cert`, a `[tls.cert]` name,
+    required on both and refused elsewhere; `days`, a whole number above `TLS_INITIAL_DAYS`,
+    required on a `rotate`, and `broken`, true or false, allowed on one only; `port`, 1 to
+    65535, required on a `probe` only, whose `cert` is a `server` one. `_rotate_problems()`
+    checks the steps against each other and the configs."""
+    problems = []
+    certs = tls or {}
+    if spec.action in ("rotate", "probe"):
+        if tls is None:
+            problems.append(f"{where}: {spec.action} needs a [tls] table naming its certificate")
+        elif spec.cert is None:
+            problems.append(f"{where}: {spec.action} needs `cert`, a [tls.cert] name")
+        elif spec.cert not in certs:
+            problems.append(f"{where}: `cert` {spec.cert!r} names no [tls.cert] table; the "
+                            f"scenario's are {', '.join(sorted(certs)) or 'none'}")
+        elif spec.action == "probe" and certs[spec.cert]["usage"] != "server":
+            problems.append(f"{where}: a probe handshakes with the listener a `server` "
+                            f"certificate serves, and {spec.cert} is a "
+                            f"{certs[spec.cert]['usage']} one")
+    elif spec.cert is not None:
+        problems.append(f"{where}: `cert` is for rotate and probe only")
+    if spec.action == "rotate":
+        if spec.days is None:
+            problems.append(f"{where}: rotate needs `days`, the new certificate's validity")
+        elif (not isinstance(spec.days, int) or isinstance(spec.days, bool)
+              or spec.days <= TLS_INITIAL_DAYS):
+            problems.append(f"{where}: `days` must be a whole number above the first issue's "
+                            f"{TLS_INITIAL_DAYS}, got {spec.days!r}")
+        if spec.broken is not None and not isinstance(spec.broken, bool):
+            problems.append(f"{where}: `broken` must be true or false")
+    else:
+        for name in ("days", "broken"):
+            if getattr(spec, name) is not None:
+                problems.append(f"{where}: `{name}` is for rotate only")
+    if spec.action == "probe":
+        if spec.port is None:
+            problems.append(f"{where}: probe needs `port`, the listener's port in its service's "
+                            "network namespace")
+        elif (not isinstance(spec.port, int) or isinstance(spec.port, bool)
+              or not 1 <= spec.port <= 65535):
+            problems.append(f"{where}: `port` must be a port number, 1 to 65535, got "
+                            f"{spec.port!r}")
+    elif spec.port is not None:
+        problems.append(f"{where}: `port` is for probe only")
+    return problems
+
+
+def _once_per_run(scenario, duration, action, why):
+    """A problem for each `action` step that a run of `duration` repeats in a later cycle."""
+    problems = []
+    if scenario.random is not None or scenario.cycle <= 0:
+        return problems
+    counts = {}
+    for step in expand(scenario, duration):
+        if step.action == action:
+            counts[step.spec_index] = counts.get(step.spec_index, 0) + 1
+    for index, count in sorted(counts.items()):
+        if count > 1:
+            problems.append(f"step {index + 1} ({action}): runs {count} times in "
+                            f"{format_duration(duration)}, and {why}; set max_duration to one "
+                            "cycle's run")
+    return problems
+
+
+def _rotate_problems(scenario, duration):
+    """What the `rotate` and `probe` steps break: each rotate on a service whose config reads
+    its certificate's `live` files, its `days` above every earlier rotate's of that
+    certificate, and once per run of `duration`; each probe starting inside a rotate of its
+    `cert` on its own service, after a `signal = "HUP"` step on that service that starts
+    inside the same rotate, so the probe reads what the reload left."""
+    problems = []
+    rotates = sorted((s for s in scenario.steps if s.action == "rotate"), key=lambda s: s.at)
+    last_days = {}
+    for spec in rotates:
+        where = f"step {spec.index + 1} (rotate on {spec.on or '?'})"
+        key = service_config_key(scenario, spec.on)
+        live = f"{TLS_MOUNT}/{spec.cert}/live/"
+        if key is None:
+            problems.append(f"{where}: {spec.on} has no config in [configs], so nothing reads "
+                            f"{live}")
+        elif isinstance(spec.cert, str):
+            try:
+                text = scenario.config_path(key).read_text()
+            except OSError:
+                text = ""
+            if live not in _uncommented(text):
+                problems.append(f"{where}: {spec.on}'s config reads nothing under {live}, so "
+                                "the rotation reaches no process")
+        if isinstance(spec.days, int) and not isinstance(spec.days, bool):
+            before = last_days.get(spec.cert)
+            if before is not None and spec.days <= before:
+                problems.append(f"{where}: `days` {spec.days} must be above the earlier "
+                                f"rotation's {before}, so the certificate's notAfter rises")
+            last_days[spec.cert] = max(spec.days, before or 0)
+    for spec in scenario.steps:
+        if spec.action != "probe":
+            continue
+        where = f"step {spec.index + 1} (probe on {spec.on or '?'})"
+        holder = next((r for r in rotates if r.on == spec.on and r.cert == spec.cert
+                       and r.at < spec.at < r.at + r.for_), None)
+        if holder is None:
+            problems.append(f"{where}: must start inside a rotate of {spec.cert} on "
+                            f"{spec.on}, which names the certificate it reads")
+            continue
+        if not any(other.action == "signal" and other.on == spec.on and other.signal == "HUP"
+                   and holder.at < other.at < spec.at for other in scenario.steps):
+            problems.append(f"{where}: needs a signal = \"HUP\" step on {spec.on} starting "
+                            f"inside step {holder.index + 1}'s rotate and before the probe, "
+                            "so the listener has reloaded")
+    if rotates:
+        problems += _once_per_run(scenario, duration, "rotate",
+                                  "a second cycle's rotation would name the same days")
     return problems
 
 
@@ -2396,7 +2600,8 @@ def expand(scenario, duration=None, seed=None):
                     ready=spec.ready, code=spec.code, key=spec.key, status=spec.status,
                     body=spec.body, apply=spec.apply, answer=spec.answer,
                     series_errors=spec.series_errors, fault_class=spec.fault_class,
-                    signal=spec.signal, path=spec.path, to=spec.to,
+                    signal=spec.signal, path=spec.path, to=spec.to, cert=spec.cert,
+                    days=spec.days, broken=spec.broken, port=spec.port,
                 ))
         cycle += 1
     steps.sort(key=lambda s: (s.start, s.spec_index))

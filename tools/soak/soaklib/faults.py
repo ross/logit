@@ -33,6 +33,15 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   is an `os.rename` on the host inside `<run>/shared`, which the containers mount. Neither can
   lose data on any leg, so every `affects_*` predicate is false, and neither revert does
   anything. A `rename` refuses to replace a file already at its `to`.
+- A `rotate` and a `probe` run `certs.sh` (tools/soak/netem/certs.sh) in the netem image, as
+  the host user. A `rotate` issues the certificate's next generation into `<run>/tls` and
+  repoints its `live` symlink there in one rename; generations count from the driver's first
+  issue, 1, and a failed issue still uses its number up. A `probe` joins the target's network
+  namespace and handshakes with the listener on its port, presenting the probe's own client
+  certificate, so a listener that requires one completes the handshake. Each records the
+  `serial` and `not_after` its script reports, and a probe whether the served chain verified
+  against the CA for the certificate's first DNS name (`verified`). Neither can lose data, and
+  neither revert does anything.
 - A `mark` and an `exit` name an event the SUT's own config causes, so neither apply makes a
   Docker call. An `exit`'s revert starts the container only when it has exited, and its record
   says whether it did (`started`): a revert that found the process still running starts no new
@@ -46,7 +55,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, NETNS_ROLE, STANDIN_ROLE,
-                       STOP_TIMEOUT_S, SUT_ROLE, SUT_SERVICE)
+                       STOP_TIMEOUT_S, SUT_ROLE, SUT_SERVICE, TLS_MOUNT)
 
 NETEM_LIMIT = "100000"
 # The timeline key recording, per `[[ledger.source]]` wire, whether a step can affect it.
@@ -55,6 +64,10 @@ INGRESS_KEYS = {"udp": "affects_udp_ingress", "tcp": "affects_tcp_ingress",
 # 128 + SIGKILL: the exit code Docker records for a container a `kill` ended.
 KILL_EXIT_CODE = 137
 CUE_TIMEOUT_S = 10
+# The netem image's certificate script (tools/soak/netem/certs.sh), and the `Context.state` key
+# holding each certificate's last generation.
+CERTS_ENTRYPOINT = "/certs.sh"
+TLS_GEN_KEY = "tls_gen"
 
 
 @dataclass
@@ -70,6 +83,11 @@ class Context:
     standin_base: dict = field(default_factory=dict)
     # `<run>/shared` on the host, for a `rename`; None when the run has none.
     shared_dir: object = None
+    # `<run>/tls` on the host, the `[tls]` certificates (`{name: {san, usage}}`), and the
+    # `uid:gid` certs.sh runs as, for a `rotate` and a `probe`; None when the run has no [tls].
+    tls_dir: object = None
+    tls_certs: dict = field(default_factory=dict)
+    user: object = None
 
 
 @dataclass
@@ -166,6 +184,70 @@ def rename_apply(ctx, step):
     except OSError as err:
         return {"rc": 1, "stderr": str(err)}
     return {"rc": 0, "stderr": "", "path": step.path, "to": step.to}
+
+
+def certs_argv(ctx, command, *args, network=None, read_only=False):
+    """`docker run --rm` arguments for one `certs.sh` command in the netem image, as the host
+    user so the files it writes in `<run>/tls` are the user's, with `<run>/tls` at
+    `TLS_MOUNT`, inside `network`'s namespace when given."""
+    argv = []
+    if network is not None:
+        argv += ["--network", f"container:{network}"]
+    mode = "ro,z" if read_only else "z"
+    argv += ["--user", ctx.user, "-v", f"{ctx.tls_dir}:{TLS_MOUNT}:{mode}",
+             "--entrypoint", CERTS_ENTRYPOINT, ctx.netem_image, command, *args]
+    return argv
+
+
+def issue_args(name, gen, days, cert, broken=False):
+    """`certs.sh issue`'s arguments: the certificate's name, its generation, its days, its
+    usage, and its DNS names, then `--broken` for a key that doesn't match it."""
+    return ([name, str(gen), str(days), cert["usage"], *cert["san"]]
+            + (["--broken"] if broken else []))
+
+
+def cert_report(result):
+    """`{serial, not_after, verified?}` from the JSON line `certs.sh` prints last, or None."""
+    lines = result.stdout.strip().splitlines()
+    try:
+        report = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        return None
+    return report if isinstance(report, dict) and "serial" in report else None
+
+
+def _certs_record(result):
+    """A timeline record for one `certs.sh` call: rc 1 when it printed no report."""
+    record = _record(result)
+    report = cert_report(result)
+    if report is None:
+        record["rc"] = record["rc"] or 1
+        record["stderr"] = (record["stderr"] or "certs.sh printed no report")
+        return record
+    record.update(report)
+    return record
+
+
+def rotate_apply(ctx, step):
+    if ctx.tls_dir is None or step.cert not in ctx.tls_certs:
+        return {"rc": 1, "stderr": f"the run has no [tls] certificate {step.cert}"}
+    # A failed issue can leave a partial directory, so a generation is never reused.
+    gen = ctx.state.get(TLS_GEN_KEY, {}).get(step.cert, 1) + 1
+    ctx.state.setdefault(TLS_GEN_KEY, {})[step.cert] = gen
+    result = ctx.docker.run_oneshot(certs_argv(
+        ctx, "issue", *issue_args(step.cert, gen, step.days, ctx.tls_certs[step.cert],
+                                  bool(step.broken))))
+    record = _certs_record(result)
+    record["gen"] = gen
+    return record
+
+
+def probe_apply(ctx, step):
+    if ctx.tls_dir is None or step.cert not in ctx.tls_certs:
+        return {"rc": 1, "stderr": f"the run has no [tls] certificate {step.cert}"}
+    server_name = ctx.tls_certs[step.cert]["san"][0]
+    return _certs_record(ctx.docker.run_oneshot(certs_argv(
+        ctx, "probe", str(step.port), server_name, network=ctx.ids[step.on], read_only=True)))
 
 
 def restart_apply(ctx, step):
@@ -387,6 +469,22 @@ ACTIONS = {
     ),
     "rename": Action(
         apply=rename_apply,
+        revert=no_op,
+        affects_udp_ingress=_never,
+        affects_egress=_never,
+        affects_tcp_ingress=_never,
+        affects_file_ingress=_never,
+    ),
+    "rotate": Action(
+        apply=rotate_apply,
+        revert=no_op,
+        affects_udp_ingress=_never,
+        affects_egress=_never,
+        affects_tcp_ingress=_never,
+        affects_file_ingress=_never,
+    ),
+    "probe": Action(
+        apply=probe_apply,
         revert=no_op,
         affects_udp_ingress=_never,
         affects_egress=_never,

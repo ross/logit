@@ -67,8 +67,9 @@ A rolling overlap (`[overlap]`) runs several instances of one pipeline on one sh
 rows about a process life judge each instance on its own lives, and the wire, `progress`,
 `recovery`, and `ledger.overlap` judge them together ("a rolling overlap" below).
 
-A `signal` or `rename` step opens no fault window (`RunData.events`): only `[[expect]]` and
-`file.reopen` read it, and every other row judges straight through it.
+A `signal`, `rename`, `rotate`, or `probe` step opens no fault window (`RunData.events`): only
+`[[expect]]`, `file.reopen`, `tls.served`, and `self_log`'s excusal of a broken rotation's
+failed reload read it, and every other row judges straight through it.
 
 `rss_slope` and `fd_slope` judge each `logit` service on its own line, and a scenario's
 `[expected]` table can set the verdict a service should get on either (`judge_services`).
@@ -92,6 +93,9 @@ from .scenario import (DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
+# The self-log key of a TLS reload that kept the previous files (crates/logit-pipeline/src/tls.rs,
+# `Watched::check`).
+TLS_RELOAD_FAILED_KEY = "tls_reload_failed"
 
 
 def is_start(record):
@@ -212,6 +216,17 @@ class Fault:
     to: object = None
     # When the apply finished, which for a `signal` is when Docker had sent it.
     applied: object = None
+    # A `rotate`'s certificate, days, generation, and whether it was issued broken, with the
+    # serial and `notAfter` it issued; a `probe`'s certificate and port, with the serial and
+    # `notAfter` the listener served and whether they verified against the CA. None elsewhere.
+    cert: object = None
+    days: object = None
+    broken: object = None
+    gen: object = None
+    port: object = None
+    serial: object = None
+    not_after: object = None
+    verified: object = None
 
     def affects(self, wire):
         return bool(getattr(self, faults.INGRESS_KEYS[wire]))
@@ -291,8 +306,9 @@ class RunData:
         self.end = phases.get("end_begin", phases.get("fail_fast", {})).get("t") or last
 
         # A fault whose apply returned nonzero gets no window, so nothing after it is excused;
-        # `timeline` FAILs the action itself. A `signal` or a `rename` step opens no window, so
-        # it goes in `events`, which only `[[expect]]` and `file.reopen` read.
+        # `timeline` FAILs the action itself. A step of `NO_WINDOW_ACTIONS` opens no window, so
+        # it goes in `events`, which only `[[expect]]`, `file.reopen`, `tls.served`, and
+        # `self_log`'s broken-rotation excusal read.
         self.faults = []
         self.events = []
         applies = {}
@@ -369,6 +385,9 @@ class RunData:
             ips=apply.get("ips"), ips_after=(revert or {}).get("ips_after"),
             signal=apply.get("signal"), path=apply.get("path"), to=apply.get("to"),
             applied=apply.get("finished_at"),
+            cert=apply.get("cert"), days=apply.get("days"), broken=apply.get("broken"),
+            gen=apply.get("gen"), port=apply.get("port"), serial=apply.get("serial"),
+            not_after=apply.get("not_after"), verified=apply.get("verified"),
         )
 
     def offset(self, t):
@@ -640,6 +659,8 @@ def check_self_log(data):
     step's code and an ERROR line keyed with its `key`. Each `exit` step must show both, or the
     expected exit didn't happen as named. The `Error: ` text line `main` prints as it returns
     the failure, right after that `exiting` line, has no timestamp and is excused by its place.
+    A `tls_reload_failed` line FAILs too, except inside a `rotate` step on its service that
+    issued a broken certificate: every other rotation issues a whole set in one rename.
     """
     if not data.stderr:
         return Result("self_log", SKIP, "no logs/*.stderr")
@@ -647,7 +668,13 @@ def check_self_log(data):
     status = PASS
     lines = []
     counts = {"error": 0, "fault_key_inside": 0, "fault_key_outside": 0, "text": 0,
-              "expected": 0}
+              "expected": 0, "tls_expected": 0}
+    # `{service: [(start, end)]}` of each `rotate` step issued `broken = true` on it, from its
+    # apply to its revert, the one place a failed TLS reload is expected.
+    broken = {}
+    for event in data.events:
+        if event.action == "rotate" and event.broken:
+            broken.setdefault(event.on, []).append((event.start, event.end))
     # {step: {"exiting", "key"}} for each `exit` step: which of its two lines appeared.
     found = {}
     exit_windows = {service: data.exit_windows(service) for service in data.stderr}
@@ -694,6 +721,15 @@ def check_self_log(data):
                 status = FAIL
                 lines.append(f"{service}: thread_panicked: {entry.raw[:200]}")
                 continue
+            if entry.key == TLS_RELOAD_FAILED_KEY:
+                if entry.ts is not None and data.in_window(entry.ts, broken.get(service, [])):
+                    counts["tls_expected"] += 1
+                else:
+                    status = FAIL
+                    lines.append(f"{service}: {entry.level} {entry.key} at "
+                                 f"{data.offset(entry.ts)}, outside every broken rotate on "
+                                 f"{service}: {entry.message[:160]}")
+                continue
             if is_sink_fault_line(entry):
                 if entry.ts is not None and data.in_window(entry.ts, windows):
                     counts["fault_key_inside"] += 1
@@ -726,7 +762,9 @@ def check_self_log(data):
                                 f"{' and no '.join(missing)} in {fault.step}'s window")
     summary = (f"{counts['fault_key_inside']} sink fault line(s) inside fault windows, "
                f"{counts['fault_key_outside']} outside, {counts['expected']} expected-exit "
-               f"line(s), {counts['error']} other ERROR, {counts['text']} non-JSON")
+               f"line(s), {counts['error']} other ERROR, {counts['text']} non-JSON"
+               + (f", {counts['tls_expected']} tls_reload_failed line(s) inside broken "
+                  "rotations" if counts["tls_expected"] else ""))
     return Result("self_log", status, summary if status == PASS else f"{lines[0]} ({summary})",
                   lines)
 
@@ -4650,6 +4688,70 @@ def check_file_reopen(data):
     return results
 
 
+# ---- served certificates --------------------------------------------------------------------------
+#
+# A `rotate` issues a certificate's next generation into `<run>/tls` and repoints its `live`
+# symlink; a SIGHUP makes the listener reload the files, and a `probe` reads what the listener
+# serves after it. A failed reload keeps the previous files, so after a broken rotation the
+# listener still serves the last good generation (docs/adr/tls-certificate-reload.md, "Failure
+# policy: keep serving the old material").
+
+
+def check_tls_served(data):
+    """One `tls.served.<step>` row per `probe` step, else one `tls.served` row that SKIPs. The
+    probe pairs with the generation in force for its certificate: the latest rotation of it
+    that started before the probe and wasn't broken, else the first issue (the driver's
+    `tls_issued` phase). The row FAILs when the probe didn't apply, the served serial or
+    `notAfter` isn't that generation's, the served chain didn't verify against the run's CA for
+    the certificate's name, or no first issue was recorded."""
+    probes = sorted((f for f in data.events if f.action == "probe"), key=lambda f: f.start)
+    failed = [r for r in data.timeline if r.get("event") == "apply"
+              and r.get("action") == "probe" and r.get("rc")]
+    if not probes and not failed:
+        return [Result("tls.served", SKIP, "the scenario has no probe step")]
+    results = [Result(f"tls.served.{r.get('step')}", FAIL,
+                      f"the probe of {r.get('cert')} on {r.get('on')} returned rc "
+                      f"{r.get('rc')}: {(r.get('stderr') or '')[:160]}")
+               for r in failed]
+    issued = (data.phases.get("tls_issued") or {}).get("certs") or {}
+    rotations = sorted((f for f in data.events if f.action == "rotate"), key=lambda f: f.start)
+    for probe in probes:
+        first = issued.get(probe.cert)
+        want = None if first is None else {"what": "the first issue (gen 1)",
+                                           "serial": first.get("serial"),
+                                           "not_after": first.get("not_after")}
+        skipped = []
+        for rotation in rotations:
+            if rotation.cert != probe.cert or rotation.start > probe.start:
+                continue
+            if rotation.broken:
+                skipped.append(rotation.step)
+                continue
+            want = {"what": f"{rotation.step}'s gen {rotation.gen}", "serial": rotation.serial,
+                    "not_after": rotation.not_after}
+        served = (f"{probe.on}:{probe.port} served {probe.cert} serial {probe.serial}, "
+                  f"notAfter {probe.not_after}")
+        if want is None:
+            results.append(Result(f"tls.served.{probe.step}", FAIL,
+                                  f"{served}; no first issue of {probe.cert} recorded "
+                                  "(tls_issued)"))
+            continue
+        line = (f"{served}; want {want['what']}, serial {want['serial']}, notAfter "
+                f"{want['not_after']}"
+                + (f", still in force after broken {', '.join(skipped)}" if skipped else ""))
+        problems = []
+        if probe.serial != want["serial"]:
+            problems.append("serial differs")
+        if probe.not_after != want["not_after"]:
+            problems.append("notAfter differs")
+        if probe.verified is not True:
+            problems.append("the served chain didn't verify against the run's CA")
+        status = FAIL if problems else PASS
+        results.append(Result(f"tls.served.{probe.step}", status,
+                              f"{line}" + (f": {'; '.join(problems)}" if problems else "")))
+    return results
+
+
 # ---- per-scenario expectations --------------------------------------------------------------------
 #
 # A scenario's `[[expect]]` tables, copied into `scenario.resolved.json`'s `expect`. The plan's
@@ -4701,8 +4803,9 @@ def reduce_gauge(tel, metric, attrs, start, end, reduce):
     """`(value, note)` for a gauge over (start, end]: the value in force at `start` and every
     sample in the window. The value in force comes from the life whose drains cover `start`
     only (a gauge is exported only in a drain after it was set), so a gauge a previous process
-    set reads as unset in the next. `last` is the value in force at `end`. `value` is None when
-    the gauge was never set by `end`.
+    set reads as unset in the next. `last` is the value in force at `end`. `rise` is that value
+    less the value in force at `start`, and None with no value in force there. `value` is None
+    when the gauge was never set by `end`.
 
     `slope` is the least-squares slope of the window's own samples, in the metric's unit per
     hour, fitted per process life, since a restart resets a process gauge: `value` is
@@ -4735,6 +4838,10 @@ def reduce_gauge(tel, metric, attrs, start, end, reduce):
     if not values:
         return None, "no sample by the window's end"
     note = f"{len(inside)} sample(s)" + (" and the value in force at its start" if before else "")
+    if reduce == "rise":
+        if not before:
+            return None, f"no value in force at the window's start ({len(inside)} sample(s))"
+        return values[-1] - before[-1], note
     if reduce == "last":
         return values[-1], note
     return (max(values) if reduce == "max" else min(values)), note
@@ -4930,7 +5037,7 @@ CHECKS = (
     check_ledger_intake, check_ledger_edge, check_ledger_hop, check_ledger_script, check_ledger_aggregate,
     check_ledger_egress, check_ledger_windows, check_ledger_replay, check_ledger_summary,
     check_ledger_sent, check_ledger_topic, check_ledger_standin, check_identity_sink, check_drops, check_recovery,
-    check_file_reopen, check_expect,
+    check_file_reopen, check_tls_served, check_expect,
 )
 
 

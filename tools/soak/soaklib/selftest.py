@@ -152,6 +152,16 @@ FAILing, a kill's count reported, neither step opening a fault window, a SIGHUP'
 leaving `self_log` alone, an `[[expect]]` through a signal step, and deleted files read
 from the run's recorded counts.
 
+For `[tls]`, `rotate`, and `probe`, it covers every validation rule (the table's keys, names,
+DNS names, and usages; the keys each step takes; a rotate's certificate read by its service's
+config, outside a comment, its days rising, once per run; a probe of a server certificate inside
+a rotate on its own service after a SIGHUP, never inside a lifecycle fault; neither in a
+`[random]` schedule), the pinned certs.sh command lines through a fake Docker, `prepare()`
+making the CA and each first issue and stopping on a failed one, and over synthetic runs:
+`tls.served` reading the generation in force through a broken rotation, a wrong serial, an
+unverified chain, a missing first issue, and a failed probe each FAILing; `self_log` excusing
+`tls_reload_failed` only inside a broken rotation on its service; and the `rise` reducer.
+
 No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
 suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
 a slip in a part's own stand-ins included, gets rc 127 from `Docker.run`'s `OSError` instead of
@@ -8141,6 +8151,465 @@ def _reopen_checks():
                f"a run with no rename SKIPs, got {none}")
 
 
+def _tls_base(root):
+    path = root / "scenarios" / "tls-reload" / "scenario.toml"
+    return path, tomllib.loads(path.read_text())
+
+
+def _tls_rules(root):
+    """Every `[tls]`, `rotate`, and `probe` rule: the table's keys, names, DNS names, and
+    usages; the keys each step takes and refuses; a rotate's certificate read by its service's
+    config, its days above the first issue's and every earlier rotation's, and once per run; a
+    probe of a server certificate inside a rotate of it on its own service, after a SIGHUP
+    there, never inside the service's lifecycle faults; neither in a `[random]` schedule; and
+    the `rise` reducer read against a gauge only."""
+    path, base = _tls_base(root)
+    loaded = scenario.load(path)
+    expect(loaded.uses_tls_dir and not loaded.uses_shared_dir
+           and loaded.tls == {"statsd": {"san": ["logit"], "usage": "server"},
+                              "generator": {"san": ["generator"], "usage": "client"}}
+           and loaded.to_json()["tls"] == loaded.tls,
+           f"tls-reload's [tls] table loads and reaches the resolved scenario, got {loaded.tls}")
+    expect(scenario.service_problems(loaded, _override_roles(loaded)) == [],
+           f"tls-reload passes its service rules, got "
+           f"{scenario.service_problems(loaded, _override_roles(loaded))}")
+    probes = [s for s in scenario.expand(loaded) if s.action == "probe"]
+    expect([(s.cert, s.port) for s in probes] == [("statsd", 8125)] * 4
+           and probes[0].expected() == {"cert": "statsd", "port": 8125},
+           f"each probe's certificate and port reach its step and its timeline fields, got "
+           f"{probes}")
+    rotates = [s for s in scenario.expand(loaded) if s.action == "rotate"]
+    expect([(s.cert, s.days, s.broken) for s in rotates]
+           == [("statsd", 31, None), ("generator", 31, None), ("statsd", 32, True),
+               ("statsd", 33, None), ("statsd", 34, None)],
+           f"each rotation's certificate, days, and broken flag reach its step, got {rotates}")
+
+    def mutate(edit):
+        raw = copy.deepcopy(base)
+        edit(raw)
+        return raw
+
+    def step(index, **fields):
+        def edit(raw):
+            raw["step"][index].update(fields)
+            for key in [k for k, v in fields.items() if v is None]:
+                del raw["step"][index][key]
+        return edit
+
+    def cert(name, **fields):
+        def edit(raw):
+            raw["tls"]["cert"][name].update(fields)
+        return edit
+
+    def add(**fields):
+        return lambda raw: raw["step"].append(fields)
+
+    cases = [
+        (lambda raw: raw.update(tls="x"), "`tls` must be a table", "a [tls] that isn't a table"),
+        (lambda raw: raw["tls"].update(ca="x"), "tls: unknown key `ca`", "an unknown [tls] key"),
+        (lambda raw: raw["tls"].update(cert={}), "needs one [tls.cert.<name>] table or more",
+         "a [tls] with no certificate"),
+        (lambda raw: raw["tls"]["cert"].update(probe={"san": ["p"], "usage": "client"}),
+         "isn't `probe`", "a certificate named as the probe's own"),
+        (lambda raw: raw["tls"]["cert"].update(Bad={"san": ["p"], "usage": "client"}),
+         "a certificate's name is lowercase", "a certificate name that isn't a slug"),
+        (cert("statsd", days=30), "tls.cert.statsd: unknown key `days`",
+         "an unknown certificate key"),
+        (cert("statsd", san=[]), "`san` must be a list of one DNS name or more",
+         "an empty san"),
+        (cert("statsd", san="logit"), "`san` must be a list", "a san that isn't a list"),
+        (cert("statsd", san=["Logit_1"]), "`san` must be a list", "a san that isn't a DNS name"),
+        (cert("statsd", usage="both"), "`usage` must be one of server, client", "a bad usage"),
+        (lambda raw: raw.pop("tls"), "rotate needs a [tls] table", "a rotate with no [tls]"),
+        (step(0, cert=None), "rotate needs `cert`", "a rotate with no cert"),
+        (step(0, cert="other"), "`cert` 'other' names no [tls.cert] table",
+         "a rotate of an unknown certificate"),
+        (step(0, days=None), "rotate needs `days`", "a rotate with no days"),
+        (step(0, days=30), "`days` must be a whole number above the first issue's 30",
+         "a rotate no longer than the first issue"),
+        (step(0, days="31"), "`days` must be a whole number", "days as a string"),
+        (step(0, days=True), "`days` must be a whole number", "days as a boolean"),
+        (step(0, broken="yes"), "`broken` must be true or false", "broken as a string"),
+        (step(1, cert="statsd"), "`cert` is for rotate and probe only", "cert on a signal"),
+        (step(1, days=31), "`days` is for rotate only", "days on a signal"),
+        (step(4, broken=True), "`broken` is for rotate only", "broken on a restart"),
+        (step(0, port=8125), "`port` is for probe only", "port on a rotate"),
+        (step(2, port=None), "probe needs `port`", "a probe with no port"),
+        (step(2, port=0), "`port` must be a port number", "port 0"),
+        (step(2, port=70000), "`port` must be a port number", "a port past 65535"),
+        (step(2, cert="generator"), "and generator is a client one",
+         "a probe of a client certificate"),
+        (step(2, args="x"), "`args` is for netem only", "args on a probe"),
+        (step(0, on="generator"), "generator's config reads nothing under /tls/statsd/live/",
+         "a rotate on a service whose config doesn't read it"),
+        (step(8, days=32), "`days` 32 must be above the earlier rotation's 32",
+         "a rotation no longer than the one before it"),
+        (step(2, at="45s"), "must start inside a rotate of statsd on logit",
+         "a probe after its rotation"),
+        (step(1, at="27s"), "needs a signal = \"HUP\" step on logit starting inside step 1's "
+         "rotate and before the probe", "a probe before its SIGHUP"),
+        (add(at="3m10s", action="probe", on="logit", cert="statsd", port=8125,
+             **{"for": "5s"}), "probe on logit during its restart",
+         "a probe inside its service's restart"),
+        (add(at="20s", action="rotate", on="logit", cert="statsd", days=40,
+             **{"for": "30s"}), "two faults overlap on logit", "two rotations overlapping"),
+        (lambda raw: raw["expect"][0].update(reduce="rise"),
+         "reduce `rise` reads a gauge, and logit.tls.reloads is a sum",
+         "rise on a counter"),
+    ]
+    for edit, needle, what in cases:
+        _refused(path, mutate(edit), needle, what, roles=_override_roles(loaded))
+    _refused(path, mutate(step(0, on="victoria-metrics")), "victoria-metrics has no config",
+             "a rotate on a service with no config", roles=_override_roles(loaded))
+    # The loader refuses a probe on a service with no rotation first, so the service rule is
+    # checked on a loaded scenario's step directly.
+    moved = scenario.load(path)
+    moved.steps[2].on = "victoria-metrics"
+    problems = scenario.service_problems(moved, _override_roles(moved))
+    expect(any("probe is for a service that runs logit" in p for p in problems),
+           f"a probe on a backend is refused, got {problems}")
+    _refused(path, base, "runs 2 times", "a rotation in a second cycle",
+             duration=scenario.parse_duration("28m"), roles=_override_roles(loaded))
+    # A rotate whose service reads the file only in a comment reaches no process.
+    with tempfile.TemporaryDirectory() as tmp:
+        for name in ("scenario.toml", "logit-generator.yaml", "compose.override.yaml"):
+            shutil.copy(path.parent / name, Path(tmp) / name)
+        sut = (path.parent / "logit-sut.yaml").read_text()
+        (Path(tmp) / "logit-sut.yaml").write_text(
+            sut.replace("cert_file: /tls/statsd/live/cert.pem", "cert_file: /tls/x.pem")
+            .replace("key_file: /tls/statsd/live/key.pem", "key_file: /tls/y.pem")
+            + "# /tls/statsd/live/cert.pem\n")
+        _refused(Path(tmp) / "scenario.toml", copy.deepcopy(base),
+                 "logit's config reads nothing under /tls/statsd/live/",
+                 "a rotate whose path appears only in a comment", roles=_override_roles(loaded))
+
+    random_path, random_raw = _random_base(root)
+    for action in ("rotate", "probe"):
+        raw = copy.deepcopy(random_raw)
+        raw["random"]["fault"].append({"weight": 1, "action": action, "on": "logit",
+                                       "for": {"min": "10s", "max": "20s"}})
+        _refused(random_path, raw, f"{action} opens no fault window",
+                 f"a {action} in a [random] schedule")
+
+
+class _CertsDocker:
+    """Records each `run_oneshot` call and answers with the next of `answers`, a list of
+    `docker.Result`s, or a report naming the serial `S<n>` for the n-th call."""
+
+    def __init__(self, answers=None):
+        self.calls = []
+        self.answers = list(answers or [])
+
+    def run_oneshot(self, args, timeout=None):
+        self.calls.append(list(args))
+        if self.answers:
+            return self.answers.pop(0)
+        return docker.Result(0, "Generating...\n" + json.dumps(
+            {"serial": f"S{len(self.calls)}", "not_after": 1000 + len(self.calls)}) + "\n", "")
+
+    def __getattr__(self, name):
+        raise AssertionError(f"_CertsDocker.{name} called")
+
+
+def _tls_actions():
+    """The pinned certs.sh command lines: a `rotate` issues the next generation as the host user
+    into `<run>/tls`, with `--broken` when asked, and records its serial, notAfter, and
+    generation; a `probe` joins the target's namespace with the directory read-only and records
+    what was served and whether it verified; a run of certs.sh with no report, a failed one,
+    and an unknown certificate each fail the step."""
+    certs = {"statsd": {"san": ["logit", "logit.local"], "usage": "server"},
+             "generator": {"san": ["generator"], "usage": "client"}}
+    fake = _CertsDocker()
+    ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem",
+                         tls_dir="/run/tls", tls_certs=certs, user="1000:1001",
+                         state={faults.TLS_GEN_KEY: {"statsd": 1, "generator": 1}})
+    rotate = scenario.Step("c0s1", 0, 0, "rotate", "logit", "", 60.0, 100.0, cert="statsd",
+                           days=31)
+    result = faults.ACTIONS["rotate"].apply(ctx, rotate)
+    expect(fake.calls[-1] == ["--user", "1000:1001", "-v", "/run/tls:/tls:z", "--entrypoint",
+                              "/certs.sh", "netem", "issue", "statsd", "2", "31", "server",
+                              "logit", "logit.local"]
+           and result == {"rc": 0, "stderr": "", "serial": "S1", "not_after": 1001, "gen": 2},
+           f"a rotate issues the next generation as the host user, got {fake.calls} {result}")
+    broken = scenario.Step("c0s6", 5, 0, "rotate", "logit", "", 300.0, 340.0, cert="statsd",
+                           days=32, broken=True)
+    result = faults.ACTIONS["rotate"].apply(ctx, broken)
+    expect(fake.calls[-1][7:] == ["issue", "statsd", "3", "32", "server", "logit",
+                                  "logit.local", "--broken"]
+           and result["gen"] == 3,
+           f"a broken rotate passes --broken, got {fake.calls[-1]} {result}")
+    expect(faults.ACTIONS["rotate"].revert(ctx, rotate) == {"rc": 0, "stderr": ""}
+           and len(fake.calls) == 2, "a rotate's revert makes no Docker call")
+    probe = scenario.Step("c0s3", 2, 0, "probe", "logit", "", 85.0, 90.0, cert="statsd",
+                          port=8125)
+    fake.answers = [docker.Result(0, json.dumps({"serial": "S1", "not_after": 1001,
+                                                 "verified": True}) + "\n", "")]
+    result = faults.ACTIONS["probe"].apply(ctx, probe)
+    expect(fake.calls[-1] == ["--network", "container:sut", "--user", "1000:1001", "-v",
+                              "/run/tls:/tls:ro,z", "--entrypoint", "/certs.sh", "netem",
+                              "probe", "8125", "logit"]
+           and result == {"rc": 0, "stderr": "", "serial": "S1", "not_after": 1001,
+                          "verified": True},
+           f"a probe joins the target's namespace and reads the first DNS name, got "
+           f"{fake.calls[-1]} {result}")
+    fake.answers = [docker.Result(0, "no report\n", "")]
+    result = faults.ACTIONS["probe"].apply(ctx, probe)
+    expect(result["rc"] == 1 and "printed no report" in result["stderr"],
+           f"certs.sh with no report fails the step, got {result}")
+    fake.answers = [docker.Result(1, "", "127.0.0.1:8125 served no certificate")]
+    result = faults.ACTIONS["probe"].apply(ctx, probe)
+    expect(result["rc"] == 1 and "served no certificate" in result["stderr"],
+           f"a failed probe keeps its rc and stderr, got {result}")
+    fake.answers = [docker.Result(2, "", "openssl: error")]
+    result = faults.ACTIONS["rotate"].apply(ctx, rotate)
+    expect(result["rc"] == 2 and result["gen"] == 4
+           and ctx.state[faults.TLS_GEN_KEY]["statsd"] == 4,
+           f"a failed issue still uses its generation up, got {result} {ctx.state}")
+    calls = len(fake.calls)
+    unknown = scenario.Step("x", 0, 0, "rotate", "logit", "", 0.0, 1.0, cert="other", days=31)
+    expect(faults.ACTIONS["rotate"].apply(ctx, unknown)["rc"] == 1
+           and faults.ACTIONS["probe"].apply(ctx, unknown)["rc"] == 1
+           and len(fake.calls) == calls,
+           "a rotate or probe of a certificate the run doesn't have fails with no call")
+    expect(faults.cert_report(docker.Result(0, "{\"not\": 1}\n", "")) is None
+           and faults.cert_report(docker.Result(0, "", "")) is None,
+           "a report needs a serial")
+
+
+def _tls_driver(root):
+    """`prepare()` for a scenario with a `[tls]` table: `<run>/tls` and its compose variable,
+    certs.sh's `init` and then each certificate's first issue, pinned, the `tls_issued` phase,
+    the generations the rotations count from, and the actions' context; a certs.sh that fails
+    stops `prepare()`. The override mounts the directory into both `logit` services."""
+    path, _ = _tls_base(root)
+    loaded = scenario.load(path)
+    original = driver.Docker
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            made = []
+
+            def fake(*args, answers=None, **kwargs):
+                made.append(_CertsDocker(answers))
+                return made[-1]
+
+            driver.Docker = fake
+            run = driver.Run(root, loaded, loaded.duration, None, False, tmp, [], "logit:soak",
+                             roles=_override_roles(loaded))
+            run.prepare()
+            tls = (run.run_dir / "tls").resolve()
+            env = (run.run_dir / "compose.env").read_text()
+            user = f"{os.getuid()}:{os.getgid()}"
+            head = ["--user", user, "-v", f"{tls}:/tls:z", "--entrypoint", "/certs.sh",
+                    driver.NETEM_IMAGE]
+            expect(tls.is_dir() and f"SOAK_TLS_DIR={tls}\n" in env and run.ctx.tls_dir == tls
+                   and run.ctx.user == user and run.ctx.tls_certs == loaded.tls,
+                   f"prepare() makes the TLS directory and names it, got {env} {run.ctx}")
+            expect(made[0].calls == [head + ["init"],
+                                     head + ["issue", "generator", "1", "30", "client",
+                                             "generator"],
+                                     head + ["issue", "statsd", "1", "30", "server", "logit"]],
+                   f"prepare() makes the CA, then each certificate's first issue, got "
+                   f"{made[0].calls}")
+            for jsonl in (run.timeline, run.watchdog, run.stats, run.freshness, run.capture):
+                jsonl.close()
+            issued = [r for r in collect.read_jsonl(run.run_dir / "timeline.jsonl")
+                      if r.get("phase") == "tls_issued"]
+            expect(len(issued) == 1 and issued[0]["certs"] == {
+                       "generator": {"gen": 1, "days": 30, "serial": "S2", "not_after": 1002},
+                       "statsd": {"gen": 1, "days": 30, "serial": "S3", "not_after": 1003}}
+                   and run.ctx.state[faults.TLS_GEN_KEY] == {"generator": 1, "statsd": 1},
+                   f"prepare() records the first issues and counts generations from 1, got "
+                   f"{issued} {run.ctx.state}")
+
+            driver.Docker = lambda *args, **kwargs: _CertsDocker(
+                [docker.Result(0, "{}\n", ""), docker.Result(1, "", "unknown command")])
+            stale = driver.Run(root, loaded, loaded.duration, None, False, Path(tmp) / "stale",
+                               [], "logit:soak", roles=_override_roles(loaded))
+            try:
+                stale.prepare()
+                expect(False, "prepare() went on after certs.sh printed no report")
+            except scenario.ScenarioError as err:
+                expect("certs.sh init failed (rc 0)" in str(err)
+                       and "rebuild it without SOAK_SKIP_IMAGE" in str(err),
+                       f"prepare() stops when certs.sh fails, got {err}")
+            for jsonl in (stale.timeline, stale.watchdog, stale.stats, stale.freshness,
+                          stale.capture):
+                jsonl.close()
+    finally:
+        driver.Docker = original
+    override = loaded.compose_path().read_text()
+    expect(override.count("${SOAK_TLS_DIR:?set by script/soak}:/tls:ro,z") == 2
+           and "\n  logit:" in override and "\n  generator:" in override,
+           "tls-reload's override mounts the TLS directory read-only into both logit services")
+    netem = (root / "netem" / "Dockerfile").read_text()
+    expect("openssl" in netem and "COPY certs.sh /certs.sh" in netem
+           and faults.CERTS_ENTRYPOINT == "/certs.sh",
+           "the netem image carries openssl and certs.sh at the entrypoint faults.py names")
+    script = (root / "netem" / "certs.sh").read_text()
+    expect("ec_paramgen_curve:P-256" in script and "mv -T" in script
+           and 'ln -sfn "gen-${gen}"' in script and "chmod 0644" in script
+           and "-cert probe/cert.pem" in script,
+           "certs.sh makes P-256 keys, swaps a relative live link in one rename, makes its "
+           "files readable, and presents the probe's certificate")
+
+
+def _tls_run(tmp, name, served="B2", verified=True, issued=True, first_broken=False,
+             failed_probe=False, reload_failed_at=None, failed_on="logit"):
+    """A run directory for `tls.served`, `self_log`, and `rise`: statsd first issued as A1
+    (notAfter 100), rotated at c0s1 [+100, +140] to gen 2, B2 (notAfter 200), with a SIGHUP
+    c0s2 [+110, +120] and a probe c0s3 [+125, +130], then rotated broken at c0s6 [+200, +240]
+    to gen 3, C3, with a SIGHUP c0s7 and a probe c0s8 [+225, +230] that read `served`.
+    `first_broken` makes c0s1 the broken one, `issued` False leaves out the `tls_issued` phase,
+    `failed_probe` fails c0s8's apply, and `reload_failed_at` puts a `tls_reload_failed` line on
+    `failed_on`'s stderr at that offset. The SUT's not_after gauge reads 100 until +115 and 200
+    after it."""
+    timeline = [_phase("start", 0, t0=T0)]
+    if issued:
+        timeline.append(_phase("tls_issued", -5, certs={"statsd": {
+            "gen": 1, "days": 30, "serial": "A1", "not_after": 100}}))
+    steps = []
+    for step_id, action, start, end, fields in (
+            ("c0s1", "rotate", 100, 140, {"cert": "statsd", "days": 31, "gen": 2,
+                                          "serial": "B2", "not_after": 200,
+                                          **({"broken": True} if first_broken else {})}),
+            ("c0s2", "signal", 110, 120, {"signal": "HUP"}),
+            ("c0s3", "probe", 125, 130, {"cert": "statsd", "port": 8125,
+                                         "serial": "A1" if first_broken else "B2",
+                                         "not_after": 100 if first_broken else 200,
+                                         "verified": True}),
+            ("c0s6", "rotate", 200, 240, {"cert": "statsd", "days": 32, "gen": 3,
+                                          "serial": "C3", "not_after": 300, "broken": True}),
+            ("c0s7", "signal", 210, 220, {"signal": "HUP"}),
+            ("c0s8", "probe", 225, 230, {"cert": "statsd", "port": 8125, "serial": served,
+                                         "not_after": {"B2": 200, "C3": 300, "A1": 100}[served],
+                                         "verified": verified})):
+        rc = 1 if failed_probe and step_id == "c0s8" else 0
+        apply_fields = dict(fields)
+        if rc:
+            apply_fields = {"cert": "statsd", "port": 8125, "stderr": "served no certificate"}
+        timeline += [_action("apply", step_id, action, "logit", start, start + 0.5, rc=rc,
+                             **apply_fields),
+                     _action("revert", step_id, action, "logit", end, end + 0.01)]
+        steps.append({"id": step_id, "spec_index": int(step_id[3:]) - 1, "cycle": 0,
+                      "action": action, "on": "logit", "args": "", "start": start, "end": end})
+    timeline += [_phase("end_begin", 300), _phase("end_end", 330)]
+    stdout = []
+    for offset in range(5, 301, 5):
+        ts = _stamp(T0 + offset)
+        stdout.append(_line(ts, "logit.process.uptime", "gauge", float(offset)))
+        stdout.append(_line(ts, "logit.tls.certificate.not_after", "gauge",
+                            100.0 if offset <= 115 else 200.0, component="statsd",
+                            attrs={"side": "server"}))
+    expectations = [
+        {"name": "rises", "service": "logit", "metric": "logit.tls.certificate.not_after",
+         "attrs": {"component": "statsd", "side": "server"}, "step": 2, "window": "through",
+         "reduce": "rise", "min": 86, "max": 100},
+        {"name": "holds", "service": "logit", "metric": "logit.tls.certificate.not_after",
+         "attrs": {"component": "statsd", "side": "server"}, "step": 7, "window": "through",
+         "reduce": "rise", "min": 0, "max": 0},
+        {"name": "too-little", "service": "logit", "metric": "logit.tls.certificate.not_after",
+         "attrs": {"component": "statsd", "side": "server"}, "step": 2, "window": "through",
+         "reduce": "rise", "min": 86400},
+        {"name": "before-any", "service": "logit", "metric": "logit.tls.certificate.not_after",
+         "attrs": {"component": "statsd", "side": "client"}, "step": 2, "window": "through",
+         "reduce": "rise", "min": 0}]
+    run_dir = _run_dir(tmp, name, timeline, stdout, suts=["logit"], steps=steps,
+                       expect=expectations)
+    if reload_failed_at is not None:
+        (run_dir / "logs" / f"{failed_on}.stderr").write_text(
+            f'{{"timestamp":"{_stamp(T0 + reload_failed_at)}","level":"WARN","message":"TLS '
+            'reload failed, still using the previous files: loading tls.cert_file '
+            '/tls/statsd/live/cert.pem with tls.key_file /tls/statsd/live/key.pem: keys may '
+            'not be consistent: KeyMismatch (x1, further occurrences suppressed)",'
+            '"component":"statsd","key":"tls_reload_failed","target":"logit"}\n')
+    return run_dir
+
+
+def _tls_checks():
+    """`tls.served` per probe: the generation in force passing, a broken rotation's serial
+    served FAILing, a chain that didn't verify FAILing, the first issue in force after a broken
+    first rotation, no recorded first issue FAILing, a failed probe FAILing, and no probe
+    SKIPping; `self_log` excusing `tls_reload_failed` inside a broken rotation on its service
+    only; the four steps opening no fault window; and the `rise` reducer."""
+    with tempfile.TemporaryDirectory() as tmp:
+        data = checks.RunData(_tls_run(tmp, "clean"))
+        expect(not data.faults and sorted(f.step for f in data.events)
+               == ["c0s1", "c0s2", "c0s3", "c0s6", "c0s7", "c0s8"],
+               f"a rotate and a probe open no fault window, got {data.faults}")
+        rows = {r.id: r for r in checks.check_tls_served(data)}
+        expect(set(rows) == {"tls.served.c0s3", "tls.served.c0s8"}
+               and all(r.status == checks.PASS for r in rows.values())
+               and "want c0s1's gen 2, serial B2, notAfter 200" in rows["tls.served.c0s3"].detail
+               and "still in force after broken c0s6" in rows["tls.served.c0s8"].detail,
+               f"each probe reads the generation in force, got {rows}")
+        bad = {r.id: r for r in checks.check_tls_served(checks.RunData(
+            _tls_run(tmp, "bad", served="C3")))}
+        expect(bad["tls.served.c0s8"].status == checks.FAIL
+               and "serial differs; notAfter differs" in bad["tls.served.c0s8"].detail
+               and bad["tls.served.c0s3"].status == checks.PASS,
+               f"a broken rotation's certificate served FAILs, got {bad}")
+        unverified = {r.id: r for r in checks.check_tls_served(checks.RunData(
+            _tls_run(tmp, "unverified", verified=False)))}
+        expect(unverified["tls.served.c0s8"].status == checks.FAIL
+               and "didn't verify" in unverified["tls.served.c0s8"].detail,
+               f"a chain that didn't verify FAILs, got {unverified}")
+        first = {r.id: r for r in checks.check_tls_served(checks.RunData(
+            _tls_run(tmp, "first", served="A1", first_broken=True)))}
+        expect(all(r.status == checks.PASS for r in first.values())
+               and "want the first issue (gen 1), serial A1" in first["tls.served.c0s8"].detail,
+               f"the first issue stays in force through broken rotations, got {first}")
+        unissued = {r.id: r for r in checks.check_tls_served(checks.RunData(
+            _tls_run(tmp, "unissued", served="A1", first_broken=True, issued=False)))}
+        expect(all(r.status == checks.FAIL and "no first issue" in r.detail
+                   for r in unissued.values()),
+               f"a probe with no recorded first issue FAILs, got {unissued}")
+        failed = {r.id: r for r in checks.check_tls_served(checks.RunData(
+            _tls_run(tmp, "failed", failed_probe=True)))}
+        expect(failed["tls.served.c0s8"].status == checks.FAIL
+               and "returned rc 1: served no certificate" in failed["tls.served.c0s8"].detail,
+               f"a probe that failed FAILs its row, got {failed}")
+        none = checks.check_tls_served(checks.RunData(_run_dir(tmp, "none",
+                                                                [_phase("start", 0, t0=T0)])))
+        expect(len(none) == 1 and none[0].status == checks.SKIP,
+               f"a run with no probe SKIPs, got {none}")
+
+        inside = checks.check_self_log(checks.RunData(
+            _tls_run(tmp, "inside", reload_failed_at=210.2)))
+        expect(inside.status == checks.PASS
+               and "1 tls_reload_failed line(s) inside broken rotations" in inside.detail,
+               f"a failed reload inside a broken rotation is expected, got {inside}")
+        outside = checks.check_self_log(checks.RunData(
+            _tls_run(tmp, "outside", reload_failed_at=110.2)))
+        expect(outside.status == checks.FAIL
+               and "tls_reload_failed at +110s, outside every broken rotate on logit"
+                   in outside.detail,
+               f"a failed reload outside every broken rotation FAILs, got {outside}")
+        elsewhere = checks.check_self_log(checks.RunData(
+            _tls_run(tmp, "elsewhere", reload_failed_at=210.2, failed_on="generator")))
+        expect(elsewhere.status == checks.FAIL
+               and "outside every broken rotate on generator" in elsewhere.detail,
+               f"a broken rotation on one service excuses no other's, got {elsewhere}")
+
+        rows = {r.id: r for r in checks.check_expect(data)}
+        expect(rows["expect.rises"].status == checks.PASS
+               and "c0s2 (+110s, +165s]: 100 " in rows["expect.rises"].detail,
+               f"rise is the value at the window's end less the one in force at its start, got "
+               f"{rows['expect.rises']}")
+        expect(rows["expect.holds"].status == checks.PASS
+               and ": 0 (" in rows["expect.holds"].detail,
+               f"a gauge that holds rises 0, got {rows['expect.holds']}")
+        expect(rows["expect.too-little"].status == checks.FAIL,
+               f"a rise under its bound FAILs, got {rows['expect.too-little']}")
+        expect(rows["expect.before-any"].status == checks.FAIL
+               and "no sample by the window's end" in rows["expect.before-any"].detail,
+               f"a gauge never set FAILs rise, got {rows['expect.before-any']}")
+        tel = data.telemetry["logit"]
+        value, note = checks.reduce_gauge(tel, "logit.tls.certificate.not_after",
+                                          {"component": "statsd"}, T0 + 2, T0 + 30, "rise")
+        expect(value is None and "no value in force at the window's start" in note,
+               f"rise with no value in force at the start is None, got {value} {note}")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -8181,7 +8650,8 @@ def run(root, quiet=False):
                      _class_signatures, _datadog_codec, _datadog_counts, _datadog_server,
                      _datadog_rules, _datadog_checks, _overlap_rules, _overlap_driver,
                      _overlap_checks, _signal_rules, _signal_actions, _sighup_driver,
-                     _reopen_checks, _shipped):
+                     _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
+                     _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
@@ -8191,7 +8661,7 @@ def run(root, quiet=False):
                               _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
                               _datadog_rules, _overlap_rules, _overlap_driver,
-                              _signal_rules, _sighup_driver)
+                              _signal_rules, _sighup_driver, _tls_rules, _tls_driver)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")
