@@ -12121,7 +12121,12 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a", "b"],
-                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
+                ComponentKind::Lua {
+                    script: String::new(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("b", vec![], vec![], ComponentKind::Target {}),
