@@ -137,7 +137,7 @@ components:
     type: target
 
   # An nginx line carries a log, metrics, and a span in one event, so every event belongs to all
-  # three gates and a router would copy it just as a fan-out does. It feeds them directly.
+  # three gates and a router would copy it as a fan-out does. It feeds them directly.
   #
   # Metric tags: only these low-cardinality attributes. `service.name` is on the resource, which
   # `keep` leaves alone.
