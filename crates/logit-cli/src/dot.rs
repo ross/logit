@@ -215,7 +215,7 @@ mod tests {
                         ("app", "app_stream"),
                     ]
                     .into_iter()
-                    .map(|(value, target)| (value.to_string(), target.to_string()))
+                    .map(|(value, target)| (value.to_string(), target.into()))
                     .collect(),
                 },
             ),
@@ -265,7 +265,7 @@ mod tests {
                 vec![],
                 ComponentKind::Route {
                     by: logit_config::RouteBy::Attribute("stream".to_string()),
-                    routes: [("app".to_string(), "app_stream".to_string())].into_iter().collect(),
+                    routes: [("app".to_string(), "app_stream".into())].into_iter().collect(),
                 },
             ),
         );

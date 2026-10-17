@@ -174,7 +174,8 @@ span per node-visit at `span_sample_rate: 1.0`, so nothing is thinned out
 drains once more, so counts recorded during the drain are exported
 (`../docs/deploying.md`'s "Self-logging").
 
-`self` (`internal`) mixes metric-only and span-only events in one stream. `trace_only`
+`self` (`internal`) mixes metric-only, log-only, and span-only events in one stream. `self_by_signal`
+(`type: route`, `by: signal`) sends each to its own branch without copying it, and `trace_only`
 (`type: has_signal`) drops the metric-only ones before they reach `self_tempo_out`, because Tempo
 is a traces-only backend and would reject them. `has_signal` never forwards a metrics-only batch at
 all, so you shouldn't see any `component 'self_tempo_out'` send failures in steady state. Without

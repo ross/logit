@@ -108,11 +108,11 @@
 #                                    v                                                    v
 #                             VictoriaMetrics                                           Tempo
 #
-#   self (internal) --+-> self_logs (keep_signals: [logs]) ---> self_loki_out (otlp_out, HTTP) --> Loki
-#                     |
-#                     +-> self_windowed (aggregate) ---------> self_victoria_out --> VictoriaMetrics
-#                     |
-#                     +-> trace_only (has_signal) -----------> self_tempo_out (otlp_out, gRPC) --> Tempo
+#   self (internal) -> self_by_signal (route) --+-> self_logs (keep_signals: [logs]) -> self_loki_out (otlp_out, HTTP) --> Loki
+#                                               |
+#                                               +-> self_windowed (aggregate) --------> self_victoria_out --> VictoriaMetrics
+#                                               |
+#                                               +-> trace_only (has_signal) ----------> self_tempo_out (otlp_out, gRPC) --> Tempo
 #
 #   demo-app --OTLP/HTTP protobuf--> tempo:4318 directly, bypassing `logit`. Its span parents to
 #   nginx's span (nginx mints and forwards its own span id, docs/adr/trace-context-span-lifting.md),
@@ -531,7 +531,7 @@ components:
   # lose the counts `self` exports after it (docs/deploying.md's "Self-logging").
   self_logs:
     type: keep_signals
-    sources: [self]
+    sources: [self_log_events]
     signals: [logs]
 
   self_loki_out:
@@ -659,10 +659,35 @@ components:
     interval: 10s
     span_sample_rate: 1.0
 
+  # `self` feeds three branches that each take one signal. A `route` on signal sends every event
+  # to its branch without the copy a three-way fan-out would make of each. An event with no
+  # signal goes to `self_discard`, since a router needs a consumer for what it doesn't claim.
+  self_by_signal:
+    type: route
+    sources: [self]
+    by: signal
+    routes:
+      metrics: self_metric_events
+      logs: self_log_events
+      traces: self_trace_events
+
+  self_metric_events:
+    type: target
+
+  self_log_events:
+    type: target
+
+  self_trace_events:
+    type: target
+
+  self_discard:
+    type: null_out
+    sources: [self_by_signal]
+
   # Cumulative for the same reason as `windowed`: `self`'s counters are deltas.
   self_windowed:
     type: aggregate
-    sources: [self]
+    sources: [self_metric_events]
     interval: 60s # `self`'s 10s divides evenly into it, as internal-telemetry.md's guidance asks
     temporality: cumulative
 
@@ -718,7 +743,7 @@ components:
   # only ever emits traces (see `browser_spans`'s comment above).
   trace_only:
     type: has_signal
-    sources: [self]
+    sources: [self_trace_events]
     signals: [traces]
 
   # Deliberately gRPC, not HTTP (docs/adr/hand-rolled-grpc-over-hyper.md): Tempo's `:4317`

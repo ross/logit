@@ -5141,6 +5141,43 @@ def _tcp_rules(root):
            f"a tail_in source takes wire file, and its writer must be a file_out, got "
            f"{problems}")
 
+    # A route that can send one event to several sinks is refused under split = "route".
+    def route_problems(text, split="route"):
+        with tempfile.TemporaryDirectory() as tmp:
+            scenario_path = Path(tmp) / "scenario.toml"
+            changed = copy.deepcopy(raw)
+            for key, name in changed["configs"].items():
+                (Path(tmp) / name).write_text(
+                    text if key == "sut" else (path.parent / name).read_text())
+            changed["ledger"]["split"] = split
+            first = changed["ledger"]["sink"][0]
+            changed["ledger"]["sink"] = [dict(first, target="tier_a"),
+                                         dict(first, id="other", target="tier_b")]
+            try:
+                scenario.from_dict(changed, scenario_path)
+                return []
+            except scenario.ScenarioError as err:
+                return [p for p in err.problems if "route " in p and "several sinks" in p]
+
+    single = "components:\n  split:\n    type: route\n    by: { attribute: shard }\n" \
+             "    routes: { \"0\": tier_a, \"1\": tier_b }\n    sources: [window]\n"
+    expect(route_problems(single) == [],
+           f"a one-target-per-value route loads under split = route, got {route_problems(single)}")
+    flow_list = "components:\n  split: { type: route, by: { attribute: shard }, " \
+                "routes: { \"0\": [tier_a, tier_b] } }\n"
+    block_list = "components:\n  split:\n    type: route\n    by: { attribute: shard }\n" \
+                 "    routes:\n      \"0\":\n        - tier_a\n        - tier_b\n"
+    by_signal = "components:\n  split:\n    type: route\n    by: signal\n" \
+                "    routes: { logs: tier_a, metrics: tier_b }\n"
+    for name, text in (("a flow list", flow_list), ("a block list", block_list),
+                       ("by: signal", by_signal)):
+        problems = route_problems(text)
+        expect(len(problems) == 1 and "route 'split'" in problems[0]
+               and "use split = \"copy\" or one target per value" in problems[0],
+               f"{name} under split = route is refused, got {problems}")
+        expect(route_problems(text, split="copy") == [],
+               f"{name} loads under split = copy, got {route_problems(text, split='copy')}")
+
     # The fault predicates per wire.
     roles = scenario.BASE_ROLES
     for action, on, udp, tcp, file in (

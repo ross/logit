@@ -701,7 +701,9 @@ def from_dict(raw, path):
         problems += _source_problems(ledger)
         sut_config = configs.get(SUT_CONFIG_KEY) if isinstance(configs, dict) else None
         if isinstance(sut_config, str) and (path.parent / sut_config).is_file():
-            problems += _wire_problems(ledger, (path.parent / sut_config).read_text())
+            sut_text = (path.parent / sut_config).read_text()
+            problems += _wire_problems(ledger, sut_text)
+            problems += _route_problems(ledger, sut_text)
         problems += _writer_problems(ledger, configs, path.parent)
         problems += _extra_sut_problems(extra_suts, ledger)
         problems += _hop_problems(ledger, extra_suts)
@@ -913,6 +915,77 @@ def listener_wire(text, component):
         wire = default if transport is None else by_transport.get(transport)
         return wire, kind.group(1), transport
     return None, None, None
+
+
+def _route_blocks(text):
+    """`(id, body)` for each `type: route` component in config `text`, comments removed: the
+    component's own header line and every deeper-indented line after it."""
+    lines = [re.sub(r"(^|\s)#.*$", "", line) for line in (text or "").splitlines()]
+    for index, line in enumerate(lines):
+        if not re.search(r"\btype\s*:\s*[\"']?route\b", line):
+            continue
+        indent = len(line) - len(line.lstrip())
+        head = index
+        if re.match(r"^\s*[\w.-]+\s*:\s*\{", line):
+            pass
+        else:
+            while head > 0 and (not lines[head].strip()
+                                or len(lines[head]) - len(lines[head].lstrip()) >= indent):
+                head -= 1
+        found = re.match(r"^\s*([\w.-]+)\s*:(.*)$", lines[head])
+        if not found:
+            continue
+        head_indent = len(lines[head]) - len(lines[head].lstrip())
+        block = [found.group(2)]
+        for following in lines[head + 1:]:
+            if following.strip() and len(following) - len(following.lstrip()) <= head_indent:
+                break
+            block.append(following)
+        yield found.group(1), "\n".join(block)
+
+
+def _routes_value(body):
+    """The text of a route component's `routes:` value in `body`: a flow mapping to its closing
+    brace, or the deeper-indented lines of a block mapping; empty when there is none."""
+    found = re.search(r"\broutes\s*:[ \t]*(\{)?", body)
+    if not found:
+        return ""
+    if found.group(1):
+        depth, end = 0, found.end() - 1
+        for position in range(found.end() - 1, len(body)):
+            depth += {"{": 1, "}": -1}.get(body[position], 0)
+            if depth == 0:
+                end = position
+                break
+        else:
+            end = len(body)
+        return body[found.end() - 1:end + 1]
+    start = body.rfind("\n", 0, found.start()) + 1
+    indent = found.start() - start
+    out = []
+    for line in body[found.end():].split("\n")[1:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
+def _route_problems(ledger, sut_text):
+    """Under `split = "route"`, the sinks' V add up only if a router sends each event to one
+    target. A `routes:` value that is a list, or `by: signal`, can deliver one event to several
+    sinks, so the SUT config's `route` components must use neither."""
+    if ledger.get("split", "copy") != "route":
+        return []
+    problems = []
+    for name, body in _route_blocks(sut_text):
+        listed = re.search(r"\[|^\s*-\s", _routes_value(body), re.M)
+        by_signal = re.search(r"\bby\s*:\s*[\"']?signal\b", body)
+        if listed or by_signal:
+            what = "`by: signal`" if by_signal else "a list-valued `routes:` value"
+            problems.append(f"ledger.split = \"route\": route {name!r} uses {what}, which can "
+                            "deliver one event to several sinks, so their totals don't add up; "
+                            "use split = \"copy\" or one target per value")
+    return problems
 
 
 def _wire_problems(ledger, sut_text):

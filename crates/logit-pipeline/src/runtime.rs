@@ -16,7 +16,7 @@ use crate::output::{classify, is_head_only, is_retryable, DeliveryPosture, Fault
 use crate::queue::{SinkQueue, SinkQueueConfig};
 use crate::queue::{SinkStore, SinkStoreConfig, StoreItem};
 use crate::readiness::{NodeState, Phase};
-use crate::router::{Destination, Router, RouterScratch};
+use crate::router::{Destinations, Router, RouterScratch};
 use crate::{Edge, Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
 use anyhow::Context;
 use logit_core::{Diagnostics, Event, EventBatch, Resource, Scope, SpanKind, Telemetry};
@@ -61,8 +61,8 @@ pub enum NodeSpec {
     Output(Box<dyn Output + Send>, SinkStoreConfig, WriteLoopConfig),
     Transform(Box<dyn Transform + Send>),
     /// A [`Router`] node (`docs/adr/target-components.md`): directs each event to its own
-    /// outbound `Fanout` ([`Destination::Forward`]) or to one of the slot-ordered target
-    /// `Fanout`s the runtime clones in from `ResolvedComponent::targets`.
+    /// outbound `Fanout` ([`Destinations::FORWARD`]), to the slot-ordered target `Fanout`s the
+    /// runtime clones in from `ResolvedComponent::targets`, or to several of them at once.
     Router(Box<dyn Router + Send>),
     /// A `target`: nothing is spawned for it, and it holds nothing.
     ///
@@ -415,7 +415,7 @@ pub async fn run_with_options(
             }
             NodeSpec::Router(router) => {
                 // Slot order is `ResolvedComponent::targets`' order, derived only in
-                // `graph::targets_of`, so `Destination::To(n)` means `routes[n]` here and in the
+                // `graph::targets_of`, so `Destinations::target(n)` means `routes[n]` here and in the
                 // Lua name -> slot table alike. Cloning a `Fanout` clones its `Sender`s, so two
                 // routers directing at one target fan in there like `sources:` fan-in.
                 let routes = resolve_target_fanouts(&id, &component.targets, &target_fanouts);
@@ -432,7 +432,7 @@ pub async fn run_with_options(
             NodeSpec::Lua { script, interval, runtime } => {
                 // A Lua node is a router too: the ids in `component.targets` become
                 // `event:to("..")`'s name -> slot table in the VM, resolved from the same
-                // pre-spawn map as the `Router` arm, so `Destination::To(n)` and the script's n-th
+                // pre-spawn map as the `Router` arm, so target slot `n` and the script's n-th
                 // target id agree.
                 let targets = component.targets.clone();
                 let target_routes =
@@ -1834,7 +1834,8 @@ pub fn process_batch(
 /// flushes (`crate::router`). Per incoming batch it mints one child context and records one
 /// `"process"` span, then sends one batch per non-empty destination under that same context: one
 /// batch is one hop however many ways it forks, as with `Fanout`
-/// (`docs/design/pipeline-graph.md`'s "Trace context propagation").
+/// (`docs/design/pipeline-graph.md`'s "Trace context propagation"). The span's `events` counts
+/// what left, so an event sent to two destinations counts twice there.
 ///
 /// Provenance passes through; each destination's `Fanout::stamp` rewrites `previous` to its own
 /// id (the target's, or this router's for the forward edge) and keeps `origin`. That's all of
@@ -1873,7 +1874,7 @@ async fn run_router(
         span.events(partitions.iter().map(|(_, batch)| batch.events.len() as u64).sum());
 
         for (slot, out) in partitions {
-            // Slot 0 is this router's own outbound edge; slot n + 1 is `Destination::To(n)`.
+            // Slot 0 is this router's own outbound edge; slot n + 1 is target n.
             let destination = match slot {
                 0 => &fanout,
                 n => match targets.get(n - 1) {
@@ -1889,41 +1890,84 @@ async fn run_router(
                 !destination.is_empty(),
                 "router destination slot {slot} has no consumer"
             );
-            destination.send_with_own_context(out, ctx).await;
+            match out {
+                Partition::Owned(batch) => destination.send_with_own_context(batch, ctx).await,
+                Partition::Shared(batch) => {
+                    destination.send_shared_with_own_context(batch, ctx).await
+                }
+            };
         }
     }
     Ok(())
 }
 
+/// One destination's share of a routed batch, from [`route_batch`]. Derefs to the batch, so a
+/// caller that only reads it doesn't match on the variant.
+pub enum Partition {
+    /// Events moved into this destination's own batch: every event when the batch's marks name
+    /// one destination each, and the mixed-mark path, where an event for several destinations is
+    /// cloned into each but the highest slot.
+    Owned(EventBatch),
+    /// The whole incoming batch, unchanged, behind one `Arc` that every destination in the
+    /// batch's one shared mark holds. Sent as `Delivered::Shared`, so a sink borrows it and a
+    /// mutating consumer pays its copy-on-write clone only while another destination still holds
+    /// it (`docs/adr/arc-eventbatch-copy-on-write.md`).
+    Shared(Arc<EventBatch>),
+}
+
+impl std::ops::Deref for Partition {
+    type Target = EventBatch;
+
+    fn deref(&self) -> &EventBatch {
+        match self {
+            Partition::Owned(batch) => batch,
+            Partition::Shared(batch) => batch,
+        }
+    }
+}
+
 /// The per-batch body of `run_router`: telemetry accounting, `Router::route` over every event, and
-/// one outgoing [`EventBatch`] per destination that received at least one event. `pub` so
+/// one outgoing [`Partition`] per destination that received at least one event. `pub` so
 /// `crates/logit-bench/tests/allocations.rs` measures the real path.
 ///
-/// Four passes, because `Router::route` borrows its event (returning an `Event` through an enum
+/// Four passes, because `Router::route` borrows its event (returning an `Event` through a tuple
 /// would memcpy the batch), so every verdict is recorded before anything moves:
 ///
-/// 1. **Route.** One `Destination` per event, appended to `scratch.marks`.
-/// 2. **Count.** `scratch.counts[d]` from those marks.
+/// 1. **Route.** One [`Destinations`] set per event, appended to `scratch.marks`.
+/// 2. **Count.** `scratch.counts[d]` from those marks, one per slot each mark names.
 /// 3. **Reserve.** `reserve_exact(count)` on each destination with a nonzero count. The previous
 ///    batch's `std::mem::take` left every `scratch.dests` entry at capacity 0, so this is that
 ///    destination's only allocation.
 /// 4. **Move.** Each event is pushed into its exactly sized buffer: no regrowth, no second copy.
+///    An event whose mark names several slots is cloned into each but the highest, and moved
+///    into that one, so each destination sees its events in arrival order.
 ///
-/// Allocations: `1 + (destinations that received at least one event)` per batch, zero per event
-/// (`docs/adr/target-components.md`; pinned by
-/// `route_batch_two_targets_costs_one_vec_per_used_destination`). The `1` is the returned `Vec`,
-/// sized `used` up front. `scratch.marks`/`scratch.counts` amortize to zero once grown to the
-/// node's largest batch, `resource`/`scope` are refcount bumps, and an unused destination
-/// allocates nothing.
+/// **Shared fast path.** When every event in the batch carries the same mark and it names
+/// several slots, passes 2 to 4 are skipped: the incoming batch goes out whole behind one `Arc`
+/// that every slot in the mark holds ([`Partition::Shared`]), and nothing is cloned. A batch
+/// whose shared mark names one slot keeps the move path, so its cost is the same as when a router
+/// could name one destination only.
 ///
-/// An out-of-range `Destination::To(n)` is a bug in the `Router` impl: a `debug_assert!` in debug
-/// builds, unrouted with a warning in release. A resolved graph never produces one.
+/// Allocations: `1 + (destinations that received at least one event)` per batch when no event is
+/// copied (`docs/adr/target-components.md`; pinned by
+/// `route_batch_two_targets_costs_one_vec_per_used_destination`), `2` on the shared path (the
+/// returned `Vec` and the `Arc`), and on the mixed path each event clone's own allocations on
+/// top. The `1` is the returned `Vec`, sized `used` up front. `scratch.marks`/`scratch.counts`
+/// amortize to zero once grown to the node's largest batch, `resource`/`scope` are refcount
+/// bumps, and an unused destination allocates nothing.
+///
+/// Every delivery past an event's first counts as `logit.component.events.copied`, on the shared
+/// path too: it counts what reached a destination, not deep clones.
+///
+/// A mark with a slot past this scratch's, or an empty one, is a bug in the `Router` impl: a
+/// `debug_assert!` in debug builds; release keeps the in-range slots, falling back to `Forward`
+/// with a warning when none is left. A resolved graph never produces one.
 pub fn route_batch(
     router: &mut (dyn Router + Send),
     scratch: &mut RouterScratch,
     batch: EventBatch,
     telemetry: &Telemetry,
-) -> Vec<(usize, EventBatch)> {
+) -> Vec<(usize, Partition)> {
     telemetry.count("logit.component.batches.received", 1.0, &[]);
     telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
 
@@ -1942,29 +1986,31 @@ pub fn route_batch(
 
     // Pass 1: route, borrowing.
     for event in &batch.events {
-        let mark = match router.route(&resource, event) {
-            Destination::To(n) if usize::from(n) + 1 >= slots => {
-                debug_assert!(
-                    false,
-                    "router returned Destination::To({n}) with only {} target slot(s)",
-                    slots - 1
-                );
-                tracing::warn!(
-                    target: "logit",
-                    slot = n,
-                    targets = slots - 1,
-                    "router returned an out-of-range target slot; treating the event as unrouted"
-                );
-                Destination::Forward
-            }
-            mark => mark,
-        };
+        let mark = checked_mark(router.route(&resource, event), slots);
         scratch.marks.push(mark);
     }
 
+    let events = batch.events;
+    if let Some(&first) = scratch.marks.first() {
+        if first.len() > 1 && scratch.marks.iter().all(|mark| *mark == first) {
+            drop(process_timer);
+            telemetry.count(
+                "logit.component.events.copied",
+                ((first.len() - 1) * events.len()) as f64,
+                &[],
+            );
+            let shared = Arc::new(EventBatch { resource, scope, events });
+            return first.slots().map(|slot| (slot, Partition::Shared(shared.clone()))).collect();
+        }
+    }
+
     // Pass 2: count.
+    let mut copies = 0usize;
     for mark in &scratch.marks {
-        scratch.counts[slot_of(*mark)] += 1;
+        copies += mark.len() - 1;
+        for slot in mark.slots() {
+            scratch.counts[slot] += 1;
+        }
     }
 
     // Pass 3: reserve exactly, and only where something is going.
@@ -1976,11 +2022,19 @@ pub fn route_batch(
         }
     }
 
-    // Pass 4: move. A router never absorbs (`crate::router`: no `Destination::Drop`).
-    for (event, mark) in batch.events.into_iter().zip(&scratch.marks) {
-        scratch.dests[slot_of(*mark)].push(event);
+    // Pass 4: move. A router never absorbs (`crate::router`: no drop), and `checked_mark` left
+    // every mark non-empty.
+    for (event, mark) in events.into_iter().zip(&scratch.marks) {
+        let Some(last) = mark.highest_slot() else { continue };
+        for slot in mark.without_slot(last).slots() {
+            scratch.dests[slot].push(event.clone());
+        }
+        scratch.dests[last].push(event);
     }
     drop(process_timer);
+    if copies > 0 {
+        telemetry.count("logit.component.events.copied", copies as f64, &[]);
+    }
 
     let mut out = Vec::with_capacity(used);
     for (slot, dest) in scratch.dests.iter_mut().enumerate() {
@@ -1989,16 +2043,49 @@ pub fn route_batch(
         }
         // Leaves a capacity-0 `Vec` for the next batch's `reserve_exact` (`RouterScratch`).
         let events = std::mem::take(dest);
-        out.push((slot, EventBatch { resource: resource.clone(), scope: scope.clone(), events }));
+        out.push((
+            slot,
+            Partition::Owned(EventBatch {
+                resource: resource.clone(),
+                scope: scope.clone(),
+                events,
+            }),
+        ));
     }
     out
+}
+
+/// `route_batch`'s guard on one mark: keeps the slots `slots` covers, and turns an empty result
+/// into `Forward`. Either repair is a `Router` bug, so debug builds assert.
+fn checked_mark(mark: Destinations, slots: usize) -> Destinations {
+    let (kept, out_of_range) = mark.within(slots);
+    if !out_of_range && !kept.is_empty() {
+        return kept;
+    }
+    debug_assert!(
+        false,
+        "router returned {mark:?}, out of range or empty, with only {} target slot(s)",
+        slots - 1
+    );
+    tracing::warn!(
+        target: "logit",
+        targets = slots - 1,
+        "router returned an out-of-range or empty destination set; keeping the in-range slots, \
+         or treating the event as unrouted if none is left"
+    );
+    if kept.is_empty() {
+        Destinations::FORWARD
+    } else {
+        kept
+    }
 }
 
 /// The slot-ordered target `Fanout`s one routing node (`NodeSpec::Router`, or `NodeSpec::Lua`
 /// with `targets:`) owns, cloned from [`run_with_telemetry`]'s pre-spawn map.
 ///
 /// Slot order is `ResolvedComponent::targets`' order, derived only in `graph::targets_of`, so
-/// `Destination::To(n)` and the n-th id in a Lua component's `targets:` name the same target.
+/// [`Destinations::target`]`(n)` and the n-th id in a Lua component's `targets:` name the same
+/// target.
 ///
 /// # Panics
 ///
@@ -2019,15 +2106,6 @@ fn resolve_target_fanouts(
             })
         })
         .collect()
-}
-
-/// `Destination` -> index into [`RouterScratch`]'s per-destination buffers: slot 0 is the router's
-/// own outbound edge, slot `n + 1` is `Destination::To(n)`.
-fn slot_of(destination: Destination) -> usize {
-    match destination {
-        Destination::Forward => 0,
-        Destination::To(n) => usize::from(n) + 1,
-    }
 }
 
 /// Runs one flush, for both `run_transform`'s deadline tick and its close-time flush. Timed as one
@@ -2847,8 +2925,8 @@ fn count_revoked(dests: &mut [Vec<Event>], telemetry: &Telemetry) {
     }
 }
 
-/// An `event:to(..)` mark -> index into `run_lua`'s per-destination buffers, numbered as
-/// [`slot_of`] numbers a [`Destination`]: 0 is the node's own edge, `n + 1` is target slot `n`.
+/// An `event:to(..)` mark -> index into `run_lua`'s per-destination buffers, numbered as a
+/// [`Destinations`] slot: 0 is the node's own edge, `n + 1` is target slot `n`.
 ///
 /// An out-of-range mark can't happen: `event:to(id)` resolves against the same `targets:` list
 /// that sized the buffers, and an unknown id is a script error (`TargetTable` in
@@ -11803,8 +11881,9 @@ mod tests {
     // Routers and targets (`docs/adr/target-components.md`)
     // -------------------------------------------------------------------------------------------
 
-    /// Maps one attribute's value to a target slot, else [`Destination::Forward`]; a local
-    /// stand-in for `logit-transforms::Route`.
+    /// Maps one attribute's value to every target slot listed for it, else
+    /// [`Destinations::FORWARD`]; a local stand-in for `logit-transforms::Route`. A value listed
+    /// twice names both slots.
     struct SplitByAttr {
         key: String,
         values: Vec<(String, u16)>,
@@ -11820,14 +11899,20 @@ mod tests {
     }
 
     impl Router for SplitByAttr {
-        fn route(&mut self, _resource: &Arc<Resource>, event: &Event) -> Destination {
+        fn route(&mut self, _resource: &Arc<Resource>, event: &Event) -> Destinations {
             let Some(value) = event.attributes.get(&self.key).and_then(|v| v.as_str()) else {
-                return Destination::Forward;
+                return Destinations::FORWARD;
             };
-            self.values
+            let mark = self
+                .values
                 .iter()
-                .find(|(candidate, _)| candidate == value)
-                .map_or(Destination::Forward, |(_, slot)| Destination::To(*slot))
+                .filter(|(candidate, _)| candidate == value)
+                .fold(Destinations::NONE, |mark, (_, slot)| mark | Destinations::target(*slot));
+            if mark.is_empty() {
+                Destinations::FORWARD
+            } else {
+                mark
+            }
         }
     }
 
@@ -12006,6 +12091,112 @@ mod tests {
         assert!(rx_a.recv_timeout(Duration::from_millis(50)).is_err(), "no duplicate batch");
         assert!(rx_b.recv_timeout(Duration::from_millis(50)).is_err(), "no duplicate batch");
         assert!(rx_fwd.recv_timeout(Duration::from_millis(50)).is_err(), "no duplicate batch");
+    }
+
+    /// Runs `batch` through `in -> split -> {a, b, split's own edge}` with `split` routing by the
+    /// `stream` attribute per `values`, and returns what each of the three consumers received.
+    async fn run_two_target_router(
+        batch: EventBatch,
+        values: &[(&str, u16)],
+    ) -> [Vec<Option<String>>; 3] {
+        let g = routed_graph(vec![
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                    idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
+                    peer: false,
+                    reuse_port: false,
+                    proxy_protocol: false,
+                    socket_mode: None,
+                },
+            ),
+            (
+                "split",
+                vec!["in"],
+                vec!["a", "b"],
+                ComponentKind::Lua {
+                    script: String::new(),
+                    interval: None,
+                    max_memory: None,
+                    jit: false,
+                },
+            ),
+            ("a", vec![], vec![], ComponentKind::Target {}),
+            ("b", vec![], vec![], ComponentKind::Target {}),
+            ("sink_a", vec!["a"], vec![], influxdb_out()),
+            ("sink_b", vec!["b"], vec![], influxdb_out()),
+            ("sink_fwd", vec!["split"], vec![], influxdb_out()),
+        ]);
+        let (tx_a, rx_a) = std::sync::mpsc::channel();
+        let (tx_b, rx_b) = std::sync::mpsc::channel();
+        let (tx_fwd, rx_fwd) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "split".to_string(),
+            NodeSpec::Router(Box::new(SplitByAttr::new("stream", values))),
+        );
+        specs.insert("sink_a".to_string(), recording_sink(tx_a));
+        specs.insert("sink_b".to_string(), recording_sink(tx_b));
+        specs.insert("sink_fwd".to_string(), recording_sink(tx_fwd));
+
+        tokio::time::timeout(Duration::from_secs(5), run(g, specs))
+            .await
+            .expect("run should return once the only input finishes")
+            .expect("run should complete without error");
+
+        // A run that has returned has delivered everything, so draining what arrived is complete.
+        let drain = |rx: std::sync::mpsc::Receiver<EventBatch>| -> Vec<Option<String>> {
+            rx.try_iter()
+                .flat_map(|batch| batch.events)
+                .map(|event| stream_tag(&event).map(String::from))
+                .collect()
+        };
+        [drain(rx_a), drain(rx_b), drain(rx_fwd)]
+    }
+
+    fn tags(tags: &[Option<&str>]) -> Vec<Option<String>> {
+        tags.iter().map(|tag| tag.map(String::from)).collect()
+    }
+
+    /// An event marked for two targets reaches both consumers once each; the rest of the batch is
+    /// partitioned as before, and each consumer sees its events in arrival order.
+    #[tokio::test]
+    async fn a_router_copies_an_event_marked_for_two_targets_to_both() {
+        let batch = one_batch(vec![
+            tagged_event("e1", Some("both")),
+            tagged_event("e2", Some("a")),
+            tagged_event("e3", None),
+            tagged_event("e4", Some("both")),
+        ]);
+        let [a, b, fwd] = run_two_target_router(batch, &[("a", 0), ("both", 0), ("both", 1)]).await;
+        assert_eq!(a, tags(&[Some("both"), Some("a"), Some("both")]));
+        assert_eq!(b, tags(&[Some("both"), Some("both")]));
+        assert_eq!(fwd, tags(&[None]));
+    }
+
+    /// A batch whose every event carries the same two-target mark reaches both consumers whole.
+    #[tokio::test]
+    async fn a_router_sends_a_uniformly_marked_batch_whole_to_every_target() {
+        let batch =
+            one_batch(vec![tagged_event("e1", Some("both")), tagged_event("e2", Some("both"))]);
+        let [a, b, fwd] = run_two_target_router(batch, &[("both", 0), ("both", 1)]).await;
+        assert_eq!(a, tags(&[Some("both"), Some("both")]));
+        assert_eq!(b, tags(&[Some("both"), Some("both")]));
+        assert!(fwd.is_empty(), "nothing is unrouted, got {fwd:?}");
     }
 
     /// When no route claims anything, the whole batch reaches the router's ordinary consumer.
@@ -12393,6 +12584,98 @@ mod tests {
             vec!["from_a".to_string(), "from_b".to_string()],
             "both routers' claims should land at the one shared target's consumer"
         );
+    }
+
+    /// Mixed marks: an event for two slots is cloned into the lower and moved into the higher,
+    /// each destination keeps arrival order, and every delivery past an event's first counts as
+    /// `events.copied`.
+    #[test]
+    fn route_batch_copies_a_multi_marked_event_and_counts_the_copies() {
+        let mut router = SplitByAttr::new("stream", &[("a", 0), ("both", 0), ("both", 1)]);
+        let mut scratch = RouterScratch::new(2);
+        let probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("split", "route", "transform");
+
+        let partitions = route_batch(
+            &mut router,
+            &mut scratch,
+            one_batch(vec![
+                tagged_event("one", Some("both")),
+                tagged_event("two", Some("a")),
+                tagged_event("three", None),
+                tagged_event("four", Some("both")),
+            ]),
+            &telemetry,
+        );
+
+        let shape: Vec<(usize, bool, Vec<Option<&str>>)> = partitions
+            .iter()
+            .map(|(slot, out)| {
+                let owned = matches!(out, Partition::Owned(_));
+                (*slot, owned, out.events.iter().map(stream_tag).collect())
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, true, vec![None]),
+                (1, true, vec![Some("both"), Some("a"), Some("both")]),
+                (2, true, vec![Some("both"), Some("both")]),
+            ]
+        );
+        let totals = Totals::of(probe.registry().drain(0));
+        assert_eq!(totals.sum("logit.component.events.received", &[]), 4.0);
+        assert_eq!(totals.sum("logit.component.events.copied", &[]), 2.0);
+        assert!(
+            scratch.dests.iter().all(|dest| dest.is_empty() && dest.capacity() == 0),
+            "the mixed path must leave the scratch as the single-destination path does"
+        );
+    }
+
+    /// One mark shared by the whole batch and naming two slots: one `Arc`, held by both, and the
+    /// batch's events counted once per extra destination.
+    #[test]
+    fn route_batch_shares_a_uniformly_multi_marked_batch_behind_one_arc() {
+        let mut router = SplitByAttr::new("stream", &[("both", 0), ("both", 1)]);
+        let mut scratch = RouterScratch::new(2);
+        let probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("split", "route", "transform");
+
+        let partitions = route_batch(
+            &mut router,
+            &mut scratch,
+            one_batch(vec![tagged_event("one", Some("both")), tagged_event("two", Some("both"))]),
+            &telemetry,
+        );
+
+        let [(1, Partition::Shared(first)), (2, Partition::Shared(second))] = partitions.as_slice()
+        else {
+            panic!("expected slots 1 and 2 sharing one batch");
+        };
+        assert!(Arc::ptr_eq(first, second), "both destinations must hold the same Arc");
+        assert_eq!(first.events.len(), 2);
+        let totals = Totals::of(probe.registry().drain(0));
+        assert_eq!(totals.sum("logit.component.events.copied", &[]), 2.0);
+    }
+
+    /// A uniform mark naming one slot keeps the move path: an owned partition, nothing copied.
+    #[test]
+    fn route_batch_keeps_a_uniform_single_destination_batch_owned() {
+        let mut router = SplitByAttr::new("stream", &[("a", 0)]);
+        let mut scratch = RouterScratch::new(1);
+        let probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("split", "route", "transform");
+
+        let partitions = route_batch(
+            &mut router,
+            &mut scratch,
+            one_batch(vec![tagged_event("one", Some("a")), tagged_event("two", Some("a"))]),
+            &telemetry,
+        );
+
+        assert!(matches!(partitions.as_slice(), [(1, Partition::Owned(_))]));
+        let totals = Totals::of(probe.registry().drain(0));
+        assert_eq!(totals.sum("logit.component.events.copied", &[]), 0.0);
     }
 
     /// `route_batch` yields slot-ordered, non-empty partitions and leaves every buffer capacity 0.

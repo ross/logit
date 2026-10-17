@@ -16,7 +16,8 @@
 //! (`docs/adr/arc-eventbatch-copy-on-write.md`). The move-vs-clone rule: an edge with one
 //! consumer (a linear chain, every listener's first hop) moves the batch through as
 //! `Delivered::Owned` with no `Arc`; only a real fan-out wraps it in one `Arc` and hands out
-//! `Delivered::Shared` refcount bumps, never a deep clone. `run_output` borrows `&EventBatch` out
+//! `Delivered::Shared` refcount bumps, never a deep clone. A router whose batch goes whole to
+//! several destinations hands each the same `Arc` the same way. `run_output` borrows `&EventBatch` out
 //! of either variant, which is where the fan-out saving lands; `run_transform`/`run_lua` call
 //! `unwrap_batch` for an owned batch, which deep-clones only a contended `Shared`
 //! (`docs/design/memory.md` pins those allocation counts). A listener's inbox is never fed, so
@@ -140,12 +141,14 @@ impl From<TraceContext> for BatchContext {
 }
 
 /// What travels one graph edge. The variant is picked per send from how many consumers the
-/// `Fanout` has: a property of the edge, not the batch.
+/// `Fanout` has, a property of the edge, not the batch, except that a router's shared partition
+/// is `Shared` on every edge (`Fanout::send_shared_with_own_context`).
 pub enum Delivered {
     /// The `Fanout` had one consumer: the batch moved through with no `Arc`. The common case:
     /// every listener's first hop and every edge of a linear chain.
     Owned(EventBatch, BatchContext),
-    /// The `Fanout` had more than one consumer, each holding a handle to the same `Arc`. No
+    /// The `Fanout` had more than one consumer, or a router sent one batch to several
+    /// destinations, each holding a handle to the same `Arc`. No
     /// branch is privileged: whichever handle is unwrapped last reclaims the batch without
     /// cloning, and under concurrent consumption more than one can clone (see `unwrap_batch`).
     Shared(Arc<EventBatch>, BatchContext),
@@ -366,6 +369,26 @@ impl Fanout {
         self.deliver(batch, ctx).await
     }
 
+    /// [`Fanout::send_with_own_context`] for a batch already behind an `Arc` that other holders
+    /// share: a router sending one batch to every destination its shared mark names
+    /// (`crate::runtime::Partition::Shared`). Every consumer, a lone one included, gets a
+    /// [`Delivered::Shared`] handle; nothing is cloned here. Stamps and counts as
+    /// `send_with_own_context` does.
+    pub async fn send_shared_with_own_context(
+        &self,
+        batch: Arc<EventBatch>,
+        ctx: BatchContext,
+    ) -> bool {
+        let ctx = self.stamp(ctx);
+        let Some((last, rest)) = self.consumers.split_last() else { return false };
+        let n = batch.events.len();
+        self.record_send(n);
+        let timer = self.telemetry.timer("logit.component.send.blocked.duration");
+        let taken = self.offer_shared(rest, last, batch, ctx, n).await;
+        drop(timer);
+        taken
+    }
+
     /// [`Fanout::send`] with all-edges-or-nothing delivery under `deadline`: the call for a
     /// listener that answers "busy" rather than blocking its client (`datadog_in`).
     ///
@@ -493,7 +516,21 @@ impl Fanout {
             }
             return true;
         }
-        let batch = Arc::new(batch);
+        let taken = self.offer_shared(rest, last, Arc::new(batch), ctx, n).await;
+        drop(timer);
+        taken
+    }
+
+    /// Offers one `Arc` to every edge, cloning it for each but `last`, which gets it moved.
+    /// Returns whether any edge took it; a closed edge counts its `n` events as dropped.
+    async fn offer_shared(
+        &self,
+        rest: &[Edge],
+        last: &Edge,
+        batch: Arc<EventBatch>,
+        ctx: BatchContext,
+        n: usize,
+    ) -> bool {
         let mut taken = false;
         for edge in rest {
             if edge.offer(Delivered::Shared(batch.clone(), ctx)).await.is_err() {
@@ -507,7 +544,6 @@ impl Fanout {
         } else {
             taken = true;
         }
-        drop(timer);
         taken
     }
 

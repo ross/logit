@@ -1,6 +1,6 @@
 ---
 created: 2026-09-07
-updated: 2026-10-11
+updated: 2026-10-16
 ---
 
 # Routing by condition, sampling, throttling, dedup, and renaming are `lua` components
@@ -210,4 +210,7 @@ to resume.
   value → target map -- `has_attributes`' bounded matcher pointed at a destination, no wider) and
   `event:to("id")` for `lua`. Same posture as the two entries above: no operators, no boolean
   algebra, no predicate language, and this ADR's core holding is unchanged -- anything needing an
-  operator still means writing `lua`, which can now route as well as filter.
+  operator still means writing `lua`, which can now route as well as filter. [2026-10-16: `by:`
+  also takes `signal`, keyed by `logs`/`metrics`/`traces`, and a route value may list several
+  targets. Signal presence is a fixed, three-way key, not a predicate, so the posture holds; see
+  [ADR `target-components`](target-components.md)'s 2026-10-16 amendment.]

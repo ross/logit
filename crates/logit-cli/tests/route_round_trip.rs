@@ -106,8 +106,8 @@ const EPHEMERAL_BIND: &str = "127.0.0.1:0";
 /// an `influxdb_out`-shaped `Config` with a hand-built `NodeSpec`.
 fn central_graph() -> graph::Graph {
     let mut routes = BTreeMap::new();
-    routes.insert("edge_host".to_string(), "host_stream".to_string());
-    routes.insert("edge_app".to_string(), "app_stream".to_string());
+    routes.insert("edge_host".to_string(), "host_stream".into());
+    routes.insert("edge_app".to_string(), "app_stream".into());
 
     let mut components = HashMap::new();
     components.insert(
@@ -161,8 +161,8 @@ async fn a_route_component_splits_a_real_logit_in_stream_onto_its_targets() {
     );
 
     let mut routes = BTreeMap::new();
-    routes.insert("edge_host".to_string(), "host_stream".to_string());
-    routes.insert("edge_app".to_string(), "app_stream".to_string());
+    routes.insert("edge_host".to_string(), "host_stream".into());
+    routes.insert("edge_app".to_string(), "app_stream".into());
     let route = Route::new(RouteBy::Provenance(ProvenanceField::Origin), &routes, &split_targets);
 
     let (mut host_rx, host_output) = recording_sink();

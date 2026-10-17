@@ -495,6 +495,7 @@ config asked for never uses the word:
 |---|---|---|
 | `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
 | `logit.component.events.discarded` | A filter, `sample`, `aggregate`, or Lua script removed an event because the config asked it to. | None. |
+| `logit.component.events.copied` | A router delivered an event to more than one destination; counts the deliveries past each event's first. Nothing is lost. | None. |
 | `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, sample value, or a metric record or span beside a log body) removed from a record that's still delivered. | `reason` where more than one cause exists. |
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
 | `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. | `reason`, `metric_kind`, or `field`. |
@@ -572,6 +573,7 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.batches.delivered` / `.events.delivered` | count | `write_loop`, once per batch `Output::send` delivered. At shutdown a sink's `batches.received` equals `batches.delivered` plus `batches.dropped` under every reason plus what a disk spool still holds, and the same for events |
 | `logit.component.process.duration` | timing | `run_transform`, `run_lua`, `run_router` (whole batch — for a router this spans `route_batch`'s partition, not any one destination's send) |
 | `logit.component.events.discarded` | count | `Transform::process_into` returned `false` for an incoming event, or a Lua `process()` returned `nil` (`ProcessOutcome::Drop`): an event the config removed by design. Untagged, and recorded only when nonzero |
+| `logit.component.events.copied` | count | `run_router` (`route_batch`): one per delivery past an event's first, for an event a `route` list or `by: signal` sends to several destinations. Counted on the shared-`Arc` path too, so it counts deliveries, not deep clones. Untagged, and recorded only when nonzero |
 | `logit.component.events.dropped{reason="script_error"}` | count | `run_lua`, one per event whose `process()` call raised an error: that event is lost. Counted beside `errors{reason="process"}` |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
 | `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window` |
@@ -620,6 +622,14 @@ under its own id. A memory failure is not a panic, so it never logs `thread_pani
 Graph rule 50 rejects a router (`route`, or `lua`/`lua_file` with `targets:`) that has no
 ordinary consumer, so every event no target claims reaches one. A config that discards those
 events names a `null_out` as that consumer, whose `events.received` counts them.
+
+**A router's copies count once per destination.** An event sent to two destinations counts as
+`events.sent` on each: under the router's own id for its forward edge, and under the target's id
+for a target. The router's `"process"` span counts it twice too. Over one interval, a router's
+`events.received` plus its `events.copied` equals the events across the partitions it sent. A
+target's `events.sent` sums every router that directs at it, so the destinations' `events.sent`
+gives that total only when no other router feeds those targets
+([ADR `target-components`](../adr/target-components.md)'s 2026-10-16 amendment).
 
 **A `target` emits the layer-2 *producer* set and nothing else.** It has no task, no inbox, and no
 receive side: it's one `Fanout` carrying the target's own id and telemetry handle

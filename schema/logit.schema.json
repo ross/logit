@@ -2331,7 +2331,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Equality-only routing: one key read per event, one target per matching value. There is no predicate language; use `lua` for a condition. An event whose key is absent, or whose value no route names, is unrouted: it goes to this component's ordinary consumers, the components that list it in `sources:`. A `route` must have at least one; to discard unrouted events, list it in a `null_out`'s `sources:`.",
+          "description": "Equality-only routing: one key read per event, which goes to the targets of the first value it matches. There is no predicate language; use `lua` for a condition. An event whose key is absent, or whose value no route names, is unrouted: it goes to this component's ordinary consumers, the components that list it in `sources:`. A `route` must have at least one; to discard unrouted events, list it in a `null_out`'s `sources:`.\n\nAn event bound for several targets is copied to each, and its copies count as `logit.component.events.copied`. No component may list two targets one event can reach together in its `sources:`, since it would receive that event twice.",
           "type": "object",
           "required": [
             "by",
@@ -2345,10 +2345,10 @@
             },
             "receive": true,
             "routes": {
-              "description": "Value to target id. Several values may name one target. The router's edges derive from these values, so there is no separate `targets:` list. Must be non-empty, with no empty key or value, and every value must name a `target` component.",
+              "description": "Value to a target id, or to a list of target ids that each receive a copy of a matching event. Several values may name one target. The router's edges derive from these values, so there is no separate `targets:` list. Must be non-empty, with no empty key, value, or list, no target repeated within one list, and at most 63 distinct targets; every id must name a `target` component. Under `by: signal`, the keys are `logs`, `metrics`, and `traces`.",
               "type": "object",
               "additionalProperties": {
-                "type": "string"
+                "$ref": "#/definitions/RouteTargets"
               }
             },
             "sources": true,
@@ -5291,7 +5291,7 @@
       ]
     },
     "RouteBy": {
-      "description": "What one `route` reads from each event. Written `by: {provenance: origin}`, `by: {attribute: stream}`, or `by: {resource: service.name}`.",
+      "description": "What one `route` reads from each event. Written `by: {provenance: origin}`, `by: {attribute: stream}`, `by: {resource: service.name}`, or `by: signal`.",
       "oneOf": [
         {
           "type": "object",
@@ -5328,6 +5328,27 @@
             }
           },
           "additionalProperties": false
+        },
+        {
+          "description": "The signals the event carries. `routes:` keys are `logs`, `metrics`, and `traces`. An event goes to the targets of every signal it carries, whole, never split per signal; a carried signal with no route sends it to this component's ordinary consumers as well. An event that carries no signal goes to the ordinary consumers.",
+          "type": "string",
+          "enum": [
+            "signal"
+          ]
+        }
+      ]
+    },
+    "RouteTargets": {
+      "description": "A target id, or a non-empty list of target ids that each receive a copy of a matching event.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       ]
     },

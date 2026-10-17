@@ -594,7 +594,10 @@ The ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`, `iden
 `ledger.sent`) judges each sink, reports a line per sink, and takes the worst status. Under
 `split = "copy"`, the default, each sink holds all of `aggregate`'s output, so each sink's V is
 judged against Ab alone; under `split = "route"` each sink holds its target's share, so their
-summed V is.
+summed V is. `load()` refuses `split = "route"` when the SUT config has a `route` with a
+list-valued `routes:` value or `by: signal`: either can deliver one event to several sinks, so
+their totals don't add up to what `aggregate` absorbed. Use `split = "copy"`, or one target
+per value.
 
 ```toml
 [ledger]

@@ -5,8 +5,8 @@
 #   syslog senders    -> syslog_in     :5140/udp  (nginx access logs take their own branch)
 #   OTel SDKs         -> otlp_grpc_in  :4317, otlp_http_in :4318
 #
-# Three gates (metrics, logs, traces) collect one signal each from every input, and each backend
-# reads the gates it wants:
+# One router sends each other input's events to the target of every signal they carry, three
+# gates (metrics, logs, traces) keep one signal each, and each backend reads the gates it wants:
 #
 #   metrics -> Datadog (per-window deltas) and VictoriaMetrics (running totals)
 #   logs    -> Datadog and Loki
@@ -111,6 +111,34 @@ components:
         field: http.response.body.size
         unit: By
 
+  # --- Signal routing ------------------------------------------------------------------------
+
+  # The router sends an event to the target of every signal it carries, so an event is moved,
+  # not copied, unless it carries signals bound for different gates. `by_app` passes on every
+  # syslog line except nginx's. Those arrive from the end of their branch instead, parsed and
+  # carrying their trace ids and service name, so a log line, its span, and its metrics line up
+  # in each backend. DogStatsD events arrive as logs.
+  by_signal:
+    type: route
+    sources: [by_app, dogstatsd_in, otlp_grpc_in, otlp_http_in]
+    by: signal
+    routes:
+      metrics: metric_events
+      logs: log_events
+      traces: trace_events
+
+  metric_events:
+    type: target
+
+  log_events:
+    type: target
+
+  trace_events:
+    type: target
+
+  # An nginx line carries a log, metrics, and a span in one event, so every event belongs to all
+  # three gates and a router would copy it as a fan-out does. It feeds them directly.
+  #
   # Metric tags: only these low-cardinality attributes. `service.name` is on the resource, which
   # `keep` leaves alone.
   nginx_series:
@@ -121,24 +149,28 @@ components:
       - http.response.status_code
       - http.route
 
+  # An event with no signal, or a signal with no route, ends here.
+  discard:
+    type: null_out
+    sources: [by_signal]
+
   # --- Signal gates --------------------------------------------------------------------------
 
+  # A routed event reaches a gate whole, including the signals it carries for other gates. Each
+  # gate clears those, so a backend receives only its own signal.
   metrics:
     type: keep_signals
-    sources: [dogstatsd_in, nginx_series, otlp_grpc_in, otlp_http_in]
+    sources: [metric_events, nginx_series]
     signals: [metrics]
 
-  # `by_app` passes on every syslog line except nginx's. Those arrive from the end of their branch
-  # instead, parsed and carrying their trace ids and service name, so a log line, its span, and
-  # its metrics line up in each backend. DogStatsD events arrive as logs.
   logs:
     type: keep_signals
-    sources: [by_app, dogstatsd_in, nginx_metrics, otlp_grpc_in, otlp_http_in]
+    sources: [log_events, nginx_metrics]
     signals: [logs]
 
   traces:
     type: keep_signals
-    sources: [nginx_metrics, otlp_grpc_in, otlp_http_in]
+    sources: [trace_events, nginx_metrics]
     signals: [traces]
 
   # --- Windows -------------------------------------------------------------------------------

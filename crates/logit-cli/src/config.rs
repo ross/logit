@@ -451,6 +451,59 @@ components:
         }
     }
 
+    /// `route`'s `routes:` values read as a target id or a list of them, and `by: signal` as a
+    /// bare string, through YAML.
+    #[test]
+    fn route_targets_and_by_signal_read_through_the_real_yaml_path() {
+        let yaml = r#"
+components:
+  in:
+    type: otlp_in
+    bind: 127.0.0.1:4318
+  split:
+    type: route
+    sources: [in]
+    by: signal
+    routes:
+      logs: [logs_stream, archive]
+      traces: traces_stream
+"#;
+        let config = parse(yaml, &env(&[])).expect("should parse");
+        match &config.components["split"].kind {
+            logit_config::ComponentKind::Route { by, routes } => {
+                assert_eq!(by, &logit_config::RouteBy::Signal);
+                assert_eq!(
+                    routes["logs"],
+                    logit_config::RouteTargets(vec!["logs_stream".into(), "archive".into()])
+                );
+                assert_eq!(routes["traces"], "traces_stream".into());
+            }
+            other => panic!("expected Route, got {other:?}"),
+        }
+    }
+
+    /// A `routes:` value of any other shape names both accepted forms in its error.
+    #[test]
+    fn a_route_value_of_the_wrong_shape_names_both_forms() {
+        let yaml = r#"
+components:
+  in:
+    type: statsd_in
+    bind: 127.0.0.1:8125
+  split:
+    type: route
+    sources: [in]
+    by: {attribute: stream}
+    routes:
+      host: {target: host_stream}
+"#;
+        let err = format!("{:#}", parse(yaml, &env(&[])).expect_err("a map is not a route value"));
+        assert!(
+            err.contains("invalid type: map, expected a target id or a list of target ids"),
+            "got: {err}"
+        );
+    }
+
     fn statsd_socket_mode(raw: &str) -> anyhow::Result<Option<u32>> {
         let yaml = format!(
             "components:\n  in:\n    type: statsd_in\n    bind: /run/dsd.socket\n    \

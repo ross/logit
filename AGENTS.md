@@ -152,7 +152,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `has_stale`, `drop_stale` | forward, or discard, an event older than `max_age` or, with `max_ahead` set, stamped further ahead of the wall clock; exact complements, so `drop_stale` keeps a replayed backlog out of `aggregate` and `has_stale` archives it | [ADR `stale-event-filtering`](docs/adr/stale-event-filtering.md) |
 | `sample` | consistent, keyed sampling | [ADR `consistent-sampling-component`](docs/adr/consistent-sampling-component.md) |
 | `shape` | an observer that measures each event's shape | [ADR `shape-observer-component`](docs/adr/shape-observer-component.md) |
-| `route`, `target` | native equality-only router, and the named destinations it fills | [ADR `target-components`](docs/adr/target-components.md) |
+| `route`, `target` | native equality-only router (or `by: signal`), and the named destinations it fills; one event may go whole to several | [ADR `target-components`](docs/adr/target-components.md) |
 
 Details an agent needs beyond the table:
 
@@ -243,7 +243,11 @@ Details an agent needs beyond the table:
   structural costs the central-collector split-apart topology had no better answer for: a filter
   chain paid by every branch, and the deep clone an all-mutating fan-out can't avoid. A router
   needs an ordinary consumer for the events no target claims (graph rule 50); `null_out` is how a
-  config discards them on purpose.
+  config discards them on purpose. A `routes:` value may list several targets, and `by: signal`
+  sends a mixed-signal event to every carried signal's target; either way the event goes whole to
+  each, moved when it has one destination, shared or cloned when it has several, and counted in
+  `logit.component.events.copied`. A router never splits an event per signal, and rule 51 keeps a
+  component from reading two destinations one event can reach together.
 - **`generate_in`**: `event:` templates via `logit_core::template`, with `{seq}`/`{seq%N}`
   placeholders. `generate_in` ships unconditionally but exists only to drive the load-test
   harness (see [Harnesses](#harnesses)), whose sink end is `null_out`.
