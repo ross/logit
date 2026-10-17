@@ -245,9 +245,11 @@ every steady-state row judges straight through the signals, which open no fault 
 `file.reopen` judges each rename, and the expectations assert one reopen through each SIGHUP to
 `logit`, a generator that keeps sending through its own, and an `archive` that drops nothing.
 `archive` is best-effort (`overflow: drop_oldest`), so a stall there can't hold the listener the
-ledger follows. Its files stay in the run directory, about 350 MB of them, and its
+ledger follows. Its files stay in the run directory, about 260 MB of them, and its
 `max_duration` is its own duration, because a second cycle's rename would find
-`archive.log.1` taken.
+`archive.log.1` taken. To keep a scored run small, write each file's
+`checks.ndjson_file_lines()` into `<run>/shared-counts.json`, keyed by file name, and delete the
+files: `check` reads a file `shared/` no longer holds from there.
 
 ### Several SUT services
 

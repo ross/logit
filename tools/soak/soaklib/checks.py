@@ -4473,6 +4473,9 @@ def check_recovery(data):
 # read. 2 s is 20 of those, for a loaded host, and far under the minutes between a scenario's
 # signals, so a target that missed the reopen is off by far more.
 REOPEN_TOLERANCE_S = 2.0
+# What stands in for a run's `shared/` files once they are deleted to save space:
+# `{file name: ndjson_file_lines(file)}`, read for a name `shared/` no longer holds.
+SHARED_COUNTS = "shared-counts.json"
 _NDJSON_TIMESTAMP = re.compile(rb'^\{"timestamp":"([^"]+)"')
 
 
@@ -4521,6 +4524,20 @@ def ndjson_file_lines(path):
             first = ts if first is None or ts < first else first
             last = ts if last is None or ts > last else last
     return {"lines": lines, "first": first, "last": last, "unparsed": unparsed}
+
+
+def _reopen_files(data, names):
+    """`{name: ndjson_file_lines()}` for each of `names` in the run's `shared/`, taking a name
+    the directory no longer holds from `SHARED_COUNTS` when the run has one."""
+    try:
+        recorded = json.loads((data.run_dir / SHARED_COUNTS).read_text())
+    except (OSError, ValueError):
+        recorded = {}
+    files = {}
+    for name in names:
+        found = ndjson_file_lines(data.run_dir / SHARED_DIR / name)
+        files[name] = found if found is not None else recorded.get(name)
+    return files
 
 
 def _reopen_count(data, service, path, names, files):
@@ -4574,7 +4591,7 @@ def check_file_reopen(data):
         chains.setdefault((rename.on, rename.path), []).append(rename)
     for (service, path), chain in chains.items():
         names = [rename.to for rename in chain] + [path]
-        files = {name: ndjson_file_lines(data.run_dir / SHARED_DIR / name) for name in names}
+        files = _reopen_files(data, names)
         count = _reopen_count(data, service, path, names, files)
         previous = None
         for index, rename in enumerate(chain):

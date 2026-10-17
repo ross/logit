@@ -149,7 +149,8 @@ temporary directory, that neither affects any leg, `prepare()` making the shared
 rename, and `file.reopen` over a synthetic run of two renames: both rows passing, a late line in
 the renamed file, an early line in the new one, a count off by one, and a missing new file each
 FAILing, a kill's count reported, neither step opening a fault window, a SIGHUP's info line
-leaving `self_log` alone, and an `[[expect]]` through a signal step.
+leaving `self_log` alone, an `[[expect]]` through a signal step, and deleted files read
+from the run's recorded counts.
 
 No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
 suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
@@ -8058,10 +8059,10 @@ def _reopen_run(tmp, name, late=False, early=False, extra=0, new_missing=False, 
                      "reduce": "delta", "min": 1, "max": None}]
     run_dir = _run_dir(tmp, name, timeline, stdout, configs={"sut": "logit-sut.yaml"},
                        suts=["logit"], steps=steps, expect=expectations)
-    # What signals.rs logs on each SIGHUP, at info.
+    # What signals.rs logs on each SIGHUP, at info, as the sighup run recorded it.
     (run_dir / "logs" / "logit.stderr").write_text("".join(
-        f'{{"timestamp":"{_stamp(T0 + at)}","level":"INFO","fields":{{"message":"reopen signal '
-        f'received","generation":{n},"config_reloaded":false}},"target":"logit"}}\n'
+        f'{{"timestamp":"{_stamp(T0 + at)}","level":"INFO","message":"reopen signal received",'
+        f'"generation":{n},"config_reloaded":false,"target":"logit"}}\n'
         for n, at in ((1, 110.1), (2, 210.1))))
     return run_dir
 
@@ -8120,6 +8121,20 @@ def _reopen_checks():
         expect(all(r.status == checks.PASS and "reported, not judged: c0s9" in r.detail
                    for r in killed.values()),
                f"a killed life's count is reported, got {killed}")
+        pruned_dir = _reopen_run(tmp, "pruned")
+        counts = {name: checks.ndjson_file_lines(pruned_dir / "shared" / name)
+                  for name in ("archive.log.1", "archive.log.2")}
+        (pruned_dir / checks.SHARED_COUNTS).write_text(json.dumps(counts))
+        for name in counts:
+            (pruned_dir / "shared" / name).unlink()
+        pruned = {r.id: r for r in checks.check_file_reopen(checks.RunData(pruned_dir))}
+        expect(all(r.status == checks.PASS for r in pruned.values()),
+               f"deleted files are read from the recorded counts, got {pruned}")
+        (pruned_dir / "shared" / "archive.log").unlink()
+        pruned = {r.id: r for r in checks.check_file_reopen(checks.RunData(pruned_dir))}
+        expect(pruned["file.reopen.c0s7"].status == checks.FAIL
+               and "the new file archive.log is missing" in pruned["file.reopen.c0s7"].detail,
+               f"a file neither present nor recorded is missing, got {pruned}")
         none = checks.check_file_reopen(checks.RunData(_run_dir(tmp, "none",
                                                                  [_phase("start", 0, t0=T0)])))
         expect(len(none) == 1 and none[0].status == checks.SKIP,

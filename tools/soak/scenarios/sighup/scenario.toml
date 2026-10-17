@@ -10,7 +10,7 @@ name = "sighup"
 description = "generator -> statsd_in (UDP) -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics, and statsd_in -> stdio_out /shared/archive.log, under SIGHUPs and renames"
 duration = "14m30s"       # warmup + one cycle + cooldown; --duration overrides
 # A second cycle would rename archive.log onto archive.log.1 again, which the rename refuses.
-# About 2,000 lines a second of about 200 bytes each puts some 350 MB in <run>/shared.
+# About 2,000 lines a second of about 150 bytes each puts some 260 MB in <run>/shared.
 max_duration = "14m30s"
 warmup = "60s"            # no faults: baseline rate, RSS, fds
 cooldown = "120s"         # no faults at the end; >= recovery_bound
