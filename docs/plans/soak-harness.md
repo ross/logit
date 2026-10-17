@@ -198,7 +198,7 @@ for = "45s"
 
 - Every fault carries `for`, so its revert is scheduled with it. `netem clear` is a revert, never
   a step.
-- No two faults overlap on one container.
+- No two faults overlap on one container, except a `signal` inside a `rename` (W12c).
 - No netem on a container during its `stop`, `kill`, `pause`, `partition`, or `exit`, because the qdisc
   is lost with the namespace and `docker run --network container:<id>` needs a running target.
 - No fault ends inside `cooldown`, and `cooldown` is at least `recovery_bound`.
@@ -207,7 +207,8 @@ for = "45s"
   W7b any service a `compose` override adds. W3 adds `kill`, on the SUT only:
   the lines a killed generator sent after its last telemetry drain reach the SUT with no G
   behind them, and `ledger.wire` would net them against real loss. W7a adds `mark` and `exit`
-  (below). W9a adds `respond`, on a stand-in only (below).
+  (below). W9a adds `respond`, on a stand-in only (below). W12c adds `signal` and `rename`, on
+  a service that runs `logit` (below).
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -346,6 +347,44 @@ for = "20s"
   The step's `class` is the harness's only copy of `datadog_out`'s response-class table, so the
   loader checks that one is there, not which one it is; `ledger.standin` judges it against the
   sink.
+
+**Signals and renames (W12c)** drive a `logit` process's SIGHUP handling
+([ADR `signal-handling`](../adr/signal-handling.md)): the signal bumps the reopen generation,
+and each `stdio_out` or `file_out` file target reopens its path before its next write.
+
+```toml
+[[step]]
+at = "2m"
+action = "rename"         # an external rotator's move, on the host
+on = "logit"              # the service whose config has the stdio_out
+path = "archive.log"      # a stdio_out target in /shared, the mounted <run>/shared
+to = "archive.log.1"      # the name it moves to, in the same directory
+for = "30s"
+
+[[step]]
+at = "2m10s"
+action = "signal"         # docker kill -s HUP
+on = "logit"              # a service that runs logit
+signal = "HUP"
+for = "10s"
+```
+
+- A `signal`'s apply is `docker kill -s <signal>` through the same CLI path as a `kill`, and
+  its revert does nothing. `signal` is required, and `HUP` is its one value. It is on a `sut`
+  or `generator` service. Like any step it may not overlap another on its service, a `rename`
+  aside, so it never lands in a `stop`, `kill`, `pause`, `restart`, or `exit`, when the process
+  may not be running to receive it.
+- A `rename`'s apply is an `os.rename` inside `<run>/shared` on the host, which the driver
+  creates for a scenario with one, and its revert does nothing. It refuses to replace a file
+  already at `to`. `path` and `to` are bare names; `path` is a `stdio_out` with a `target:` in
+  `/shared` in the config of the service the step is `on`, and `to` is neither such a target
+  nor another rename's `to`. A `signal = "HUP"` step on the same service starts inside its
+  `for`, after its start. A rename runs once per run, since a second cycle's would find its
+  `to` taken, so a scenario with one sets `max_duration` to one cycle's run.
+- Neither opens a fault window: every `affects_*` predicate is false, and the checks keep them
+  out of the windows that excuse anything (`RunData.events`). `[[expect]]` reads either's
+  window, and `file.reopen` (§6) judges each rename.
+- Neither can appear in a `[random]` schedule, whose faults take no `signal`, `path`, or `to`.
 
 **`sut_script` (W7a)**, an optional `[ledger]` key, names a `lua` component between the
 listener and `aggregate`, and adds the script hop to the ledger ("The ledger and identities").
@@ -598,7 +637,8 @@ W11b a scenario with a `file` wire is the exception: the driver creates `<run>/s
 0777, since the image's unprivileged `logit` user has a uid the host doesn't know, names its
 absolute path in `compose.env` as `SOAK_SHARED_DIR`, and the scenario's override mounts it
 `:z` at `/shared` in the writer and the SUT. The writer's files stay in the run directory, the
-evidence the end sequence counts G from.
+evidence the end sequence counts G from. From W12c a scenario with a `rename` step gets the same
+directory, mounted into the service whose `stdio_out` writes there.
 
 Collection uses `docker logs <id> >svc.stdout 2>svc.stderr`, not `docker compose logs`, which
 merges the two streams. `docker logs` spans every life of a container that is stopped and started
@@ -1113,6 +1153,19 @@ The rows:
   against what the instances' socket closes could discard. Under `[overlap]` the per-life rows
   judge each instance on its own lives and the wire, `progress`, and `recovery` judge them
   together; §8e has the rules.
+- `file.reopen.<step>` (W12c), one row per `rename` step, else one `file.reopen` row that
+  SKIPs: a rename moves a `stdio_out` file target's `path` to `to`, and the first SIGHUP on
+  its service starting inside its window makes the target reopen. The reopen is lazy, at the
+  target's next send, and a line's `timestamp` is when its listener read it, so every line in
+  the renamed file is stamped by the signal's apply finishing, and every line in the new file
+  (the next rename's `to`, or `path` after the last) from the signal's start, each within 2 s:
+  `statsd_in` sends a batch at least every 100 ms and the file target writes it as it arrives.
+  The row FAILs when the rename or that SIGHUP didn't apply, either file is missing or breaks
+  its bound, an earlier rename's file holds a line from before that rename's SIGHUP, a line has
+  no `timestamp`, or the lines in every file of the path's renames differ from the target's
+  `events.delivered` summed over the service's lives, one line per event under
+  `format: json`. A `kill` or an `exit` of the service loses its last drain's counts, so the
+  count is then reported, not judged. A new file with no lines WARNs.
 - `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
   window around one step, or over the whole run (W8c); see "The scenario schema".
 
@@ -1877,10 +1930,11 @@ where it needs them, and a small check extension.
     and SIGHUP"). Rows: `[[expect]]` on `logit.tls.reloads{outcome="reloaded"}` and
     `logit.tls.certificate.not_after`, and the ledger at zero across reconnects. The harness's
     telemetry stream is a stdout `stdio_out`, which ignores SIGHUP, so it's expected to run
-    unaffected; a separate row covers the reopen with a SUT `file_out` on a mounted volume, whose
-    path a rename moves aside before the signal and whose next batch lands in a fresh file.
-    Needs: a `signal` action and a certificate-rotation action writing into a mounted
-    directory.
+    unaffected; a separate row covers the reopen with a SUT `stdio_out` file target on a
+    mounted volume, whose path a rename moves aside before the signal and whose next batch
+    lands in a fresh file. Needs: a `signal` action and a certificate-rotation action writing
+    into a mounted directory. W12c builds the SIGHUP half: the `signal` and `rename` actions,
+    `file.reopen`, and the `sighup` scenario.
 
 **Items 1 and 2 land first, as two stacked PRs, W7a and W7b.** Both touch code the harness has
 never driven, and item 2 forces the compose override, the service list, and the per-sink ledger

@@ -765,7 +765,9 @@ the operator-facing account of all of this.
   with the SUT's `tail_in` (`wire = "file"`, `<run>/shared` mounted by an override): G is the
   writer's `events.delivered`, held to the lines the driver counts in that directory at the end,
   W is `input.lines`, and the run's W − G is judged against a replay band per killed or stopped
-  SUT life (the plan's `ledger.wire` row).
+  SUT life (the plan's `ledger.wire` row). `sighup` sends SIGHUPs (a `signal` step) to a SUT
+  whose `stdio_out` file target a `rename` step moves aside, and `file.reopen` checks each line
+  landed on its side of the reopen.
   `random-faults` draws its schedule from
   a seed (a `[random]` table; `--seed N` reproduces a run) and is meant for `--duration 8h`; the
   driver appends container logs in 5-minute chunks so a long run never reads a whole log at
