@@ -27,8 +27,9 @@ use std::sync::Arc;
 /// `ResolvedComponent::targets` records and the node runtime builds its `Vec<Fanout>` in), never
 /// a component id, so the hot path never compares or hashes a string.
 ///
-/// `Copy` and 8 bytes, so a per-event mark is as cheap as a one-slot enum. A `u64` caps a router at [`Destinations::MAX_TARGETS`] targets; graph rule 51 enforces
-/// that on `route`. A Lua router marks with `event:to(..)`'s `Option<u16>` and never builds one.
+/// `Copy` and 8 bytes, so a per-event mark is as cheap as a one-slot enum. A `u64` caps a router
+/// at [`Destinations::MAX_TARGETS`] targets; graph rule 51 enforces that on `route`. A Lua router
+/// marks with `event:to(..)`'s `Option<u16>` and never builds one.
 ///
 /// Graph rule 50 rejects a router with no ordinary consumer, so a `Forward` event always has
 /// somewhere to go; an operator who wants those events gone lists the router in a `null_out`.
