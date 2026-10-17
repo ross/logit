@@ -340,8 +340,8 @@ first-match in `routes:` key order for `by: {provenance: ..}`, `{attribute: ..}`
 `{resource: ..}`, so two keys that both match one value never union; a list is the only way one
 value reaches several targets.
 
-**`by: signal`** [removed; see the `route_signals` amendment below] is a unit form. Its `routes:` keys are `logs`, `metrics`, and `traces`, the
-names `has_signal`'s `signals:` takes, and any other key fails validation. An event's mark is the
+**`by: signal`** [removed; see the `route_signals` amendment below] is a unit form. Its
+`routes:` keys are `logs`, `metrics`, and `traces`, the names `has_signal`'s `signals:` takes, and any other key fails validation. An event's mark is the
 union, over each signal it carries, of that signal's targets, where a carried signal with no
 route contributes `Forward`. So a log-and-metrics event with only `logs` routed reaches the logs
 target and the router's ordinary consumers, and no payload drops out of the else-branch. An event
@@ -353,8 +353,8 @@ combinations to a mark once, at construction.
 **No component may read two destinations one event can reach together.** Rule 51 rejects a
 component whose `sources:` lists two targets of one `routes:` list, or, under `by: signal`
 [removed], any two of that route's targets, since a mixed event can reach all of them. The route
-itself joined that set only when some signal had no route: with all three routed, only an event with no
-payload reaches the route's own consumers, and it reaches nothing else. Such a component would
+itself joined that set only when some signal had no route: with all three routed, only an event
+with no payload reaches the route's own consumers, and it reaches nothing else. Such a component would
 receive the event once per destination. An ordinary diamond (`in -> [a, b] -> c`) stays legal:
 there, each branch is a component the operator placed and `c` lists both by choice, receiving
 every batch twice. A router's copy is invisible in the config, so `c`'s doubled count would have
