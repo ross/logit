@@ -393,4 +393,4 @@ value or `by: signal`.
   `RouteBy::Signal` the new form. Schema regenerated.
 - `crates/logit-bench/tests/allocations.rs` pins the shared path at 2 and a mixed batch at its
   clones' cost, beside the unchanged single-destination rows.
-- Converting the shipped `has_signal`/`keep_signals` fan-outs to `route` is separate work.
+- The shipped `has_signal`/`keep_signals` fan-outs that fed several gates from one source now use `route`, for example `examples/forwarding/central.yaml`.

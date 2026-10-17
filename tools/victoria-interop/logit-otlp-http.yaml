@@ -1,5 +1,5 @@
 # Leg 6 of `script/victoria-interop`: `otlp_out` over HTTP to all three products, one sink per
-# product behind a `keep_signals`, because one `otlp_out` posts every signal it carries to one
+# product behind a `route` on signal, because one `otlp_out` posts every signal it carries to one
 # host.
 #
 # A `lua` stage mints, per tick, one event per signal with `Event.new`: a metrics event carrying a
@@ -63,20 +63,29 @@ components:
         return {metrics, log, span}
       end
 
-  only_metrics:
-    type: keep_signals
+  # `mint` returns one single-signal event per signal, so each target receives one signal and no
+  # gate is needed behind it.
+  by_signal:
+    type: route
     sources: [mint]
-    signals: [metrics]
+    by: signal
+    routes:
+      metrics: only_metrics
+      logs: only_logs
+      traces: only_traces
+
+  only_metrics:
+    type: target
 
   only_logs:
-    type: keep_signals
-    sources: [mint]
-    signals: [logs]
+    type: target
 
   only_traces:
-    type: keep_signals
-    sources: [mint]
-    signals: [traces]
+    type: target
+
+  discard:
+    type: null_out
+    sources: [by_signal]
 
   # The four sinks share `tick`, so each drops its oldest batches rather than stall the others
   # when one product falls behind. At one tick a second nothing should drop, and check.py's

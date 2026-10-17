@@ -1,9 +1,9 @@
 # The central half of a forwarding pair: this `logit` receives what every edge.yaml forwards over
 # the native transport, windows the metrics once, and delivers each signal to its backend.
 #
-#   edges ==native, TLS==> remote_in --> metrics -> cumulative_10s -> VictoriaMetrics
-#                                    --> logs    -> Loki
-#                                    --> traces  -> Tempo
+#   edges ==native, TLS==> remote_in -> by_signal --> metrics -> cumulative_10s -> VictoriaMetrics
+#                                                 --> logs    -> Loki
+#                                                 --> traces  -> Tempo
 #
 # Check it with `logit validate central.yaml` and draw it with
 # `logit graph central.yaml | dot -Tsvg > central.svg`. docs/deploying.md's "Operating a pair"
@@ -29,29 +29,56 @@ components:
       # server-only TLS, and drop the edges' client certificates to match.
       client_ca_file: /etc/logit/tls/ca.pem
 
-  # --- Signal gates --------------------------------------------------------------------------
+  # --- Signal routing ------------------------------------------------------------------------
 
-  # An edge's `internal` telemetry arrives here as ordinary events and rides these gates with
-  # everything else. A signal no gate takes is discarded without a warning, so add its gate here
-  # before an edge starts sending it.
+  # One router sends each event to the target of every signal it carries, so an event is moved,
+  # not copied, unless it carries signals bound for different backends. An edge's `internal`
+  # telemetry arrives here as ordinary events and takes the same route as everything else. An
+  # event with no signal, or a signal with no route, goes to `discard`, so add a route here
+  # before an edge starts sending a new signal.
+  by_signal:
+    type: route
+    sources: [remote_in]
+    by: signal
+    routes:
+      metrics: metric_events
+      logs: log_events
+      traces: trace_events
+
+  metric_events:
+    type: target
+
+  log_events:
+    type: target
+
+  trace_events:
+    type: target
+
+  discard:
+    type: null_out
+    sources: [by_signal]
+
+  # An event that carries several signals reaches every matching target whole. These gates keep
+  # each backend's input to its own signal, so Loki never receives a metric point and Tempo never
+  # receives a log. Each gate has one consumer, so none costs a copy.
   metrics:
     type: keep_signals
-    sources: [remote_in]
+    sources: [metric_events]
     signals: [metrics]
 
   logs:
     type: keep_signals
-    sources: [remote_in]
+    sources: [log_events]
     signals: [logs]
 
   traces:
     type: keep_signals
-    sources: [remote_in]
+    sources: [trace_events]
     signals: [traces]
 
   # If a backend needs the edges' self-telemetry treated differently (an InfluxDB org and bucket,
   # say), split it once here, whatever each edge names its `internal`: every `internal` carries
-  # `service.name: logit`. Point the gates' `sources` at `by_service`, which passes on everything
+  # `service.name: logit`. Point `by_signal`'s `sources` at `by_service`, which passes on everything
   # it doesn't claim, and put the special handling downstream of `peer_self`. docs/deploying.md's
   # "Operating a pair" has the whole recipe.
   #
@@ -122,28 +149,36 @@ components:
     interval: 10s
     span_sample_rate: 0.1
 
-  # The same gates as the data path: `aggregate` passes a log or span event through, so without
-  # this gate `self`'s spans and logs would reach the metrics sink and be skipped there.
-  self_metrics:
-    type: keep_signals
+  # `internal` emits each metric, log, and span as its own event, so each target below receives
+  # one signal and no gate is needed. The metrics get their own branch because `aggregate`
+  # passes a log or span event through.
+  self_by_signal:
+    type: route
     sources: [self]
-    signals: [metrics]
+    by: signal
+    routes:
+      metrics: self_metric_events
+      logs: self_log_events
+      traces: self_trace_events
+
+  self_metric_events:
+    type: target
+
+  self_log_events:
+    type: target
+
+  self_trace_events:
+    type: target
+
+  self_discard:
+    type: null_out
+    sources: [self_by_signal]
 
   self_cumulative_10s:
     type: aggregate
-    sources: [self_metrics]
+    sources: [self_metric_events]
     interval: 10s
     temporality: cumulative
-
-  self_logs:
-    type: keep_signals
-    sources: [self]
-    signals: [logs]
-
-  self_traces:
-    type: keep_signals
-    sources: [self]
-    signals: [traces]
 
   # Best-effort: a stalled backend sheds this node's oldest telemetry instead of spooling it.
   self_victoria_out:
@@ -157,7 +192,7 @@ components:
 
   self_loki_out:
     type: otlp_out
-    sources: [self_logs]
+    sources: [self_log_events]
     protocol: http
     endpoint: http://loki:3100/otlp
     buffer:
@@ -165,7 +200,7 @@ components:
 
   self_tempo_out:
     type: otlp_out
-    sources: [self_traces]
+    sources: [self_trace_events]
     protocol: grpc
     endpoint: tempo:4317
     buffer:
