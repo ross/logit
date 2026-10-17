@@ -1650,6 +1650,13 @@ fn build_spec(
         Route { by, routes } => {
             NodeSpec::Router(Box::new(RouteTransform::new(by.clone(), routes, &component.targets)))
         }
+
+        // Resolved against `component.targets` once (rules 48 and 92 guarantee each id resolves).
+        // Its points (`payloads.stripped`, `events.copied`) come from the node loop, on the
+        // telemetry handle returned beside the spec.
+        RouteSignals { signals, strip } => NodeSpec::RouteSignals(
+            logit_pipeline::SignalRoutes::new(signals, *strip, &component.targets),
+        ),
     };
     Ok((spec, telemetry))
 }
@@ -3153,6 +3160,29 @@ mod tests {
             build_spec("r", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Router(_)
         ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_route_signals_node() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: vec!["log_events".to_string(), "metric_events".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::RouteSignals {
+                signals: logit_config::SignalTargets {
+                    logs: Some("log_events".to_string()),
+                    metrics: Some("metric_events".to_string()),
+                    traces: None,
+                },
+                strip: true,
+            },
+        };
+        match build_spec("by_signal", &component, Path::new(""), None).unwrap().0 {
+            NodeSpec::RouteSignals(routes) => assert_eq!(routes.targets(), 2),
+            _ => panic!("expected NodeSpec::RouteSignals"),
+        }
     }
 
     #[test]

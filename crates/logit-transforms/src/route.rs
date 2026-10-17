@@ -45,7 +45,7 @@ use crate::value_matches;
 use logit_config::{ProvenanceField, RouteBy, RouteTargets, Signal};
 use logit_core::interner::{intern, Symbol};
 use logit_core::{Event, Provenance, Resource, Value};
-use logit_pipeline::{Destinations, Router};
+use logit_pipeline::{signal_index, signal_masks, Destinations, Router};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -55,7 +55,7 @@ enum By {
     Previous(Vec<(Symbol, Destinations)>),
     Attribute(Symbol, Vec<(Value, Destinations)>),
     Resource(Symbol, Vec<(Value, Destinations)>),
-    /// Indexed by [`signal_index`] of the signals an event carries.
+    /// [`signal_masks`]' table, indexed by [`signal_index`] of the signals an event carries.
     Signal([Destinations; 8]),
 }
 
@@ -125,25 +125,11 @@ impl Route {
                     };
                     per_signal[bit] = mark_of(ids);
                 }
-                let mut masks = [Destinations::FORWARD; 8];
-                for (carried, mask) in masks.iter_mut().enumerate().skip(1) {
-                    *mask = (0..3)
-                        .filter(|bit| carried & (1 << bit) != 0)
-                        .fold(Destinations::NONE, |mark, bit| mark | per_signal[bit]);
-                }
-                By::Signal(masks)
+                By::Signal(signal_masks(per_signal, Destinations::FORWARD))
             }
         };
         Self { by, provenance: Provenance::default() }
     }
-}
-
-/// The index into `By::Signal`'s masks for an event: bit 0 a log, bit 1 metrics, bit 2 a span
-/// (`traces`), the bits [`Route::new`] fills `per_signal` by.
-fn signal_index(event: &Event) -> usize {
-    usize::from(event.log.is_some())
-        | usize::from(!event.metrics.is_empty()) << 1
-        | usize::from(event.span.is_some()) << 2
 }
 
 impl Router for Route {

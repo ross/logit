@@ -482,6 +482,34 @@ components:
         }
     }
 
+    /// `route_signals`' `signals:` map and its `strip` default read through YAML.
+    #[test]
+    fn route_signals_reads_through_the_real_yaml_path() {
+        let yaml = r#"
+components:
+  in:
+    type: otlp_in
+    bind: 127.0.0.1:4318
+  by_signal:
+    type: route_signals
+    sources: [in]
+    signals:
+      metrics: metric_events
+      logs: log_events
+      traces: log_events
+"#;
+        let config = parse(yaml, &env(&[])).expect("should parse");
+        match &config.components["by_signal"].kind {
+            logit_config::ComponentKind::RouteSignals { signals, strip } => {
+                assert!(*strip);
+                assert_eq!(signals.logs.as_deref(), Some("log_events"));
+                assert_eq!(signals.metrics.as_deref(), Some("metric_events"));
+                assert_eq!(signals.traces.as_deref(), Some("log_events"));
+            }
+            other => panic!("expected RouteSignals, got {other:?}"),
+        }
+    }
+
     /// A `routes:` value of any other shape names both accepted forms in its error.
     #[test]
     fn a_route_value_of_the_wrong_shape_names_both_forms() {

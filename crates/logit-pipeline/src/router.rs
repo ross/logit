@@ -128,6 +128,28 @@ impl std::ops::BitOrAssign for Destinations {
     }
 }
 
+/// The index into a [`signal_masks`] table for `event`: bit 0 a log, bit 1 metrics, bit 2 a span
+/// (`traces`).
+pub fn signal_index(event: &Event) -> usize {
+    usize::from(event.log.is_some())
+        | usize::from(!event.metrics.is_empty()) << 1
+        | usize::from(event.span.is_some()) << 2
+}
+
+/// The mark for each of the eight carried-signal combinations, indexed by [`signal_index`], so a
+/// signal router's per-event path is three presence checks and an index. Entry `c` is the union
+/// of `per_signal[bit]` over each bit set in `c` (`per_signal` in `logs`, `metrics`, `traces`
+/// order), and entry 0, an event with no payload, is `none`.
+pub fn signal_masks(per_signal: [Destinations; 3], none: Destinations) -> [Destinations; 8] {
+    let mut masks = [none; 8];
+    for (carried, mask) in masks.iter_mut().enumerate().skip(1) {
+        *mask = (0..3)
+            .filter(|bit| carried & (1 << bit) != 0)
+            .fold(Destinations::NONE, |mark, bit| mark | per_signal[bit]);
+    }
+    masks
+}
+
 /// A node that directs each event to one or more destinations and never mutates or absorbs it.
 pub trait Router: Send {
     /// Returns the event's destinations. Borrows the event: `Event` is large
