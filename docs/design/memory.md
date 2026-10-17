@@ -949,7 +949,7 @@ which allocates only when a transform pushes onto it
 batch besides `Fanout`'s unconditional fan-out: a `Router` node (`route`, or `lua`/`lua_file` with
 `targets:`) moves each event into one of `1 + targets.len()` destination buffers in one pass over
 the batch (`crate::runtime::route_batch`, `crates/logit-pipeline/src/router.rs`), then sends every
-non-empty one under a single child `BatchContext`. An event a `route` list or `by: signal` marks
+non-empty one under a single child `BatchContext`. An event a `route` list marks
 for several destinations is cloned into each but the last. The rule this buys, as exact counts
 (`crates/logit-bench/tests/allocations.rs`'s `// Routing` section; the first three rows have zero
 per-event allocations and one `reserve_exact` per used destination):

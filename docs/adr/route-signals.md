@@ -84,11 +84,11 @@ ordinary edge.
 
 The per-batch body, `route_signals_batch`, keeps `route_batch`'s four passes and its
 `reserve_exact` allocation shape, sharing the count, reserve, and partition-assembly code. The
-eight-entry table of marks by carried-signal combination moves from `route`'s `by: signal` into
-`logit_pipeline::signal_masks`, and both use it: `route` with `Forward` for an unrouted signal,
-`route_signals` with an empty mark that means discard.
+eight-entry table of marks by carried-signal combination, which `route by: signal` used, is now
+`logit_pipeline::signal_masks`, and `route_signals` uses it with an empty mark that means
+discard.
 
-**`strip: false`** routes as `route by: signal` does with every listed signal routed: each target
+**`strip: false`** routes as the removed `route by: signal` did with every signal routed: each target
 receives the whole event, an event bound for several targets is cloned into each but the highest
 slot, and a batch whose every event carries one multi-target mark goes out whole behind one shared
 `Arc`. An unlisted payload rides along inside a listed signal's event.
@@ -169,8 +169,8 @@ All three are tallied per batch and recorded only when nonzero.
   every event of which is discarded (0).
 - The soak harness's `split = "route"` ledger refuses a `route_signals`, under either `strip:`
   value: its parts or copies land in several sinks, so the sinks' totals don't add up.
-- `route by: signal` stays for now. Replacing it, and converting the shipped configs that pair it
-  with `keep_signals` gates and a `null_out`, is follow-up work.
+- `route by: signal` is removed, and the shipped configs that paired it with `keep_signals` gates
+  and a `null_out` use `route_signals`. `route` keeps list-valued `routes:` values.
 - Amendments, dated 2026-10-16: [ADR `target-components`](target-components.md),
   [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), and
   [ADR `signal-filtering-components`](signal-filtering-components.md).

@@ -102,8 +102,8 @@ direct one event to several destinations. See the amendment at the end.] Two rou
   no wider than theirs: no operators, no boolean algebra. `routing-by-condition-is-lua`'s core
   holding is unchanged -- anything needing an operator is still a `lua` component. [2026-10-11: a
   numeric range is now `bucket` plus an equality match on `route`
-  ([ADR `bucket-transform`](bucket-transform.md)).] [2026-10-16: `by: signal` joins the four
-  forms, and a `routes:` value may be a list of target ids. See the amendment at the end.]
+  ([ADR `bucket-transform`](bucket-transform.md)).] [2026-10-16: a `routes:` value may be a list of target ids. See the amendment at the end.
+  A `by: signal` form was added the same day and moved to `route_signals`.]
 - **`lua`/`lua_file`**, with a `targets: [..]` list on the component and a new handle method,
   `event:to("target_id")`. The mark rides on the handle, so `return event` and `return {a, b}` are
   unchanged and each event carries its own destination; an unmarked event is unrouted;
@@ -393,7 +393,7 @@ value or `by: signal`.
 - `logit_pipeline::Destinations` replaces `Destination`; `route_batch` returns a `Partition`
   (owned or shared) per destination; `Fanout::send_shared_with_own_context` sends an `Arc` already
   shared by several destinations. `logit_config::RouteTargets` is the `routes:` value, and
-  `RouteBy::Signal` the new form. Schema regenerated.
+  `RouteBy::Signal` the new form (since removed). Schema regenerated.
 - `crates/logit-bench/tests/allocations.rs` pins the shared path at 2 and a mixed batch at its
   clones' cost, beside the unchanged single-destination rows.
 - The shipped `has_signal`/`keep_signals` fan-outs that fed several gates from one source now use `route`, for example `examples/forwarding/central.yaml`.
@@ -412,5 +412,9 @@ part.
 - **Rule 50 doesn't apply to `route_signals`.** It has no ordinary edge: rule 92 keeps it out of
   every `sources:`, and an event carrying no listed signal is discarded and counted
   `logit.component.events.discarded`, because the `signals:` map names what's kept.
+- **`route by: signal` is removed.** The `route_signals` kind took over its job, and the shipped
+  configs that used it moved to `route_signals`. `route` keeps list-valued `routes:` values, the
+  shared-`Arc` path, `logit.component.events.copied`, and rule 51's reconvergence clause for
+  lists; the mask table moved to `logit_pipeline::signal_masks`, which `route_signals` uses.
 - **`route_signals` isn't a `Router`.** A router still never mutates or absorbs an event; the new
   kind has its own node arm and shares the partition code.

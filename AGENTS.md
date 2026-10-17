@@ -152,7 +152,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `has_stale`, `drop_stale` | forward, or discard, an event older than `max_age` or, with `max_ahead` set, stamped further ahead of the wall clock; exact complements, so `drop_stale` keeps a replayed backlog out of `aggregate` and `has_stale` archives it | [ADR `stale-event-filtering`](docs/adr/stale-event-filtering.md) |
 | `sample` | consistent, keyed sampling | [ADR `consistent-sampling-component`](docs/adr/consistent-sampling-component.md) |
 | `shape` | an observer that measures each event's shape | [ADR `shape-observer-component`](docs/adr/shape-observer-component.md) |
-| `route`, `target` | native equality-only router (or `by: signal`), and the named destinations it fills; one event may go whole to several | [ADR `target-components`](docs/adr/target-components.md) |
+| `route`, `target` | native equality-only router, and the named destinations it fills; one event may go whole to several | [ADR `target-components`](docs/adr/target-components.md) |
 | `route_signals` | sends each signal an event carries to that signal's target, by default splitting a mixed event into one part per target; no ordinary consumers, and an event carrying no listed signal is discarded | [ADR `route-signals`](docs/adr/route-signals.md) |
 
 Details an agent needs beyond the table:
@@ -244,11 +244,10 @@ Details an agent needs beyond the table:
   structural costs the central-collector split-apart topology had no better answer for: a filter
   chain paid by every branch, and the deep clone an all-mutating fan-out can't avoid. A router
   needs an ordinary consumer for the events no target claims (graph rule 50); `null_out` is how a
-  config discards them on purpose. A `routes:` value may list several targets, and `by: signal`
-  sends a mixed-signal event to every carried signal's target; either way the event goes whole to
-  each, moved when it has one destination, shared or cloned when it has several, and counted in
+  config discards them by name. A `routes:` value may list several targets; the event goes whole
+  to each, moved when it has one destination, shared or cloned when it has several, and counted in
   `logit.component.events.copied`. A router never splits an event per signal, and rule 51 keeps a
-  component from reading two destinations one event can reach together.
+  component from reading two targets of one list.
 - **`route_signals`** splits per signal where a router can't: under `strip: true` (the default)
   each target receives one part holding only its own signals' payloads, moved out of the event,
   with a clone of its attributes, and unlisted signals are stripped. It isn't a `Router` (a router

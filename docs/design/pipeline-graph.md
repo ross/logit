@@ -294,12 +294,10 @@ filters.
 
 A `routes:` value may be a list (`host: [host_stream, archive]`), which sends a matching event to
 every listed target. Matching is first-match in key order, so a list is the only way one value
-reaches several targets. Under `by: signal` the keys are `logs`, `metrics`, and `traces`, and an
-event goes to the targets of every signal it carries, plus the router's own consumers for a
-carried signal with no route. The event is never split: each destination receives it whole, and
-an event bound for several destinations is copied to each, counted as
-`logit.component.events.copied`. Rule 51 keeps one component from reading two destinations one
-event can reach together, since it would receive that event twice. A `target` has no fields and no `sources:`. A router points at it, and downstream
+reaches several targets. The event is never split: each destination receives it whole, and an
+event bound for several destinations is copied to each, counted as
+`logit.component.events.copied`. Rule 51 keeps one component from reading two targets of one
+list, since it would receive that event twice. A `target` has no fields and no `sources:`. A router points at it, and downstream
 components read it like any other source (for example, `windowed: {sources: [host_stream]}`).
 `lua`/`lua_file` is the other router kind: it picks a target per event with `event:to("id")`
 instead of an equality table (see `docs/design/lua-api.md`'s "Routing to a target."). A complete,
@@ -403,10 +401,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 50. A router (`route`, or `lua`/`lua_file` with `targets:`) with no ordinary consumer. Name a
     `null_out` as its consumer to discard the events no target claims.
 51. A `route` with no `routes:`, an empty key or value, an empty list, a target repeated within
-    one list, a `by: signal` key other than `logs`/`metrics`/`traces`, more than 63 distinct
-    targets, or an empty `by:` key; or a component whose `sources:` lists two destinations of one
-    `route` that one event can reach together: two targets of one list, or any two of a
-    `by: signal` route's targets, plus the route itself when some signal has no route.
+    one list, more than 63 distinct targets, or an empty `by:` key; or a component whose
+    `sources:` lists two targets of one `route` list.
 52. An inconsistent `statsd_out` `tls:`, or one under `transport: udp`.
 53. A `0s` `idle_timeout`, or any `idle_timeout` on a UDP listener.
 54. A `keep_values` with nothing configured, an empty name or `allow`, a non-finite literal, a
