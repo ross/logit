@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-13
+updated: 2026-10-16
 ---
 
 # Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words
@@ -230,6 +230,17 @@ The last two entries leave [Loss with no counter](#loss-with-no-counter), which 
   counts the line splitter's unterminated line only when the decoder holds no entry, because that
   line most often continues the held one. An unterminated line on the other stream, beside a
   held reassembly or a drop in progress, goes uncounted (`docs/known-gaps/tailing.md`).
+
+## Amendment (2026-10-16): `route_signals` discards what its `signals:` map leaves out
+
+[ADR `route-signals`](route-signals.md)'s `route_signals` has no ordinary consumer. An event
+carrying none of its listed signals counts `component.events.discarded`, and under `strip: true`
+each unlisted payload cleared counts `transform.payloads.stripped{signal}`. The "Count unrouted
+events as an intended outcome" alternative still holds for `route` and Lua routers: their unrouted
+events need an ordinary consumer. For `route_signals` the config choice is visible in the graph
+already: its `signals:` map names what's kept, as `keep_signals`' list names its own. With all
+three signals listed, only an event with no payload is discarded, as `has_signal` and
+`keep_signals` also do. Its parts and copies count `component.events.copied`, never `*.dropped`.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related

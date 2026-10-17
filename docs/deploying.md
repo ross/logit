@@ -3770,7 +3770,10 @@ warns, and still sends the other signals once, but the request is wasted on ever
 flow with a `route` with `by: signal`, which sends each event to the target of every signal it
 carries without copying it, and keep a `keep_signals` (or `has_signal`) behind each target when an
 event can carry more than one signal, because the route delivers such an event whole to each
-matching target. `fixtures/victoriametrics-otlp.yaml` does both.
+matching target. `fixtures/victoriametrics-otlp.yaml` does both. A `route_signals` does it in one
+component: it sends each signal to its own target and gives each target only that target's
+signals' payloads, with no gate behind it
+([ADR `route-signals`](adr/route-signals.md)).
 
 **Put `aggregate` with `temporality: cumulative` ahead of metrics bound for VictoriaMetrics.**
 VictoriaMetrics keeps no temporality. A delta `Sum` sent over OTLP is stored as its raw

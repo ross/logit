@@ -371,7 +371,8 @@ value or `by: signal`.
 ### Alternatives considered
 
 - **Per-signal copies** (`keep_signals` on each branch). Rejected above: it splits what a sink may
-  want together and clones every mixed event.
+  want together and clones every mixed event. [2026-10-16: superseded for `route_signals`, which
+  splits by moving payloads. See the `route_signals` amendment below.]
 - **Union across matching keys** for the value-keyed forms. Two keys match one value only through
   `has_attributes`' coercion (`"500"` and `"500.0"`), so a union would make the coercion decide
   where an event goes. A list says it in one place.
@@ -396,3 +397,20 @@ value or `by: signal`.
 - `crates/logit-bench/tests/allocations.rs` pins the shared path at 2 and a mixed batch at its
   clones' cost, beside the unchanged single-destination rows.
 - The shipped `has_signal`/`keep_signals` fan-outs that fed several gates from one source now use `route`, for example `examples/forwarding/central.yaml`.
+
+## Amendment (2026-10-16): `route_signals` splits per signal
+
+[ADR `route-signals`](route-signals.md) adds `route_signals`, a third kind that fills targets. It
+sends each signal an event carries to that signal's target and, by default, splits a mixed event
+into one part per target: the payloads move, and only the attributes are cloned for each extra
+part.
+
+- **The "Per-signal copies" alternative above is superseded for `route_signals`.** It was rejected
+  as a whole-event copy per branch plus a copy-on-write `keep_signals` gate. A split pays one
+  attribute clone per extra part and no gate, and the operator chooses it per component with
+  `strip:`. `route` still forwards a mixed event whole.
+- **Rule 50 doesn't apply to `route_signals`.** It has no ordinary edge: rule 92 keeps it out of
+  every `sources:`, and an event carrying no listed signal is discarded and counted
+  `logit.component.events.discarded`, because the `signals:` map names what's kept.
+- **`route_signals` isn't a `Router`.** A router still never mutates or absorbs an event; the new
+  kind has its own node arm and shares the partition code.

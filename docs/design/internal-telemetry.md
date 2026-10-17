@@ -494,8 +494,8 @@ config asked for never uses the word:
 | Name | Meaning | Tags |
 |---|---|---|
 | `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
-| `logit.component.events.discarded` | A filter, `sample`, `aggregate`, or Lua script removed an event because the config asked it to. | None. |
-| `logit.component.events.copied` | A router delivered an event to more than one destination; counts the deliveries past each event's first. Nothing is lost. | None. |
+| `logit.component.events.discarded` | A filter, `sample`, `aggregate`, `route_signals`, or Lua script removed an event because the config asked it to. | None. |
+| `logit.component.events.copied` | A router delivered an event to more than one destination, or `route_signals` split one into a part per target; counts the deliveries past each event's first. Nothing is lost. | None. |
 | `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, sample value, or a metric record or span beside a log body) removed from a record that's still delivered. | `reason` where more than one cause exists. |
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
 | `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. | `reason`, `metric_kind`, or `field`. |
@@ -548,7 +548,7 @@ constrains its producer is the one that carries them:
 |---|---|---|
 | `logit.component.inbox.full` | count | a send found this inbox full, on any send path |
 | `logit.component.inbox.blocked.duration` | timing | time a send waited for room in this inbox. Recorded only when the send waited, whereas the producer's `send.blocked.duration` records a sample on every send |
-| `logit.component.inbox.batches` | gauge | the inbox's depth, sampled after each receive (`run_transform`, `run_router`, `run_lua`, and a sink's `drain_inbox`). A consumer parked in a full downstream send, or a sink parked on its full store, receives nothing and so reports no new depth; its `inbox.full` and `inbox.blocked.duration` are the signal then |
+| `logit.component.inbox.batches` | gauge | the inbox's depth, sampled after each receive (`run_transform`, `run_router`, `run_route_signals`, `run_lua`, and a sink's `drain_inbox`). A consumer parked in a full downstream send, or a sink parked on its full store, receives nothing and so reports no new depth; its `inbox.full` and `inbox.blocked.duration` are the signal then |
 
 A send tries the inbox first. On a full inbox it counts `inbox.full`, starts the consumer's blocked
 timer, and waits as before. A `Fanout::send_with_deadline` that times out sends nothing, but an
@@ -569,11 +569,11 @@ receive and processing side from their own loops, which already see every batch 
 
 | Name | Kind | Recorded in |
 |---|---|---|
-| `logit.component.batches.received` / `.events.received` | count | `run_transform`, `run_output`, `run_lua`, `run_router`. For `run_output`, this includes every batch its shutdown sweep takes from the inbox |
+| `logit.component.batches.received` / `.events.received` | count | `run_transform`, `run_output`, `run_lua`, `run_router`, `run_route_signals`. For `run_output`, this includes every batch its shutdown sweep takes from the inbox |
 | `logit.component.batches.delivered` / `.events.delivered` | count | `write_loop`, once per batch `Output::send` delivered. At shutdown a sink's `batches.received` equals `batches.delivered` plus `batches.dropped` under every reason plus what a disk spool still holds, and the same for events |
-| `logit.component.process.duration` | timing | `run_transform`, `run_lua`, `run_router` (whole batch — for a router this spans `route_batch`'s partition, not any one destination's send) |
-| `logit.component.events.discarded` | count | `Transform::process_into` returned `false` for an incoming event, or a Lua `process()` returned `nil` (`ProcessOutcome::Drop`): an event the config removed by design. Untagged, and recorded only when nonzero |
-| `logit.component.events.copied` | count | `run_router` (`route_batch`): one per delivery past an event's first, for an event a `route` list or `by: signal` sends to several destinations. Counted on the shared-`Arc` path too, so it counts deliveries, not deep clones. Untagged, and recorded only when nonzero |
+| `logit.component.process.duration` | timing | `run_transform`, `run_lua`, `run_router`, `run_route_signals` (whole batch — for a router this spans `route_batch`'s or `route_signals_batch`'s partition, not any one destination's send) |
+| `logit.component.events.discarded` | count | `Transform::process_into` returned `false` for an incoming event, a Lua `process()` returned `nil` (`ProcessOutcome::Drop`), or `route_signals_batch` found an event carrying none of its listed signals: an event the config removed by design. Untagged, and recorded only when nonzero |
+| `logit.component.events.copied` | count | `run_router` (`route_batch`) and `run_route_signals` (`route_signals_batch`): one per delivery past an event's first, for an event a `route` list or `by: signal` sends to several destinations, or a `route_signals` sends whole (`strip: false`) or splits into parts (`strip: true`, one per part past the first). Counted on the shared-`Arc` path too, so it counts deliveries, not deep clones. Untagged, and recorded only when nonzero |
 | `logit.component.events.dropped{reason="script_error"}` | count | `run_lua`, one per event whose `process()` call raised an error: that event is lost. Counted beside `errors{reason="process"}` |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
 | `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window` |
@@ -621,12 +621,16 @@ under its own id. A memory failure is not a panic, so it never logs `thread_pani
 **An unrouted event has no counter of its own** ([ADR `target-components`](../adr/target-components.md)).
 Graph rule 50 rejects a router (`route`, or `lua`/`lua_file` with `targets:`) that has no
 ordinary consumer, so every event no target claims reaches one. A config that discards those
-events names a `null_out` as that consumer, whose `events.received` counts them.
+events names a `null_out` as that consumer, whose `events.received` counts them. A
+`route_signals` has no ordinary consumer: an event carrying none of its listed signals counts
+`logit.component.events.discarded` under its id ([ADR `route-signals`](../adr/route-signals.md)).
 
 **A router's copies count once per destination.** An event sent to two destinations counts as
 `events.sent` on each: under the router's own id for its forward edge, and under the target's id
 for a target. The router's `"process"` span counts it twice too. Over one interval, a router's
-`events.received` plus its `events.copied` equals the events across the partitions it sent. A
+`events.received` plus its `events.copied` equals the events across the partitions it sent. For
+a `route_signals`, whose split parts count as copies and whose discards leave no partition, it's
+`events.received + events.copied − events.discarded`. A
 target's `events.sent` sums every router that directs at it, so the destinations' `events.sent`
 gives that total only when no other router feeds those targets
 ([ADR `target-components`](../adr/target-components.md)'s 2026-10-16 amendment).
@@ -1520,6 +1524,17 @@ counts what it sent, so a native equality match has nothing further worth a coun
 `route` can't place lands on its router's `Forward` partition, and so on its ordinary consumers,
 which every router has.
 
+##### `route_signals`
+
+`crates/logit-pipeline/src/route_signals.rs`, [ADR `route-signals`](../adr/route-signals.md).
+
+Recorded by its node loop, `run_route_signals`, on the component's own handle: the layer-2
+receive set, `events.copied` for each part or copy past an event's first,
+`logit.component.events.discarded` for an event carrying none of its listed signals, and, under
+`strip: true`, `logit.transform.payloads.stripped{signal}` per unlisted payload cleared. Each
+target's `Fanout` counts what it sent. It has no forward edge, so none of its events reach an
+ordinary consumer.
+
 ##### `aggregate`
 
 `crates/logit-transforms/src/aggregate.rs`.
@@ -1660,7 +1675,8 @@ minted `SpanRecord`'s id came from the line or from `mint_id`. This is the `kv_m
 None of the nine counts the events it removes: the runtime's `logit.component.events.discarded`
 does, under the filter's own id. `keep_signals`/`drop_signals` record
 `logit.transform.payloads.stripped{signal}` (count), one per payload slot cleared, because
-the event survives a strip. `has_stale`/`drop_stale` record why an event was classed stale (below).
+the event survives a strip. `route_signals` under `strip: true` records the same counter for the
+signals its `signals:` map leaves out. `has_stale`/`drop_stale` record why an event was classed stale (below).
 No other filter mutates a forwarded event or has a reason to give, so the other five record
 nothing of their own. Only `drop_stale` has `Diagnostics`; matching a fixed set or clearing a fixed
 signal set can't fail, and `has_stale` discarding fresh events is its normal work.

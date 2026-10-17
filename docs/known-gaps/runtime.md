@@ -29,7 +29,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   tracing every path from each pair of co-marked destinations, which an ordinary diamond would
   trip on too. **Workaround:** none in the graph; keep a component that reads several of one
   router's destinations behind one of them, or give it one target that every relevant value
-  lists ([ADR `target-components`](../adr/target-components.md)'s 2026-10-16 amendment).
+  lists ([ADR `target-components`](../adr/target-components.md)'s 2026-10-16 amendment). A
+  `route_signals` with `strip: false` has the same gap past rule 92. Under `strip: true` its
+  targets carry disjoint payloads, so reading several, directly or downstream, delivers no payload
+  twice, but each part is its own event: an event-level count over them counts a mixed event
+  once per part. To count it once, send its signals to one target
+  ([ADR `route-signals`](../adr/route-signals.md)).
 
 - **Channel depth is bounded in batches, not bytes or events** (`CHANNEL_CAPACITY`,
   `crates/logit-pipeline/src/runtime.rs`) — 64 batches per edge, whatever each batch weighs, so
