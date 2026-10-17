@@ -2039,7 +2039,7 @@ that items 3, 7, and 11 need.
   `ledger.wire` and the end-to-end bound.
 - **W12a**: §10's items 13 to 18 and these rows; the `docs/known-gaps/tailing.md` entry for the
   descriptors a matching glob keeps open; and four variants with no harness change:
-  `native-hop-spans` (item 7 with every internal span kept) and `lua-path-jit`, `lua-stall-jit`,
+  `native-hop-spans` (item 7 with internal spans at the default rate) and `lua-path-jit`, `lua-stall-jit`,
   and `lua-memory-jit` (item 1 under `jit: true`), each run recorded under "Findings".
 - **W12b**: item 11, the namespace-holder service and per-instance totals.
 - **W12c**: item 12's SIGHUP half, the `signal` action and the `stdio_out` reopen row.
@@ -3774,7 +3774,7 @@ drain-interval rows into runs:
 
 ### W12a: spans across the native hop, and Lua under the trace compiler (2026-10-17)
 
-Every run used `logit:soak` `sha256:99edd881460f`, built with `--no-cache` from `origin/main` at
+The first four runs used `logit:soak` `sha256:99edd881460f`, built with `--no-cache` from `origin/main` at
 `4b86ccc7` (W12a changes no Rust but a doc comment), and `logit-soak-netem:local`
 `sha256:25de6298bd24`, on the development host. The scenarios ran two at a time from `soak/w12a`'s
 working tree, at their own durations. No run found a harness bug or a `logit` defect. The
@@ -3794,7 +3794,8 @@ to the product's default, `0.1`, and tightened `lua-path-jit`'s checks, and both
 | `20261017T203350Z` | `lua-path-jit` with the pinned expectations | every row PASS |
 
 The last four ran on `logit:soak` `sha256:75c60bba2ff8`, rebuilt at 10:34 local from a later
-branch of this stack, which changes no Rust either. All four started after the host's 10:54 to
+branch of this stack, which changes no Rust either, and `logit-soak-netem:local`
+`sha256:094e63b23016`. All four started after the host's 10:54 to
 13:15 local suspend, which none of the W12a runs spans.
 
 What the runs showed:
