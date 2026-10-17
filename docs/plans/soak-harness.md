@@ -3921,18 +3921,50 @@ What the runs showed:
 
 ### W12b: rolling overlap (2026-10-17)
 
-`rolling-overlap` ran twice on the development host (`trout`, 24 cores, 64 GB, Linux 7.2.9,
-Docker 29.8.2), against `logit:soak` `sha256:75c60bba2ff8` built from `soak/w12b` after the
-merge of `soak/w12a`, beside other soak scenarios. The final run is
-`perf/results/soak/20261017T202637Z`, from `soak/w12b` at `e0236ed4` with no modified path,
-exit 0:
+`rolling-overlap` ran three times on the development host (`trout`, 24 cores, 64 GB, Linux
+7.2.9, Docker 29.8.2), one of them stopped early, against `logit:soak` `sha256:75c60bba2ff8`
+built from `soak/w12b` after the merge of `soak/w12a`, beside other soak scenarios. The final
+run is `perf/results/soak/20261017T202637Z`, from `soak/w12b` at `e0236ed4` with no modified
+path, exit 0, shown here as `check` re-scores it at the branch's head, whose end allowance
+weights each generator sink by its own input's batch:
 
 | Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 14 apply/revert action(s) returned 0; 5 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 7 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 6 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 4 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 136 readiness sample(s) read ok outside fault windows; 5 start(s) or unpause(s) ready in time, slowest ready 0.2s |
+| `progress` | PASS | 26 30s window(s) outside fault windows but an instance's own hold, judged per sink on the instances running through each (0 with none running skipped), each freshness sample under 30s: victoria_metrics: deliveries in 26 of 26, 26 freshness sample(s); 750s of 1080s after warmup judged (69%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +1.8 (limit 64); 360s of 1080s after warmup judged (33%; WARN under 5%) \| logit PASS: MiB/h life 1 +7.1, life 2 +7.9 (limit 64); 340s of 1080s after warmup judged (31%; WARN under 5%) \| logit-b PASS: MiB/h life 1 +8.7, life 3 +5.1 (limit 64); 260s of 1080s after warmup judged (24%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 26 -> end 26 (limit +8) \| logit PASS: warmup median 15 -> end 15 (limit +8) \| logit-b PASS: warmup median 15 -> end 15 (limit +8) |
+| `ledger.wire` | PASS | G 2,293,600 = W 2,293,600 + K 0 + wire 0 (by design: -127 in UDP-affecting windows, 117 steady, 10 at the end; steady loss judged 246, each run at 0 or more, against limit 2,200); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es); W by instance: logit 1,177,000, logit-b 1,116,600 |
+| `ledger.overlap` | PASS | G 2,293,600 − Σ(W + K + F) 2,293,600 (logit 1,177,000, logit-b 1,116,600) = 0, within [-200, 5]: 5 close(s) of an instance's socket, each at most ceil(used / 512) + 1 datagrams, loose by up to a quarter of its SO_RCVBUF; below, the generators' end allowance |
+| `ledger.intake` | PASS | logit: final life 2: W − D 605,500 vs E + B 605,500; life 0: W − D − B − X − Ab 0 within [0, R]; life 1: W − D − B − X − Ab 0 within [0, R] (R 142,000 = 10,000 + 67 x 1,000 + 65 x 1,000) \| logit-b: final life 3: W − D 240,200 vs E + B 240,200; life 0: W − D − B − X − Ab 0 within [0, R]; life 1: W − D − B − X − Ab 0 within [0, R]; life 2: W − D − B − X − Ab 0 within [0, R] (R 142,000 = 10,000 + 67 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | logit: final life 2: E[statsd] 605,500 == T_in[instance] 605,500 (into instance); T_in[instance] 605,500 == T_out[instance] 605,500 (instance forwards every event); Σ(sent into aggregate) 605,500 == A 605,500 (listeners to aggregate); A_sent 5,575 == S_in[victoria_metrics] 5,575 (aggregate to victoria_metrics) \| logit-b: final life 3: E[statsd] 240,200 == T_in[instance] 240,200 (into instance); T_in[instance] 240,200 == T_out[instance] 240,200 (instance forwards every event); Σ(sent into aggregate) 240,200 == A 240,200 (listeners to aggregate); A_sent 2,475 == S_in[victoria_metrics] 2,475 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | logit: no [ledger] sut_script \| logit-b: no [ledger] sut_script |
+| `ledger.aggregate` | PASS | logit: final life 2: Ab 605,500 == A 605,500 (every event absorbed) \| logit-b: final life 3: Ab 240,200 == A 240,200 (every event absorbed) |
+| `ledger.egress` | PASS | logit: victoria_metrics: life 0: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 1: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 2 (final): Ab 605,500 − V[victoria_metrics] 605,500 = 0, ok (split copy; R 142,000 = 10,000 + 67 x 1,000 + 65 x 1,000) \| logit-b: victoria_metrics: life 0: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 1: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 2: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 3 (final): Ab 240,200 − V[victoria_metrics] 240,200 = 0, ok (split copy; R 142,000 = 10,000 + 67 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | logit: not enabled ([ledger] vm_every_window) \| logit-b: not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | logit: no killed life followed by another \| logit-b: no killed life followed by another |
+| `ledger.summary` | PASS | logit: final life 2: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0 \| logit-b: final life 3: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − Σ(W + K + F) 0 over the run, ledger.overlap's; end to end over the run, G 2,293,600 less the instances' counted loss 0: victoria_metrics: ΣV 2,293,600 <= G − counted 2,293,600 |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | logit: final life 2 at +1175s: victoria_metrics: received 56 + replayed 4 vs delivered 60 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) \| logit-b: final life 3 at +1180s: victoria_metrics: received 25 vs delivered 25 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | logit: no *.dropped count outside the ledger and the sink rows \| logit-b: no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 6 of 7 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect.logit-b-carries-c0s1` | PASS | min_delta of logit.input.datagrams{component=statsd} on logit-b, during c0s1: c0s1 (+60s, +120s]: 5,000 (smallest of 12 drain(s)), want >= 1 |
+| `expect.logit-carries-c0s2` | PASS | min_delta of logit.input.datagrams{component=statsd} on logit, during c0s2: c0s2 (+210s, +270s]: 5,000 (smallest of 13 drain(s)), want >= 1 |
+| `expect.logit-kernel-drops` | PASS | delta of logit.input.kernel.dropped{component=statsd} on logit, run: run (+60s, +1140s]: 0 (over 201 drain(s)), want <= 0 |
+| `expect.logit-b-kernel-drops` | PASS | delta of logit.input.kernel.dropped{component=statsd} on logit-b, run: run (+60s, +1140s]: 0 (over 194 drain(s)), want <= 0 |
 
 - **The first run, `20261017T173458Z`, FAILed `progress` because the host slept, not because
-  of `logit`.** Its schedule ran, and every fault had recovered by +945 s. Then the laptop
-  suspended (`systemd-sleep`, 10:54:54 to 13:15:40 local), 162 s into the cooldown, freezing the
-  driver and every container for 2 h 21 min. On resume the loop was past its duration and ran
+  of `logit`.** Its schedule ran, and every fault had recovered by +945 s. From +1120 s, about
+  100 s into the cooldown, the laptop froze the driver and every container on its way to a
+  suspend (`systemd-sleep` suspended at 10:54:54 local, +1182 s, and resumed at 13:15:40), for
+  2 h 22 min. On resume the loop was past its duration and ran
   the end sequence at once; every wait in it stayed inside its bound, though `quiet` ran its full
   90 s, since no sample was newer than the export's 300 s lookback. `progress` then read the
   sleep as 30-second windows with nothing delivered. Every other row passed, `ledger.overlap`
