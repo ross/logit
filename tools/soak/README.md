@@ -194,6 +194,16 @@ Three scenarios run a sink against a scripted stand-in in place of VictoriaMetri
 |---|---|---|
 | `native-hop` | 17 minutes | `logit` takes statsd and forwards it with `logit_out` from a disk spool to `collector`'s `logit_in`, which aggregates into VictoriaMetrics: a netem delay and then 10% loss on `logit`'s sends, a partition, a stop, a pause, and a kill of `collector`, a kill of `logit` with `collector` up, and a kill of `logit` inside a stop of `collector`. `ledger.hop` judges the hop; its expectations assert the replay after the first `logit` kill is deduplicated, `logit` reconnects after the `collector` kill, and the spool holds the hop through the stop |
 
+`rolling-overlap` (19 minutes) runs two instances of one SUT, `logit` and `logit-b`, on one UDP
+port under `reuse_port`, in the network namespace of a holder, `sut-net` (see
+[Rolling overlap](#rolling-overlap)). Its generator sends `statsd-vm`'s 2,000 lines a second as
+eight flows, one per `statsd_out`, which the kernel spreads over the instances and moves as they
+stop and start. Each instance stamps its name on its series, aggregates, and spools to
+VictoriaMetrics. Its 16-minute cycle stops `logit`, then `logit-b`, delays the holder's egress,
+stops `logit` inside a stop of VictoriaMetrics, restarts `logit-b`, and stops it again. Its
+expectations assert that each instance reads while the other is down and that neither socket
+queue overflows; `ledger.overlap` bounds what each close discarded.
+
 `tcp-ingress` (20 minutes 30 seconds) is `statsd-vm`'s stream over one TCP connection:
 `statsd_out` with `transport: tcp` into `statsd_in` with `transport: tcp` and a 60 s
 `idle_timeout`, its source declared `wire = "tcp"`. Its 17.5-minute cycle delays and then drops
@@ -271,6 +281,54 @@ adds a bound end to end: V over the run is at most what the generators sent less
 loss. A duplicate balances every count after the hop, so the bound catches one only once it
 exceeds the run's uncounted loss, the wire loss among it; `ledger.hop` judges a smaller one. The
 plan's "The native hop (W10b)" has the rules.
+
+### Rolling overlap
+
+A scenario can run two or more instances of one SUT on one UDP port, as a rolling upgrade
+overlaps them. Each instance runs the whole pipeline. The override adds a namespace holder with
+the role `netns`, which owns the address, since an instance that owned it would take it along
+when it stopped, and puts every instance in it:
+
+```toml
+[overlap]
+holder = "sut-net"                  # the netns service
+instances = ["logit", "logit-b"]    # logit first; each runs [configs] sut unless it has a key
+label = "soak_instance"             # the attribute each instance's `set` stamps on its events
+```
+
+```yaml
+services:
+  sut-net:
+    image: logit-soak-netem:local
+    entrypoint: ["sleep", "infinity"]
+    labels: { soak.role: netns }
+    stop_signal: SIGKILL
+  logit:
+    network_mode: "service:sut-net"
+    environment: { LOGIT_ADMIN: unix:/tmp/admin.sock, SOAK_INSTANCE: logit }
+  logit-b:
+    extends: { file: compose.yaml, service: logit }
+    labels: { soak.role: sut }
+    network_mode: "service:sut-net"
+    environment: { LOGIT_ADMIN: unix:/tmp/admin.sock, SOAK_INSTANCE: logit-b }
+```
+
+The loader holds each instance's config to the overlap: `reuse_port: true` on every listener a
+source names, a `shutdown.delay` that with the drain fits `docker stop -t 30`, an admin
+`socket:` and no `bind:` (the driver probes `logit ready` through the container's
+`LOGIT_ADMIN`), and a `set` stamping `label` that each source's `sut_transforms` lists. The
+generators send to the holder's name, over UDP only. A generator needs several flows to spread:
+`generator_input` and `generator_sink` may each list several components, one sink per flow,
+whose counts sum. Only `netem` and `partition` go on the holder, neither on an instance, and two
+instances may not be held (paused, stopped, killed, restarted, or exited) at once. At the end the
+driver waits once on the backends' totals, then stops each instance.
+
+The rows about a process life judge each instance on its own lives, its V the series whose
+`label` names it, and FAIL a series that names no instance. The wire, `progress`, `recovery`,
+and the new `ledger.overlap` judge the instances together, since flows move between them:
+`progress` counts deliveries from the instances not held, and `ledger.overlap` holds the run's
+wire loss to what the instances' socket closes could discard. The plan's "Rolling overlap
+(W12b)" has the rules.
 
 ### Faults
 
@@ -583,7 +641,7 @@ generator-lines = "logit-generator-lines.yaml"
 [[ledger.source]]         # one per generator
 service = "generator-lines"                     # a service with soak.role generator
 generator_input = "load"                        # its generate_in
-generator_sink = "syslog"                       # its sink, G's source
+generator_sink = "syslog"                       # its sink, G's source; a list sums several
 sut_listener = "lines"                          # the SUT listener it reaches
 wire = "udp"                                    # optional: udp (the default), tcp, or file
 sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional: nodes to aggregate
@@ -623,6 +681,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `rss_slope` | a `logit` service's resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead, and so do slopes covering under 5% of the run after warmup. Each service is judged on its own line, and `[expected]` can set its verdict (see [Expected verdicts](#expected-verdicts)) |
 | `fd_slope` | a `logit` service's open file descriptors end, or sit after a recovery, more than `fd_growth` above the warmup median. Each service is judged on its own line, and `[expected]` can set its verdict |
 | `ledger.wire` | for a UDP or TCP source, its generator's lines minus what its listener read, what the kernel dropped, and what its framer dropped, counted (G − (W + K + F)), exceeds `wire_loss_outside_faults` outside the reported fault windows that affect its wire, with one generator batch of tolerance per window edge, each judged run counting at 0 or more; or, on UDP, its generator's sink counts messages and datagrams apart, and on TCP it counts any datagram. On UDP that loss is by design and every affecting window is reported: netem on a generator, and a lifecycle fault or partition of the SUT or of a generator. On TCP only a stop, kill, restart, or `exit`, and a partition that moved the container's address, are reported; every other TCP-affecting window (netem on the SUT, a pause, a partition that kept the address) is judged, and a surplus in it beyond one generator batch per `ambiguous_at_most_once` drop the generator counted there, plus one per edge, FAILs. Netem on a TCP generator affects nothing and is judged as steady state. A file source is judged otherwise: its run's W + F − G against a replay band per SUT life, and G against the lines counted in the shared directory (the plan's §6 `ledger.wire` row). The detail lists the gap per source and per run of drain intervals, and the generator's own counted loss beside it |
+| `ledger.overlap` | under `[overlap]` only, else no row: over the run, the generators' lines minus what every instance read or counted dropped (G − Σ(W + K + F)) exceeds, for each stop or restart of an instance, `ceil(used / 512) + 1` datagrams, `used` being the closing life's last `logit.input.receive_buffer.used.bytes`; or falls below 0 past the generators' end allowance. Each close's own gap is reported, not judged. A kill or `exit` of an instance, which leaves no final sample, or another fault that can lose UDP on its way in makes the row report its numbers and SKIP. See [Rolling overlap](#rolling-overlap) |
 | `ledger.intake` | for any listener, the final SUT life's lines read minus dropped differ from the events sent plus bad lines (B: `messages.dropped{reason="malformed"}`, `frames.dropped{reason="undecodable"}`, and on UDP `lines_in`'s oversize lines); or an earlier life's read-but-unabsorbed residual summed over the listeners (W − D − B − X − Ab, X being the listeners' own counted event drops) falls outside [0, R], R being each UDP listener's receive queue plus 2 batches per listener, 65 more batches for each node between it and `aggregate`, and 65 for `aggregate` |
 | `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listeners' summed events sent (or, with `sut_script`, the script's) differ from those `aggregate` received; a node in a source's `sut_transforms` received a different number from those sent to it, or sent a different number from those it received; a sink received a different number of events from those sent to it (under `copy` `aggregate`'s events sent, which a fan-out counts once per batch, and under `route` its target's); or `aggregate` received a different number from those it absorbed |
 | `ledger.script` | with `[ledger] sut_script` only, else SKIP: in the final SUT life, the listener's events sent differ from those the script received, those it received from those it emitted, discarded (`events.discarded`), and lost to an error (`events.dropped{reason="script_error"}`), or those it sent from those it emitted plus those `flush()` returned |

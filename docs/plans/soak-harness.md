@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-15
+updated: 2026-10-17
 ---
 
 # Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger
@@ -352,8 +352,8 @@ listener and `aggregate`, and adds the script hop to the ledger ("The ledger and
 
 **Compose overrides, service roles, and sinks (W7b).** Every compose service carries a
 `soak.role` label: `sut`, `generator`, `backend`, `broker` (a Kafka target's broker; see
-"Kafka targets"), or `standin` (W9a, a stand-in target's destination; see "Stand-in
-targets"). The harness knows a service by its role, never its name. Its ingress SUT is `logit`,
+"Kafka targets"), `standin` (W9a, a stand-in target's destination; see "Stand-in
+targets"), or `netns` (W12b, a rolling overlap's namespace holder; see "Rolling overlap"). The harness knows a service by its role, never its name. Its ingress SUT is `logit`,
 and from W10a an override can add further SUT services (see "Several SUT services").
 The base stack's generator is `generator`; from W8b an override can add more (see "Sources"). A scenario adds services with an optional top-level key naming an override file
 beside `scenario.toml`:
@@ -420,7 +420,9 @@ sut_listener = "lines"
 sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in order
 ```
 
-- A scenario lists one or more sources. Each names all four keys, each a component id, with a
+- A scenario lists one or more sources. Each names all four keys, each a component id (from
+  W12b `generator_input` and `generator_sink` may each list several, whose counts sum, one sink
+  per UDP flow), with a
   `service` that is a slug (lowercase letters, digits, `_`, and `-`) no other source names and
   a `sut_listener` no other source names. Unknown keys are refused. A `service` whose compose
   variable is `SOAK_SUT_CONFIG` or another source's (`generator-lines` and `generator_lines`
@@ -477,7 +479,8 @@ services:
   holds `sut_aggregate` and every `[[ledger.sink]]`.
 - From W10b a second SUT service needs a `[[ledger.hop]]` naming the native hop that joins it to
   `logit`, and a scenario has at most one hop, so at most two SUT services ("The native hop
-  (W10b)" in §8d).
+  (W10b)" in §8d). From W12b an `[overlap]` table instead runs two or more instances of one
+  SUT on one port, each a whole pipeline, with no hop ("Rolling overlap (W12b)" in §8e).
 - A further SUT's key is a slug, isn't `logit`, and has a compose variable,
   `scenario.config_env(service)`, that no source and no other SUT service shares. With the role
   map, the stack's `sut` services are `logit` and those keys, so a `sut` service the scenario
@@ -692,7 +695,8 @@ ticket with `${DOCKER} version` first.
    of its own stdout, two aggregate windows after the wait began, shows its `[[ledger.hop]]`
    sink (W10b) with `buffer.batches` 0, and `retrying` and `logit.output.in_flight` 0 or never
    set (120 s bound, a `sink_drained` phase naming the service); the last waits as above, on
-   its sinks.
+   its sinks. Under `[overlap]` (W12b) one wait on the stored totals covers every instance, and
+   then each instance stops (§8e).
 5. Collect: the last `docker logs` chunk per service, from its cursor to the end, into
    `.stdout` and `.stderr`, and `inspect/<svc>.json`.
    Then `compose down -v --remove-orphans`, unless `--keep`. A `try`/`finally` makes SIGINT still
@@ -1105,6 +1109,10 @@ The rows:
   any other WARNs. On an external target `ledger.egress` SKIPs, so `ledger.sent` FAILs a
   `rejected` or `disk_corrupt` batch drop at a sink, and one at any other node stays in this
   row.
+- `ledger.overlap` (W12b), under `[overlap]` only, else no row: the run's G − Σ(W + K + F)
+  against what the instances' socket closes could discard. Under `[overlap]` the per-life rows
+  judge each instance on its own lives and the wire, `progress`, and `recovery` judge them
+  together; §8e has the rules.
 - `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
   window around one step, or over the whole run (W8c); see "The scenario schema".
 
@@ -1498,8 +1506,9 @@ listener = "hop"          # its logit_in component id
 
 **The schema.** At most one `[[ledger.hop]]`, with the four keys and no other, `sink` and
 `listener` component ids, `from` `logit`, and `to` the one further SUT service `[configs]`
-names. Two SUT services with no hop are refused, and so is a hop beside `[ledger] sut_script` or
-a source's `sut_transforms`, whose rows judge a path into `aggregate` inside one process.
+names. Two SUT services with no hop and no `[overlap]` (§8e) are refused, and so is a hop
+beside `[ledger] sut_script` or a source's `sut_transforms`, whose rows judge a path into
+`aggregate` inside one process.
 
 **The driver.** Before it stops `logit`, the end sequence waits on the hop sink alone: its
 `buffer.batches` 0, and `retrying` and `logit.output.in_flight` 0 or never set, so everything it
@@ -1588,6 +1597,92 @@ with `collector` up, and a 30 s kill of `logit` inside a 90 s stop of `collector
 `[[expect]]` tables assert the replay after the first `logit` kill is deduplicated
 (`logit.input.batches.resends` above 0), `logit` reconnects after the `collector` kill, and the
 spool holds the hop's frames through the stop.
+
+### 8e. Rolling overlap (W12b)
+
+A scenario can run two or more instances of one SUT on one UDP port, as a rolling upgrade
+overlaps them ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md),
+"What an overlap means for the data"):
+
+```toml
+compose = "compose.override.yaml"   # adds sut-net (soak.role netns) and logit-b (soak.role sut)
+
+[overlap]
+holder = "sut-net"                  # owns the network namespace the instances join
+instances = ["logit", "logit-b"]    # each runs the whole pipeline; logit first
+label = "soak_instance"             # the attribute each instance's `set` stamps, a label on V
+```
+
+**The stack.** A SUT that owned the namespace would take the address with it when it stopped,
+so the holder, a service with the role `netns`, owns it and runs nothing: the netem image,
+`sleep infinity`, `stop_signal: SIGKILL`. Each instance has `network_mode: "service:<holder>"`
+and the generators send to the holder's name. The instances share an address, so each serves its
+admin endpoint on a Unix socket and sets `LOGIT_ADMIN` to it, which the image's `HEALTHCHECK`
+and the driver's readiness probe, `logit ready` with no `--admin`, both read. A generator needs
+several flows for the kernel to spread them: a UDP sink sends from one socket, so one sink is one
+flow, and `generator_input` and `generator_sink` may each list several components, whose counts
+sum.
+
+**The schema.** `[overlap]` has the three keys and no other; `instances` lists two or more
+distinct services, `logit` first, none the holder; `label` is a Prometheus label name. With the
+config: no `[[ledger.hop]]`; every source on a `udp` wire; a `[configs]` key other than `sut` and
+the generators only for an instance, which then runs its own config, else `sut`'s; and in each
+instance's config `reuse_port: true` on every source's listener, a `shutdown.delay` above 0 that
+with a 10 s drain (the listeners' 5 s `shutdown_grace` and `internal`'s 5 s second stage) is
+under `docker stop -t 30`, `admin.socket` with no `admin.bind`, and a `set` stamping `label`
+that every source's `sut_transforms` lists. Two instance configs may differ only in the lines
+that set `label`. With the steps: only `netem` and `partition` on the holder, neither on an
+instance, and no two of `pause`, `stop`, `kill`, `restart`, or `exit` on different instances
+overlapping. With the role map: the holder is the stack's one `netns` service, a `netns` service
+needs an `[overlap]`, and each instance's `network_mode` names the holder (read from
+`docker compose config` beside the roles).
+
+**The faults.** A netem on the holder shapes every instance's egress, and a partition of it cuts
+their ingress too. Every instance is an ingress SUT, so a lifecycle fault on any of them is
+UDP-affecting.
+
+**The driver.** The end sequence stops the generators, waits once until every sink's stored
+total holds, which covers every instance, and then stops each instance.
+
+**The rows.** A row about a process life (`ledger.intake`, `ledger.edge`, `ledger.script`,
+`ledger.aggregate`, `ledger.egress`, `ledger.windows`, `ledger.replay`, `identity.sink`,
+`drops`, and `ledger.summary`'s per-life terms) judges each instance on its own lives, V being
+the series whose `label` names it, with one detail per instance and the worst status. A series
+whose `label` names no instance FAILs `ledger.egress`. The flows move between the instances, so
+the rest judge them together:
+
+- `ledger.wire`: G against W + K + F summed over the instances, each instance's running total
+  interpolated at every instance's drains, since they drain out of phase. An instance's stop is
+  UDP-affecting, so its window is reported.
+- `ledger.overlap`, on run totals: G − Σ(W + K + F) ≤ Σ over the instances' stops and restarts
+  of `ceil(used / 512) + 1` datagrams, `used` being the closing life's last
+  `logit.input.receive_buffer.used.bytes`, which the listener samples once more after its read
+  loop stops, and 512 B the smallest truesize the kernel charges a small datagram. The bound is
+  loose by up to a quarter of `SO_RCVBUF`, since `udp_rmem_release` frees a socket's charge in
+  batches. Below 0 it allows the generators' end allowance. Each stop's own gap is reported, not
+  judged: interpolating the out-of-phase drains errs by about a generator batch at each edge. A
+  kill or an `exit` of an instance closes with no final sample, and a partition, a netem, or a
+  lifecycle fault elsewhere that can lose UDP adds loss the closes don't explain, so a run with
+  either is reported and not judged. A pause of an instance loses only what its kernel counts in
+  K.
+- `ledger.summary` adds the wire over the run and a bound end to end: each egress group's V
+  summed over the instances is at most G less the instances' counted loss.
+- `progress`: a fault that holds an instance opens no window, since the others carry its flows;
+  each window is judged on the deliveries summed over the instances no such fault holds in it,
+  and skipped when every instance is held.
+- `recovery`: each instance's sinks and receive queue on its own drains, so only while it runs,
+  against the ingest summed over the instances.
+
+**The scenario.** `rolling-overlap` (19 minutes: warmup 60 s, a 16-minute cycle, cooldown
+120 s) runs `statsd_in` (`reuse_port`) → `set` → `aggregate` (10 s, cumulative) →
+`prometheus_out` (remote-write 1.0, zstd, `buffer.disk`) in both instances, `shutdown.delay:
+5s`, one config with `soak_instance: !env SOAK_INSTANCE`, and a generator of eight
+`generate_in` inputs of 250 lines a second, each into its own `statsd_out`. Its steps stop
+`logit` for 60 s, then `logit-b`, delay the holder's egress (200 ms ± 50 ms, 120 s), stop
+`logit` inside a 90 s stop of VictoriaMetrics, restart `logit-b`, and stop it again. No step
+partitions the holder or drops packets, whose loss `ledger.overlap` couldn't tell from a close's.
+Its `[[expect]]` tables assert that each instance reads while the other is stopped and that
+neither counts a kernel drop.
 
 ### 9. Not in this stack
 

@@ -745,14 +745,17 @@ the operator-facing account of all of this.
   (`split = "copy"`), a fan-out whose blocked sink stalls the healthy one through the shared
   send, and a `route` on a DogStatsD tag whose backends' totals add up (`split = "route"`). The
   harness knows each compose service by its `soak.role` label (`sut`, `generator`, `backend`,
-  `broker`, `standin`). `fanin` adds a second generator the same way, `syslog_out` over UDP into
-  `lines_in` beside statsd, with one `[[ledger.source]]` per generator: the wire is judged per
+  `broker`, `standin`, `netns`). `fanin` adds a second generator the same way, `syslog_out` over
+  UDP into `lines_in` beside statsd, with one `[[ledger.source]]` per generator: the wire is judged per
   source and the intake per listener. `native-hop` adds a second SUT, `collector`, behind the
   native hop (`[[ledger.hop]]`), each SUT scored on its own process lives: `ledger.hop` judges
   the hop on run totals, allowing duplicates only where a mechanism forwards them (a kill or a
   pause of `collector`, and a killed `logit`'s spool replay to a `collector` that restarted
   since; the plan's "The native hop (W10b)"), and `ledger.summary` bounds V end to end by what
-  the generators sent.
+  the generators sent. `rolling-overlap` runs two instances on one port under `reuse_port`, in a
+  namespace holder's network (`[overlap]`, role `netns`), stopped in turn, each judged on its own
+  lives and its own labeled series, with `ledger.overlap` bounding the run's wire loss by what
+  each socket's close could discard.
   `tcp-ingress` sends statsd over TCP, its source declared `wire = "tcp"` and checked at load
   against the listener's `transport:`: W is `input.frames`, the framer's drops are counted wire
   loss, and the generator's netem is judged at 0 because TCP retransmits. A process-ending
