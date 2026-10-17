@@ -345,6 +345,9 @@ was called on, so `return event:to("host_stream")` is the idiomatic one-liner, a
   complementary filters. A component with `targets:` and **no** ordinary consumer fails
   validation, because its unmarked events, including unmarked output from `flush()`, would have
   nowhere to go. To discard them on purpose, list the component in a `null_out`'s `sources:`.
+- **A mark names one target.** `event:to("y")` after `event:to("x")` replaces the mark. To send
+  one event to two targets, clone it and mark each copy. A native `route` can name several
+  targets per value, but a Lua router can't.
 - **`event:clone()` copies the mark**, so a script fanning a routed event out gets two events
   headed the same way; `copy:to(nil)` (or `copy:to("other")`) makes them diverge. The mark is
   per-*event*, not per-call: `return {a:to("x"), b}` sends `a` to `x` and `b` to the component's
@@ -358,8 +361,9 @@ mark and sends one batch per destination that received any, all under the same t
 the same `process` span. Downstream of a target, `provenance.previous` is the **target's** id, not
 this component's (`docs/design/pipeline-graph.md`); `provenance.origin` is unchanged.
 
-To route on an equality check alone, use the native `route` component instead: it covers
-`{attribute: ..}`/`{resource: ..}`/`{provenance: ..}` equality with no VM in the path. Use a `lua`
+To route on an equality check or on the signals an event carries, use the native `route`
+component instead: it covers `{attribute: ..}`/`{resource: ..}`/`{provenance: ..}` equality and
+`by: signal` with no VM in the path. Use a `lua`
 router when the decision needs something `route`'s deliberately narrow `by:` can't express.
 
 ## Emitting telemetry from a script

@@ -148,10 +148,11 @@ pub enum ComponentKind {
     // Splits each row of a delimited line into positional attributes named by a configured
     // `columns` list (docs/adr/csv-positional-columns.md).
     Csv { columns: Vec<String>, delimiter: char },
-    // Equality-only routing: one key read per event, one target per matching value
+    // Equality-only routing: one key read per event, or the signals it carries; a matching
+    // value names a target or a list of them, each receiving the event
     // (docs/adr/target-components.md). An unrouted event goes to this component's ordinary
     // consumers, which it must have (a null_out to discard them).
-    Route { by: RouteBy, routes: BTreeMap<String, String> },
+    Route { by: RouteBy, routes: BTreeMap<String, RouteTargets> },
     // Keeps a fraction of events by a hashed key (trace_id, an attribute, or a resource
     // attribute), so every event sharing a key gets the same verdict in every process;
     // `always_keep` pins flagged events through (docs/adr/consistent-sampling-component.md).
@@ -276,12 +277,21 @@ components:
     target: stderr
 ```
 
-`route` reads one key per event. `by:` is exactly one of `{provenance: origin}`,
-`{provenance: previous}`, `{attribute: <key>}`, or `{resource: <key>}`, and `routes:` maps that
-key's values onto `target` ids; several values may map to one target. An event whose value no
-route names, or that lacks the key, is *unrouted*: it goes to the router's own consumers
+`route` reads one key per event. `by:` is one of `{provenance: origin}`,
+`{provenance: previous}`, `{attribute: <key>}`, `{resource: <key>}`, or `signal`, and `routes:`
+maps that key's values onto `target` ids; several values may map to one target. An event whose
+value no route names, or that lacks the key, is *unrouted*: it goes to the router's own consumers
 (`untagged_out` above, which names the router in `sources:`), not through a chain of complementary
-filters. A `target` has no fields and no `sources:`. A router points at it, and downstream
+filters.
+
+A `routes:` value may be a list (`host: [host_stream, archive]`), which sends a matching event to
+every listed target. Matching is first-match in key order, so a list is the only way one value
+reaches several targets. Under `by: signal` the keys are `logs`, `metrics`, and `traces`, and an
+event goes to the targets of every signal it carries, plus the router's own consumers for a
+carried signal with no route. The event is never split: each destination receives it whole, and
+an event bound for several destinations is copied to each, counted as
+`logit.component.events.copied`. Rule 51 keeps one component from reading two destinations one
+event can reach together, since it would receive that event twice. A `target` has no fields and no `sources:`. A router points at it, and downstream
 components read it like any other source (for example, `windowed: {sources: [host_stream]}`).
 `lua`/`lua_file` is the other router kind: it picks a target per event with `event:to("id")`
 instead of an equality table (see `docs/design/lua-api.md`'s "Routing to a target."). A complete,
@@ -364,7 +374,11 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 49. A `target` with `sources`, or one no router directs to.
 50. A router (`route`, or `lua`/`lua_file` with `targets:`) with no ordinary consumer. Name a
     `null_out` as its consumer to discard the events no target claims.
-51. A `route` with no `routes:`, an empty key or value, or an empty `by:` key.
+51. A `route` with no `routes:`, an empty key or value, an empty list, a target repeated within
+    one list, a `by: signal` key other than `logs`/`metrics`/`traces`, more than 63 distinct
+    targets, or an empty `by:` key; or a component whose `sources:` lists two destinations of one
+    `route` that one event can reach together: two targets of one list, or any two of a
+    `by: signal` route's targets and the route itself.
 52. An inconsistent `statsd_out` `tls:`, or one under `transport: udp`.
 53. A `0s` `idle_timeout`, or any `idle_timeout` on a UDP listener.
 54. A `keep_values` with nothing configured, an empty name or `allow`, a non-finite literal, a
@@ -498,12 +512,14 @@ component is one that appears in several `sources` lists, with nothing to specia
   ([ADR `target-components`](../adr/target-components.md)).
 - **A router is an ordinary node with one extra edge set.** It owns its own `Fanout` (slot 0, the
   unrouted/forward edge) plus a slot-ordered `Vec<Fanout>`, one per `graph::targets_of` entry. For
-  each incoming batch it routes every event by *borrowing* it, counts per destination,
-  `reserve_exact`s, moves each event into its destination's buffer (`route_batch`), and sends
-  **one batch per non-empty destination under one child `BatchContext` and one span**. One
-  incoming batch is one hop however many ways it forks, the same rule ordinary fan-out follows.
-  Rule 50 gives every router an ordinary consumer, so its forward partition always has a
-  destination.
+  each incoming batch it marks every event with its set of destinations by *borrowing* it, counts
+  per destination, `reserve_exact`s, moves each event into its destination's buffer
+  (`route_batch`), and sends **one batch per non-empty destination under one child `BatchContext`
+  and one span**. An event marked for several destinations is cloned into each but the last, and
+  a batch whose every event carries the same multi-destination mark skips the partition and goes
+  to each destination as one shared `Arc`. One incoming batch is one hop however many ways it
+  forks, the same rule ordinary fan-out follows. Rule 50 gives every router an ordinary consumer,
+  so its forward partition always has a destination.
 - **Shutdown cascades by channel closure** from listeners toward sinks. A node whose inbox closes
   drains it and exits, which drops its `Fanout`'s senders and closes its consumers' inboxes in
   turn. With `shutdown.delay` set and the process `Ready` at the signal, the runtime's shutdown
@@ -814,7 +830,7 @@ topology, not a rare one, with these consequences:
 
   There is no single "fan-out cost"; `docs/design/memory.md` §3 has the account by shape.
 - **A router and targets (ADR `target-components`) is the cheap form of this diamond**: one
-  partition pass and no clone. It doesn't change backpressure: a stalled consumer of one target
+  partition pass, and no clone for an event bound for one destination. It doesn't change backpressure: a stalled consumer of one target
   backs up through its router into every other target's flow, the same head-of-line blocking as
   the first bullet, paid by a router instead of a filter chain.
 

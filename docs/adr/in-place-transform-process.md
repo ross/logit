@@ -47,7 +47,10 @@ its doc comment gives exactly this ADR's argument: "`Event` is large … a by-va
 `(Destination, Event)`-shaped return would memcpy every event through an enum on the hot path for
 nothing — the routing verdict is a two-byte answer to a question about the event, not a
 transformation of it." `Transform::process`'s verdict is a one-*bit* answer to a question about the
-event. The two node traits were gratuitously different in the one place they should have matched.
+event. The two node traits were gratuitously different in the one place they should have matched. [2026-10-16:
+`Router::route` now answers an 8-byte `Destinations` set, since one event may go to several
+destinations; the borrowing argument is unchanged. See
+[ADR `target-components`](target-components.md)'s 2026-10-16 amendment.]
 
 **Why this came up now, and what it is a step toward.** It fell out of evaluating whether adjacent
 transform hops should be *fused onto one thread* — `docs/design/pipeline-graph.md`'s "Fusing a

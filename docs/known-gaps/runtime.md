@@ -18,8 +18,18 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `target` components (ADR [`target-components`](../adr/target-components.md)) costs
   `1 + used destinations` allocations per batch, against 194 for the fan-out-plus-filters shape
   `memory.md` §3 measures for the same split. Any destination split, whether named by an
-  attribute, provenance, or resource value or by a Lua script's own decision, has that cheap,
-  non-cloning answer.
+  attribute, provenance, resource value, or signal, or by a Lua script's own decision, has that
+  cheap, non-cloning answer. An event a `route` sends to several targets is the exception: it
+  costs one clone per extra destination, unless every event in its batch goes to the same set.
+
+- **A router's copies can reconverge downstream undetected.** Graph rule 51 rejects a component
+  that lists two destinations one event can reach together in its `sources:`, but not one that
+  reads them further downstream: `route` sends an event to targets `a` and `b`, `a -> x`,
+  `b -> y`, and `c` lists `x` and `y`. `c` then receives that event twice. Detecting it means
+  tracing every path from each pair of co-marked destinations, which an ordinary diamond would
+  trip on too. **Workaround:** none in the graph; keep a component that reads several of one
+  router's destinations behind one of them, or give it one target that every relevant value
+  lists ([ADR `target-components`](../adr/target-components.md)'s 2026-10-16 amendment).
 
 - **Channel depth is bounded in batches, not bytes or events** (`CHANNEL_CAPACITY`,
   `crates/logit-pipeline/src/runtime.rs`) — 64 batches per edge, whatever each batch weighs, so

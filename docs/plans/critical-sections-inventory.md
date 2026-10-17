@@ -3741,13 +3741,16 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 ---
 
 ### RT-10 — `run_router` / `route_batch`: the four-pass partition and `RouterScratch` reuse
-- **Location:** `runtime.rs` (`run_router`, `route_batch`, `slot_of`);
-  `crates/logit-pipeline/src/router.rs` (`Destination`, `Router`, `RouterScratch`);
+- **Location:** `runtime.rs` (`run_router`, `route_batch`, `checked_mark`, `Partition`);
+  `crates/logit-pipeline/src/router.rs` (`Destinations`, `Router`, `RouterScratch`);
+  `Fanout::send_shared_with_own_context`;
   registry arm `crates/logit-cli/src/pipeline.rs` (`build_spec`'s `route` arm).
 - **What it does:** Per incoming batch: one child context, one `"process"` span, then a four-pass partition
   (route-borrowing → count → `reserve_exact` per used destination → move) into node-owned scratch buffers that
   `std::mem::take` leaves capacity-0 for the next batch. Sends one batch per non-empty destination under the
-  *same* context. Slot 0 is the router's own outbound edge. `Fanout::deliver` returns early and counts nothing on
+  *same* context. Slot 0 is the router's own outbound edge. An event whose mark names several slots is cloned
+  into each but the highest and moved into that one; a batch whose every mark is the same multi-slot set skips
+  passes 2-4 and goes to each slot as one shared `Arc`. `Fanout::deliver` returns early and counts nothing on
   zero consumers, so graph rule 50 (a router needs an ordinary consumer) is what keeps slot 0 from being a
   silent sink; the `debug_assert!`s in `run_router` and `send_lua_partitions` pin it in debug builds.
 - **Why sensitive:** hot-path (per event); custom (the four-pass partition and the exact allocation contract:
@@ -3755,12 +3758,18 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   they're visible only as slot 0's consumer's `events.received`, so a slot 0 with no consumer would lose them
   uncounted); data-loss (an out-of-range slot falls back to slot 0 in release).
 - **Invariants to verify:**
-  - The partition is total: every event in appears in exactly one destination out (no `Destination::Drop`).
+  - The partition is total: every event in appears once in each destination its mark names, and in at least one
+    (no drop; `checked_mark` turns an empty set into `Forward`). `events.copied` equals the deliveries past each
+    event's first, on the shared path too.
   - `scratch.dests` entries are always left empty on return (the final `mem::take` loop in `route_batch`), so a stale event can never leak into
     the next batch.
-  - `slot_of(Forward) == 0` and `slot_of(To(n)) == n + 1` agree with `resolve_target_fanouts`' ordering and with
-    `RouterScratch::new(targets)` sizing `targets + 1`.
-  - The out-of-range guard in pass 1 (the `Destination::To(n) if ..` arm) is `usize::from(n) + 1 >= slots` (`>=`, not `>`) — verify the boundary.
+  - `Destinations::FORWARD` is bit 0 and `Destinations::target(n)` bit `n + 1`, agreeing with
+    `resolve_target_fanouts`' ordering and with `RouterScratch::new(targets)` sizing `targets + 1`;
+    `target(63)` and above yield an empty set rather than overflowing the shift.
+  - The out-of-range guard in pass 1 (`checked_mark`, through `Destinations::within(slots)`) masks every bit at or
+    past `slots` — verify the boundary, and the `slots >= 64` case.
+  - The shared path is taken only for a uniform mark naming two or more slots; a uniform single-slot mark keeps
+    the move path, so the single-destination allocation pins hold.
   - `counts.resize(slots, 0)` after `clear()` re-zeroes every slot each batch.
   - One incoming batch = exactly one span and one context, however many destinations it forks into.
   - `Fanout::deliver`'s zero-consumer early return is never reached for slot 0: graph rule 50 gives every
@@ -3956,7 +3965,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 - **What it does:** Validation, mostly — but four of its outputs are load-bearing at runtime: (1) **no cycles**,
   including router→target edges, which is what stops a runtime deadlock rather than merely an ugly graph;
   (2) **rule 49** (nothing names a `target` as a source), which is what makes `senders[c]` in `runtime.rs`'s
-  target-`Fanout` pre-pass and spawn loop non-panicking; (3) **`targets_of`'s order is the slot order** used identically by `Destination::To(n)`,
+  target-`Fanout` pre-pass and spawn loop non-panicking; (3) **`targets_of`'s order is the slot order** used identically by `Destinations::target(n)`,
   the runtime's `Vec<Fanout>`, and the Lua name→slot table; (4) **rule 50** (a router has an ordinary
   consumer), which is what keeps a router's slot 0 from dropping unrouted events uncounted (RT-10).
 - **Why sensitive:** the runtime *indexes and panics* on these guarantees; a cycle that slipped through is a

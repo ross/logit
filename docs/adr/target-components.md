@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-13
+updated: 2026-10-16
 ---
 
 # `target` components: named destinations a router directs events into, beside `sources:`
@@ -91,7 +91,8 @@ components:
     target: stderr
 ```
 
-**A router directs each event to at most one target.** Two router kinds:
+**A router directs each event to at most one target.** [2026-10-16: superseded; a router may
+direct one event to several destinations. See the amendment at the end.] Two router kinds:
 
 - **`route`**, a native transform: equality only, one key read per event. `by:` is exactly one of
   `{provenance: origin}`, `{provenance: previous}`, `{attribute: <key>}`, `{resource: <key>}`;
@@ -101,7 +102,8 @@ components:
   no wider than theirs: no operators, no boolean algebra. `routing-by-condition-is-lua`'s core
   holding is unchanged -- anything needing an operator is still a `lua` component. [2026-10-11: a
   numeric range is now `bucket` plus an equality match on `route`
-  ([ADR `bucket-transform`](bucket-transform.md)).]
+  ([ADR `bucket-transform`](bucket-transform.md)).] [2026-10-16: `by: signal` joins the four
+  forms, and a `routes:` value may be a list of target ids. See the amendment at the end.]
 - **`lua`/`lua_file`**, with a `targets: [..]` list on the component and a new handle method,
   `event:to("target_id")`. The mark rides on the handle, so `return event` and `return {a, b}` are
   unchanged and each event carries its own destination; an unmarked event is unrouted;
@@ -278,3 +280,117 @@ Why: [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md) makes any n
 `*.dropped` a loss to investigate, and an unrouted drop was a config choice counted as one.
 Requiring a consumer moves that choice into the graph, where `null_out` names it, instead of
 leaving it inferred from a counter.
+
+## Amendment (2026-10-16): one event to several destinations, and `route by: signal`
+
+A router may direct one event to several destinations. `route`'s `routes:` value is a target id
+or a non-empty list of them, and `route` gains `by: signal`. An event goes whole to each
+destination its mark names and is never split into per-signal copies; only an event bound for
+more than one destination pays for a copy.
+
+### Context
+
+Configs that send each signal somewhere different fan one source into two or three
+`has_signal`/`keep_signals` gates (`examples/forwarding/central.yaml`,
+`examples/canonical/logit.yaml`, `demo/logit.yaml`). That is the filter-chain shape this ADR's
+Context describes: each gate is a mutating transform, so every branch but the last pays a full
+`EventBatch` clone, and every gate scans every event. `route` couldn't take those configs over,
+for two reasons:
+
+- It couldn't key on signal.
+- It named at most one destination per event, and an event can carry several signals at once (a
+  log plus the metrics `kv_metrics` derived from it, or a log, metrics, and a span after
+  `http_access` and `trace_context`). Such an event belongs in more than one place.
+
+Splitting such an event into per-signal copies was ruled out. It would separate payloads a sink
+may want together, clone the shared attributes for every mixed event, and change what each sink
+receives. The forwarded event is whole, with `has_signal`'s semantics, never `keep_signals`'.
+
+### Decision
+
+**A mark is a set of destinations.** `Router::route` returns `Destinations`, a `Copy` bitset
+over `u64`: bit 0 is the router's own edge (`Forward`), bit `n + 1` is target `n`. It is the same
+8 bytes per event as the enum it replaces. A `route` may name at most 63 distinct targets (graph
+rule 51). A Lua router is unchanged: `event:to("..")` still marks one target, as an
+`Option<u16>`, and a Lua router never builds a set.
+
+**The partition keeps its four passes and gains two paths.**
+
+- **One destination per event**, every case before this amendment: unchanged. Each event is
+  moved, and the pinned allocation counts in `docs/design/memory.md` stand.
+- **One mark for the whole batch, naming several destinations** (every event in a batch bound
+  for the same two targets): the incoming batch goes out whole behind one `Arc` that every
+  destination holds, sent as `Delivered::Shared` even to a single-consumer edge. A sink borrows
+  it; a mutating consumer pays the copy-on-write clone
+  ([ADR `arc-eventbatch-copy-on-write`](arc-eventbatch-copy-on-write.md)) only while another
+  destination still holds it. Two allocations per batch, whatever its size.
+- **Mixed marks**: each event bound for several destinations is cloned into every one but the
+  highest slot and moved into that one, so each destination receives its events in arrival
+  order. The clones are the only per-event cost, and only the multi-destination events pay it.
+
+Still one child `BatchContext` and one span per incoming batch.
+
+**`routes:` takes a list.** `host: [host_stream, archive]` sends a matching event to both.
+The graph rejects an empty list and a target repeated within one list. Matching stays
+first-match in `routes:` key order for `by: {provenance: ..}`, `{attribute: ..}`, and
+`{resource: ..}`, so two keys that both match one value never union; a list is the only way one
+value reaches several targets.
+
+**`by: signal`** is a unit form. Its `routes:` keys are `logs`, `metrics`, and `traces`, the
+names `has_signal`'s `signals:` takes, and any other key fails validation. An event's mark is the
+union, over each signal it carries, of that signal's targets, where a carried signal with no
+route contributes `Forward`. So a log-and-metrics event with only `logs` routed reaches the logs
+target and the router's ordinary consumers, and no payload drops out of the else-branch. An event
+carrying no signal goes to `Forward`; `has_signal` would drop it, but a router never drops. A sink
+that must see one signal alone (Tempo behind `otlp_out`, say) keeps a `keep_signals` in front of
+it, which has one consumer and costs no clone. `route` resolves all eight carried-signal
+combinations to a mark once, at construction.
+
+**No component may read two destinations one event can reach together.** Rule 51 rejects a
+component whose `sources:` lists two targets of one `routes:` list, or, under `by: signal`, any
+two of that route's destinations, the route itself included, since a mixed event can reach all
+of them. Such a component would receive the event once per destination. An ordinary diamond
+(`in -> [a, b] -> c`) stays legal: there, each branch is a component the operator placed and `c`
+lists both by choice, receiving every batch twice. A router's copy is invisible in the config, so
+`c`'s doubled count would have no line explaining it. Reconvergence further downstream
+(`a -> x`, `b -> x`, `x -> c`) is not checked and is listed in `docs/known-gaps/runtime.md`.
+
+**Telemetry.** Each copy counts as `logit.component.events.sent` on the destination that sent it,
+so a target's volume stays what its consumers received. The router adds
+`logit.component.events.copied`: deliveries past each event's first, on the shared path too. It
+counts what reached destinations, not deep clones, and is never `*.dropped` or
+`*.discarded`, since nothing is lost. The router's span counts what left, copies included.
+
+**The router invariant becomes "every event leaves at least once, once to each destination its
+mark names".** A router still never mutates or absorbs an event. The soak harness's
+`split = "route"` ledger assumes the sinks' totals add up, so it refuses a `route` with a list
+value or `by: signal`.
+
+### Alternatives considered
+
+- **Per-signal copies** (`keep_signals` on each branch). Rejected above: it splits what a sink may
+  want together and clones every mixed event.
+- **Union across matching keys** for the value-keyed forms. Two keys match one value only through
+  `has_attributes`' coercion (`"500"` and `"500.0"`), so a union would make the coercion decide
+  where an event goes. A list says it in one place.
+- **A `Vec` or `SmallVec` of slots per event.** A heap-backed mark costs an allocation, or 16
+  bytes or more, per event on the path every single-destination batch takes. The bitset costs
+  what the enum did, and 63 targets is far beyond any shipped config.
+- **Eager clones for a uniform multi-destination batch too.** One code path, but a batch bound
+  whole for two sinks would pay a deep clone per event that a shared `Arc` avoids.
+- **A multi-target `event:to(..)` for Lua.** Out of scope here; a script can already `clone()` an
+  event and mark each copy.
+
+### Consequences
+
+- Superseded: the Decision section's "a router directs each event to at most one target", and
+  Context's "each event has *one* destination, decided once" as a property routing needs. The
+  partition still moves every single-destination event, and the measured savings in
+  Consequences hold for those.
+- `logit_pipeline::Destinations` replaces `Destination`; `route_batch` returns a `Partition`
+  (owned or shared) per destination; `Fanout::send_shared_with_own_context` sends an `Arc` already
+  shared by several destinations. `logit_config::RouteTargets` is the `routes:` value, and
+  `RouteBy::Signal` the new form. Schema regenerated.
+- `crates/logit-bench/tests/allocations.rs` pins the shared path at 2 and a mixed batch at its
+  clones' cost, beside the unchanged single-destination rows.
+- Converting the shipped `has_signal`/`keep_signals` fan-outs to `route` is separate work.
