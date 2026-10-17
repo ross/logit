@@ -861,6 +861,58 @@ def _deadlines():
            "a poll's next deadline is the next multiple of its period")
 
 
+def _stalled(root):
+    """A tick that runs far late, as across a host suspend, records a `stalled` phase, and
+    `run` FAILs it; a slow action's lateness, under `STALL_S`, doesn't."""
+    loaded = scenario.load(root / "scenarios" / "statsd-vm" / "scenario.toml")
+
+    def loop(jump):
+        run = driver.Run(root, loaded, 5.0, None, False, "/nonexistent", [], "logit:soak",
+                         roles=scenario.BASE_ROLES)
+        run.steps = []
+        run.t0 = 1000.0
+        run.timeline = _Records()
+        clock = [1000.0]
+        for name in ("poll_ready", "inspect_all", "sample_stats", "sample_freshness"):
+            setattr(run, name, lambda: None)
+        reals = (driver._now, driver.time.sleep, driver._print)
+        driver._now = lambda: clock[0]
+
+        def sleep(seconds):
+            clock[0] += seconds + (jump if clock[0] == 1002.0 else 0)
+
+        driver.time.sleep = sleep
+        driver._print = lambda text, stream=None: None
+        try:
+            run.loop()
+        finally:
+            driver._now, driver.time.sleep, driver._print = reals
+        return [r for r in run.timeline if r.get("phase") == "stalled"]
+
+    stalled = loop(8000.0)
+    expect(len(stalled) == 1 and stalled[0]["late_s"] == 8000.0 and stalled[0]["since"] == 3,
+           f"a tick 8,000 s late records a stalled phase, got {stalled}")
+    expect(loop(driver.STALL_S - 1) == [],
+           f"a tick under STALL_S late records none, got {loop(driver.STALL_S - 1)}")
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = _run_dir(tmp, "stalled", [_phase("start", 0, t0=T0),
+                                            _phase("stalled", 1183, late_s=8445.6, since=1182),
+                                            _phase("end_begin", 9628), _phase("end_end", 9730)])
+        result = _status(run_dir, checks.check_run)
+        expect(result.status == checks.FAIL
+               and "stalled: the driver's tick ran 8,446s late from +1182s" in result.detail,
+               f"run FAILs a stalled driver, got {result}")
+        polls = [{"t": T0 + offset, "offset": offset, "svc": "logit"}
+                 for offset in list(range(0, 1121, 5)) + [9628]]
+        old = _run_dir(tmp, "stalled-old", [_phase("start", 0, t0=T0),
+                                            _phase("end_begin", 9628), _phase("end_end", 9730)])
+        (old / "watchdog.jsonl").write_text("".join(json.dumps(r) + "\n" for r in polls))
+        result = _status(old, checks.check_run)
+        expect(result.status == checks.FAIL
+               and "stalled: the driver's tick ran 8,508s late from +1120s" in result.detail,
+               f"run reads a stall from the watchdog's gap in an older run, got {result}")
+
+
 def _ndjson():
     stamp = "2026-10-08T12:00:%02d.123456789Z"
     lines = [
@@ -7820,7 +7872,7 @@ def run(root, quiet=False):
     os.environ["DOCKER"] = _NO_DAEMON
     try:
         for part in (_isolated, _durations, _rules, _expect_rules, _expand, _random,
-                     _log_capture, _signals, _deadlines, _hung_inspect, _inspect_redacted,
+                     _log_capture, _signals, _deadlines, _stalled, _hung_inspect, _inspect_redacted,
                      _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks,
                      _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
@@ -7837,6 +7889,7 @@ def run(root, quiet=False):
                      _overlap_checks, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
+                              _stalled,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
                               _fanin_driver, _tcp_rules, _file_rules, _two_sut_rules,

@@ -730,7 +730,10 @@ returned nonzero has none, so nothing after it is excused.
 
 - `run`: the timeline has `start` and `end_end`, and no `aborted`, `error`, or `interrupted`
   phase. An interrupted run FAILs so its `results.md` can't read as a pass; the driver still
-  exits 130 for it.
+  exits 130 for it. From W12b a run also FAILs as `stalled` when the driver's 1 s tick ran more
+  than 120 s late, past anything the loop does, as when the host sleeps: nothing was scheduled
+  or polled in that span. The driver records a `stalled` phase; for an older run directory the
+  row reads the same from a gap in `watchdog.jsonl`.
 - `timeline`: every apply and revert returned 0, the schedule didn't fail fast, and every
   start or unpause of a `logit` service has a `ready` record. An early revert in the end
   sequence isn't probed, so it needs none.

@@ -122,6 +122,9 @@ SLOPE_MIN_SPAN_S = 60
 COVERAGE_MIN_SHARE = 0.05
 # Phases that mean the driver didn't run the schedule to its end sequence.
 RUN_FAIL_PHASES = ("aborted", "error", "interrupted")
+# How late the driver's tick may run before the run is `stalled` (driver.py's `STALL_S`).
+STALL_S = 120
+POLL_SLACK_S = 5
 
 
 @dataclass
@@ -439,7 +442,8 @@ class RunData:
 
 def check_run(data):
     """FAILs a run the driver didn't take from `start` through `end_end`: aborted, errored,
-    interrupted, or missing either phase. The driver still exits 130 when interrupted."""
+    interrupted, stalled (its tick ran far late, as across a host suspend), or missing either
+    phase. The driver still exits 130 when interrupted."""
     lines = []
     for name in RUN_FAIL_PHASES:
         record = data.phases.get(name)
@@ -451,6 +455,18 @@ def check_run(data):
             reason = reason[0]
         lines.append(f"{name} at {data.offset(record.get('t'))}" + (f": {reason[:300]}"
                                                                      if reason else ""))
+    stalls = [(record.get("since", 0), record.get("late_s", 0)) for record in data.timeline
+              if record.get("event") == "phase" and record.get("phase") == "stalled"]
+    if not stalls and data.t0 is not None:
+        # A run directory from before the driver recorded the phase: the watchdog's 5 s
+        # inspections stop for the span. The end sequence inspects once as it begins.
+        polled = sorted({r["t"] for r in data.watchdog
+                         if r.get("t") and r["t"] <= data.end + POLL_SLACK_S})
+        stalls = [(a - data.t0, b - a) for a, b in zip(polled, polled[1:])
+                  if b - a > STALL_S]
+    for since, late in stalls:
+        lines.append(f"stalled: the driver's tick ran {late:,.0f}s late from +{since:.0f}s, as "
+                     "when the host sleeps; nothing was scheduled or polled in that span")
     lines += [f"no {name} phase" for name in ("start", "end_end") if name not in data.phases]
     if lines:
         return Result("run", FAIL, "; ".join(lines), lines)

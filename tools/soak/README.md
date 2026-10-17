@@ -676,7 +676,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 
 | Check | `FAIL`s when |
 |---|---|
-| `run` | the driver aborted, hit an error, or was interrupted, or the timeline lacks its `start` or `end_end` phase |
+| `run` | the driver aborted, hit an error, or was interrupted, its tick ran more than 120 s late (`stalled`, as when the host sleeps), or the timeline lacks its `start` or `end_end` phase |
 | `timeline` | a fault's apply or revert returned nonzero, the schedule failed fast, or a start or unpause of a `logit` service has no readiness probe; a fault whose apply failed gets no window |
 | `exit` | a `logit` container exits outside a scheduled stop, restart, kill, or `exit` step, or with a code other than the one that action leaves (0, 137 for a kill, the step's `code` for an `exit`); an `exit` step sees no exit; or any container is OOM-killed |
 | `restarts` | a container starts with no scheduled start or restart behind it: the revert of a `stop` or `kill`, an `exit` revert that started it, or a `restart` |
