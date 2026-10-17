@@ -348,8 +348,9 @@ combinations to a mark once, at construction.
 
 **No component may read two destinations one event can reach together.** Rule 51 rejects a
 component whose `sources:` lists two targets of one `routes:` list, or, under `by: signal`, any
-two of that route's destinations, the route itself included, since a mixed event can reach all
-of them. Such a component would receive the event once per destination. An ordinary diamond
+two of that route's targets, since a mixed event can reach all of them. The route itself joins
+that set only when some signal has no route: with all three routed, only an event with no
+payload reaches the route's own consumers, and it reaches nothing else. Such a component would receive the event once per destination. An ordinary diamond
 (`in -> [a, b] -> c`) stays legal: there, each branch is a component the operator placed and `c`
 lists both by choice, receiving every batch twice. A router's copy is invisible in the config, so
 `c`'s doubled count would have no line explaining it. Reconvergence further downstream
