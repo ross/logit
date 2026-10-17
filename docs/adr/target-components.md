@@ -411,7 +411,7 @@ part.
   `strip:`. `route` still forwards a mixed event whole.
 - **Rule 50 doesn't apply to `route_signals`.** It has no ordinary edge: rule 92 keeps it out of
   every `sources:`, and an event carrying no listed signal is discarded and counted
-  `logit.component.events.discarded`, because the `signals:` map names what's kept.
+  `logit.component.events.discarded`, because the `signals:` map names which events are kept.
 - **`route by: signal` is removed.** The `route_signals` kind took over its job, and the shipped
   configs that used it moved to `route_signals`. `route` keeps list-valued `routes:` values, the
   shared-`Arc` path, `logit.component.events.copied`, and rule 51's reconvergence clause for

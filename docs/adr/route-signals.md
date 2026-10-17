@@ -27,7 +27,8 @@ consumer, so a `route by: signal` with all three signals routed still needs a `n
 payload-less events no signal claims. That rule exists because an unrouted event is a config
 choice the graph should show ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s
 "Count unrouted events as an intended outcome" alternative). For signal routing the config already
-shows it: the signals the operator lists are the signals kept, as `keep_signals`' list is.
+shows it: an event survives only if it carries a signal the operator listed, as with
+`keep_signals`' list.
 
 ## Decision
 
