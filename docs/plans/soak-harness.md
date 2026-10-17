@@ -3783,6 +3783,72 @@ drain-interval rows into runs:
   first drain interval after it: a drain interval's G − W on a file wire is lag, which is why
   only the run's total is judged.
 
+### W12c: SIGHUP and reopen (2026-10-17)
+
+`sighup` ran once on the development host (`sailfish`), against `logit:soak` built from
+`soak/w12c` at `082443e0`, which holds `soak/w12b`'s head. The run is
+`perf/results/soak/20261017T173412Z`, exit 0, every row PASS or SKIP:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 20 apply/revert action(s) returned 0; 0 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 2 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 1 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 2 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 146 readiness sample(s) read ok outside fault windows; 0 start(s) or unpause(s) ready in time |
+| `progress` | PASS | 23 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 23 of 23, 23 freshness sample(s); 660s of 810s after warmup judged (81%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 -0.5 (limit 64); 665s of 810s after warmup judged (82%; WARN under 5%) \| logit PASS: MiB/h life 0 +2.0 (limit 64); 665s of 810s after warmup judged (82%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 12 -> end 11 (limit +8) \| logit PASS: warmup median 13 -> end 13 (limit +8) |
+| `ledger.wire` | PASS | G 1,752,300 = W 1,752,300 + K 0 + wire 0 (by design: 0 in UDP-affecting windows, -53 steady, 53 at the end; steady loss judged 0, each run at 0 or more, against limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 1,752,300 vs E + B 1,752,300 (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E 1,752,300 == A 1,752,300 (listener to aggregate); A_sent 8,900 == S_in[victoria_metrics] 8,900 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 0: Ab 1,752,300 == A 1,752,300 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0 (final): Ab 1,752,300 − V[victoria_metrics] 1,752,300 = 0, ok (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K) 0 over the run, by design |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 0 at +899s: victoria_metrics: received 89 vs delivered 89 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 1 of 1 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `file.reopen.c0s3` | PASS | logit: archive.log -> archive.log.1 with c0s4's SIGHUP; lines in archive.log.1, archive.log.2, archive.log: 1,752,300, archive's events.delivered over logit's lives: 1,752,300; archive.log.1: 391,800 line(s), the latest at +190s; c0s4's SIGHUP finished at +190s; archive.log.2: 600,000 line(s), the earliest at +190s; c0s4's SIGHUP started at +190s |
+| `file.reopen.c0s7` | PASS | logit: archive.log -> archive.log.2 with c0s8's SIGHUP; lines in archive.log.1, archive.log.2, archive.log: 1,752,300, archive's events.delivered over logit's lives: 1,752,300; archive.log.2: 600,000 line(s), the latest at +490s; c0s8's SIGHUP finished at +490s; archive.log: 760,500 line(s), the earliest at +490s; c0s8's SIGHUP started at +490s |
+| `expect.reopen-steady-1` | PASS | delta of logit.output.file.reopens{component=archive} on logit, through 1: c0s1 (+60s, +115s]: 1 (over 11 drain(s)), want >= 1 |
+| `expect.reopen-steady-2` | PASS | delta of logit.output.file.reopens{component=archive} on logit, through 2: c0s2 (+120s, +175s]: 1 (over 11 drain(s)), want >= 1 |
+| `expect.reopen-rename-1` | PASS | delta of logit.output.file.reopens{component=archive} on logit, through 4: c0s4 (+190s, +245s]: 1 (over 11 drain(s)), want >= 1 |
+| `expect.reopen-backend-stopped` | PASS | delta of logit.output.file.reopens{component=archive} on logit, through 6: c0s6 (+330s, +385s]: 1 (over 11 drain(s)), want >= 1 |
+| `expect.reopen-rename-2` | PASS | delta of logit.output.file.reopens{component=archive} on logit, through 8: c0s8 (+490s, +545s]: 1 (over 11 drain(s)), want >= 1 |
+| `expect.reopen-steady-3` | PASS | delta of logit.output.file.reopens{component=archive} on logit, through 10: c0s10 (+630s, +685s]: 1 (over 11 drain(s)), want >= 1 |
+| `expect.generator-keeps-sending` | PASS | min_delta of logit.output.messages{component=statsd} on generator, through 9: c0s9 (+570s, +625s]: 10,000 (smallest of 11 drain(s)), want >= 1 |
+| `expect.archive-never-drops` | PASS | delta of logit.component.batches.dropped{component=archive} on logit, run: run (+60s, +870s]: 0 (over 162 drain(s)), want <= 0 |
+
+- **Each reopen landed between two batches, well inside the 2 s tolerance.** `docker kill -s
+  HUP` took 94 ms and 101 ms. The renamed file's last line was stamped 50 ms and 56 ms before
+  the signal's apply finished, and the new file's first line 93 ms and 94 ms after it started:
+  `archive` switched files within one 100 ms listener batch of the signal.
+- **Every event is in one file, and in one only.** The three files hold 391,800, 600,000, and 760,500
+  lines, 1,752,300 in all, equal to `archive`'s `events.delivered`, to G, and to V. No line
+  lacked a timestamp.
+- **One reopen per SIGHUP to `logit`, none from the generator's.** `logit` logged six `reopen
+  signal received` lines at info, which `self_log` ignores, and `logit.output.file.reopens`
+  rose by 1 through each. The generator logged one and kept sending 10,000 lines per drain.
+- **The signals opened no fault window, and the steady-state rows judged straight through
+  them.** `progress` judged 81% of the run after warmup, the VictoriaMetrics stop and its
+  recovery being the only window; `ledger.wire` judged steady-state loss at 0 across all seven
+  signals; the stdout telemetry stream kept its 5 s drains.
+- **The off-ledger sink changed no ledger row.** `ledger.edge` read E == A, since a fan-out
+  counts one send per batch, and `drops` found nothing, with `archive` under
+  `overflow: drop_oldest`.
+- After scoring, the three archive files (260 MB) were deleted from the run's `shared/`, and
+  their line counts and first and last timestamps kept in `shared-counts.json`, which
+  `file.reopen` reads for a file `shared/` no longer holds. A `check` before that fallback
+  existed FAILed both rows on the missing files; at the branch's head the run re-scores as
+  above.
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
