@@ -199,7 +199,8 @@ for = "45s"
 
 An optional top-level `rss_settle` (default `60s`) is how long past `recovery_bound` the
 `rss_slope` row alone keeps excusing each fault (§6). Every other row's recovery is
-`recovery_bound`.
+`recovery_bound`. A scenario whose schedule leaves no gap past `recovery_bound` sets it to
+`0s`, so `rss_slope` keeps something to judge.
 
 `validate()` enforces these rules:
 
@@ -5302,9 +5303,18 @@ reaches no fit, and a schedule with longer gaps could still fit it.
 A first default of 120 s left both runs with no fittable life, 0% judged, and a coverage WARN.
 At 60 s, across the shipped scenarios at their own durations, the share of the run after warmup
 outside the widened windows is 2 to 82%, against 11 to 85% with `recovery_bound` alone; most
-keep 10% or more. `native-hop`, `native-hop-spans`, `standin-datadog`, and the four
-remote-write and InfluxDB stand-in scenarios fall under 5% and will WARN on coverage. The
-estimate predicted the re-scored runs' 12% and 10%.
+keep 10% or more. The estimate predicted the re-scored runs' 12% and 10%. Seven scenarios
+would fall under 5% and WARN on coverage, so they set `rss_settle = "0s"`, which the estimate
+confirms returns each to its coverage without the key: `native-hop` and `native-hop-spans` 11%,
+`standin-datadog` 41%, and `standin-remote-write` and the three `standin-influxdb` scenarios
+41%. Each fitted a life on every service before, so the row's new coverage rule changes none
+of their verdicts from SKIP to WARN.
+
+A run directory recorded before the key existed has no `rss_settle` in
+`scenario.resolved.json` and re-scores at the 60 s default, even for the seven. Re-scoring the
+three preserved `standin-influxdb` runs (`20261018T024144Z`, `20261018T024204Z`,
+`20261018T024224Z`) gives PASS at 36% judged on `main` and at `0s`, and WARN on coverage at 0 to
+3% judged at the default.
 
 What the work showed about the harness:
 

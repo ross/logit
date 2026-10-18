@@ -843,7 +843,8 @@ rule only holds in steady state. `rss_slope` alone skips a further `rss_settle` 
 window, an optional top-level duration (default `60s`): a process gives back the memory a
 fault's backlog took in steps, over minutes, and a fit over those plateaus beside the
 pre-fault baseline slopes upward with no leak. On a fault-dense schedule the wider windows can
-leave little to fit, and the row's coverage `WARN` says so. The plan's "The checks" has the
+leave little to fit, and the row's coverage `WARN` says so; such a scenario sets
+`rss_settle = "0s"`. The plan's "The checks" has the
 full rules.
 
 The ledger follows each `[[ledger.source]]`, a generator and the SUT listener its lines reach

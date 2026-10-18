@@ -3432,6 +3432,13 @@ def _rss_settle_rules(root):
     for value in ("-30s", "soon", "30", 30):
         _refused(path, with_settle(value), "scenario.rss_settle: not a duration",
                  f"rss_settle = {value!r}")
+    # These schedules leave no gap past recovery_bound, so they opt out of the settle window.
+    opted_out = ("native-hop", "native-hop-spans", "standin-datadog", "standin-remote-write",
+                 "standin-influxdb", "standin-influxdb-carried", "standin-influxdb-mixed")
+    for name in opted_out:
+        shipped = scenario.load(root / "scenarios" / name / "scenario.toml")
+        expect(shipped.rss_settle == 0.0 and shipped.to_json()["rss_settle"] == 0.0,
+               f"{name} loads rss_settle = 0s, got {shipped.rss_settle}")
     loaded = scenario.from_dict(copy.deepcopy(base), path)
     loaded.rss_settle = -1.0
     try:

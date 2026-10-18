@@ -11,6 +11,7 @@ duration = "17m"          # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "120s"         # >= recovery_bound
 recovery_bound = "60s"    # the hop's request_timeout 10s, a sink's retry_max_delay 10s, two windows, a drain
+rss_settle = "0s"         # the schedule leaves no room for a settle window past recovery_bound
 cycle = "14m"
 compose = "compose.override.yaml"   # adds collector, the far SUT
 
