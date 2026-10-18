@@ -95,6 +95,10 @@ window = "during"
 reduce = "delta"
 min = 1
 
+# Pinned near every 97th event's share, so a failed in-place check in the script FAILs them.
+# c0s1's netem delays remote-write, not the generator's lines, so the window's 120 s carry
+# 240,000 events, of which 2,427 are a 97th and not a 53rd. A drain either side moves that by
+# about 101.
 [[expect]]
 name = "script-errors"
 service = "logit"
@@ -104,7 +108,8 @@ attrs = { reason = "process" }
 step = "c0s1"
 window = "during"
 reduce = "delta"
-min = 1
+min = 2200
+max = 2650
 
 [[expect]]
 name = "script-error-loss"
@@ -115,7 +120,8 @@ attrs = { reason = "script_error" }
 step = "c0s1"
 window = "during"
 reduce = "delta"
-min = 1
+min = 2200
+max = 2650
 
 [[expect]]
 name = "flush-emits"
