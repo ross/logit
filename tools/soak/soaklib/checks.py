@@ -3134,10 +3134,10 @@ def check_ledger_edge(data):
     them, every transform sending each event it received that it didn't discard
     (received − discarded == sent), or for a `fan_out` node of k its children against
     k × received less the lines it dropped (`_node_edge`), and the last transform's sent in place
-    of that listener's E in the sum; and out to each sink, under `copy` `aggregate`'s events.sent == the sink's
-    events.received
-    (a fan-out counts one send per batch, however many consumers it reaches), and under `route`
-    the sink's target's events.sent == the sink's events.received. Earlier lives are
+    of that listener's E in the sum; and out to each sink, under `copy` `aggregate`'s
+    events.sent == the sink's events.received (a fan-out counts one send per batch, however
+    many consumers it reaches), and under `route` the sink's target's events.sent == the
+    sink's events.received. Earlier lives are
     reported."""
     if _overlapped(data):
         return _per_instance(data, check_ledger_edge)
