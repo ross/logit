@@ -10,12 +10,17 @@
 //! replays every file from its beginning rather than falling back to `read_from`, so that holds
 //! after a power loss or corruption too (`docs/adr/durable-checkpoint-writes-and-fault-injection.md`).
 //!
-//! # Format 2
+//! # Format 3
 //!
 //! One entry per file: `dev` and `ino` (the [`FileId`] a resume matches on), `path` (for a human
-//! reading the file; never matched), `offset`, and the head fingerprint `head_len` and
-//! `head_hash` ([`Head`]).
+//! reading the file, and for whether a pattern still covers it; never matched against a file),
+//! `offset`, `len`, and the head fingerprint `head_len` and `head_hash` ([`Head`]).
 //!
+//! - **Length.** `len` is the file's size as the tailer last saw it, from a `stat` or `fstat` it
+//!   already makes or a read that reached the end, and never less than the offset read. When an
+//!   entry's file is gone at a restart, `len - offset` is counted as unread once a write without
+//!   the entry lands (`Tailer::prune_checkpoint_entries` has what that count means). It's the size
+//!   last seen, not the size at the write: the file may have grown since.
 //! - **Capture.** The tailer keeps the first `min(HEAD_BYTES, offset)` bytes of each file as it
 //!   reads them, and clears them on a truncation. The fingerprint is XXH64, seed 0, over those
 //!   bytes, so a head is always from the same generation of the file as the offset beside it,
@@ -29,11 +34,12 @@
 //!   at most `HEAD_BYTES`, every skipped byte is identical content. Past it, a recycled inode
 //!   whose new content shares its first `HEAD_BYTES` bytes resumes at a stale offset
 //!   (`docs/known-gaps/tailing.md`).
-//! - **Versioning.** The hash and `HEAD_BYTES` are part of format 2: changing either is a version
+//! - **Versioning.** The hash and `HEAD_BYTES` are part of format 3: changing either is a version
 //!   bump. No other version is read, so a file of any other version is unusable, and upgrading
 //!   replays every file once.
 //!
-//! The decision is `docs/adr/tail-discovery-failure-and-resume-identity.md`, decisions 2 to 4.
+//! The decision is `docs/adr/tail-discovery-failure-and-resume-identity.md`, decisions 2 to 4, and
+//! its amendment adding `len`.
 
 use logit_core::{Diagnostics, Telemetry};
 use logit_pipeline::atomic_write;
@@ -63,11 +69,11 @@ impl FileId {
     }
 }
 
-/// How many leading bytes of a file its [`Head`] covers. Part of format 2.
+/// How many leading bytes of a file its [`Head`] covers. Part of format 3.
 pub(crate) const HEAD_BYTES: usize = 256;
 
 /// A fingerprint of a file's first `len` bytes (at most [`HEAD_BYTES`]): XXH64, seed 0. Part of
-/// format 2, and separate from `logit_core::sampling`'s hash, whose freeze is that contract's.
+/// format 3, and separate from `logit_core::sampling`'s hash, whose freeze is that contract's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Head {
     pub len: u32,
@@ -103,11 +109,23 @@ pub(crate) enum Source {
 pub(crate) struct Retained {
     pub path: PathBuf,
     pub offset: u64,
+    /// The file's size as last seen, at least `offset`: a gone file's unread bytes are counted
+    /// against it.
+    pub len: u64,
     pub head: Head,
     pub source: Source,
 }
 
-const CHECKPOINT_VERSION: u32 = 2;
+/// One entry a [`CheckpointStore::write`] persists.
+pub(crate) struct Persisted<'a> {
+    pub id: FileId,
+    pub path: &'a Path,
+    pub offset: u64,
+    pub len: u64,
+    pub head: Head,
+}
+
+const CHECKPOINT_VERSION: u32 = 3;
 
 /// Parsed before [`CheckpointFile`], so another version's document reports its version rather
 /// than the first field it lacks.
@@ -128,6 +146,7 @@ struct CheckpointEntry {
     ino: u64,
     path: String,
     offset: u64,
+    len: u64,
     head_len: u32,
     head_hash: u64,
 }
@@ -167,6 +186,7 @@ fn parse(bytes: &[u8]) -> Result<HashMap<FileId, Retained>, String> {
             let retained = Retained {
                 path: PathBuf::from(entry.path),
                 offset: entry.offset,
+                len: entry.len,
                 head: Head { len: entry.head_len, hash: entry.head_hash },
                 source: Source::Checkpoint,
             };
@@ -229,22 +249,28 @@ impl CheckpointStore {
     /// `logit.input.checkpoint.errors{op="write"}` and leaves the store dirty, so the next tick
     /// retries.
     ///
+    /// Resolves to `true` once this call put `entries` in place at the checkpoint path, so a later
+    /// load reads them: a durable write, and a rename that landed before a failed directory sync,
+    /// which stays dirty so the next tick still makes it durable. A no-op, an encoding error, and
+    /// every failure before the rename are `false`.
+    ///
     /// Not an `async fn`: `entries` borrows the tailer's files, which aren't `Sync`, so it's
     /// consumed before the returned future is built rather than held across its `.await`.
     pub fn write<'s, 'a>(
         &'s mut self,
-        entries: impl Iterator<Item = (FileId, &'a Path, u64, Head)>,
+        entries: impl Iterator<Item = Persisted<'a>>,
         force: bool,
         diag: &'s mut Diagnostics,
         telemetry: &'s Telemetry,
-    ) -> impl Future<Output = ()> + Send + 's {
+    ) -> impl Future<Output = bool> + Send + 's {
         let encoded = (self.dirty || force).then(|| {
             let files = entries
-                .map(|(id, path, offset, head)| CheckpointEntry {
+                .map(|Persisted { id, path, offset, len, head }| CheckpointEntry {
                     dev: id.dev,
                     ino: id.ino,
                     path: path.to_string_lossy().into_owned(),
                     offset,
+                    len,
                     head_len: head.len,
                     head_hash: head.hash,
                 })
@@ -253,12 +279,12 @@ impl CheckpointStore {
         });
         async move {
             let bytes = match encoded {
-                None => return,
+                None => return false,
                 Some(Ok(bytes)) => bytes,
                 Some(Err(err)) => {
                     telemetry.count("logit.input.checkpoint.errors", 1.0, &[("op", "write")]);
                     diag.warn_throttled("checkpoint_error", format!("encoding checkpoint: {err}"));
-                    return;
+                    return false;
                 }
             };
             let path = self.path.clone();
@@ -266,19 +292,20 @@ impl CheckpointStore {
                 atomic_write::write_file_durably(&path, &bytes, sites::TAIL_CHECKPOINT)
             })
             .await;
-            let (err, outcome) = match result {
+            let (err, outcome, in_place) = match result {
                 Ok(Ok(())) => {
                     self.dirty = false;
                     telemetry.count("logit.input.checkpoint.writes", 1.0, &[]);
-                    return;
+                    return true;
                 }
                 Ok(Err(err)) if err.replaced() => (
                     err.to_string(),
                     "the new checkpoint is in place but may not survive a power loss",
+                    true,
                 ),
-                Ok(Err(err)) => (err.to_string(), "the previous checkpoint stays in effect"),
+                Ok(Err(err)) => (err.to_string(), "the previous checkpoint stays in effect", false),
                 // A panic in the helper; the step it reached is unknown.
-                Err(join) => (join.to_string(), "the checkpoint on disk may be old or new"),
+                Err(join) => (join.to_string(), "the checkpoint on disk may be old or new", false),
             };
             telemetry.count("logit.input.checkpoint.errors", 1.0, &[("op", "write")]);
             diag.warn_throttled(
@@ -288,6 +315,7 @@ impl CheckpointStore {
                     self.path.display()
                 ),
             );
+            in_place
         }
     }
 }
@@ -357,12 +385,7 @@ mod tests {
         let file = PathBuf::from("/var/log/app.log");
         store.mark_dirty();
         store
-            .write(
-                [(id, file.as_path(), offset, HEAD)].into_iter(),
-                false,
-                &mut obs.diag,
-                &obs.telemetry,
-            )
+            .write([at(id, &file, offset)].into_iter(), false, &mut obs.diag, &obs.telemetry)
             .await;
     }
 
@@ -386,6 +409,11 @@ mod tests {
 
     fn point(op: Op) -> Point {
         Point::new(fault::sites::TAIL_CHECKPOINT, op)
+    }
+
+    /// An entry for `id` at `offset`, with `len` a fixed 100 bytes past it and [`HEAD`].
+    fn at(id: FileId, path: &Path, offset: u64) -> Persisted<'_> {
+        Persisted { id, path, offset, len: offset + 100, head: HEAD }
     }
 
     #[test]
@@ -413,7 +441,7 @@ mod tests {
     fn a_truncated_checkpoint_document_is_unusable_and_counted() {
         let dir = scratch_dir("checkpoint-truncated");
         let path = dir.join("checkpoint.json");
-        std::fs::write(&path, br#"{"version":2,"files":[{"dev":1,"ino":42,"pa"#).unwrap();
+        std::fs::write(&path, br#"{"version":3,"files":[{"dev":1,"ino":42,"pa"#).unwrap();
         assert_unusable(&path);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -442,7 +470,7 @@ mod tests {
     fn a_missing_checkpoint_with_a_stray_tmp_beside_it_is_unusable() {
         let dir = scratch_dir("checkpoint-stray-tmp");
         let path = dir.join("checkpoint.json");
-        std::fs::write(tmp_path(&path), br#"{"version":2,"files":[]}"#).unwrap();
+        std::fs::write(tmp_path(&path), br#"{"version":3,"files":[]}"#).unwrap();
         assert_unusable(&path);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -521,12 +549,7 @@ mod tests {
             // The next tick needs no new data to retry: the store is still dirty.
             let file = PathBuf::from("/var/log/app.log");
             store
-                .write(
-                    [(ID, file.as_path(), 30, HEAD)].into_iter(),
-                    false,
-                    &mut obs.diag,
-                    &obs.telemetry,
-                )
+                .write([at(ID, &file, 30)].into_iter(), false, &mut obs.diag, &obs.telemetry)
                 .await;
             drop(scope);
             assert!(!store.dirty, "{step:?}");
@@ -596,20 +619,47 @@ mod tests {
         assert!(matches!(loaded, Loaded::Missing));
         store.mark_dirty();
         let file_path = dir.join("app.log");
-        store
-            .write(
-                [(ID, file_path.as_path(), 123u64, HEAD)].into_iter(),
-                false,
-                &mut obs.diag,
-                &obs.telemetry,
-            )
-            .await;
+        let written = Persisted { id: ID, path: &file_path, offset: 123, len: 456, head: HEAD };
+        store.write([written].into_iter(), false, &mut obs.diag, &obs.telemetry).await;
 
         let resume = resume_of(obs.load(&path).1);
-        let expected =
-            Retained { path: file_path, offset: 123, head: HEAD, source: Source::Checkpoint };
+        let expected = Retained {
+            path: file_path,
+            offset: 123,
+            len: 456,
+            head: HEAD,
+            source: Source::Checkpoint,
+        };
         assert_eq!(resume.get(&ID), Some(&expected));
         assert!(!tmp_path(&path).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An entry loaded and written back unspent, as every write until it's pruned does, keeps the
+    /// length it was loaded with rather than one derived from its offset.
+    #[tokio::test]
+    async fn an_unspent_entry_keeps_its_len_through_a_rewrite() {
+        let dir = scratch_dir("checkpoint-len-rewrite");
+        let path = dir.join("checkpoint.json");
+        std::fs::write(
+            &path,
+            br#"{"version":3,"files":[{"dev":1,"ino":42,"path":"/var/log/app.log","offset":4,"len":90,"head_len":4,"head_hash":7}]}"#,
+        )
+        .unwrap();
+        let mut obs = observed();
+        let (mut store, loaded) = obs.load(&path);
+        let loaded = resume_of(loaded).remove(&ID).expect("the entry loads");
+        assert_eq!((loaded.offset, loaded.len), (4, 90));
+
+        let rewritten = Persisted {
+            id: ID,
+            path: &loaded.path,
+            offset: loaded.offset,
+            len: loaded.len,
+            head: loaded.head,
+        };
+        store.write([rewritten].into_iter(), true, &mut obs.diag, &obs.telemetry).await;
+        assert_eq!(resume_of(obs.load(&path).1).remove(&ID), Some(loaded));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -636,14 +686,7 @@ mod tests {
         let (mut store, _) = obs.load(&path);
         let id = FileId { dev: 2, ino: 7 };
         let file_path = dir.join("app.log");
-        store
-            .write(
-                [(id, file_path.as_path(), 5u64, HEAD)].into_iter(),
-                true,
-                &mut obs.diag,
-                &obs.telemetry,
-            )
-            .await;
+        store.write([at(id, &file_path, 5)].into_iter(), true, &mut obs.diag, &obs.telemetry).await;
 
         assert!(path.exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -664,22 +707,14 @@ mod tests {
         store.mark_dirty();
         store
             .write(
-                [(a, a_path.as_path(), 10u64, HEAD), (b, b_path.as_path(), 20u64, HEAD)]
-                    .into_iter(),
+                [at(a, &a_path, 10), at(b, &b_path, 20)].into_iter(),
                 false,
                 &mut obs.diag,
                 &obs.telemetry,
             )
             .await;
         store.mark_dirty();
-        store
-            .write(
-                [(a, a_path.as_path(), 15u64, HEAD)].into_iter(),
-                false,
-                &mut obs.diag,
-                &obs.telemetry,
-            )
-            .await;
+        store.write([at(a, &a_path, 15)].into_iter(), false, &mut obs.diag, &obs.telemetry).await;
 
         let resume = resume_of(obs.load(&path).1);
         assert_eq!(resume.get(&a).map(|r| (&r.path, r.offset)), Some((&a_path, 15)));
@@ -704,10 +739,24 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Format 2 had no `len`. A full format 2 document is another version, not a malformed one,
+    /// so it takes the counted, diagnosed unusable path and replays once.
+    #[test]
+    fn a_v2_checkpoint_is_an_unsupported_version() {
+        let v2 = br#"{"version":2,"files":[{"dev":1,"ino":42,"path":"/var/log/app.log","offset":4,"head_len":4,"head_hash":7}]}"#;
+        assert_eq!(parse(v2).unwrap_err(), "unsupported version 2");
+
+        let dir = scratch_dir("checkpoint-v2");
+        let path = dir.join("checkpoint.json");
+        std::fs::write(&path, v2).unwrap();
+        assert_unusable(&path);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_checkpoint_head_len_over_head_bytes_is_unusable() {
         let over = format!(
-            r#"{{"version":2,"files":[{{"dev":1,"ino":42,"path":"a","offset":4,"head_len":{},"head_hash":0}}]}}"#,
+            r#"{{"version":3,"files":[{{"dev":1,"ino":42,"path":"a","offset":4,"len":4,"head_len":{},"head_hash":0}}]}}"#,
             HEAD_BYTES + 1
         );
         let reason = parse(over.as_bytes()).unwrap_err();
@@ -724,9 +773,14 @@ mod tests {
     }
 
     #[test]
-    fn a_v2_entry_missing_its_head_is_malformed() {
-        let missing = br#"{"version":2,"files":[{"dev":1,"ino":42,"path":"a","offset":4}]}"#;
-        let reason = parse(missing).unwrap_err();
+    fn a_v3_entry_missing_its_len_or_head_is_malformed() {
+        let no_len = br#"{"version":3,"files":[{"dev":1,"ino":42,"path":"a","offset":4,"head_len":4,"head_hash":7}]}"#;
+        let reason = parse(no_len).unwrap_err();
+        assert!(reason.starts_with("malformed:") && reason.contains("`len`"), "{reason}");
+
+        let no_head =
+            br#"{"version":3,"files":[{"dev":1,"ino":42,"path":"a","offset":4,"len":4}]}"#;
+        let reason = parse(no_head).unwrap_err();
         assert!(reason.starts_with("malformed:") && reason.contains("head_len"), "{reason}");
     }
 
@@ -742,7 +796,7 @@ mod tests {
         assert!(Head::of(b"").matches(b"anything"));
     }
 
-    /// The hash is part of format 2: XXH64 with seed 0. A changed hash would make every
+    /// The hash is part of format 3: XXH64 with seed 0. A changed hash would make every
     /// checkpoint written by an earlier build reject its resumes.
     #[test]
     fn the_head_hash_is_xxh64_with_seed_zero() {

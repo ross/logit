@@ -393,28 +393,6 @@ wants a rate bounds it with `[[expect]]`. A discard of a line a kill replays is 
 as its read counts in W again, so the replay band still bounds a file wire's surplus.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "6. The checks", has the rules.
 
-## Amendment: a deleting writer's G stands alone (2026-10-18)
-
-A writer that bounds its retention (`file_out`'s `rotate.max_files`) deletes its oldest file at
-every rotation past it, and the shared directory then holds fewer lines than the writer wrote.
-The lines a deleted file held can't be counted at the end, so once the writer has deleted one,
-G, its own `events.delivered`, stands alone: the lines left in the directory must not exceed
-G, and the directory must hold the files the writer keeps, read from its rotation count and
-config. The equality with the count still holds while the writer deletes none. The end
-sequence waits for the tailers' W to reach G, read from the writer's telemetry after it stops,
-rather than the count, which a deleting writer leaves short.
-
-A deleted file the tailer hadn't read is lost, and `tail_in` counts that loss nowhere: a
-restarted tailer drops the checkpoint entry it can't use with no counter and no diagnostic
-([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md), "A file removed or rotated out of
-every pattern loses its unread tail"). The ledger can't see such a loss in W − G, because G
-stands alone, so a retention guard FAILs `ledger.wire` for any SUT fault during which the
-writer rotated often enough to delete a file the tailer hadn't read: `max_files − 2` rotations
-in a stop, kill, restart, or `exit`, which close the tailer's files, and `max_files` in a
-pause, which keeps them open. The alternative, reading the loss from the product, needs a
-counter `tail_in` doesn't have. [`docs/plans/soak-harness.md`](../plans/soak-harness.md),
-"6. The checks", has the rules.
-
 ## Amendment: an HTTP wire's G is what the listener answered, and a resend may surplus (2026-10-17)
 
 A source's `wire` can be `http`: a generator `influxdb_out` or `otlp_out` writes to
@@ -431,6 +409,29 @@ in it, plus one per edge: the writer sends one batch per request, one request in
 resends it after a transport error, when the listener may already have taken it. The same
 allowance, with X left out of the counted loss, bounds `ledger.summary`'s end to end.
 `influxdb_in`'s request identities are judged in `ledger.intake`.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "6. The checks", has the rules.
+
+## Amendment: a deleting writer's G stands alone (2026-10-18)
+
+A writer that bounds its retention (`file_out`'s `rotate.max_files`) deletes its oldest file at
+every rotation past it, and the shared directory then holds fewer lines than the writer wrote.
+The lines a deleted file held can't be counted at the end, so once the writer has deleted one,
+G, its own `events.delivered`, stands alone: the lines left in the directory must not exceed
+G, and the directory must hold the files the writer keeps, read from its rotation count and
+config. The equality with the count still holds while the writer deletes none. The end
+sequence waits for the tailers' W to reach G, read from the writer's telemetry after it stops,
+rather than the count, which a deleting writer leaves short.
+
+A deleted file the tailer hadn't read is lost, and `tail_in` counts that loss only as far as the
+last checkpoint knew: a restarted tailer counts the bytes the entry it can't use recorded as
+unread, `logit.input.bytes.dropped{reason="gone"}`, but not what the file gained after that
+checkpoint ([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md), "A file removed or rotated
+out of every pattern before `tail_in` read it to its end"). The ledger can't see such a loss in
+W − G, because G stands alone, so a retention guard FAILs `ledger.wire` for any SUT fault during
+which the writer rotated often enough to delete a file the tailer hadn't read: `max_files − 2`
+rotations in a stop, kill, restart, or `exit`, which close the tailer's files, and `max_files`
+in a pause, which keeps them open. Reading the loss from that counter instead would miss what a
+file gained after its last checkpoint, so `tail-rotate-delete` expects it at 0 beside the guard.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "6. The checks", has the rules.
 
 ## Amendment: a fan-out node's events are carried through its chain, and adjacent judged windows net at their boundary (2026-10-18)

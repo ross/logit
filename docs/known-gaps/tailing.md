@@ -51,19 +51,35 @@ Entry format and the other areas: [the known-gaps index](README.md).
   drop the task first, with no final flush and no final checkpoint. Nothing is lost: the restart
   resumes from the last interval checkpoint, which lands between passes even under a backlog, so
   it replays at most one `checkpoint_interval` or one 64 KiB chunk per file.
-- **A file removed or rotated out of every pattern loses its unread tail at a clean stop or a
-  crash**, whether or not a scan noticed first.
-  - After a clean stop, the checkpoint records its inode and offset, but the restart's scan never
-    finds the file, so the entry is never used.
-  - After a crash, the lines it had read but not yet flushed are gone too.
+- **A file removed or rotated out of every pattern before `tail_in` read it to its end, at a stop
+  or while `tail_in` is down, loses its unread tail, and the loss is counted only as far as the
+  last checkpoint knew.** The checkpoint records the file's inode, offset, and length, but the
+  restart's scan never finds the file. It drops the entry
+  (`crates/logit-inputs/src/tail/driver.rs`, `Tailer::prune_checkpoint_entries`) and counts the
+  bytes the entry recorded as unread as `logit.input.bytes.dropped{reason="gone"}`, with a
+  `file_gone` diagnostic, once a checkpoint write without the entry lands. The count is exact
+  only when no line was held or being dropped at the stop and a scan or a read to the end saw the
+  file's final size. Otherwise it isn't the loss:
+  - What the file gained after `tail_in` last saw its size isn't counted, so for a file still
+    being written the count is short.
+  - The count runs from the resume offset, not the read position, so it includes bytes read after
+    a held or dropping line's start: an oversize line's consumed prefix, already counted in
+    `logit.input.frames.dropped{reason="oversize"}`, and under `docker_in`, the other stream's
+    entries delivered after a held partial.
+  - After a kill, the count comes from the last interval checkpoint, not the process's last
+    read. It can include bytes the killed process had already delivered, and miss bytes written
+    after that checkpoint.
+  - A file created and removed wholly while `tail_in` was down isn't counted: no checkpoint
+    names it.
+  - A file whose inode a new file reused while `tail_in` was down isn't counted. The new file's
+    head doesn't match the entry, so its resume is rejected, counted
+    `logit.input.files.resume_rejected`, and the original's unread tail is lost uncounted.
 
-  The loss is uncounted: the restart's scan drops the unused entry
-  (`crates/logit-inputs/src/tail/driver.rs`, `Tailer::prune_checkpoint_entries`) with no counter
-  and no diagnostic, so nothing in the telemetry shows the lines never read. A pattern that also
-  matches the rotated name (`app.log*`) avoids the loss for a rename, but not for a removal,
-  such as a rotator's deletion of its oldest file while `tail_in` is down. See [ADR
+  A pattern that also matches the rotated name (`app.log*`) avoids the loss for a rename, but not
+  for a removal, such as a rotator's deletion of its oldest file while `tail_in` is down. See
+  [ADR
   `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md),
-  decision 6.
+  decision 6 and its 2026-10-18 amendment.
 - **A rotated file stays open, read to its end, for as long as a pattern matches its new
   name.** A scan that finds a tracked inode under another matched name rebinds it and keeps it
   `Active`, so under `app.log*` each rename of `file_out`'s or logrotate's cascade moves the open
@@ -81,7 +97,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     (`docs/plans/soak-harness.md`, "W18: a deleting rotation").
   - **Workaround:** bound the rotator's retention. A pattern that matches only the active name
     (`app.log`) closes each rotated file once it's read, but loses the file's unread tail at a
-    stop or a crash (the entry above).
+    stop or a crash, counted only as far as the last checkpoint knew (the entry above).
 - **Under a pattern that matches rotated names, `copytruncate` re-emits the whole file on every
   rotation, and `compress` tails `app.log.N.gz` as text.**
   - The copy `copytruncate` writes is a new inode, so `app.log*` reads it from `0`; a recorded run

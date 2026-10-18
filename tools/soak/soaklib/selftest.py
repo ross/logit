@@ -6758,8 +6758,8 @@ def _file_rules(root):
     expect([source["wire"] for source in delete.file_sources] == ["file"]
            and delete.max_duration is None and delete.duration == 4 * 3600
            and [e.name for e in delete.expectations] == [
-               "files-rotated", "no-checkpoint-errors", "files-open-bounded", "fds-bounded",
-               "files-open-plateau", "writer-deletes", "watches-bounded"],
+               "files-rotated", "no-gone-bytes", "no-checkpoint-errors", "files-open-bounded",
+               "fds-bounded", "files-open-plateau", "writer-deletes", "watches-bounded"],
            f"tail-rotate-delete is a file wire with no max_duration and its expects, got "
            f"{delete.file_sources} {delete.max_duration}")
     with tempfile.TemporaryDirectory() as tmp:

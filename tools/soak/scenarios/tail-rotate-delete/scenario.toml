@@ -100,6 +100,18 @@ min = 1
 # can be reused by the writer's next file, and the restarted tailer then counts
 # `resume_rejected` for the checkpoint entry whose head no longer matches, which is correct.
 
+# No file the tailer hadn't finished is deleted while it's down, so no restart finds a
+# checkpointed file gone with bytes it recorded as unread. The count misses what such a file
+# gained after its last checkpoint, which is why ledger.wire's retention guard stays.
+[[expect]]
+name = "no-gone-bytes"
+service = "logit"
+metric = "logit.input.bytes.dropped"
+component = "tail"
+window = "run"
+reduce = "delta"
+max = 0
+
 [[expect]]
 name = "no-checkpoint-errors"
 service = "logit"
