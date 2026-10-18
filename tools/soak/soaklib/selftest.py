@@ -5611,6 +5611,23 @@ def _http_ledger():
                and "busy 3 != batches.deferred 0, so a busy 503 isn't one deferred batch"
                in unmatched["ledger.intake"].detail,
                f"a busy 503 with no deferred batch FAILs, got {unmatched['ledger.intake']}")
+        # The identities hold in every life a kill didn't end, not only the final one.
+        earlier = results("http-busy-earlier", sut_edit=_at_offset(
+            "logit.input.requests", 50, 3, "in", attrs={"route": "write", "class": "busy"}))
+        expect(earlier["ledger.intake"].status == checks.FAIL
+               and earlier["ledger.intake"].detail.startswith(
+                   "life 0: busy 3 != batches.deferred 0, so a busy 503 isn't one deferred batch")
+               and "life 0: logit.input.requests{route=write} ok 200 + closed_consumer 0 == "
+               "batches.sent 200" in earlier["ledger.intake"].detail,
+               f"an earlier life's busy 503 with no deferred batch FAILs, got "
+               f"{earlier['ledger.intake']}")
+        killed_busy = results("http-busy-killed", sut_end="kill", sut_edit=_at_offset(
+            "logit.input.requests", 50, 3, "in", attrs={"route": "write", "class": "busy"}))
+        expect(killed_busy["ledger.intake"].status == checks.PASS
+               and "life 0 (killed): request identities not judged"
+               in killed_busy["ledger.intake"].detail,
+               f"a killed life's identities are reported unjudged, got "
+               f"{killed_busy['ledger.intake']}")
 
         # V above G less counted loss, plus the resend allowance, FAILs end to end.
         surplus = results("http-v-surplus", v1_short=-300)

@@ -2911,17 +2911,17 @@ def _http_intake(led, listener, life):
     """`[(problem, text)]`: an HTTP listener's own identities in `life` (`HTTP_LISTENERS`), each
     a problem when it doesn't hold. One request is one batch, so its `ok` and `closed_consumer`
     requests sum to its `batches.sent`, and a busy `503` sends nothing, so its `busy` requests
-    equal its `batches.deferred`. A listener with no request counter has neither; one whose kind
-    the SUT config doesn't give is reported."""
+    equal its `batches.deferred`. A listener with no request counter has neither, and one whose
+    kind the SUT config doesn't give is reported; either note's `problem` is None."""
     if listener not in led.http_kinds:
-        return ([(False, "an http listener whose kind the SUT config doesn't give: no request "
+        return ([(None, "an http listener whose kind the SUT config doesn't give: no request "
                          "identities")]
                 if any(source.get("sut_listener") == listener and source_wire(source) == HTTP_WIRE
                        for source in led.sources) else [])
     kind = led.http_kinds[listener]
     symbols = HTTP_LISTENERS[kind]
     if symbols.requests is None:
-        return [(False, f"{kind} counts no requests: W − D == E + B alone")]
+        return [(None, f"{kind} counts no requests: W − D == E + B alone")]
     out = []
     one = led.per[listener]
     ok = one["requests_ok"].get(life, 0)
@@ -2949,7 +2949,7 @@ def _route_text(symbols):
 
 def check_ledger_intake(data):
     """The final life's W − D == E + B per listener, and on an HTTP wire the listener's own
-    identities (`_http_intake`); each earlier life's residual (`Ledger.residual`), summed over
+    identities (`_http_intake`) in every life a kill didn't end; each earlier life's residual (`Ledger.residual`), summed over
     the listeners, in [0, R], a sanity bound. `ledger.egress` ties that residual to V. A life
     whose stderr shutdown lines disagree with telemetry's shutdown drops WARNs."""
     if _overlapped(data):
@@ -2974,12 +2974,21 @@ def check_ledger_intake(data):
             parts.insert(0, part + f", off by {_n(lhs - rhs)}")
         else:
             parts.append(part)
-        for problem, text in _http_intake(led, listener, life):
-            if problem:
-                status = FAIL
-                parts.insert(0, f"final life {life}{name}: {text}")
-            else:
-                parts.append(f"final life {life}{name}: {text}")
+        # An HTTP listener's identities hold in every life its telemetry ends cleanly, so each
+        # is judged; a killed life loses its last interval's counts, so it's reported unjudged.
+        for each in led.inn.lives:
+            label = f"{'final ' if each == life else ''}life {each}{name}"
+            found = _http_intake(led, listener, each)
+            if each in led.inn.killed and each != life:
+                if any(problem is not None for problem, _ in found):
+                    parts.append(f"{label} (killed): request identities not judged")
+                continue
+            for problem, text in found:
+                if problem:
+                    status = FAIL
+                    parts.insert(0, f"{label}: {text}")
+                elif problem is not None or each == life:
+                    parts.append(f"{label}: {text}")
     # Each earlier life's residual and its bound: with one SUT, `Ledger.residual` in [0, R];
     # across a hop, each side's own, the ingress SUT's up to its hop sink in [0, R] and the far
     # SUT's from `logit_in` on in [0, R_hop].

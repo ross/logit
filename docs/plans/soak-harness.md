@@ -932,7 +932,8 @@ in every inbox, `503` busy after 5 s with nothing taken and the batch in
 `logit.input.batches.deferred`, or `503` `closed_consumer`; it counts each request in
 `logit.input.requests{route, class}`. So per life its `ok` and `closed_consumer` write requests
 sum to its `logit.component.batches.sent`, and its `busy` ones equal `batches.deferred`, which
-`ledger.intake` holds it to. A busy `503` is a retry the producer makes, not loss. `otlp_in`
+`ledger.intake` holds it to in every life a kill didn't end; a SIGKILL loses the killed life's
+last interval of counts, so that life is reported unjudged. A busy `503` is a retry the producer makes, not loss. `otlp_in`
 counts no requests and never answers busy: a slow downstream holds the request, and a client
 that gives up leaves its batches to be delivered, so it has no identity beyond W − D == E + B.
 The writer's `logit.component.events.received` is reported beside G as the points attempted,
@@ -1128,9 +1129,10 @@ The rows:
 - `ledger.intake`: W − D == E + B, for the final life, per listener from W8b, one detail line
   each, a listener off its balance first. A TCP listener's F never reached W, so it's
   `ledger.wire`'s, and `drops` leaves it out. On an HTTP wire (W14) W − D == E + B holds by
-  construction, and `influxdb_in`'s final life must also show its `ok` and `closed_consumer`
-  write requests summing to its `batches.sent`, one request one batch, and its `busy` ones
-  equal to its `batches.deferred`; a listener whose kind the SUT config doesn't give is
+  construction, and every life of `influxdb_in` a kill didn't end must also show its `ok` and
+  `closed_consumer` write requests summing to its `batches.sent`, one request one batch, and
+  its `busy` ones equal to its `batches.deferred`, one line per life, a failed identity first;
+  a killed life is reported unjudged, and a listener whose kind the SUT config doesn't give is
   reported.
 - `ledger.edge`: E == A, a single-consumer edge, for the final life; from W8b ΣE == A, E summed
   over the listeners, which every source's events reach. A source's `sut_transforms` (W8b) are
@@ -4376,7 +4378,8 @@ weights each generator sink by its own input's batch:
 `logit:soak` built with `--no-cache` from `soak/w14`, whose diff touches no product code, over
 `origin/main`'s head (`9bfc434f`). The first run, at `3f1407ac`, delayed the SUT's egress 6 s;
 the second, at `a4051d77`, 11 s. The second is `perf/results/soak/20261018T025154Z`, exit 0,
-every row PASS or SKIP:
+every row PASS or SKIP, re-scored offline with `script/soak check` after `ledger.intake` came
+to judge `influxdb_in`'s identities in every life, which changed only that row:
 
 | Check | Status | Detail |
 |---|---|---|
@@ -4390,7 +4393,7 @@ every row PASS or SKIP:
 | `rss_slope` | PASS | generator PASS: MiB/h life 0 -0.5 (limit 64); 300s of 1020s after warmup judged (29%; WARN under 5%) \| logit PASS: MiB/h life 0 +54.4, life 3 +7.7 (limit 64); 285s of 1020s after warmup judged (28%; WARN under 5%) |
 | `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +8) \| logit PASS: warmup median 13 -> end 13 (limit +8) |
 | `ledger.wire` | PASS | G 1,745,200 (acknowledged of 2,172,600 attempted) = W 1,736,000 − X 0 + gap 9,200 (9,264 in reported windows, -92 in judged HTTP-affecting windows, 36 steady, -8 at the end; loss judged 99, each run at 0 or more, against limit 2,100); the generator's requests: 23 transport-error attempt(s), 9 answered 5xx and retried; the listener's busy 503s 9 and batches.deferred 9, a retry, not loss; its counted loss, not in G: 427,400 event(s) in 4,274 batch(es) (overflow_newest 4,274) |
-| `ledger.intake` | PASS | final life 3: W − D 477,900 vs E + B 477,900; final life 3: logit.input.requests{route=write} ok 4,779 + closed_consumer 0 == batches.sent 4,779; final life 3: busy 0 == batches.deferred 0; life 0: W − D − B − X − Ab 0 within [0, R]; life 1: W − D − B − X − Ab 0 within [0, R]; life 2: W − D − B − X − Ab 0 within [0, R] (R 132,000 = 0 + 67 x 1,000 + 65 x 1,000) |
+| `ledger.intake` | PASS | final life 3: W − D 477,900 vs E + B 477,900; life 0: logit.input.requests{route=write} ok 10,325 + closed_consumer 0 == batches.sent 10,325; life 0: busy 9 == batches.deferred 9; life 1: logit.input.requests{route=write} ok 1,177 + closed_consumer 0 == batches.sent 1,177; life 1: busy 0 == batches.deferred 0; life 2 (killed): request identities not judged; final life 3: logit.input.requests{route=write} ok 4,779 + closed_consumer 0 == batches.sent 4,779; final life 3: busy 0 == batches.deferred 0; life 0: W − D − B − X − Ab 0 within [0, R]; life 1: W − D − B − X − Ab 0 within [0, R]; life 2: W − D − B − X − Ab 0 within [0, R] (R 132,000 = 0 + 67 x 1,000 + 65 x 1,000) |
 | `ledger.edge` | PASS | final life 3: E[influx] 477,900 == T_in[count] 477,900 (into count); T_in[count] 477,900 == T_out[count] 477,900 (count forwards every event); Σ(sent into aggregate) 477,900 == A 477,900 (listeners to aggregate); A_sent 47,400 == S_in[victoria_metrics] 47,400 (aggregate to victoria_metrics) |
 | `ledger.script` | SKIP | no [ledger] sut_script |
 | `ledger.aggregate` | PASS | final life 3: Ab 477,900 == A 477,900 (every event absorbed) |
@@ -4431,8 +4434,10 @@ every row PASS or SKIP:
   second, so the killed life's W misses points the generator saw acknowledged. The same
   unexported interval shows in `ledger.egress` as V 9,000 above the killed life's Ab, inside
   its band.
-- **`influxdb_in`'s request identities held in every life**: `ok` write requests equal to
-  `batches.sent` (4,779 in the final life), with no `closed_consumer` answer in either run.
+- **`influxdb_in`'s request identities held in every life a kill didn't end**: `ok` write
+  requests equal to `batches.sent` (10,325, 1,177, and 4,779 in lives 0, 1, and 3), and the
+  backend stop's 9 busy `503`s equal to life 0's 9 `batches.deferred`, with no
+  `closed_consumer` answer in either run. The killed life 2 is reported unjudged.
 - 30% loss on the SUT's egress and 10% on the generator's made no transport error: TCP
   retransmitted inside the writer's timeout.
 - `ledger.summary`'s end-to-end bound held: V 1,745,000 against G 1,745,200 plus a resend
