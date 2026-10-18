@@ -535,13 +535,16 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   config path into `compose.env` under `scenario.config_env(service)`:
   `SOAK_GENERATOR_CONFIG` for `generator`, `SOAK_GENERATOR_LINES_CONFIG` for
   `generator-lines`. An override's generator mounts its own variable at `/config.yaml`.
-- `wire`, optional (W11a), is `udp` (the default), `tcp`, or `file`: what the source's lines
-  cross into the SUT, which picks the ledger's symbols for it (§6). `load()` reads the SUT
-  config and checks the source's `sut_listener` against it: a component of a kind and
-  `transport:` the ledger has a wire for (`scenario.LISTENER_WIRES`: `statsd_in` and `syslog_in`
-  UDP unless `transport: tcp`, `lines_in` and `graphite_in` TCP unless `transport: udp`,
-  `collectd_in` UDP, `tail_in` and `docker_in` file), whose wire is the source's. A listener the
-  config lacks, a kind or transport with no wire (a Unix socket), and a mismatch are refused.
+- `wire`, optional (W11a), is `udp` (the default), `tcp`, `file`, or `http` (W14): what the
+  source's lines cross into the SUT, which picks the ledger's symbols for it (§6). `load()`
+  reads the SUT config and checks the source's `sut_listener` against it: a component of a kind
+  and `transport:` the ledger has a wire for (`scenario.LISTENER_WIRES`: `statsd_in` and
+  `syslog_in` UDP unless `transport: tcp`, `lines_in` and `graphite_in` TCP unless
+  `transport: udp`, `collectd_in` UDP, `tail_in` and `docker_in` file, `influxdb_in` and
+  `otlp_in` HTTP), whose wire is the source's. A listener the config lacks, a kind or transport
+  with no wire (a Unix socket), and a mismatch are refused. It also reads the generator's
+  config: a file wire's `generator_sink` must be a `file_out`, an HTTP wire's an `influxdb_out`
+  or an `otlp_out`, and any other wire's neither.
 - `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct, none
   of them a listener, and none on another source's list. Each must send every event it
   receives or count it in `logit.component.events.discarded`, which `ledger.edge` judges hop by
@@ -728,8 +731,8 @@ A root qdisc on a container's default-route interface shapes that container's eg
 
 | `on =` | What it impairs |
 |---|---|
-| `logit` | the SUT's remote-write to VictoriaMetrics, not the statsd arriving at it; on a TCP source (W11a), the ACKs it sends the generator |
-| a `generator` | its own UDP into the SUT, and no other generator's; on a TCP source, segments TCP retransmits |
+| `logit` | the SUT's remote-write to VictoriaMetrics, not the statsd arriving at it; on a TCP source (W11a), the ACKs it sends the generator; on an HTTP source (W14), its answers |
+| a `generator` | its own UDP into the SUT, and no other generator's; on a TCP source, segments TCP retransmits; on an HTTP source, its requests |
 | a further SUT service (W10a) | its own sends, never UDP ingress, which only `logit` takes |
 | a `backend` | its responses |
 
@@ -920,6 +923,25 @@ W is `logit.input.lines{component=<tail_in>}`, K and D are 0, and F is the taile
 and `truncated` (a held partial discarded when its file was truncated). `kill_band` and `recovery`
 read the wire's W; `_end_to_end` and `ledger.summary` also subtract F.
 
+On an HTTP wire (W14) G is the writer's `logit.component.events.delivered`, the points of the
+batches the listener answered with a success, and W is the listener's
+`logit.component.events.sent`: neither `influxdb_in` nor `otlp_in` counts points before it sends
+them, so W is also E, and K, D, F, and B are 0, since a request the listener refuses decodes to
+nothing it sends. The wire compares G with W − X: a batch refused with `503` because every
+consumer had closed is in `events.sent` and its events in X, and the client still holds it.
+`checks.HTTP_LISTENERS` is the per-listener table of what else each counts. `influxdb_in`
+decodes a body whole into one batch, sends it under one deadline, and answers `204` once it is
+in every inbox, `503` busy after 5 s with nothing taken and the batch in
+`logit.input.batches.deferred`, or `503` `closed_consumer`; it counts each request in
+`logit.input.requests{route, class}`. So per life its `ok` and `closed_consumer` write requests
+sum to its `logit.component.batches.sent`, and its `busy` ones equal `batches.deferred`, which
+`ledger.intake` holds it to in every life a kill didn't end; a SIGKILL loses the killed life's
+last interval of counts, so that life is reported unjudged. A busy `503` is a retry the producer makes, not loss. `otlp_in`
+counts no requests and never answers busy: a slow downstream holds the request, and a client
+that gives up leaves its batches to be delivered, so it has no identity beyond W − D == E + B.
+The writer's `logit.component.events.received` is reported beside G as the points attempted,
+and its `logit.output.requests{class="5xx"}` as the answers it retried.
+
 From W7b the ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`,
 `identity.sink`, `recovery`, `ledger.edge`'s sink edges, `ledger.egress`, `ledger.windows`,
 `ledger.replay`, and `ledger.sent`) keeps its id, judges each sink, reports one line per sink,
@@ -1066,6 +1088,26 @@ The rows:
   names the generator's counted loss by reason (`overflow_newest`, `ambiguous_at_most_once`)
   beside the gap; none of it is in G.
 
+  On an HTTP wire (W14) the row judges G − (W − X), and every lifecycle fault, `partition`,
+  and netem of the ingress SUT or of a generator, and a `mark` or `exit` on the ingress SUT,
+  affects the wire: netem on either end can hold a request or its answer past the writer's
+  timeout. A backend stop doesn't: under `overflow: block` it backs up into busy `503`s, which
+  take nothing. G counts a point only once the listener answered it `204`, after its batch was
+  in every inbox and W had counted it, so no window can lose a point G counted, and only a
+  `kill` or an `exit` is reported (`checks.HTTP_REPORTED_ACTIONS`): either can lose up to one
+  `internal` interval of the SUT's unexported W. A graceful `stop` or `restart` answers what it
+  took before it exits and is judged. Every judged window's surplus, W − X above G, may not
+  exceed one generator batch per attempt the writer counted
+  `logit.output.requests{class="network_error"}` inside it, plus one per edge. The bound comes
+  from the writers: `influxdb_out` sends one batch per request with one request in flight
+  (`Output::window` is 1; its module doc, "Destination resolution"), as `otlp_out` does for one
+  signal, and after a transport error, `Ambiguous` in its response-class table, resends the
+  same batch under `at_least_once`. The listener may have taken that batch before its answer was
+  lost, so each such attempt leaves at most one batch in W that G never counts. A `503` is
+  `Ambiguous` too, but the listener took nothing (busy) or counted what it refused in X
+  (`closed_consumer`), so it allows none. `network_error` also counts a refused dial, which
+  takes nothing, so the allowance is an upper bound, loose across a SUT stop.
+
   On a file wire (W11b) only a lifecycle fault or an `exit` of the ingress SUT affects the wire.
   A tailer reads behind its writer, so a drain interval's gap is lag, not loss: every run of
   drain intervals is reported, and the row judges the run's W + F − G against a **replay band**
@@ -1096,7 +1138,12 @@ The rows:
   still bounds the surplus.
 - `ledger.intake`: W − D == E + B, for the final life, per listener from W8b, one detail line
   each, a listener off its balance first. A TCP listener's F never reached W, so it's
-  `ledger.wire`'s, and `drops` leaves it out.
+  `ledger.wire`'s, and `drops` leaves it out. On an HTTP wire (W14) W − D == E + B holds by
+  construction, and every life of `influxdb_in` a kill didn't end must also show its `ok` and
+  `closed_consumer` write requests summing to its `batches.sent`, one request one batch, and
+  its `busy` ones equal to its `batches.deferred`, one line per life, a failed identity first;
+  a killed life is reported unjudged, and a listener whose kind the SUT config doesn't give is
+  reported.
 - `ledger.edge`: E == A, a single-consumer edge, for the final life; from W8b ΣE == A, E summed
   over the listeners, which every source's events reach. A source's `sut_transforms` (W8b) are
   judged hop by hop: its listener's E == T_in[first node], T_in − T_disc == T_out at every node
@@ -1221,6 +1268,9 @@ The rows:
   counted and the row judges the rest. A `rejected` or `disk_corrupt` drop in the final life's
   group FAILs the row as it FAILs `ledger.egress`, named beside its term, unless a cued step
   explains it (W9a).
+  With an HTTP source (W14) the row also runs the end-to-end bound: V over the run may not
+  exceed G less every counted loss, with the HTTP listener's X left out, since its client
+  resends it, plus one generator batch per transport-error attempt.
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at each sink's own
   telemetry; see "External targets". A Kafka target's sink is judged the same way, and so is a
   `datadog` stand-in's (W9b), with what a `respond` step cued excused; a `remote_write` or
@@ -1887,8 +1937,8 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
 
 Every shipped scenario drives UDP datagrams into one `aggregate`: `statsd_in`, and from W8b in
 `fanin` `lines_in` beside it, on §3's base stack plus any services its `compose` override adds;
-from W11a `tcp-ingress` drives TCP into `statsd_in` instead, and from W11b `tail-rotate` tails
-files.
+from W11a `tcp-ingress` drives TCP into `statsd_in` instead, from W11b `tail-rotate` tails
+files, and from W14 `http-ingress` drives HTTP into `influxdb_in`.
 `[ledger]` names one `[[ledger.source]]` per generator and its listener, and one
 `[[ledger.sink]]` per sink after `aggregate`. The scenarios below widen
 that, grouped by cost; the Workstreams table gives the landing order. Each states what it
@@ -2163,21 +2213,28 @@ where it needs them, and a small check extension.
       `line_protocol` holds k times the events.
     - Rows: `ledger.edge` with the fan-out term, then the rows as written. Needs: `fan_out` per
       `sut_transforms` node, with self-test fixtures, and W14's `http` wire.
-14. **HTTP ingress, starting with `influxdb_in` (41ccfbc4).** Generator `influxdb_out` → SUT
-    `influxdb_in` → `aggregate` → `prometheus_out`. Proves that a listener answering `503` when
-    busy loses nothing it doesn't count, across the SUT's own faults. A `wire = "http"` source
-    will have its own symbols: W per point, from the listener's `events.sent`, since
-    `influxdb_in` counts requests, not points; a `503` and `logit.input.batches.deferred` are a
-    retry the producer makes, not loss; and a client's resend of a request the SUT took before
-    the answer was lost is a surplus, given an allowance as a TCP window's is. Faults: a backend
-    stop under `overflow: block`, which backs up into `503`s; netem on the SUT's egress, which
-    carries the responses; and a SUT `stop`, `restart`, and `kill`. Rows: `ledger.wire` with
-    the surplus allowance, `ledger.intake`, and `[[expect]]` on deferred batches during the
-    stop. W14 will also give the wire `otlp_in`'s rows, which item 13's generator needs: its
-    counters aren't `influxdb_in`'s, so it gets symbols of its own, with W per log record.
-    `datadog_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver come later.
-    Needs: the `http` wire and its listener table rows for both listeners, and self-test
-    fixtures.
+14. **HTTP ingress, starting with `influxdb_in` (built in W14).** Generator `influxdb_out` →
+    SUT `influxdb_in` → `kv_metrics` → `aggregate` → `prometheus_out`. Proves that a listener
+    answering `503` when busy loses nothing it doesn't count, across the SUT's own faults. A
+    `wire = "http"` source has its own symbols (§6): G the writer's `events.delivered`, the
+    points the listener answered `204` for; W per point, from the listener's `events.sent`,
+    since `influxdb_in` counts requests, not points; X, a batch refused because no consumer was
+    open, taken off W, since the client resends it. A `503` and
+    `logit.input.batches.deferred` are a retry the producer makes, not loss, and a client's
+    resend of a request the SUT took before the answer was lost is a surplus, allowed one
+    batch per transport-error attempt, as a TCP window's is per ambiguous drop. `otlp_in` has
+    rows of its own in `checks.HTTP_LISTENERS`, with W per log record (one `Event` per
+    `LogRecord`) and no request identity, for W13b's generator; no scenario runs it yet.
+    Built as `http-ingress`: each point carries a string field alone, so the SUT decodes no
+    gauge, which V can't count, and `kv_metrics` counts one per point. Faults: netem delaying
+    the SUT's egress past `influxdb_out`'s 10 s timeout, which carries the answers, and
+    dropping 30% of it; 10% loss on the generator's; a backend stop under `overflow: block`
+    with a 500 ms window, which backs up into `503`s; and a SUT `stop`, `restart`, and `kill`.
+    Rows: `ledger.wire` with the surplus allowance, `ledger.intake` with `influxdb_in`'s request
+    identities, `ledger.summary`'s end-to-end bound, and `[[expect]]` on deferred batches and
+    the generator's `5xx` answers during the backend stop and its transport errors under the
+    delay. `datadog_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver come
+    later.
 15. **Multi-destination `route` and `route_signals` (81b0befa, 4b86ccc7).** Today
     `scenario.py`'s `_route_problems` refuses a list-valued `routes:` and any `route_signals`
     under `split = "route"`, because one event can reach several sinks and their V no longer
@@ -2371,7 +2428,10 @@ that items 3, 7, and 11 need.
   scenario. Its generator sends over OTLP/HTTP, so it lands after W14's `http` wire and its
   `otlp_in` rows.
 - **W14**: item 14, the `http` wire, with rows for `influxdb_in`, which its scenario runs, and
-  for `otlp_in`, which W13b's generator needs.
+  for `otlp_in`, which W13b's generator needs; the generator sink's kind checked at load, the
+  wire's fault predicates and judgments, `influxdb_in`'s request identities in
+  `ledger.intake`, the end-to-end bound in `ledger.summary`, self-test fixtures for each rule,
+  and the `http-ingress` scenario.
 - **W15**: item 15, a third `split` mode for multi-destination `route` and `route_signals`.
 - **W16**: item 17: the stand-in's `influxdb` shape (the query split off the path, a `204`
   with no body), a stdlib line-protocol parser and its vectors, V as one stored point per
@@ -4540,6 +4600,78 @@ no ERROR line, the throttled `stale_event` lines being WARN; and `drops` found n
 
 `tail-rotate`, `perf/results/soak/20261018T025421Z`, passed every row under the changed ledger:
 its nodes discard nothing, so ΣT_disc is 0 in every life and each row reads as in W11b's run.
+
+### W14: HTTP ingress (2026-10-17)
+
+`http-ingress` ran twice on the development host (`trout`, 24 cores, Linux 7.2.9), against
+`logit:soak` built with `--no-cache` from `soak/w14`, whose diff touches no product code, over
+`origin/main`'s head (`9bfc434f`). The first run, at `3f1407ac`, delayed the SUT's egress 6 s;
+the second, at `a4051d77`, 11 s. The second is `perf/results/soak/20261018T025154Z`, exit 0,
+every row PASS or SKIP, re-scored offline with `script/soak check` after `ledger.intake` came
+to judge `influxdb_in`'s identities in every life, which changed only that row:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 14 apply/revert action(s) returned 0; 3 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 4 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (1 kill(s)) |
+| `restarts` | PASS | 4 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 8 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 78 readiness sample(s) read ok outside fault windows; 3 start(s) or unpause(s) ready in time, slowest ready 0.2s |
+| `progress` | PASS | 9 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 9 of 9, 9 freshness sample(s); 240s of 1020s after warmup judged (24%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 -0.5 (limit 64); 300s of 1020s after warmup judged (29%; WARN under 5%) \| logit PASS: MiB/h life 0 +54.4, life 3 +7.7 (limit 64); 285s of 1020s after warmup judged (28%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +8) \| logit PASS: warmup median 13 -> end 13 (limit +8) |
+| `ledger.wire` | PASS | G 1,745,200 (acknowledged of 2,172,600 attempted) = W 1,736,000 − X 0 + gap 9,200 (9,264 in reported windows, -92 in judged HTTP-affecting windows, 36 steady, -8 at the end; loss judged 99, each run at 0 or more, against limit 2,100); the generator's requests: 23 transport-error attempt(s), 9 answered 5xx and retried; the listener's busy 503s 9 and batches.deferred 9, a retry, not loss; its counted loss, not in G: 427,400 event(s) in 4,274 batch(es) (overflow_newest 4,274) |
+| `ledger.intake` | PASS | final life 3: W − D 477,900 vs E + B 477,900; life 0: logit.input.requests{route=write} ok 10,325 + closed_consumer 0 == batches.sent 10,325; life 0: busy 9 == batches.deferred 9; life 1: logit.input.requests{route=write} ok 1,177 + closed_consumer 0 == batches.sent 1,177; life 1: busy 0 == batches.deferred 0; life 2 (killed): request identities not judged; final life 3: logit.input.requests{route=write} ok 4,779 + closed_consumer 0 == batches.sent 4,779; final life 3: busy 0 == batches.deferred 0; life 0: W − D − B − X − Ab 0 within [0, R]; life 1: W − D − B − X − Ab 0 within [0, R]; life 2: W − D − B − X − Ab 0 within [0, R] (R 132,000 = 0 + 67 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 3: E[influx] 477,900 == T_in[count] 477,900 (into count); T_in[count] 477,900 == T_out[count] 477,900 (count forwards every event); Σ(sent into aggregate) 477,900 == A 477,900 (listeners to aggregate); A_sent 47,400 == S_in[victoria_metrics] 47,400 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 3: Ab 477,900 == A 477,900 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 1: W − D − B − X − V 0 = residual 0 + Ab − V 0, ok; life 2 (killed): Ab 107,900 − V[victoria_metrics] 116,900 = -9,000, within band (band [-10,000, 11,000]: ingest 2,000/s over the last drain interval; below, the residual 0 plus one 4.99996s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 0.5s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − Ab 0 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 3 (final): Ab 477,900 − V[victoria_metrics] 477,900 = 0, ok (split copy; R 132,000 = 0 + 67 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | PASS | victoria_metrics: life 3's first drain replayed 0 vs killed life 2's last-drain buffer.batches 1 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 3: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K + F) 9,200 over the run, F 0 counted; ledger.wire judges the rest; end to end over the run, G 1,745,200 less counted loss 0 plus a resend allowance 2,300: victoria_metrics: V 1,745,000 <= G − counted + resent 1,747,500 |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 3 at +1080s: victoria_metrics: received 473 vs delivered 472 + dropped 0 + buffer.batches 1, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 7 of 7 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served` | SKIP | the scenario has no probe step |
+| `expect.listener-defers` | PASS | delta of logit.input.batches.deferred{component=influx} on logit, through c0s4: c0s4 (+480s, +615s]: 9 (over 27 drain(s)), want >= 1 |
+| `expect.generator-retries-503s` | PASS | delta of logit.output.requests{class=5xx, component=influx} on generator, through c0s4: c0s4 (+480s, +615s]: 9 (over 27 drain(s)), want >= 1 |
+| `expect.generator-resends` | PASS | delta of logit.output.requests{class=network_error, component=influx} on generator, through c0s1: c0s1 (+60s, +166s]: 5 (over 21 drain(s)), want >= 1 |
+| `expect.sink-never-drops` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics} on logit, through c0s4: c0s4 (+480s, +615s]: 0 (over 27 drain(s)), want <= 0 |
+
+- **The first run, `20261018T023228Z`, FAILed only `expect.generator-resends`, with nothing
+  lost.** A 6 s delay holds `influxdb_out`'s answers under its 10 s timeout on the keep-alive
+  connection it reuses, so no attempt ended in a transport error. At 11 s the request in flight
+  timed out after the SUT took it, and the generator's next attempts each opened a connection
+  whose handshake timed out first: 5 transport errors, a surplus of 102 points, one batch,
+  against an allowance of 700. Every other row of the first run read as the second's.
+- **A busy `503` lost nothing.** The 90 s VictoriaMetrics stop backed the sink's two-batch
+  queue, its inbox, `aggregate`'s, and `count`'s up to the listener, which answered 9 busy
+  `503`s, each one `batches.deferred` (8 and 8 in the first run). The generator counted 9
+  `5xx` answers and resent each batch. A backend stop doesn't affect the wire, so the stop sat
+  in a steady run, which gapped by −2 points, and the sink dropped nothing.
+- **A graceful stop and a restart lost nothing, and their surplus stayed inside the
+  allowance.** The stop's window gapped by 38 points and the restart's by −27, against
+  allowances of 1,000 and 400, which its refused dials, counted `network_error`, inflate. The
+  listener answered what it took before it exited, so G never exceeded W.
+- **A kill's window shows 9,268 points it can't split** (9,185 in the first run): a SIGKILL
+  loses up to one `internal` interval of the SUT's counters, about 10,000 points at 2,000 a
+  second, so the killed life's W misses points the generator saw acknowledged. The same
+  unexported interval shows in `ledger.egress` as V 9,000 above the killed life's Ab, inside
+  its band.
+- **`influxdb_in`'s request identities held in every life a kill didn't end**: `ok` write
+  requests equal to `batches.sent` (10,325, 1,177, and 4,779 in lives 0, 1, and 3), and the
+  backend stop's 9 busy `503`s equal to life 0's 9 `batches.deferred`, with no
+  `closed_consumer` answer in either run. The killed life 2 is reported unjudged.
+- 30% loss on the SUT's egress and 10% on the generator's made no transport error: TCP
+  retransmitted inside the writer's timeout.
+- `ledger.summary`'s end-to-end bound held: V 1,745,000 against G 1,745,200 plus a resend
+  allowance of 2,300.
+- No product finding.
 
 ### W17: Kafka SASL re-authentication (2026-10-18)
 

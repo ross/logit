@@ -184,6 +184,10 @@ pub(crate) trait Authenticator: Send + Sync {
     /// Who this authenticates as, for error messages, such as `user "alice"`. Never a secret.
     fn principal(&self) -> String;
 
+    /// Attaches the sink's diagnostics, for a mechanism that reports something it recovers
+    /// from, such as `OAUTHBEARER`'s failed token refresh.
+    fn set_diagnostics(&self, _diag: &logit_core::Diagnostics) {}
+
     /// Starts one connection's exchange with the broker at `host`. An error without a fault
     /// class of its own is `Clean`.
     async fn start(&self, host: &str) -> anyhow::Result<Box<dyn Session>>;

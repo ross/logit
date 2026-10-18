@@ -262,6 +262,9 @@ impl KafkaOutput {
 
     /// Attaches the diagnostics handle, also threaded, gated, into the encoder's OTLP mapping.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        if let Some(sasl) = &self.producer.template().sasl {
+            sasl.set_diagnostics(&diag);
+        }
         self.diag = diag;
         self.encoder =
             self.encoder.with_counters(&self.telemetry, &self.diag, self.accounting.gate());

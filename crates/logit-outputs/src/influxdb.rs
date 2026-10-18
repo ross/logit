@@ -719,6 +719,47 @@ mod tests {
         assert_eq!(class_of(influx_error("404 Not Found", body)).await.0, Fault::Refused);
     }
 
+    /// With `bucket:` and `org:` configured nothing is carried, so a `404` whose body names
+    /// neither value holds the queue, as the status-only table reads it.
+    #[tokio::test]
+    async fn a_404_with_an_unrecognized_body_and_nothing_carried_is_refused() {
+        let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        assert_eq!(class_of(response).await.0, Fault::Refused, "empty body");
+        let body = r#"{"code":"not found","message":"resource not found"}"#;
+        let fault = class_of(influx_error("404 Not Found", body)).await.0;
+        assert_eq!(fault, Fault::Refused, "a body that names neither value");
+    }
+
+    /// A status the route doesn't document reads as `classify_status` does, and a redirect is
+    /// `Rejected` because the client follows none.
+    #[tokio::test]
+    async fn an_undocumented_status_and_a_redirect_are_rejected() {
+        let request_timeout = "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\
+                               Connection: close\r\n\r\n";
+        let redirect = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/api/v2/write\r\n\
+                        Content-Length: 0\r\nConnection: close\r\n\r\n";
+        assert_eq!(class_of(request_timeout).await.0, Fault::Rejected, "408");
+        assert_eq!(class_of(redirect).await.0, Fault::Rejected, "302");
+    }
+
+    /// A name that fails to resolve never reaches a server, so it is `Clean`. The `.invalid` TLD
+    /// (RFC 6761) never resolves; the timeout bounds a resolver that is slow to say so.
+    #[tokio::test]
+    async fn a_dns_failure_is_classified_as_a_clean_fault() {
+        let mut output = InfluxDbOutput::new(
+            "http://logit-test.invalid:8086".to_string(),
+            Organization::Fixed("org".into()),
+            Destination::Fixed("bucket".into()),
+            "token".into(),
+        )
+        .with_timeout(Duration::from_secs(5));
+        let err = output
+            .send(&one_metric_batch())
+            .await
+            .expect_err("an unresolvable host should fail send");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
+    }
+
     #[tokio::test]
     async fn a_413_too_large_is_rejected() {
         let body = r#"{"code":"request too large","message":"unable to read data: points batch is too large"}"#;

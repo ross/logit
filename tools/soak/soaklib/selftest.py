@@ -96,7 +96,12 @@ framer's counted drop as wire loss kept out of `drops`, the same lines uncounted
 generator netem judged on TCP but not on UDP, a SUT netem judged, a judged window's surplus
 against its ambiguous drops, a partition judged or reported by its address, `recovery` and a
 killed life's band reading the frames, and a source naming `wire = "udp"` scoring as one
-naming none.
+naming none. On an HTTP wire it covers the generator sink's kind checked at load either way,
+the fault predicates and judgments, and runs into `influxdb_in` and `otlp_in`: G from the
+writer's acknowledged events, a stop judged and a kill reported, a judged window's surplus
+against its transport-error attempts and not its `5xx` answers, a `closed_consumer` refusal
+taken off W, `influxdb_in`'s request and deferral identities in `ledger.intake` each broken,
+the end-to-end bound in `ledger.summary`, and a listener kind the checks can't read.
 
 For two SUT services, it covers a further SUT declared by its own `[configs]` key and the
 `[[ledger.hop]]` joining it to `logit` (the chain they make, their config variable, and each
@@ -5365,7 +5370,7 @@ def _tcp_rules(root):
                 return err.problems
 
     _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(wire="sctp")),
-             "ledger.source 1: `wire` must be one of udp, tcp, file", "an unknown wire")
+             "ledger.source 1: `wire` must be one of udp, tcp, file, http", "an unknown wire")
     _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(wire="tcp")),
              "ledger.source 1: `wire` is tcp, but `sut_listener` 'statsd' is a statsd_in with "
              "no transport:, a udp listener", "a TCP source on a UDP listener")
@@ -5514,7 +5519,8 @@ def _tcp_rules(root):
     run.act("apply", scenario.Step("c0s1", 0, 0, "mark", "logit", "", 0, 1))
     record = run.timeline[-1]
     expect(record.get("affects_udp_ingress") is True and record.get("affects_tcp_ingress") is True
-           and record.get("affects_file_ingress") is False,
+           and record.get("affects_file_ingress") is False
+           and record.get("affects_http_ingress") is True,
            f"the driver records every wire's flag, got {record}")
 
     tcp = scenario.load(root / "scenarios" / "tcp-ingress" / "scenario.toml")
@@ -5522,6 +5528,389 @@ def _tcp_rules(root):
            and [step.action for step in tcp.steps] == [
                "netem", "netem", "netem", "pause", "stop", "kill", "partition", "pause"],
            f"tcp-ingress names a TCP source and its eight faults, got {tcp.sources}")
+
+
+HTTP_SUT_CONFIGS = {
+    "influxdb_in": "components:\n  in: { type: influxdb_in, bind: 0.0.0.0:8086 }\n",
+    "otlp_in": "components:\n  in:\n    type: otlp_in\n    bind: 0.0.0.0:4318\n",
+}
+
+
+def _http_run(tmp, name, kind="influxdb_in", sut_edit=None, gen_edit=None, stop_dropped=True,
+              timeline_extra=(), **kwargs):
+    """`_ledger_run`'s two-life run directory with its one source on an HTTP wire into a `kind`
+    listener `in`, whose config the run's `configs/` holds: W is the listener's
+    `events.sent`, so no datagram is counted and life 0 reads nothing it doesn't send; under
+    `influxdb_in` each drain's 10 batches are 10 `ok` write requests; G is the generator sink's
+    `events.delivered`, its `events.received` beside it, and during the stop over `STOP` the
+    sink has nothing acknowledged and, with `stop_dropped`, counts its overflow dropped; the stop
+    is HTTP-affecting, as the driver records it. `sut_edit(record)` and `gen_edit(record)` may
+    change or drop (return None) each SUT and generator record, or return a list of them."""
+    kwargs.setdefault("life0_extra", 0)
+    kwargs.setdefault("v0_extra", 0)
+    run_dir = _ledger_run(tmp, name, shutdown_drops=0, timeline_extra=timeline_extra, **kwargs)
+
+    def emit(out, record, edit):
+        record = edit(record) if edit else record
+        out += [json.dumps(one) for one in (record if isinstance(record, list) else [record])
+                if one is not None]
+
+    out = []
+    for line in (run_dir / "logs" / "logit.stdout").read_text().splitlines():
+        record = json.loads(line)
+        metric = record["metrics"][0]
+        if metric["name"] == "logit.input.datagrams":
+            continue
+        records = [record]
+        if (metric["name"] == "logit.component.events.sent"
+                and record["attributes"]["component"] == "in"):
+            batches = metric["value"] // 100
+            records.append(json.loads(_line(record["timestamp"], "logit.component.batches.sent",
+                                            "sum", batches, component="in")))
+            if kind == "influxdb_in":
+                records.append(json.loads(_line(
+                    record["timestamp"], "logit.input.requests", "sum", batches, component="in",
+                    attrs={"route": "write", "class": "ok"})))
+        for one in records:
+            emit(out, one, sut_edit)
+    (run_dir / "logs" / "logit.stdout").write_text("\n".join(out) + "\n")
+    gen = []
+    stopped = (_stamp(T0 + STOP[0]), _stamp(T0 + STOP[1]))
+    for line in (run_dir / "logs" / "generator.stdout").read_text().splitlines():
+        record = json.loads(line)
+        metric = record["metrics"][0]
+        if metric["name"] == "logit.output.datagrams":
+            continue
+        records = [record]
+        if metric["name"] == "logit.output.messages":
+            metric["name"] = "logit.component.events.delivered"
+            records.append(json.loads(_line(record["timestamp"],
+                                            "logit.component.events.received", "sum",
+                                            metric["value"], component="out")))
+            if stopped[0] < record["timestamp"] <= stopped[1]:
+                if stop_dropped:
+                    records.append(json.loads(_line(
+                        record["timestamp"], "logit.component.batches.dropped", "sum",
+                        metric["value"] // 100, component="out",
+                        attrs={"reason": "overflow_newest"})))
+                metric["value"] = 0
+        for one in records:
+            emit(gen, one, gen_edit)
+    (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
+    timeline = []
+    for line in (run_dir / "timeline.jsonl").read_text().splitlines():
+        record = json.loads(line)
+        if record.get("step") == "c0s1":
+            record["affects_http_ingress"] = True
+        timeline.append(json.dumps(record))
+    (run_dir / "timeline.jsonl").write_text("\n".join(timeline) + "\n")
+    (run_dir / "configs").mkdir(exist_ok=True)
+    (run_dir / "configs" / "sut.yaml").write_text(HTTP_SUT_CONFIGS[kind])
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    resolved["configs"] = {"sut": "sut.yaml"}
+    resolved["ledger"]["source"] = [{**resolved["ledger"]["source"][0], "wire": "http"}]
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    return run_dir
+
+
+def _http_fault(step, action, on, start, end):
+    """An apply and a revert of `action` on `on` that affects the HTTP wire alone."""
+    flags = {"affects_udp_ingress": False, "affects_tcp_ingress": False,
+             "affects_file_ingress": False, "affects_http_ingress": True}
+    return (_action("apply", step, action, on, start, **flags),
+            _action("revert", step, action, on, end - 1, end, **flags))
+
+
+def _at_offset(name, offset, value, component, attrs=None, add=False):
+    """A `sut_edit` or `gen_edit` that appends a `name` point of `value` under `component` to
+    the drain at +`offset`, or with `add` adds `value` to the existing `name` point there."""
+    stamp = _stamp(T0 + offset)
+
+    def edit(record):
+        metric = record["metrics"][0]
+        if record["timestamp"] != stamp or record["attributes"].get("component") != component:
+            return record
+        if add and metric["name"] == name:
+            metric["value"] += value
+            return record
+        if not add and metric["name"] in ("logit.component.events.sent",
+                                          "logit.component.events.delivered"):
+            return [record, json.loads(_line(stamp, name, "sum", value, component=component,
+                                             attrs=attrs))]
+        return record
+    return edit
+
+
+def _chain(*edits):
+    """One record edit applying `edits` in order, each to every record the last returned."""
+    def edit(record):
+        records = [record]
+        for one in edits:
+            out = []
+            for each in records:
+                got = one(each)
+                out += [r for r in (got if isinstance(got, list) else [got]) if r is not None]
+            records = out
+        return records
+    return edit
+
+
+def _http_ledger():
+    """The ledger on an HTTP source: G from the writer's acknowledged events, W from the
+    listener's `events.sent` less X, a stop judged, a judged window's surplus against the
+    writer's transport-error attempts, `influxdb_in`'s request and deferral identities in
+    `ledger.intake`, `otlp_in`'s rows with none, and the end-to-end bound in
+    `ledger.summary`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            return {r.id: r for r in checks.run_all(_http_run(tmp, name, **kwargs))}
+
+        clean = results("http-clean")
+        for row in ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.egress",
+                    "ledger.summary", "recovery", "drops"):
+            expect(clean[row].status == checks.PASS,
+                   f"{row} PASSes the balanced HTTP fixture, got {clean[row]}")
+        wire = clean["ledger.wire"].detail
+        expect(wire.startswith("G 54,000 (acknowledged of 60,000 attempted) = W 54,000 − X 0 + "
+                               "gap 0 (0 in reported windows, 0 in judged HTTP-affecting")
+               and "overflow_newest 60" in wire,
+               f"an HTTP source's G is acknowledged events, and its counted overflow stays out "
+               f"of it, got {wire}")
+        expect(any("judged (c0s1 stop on logit)" in line for line in clean["ledger.wire"].lines),
+               f"a graceful stop is judged on HTTP, got {clean['ledger.wire'].lines}")
+        intake = clean["ledger.intake"].detail
+        expect("logit.input.requests{route=write} ok 340 + closed_consumer 0 == batches.sent "
+               "340" in intake and "busy 0 == batches.deferred 0" in intake,
+               f"ledger.intake shows influxdb_in's identities on the final life, got {intake}")
+        expect("plus a resend allowance 0: sink: V 54,000 <= G − counted + resent 54,000"
+               in clean["ledger.summary"].detail,
+               f"ledger.summary bounds V end to end on HTTP, got {clean['ledger.summary'].detail}")
+
+        # An acknowledged point the listener never sent: loss inside the judged stop FAILs.
+        acked = results("http-stop-loss", gen_edit=_at_offset(
+            "logit.component.events.delivered", 110, 1000, "out", add=True))
+        expect(acked["ledger.wire"].status == checks.FAIL
+               and acked["ledger.wire"].detail.startswith("1,000 lost outside reported HTTP "
+                                                          "windows"),
+               f"G above W inside a stop FAILs on HTTP, got {acked['ledger.wire']}")
+        # A kill's window is reported, never judged.
+        killed = results("http-kill-loss", sut_end="kill",
+                         gen_edit=_at_offset("logit.component.events.delivered", 110, 1000, "out",
+                                             add=True))
+        expect(any("fault (c0s1 kill on logit)" in line for line in killed["ledger.wire"].lines)
+               and killed["ledger.wire"].status == checks.PASS,
+               f"a kill's window is reported on HTTP, got {killed['ledger.wire']}")
+
+        # A judged window's surplus: each transport-error attempt allows one batch.
+        late = _http_fault("x1", "netem", "logit", 200, 210)
+        over = results("http-surplus", steady_surplus=350, timeline_extra=late)
+        expect(over["ledger.wire"].status == checks.FAIL
+               and "W − X exceeds G by 350, over the 200 its 0 transport-error attempt(s) and 2 "
+               "edge(s) allow" in over["ledger.wire"].detail,
+               f"a surplus past a judged HTTP window's edges FAILs, got {over['ledger.wire']}")
+        resent = _at_offset("logit.output.requests", 230, 2, "out",
+                            attrs={"class": "network_error"})
+        allowed = results("http-surplus-resent", steady_surplus=350, timeline_extra=late,
+                          gen_edit=resent)
+        expect(allowed["ledger.wire"].status == checks.PASS
+               and "surplus allowed 400 (2 transport-error attempt(s) + 2 edge(s), x one "
+               "100-line batch)" in "\n".join(allowed["ledger.wire"].lines)
+               and "2 transport-error attempt(s)" in allowed["ledger.wire"].detail,
+               f"two transport-error attempts allow two batches, got {allowed['ledger.wire']}")
+        # A `503` isn't a transport error: it allows nothing.
+        answered = _at_offset("logit.output.requests", 230, 2, "out", attrs={"class": "5xx"})
+        refused = results("http-surplus-5xx", steady_surplus=350, timeline_extra=late,
+                          gen_edit=answered)
+        expect(refused["ledger.wire"].status == checks.FAIL
+               and "2 answered 5xx and retried" in refused["ledger.wire"].detail,
+               f"a 503 allows no surplus, got {refused['ledger.wire']}")
+
+        # A batch refused with `503` closed_consumer is in W and X, not G: the wire nets it.
+        refused_sent = _chain(
+            _at_offset("logit.component.events.sent", 250, 300, "in", add=True),
+            _at_offset("logit.component.events.dropped", 250, 300, "in",
+                       attrs={"reason": "closed_consumer"}),
+            _at_offset("logit.component.batches.sent", 250, 3, "in", add=True),
+            _at_offset("logit.input.requests", 250, 3, "in",
+                       attrs={"route": "write", "class": "closed_consumer"}))
+        netted = results("http-closed-consumer", sut_edit=refused_sent, timeline_extra=late)
+        expect(netted["ledger.wire"].status == checks.PASS
+               and "W 54,300 − X 300 + gap 0" in netted["ledger.wire"].detail,
+               f"an HTTP listener's X leaves the wire's W, got {netted['ledger.wire']}")
+        expect("ok 340 + closed_consumer 3 == batches.sent 343" in netted["ledger.intake"].detail,
+               f"a closed_consumer request is one batch sent, got {netted['ledger.intake']}")
+        expect("G − counted + resent 54,000" in netted["ledger.summary"].detail,
+               f"an HTTP listener's X isn't counted loss end to end, got "
+               f"{netted['ledger.summary'].detail}")
+        uncounted = results("http-closed-consumer-uncounted", timeline_extra=late,
+                            sut_edit=_chain(
+                                _at_offset("logit.component.events.sent", 250, 300, "in",
+                                           add=True),
+                                _at_offset("logit.component.batches.sent", 250, 3, "in",
+                                           add=True)))
+        expect(uncounted["ledger.wire"].status == checks.FAIL
+               and uncounted["ledger.intake"].status == checks.FAIL
+               and "ok 340 + closed_consumer 0 != batches.sent 343, so a request isn't one batch"
+               in uncounted["ledger.intake"].detail,
+               f"a batch sent with no request answered FAILs both rows, got "
+               f"{uncounted['ledger.wire']}, {uncounted['ledger.intake']}")
+
+        # A busy `503` is one deferred batch, and is no loss.
+        busy = results("http-busy", sut_edit=_chain(
+            _at_offset("logit.input.requests", 250, 3, "in",
+                       attrs={"route": "write", "class": "busy"}),
+            _at_offset("logit.input.batches.deferred", 250, 3, "in")))
+        expect(busy["ledger.intake"].status == checks.PASS
+               and "busy 3 == batches.deferred 3" in busy["ledger.intake"].detail
+               and "busy 503s 3 and batches.deferred 3, a retry, not loss"
+               in busy["ledger.wire"].detail
+               and busy["drops"].status == checks.PASS,
+               f"busy 503s are deferred batches, not loss, got {busy['ledger.intake']}, "
+               f"{busy['ledger.wire']}")
+        unmatched = results("http-busy-unmatched", sut_edit=_at_offset(
+            "logit.input.requests", 250, 3, "in", attrs={"route": "write", "class": "busy"}))
+        expect(unmatched["ledger.intake"].status == checks.FAIL
+               and "busy 3 != batches.deferred 0, so a busy 503 isn't one deferred batch"
+               in unmatched["ledger.intake"].detail,
+               f"a busy 503 with no deferred batch FAILs, got {unmatched['ledger.intake']}")
+        # The identities hold in every life a kill didn't end, not only the final one.
+        earlier = results("http-busy-earlier", sut_edit=_at_offset(
+            "logit.input.requests", 50, 3, "in", attrs={"route": "write", "class": "busy"}))
+        expect(earlier["ledger.intake"].status == checks.FAIL
+               and earlier["ledger.intake"].detail.startswith(
+                   "life 0: busy 3 != batches.deferred 0, so a busy 503 isn't one deferred batch")
+               and "life 0: logit.input.requests{route=write} ok 200 + closed_consumer 0 == "
+               "batches.sent 200" in earlier["ledger.intake"].detail,
+               f"an earlier life's busy 503 with no deferred batch FAILs, got "
+               f"{earlier['ledger.intake']}")
+        killed_busy = results("http-busy-killed", sut_end="kill", sut_edit=_at_offset(
+            "logit.input.requests", 50, 3, "in", attrs={"route": "write", "class": "busy"}))
+        expect(killed_busy["ledger.intake"].status == checks.PASS
+               and "life 0 (killed): request identities not judged"
+               in killed_busy["ledger.intake"].detail,
+               f"a killed life's identities are reported unjudged, got "
+               f"{killed_busy['ledger.intake']}")
+
+        # V above G less counted loss, plus the resend allowance, FAILs end to end.
+        surplus = results("http-v-surplus", v1_short=-300)
+        expect(surplus["ledger.summary"].status == checks.FAIL
+               and "V 54,300 > G − counted + resent 54,000, a surplus of 300"
+               in surplus["ledger.summary"].detail,
+               f"V over G end to end FAILs on HTTP, got {surplus['ledger.summary']}")
+        covered = results("http-v-resent", v1_short=-300, gen_edit=_at_offset(
+            "logit.output.requests", 230, 3, "out", attrs={"class": "network_error"}))
+        expect("V 54,300 <= G − counted + resent 54,300" in covered["ledger.summary"].detail,
+               f"three transport-error attempts cover 300 end to end, got "
+               f"{covered['ledger.summary'].detail}")
+
+        # `otlp_in` counts no requests: its intake has no identity of its own, and its wire
+        # still FAILs uncounted loss.
+        otlp = results("http-otlp", kind="otlp_in")
+        expect(otlp["ledger.wire"].status == checks.PASS
+               and otlp["ledger.intake"].status == checks.PASS
+               and "otlp_in counts no requests: W − D == E + B alone"
+               in otlp["ledger.intake"].detail,
+               f"otlp_in's rows PASS its balanced fixture, got {otlp['ledger.wire']}, "
+               f"{otlp['ledger.intake']}")
+        otlp_lost = results("http-otlp-lost", kind="otlp_in", gen_edit=_at_offset(
+            "logit.component.events.delivered", 60, 1000, "out", add=True))
+        expect(otlp_lost["ledger.wire"].status == checks.FAIL
+               and otlp_lost["ledger.wire"].detail.startswith("1,000 lost outside reported HTTP"),
+               f"acknowledged points otlp_in never sent FAIL, got {otlp_lost['ledger.wire']}")
+        otlp_over = results("http-otlp-surplus", kind="otlp_in", steady_surplus=350,
+                            timeline_extra=late)
+        expect(otlp_over["ledger.wire"].status == checks.FAIL,
+               f"a surplus past otlp_in's allowance FAILs, got {otlp_over['ledger.wire']}")
+
+        # A config the checks can't read leaves the listener's kind unknown, reported.
+        blind_dir = _http_run(tmp, "http-no-config")
+        (blind_dir / "configs" / "sut.yaml").unlink()
+        blind = {r.id: r for r in checks.run_all(blind_dir)}
+        expect("an http listener whose kind the SUT config doesn't give"
+               in blind["ledger.intake"].detail,
+               f"an unknown HTTP listener kind is reported, got {blind['ledger.intake']}")
+
+
+def _http_rules(root):
+    """The `http` wire's load-time cross-checks against the SUT and generator configs, its fault
+    predicates and judgments, and the shipped http-ingress scenario."""
+    path, raw = _base(root)
+
+    def with_configs(sut, generator, wire, listener="statsd", sink="statsd"):
+        """`load()`'s problems for statsd-vm with its SUT and generator configs replaced and its
+        source's `wire`, `sut_listener`, and `generator_sink` set."""
+        with tempfile.TemporaryDirectory() as tmp:
+            changed = copy.deepcopy(raw)
+            texts = {"sut": sut, "generator": generator}
+            for key, name in changed["configs"].items():
+                (Path(tmp) / name).write_text(texts[key])
+            changed["ledger"]["source"][0].update(sut_listener=listener, generator_sink=sink)
+            if wire is not None:
+                changed["ledger"]["source"][0]["wire"] = wire
+            try:
+                scenario.from_dict(changed, Path(tmp) / "scenario.toml")
+                return []
+            except scenario.ScenarioError as err:
+                return err.problems
+
+    influx_in = "components:\n  influx: { type: influxdb_in, bind: 0.0.0.0:8086 }\n"
+    otlp_in = "components:\n  otlp:\n    type: otlp_in\n    protocol: grpc\n"
+    influx_out = ("components:\n  load: { type: generate_in }\n  influx:\n    type: influxdb_out\n"
+                  "    sources: [load]\n")
+    otlp_out = "components:\n  otlp: { type: otlp_out, endpoint: http://logit:4318 }\n"
+    statsd_out = "components:\n  statsd: { type: statsd_out, endpoint: logit:8125 }\n"
+    statsd_in = "components:\n  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }\n"
+    loaded = with_configs(influx_in, influx_out, "http", "influx", "influx")
+    expect(loaded == [], f"an http source from influxdb_out into influxdb_in loads, got {loaded}")
+    loaded = with_configs(otlp_in, otlp_out, "http", "otlp", "otlp")
+    expect(loaded == [], f"an http source from otlp_out into otlp_in loads, got {loaded}")
+    problems = with_configs(influx_in, influx_out, None, "influx", "influx")
+    expect(any("`wire` is udp, but `sut_listener` 'influx' is a influxdb_in with no transport:, "
+               "an http listener" in p for p in problems),
+           f"influxdb_in with no wire named is refused, got {problems}")
+    problems = with_configs(influx_in, statsd_out, "http", "influx", "statsd")
+    expect(problems == ["ledger.source 1: an http wire's `generator_sink` must be one of "
+                        "influxdb_out, otlp_out, and 'statsd' is a statsd_out"],
+           f"an http wire's writer must be an HTTP sink, got {problems}")
+    problems = with_configs(statsd_in, influx_out, None, "statsd", "influx")
+    expect(problems == ["ledger.source 1: `generator_sink` 'influx' is an influxdb_out, which "
+                        "only an http wire reads"],
+           f"an HTTP sink on a UDP wire is refused, got {problems}")
+    problems = with_configs(statsd_in, statsd_out, "http")
+    expect(any("`wire` is http, but `sut_listener` 'statsd' is a statsd_in with no transport:, "
+               "a udp listener" in p for p in problems),
+           f"an http source on a UDP listener is refused, got {problems}")
+
+    roles = scenario.BASE_ROLES
+    for action, on, http in (
+            ("netem", "generator", True), ("netem", "logit", True),
+            ("stop", "logit", True), ("restart", "logit", True), ("kill", "logit", True),
+            ("partition", "generator", True), ("pause", "generator", True),
+            ("stop", "victoria-metrics", False), ("netem", "victoria-metrics", False),
+            ("mark", "logit", True), ("respond", "standin", False),
+            ("signal", "logit", False)):
+        step = scenario.Step("c0s1", 0, 0, action, on, "", 0, 1)
+        got = faults.ACTIONS[action].affects("http", step, roles)
+        expect(got == http, f"{action} on {on} affects http {got}, expected {http}")
+    for action, how in (("kill", "fault"), ("exit", "fault"), ("stop", "judged"),
+                        ("restart", "judged"), ("netem", "judged"), ("partition", "judged"),
+                        ("pause", "judged")):
+        fault = checks.Fault("x", action, "logit", 0, 1, affects_udp_ingress=True,
+                             affects_egress=False, affects_http_ingress=True)
+        expect(checks.wire_judgment(fault, "http") == how,
+               f"a {action} on logit is {checks.wire_judgment(fault, 'http')} on HTTP, "
+               f"expected {how}")
+
+    http = scenario.load(root / "scenarios" / "http-ingress" / "scenario.toml")
+    expect(http.sources[0].get("wire") == "http"
+           and http.sources[0].get("sut_transforms") == ["count"]
+           and [step.action for step in http.steps] == [
+               "netem", "netem", "netem", "stop", "stop", "restart", "kill"]
+           and [e.name for e in http.expectations] == [
+               "listener-defers", "generator-retries-503s", "generator-resends",
+               "sink-never-drops"],
+           f"http-ingress names an HTTP source, its seven faults, and its expects, got "
+           f"{http.sources}")
 
 
 def _as_file_wire(run_dir, w_minus_g=0, counted=True, line_bytes=95, files_open=None):
@@ -9331,7 +9720,7 @@ def run(root, quiet=False):
                      _report, _expected_event_rules, _exit_driver, _ready_words, _exit_watchdog,
                      _script_ledger, _sink_ledger, _roles, _sink_rules, _driver_roles,
                      _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
-                     _file_ledger, _file_rules,
+                     _http_ledger, _http_rules, _file_ledger, _file_rules,
                      _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _per_service, _slope_edges,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
@@ -9347,7 +9736,7 @@ def run(root, quiet=False):
                               _stalled,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
-                              _fanin_driver, _tcp_rules, _file_rules, _two_sut_rules,
+                              _fanin_driver, _tcp_rules, _http_rules, _file_rules, _two_sut_rules,
                               _two_sut_driver,
                               _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_driver, _datadog_codec, _datadog_server,

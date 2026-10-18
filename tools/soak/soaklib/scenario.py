@@ -212,13 +212,18 @@ SOURCE_KEYS = {"service", "generator_input", "generator_sink", "sut_listener"}
 LISTED_SOURCE_KEYS = ("generator_input", "generator_sink")
 OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire"}
 # The wires a source's lines can cross into the SUT, each with its own ledger symbols
-# (checks.py's `WIRES`): datagrams, a TCP stream of LF-terminated lines, or a file the SUT tails.
-WIRES = ("udp", "tcp", "file")
+# (checks.py's `WIRES`): datagrams, a TCP stream of LF-terminated lines, a file the SUT tails,
+# or HTTP requests a listener answers.
+WIRES = ("udp", "tcp", "file", "http")
 DEFAULT_WIRE = "udp"
 FILE_WIRE = "file"
-# A file wire's writer: the only generator sink whose G is `events.delivered` (checks.py's
-# `WIRES`), since it counts no `output.messages`.
+HTTP_WIRE = "http"
+# A file wire's writer: a generator sink whose G is `events.delivered` (checks.py's `WIRES`),
+# since it counts no `output.messages`.
 FILE_WRITER_KIND = "file_out"
+# An HTTP wire's writers, whose G is also `events.delivered`: the events of the batches the
+# listener answered with a success.
+HTTP_WRITER_KINDS = ("influxdb_out", "otlp_out")
 # Each listener kind the ledger can follow: the wire it takes with no `transport:`, and the
 # wire each `transport:` value it accepts gives. A kind or transport missing here has no wire.
 LISTENER_WIRES = {
@@ -229,6 +234,8 @@ LISTENER_WIRES = {
     "collectd_in": ("udp", {}),
     "tail_in": ("file", {}),
     "docker_in": ("file", {}),
+    "influxdb_in": ("http", {}),
+    "otlp_in": ("http", {}),
 }
 # `[overlap]`: two or more SUT services, `instances`, each running the whole pipeline on one
 # shared UDP port under `reuse_port`, in the network namespace of the `holder` service, each
@@ -1182,7 +1189,8 @@ def _wire_problems(ledger, sut_text):
                             "the ledger has no wire for")
         elif declared in WIRES and wire != declared:
             problems.append(f"{where}: `wire` is {declared}, but `sut_listener` {listener!r} "
-                            f"is a {kind} {over}, a {wire} listener")
+                            f"is a {kind} {over}, {'an' if wire == HTTP_WIRE else 'a'} {wire} "
+                            "listener")
     return problems
 
 
@@ -1201,8 +1209,8 @@ def source_pairs(source):
 
 def _writer_problems(ledger, configs, directory):
     """What a source's `generator_sink` breaks against its generator's config: on a `file`
-    wire it must be a `file_out`, and on any other wire it must not be, because the two read G
-    from different counters."""
+    wire it must be a `file_out` and on an `http` wire one of `HTTP_WRITER_KINDS`, and on any
+    other wire it must be neither, because each reads G from its own counter."""
     sources = ledger.get("source")
     if not isinstance(sources, list) or not isinstance(configs, dict):
         return []
@@ -1234,6 +1242,13 @@ def _writer_problems(ledger, configs, directory):
             elif wire != FILE_WIRE and kind == FILE_WRITER_KIND:
                 problems.append(f"{where}: `generator_sink` {sink!r} is a {FILE_WRITER_KIND}, "
                                 "which only a file wire reads")
+            elif wire == HTTP_WIRE and kind not in HTTP_WRITER_KINDS:
+                problems.append(f"{where}: an http wire's `generator_sink` must be one of "
+                                f"{', '.join(HTTP_WRITER_KINDS)}, and {sink!r} is "
+                                + (f"a {kind}" if kind else "no component of its config"))
+            elif wire != HTTP_WIRE and kind in HTTP_WRITER_KINDS:
+                problems.append(f"{where}: `generator_sink` {sink!r} is an {kind}, which only "
+                                "an http wire reads")
     return problems
 
 

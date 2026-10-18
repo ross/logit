@@ -37,8 +37,9 @@ The ledger also follows each `[[ledger.source]]`, a generator and the SUT listen
 over the source's `wire` (`WIRES`), which names the counters each symbol reads.
 `ledger.wire` reports one line per source, each judged against the fault windows that affect
 its wire, of its own generator and of every service that isn't a generator (`affects_source`);
-on TCP only a window that can reset the connection is reported, and every other one is judged
-(`wire_judgment`). `ledger.intake` judges each listener's final life alone. From the edge into
+on TCP only a window that can reset the connection is reported, on HTTP only one that can lose
+the SUT's unexported counts, and every other one is judged (`wire_judgment`). `ledger.intake`
+judges each listener's final life alone. From the edge into
 `aggregate` on, every row sums the listeners' symbols, since their events merge there; a
 source's `sut_transforms` are judged hop by hop in `ledger.edge`, each node's discards
 (`events.discarded`, T_disc) counted there, and their sum leaves the residual, the stopped-life
@@ -91,11 +92,11 @@ from pathlib import Path
 
 from . import collect, faults, standin, telemetry, topic, vm
 from .scenario import (DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET, GENERATOR_ROLE,
-                       KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS, RUN_WINDOW,
-                       SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET, SUT_CONFIG_ENV,
-                       SUT_CONFIG_KEY, SUT_SERVICE, component_blocks, config_env,
-                       parse_duration, source_ids, source_pairs, stdio_shared_targets,
-                       tls_reload_polls)
+                       HTTP_WIRE, KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS,
+                       RUN_WINDOW, SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET,
+                       SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE, component_blocks, config_env,
+                       listener_wire, parse_duration, source_ids, source_pairs,
+                       stdio_shared_targets, tls_reload_polls)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
@@ -213,10 +214,11 @@ class Fault:
     answer: object = None
     fault_class: object = None
     series_errors: object = None
-    # Whether the fault can lose lines on a `tcp` or a `file` source's wire, as
+    # Whether the fault can lose lines on a `tcp`, a `file`, or an `http` source's wire, as
     # `affects_udp_ingress` is for a `udp` one (faults.py's `INGRESS_KEYS`).
     affects_tcp_ingress: bool = False
     affects_file_ingress: bool = False
+    affects_http_ingress: bool = False
     # A partition's `{network: IP address}` before its disconnect and after its reconnect.
     ips: object = None
     ips_after: object = None
@@ -399,6 +401,7 @@ class RunData:
             fault_class=apply.get("class"), series_errors=apply.get("series_errors"),
             affects_tcp_ingress=apply.get("affects_tcp_ingress", False),
             affects_file_ingress=apply.get("affects_file_ingress", False),
+            affects_http_ingress=apply.get("affects_http_ingress", False),
             ips=apply.get("ips"), ips_after=(revert or {}).get("ips_after"),
             signal=apply.get("signal"), path=apply.get("path"), to=apply.get("to"),
             applied=apply.get("finished_at"),
@@ -1324,7 +1327,10 @@ class Wire:
 # `undecodable`, counted after `input.frames`, is in B (docs/design/internal-telemetry.md,
 # "statsd_in"). A UDP listener counts the datagram first, so a `lines_in` line over
 # `max_line_bytes` is in W and its `oversize` drop is B. A file wire's G is the writer's
-# `file_out`, which counts no `output.messages`.
+# `file_out`, which counts no `output.messages`. An HTTP wire's G is the writer's points in the
+# batches its listener answered with a success, and W the listener's `events.sent`, since
+# neither listener counts points before it sends them (`HTTP_LISTENERS`); a request the
+# listener refuses decodes to nothing W counts, so the wire has no F and no B.
 WIRES = {
     "udp": Wire("UDP", "logit.output.messages", "logit.input.datagrams",
                 "logit.input.kernel.dropped", (), ("undecodable", "oversize")),
@@ -1332,6 +1338,34 @@ WIRES = {
                 ("truncated", "oversize", "drained", "malformed"), ("undecodable",)),
     "file": Wire("file", "logit.component.events.delivered", "logit.input.lines", None,
                  ("oversize", "truncated"), ()),
+    "http": Wire("HTTP", "logit.component.events.delivered", "logit.component.events.sent",
+                 None, (), ()),
+}
+
+
+@dataclass(frozen=True)
+class HttpListener:
+    """One HTTP listener kind's symbols beside its wire's: `requests`, its per-request counter,
+    whose `class` tags `ok`, `busy`, and `closed_consumer` split the answers on its write route
+    `route`, or None for a listener that counts no requests; and `deferred`, the batches a busy
+    `503` left with the client, or None for a listener that never answers busy."""
+
+    requests: object
+    route: object
+    deferred: object
+
+
+# `influxdb_in` decodes a body whole into one batch and sends it under one deadline, answering
+# `204` once it is in every inbox, `503` busy with nothing taken, and `503` `closed_consumer` with
+# the batch counted sent and its events dropped (crates/logit-inputs/src/influxdb.rs,
+# "Responses"; docs/design/internal-telemetry.md, "influxdb_in"). So per life its `ok` and
+# `closed_consumer` requests sum to its `batches.sent`, and its `busy` requests equal its
+# `batches.deferred`. `otlp_in` counts no requests and never answers busy: a slow downstream
+# holds the request, and a client that gives up leaves its batches to be delivered
+# (crates/logit-inputs/src/otlp.rs).
+HTTP_LISTENERS = {
+    "influxdb_in": HttpListener("logit.input.requests", "write", "logit.input.batches.deferred"),
+    "otlp_in": HttpListener(None, None, None),
 }
 # A file wire's tailer reads at most this much of one file per read, so a kill can replay up to
 # one read's lines per file past its last checkpoint (docs/known-gaps/tailing.md, "The tail
@@ -1353,6 +1387,18 @@ TAIL_REPLAY_FILES = 2
 # and the generator never counted.
 TCP_REPORTED_ACTIONS = ("stop", "kill", "restart", "exit")
 AMBIGUOUS_DROP = "ambiguous_at_most_once"
+# On an HTTP wire G counts only points the listener answered with a success, which it does once
+# their batch is in every inbox, after W counted it, so no window can lose a point G counted. A
+# SIGKILL or an exit loses up to one `internal` interval of the SUT's unexported W, so those
+# windows are reported. Every other window is judged with a surplus allowed of one generator
+# batch per attempt that ended in a transport error (`HTTP_AMBIGUOUS_CLASS`): the writer sends
+# one batch per request with one request in flight (crates/logit-outputs/src/influxdb.rs,
+# "Response classes"; crates/logit-outputs/src/otlp.rs) and resends the whole batch after such
+# an attempt, so each can leave at most one batch the listener took that G never counts. The
+# class also counts a refused dial, which takes nothing, so the allowance is an upper bound. A
+# `503` takes nothing or counts what it refused as X (`HTTP_LISTENERS`), and adds none.
+HTTP_REPORTED_ACTIONS = ("kill", "exit")
+HTTP_AMBIGUOUS_CLASS = "network_error"
 
 
 def source_wire(source):
@@ -1480,6 +1526,7 @@ class Ledger:
             self.problems.append(f"SUT services {data.sut_in} and {data.sut_out} have no "
                                  "[[ledger.hop]] joining them")
         self.killed = []
+        self.http_kinds = {}
         if any(view.tel is None or not view.tel.drains for view in self.views.values()):
             self.lives = []
             return
@@ -1487,6 +1534,16 @@ class Ledger:
                                                     self.out.final)
 
         sut = self.ingress
+        # `{listener: kind}` for each listener on an HTTP wire, from the SUT config, which
+        # `load()` held to a kind `HTTP_LISTENERS` names; one it can't read has none.
+        config = self._sut_config_text(self.inn.service)
+        self.http_kinds = {}
+        for source in self.sources:
+            listener = source.get("sut_listener")
+            if source_wire(source) == HTTP_WIRE:
+                kind = listener_wire(config, listener)[1]
+                if kind in HTTP_LISTENERS:
+                    self.http_kinds[listener] = kind
         self.per = {}
         for listener in self.listeners:
             one = self.per[listener] = {}
@@ -1518,6 +1575,20 @@ class Ledger:
             # Events the listener counted as sent and then dropped, every reason: a batch sent
             # into the inbox of a node that has failed is `closed_consumer`.
             one["X"] = sut.counter_by_life("logit.component.events.dropped", component=listener)
+            # On an HTTP wire, the listener kind's own symbols (`HTTP_LISTENERS`): its batches
+            # sent, its write route's requests by class, and the batches it deferred.
+            kind = self.http_kinds.get(listener)
+            if kind is not None:
+                symbols = HTTP_LISTENERS[kind]
+                one["batches"] = sut.counter_by_life("logit.component.batches.sent",
+                                                     component=listener)
+                for cls in ("ok", "busy", "closed_consumer"):
+                    one[f"requests_{cls}"] = (
+                        sut.counter_by_life(symbols.requests, component=listener,
+                                            route=symbols.route, **{"class": cls})
+                        if symbols.requests else {})
+                one["deferred"] = (sut.counter_by_life(symbols.deferred, component=listener)
+                                   if symbols.deferred else {})
         for symbol in LISTENER_SYMBOLS:
             setattr(self, symbol, _summed({listener: one[symbol]
                                            for listener, one in self.per.items()}))
@@ -1686,6 +1757,12 @@ class Ledger:
                 "batch": batch,
                 "sink_batch": {sink: input_batch.get(load, 0.0)
                                for load, sink in source_pairs(source)},
+                # An HTTP writer's events received, and its requests answered `5xx`, which it
+                # retries.
+                "attempted": total("logit.component.events.received", sinks),
+                "answered_5xx": sum(sum(gen.counter_by_life(
+                    "logit.output.requests", component=sink, **{"class": "5xx"}).values())
+                    for sink in sinks),
             }
         self.G = sum(stats["G"] for stats in self.gen_stats.values())
 
@@ -2465,8 +2542,11 @@ def affects_source(data, fault, service, wire=DEFAULT_WIRE):
 def wire_judgment(fault, wire):
     """How `ledger.wire` takes the window of a `fault` that affects a `wire` source: `fault`,
     reported and never judged, or `judged`, judged as steady state is with a surplus allowed
-    (`TCP_REPORTED_ACTIONS`). Every UDP and file window is reported. A partition is reported
-    unless its record shows the container kept its address."""
+    (`TCP_REPORTED_ACTIONS`, `HTTP_REPORTED_ACTIONS`). Every UDP and file window is reported.
+    On TCP a partition is reported unless its record shows the container kept its address; on
+    HTTP it is judged, since G counts only what the listener answered."""
+    if wire == HTTP_WIRE:
+        return "fault" if fault.action in HTTP_REPORTED_ACTIONS else "judged"
     if wire != "tcp" or fault.action in TCP_REPORTED_ACTIONS:
         return "fault"
     if fault.action == "partition" and (fault.ips is None or fault.ips != fault.ips_after):
@@ -2531,6 +2611,12 @@ def _wire_buckets(data, led, source, combined=None):
                                                    component=listener, reason=reason):
                 counts[ts] = counts.get(ts, 0) + value
                 counted[ts] = counted.get(ts, 0) + value
+        if wire_name == HTTP_WIRE:
+            # A batch the listener sent and answered `503` for, every consumer having closed,
+            # is in W and its events in X, and the client still holds it, so G never counts it.
+            for ts, value, _ in sut.counter_points("logit.component.events.dropped",
+                                                   component=listener):
+                counts[ts] = counts.get(ts, 0) - value
         drains = sorted(set(sut.drains) | set(counts))
         sut_starts = led.inn.life_starts
         previous = sut_starts[0] if sut_starts else (drains[0] if drains else 0)
@@ -2566,8 +2652,10 @@ def check_ledger_wire(data):
     loss is by design and every affecting window is reported; on TCP F is the listener's counted
     framer drops, only a process end or a partition that moved an address is reported, and
     every other affecting window is judged with a surplus allowed for its ambiguous drops
-    (`wire_judgment`). See `_wire_buckets` for the tolerance. One detail per source; the worst
-    status wins."""
+    (`wire_judgment`); on HTTP G counts acknowledged points against W − X, only a kill or an
+    exit is reported, and every other affecting window is judged with a surplus allowed for its
+    transport-error attempts (`HTTP_REPORTED_ACTIONS`). See `_wire_buckets` for the tolerance.
+    One detail per source; the worst status wins."""
     instances = None
     if _overlapped(data):
         leds = _instance_ledgers(data)
@@ -2599,12 +2687,22 @@ def check_ledger_wire(data):
 
 
 def _ambiguous_drops(led, source):
-    """`[(timestamp, count)]` of a source's generator sink's `ambiguous_at_most_once` batch
-    drops. Each leaves up to one generator batch of whole lines in W that G doesn't count, so
-    `ledger.wire` and `_end_to_end` allow that much surplus per drop on a TCP wire."""
+    """`[(timestamp, count)]` of what can leave one generator batch in W that G doesn't count,
+    so `ledger.wire` and `_end_to_end` allow that much surplus per count: on a TCP wire the
+    generator sink's `ambiguous_at_most_once` batch drops, each a write that failed partway, and
+    on an HTTP wire its attempts that ended in a transport error (`HTTP_AMBIGUOUS_CLASS`), each
+    a request the listener may have taken before the answer was lost. Empty on any other
+    wire."""
+    wire = source_wire(source)
+    if wire == "tcp":
+        name, attrs = "logit.component.batches.dropped", {"reason": AMBIGUOUS_DROP}
+    elif wire == HTTP_WIRE:
+        name, attrs = "logit.output.requests", {"class": HTTP_AMBIGUOUS_CLASS}
+    else:
+        return []
     return sorted((ts, v) for sink in source_ids(source, "generator_sink")
                   for ts, v, _ in led.gens[source.get("service")].counter_points(
-                      "logit.component.batches.dropped", component=sink, reason=AMBIGUOUS_DROP))
+                      name, component=sink, **attrs))
 
 
 def _wire_one(data, led, source, instances=None):
@@ -2624,7 +2722,10 @@ def _wire_one(data, led, source, instances=None):
     K = sum(sum(one.per[listener]["K"].values()) for one in readers)
     F = sum(sum(one.per[listener]["F"].values()) for one in readers)
     G = stats["G"]
-    gap = G - W - K - F
+    http = wire_name == HTTP_WIRE
+    # On HTTP, the events the listener refused after W counted them (`_wire_buckets`).
+    X = sum(sum(one.per[listener]["X"].values()) for one in readers) if http else 0
+    gap = G - W - K - F + X
     if udp and G != stats["G_datagrams"]:
         status = FAIL
         lines.append(f"precondition: generator output.messages {_n(G)} != output.datagrams "
@@ -2659,6 +2760,8 @@ def _wire_one(data, led, source, instances=None):
         span = f"[{data.offset(start)}, {data.offset(end)}] {kind} ({label})"
         if udp:
             lines.append(f"{span}: G {_n(round(g))}, W+K {_n(wk)}, gap {_n(round(g - wk))}")
+        elif http:
+            lines.append(f"{span}: G {_n(round(g))}, W − X {_n(wk)}, gap {_n(round(g - wk))}")
         else:
             lines.append(f"{span}: G {_n(round(g))}, W {_n(wk - f)}, counted {_n(f)}, gap "
                          f"{_n(round(g - wk))}")
@@ -2672,11 +2775,13 @@ def _wire_one(data, led, source, instances=None):
         if kind == "judged":
             drops = sum(v for ts, v in ambiguous if start < ts <= end)
             allowed = (drops + run_edges) * batch
-            lines[-1] += (f", surplus allowed {_n(allowed)} ({_n(drops)} ambiguous drop(s) + "
+            what = "transport-error attempt(s)" if http else "ambiguous drop(s)"
+            lines[-1] += (f", surplus allowed {_n(allowed)} ({_n(drops)} {what} + "
                           f"{run_edges} edge(s), x one {_n(batch)}-line batch)")
             if wk - g > allowed:
-                surplus.append(f"{span}: W + counted exceeds G by {_n(round(wk - g))}, over "
-                               f"the {_n(allowed)} its {_n(drops)} ambiguous drop(s) and "
+                took = "W − X" if http else "W + counted"
+                surplus.append(f"{span}: {took} exceeds G by {_n(round(wk - g))}, over "
+                               f"the {_n(allowed)} its {_n(drops)} {what} and "
                                f"{run_edges} edge(s) allow")
     if surplus:
         status = FAIL
@@ -2710,6 +2815,25 @@ def _wire_one(data, led, source, instances=None):
             detail += "; W by instance: " + ", ".join(
                 f"{one.service} {_n(sum(one.per[listener]['W'].values()))}"
                 for one in instances)
+    elif http:
+        one = led.per[listener]
+        deferred = sum(one.get("deferred", {}).values())
+        busy = sum(one.get("requests_busy", {}).values())
+        retries = (f"{_n(stats['answered_5xx'])} answered 5xx and retried; the listener's busy "
+                   f"503s {_n(busy)} and batches.deferred {_n(deferred)}, a retry, not loss"
+                   if listener in led.http_kinds
+                   and HTTP_LISTENERS[led.http_kinds[listener]].deferred
+                   else f"{_n(stats['answered_5xx'])} answered 5xx and retried")
+        detail = (f"G {_n(G)} (acknowledged of {_n(stats['attempted'])} attempted) = W "
+                  f"{_n(W)} − X {_n(X)} + gap {_n(gap)} ({_n(round(sums['fault']))} in reported "
+                  f"windows, {_n(round(sums['judged']))} in judged {wire.label}-affecting "
+                  f"windows, {_n(round(sums['steady']))} steady, {_n(round(sums['end']))} at "
+                  f"the end; loss judged {_n(round(steady_lost))}, each run at 0 or more, "
+                  f"against limit {_n(round(allowed))}); the generator's requests: "
+                  f"{_n(sum(v for _, v in ambiguous))} transport-error attempt(s), {retries}; "
+                  f"its counted loss, not in G: {_n(stats['dropped_events'])} event(s) in "
+                  f"{_n(stats['dropped_batches'])} batch(es)"
+                  + (f" ({_reasons(stats['dropped_by'])})" if stats["dropped_by"] else ""))
     else:
         framed = {reason: sum(led.ingress.counter_by_life(
             "logit.input.frames.dropped", component=listener, reason=reason).values())
@@ -2815,11 +2939,51 @@ def _ingress_lines(led):
             for life in inn.lives]
 
 
+def _http_intake(led, listener, life):
+    """`[(problem, text)]`: an HTTP listener's own identities in `life` (`HTTP_LISTENERS`), each
+    a problem when it doesn't hold. One request is one batch, so its `ok` and `closed_consumer`
+    requests sum to its `batches.sent`, and a busy `503` sends nothing, so its `busy` requests
+    equal its `batches.deferred`. A listener with no request counter has neither, and one whose
+    kind the SUT config doesn't give is reported; either note's `problem` is None."""
+    if listener not in led.http_kinds:
+        return ([(None, "an http listener whose kind the SUT config doesn't give: no request "
+                         "identities")]
+                if any(source.get("sut_listener") == listener and source_wire(source) == HTTP_WIRE
+                       for source in led.sources) else [])
+    kind = led.http_kinds[listener]
+    symbols = HTTP_LISTENERS[kind]
+    if symbols.requests is None:
+        return [(None, f"{kind} counts no requests: W − D == E + B alone")]
+    out = []
+    one = led.per[listener]
+    ok = one["requests_ok"].get(life, 0)
+    refused = one["requests_closed_consumer"].get(life, 0)
+    batches = one["batches"].get(life, 0)
+    out.append((ok + refused != batches,
+                f"{_route_text(symbols)} ok {_n(ok)} + closed_consumer {_n(refused)} "
+                f"{'==' if ok + refused == batches else '!='} batches.sent {_n(batches)}"
+                + ("" if ok + refused == batches else
+                   ", so a request isn't one batch")))
+    if symbols.deferred:
+        busy = one["requests_busy"].get(life, 0)
+        deferred = one["deferred"].get(life, 0)
+        out.append((busy != deferred,
+                    f"busy {_n(busy)} {'==' if busy == deferred else '!='} batches.deferred "
+                    f"{_n(deferred)}"
+                    + ("" if busy == deferred else ", so a busy 503 isn't one deferred batch")))
+    return out
+
+
+def _route_text(symbols):
+    """An `HttpListener`'s write-route requests, as text."""
+    return f"{symbols.requests}{{route={symbols.route}}}"
+
+
 def check_ledger_intake(data):
-    """The final life's W − D == E + B per listener; each earlier life's residual
-    (`Ledger.residual`), summed over the listeners, in [0, R], a sanity bound. `ledger.egress`
-    ties that residual to V. A life whose stderr shutdown lines disagree with telemetry's
-    shutdown drops WARNs."""
+    """The final life's W − D == E + B per listener, and on an HTTP wire the listener's own
+    identities (`_http_intake`) in every life a kill didn't end; each earlier life's residual (`Ledger.residual`), summed over
+    the listeners, in [0, R], a sanity bound. `ledger.egress` ties that residual to V. A life
+    whose stderr shutdown lines disagree with telemetry's shutdown drops WARNs."""
     if _overlapped(data):
         return _per_instance(data, check_ledger_intake)
     led = _ledger(data)
@@ -2842,6 +3006,21 @@ def check_ledger_intake(data):
             parts.insert(0, part + f", off by {_n(lhs - rhs)}")
         else:
             parts.append(part)
+        # An HTTP listener's identities hold in every life its telemetry ends cleanly, so each
+        # is judged; a killed life loses its last interval's counts, so it's reported unjudged.
+        for each in led.inn.lives:
+            label = f"{'final ' if each == life else ''}life {each}{name}"
+            found = _http_intake(led, listener, each)
+            if each in led.inn.killed and each != life:
+                if any(problem is not None for problem, _ in found):
+                    parts.append(f"{label} (killed): request identities not judged")
+                continue
+            for problem, text in found:
+                if problem:
+                    status = FAIL
+                    parts.insert(0, f"{label}: {text}")
+                elif problem is not None or each == life:
+                    parts.append(f"{label}: {text}")
     # Each earlier life's residual and its bound: with one SUT, `Ledger.residual` in [0, R];
     # across a hop, each side's own, the ingress SUT's up to its hop sink in [0, R] and the far
     # SUT's from `logit_in` on in [0, R_hop].
@@ -3189,7 +3368,8 @@ def check_ledger_summary(data):
     others. On a Kafka target V counts the topic's distinct records, so a duplicate never
     enters the sum. Across a hop, W − D − E − B and E − S_hop are the ingress SUT's final
     life's, E_B − A and the rest the far SUT's, and the row also FAILs any group whose V over
-    the run exceeds G less every counted loss (`_end_to_end`), as it does from a file wire."""
+    the run exceeds G less every counted loss (`_end_to_end`), as it does with a file or an
+    HTTP source."""
     if _overlapped(data):
         return _summary_overlap(data)
     led = _ledger(data)
@@ -3266,7 +3446,8 @@ def check_ledger_summary(data):
         bound_status, bound_text = _end_to_end(data, led)
         status = worst([status, bound_status])
         wire += f"; {bound_text}"
-    if led.hop is None and any(source_wire(source) == FILE_WIRE for source in led.sources):
+    if led.hop is None and any(source_wire(source) in (FILE_WIRE, HTTP_WIRE)
+                               for source in led.sources):
         bound_status, bound_text = _end_to_end(data, led)
         status = worst([status, bound_status])
         wire += f"; {bound_text}"
@@ -3331,31 +3512,39 @@ def _summary_overlap(data):
 
 
 def _end_to_end(data, led):
-    """`(status, text)`: across a hop or from a file wire, each egress group's V over the whole
-    run against what the generators sent less every counted loss on the way (K, D, B, X, the
-    hop sink's drops, X_B, and the path's counted discards; on a TCP or file wire F too), plus
-    on a TCP wire one generator batch per ambiguous drop, as `ledger.wire` allows, and on a
-    file wire the replay band's upper edge. A kill on either side shifts lives but never adds
-    increments, so V above that is a surplus whatever was killed; V below it is the per-life
-    rows' to judge."""
+    """`(status, text)`: across a hop or from a file or HTTP wire, each egress group's V over
+    the whole run against what the generators sent less every counted loss on the way (K, D, B,
+    X, the hop sink's drops, X_B, and the path's counted discards; on a TCP or file wire F too;
+    on an HTTP wire no X, which the client resends), plus one generator batch per ambiguous drop
+    on a TCP wire and per transport-error attempt on an HTTP wire, as `ledger.wire` allows, and
+    on a file wire the replay band's upper edge. A kill on either side shifts lives but never
+    adds increments, so V above that is a surplus whatever was killed; V below it is the
+    per-life rows' to judge."""
     counted = sum(sum(getattr(led, symbol).values())
                   for symbol in ("K", "F", "D_tel", "B", "X"))
+    counted -= sum(sum(led.per[source.get("sut_listener")]["X"].values())
+                   for source in led.sources if source_wire(source) == HTTP_WIRE)
     # A replayed line's discard counts here as its read counts in W, so the band still bounds
     # the surplus.
     counted += sum(led.discarded(life) for life in led.lives)
     if led.hop is not None:
         counted += sum(led.hop_dropped.values()) + sum(led.X_B.values())
-    partial = sum(sum(v for _, v in _ambiguous_drops(led, source))
-                  * led.gen_stats[source.get("service")]["batch"]
-                  for source in led.sources
-                  if source_wire(source) == "tcp" and source.get("service") in led.gens)
+
+    def allowance(wire):
+        return sum(sum(v for _, v in _ambiguous_drops(led, source))
+                   * led.gen_stats[source.get("service")]["batch"]
+                   for source in led.sources
+                   if source_wire(source) == wire and source.get("service") in led.gens)
+
+    partial, resent = allowance("tcp"), allowance(HTTP_WIRE)
+    https = any(source_wire(source) == HTTP_WIRE for source in led.sources)
     # A file wire's tailers replay lines after a kill and split one line per file at a stop,
     # so V may exceed G by the replay band's upper edge.
     files = [source.get("sut_listener") for source in led.sources
              if source_wire(source) == FILE_WIRE]
     replay = led.replay_band(files)[1] if files else 0
-    limit = led.G - counted + partial + replay
-    bound = ("G − counted" + (" + partial" if partial else "")
+    limit = led.G - counted + partial + resent + replay
+    bound = ("G − counted" + (" + partial" if partial else "") + (" + resent" if https else "")
              + (" + replay" if files else ""))
     status, parts = PASS, []
     for label, sinks in led.egress_groups():
@@ -3369,6 +3558,7 @@ def _end_to_end(data, led):
     return status, ("end to end over the run, G " + _n(led.G) + " less counted loss "
                     + _n(counted) + (f" and a partial-frame allowance {_n(partial)}"
                                      if partial else "")
+                    + (f" plus a resend allowance {_n(resent)}" if https else "")
                     + (f" plus the replay band's {_n(replay)}" if files else "")
                     + ": " + "; ".join(parts))
 
