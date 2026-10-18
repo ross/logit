@@ -12,8 +12,9 @@
 #          the probe certificate's report
 #   issue  NAME's generation GEN into NAME/gen-GEN/{cert.pem,key.pem}, valid DAYS days, for
 #          USAGE (server or client) and the DNS names given, then points the relative symlink
-#          NAME/live at it in one rename(2), so a process reading NAME/live/ sees one
-#          generation or the other, never a mix. `--broken` writes a key.pem that doesn't match
+#          NAME/live at it in one rename(2), so each file read through NAME/live/ is one
+#          generation's or the other's. A reader that reads cert.pem and key.pem one at a
+#          time can still pair the two generations. `--broken` writes a key.pem that doesn't match
 #          cert.pem, which a TLS reload refuses
 #   probe  handshakes with 127.0.0.1:PORT in the namespace this container joined, presenting
 #          the probe's client certificate, and reports the certificate the listener served,

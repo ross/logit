@@ -262,13 +262,16 @@ from the run's private CA (see [TLS certificates](#tls-certificates)). The SUT r
 `tls_reload_interval: 0s`, so only a SIGHUP reloads it, and the generator polls every 10 s. Its
 12.5-minute cycle rotates the SUT's server certificate and sends a SIGHUP, then probes what the
 listener serves; rotates the generator's client certificate, which its poll reloads, and
-restarts the SUT so the generator handshakes again with the new one; rotates the server
+restarts the SUT so the generator reconnects after the reload; rotates the server
 certificate broken, so the SIGHUP's reload fails and the listener keeps serving the previous
 one; rotates it again, good; and rotates it once more during a 90 s VictoriaMetrics stop. Its
 expectations assert one reload through each SIGHUP after a good rotation and a `notAfter` a
 day later at least, one failed reload and an unchanged `notAfter` through the broken one's,
 the generator's own reload, lines read in every drain after the restart, and no
-`connection_error` in the run. `tls.served` checks each probe's serial. Its `max_duration` is
+`connection_error` in the run. `tls.served` checks each probe's serial. The SUT trusts any
+certificate from the run's CA, so no row tells which generation the generator presents after
+the restart; it presents the loaded one because its resolver hands every handshake the current
+pair (`ReloadingCert` in `crates/logit-pipeline/src/tls.rs`). Its `max_duration` is
 its own duration, because a second cycle's rotations would name the same days. The netem image
 carries the certificate tooling, so a run with `SOAK_SKIP_IMAGE` set needs one built from this
 tree.
@@ -383,8 +386,11 @@ usage = "server"          # server or client: its extended key usage
 ```
 
 Each certificate is `<name>/live/cert.pem` and `<name>/live/key.pem`, and the CA is `ca.pem`.
-`live` is a relative symlink to `<name>/gen-N/`, which a `rotate` step repoints in one rename,
-so a process never reads one generation's certificate with another's key. The driver names the
+`live` is a relative symlink to `<name>/gen-N/`, which a `rotate` step repoints in one rename.
+The swap is atomic per file, not across a set: a reload reads a set's files one at a time, so
+a poll that lands on the rename can read one generation's certificate with the other's key. That
+load fails, and the next poll loads the new pair; `self_log` excuses such a torn read on a
+service that polls when a reload of the same component follows it inside the rotate. The driver names the
 directory in `compose.env` as `SOAK_TLS_DIR`, and the override mounts the whole directory, not
 single files, so the repointed link reaches every container:
 
@@ -424,7 +430,9 @@ The loader holds a `rotate` to a service whose config reads its certificate's `l
 days above 30 and above every earlier rotation of that certificate, and to one run of the
 cycle, so `max_duration` is one cycle's run. A `probe` starts inside a `rotate` of its
 certificate on its own service, after a SIGHUP there, which a listener with the poll off needs
-before it serves anything new. A probe presents the probe certificate, so a listener that
+before it serves anything new. On such a service every earlier rotate of a probed certificate
+needs a SIGHUP inside it too, or a start of the service before the certificate's next rotate,
+since `tls.served` expects the latest rotation that wasn't broken to be the one loaded. A probe presents the probe certificate, so a listener that
 requires one completes the handshake and logs no `connection_error`.
 
 ### Faults
@@ -780,7 +788,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `timeline` | a fault's apply or revert returned nonzero, the schedule failed fast, or a start or unpause of a `logit` service has no readiness probe; a fault whose apply failed gets no window |
 | `exit` | a `logit` container exits outside a scheduled stop, restart, kill, or `exit` step, or with a code other than the one that action leaves (0, 137 for a kill, the step's `code` for an `exit`); an `exit` step sees no exit; or any container is OOM-killed |
 | `restarts` | a container starts with no scheduled start or restart behind it: the revert of a `stop` or `kill`, an `exit` revert that started it, or a `restart` |
-| `self_log` | stderr has an `exiting` line with a nonzero code, a panic, or an `ERROR` line other than a sink's `retrying`; sink fault lines outside a fault window `WARN`. Inside an `exit` step, its `exiting` line and an `ERROR` line keyed its `key` are expected, and FAIL the row when either is missing. A `tls_reload_failed` line FAILs too, except inside a `rotate` step with `broken = true` on its service |
+| `self_log` | stderr has an `exiting` line with a nonzero code, a panic, or an `ERROR` line other than a sink's `retrying`; sink fault lines outside a fault window `WARN`. Inside an `exit` step, its `exiting` line and an `ERROR` line keyed its `key` are expected, and FAIL the row when either is missing. A `tls_reload_failed` line FAILs too, except inside a `rotate` step with `broken = true` on its service, or, on a service that polls its TLS files, inside any other rotate on it with a `tls_reloaded` of the same component after it in that rotate |
 | `ready` | a `logit` container's readiness word, from each image `HEALTHCHECK` result timed at its start, isn't `ok` outside a fault window; a `mark` with `ready` sees no sample with that word; `degraded` appears outside an `exit` step; or a container isn't ready within 30 s of a start. With no `HEALTHCHECK` results recorded, it judges Docker's health status instead |
 | `progress` | a SUT sink delivers nothing in a `progress_window` outside fault windows with work queued (a hang), a `logit` container's telemetry goes quiet, or a sink's newest stored sample is 30 s old (a local target only); a sink still retrying past `recovery_bound` `WARN`s, and so do windows covering under 5% of the run after warmup |
 | `rss_slope` | a `logit` service's resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead, and so do slopes covering under 5% of the run after warmup. Each service is judged on its own line, and `[expected]` can set its verdict (see [Expected verdicts](#expected-verdicts)) |

@@ -423,8 +423,11 @@ for = "5s"
   and `issue` each certificate's first generation, `gen-1`, valid 30 days, recorded in the
   timeline as the `tls_issued` phase. Keys are EC P-256 with v3 extensions, and every file is
   0644, so the image's `logit` user reads it. Each generation is a directory, and `<name>/live`
-  is a relative symlink that `issue` repoints with one `rename(2)`, so a reader sees one
-  generation or the other. A certs.sh failure stops `prepare()`.
+  is a relative symlink that `issue` repoints with one `rename(2)`, so each file read through it
+  is one generation's or the other's. The swap is atomic per file, not across a set: a reload
+  reads a set's files one at a time, so a poll that lands on the rename can pair two
+  generations, fail, and load the new pair on its next poll. A certs.sh failure stops
+  `prepare()`.
 - A `rotate`'s apply issues the next generation and records its `gen`, `serial`, and
   `not_after`; a failed issue still uses its number up. `cert` and `days` are required, `days` a
   whole number above 30 and above every earlier rotation of the certificate, so its `notAfter`
@@ -438,7 +441,11 @@ for = "5s"
   and `verified`, whether the chain verifies against the CA for the certificate's first DNS
   name. `cert`, a `server` certificate, and `port` are required. A probe starts inside a
   `rotate` of its certificate on its own service, after a `signal = "HUP"` step there that
-  starts inside the same rotate, because a listener reloads only on a SIGHUP or its poll.
+  starts inside the same rotate, because a listener reloads only on a SIGHUP or its poll. On a
+  service with `tls_reload_interval: 0s`, every earlier rotate of a certificate a probe reads
+  holds a SIGHUP on that service too, or a start of the service (a `restart`, `stop`, `kill`,
+  or `exit`) falls between it and the certificate's next rotate: `tls.served` expects the
+  latest rotation that wasn't broken, which only a reload or a start loads.
 - Neither opens a fault window, and neither reverts anything. Neither can appear in a
   `[random]` schedule.
 
@@ -696,8 +703,10 @@ absolute path in `compose.env` as `SOAK_SHARED_DIR`, and the scenario's override
 `:z` at `/shared` in the writer and the SUT. The writer's files stay in the run directory, the
 evidence the end sequence counts G from. From W12c a scenario with a `rename` step gets the same
 directory, mounted into the service whose `stdio_out` writes there. From W12d a scenario with a
-`[tls]` table gets `<run>/tls`, named `SOAK_TLS_DIR`, which the override mounts `:ro,z` at `/tls`
-as a whole directory, so a repointed `live` symlink reaches every container that reads it.
+`[tls]` table gets `<run>/tls`, mode 0755 whatever the host umask, named `SOAK_TLS_DIR`, which
+the override mounts `:ro,z` at `/tls` as a whole directory, so a repointed `live` symlink reaches
+every container that reads it. The symlink swap is atomic per file, not across a certificate's
+pair (§2's "Certificates and rotations (W12d)").
 
 Collection uses `docker logs <id> >svc.stdout 2>svc.stderr`, not `docker compose logs`, which
 merges the two streams. `docker logs` spans every life of a container that is stopped and started
@@ -846,7 +855,10 @@ returned nonzero has none, so nothing after it is excused.
   An ERROR line keyed `retrying` is expected inside a fault window and WARNs outside one. A
   WARN line keyed `send_failed`, or whose message is `degraded`, does the same. Any other
   ERROR line FAILs. From W12d a `tls_reload_failed` line FAILs, except inside a `rotate` step
-  with `broken = true` on its service, from its apply to its revert. Inside an `exit` step's
+  with `broken = true` on its service, from its apply to its revert, or, on a service whose
+  config polls its TLS files (`tls_reload_interval` unset or above 0), inside any other rotate
+  on it when a `tls_reloaded` line of the same component follows it in that rotate: a torn
+  read of a set mid-rename. Inside an `exit` step's
   window (W7a), the `exiting` line with the step's
   `code`, an ERROR line keyed the step's `key`, and the `Error: ` text line `main` prints right
   after that `exiting` line are expected; the step FAILs the row when either of the first two is
@@ -2040,8 +2052,8 @@ where it needs them, and a small check extension.
       `tls.served`, matching a probe's served serial to the generation in force; and the ledger
       at zero across reconnects. No leg to VictoriaMetrics over TLS: its open-source build
       doesn't verify client certificates. Built as the `[tls]` table, the `rotate` and `probe`
-      actions, and the `tls-reload` scenario, whose generator presents a rotated client
-      certificate that its poll reloads and a SUT restart makes it present, and whose SUT
+      actions, and the `tls-reload` scenario, whose generator reloads a rotated client
+      certificate on its poll and reconnects cleanly after a SUT restart, and whose SUT
       reloads a rotated server certificate on each SIGHUP and keeps the previous one through a
       broken rotation.
 
@@ -4245,9 +4257,11 @@ weights each generator sink by its own input's batch:
   inside the rotation; `not_after` held, and the next good rotation reloaded as usual.
 - **The generator's poll reloaded its client certificate 3.5 s after the rotation**, inside its
   10 s `tls_reload_interval`, with no signal, and its `not_after{side="client"}` rose by a day.
-  After the SUT's restart a minute later it handshook again with the new certificate: the SUT
-  read 10,000 lines or more in every drain of the recovery window, and counted no
-  `connection_error` all run, the four probes' handshakes included.
+  After the SUT's restart a minute later it reconnected cleanly: the SUT read 10,000 lines or
+  more in every drain of the recovery window, and counted no `connection_error` all run, the
+  four probes' handshakes included. The SUT trusts any certificate from the run's CA, so no
+  row shows which generation the generator presented; it presents the loaded one because
+  `ReloadingCert`'s resolver returns `current()` (`crates/logit-pipeline/src/tls.rs`).
 - **The restart lost nothing on the wire.** The generator counted 31 batches `overflow_newest`
   while the SUT was down, outside G; W equaled G over the run.
 - The SUT's reopen generation restarts at 1 in a new process life, so `reopen signal received`

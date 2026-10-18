@@ -3,8 +3,11 @@
 # rotates three times and reloads on a SIGHUP each time, with the poll off, and once broken, which
 # the reload refuses while the listener keeps serving the previous one; a probe reads the served
 # certificate after each SIGHUP. The generator's client certificate rotates once and reloads on
-# its own 10 s poll, and a SUT restart then makes it handshake again with the new one. The
-# schema is docs/plans/soak-harness.md's "The scenario schema".
+# its own 10 s poll, and a SUT restart then shows it reconnects cleanly after the reload. The SUT
+# trusts any certificate from the run's CA, so no row tells which generation the generator
+# presents; it presents the loaded one because its resolver hands every handshake the current
+# pair (`ReloadingCert`, crates/logit-pipeline/src/tls.rs). The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
 
 name = "tls-reload"
 description = "generator -> statsd_in (TCP, mutual TLS) -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics, under certificate rotations"
@@ -86,8 +89,8 @@ cert = "generator"
 days = 31
 for = "40s"
 
-# Step 5: a SUT restart drops the connection, and the generator's next handshake presents the
-# rotated certificate. A stop can reset the connection with lines in its buffers: reported.
+# Step 5: a SUT restart drops the connection, and the generator handshakes again after its
+# reload. A stop can reset the connection with lines in its buffers: reported.
 [[step]]
 at = "3m"
 action = "restart"
@@ -328,8 +331,8 @@ window = "through"
 reduce = "rise"
 min = 86400
 
-# After the restart the generator handshakes with its rotated certificate, and every drain reads
-# lines.
+# After the restart the generator reconnects, and every drain reads lines; a refused handshake
+# would show as a drain with none and as a connection_error.
 [[expect]]
 name = "lines-after-restart"
 service = "logit"
