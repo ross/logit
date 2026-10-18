@@ -542,10 +542,12 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   `collectd_in` UDP, `tail_in` and `docker_in` file), whose wire is the source's. A listener the
   config lacks, a kind or transport with no wire (a Unix socket), and a mismatch are refused.
 - `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct, none
-  of them a listener, and none on another source's list. Each must forward every event it
-  receives, which `ledger.edge` judges hop by hop (§10's item 13 will admit a node that emits
-  several events per event or discards some), and each adds an inbox and a batch to R ("The
-  ledger and identities"). It can't be combined with `[ledger] sut_script`, whose hop
+  of them a listener, and none on another source's list. Each must send every event it
+  receives or count it in `logit.component.events.discarded`, which `ledger.edge` judges hop by
+  hop (from W13a; §10's item 13 will admit a node that emits several events per event), and
+  each adds an inbox and a batch to R ("The ledger and identities"). The nodes' discards are
+  counted loss everywhere else in the ledger too (§6). It can't be combined with
+  `[ledger] sut_script`, whose hop
   `ledger.script` judges from every listener's E.
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
   stack has a source, because a generator with none would put lines into a listener with no
@@ -933,6 +935,7 @@ and takes the worst status; `report.py` is unchanged.
 | E | per listener, SUT `logit.component.events.sent{component=<sut_listener>}` |
 | X | per listener, SUT `logit.component.events.dropped{component=<sut_listener>}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`) |
 | T_in[node], T_out[node] | with a source's `sut_transforms` (W8b), each node's `logit.component.events.received` and `logit.component.events.sent` |
+| T_disc[node] | each such node's `logit.component.events.discarded` (W13a), the events it received and sent no part of, which the runtime counts for every Transform node, only when nonzero, so an absent count is 0; ΣT_disc sums every node of every source |
 | A | aggregate `logit.component.events.received` |
 | A_sent | aggregate `logit.component.events.sent` (W7b), counted once per send however many consumers a fan-out reaches |
 | S_in[sink], T_sent[target] | each sink's `logit.component.events.received`, and under `split = "route"` its target's `logit.component.events.sent` (W7b) |
@@ -973,9 +976,13 @@ push counts its datagrams as shutdown drops without logging a line.
   waits for a slot on a full inbox, `aggregate`'s 64-slot inbox, and the batch `aggregate` has
   taken off that inbox but not yet absorbed. A script between them (W7a) adds its own 64-slot
   inbox and the batch it holds, 65 batches more, and its counted drops and errors leave the
-  residual: W − D − B − X − (L_drop + L_err) − (Ab − L_flush). `aggregate`'s close-time flush
-  delivers that residual into V, and the final drain runs after that flush, so `ledger.egress`
-  judges the life's W − D − B − X − V as it judges the final life's Ab − V.
+  residual: W − D − B − X − (L_drop + L_err) − (Ab − L_flush). From W13a the `sut_transforms`
+  nodes' discards leave it the same way: W − D − B − X − ΣT_disc − Ab. A scenario has a script
+  or transforms, never both, so no discard counts twice (`Ledger.discarded`). `aggregate`'s
+  close-time flush delivers that residual into V, and the final drain runs after that flush, so
+  `ledger.egress` judges the life's W − D − B − X − V, less those discards, as it judges the
+  final life's Ab − V. The discards are subtracted in every life, whatever ended it: a killed
+  life's residual, and so its kill band's lower edge, leaves them out as well.
   The [0, R] bound only catches a residual no shutdown could leave. With several listeners (W8b)
   the residual is summed over them, and R is the sum of each listener's own receive queue and 2
   batches of its own `batch_max_events` (its accumulator and its held batch), 65 more for each
@@ -1083,15 +1090,18 @@ The rows:
   G must also equal the lines the driver counted in the shared directory at the end
   (`shared_counted`), else the row FAILs its precondition. `ledger.summary`'s end-to-end bound
   runs for a file wire too, with the band's upper edge added to its limit, since a replayed line
-  is absorbed and stored again.
+  is absorbed and stored again. From W13a it counts the path's discards with the counted loss:
+  a replayed line a node discards is counted again as its read counts in W again, so the band
+  still bounds the surplus.
 - `ledger.intake`: W − D == E + B, for the final life, per listener from W8b, one detail line
   each, a listener off its balance first. A TCP listener's F never reached W, so it's
   `ledger.wire`'s, and `drops` leaves it out.
 - `ledger.edge`: E == A, a single-consumer edge, for the final life; from W8b ΣE == A, E summed
   over the listeners, which every source's events reach. A source's `sut_transforms` (W8b) are
-  judged hop by hop: its listener's E == T_in[first node], T_in == T_out at every node (each
-  forwards every event it receives), T_out[node] == T_in[next node], and the last node's T_out
-  takes that listener's E's place in the sum. With `sut_script` (W7a),
+  judged hop by hop: its listener's E == T_in[first node], T_in − T_disc == T_out at every node
+  (from W13a; each sends every event it receives that it doesn't discard), T_out[node] ==
+  T_in[next node], and the last node's T_out takes that listener's E's place in the sum. The
+  detail shows each node's T_disc. With `sut_script` (W7a),
   L_sent == A, the edge from the script to `aggregate`. From W7b, each sink's edge too: under
   `copy`, A_sent == S_in[sink], since a fan-out counts one send per batch; under `route`,
   T_sent[target] == S_in[sink] for the target that feeds it.
@@ -1107,7 +1117,8 @@ The rows:
   VictoriaMetrics before the final drain. The detail shows both parts. With
   `sut_script` (W7a), Ab becomes Ab − L_flush, because each `flush()` event carries one metric
   whose series `vm_selector` excludes, and a stopped earlier life's gap becomes
-  W − D − B − X − (L_drop + L_err) − V. The subtraction holds only while each flush event carries
+  W − D − B − X − (L_drop + L_err) − V; with `sut_transforms` (W13a) it becomes
+  W − D − B − X − ΣT_disc − V. The subtraction holds only while each flush event carries
   one metric, which the scenario's script guarantees. `internal` drains last, so the final drain
   exports the script's drops and errors on a stopped life's residual too, and L_drop and L_err
   include them. A gap of 0 passes. A positive gap is lost increments. It is reported with the
@@ -1202,11 +1213,13 @@ The rows:
   From W8b the first two terms read the listeners' sums, and the wire loss sums every source's.
   With `sut_script` (W7a), E − A becomes (E − L_in) + (L_in − L_emit − L_drop − L_err) +
   (L_emit + L_flush − L_sent) + (L_sent − A), the egress term is Ab − L_flush − V, and the
-  script's L_drop and L_err are shown beside them as counted. From W7b there is one egress term
-  per egress group, each of which must be 0 or counted on its own, so a surplus at one sink
-  can't net out loss at another. When an egress term is counted, it is shown as counted and the
-  row judges the rest. A `rejected` or `disk_corrupt` drop in the final life's group FAILs the
-  row as it FAILs `ledger.egress`, named beside its term, unless a cued step explains it (W9a).
+  script's L_drop and L_err are shown beside them as counted. With `sut_transforms` (W13a),
+  E − A becomes E − ΣT_disc − A, and ΣT_disc is shown beside it as counted. From W7b there is
+  one egress term per egress group, each of which must be 0 or counted on its own, so a surplus
+  at one sink can't net out loss at another. When an egress term is counted, it is shown as
+  counted and the row judges the rest. A `rejected` or `disk_corrupt` drop in the final life's
+  group FAILs the row as it FAILs `ledger.egress`, named beside its term, unless a cued step
+  explains it (W9a).
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at each sink's own
   telemetry; see "External targets". A Kafka target's sink is judged the same way, and so is a
   `datadog` stand-in's (W9b), with what a `respond` step cued excused; a `remote_write` stand-in
@@ -1803,7 +1816,8 @@ the rest judge them together:
   either is reported and not judged. A pause of an instance loses only what its kernel counts in
   K.
 - `ledger.summary` adds the wire over the run and a bound end to end: each egress group's V
-  summed over the instances is at most G less the instances' counted loss.
+  summed over the instances is at most G less the instances' counted loss, from W13a their
+  `sut_transforms` nodes' discards included.
 - `progress`: a fault that holds an instance opens no window, since the others carry its flows;
   each window is judged on the deliveries summed over the instances no such fault holds in it,
   and skipped when every instance is held.
@@ -2068,13 +2082,28 @@ where it needs them, and a small check extension.
 
 13. **Fan-out and discarding transforms in the ledger.** `line_protocol` (63fd8238) emits one
     event per point through `Transform::process_into`, so its `events.sent` can exceed its
-    `events.received`, and `drop_stale` and `has_stale` (e3a2649b) discard. Today `ledger.edge`
-    requires T_in == T_out at every `sut_transforms` node, so neither can be in a scenario's
-    path. The product won't add a counter: [ADR `transform-fan-out`](../adr/transform-fan-out.md),
-    "Telemetry stays as it is", gives a node's children as `events.sent − (events.received −
-    events.discarded)`, and the harness will own that arithmetic. A `fan_out = k` per transform
-    in `[ledger]` will switch its hop to that count, judged with no tolerance against
-    k × parents − the lines it dropped, `logit.transform.lines.dropped{reason="malformed"}`.
+    `events.received`, and `drop_stale` and `has_stale` (e3a2649b) discard. Before W13a,
+    `ledger.edge` required T_in == T_out at every `sut_transforms` node, so neither could be in
+    a scenario's path.
+    - **Discards (built in W13a).** The runtime counts `logit.component.events.discarded` for
+      every Transform node in `process_batch`, so the ledger reads each node's T_disc with no
+      per-node key, and `ledger.edge` judges T_in − T_disc == T_out with no tolerance. A
+      discard is counted loss, so the edge alone isn't enough: the residual, a stopped life's
+      egress gap, a killed life's band, `ledger.summary`'s path term, and the end-to-end bound
+      each take ΣT_disc out, as they take a script's discards (§6). Built with the
+      `tail-rotate-stale` scenario: `tail-rotate` with `timestamp` and `drop_stale`
+      (`max_age: 50s`) after `json`, and its 30 s stop lengthened to 90 s. `tail-rotate`'s 30 s
+      stop is too short: `max_age` must clear what a 30 s kill replays, lines about 40 s old,
+      so no 30 s fault can leave a stale line. Only the lines older than `max_age` when the
+      restarted tailer reads them are discarded, about 40 s of the stop's backlog, not every
+      line read after the restart. `[[expect]]` tables bound `drop_stale`'s `events.discarded`
+      around each fault.
+    - **Fan-out (W13b).** The product won't add a counter:
+      [ADR `transform-fan-out`](../adr/transform-fan-out.md), "Telemetry stays as it is", gives
+      a node's children as `events.sent − (events.received − events.discarded)`, and the
+      harness will own that arithmetic. A `fan_out = k` per transform in `[ledger]` will add
+      the children to its hop, judged with no tolerance against k × parents − the lines it
+      dropped, `logit.transform.lines.dropped{reason="malformed"}`.
     - **The generator.** Points of one message with the same measurement, tag set, and
       timestamp merge into one event (`crates/logit-transforms/src/line_protocol.rs`'s module
       doc), so each of a message's k points will carry its own tag value, and none merge.
@@ -2082,17 +2111,15 @@ where it needs them, and a small check extension.
       transport (`crates/logit-outputs/src/syslog.rs`, "Injection safety"), and `line_protocol`
       reads that as one line. So the generator will put k lines in one OTLP log body,
       `otlp_out` over HTTP into `otlp_in`, which carries the body unchanged, and the source will
-      need item 14's `http` wire with `otlp_in`'s rows, which W14 builds. `syslog_in`'s `framing: datagram` (fdd5b039) stays unsoaked
-      until a sender can write a multi-line datagram.
+      need item 14's `http` wire with `otlp_in`'s rows, which W14 builds. `syslog_in`'s
+      `framing: datagram` (fdd5b039) stays unsoaked until a sender can write a multi-line
+      datagram.
     - **Topology.** `otlp_in → line_protocol → count chain → aggregate → prometheus_out`.
     - **Faults.** `statsd-vm`'s schedule, plus a backend stop under `overflow: block` with
       `rss_slope` watched: an inbox's bound counts batches, not events, and each batch past
       `line_protocol` holds k times the events.
-    - **A discarding variant.** `tail-rotate` with `timestamp` and `drop_stale` after `json`,
-      and a SUT stop longer than `max_age`, so the lines read after the restart are stale and
-      discarded, with an `[[expect]]` on `drop_stale`'s `events.discarded`.
-    - Rows: `ledger.edge` with the fan-out and discard terms, then the rows as written. Needs:
-      `fan_out` and the discard term per `sut_transforms` node, with self-test fixtures.
+    - Rows: `ledger.edge` with the fan-out term, then the rows as written. Needs: `fan_out` per
+      `sut_transforms` node, with self-test fixtures, and W14's `http` wire.
 14. **HTTP ingress, starting with `influxdb_in` (41ccfbc4).** Generator `influxdb_out` → SUT
     `influxdb_in` → `aggregate` → `prometheus_out`. Proves that a listener answering `503` when
     busy loses nothing it doesn't count, across the SUT's own faults. A `wire = "http"` source
@@ -2174,9 +2201,10 @@ that items 3, 7, and 11 need.
 | W12b | `soak/w12b` | `soak/w12b: a rolling-overlap soak, a namespace holder, and per-instance totals` | M | W12a |
 | W12c | `soak/w12c` | `soak/w12c: a SIGHUP soak, with a signal action and a stdio_out reopen check` | M | W12b |
 | W12d | `soak/w12d` | `soak/w12d: a TLS-reload soak, with a private CA and a rotate action` | M | W12c |
-| W13 | `soak/w13` | `soak/w13: fan-out and discarding transforms in the ledger` | M | W14 |
+| W13a | `soak/w13a` | `soak/w13a: discarding transforms in the soak ledger, with a drop_stale tail soak` | M | W12d |
+| W13b | `soak/w13b` | `soak/w13b: fan-out transforms in the soak ledger, with a line_protocol soak` | M | W14, W13a |
 | W14 | `soak/w14` | `soak/w14: an HTTP-ingress soak into influxdb_in, with an http wire for it and otlp_in` | M | W12d |
-| W15 | `soak/w15` | `soak/w15: multi-destination route and route_signals soaks, with a target split` | M | W13 |
+| W15 | `soak/w15` | `soak/w15: multi-destination route and route_signals soaks, with a target split` | M | W13b |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -2282,15 +2310,19 @@ that items 3, 7, and 11 need.
 - **W12d**: item 12's TLS half: a private CA per run, the `[tls]` table, the `rotate` and `probe`
   actions, `tls.served`, the `rise` reducer, the broken-rotation excusal in `self_log`, and the
   `tls-reload` scenario.
-- **W13**: item 13, `fan_out` and a discard term per transform in `ledger.edge`. Its fan-out
-  generator sends over OTLP/HTTP, so it lands after W14's `http` wire and its `otlp_in` rows.
+- **W13a**: item 13's discards: T_disc per `sut_transforms` node in `ledger.edge`, and ΣT_disc
+  as counted loss in the residual, the egress gap, `ledger.summary`, and the end-to-end bound,
+  with self-test fixtures and the `tail-rotate-stale` scenario.
+- **W13b**: item 13's fan-out: `fan_out` per transform in `ledger.edge` and the `line_protocol`
+  scenario. Its generator sends over OTLP/HTTP, so it lands after W14's `http` wire and its
+  `otlp_in` rows.
 - **W14**: item 14, the `http` wire, with rows for `influxdb_in`, which its scenario runs, and
-  for `otlp_in`, which W13's generator needs.
+  for `otlp_in`, which W13b's generator needs.
 - **W15**: item 15, a third `split` mode for multi-destination `route` and `route_signals`.
 
 Items 16 to 18, and §10's follow-ups to items 11 and 12, have no workstream yet.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13 → W15, linear. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a and W16 land off `main` beside W14. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
