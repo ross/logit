@@ -401,7 +401,7 @@ class Run:
                    "daemon.\n  Not this run's to stop. If it is yours, run:\n"
                    f"  {' '.join(self.docker.prefix)} compose -p {self.project} "
                    + "".join(f"-f {path} " for path in self.docker.compose_files) + "down -v")
-            return 1
+            return 2
         images = ([self.image, NETEM_IMAGE] + ([VM_IMAGE] if self.has_vm else [])
                   + ([KAFKA_IMAGE] if self.kafka else [])
                   + ([STANDIN_IMAGE] if self.standin else []))

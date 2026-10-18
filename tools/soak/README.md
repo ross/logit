@@ -808,14 +808,15 @@ scenario with a `rejected` step can't set it.
    |---|---|
    | 0 | every row passes or warns |
    | 1 | any `FAIL`, including a run the driver aborted or hit an error in |
-   | 2 | a scenario or argument error, before anything starts |
-   | 3 | `stalled`: the host slept or the driver was stopped mid-run, and `run` FAILs. Nothing else in the run can be judged, so rerun it once the host is awake |
+   | 2 | the run never started: a scenario, argument, or setup error, such as a config `logit validate` refuses, a missing env file, a failed self-test, a failed image build, or a compose project that already has containers |
+   | 3 | `stalled`: the host slept or the driver was stopped mid-run, and `run` FAILs. Rerun it once the host is awake |
    | 130 | SIGINT, SIGTERM, or SIGHUP interrupted it, and `run` FAILs |
 
    `check` on a run directory exits 0, 1, or 3 the same way. On an interrupted run it exits 1,
    because only the live run knows it was interrupted. `--retry-stalled N` reruns a stalled run
    up to N times, 30 s apart, each in a new run directory with the same duration and seed; it
-   doesn't combine with `--keep`, whose stack would block the rerun.
+   doesn't combine with `--keep`. The [ADR's stall amendment](../../docs/adr/soak-harness.md#amendment-a-run-the-host-slept-through-ends-at-its-first-stall-and-exits-3-2026-10-18)
+   says why a stall ends the run and gets its own status.
 
 A run writes `perf/results/soak/<UTC stamp>/` (gitignored, or under `SOAK_OUT`):
 

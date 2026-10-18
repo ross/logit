@@ -10,10 +10,11 @@ directories go, default `perf/results/soak`), `SOAK_IMAGE` (the `logit` image ta
 `logit:soak`), and `SOAK_EXTERNAL_ENV` (the env file an external target's variables come from,
 default `perf/results/soak-external.env`).
 
-`run` exits 0 when every row passes, 1 on any FAIL (an aborted or errored run included), 2 for a
-scenario or argument error, 3 when the host slept or the driver was stopped mid-run (`stalled`,
-which `--retry-stalled N` reruns), and 130 when interrupted. `check` exits 0, 1, or 3 the same
-way, and 2 for a directory with no `timeline.jsonl`.
+`run` exits 0 when every row passes, 1 on any FAIL (an aborted or errored run included), 2 when
+the run never started (a scenario, argument, or setup error, a failed self-test included), 3
+when the host slept or the driver was stopped mid-run (`stalled`, which `--retry-stalled N`
+reruns), and 130 when interrupted. `check` exits 0, 1, or 3 the same way, and 2 for a directory
+with no `timeline.jsonl`. docs/adr/soak-harness.md's stall amendment has the reasoning.
 """
 
 import argparse
@@ -60,7 +61,7 @@ def cmd_run(args):
         return 2
     if selftest.run(TOOLS, quiet=True) != 0:
         print("soak: self-test failed; not running", file=sys.stderr)
-        return 1
+        return 2
     try:
         duration = None if args.duration is None else scenario.parse_duration(args.duration)
         out = Path(args.out or os.environ.get("SOAK_OUT") or ROOT / "perf/results/soak")

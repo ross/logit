@@ -414,3 +414,23 @@ in a stop, kill, restart, or `exit`, which close the tailer's files, and `max_fi
 pause, which keeps them open. The alternative, reading the loss from the product, needs a
 counter `tail_in` doesn't have. [`docs/plans/soak-harness.md`](../plans/soak-harness.md),
 "6. The checks", has the rules.
+
+## Amendment: a run the host slept through ends at its first stall and exits 3 (2026-10-18)
+
+The host running a soak may suspend, as a laptop does with its lid closed, and nothing should
+keep it awake. A run it slept through can't be judged: nothing was scheduled or polled in the
+gap. So the driver rejects the run instead of running out its schedule:
+
+- **The first stall ends the schedule.** A tick more than 120 s late applies no further step,
+  because every step overdue by then would run back to back. The driver records `stalled` and
+  an `aborted` phase naming it, and the end sequence still runs and reverts the open faults, so
+  the run directory is complete and `check` scores it like any other. Its waits keep their own
+  bounds, so an aborted run ends within minutes of the host waking.
+- **A stalled run exits 3**, apart from a FAIL's 1. A FAIL needs someone to read it; a stall
+  needs only a rerun once the host is awake, and that rerun can pass. `check` exits 3 on the
+  same directory, since both read the stall from the `run` row.
+- **3 outranks 1 but not 130.** Nothing else in a stalled run can be judged, so its other
+  FAILs don't change what to do next. An interrupt is the operator's own stop, and 130 says so.
+- **`--retry-stalled N` is opt-in** (default 0): it reruns a stalled run up to N times in new
+  run directories with the same duration and seed. It's refused with `--keep`, because the kept
+  stack would block the rerun. Without it, the caller reruns on a 3.

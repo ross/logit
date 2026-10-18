@@ -1023,8 +1023,8 @@ def _stall_abort(root):
         fake = _AnswerDocker()
         run.docker = run.ctx.docker = run.capture.docker = fake
         clock = [1000.0]
-        # c0s1, netem on logit, is open from +60 s to +180 s; the host sleeps at +90 s for
-        # 200 s, so the old loop would revert it and apply c0s2 at +240 s late.
+        # c0s1, netem on logit, is open from +60 s to +180 s, and c0s2 is due at +240 s. The
+        # host sleeps at +90 s for 200 s, so both are overdue when the driver wakes.
         jumped = []
 
         def sleep(seconds):
@@ -4014,8 +4014,8 @@ def _target_rules(root):
             code = run.execute()
         finally:
             driver._print = real_print
-        expect(code == 1 and not private.exists() and not private.parent.exists(),
-               "execute() removes the private env copy, an early return included")
+        expect(code == 2 and not private.exists() and not private.parent.exists(),
+               "execute() exits 2 on a busy project, and removes the private env copy")
         vm_run = driver.Run(root, local, local.duration, None, False, Path(tmp) / "vm", [],
                             "logit:soak", roles=scenario.BASE_ROLES)
         vm_run.prepare()

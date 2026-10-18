@@ -839,11 +839,11 @@ ticket with `${DOCKER} version` first.
    its jobs as the terminal closes.
 6. Score with `checks.run_all(run_dir)` into `results.md` and `results.json`, whose header
    names the seed of a random schedule. Exit 1 on any FAIL
-   or an aborted or errored run, 2 on a scenario or argument error, 3 when `run` FAILs a stall,
-   and 130 when interrupted. A stall's 3 wins over 1, because nothing else in the run can be
-   judged and a rerun once the host is awake can pass. `check` exits 0, 1, or 3 the same way.
-   `--retry-stalled N` reruns a stalled run up to N times, 30 s apart, each in a new run
-   directory with the same duration and seed.
+   or an aborted or errored run, 2 when the run never started (a scenario, argument, or setup
+   error), 3 when `run` FAILs a stall, and 130 when interrupted; 3 outranks 1 but not 130.
+   `check` exits 0, 1, or 3 the same way. `--retry-stalled N` reruns a stalled run up to N times,
+   30 s apart, each in a new run directory with the same duration and seed. The reasoning is
+   [ADR `soak-harness`](../adr/soak-harness.md)'s stall amendment.
 
 ### 6. The checks (W1a, W1b)
 
@@ -4961,8 +4961,8 @@ defaults to is pending; it will be recorded here.
   longer fault can free one.
 - **An earlier attempt, `20261018T053350Z`, ran while the host suspended** on a lid close for
   8.5 hours: `systemd-inhibit --what=sleep:idle` doesn't block `handle-lid-switch`. `run`
-  FAILed it as stalled. The driver now ends a run at its first stall and exits 3, so a run
-  the host slept through is rerun once the host is awake rather than kept awake.
+  FAILed it as stalled. A run the host slept through ends at its first stall and exits 3,
+  and is rerun once the host is awake rather than kept awake (§5).
 
 ## Verification
 
