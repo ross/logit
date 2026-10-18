@@ -4897,6 +4897,99 @@ but `ledger.windows` and `ledger.replay`, which SKIP on a Kafka target with no k
   descriptors went from 13 to 12 (SUT) and 12 to 11 (generator), so no redial left a
   descriptor behind.
 
+### W15: multi-destination routers under a target split (2026-10-18)
+
+`route-copy` and `route-signals` ran once each, side by side, on the development host (`trout`,
+24 cores, Linux 7.2.9), against the `logit:soak` image `sha256:30b450da18b2…` built
+2026-10-18 08:07 PDT with `--no-cache` from `soak/w15` after its merge of `origin/main`
+(`fdc4eb8c`), so the binary holds every product change through W17; `route`, `route_signals`,
+and `target` are unchanged since `4b86ccc7`. Both ran from `soak/w15` at `e824297f`, exit 0,
+Overall PASS, every row PASS or SKIP.
+
+- **The router balances with no tolerance.** `route-copy`'s router read R_in 768,525 and
+  R_copied 384,269, one copy per shard-0 line, against ΣT_sent 1,152,794, and `route-signals`'s
+  read R_in 828,381 and R_copied 828,381, one copy per line since every event carries a log and
+  a metric, against ΣT_sent 1,656,762. Neither discarded an event, and `route-copy`'s unrouted
+  consumer received none.
+- **Each sink balances from its own target.** In the stopped life each sink's
+  T_sent − T_x − V was 0, and so was the listeners' side up to the router. `route-signals`' kill
+  left each branch inside its own band, 10,200 at `vm_logs`, one aggregate window.
+- **A stop of one backend didn't hold the other branch.** With `vm_metrics`' backend down 90 s,
+  `vm_logs` delivered every window: the stopped sink's queue held its windows, so nothing backed
+  up to the router, which waits on a full inbox at any one target before it serves the next.
+
+`route-copy`, `perf/results/soak/20261018T150812Z`:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 6 apply/revert action(s) returned 0; 1 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 2 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 2 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 3 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 56 readiness sample(s) read ok outside fault windows; 1 start(s) or unpause(s) ready in time, slowest ready 0.2s |
+| `progress` | PASS | 7 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: vm_a: deliveries in 7 of 7, 7 freshness sample(s); vm_b: deliveries in 7 of 7, 7 freshness sample(s); 180s of 540s after warmup judged (33%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +7.6 (limit 64); 210s of 540s after warmup judged (39%; WARN under 5%) \| logit PASS: MiB/h life 1 +1.8 (limit 64); 200s of 540s after warmup judged (37%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 12 -> end 11 (limit +8) \| logit PASS: warmup median 13 -> end 13 (limit +8) |
+| `ledger.wire` | PASS | G 1,213,300 = W 1,201,225 + K 0 + wire 12,075 (by design: 12,095 in UDP-affecting windows, -76 steady, 56 at the end; steady loss judged 1, each run at 0 or more, against limit 500); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 1: W − D 768,525 vs E + B 768,525; life 0 (stopped): W − D − B − X − R_in 0 (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 1: E 768,525 == R_in[split] 768,525 (listeners to router split); R_in 768,525 + R_copied 384,269 − R_disc 0 = 1,152,794 == R_fwd + ΣT_sent 1,152,794 (router split sends each event to every destination it names); T_sent[tier_a] − T_x[tier_a] 384,269 == A[window_a] 384,269 (into window_a); A_sent[window_a] 2,000 == S_in[vm_a] 2,000 (window_a to vm_a); T_sent[tier_b] − T_x[tier_b] 768,525 == A[window_b] 768,525 (into window_b); A_sent[window_b] 4,000 == S_in[vm_b] 4,000 (window_b to vm_b) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 1: window_a: Ab 384,269 == A 384,269; window_b: Ab 768,525 == A 768,525 (every event absorbed) |
+| `ledger.egress` | PASS | vm_a: life 0: T_sent[tier_a] − T_x − V 0 = residual 0 + Ab[window_a] − V 0, ok; life 1 (final): Ab[window_a] 384,269 − V[vm_a] 384,269 = 0, ok \| vm_b: life 0: T_sent[tier_b] − T_x − V 0 = residual 0 + Ab[window_b] − V 0, ok; life 1 (final): Ab[window_b] 768,525 − V[vm_b] 768,525 = 0, ok (split target; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 1: uncounted 0, each term judged on its own: Ab[window_a] − V[vm_a] 0; Ab[window_b] − V[vm_b] 0; the other 9 term(s) 0; wire G − (W + K + F) 12,075 over the run; ledger.wire's |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 1 at +630s: vm_a: received 40 vs delivered 40 + dropped 0 + buffer.batches 0, gap 0; vm_b: received 40 vs delivered 40 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 3 of 3 fault(s) judged at 2 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served` | SKIP | the scenario has no probe step |
+| `expect.b-delivers-while-a-stopped` | PASS | delta of logit.component.batches.delivered{component=vm_b} on logit, during c0s1: c0s1 (+60s, +150s]: 9 (over 18 drain(s)), want >= 6 |
+| `expect.a-queues-while-stopped` | PASS | max of logit.component.buffer.batches{component=vm_a} on logit, during c0s1: c0s1 (+60s, +150s]: 9 (10 sample(s) and the value in force at its start), want >= 5 |
+| `expect.a-drops-nothing` | PASS | delta of logit.component.batches.dropped{component=vm_a} on logit, through c0s1: c0s1 (+60s, +195s]: 0 (over 27 drain(s)), want <= 0 |
+| `expect.router-copies-shard-0` | PASS | delta of logit.component.events.copied{component=split} on logit, during c0s1: c0s1 (+60s, +150s]: 90,000 (over 18 drain(s)), want >= 50000 |
+| `expect.nothing-unrouted` | PASS | delta of logit.component.events.received{component=unrouted} on logit, run: run (+60s, +600s]: 0 (over 108 drain(s)), want <= 0 |
+
+`route-signals`, `perf/results/soak/20261018T150821Z`:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 8 apply/revert action(s) returned 0; 2 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 4 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (1 kill(s)) |
+| `restarts` | PASS | 3 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 4 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 77 readiness sample(s) read ok outside fault windows; 2 start(s) or unpause(s) ready in time, slowest ready 0.2s |
+| `progress` | PASS | 10 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: vm_logs: deliveries in 10 of 10, 10 freshness sample(s); vm_metrics: deliveries in 10 of 10, 10 freshness sample(s); 270s of 720s after warmup judged (37%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +1.8 (limit 64); 310s of 720s after warmup judged (43%; WARN under 5%) \| logit PASS: MiB/h life 2 +22.6 (limit 64); 225s of 720s after warmup judged (31%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 12 (limit +8) \| logit PASS: warmup median 13 -> end 13 (limit +8) |
+| `ledger.wire` | PASS | G 1,573,400 = W 1,551,381 + K 0 + wire 22,019 (by design: 21,992 in UDP-affecting windows, -64 steady, 91 at the end; steady loss judged 1, each run at 0 or more, against limit 700); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 2: W − D 828,381 vs E + B 828,381; life 0 (stopped): W − D − B − X − ΣT_disc − R_in 0; life 1: W − D − B − X − ΣT_disc − R_in 0 within [0, R] (R 272,000 = 10,000 + 197 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 2: E[lines] 828,381 == T_in[parse] 828,381 (into parse); T_in[parse] 828,381 − T_disc[parse] 0 = 828,381 == T_out[parse] 828,381 (parse sends what it doesn't discard); T_out[parse] 828,381 == T_in[labels] 828,381 (into labels); T_in[labels] 828,381 − T_disc[labels] 0 = 828,381 == T_out[labels] 828,381 (labels sends what it doesn't discard); T_out[labels] 828,381 == T_in[count] 828,381 (into count); T_in[count] 828,381 − T_disc[count] 0 = 828,381 == T_out[count] 828,381 (count sends what it doesn't discard); Σ(sent into router) 828,381 == R_in[split] 828,381 (listeners to router split); R_in 828,381 + R_copied 828,381 − R_disc 0 = 1,656,762 == R_fwd + ΣT_sent 1,656,762 (router split sends each event to every destination it names); T_sent[tier_logs] − T_x[tier_logs] 828,381 == T_in[count_logs] 828,381 (into count_logs); T_in[count_logs] 828,381 − T_disc[count_logs] 0 = 828,381 == T_out[count_logs] 828,381 (count_logs sends what it doesn't discard); T_out[count_logs] 828,381 == T_in[logs_metrics_only] 828,381 (into logs_metrics_only); T_in[logs_metrics_only] 828,381 − T_disc[logs_metrics_only] 0 = 828,381 == T_out[logs_metrics_only] 828,381 (logs_metrics_only sends what it doesn't discard); T_out[logs_metrics_only] 828,381 == A[window_logs] 828,381 (into window_logs); A_sent[window_logs] 2,000 == S_in[vm_logs] 2,000 (window_logs to vm_logs); T_sent[tier_metrics] − T_x[tier_metrics] 828,381 == A[window_metrics] 828,381 (into window_metrics); A_sent[window_metrics] 2,000 == S_in[vm_metrics] 2,000 (window_metrics to vm_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 2: window_logs: Ab 828,381 == A 828,381; window_metrics: Ab 828,381 == A 828,381 (every event absorbed) |
+| `ledger.egress` | PASS | vm_logs: life 0: T_sent[tier_logs] − T_x − ΣT_disc − V 0 = residual 0 + Ab[window_logs] − V 0, ok; life 1 (killed): Ab[window_logs] 230,200 − V[vm_logs] 220,000 = 10,200, within band (band [-10,001, 30,002]: ingest 2,000/s over the last drain interval; below, the residual 0 plus one 5.00004s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual T_sent[tier_logs] − T_x − ΣT_disc − Ab 0 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 2 (final): Ab[window_logs] 828,381 − V[vm_logs] 828,381 = 0, ok \| vm_metrics: life 0: T_sent[tier_metrics] − T_x − V 0 = residual 0 + Ab[window_metrics] − V 0, ok; life 1 (killed): Ab[window_metrics] 230,200 − V[vm_metrics] 220,000 = 10,200, within band (band [-10,001, 30,002]: ingest 2,000/s over the last drain interval; below, the residual 0 plus one 5.00004s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual T_sent[tier_metrics] − T_x − Ab 0 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 2 (final): Ab[window_metrics] 828,381 − V[vm_metrics] 828,381 = 0, ok (split target; R 272,000 = 10,000 + 197 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | PASS | vm_logs: life 2's first drain replayed 0 vs killed life 1's last-drain buffer.batches 0; vm_metrics: life 2's first drain replayed 0 vs killed life 1's last-drain buffer.batches 0 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 2: uncounted 0, each term judged on its own: Ab[window_logs] − V[vm_logs] 0; Ab[window_metrics] − V[vm_metrics] 0; the other 19 term(s) 0; wire G − (W + K + F) 22,019 over the run; ledger.wire's |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 2 at +810s: vm_logs: received 40 vs delivered 40 + dropped 0 + buffer.batches 0, gap 0; vm_metrics: received 40 vs delivered 40 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 4 of 4 fault(s) judged at 2 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served` | SKIP | the scenario has no probe step |
+| `expect.logs-deliver-while-metrics-backend-stopped` | PASS | delta of logit.component.batches.delivered{component=vm_logs} on logit, during c0s1: c0s1 (+60s, +150s]: 9 (over 18 drain(s)), want >= 6 |
+| `expect.metrics-queue-while-stopped` | PASS | max of logit.component.buffer.batches{component=vm_metrics} on logit, during c0s1: c0s1 (+60s, +150s]: 9 (10 sample(s) and the value in force at its start), want >= 5 |
+| `expect.metrics-drop-nothing` | PASS | delta of logit.component.batches.dropped{component=vm_metrics} on logit, through c0s1: c0s1 (+60s, +195s]: 0 (over 27 drain(s)), want <= 0 |
+| `expect.router-copies-every-event` | PASS | delta of logit.component.events.copied{component=split} on logit, during c0s1: c0s1 (+60s, +150s]: 180,000 (over 18 drain(s)), want >= 100000 |
+| `expect.router-discards-nothing` | PASS | delta of logit.component.events.discarded{component=split} on logit, run: run (+60s, +780s]: 0 (over 131 drain(s)), want <= 0 |
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
@@ -4974,6 +5067,10 @@ but `ledger.windows` and `ledger.replay`, which SKIP on a Kafka target with no k
 - **W12a** changes no harness code: the self-test passes (1,478 expectations), and the four new
   scenarios pass `self-test` validation, the shipped-config test, and `script/validate`. Met:
   a run of each is recorded under "Findings", every ledger row PASS.
+- **W15**: the self-test passes (1,969 expectations), and each new rule fails it when
+  reverted (ten reverts, listed in the PR). `route-signals` and `route-copy` pass `self-test`
+  validation, the shipped-config test, and `logit validate` in `logit:soak`. Met: a run of each
+  is recorded under "Findings", Overall PASS.
 - **W17**: `kafka_out`'s tests pass, and the two reconnect assertions fail with the count
   reverted. The self-test passes (1,797 expectations), and the `rate` fixtures fail with the
   reducer reverted. `kafka-sasl-reauth` passes `self-test` validation, the shipped-config test,
