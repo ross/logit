@@ -800,8 +800,10 @@ the operator-facing account of all of this.
   `perf/results/soak-external.env`, and its ledger ends at the sink's telemetry (`ledger.sent`,
   `SENT`), with no backend query. `kafka-broker-restart` runs `kafka_out` against a broker in the
   stack (a `kafka` target) that it restarts, pauses, and stops, and reads the topic back as the
-  ledger's egress total (`ledger.topic`). `standin-remote-write` and `standin-at-most-once` point
-  `prometheus_out` at a scripted HTTP stand-in (a `standin` target, `tools/soak/standin/`) that
+  ledger's egress total (`ledger.topic`). `kafka-sasl-reauth` is the same over SCRAM-SHA-512 to
+  a broker that ends each session after 30 s, and bounds the sink's redial rate
+  (`logit.output.reconnects`, a `rate` expectation). `standin-remote-write` and
+  `standin-at-most-once` point `prometheus_out` at a scripted HTTP stand-in (a `standin` target, `tools/soak/standin/`) that
   `respond` steps cue through every row of the sink's response-class table, each step naming the
   fault class the sink must read; the stand-in's stdout records every request, raw body included,
   and is the ledger's V (`ledger.standin`). `standin-datadog` points `datadog_out` at a

@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-17
+updated: 2026-10-18
 ---
 
 # Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger
@@ -34,9 +34,9 @@ Non-goals:
   them.
 
 Stream key **`soak`**: branches `soak/w0`, `soak/w1a`, `soak/w1b`, then `soak/w2` through
-`soak/w12d`, a linear stack. After it come `soak/w13a` and `soak/w16`, which each branch off
-`main`, `soak/w14`, `soak/w13b`, and `soak/w15`, stacked in that order, and `soak/w18`, which
-branches off `main` after W14 merged. PR stack only: nothing is
+`soak/w12d`, a linear stack. After it come `soak/w13a`, `soak/w16`, and `soak/w17`, which each
+branch off `main`, `soak/w14`, `soak/w13b`, and `soak/w15`, stacked in that order, and
+`soak/w18`, which branches off `main` after W14 merged. PR stack only: nothing is
 merged by this workstream; Ross directs merging.
 
 Settled with Ross (2026-10-08): faults are an iproute2 image with `NET_ADMIN` applying `tc netem`
@@ -628,7 +628,7 @@ component = "victoria_metrics"          # optional; joins `attrs`
 attrs = { reason = "overflow_oldest" }  # optional attribute filters, all strings
 step = "c0s1"                           # an expanded step id, or a 1-based [[step]] index
 window = "during"                       # during | after | through | run (W8c, no step)
-reduce = "max"                          # delta | min_delta | max | min | last | slope (W8c) | rise (W12d)
+reduce = "max"                          # delta | min_delta | rate (W17) | max | min | last | slope (W8c) | rise (W12d)
 min = 2                                 # min, max, or both
 ```
 
@@ -636,7 +636,7 @@ min = 2                                 # min, max, or both
 |---|---|
 | `step` | An expanded step id names one occurrence. An integer names that `[[step]]` table's occurrence in every cycle, and the row FAILs if any occurrence does. `window = "run"` takes none |
 | `window` | `during` is the fault's span, from its apply starting to its revert finishing; `after` is the `recovery_bound` after it; `through` is both, from the apply starting to `recovery_bound` after the revert finishes. Each is open at its start, because a drain's deltas cover the interval before its timestamp. A bound that must hold for the whole episode, such as a loss counter that must stay 0, reads `through`: a chain blocked behind a sink stays blocked until the sink's next retry after the revert, up to its `retry_max_delay` later, so `during` misses the tail. `run` (W8c) has no step: it runs from the end of warmup to the start of the end sequence, fault windows included |
-| `reduce` | For a counter (`kind: sum`): `delta` sums the window's drains, and `min_delta` is the smallest single drain, a drain with no point counting 0, because a loss counter isn't emitted while it's 0. For a gauge: `max`, `min`, and `last` over the window's samples and the value in force at its start, because `internal` exports a gauge only in a drain after it was set. The value in force comes only from the SUT life whose drains cover the window's start, so a value an earlier process set doesn't carry into the next; a life that hasn't set the gauge yet leaves it unset. `last` is the value in force at the window's end. `slope` (W8c) is the least-squares slope of the window's own samples, without the value in force, in the metric's unit per hour (`checks.slope()`, times 3,600). A restart resets a process gauge, so `slope` fits each SUT life on its own and judges each life's slope against the bounds; a fit across a restart would read the drop as a negative trend. A life needs `rss_slope`'s minimum, 6 samples spanning 60 s, and the row FAILs when no life in the window has it, as a counter's window with no drain does. `rise` (W12d) is the value in force at the window's end less the one in force at its start, and the row FAILs with no value in force at the start |
+| `reduce` | For a counter (`kind: sum`): `delta` sums the window's drains, `min_delta` is the smallest single drain, a drain with no point counting 0, because a loss counter isn't emitted while it's 0, and `rate` (W17) is the `delta` divided by the window's length in hours, so a bound on a steady rate holds at any `--duration`. For a gauge: `max`, `min`, and `last` over the window's samples and the value in force at its start, because `internal` exports a gauge only in a drain after it was set. The value in force comes only from the SUT life whose drains cover the window's start, so a value an earlier process set doesn't carry into the next; a life that hasn't set the gauge yet leaves it unset. `last` is the value in force at the window's end. `slope` (W8c) is the least-squares slope of the window's own samples, without the value in force, in the metric's unit per hour (`checks.slope()`, times 3,600). A restart resets a process gauge, so `slope` fits each SUT life on its own and judges each life's slope against the bounds; a fit across a restart would read the drop as a negative trend. A life needs `rss_slope`'s minimum, 6 samples spanning 60 s, and the row FAILs when no life in the window has it, as a counter's window with no drain does. `rise` (W12d) is the value in force at the window's end less the one in force at its start, and the row FAILs with no value in force at the start |
 
 `validate()` refuses an unknown key, a missing field (`step` is required for every window but
 `run`, which refuses one), a `name` that isn't lowercase letters,
@@ -2299,12 +2299,20 @@ where it needs them, and a small check extension.
     backend, with one backend stopped. Rows: `ledger.edge` through the router, and
     `ledger.egress` per sink from its target. Needs: the split mode, a per-target `aggregate`
     in `[[ledger.sink]]`, and self-test fixtures.
-16. **Kafka SASL re-authentication and token refresh over hours (5da5ab8c), and an
-    `otlp_proto` topic (2969c24e).** A `kafka-broker-restart` variant with SCRAM or
-    OAUTHBEARER, a short `connections.max.reauth.ms` on the broker, and short-lived tokens from
-    `tools/kafka-interop`'s `mock-oauth2-server`, run for hours: each reauthentication ends a
-    connection (`crates/logit-outputs/src/kafka/conn.rs`'s module doc), so the run exercises
-    reconnects at a steady rate. Rows: `ledger.topic`, `fd_slope`, and duplicates per life.
+16. **Kafka SASL re-authentication over hours (5da5ab8c), built in W17 for SCRAM.**
+    `kafka-sasl-reauth` is `kafka-broker-restart` over SCRAM-SHA-512 to a broker whose SASL
+    listener sets `connections.max.reauth.ms` to 30 s. Each session's end retires a connection
+    (`crates/logit-outputs/src/kafka/conn.rs`'s module doc), so the run redials at a steady
+    rate, which `kafka_out` counts in `logit.output.reconnects` from W17 on and a `rate`
+    expectation bounds. Rows: `ledger.topic`, `fd_slope`, duplicates per life, and
+    `[[expect]]` on the redial rate, the `ambiguous` rate, `refused` attempts, and dropped
+    batches. Two halves remain:
+    - **OAUTHBEARER with short-lived tokens.** It needs `tools/kafka-interop`'s
+      `mock-oauth2-server` in the stack, under a new `idp` role, and a namespace holder, because
+      `kafka_out` takes a `token_endpoint` only over loopback HTTP or HTTPS with a public CA's
+      certificate.
+    - **An `otlp_proto` topic (2969c24e).** `ledger.topic` reads `format: json` records only;
+      V from an OTLP topic needs a stdlib protobuf walker for the export requests.
 17. **`influxdb_out`'s response-class table on a stand-in (ffe33654, b93cb23a), built in W16.**
     W9's stand-in design with InfluxDB's shape, cueing the `403` and `404` rows that split on
     whether the bucket or org was carried or configured: `Rejected` for a carried value,
@@ -2377,6 +2385,7 @@ that items 3, 7, and 11 need.
 | W14 | `soak/w14` | `soak/w14: an HTTP-ingress soak into influxdb_in, with an http wire for it and otlp_in` | M | W12d |
 | W15 | `soak/w15` | `soak/w15: multi-destination route and route_signals soaks, with a target split` | M | W13b |
 | W16 | `soak/w16` | `soak/w16: an InfluxDB-shaped stand-in for every influxdb_out response class` | M | W12d |
+| W17 | `soak/w17` | `soak/w17: a Kafka SASL re-authentication soak` | M | W16 |
 | W18 | `soak/w18` | `soak/w18: a tail_in descriptor soak under a deleting rotation` | M | W14 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
@@ -2501,14 +2510,19 @@ that items 3, 7, and 11 need.
   series and timestamp, `ledger.standin`'s rules for the shape, the class required on its
   `respond` steps, and the `standin-influxdb`, `standin-influxdb-carried`, and
   `standin-influxdb-mixed` scenarios, each run recorded under "Findings".
+- **W17**: item 16's SCRAM half: `kafka_out` counts `logit.output.reconnects`, `[[expect]]`
+  gains the `rate` reducer, and the `kafka-sasl-reauth` scenario, whose compose override starts
+  the broker from its own `kafka-server.properties` with a SCRAM user, with a run recorded under
+  "Findings".
 - **W18**: item 18: the writer's deletions in `ledger.wire` (the end count held to G only
   while the writer deleted no file, then as a bound with the writer's file count) and its
   retention guard, the end sequence's wait for G, self-test fixtures for each rule, and the
   `tail-rotate-delete` scenario, a short run recorded under "Findings".
 
-Item 16, and §10's follow-ups to items 11 and 12, have no workstream yet.
+Item 16's OAUTHBEARER and `otlp_proto` halves, and §10's follow-ups to items 11 and 12, have no
+workstream yet.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a and W16 land off `main` beside W14, and W18 off `main` after it. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18 off `main` after it. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
@@ -4820,6 +4834,50 @@ of 650:
   each judged run's surplus stayed inside its allowance once the boundaries netted.
 - No product finding.
 
+### W17: Kafka SASL re-authentication (2026-10-18)
+
+Run `20261018T051509Z`: `kafka-sasl-reauth` at its own 8 minutes 30 seconds, from `soak/w17` at
+`de32105b` with the scenario and its documentation uncommitted, on the development host, against
+`logit:soak-w17` (`sha256:ff0effb78cba`, built from that tree, since the branch changes
+`kafka_out`) and `apache/kafka:4.2.0` (`sha256:9516fb7634ba`). Overall PASS: every row passed
+but `ledger.windows` and `ledger.replay`, which SKIP on a Kafka target with no kill.
+
+- **Nothing was lost or stored twice.** The generator sent 1,032,000 lines, all absorbed, and the
+  topic held 2,590 distinct records, every one the sink saw accepted, whose increments summed to
+  1,032,000. The sink delivered all 259 batches and dropped none.
+- **The sink redialed 17 times in the 450 s run window, 136 an hour.** While the broker
+  answered, a redial came every 20 to 25 s at the 5 s drain resolution, about 23 s on average:
+  the 20 s deadline, then the next 2 s produce slot and the dial. Each fault ended the connection
+  and restarted the clock: the restart's redial at +94 s, the pause's at +209 s, and the stop's at
+  +359 s, two in one drain, the second most likely the bootstrap connection on the metadata
+  refresh the stop's `NotLeaderOrFollower` asked for.
+  The three up-segments, 71 s, 76 s, and 151 s, predict 4, 4, and 8 dials with the segment model
+  in the scenario's comment, which is what the run counted.
+- **The bounds were widened after the run.** It ran under `[120, 300]`, from a first derivation
+  that added the forced redials to the renewals. A forced redial restarts the renewal clock
+  instead, so the scenario's comment re-derives the floor from the up-segments, 96 an hour, and
+  ships `[80, 300]`. That band catches a sink that redials before every send, about 1,800 an
+  hour, but not one that never renews: the broker closes an expired session's connection on its
+  next request without answering it (Kafka 4.0.0's `SocketServer`
+  `Processor.processCompletedReceives()`), the sink reads that as `Ambiguous` and redials, and
+  those redials come every 30 to 33 s of broker uptime, 90 to 120 an hour. So the scenario adds
+  `no-expired-session-sends`: the `ambiguous` rate over the run at most 40 an hour, against at
+  most one per fault, 28 an hour, for a sink that renews, and 83 or more for one that doesn't.
+  Re-scored offline (`soak.py check` on a copy of the run directory carrying the new
+  expectations), it reads 1 `ambiguous` attempt, the pause's, 8 an hour, and every row still
+  passes.
+- **No attempt was `refused`.** The restart kept the SCRAM credential, which
+  `kafka-storage.sh format --ignore-formatted` leaves in the metadata log. Of 274 attempts, 14
+  were `clean` and 1 `ambiguous`; the self-log's throttled lines name a connection refused in the
+  restart, a response timeout in the pause, a `NotLeaderOrFollower` as the stop began, and the
+  broker's name gone from DNS during it.
+- **The read-back took 5 s** after the SUT stopped, for 2,590 records. At ten series an 8-hour
+  run holds 144,000 records, which at `kafka-broker-restart`'s observed rate reads well inside
+  the driver's 180 s bound, so the scenario's `max_duration` is 8 hours.
+- **RSS slopes** were +9.8 MiB/h (SUT) and −0.2 MiB/h (generator) over 370 s, and file
+  descriptors went from 13 to 12 (SUT) and 12 to 11 (generator), so no redial left a
+  descriptor behind.
+
 ### W18: a deleting rotation (2026-10-18)
 
 `tail-rotate-delete` ran for 20 minutes on the development host, against `logit:soak-w18`
@@ -4963,3 +5021,7 @@ defaults to is pending; it will be recorded here.
 - **W12a** changes no harness code: the self-test passes (1,478 expectations), and the four new
   scenarios pass `self-test` validation, the shipped-config test, and `script/validate`. Met:
   a run of each is recorded under "Findings", every ledger row PASS.
+- **W17**: `kafka_out`'s tests pass, and the two reconnect assertions fail with the count
+  reverted. The self-test passes (1,797 expectations), and the `rate` fixtures fail with the
+  reducer reverted. `kafka-sasl-reauth` passes `self-test` validation, the shipped-config test,
+  and `logit validate` in its image. Met: its run is recorded under "Findings", Overall PASS.
