@@ -1,10 +1,13 @@
 #!/bin/bash
-# Usage: script/soak run <scenario> [--duration 20m] [--seed N] [--keep] [--out DIR]
+# Usage: script/soak run <scenario> [--duration 20m] [--seed N] [--keep] [--retry-stalled N]
+#                         [--out DIR]
 #        script/soak list | check <run-dir> | self-test
 #
 # Runs a soak scenario from tools/soak/scenarios/: real `logit` containers under network and
 # lifecycle faults on a timeline, scored by a watchdog. See tools/soak/README.md for what it runs
-# and what it writes, and docs/plans/soak-harness.md for the design.
+# and what it writes, and docs/plans/soak-harness.md for the design. The driver's exit status
+# passes through: 0 PASS, 1 FAIL, 2 a scenario or argument error, 3 a run the host slept
+# through (rerun it), 130 interrupted.
 #
 # Not part of script/cibuild: it drives the host's docker daemon, and no test depends on it.
 #
@@ -34,7 +37,7 @@ fi
 
 scenario="${2:-}"
 if [ -z "${scenario}" ]; then
-    echo "usage: script/soak run <scenario> [--duration 20m] [--seed N] [--keep] [--out DIR]" >&2
+    echo "usage: script/soak run <scenario> [--duration 20m] [--seed N] [--keep] [--retry-stalled N] [--out DIR]" >&2
     exit 2
 fi
 scenario_dir="${TOOLS_DIR}/scenarios/${scenario}"

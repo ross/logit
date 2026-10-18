@@ -142,6 +142,10 @@ COVERAGE_MIN_SHARE = 0.05
 RUN_FAIL_PHASES = ("aborted", "error", "interrupted")
 # How late the driver's tick may run before the run is `stalled` (driver.py's `STALL_S`).
 STALL_S = 120
+# The `aborted` phase's reason when the driver ended the schedule at a stall, and the start of
+# each line `run` writes for a stall, which `stalled()` reads.
+STALL_ABORT_REASON = "the schedule stopped at a stall, and the end sequence ran"
+STALL_LINE = "stalled:"
 POLL_SLACK_S = 5
 
 
@@ -521,12 +525,18 @@ def check_run(data):
         stalls = [(a - data.t0, b - a) for a, b in zip(polled, polled[1:])
                   if b - a > STALL_S]
     for since, late in stalls:
-        lines.append(f"stalled: the driver's tick ran {late:,.0f}s late from +{since:.0f}s, as "
-                     "when the host sleeps; nothing was scheduled or polled in that span")
+        lines.append(f"{STALL_LINE} the driver's tick ran {late:,.0f}s late from +{since:.0f}s, "
+                     "as when the host sleeps; nothing was scheduled or polled in that span")
     lines += [f"no {name} phase" for name in ("start", "end_end") if name not in data.phases]
     if lines:
         return Result("run", FAIL, "; ".join(lines), lines)
     return Result("run", PASS, "ran from start through end_end")
+
+
+def stalled(results):
+    """Whether the `run` row in `results` FAILed a stall."""
+    return any(result.id == "run" and any(line.startswith(STALL_LINE) for line in result.lines)
+               for result in results)
 
 
 def check_timeline(data):

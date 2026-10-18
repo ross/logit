@@ -95,7 +95,8 @@ tools/soak/
   scenarios/kafka-broker-restart/       # a Kafka target: kafka_out to a local broker, read back
 ```
 
-Subcommands: `run <scenario> [--duration 20m] [--seed N] [--keep] [--out DIR]`, `list`,
+Subcommands: `run <scenario> [--duration 20m] [--seed N] [--keep] [--retry-stalled N]
+[--out DIR]`, `list`,
 `check <run-dir>`, `target <scenario> [--env-file FILE]` (W5: the target's kind, for
 `script/soak`), and `self-test`, which also runs at the start of `run`, as
 `survey_self_test` does for `script/shape-survey`. Environment: `SOAK_SKIP_IMAGE=1` reuses the
@@ -805,6 +806,11 @@ ticket with `${DOCKER} version` first.
    - **Fail fast:** a `logit` container leaving `running`, or a `StartedAt` change, with no step
      behind it ends the timeline at once. The end sequence and collection still run. Inside an
      `exit` step (W7a) the container may be `running` or `exited`.
+   - **Stall:** a tick more than 120 s late (`STALL_S`, past the slowest thing the loop does)
+     means the host slept or the driver was stopped, and nothing was scheduled or polled in that
+     span. The loop records a `stalled` phase and an `aborted` phase with that reason, then
+     ends the timeline before any further step: every step overdue by then would run back to
+     back. The end sequence and collection still run, so `check` can re-score the directory.
 4. End (for an external target, W5, see "External targets"): revert active faults; `docker stop -t 30` every generator; with a `file` wire (W11b), count the
    newline-terminated lines in every file of `<run>/shared` (phase `shared_counted`), read G,
    the writers' `events.delivered`, from a log chunk of each writer taken 6 s later, past the
@@ -821,7 +827,9 @@ ticket with `${DOCKER} version` first.
    sink (W10b) with `buffer.batches` 0, and `retrying` and `logit.output.in_flight` 0 or never
    set (120 s bound, a `sink_drained` phase naming the service); the last waits as above, on
    its sinks. Under `[overlap]` (W12b) one wait on the stored totals covers every instance, and
-   then each instance stops (§8e).
+   then each instance stops (§8e). After a stall the sequence is the same: its waits are each
+   bounded, so an aborted run ends within minutes of the host waking, and the directory has
+   what any run's has.
 5. Collect: the last `docker logs` chunk per service, from its cursor to the end, into
    `.stdout` and `.stderr`, and `inspect/<svc>.json`.
    Then `compose down -v --remove-orphans`, unless `--keep`. A `try`/`finally` makes SIGINT still
@@ -831,7 +839,11 @@ ticket with `${DOCKER} version` first.
    its jobs as the terminal closes.
 6. Score with `checks.run_all(run_dir)` into `results.md` and `results.json`, whose header
    names the seed of a random schedule. Exit 1 on any FAIL
-   or an aborted or errored run, and 130 when interrupted.
+   or an aborted or errored run, 2 on a scenario or argument error, 3 when `run` FAILs a stall,
+   and 130 when interrupted. A stall's 3 wins over 1, because nothing else in the run can be
+   judged and a rerun once the host is awake can pass. `check` exits 0, 1, or 3 the same way.
+   `--retry-stalled N` reruns a stalled run up to N times, 30 s apart, each in a new run
+   directory with the same duration and seed.
 
 ### 6. The checks (W1a, W1b)
 
@@ -857,7 +869,8 @@ returned nonzero has none, so nothing after it is excused.
   exits 130 for it. From W12b a run also FAILs as `stalled` when the driver's 1 s tick ran more
   than 120 s late, past anything the loop does, as when the host sleeps: nothing was scheduled
   or polled in that span. The driver records a `stalled` phase; for an older run directory the
-  row reads the same from a gap in `watchdog.jsonl`.
+  row reads the same from a gap in `watchdog.jsonl`. The driver ends the schedule at the first
+  stall, with an `aborted` phase naming it, and exits 3 (§5).
 - `timeline`: every apply and revert returned 0, the schedule didn't fail fast, and every
   start or unpause of a `logit` service has a `ready` record. An early revert in the end
   sequence isn't probed, so it needs none.
@@ -4948,7 +4961,8 @@ defaults to is pending; it will be recorded here.
   longer fault can free one.
 - **An earlier attempt, `20261018T053350Z`, ran while the host suspended** on a lid close for
   8.5 hours: `systemd-inhibit --what=sleep:idle` doesn't block `handle-lid-switch`. `run`
-  FAILed it as stalled. Run a long soak under `--what=sleep:idle:handle-lid-switch`.
+  FAILed it as stalled. The driver now ends a run at its first stall and exits 3, so a run
+  the host slept through is rerun once the host is awake rather than kept awake.
 
 ## Verification
 

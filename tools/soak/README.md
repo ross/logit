@@ -21,6 +21,7 @@ script/soak run statsd-vm                        # the scenario's own duration (
 script/soak run statsd-vm --duration 5m --keep   # shorter, and leave the stack up afterward
 script/soak run random-faults --duration 8h      # a seeded random schedule; see "Long runs"
 script/soak run random-faults --seed 7           # the same scenario, another schedule
+script/soak run random-faults --duration 8h --retry-stalled 2   # rerun if the host sleeps
 script/soak run statsd-datadog                   # an external target; needs a key, see "External targets"
 script/soak run kafka-broker-restart             # a Kafka target; see "Kafka targets"
 script/soak run standin-remote-write             # a stand-in target; see "Stand-in targets"
@@ -784,21 +785,37 @@ scenario with a `rejected` step can't set it.
    5 s, samples `docker stats` and, for a local target, each sink's newest stored sample every
    30 s, and appends each
    container's new log lines every 5 minutes. A `logit`
-   container that exits or restarts with no step behind it ends the schedule at once.
+   container that exits or restarts with no step behind it ends the schedule at once. So does a
+   tick more than 120 s late, which means the host slept or the driver was stopped: the driver
+   records a `stalled` phase and an `aborted` one, and applies no further step, since every
+   overdue step would otherwise run back to back.
 4. At the end it reverts active faults, stops every generator, waits until every sink's stored
    total holds across two aggregate windows, stops the SUT (expecting exit 0), and exports each
    sink's series from its backend. For an external target it waits for every SUT sink's queue
    to empty instead, and exports nothing. With several SUT services it stops each in chain
-   order, as [Several SUT services](#several-sut-services) describes.
+   order, as [Several SUT services](#several-sut-services) describes. After a stall it runs the
+   same sequence, so the run directory is complete and `check` scores it like any other. Each
+   wait has its own bound, so an aborted run ends within minutes of the host waking.
 5. It collects the rest of each service's stdout and stderr separately with `docker logs`, and
    its final `docker inspect`, then tears the project down (`down -v --remove-orphans`) unless `--keep`.
    This step runs on every exit but SIGKILL: SIGINT (Ctrl-C), SIGTERM, and SIGHUP each stop the
    schedule and reach it, unless the driver started with that signal ignored, as `nohup` leaves
    SIGHUP. After a SIGHUP the driver drops its terminal output and carries on, because the run
    directory has everything.
-6. It scores the run. The script exits 1 on any `FAIL`, including a run the driver aborted or
-   hit an error in, and 130 when SIGINT, SIGTERM, or SIGHUP interrupted it, whose `run` row
-   FAILs too. `check` on that directory exits 1: only the live run knows it was interrupted.
+6. It scores the run and exits with one of these statuses, which `script/soak` passes through:
+
+   | Status | Run |
+   |---|---|
+   | 0 | every row passes or warns |
+   | 1 | any `FAIL`, including a run the driver aborted or hit an error in |
+   | 2 | a scenario or argument error, before anything starts |
+   | 3 | `stalled`: the host slept or the driver was stopped mid-run, and `run` FAILs. Nothing else in the run can be judged, so rerun it once the host is awake |
+   | 130 | SIGINT, SIGTERM, or SIGHUP interrupted it, and `run` FAILs |
+
+   `check` on a run directory exits 0, 1, or 3 the same way. On an interrupted run it exits 1,
+   because only the live run knows it was interrupted. `--retry-stalled N` reruns a stalled run
+   up to N times, 30 s apart, each in a new run directory with the same duration and seed; it
+   doesn't combine with `--keep`, whose stack would block the rerun.
 
 A run writes `perf/results/soak/<UTC stamp>/` (gitignored, or under `SOAK_OUT`):
 
@@ -910,7 +927,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 
 | Check | `FAIL`s when |
 |---|---|
-| `run` | the driver aborted, hit an error, or was interrupted, its tick ran more than 120 s late (`stalled`, as when the host sleeps), or the timeline lacks its `start` or `end_end` phase |
+| `run` | the driver aborted, hit an error, or was interrupted, its tick ran more than 120 s late (`stalled`, as when the host sleeps, which also ends the schedule there and exits 3), or the timeline lacks its `start` or `end_end` phase |
 | `timeline` | a fault's apply or revert returned nonzero, the schedule failed fast, or a start or unpause of a `logit` service has no readiness probe; a fault whose apply failed gets no window |
 | `exit` | a `logit` container exits outside a scheduled stop, restart, kill, or `exit` step, or with a code other than the one that action leaves (0, 137 for a kill, the step's `code` for an `exit`); an `exit` step sees no exit; or any container is OOM-killed |
 | `restarts` | a container starts with no scheduled start or restart behind it: the revert of a `stop` or `kill`, an `exit` revert that started it, or a `restart` |
@@ -1077,9 +1094,10 @@ on. The driver runs every docker command as `sudo -n`, which fails instead of pr
 no terminal there's nothing to prompt on; `tmux` keeps the terminal the ticket was primed on.
 Follow a run with `tail -f perf/results/soak/<stamp>/timeline.jsonl`.
 
-On a laptop, keep the host awake too: a suspended host stalls the run, which `run` FAILs. Wrap
-the command in `systemd-inhibit --what=sleep:idle:handle-lid-switch`; without
-`handle-lid-switch`, closing the lid still suspends it.
+A host that suspends mid-run, such as a laptop with its lid closed, stalls the run. When the
+host wakes, the driver ends the schedule, runs the end sequence, and exits 3 with `run` FAILed as
+`stalled`. Rerun the scenario once the host is awake, or pass `--retry-stalled N` to rerun it
+automatically.
 
 What an 8-hour run costs, from the recorded runs' rates:
 
