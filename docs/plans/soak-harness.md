@@ -4678,6 +4678,76 @@ to judge `influxdb_in`'s identities in every life, which changed only that row:
   allowance of 2,300.
 - No product finding.
 
+### W13b: fan-out transforms (2026-10-18)
+
+`otlp-fan-out` ran three times on the development host (`trout`, 24 cores, Linux 7.2.9), against
+the `logit:soak` image `sha256:68c3d292…` built 2026-10-17 19:29 PDT from `soak/w14`; no product
+code changed since `origin/main`'s `9bfc434f`, and `line_protocol`, `otlp_in`, and `otlp_out` are
+all on `main`. The third run, `perf/results/soak/20261018T043911Z`, from `soak/w13b` at
+`fd3cab7c`, exit 0, every row PASS or SKIP:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 14 apply/revert action(s) returned 0; 2 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 3 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 2 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 7 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 53 readiness sample(s) read ok outside fault windows; 2 start(s) or unpause(s) ready in time, slowest ready 0.2s |
+| `progress` | PASS | 7 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 7 of 7, 7 freshness sample(s); 180s of 900s after warmup judged (20%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +1.6 (limit 64); 200s of 900s after warmup judged (22%; WARN under 5%) \| logit PASS: MiB/h life 1 +3.4 (limit 64); 190s of 900s after warmup judged (21%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +8) \| logit PASS: warmup median 13 -> end 14 (limit +8) |
+| `ledger.wire` | PASS | G 381,500 (acknowledged of 483,150 attempted) = W 381,650 − X 0 + gap -150 (0 in reported windows, -5 in judged HTTP-affecting windows, -114 steady, -31 at the end; loss judged 82, each run at 0 or more, against limit 650); the generator's requests: 22 transport-error attempt(s), 0 answered 5xx and retried; its counted loss, not in G: 101,650 event(s) in 2,033 batch(es) (overflow_newest 2,033) |
+| `ledger.intake` | PASS | final life 1: W − D 128,700 vs E + B 128,700; final life 1: otlp_in counts no requests: W − D == E + B alone; life 0: W′ − Ab 0 within [0, R] (R 788,000 = (0 + 132 x 1,000) x 4 + 65 x 1,000 x 4; W′ is each listener's W − D − B − X carried through its chain's fan_out and discards) |
+| `ledger.edge` | PASS | final life 1: E[otlp] 128,700 == T_in[points] 128,700 (into points); children[points] = T_out 514,800 − (T_in 128,700 − T_disc 128,700) = 514,800 == 4 x T_in − T_lines[points] 514,800 (points emits 4 per event); T_out[points] 514,800 == T_in[count] 514,800 (into count); T_in[count] 514,800 − T_disc[count] 0 = 514,800 == T_out[count] 514,800 (count sends what it doesn't discard); Σ(sent into aggregate) 514,800 == A 514,800 (listeners to aggregate); A_sent 19,840 == S_in[victoria_metrics] 19,840 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 1: Ab 514,800 == A 514,800 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: W′ − V 0 = residual 0 + Ab − V 0, ok; life 1 (final): Ab 514,800 − V[victoria_metrics] 514,800 = 0, ok (split copy; R 788,000 = (0 + 132 x 1,000) x 4 + 65 x 1,000 x 4; W′ is each listener's W − D − B − X carried through its chain's fan_out and discards) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 1: uncounted 0 = W − D − E − B 0 + ledger.edge's chain terms 0 + Σ(sent into aggregate) − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K + F) -150 over the run, F 0 counted; ledger.wire judges the rest; end to end over the run, G 381,500 less counted loss 0 plus a resend allowance 1,100, carried through the chains' fan_out and discards to 1,530,400: victoria_metrics: V 1,526,600 <= (G − counted + resent) carried through the chains 1,530,400 |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 1 at +960s: victoria_metrics: received 496 vs delivered 495 + dropped 0 + buffer.batches 1, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 7 of 7 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 500/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served` | SKIP | the scenario has no probe step |
+| `expect.sink-queue-fills` | PASS | max of logit.component.buffer.batches{component=victoria_metrics} on logit, during c0s4: c0s4 (+450s, +540s]: 2 (1 sample(s) and the value in force at its start), want >= 2 |
+| `expect.sink-never-drops` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics} on logit, through c0s4: c0s4 (+450s, +585s]: 0 (over 24 drain(s)), want <= 0 |
+| `expect.generator-resends` | PASS | delta of logit.output.requests{class=network_error, component=otlp} on generator, through c0s5: c0s5 (+570s, +645s]: 6 (over 15 drain(s)), want >= 1 |
+| `expect.no-lines-dropped` | PASS | delta of logit.transform.lines.dropped{component=points} on logit, run: run (+60s, +960s]: 0 (over 174 drain(s)), want <= 0 |
+
+- **The fan-out term held to the event.** `points` received 128,700 records in the final life
+  and discarded each once its four points were out, so its children, T_out − (T_in − T_disc),
+  were 514,800, 4 × T_in with no line dropped, and `aggregate` absorbed and VictoriaMetrics
+  stored the same 514,800. The stopped life 0 drained to a residual of 0. End to end, V was
+  1,526,600 against G 381,500 plus a resend allowance of 1,100, carried through the fan-out to
+  1,530,400.
+- **The first two runs found two `ledger.wire` defects, both in the HTTP wire's judgment, fixed
+  here.** `perf/results/soak/20261018T034333Z`, from a prototype of this branch, FAILed 1,775
+  points lost inside the SUT's partition and a 1,713-point surplus after it: the generator's
+  `events.delivered` exported no point for the drains the partition stalled, so the backlog
+  it delivered after the revert was interpolated back across the stall. G is now anchored at
+  every generator drain. `perf/results/soak/20261018T041409Z`, at `c242f67e`, FAILed a
+  140-point surplus in a 20 s run between two overlapping netem windows: the 30% loss on the
+  SUT's egress delays answers in bursts, and a run boundary between two judged windows had no
+  edge to allow the interpolation's error there. Adjacent judged windows are now one run. Both
+  runs re-score PASS on every row with `script/soak check`, which rewrote their `results.md`.
+- **The generator lost a fifth of its records, counted.** `otlp_out` sends one request at a
+  time, so its rate is a batch per round trip: under the SUT's 200 ms egress delay it
+  dropped about half its batches (`overflow_newest`), fewer under the 30% egress loss, and
+  through every outage all of them, 101,650 records over the run, none of them in G. A known-gaps candidate
+  for `otlp_out` on a slow link, not a ledger finding.
+- **The backend stop backed up to the generator, as `otlp_in` has no busy answer.** The sink's
+  two-batch queue filled, the inboxes behind it held batches of four times the events, and
+  `otlp_in` held each request past `otlp_out`'s 10 s timeout: 3 transport errors and 337
+  batches' overflow on the generator through the stop, no sink drop, and `rss_slope` flat at +3.4 MiB/h.
+- The pause, the stop, and the partition gave 19 transport-error attempts between them; the
+  merged judged run's surplus stayed inside their allowance.
+- No product finding.
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
