@@ -105,9 +105,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
     (`docs/known-gaps/datadog.md`).
   - **Revisit trigger:** an operator who needs a crash replay to skip delivered requests.
 
-- **Every sink but `logit_out` sends one request at a time, so over a slow link its throughput is
-  one batch per round trip.** `write_loop` (`crates/logit-pipeline/src/runtime.rs`) takes the
-  head batch, calls the sink's `send`, and takes the next only after `send` returns. It submits
+- **Every sink that waits for a response, but `logit_out`, sends one request at a time, so over a
+  slow link its throughput is one batch per round trip.** `write_loop`
+  (`crates/logit-pipeline/src/runtime.rs`) takes the head batch, calls the sink's `send`, and
+  takes the next only after `send` returns. It submits
   several batches together only for a sink whose `Output::window` reads above 1, and the default
   is 1. Only `logit_out` overrides it (`window:`, [ADR
   `native-hop-send-window`](../adr/native-hop-send-window.md)). No other sink has a concurrency or
