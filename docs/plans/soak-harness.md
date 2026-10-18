@@ -102,7 +102,7 @@ Subcommands: `run <scenario> [--duration 20m] [--seed N] [--keep] [--retry-stall
 `survey_self_test` does for `script/shape-survey`. Environment: `SOAK_SKIP_IMAGE=1` reuses the
 images, and `SOAK_OUT=<dir>` moves the results.
 
-A run writes `perf/results/soak/<UTC stamp>/` (gitignored): `compose.env`, a copy of
+A run writes `perf/results/soak/<UTC stamp>/` (gitignored; `<UTC stamp>-N` when that name is taken): `compose.env`, a copy of
 `scenario.toml`, `scenario.resolved.json`, `configs/` (each `logit` config, so the ledger reads
 the SUT's `receive:` limits), `provenance.txt`, `timeline.jsonl`,
 `watchdog.jsonl`, `stats.ndjson`, `vm-freshness.jsonl`, `vm-export/<sink>.jsonl`,
