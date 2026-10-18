@@ -35,7 +35,8 @@ Non-goals:
 
 Stream key **`soak`**: branches `soak/w0`, `soak/w1a`, `soak/w1b`, then `soak/w2` through
 `soak/w12d`, a linear stack. After it come `soak/w13a` and `soak/w16`, which each branch off
-`main`, and `soak/w14`, `soak/w13b`, and `soak/w15`, stacked in that order. PR stack only: nothing is
+`main`, `soak/w14`, `soak/w13b`, and `soak/w15`, stacked in that order, and `soak/w18`, which
+branches off `main` after W14 merged. PR stack only: nothing is
 merged by this workstream; Ross directs merging.
 
 Settled with Ross (2026-10-08): faults are an iproute2 image with `NET_ADMIN` applying `tc netem`
@@ -798,9 +799,12 @@ ticket with `${DOCKER} version` first.
      behind it ends the timeline at once. The end sequence and collection still run. Inside an
      `exit` step (W7a) the container may be `running` or `exited`.
 4. End (for an external target, W5, see "External targets"): revert active faults; `docker stop -t 30` every generator; with a `file` wire (W11b), count the
-   newline-terminated lines in every file of `<run>/shared` (phase `shared_counted`) and wait,
-   up to 180 s, until the tailers' W, read from a log chunk the driver captures every 5 s,
-   reaches that count or holds for four reads (phase `tail_caught_up`); wait until every sink's stored
+   newline-terminated lines in every file of `<run>/shared` (phase `shared_counted`), read G,
+   the writers' `events.delivered`, from a log chunk of each writer taken 6 s later, past the
+   chunk's 5 s lag, and wait, up to 180 s, until the tailers' W, read from a log chunk the
+   driver captures every 5 s, reaches G or holds for four reads (phase `tail_caught_up`, which
+   records G and the count); G, not the count, since a writer that deleted a file (W18) left
+   fewer lines than it wrote, and W reaches that count before the tailers read to the end; wait until every sink's stored
    total holds across two aggregate windows (90 s bound); `docker stop -t 60` the SUT, expecting
    exit 0; call each backend's `/internal/force_flush`; write each sink's
    `vm-export/<sink>.jsonl` from its backend's `/api/v1/export` with `match[]=<vm_selector>`
@@ -1118,7 +1122,8 @@ The rows:
     read file replays nothing, and rotations tens of seconds apart leave at most one inside an
     interval of seconds); below, rate × the life's drain interval, the counts a SIGKILL never
     exports. The rate is the life's `input.lines` over its last drain interval, the line size
-    the shared directory's bytes over its lines. A killed life with one drain has no drain
+    the shared directory's bytes over its lines, from the files that survive the writer's
+    retention. A killed life with one drain has no drain
     interval, and its last checkpoint can be the previous life's, so its allowance above is that
     drain's W, all of which can replay, plus the same reads, and that W below, about one drain
     interval of reads a checkpoint after the drain committed and the kill never exported;
@@ -1130,8 +1135,20 @@ The rows:
   - the final life adds nothing: the end sequence waits until the tailers have read what the
     writer wrote (§5).
 
-  G must also equal the lines the driver counted in the shared directory at the end
-  (`shared_counted`), else the row FAILs its precondition. `ledger.summary`'s end-to-end bound
+  While the writer deleted no file, G must also equal the lines the driver counted in the
+  shared directory at the end (`shared_counted`), else the row FAILs its precondition. From
+  W18, `file_out` deletes `.{max_files − 1}` at each rotation, so a writer deleted
+  max(0, rotations − (max_files − 1)) files, its `logit.output.file.rotations` read against
+  its config's `rotate.max_files`. Once it deleted one, G stands alone: the count must not
+  exceed G, and the directory must hold min(rotations + 1, max_files) files, else the
+  precondition FAILs. G less the count is reported beside the lines the deleted files'
+  `max_bytes` would hold, never judged. A deleted file the tailer hadn't read is lost and
+  counted nowhere (docs/known-gaps/tailing.md), so a **retention guard** FAILs the row for any
+  pause, stop, kill, restart, or `exit` of the ingress SUT, widened by one of the writer's
+  drain intervals on each side, during which the writer rotated `max(1, max_files − 2)` times
+  or more: a file rotated to `.1` shortly before the fault, which a tailer one file behind hasn't
+  finished, is deleted at the fault's `max_files − 1`th rotation, so the guard trips one
+  rotation early. `ledger.summary`'s end-to-end bound
   runs for a file wire too, with the band's upper edge added to its limit, since a replayed line
   is absorbed and stored again. From W13a it counts the path's discards with the counted loss:
   a replayed line a node discards is counted again as its read counts in W again, so the band
@@ -2259,12 +2276,27 @@ where it needs them, and a small check extension.
     from a `set` after `aggregate` in place of `influxdb_in`, so the SUT needs no HTTP generator,
     and one carrying the bucket beside `default_org:`. Rows: `ledger.standin` and `[[expect]]`
     per class.
-18. **`tail_in` descriptors over hours under a deleting rotation.** `tail-rotate` with a small
-    `max_files`, run for hours. A matched rotated file stays open until the writer deletes it
-    ([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md)), so the open count should stay at
-    about `max_files`, and `fd_slope` flat is the pass. Needs: `ledger.wire`'s end count across
-    the shared directory replaced by the writer's `events.delivered` alone, since deleted files
-    can't be counted at the end, and the scenario's `max_duration` lifted.
+18. **`tail_in` descriptors over hours under a deleting rotation (built in W18).** `tail-rotate`
+    with `max_files: 8`, run for hours. A matched rotated file stays open until the writer
+    deletes it ([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md)), so the open count
+    should stay at about `max_files`. Built as `tail-rotate-delete`, with these corrections to
+    the item as first written:
+    - `fd_slope` isn't a slope: it compares the warmup median with the end. The pass is
+      `fd_growth` at about `max_files` + 2, the files the writer keeps plus a deleted one
+      draining and the staged `app.log.rotating`, over the warmup's two, with `[[expect]]`
+      maxima on `logit.input.files.open` and `logit.process.fds` over the whole run, a last
+      `files.open` of 7 or more, and eight or more writer rotations, so it deleted.
+    - The end count isn't replaced: it still gives the replay band its line size, and it
+      cross-checks G as an equality while the writer deleted no file and as a bound with the file
+      count after (§6's `ledger.wire` row), beside a retention guard for a SUT down long enough
+      to lose an unread file.
+    - The end sequence's wait needed G: against the count it returned at once once the writer
+      had deleted a file (§5).
+    - A short repeating cycle hides a leak, since a restart resets one, so the cycle is an hour
+      with about 50 minutes of one quiet life in it, run for 4 hours with no `max_duration`.
+    - An inode a deletion freed while the SUT was down can be reused by the writer's next file,
+      and the restart then counts `resume_rejected` correctly, so the scenario drops
+      `tail-rotate`'s expectation of none.
 
 Two follow-ups have no item yet. An overlap of TCP listeners, item 11 over `transport: tcp`,
 will need `net.ipv4.tcp_migrate_req`, without which the connections still in the old socket's
@@ -2308,6 +2340,7 @@ that items 3, 7, and 11 need.
 | W14 | `soak/w14` | `soak/w14: an HTTP-ingress soak into influxdb_in, with an http wire for it and otlp_in` | M | W12d |
 | W15 | `soak/w15` | `soak/w15: multi-destination route and route_signals soaks, with a target split` | M | W13b |
 | W16 | `soak/w16` | `soak/w16: an InfluxDB-shaped stand-in for every influxdb_out response class` | M | W12d |
+| W18 | `soak/w18` | `soak/w18: a tail_in descriptor soak under a deleting rotation` | M | W14 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -2430,10 +2463,14 @@ that items 3, 7, and 11 need.
   series and timestamp, `ledger.standin`'s rules for the shape, the class required on its
   `respond` steps, and the `standin-influxdb`, `standin-influxdb-carried`, and
   `standin-influxdb-mixed` scenarios, each run recorded under "Findings".
+- **W18**: item 18: the writer's deletions in `ledger.wire` (the end count held to G only
+  while the writer deleted no file, then as a bound with the writer's file count) and its
+  retention guard, the end sequence's wait for G, self-test fixtures for each rule, and the
+  `tail-rotate-delete` scenario, a short run recorded under "Findings".
 
-Items 16 and 18, and §10's follow-ups to items 11 and 12, have no workstream yet.
+Item 16, and §10's follow-ups to items 11 and 12, have no workstream yet.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a and W16 land off `main` beside W14. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a and W16 land off `main` beside W14, and W18 off `main` after it. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings

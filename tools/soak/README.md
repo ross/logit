@@ -248,7 +248,7 @@ in its own filesystem) through `json` and a count chain into `aggregate` and a d
 sink, its source declared `wire = "file"`. Its 10.75-minute cycle pauses the SUT for 60 s,
 stops it, restarts it, and kills it for 30 s and then for 150 s, across several rotations.
 `ledger.wire` judges the run's W − G against a replay band per SUT life, and the end sequence
-counts the writer's lines in the shared directory before it waits for the tailer to read them.
+counts the writer's lines in the shared directory before it waits for the tailer to reach G.
 Its expectations assert that rotations are seen and that no resume is rejected and no
 checkpoint fails. The writer's files stay in the run directory, about 80 MB of them. Its
 `max_duration` is 25 minutes, and a longer `--duration` is refused: the tailer holds every
@@ -266,6 +266,22 @@ stale when the tailer reads them. A 90 s stop discards about 40 s of lines. A 30
 replays the lines read since the last 5 s checkpoint, which are about 40 s old and stay
 fresh. Its expectations assert discards after the pause, the stop, and the long kill, none
 through the restart or the short kill, and every line's `timestamp` resolved.
+
+`tail-rotate-delete` (4 hours) is `tail-rotate` against a writer that keeps eight files
+(`max_files: 8`) and deletes the oldest at every rotation from its eighth on, about one every
+44 s. `tail_in` holds a rotated file open until the writer deletes it, so its descriptors must
+stay bounded by that retention over hours. Its cycle is an hour long: the same five faults,
+then about 50 minutes of one SUT life with no fault, where a leak a restart resets still shows.
+Deleted files can't be counted at the end, so `ledger.wire` holds the lines left in the shared
+directory to G only as a bound, and requires the eight files the writer keeps. It FAILs a SUT
+fault during which the writer rotated six times or more, enough to delete a file the tailer
+hadn't read, a loss `tail_in` counts nowhere. The 150 s kill spans about three rotations.
+`fd_growth` is 10, about the eight files plus two more than at warmup, and its expectations
+bound `logit.input.files.open` at 10 and the process's descriptors at 26, require eight
+or more writer rotations, so the writer deleted files, and assert no checkpoint error. It has
+no `no-resume-rejected` expectation: an inode a deletion freed while the SUT was down can be
+reused by the writer's next file, and the restart then rejects the checkpoint entry whose head
+no longer matches.
 
 `sighup` (14 minutes 30 seconds) runs `statsd-vm`'s stream with a second SUT sink off the
 ledger, `archive`: a `stdio_out` writing one `format: json` line per statsd event, straight from
@@ -789,7 +805,10 @@ and its `busy` ones to `batches.deferred` in every SUT life a kill didn't end, a
 killed life unjudged; `otlp_in` counts none. A file wire is judged differently, because a tailer reads behind its writer: the run's
 W − G against a replay band summed over the SUT's lives, a killed life's replay after its last
 checkpoint and its unexported last drain interval, and a stopped life's split line per open
-file, with G held to the lines the driver counts in the shared directory at the end.
+file. While the writer deleted no file, G is held to the lines the driver counts in the shared
+directory at the end; once it deleted one, the count must not exceed G, the directory must hold
+the files the writer keeps, and no SUT fault may last long enough for the writer to delete a
+file the tailer hadn't read.
 `ledger.wire` judges each source on its own, against the fault windows of its own
 generator and of every service that isn't a generator that affect its wire, and
 `ledger.intake` judges each listener's final life; each reports a line per source or listener
@@ -850,7 +869,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `progress` | a SUT sink delivers nothing in a `progress_window` outside fault windows with work queued (a hang), a `logit` container's telemetry goes quiet, or a sink's newest stored sample is 30 s old (a local target only); a sink still retrying past `recovery_bound` `WARN`s, and so do windows covering under 5% of the run after warmup |
 | `rss_slope` | a `logit` service's resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead, and so do slopes covering under 5% of the run after warmup. Each service is judged on its own line, and `[expected]` can set its verdict (see [Expected verdicts](#expected-verdicts)) |
 | `fd_slope` | a `logit` service's open file descriptors end, or sit after a recovery, more than `fd_growth` above the warmup median. Each service is judged on its own line, and `[expected]` can set its verdict |
-| `ledger.wire` | for a UDP or TCP source, its generator's lines minus what its listener read, what the kernel dropped, and what its framer dropped, counted (G − (W + K + F)), exceeds `wire_loss_outside_faults` outside the reported fault windows that affect its wire, with one generator batch of tolerance per window edge, each judged run counting at 0 or more; or, on UDP, its generator's sink counts messages and datagrams apart, and on TCP it counts any datagram. On UDP that loss is by design and every affecting window is reported: netem on a generator, and a lifecycle fault or partition of the SUT or of a generator. On TCP only a stop, kill, restart, or `exit`, and a partition that moved the container's address, are reported; every other TCP-affecting window (netem on the SUT, a pause, a partition that kept the address) is judged, and a surplus in it beyond one generator batch per `ambiguous_at_most_once` drop the generator counted there, plus one per edge, FAILs. Netem on a TCP generator affects nothing and is judged as steady state. On HTTP, G − (W − X), only a kill or an `exit` of the SUT is reported, since either can lose its unexported counts; every other HTTP-affecting window (netem on either end, a pause, a stop, a restart, a partition) is judged, and a surplus in it beyond one generator batch per attempt the generator counted `logit.output.requests{class="network_error"}`, plus one per edge, FAILs: the writer sends one batch per request, one at a time, and resends it after a transport error, when the SUT may have taken it. A backend stop doesn't affect the wire: a busy `503` takes nothing. A file source is judged otherwise: its run's W + F − G against a replay band per SUT life, and G against the lines counted in the shared directory (the plan's §6 `ledger.wire` row). The detail lists the gap per source and per run of drain intervals, and the generator's own counted loss beside it |
+| `ledger.wire` | for a UDP or TCP source, its generator's lines minus what its listener read, what the kernel dropped, and what its framer dropped, counted (G − (W + K + F)), exceeds `wire_loss_outside_faults` outside the reported fault windows that affect its wire, with one generator batch of tolerance per window edge, each judged run counting at 0 or more; or, on UDP, its generator's sink counts messages and datagrams apart, and on TCP it counts any datagram. On UDP that loss is by design and every affecting window is reported: netem on a generator, and a lifecycle fault or partition of the SUT or of a generator. On TCP only a stop, kill, restart, or `exit`, and a partition that moved the container's address, are reported; every other TCP-affecting window (netem on the SUT, a pause, a partition that kept the address) is judged, and a surplus in it beyond one generator batch per `ambiguous_at_most_once` drop the generator counted there, plus one per edge, FAILs. Netem on a TCP generator affects nothing and is judged as steady state. On HTTP, G − (W − X), only a kill or an `exit` of the SUT is reported, since either can lose its unexported counts; every other HTTP-affecting window (netem on either end, a pause, a stop, a restart, a partition) is judged, and a surplus in it beyond one generator batch per attempt the generator counted `logit.output.requests{class="network_error"}`, plus one per edge, FAILs: the writer sends one batch per request, one at a time, and resends it after a transport error, when the SUT may have taken it. A backend stop doesn't affect the wire: a busy `503` takes nothing. A file source is judged otherwise: its run's W + F − G against a replay band per SUT life, and G against the lines counted in the shared directory when the writer deleted no file; once it deleted one, the count at or below G, the file count at the writer's retention, and a FAIL for any SUT fault during which the writer rotated `max_files − 2` times or more (the plan's §6 `ledger.wire` row). The detail lists the gap per source and per run of drain intervals, and the generator's own counted loss beside it |
 | `ledger.overlap` | under `[overlap]` only, else no row: over the run, the generators' lines minus what every instance read or counted dropped (G − Σ(W + K + F)) exceeds, for each stop or restart of an instance, `ceil(used / 512) + 1` datagrams, `used` being the closing life's last `logit.input.receive_buffer.used.bytes`; or falls below 0 past the generators' end allowance. Each close's own gap is reported, not judged. A kill or `exit` of an instance, which leaves no final sample, or another fault that can lose UDP on its way in makes the row report its numbers and SKIP. See [Rolling overlap](#rolling-overlap) |
 | `ledger.intake` | for any listener, the final SUT life's lines read minus dropped differ from the events sent plus bad lines (B: `messages.dropped{reason="malformed"}`, `frames.dropped{reason="undecodable"}`, and on UDP `lines_in`'s oversize lines); or an earlier life's read-but-unabsorbed residual summed over the listeners (W − D − B − X − Ab, X being the listeners' own counted event drops, less a script's or the `sut_transforms` nodes' counted discards) falls outside [0, R], R being each UDP listener's receive queue plus 2 batches per listener, 65 more batches for each node between it and `aggregate`, and 65 for `aggregate`; or, for an `influxdb_in` on an HTTP wire, in any SUT life a kill didn't end, its `ok` and `closed_consumer` write requests don't sum to its `batches.sent`, or its `busy` ones differ from its `batches.deferred` |
 | `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listeners' summed events sent (or, with `sut_script`, the script's) differ from those `aggregate` received; a node in a source's `sut_transforms` received a different number from those sent to it, or sent a different number from those it received less those it discarded (T_in − T_disc ≠ T_out); a sink received a different number of events from those sent to it (under `copy` `aggregate`'s events sent, which a fan-out counts once per batch, and under `route` its target's); or `aggregate` received a different number from those it absorbed |
@@ -989,7 +1008,8 @@ for = { min = "60s", max = "3m" }
 ## Long runs
 
 A scenario that sets `max_duration` refuses a longer `--duration`, because its thresholds or
-configs hold only that long; `tail-rotate`'s is 25 minutes.
+configs hold only that long; `tail-rotate`'s is 25 minutes. `tail-rotate-delete` has none:
+its writer's retention bounds both the shared directory and the tailer's descriptors.
 
 To run for hours, keep the driver alive when the terminal closes: a closed terminal sends
 SIGHUP, which ends the schedule, collects, and tears down, so an unprotected 8-hour run stops at
