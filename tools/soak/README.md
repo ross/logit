@@ -190,9 +190,12 @@ series instead of 100, over SCRAM-SHA-512 to a broker that ends every session af
 `kafka-server.properties`, with a SASL listener on 9096 beside the unauthenticated 9092 that the
 healthcheck and the read-back use, and a SCRAM user written at format time. `kafka_out` doesn't
 re-authenticate in band: it stops reusing a connection 20 s after it authenticates and redials,
-counting `logit.output.reconnects`. Beside the base scenario's expectations, it asserts that
-rate over the run (80 to 300 an hour, derived in its `scenario.toml`), that no attempt was
-`refused`, and that the sink dropped no batch over the whole run. Ten series keep an 8-hour
+counting `logit.output.reconnects`. Beside the base scenario's expectations, it bounds that
+rate over the run (80 to 300 an hour, derived in its `scenario.toml`), which catches a redial
+before every send. A sink that never renewed would still redial, because the broker closes an
+expired session's connection on its next request, so a second rate catches that sink: at most
+40 `ambiguous` attempts an hour, the faults' own. It also asserts that no attempt was `refused`
+and that the sink dropped no batch over the whole run. Ten series keep an 8-hour
 topic at 144,000 records, inside the read-back's bound.
 
 Six scenarios run a sink against a scripted stand-in in place of VictoriaMetrics (see

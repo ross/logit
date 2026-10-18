@@ -2251,7 +2251,8 @@ where it needs them, and a small check extension.
     (`crates/logit-outputs/src/kafka/conn.rs`'s module doc), so the run redials at a steady
     rate, which `kafka_out` counts in `logit.output.reconnects` from W17 on and a `rate`
     expectation bounds. Rows: `ledger.topic`, `fd_slope`, duplicates per life, and
-    `[[expect]]` on the redial rate, `refused` attempts, and dropped batches. Two halves remain:
+    `[[expect]]` on the redial rate, the `ambiguous` rate, `refused` attempts, and dropped
+    batches. Two halves remain:
     - **OAUTHBEARER with short-lived tokens.** It needs `tools/kafka-interop`'s
       `mock-oauth2-server` in the stack, under a new `idp` role, and a namespace holder, because
       `kafka_out` takes a `token_endpoint` only over loopback HTTP or HTTPS with a public CA's
@@ -4695,7 +4696,16 @@ but `ledger.windows` and `ledger.replay`, which SKIP on a Kafka target with no k
 - **The bounds were widened after the run.** It ran under `[120, 300]`, from a first derivation
   that added the forced redials to the renewals. A forced redial restarts the renewal clock
   instead, so the scenario's comment re-derives the floor from the up-segments, 96 an hour, and
-  ships `[80, 300]`, still well above the 28 to 55 an hour a sink that never renewed would count.
+  ships `[80, 300]`. That band catches a sink that redials before every send, about 1,800 an
+  hour, but not one that never renews: the broker closes an expired session's connection on its
+  next request without answering it (Kafka 4.0.0's `SocketServer`
+  `Processor.processCompletedReceives()`), the sink reads that as `Ambiguous` and redials, and
+  those redials come every 30 to 33 s of broker uptime, 90 to 120 an hour. So the scenario adds
+  `no-expired-session-sends`: the `ambiguous` rate over the run at most 40 an hour, against at
+  most one per fault, 28 an hour, for a sink that renews, and 83 or more for one that doesn't.
+  Re-scored offline (`soak.py check` on a copy of the run directory carrying the new
+  expectations), it reads 1 `ambiguous` attempt, the pause's, 8 an hour, and every row still
+  passes.
 - **No attempt was `refused`.** The restart kept the SCRAM credential, which
   `kafka-storage.sh format --ignore-formatted` leaves in the metadata log. Of 274 attempts, 14
   were `clean` and 1 `ambiguous`; the self-log's throttled lines name a connection refused in the

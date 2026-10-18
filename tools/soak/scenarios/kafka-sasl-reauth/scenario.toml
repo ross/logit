@@ -5,10 +5,11 @@
 #
 # `kafka_out` doesn't re-authenticate in band. It stops reusing a connection 20 s after it
 # authenticates (the 30 s session less the sink's 10 s `timeout`) and dials a new one on the next
-# request, counting `logit.output.reconnects`. The run judges that rate, that no attempt was
-# `refused` (no redial's SCRAM exchange was refused), and that nothing was dropped or stored
-# twice: a redial keeps the producer id and sequences, so `ledger.topic` FAILs a duplicate copy
-# in a SUT life with no epoch bump, as it does for kafka-broker-restart.
+# request, counting `logit.output.reconnects`. The run judges that rate, that no request reached
+# an expired session (the `ambiguous` rate), that no attempt was `refused` (no redial's SCRAM
+# exchange was refused), and that nothing was dropped or stored twice: a redial keeps the
+# producer id and sequences, so `ledger.topic` FAILs a duplicate copy in a SUT life with no epoch
+# bump, as it does for kafka-broker-restart.
 #
 # compose.override.yaml starts the broker from kafka-server.properties with the SCRAM user. The
 # schema is docs/plans/soak-harness.md's "The scenario schema".
@@ -152,10 +153,13 @@ max = 0
 # up-segments, so at least 275 / 23 renewals less one lost to rounding per segment, plus the
 # segments' opening dials: 12 dials, 96 an hour. At most, with no outage,
 # 450 s / 20 s + 1 renewals and a bootstrap redial per fault and per refresh, 29 dials, 232 an
-# hour. Over a longer run each 390 s cycle gives the same range. The bounds sit outside it, and
-# still separate the two failures that matter: a sink that never renewed would count only the
-# forced redials, about 3 to 6 a cycle, or 28 to 55 an hour, and one that redialed before every
-# send about 1,800.
+# hour. Over a longer run each 390 s cycle gives the same range. The bounds sit outside it.
+#
+# This band catches a sink that redials before every send, about 1,800 an hour. It can't catch
+# one that never renews: the broker closes an expired session's connection on its next request
+# without answering it, the sink reads that as `Ambiguous` and redials, and those redials come
+# every 30 to 33 s of broker uptime, 90 to 120 an hour, inside the band. `no-expired-session-sends`
+# below catches that sink.
 [[expect]]
 name = "reauth-rate"
 service = "logit"
@@ -165,6 +169,21 @@ window = "run"
 reduce = "rate"
 min = 80
 max = 300
+
+# No request reaches an expired session. A sink that renews meets `Ambiguous` only from a fault:
+# the pause's response timeout, and at most one request in flight when the restart or the stop
+# closes the connection, so at most 3 a 390 s cycle, 28 an hour (24 an hour over the default
+# 450 s window). The bound allows one more a cycle, 37 an hour. A sink that wrote to its expired
+# sessions would add one `Ambiguous` per session, every 30 to 33 s of the at least 215 s a cycle
+# the broker answers: 6 or more a cycle on top of the faults', 83 an hour or more.
+[[expect]]
+name = "no-expired-session-sends"
+service = "logit"
+metric = "logit.output.requests"
+attrs = { component = "kafka", class = "ambiguous" }
+window = "run"
+reduce = "rate"
+max = 40
 
 # A redial the broker refuses, such as a SCRAM credential lost across the restart, is `refused`
 # and holds the queue. None is.
