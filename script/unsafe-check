@@ -8,6 +8,7 @@
 #        script/unsafe-check fuzz-all [seconds]
 #        script/unsafe-check fuzz-tmin <target> <crash file>
 #        script/unsafe-check fuzz-seed
+#        script/unsafe-check fuzz-self-test
 #        script/unsafe-check shell
 #        script/unsafe-check --help
 #
@@ -22,7 +23,11 @@
 # The same image fuzzes the decoders that read a peer's or the disk spool's bytes (`fuzz/`,
 # cargo-fuzz under ASan). `fuzz` runs one target from FUZZ_TARGETS for FUZZ_SECONDS, `fuzz-all`
 # runs each for `seconds` (default 120), prints a summary, and exits 1 if any target failed,
-# `fuzz-tmin` minimizes a crash, and `fuzz-seed` rewrites the committed seeds.
+# `fuzz-tmin` minimizes a crash, and `fuzz-seed` rewrites the committed seeds. The host may
+# suspend: a run it slept through is rerun up to FUZZ_RETRY_SLEPT times, its `timeout-*` and
+# `slow-unit-*` artifacts move to fuzz/artifacts/<target>/slept/, and a target whose every
+# attempt slept reads `slept` and exits 3 (`fuzz-all`: 3 when no target failed). Fuzzing needs
+# python3 on the host to read its suspend clock; `fuzz-self-test` checks that detection.
 #
 #   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
 #   UNSAFE_CHECK_FUZZ_TARGET_VOLUME  the same, for the sanitizer builds `fuzz` makes
@@ -30,6 +35,9 @@
 #                                    default seccomp profile blocks ptrace
 #   MIRIFLAGS                        defaults to -Zmiri-disable-isolation
 #   FUZZ_SECONDS                     `fuzz`'s -max_total_time, default 600
+#   FUZZ_RETRY_SLEPT                 reruns of a run the host suspended during, default 1
+#   UNSAFE_CHECK_FAKE_SUSPEND        N makes each target's first N attempts read as slept, to
+#                                    test the retry path
 #
 # Not part of script/cibuild: needs nightly and ptrace (docs/adr/out-of-ci-unsafe-verification.md,
 # docs/adr/out-of-ci-fuzzing.md).
@@ -364,8 +372,44 @@ fuzz_extra_args() {
     echo "${entry##*|}"
 }
 
+# Prints the whole seconds this host has spent suspended since boot: CLOCK_BOOTTIME counts a
+# suspend and CLOCK_MONOTONIC doesn't. libFuzzer times `-timeout` and `-max_total_time` on
+# `system_clock`, which a suspend advances, so a run that spans one ends early and can report a
+# timeout no input caused (docs/adr/out-of-ci-fuzzing.md, "Amendment (2026-10-18)").
+suspended_seconds() {
+    python3 -c 'import time; print(int(time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)))'
+}
+
+# Below the 10 s `-timeout` fuzz_limits sets, so every suspend long enough to fake a timeout
+# counts.
+FUZZ_SLEPT_THRESHOLD=5
+
+# Succeeds when two suspended_seconds readings, `before` then `after`, show a suspend between them.
+slept_between() {
+    [ $(("${2}" - "${1}")) -ge "${FUZZ_SLEPT_THRESHOLD}" ]
+}
+
 # libFuzzer writes new inputs only to the first corpus directory, so fuzz/corpus/<target> grows
 # and fuzz/seeds/<target> stays as committed. Caller arguments come last, so they win.
+fuzz_once() {
+    local target="${1}"
+    local limits="${2}"
+    shift 2
+    mkdir -p "${ROOT}/fuzz/corpus/${target}"
+    local extra
+    extra="$(fuzz_extra_args "${target}")"
+    # shellcheck disable=SC2086 # `limits` and `extra` are word-split argument lists
+    run_in_image "${FUZZ_TARGET_VOLUME}" cargo fuzz run "${target}" \
+        "fuzz/corpus/${target}" "fuzz/seeds/${target}" -- \
+        ${limits} ${extra} -max_total_time="${FUZZ_SECONDS:-600}" "$@"
+}
+
+# Runs one target, and reruns it up to FUZZ_RETRY_SLEPT times while the host suspends during a
+# run. A slept run's new `timeout-*` and `slow-unit-*` artifacts move to
+# fuzz/artifacts/<target>/slept/, because libFuzzer counted the suspend against the input in
+# flight. A slept run that failed and left any other new artifact (`crash-*`, `oom-*`, `leak-*`)
+# returns its own status: none of those depends on time, so the finding stands. Returns 3 when
+# the last attempt slept too.
 cmd_fuzz() {
     local target="${1:-}"
     local limits
@@ -374,15 +418,136 @@ cmd_fuzz() {
     if [ "${1:-}" = "--" ]; then
         shift
     fi
+    if ! command -v python3 >/dev/null; then
+        echo "error: fuzzing needs python3 on the host, to tell a suspend from a slow input" >&2
+        exit 1
+    fi
 
     build_image
-    mkdir -p "${ROOT}/fuzz/corpus/${target}"
-    local extra
-    extra="$(fuzz_extra_args "${target}")"
-    # shellcheck disable=SC2086 # `limits` and `extra` are word-split argument lists
-    run_in_image "${FUZZ_TARGET_VOLUME}" cargo fuzz run "${target}" \
-        "fuzz/corpus/${target}" "fuzz/seeds/${target}" -- \
-        ${limits} ${extra} -max_total_time="${FUZZ_SECONDS:-600}" "$@"
+    local artifacts="${ROOT}/fuzz/artifacts/${target}"
+    local retries="${FUZZ_RETRY_SLEPT:-1}"
+    local attempt=0
+    local marker
+    marker="$(mktemp)"
+    while true; do
+        touch "${marker}"
+        local before after status=0
+        before="$(suspended_seconds)"
+        fuzz_once "${target}" "${limits}" "$@" || status=$?
+        after="$(suspended_seconds)"
+        # A test seam: the first UNSAFE_CHECK_FAKE_SUSPEND attempts read as slept.
+        if [ "${attempt}" -lt "${UNSAFE_CHECK_FAKE_SUSPEND:-0}" ]; then
+            after=$((after + FUZZ_SLEPT_THRESHOLD))
+        fi
+        if ! slept_between "${before}" "${after}"; then
+            rm -f "${marker}"
+            return "${status}"
+        fi
+        echo "## fuzz: ${target}: the host was suspended for about $((after - before))s of this run" >&2
+        local timing=() other=()
+        if [ -d "${artifacts}" ]; then
+            mapfile -t timing < <(find "${artifacts}" -maxdepth 1 -type f -newer "${marker}" \
+                \( -name 'timeout-*' -o -name 'slow-unit-*' \))
+            mapfile -t other < <(find "${artifacts}" -maxdepth 1 -type f -newer "${marker}" \
+                ! -name 'timeout-*' ! -name 'slow-unit-*')
+        fi
+        if [ "${#timing[@]}" -gt 0 ]; then
+            mkdir -p "${artifacts}/slept"
+            mv -- "${timing[@]}" "${artifacts}/slept/"
+            echo "## fuzz: ${target}: moved ${#timing[@]} timing artifact(s) to fuzz/artifacts/${target}/slept/" >&2
+        fi
+        if [ "${status}" -ne 0 ] && [ "${#other[@]}" -gt 0 ]; then
+            rm -f "${marker}"
+            return "${status}"
+        fi
+        if [ "${attempt}" -ge "${retries}" ]; then
+            echo "## fuzz: ${target}: slept: the host suspended during every attempt; rerun it" >&2
+            rm -f "${marker}"
+            return 3
+        fi
+        attempt=$((attempt + 1))
+        echo "## fuzz: ${target}: rerunning, attempt $((attempt + 1)) of $((retries + 1))" >&2
+    done
+}
+
+# Prints the last failure artifact `log` names that still exists under `base`, or nothing. The
+# pattern matches only a file directly in a target's artifacts directory, so neither the
+# `slept/` path cmd_fuzz prints nor `-artifact_prefix` matches, and the existence check skips a
+# timeout cmd_fuzz moved out of a slept run.
+fuzz_artifact_from_log() {
+    local log="${1}"
+    local base="${2}"
+    local path
+    while read -r path; do
+        if [ -f "${base}/${path}" ]; then
+            echo "${path}"
+            return
+        fi
+    done < <(grep -oE 'fuzz/artifacts/[^ /]+/(crash|oom|leak|timeout)-[^ ]+' "${log}" | tac)
+}
+
+# Checks slept_between against simulated readings, fuzz_artifact_from_log against simulated
+# logs, and that this host gives a suspend reading.
+cmd_fuzz_self_test() {
+    local fails=0
+    check() {
+        local want="${1}" before="${2}" after="${3}" got=awake
+        if slept_between "${before}" "${after}"; then
+            got=slept
+        fi
+        if [ "${got}" = "${want}" ]; then
+            echo "ok   ${before} -> ${after}: ${got}"
+        else
+            echo "FAIL ${before} -> ${after}: ${got}, want ${want}"
+            fails=1
+        fi
+    }
+    check awake 0 0
+    check awake 120 124
+    check slept 120 125
+    check slept 0 10123
+
+    # A slept run's log as fuzz-all tees it: libFuzzer's line for each artifact, then cmd_fuzz's.
+    local base
+    base="$(mktemp -d)"
+    local dir="${base}/fuzz/artifacts/t"
+    mkdir -p "${dir}/slept"
+    touch "${dir}/oom-aa" "${dir}/slept/timeout-bb"
+    pick() {
+        local want="${1}" name="${2}" got
+        got="$(fuzz_artifact_from_log "${base}/${name}.log" "${base}")"
+        if [ "${got}" = "${want}" ]; then
+            echo "ok   artifact for ${name}: '${got}'"
+        else
+            echo "FAIL artifact for ${name}: '${got}', want '${want}'"
+            fails=1
+        fi
+    }
+    cat >"${base}/crash-then-slept.log" <<'EOF'
+artifact_prefix='/work/fuzz/artifacts/t/'; Test unit written to /work/fuzz/artifacts/t/oom-aa
+## fuzz: t: the host was suspended for about 9s of this run
+## fuzz: t: moved 1 timing artifact(s) to fuzz/artifacts/t/slept/
+EOF
+    pick fuzz/artifacts/t/oom-aa crash-then-slept
+    cat >"${base}/moved-then-failed.log" <<'EOF'
+artifact_prefix='/work/fuzz/artifacts/t/'; Test unit written to /work/fuzz/artifacts/t/timeout-bb
+## fuzz: t: the host was suspended for about 9s of this run
+## fuzz: t: moved 1 timing artifact(s) to fuzz/artifacts/t/slept/
+## fuzz: t: rerunning, attempt 2 of 2
+Error: Fuzz target exited with exit status: 1
+EOF
+    pick "" moved-then-failed
+    rm -rf "${base}"
+
+    local now
+    now="$(suspended_seconds)"
+    if [[ "${now}" =~ ^[0-9]+$ ]]; then
+        echo "ok   this host has been suspended for ${now}s since boot"
+    else
+        echo "FAIL suspended_seconds printed '${now}'"
+        fails=1
+    fi
+    return "${fails}"
 }
 
 # An `oom-*` file gets the target's limits, since without `-malloc_limit_mb` an allocation-limit
@@ -418,6 +583,7 @@ cmd_fuzz_all() {
     mkdir -p "${ROOT}/${out_dir}"
     local summary=()
     local failed=0
+    local slept=0
     for entry in "${FUZZ_TARGETS[@]}"; do
         local target="${entry%%|*}"
         local log="${ROOT}/${out_dir}/${target}.log"
@@ -429,9 +595,12 @@ cmd_fuzz_all() {
         stats="$(grep -E '^#[0-9]+' "${log}" | tail -1 || true)"
         if [ "${status}" -eq 0 ]; then
             summary+=("ok     ${target}: ${stats}")
+        elif [ "${status}" -eq 3 ]; then
+            slept=1
+            summary+=("slept  ${target}: the host suspended during every attempt; rerun it")
         else
             local artifact
-            artifact="$(grep -oE 'fuzz/artifacts/[^ ]+' "${log}" | tail -1 || true)"
+            artifact="$(fuzz_artifact_from_log "${log}" "${ROOT}")"
             failed=1
             summary+=("FAILED ${target} (exit ${status}): ${stats}")
             if [ -n "${artifact}" ]; then
@@ -442,7 +611,13 @@ cmd_fuzz_all() {
     echo
     echo "===== fuzz-all summary: ${seconds}s per target, logs in ${out_dir} ====="
     printf '%s\n' "${summary[@]}"
-    return "${failed}"
+    if [ "${failed}" -ne 0 ]; then
+        return 1
+    fi
+    if [ "${slept}" -ne 0 ]; then
+        return 3
+    fi
+    return 0
 }
 
 # A plain binary with no sanitizer, so it needs nothing the stable dev image lacks either.
@@ -468,6 +643,7 @@ Usage: script/unsafe-check miri [cargo-miri-test args]
        script/unsafe-check fuzz-all [seconds]
        script/unsafe-check fuzz-tmin <target> <crash file>
        script/unsafe-check fuzz-seed
+       script/unsafe-check fuzz-self-test
        script/unsafe-check shell
        script/unsafe-check --help
 
@@ -482,7 +658,11 @@ debug-assertion std, and `inject`/`inject-all` force errno paths with `strace -e
 The same image fuzzes the decoders that read a peer's or the disk spool's bytes (`fuzz/`,
 cargo-fuzz under ASan). `fuzz` runs one target from FUZZ_TARGETS for FUZZ_SECONDS, `fuzz-all`
 runs each for `seconds` (default 120), prints a summary, and exits 1 if any target failed,
-`fuzz-tmin` minimizes a crash, and `fuzz-seed` rewrites the committed seeds.
+`fuzz-tmin` minimizes a crash, and `fuzz-seed` rewrites the committed seeds. The host may
+suspend: a run it slept through is rerun up to FUZZ_RETRY_SLEPT times, its `timeout-*` and
+`slow-unit-*` artifacts move to fuzz/artifacts/<target>/slept/, and a target whose every
+attempt slept reads `slept` and exits 3 (`fuzz-all`: 3 when no target failed). Fuzzing needs
+python3 on the host to read its suspend clock; `fuzz-self-test` checks that detection.
 
   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
   UNSAFE_CHECK_FUZZ_TARGET_VOLUME  the same, for the sanitizer builds `fuzz` makes
@@ -490,6 +670,9 @@ runs each for `seconds` (default 120), prints a summary, and exits 1 if any targ
                                    default seccomp profile blocks ptrace
   MIRIFLAGS                        defaults to -Zmiri-disable-isolation
   FUZZ_SECONDS                     `fuzz`'s -max_total_time, default 600
+  FUZZ_RETRY_SLEPT                 reruns of a run the host suspended during, default 1
+  UNSAFE_CHECK_FAKE_SUSPEND        N makes each target's first N attempts read as slept, to
+                                   test the retry path
 
 Not part of script/cibuild: needs nightly and ptrace (docs/adr/out-of-ci-unsafe-verification.md,
 docs/adr/out-of-ci-fuzzing.md).
@@ -529,6 +712,9 @@ fuzz-tmin)
     ;;
 fuzz-seed)
     cmd_fuzz_seed
+    ;;
+fuzz-self-test)
+    cmd_fuzz_self_test
     ;;
 shell)
     cmd_shell

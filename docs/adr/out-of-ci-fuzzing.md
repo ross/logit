@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-10-11
+updated: 2026-10-18
 ---
 
 # Out-of-CI fuzzing: a `cargo-fuzz` workspace in the unsafe-check image, with every crash landed as a stable test
@@ -289,8 +289,8 @@ Two things the campaign turned up about the harness, not the decoders:
   four targets. On resume, libFuzzer counted the whole suspend against the input in flight and
   reported `timeout-*` artifacts in `prom_decompress` and both batch targets, and a
   10,315-second `slow-unit-*` in `prom_remote_write`. Each artifact runs in 1 ms on its own. The
-  four targets were rerun from their seeds, and the table has the rerun. Wrap a long campaign
-  in `systemd-inhibit --what=sleep:idle`.
+  four targets were rerun from their seeds, and the table has the rerun. The driver now detects
+  a suspend and reruns the target itself (the 2026-10-18 amendment).
 
 After the campaign, both `native_batch_*` targets' `malloc_limit_mb` rose from 16 to 64, because
 a valid batch of more than 16,384 empty events regrows `decode_batch_body`'s events `Vec` past
@@ -484,3 +484,74 @@ The check doesn't build under the sanitizer, run a target, or lint `fuzz/`. A ch
 decoder accepts can still break a target's oracle with every check green, so the
 "Consequences" advice stands: run `script/unsafe-check fuzz-seed` and a short `fuzz-all` after
 changing a decoder a target calls.
+
+## Amendment (2026-10-18): a run the host slept through is rerun, not kept awake
+
+The host that fuzzes may be a laptop that suspends, closed in a sleeve, where holding it awake
+heats it. So nothing in the harness inhibits sleep. The driver detects a run that spanned a
+suspend and reruns it once the host is awake, as `script/soak` does for a stalled run
+([ADR `soak-harness`](soak-harness.md)'s 2026-10-18 amendment).
+
+### What libFuzzer does across a suspend
+
+libFuzzer, as `libfuzzer-sys` 0.4.13 bundles it, reads every duration off
+`std::chrono::system_clock`, which is `CLOCK_REALTIME`, and a suspend advances it:
+
+- **`-timeout` fires on the input in flight.** `SetSignalHandler` arms `setitimer(ITIMER_REAL)`
+  every `timeout / 2 + 1` seconds (`FuzzerUtilPosix.cpp`), and `Fuzzer::AlarmCallback`
+  (`FuzzerLoop.cpp`) measures the running unit as `system_clock::now() - UnitStartTime`. The
+  first alarm after a resume counts the whole suspend against that unit, writes `timeout-<sha1>`,
+  and exits with `-timeout_exitcode`, 70 by default. Outside fork mode that ends the run as a
+  failure.
+- **In fork mode the false timeout is quieter.** `-ignore_timeouts` defaults to 1, so
+  `FuzzWithFork` (`FuzzerFork.cpp`) counts a child's exit 70 and goes on, but the child has
+  already written its `timeout-*` artifact into `fuzz/artifacts/<target>/`.
+- **A unit that finishes across a suspend is a `slow-unit-*`.**
+  `PrintPulseAndReportSlowInput` writes one when the unit took over `-report_slow_units` seconds
+  (default 10) by the same clock; it doesn't fail the run.
+- **`-max_total_time` counts the suspend.** `secondsSinceProcessStartUp()` (`FuzzerInternal.h`,
+  and its fork-mode copy in `FuzzerFork.cpp`) is also `system_clock`, so the run ends early, with
+  fewer executions than its budget asked for.
+
+The 2026-09-25 campaign's suspend left `timeout-*` artifacts in three targets and a
+10,315-second `slow-unit-*` in a fourth, each of which ran in 1 ms on its own.
+
+### Decision
+
+- **Detection is on the host, around each target's `docker run`.** `CLOCK_BOOTTIME` counts a
+  suspend and `CLOCK_MONOTONIC` doesn't, so their difference grows by the suspend's length. The
+  driver reads it before and after the run, and growth of 5 seconds or more means the run slept.
+  A suspend has to last about as long as the 10-second `-timeout` the driver passes to fake a
+  timeout, so half that catches every suspend that can. Bash has no monotonic clock (`date` and `$EPOCHREALTIME` read `CLOCK_REALTIME`), so
+  the driver reads both clocks with `python3`'s `time.clock_gettime`, a new host dependency of
+  `fuzz` and `fuzz-all`.
+- **A slept run is neither a pass, a crash, nor a timeout finding.** Its new `timeout-*` and
+  `slow-unit-*` artifacts move to `fuzz/artifacts/<target>/slept/`, out of the directory a crash
+  is listed from, and are kept so a doubtful one can still be run by hand. A slept run that
+  failed and left any other new artifact (`crash-*`, `oom-*`, `leak-*`) keeps its own exit
+  status and its `fuzz-tmin` line, because none of those depends on time. `fuzz-all`'s
+  `fuzz-tmin` line names the last `crash-*`, `oom-*`, `leak-*`, or `timeout-*` file the log
+  names that's still in the target's artifacts directory, so it never names `slept/` or a
+  timeout moved there.
+- **A slept run is rerun.** `FUZZ_RETRY_SLEPT` (default 1) reruns it right away, since the
+  driver only runs while the host is awake. The rerun starts from the corpus the slept run
+  grew: coverage doesn't depend on time, so those inputs stand. That's why the default is 1
+  where `script/soak`'s `--retry-stalled` defaults to 0: a fuzz rerun costs one target's time
+  and loses nothing, while a soak rerun replays a whole scenario.
+- **A target whose last attempt slept exits 3**, as a stalled soak run does. `fuzz-all` lists it
+  as `slept`, never `ok` or `FAILED`, and exits 1 if any target failed, else 3 if any slept.
+  That reverses soak's order, where 3 outranks 1, because a stall leaves nothing in a soak run
+  to judge, while each `fuzz-all` target is its own run and another target's crash still needs
+  reading.
+- **`UNSAFE_CHECK_FAKE_SUSPEND=N` makes each target's first `N` attempts read as slept**, the
+  seam that tests the retry path without suspending the host. `fuzz-self-test` checks the
+  detection against simulated clock readings and the `fuzz-tmin` line's artifact against
+  simulated slept-run logs.
+
+### Limits
+
+- A `CLOCK_REALTIME` step, such as an NTP correction, moves libFuzzer's clock without moving
+  `CLOCK_BOOTTIME` against `CLOCK_MONOTONIC`, so the driver doesn't see it. The development
+  host's chrony steps the clock only at boot.
+- A suspend shorter than 5 seconds isn't detected. It can't fake a timeout, and it shortens the
+  run by under 5 seconds.
