@@ -196,7 +196,7 @@ RANGE_KEYS = {"min", "max"}
 # name, and each further SUT service's under its service name.
 SUT_CONFIG_KEY = "sut"
 LEDGER_KEYS = {"sut_aggregate", "sink", "source", "wire_loss_outside_faults"}
-OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script", "split", "hop"}
+OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script", "split", "hop", "sut_router"}
 # A `[[ledger.hop]]`: the native hop between two SUT services, `from`'s `logit_out` component
 # `sink` and `to`'s `logit_in` component `listener`. A scenario has at most one.
 HOP_KEYS = {"from", "sink", "to", "listener"}
@@ -265,12 +265,20 @@ OVERLAP_DRAIN_S = 10
 # A generator's service name, which also names its config's compose variable
 # (`config_env()`), so it is a slug.
 _SERVICE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-# How the SUT's sinks share `aggregate`'s output: `copy`, each sink a full copy by fan-out, or
-# `route`, each sink fed by one `target` a `route` fills, so the sinks' V add up to it.
-SPLITS = ("copy", "route")
+# How the SUT's sinks share its events: `copy`, each sink a full copy of `aggregate`'s output by
+# fan-out; `route`, each sink fed by one `target` that a `route` after `aggregate` fills, so the
+# sinks' V add up to it; or `target`, each sink behind its own `target` and `aggregate`, the
+# targets filled by `[ledger] sut_router`, a `route` or `route_signals` that can send one event
+# to several of them, so each sink's V is judged against its own target's `events.sent`.
+SPLITS = ("copy", "route", "target")
+TARGET_SPLIT = "target"
+# The router kinds `split = "target"` follows.
+ROUTER_KINDS = ("route", "route_signals")
 # A `[[ledger.sink]]`: the sink's component id, the backend service it delivers to and the
-# selector V is read with (both local only), and under `split = "route"` the `target` feeding it.
-SINK_KEYS = {"id", "backend", "vm_selector", "target"}
+# selector V is read with (both local only), under `split = "route"` or `"target"` the `target`
+# feeding it, and under `"target"` its own `aggregate` and the `transforms` between the target
+# and that `aggregate`, in order.
+SINK_KEYS = {"id", "backend", "vm_selector", "target", "aggregate", "transforms"}
 _COMPONENT_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 THRESHOLD_KEYS = {"progress_window", "rss_growth_mib_per_hour", "fd_growth"}
 EXPECT_KEYS = {"name", "service", "metric", "component", "attrs", "step", "window", "reduce",
@@ -782,6 +790,11 @@ def from_dict(raw, path):
     thresholds = dict(raw.get("thresholds", {}))
     ledger_keys = LEDGER_KEYS - VM_LEDGER_KEYS if no_vm else LEDGER_KEYS
     ledger_optional = OPTIONAL_LEDGER_KEYS | (VM_LEDGER_KEYS if no_vm else set())
+    # Under `split = "target"` each sink names its own `aggregate`, and `_sink_problems()`
+    # refuses `sut_aggregate` with its own message.
+    if isinstance(ledger, dict) and ledger.get("split") == TARGET_SPLIT:
+        ledger_keys = ledger_keys - {"sut_aggregate"}
+        ledger_optional = ledger_optional | {"sut_aggregate"}
     if no_vm and isinstance(ledger, dict):
         for key in sorted(VM_LEDGER_KEYS & set(ledger)):
             problems.append(f"ledger.{key} names a VictoriaMetrics query, and the "
@@ -843,6 +856,8 @@ def from_dict(raw, path):
             problems += _hop_problems(ledger, extra_suts)
         elif isinstance(configs, dict):
             problems += _overlap_problems(overlap, ledger, configs, extra_suts, path.parent)
+        if overlap is not None and ledger.get("split") == TARGET_SPLIT:
+            problems.append("[overlap] can't be combined with split = \"target\"")
 
     steps = []
     for index, raw_step in enumerate(raw.get("step", [])):
@@ -1003,14 +1018,18 @@ def _sink_problems(ledger, kind):
     """What the `[[ledger.sink]]` tables and `[ledger] split` break: at least one sink, each a
     table of known keys with a distinct component `id`; for a local target a `backend` and a
     `vm_selector` on every sink, and for any other target neither; for a Kafka target one sink
-    only, the `kafka_out` whose topic is V, and for a stand-in target one sink only; and under
-    `split = "route"` at least two sinks, each with a distinct `target`, which `copy` refuses. Whether `backend` names a
-    backend service needs the role map: `service_problems()`."""
+    only, the `kafka_out` whose topic is V, and for a stand-in target one sink only; under
+    `split = "route"` at least two sinks, each with a distinct `target`, which `copy` refuses;
+    and under `split = "target"` the same, each sink also naming its own `aggregate` and
+    optionally the `transforms` between its target and that `aggregate`, with `[ledger]
+    sut_router` in place of `sut_aggregate` (`_target_split_problems()`). Whether `backend`
+    names a backend service needs the role map: `service_problems()`."""
     problems = []
     no_backend = kind != LOCAL_TARGET
     split = ledger.get("split", "copy")
     if split not in SPLITS:
         problems.append(f"ledger.split must be one of {', '.join(SPLITS)}, got {split!r}")
+    problems += _target_split_problems(ledger, kind, split)
     sinks = ledger.get("sink")
     if "sink" not in ledger:
         return problems
@@ -1044,18 +1063,83 @@ def _sink_problems(ledger, kind):
                     problems.append(f"{where}: missing `{key}`; a local sink names the backend "
                                     "service it delivers to and the selector its V is read with")
         target = sink.get("target")
-        if split == "route":
+        if split in ("route", TARGET_SPLIT):
             if not isinstance(target, str) or not _COMPONENT_ID.match(target):
-                problems.append(f"{where}: under split = \"route\" a sink needs `target`, the "
+                problems.append(f"{where}: under split = \"{split}\" a sink needs `target`, the "
                                 "id of the target that feeds it")
             elif target in targets:
                 problems.append(f"{where}: `target` {target!r} repeats another sink's")
             else:
                 targets.append(target)
         elif target is not None:
-            problems.append(f"{where}: `target` is for split = \"route\"")
-    if split == "route" and len(sinks) < 2:
-        problems.append("ledger.split = \"route\" needs two or more [[ledger.sink]] tables")
+            problems.append(f"{where}: `target` is for split = \"route\" or \"target\"")
+    if split in ("route", TARGET_SPLIT) and len(sinks) < 2:
+        problems.append(f"ledger.split = \"{split}\" needs two or more [[ledger.sink]] tables")
+    return problems
+
+
+def _target_split_problems(ledger, kind, split):
+    """What `split = "target"` breaks, and what it alone allows: `[ledger] sut_router` naming
+    the router and no `sut_aggregate`; on each sink an `aggregate` and an optional `transforms`
+    list, every one of these components distinct across the sinks and off every source's
+    `sut_transforms`; a local target, whose backends hold each sink's V; and no `sut_script`,
+    `hop`, or `vm_every_window`, whose rows read one `aggregate`. Under any other split,
+    `sut_router` and the two sink keys are refused."""
+    sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
+    sinks = [sink for sink in sinks if isinstance(sink, dict)]
+    if split != TARGET_SPLIT:
+        problems = []
+        if "sut_router" in ledger:
+            problems.append("ledger.sut_router is for split = \"target\"")
+        for index, sink in enumerate(sinks):
+            for key in ("aggregate", "transforms"):
+                if key in sink:
+                    problems.append(f"ledger.sink {index + 1}: `{key}` is for split = "
+                                    "\"target\"; under any other split the sinks share "
+                                    "[ledger] sut_aggregate")
+        return problems
+    problems = []
+    router = ledger.get("sut_router")
+    if not isinstance(router, str) or not _COMPONENT_ID.match(router):
+        problems.append("ledger.split = \"target\" needs `sut_router`, the id of the route or "
+                        "route_signals that fills the sinks' targets")
+    if "sut_aggregate" in ledger:
+        problems.append("ledger.sut_aggregate is refused under split = \"target\"; each "
+                        "[[ledger.sink]] names its own `aggregate`")
+    if kind != LOCAL_TARGET:
+        problems.append(f"ledger.split = \"target\" needs the local target, whose backends hold "
+                        f"each sink's V; this is a {kind} target")
+    for key in ("sut_script", "hop", "vm_every_window"):
+        if key in ledger:
+            problems.append(f"ledger.{key} can't be combined with split = \"target\", whose "
+                            "rows judge one aggregate per sink")
+    sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
+    named = {node for source in sources if isinstance(source, dict)
+             for node in (source.get("sut_transforms") or []) if isinstance(node, str)}
+    if isinstance(router, str):
+        named.add(router)
+    for index, sink in enumerate(sinks):
+        where = f"ledger.sink {index + 1}"
+        aggregate = sink.get("aggregate")
+        if not isinstance(aggregate, str) or not _COMPONENT_ID.match(aggregate):
+            problems.append(f"{where}: under split = \"target\" a sink needs `aggregate`, the id "
+                            "of the aggregate between its target and it")
+            aggregate = None
+        chain = sink.get("transforms", [])
+        if (not isinstance(chain, list)
+                or not all(isinstance(c, str) and _COMPONENT_ID.match(c) for c in chain)):
+            problems.append(f"{where}: `transforms` must list the component ids between the "
+                            "sink's target and its aggregate, in order")
+            chain = []
+        nodes = chain + ([aggregate] if aggregate else [])
+        repeated = sorted({node for node in nodes if nodes.count(node) > 1}
+                          | (set(nodes) & named)
+                          | ({sink.get("target"), sink.get("id")} & set(nodes)))
+        if repeated:
+            problems.append(f"{where}: {', '.join(repeated)} is on another sink's branch, a "
+                            "source's chain, or names the router, the sink, or its target; "
+                            "each branch node feeds one sink")
+        named |= set(nodes)
     return problems
 
 
@@ -1121,10 +1205,11 @@ def _route_blocks(text, kind="route"):
         yield found.group(1), "\n".join(block)
 
 
-def _routes_value(body):
-    """The text of a route component's `routes:` value in `body`: a flow mapping to its closing
-    brace, or the deeper-indented lines of a block mapping; empty when there is none."""
-    found = re.search(r"\broutes\s*:[ \t]*(\{)?", body)
+def _routes_value(body, key="routes"):
+    """The text of a router's `routes:` value in `body`, or another `key`'s, such as a
+    `route_signals`'s `signals:`: a flow mapping to its closing brace, or the deeper-indented
+    lines of a block mapping; empty when there is none."""
+    found = re.search(r"\b" + re.escape(key) + r"\s*:[ \t]*(\{)?", body)
     if not found:
         return ""
     if found.group(1):
@@ -1147,25 +1232,75 @@ def _routes_value(body):
     return "\n".join(out)
 
 
+def router_targets(body, kind):
+    """The target ids a router's block `body` names: a `route`'s `routes:` values or a
+    `route_signals`'s `signals:` values, each a target id or a list of them, in order with
+    repeats removed."""
+    value = _routes_value(body, "signals" if kind == "route_signals" else "routes")
+    # Drop each mapping key, quoted or bare, so only the values' ids remain.
+    value = re.sub(r"(\"[^\"]*\"|'[^']*'|[\w.-]+)\s*:", " ", value)
+    found = []
+    for word in re.findall(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", value):
+        if word not in found:
+            found.append(word)
+    return found
+
+
 def _route_problems(ledger, sut_text):
     """Under `split = "route"`, the sinks' V add up only if a router sends each event to one
     target. A `routes:` value that is a list can deliver one event to several
     sinks, so the SUT config's `route` components must use none. A `route_signals` can send
-    parts of one event to several sinks under either `strip:` value, so it is refused outright."""
-    if ledger.get("split", "copy") != "route":
+    parts of one event to several sinks under either `strip:` value, so it is refused outright.
+    Both belong under `split = "target"`, whose `_target_router_problems()` this returns."""
+    split = ledger.get("split", "copy")
+    if split == TARGET_SPLIT:
+        return _target_router_problems(ledger, sut_text)
+    if split != "route":
         return []
     problems = []
     for name, _ in _route_blocks(sut_text, "route_signals"):
         problems.append(f"ledger.split = \"route\": route_signals {name!r} can deliver parts of "
                         "one event to several sinks, so their totals don't add up; use "
-                        "split = \"copy\" or a route with one target per value")
+                        "split = \"target\", split = \"copy\", or a route with one target per "
+                        "value")
     for name, body in _route_blocks(sut_text):
         listed = re.search(r"\[|^\s*-\s", _routes_value(body), re.M)
         if listed:
             problems.append(f"ledger.split = \"route\": route {name!r} uses a list-valued "
                             "`routes:` value, which can deliver one event to several sinks, so "
-                            "their totals don't add up; use split = \"copy\" or one target "
-                            "per value")
+                            "their totals don't add up; use split = \"target\", split = "
+                            "\"copy\", or one target per value")
+    return problems
+
+
+def _target_router_problems(ledger, sut_text):
+    """Under `split = "target"`, `sut_router` must be a `ROUTER_KINDS` component of the SUT
+    config whose targets are the sinks' targets, every one: the router's balance sums each
+    target's `events.sent`, so a target no sink follows would leave it short."""
+    router = ledger.get("sut_router")
+    if not isinstance(router, str) or not _COMPONENT_ID.match(router):
+        return []
+    found = None
+    for kind in ROUTER_KINDS:
+        for name, body in _route_blocks(sut_text, kind):
+            if name == router:
+                found = (kind, body)
+    if found is None:
+        return [f"ledger.sut_router {router!r} isn't a {' or '.join(ROUTER_KINDS)} component of "
+                "the SUT config"]
+    kind, body = found
+    named = router_targets(body, kind)
+    sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
+    followed = [sink.get("target") for sink in sinks if isinstance(sink, dict)]
+    problems = []
+    unfollowed = [target for target in named if target not in followed]
+    if unfollowed:
+        problems.append(f"ledger.sut_router {router!r} fills {', '.join(unfollowed)}, which no "
+                        "[[ledger.sink]] follows; every target it fills needs a sink")
+    unnamed = [target for target in followed if isinstance(target, str) and target not in named]
+    if unnamed:
+        problems.append(f"ledger.sink `target` {', '.join(unnamed)} isn't one {kind} "
+                        f"{router!r} fills")
     return problems
 
 

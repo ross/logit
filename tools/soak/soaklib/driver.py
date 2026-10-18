@@ -866,14 +866,18 @@ class Run:
 
     def aggregate_interval(self):
         """The `aggregate` window of the SUT service holding `sut_aggregate`, in seconds, or
-        `DEFAULT_AGGREGATE_INTERVAL_S`."""
+        `DEFAULT_AGGREGATE_INTERVAL_S`; under `split = "target"` the longest of the sinks' own
+        `aggregate` windows."""
         try:
             text = self.scenario.sut_config_path(self.scenario.sink_sut).read_text()
         except OSError:
             text = ""
-        interval = checks.component_duration(
-            text, self.scenario.ledger.get("sut_aggregate", ""), "interval")
-        return interval or DEFAULT_AGGREGATE_INTERVAL_S
+        names = ([sink.get("aggregate") or "" for sink in self.scenario.sinks]
+                 if self.scenario.split == scenario_mod.TARGET_SPLIT
+                 else [self.scenario.ledger.get("sut_aggregate", "")])
+        intervals = [checks.component_duration(text, name, "interval") for name in names]
+        return max([interval for interval in intervals if interval] or
+                   [DEFAULT_AGGREGATE_INTERVAL_S])
 
     def wait_sink_drained(self, service=scenario_mod.SUT_SERVICE, sinks=None):
         """Waits until a drain of SUT `service` at least two aggregate windows after the wait

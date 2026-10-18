@@ -1,0 +1,47 @@
+# The system under test in `script/soak`'s route-copy scenario: DogStatsD over UDP into a `route`
+# on the `shard` tag whose `"0"` value lists two targets, so each shard-0 event goes whole to both
+# and each shard-1 event to `tier_b` alone. Each target feeds its own 10 s cumulative aggregate,
+# remote-write sink, and VictoriaMetrics: `vm_a` holds shard 0's series and `vm_b` every series.
+# Its `internal` telemetry goes to stdout as NDJSON for the harness to read.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # DogStatsD tags become attributes
+  split:
+    type: route
+    sources: [statsd]
+    by: { attribute: shard }
+    routes: { "0": [tier_a, tier_b], "1": tier_b }
+  # A router needs a consumer for what no route claims. The generator sends only shards 0 and 1,
+  # so this receives nothing; `nothing-unrouted` in scenario.toml checks that.
+  unrouted: { type: null_out, sources: [split] }
+  tier_a: { type: target }
+  tier_b: { type: target }
+  window_a:
+    type: aggregate
+    sources: [tier_a]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  vm_a:
+    type: prometheus_out
+    sources: [window_a]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  window_b:
+    type: aggregate
+    sources: [tier_b]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360
+  vm_b:
+    type: prometheus_out
+    sources: [window_b]
+    endpoint: http://victoria-metrics-b:8428/api/v1/write
+    version: 1
+    compression: zstd
+    # Its 1024-batch queue holds every fault's windows, so `drop_oldest` never drops here; one
+    # blocking sink behind the listener keeps `logit validate` quiet.
+    buffer: { overflow: drop_oldest }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
