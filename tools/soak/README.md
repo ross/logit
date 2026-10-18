@@ -285,21 +285,21 @@ fresh. Its expectations assert discards after the pause, the stop, and the long 
 through the restart or the short kill, and every line's `timestamp` resolved.
 
 `tail-rotate-delete` (4 hours by default) is `tail-rotate` against a writer that keeps eight files
-(`max_files: 8`) and deletes the oldest at every rotation from its eighth on, about one every
-44 s. `tail_in` holds a rotated file open until the writer deletes it, so its descriptors must
-stay bounded by that retention over hours. Its cycle is an hour long: the same five faults,
-then about 50 minutes of one SUT life with no fault, where a leak a restart resets still shows.
-Deleted files can't be counted at the end, so `ledger.wire` holds the lines left in the shared
-directory to G only as a bound, and requires the eight files the writer keeps. It FAILs a SUT
-stop, kill, restart, or `exit` during which the writer rotated six times or more, or a pause
-during which it rotated eight times or more, enough to delete a file the tailer hadn't read, a
-loss `tail_in` counts nowhere. The 150 s kill spans about three rotations. `fd_growth` is 10:
-the tailer holds about eight more files than at warmup, plus two to spare. Its expectations
-bound `logit.input.files.open` at 10 and the process's descriptors at 26, require eight
-or more writer rotations, so the writer deleted files, and assert no checkpoint error. It has
-no `no-resume-rejected` expectation: an inode a deletion freed while the SUT was down can be
-reused by the writer's next file, and the restart then rejects the checkpoint entry whose head
-no longer matches.
+(`max_files: 8`) and deletes the oldest at every rotation from its eighth on, about one every 44 s.
+`tail_in` holds a rotated file open until the writer deletes it, so its descriptors must stay
+bounded by that retention over hours. Its cycle is an hour long: the same five faults, then about
+50 minutes of one SUT life with no fault, where a leak a restart resets still shows. Deleted files
+can't be counted at the end, so `ledger.wire` holds the lines left in the shared directory to G
+only as a bound, and requires the eight files the writer keeps. It FAILs a SUT stop, kill, restart,
+or `exit` during which the writer rotated six times or more, or a pause during which it rotated
+eight times or more, enough to delete a file the tailer hadn't read, a loss `tail_in` counts only
+as far as the last checkpoint knew. The 150 s kill spans about three rotations. `fd_growth` is 10:
+the tailer holds about eight more files than at warmup, plus two to spare. Its expectations bound
+`logit.input.files.open` at 10 and the process's descriptors at 26, require eight or more writer
+rotations, so the writer deleted files, and assert no checkpoint error and no gone-file bytes
+(`no-gone-bytes`, `logit.input.bytes.dropped` at 0). It has no `no-resume-rejected` expectation: an
+inode a deletion freed while the SUT was down can be reused by the writer's next file, and the
+restart then rejects the checkpoint entry whose head no longer matches.
 
 `otlp-fan-out` (16 minutes) sends 500 OTLP log records a second with `otlp_out` over HTTP, 50
 to a request, into `otlp_in`, its source declared `wire = "http"`. Each record's body is four

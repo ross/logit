@@ -1,6 +1,6 @@
 ---
 created: 2026-09-28
-updated: 2026-10-02
+updated: 2026-10-18
 ---
 
 # Tail discovery failure and resume identity: a failed listing is no information, and a resume verifies the file's head
@@ -311,6 +311,64 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
   - A decoder opt-out from `take_partial` at shutdown, so `docker_in` checkpoints before a torn
     envelope instead of emitting it as a `bad_line`. Done 2026-10-08.
 
+## Amendment (2026-10-18): a gone file's unread bytes are counted, from a length in the checkpoint
+
+A checkpointed file that a restart's scan can't find now counts the bytes its entry recorded as
+unread. This amends decision 3's format and the loss decision 6's "Cost" leaves to the known
+orphan gap. Until now, `Tailer::prune_checkpoint_entries` dropped such an entry with no counter
+and no diagnostic, so a rotator that deleted a file `tail_in` hadn't finished while it was down
+lost lines that no telemetry showed. That breaks the loss vocabulary's rule that a loss gets a
+`*.dropped` counter ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)).
+
+- **Checkpoint format 3, with no format 2 reader.** An entry gains `len`, the file's size at the
+  latest observation the driver already makes: the scan's `stat` of its path, an `fstat` of its
+  handle (`keep_unlisted`, `recheck_length`, `open_tracked`), or a read returning 0 bytes, which
+  means the size is the offset. It's the latest observation, not the largest, so a truncation
+  lowers it. A write persists the larger of it and the offset read, and an unspent entry carries
+  its `len` through every write until it's spent or pruned. There's no new syscall.
+  `CHECKPOINT_VERSION` becomes `3`. A format 2 file loads as `Loaded::Unusable` ("unsupported
+  version 2"), counted and diagnosed, and every file replays once on upgrade, as decision 3's
+  bump did. Logit is pre-release, so no format 2 reader is kept.
+- **The count.** When a scan prunes a checkpoint entry whose stored path a current pattern still
+  covers, its `len - offset` bytes count `logit.input.bytes.dropped{reason="gone"}`, diagnosed
+  `file_gone` with the path, `dev:ino`, offset, and bytes. A stored path no pattern covers is the
+  operator's config change, not loss, and counts nothing. A file renamed out of every pattern
+  counts the same as a removed one: no scan can find either. The name isn't
+  `logit.component.bytes.dropped`, which the UDP receive queue owns beside its datagram counts
+  (and which the soak harness balances against them).
+- **Counted after the write.** The prune holds the entry in a pending list, and
+  `Tailer::write_checkpoint` counts it only once `CheckpointStore::write` reports that a document
+  without it is in place at the checkpoint path; a write that failed before its rename keeps it
+  pending for the retry. A rename followed by a failed directory sync counts as in place: a later
+  load reads the new document, and the store stays dirty so the next tick makes it durable. The
+  one double count left is a power loss between that rename and a durable retry, which can bring
+  the old document, and its entry, back. Counted at the prune, a
+  process ending before the next write (a kill, an exit 2, a later listener's failed bind) would
+  leave the entry on disk, and every such life would count the same bytes again. A forced write
+  after the prune isn't safe instead: outside `bind`, a scan runs with accumulators holding
+  absorbed but unemitted events, which both existing writers flush first.
+- **What the count means.** It's `len` less the entry's `offset`, which is the resume position,
+  not the read position. It's the whole loss only in the first case:
+
+  | Case | The count |
+  |---|---|
+  | No line held or being dropped at a clean stop, and a scan or a read to the end saw the file's final size | exact |
+  | A line held or being dropped at the stop | high: it includes bytes read after that line's start, an oversize line's prefix already counted in `logit.input.frames.dropped{reason="oversize"}`, or under `docker_in` the other stream's entries delivered after a held partial |
+  | Appends no `stat`, `fstat`, or read to the end observed, such as a backlogged file renamed away between full reads | low: they aren't counted |
+  | Any file after a kill | approximate either way: the last interval checkpoint's offset can trail what the process delivered, and its `len` trail what the file held |
+  | A file created and removed while `tail_in` was down | nothing: no entry names it |
+  | An inode a new file reused while `tail_in` was down | nothing: the head check rejects the resume (`logit.input.files.resume_rejected`), and the original's unread tail is lost uncounted |
+  | A stored path no current pattern covers | nothing: a config change |
+
+  A separate "unread from" position would remove the over-count, but `TailDecoder` doesn't report
+  one: `DockerDecoder` holds decoded text, not raw line lengths. `docs/known-gaps/tailing.md`
+  keeps the uncounted remainder.
+- **Alternatives considered.** A `stat` of every tracked file at each checkpoint write would make
+  `len` current at the write, at a syscall per file per tick, and the file still grows after the
+  last write, so the count would still miss what came after it. A format 2 reader that read a missing
+  `len` as the offset would count nothing for those entries, which is today's behavior, at the
+  cost of a second decode path pre-release.
+
 ## Running it
 
 Each workstream updates its inventory rows in the PR that lands its artifact, and fills in its
@@ -353,8 +411,9 @@ directory and an unreadable `root`, each recovering with no identity change.
 
 ### `tailbk/w4`: head fingerprint and eviction (TAIL-02)
 
-Decisions 2 to 4 as written. `checkpoint.rs`'s module doc is the canonical statement of format 2,
-the capture rule, the accept rule, and the residual. Three details the decisions leave open:
+Decisions 2 to 4 as written. `checkpoint.rs`'s module doc is the canonical statement of the
+checkpoint format, the capture rule, the accept rule, and the residual. Three details the decisions
+leave open:
 
 - **A resume reads `min(256, max(offset, head_len))` bytes from `0`** before the seek, so the
   tracked file's head satisfies its invariant (`head.len() >= min(256, offset)`) without a second

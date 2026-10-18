@@ -1186,10 +1186,11 @@ The rows:
   exceed G, and the directory must hold min(rotations + 1, max_files) files, else the
   precondition FAILs. G less the count is reported beside the lines the deleted files'
   `max_bytes` would hold, never judged. A deleted file the tailer hadn't read is lost and
-  counted nowhere (docs/known-gaps/tailing.md), so a **retention guard** FAILs the row for any
-  pause, stop, kill, restart, or `exit` of the ingress SUT, widened by one of the writer's
-  drain intervals on each side, during which the writer rotated as often as its limit, which
-  trips one rotation before the first unread deletion:
+  counted only as far as the last checkpoint knew (docs/known-gaps/tailing.md), so a
+  **retention guard** FAILs the row for any pause, stop, kill, restart, or `exit` of the
+  ingress SUT, widened by one of the writer's drain intervals on each side, during which the
+  writer rotated as often as its limit, which trips one rotation before the first unread
+  deletion:
   - a stop, kill, restart, or `exit`: `max(1, max_files − 2)`. The process closes every file,
     so a file rotated to `.1` shortly before the fault, which a tailer one file behind hasn't
     finished, is lost when it's deleted, at the fault's `max_files − 1`th rotation;
