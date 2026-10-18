@@ -120,8 +120,8 @@ window = "run"
 reduce = "max"
 max = 10
 
-# Those files plus the process's other descriptors, about 14.5 at the warmup's two files open
-# (the W11b run's 16 less its two files, and this run's warmup median less its files.open).
+# Those files plus the process's other descriptors: `logit.process.fds` less `files.open` was 15
+# at nearly every drain of a 20-minute run, so 15 + files-open-bounded's 10 + 1 to spare.
 [[expect]]
 name = "fds-bounded"
 service = "logit"

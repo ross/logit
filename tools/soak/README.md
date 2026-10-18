@@ -1056,6 +1056,10 @@ on. The driver runs every docker command as `sudo -n`, which fails instead of pr
 no terminal there's nothing to prompt on; `tmux` keeps the terminal the ticket was primed on.
 Follow a run with `tail -f perf/results/soak/<stamp>/timeline.jsonl`.
 
+On a laptop, keep the host awake too: a suspended host stalls the run, which `run` FAILs. Wrap
+the command in `systemd-inhibit --what=sleep:idle:handle-lid-switch`; without
+`handle-lid-switch`, closing the lid still suspends it.
+
 What an 8-hour run costs, from the recorded runs' rates:
 
 | Resource | 8 hours | 24 hours |
