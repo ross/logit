@@ -8,7 +8,9 @@
 //! beginning. A tracked file whose size is below the offset already read was
 //! truncated in place: it's re-read from `0` with its partial-line state discarded.
 
-use super::checkpoint::{CheckpointStore, FileId, Head, Loaded, Retained, Source, HEAD_BYTES};
+use super::checkpoint::{
+    CheckpointStore, FileId, Head, Loaded, Persisted, Retained, Source, HEAD_BYTES,
+};
 use super::line::{LineSplitter, TailDecoder};
 use super::pattern::PathPattern;
 use super::TailConfig;
@@ -183,6 +185,12 @@ struct TrackedFile<D> {
     id: FileId,
     file: tokio::fs::File,
     offset: u64,
+    /// The file's size at the latest observation the driver already makes: a scan's `stat`, an
+    /// `fstat` of the handle, or a read returning `0` bytes (size equals `offset`). The latest,
+    /// not the largest, so a truncation lowers it. A checkpoint persists the larger of it and
+    /// `offset`, which `Tailer::prune_checkpoint_entries` counts a gone file's unread bytes
+    /// against.
+    last_len: u64,
     splitter: LineSplitter,
     decoder: D,
     accumulator: BatchAccumulator,
@@ -734,19 +742,40 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// its stored path is listed and its inode wasn't discovered under any path. Runs after the
     /// discovery loop, on every scan; an entry whose path a failed listing or `stat` covers stays,
     /// and is persisted by every checkpoint write meanwhile. Returns whether it dropped any.
+    ///
+    /// A dropped entry's file is gone: removed, or renamed out of every pattern, before a stop
+    /// left it read to its end or while `logit` was down. If a pattern still covers its stored path, its `len - offset` bytes count as
+    /// `logit.input.bytes.dropped{reason="gone"}`, diagnosed `file_gone`. A stored path no pattern
+    /// covers is the operator's config change, not loss, and isn't counted. The count is what the
+    /// last checkpoint recorded as unread: exact for a file rotated out before a clean stop, a
+    /// lower bound for the file being written to, and approximate either way after a kill, which
+    /// leaves an older checkpoint. A file created and removed wholly while `logit` was down has no
+    /// entry, and isn't counted.
     fn prune_checkpoint_entries(
         &mut self,
         listing: &Listing,
         discovered_ids: &HashSet<FileId>,
     ) -> bool {
-        let before = self.resume.len();
         let patterns = &self.patterns;
+        let mut pruned = Vec::new();
         self.resume.retain(|id, r| {
-            r.source != Source::Checkpoint
+            let keep = r.source != Source::Checkpoint
                 || !listing.listed(patterns, &r.path)
-                || discovered_ids.contains(id)
+                || discovered_ids.contains(id);
+            if !keep {
+                pruned.push((*id, r.path.clone(), r.offset, r.len));
+            }
+            keep
         });
-        self.resume.len() != before
+        for (id, path, offset, len) in &pruned {
+            let unread = len.saturating_sub(*offset);
+            if unread == 0 || !self.patterns.iter().any(|p| p.covers(path)) {
+                continue;
+            }
+            self.telemetry.count("logit.input.bytes.dropped", unread as f64, &[("reason", "gone")]);
+            self.diag.warn_throttled("file_gone", file_gone_message(path, *id, *offset, unread));
+        }
+        !pruned.is_empty()
     }
 
     /// `scan`'s listing step: every pattern's [`PathPattern::scan`], then one `stat` per distinct
@@ -834,6 +863,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let Some(tracked) = self.files.get_mut(&id) else { return };
         match tracked.file.metadata().await {
             Ok(meta) if meta.nlink() == 0 => {
+                tracked.last_len = meta.len();
                 tracked.start_draining(self.scan_generation);
                 self.by_path.remove(&path);
                 return;
@@ -883,6 +913,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     async fn reconcile_truncation(&mut self, id: FileId, len: u64) {
         let max_line_bytes = self.config.max_line_bytes;
         let Some(tracked) = self.files.get_mut(&id) else { return };
+        tracked.last_len = len;
         if len >= tracked.offset {
             return;
         }
@@ -1093,6 +1124,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             id,
             file,
             offset,
+            last_len: len,
             splitter: LineSplitter::new(self.config.max_line_bytes),
             decoder,
             accumulator: BatchAccumulator::new(batching.max_events, batching.max_bytes),
@@ -1220,6 +1252,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 0,
                 tracked.file.read_buf(&mut (&mut self.read_buf).limit(READ_CHUNK_BYTES)).await
             ) {
+                Ok(0) => {
+                    tracked.last_len = tracked.offset;
+                    0
+                }
                 Ok(n) => n,
                 Err(err) => {
                     self.diag
@@ -1415,6 +1451,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 let retained = Retained {
                     path: tracked.path.clone(),
                     offset: tracked.held_from.map_or(boundary, |h| h.min(boundary)),
+                    len: tracked.last_len.max(tracked.offset),
                     head: Head::of(&tracked.head),
                     source: Source::Deselected,
                 };
@@ -1496,16 +1533,23 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let tracked = self.files.values().map(|f| {
             let boundary = f.offset.saturating_sub(f.splitter.pending_bytes());
             let offset = boundary.min(f.held_from.unwrap_or(u64::MAX));
-            (f.id, f.path.as_path(), offset, Head::of(&f.head))
+            // `offset` is a size observation too: the file held every byte read.
+            let len = f.last_len.max(f.offset);
+            Persisted { id: f.id, path: f.path.as_path(), offset, len, head: Head::of(&f.head) }
         });
         // An entry not yet spent persists until `scan` prunes it: dropping it here would lose
         // the position of a file whose listing failed, and a restart under `read_from: end`
         // would then skip what it gained.
-        let unspent = self
-            .resume
-            .iter()
-            .filter(|(_, r)| r.source == Source::Checkpoint)
-            .map(|(id, r)| (*id, r.path.as_path(), r.offset, r.head));
+        let unspent =
+            self.resume.iter().filter(|(_, r)| r.source == Source::Checkpoint).map(|(id, r)| {
+                Persisted {
+                    id: *id,
+                    path: r.path.as_path(),
+                    offset: r.offset,
+                    len: r.len,
+                    head: r.head,
+                }
+            });
         checkpoint.write(tracked.chain(unspent), force, &mut self.diag, &self.telemetry).await;
     }
 }
@@ -1614,6 +1658,17 @@ fn resume_rejected_message(path: &Path, offset: u64) -> String {
         "{}: the retained offset {offset} doesn't match this file (a recycled inode, or \
          rewritten while not tailed) -- reading from the beginning",
         path.display()
+    )
+}
+
+/// The `file_gone` diagnostic for a checkpointed file no pattern finds at a restart.
+fn file_gone_message(path: &Path, id: FileId, offset: u64, unread: u64) -> String {
+    format!(
+        "{} (inode {}:{}) is gone: {unread} byte(s) past offset {offset} were unread at the last \
+         checkpoint and are lost, and so is anything written to it after that checkpoint",
+        path.display(),
+        id.dev,
+        id.ino,
     )
 }
 
@@ -2413,9 +2468,9 @@ mod tests {
         // `(label, bytes, written at the tmp path rather than the checkpoint path)`.
         let cases: [(&str, &[u8], bool); 4] = [
             ("empty", b"", false),
-            ("truncated", br#"{"version":2,"files":[{"dev":"#, false),
+            ("truncated", br#"{"version":3,"files":[{"dev":"#, false),
             ("wrong-version", br#"{"version":99,"files":[]}"#, false),
-            ("stray-tmp", br#"{"version":2,"#, true),
+            ("stray-tmp", br#"{"version":3,"#, true),
         ];
         for (label, bytes, at_tmp) in cases {
             let dir = scratch_dir(&format!("unusable-checkpoint-{label}"));
@@ -4301,32 +4356,51 @@ mod tests {
         config
     }
 
-    /// A format 2 checkpoint naming `file`'s live `(dev, ino)` at `offset` with `head`.
-    fn write_checkpoint_for(dir: &Path, file: &Path, offset: u64, head: Head) {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(file).unwrap();
-        let text = format!(
-            r#"{{"version":2,"files":[{{"dev":{},"ino":{},"path":"{}","offset":{offset},"head_len":{},"head_hash":{}}}]}}"#,
-            meta.dev(),
-            meta.ino(),
-            file.display(),
+    /// One format 3 checkpoint entry, as JSON.
+    fn entry_json(id: FileId, path: &Path, offset: u64, len: u64, head: Head) -> String {
+        format!(
+            r#"{{"dev":{},"ino":{},"path":"{}","offset":{offset},"len":{len},"head_len":{},"head_hash":{}}}"#,
+            id.dev,
+            id.ino,
+            path.display(),
             head.len,
             head.hash,
-        );
+        )
+    }
+
+    /// Writes a format 3 checkpoint holding `entries` (from [`entry_json`]) to `dir`.
+    fn write_checkpoint_doc(dir: &Path, entries: &[String]) {
+        let text = format!(r#"{{"version":3,"files":[{}]}}"#, entries.join(","));
         std::fs::write(dir.join("checkpoint.json"), text).unwrap();
+    }
+
+    /// A format 3 checkpoint naming `file`'s live `(dev, ino)` at `offset` with `head`, and its
+    /// current length.
+    fn write_checkpoint_for(dir: &Path, file: &Path, offset: u64, head: Head) {
+        let meta = std::fs::metadata(file).unwrap();
+        let entry =
+            entry_json(FileId::from_metadata(&meta), file, offset, meta.len().max(offset), head);
+        write_checkpoint_doc(dir, &[entry]);
     }
 
     /// The first entry of the checkpoint on disk, as `(offset, head_len, head_hash)`.
     fn checkpointed_entry(dir: &Path) -> (u64, u32, u64) {
         let text = std::fs::read_to_string(dir.join("checkpoint.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(doc["version"], 2, "{text}");
+        assert_eq!(doc["version"], 3, "{text}");
         let entry = &doc["files"][0];
         (
             entry["offset"].as_u64().unwrap(),
             entry["head_len"].as_u64().unwrap() as u32,
             entry["head_hash"].as_u64().unwrap(),
         )
+    }
+
+    /// The first entry's `len` in the checkpoint on disk.
+    fn checkpointed_len(dir: &Path) -> u64 {
+        let text = std::fs::read_to_string(dir.join("checkpoint.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        doc["files"][0]["len"].as_u64().unwrap_or_else(|| panic!("no len: {text}"))
     }
 
     /// Rewrites `path` in place, as `copytruncate` and a refilling writer leave it: same inode.
@@ -4642,7 +4716,8 @@ mod tests {
             fast_config(ReadFrom::Beginning),
         );
         let head = Head::of(b"one\n");
-        let retained = Retained { path: path.clone(), offset: 4, head, source: Source::Checkpoint };
+        let retained =
+            Retained { path: path.clone(), offset: 4, len: 4, head, source: Source::Checkpoint };
         tailer.resume.insert(scanned, retained.clone());
         let mut watcher = crate::tail::watch::Watcher::Poll;
         tailer
@@ -4764,7 +4839,7 @@ mod tests {
         let meta = std::fs::metadata(&path).unwrap();
         let entry = |ino: u64, name: &str, offset: u64, head: Head| {
             format!(
-                r#"{{"dev":{},"ino":{ino},"path":"{}","offset":{offset},"head_len":{},"head_hash":{}}}"#,
+                r#"{{"dev":{},"ino":{ino},"path":"{}","offset":{offset},"len":{offset},"head_len":{},"head_hash":{}}}"#,
                 meta.dev(),
                 dir.join(name).display(),
                 head.len,
@@ -4778,7 +4853,7 @@ mod tests {
         ];
         std::fs::write(
             dir.join("checkpoint.json"),
-            format!(r#"{{"version":2,"files":[{}]}}"#, files.join(",")),
+            format!(r#"{{"version":3,"files":[{}]}}"#, files.join(",")),
         )
         .unwrap();
 
@@ -4868,6 +4943,7 @@ mod tests {
         assert!(hand.shutdown().await.is_empty());
         drop(scope);
         assert_eq!(checkpointed_entry(&dir), (4, 4, Head::of(b"one\n").hash));
+        assert_eq!(checkpointed_len(&dir), 8, "the unspent entry keeps the len it loaded with");
 
         append(&path, b"three\n");
         let mut hand = Hand::bind(patterns(), LineFactory, config).await;
@@ -5774,6 +5850,8 @@ mod tests {
         let mut hand = Hand::bind(patterns, LineFactory, config).await;
         assert!(hand.pump().await.is_empty());
         assert_eq!(hand.tailer.tracked_len(), 0);
+        // The scan's `fstat` of the unlinked handle saw "two\n", so the checkpoint recorded it.
+        assert_eq!(gone_bytes(&mut hand.probe), 4.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5799,6 +5877,191 @@ mod tests {
         assert!(hand.pump().await.is_empty(), "\"two\" is orphaned in app.log.1");
         assert_eq!(hand.tailer.tracked_len(), 1, "only the new app.log");
         assert!(hand.tailer.resume.is_empty(), "the rotated file's entry is pruned");
+        // The last checkpoint, before the crash, saw no unread bytes: "two\n" goes uncounted.
+        assert_eq!(gone_bytes(&mut hand.probe), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- a checkpointed file gone at a restart counts what the checkpoint recorded as unread
+    // (`Tailer::prune_checkpoint_entries`)
+
+    fn gone_bytes(probe: &mut TelemetryProbe) -> f64 {
+        probe.sum("logit.input.bytes.dropped", &[("reason", "gone")])
+    }
+
+    /// A `(dev, ino)` no file in a scratch directory has.
+    const GONE: FileId = FileId { dev: u64::MAX, ino: u64::MAX };
+
+    /// Binds a hand-driven tailer over `dir/*.log`, whose first scan prunes `entries`.
+    async fn bind_over(dir: &Path, entries: &[String]) -> Hand<LineFactory> {
+        write_checkpoint_doc(dir, entries);
+        let patterns = vec![PathPattern::new(dir.join("*.log"))];
+        Hand::bind(patterns, LineFactory, checkpointed(dir, ReadFrom::Beginning)).await
+    }
+
+    #[tokio::test]
+    async fn a_checkpointed_file_gone_at_a_restart_counts_its_unread_bytes_once() {
+        let dir = scratch_dir("gone-unread");
+        let path = dir.join("app.log");
+        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"one\n"))]).await;
+        assert_eq!(gone_bytes(&mut hand.probe), 6.0);
+        assert_eq!(hand.diag.occurrences("file_gone"), 1);
+        assert!(hand.tailer.resume.is_empty(), "the entry is pruned");
+
+        hand.scan().await;
+        assert_eq!(gone_bytes(&mut hand.probe), 6.0, "counted once");
+        assert_eq!(hand.diag.occurrences("file_gone"), 1);
+        hand.shutdown().await;
+        let text = std::fs::read_to_string(dir.join("checkpoint.json")).unwrap();
+        assert!(!text.contains("app.log"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_file_gone_diagnostic_names_the_file_and_what_it_lost() {
+        let message =
+            file_gone_message(Path::new("/var/log/app.log"), FileId { dev: 3, ino: 7 }, 4, 6);
+        for part in [
+            "/var/log/app.log",
+            "inode 3:7",
+            "6 byte(s) past offset 4",
+            "unread at the last checkpoint",
+            "anything written to it after that checkpoint",
+        ] {
+            assert!(message.contains(part), "{part:?} missing from {message:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gone_file_read_to_its_recorded_length_counts_nothing() {
+        let dir = scratch_dir("gone-read");
+        let path = dir.join("app.log");
+        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 10, 10, Head::of(b"x"))]).await;
+        assert!(hand.tailer.resume.is_empty(), "the entry is pruned");
+        assert_eq!(gone_bytes(&mut hand.probe), 0.0);
+        assert_eq!(hand.diag.occurrences("file_gone"), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The operator changed `paths:`: the file wasn't lost, it stopped being asked for.
+    #[tokio::test]
+    async fn a_stored_path_no_pattern_covers_counts_nothing() {
+        let dir = scratch_dir("gone-uncovered");
+        let path = dir.join("elsewhere.txt");
+        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"))]).await;
+        assert!(hand.tailer.resume.is_empty(), "the entry is pruned");
+        assert_eq!(gone_bytes(&mut hand.probe), 0.0);
+        assert_eq!(hand.diag.occurrences("file_gone"), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failed listing can't say the file is gone, so nothing counts until one succeeds.
+    #[tokio::test]
+    async fn a_gone_file_under_a_failing_listing_is_counted_once_the_listing_recovers() {
+        let dir = scratch_dir("gone-read-dir-fails");
+        let path = dir.join("app.log");
+        let scope = fault::scope(&dir);
+        scope.fail(READ_DIR, errno::EACCES);
+        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"))]).await;
+        hand.scan().await;
+        assert_eq!(hand.tailer.resume.len(), 1, "kept while the listing fails");
+        assert_eq!(gone_bytes(&mut hand.probe), 0.0);
+        assert_eq!(hand.diag.occurrences("file_gone"), 0);
+        drop(scope);
+
+        hand.scan().await;
+        assert!(hand.tailer.resume.is_empty());
+        assert_eq!(gone_bytes(&mut hand.probe), 6.0);
+        assert_eq!(hand.diag.occurrences("file_gone"), 1);
+        hand.scan().await;
+        assert_eq!(gone_bytes(&mut hand.probe), 6.0, "never counted again");
+        assert_eq!(hand.diag.occurrences("file_gone"), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Renamed out of every pattern while `logit` was down: no scan finds the inode, so its
+    /// unread bytes are lost as a deletion's are.
+    #[tokio::test]
+    async fn a_file_renamed_out_of_every_pattern_counts_its_unread_bytes() {
+        let dir = scratch_dir("gone-renamed");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        write_checkpoint_for(&dir, &path, 4, Head::of(b"one\n"));
+        std::fs::rename(&path, dir.join("app.log.1")).unwrap();
+
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::Beginning),
+        )
+        .await;
+        assert!(hand.tailer.files.is_empty());
+        assert!(hand.tailer.resume.is_empty(), "the entry is pruned");
+        assert_eq!(gone_bytes(&mut hand.probe), 4.0, "\"two\\n\"");
+        assert_eq!(hand.diag.occurrences("file_gone"), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A backlog read against a parked downstream, a clean stop, a delete, and a restart: the
+    /// restart counts what the stop's checkpoint recorded as unread.
+    #[tokio::test]
+    async fn a_backlog_file_deleted_after_a_clean_stop_counts_what_its_checkpoint_left_unread() {
+        let dir = scratch_dir("gone-backlog");
+        let path = dir.join("app.log");
+        let content = backlog(8_000);
+        std::fs::write(&path, content.as_bytes()).unwrap();
+        let mut config = checkpointed(&dir, ReadFrom::Beginning);
+        config.batching.max_events = 1;
+
+        // A one-batch channel nobody reads past three batches parks the tailer inside its first
+        // chunk, so it can't read the second before the stop.
+        let (fanout, mut rx) = fanout_channel(1);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config.clone());
+        let running = spawn_tailer(tailer, fanout);
+        recv_events(&mut rx, 3).await;
+        running.shutdown.send(true).unwrap();
+        while tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("the stopping tailer keeps emitting until it ends")
+            .is_some()
+        {}
+        running.handle.await.unwrap().unwrap();
+
+        let offset = checkpointed_offset(&config.checkpoint_path.clone().unwrap()).unwrap();
+        let len = checkpointed_len(&dir);
+        assert_eq!(len, content.len() as u64, "the open's fstat saw the whole file");
+        assert!(offset < len, "the stop left {offset} of {len} read");
+
+        std::fs::remove_file(&path).unwrap();
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config).await;
+        assert!(hand.pump().await.is_empty());
+        assert_eq!(gone_bytes(&mut hand.probe), (len - offset) as f64);
+        assert_eq!(hand.diag.occurrences("file_gone"), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A truncation lowers the persisted length to the new size: a running maximum would count
+    /// bytes the file no longer holds if it were gone at a restart.
+    #[tokio::test]
+    async fn a_truncation_persists_the_new_smaller_len() {
+        let dir = scratch_dir("gone-len-truncated");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::Beginning),
+        )
+        .await;
+        assert_eq!(hand.pump().await, vec!["one", "two"]);
+        hand.checkpoint().await;
+        assert_eq!(checkpointed_len(&dir), 8);
+
+        copytruncate_and_refill(&path, b"x\n");
+        hand.scan().await;
+        hand.checkpoint().await;
+        assert_eq!(checkpointed_entry(&dir).0, 0, "the truncation rewound the offset");
+        assert_eq!(checkpointed_len(&dir), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
