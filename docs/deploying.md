@@ -2288,6 +2288,18 @@ tracked files, and a pass reads at most 64 KiB per file, so a crash then replays
 at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bounds how much a
 crash can replay, and replay is always safe.
 
+**A file gone at a restart is counted as far as the checkpoint knew.** Each checkpoint entry
+records the file's length as `tail_in` last saw it. If a restart finds an entry's file under no
+path, because it was removed or renamed out of every pattern before `logit` read it to its end, it
+counts the bytes the entry recorded as unread as `logit.input.bytes.dropped{reason="gone"}` and
+logs a `file_gone` diagnostic. Any nonzero value is lost lines. Outside a kill, the count is a
+lower bound: what the file gained after the last checkpoint isn't counted, and neither is a file
+created and removed while `logit` was down. After a kill, it comes from the last interval
+checkpoint, so it can be high or low. A path that no `paths:` entry covers any more isn't counted,
+because changing the config isn't loss. To avoid the loss, match the rotated names too
+(`app.log*`), which covers a rename, and keep enough rotated files that the rotator can't delete
+one `logit` hasn't read while it's down.
+
 **A closed downstream stops the tailer.** When no consumer takes a batch, `tail_in`/`docker_in`
 stops at the first refused batch and stops writing the checkpoint, and the node finishes. The
 checkpoint on disk is the last one written, at or before the last line a consumer took, up to one
