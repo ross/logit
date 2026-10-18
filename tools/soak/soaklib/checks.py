@@ -89,13 +89,15 @@ from .scenario import (DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET
                        KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS, RUN_WINDOW,
                        SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET, SUT_CONFIG_ENV,
                        SUT_CONFIG_KEY, SUT_SERVICE, component_blocks, config_env,
-                       parse_duration, source_ids, source_pairs, stdio_shared_targets)
+                       parse_duration, source_ids, source_pairs, stdio_shared_targets,
+                       tls_reload_polls)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
-# The self-log key of a TLS reload that kept the previous files (crates/logit-pipeline/src/tls.rs,
-# `Watched::check`).
+# The self-log keys of a TLS reload that kept the previous files, and of one that loaded
+# (crates/logit-pipeline/src/tls.rs, `Watched::check`).
 TLS_RELOAD_FAILED_KEY = "tls_reload_failed"
+TLS_RELOADED_KEY = "tls_reloaded"
 
 
 def is_start(record):
@@ -677,7 +679,9 @@ def check_self_log(data):
     expected exit didn't happen as named. The `Error: ` text line `main` prints as it returns
     the failure, right after that `exiting` line, has no timestamp and is excused by its place.
     A `tls_reload_failed` line FAILs too, except inside a `rotate` step on its service that
-    issued a broken certificate: every other rotation issues a whole set in one rename.
+    issued a broken certificate, or, on a service that polls its TLS files, inside any other
+    rotate on it with a `tls_reloaded` line of the same component after it in that rotate: a
+    poll can read one file before a rotation's rename and the next after it.
     """
     if not data.stderr:
         return Result("self_log", SKIP, "no logs/*.stderr")
@@ -685,13 +689,30 @@ def check_self_log(data):
     status = PASS
     lines = []
     counts = {"error": 0, "fault_key_inside": 0, "fault_key_outside": 0, "text": 0,
-              "expected": 0, "tls_expected": 0}
+              "expected": 0, "tls_expected": 0, "tls_torn": 0}
     # `{service: [(start, end)]}` of each `rotate` step issued `broken = true` on it, from its
-    # apply to its revert, the one place a failed TLS reload is expected.
-    broken = {}
+    # apply to its revert, where a failed TLS reload is expected, and of each other rotate on it.
+    broken, whole = {}, {}
     for event in data.events:
-        if event.action == "rotate" and event.broken:
-            broken.setdefault(event.on, []).append((event.start, event.end))
+        if event.action == "rotate":
+            (broken if event.broken else whole).setdefault(event.on, []).append(
+                (event.start, event.end))
+    polls = {service: tls_reload_polls(_service_config_text(data, service))
+             for service in data.stderr}
+
+    def torn_read(service, entry, entries):
+        """Whether a failed reload on a polling `service` is a poll that read a set between
+        two of a rotation's renames: inside a rotate that wasn't broken, with a reload of the
+        same component after it in that rotate. The rename is atomic per file only, and a
+        set's files are read one at a time (crates/logit-pipeline/src/tls.rs,
+        `Watched::check`)."""
+        if entry.ts is None or not polls.get(service):
+            return False
+        window = next(((start, end) for start, end in whole.get(service, [])
+                       if start <= entry.ts <= end), None)
+        return window is not None and any(
+            later.key == TLS_RELOADED_KEY and later.component == entry.component
+            and later.ts is not None and entry.ts < later.ts <= window[1] for later in entries)
     # {step: {"exiting", "key"}} for each `exit` step: which of its two lines appeared.
     found = {}
     exit_windows = {service: data.exit_windows(service) for service in data.stderr}
@@ -741,11 +762,14 @@ def check_self_log(data):
             if entry.key == TLS_RELOAD_FAILED_KEY:
                 if entry.ts is not None and data.in_window(entry.ts, broken.get(service, [])):
                     counts["tls_expected"] += 1
+                elif torn_read(service, entry, entries):
+                    counts["tls_torn"] += 1
                 else:
                     status = FAIL
                     lines.append(f"{service}: {entry.level} {entry.key} at "
                                  f"{data.offset(entry.ts)}, outside every broken rotate on "
-                                 f"{service}: {entry.message[:160]}")
+                                 f"{service} and with no reload after it in its rotate: "
+                                 f"{entry.message[:160]}")
                 continue
             if is_sink_fault_line(entry):
                 if entry.ts is not None and data.in_window(entry.ts, windows):
@@ -781,7 +805,9 @@ def check_self_log(data):
                f"{counts['fault_key_outside']} outside, {counts['expected']} expected-exit "
                f"line(s), {counts['error']} other ERROR, {counts['text']} non-JSON"
                + (f", {counts['tls_expected']} tls_reload_failed line(s) inside broken "
-                  "rotations" if counts["tls_expected"] else ""))
+                  "rotations" if counts["tls_expected"] else "")
+               + (f", {counts['tls_torn']} torn read(s) a later reload in their rotation "
+                  "replaced" if counts["tls_torn"] else ""))
     return Result("self_log", status, summary if status == PASS else f"{lines[0]} ({summary})",
                   lines)
 

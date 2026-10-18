@@ -126,6 +126,11 @@ TLS_KEYS = {"cert"}
 TLS_CERT_KEYS = {"san", "usage"}
 TLS_USAGES = ("server", "client")
 TLS_INITIAL_DAYS = 30
+# A config's top-level `tls_reload_interval`, and a zero duration, which turns the poll off.
+_TLS_RELOAD_INTERVAL = re.compile(r"^tls_reload_interval\s*:\s*[\"']?([^\"'\s]+)", re.M)
+_ZERO_DURATION = re.compile(r"^0+(\.0+)?(ns|us|ms|s|m|h)?$")
+# The actions that start a service's process again, which reads its TLS files at startup.
+RESTART_ACTIONS = ("restart", "stop", "kill", "exit")
 # The probe's own client certificate, which `certs.sh init` issues, so its name is no
 # `[tls.cert]` table's.
 TLS_PROBE_CERT = "probe"
@@ -2203,12 +2208,44 @@ def _once_per_run(scenario, duration, action, why):
     return problems
 
 
+def tls_reload_polls(text):
+    """Whether config `text` polls its TLS files: a top-level `tls_reload_interval` unset, which
+    defaults to 60s, or anything but zero."""
+    found = _TLS_RELOAD_INTERVAL.search(_uncommented(text))
+    return found is None or not _ZERO_DURATION.match(found.group(1))
+
+
+def _unloaded_rotation(scenario, spec, rotates, where):
+    """A problem when rotate `spec`, on a service that reloads only on a SIGHUP or a start, is
+    read by a later probe of its certificate and holds neither: no SIGHUP on its service
+    inside its `for`, and no start of the service before the certificate's next rotate."""
+    if not any(other.action == "probe" and other.cert == spec.cert and other.on == spec.on
+               and other.at > spec.at for other in scenario.steps):
+        return []
+    following = [r.at for r in rotates if r.cert == spec.cert and r.at > spec.at]
+    until = min(following) if following else scenario.cycle
+    hup = any(other.action == "signal" and other.on == spec.on and other.signal == "HUP"
+              and spec.at < other.at < spec.at + spec.for_ for other in scenario.steps)
+    started = any(other.action in RESTART_ACTIONS and other.on == spec.on
+                  and spec.at < other.at < until for other in scenario.steps)
+    if hup or started:
+        return []
+    return [f"{where}: {spec.on} polls no TLS files (tls_reload_interval: 0s), and nothing loads "
+            f"this rotation of {spec.cert} before a later probe reads it: add a signal = \"HUP\" "
+            f"step on {spec.on} inside its `for`, or a restart of {spec.on} before the next "
+            "rotation"]
+
+
 def _rotate_problems(scenario, duration):
     """What the `rotate` and `probe` steps break: each rotate on a service whose config reads
     its certificate's `live` files, its `days` above every earlier rotate's of that
     certificate, and once per run of `duration`; each probe starting inside a rotate of its
     `cert` on its own service, after a `signal = "HUP"` step on that service that starts
-    inside the same rotate, so the probe reads what the reload left."""
+    inside the same rotate, so the probe reads what the reload left. On a service that doesn't
+    poll its TLS files (`tls_reload_interval: 0s`), every rotate of a certificate a later probe
+    reads holds a SIGHUP on that service, or a start of it (`RESTART_ACTIONS`) falls between the
+    rotate and the certificate's next one, since `tls.served` expects the latest rotation that
+    wasn't broken to be the one served."""
     problems = []
     rotates = sorted((s for s in scenario.steps if s.action == "rotate"), key=lambda s: s.at)
     last_days = {}
@@ -2224,6 +2261,8 @@ def _rotate_problems(scenario, duration):
                 text = scenario.config_path(key).read_text()
             except OSError:
                 text = ""
+            if live in _uncommented(text) and not tls_reload_polls(text):
+                problems += _unloaded_rotation(scenario, spec, rotates, where)
             if live not in _uncommented(text):
                 problems.append(f"{where}: {spec.on}'s config reads nothing under {live}, so "
                                 "the rotation reaches no process")

@@ -301,9 +301,12 @@ class Run:
 
     def make_tls_dir(self):
         """Creates `<run>/tls` for the private CA and the `[tls]` certificates and returns its
-        path. certs.sh writes it as the host user, so it needs no wider mode."""
+        path. certs.sh writes it as the host user; the mode is 0755 whatever the umask, so the
+        image's `logit` user, another uid, can traverse the bind mount. The chmod follows the
+        mkdir because the umask narrows the mode `mkdir` is given."""
         tls = self.run_dir / scenario_mod.TLS_DIR
         tls.mkdir()
+        os.chmod(tls, 0o755)
         self.tls_dir = tls.resolve()
         return self.tls_dir
 
