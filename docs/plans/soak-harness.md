@@ -4344,6 +4344,77 @@ weights each generator sink by its own input's batch:
 - The run started before the host was told not to sleep; a `systemd-inhibit --what=sleep:idle`
   lock was held from about 9 minutes in to the end, and the timeline shows no gap.
 
+### W13a: discarding transforms (2026-10-18)
+
+`tail-rotate-stale` ran twice and `tail-rotate` once on the development host (`trout`), against
+the `logit:soak` image built at 2026-10-17 19:29 PDT, after `origin/main`'s head (`9bfc434f`);
+the branch changes no Rust, so the image needs only `timestamp` and `drop_stale`, both on
+`main`. The first run, `perf/results/soak/20261018T023724Z`, passed every row under the design's
+first `stop-discards` bounds, `[36,000, 50,000]`; the bounds were then set from the derivation
+in the scenario's comment, `[38,000, 46,000]`. The second run, `perf/results/soak/20261018T030955Z`,
+from `soak/w13a` at `7359c9e2` with only documentation modified, exit 0, every row PASS or
+SKIP:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 10 apply/revert action(s) returned 0; 5 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 5 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (2 kill(s)) |
+| `restarts` | PASS | 4 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 0 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 58 readiness sample(s) read ok outside fault windows; 5 start(s) or unpause(s) ready in time, slowest ready 0.2s |
+| `progress` | PASS | 6 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 6 of 6, 7 freshness sample(s); 150s of 825s after warmup judged (18%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +1.9 (limit 64); 215s of 825s after warmup judged (26%; WARN under 5%) \| logit PASS: MiB/h life 4 -863.1 (limit 64); 175s of 825s after warmup judged (21%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +40) \| logit PASS: warmup median 16 -> end 36 (limit +40) |
+| `ledger.wire` | PASS | G 891,300 (shared directory: 891,300 lines in 21 files) vs W 891,100 + counted 0: W + F − G -200 against the replay band [-10,001, 12,777]; the tailers stopped short at the end with W 891,100 |
+| `ledger.intake` | PASS | final life 4: W − D 379,900 vs E + B 379,900; life 0: W − D − B − X − ΣT_disc − Ab 0 within [0, R]; life 1: W − D − B − X − ΣT_disc − Ab 0 within [0, R]; life 2: W − D − B − X − ΣT_disc − Ab 0 within [0, R]; life 3: W − D − B − X − ΣT_disc − Ab 100 within [0, R] (R 457,000 = 0 + 392 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 4: E[tail] 379,900 == T_in[parse] 379,900 (into parse); T_in[parse] 379,900 − T_disc[parse] 0 = 379,900 == T_out[parse] 379,900 (parse sends what it doesn't discard); T_out[parse] 379,900 == T_in[stamp] 379,900 (into stamp); T_in[stamp] 379,900 − T_disc[stamp] 0 = 379,900 == T_out[stamp] 379,900 (stamp sends what it doesn't discard); T_out[stamp] 379,900 == T_in[labels] 379,900 (into labels); T_in[labels] 379,900 − T_disc[labels] 0 = 379,900 == T_out[labels] 379,900 (labels sends what it doesn't discard); T_out[labels] 379,900 == T_in[count] 379,900 (into count); T_in[count] 379,900 − T_disc[count] 0 = 379,900 == T_out[count] 379,900 (count sends what it doesn't discard); T_out[count] 379,900 == T_in[metrics_only] 379,900 (into metrics_only); T_in[metrics_only] 379,900 − T_disc[metrics_only] 0 = 379,900 == T_out[metrics_only] 379,900 (metrics_only sends what it doesn't discard); T_out[metrics_only] 379,900 == T_in[fresh] 379,900 (into fresh); T_in[fresh] 379,900 − T_disc[fresh] 105,200 = 274,700 == T_out[fresh] 274,700 (fresh sends what it doesn't discard); Σ(sent into aggregate) 274,700 == A 274,700 (listeners to aggregate); A_sent 23 == S_in[victoria_metrics] 23 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 4: Ab 274,700 == A 274,700 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − ΣT_disc − V 0 = residual 0 + Ab − V 0, ok; life 1: W − D − B − X − ΣT_disc − V 0 = residual 0 + Ab − V 0, ok; life 2 (killed): Ab 85,400 − V[victoria_metrics] 80,300 = 5,100, within band (band [-5,001, 15,002]: ingest 1,000/s over the last drain interval; below, the residual 0 plus one 5.00007s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − ΣT_disc − Ab 0 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 3 (killed): Ab 89,600 − V[victoria_metrics] 84,700 = 4,900, within band (band [-5,100, 15,000]: ingest 1,000/s over the last drain interval; below, the residual 100 plus one 5.00001s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − ΣT_disc − Ab 100 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 4 (final): Ab 274,700 − V[victoria_metrics] 274,700 = 0, ok (split copy; R 457,000 = 0 + 392 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | PASS | 1 series over 1 sink(s) x 5 life/lives, widest gap 10.001s (gaps <= 15s (1.5 x the 10s aggregate interval) or idle, with no window batches.sent from a + 7.5s to b - 2.5s (5s drains); a killed life's last sample within 11s (1.1 x) of the kill, a later life's first within 20s (2 x) of its start; 1 idle gap(s) excused: life 0 +59s to +120s (61.313s, 1 series), window sent 0 batch(es) over 0 drain(s) from +66s to +118s) |
+| `ledger.replay` | PASS | victoria_metrics: life 3's first drain replayed 0 vs killed life 2's last-drain buffer.batches 0; victoria_metrics: life 4's first drain replayed 0 vs killed life 3's last-drain buffer.batches 0 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 4: uncounted 0 = W − D − E − B 0 + E − ΣT_disc − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; the transforms' ΣT_disc 105,200, counted; wire G − (W + K + F) 200 over the run, F 0 counted; ledger.wire judges the rest; end to end over the run, G 891,300 less counted loss 155,700 plus the replay band's 12,777: victoria_metrics: V 725,300 <= G − counted + replay 748,377 |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 4 at +925s: victoria_metrics: received 23 vs delivered 23 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 5 of 5 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 1,000/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served` | SKIP | the scenario has no probe step |
+| `expect.files-rotated` | PASS | delta of logit.input.files.rotated{component=tail} on logit, run: run (+60s, +885s]: 131 (over 109 drain(s)), want >= 1 |
+| `expect.no-resume-rejected` | PASS | delta of logit.input.files.resume_rejected{component=tail} on logit, run: run (+60s, +885s]: 0 (over 109 drain(s)), want <= 0 |
+| `expect.no-checkpoint-errors` | PASS | delta of logit.input.checkpoint.errors{component=tail} on logit, run: run (+60s, +885s]: 0 (over 109 drain(s)), want <= 0 |
+| `expect.timestamps-resolved` | PASS | delta of logit.transform.timestamp.resolved{component=stamp} on logit, run: run (+60s, +885s]: 821,300 (over 109 drain(s)), want >= 1 |
+| `expect.no-timestamp-invalid` | PASS | delta of logit.transform.timestamp.skipped{component=stamp, reason=invalid} on logit, run: run (+60s, +885s]: 0 (over 109 drain(s)), want <= 0 |
+| `expect.pause-discards` | PASS | delta of logit.component.events.discarded{component=fresh} on logit, after c0s1: c0s1 (+120s, +165s]: 10,100 (over 9 drain(s)), want >= 1 |
+| `expect.stop-discards` | PASS | delta of logit.component.events.discarded{component=fresh} on logit, after c0s2: c0s2 (+270s, +315s]: 40,300 (over 8 drain(s)), want >= 38000 and <= 46000 |
+| `expect.restart-keeps-fresh` | PASS | delta of logit.component.events.discarded{component=fresh} on logit, through c0s3: c0s3 (+330s, +405s]: 0 (over 15 drain(s)), want <= 0 |
+| `expect.short-kill-keeps-fresh` | PASS | delta of logit.component.events.discarded{component=fresh} on logit, through c0s4: c0s4 (+420s, +495s]: 0 (over 8 drain(s)), want <= 0 |
+| `expect.long-kill-discards` | PASS | delta of logit.component.events.discarded{component=fresh} on logit, after c0s5: c0s5 (+660s, +705s]: 105,200 (over 8 drain(s)), want >= 1 |
+
+`drop_stale` discarded what the derivation gives, a rate of 1,000 lines a second times the time
+each fault kept the tailer from reading, less `max_age`, plus what it replays:
+
+| Fault | Unread | Expected | Run 1 | Run 2 |
+|---|---|---|---|---|
+| pause, 60 s | 60 s | 10,000 | 10,000 | 10,100 |
+| stop, 90 s | 90 s plus the start | 40,000 plus 1,000 a second of start and catch-up | 40,300 | 40,300 |
+| restart | a few seconds | 0 | 0 | 0 |
+| kill, 30 s | 30 s, plus up to 5 s since the last checkpoint replayed | 0: the oldest replayed line is about 36 s old | 0 | 0 |
+| kill, 150 s | 150 s plus up to 5 s replayed | about 105,000 | 105,200 | 105,200 |
+
+So the 90 s stop's start and its catch-up past the backlog's last stale line took about 0.3 s.
+Every other row read the discards as the design expected. `ledger.windows` excused only the
+pause's gap, since every window after a fault held a backlog's fresh lines; `self_log` counted
+no ERROR line, the throttled `stale_event` lines being WARN; and `drops` found nothing, since
+`events.discarded` isn't a `*.dropped` count. The final life's ΣT_disc is the 150 s kill's
+105,200, and the end-to-end bound counts all three faults' 155,700 with the counted loss.
+
+`tail-rotate`, `perf/results/soak/20261018T025421Z`, passed every row under the changed ledger:
+its nodes discard nothing, so ΣT_disc is 0 in every life and each row reads as in W11b's run.
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
