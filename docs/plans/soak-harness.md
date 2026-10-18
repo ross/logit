@@ -34,8 +34,9 @@ Non-goals:
   them.
 
 Stream key **`soak`**: branches `soak/w0`, `soak/w1a`, `soak/w1b`, then `soak/w2` through
-`soak/w12d`, a linear stack, with `soak/w13` to `soak/w15` planned after it. PR stack only:
-nothing is merged by this workstream; Ross directs merging.
+`soak/w12d`, a linear stack. After it come `soak/w13a`, which branches off `main`, and
+`soak/w14`, `soak/w13b`, and `soak/w15`, stacked in that order. PR stack only: nothing is
+merged by this workstream; Ross directs merging.
 
 Settled with Ross (2026-10-08): faults are an iproute2 image with `NET_ADMIN` applying `tc netem`
 inside a target container's network namespace, plus Docker lifecycle actions (`pause`, `stop`,
@@ -2322,7 +2323,7 @@ that items 3, 7, and 11 need.
 
 Items 16 to 18, and §10's follow-ups to items 11 and 12, have no workstream yet.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a and W16 land off `main` beside W14. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a lands off `main` beside W14. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
