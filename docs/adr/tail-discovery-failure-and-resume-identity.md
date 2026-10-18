@@ -338,7 +338,11 @@ lost lines that no telemetry showed. That breaks the loss vocabulary's rule that
   (and which the soak harness balances against them).
 - **Counted after the write.** The prune holds the entry in a pending list, and
   `Tailer::write_checkpoint` counts it only once `CheckpointStore::write` reports that a document
-  without it is on disk; a failed write keeps it pending for the retry. Counted at the prune, a
+  without it is in place at the checkpoint path; a write that failed before its rename keeps it
+  pending for the retry. A rename followed by a failed directory sync counts as in place: a later
+  load reads the new document, and the store stays dirty so the next tick makes it durable. The
+  one double count left is a power loss between that rename and a durable retry, which can bring
+  the old document, and its entry, back. Counted at the prune, a
   process ending before the next write (a kill, an exit 2, a later listener's failed bind) would
   leave the entry on disk, and every such life would count the same bytes again. A forced write
   after the prune isn't safe instead: outside `bind`, a scan runs with accumulators holding

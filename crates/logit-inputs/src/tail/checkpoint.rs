@@ -249,9 +249,10 @@ impl CheckpointStore {
     /// `logit.input.checkpoint.errors{op="write"}` and leaves the store dirty, so the next tick
     /// retries.
     ///
-    /// Resolves to `true` only when this call put `entries` on disk durably. A no-op, an encoding
-    /// error, and every failed step, including a rename that landed before a failed directory
-    /// sync, are `false`.
+    /// Resolves to `true` once this call put `entries` in place at the checkpoint path, so a later
+    /// load reads them: a durable write, and a rename that landed before a failed directory sync,
+    /// which stays dirty so the next tick still makes it durable. A no-op, an encoding error, and
+    /// every failure before the rename are `false`.
     ///
     /// Not an `async fn`: `entries` borrows the tailer's files, which aren't `Sync`, so it's
     /// consumed before the returned future is built rather than held across its `.await`.
@@ -291,7 +292,7 @@ impl CheckpointStore {
                 atomic_write::write_file_durably(&path, &bytes, sites::TAIL_CHECKPOINT)
             })
             .await;
-            let (err, outcome) = match result {
+            let (err, outcome, in_place) = match result {
                 Ok(Ok(())) => {
                     self.dirty = false;
                     telemetry.count("logit.input.checkpoint.writes", 1.0, &[]);
@@ -300,10 +301,11 @@ impl CheckpointStore {
                 Ok(Err(err)) if err.replaced() => (
                     err.to_string(),
                     "the new checkpoint is in place but may not survive a power loss",
+                    true,
                 ),
-                Ok(Err(err)) => (err.to_string(), "the previous checkpoint stays in effect"),
+                Ok(Err(err)) => (err.to_string(), "the previous checkpoint stays in effect", false),
                 // A panic in the helper; the step it reached is unknown.
-                Err(join) => (join.to_string(), "the checkpoint on disk may be old or new"),
+                Err(join) => (join.to_string(), "the checkpoint on disk may be old or new", false),
             };
             telemetry.count("logit.input.checkpoint.errors", 1.0, &[("op", "write")]);
             diag.warn_throttled(
@@ -313,7 +315,7 @@ impl CheckpointStore {
                     self.path.display()
                 ),
             );
-            false
+            in_place
         }
     }
 }

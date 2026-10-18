@@ -6026,6 +6026,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A rename that landed before a failed directory sync puts the document without the entry
+    /// in place, so a later process can't count it: this one does, and the next tick, unforced,
+    /// still retries the write to make it durable.
+    #[tokio::test]
+    async fn a_gone_file_is_counted_when_its_write_lands_but_the_directory_sync_fails() {
+        let dir = scratch_dir("gone-sync-dir-fails");
+        let path = dir.join("app.log");
+        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"))]).await;
+
+        let scope = fault::scope(&dir);
+        scope.fail_nth(
+            fault::Point::new(fault::sites::TAIL_CHECKPOINT, fault::Op::SyncDir),
+            1,
+            errno::EIO,
+        );
+        hand.checkpoint().await;
+        assert_eq!(hand.probe.sum("logit.input.checkpoint.errors", &[("op", "write")]), 1.0);
+        assert!(!checkpoint_text(&dir).contains("app.log"), "the rename landed");
+        assert_eq!(gone_bytes(&mut hand.probe), 6.0);
+        assert_eq!(hand.diag.occurrences("file_gone"), 1);
+
+        hand.tailer.write_checkpoint(false).await;
+        drop(scope);
+        assert_eq!(
+            hand.probe.sum("logit.input.checkpoint.writes", &[]),
+            1.0,
+            "the store stayed dirty, so the unforced tick retried"
+        );
+        assert_eq!(gone_bytes(&mut hand.probe), 6.0, "counted once");
+        assert_eq!(hand.diag.occurrences("file_gone"), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn the_file_gone_diagnostic_names_the_file_and_what_it_lost() {
         let message =
