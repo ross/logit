@@ -9675,6 +9675,234 @@ def _tls_checks():
         expect(value is None and "no value in force at the window's start" in note,
                f"rise with no value in force at the start is None, got {value} {note}")
 
+def _reshape(run_dir, chain, fan_out=None, discard_at=None, lines_at=None, short_at=None,
+             declared=None):
+    """Rewrites a one-source `_ledger_run` or `_http_run` directory in place so the nodes
+    `chain` sit between the listener `in` and `window`. `fan_out` is `{node: k}`: each event
+    into the node leaves as k, its parent discarded; `lines_at` is `{offset: lines}` that node
+    lost at a drain, and `short_at` `{offset: n}` children it sent short with nothing counted.
+    `discard_at` is `{(node, offset): n}` events another node discarded at a drain. `window`'s
+    received and absorbed counts and each life's V follow what the chain sent, so every
+    identity holds; `declared` replaces the source's `fan_out`, which defaults to the
+    telemetry's."""
+    fan_out, discard_at = fan_out or {}, discard_at or {}
+    lines_at, short_at = lines_at or {}, short_at or {}
+    factor = 1
+    for node in chain:
+        factor *= fan_out.get(node, 1)
+    out, delta, shift = [], {0: 0, 1: 0}, {}
+    for line in (run_dir / "logs" / "logit.stdout").read_text().splitlines():
+        record = json.loads(line)
+        metric = record["metrics"][0]
+        out.append(record)
+        if (record["attributes"].get("component") != "in"
+                or metric["name"] != "logit.component.events.sent"):
+            continue
+        stamp = record["timestamp"]
+        offset = round(telemetry.parse_rfc3339(stamp) - T0)
+        x = e = metric["value"]
+        for node in chain:
+            k = fan_out.get(node)
+            received = x
+            discarded = received if k else discard_at.get((node, offset), 0)
+            lost = lines_at.get(offset, 0) if k else 0
+            x = (k * received - lost - short_at.get(offset, 0)) if k else received - discarded
+            for name, value, attrs in (
+                    ("logit.component.events.received", received, None),
+                    ("logit.component.events.sent", x, None),
+                    ("logit.component.events.discarded", discarded, None),
+                    ("logit.transform.lines.dropped", lost, {"reason": "malformed"})):
+                if value or name.endswith(("received", "sent")):
+                    out.append(json.loads(_line(stamp, name, "sum", value, component=node,
+                                                attrs=attrs)))
+        shift[stamp] = x - e
+        delta[0 if offset < STOP[0] else 1] += x - factor * e
+    for record in out:
+        if (record["attributes"].get("component") == "window"
+                and record["metrics"][0]["name"] in ("logit.component.events.received",
+                                                     "logit.transform.metrics.absorbed")):
+            record["metrics"][0]["value"] += shift.get(record["timestamp"], 0)
+    (run_dir / "logs" / "logit.stdout").write_text(
+        "\n".join(json.dumps(record) for record in out) + "\n")
+    series = vm.parse_export((run_dir / "vm-export" / "sink.jsonl").read_text())
+    for one in series:
+        one["values"] = [value * factor for value in one["values"]]
+    # Each life's total is its last sample per series, so x_1's carries the life's change.
+    series[1]["values"][1] += delta[0]
+    series[1]["values"][3] += delta[1]
+    _write_export(run_dir, "sink", series)
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    source = dict(resolved["ledger"]["source"][0], sut_transforms=list(chain))
+    declared = fan_out if declared is None else declared
+    if declared:
+        source["fan_out"] = dict(declared)
+    resolved["ledger"]["source"] = [source]
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    return run_dir
+
+
+def _fan_out_ledger():
+    """`ledger.edge`'s fan-out term on a source's `sut_transforms`, and every row after it
+    reading the listener's symbols carried through the chain (W′): the residual, R, a killed
+    life's band, each life's egress, the summary's terms, and the end-to-end bound on an HTTP
+    wire, with a discarding node beside the fan-out."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, http=False, **kwargs):
+            base = (_http_run(tmp, name, kind="otlp_in") if http
+                    else _ledger_run(tmp, name))
+            return {r.id: r for r in checks.run_all(_reshape(base, **kwargs))}
+
+        rows = ("ledger.intake", "ledger.edge", "ledger.aggregate", "ledger.egress",
+                "ledger.summary")
+        fanned = results("fan-out", chain=["points", "count"], fan_out={"points": 4})
+        for row in rows:
+            expect(fanned[row].status == checks.PASS,
+                   f"{row} PASSes a balanced fan-out chain, got {fanned[row]}")
+        edge = fanned["ledger.edge"].detail
+        expect("children[points] = T_out 136,000 − (T_in 34,000 − T_disc 34,000) = 136,000 == "
+               "4 x T_in − T_lines[points] 136,000 (points emits 4 per event)" in edge
+               and "T_in[count] 136,000 − T_disc[count] 0 = 136,000 == T_out[count] 136,000"
+               in edge,
+               f"ledger.edge judges the fan-out node's children, got {edge}")
+        intake = fanned["ledger.intake"].detail
+        expect("life 0: W′ − Ab 120 within [0, R]" in intake
+               and "R 828,000 = (10,000 + 132 x 1,000) x 4 + 65 x 1,000 x 4" in intake,
+               f"the residual and R are counted in W′, got {intake}")
+        expect("W′ − V 0 = residual 120" in fanned["ledger.egress"].detail,
+               f"a stopped life's egress gap reads W′, got {fanned['ledger.egress']}")
+        expect("ledger.edge's chain terms 0" in fanned["ledger.summary"].detail,
+               f"the summary sums the chain's terms, got {fanned['ledger.summary']}")
+
+        # A killed life's band takes its ingest rate in W′: 4 x the last drain's 1,050 records
+        # over 5 s.
+        killed = _reshape(_ledger_run(tmp, "fan-out-killed"), chain=["points"],
+                          fan_out={"points": 4})
+        timeline = (killed / "timeline.jsonl").read_text().replace('"action": "stop"',
+                                                                  '"action": "kill"')
+        (killed / "timeline.jsonl").write_text(timeline)
+        egress = {r.id: r for r in checks.run_all(killed)}["ledger.egress"].detail
+        expect("life 0 (killed)" in egress and "ingest 840/s" in egress,
+               f"a killed life's band reads the fan-out's rate, got {egress}")
+
+        lost = results("fan-out-lines", chain=["points"], fan_out={"points": 4},
+                       lines_at={200: 3})
+        for row in rows:
+            expect(lost[row].status == checks.PASS,
+                   f"{row} PASSes children short by the lines the node counted dropped, got "
+                   f"{lost[row]}")
+        short = results("fan-out-short", chain=["points"], fan_out={"points": 4},
+                        short_at={200: 3})
+        expect(short["ledger.edge"].status == checks.FAIL
+               and "off by -3 (points emits 4 per event)" in short["ledger.edge"].detail,
+               f"children short with nothing counted FAIL the node, got {short['ledger.edge']}")
+        expect(short["ledger.summary"].status == checks.FAIL,
+               f"the summary FAILs the same shortfall, got {short['ledger.summary']}")
+        wrong = results("fan-out-wrong-k", chain=["points"], fan_out={"points": 4},
+                        declared={"points": 3})
+        expect(wrong["ledger.edge"].status == checks.FAIL
+               and "3 x T_in − T_lines[points]" in wrong["ledger.edge"].detail,
+               f"a fan-out other than the declared k FAILs, got {wrong['ledger.edge']}")
+
+        # A node after the fan-out discards children, in the final life and then in the stopped
+        # one, whose residual and egress gap carry the discard through W′.
+        for name, offset in (("fan-out-discard-final", 200), ("fan-out-discard-stopped", 60)):
+            kept = results(name, chain=["points", "stale"], fan_out={"points": 4},
+                           discard_at={("stale", offset): 40})
+            for row in rows:
+                expect(kept[row].status == checks.PASS,
+                       f"{row} PASSes a fan-out with discards after it at +{offset}, got "
+                       f"{kept[row]}")
+
+        # On an HTTP wire V is bounded end to end by G less counted loss, carried through the
+        # chain: 4 x G here.
+        http = results("fan-out-http", http=True, chain=["points"], fan_out={"points": 4})
+        for row in rows:
+            expect(http[row].status == checks.PASS,
+                   f"{row} PASSes a fan-out behind otlp_in, got {http[row]}")
+        expect("carried through the chains' fan_out and discards to 216,000" in http[
+            "ledger.summary"].detail,
+            f"the end-to-end bound is carried through the chain, got {http['ledger.summary']}")
+
+
+def _idle_writer():
+    """`ledger.wire` on an HTTP source whose writer delivers nothing for a while, a drain with
+    no `events.delivered` point, and then its backlog at once, with a judged window's edge in
+    the idle stretch: G holds flat to the burst, so no loss shows at the edge."""
+    idle = {_stamp(T0 + offset) for offset in range(160, 205, 5)}
+    moved = {"in": 0, "out": 0}
+
+    def hold(component, name):
+        def edit(record):
+            metric = record["metrics"][0]
+            if (record["attributes"].get("component") != component
+                    or metric["name"] != name):
+                return record
+            if record["timestamp"] in idle:
+                moved[component] += metric["value"]
+                return None
+            if record["timestamp"] == _stamp(T0 + 205):
+                metric["value"] += moved[component]
+            return record
+        return edit
+
+    window = _http_fault("x1", "netem", "generator", 140, 150)
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = _http_run(tmp, "idle-writer", kind="otlp_in", timeline_extra=window,
+                            sut_edit=hold("in", "logit.component.events.sent"),
+                            gen_edit=hold("out", "logit.component.events.delivered"))
+        wire = {r.id: r for r in checks.run_all(run_dir)}["ledger.wire"]
+        expect(wire.status == checks.PASS,
+               f"a writer's idle drains hold G flat across the stall, got {wire}")
+
+
+def _fan_out_rules(root):
+    """`load()`'s rules for a source's `fan_out`, and the shipped otlp-fan-out scenario."""
+    path, raw = _base(root)
+    sut = ("components:\n  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }\n"
+           "  points: { type: line_protocol, sources: [statsd] }\n"
+           "  stale: { type: drop_stale, sources: [points], max_age: 30s }\n")
+
+    def problems(overlap=False, **source):
+        with tempfile.TemporaryDirectory() as tmp:
+            changed = copy.deepcopy(raw)
+            for key, name in changed["configs"].items():
+                text = sut if key == "sut" else (path.parent / name).read_text()
+                (Path(tmp) / name).write_text(text)
+            changed["ledger"]["source"][0].update(sut_transforms=["points", "stale"], **source)
+            if overlap:
+                changed["overlap"] = {"holder": "holder", "instances": ["logit", "logit-b"],
+                                      "label": "instance"}
+            try:
+                scenario.from_dict(changed, Path(tmp) / "scenario.toml")
+                return []
+            except scenario.ScenarioError as err:
+                return err.problems
+
+    good = problems(fan_out={"points": 4})
+    expect(good == [], f"a fan_out on a line_protocol node loads, got {good}")
+    for source, needle in (
+            ({"fan_out": 4}, "`fan_out` must be a table"),
+            ({"fan_out": {}}, "`fan_out` must be a table"),
+            ({"fan_out": {"points": 1}}, "must be an integer of at least 2"),
+            ({"fan_out": {"points": True}}, "must be an integer of at least 2"),
+            ({"fan_out": {"points": "4"}}, "must be an integer of at least 2"),
+            ({"fan_out": {"points": 2.5}}, "must be an integer of at least 2"),
+            ({"fan_out": {"other": 4}}, "`fan_out` names 'other', which isn't in"),
+            ({"fan_out": {"stale": 4}}, "`fan_out` names 'stale', a drop_stale; only a "
+                                        "line_protocol")):
+        found = problems(**source)
+        expect(any(needle in problem for problem in found),
+               f"{source} is refused with {needle!r}, got {found}")
+    found = problems(overlap=True, fan_out={"points": 4})
+    expect(any("[overlap] and a source's `fan_out` can't be combined" in problem
+               for problem in found), f"fan_out under [overlap] is refused, got {found}")
+
+    fan = scenario.load(root / "scenarios" / "otlp-fan-out" / "scenario.toml")
+    expect(fan.sources[0].get("fan_out") == {"points": 4}
+           and fan.sources[0].get("wire") == "http"
+           and fan.sources[0].get("sut_transforms") == ["points", "count"],
+           f"otlp-fan-out declares its fan-out over an http wire, got {fan.sources}")
+
 
 def _shipped(root):
     paths = scenario.shipped(root)
@@ -9718,7 +9946,7 @@ def run(root, quiet=False):
                      _influx_server, _influx_rules, _influx_checks, _overlap_rules,
                      _overlap_driver, _overlap_checks, _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
-                     _shipped):
+                     _fan_out_ledger, _idle_writer, _fan_out_rules, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _stalled,
@@ -9729,7 +9957,8 @@ def run(root, quiet=False):
                               _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
                               _datadog_rules, _influx_codec, _influx_server, _influx_rules,
-                              _overlap_rules, _overlap_driver, _signal_rules, _sighup_driver, _tls_rules, _tls_driver)
+                              _overlap_rules, _overlap_driver, _signal_rules, _sighup_driver,
+                              _tls_rules, _tls_driver, _fan_out_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")

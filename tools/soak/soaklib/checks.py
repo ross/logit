@@ -44,7 +44,9 @@ judges each listener's final life alone. From the edge into
 source's `sut_transforms` are judged hop by hop in `ledger.edge`, each node's discards
 (`events.discarded`, T_disc) counted there, and their sum leaves the residual, the stopped-life
 egress gap, `ledger.summary`'s path term, and the end-to-end bound as a script's discards do
-(`Ledger.discarded`). `recovery` judges the
+(`Ledger.discarded`). A source's `fan_out` node emits k events per event, so with one the rows
+that compare the listeners' symbols with `aggregate`'s or V read them carried through the chain,
+W′ (`Ledger.through`), which takes the discards in. `recovery` judges the
 listeners' summed ingest against the generators' summed warmup rate.
 
 A run against a stand-in target (`[target] kind = "standin"`) has no VictoriaMetrics either: V
@@ -1185,7 +1187,8 @@ def check_fd_slope(data):
 # ---- the ledger, the sink identity, and recovery --------------------------------------------------
 #
 # One unit runs through the ledger: a line is one event is one increment, and on a UDP wire one
-# datagram. The plan's "The ledger and identities" has the symbol table; `Ledger` computes each
+# datagram. A source's `fan_out` node is the exception, and `Ledger.through` carries a count
+# across it. The plan's "The ledger and identities" has the symbol table; `Ledger` computes each
 # symbol per SUT process life. Each `[[ledger.source]]` is a generator and the SUT listener its
 # lines reach over the source's `wire` (`WIRES`): the wire is judged per source, the intake per
 # listener, and from the edge into `aggregate` on the listeners' symbols are summed.
@@ -1502,9 +1505,17 @@ class Ledger:
         # How a stopped life's residual and egress gap write the events the path to `aggregate`
         # removed, counted (`discarded`).
         chained = any(source.get("sut_transforms") for source in self.sources)
+        # Each source's `fan_out` nodes, `{node: k}`. With one the listeners' symbols are read
+        # carried through each chain, W′ (`through`), which counts the chain's discards itself.
+        self.fan_out = {}
+        for source in self.sources:
+            self.fan_out.update(source.get("fan_out") or {})
+        self.reshaped = bool(self.fan_out)
         self.discarded_text = ("(L_drop + L_err) − " if self.script
+                               else "" if self.reshaped
                                else "ΣT_disc − " if chained else "")
         self.residual_text = ("E_B − X_B − Ab" if cfg.get("hop")
+                              else "W′ − Ab" if self.reshaped
                               else f"W − D − B − X − {self.discarded_text}"
                               + ("(Ab − L_flush)" if self.script else "Ab"))
         # `{service: SutLives}` for each SUT service, the one holding the listeners, and the one
@@ -1708,7 +1719,7 @@ class Ledger:
         # `events.discarded` only when nonzero, so an absent count is 0.
         self.transforms = {source.get("sut_listener"): list(source.get("sut_transforms") or [])
                            for source in self.sources}
-        self.T_in, self.T_out, self.T_disc = {}, {}, {}
+        self.T_in, self.T_out, self.T_disc, self.T_lines = {}, {}, {}, {}
         for chain in self.transforms.values():
             for component in chain:
                 self.T_in[component] = sut.counter_by_life("logit.component.events.received",
@@ -1717,6 +1728,10 @@ class Ledger:
                                                             component=component)
                 self.T_disc[component] = sut.counter_by_life(
                     "logit.component.events.discarded", component=component)
+                # The lines a `fan_out` node lost, under every reason: only `line_protocol`
+                # counts it, under `malformed`.
+                self.T_lines[component] = sut.counter_by_life(
+                    "logit.transform.lines.dropped", component=component)
 
         # Per source, from its generator's telemetry: G and its wire's precondition, the sink's
         # counted loss (`drop_newest`, and on a stream `ambiguous_at_most_once`) by reason, and
@@ -1782,13 +1797,20 @@ class Ledger:
             largest = max(largest, batch_max)
             batches = (LISTENER_RESIDUAL_BATCHES
                        + NODE_RESIDUAL_BATCHES * len(self.transforms.get(listener, [])))
-            self.R += max_datagrams + batches * batch_max
-            parts.append(f"{_n(max_datagrams)} + {batches} x {_n(batch_max)}"
+            # A residual counted in W′ is worth up to the chain's fan-out per event it holds.
+            factor = self.factor(listener)
+            self.R += (max_datagrams + batches * batch_max) * factor
+            part = f"{_n(max_datagrams)} + {batches} x {_n(batch_max)}"
+            parts.append((f"({part}) x {factor}" if factor > 1 else part)
                          + (f" ({listener})" if len(self.listeners) > 1 else ""))
         shared = NODE_RESIDUAL_BATCHES * (2 if self.script else 1)
-        self.R += shared * largest
-        parts.append(f"{shared} x {_n(largest)}")
+        widest = max([self.factor(listener) for listener in self.listeners] or [1])
+        self.R += shared * largest * widest
+        parts.append(f"{shared} x {_n(largest)}" + (f" x {widest}" if widest > 1 else ""))
         self.R_text = f"R {_n(self.R)} = " + " + ".join(parts)
+        if self.reshaped:
+            self.R_text += ("; W′ is each listener's W − D − B − X carried through its chain's "
+                            "fan_out and discards")
         if self.hop is not None:
             # Across a hop, the far SUT's residual is what `aggregate`'s inbox and its taken
             # batch can hold, in frames of at most `per_frame` events; the ingress SUT's R
@@ -1854,10 +1876,40 @@ class Ledger:
 
     def fed(self, life):
         """What reached `aggregate`'s side of the sinks' SUT in `life`: W − D − B − X, or across
-        a hop E_B − X_B."""
+        a hop E_B − X_B. With a `fan_out` it's W′, each listener's W − D − B − X carried through
+        its chain (`through`)."""
         if self.hop is not None:
             return self.get("E_B", life) - self.get("X_B", life)
+        if self.reshaped:
+            return sum(self.through(listener, self.lget(listener, "W", life)
+                                    - self.lget(listener, "D_tel", life)
+                                    - self.lget(listener, "B", life)
+                                    - self.lget(listener, "X", life), [life])
+                       for listener in self.listeners)
         return self.get("W", life) - self.D(life) - self.get("B", life) - self.get("X", life)
+
+    def factor(self, listener):
+        """The events one of `listener`'s events can become by `aggregate`: the product of its
+        chain's `fan_out`s, 1 with none."""
+        product = 1
+        for component in self.transforms.get(listener) or []:
+            product *= self.fan_out.get(component, 1)
+        return product
+
+    def through(self, listener, events, lives):
+        """`events` of `listener` carried through its chain over `lives`: a `fan_out` node of k
+        makes each event k, less the lines it dropped, plus the parents it sent on rather than
+        discarded (T_in − T_disc), ADR `transform-fan-out`'s count of its output; any other node
+        takes off what it discarded."""
+        for component in self.transforms.get(listener) or []:
+            def total(symbol, component=component):
+                return sum(getattr(self, symbol)[component].get(life, 0) for life in lives)
+            k = self.fan_out.get(component)
+            if k:
+                events = k * events - total("T_lines") + total("T_in") - total("T_disc")
+            else:
+                events -= total("T_disc")
+        return events
 
     def ingress_residual(self, life):
         """Across a hop, what a life of the ingress SUT read but neither sent to its hop sink
@@ -2034,17 +2086,20 @@ class Ledger:
         and errors (L_drop + L_err), or the `sut_transforms` nodes' discards (ΣT_disc). A scenario
         has one or the other, so neither counts twice."""
         script = self.get("L_drop", life) + self.get("L_err", life) if self.script else 0
-        return script + self.t_disc(life)
+        # With a `fan_out`, W′ has taken the chain's discards in already (`through`), and a
+        # fan-out node's discarded parents went on as its children.
+        return script + (0 if self.reshaped else self.t_disc(life))
 
     def residual(self, life):
         """What a life read but neither absorbed nor removed, counted, by its last drain:
         W − D − B − X − Ab, with a script W − D − B − X − (L_drop + L_err) − (Ab − L_flush), with
-        `sut_transforms` W − D − B − X − ΣT_disc − Ab, and across a hop E_B − X_B − Ab."""
+        `sut_transforms` W − D − B − X − ΣT_disc − Ab, with a `fan_out` W′ − Ab, and across a hop
+        E_B − X_B − Ab."""
         return self.fed(life) - self.discarded(life) - self.absorbed(life)
 
     def kill_band(self, life):
         """`(low, high, text)`: the Ab − V a killed life may show with nothing lost, from its
-        ingest rate over its last drain interval.
+        ingest rate over its last drain interval, each listener's times its chain's fan-out.
 
         Below: the residual at the last drain, which leaves out what the path discarded,
         counted, and the reads after it, up to one drain interval, are in no Ab, and an
@@ -2060,7 +2115,8 @@ class Ledger:
             fed = [self.sut.counter_points("logit.component.events.sent",
                                            component=self.hop.get("listener"))]
         else:
-            fed = [self.ingress.counter_points(self.wires[listener].w, component=listener)
+            fed = [[(ts, v * self.factor(listener), point_life) for ts, v, point_life
+                    in self.ingress.counter_points(self.wires[listener].w, component=listener)]
                    for listener in self.listeners]
         last_w = sum(v for points in fed for ts, v, point_life in points
                      if point_life == life and drains and ts == drains[-1])
@@ -2561,7 +2617,8 @@ def _wire_buckets(data, led, source, combined=None):
     (`wire_judgment`).
 
     G is cumulative at each generator drain, anchored at 0 at the generator's start and held
-    flat across a gap between its lives, and is read at each SUT drain timestamp by linear
+    flat across a gap between its lives and across a drain that exports no G point, since a
+    counter that didn't move in a drain has none, and is read at each SUT drain timestamp by linear
     interpolation, because the two processes' drains are out of phase. Within a run of steady
     intervals the interpolation telescopes; each edge of a run errs by at most one generator
     batch, which is the judgment's tolerance. Returns `[(start, end, kind, label, g, wkf, f)]`,
@@ -2581,10 +2638,12 @@ def _wire_buckets(data, led, source, combined=None):
     starts = list(gen.life_starts)
     for life, start in enumerate(starts):
         anchors.append((start, cum))
-        for ts, value, point_life in points:
-            if point_life == life:
-                cum += value
-                anchors.append((ts, cum))
+        # Every drain of the life is an anchor, a drain with no point at the running total:
+        # without it a stalled writer's later G spreads back across the stall.
+        moved = {ts: value for ts, value, point_life in points if point_life == life}
+        for ts in sorted(set(gen.life_drains(life)) | set(moved)):
+            cum += moved.get(ts, 0)
+            anchors.append((ts, cum))
     anchors.sort(key=lambda item: item[0])
     anchor_ts = [t for t, _ in anchors]
 
@@ -3073,8 +3132,9 @@ def check_ledger_edge(data):
     listeners, or with a script L_sent == A, the edge from the script, since `ledger.script`
     judges the listeners'; with a source's `sut_transforms`, each hop from its listener through
     them, every transform sending each event it received that it didn't discard
-    (received − discarded == sent), and the last transform's sent in place of that listener's
-    E in the sum; and out to each sink, under `copy` `aggregate`'s events.sent == the sink's
+    (received − discarded == sent), or for a `fan_out` node of k its children against
+    k × received less the lines it dropped (`_node_edge`), and the last transform's sent in place
+    of that listener's E in the sum; and out to each sink, under `copy` `aggregate`'s events.sent == the sink's
     events.received
     (a fan-out counts one send per batch, however many consumers it reaches), and under `route`
     the sink's target's events.sent == the sink's events.received. Earlier lives are
@@ -3094,15 +3154,7 @@ def check_ledger_edge(data):
     elif led.script:
         edges = [("L_sent", "A", led.L_sent, led.A, "script to aggregate", out)]
     else:
-        edges = []
-        for listener in led.listeners:
-            chain = led.transforms.get(listener) or []
-            left, lhs = f"E[{listener}]", led.per[listener]["E"]
-            for component in chain:
-                edges.append((left, f"T_in[{component}]", lhs, led.T_in[component],
-                              f"into {component}", out))
-                edges.append(_node_edge(led, component, out))
-                left, lhs = f"T_out[{component}]", led.T_out[component]
+        edges = _chain_edges(led, out)
         into = {life: sum(led.into_aggregate(life).values()) for life in led.lives}
         if len(led.listeners) == 1 and not any(led.transforms.values()):
             edges.append(("E", "A", led.E, led.A, "listener to aggregate", out))
@@ -3149,11 +3201,43 @@ def check_ledger_edge(data):
     return Result("ledger.edge", PASS, head + "; ".join(parts), lines)
 
 
+def _chain_edges(led, view):
+    """Each source's `sut_transforms` hops for `ledger.edge`: its listener's E into the first
+    node, each node's own term (`_node_edge`), and each node's T_out into the next."""
+    edges = []
+    for listener in led.listeners:
+        left, lhs = f"E[{listener}]", led.per[listener]["E"]
+        for component in led.transforms.get(listener) or []:
+            edges.append((left, f"T_in[{component}]", lhs, led.T_in[component],
+                          f"into {component}", view))
+            edges.append(_node_edge(led, component, view))
+            left, lhs = f"T_out[{component}]", led.T_out[component]
+    return edges
+
+
 def _node_edge(led, component, view):
     """A `sut_transforms` node's hop for `ledger.edge`: T_in − T_disc == T_out, every event it
-    received sent on or counted discarded. The left side is a name and a per-life text beside
-    its per-life values, so a further term joins all three here."""
+    received sent on or counted discarded. A `fan_out` node of k instead has children
+    T_out − (T_in − T_disc), the count ADR `transform-fan-out` gives, equal to
+    k × T_in − T_lines, every parent's k points less the lines it dropped. The left side is a
+    name and a per-life text beside its per-life values, so a further term joins all three
+    here."""
     t_in, t_disc = led.T_in[component], led.T_disc[component]
+    k = led.fan_out.get(component)
+    if k:
+        t_out, t_lines = led.T_out[component], led.T_lines[component]
+        lives = set(t_in) | set(t_disc) | set(t_out) | set(t_lines)
+        children = {life: t_out.get(life, 0) - t_in.get(life, 0) + t_disc.get(life, 0)
+                    for life in lives}
+        points = {life: k * t_in.get(life, 0) - t_lines.get(life, 0) for life in lives}
+
+        def told(life):
+            return (f"children[{component}] = T_out {_n(t_out.get(life, 0))} − (T_in "
+                    f"{_n(t_in.get(life, 0))} − T_disc {_n(t_disc.get(life, 0))}) = "
+                    f"{_n(children.get(life, 0))}")
+
+        return ((f"children[{component}]", told), f"{k} x T_in − T_lines[{component}]",
+                children, points, f"{component} emits {k} per event", view)
     lhs = {life: t_in.get(life, 0) - t_disc.get(life, 0) for life in set(t_in) | set(t_disc)}
     name = f"T_in[{component}] − T_disc[{component}]"
 
@@ -3263,6 +3347,7 @@ def check_ledger_egress(data):
                         "shutdown drops")
             else:
                 whole = ("E_B − X_B − V" if led.hop is not None
+                         else "W′ − V" if led.reshaped
                          else f"W − D − B − X − {led.discarded_text}V")
                 part = (f"life {life}: {whole} {_n(gap)} = residual "
                         f"{_n(led.residual(life))} + {led.ab_text} − V {_n(ab_v)}, {verdict}")
@@ -3392,6 +3477,14 @@ def check_ledger_summary(data):
              - g("L_sent", life)),
             ("L_sent − A", g("L_sent", life) - g("A", life)),
         ]
+    elif led.reshaped:
+        # A fan-out doesn't telescope, so each of ledger.edge's chain terms is summed, then the
+        # chains' ends into `aggregate`.
+        chain = sum(lhs.get(life, 0) - rhs.get(life, 0)
+                    for _, _, lhs, rhs, _, _ in _chain_edges(led, led.out))
+        terms += [("ledger.edge's chain terms", chain),
+                  ("Σ(sent into aggregate) − A",
+                   sum(led.into_aggregate(life).values()) - g("A", life))]
     elif led.T_disc:
         terms.append(("E − ΣT_disc − A", g("E", life) - led.t_disc(life) - g("A", life)))
     else:
@@ -3422,7 +3515,7 @@ def check_ledger_summary(data):
     if led.script:
         counted_script = (f"; the script's L_drop {_n(g('L_drop', life))} and L_err "
                           f"{_n(g('L_err', life))}, counted")
-    elif led.T_disc:
+    elif led.T_disc and not led.reshaped:
         counted_script = f"; the transforms' ΣT_disc {_n(led.t_disc(life))}, counted"
     wire = ""
     # An overlap instance reads part of the generators' lines; `_summary_overlap` adds the wire.
@@ -3517,8 +3610,9 @@ def _end_to_end(data, led):
     X, the hop sink's drops, X_B, and the path's counted discards; on a TCP or file wire F too;
     on an HTTP wire no X, which the client resends), plus one generator batch per ambiguous drop
     on a TCP wire and per transport-error attempt on an HTTP wire, as `ledger.wire` allows, and
-    on a file wire the replay band's upper edge. A kill on either side shifts lives but never
-    adds increments, so V above that is a surplus whatever was killed; V below it is the
+    on a file wire the replay band's upper edge. With a `fan_out`, each source's share is
+    carried through its chain instead (`Ledger.through`). A kill on either side shifts lives but
+    never adds increments, so V above that is a surplus whatever was killed; V below it is the
     per-life rows' to judge."""
     counted = sum(sum(getattr(led, symbol).values())
                   for symbol in ("K", "F", "D_tel", "B", "X"))
@@ -3546,6 +3640,27 @@ def _end_to_end(data, led):
     limit = led.G - counted + partial + resent + replay
     bound = ("G − counted" + (" + partial" if partial else "") + (" + resent" if https else "")
              + (" + replay" if files else ""))
+    carried = ""
+    if led.reshaped:
+        # Each source's own share of the limit, in its listener's events, carried through its
+        # chain over the run: V counts what `aggregate` absorbed, k per event past a fan-out
+        # and none for a discarded one.
+        lives = sorted(set(led.lives) | set(led.inn.lives))
+        limit = 0
+        for source in led.sources:
+            listener, service = source.get("sut_listener"), source.get("service")
+            one = led.per[listener]
+            share = led.gen_stats.get(service, {}).get("G", 0) - sum(
+                sum(one[symbol].values()) for symbol in ("K", "F", "D_tel", "B")
+                + (() if source_wire(source) == HTTP_WIRE else ("X",)))
+            if service in led.gens and source_wire(source) in ("tcp", HTTP_WIRE):
+                share += (sum(v for _, v in _ambiguous_drops(led, source))
+                          * led.gen_stats[service]["batch"])
+            if source_wire(source) == FILE_WIRE:
+                share += led.replay_band([listener])[1]
+            limit += led.through(listener, share, lives)
+        bound = f"({bound}) carried through the chains"
+        carried = f", carried through the chains' fan_out and discards to {_n(limit)}"
     status, parts = PASS, []
     for label, sinks in led.egress_groups():
         total = sum(led.V_total.get(sink, 0) for sink in sinks)
@@ -3560,7 +3675,7 @@ def _end_to_end(data, led):
                                      if partial else "")
                     + (f" plus a resend allowance {_n(resent)}" if https else "")
                     + (f" plus the replay band's {_n(replay)}" if files else "")
-                    + ": " + "; ".join(parts))
+                    + carried + ": " + "; ".join(parts))
 
 
 def _last_interval(tel, name, component, life):
