@@ -18,8 +18,9 @@
 //!
 //! - **Length.** `len` is the file's size as the tailer last saw it, from a `stat` or `fstat` it
 //!   already makes or a read that reached the end, and never less than the offset read. When an
-//!   entry's file is gone at a restart, `Tailer::prune_checkpoint_entries` counts `len - offset`
-//!   as unread. It's the size last seen, not the size at the write: the file may have grown since.
+//!   entry's file is gone at a restart, `len - offset` is counted as unread once a write without
+//!   the entry lands (`Tailer::prune_checkpoint_entries` has what that count means). It's the size
+//!   last seen, not the size at the write: the file may have grown since.
 //! - **Capture.** The tailer keeps the first `min(HEAD_BYTES, offset)` bytes of each file as it
 //!   reads them, and clears them on a truncation. The fingerprint is XXH64, seed 0, over those
 //!   bytes, so a head is always from the same generation of the file as the offset beside it,
@@ -248,6 +249,10 @@ impl CheckpointStore {
     /// `logit.input.checkpoint.errors{op="write"}` and leaves the store dirty, so the next tick
     /// retries.
     ///
+    /// Resolves to `true` only when this call put `entries` on disk durably. A no-op, an encoding
+    /// error, and every failed step, including a rename that landed before a failed directory
+    /// sync, are `false`.
+    ///
     /// Not an `async fn`: `entries` borrows the tailer's files, which aren't `Sync`, so it's
     /// consumed before the returned future is built rather than held across its `.await`.
     pub fn write<'s, 'a>(
@@ -256,7 +261,7 @@ impl CheckpointStore {
         force: bool,
         diag: &'s mut Diagnostics,
         telemetry: &'s Telemetry,
-    ) -> impl Future<Output = ()> + Send + 's {
+    ) -> impl Future<Output = bool> + Send + 's {
         let encoded = (self.dirty || force).then(|| {
             let files = entries
                 .map(|Persisted { id, path, offset, len, head }| CheckpointEntry {
@@ -273,12 +278,12 @@ impl CheckpointStore {
         });
         async move {
             let bytes = match encoded {
-                None => return,
+                None => return false,
                 Some(Ok(bytes)) => bytes,
                 Some(Err(err)) => {
                     telemetry.count("logit.input.checkpoint.errors", 1.0, &[("op", "write")]);
                     diag.warn_throttled("checkpoint_error", format!("encoding checkpoint: {err}"));
-                    return;
+                    return false;
                 }
             };
             let path = self.path.clone();
@@ -290,7 +295,7 @@ impl CheckpointStore {
                 Ok(Ok(())) => {
                     self.dirty = false;
                     telemetry.count("logit.input.checkpoint.writes", 1.0, &[]);
-                    return;
+                    return true;
                 }
                 Ok(Err(err)) if err.replaced() => (
                     err.to_string(),
@@ -308,6 +313,7 @@ impl CheckpointStore {
                     self.path.display()
                 ),
             );
+            false
         }
     }
 }

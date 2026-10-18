@@ -2632,6 +2632,53 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A clean stop holding a stdout fragment checkpoints at its start, though a complete stderr
+    /// entry after it was delivered. A log removed while `logit` is down then counts that
+    /// delivered entry among its gone bytes, as `Tailer::prune_checkpoint_entries`'s doc says.
+    #[tokio::test]
+    async fn a_gone_log_held_mid_reassembly_counts_the_other_streams_delivered_entry() {
+        let stderr_line = format!(
+            "{}\n",
+            serde_json::json!({"log": "err\n", "stream": "stderr", "time": "2026-08-17T19:35:47.000000000Z"})
+        );
+        let (root, log, checkpoint, whole_len, config) =
+            fragment_fixture("docker-gone-held", &stderr_line);
+        let file_len = std::fs::metadata(&log).unwrap().len();
+
+        let (fanout, mut rx) = fanout_channel(8);
+        let input = DockerInput::new(
+            root.clone(),
+            ContainerFilter::new(vec![], true),
+            vec![],
+            config.clone(),
+        );
+        let running = spawn_input(input, fanout).await;
+        assert_eq!(messages(&recv_events(&mut rx, 2).await), vec!["whole", "err"]);
+        running.stop().await;
+        assert_eq!(checkpointed_offset(&checkpoint), Some(whole_len), "the held fragment's start");
+
+        std::fs::remove_file(&log).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let (fanout2, _rx2) = fanout_channel(8);
+        let input2 =
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config)
+                .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running2 = spawn_input(input2, fanout2).await;
+        let gone = [("reason", "gone")];
+        probe
+            .wait_for("the interval checkpoint to drop the gone entry", |t| {
+                t.sum("logit.input.bytes.dropped", &gone) > 0.0
+            })
+            .await;
+        assert_eq!(
+            probe.sum("logit.input.bytes.dropped", &gone),
+            (file_len - whole_len) as f64,
+            "the held fragment and the delivered stderr entry"
+        );
+        running2.stop().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A file rotated away mid-reassembly is `Draining`, and a restart never re-reads its inode,
     /// so a clean stop still emits its held fragment instead of checkpointing against it. The
     /// 2 s poll interval keeps the reap grace from elapsing before the stop.

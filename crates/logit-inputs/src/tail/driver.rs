@@ -180,6 +180,15 @@ impl Listing {
     }
 }
 
+/// A checkpoint entry whose file is gone with `unread` bytes past its offset, held in
+/// `Tailer::gone` until a checkpoint write without it lands.
+struct Gone {
+    id: FileId,
+    path: PathBuf,
+    offset: u64,
+    unread: u64,
+}
+
 struct TrackedFile<D> {
     path: PathBuf,
     id: FileId,
@@ -253,6 +262,11 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     /// ([`Source::Deselected`], process-local), so a container renamed back into the selection
     /// resumes instead of replaying (`docs/adr/docker-container-identity-and-minimal-watches.md`).
     resume: HashMap<FileId, Retained>,
+    /// Checkpoint entries `prune_checkpoint_entries` dropped with unread bytes, not yet counted.
+    /// [`Tailer::write_checkpoint`] counts them once a write without them lands. Counted at the
+    /// prune instead, a process that ended before that write would leave the entry on disk, and
+    /// the next process would count the same bytes again.
+    gone: Vec<Gone>,
     /// Where a file found by the first scan with no `resume` entry starts. Set at `bind`:
     /// `Beginning` after [`Loaded::Unusable`], else from `read_from`.
     first_scan_start: StartOffset,
@@ -299,6 +313,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             by_path: HashMap::new(),
             checkpoint: None,
             resume: HashMap::new(),
+            gone: Vec::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             watched_dirs: HashSet::new(),
@@ -744,13 +759,21 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// and is persisted by every checkpoint write meanwhile. Returns whether it dropped any.
     ///
     /// A dropped entry's file is gone: removed, or renamed out of every pattern, before a stop
-    /// left it read to its end or while `logit` was down. If a pattern still covers its stored path, its `len - offset` bytes count as
+    /// left it read to its end or while `logit` was down. If a pattern still covers its stored
+    /// path and `len` is past `offset`, the entry joins `Tailer::gone`, and the first checkpoint
+    /// write without it that lands counts its `len - offset` bytes as
     /// `logit.input.bytes.dropped{reason="gone"}`, diagnosed `file_gone`. A stored path no pattern
-    /// covers is the operator's config change, not loss, and isn't counted. The count is what the
-    /// last checkpoint recorded as unread: exact for a file rotated out before a clean stop, a
-    /// lower bound for the file being written to, and approximate either way after a kill, which
-    /// leaves an older checkpoint. A file created and removed wholly while `logit` was down has no
-    /// entry, and isn't counted.
+    /// covers is the operator's config change, not loss, and isn't counted.
+    ///
+    /// `offset` is the resume position, not the read position, so the count is exact only when no
+    /// line was held or being dropped at the stop and a scan or a read to the end saw the file's
+    /// final size. Otherwise:
+    /// - It includes bytes read after a held or dropping line's start: an oversize line's
+    ///   consumed prefix, already counted in `logit.input.frames.dropped{reason="oversize"}`, and
+    ///   under `docker_in`, the other stream's entries delivered after a held partial.
+    /// - It misses appends that no `stat`, `fstat`, or read to the end observed.
+    /// - After a kill it comes from the last interval checkpoint, so it can be high or low.
+    /// - A file created and removed wholly while `logit` was down has no entry, and isn't counted.
     fn prune_checkpoint_entries(
         &mut self,
         listing: &Listing,
@@ -767,15 +790,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
             keep
         });
-        for (id, path, offset, len) in &pruned {
-            let unread = len.saturating_sub(*offset);
-            if unread == 0 || !self.patterns.iter().any(|p| p.covers(path)) {
-                continue;
+        let dropped = !pruned.is_empty();
+        for (id, path, offset, len) in pruned {
+            let unread = len.saturating_sub(offset);
+            if unread > 0 && self.patterns.iter().any(|p| p.covers(&path)) {
+                self.gone.push(Gone { id, path, offset, unread });
             }
-            self.telemetry.count("logit.input.bytes.dropped", unread as f64, &[("reason", "gone")]);
-            self.diag.warn_throttled("file_gone", file_gone_message(path, *id, *offset, unread));
         }
-        !pruned.is_empty()
+        dropped
     }
 
     /// `scan`'s listing step: every pattern's [`PathPattern::scan`], then one `stat` per distinct
@@ -1525,6 +1547,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// leaves both unemitted at a clean stop, so the same rule checkpoints at their start and the
     /// restart re-reads them whole. Otherwise, at shutdown `close_all_for_shutdown` has already
     /// emitted both, so the offset is the file's full `offset`.
+    ///
+    /// A write that lands counts and diagnoses every entry in `Tailer::gone`; a failed one leaves
+    /// them for the retry.
     async fn write_checkpoint(&mut self, force: bool) {
         if self.untaken {
             return;
@@ -1550,7 +1575,23 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     head: r.head,
                 }
             });
-        checkpoint.write(tracked.chain(unspent), force, &mut self.diag, &self.telemetry).await;
+        let landed =
+            checkpoint.write(tracked.chain(unspent), force, &mut self.diag, &self.telemetry).await;
+        // A pruned entry left every document written since its prune, so once one lands, no
+        // later process loads it to count it again.
+        if landed {
+            for g in std::mem::take(&mut self.gone) {
+                self.telemetry.count(
+                    "logit.input.bytes.dropped",
+                    g.unread as f64,
+                    &[("reason", "gone")],
+                );
+                self.diag.warn_throttled(
+                    "file_gone",
+                    file_gone_message(&g.path, g.id, g.offset, g.unread),
+                );
+            }
+        }
     }
 }
 
@@ -5851,6 +5892,7 @@ mod tests {
         assert!(hand.pump().await.is_empty());
         assert_eq!(hand.tailer.tracked_len(), 0);
         // The scan's `fstat` of the unlinked handle saw "two\n", so the checkpoint recorded it.
+        hand.checkpoint().await;
         assert_eq!(gone_bytes(&mut hand.probe), 4.0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5878,12 +5920,13 @@ mod tests {
         assert_eq!(hand.tailer.tracked_len(), 1, "only the new app.log");
         assert!(hand.tailer.resume.is_empty(), "the rotated file's entry is pruned");
         // The last checkpoint, before the crash, saw no unread bytes: "two\n" goes uncounted.
+        hand.checkpoint().await;
         assert_eq!(gone_bytes(&mut hand.probe), 0.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     // -- a checkpointed file gone at a restart counts what the checkpoint recorded as unread
-    // (`Tailer::prune_checkpoint_entries`)
+    // (`Tailer::prune_checkpoint_entries`), once a checkpoint write without it lands
 
     fn gone_bytes(probe: &mut TelemetryProbe) -> f64 {
         probe.sum("logit.input.bytes.dropped", &[("reason", "gone")])
@@ -5899,21 +5942,87 @@ mod tests {
         Hand::bind(patterns, LineFactory, checkpointed(dir, ReadFrom::Beginning)).await
     }
 
+    fn checkpoint_text(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("checkpoint.json")).unwrap()
+    }
+
     #[tokio::test]
     async fn a_checkpointed_file_gone_at_a_restart_counts_its_unread_bytes_once() {
         let dir = scratch_dir("gone-unread");
         let path = dir.join("app.log");
         let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"one\n"))]).await;
+        assert!(hand.tailer.resume.is_empty(), "the entry is pruned");
+        assert_eq!(gone_bytes(&mut hand.probe), 0.0, "not before a write drops it from disk");
+
+        hand.checkpoint().await;
         assert_eq!(gone_bytes(&mut hand.probe), 6.0);
         assert_eq!(hand.diag.occurrences("file_gone"), 1);
-        assert!(hand.tailer.resume.is_empty(), "the entry is pruned");
-
         hand.scan().await;
+        hand.checkpoint().await;
         assert_eq!(gone_bytes(&mut hand.probe), 6.0, "counted once");
         assert_eq!(hand.diag.occurrences("file_gone"), 1);
         hand.shutdown().await;
-        let text = std::fs::read_to_string(dir.join("checkpoint.json")).unwrap();
-        assert!(!text.contains("app.log"), "{text}");
+        assert!(!checkpoint_text(&dir).contains("app.log"), "{}", checkpoint_text(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A process that prunes an entry and ends before a checkpoint write leaves it on disk, so
+    /// the life whose write drops it counts it, and no later life does.
+    #[tokio::test]
+    async fn a_gone_file_is_counted_by_the_life_whose_checkpoint_drops_it_and_never_again() {
+        let dir = scratch_dir("gone-three-lives");
+        let path = dir.join("app.log");
+        write_checkpoint_doc(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"))]);
+        let patterns = || vec![PathPattern::new(dir.join("*.log"))];
+        let config = checkpointed(&dir, ReadFrom::Beginning);
+
+        // Life 1 ends with no checkpoint write, as a kill or a failed startup would.
+        let mut life1 = Hand::bind(patterns(), LineFactory, config.clone()).await;
+        assert_eq!(gone_bytes(&mut life1.probe), 0.0);
+        assert_eq!(life1.diag.occurrences("file_gone"), 0);
+        drop(life1);
+        assert!(checkpoint_text(&dir).contains("app.log"), "life 1 wrote nothing");
+
+        let mut life2 = Hand::bind(patterns(), LineFactory, config.clone()).await;
+        life2.checkpoint().await;
+        assert_eq!(gone_bytes(&mut life2.probe), 6.0);
+        assert_eq!(life2.diag.occurrences("file_gone"), 1);
+        drop(life2);
+
+        let mut life3 = Hand::bind(patterns(), LineFactory, config).await;
+        life3.checkpoint().await;
+        assert_eq!(gone_bytes(&mut life3.probe), 0.0);
+        assert_eq!(life3.diag.occurrences("file_gone"), 0);
+        assert!(!checkpoint_text(&dir).contains("app.log"), "{}", checkpoint_text(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failed write leaves the entry on disk, so the count waits for the retry that lands.
+    #[tokio::test]
+    async fn a_gone_file_is_counted_only_once_a_checkpoint_write_lands() {
+        let dir = scratch_dir("gone-write-fails");
+        let path = dir.join("app.log");
+        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"))]).await;
+
+        let scope = fault::scope(&dir);
+        scope.fail_nth(
+            fault::Point::new(fault::sites::TAIL_CHECKPOINT, fault::Op::Write),
+            1,
+            errno::EIO,
+        );
+        hand.checkpoint().await;
+        assert_eq!(hand.probe.sum("logit.input.checkpoint.errors", &[("op", "write")]), 1.0);
+        assert!(checkpoint_text(&dir).contains("app.log"), "the failed write left the entry");
+        assert_eq!(gone_bytes(&mut hand.probe), 0.0);
+        assert_eq!(hand.diag.occurrences("file_gone"), 0);
+
+        hand.checkpoint().await;
+        drop(scope);
+        assert!(!checkpoint_text(&dir).contains("app.log"), "{}", checkpoint_text(&dir));
+        assert_eq!(gone_bytes(&mut hand.probe), 6.0);
+        assert_eq!(hand.diag.occurrences("file_gone"), 1);
+        hand.checkpoint().await;
+        assert_eq!(gone_bytes(&mut hand.probe), 6.0, "counted once");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5938,6 +6047,7 @@ mod tests {
         let path = dir.join("app.log");
         let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 10, 10, Head::of(b"x"))]).await;
         assert!(hand.tailer.resume.is_empty(), "the entry is pruned");
+        hand.checkpoint().await;
         assert_eq!(gone_bytes(&mut hand.probe), 0.0);
         assert_eq!(hand.diag.occurrences("file_gone"), 0);
         std::fs::remove_dir_all(&dir).ok();
@@ -5950,6 +6060,7 @@ mod tests {
         let path = dir.join("elsewhere.txt");
         let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"))]).await;
         assert!(hand.tailer.resume.is_empty(), "the entry is pruned");
+        hand.checkpoint().await;
         assert_eq!(gone_bytes(&mut hand.probe), 0.0);
         assert_eq!(hand.diag.occurrences("file_gone"), 0);
         std::fs::remove_dir_all(&dir).ok();
@@ -5964,16 +6075,19 @@ mod tests {
         scope.fail(READ_DIR, errno::EACCES);
         let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"))]).await;
         hand.scan().await;
+        hand.checkpoint().await;
         assert_eq!(hand.tailer.resume.len(), 1, "kept while the listing fails");
         assert_eq!(gone_bytes(&mut hand.probe), 0.0);
         assert_eq!(hand.diag.occurrences("file_gone"), 0);
         drop(scope);
 
         hand.scan().await;
+        hand.checkpoint().await;
         assert!(hand.tailer.resume.is_empty());
         assert_eq!(gone_bytes(&mut hand.probe), 6.0);
         assert_eq!(hand.diag.occurrences("file_gone"), 1);
         hand.scan().await;
+        hand.checkpoint().await;
         assert_eq!(gone_bytes(&mut hand.probe), 6.0, "never counted again");
         assert_eq!(hand.diag.occurrences("file_gone"), 1);
         std::fs::remove_dir_all(&dir).ok();
@@ -5997,6 +6111,7 @@ mod tests {
         .await;
         assert!(hand.tailer.files.is_empty());
         assert!(hand.tailer.resume.is_empty(), "the entry is pruned");
+        hand.checkpoint().await;
         assert_eq!(gone_bytes(&mut hand.probe), 4.0, "\"two\\n\"");
         assert_eq!(hand.diag.occurrences("file_gone"), 1);
         std::fs::remove_dir_all(&dir).ok();
@@ -6035,8 +6150,39 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config).await;
         assert!(hand.pump().await.is_empty());
+        hand.checkpoint().await;
         assert_eq!(gone_bytes(&mut hand.probe), (len - offset) as f64);
         assert_eq!(hand.diag.occurrences("file_gone"), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A clean stop part-way through dropping an oversize line checkpoints at that line's start,
+    /// so a gone file's count includes the prefix already counted as an oversize frame.
+    #[tokio::test]
+    async fn a_gone_file_stopped_mid_drop_counts_the_dropped_prefix_again() {
+        let dir = scratch_dir("gone-mid-drop");
+        let path = dir.join("app.log");
+        let prefix = "x".repeat(100);
+        std::fs::write(&path, format!("ok\n{prefix}")).unwrap();
+        let patterns = || vec![PathPattern::new(&path)];
+        let mut config = checkpointed(&dir, ReadFrom::Beginning);
+        config.max_line_bytes = 16;
+
+        let mut hand = Hand::bind(patterns(), LineFactory, config.clone()).await;
+        assert_eq!(hand.pump().await, vec!["ok"]);
+        assert_eq!(
+            hand.probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]),
+            1.0,
+            "the line is dropped while it's read"
+        );
+        assert!(hand.shutdown().await.is_empty());
+        assert_eq!(checkpointed_entry(&dir).0, 3, "the dropped line's start");
+        assert_eq!(checkpointed_len(&dir), 103);
+
+        std::fs::remove_file(&path).unwrap();
+        let mut hand = Hand::bind(patterns(), LineFactory, config).await;
+        hand.checkpoint().await;
+        assert_eq!(gone_bytes(&mut hand.probe), 100.0, "the counted prefix, again");
         std::fs::remove_dir_all(&dir).ok();
     }
 
