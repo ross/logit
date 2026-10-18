@@ -197,6 +197,10 @@ on = "logit"
 for = "45s"
 ```
 
+An optional top-level `rss_settle` (default `120s`) is how long past `recovery_bound` the
+`rss_slope` row alone keeps excusing each fault (§6). Every other row's recovery is
+`recovery_bound`.
+
 `validate()` enforces these rules:
 
 - Every fault carries `for`, so its revert is scheduled with it. `netem clear` is a revert, never
@@ -206,6 +210,7 @@ for = "45s"
 - No netem on a container during its `stop`, `kill`, `pause`, `partition`, or `exit`, because the qdisc
   is lost with the namespace and `docker run --network container:<id>` needs a running target.
 - No fault ends inside `cooldown`, and `cooldown` is at least `recovery_bound`.
+- `rss_settle`, when set, is a duration of `0s` or more.
 - Actions and services are known. W1's actions are `netem`, `pause`, `stop`, `restart`, and
   `partition`, on any service of the stack: `logit`, `generator`, `victoria-metrics`, and from
   W7b any service a `compose` override adds. W3 adds `kill`, on the SUT only:
@@ -918,7 +923,15 @@ returned nonzero has none, so nothing after it is excused.
   per life, over samples outside fault windows after warmup, against `rss_growth_mib_per_hour`.
   `logit.process.fds` at the end minus the warmup median is at most `fd_growth`, and returns to
   baseline at the first steady-state sample after each recovery. `docker stats` RSS is the
-  fallback series. Judged slopes covering under 5% of the run after warmup WARN. From W8c both
+  fallback series. Judged slopes covering under 5% of the run after warmup WARN.
+  `rss_slope` widens each fault window by the scenario's `rss_settle` (default 120 s), because
+  a process returns a backlog's memory in steps over minutes: `fanin`'s generator held 62.6,
+  then 52.6, then about 32 MiB for over 100 s after a 45 s partition, and a fit over those
+  plateaus beside its 18 MiB baseline read +240 MiB/h. `fd_slope` keeps `recovery_bound`: it
+  compares single samples with the warmup median rather than fitting a line, and a connection's
+  fd closes when the connection does, with no allocator in between. A service with samples
+  after warmup but none outside the widened windows WARNs on coverage, and the row SKIPs for
+  want of a fit only when the run after warmup is shorter than the 60 s a fit needs. From W8c both
   rows judge each `logit` service apart, the SUT and every generator, with one detail line per
   service and the worst status, as the per-sink rows do; a generator that interns what the SUT
   interns grows beside it, and one verdict for both would say nothing about the SUT. A
@@ -5246,3 +5259,52 @@ Overall PASS, every row PASS or SKIP.
   reverted. The self-test passes (1,797 expectations), and the `rate` fixtures fail with the
   reducer reverted. `kafka-sasl-reauth` passes `self-test` validation, the shipped-config test,
   and `logit validate` in its image. Met: its run is recorded under "Findings", Overall PASS.
+
+### `rss_settle`: a settle window for `rss_slope` (2026-10-18)
+
+A solo `fanin` run on a quiet host, `20261018T190542Z`, WARNed `rss_slope` on `generator` at
++240.4 MiB/h. Its own `logit.process.memory.resident.bytes` around the 45 s partition `c0s3`,
+from +330.6 s to +375.5 s:
+
+| When | RSS |
+|---|---|
+| Before the partition | about 18 MiB |
+| End of the partition | 86 MiB |
+| From +14 s after the partition | 62.6 MiB |
+| From +84 s | 52.6 MiB |
+| From +104 s | about 32 MiB |
+| The next life | about 18 MiB |
+
+The allocator returns the backlog's memory in steps; nothing leaks. `recovery_bound` ends the
+excusal 45 s after the revert, so the plateaus sat in the fit beside the baseline. A
+`tcp-ingress` run, `20261018T184246Z`, WARNed `logit` life 0 at +74.0 MiB/h over 12 samples in
+400 s, which reads as the same effect. `rss_settle` (§2, §6) excuses 120 s more after each
+fault, for `rss_slope` only.
+
+Re-scored with `soak.py check`, in MiB/h per life:
+
+| Run | Service | Before | After |
+|---|---|---|---|
+| `fanin` `20261018T190542Z` | `generator` | life 0 +240.4, life 1 -4.4 (WARN) | no life fits: life 1 has 11 samples over 50 s (WARN, 0% judged) |
+| | `generator-lines` | life 0 +4.0, life 1 -4.3 | no life fits: life 1 has 11 samples over 50 s (WARN, 0% judged) |
+| | `logit` | life 0 +0.2 | no life fits: life 0 has 12 samples over 55 s (WARN, 0% judged) |
+| `tcp-ingress` `20261018T184246Z` | `generator` | life 0 +30.5 | no life fits: life 0 has 12 samples over 55 s (WARN, 0% judged) |
+| | `logit` | life 0 +74.0 (WARN), life 2 -5.3 | no life fits: life 2 has 12 samples over 55 s (WARN, 0% judged) |
+
+Both rows still WARN, now on coverage rather than on a slope. Neither schedule leaves more than
+75 s between one fault's end and the next fault's start, so `recovery_bound` plus `rss_settle`
+covers every gap, and only the stretch before the end sequence remains, under the 60 s a fit
+needs. Every other row of both runs re-scores unchanged. Across the shipped scenarios at their
+own durations, the share of the run after warmup outside the widened windows falls to about 0 to 16%
+for most, against 11 to 56% with `recovery_bound` alone; `cardinality`, `sighup`, `tls-reload`,
+`tail-rotate-delete`, and the `lua-memory` and `lua-stall` pairs keep 25% or more.
+
+What the work showed about the harness:
+
+- With every sample excused, `rss_slope` SKIPped: a service with no steady sample read SKIP and
+  the row SKIPped with no life fitted. A service with samples after warmup now WARNs on
+  coverage, and the row SKIPs for want of a fit only when the run after warmup is under 60 s.
+- The self-test fixtures failed with each change reverted (three reverts): with the settle window
+  off, the stepped-recovery fixture WARNed at +103.8 MiB/h; with a window swallowing the whole
+  run, the `cardinality`-shaped leak fixture WARNed instead of FAILing; and with the old SKIP
+  rule, the all-excused fixture and the existing thin-coverage fixture SKIPped.

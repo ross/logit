@@ -501,3 +501,26 @@ gap. So the driver rejects the run instead of running out its schedule:
 - **`--retry-stalled N` is opt-in** (default 0): it reruns a stalled run up to N times in new
   run directories with the same duration and seed. It's refused with `--keep`, because the kept
   stack would block the rerun. Without it, the caller reruns on a 3.
+
+## Amendment: `rss_slope` excuses a settle window past `recovery_bound` (2026-10-18)
+
+A process gives back a fault's backlog memory in steps, over minutes. After a 45 s partition,
+`fanin`'s generator went from about 18 MiB to 86 MiB, then held 62.6 MiB from 14 s after the
+revert, 52.6 MiB from 84 s, and about 32 MiB from 104 s. `recovery_bound` ends the excusal at
+45 s, so the plateaus sat in the fit beside the baseline, and `rss_slope` WARNed at +240 MiB/h
+on memory the allocator was returning. Widening `recovery_bound` would have widened every row's
+excusal, and the ledger and `recovery` need it tight.
+
+- **`rss_slope` alone widens each fault window by `rss_settle`**, an optional top-level
+  scenario duration, 120 s by default. It applies after every fault, as `recovery_bound` does
+  for this row, and a run directory recorded before the key existed takes the default.
+- **`fd_slope` keeps `recovery_bound`.** It compares single samples with the warmup median, and
+  a closed connection releases its fd with no allocator in between.
+- **Coverage stays visible.** A service whose samples after warmup all fall in the widened
+  windows WARNs on coverage instead of SKIPping, and the row SKIPs for want of a fit only when
+  the run after warmup is shorter than one fit's 60 s.
+
+The cost is coverage on fault-dense schedules. Most shipped scenarios leave under 120 s between
+one fault's recovery and the next fault, so with the default, `rss_slope` judges little or none
+of them and WARNs on coverage. Growth across a whole run still FAILs: a fixture of
+`cardinality`'s +73 and +61 MiB/h leak FAILs with the settle window in force.

@@ -157,7 +157,7 @@ NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart", "exit")
 
 TOP_LEVEL_KEYS = {
     "name", "description", "duration", "max_duration", "warmup", "cooldown", "recovery_bound",
-    "cycle", "configs", "ledger", "thresholds", "step", "expect", "random", "target", "compose",
+    "rss_settle", "cycle", "configs", "ledger", "thresholds", "step", "expect", "random", "target", "compose",
     "expected", "overlap", "tls",
 }
 # The local target, the default; the kind with no backend query; and the local Kafka broker,
@@ -221,6 +221,9 @@ FAN_OUT_KIND = "line_protocol"
 # or HTTP requests a listener answers.
 WIRES = ("udp", "tcp", "file", "http")
 DEFAULT_WIRE = "udp"
+# `rss_settle` when a scenario doesn't set it: how long past `recovery_bound` `rss_slope` keeps
+# excusing a fault, while the allocator returns what the fault's backlog took.
+DEFAULT_RSS_SETTLE_S = 120.0
 FILE_WIRE = "file"
 HTTP_WIRE = "http"
 # A file wire's writer: a generator sink whose G is `events.delivered` (checks.py's `WIRES`),
@@ -579,6 +582,8 @@ class Scenario:
     overlap: object = None
     # `[tls]`'s certificates: `{name: {san, usage}}`, or None with no `[tls]` table.
     tls: object = None
+    # Seconds past `recovery_bound` that `rss_slope` alone still excuses after each fault.
+    rss_settle: float = DEFAULT_RSS_SETTLE_S
 
     @property
     def external(self):
@@ -703,6 +708,7 @@ class Scenario:
             "warmup": self.warmup,
             "cooldown": self.cooldown,
             "recovery_bound": self.recovery_bound,
+            "rss_settle": self.rss_settle,
             "cycle": None if self.random is not None else self.cycle,
             "seed": seed,
             "random": None if self.random is None else self.random.to_json(),
@@ -770,6 +776,8 @@ def from_dict(raw, path):
     warmup = dur(raw, "warmup", "scenario")
     cooldown = dur(raw, "cooldown", "scenario")
     recovery_bound = dur(raw, "recovery_bound", "scenario")
+    rss_settle = (dur(raw, "rss_settle", "scenario") if "rss_settle" in raw
+                  else DEFAULT_RSS_SETTLE_S)
     # A schedule is fixed (`cycle` and `[[step]]`) or random (`[random]`), never both.
     random_spec = None
     cycle = 0.0
@@ -938,7 +946,7 @@ def from_dict(raw, path):
         cooldown=cooldown, recovery_bound=recovery_bound, cycle=cycle, configs=configs,
         ledger=ledger, thresholds=thresholds, steps=steps, expectations=expectations,
         random=random_spec, target=target, compose=compose, expected=expected,
-        max_duration=max_duration, overlap=overlap, tls=tls,
+        max_duration=max_duration, overlap=overlap, tls=tls, rss_settle=rss_settle,
     )
     if problems:
         raise ScenarioError(problems)
@@ -2088,6 +2096,8 @@ def validate(scenario, duration=None, seed=None):
             f"cooldown {format_duration(scenario.cooldown)} is shorter than recovery_bound "
             f"{format_duration(scenario.recovery_bound)}"
         )
+    if scenario.rss_settle < 0:
+        problems.append(f"rss_settle must be 0s or more, got {scenario.rss_settle:g}s")
     if scenario.random is None and scenario.cycle <= 0:
         problems.append("cycle must be longer than 0s")
     if scenario.thresholds.get("progress_window", 0) <= 0:
