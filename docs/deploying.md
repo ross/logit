@@ -3412,7 +3412,9 @@ credentials or doesn't offer the mechanism is `refused`, and the sink holds its 
 broker accepts them. The error names the mechanism and the user, never the password. When the
 broker limits a session's lifetime (`connections.max.reauth.ms`), the sink dials a new
 connection before the session ends, one `timeout` early, or halfway through a lifetime of up to
-twice `timeout`.
+twice `timeout`. Each such dial counts `logit.output.reconnects`, so with a 30 s lifetime and a
+10 s `timeout` expect about one every 20 to 23 s per broker connection in use; a count that
+climbs faster than that means connections are failing, not renewing.
 
 `mechanism: oauthbearer` sends an OAuth 2.0 access token instead, either a fixed `token:`
 (`!env`), or one fetched from `token_endpoint:` with the client-credentials grant:

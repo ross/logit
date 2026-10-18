@@ -30,6 +30,7 @@
 //! | Point | Meaning |
 //! |---|---|
 //! | `logit.output.requests{class}` | one per attempt, `class` its result across every topic (`crate::count_request`) |
+//! | `logit.output.reconnects` | every successful dial to a broker connection slot (a bootstrap entry, or a broker by its node id) this topic's producer has dialed before: after the broker closed the connection, after its SASL session's deadline, or after a failed request finished it |
 //! | `logit.output.batch.bytes` | the record values' bytes, before compression, once per batch |
 //! | `logit.output.records` | records the broker accepted |
 //! | `logit.output.records.dropped{reason}` | `oversize` (one record over `max_request_bytes`; under `record: batch` one event whose value alone is over it; under an OTLP format one per signal record an event too large alone would have formed; never sent), `rejected` (a partition batch the broker rejected), `invalid_timestamp` or `invalid_record` (records the broker named), or `ambiguous_at_most_once` (records left unsettled when `at_most_once` drops an `Ambiguous` batch, or an `Ambiguous` partition batch beside a `Refused` one, on any topic) |
@@ -39,8 +40,9 @@
 //! | `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, `logit.output.metrics.degraded{metric_kind}` | under an OTLP format, metrics the OTLP mapping skips, drops, or degrades (`logit_proto::otlp::metrics`), once per metric |
 //!
 //! `oversize`, `records.unkeyed`, `events.skipped`, `metrics.omitted`, `spans.omitted`, and the
-//! OTLP mapping's counters are encode-side, counted once per batch; the others follow the
-//! broker's answer, which a retry never meets twice for one partition batch. Each drop but `ambiguous_at_most_once` raises a
+//! OTLP mapping's counters are encode-side, counted once per batch; `requests` and `reconnects`
+//! count per attempt; the others follow the broker's answer, which a retry never meets twice for
+//! one partition batch. Each drop but `ambiguous_at_most_once` raises a
 //! throttled diagnostic of the same name: `oversize` names the record count and the
 //! `max_request_bytes` cap, and `rejected`, `invalid_timestamp`, and `invalid_record` carry the
 //! broker's error code and message.
@@ -233,6 +235,7 @@ impl KafkaOutput {
             tls: None,
             client_id: settings.client_id,
             sasl: settings.sasl.as_ref().map(|sasl| sasl::authenticator(sasl, settings.timeout)),
+            telemetry: Telemetry::default(),
         };
         let headers = settings
             .headers
@@ -270,6 +273,7 @@ impl KafkaOutput {
 
     /// Attaches the telemetry handle, also threaded, gated, into the encoder's OTLP mapping.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.producer.set_telemetry(&telemetry);
         self.telemetry = telemetry;
         self.encoder =
             self.encoder.with_counters(&self.telemetry, &self.diag, self.accounting.gate());
