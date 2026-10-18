@@ -470,7 +470,24 @@ cmd_fuzz() {
     done
 }
 
-# Checks slept_between against simulated readings, and that this host gives a reading.
+# Prints the last failure artifact `log` names that still exists under `base`, or nothing. The
+# pattern matches only a file directly in a target's artifacts directory, so neither the
+# `slept/` path cmd_fuzz prints nor `-artifact_prefix` matches, and the existence check skips a
+# timeout cmd_fuzz moved out of a slept run.
+fuzz_artifact_from_log() {
+    local log="${1}"
+    local base="${2}"
+    local path
+    while read -r path; do
+        if [ -f "${base}/${path}" ]; then
+            echo "${path}"
+            return
+        fi
+    done < <(grep -oE 'fuzz/artifacts/[^ /]+/(crash|oom|leak|timeout)-[^ ]+' "${log}" | tac)
+}
+
+# Checks slept_between against simulated readings, fuzz_artifact_from_log against simulated
+# logs, and that this host gives a suspend reading.
 cmd_fuzz_self_test() {
     local fails=0
     check() {
@@ -489,6 +506,39 @@ cmd_fuzz_self_test() {
     check awake 120 124
     check slept 120 125
     check slept 0 10123
+
+    # A slept run's log as fuzz-all tees it: libFuzzer's line for each artifact, then cmd_fuzz's.
+    local base
+    base="$(mktemp -d)"
+    local dir="${base}/fuzz/artifacts/t"
+    mkdir -p "${dir}/slept"
+    touch "${dir}/oom-aa" "${dir}/slept/timeout-bb"
+    pick() {
+        local want="${1}" name="${2}" got
+        got="$(fuzz_artifact_from_log "${base}/${name}.log" "${base}")"
+        if [ "${got}" = "${want}" ]; then
+            echo "ok   artifact for ${name}: '${got}'"
+        else
+            echo "FAIL artifact for ${name}: '${got}', want '${want}'"
+            fails=1
+        fi
+    }
+    cat >"${base}/crash-then-slept.log" <<'EOF'
+artifact_prefix='/work/fuzz/artifacts/t/'; Test unit written to /work/fuzz/artifacts/t/oom-aa
+## fuzz: t: the host was suspended for about 9s of this run
+## fuzz: t: moved 1 timing artifact(s) to fuzz/artifacts/t/slept/
+EOF
+    pick fuzz/artifacts/t/oom-aa crash-then-slept
+    cat >"${base}/moved-then-failed.log" <<'EOF'
+artifact_prefix='/work/fuzz/artifacts/t/'; Test unit written to /work/fuzz/artifacts/t/timeout-bb
+## fuzz: t: the host was suspended for about 9s of this run
+## fuzz: t: moved 1 timing artifact(s) to fuzz/artifacts/t/slept/
+## fuzz: t: rerunning, attempt 2 of 2
+Error: Fuzz target exited with exit status: 1
+EOF
+    pick "" moved-then-failed
+    rm -rf "${base}"
+
     local now
     now="$(suspended_seconds)"
     if [[ "${now}" =~ ^[0-9]+$ ]]; then
@@ -550,7 +600,7 @@ cmd_fuzz_all() {
             summary+=("slept  ${target}: the host suspended during every attempt; rerun it")
         else
             local artifact
-            artifact="$(grep -oE 'fuzz/artifacts/[^ ]+' "${log}" | tail -1 || true)"
+            artifact="$(fuzz_artifact_from_log "${log}" "${ROOT}")"
             failed=1
             summary+=("FAILED ${target} (exit ${status}): ${stats}")
             if [ -n "${artifact}" ]; then

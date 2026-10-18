@@ -529,7 +529,10 @@ The 2026-09-25 campaign's suspend left `timeout-*` artifacts in three targets an
   `slow-unit-*` artifacts move to `fuzz/artifacts/<target>/slept/`, out of the directory a crash
   is listed from, and are kept so a doubtful one can still be run by hand. A slept run that
   failed and left any other new artifact (`crash-*`, `oom-*`, `leak-*`) keeps its own exit
-  status and its `fuzz-tmin` line, because none of those depends on time.
+  status and its `fuzz-tmin` line, because none of those depends on time. `fuzz-all`'s
+  `fuzz-tmin` line names the last `crash-*`, `oom-*`, `leak-*`, or `timeout-*` file the log
+  names that's still in the target's artifacts directory, so it never names `slept/` or a
+  timeout moved there.
 - **A slept run is rerun.** `FUZZ_RETRY_SLEPT` (default 1) reruns it right away, since the
   driver only runs while the host is awake. The rerun starts from the corpus the slept run
   grew: coverage doesn't depend on time, so those inputs stand. That's why the default is 1
@@ -541,8 +544,9 @@ The 2026-09-25 campaign's suspend left `timeout-*` artifacts in three targets an
   to judge, while each `fuzz-all` target is its own run and another target's crash still needs
   reading.
 - **`UNSAFE_CHECK_FAKE_SUSPEND=N` makes each target's first `N` attempts read as slept**, the
-  seam that tests the retry path without suspending the host, and `fuzz-self-test` checks the
-  detection against simulated clock readings.
+  seam that tests the retry path without suspending the host. `fuzz-self-test` checks the
+  detection against simulated clock readings and the `fuzz-tmin` line's artifact against
+  simulated slept-run logs.
 
 ### Limits
 
