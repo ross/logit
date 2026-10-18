@@ -112,6 +112,24 @@ STALL_S = checks.STALL_S
 # The exit status of a run that stalled, apart from a FAIL's 1: a rerun once the host is awake
 # can pass, while a FAIL needs someone to read it.
 STALLED_EXIT = 3
+
+
+def claim_run_dir(out_dir, now=None):
+    """Create and return a new run directory, `<UTC stamp>` or `<UTC stamp>-N` (N from 2).
+
+    `mkdir` is the claim: it fails when the name exists, so two runs that start in the same
+    second never share a directory. The suffix keeps every name sorting after the bare stamp."""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for n in range(1, 10_000):
+        path = out_dir / (stamp if n == 1 else f"{stamp}-{n}")
+        try:
+            path.mkdir()
+        except FileExistsError:
+            continue
+        return path
+    raise RuntimeError(f"soak: no free run directory for {stamp} under {out_dir}")
 # How long `--retry-stalled` waits before a rerun: past the run directory's 1 s stamp, and long
 # enough for the previous project's `down` to settle on the daemon.
 RETRY_WAIT_S = 30
@@ -230,8 +248,9 @@ class Run:
         self.argv = argv
         self.image = image
         self.steps = scenario_mod.expand(scenario, duration, self.seed)
-        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        self.run_dir = Path(out_dir) / stamp
+        self.out_dir = Path(out_dir)
+        # Set by `prepare()`, which creates the directory.
+        self.run_dir = None
         self.project = f"soak-{scenario.name}"
         self.t0 = None
         self.ids = {}
@@ -259,7 +278,7 @@ class Run:
     # ---- setup ---------------------------------------------------------------------------------
 
     def prepare(self):
-        self.run_dir.mkdir(parents=True)
+        self.run_dir = claim_run_dir(self.out_dir)
         (self.run_dir / "logs").mkdir()
         env_file = self.run_dir / "compose.env"
         # `--env-file` rather than the environment: `sudo` resets the environment.

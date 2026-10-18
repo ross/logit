@@ -1109,6 +1109,23 @@ def _retry_stalled():
            f"no retry by default, got {code} {len(calls)} {waits}")
 
 
+def _run_dir_claim():
+    """Two runs that start in the same second get distinct directories, and a name that
+    sorts after the bare stamp."""
+    out = Path(tempfile.mkdtemp()) / "results"
+    first = driver.claim_run_dir(out, now=0)
+    second = driver.claim_run_dir(out, now=0)
+    third = driver.claim_run_dir(out, now=0)
+    expect(len({first, second, third}) == 3 and all(p.is_dir() for p in (first, second, third)),
+           f"same-second claims share a directory: {first} {second} {third}")
+    expect(first.name == "19700101T000000Z" and second.name == "19700101T000000Z-2",
+           f"names are the stamp, then stamp-N: {first.name} {second.name}")
+    expect(sorted(p.name for p in (third, second, first)) == [first.name, second.name, third.name],
+           "a suffixed name sorts after its bare stamp")
+    later = driver.claim_run_dir(out, now=1)
+    expect(later.name == "19700101T000001Z", f"a new second starts bare again: {later.name}")
+
+
 def _ndjson():
     stamp = "2026-10-08T12:00:%02d.123456789Z"
     lines = [
@@ -7046,7 +7063,7 @@ def _two_sut_driver(root):
             events = []
             seq = driver.Run(root, two, two.duration, None, False, tempfile.mkdtemp(dir=tmp),
                              [], "logit:soak", roles=TWO_SUT_ROLES)
-            seq.run_dir.mkdir(parents=True)
+            seq.run_dir = driver.claim_run_dir(seq.out_dir)
             seq.refresh_vm_base = lambda backend: None
             seq.docker = _ChainDocker(clock, events, lines)
             seq.ids = {name: f"id-{name}" for name in TWO_SUT_ROLES}
@@ -9227,7 +9244,7 @@ def _overlap_driver(root):
         events = []
         seq = driver.Run(root, loaded, loaded.duration, None, False, tempfile.mkdtemp(dir=tmp),
                          [], "logit:soak", roles=OVERLAP_ROLES)
-        seq.run_dir.mkdir(parents=True)
+        seq.run_dir = driver.claim_run_dir(seq.out_dir)
         seq.docker = _ChainDocker([1000.0], events, lambda now: [])
         seq.ids = {name: f"id-{name}" for name in OVERLAP_ROLES}
         seq.timeline = _Records()
@@ -10699,7 +10716,7 @@ def run(root, quiet=False):
     try:
         for part in (_isolated, _durations, _rules, _expect_rules, _expand, _random,
                      _log_capture, _signals, _deadlines, _stalled, _stall_abort,
-                     _retry_stalled, _hung_inspect, _inspect_redacted,
+                     _retry_stalled, _run_dir_claim, _hung_inspect, _inspect_redacted,
                      _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks,
                      _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
