@@ -1,10 +1,14 @@
 #!/bin/bash
-# Usage: script/soak run <scenario> [--duration 20m] [--seed N] [--keep] [--out DIR]
+# Usage: script/soak run <scenario> [--duration 20m] [--seed N] [--keep] [--retry-stalled N]
+#                         [--out DIR]
 #        script/soak list | check <run-dir> | self-test
 #
 # Runs a soak scenario from tools/soak/scenarios/: real `logit` containers under network and
 # lifecycle faults on a timeline, scored by a watchdog. See tools/soak/README.md for what it runs
-# and what it writes, and docs/plans/soak-harness.md for the design.
+# and what it writes, and docs/plans/soak-harness.md for the design. The driver's exit status
+# passes through: 0 PASS, 1 FAIL, 2 the run never started (a scenario, argument, or setup error,
+# including every check this script makes first), 3 a run the host slept through (rerun it),
+# 130 interrupted. docs/adr/soak-harness.md's stall amendment says why 3 is its own status.
 #
 # Not part of script/cibuild: it drives the host's docker daemon, and no test depends on it.
 #
@@ -25,7 +29,7 @@ NETEM_IMAGE="logit-soak-netem:local"
 
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' || {
     echo "soak: needs Python 3.11 or later on the host (tomllib)" >&2
-    exit 1
+    exit 2
 }
 
 if [ "${1:-}" != "run" ]; then
@@ -34,7 +38,7 @@ fi
 
 scenario="${2:-}"
 if [ -z "${scenario}" ]; then
-    echo "usage: script/soak run <scenario> [--duration 20m] [--seed N] [--keep] [--out DIR]" >&2
+    echo "usage: script/soak run <scenario> [--duration 20m] [--seed N] [--keep] [--retry-stalled N] [--out DIR]" >&2
     exit 2
 fi
 scenario_dir="${TOOLS_DIR}/scenarios/${scenario}"
@@ -43,7 +47,7 @@ scenario_dir="${TOOLS_DIR}/scenarios/${scenario}"
     exit 2
 }
 
-python3 "${TOOLS_DIR}/soak.py" self-test
+python3 "${TOOLS_DIR}/soak.py" self-test || exit 2
 
 # An external target reads its credentials from the operator's env file. `logit validate` gets a
 # private plain copy of the target's variables, since `docker run --env-file` doesn't read an
@@ -62,7 +66,7 @@ if [ "$(python3 "${TOOLS_DIR}/soak.py" target "${scenario}")" = external ]; then
     EXTERNAL_ENV="${SOAK_EXTERNAL_ENV:-${ROOT}/perf/results/soak-external.env}"
     if [ ! -f "${EXTERNAL_ENV}" ]; then
         echo "soak: ${scenario} has an external target and needs ${EXTERNAL_ENV} (set SOAK_EXTERNAL_ENV)" >&2
-        exit 1
+        exit 2
     fi
     EXTERNAL_ENV="$(readlink -f -- "${EXTERNAL_ENV}")"
     # The file holds credentials, so it must be one git would never commit: the check asks the
@@ -72,40 +76,40 @@ if [ "$(python3 "${TOOLS_DIR}/soak.py" target "${scenario}")" = external ]; then
     env_dir="$(dirname -- "${EXTERNAL_ENV}")"
     if ! command -v git >/dev/null 2>&1; then
         echo "soak: git isn't on PATH, and it checks that ${EXTERNAL_ENV} is git-ignored" >&2
-        exit 1
+        exit 2
     fi
     if git_err="$(LC_ALL=C git -C "${env_dir}" rev-parse --is-inside-work-tree 2>&1 >/dev/null)"; then
         if ! git -C "${env_dir}" check-ignore -q "${EXTERNAL_ENV}"; then
             echo "soak: ${EXTERNAL_ENV} is not git-ignored; keep credentials under perf/results/" >&2
-            exit 1
+            exit 2
         fi
     elif [[ "${git_err}" != *"not a git repository"* ]]; then
         echo "soak: can't tell whether ${EXTERNAL_ENV} is git-ignored: ${git_err}" >&2
-        exit 1
+        exit 2
     fi
     # Names each variable the file doesn't set or sets to a value compose would alter, never a
     # value, and prints the copy's path.
-    env_copy="$(python3 "${TOOLS_DIR}/soak.py" target "${scenario}" --env-file "${EXTERNAL_ENV}" --private-copy)"
+    env_copy="$(python3 "${TOOLS_DIR}/soak.py" target "${scenario}" --env-file "${EXTERNAL_ENV}" --private-copy)" || exit 2
     export SOAK_EXTERNAL_ENV="${EXTERNAL_ENV}"
     validate_env=(--env-file "${env_copy}")
 fi
 
 # The driver runs every docker command as `sudo -n` so an expired ticket fails instead of
 # prompting mid-run; this primes the ticket.
-${DOCKER} version >/dev/null
+${DOCKER} version >/dev/null || exit 2
 
 if [ -n "${SOAK_SKIP_IMAGE:-}" ]; then
     for image in "${IMAGE}" "${NETEM_IMAGE}"; do
         ${DOCKER} image inspect "${image}" >/dev/null 2>&1 || {
             echo "soak: SOAK_SKIP_IMAGE is set but ${image} does not exist" >&2
-            exit 1
+            exit 2
         }
     done
 else
     echo "soak: building ${IMAGE} from the current tree"
-    ${DOCKER} build -q -f "${ROOT}/Dockerfile" -t "${IMAGE}" "${ROOT}" >/dev/null
+    ${DOCKER} build -q -f "${ROOT}/Dockerfile" -t "${IMAGE}" "${ROOT}" >/dev/null || exit 2
     echo "soak: building ${NETEM_IMAGE}"
-    ${DOCKER} build -q -t "${NETEM_IMAGE}" "${TOOLS_DIR}/netem" >/dev/null
+    ${DOCKER} build -q -t "${NETEM_IMAGE}" "${TOOLS_DIR}/netem" >/dev/null || exit 2
 fi
 
 # SOAK_INSTANCE is a rolling overlap's instance name, which each instance's compose service sets;
@@ -113,7 +117,7 @@ fi
 for config in "${scenario_dir}"/logit-*.yaml; do
     ${DOCKER} run --rm "${validate_env[@]}" -e SOAK_INSTANCE=logit -v "${config}:/config.yaml:ro,z" "${IMAGE}" validate /config.yaml >/dev/null || {
         echo "soak: ${config} failed 'logit validate'" >&2
-        exit 1
+        exit 2
     }
 done
 
