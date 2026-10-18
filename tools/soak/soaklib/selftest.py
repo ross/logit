@@ -2710,6 +2710,13 @@ def _expect_checks():
             min=1)
         one("min_delta passes a counter that rose in every drain", checks.PASS,
             reduce="min_delta", min=1000, window="after")
+        # 16,000 over the 90 s window is 640,000 an hour.
+        result = one("rate is the window's delta per hour", checks.PASS, reduce="rate",
+                     min=639999, max=640001)
+        expect("16,000 over 90s" in result.detail, f"rate names its delta and span, got {result}")
+        one("rate over its max FAILs", checks.FAIL, reduce="rate", max=639000)
+        one("rate of a loss counter never emitted reads 0", checks.PASS, reduce="rate",
+            metric="logit.input.kernel.dropped", max=0)
         one("after reads the recovery_bound after the revert", checks.PASS, window="after",
             min=9000, max=9000)
         one("attrs filter on reason", checks.PASS, metric="logit.component.datagrams.dropped",
@@ -3017,6 +3024,11 @@ def _slope_reducer():
              "logit.process.interner.strings is a gauge", "a counter reducer on interner.strings")
     _refused(path, with_expect(metric="logit.process.memory.resident.bytes", reduce="delta"),
              "logit.process.memory.resident.bytes is a gauge", "a counter reducer on RSS")
+    _refused(path, with_expect(metric="logit.process.memory.resident.bytes", reduce="rate"),
+             "logit.process.memory.resident.bytes is a gauge", "a rate of a gauge")
+    loaded = scenario.from_dict(with_expect(metric="logit.output.reconnects", reduce="rate"),
+                                path)
+    expect(loaded.expectations[0].reduce == "rate", "a rate of a counter loads")
 
 
 def _kill_watchdog():

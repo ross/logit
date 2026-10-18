@@ -4996,9 +4996,9 @@ def expect_window(data, fault, window):
 
 def reduce_counter(tel, metric, attrs, start, end, reduce):
     """`(value, note)` for a `sum` metric over the drains timestamped in (start, end]: `delta`
-    sums them, and `min_delta` is the smallest single drain's delta, a drain with no point
-    counting 0, since a loss counter isn't emitted when it's zero. `value` is None when no
-    drain falls in the window."""
+    sums them, `rate` is that sum per hour of the window's length, and `min_delta` is the
+    smallest single drain's delta, a drain with no point counting 0, since a loss counter isn't
+    emitted when it's zero. `value` is None when no drain falls in the window."""
     per_drain = {ts: value for ts, value, _ in tel.counter_points(metric, **attrs)}
     drains = [d for d in sorted(set(tel.drains) | set(per_drain)) if start < d <= end]
     if not drains:
@@ -5006,6 +5006,12 @@ def reduce_counter(tel, metric, attrs, start, end, reduce):
     values = [per_drain.get(d, 0) for d in drains]
     if reduce == "delta":
         return sum(values), f"over {len(drains)} drain(s)"
+    if reduce == "rate":
+        if end <= start:
+            return None, "the window has no length"
+        hours = (end - start) / SECONDS_PER_HOUR
+        return (sum(values) / hours,
+                f"{_n(sum(values))} over {end - start:.0f}s, {len(drains)} drain(s), per hour")
     return min(values), f"smallest of {len(drains)} drain(s)"
 
 
