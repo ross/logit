@@ -336,22 +336,32 @@ lost lines that no telemetry showed. That breaks the loss vocabulary's rule that
   counts the same as a removed one: no scan can find either. The name isn't
   `logit.component.bytes.dropped`, which the UDP receive queue owns beside its datagram counts
   (and which the soak harness balances against them).
-- **What the count means.** It's the bytes the last checkpoint recorded as unread, which is the
-  whole loss only in the first case:
+- **Counted after the write.** The prune holds the entry in a pending list, and
+  `Tailer::write_checkpoint` counts it only once `CheckpointStore::write` reports that a document
+  without it is on disk; a failed write keeps it pending for the retry. Counted at the prune, a
+  process ending before the next write (a kill, an exit 2, a later listener's failed bind) would
+  leave the entry on disk, and every such life would count the same bytes again. A forced write
+  after the prune isn't safe instead: outside `bind`, a scan runs with accumulators holding
+  absorbed but unemitted events, which both existing writers flush first.
+- **What the count means.** It's `len` less the entry's `offset`, which is the resume position,
+  not the read position. It's the whole loss only in the first case:
 
   | Case | The count |
   |---|---|
-  | A file the writer had stopped writing (rotated away) by a clean stop's checkpoint | exact |
-  | The file still being written at a clean stop | a lower bound: what it gained after the last observation isn't counted |
+  | No line held or being dropped at a clean stop, and a scan or a read to the end saw the file's final size | exact |
+  | A line held or being dropped at the stop | high: it includes bytes read after that line's start, an oversize line's prefix already counted in `logit.input.frames.dropped{reason="oversize"}`, or under `docker_in` the other stream's entries delivered after a held partial |
+  | Appends no `stat`, `fstat`, or read to the end observed, such as a backlogged file renamed away between full reads | low: they aren't counted |
   | Any file after a kill | approximate either way: the last interval checkpoint's offset can trail what the process delivered, and its `len` trail what the file held |
   | A file created and removed while `tail_in` was down | nothing: no entry names it |
   | An inode a new file reused while `tail_in` was down | nothing: the head check rejects the resume (`logit.input.files.resume_rejected`), and the original's unread tail is lost uncounted |
   | A stored path no current pattern covers | nothing: a config change |
 
-  `docs/known-gaps/tailing.md` keeps the uncounted remainder.
+  A separate "unread from" position would remove the over-count, but `TailDecoder` doesn't report
+  one: `DockerDecoder` holds decoded text, not raw line lengths. `docs/known-gaps/tailing.md`
+  keeps the uncounted remainder.
 - **Alternatives considered.** A `stat` of every tracked file at each checkpoint write would make
   `len` current at the write, at a syscall per file per tick, and the file still grows after the
-  last write, so the count would still be a lower bound. A format 2 reader that read a missing
+  last write, so the count would still miss what came after it. A format 2 reader that read a missing
   `len` as the offset would count nothing for those entries, which is today's behavior, at the
   cost of a second decode path pre-release.
 
@@ -397,8 +407,9 @@ directory and an unreadable `root`, each recovering with no identity change.
 
 ### `tailbk/w4`: head fingerprint and eviction (TAIL-02)
 
-Decisions 2 to 4 as written. `checkpoint.rs`'s module doc is the canonical statement of format 2,
-the capture rule, the accept rule, and the residual. Three details the decisions leave open:
+Decisions 2 to 4 as written. `checkpoint.rs`'s module doc is the canonical statement of the
+checkpoint format, the capture rule, the accept rule, and the residual. Three details the decisions
+leave open:
 
 - **A resume reads `min(256, max(offset, head_len))` bytes from `0`** before the seek, so the
   tracked file's head satisfies its invariant (`head.len() >= min(256, offset)`) without a second

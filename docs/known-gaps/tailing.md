@@ -57,9 +57,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
   restart's scan never finds the file. It drops the entry
   (`crates/logit-inputs/src/tail/driver.rs`, `Tailer::prune_checkpoint_entries`) and counts the
   bytes the entry recorded as unread as `logit.input.bytes.dropped{reason="gone"}`, with a
-  `file_gone` diagnostic. The count isn't the whole loss:
-  - What the file gained after that checkpoint isn't counted. For the file still being written
-    at a clean stop, the count is a lower bound.
+  `file_gone` diagnostic, once a checkpoint write without the entry lands. The count is exact
+  only when no line was held or being dropped at the stop and a scan or a read to the end saw the
+  file's final size. Otherwise it isn't the loss:
+  - What the file gained after `tail_in` last saw its size isn't counted, so for a file still
+    being written the count is short.
+  - The count runs from the resume offset, not the read position, so it includes bytes read after
+    a held or dropping line's start: an oversize line's consumed prefix, already counted in
+    `logit.input.frames.dropped{reason="oversize"}`, and under `docker_in`, the other stream's
+    entries delivered after a held partial.
   - After a kill, the count comes from the last interval checkpoint, not the process's last
     read. It can include bytes the killed process had already delivered, and miss bytes written
     after that checkpoint.
