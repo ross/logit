@@ -96,7 +96,12 @@ framer's counted drop as wire loss kept out of `drops`, the same lines uncounted
 generator netem judged on TCP but not on UDP, a SUT netem judged, a judged window's surplus
 against its ambiguous drops, a partition judged or reported by its address, `recovery` and a
 killed life's band reading the frames, and a source naming `wire = "udp"` scoring as one
-naming none.
+naming none. On an HTTP wire it covers the generator sink's kind checked at load either way,
+the fault predicates and judgments, and runs into `influxdb_in` and `otlp_in`: G from the
+writer's acknowledged events, a stop judged and a kill reported, a judged window's surplus
+against its transport-error attempts and not its `5xx` answers, a `closed_consumer` refusal
+taken off W, `influxdb_in`'s request and deferral identities in `ledger.intake` each broken,
+the end-to-end bound in `ledger.summary`, and a listener kind the checks can't read.
 
 For two SUT services, it covers a further SUT declared by its own `[configs]` key and the
 `[[ledger.hop]]` joining it to `logit` (the chain they make, their config variable, and each
