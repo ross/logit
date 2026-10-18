@@ -556,7 +556,10 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   `line_protocol` node of the source's `sut_transforms` to the events it emits per event, an
   integer of at least 2, such as `fan_out = { points = 4 }`. `load()` checks the node's kind
   against the SUT config, and refuses `fan_out` under `[overlap]`, whose end-to-end bound
-  counts the generators' lines.
+  counts the generators' lines. The term needs every message to yield k distinct
+  points and carry no other payload; a message whose points merge, that has none, or whose
+  parent carries metrics or a span and goes on beside its children reads as a `ledger.edge`
+  FAIL, since no counter counts such a message.
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
   stack has a source, because a generator with none would put lines into a listener with no
   G behind them.
@@ -1011,13 +1014,17 @@ push counts its datagrams as shutdown drops without logging a line.
   close-time flush delivers that residual into V, and the final drain runs after that flush, so
   `ledger.egress` judges the life's W − D − B − X − V, less those discards, as it judges the
   final life's Ab − V. The discards are subtracted in every life, whatever ended it: a killed
-  life's residual, and so its kill band's lower edge, leaves them out as well.
+  life's residual, and so its kill band's lower edge, leaves them out as well. With a source's
+  `fan_out` (W13b) the residual is W′ − Ab instead, and the egress gap W′ − V, W′ having
+  carried the chain's discards and fan-out already (the symbol table).
   The [0, R] bound only catches a residual no shutdown could leave. With several listeners (W8b)
   the residual is summed over them, and R is the sum of each listener's own receive queue and 2
   batches of its own `batch_max_events` (its accumulator and its held batch), 65 more for each
   node of its source's `sut_transforms`, plus `aggregate`'s 65 and a script's 65 once, in
   batches of the largest `batch_max_events`. With one listener and no transforms that is the
-  queue plus 67 batches, as above.
+  queue plus 67 batches, as above. With a `fan_out` (W13b) R counts W′'s events: each
+  listener's share is multiplied by its chain's product of k, and `aggregate`'s and a script's
+  by the largest, since a batch past a fan-out node holds k times the events.
 - An earlier SUT life ended by a scheduled `kill` has no final drain, no close-time window, and
   no stderr shutdown lines. Its hops are compared at its last drain, which is an ordinary one,
   and reported; its residual must still lie in [0, R]. The kill loses that residual from the
@@ -1028,7 +1035,8 @@ push counts its datagrams as shutdown drops without logging a line.
   `aggregate`'s unflushed window, whose events Ab counts up to the last drain and V never
   holds, and queue growth after the last drain can add up to one more drain interval. The band
   is therefore at least −(residual + rate × drain interval) and at most rate × aggregate
-  interval + rate × drain interval, where the rate is the life's W over its last drain interval,
+  interval + rate × drain interval, where the rate is the life's W over its last drain interval
+  (with a `fan_out`, W13b, each listener's W times its chain's product of k),
   the drain interval is the median of its drain gaps, and the aggregate interval is the SUT
   config's (the export's sample spacing only when the config names none). The detail states the
   band, both of its sides, and the rate. A gap below the band is a **surplus**, above it
@@ -1064,9 +1072,15 @@ The rows:
   linearly at each SUT drain timestamp, anchored at every generator drain, one with no G point
   at the running total (W13b), since a counter exports no point for a drain it didn't move
   in; across a run of steady intervals the interpolation telescopes, and each edge of the run
-  errs by at most one batch. Judged windows that overlap or touch form one run whatever their
-  labels (W13b), since a boundary between two is no edge of a judged stretch and would carry the
-  interpolation's error with no edge to allow it. Each steady run's gap counts
+  errs by at most one batch while acknowledgments arrive steadily. The anchoring applies on
+  every wire and in `ledger.overlap`. On TCP and HTTP a boundary between two judged windows has
+  its own rule (W13b): G's error there is bounded by the G that moved in the generator interval
+  straddling it, which is many batches when acknowledgments bunch, under one request in flight
+  or a restart's backlog flush, and it shows as an opposite-signed pair in the two runs that
+  touch. A surplus past its run's own allowance (below) nets with the loss across that boundary,
+  up to that G, shown in the detail line; a surplus inside its allowance is excused already and
+  nets nothing, and runs that don't touch never net. A judged run's surplus allowance counts
+  every edge it has, a boundary with another judged run included. Each steady run's gap counts
   at 0 when W + K exceeds G in it, so a surplus in one run can't net out loss in another. The
   generator sink's own
   `drop_newest` loss while the SUT is unreachable is counted and never in G; the row shows it
@@ -1180,9 +1194,10 @@ The rows:
   `sut_script` (W7a), Ab becomes Ab − L_flush, because each `flush()` event carries one metric
   whose series `vm_selector` excludes, and a stopped earlier life's gap becomes
   W − D − B − X − (L_drop + L_err) − V; with `sut_transforms` (W13a) it becomes
-  W − D − B − X − ΣT_disc − V. The subtraction holds only while each flush event carries
-  one metric, which the scenario's script guarantees. `internal` drains last, so the final drain
-  exports the script's drops and errors on a stopped life's residual too, and L_drop and L_err
+  W − D − B − X − ΣT_disc − V, and with a `fan_out` (W13b) W′ − V. The subtraction holds only
+  while each flush event carries one metric, which the scenario's script guarantees. `internal`
+  drains last, so the final drain exports the script's drops and errors on a stopped life's
+  residual too, and L_drop and L_err
   include them. A gap of 0 passes. A positive gap is lost increments. It is reported with the
   life's telemetry `batches.dropped` that can explain it beside it, under every reason, and is
   **counted** only when that count is above 0. The reason set is open: `shutdown`, a queue's or
@@ -1276,7 +1291,9 @@ The rows:
   With `sut_script` (W7a), E − A becomes (E − L_in) + (L_in − L_emit − L_drop − L_err) +
   (L_emit + L_flush − L_sent) + (L_sent − A), the egress term is Ab − L_flush − V, and the
   script's L_drop and L_err are shown beside them as counted. With `sut_transforms` (W13a),
-  E − A becomes E − ΣT_disc − A, and ΣT_disc is shown beside it as counted. From W7b there is
+  E − A becomes E − ΣT_disc − A, and ΣT_disc is shown beside it as counted. With a `fan_out`
+  (W13b), which doesn't telescope, E − A becomes `ledger.edge`'s chain terms summed plus
+  Σ(sent into aggregate) − A, and ΣT_disc isn't shown, since W′ carries it. From W7b there is
   one egress term per egress group, each of which must be 0 or counted on its own, so a surplus
   at one sink can't net out loss at another. When an egress term is counted, it is shown as
   counted and the row judges the rest. A `rejected` or `disk_corrupt` drop in the final life's
@@ -1284,7 +1301,9 @@ The rows:
   explains it (W9a).
   With an HTTP source (W14) the row also runs the end-to-end bound: V over the run may not
   exceed G less every counted loss, with the HTTP listener's X left out, since its client
-  resends it, plus one generator batch per transport-error attempt.
+  resends it, plus one generator batch per transport-error attempt. With a `fan_out` (W13b)
+  each source's share of that limit is carried through its chain (`Ledger.through`), since V
+  counts k increments per event past the fan-out.
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at each sink's own
   telemetry; see "External targets". A Kafka target's sink is judged the same way, and so is a
   `datadog` stand-in's (W9b), with what a `respond` step cued excused; a `remote_write` or
@@ -2434,8 +2453,8 @@ that items 3, 7, and 11 need.
   as counted loss in the residual, the egress gap, `ledger.summary`, and the end-to-end bound,
   with self-test fixtures and the `tail-rotate-stale` scenario.
 - **W13b**: item 13's fan-out: a source's `fan_out`, its term in `ledger.edge`, W′ in every row
-  after it, `ledger.wire`'s G anchored at every generator drain and its adjacent judged windows
-  joined into one run, self-test fixtures for each rule, and the `otlp-fan-out` scenario. Its
+  after it, `ledger.wire`'s G anchored at every generator drain and its boundary rule between
+  two judged windows, self-test fixtures for each rule, and the `otlp-fan-out` scenario. Its
   generator sends over OTLP/HTTP, so it lands after W14's `http` wire and its `otlp_in` rows.
 - **W14**: item 14, the `http` wire, with rows for `influxdb_in`, which its scenario runs, and
   for `otlp_in`, which W13b's generator needs; the generator sink's kind checked at load, the
@@ -4684,7 +4703,9 @@ to judge `influxdb_in`'s identities in every life, which changed only that row:
 the `logit:soak` image `sha256:68c3d292…` built 2026-10-17 19:29 PDT from `soak/w14`; no product
 code changed since `origin/main`'s `9bfc434f`, and `line_protocol`, `otlp_in`, and `otlp_out` are
 all on `main`. The third run, `perf/results/soak/20261018T043911Z`, from `soak/w13b` at
-`fd3cab7c`, exit 0, every row PASS or SKIP:
+`fd3cab7c`, exit 0, every row PASS or SKIP. The table is that run re-scored offline with
+`script/soak check` after `ledger.wire`'s boundary rule replaced a merge of adjacent judged
+windows; only `ledger.wire`'s detail changed, from a loss judged of 82 to 91:
 
 | Check | Status | Detail |
 |---|---|---|
@@ -4697,7 +4718,7 @@ all on `main`. The third run, `perf/results/soak/20261018T043911Z`, from `soak/w
 | `progress` | PASS | 7 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 7 of 7, 7 freshness sample(s); 180s of 900s after warmup judged (20%; WARN under 5%) |
 | `rss_slope` | PASS | generator PASS: MiB/h life 0 +1.6 (limit 64); 200s of 900s after warmup judged (22%; WARN under 5%) \| logit PASS: MiB/h life 1 +3.4 (limit 64); 190s of 900s after warmup judged (21%; WARN under 5%) |
 | `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +8) \| logit PASS: warmup median 13 -> end 14 (limit +8) |
-| `ledger.wire` | PASS | G 381,500 (acknowledged of 483,150 attempted) = W 381,650 − X 0 + gap -150 (0 in reported windows, -5 in judged HTTP-affecting windows, -114 steady, -31 at the end; loss judged 82, each run at 0 or more, against limit 650); the generator's requests: 22 transport-error attempt(s), 0 answered 5xx and retried; its counted loss, not in G: 101,650 event(s) in 2,033 batch(es) (overflow_newest 2,033) |
+| `ledger.wire` | PASS | G 381,500 (acknowledged of 483,150 attempted) = W 381,650 − X 0 + gap -150 (0 in reported windows, -5 in judged HTTP-affecting windows, -114 steady, -31 at the end; loss judged 91, each run at 0 or more, against limit 650); the generator's requests: 22 transport-error attempt(s), 0 answered 5xx and retried; its counted loss, not in G: 101,650 event(s) in 2,033 batch(es) (overflow_newest 2,033) |
 | `ledger.intake` | PASS | final life 1: W − D 128,700 vs E + B 128,700; final life 1: otlp_in counts no requests: W − D == E + B alone; life 0: W′ − Ab 0 within [0, R] (R 788,000 = (0 + 132 x 1,000) x 4 + 65 x 1,000 x 4; W′ is each listener's W − D − B − X carried through its chain's fan_out and discards) |
 | `ledger.edge` | PASS | final life 1: E[otlp] 128,700 == T_in[points] 128,700 (into points); children[points] = T_out 514,800 − (T_in 128,700 − T_disc 128,700) = 514,800 == 4 x T_in − T_lines[points] 514,800 (points emits 4 per event); T_out[points] 514,800 == T_in[count] 514,800 (into count); T_in[count] 514,800 − T_disc[count] 0 = 514,800 == T_out[count] 514,800 (count sends what it doesn't discard); Σ(sent into aggregate) 514,800 == A 514,800 (listeners to aggregate); A_sent 19,840 == S_in[victoria_metrics] 19,840 (aggregate to victoria_metrics) |
 | `ledger.script` | SKIP | no [ledger] sut_script |
@@ -4733,8 +4754,13 @@ all on `main`. The third run, `perf/results/soak/20261018T043911Z`, from `soak/w
   every generator drain. `perf/results/soak/20261018T041409Z`, at `c242f67e`, FAILed a
   140-point surplus in a 20 s run between two overlapping netem windows: the 30% loss on the
   SUT's egress delays answers in bursts, and a run boundary between two judged windows had no
-  edge to allow the interpolation's error there. Adjacent judged windows are now one run. Both
-  runs re-score PASS on every row with `script/soak check`, which rewrote their `results.md`.
+  edge to allow the interpolation's error there. A boundary between two judged runs now nets
+  an opposite-signed pair, up to the G that moved over the generator interval straddling it,
+  when the surplus is past its run's own allowance, and every edge of a judged run allows a
+  batch of surplus. In the third run the SUT's restart at +660 shows the pair at its largest:
+  −1,890 before the +665 boundary and +1,830 after it, 1,830 netted against 4,950 of G in the
+  straddling interval. All three runs, and `http-ingress`'s `20261018T025154Z`, re-score PASS
+  on every row with `script/soak check`.
 - **The generator lost a fifth of its records, counted.** `otlp_out` sends one request at a
   time, so its rate is a batch per round trip: under the SUT's 200 ms egress delay it
   dropped about half its batches (`overflow_newest`), fewer under the 30% egress loss, and
@@ -4744,8 +4770,8 @@ all on `main`. The third run, `perf/results/soak/20261018T043911Z`, from `soak/w
   two-batch queue filled, the inboxes behind it held batches of four times the events, and
   `otlp_in` held each request past `otlp_out`'s 10 s timeout: 3 transport errors and 337
   batches' overflow on the generator through the stop, no sink drop, and `rss_slope` flat at +3.4 MiB/h.
-- The pause, the stop, and the partition gave 19 transport-error attempts between them; the
-  merged judged run's surplus stayed inside their allowance.
+- The pause, the stop, and the partition gave 19 transport-error attempts between them, and
+  each judged run's surplus stayed inside its allowance once the boundaries netted.
 - No product finding.
 
 ## Verification
