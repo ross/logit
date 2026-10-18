@@ -3412,7 +3412,7 @@ def _slope_edges():
 
 
 def _rss_settle_rules(root):
-    """`rss_settle` defaults to 120 s, loads a duration, reaches the resolved scenario, and is
+    """`rss_settle` defaults to 60 s, loads a duration, reaches the resolved scenario, and is
     refused negative or unparsable."""
     path, base = _base(root)
 
@@ -3422,9 +3422,9 @@ def _rss_settle_rules(root):
         return raw
 
     loaded = scenario.from_dict(copy.deepcopy(base), path)
-    expect(loaded.rss_settle == scenario.DEFAULT_RSS_SETTLE_S == 120.0
-           and loaded.to_json()["rss_settle"] == 120.0,
-           f"rss_settle defaults to 120s in the resolved scenario, got {loaded.rss_settle}")
+    expect(loaded.rss_settle == scenario.DEFAULT_RSS_SETTLE_S == 60.0
+           and loaded.to_json()["rss_settle"] == 60.0,
+           f"rss_settle defaults to 60s in the resolved scenario, got {loaded.rss_settle}")
     for value, seconds in (("90s", 90.0), ("0s", 0.0), ("2m30s", 150.0)):
         loaded = scenario.from_dict(with_settle(value), path)
         expect(loaded.rss_settle == seconds and loaded.to_json()["rss_settle"] == seconds,
@@ -3470,17 +3470,17 @@ def _rss_settle_checks():
         return 50 * mib
     with tempfile.TemporaryDirectory() as tmp:
         # fanin's generator around its partition (20261018T190542Z): 18 MiB, 86 MiB at the
-        # revert, a 62.6 MiB plateau from +14 s, 52.6 MiB from +84 s, 32 MiB from +104 s, and
-        # back at 18 MiB from +135 s, inside recovery_bound 45 s + rss_settle 120 s.
+        # revert, a 62.6 MiB plateau from +14 s, 52.6 MiB from +84 s, 32 MiB from +94 s, and
+        # back at 18 MiB from +100 s, inside recovery_bound 45 s + rss_settle 60 s.
         def stepped(o):
             after = o - 375
             if 330 <= o < 389:
                 return 86 * mib
             if 0 <= after < 84:
                 return 62.6 * mib
-            if 84 <= after < 104:
+            if 84 <= after < 94:
                 return 52.6 * mib
-            if 104 <= after < 135:
+            if 94 <= after < 100:
                 return 32 * mib
             return 18 * mib
         partition = [("c0s1", "partition", "generator", 330, 375)]
@@ -3514,16 +3514,16 @@ def _rss_settle_checks():
                            thresholds=thresholds)
         data = checks.RunData(leak)
         result = checks.check_rss_slope(data)
-        expect(data.rss_settle == 120.0 and result.status == checks.FAIL
+        expect(data.rss_settle == 60.0 and result.status == checks.FAIL
                and "logit FAIL: MiB/h life 0 +73.0" in result.detail
                and "generator FAIL: MiB/h life 0 +61.0" in result.detail,
                f"growth across the whole run FAILs with rss_settle in force, got {result}")
 
-        # Faults every 210 s for 30 s: rss_settle leaves 15 s after each, two samples, so a
-        # life fits over 20 s judged of the 940 s after warmup.
+        # Faults every 150 s for 30 s: rss_settle leaves 15 s after each, two samples, so a
+        # life fits over 30 s judged of the 900 s after warmup.
         dense = [(f"c{i}s1", "netem", "generator", start, start + 30)
-                 for i, start in enumerate(range(60, 901, 210))]
-        covered = _settle_run(tmp, "settle-dense", dense, 1000, flat, flat)
+                 for i, start in enumerate(range(60, 811, 150))]
+        covered = _settle_run(tmp, "settle-dense", dense, 960, flat, flat)
         result = _status(covered, checks.check_rss_slope)
         expect(result.status == checks.WARN and "cover little" in " ".join(result.lines)
                and "every sample after warmup in a fault window" not in result.detail,

@@ -512,7 +512,7 @@ on memory the allocator was returning. Widening `recovery_bound` would have wide
 excusal, and the ledger and `recovery` need it tight.
 
 - **`rss_slope` alone widens each fault window by `rss_settle`**, an optional top-level
-  scenario duration, 120 s by default. It applies after every fault, as `recovery_bound` does
+  scenario duration, 60 s by default. It applies after every fault, as `recovery_bound` does
   for this row, and a run directory recorded before the key existed takes the default.
 - **`fd_slope` keeps `recovery_bound`.** It compares single samples with the warmup median, and
   a closed connection releases its fd with no allocator in between.
@@ -520,7 +520,11 @@ excusal, and the ledger and `recovery` need it tight.
   windows WARNs on coverage instead of SKIPping, and the row SKIPs for want of a fit only when
   the run after warmup is shorter than one fit's 60 s.
 
-The cost is coverage on fault-dense schedules. Most shipped scenarios leave under 120 s between
-one fault's recovery and the next fault, so with the default, `rss_slope` judges little or none
-of them and WARNs on coverage. Growth across a whole run still FAILs: a fixture of
-`cardinality`'s +73 and +61 MiB/h leak FAILs with the settle window in force.
+The cost is coverage on fault-dense schedules. A 120 s default covered every gap between
+faults in most shipped scenarios and left `rss_slope` nothing to judge, so the default is 60 s.
+Across the shipped scenarios at their own durations, the share of the run after warmup that
+`rss_slope` can judge falls from 11 to 85% with `recovery_bound` alone to 2 to 82% with the
+default. Most keep 10% or more. `native-hop`, `native-hop-spans`, `standin-datadog`, and the four
+remote-write and InfluxDB stand-in scenarios fall under 5% and WARN on coverage. Growth across a
+whole run still FAILs: a fixture of `cardinality`'s +73 and +61 MiB/h leak FAILs with the settle
+window in force.

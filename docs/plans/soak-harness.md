@@ -197,7 +197,7 @@ on = "logit"
 for = "45s"
 ```
 
-An optional top-level `rss_settle` (default `120s`) is how long past `recovery_bound` the
+An optional top-level `rss_settle` (default `60s`) is how long past `recovery_bound` the
 `rss_slope` row alone keeps excusing each fault (§6). Every other row's recovery is
 `recovery_bound`.
 
@@ -924,7 +924,7 @@ returned nonzero has none, so nothing after it is excused.
   `logit.process.fds` at the end minus the warmup median is at most `fd_growth`, and returns to
   baseline at the first steady-state sample after each recovery. `docker stats` RSS is the
   fallback series. Judged slopes covering under 5% of the run after warmup WARN.
-  `rss_slope` widens each fault window by the scenario's `rss_settle` (default 120 s), because
+  `rss_slope` widens each fault window by the scenario's `rss_settle` (default 60 s), because
   a process returns a backlog's memory in steps over minutes: `fanin`'s generator held 62.6,
   then 52.6, then about 32 MiB for over 100 s after a 45 s partition, and a fit over those
   plateaus beside its 18 MiB baseline read +240 MiB/h. `fd_slope` keeps `recovery_bound`: it
@@ -5278,26 +5278,33 @@ from +330.6 s to +375.5 s:
 The allocator returns the backlog's memory in steps; nothing leaks. `recovery_bound` ends the
 excusal 45 s after the revert, so the plateaus sat in the fit beside the baseline. A
 `tcp-ingress` run, `20261018T184246Z`, WARNed `logit` life 0 at +74.0 MiB/h over 12 samples in
-400 s, which reads as the same effect. `rss_settle` (§2, §6) excuses 120 s more after each
+400 s, which reads as the same effect. `rss_settle` (§2, §6) excuses 60 s more after each
 fault, for `rss_slope` only.
 
-Re-scored with `soak.py check`, in MiB/h per life:
+Re-scored with `soak.py check`, in MiB/h per life, with the share of the run after warmup
+judged:
 
 | Run | Service | Before | After |
 |---|---|---|---|
-| `fanin` `20261018T190542Z` | `generator` | life 0 +240.4, life 1 -4.4 (WARN) | no life fits: life 1 has 11 samples over 50 s (WARN, 0% judged) |
-| | `generator-lines` | life 0 +4.0, life 1 -4.3 | no life fits: life 1 has 11 samples over 50 s (WARN, 0% judged) |
-| | `logit` | life 0 +0.2 | no life fits: life 0 has 12 samples over 55 s (WARN, 0% judged) |
-| `tcp-ingress` `20261018T184246Z` | `generator` | life 0 +30.5 | no life fits: life 0 has 12 samples over 55 s (WARN, 0% judged) |
-| | `logit` | life 0 +74.0 (WARN), life 2 -5.3 | no life fits: life 2 has 12 samples over 55 s (WARN, 0% judged) |
+| `fanin` `20261018T190542Z` | `generator` | life 0 +240.4, life 1 -4.4, 31% (WARN) | life 1 -9.6, 12% (PASS) |
+| | `generator-lines` | life 0 +4.0, life 1 -4.3, 32% | life 1 -15.2, 12% (PASS) |
+| | `logit` | life 0 +0.2, 32% | life 0 +3.5, 12% (PASS) |
+| `tcp-ingress` `20261018T184246Z` | `generator` | life 0 +30.5, 21% | life 0 +14.0, 10% (PASS) |
+| | `logit` | life 0 +74.0, life 2 -5.3, 20% (WARN) | life 2 -17.2, 10% (PASS) |
 
-Both rows still WARN, now on coverage rather than on a slope. Neither schedule leaves more than
-75 s between one fault's end and the next fault's start, so `recovery_bound` plus `rss_settle`
-covers every gap, and only the stretch before the end sequence remains, under the 60 s a fit
-needs. Every other row of both runs re-scores unchanged. Across the shipped scenarios at their
-own durations, the share of the run after warmup outside the widened windows falls to about 0 to 16%
-for most, against 11 to 56% with `recovery_bound` alone; `cardinality`, `sighup`, `tls-reload`,
-`tail-rotate-delete`, and the `lua-memory` and `lua-stall` pairs keep 25% or more.
+Both rows PASS, and every other row of both runs re-scores unchanged. A life missing from the
+After column has no sample outside the widened windows: neither schedule leaves more than 75 s
+between one fault's end and the next fault's start, under `recovery_bound` plus `rss_settle`.
+In `fanin` the generator's RSS stays near 32 MiB until its next life, so a leftover step can
+stay in a life's fit; in this run the 60 s settle covers every gap in life 0, so that step
+reaches no fit, and a schedule with longer gaps could still fit it.
+
+A first default of 120 s left both runs with no fittable life, 0% judged, and a coverage WARN.
+At 60 s, across the shipped scenarios at their own durations, the share of the run after warmup
+outside the widened windows is 2 to 82%, against 11 to 85% with `recovery_bound` alone; most
+keep 10% or more. `native-hop`, `native-hop-spans`, `standin-datadog`, and the four
+remote-write and InfluxDB stand-in scenarios fall under 5% and will WARN on coverage. The
+estimate predicted the re-scored runs' 12% and 10%.
 
 What the work showed about the harness:
 
@@ -5305,6 +5312,6 @@ What the work showed about the harness:
   the row SKIPped with no life fitted. A service with samples after warmup now WARNs on
   coverage, and the row SKIPs for want of a fit only when the run after warmup is under 60 s.
 - The self-test fixtures failed with each change reverted (three reverts): with the settle window
-  off, the stepped-recovery fixture WARNed at +103.8 MiB/h; with a window swallowing the whole
-  run, the `cardinality`-shaped leak fixture WARNed instead of FAILing; and with the old SKIP
-  rule, the all-excused fixture and the existing thin-coverage fixture SKIPped.
+  off, the stepped-recovery fixture WARNed at +71.0 MiB/h against 64; with a window swallowing
+  the whole run, the `cardinality`-shaped leak fixture WARNed instead of FAILing; and with the
+  old SKIP rule, the all-excused fixture SKIPped.
