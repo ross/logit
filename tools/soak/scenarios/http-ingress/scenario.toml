@@ -1,0 +1,137 @@
+# Generated InfluxDB points into `logit`'s `influxdb_in` over HTTP and out to VictoriaMetrics,
+# under network and lifecycle faults on both ends and a backend stop that backs up into `503`s.
+# G counts only the points the SUT answered `204` for, after they were in its pipeline, so every
+# window but a kill's is judged; a request the SUT took whose answer was lost is resent, a
+# surplus allowed one batch per transport-error attempt. A `503` takes nothing and is a retry,
+# not loss. The schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "http-ingress"
+description = "generator influxdb_out -> influxdb_in (HTTP) -> kv_metrics -> aggregate 500ms cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics"
+duration = "18m"          # warmup + one cycle + cooldown; --duration overrides
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # the generator's retry_max_delay 1s, the sink's 10s, and a drain
+cycle = "15m"             # >= last recovery (13m45s) + 2 x progress_window
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no rates here
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "influx"
+sut_listener = "influx"
+sut_transforms = ["count"]
+wire = "http"             # G events.delivered, W the listener's events.sent
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__="soak_requests_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# The SUT's egress carries its answers. Delayed 11 s, past influxdb_out's 10 s timeout, the
+# answer to a request the SUT took arrives after the generator gave up on it, and the generator
+# resends a batch the SUT holds: a surplus judged against its transport errors. A keep-alive
+# connection is needed for that; a new one's handshake times out first and sends nothing.
+[[step]]
+at = "0s"
+action = "netem"
+on = "logit"
+args = "delay 11s"
+for = "60s"
+
+[[step]]
+at = "2m30s"
+action = "netem"
+on = "logit"
+args = "loss 30%"
+for = "90s"
+
+# Netem on the generator delays its requests: judged as well.
+[[step]]
+at = "5m"
+action = "netem"
+on = "generator"
+args = "loss 10%"
+for = "60s"
+
+# The sink's two-batch queue, its inbox, `aggregate`'s, and `count`'s fill in about 40 s, and
+# then the listener answers `503` after 5 s busy, deferring the batch to the client.
+[[step]]
+at = "7m"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+# The SUT's graceful ends: each answers what it took before it exits, so they're judged.
+[[step]]
+at = "10m"
+action = "stop"
+on = "logit"
+for = "30s"
+
+[[step]]
+at = "11m30s"
+action = "restart"
+on = "logit"
+for = "30s"
+
+# A SIGKILL loses up to one `internal` interval of the SUT's counts: reported.
+[[step]]
+at = "12m30s"
+action = "kill"
+on = "logit"
+for = "30s"
+
+[[expect]]
+name = "listener-defers"
+service = "logit"
+metric = "logit.input.batches.deferred"
+component = "influx"
+step = "c0s4"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "generator-retries-503s"
+service = "generator"
+metric = "logit.output.requests"
+component = "influx"
+attrs = { class = "5xx" }
+step = "c0s4"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "generator-resends"
+service = "generator"
+metric = "logit.output.requests"
+component = "influx"
+attrs = { class = "network_error" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+min = 1
+
+# Backpressure never reaches the sink as a drop: `block` holds every batch.
+[[expect]]
+name = "sink-never-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "victoria_metrics"
+step = "c0s4"
+window = "through"
+reduce = "delta"
+max = 0
