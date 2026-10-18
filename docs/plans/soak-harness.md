@@ -4760,10 +4760,16 @@ of 650:
   the part of a surplus past its run's own allowance with the loss across it, up to the G that
   moved over the generator interval straddling it, and every edge of a judged run allows a
   batch of surplus. In the third run the SUT's restart at +660 shows the pair at its largest:
-  −1,890 before the +665 boundary and +1,830 after it, of which 1,339 netted, the surplus past
-  its run's allowance of 500, against 4,950 of G in the straddling interval; the 492 of loss
-  left counts in the pool. All three runs, and `http-ingress`'s `20261018T025154Z`, re-score PASS
-  on every row with `script/soak check`.
+  −1,890 before the +665 boundary and +1,830 after it. Of the 1,390 past that run's allowance of
+  500, 51 netted at +629 and the remaining 1,339 at +665, against 4,950 of G in the straddling
+  interval; the 492 of loss left counts in the pool. All three runs, and `http-ingress`'s
+  `20261018T025154Z`, re-score PASS on every row with `script/soak check`.
+- **The boundary rule leaves phantom loss in the pool, so a correct rerun can FAIL
+  `ledger.wire`.** A pure interpolation pair, surplus S beside loss L in a run with allowance
+  A, nets only S − A, so about A − (S − L) of loss stays in the pool: 492 in this run, at 582 of
+  650. Each extra transport-error attempt in the surplus run adds a batch to A without raising
+  the limit, so a rerun can FAIL by a batch or two with nothing lost; read such a FAIL against
+  its boundary detail line before calling it loss.
 - **The generator lost a fifth of its records, counted.** `otlp_out` sends one request at a
   time, so its rate is a batch per round trip: under the SUT's 200 ms egress delay it
   dropped about half its batches (`overflow_newest`), fewer under the 30% egress loss, and
