@@ -1,0 +1,23 @@
+# The writer in `script/soak`'s tail-rotate-stale scenario: 1,000 log lines a second into a
+# rotating file in the directory it shares with the system under test, one JSON object per
+# line, each with the time `generate_in` made it as its top-level `timestamp`. Its `internal`
+# telemetry goes to stdout as NDJSON, so the harness reads what it wrote.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 1000
+    batch: 100
+    event:
+      log: "soak line {seq%100}"
+  file:
+    type: file_out
+    sources: [load]
+    path: /shared/app.log
+    format: json
+    # About 44 s of lines per file. `max_files` keeps about 74 minutes of files, every file a
+    # run up to the scenario's `max_duration` writes, so the tailer never loses an unread one
+    # and the harness can count every line at the end.
+    rotate: { max_bytes: 4MiB, max_files: 100 }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
