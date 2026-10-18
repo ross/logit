@@ -121,7 +121,7 @@ on = "logit"
 signal = "HUP"
 for = "10s"
 
-# Each SIGHUP to `logit` reopens `archive` once, at its next write.
+# Each SIGHUP to `logit` reopens `archive` once, at its next write: no fewer, no more.
 [[expect]]
 name = "reopen-steady-1"
 service = "logit"
@@ -131,6 +131,7 @@ step = 1
 window = "through"
 reduce = "delta"
 min = 1
+max = 1
 
 [[expect]]
 name = "reopen-steady-2"
@@ -141,6 +142,7 @@ step = 2
 window = "through"
 reduce = "delta"
 min = 1
+max = 1
 
 [[expect]]
 name = "reopen-rename-1"
@@ -151,6 +153,7 @@ step = 4
 window = "through"
 reduce = "delta"
 min = 1
+max = 1
 
 [[expect]]
 name = "reopen-backend-stopped"
@@ -161,6 +164,7 @@ step = 6
 window = "through"
 reduce = "delta"
 min = 1
+max = 1
 
 [[expect]]
 name = "reopen-rename-2"
@@ -171,6 +175,7 @@ step = 8
 window = "through"
 reduce = "delta"
 min = 1
+max = 1
 
 [[expect]]
 name = "reopen-steady-3"
@@ -181,6 +186,7 @@ step = 10
 window = "through"
 reduce = "delta"
 min = 1
+max = 1
 
 # The generator has no file target, so its SIGHUP leaves its sends alone.
 [[expect]]
