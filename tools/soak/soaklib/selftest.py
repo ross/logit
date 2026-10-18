@@ -2058,6 +2058,312 @@ def _sink_ledger():
                    f"{edge}")
 
 
+# The `split = "target"` fixture's sinks: `(sink, backend, target, aggregate, transforms)`.
+# A router, `split`, sends each event whole to both targets; `vm_b`'s branch has one
+# transform, `count_b`, ahead of its aggregate.
+TARGET_SINKS = (("vm_a", "victoria-metrics", "t_a", "agg_a", []),
+                ("vm_b", "victoria-metrics-b", "t_b", "agg_b", ["count_b"]))
+
+
+def _to_targets(run_dir, adds=(), export_edit=None):
+    """Rewrites a `_ledger_run` or `_kill_run` directory for `split = "target"`
+    (`TARGET_SINKS`): each event `window` received, the router `split` receives and copies
+    once, each target sends, `count_b` forwards, and each sink's `aggregate` receives and
+    absorbs; each aggregate sends `AGGREGATE_SENT` events per drain, which its sink receives;
+    every line of the fixture's one sink is written once per sink; and the export goes to each
+    sink whole. `adds` is `(offset, metric, delta, component, attrs)` points written beside
+    the rest, each summing into its drain's count, and `export_edit(sink, series)` may change
+    each sink's export."""
+    out = []
+    received = "logit.component.events.received"
+    sent = "logit.component.events.sent"
+    for line in (run_dir / "logs" / "logit.stdout").read_text().splitlines():
+        record = json.loads(line)
+        component = record["attributes"]["component"]
+        metric = record["metrics"][0]
+        name, value, stamp = metric["name"], metric["value"], record["timestamp"]
+        if component == "window" and name == received:
+            for metric_name, comp in ((received, "split"), ("logit.component.events.copied",
+                                                            "split"),
+                                      (sent, "t_a"), (sent, "t_b"), (received, "count_b"),
+                                      (sent, "count_b"), (received, "agg_a"),
+                                      (received, "agg_b")):
+                out.append(_line(stamp, metric_name, "sum", value, component=comp))
+        elif component == "window" and name in ("logit.transform.metrics.absorbed",
+                                                "logit.component.batches.sent"):
+            for comp in ("agg_a", "agg_b"):
+                out.append(_line(stamp, name, "sum", value, component=comp))
+        elif component == "sink":
+            for sink, _, _, _, _ in TARGET_SINKS:
+                copied = json.loads(line)
+                copied["attributes"]["component"] = sink
+                out.append(json.dumps(copied))
+        else:
+            out.append(line)
+            if name == "logit.process.uptime":
+                for sink, _, _, aggregate, _ in TARGET_SINKS:
+                    out.append(_line(stamp, sent, "sum", AGGREGATE_SENT, component=aggregate))
+                    out.append(_line(stamp, received, "sum", AGGREGATE_SENT, component=sink))
+    for offset, name, delta, component, attrs in adds:
+        out.append(_line(_stamp(T0 + offset), name, "sum", delta, component=component,
+                         attrs=attrs))
+    (run_dir / "logs" / "logit.stdout").write_text("\n".join(out) + "\n")
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    resolved["services"] = {**scenario.BASE_ROLES, "victoria-metrics-b": "backend"}
+    ledger = resolved["ledger"]
+    selector = ledger["sink"][0].get("vm_selector")
+    for key in ("sut_aggregate", "vm_every_window"):
+        ledger.pop(key, None)
+    ledger.update(split="target", sut_router="split")
+    ledger["sink"] = [{"id": sink, "backend": backend, "vm_selector": selector,
+                       "target": target, "aggregate": aggregate, "transforms": list(chain)}
+                      for sink, backend, target, aggregate, chain in TARGET_SINKS]
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    config = run_dir / "configs" / "logit-sut.yaml"
+    if config.is_file():
+        config.write_text(config.read_text().replace(
+            "  window:\n    type: aggregate\n    interval: 10s   # every window\n",
+            "".join(f"  {aggregate}: {{ type: aggregate, interval: 10s }}\n"
+                    for _, _, _, aggregate, _ in TARGET_SINKS)))
+    series = vm.parse_export((run_dir / "vm-export" / "sink.jsonl").read_text())
+    (run_dir / "vm-export" / "sink.jsonl").unlink()
+    for sink, _, _, _, _ in TARGET_SINKS:
+        mine = copy.deepcopy(series)
+        _write_export(run_dir, sink, export_edit(sink, mine) if export_edit else mine)
+    return run_dir
+
+
+def _target_ledger():
+    """The ledger under `split = "target"`: the listeners' side ending at the router, the
+    router's balance and each of its terms, each sink's branch and egress from its own target,
+    a stopped life's exact ingress, per-sink drop credit, the summary's per-term judgment, and
+    the per-sink kill band. Each fixture's verdict depends on the rule it names."""
+    rows = ("ledger.intake", "ledger.edge", "ledger.aggregate", "ledger.egress",
+            "ledger.summary", "drops", "identity.sink", "progress")
+    copied = "logit.component.events.copied"
+    sent = "logit.component.events.sent"
+    received = "logit.component.events.received"
+    absorbed = "logit.transform.metrics.absorbed"
+    dropped = "logit.component.events.dropped"
+    discarded = "logit.component.events.discarded"
+
+    def change(sink_name, life, by):
+        """An `export_edit` moving `sink_name`'s V in `life` by `by`, on series x_0."""
+        index = {0: (0, 1), 1: (2, 3)}[life]
+
+        def edit(sink, series):
+            if sink == sink_name:
+                for one in series:
+                    if one["metric"]["__name__"] == "x_0_total":
+                        for i in index:
+                            one["values"][i] += by
+            return series
+        return edit
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, adds=(), export_edit=None, **kwargs):
+            kwargs = {"life0_extra": 20, "shutdown_drops": 20, "v0_extra": 0, **kwargs}
+            run_dir = _to_targets(_ledger_run(tmp, name, **kwargs), adds, export_edit)
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        clean = results("targets-clean")
+        for row in rows:
+            expect(clean[row].status == checks.PASS,
+                   f"{row} PASSes the balanced split = target fixture, got {clean[row]}")
+        egress = clean["ledger.egress"].detail
+        expect("vm_a: life 0: T_sent[t_a] − T_x − V 0 = residual 0 + Ab[agg_a] − V 0, ok"
+               in egress and "vm_b: life 0: T_sent[t_b] − T_x − ΣT_disc − V 0" in egress
+               and "life 1 (final): Ab[agg_b]" in egress and "split target" in egress,
+               f"egress under target judges each sink from its own target, got {egress}")
+        edge = clean["ledger.edge"].detail
+        expect("R_copied 34,000 − R_disc 0 = 68,000 == R_fwd + ΣT_sent 68,000" in edge
+               and "E 34,000 == R_in[split] 34,000" in edge
+               and "A_sent[agg_b] 380 == S_in[vm_b] 380" in edge,
+               f"edge under target judges the router and each branch, got {edge}")
+        expect("life 0 (stopped): W − D − B − X − R_in 0" in clean["ledger.intake"].detail,
+               f"intake under target judges a stopped life's ingress with no tolerance, got "
+               f"{clean['ledger.intake']}")
+        expect("agg_a: Ab 34,000 == A 34,000" in clean["ledger.aggregate"].detail
+               and "agg_b: Ab" in clean["ledger.aggregate"].detail,
+               f"aggregate under target judges each sink's aggregate, got "
+               f"{clean['ledger.aggregate']}")
+
+        # The router's balance, in the final life and in a stopped one, and each of its terms.
+        short = results("targets-router-short", adds=[(250, copied, -5, "split", None)])
+        expect(short["ledger.edge"].status == checks.FAIL
+               and "!= R_fwd + ΣT_sent 68,000, off by -5" in short["ledger.edge"].detail
+               and short["ledger.summary"].status == checks.FAIL,
+               f"a router copying fewer than its targets sent FAILs edge and summary, got "
+               f"{short['ledger.edge']} / {short['ledger.summary']}")
+        stopped = results("targets-router-stopped", adds=[(50, copied, 5, "split", None)])
+        expect(stopped["ledger.edge"].status == checks.FAIL
+               and "life 0: R_in" in stopped["ledger.edge"].detail
+               and "off by 5" in stopped["ledger.edge"].detail,
+               f"the router's balance is judged in a stopped life, got {stopped['ledger.edge']}")
+        def shift(sink, delta, offset=250):
+            """`adds` moving `sink`'s branch by `delta` events at `offset`, every hop alike."""
+            hops = ([(sent, "t_a"), (received, "agg_a"), (absorbed, "agg_a")] if sink == "vm_a"
+                    else [(sent, "t_b"), (received, "count_b"), (sent, "count_b"),
+                          (received, "agg_b"), (absorbed, "agg_b")])
+            return [(offset, name, delta, comp, None) for name, comp in hops]
+
+        def shifted(deltas, life=1):
+            """An `export_edit` moving each sink's V in `life`, the final by default, by its
+            delta."""
+            def edit(sink, series):
+                return change(sink, life, deltas.get(sink, 0))(sink, series)
+            return edit
+
+        # 5 events the router kept out of both targets, discarded or sent on its forward edge.
+        for name, counter in (("discarded", discarded), ("forward", sent)):
+            adds = ([(250, copied, -5, "split", None), (250, counter, 5, "split", None)]
+                    + shift("vm_a", -5) + shift("vm_b", -5))
+            balanced = results(f"targets-router-{name}", adds=adds,
+                               export_edit=shifted({"vm_a": -5, "vm_b": -5}))
+            expect(balanced["ledger.edge"].status == checks.PASS
+                   and balanced["ledger.summary"].status == checks.PASS,
+                   f"the router's balance takes its {name} events in, got "
+                   f"{balanced['ledger.edge']} / {balanced['ledger.summary']}")
+
+        # The balance pools the targets: 5 events moved from t_b onto t_a, which already carries
+        # every event, leave it and every branch balanced, and only t_a's bound FAILs. A forward
+        # edge sending more than the router took in FAILs its own bound the same way.
+        moved = results("targets-router-moved", adds=shift("vm_a", 5) + shift("vm_b", -5),
+                        export_edit=shifted({"vm_a": 5, "vm_b": -5}))
+        expect(moved["ledger.edge"].status == checks.FAIL
+               and "T_sent[t_a] 34,005 <= R_in − R_disc 34,000, over its bound"
+               in moved["ledger.edge"].detail
+               and all(moved[row].status == checks.PASS
+                       for row in ("ledger.egress", "ledger.aggregate", "ledger.summary")),
+               f"a target sent more than the router took in FAILs its bound alone, got "
+               f"{moved['ledger.edge']}")
+        # The same move in the stopped life 0 FAILs that life's bound.
+        moved0 = results("targets-router-moved-stopped",
+                         adds=shift("vm_a", 5, 50) + shift("vm_b", -5, 50),
+                         export_edit=shifted({"vm_a": 5, "vm_b": -5}, life=0))
+        expect(moved0["ledger.edge"].status == checks.FAIL
+               and "life 0: T_sent[t_a] 20,005 <= R_in − R_disc 20,000, over its bound"
+               in moved0["ledger.edge"].detail
+               and all(moved0[row].status == checks.PASS
+                       for row in ("ledger.egress", "ledger.aggregate", "ledger.summary")),
+               f"a target sent more than the router took in FAILs its bound in a stopped life, "
+               f"got {moved0['ledger.edge']}")
+        forward = results("targets-router-forward-over",
+                          adds=[(250, copied, 40000, "split", None),
+                                (250, sent, 40000, "split", None)])
+        expect(forward["ledger.edge"].status == checks.FAIL
+               and "R_fwd 40,000 <= R_in 34,000, over its bound" in forward["ledger.edge"].detail,
+               f"a forward edge sending more than the router took in FAILs, got "
+               f"{forward['ledger.edge']}")
+
+        # A closed consumer's drop at a target, in a stopped life and the final one: the
+        # target counted the send, its branch never received it.
+        closed = [(offset, name, delta, comp, attrs) for offset in (50, 250)
+                  for name, delta, comp, attrs in (
+                      (dropped, 5, "t_a", {"reason": "closed_consumer"}),
+                      (received, -5, "agg_a", None), (absorbed, -5, "agg_a", None))]
+        closed_run = results("targets-closed-consumer", adds=closed,
+                             export_edit=lambda sink, series: change(
+                                 "vm_a", 0, -5)(sink, change("vm_a", 1, -5)(sink, series)))
+        for row in ("ledger.edge", "ledger.egress", "ledger.summary", "drops"):
+            expect(closed_run[row].status == checks.PASS,
+                   f"{row} takes a target's closed-consumer drop off its sends, got "
+                   f"{closed_run[row]}")
+
+        # A branch transform's discard in a stopped life: the sink's egress gap leaves it out.
+        branch = results("targets-branch-discard",
+                         adds=[(50, discarded, 5, "count_b", None),
+                               (50, sent, -5, "count_b", None),
+                               (50, received, -5, "agg_b", None),
+                               (50, absorbed, -5, "agg_b", None)],
+                         export_edit=change("vm_b", 0, -5))
+        for row in ("ledger.edge", "ledger.egress", "ledger.summary"):
+            expect(branch[row].status == checks.PASS,
+                   f"{row} counts a branch transform's discard, got {branch[row]}")
+
+        # A surplus at one sink and a matching loss at the other: each sink's own line FAILs.
+        netted = results("targets-netted", export_edit=lambda sink, series: change(
+            sink, 1, 20 if sink == "vm_a" else -20)(sink, series))
+        egress = netted["ledger.egress"].detail
+        expect(netted["ledger.egress"].status == checks.FAIL
+               and "V[vm_a] 34,020 = -20, uncounted" in egress
+               and "V[vm_b] 33,980 = 20, uncounted" in egress
+               and netted["ledger.summary"].status == checks.FAIL,
+               f"opposite gaps at two sinks each FAIL, got {netted['ledger.egress']} / "
+               f"{netted['ledger.summary']}")
+
+        # One aggregate absorbing less than it received FAILs that aggregate's line.
+        short_ab = results("targets-aggregate-short", adds=[(250, absorbed, -3, "agg_b", None)],
+                           export_edit=change("vm_b", 1, -3))
+        expect(short_ab["ledger.aggregate"].status == checks.FAIL
+               and "agg_b: Ab 33,997 != A 34,000" in short_ab["ledger.aggregate"].detail
+               and "agg_a: Ab 34,000 == A 34,000" in short_ab["ledger.aggregate"].detail
+               and "A − Ab[agg_b] 3" in short_ab["ledger.summary"].detail
+               and short_ab["ledger.summary"].status == checks.FAIL,
+               f"a short aggregate FAILs by name, got {short_ab['ledger.aggregate']} / "
+               f"{short_ab['ledger.summary']}")
+
+        # Two terms that cancel: count_b sends 5 fewer than it received and discarded, and
+        # agg_b receives 5 more than count_b sent. Summed they're 0; each FAILs on its own.
+        cancel = results("targets-cancel", adds=[(250, sent, -5, "count_b", None)])
+        expect(cancel["ledger.summary"].status == checks.FAIL
+               and "uncounted 10" in cancel["ledger.summary"].detail
+               and cancel["ledger.edge"].status == checks.FAIL,
+               f"the summary judges each term alone, got {cancel['ledger.summary']}")
+
+        # A stopped life's ingress must be 0: here 5 lines read and never sent on.
+        ingress = results("targets-ingress", life0_extra=25)
+        expect(ingress["ledger.intake"].status == checks.FAIL
+               and "life 0 (stopped): W − D − B − X − R_in 5, uncounted, not 0"
+               in ingress["ledger.intake"].detail,
+               f"a stopped life's ingress short of the router FAILs, got "
+               f"{ingress['ledger.intake']}")
+
+        # A stopped life's sink gap, credited by a drop on its own branch only.
+        for name, dropped_at, verdict in (("own-sink", "vm_a", checks.PASS),
+                                          ("own-aggregate", "agg_a", checks.PASS),
+                                          ("other-sink", "vm_b", checks.FAIL),
+                                          ("other-aggregate", "agg_b", checks.FAIL)):
+            gap = results(f"targets-gap-{name}", life0_dropped=1, dropped_at=dropped_at,
+                          export_edit=change("vm_a", 0, -7))
+            egress = gap["ledger.egress"].detail
+            expect(gap["ledger.egress"].status == verdict
+                   and ("vm_a: life 0: T_sent[t_a] − T_x − V 7 = residual 0 + Ab[agg_a] − V 7, "
+                        + ("counted" if verdict == checks.PASS else "uncounted")) in egress,
+                   f"a shutdown drop at {dropped_at} counts vm_a's gap only on its own branch, "
+                   f"got {egress}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def killed(name, adds=(), **kwargs):
+            run_dir = _to_targets(_kill_run(tmp, name, every_window=False, replayed=0,
+                                            **kwargs), adds)
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        # Each target sending 1,000 more in the killed life's last drain doubles its branch's
+        # rate to 400/s and leaves a branch residual of 1,000, so the band is
+        # [-3,000, 6,000]; read from the listener's 200/s it would be [-1,000, 3,000].
+        rate = killed("targets-kill-rate", kill_gap=4000,
+                      adds=[(200, "logit.component.events.sent", 1000, target, None)
+                            for target in ("t_a", "t_b")])
+        expect(rate["ledger.egress"].status == checks.PASS
+               and "= 4,000, within band (band [-3,000, 6,000]: ingest 400/s"
+               in rate["ledger.egress"].detail,
+               f"a killed life's band reads each branch's own rate and residual, got "
+               f"{rate['ledger.egress']}")
+
+        clean = killed("targets-kill")
+        egress = clean["ledger.egress"].detail
+        expect(clean["ledger.egress"].status == checks.PASS
+               and "life 1 (killed): Ab[agg_a] 14,000 − V[vm_a] 12,500 = 1,500, within "
+               "band (band [-1,000, 3,000]" in egress
+               and "residual T_sent[t_b] − T_x − ΣT_disc − Ab 0" in egress,
+               f"a killed life's sink gap is judged in its branch's band, got {egress}")
+        lost = killed("targets-kill-lost", kill_gap=5000)
+        expect(lost["ledger.egress"].status == checks.FAIL
+               and "= 5,000, uncounted" in lost["ledger.egress"].detail,
+               f"a killed life's sink gap above its band FAILs, got {lost['ledger.egress']}")
+
+
 def _declared_roles(text):
     """`{service: role}` from a compose file's text: each service under `services:` at two
     spaces, and the `soak.role` label in its block. For the shipped files only, which label each
@@ -5588,7 +5894,8 @@ def _tcp_rules(root):
     for name, text in (("a flow list", flow_list), ("a block list", block_list)):
         problems = route_problems(text)
         expect(len(problems) == 1 and "route 'split'" in problems[0]
-               and "use split = \"copy\" or one target per value" in problems[0],
+               and "use split = \"target\", split = \"copy\", or one target per value"
+               in problems[0],
                f"{name} under split = route is refused, got {problems}")
         expect(route_problems(text, split="copy") == [],
                f"{name} loads under split = copy, got {route_problems(text, split='copy')}")
@@ -5600,6 +5907,101 @@ def _tcp_rules(root):
            f"a route_signals under split = route is refused, got {problems}")
     copied = route_problems(by_signals, split="copy")
     expect(copied == [], f"a route_signals loads under split = copy, got {copied}")
+
+    # Under split = "target" both routers load, each sink naming its own aggregate, and the
+    # router's targets must be the sinks' targets, every one.
+    def target_problems(text, edit=None):
+        text = text.replace("components:\n", "components:\n  statsd: { type: statsd_in }\n", 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            scenario_path = Path(tmp) / "scenario.toml"
+            changed = copy.deepcopy(raw)
+            for key, name in changed["configs"].items():
+                (Path(tmp) / name).write_text(
+                    text if key == "sut" else (path.parent / name).read_text())
+            ledger = changed["ledger"]
+            ledger["split"] = "target"
+            ledger["sut_router"] = "split"
+            ledger.pop("sut_aggregate")
+            first = ledger["sink"][0]
+            ledger["sink"] = [dict(first, target="tier_a", aggregate="window_a"),
+                              dict(first, id="other", target="tier_b", aggregate="window_b",
+                                   transforms=["count_b"])]
+            if edit:
+                edit(changed)
+            try:
+                loaded = scenario.from_dict(changed, scenario_path)
+                return [], loaded
+            except scenario.ScenarioError as err:
+                return err.problems, None
+
+    for name, text in (("a route_signals", by_signals), ("a flow list", flow_list),
+                       ("a block list", block_list.replace("routes:\n", "routes:\n"
+                                                           "      \"1\": tier_b\n"))):
+        problems, loaded = target_problems(text)
+        expect(problems == [] and loaded.split == "target"
+               and [s["aggregate"] for s in loaded.sinks] == ["window_a", "window_b"],
+               f"{name} loads under split = target, got {problems}")
+    # A `targets:` line inside a script's source isn't the component's key.
+    commented_script = ("  script:\n    type: lua\n    sources: [split]\n    source: |\n"
+                        "      -- targets: tier_b\n      function process(e) return e end\n")
+    problems, _ = target_problems(by_signals + commented_script)
+    expect(not any("also fills" in problem for problem in problems),
+           f"a commented targets line in a lua source isn't refused, got {problems}")
+    partial = "components:\n  split:\n    type: route_signals\n" \
+              "    signals: { logs: tier_a, metrics: tier_b, traces: tier_c }\n"
+    for text, edit, needle, what in (
+            (partial, None, "fills tier_c, which no [[ledger.sink]] follows",
+             "a router target no sink follows"),
+            (single.replace("tier_b", "tier_x"), None, "`target` tier_b isn't one route",
+             "a sink target the router doesn't fill"),
+            (by_signals + "  more:\n    type: route\n    by: { attribute: shard }\n"
+             "    routes: { \"0\": [tier_c, tier_b] }\n",
+             None, "route 'more' also fills a sink's target", "a second router"),
+            (by_signals + "  more:\n    type: route_signals\n    signals: { logs: tier_a }\n",
+             None, "route_signals 'more' also fills a sink's target",
+             "a second route_signals"),
+            (by_signals + "  script:\n    type: lua\n    targets:\n      - tier_b\n",
+             None, "lua 'script' also fills a sink's target", "a lua with targets"),
+            (by_signals + "  script: { type: lua_file, path: x.lua, targets: [tier_a] }\n",
+             None, "lua_file 'script' also fills a sink's target", "a lua_file with targets"),
+            (by_signals + "  script:\n    type: lua\n    targets:\n    - tier_b\n",
+             None, "lua 'script' also fills a sink's target",
+             "a lua whose targets list sits at the key's own indent"),
+            (by_signals + commented_script + "    targets: [tier_a]\n",
+             None, "lua 'script' also fills a sink's target",
+             "a lua with a targets key after a commented one in its source"),
+            (by_signals, lambda r: r["ledger"].update(sut_router="other"),
+             "ledger.sut_router 'other' isn't a route or route_signals component",
+             "a router the SUT config lacks"),
+            (by_signals, lambda r: r["ledger"].pop("sut_router"),
+             "ledger.split = \"target\" needs `sut_router`", "no router"),
+            (by_signals, lambda r: r["ledger"].update(sut_aggregate="window"),
+             "ledger.sut_aggregate is refused under split = \"target\"", "a shared aggregate"),
+            (by_signals, lambda r: r["ledger"]["sink"][1].pop("aggregate"),
+             "ledger.sink 2: under split = \"target\" a sink needs `aggregate`",
+             "a sink with no aggregate"),
+            (by_signals, lambda r: r["ledger"]["sink"][1].update(aggregate="window_a"),
+             "ledger.sink 2: window_a is on another sink's branch",
+             "two sinks sharing an aggregate"),
+            (by_signals, lambda r: r["ledger"]["sink"][1].update(transforms="count_b"),
+             "ledger.sink 2: `transforms` must list", "a transforms that isn't a list"),
+            (by_signals, lambda r: r["ledger"].update(sut_script="lua"),
+             "ledger.sut_script can't be combined with split = \"target\"", "a script"),
+            (by_signals, lambda r: r["ledger"].update(vm_every_window=True),
+             "ledger.vm_every_window can't be combined", "every window"),
+            (by_signals, lambda r: r["ledger"]["sink"].pop(),
+             "ledger.split = \"target\" needs two or more", "one sink")):
+        problems, _ = target_problems(text, edit)
+        expect(any(needle in problem for problem in problems),
+               f"{what} under split = target is refused with {needle!r}, got {problems}")
+    for edit, needle, what in (
+            (lambda r: r["ledger"].update(sut_router="split"),
+             "ledger.sut_router is for split = \"target\"", "a router under copy"),
+            (lambda r: r["ledger"]["sink"][0].update(aggregate="window"),
+             "ledger.sink 1: `aggregate` is for split = \"target\"", "an aggregate under copy")):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        _refused(path, changed, needle, what)
 
     # The fault predicates per wire.
     roles = scenario.BASE_ROLES
@@ -10302,7 +10704,7 @@ def run(root, quiet=False):
                      _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
                      _report, _expected_event_rules, _exit_driver, _ready_words, _exit_watchdog,
-                     _script_ledger, _sink_ledger, _roles, _sink_rules, _driver_roles,
+                     _script_ledger, _sink_ledger, _target_ledger, _roles, _sink_rules, _driver_roles,
                      _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
                      _http_ledger, _http_rules, _file_ledger, _file_rules,
                      _two_sut_rules,

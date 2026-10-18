@@ -31,7 +31,10 @@ full copy of `aggregate`'s output, so each sink's V is judged alone; under `spli
 sinks' V add up to it, so the egress gap is judged on their sum. That holds because `load()`
 refuses `split = "route"` over a `route` that can send one event to several targets (a
 list-valued `routes:` value) and over any `route_signals`, so each event reaches
-one sink.
+one sink. Those routers run under `split = "target"`: each sink sits behind its own target and
+`aggregate`, the listeners' rows end at the router (`[ledger] sut_router`), the router balances
+as received + copied − discarded == its forward edge's sends + its targets' (`router_balance`),
+and each sink's rows start at its own target (`branch_fed`), so each sink's V is judged alone.
 
 The ledger also follows each `[[ledger.source]]`, a generator and the SUT listener it reaches
 over the source's `wire` (`WIRES`), which names the counters each symbol reads.
@@ -96,7 +99,8 @@ from . import collect, faults, standin, telemetry, topic, vm
 from .scenario import (DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET, GENERATOR_ROLE,
                        HTTP_WIRE, KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS,
                        RUN_WINDOW, SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET,
-                       SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE, component_blocks, config_env,
+                       SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE, TARGET_SPLIT,
+                       component_blocks, config_env,
                        listener_wire, parse_duration, source_ids, source_pairs,
                        stdio_shared_targets, tls_reload_polls)
 
@@ -1513,8 +1517,18 @@ class Ledger:
         self.aggregate = cfg.get("sut_aggregate")
         self.sinks = list(data.sinks)
         self.split = data.split
-        # Under `route`, the `target` feeding each sink.
+        # Under `route` and `target`, the `target` feeding each sink.
         self.targets = {sink["id"]: sink.get("target") for sink in cfg.get("sink") or []}
+        # Under `target`, the router filling the targets (`sut_router`), and per sink its
+        # branch: the transforms between its target and its own `aggregate`, then that
+        # `aggregate`. The listeners' rows end at the router, and each sink's rows start at its
+        # target (`router_balance`, `branch_fed`).
+        self.targeted = self.split == TARGET_SPLIT
+        self.router = cfg.get("sut_router") if self.targeted else None
+        self.branches = ({sink["id"]: list(sink.get("transforms") or [])
+                          for sink in cfg.get("sink") or []} if self.targeted else {})
+        self.aggregates = ({sink["id"]: sink.get("aggregate") for sink in cfg.get("sink") or []}
+                           if self.targeted else {})
         # The `lua` component between the listener and `aggregate`, or None.
         self.script = cfg.get("sut_script")
         # How the egress rows write the increments `aggregate` absorbed from the listener's
@@ -1533,6 +1547,8 @@ class Ledger:
                                else "" if self.reshaped
                                else "ΣT_disc − " if chained else "")
         self.residual_text = ("E_B − X_B − Ab" if cfg.get("hop")
+                              else "W′ − R_in" if self.reshaped and self.targeted
+                              else f"W − D − B − X − {self.discarded_text}R_in" if self.targeted
                               else "W′ − Ab" if self.reshaped
                               else f"W − D − B − X − {self.discarded_text}"
                               + ("(Ab − L_flush)" if self.script else "Ab"))
@@ -1644,6 +1660,31 @@ class Ledger:
                                      component=self.aggregate)
         self.Ab = sut.counter_by_life("logit.transform.metrics.absorbed",
                                       component=self.aggregate)
+        if self.targeted:
+            # The router's own counts: what it took, the deliveries past each event's first
+            # (`copied`), the events no target took (`discarded`, only `route_signals` counts
+            # it), and what it sent on its own forward edge, a `route`'s ordinary consumer. Its
+            # targets' sends are each counted under the target's id (T_sent).
+            router = self.router
+            self.R_in = sut.counter_by_life("logit.component.events.received", component=router)
+            self.R_cp = sut.counter_by_life("logit.component.events.copied", component=router)
+            self.R_disc = sut.counter_by_life("logit.component.events.discarded",
+                                              component=router)
+            self.R_fwd = sut.counter_by_life("logit.component.events.sent", component=router)
+            # Per sink: its target's sends that a closed consumer dropped, and its own
+            # `aggregate`'s A, Ab, and events sent.
+            self.T_x = {sink: sut.counter_by_life("logit.component.events.dropped",
+                                                  component=self.targets.get(sink))
+                        for sink in self.sinks}
+            self.A_k = {sink: sut.counter_by_life("logit.component.events.received",
+                                                  component=self.aggregates.get(sink))
+                        for sink in self.sinks}
+            self.Ab_k = {sink: sut.counter_by_life("logit.transform.metrics.absorbed",
+                                                   component=self.aggregates.get(sink))
+                         for sink in self.sinks}
+            self.A_sent_k = {sink: sut.counter_by_life("logit.component.events.sent",
+                                                       component=self.aggregates.get(sink))
+                             for sink in self.sinks}
         if self.script:
             script = self.script
             self.L_in = sut.counter_by_life("logit.component.events.received", component=script)
@@ -1738,7 +1779,9 @@ class Ledger:
         self.transforms = {source.get("sut_listener"): list(source.get("sut_transforms") or [])
                            for source in self.sources}
         self.T_in, self.T_out, self.T_disc, self.T_lines = {}, {}, {}, {}
-        for chain in self.transforms.values():
+        # Under `target`, each sink's branch transforms too, read the same way; `t_disc` sums
+        # the sources' chains alone.
+        for chain in list(self.transforms.values()) + list(self.branches.values()):
             for component in chain:
                 self.T_in[component] = sut.counter_by_life("logit.component.events.received",
                                                            component=component)
@@ -1836,9 +1879,15 @@ class Ledger:
             self.R_hop = round(NODE_RESIDUAL_BATCHES * self.per_frame)
             self.R_hop_text = (f"R_hop {_n(self.R_hop)} = {NODE_RESIDUAL_BATCHES} x "
                                f"{self.per_frame:,.0f} events per frame")
-        # The aggregate's configured window, in seconds, or None when the config doesn't say.
-        self.interval = component_duration(self._sut_config_text(self.service),
-                                           self.aggregate or "", "interval")
+        # The aggregate's configured window, in seconds, or None when the config doesn't say;
+        # under `target` each sink's own (`intervals`), and the longest of them.
+        config = self._sut_config_text(self.service)
+        self.interval = component_duration(config, self.aggregate or "", "interval")
+        self.intervals = {sink: component_duration(config, aggregate or "", "interval")
+                          for sink, aggregate in self.aggregates.items()}
+        if self.targeted:
+            self.interval = max([one for one in self.intervals.values() if one] or [None],
+                                key=lambda one: one or 0)
         # Each `respond` step that expects the `rejected` class, as `(start, end, step)`: its
         # span widened by one aggregate window and `recovery_bound`, inside which a sink's
         # `rejected` drop is the step's doing (`cued_rejections`). `ledger.sent` excuses in the
@@ -1993,7 +2042,8 @@ class Ledger:
     def egress_groups(self):
         """`[(label, sinks)]`, each judged as one egress: under `copy` each sink alone, under
         `route` all of them, whose V add up to what `aggregate` absorbed. The sum is sound because
-        `load()` refuses a router that can deliver one event to several sinks."""
+        `load()` refuses a router that can deliver one event to several sinks there. Under
+        `target` each sink alone, against its own `aggregate`."""
         if self.split == "route":
             return [(" + ".join(self.sinks), list(self.sinks))]
         return [(sink, [sink]) for sink in self.sinks]
@@ -2044,6 +2094,15 @@ class Ledger:
                     f"{_n(self.get('X_B', life))}, resends {_n(self.get('resends', life))}, "
                     f"A {_n(self.get('A', life))}, Ab {_n(self.get('Ab', life))}, "
                     + ", ".join(f"V[{sink}] {_n(self.v(life, [sink]))}" for sink in self.sinks))
+        if self.targeted:
+            text = f"{self.listener_symbols(life)}, {self._router_text(life)}"
+            if self.t_disc(life):
+                text = f"{text}, ΣT_disc {_n(self.t_disc(life))}"
+            return text + "; " + "; ".join(
+                f"{sink}: T_sent {_n(self.T_sent.get(sink, {}).get(life, 0))}, T_x "
+                f"{_n(self.T_x[sink].get(life, 0))}, A {_n(self.A_k[sink].get(life, 0))}, Ab "
+                f"{_n(self.Ab_k[sink].get(life, 0))}, V {_n(self.v(life, [sink]))}"
+                for sink in self.sinks)
         script = ""
         if self.script:
             script = "".join(f"{symbol} {_n(self.get(symbol, life))}, " for symbol in (
@@ -2090,14 +2149,70 @@ class Ledger:
                 for listener in self.listeners)
         return text
 
-    def absorbed(self, life):
+    def absorbed(self, life, sinks=None):
         """The increments `aggregate` absorbed from the listener's events: Ab, less a script's
-        `flush()` events, each of which carries one metric whose series V excludes."""
+        `flush()` events, each of which carries one metric whose series V excludes. Under
+        `target`, the sum of the `aggregate`s of `sinks`, every sink when None."""
+        if self.targeted:
+            return sum(self.Ab_k[sink].get(life, 0) for sink in sinks or self.sinks)
         return self.get("Ab", life) - (self.get("L_flush", life) if self.script else 0)
 
     def t_disc(self, life):
-        """ΣT_disc: the events every `sut_transforms` node discarded in `life`."""
-        return sum(per.get(life, 0) for per in self.T_disc.values())
+        """ΣT_disc: the events every `sut_transforms` node discarded in `life`, a sink's branch
+        transforms under `target` left out."""
+        return sum(self.T_disc[component].get(life, 0) for chain in self.transforms.values()
+                   for component in chain)
+
+    def branch_disc(self, sink, life):
+        """Under `target`, the events `sink`'s branch transforms discarded in `life`."""
+        return sum(self.T_disc[component].get(life, 0) for component in self.branches[sink])
+
+    def branch_fed(self, sink, life):
+        """Under `target`, what `sink`'s target handed its branch in `life`, less what the
+        branch discarded, counted: T_sent − T_x − ΣT_disc over its transforms. A closed
+        consumer's drop (T_x) is counted after T_sent counted the send."""
+        return (self.T_sent.get(sink, {}).get(life, 0) - self.T_x[sink].get(life, 0)
+                - self.branch_disc(sink, life))
+
+    def branch_text(self, sink):
+        """`branch_fed`'s formula for `sink`, as text."""
+        target = self.targets.get(sink)
+        disc = " − ΣT_disc" if self.branches.get(sink) else ""
+        return f"T_sent[{target}] − T_x{disc}"
+
+    def router_balance(self, life):
+        """Under `target`, `(out, sent)` for the router in `life`: R_in + R_copied − R_disc, what
+        it should have handed on, and R_fwd + ΣT_sent, what its forward edge and its targets
+        counted sent. `load()` holds the sinks' targets to the router's, every one, and a
+        target's T_sent counts every router that fills it, so the router must be the only
+        one that fills them."""
+        out = (self.get("R_in", life) + self.get("R_cp", life) - self.get("R_disc", life))
+        sent = self.get("R_fwd", life) + sum(self.T_sent.get(sink, {}).get(life, 0)
+                                             for sink in self.sinks)
+        return out, sent
+
+    def router_bounds(self, life):
+        """Under `target`, `[(text, ok)]` for the bounds the router's pooled balance can't
+        judge: each target's T_sent ≤ R_in − R_disc, and R_fwd ≤ R_in. A target receives at most
+        one delivery of each event the router kept, since a `route` lists a target once per
+        value (graph rule 51) and a `route_signals` sends one part per target. `route_batch`
+        counts R_in and R_disc before a target's `Fanout` counts the send, so a drain can't
+        split them the wrong way. The bounds catch a target receiving more than the router took
+        in; a shift between targets below that passes."""
+        kept = self.get("R_in", life) - self.get("R_disc", life)
+        bounds = [(f"T_sent[{self.targets.get(sink)}] "
+                   f"{_n(self.T_sent.get(sink, {}).get(life, 0))} <= R_in − R_disc {_n(kept)}",
+                   self.T_sent.get(sink, {}).get(life, 0) <= kept) for sink in self.sinks]
+        bounds.append((f"R_fwd {_n(self.get('R_fwd', life))} <= R_in "
+                       f"{_n(self.get('R_in', life))}",
+                       self.get("R_fwd", life) <= self.get("R_in", life)))
+        return bounds
+
+    def _router_text(self, life):
+        out, sent = self.router_balance(life)
+        return (f"R_in {_n(self.get('R_in', life))}, R_copied {_n(self.get('R_cp', life))}, "
+                f"R_disc {_n(self.get('R_disc', life))}, R_fwd {_n(self.get('R_fwd', life))}, "
+                f"ΣT_sent {_n(sent - self.get('R_fwd', life))}")
 
     def discarded(self, life):
         """The events the path to `aggregate` removed, counted, in `life`: a script's discards
@@ -2108,14 +2223,24 @@ class Ledger:
         # fan-out node's discarded parents went on as its children.
         return script + (0 if self.reshaped else self.t_disc(life))
 
-    def residual(self, life):
+    def residual(self, life, sinks=None):
         """What a life read but neither absorbed nor removed, counted, by its last drain:
         W − D − B − X − Ab, with a script W − D − B − X − (L_drop + L_err) − (Ab − L_flush), with
         `sut_transforms` W − D − B − X − ΣT_disc − Ab, with a `fan_out` W′ − Ab, and across a hop
-        E_B − X_B − Ab."""
+        E_B − X_B − Ab.
+
+        Under `target` the path splits at the router, so the residual has two kinds. With no
+        `sinks`, the listeners' side: what reached the router's side short of the router,
+        W − D − B − X (less ΣT_disc) − R_in. With `sinks`, each sink's branch: what its target
+        sent that its `aggregate` hadn't absorbed, `branch_fed` − Ab, summed."""
+        if self.targeted:
+            if sinks is None:
+                return self.fed(life) - self.discarded(life) - self.get("R_in", life)
+            return sum(self.branch_fed(sink, life) - self.Ab_k[sink].get(life, 0)
+                       for sink in sinks)
         return self.fed(life) - self.discarded(life) - self.absorbed(life)
 
-    def kill_band(self, life):
+    def kill_band(self, life, sinks=None):
         """`(low, high, text)`: the Ab − V a killed life may show with nothing lost, from its
         ingest rate over its last drain interval, each listener's times its chain's fan-out.
 
@@ -2125,11 +2250,17 @@ class Ledger:
         `aggregate`'s unflushed window, whose events Ab counts and V never holds, up to one
         aggregate interval of ingest, plus one drain interval of queue growth after the last
         drain. The residual itself is reported beside the band and never judged with
-        it: `ledger.intake` bounds it."""
+        it: `ledger.intake` bounds it.
+
+        Under `target`, the band of `sinks`' branches: the ingest is what their targets sent,
+        the residual each branch's, and the window their `aggregate`s' longest."""
         drains = self.sut.life_drains(life)
         gaps = [b - a for a, b in zip(drains, drains[1:])]
         interval = statistics.median(gaps) if gaps else 0.0
-        if self.hop is not None:
+        if self.targeted and sinks is not None:
+            fed = [self.sut.counter_points("logit.component.events.sent",
+                                           component=self.targets.get(sink)) for sink in sinks]
+        elif self.hop is not None:
             fed = [self.sut.counter_points("logit.component.events.sent",
                                            component=self.hop.get("listener"))]
         else:
@@ -2140,12 +2271,14 @@ class Ledger:
                      if point_life == life and drains and ts == drains[-1])
         rate = last_w / gaps[-1] if gaps and gaps[-1] > 0 else 0.0
         window = self.interval
+        if self.targeted and sinks is not None:
+            window = max([self.intervals.get(sink) or 0 for sink in sinks]) or None
         source = "configured"
         if window is None:
             spaced = next((one for one in self.series.values() if one), [])
             window = vm.sample_spacing_s(spaced) or 0.0
             source = "the export's sample spacing, the config naming none"
-        residual = max(0, self.residual(life))
+        residual = max(0, self.residual(life, sinks))
         low = -(residual + round(rate * interval))
         high = round(rate * window) + round(rate * interval)
         text = (f"band [{_n(low)}, {_n(high)}]: ingest {rate:,.0f}/s over the last drain "
@@ -2247,6 +2380,13 @@ class Ledger:
         residual is what the kill lost from the receive queue and inbox, by design, and is
         reported, not judged here.
 
+        Under `target`, `sinks` is one sink and every term is its branch's: Ab is its own
+        `aggregate`'s, and a stopped earlier life's gap starts at its target, T_sent − T_x
+        (less its branch transforms' ΣT_disc) − V, the branch residual plus Ab − V. The
+        listeners' side up to the router is `ledger.intake`'s, and the router's balance
+        `ledger.edge`'s, each in every life a kill didn't end, so the three meet with nothing
+        between them unjudged.
+
         On a Kafka target, V counts each distinct record once, so a negative gap in a life that
         wasn't killed is a `surplus`, never a duplicate: increments V holds and Ab doesn't. A
         `datadog` stand-in's V counts each distinct point copy once, and an `influxdb`
@@ -2259,16 +2399,16 @@ class Ledger:
         return status, verdict, gap
 
     def _egress(self, life, sinks):
-        gap = self.absorbed(life) - self.v(life, sinks)
+        gap = self.absorbed(life, sinks) - self.v(life, sinks)
         if life in self.killed and life != self.final:
-            low, high, _ = self.kill_band(life)
+            low, high, _ = self.kill_band(life, sinks)
             if gap == 0:
                 return PASS, "ok", gap
             if low <= gap <= high:
                 return PASS, "within band", gap
             return FAIL, ("surplus" if gap < low else "uncounted"), gap
         if life != self.final:
-            gap += self.residual(life)
+            gap += self.residual(life, sinks)
         if gap == 0:
             return PASS, "ok", gap
         if gap > 0 and (sum(self.drop_credit(life, sinks).values()) > 0
@@ -2300,9 +2440,17 @@ class Ledger:
                 drops[reason] = drops.get(reason, 0) + point.value
         return drops
 
-    def other_sinks_drops(self, life, sinks):
-        """`{reason: batches}` the sinks outside `sinks` dropped in `life`."""
+    def _others(self, sinks):
+        """The sinks outside `sinks`, and under `target` their branches' nodes too."""
         others = set(self.sinks) - set(sinks)
+        for sink in list(others) if self.targeted else ():
+            others |= set(self.branches.get(sink) or []) | {self.aggregates.get(sink)}
+        return others
+
+    def other_sinks_drops(self, life, sinks):
+        """`{reason: batches}` the sinks outside `sinks` dropped in `life`, with their
+        branches' nodes under `target`."""
+        others = self._others(sinks)
         return self._drops(life, lambda component: component in others)
 
     def drop_credit(self, life, sinks):
@@ -2310,8 +2458,10 @@ class Ledger:
         less those of the sinks outside the group. Under `copy` another sink's drop loses
         nothing this sink was sent, while a drop upstream of the fan-out (the script,
         `aggregate`) or at this sink can; under `route`, and with one sink, the group holds
-        every sink and the count is the life's whole."""
-        others = set(self.sinks) - set(sinks)
+        every sink and the count is the life's whole. Under `target` another sink's branch
+        (its transforms and `aggregate`) is left out with it, since its drop loses nothing this
+        sink's target sent."""
+        others = self._others(sinks)
         return self._drops(life, lambda component: component not in others)
 
     def cued_rejections(self, life, sinks):
@@ -3227,7 +3377,9 @@ def check_ledger_intake(data):
     """The final life's W − D == E + B per listener, and on an HTTP wire the listener's own
     identities (`_http_intake`) in every life a kill didn't end; each earlier life's residual (`Ledger.residual`), summed over
     the listeners, in [0, R], a sanity bound. `ledger.egress` ties that residual to V. A life
-    whose stderr shutdown lines disagree with telemetry's shutdown drops WARNs."""
+    whose stderr shutdown lines disagree with telemetry's shutdown drops WARNs. Under
+    `split = "target"` the residual ends at the router (W − D − B − X − R_in), and a stopped
+    earlier life's must be 0, since each sink's egress starts at its target."""
     if _overlapped(data):
         return _per_instance(data, check_ledger_intake)
     led = _ledger(data)
@@ -3278,6 +3430,16 @@ def check_ledger_intake(data):
     for label, earlier_lives, residual_of, text, bound, name in judged:
         for earlier in earlier_lives:
             residual = residual_of(earlier)
+            if led.targeted and earlier not in led.inn.killed:
+                # The router's side starts each sink's own egress, so nothing else judges what
+                # a stopped life read short of the router. Its final drain runs after every
+                # data node has exited, so it counts the whole life: the residual is 0.
+                ok = residual == 0
+                parts.append(f"life {earlier} (stopped): {text} {_n(residual)}"
+                             + ("" if ok else ", uncounted, not 0"))
+                if not ok:
+                    status = FAIL
+                continue
             ok = 0 <= residual <= bound
             parts.append(f"{label}life {earlier}: {text} {_n(residual)} "
                          f"{'within' if ok else 'outside'} [0, {name}]")
@@ -3291,6 +3453,11 @@ def check_ledger_intake(data):
     if led.hop is not None:
         detail += f"; {led.R_hop_text}"
     return Result("ledger.intake", status, detail + ")", lines)
+
+
+def _grouped(term):
+    """`term` in parentheses when it is a sum, so a difference subtracts all of it."""
+    return f"({term})" if " + " in term else term
 
 
 def _final_equality(data, check_id, left, right, what):
@@ -3322,8 +3489,11 @@ def check_ledger_edge(data):
     of that listener's E in the sum; and out to each sink, under `copy` `aggregate`'s
     events.sent == the sink's events.received (a fan-out counts one send per batch, however
     many consumers it reaches), and under `route` the sink's target's events.sent == the
-    sink's events.received. Earlier lives are
-    reported."""
+    sink's events.received. Under `target`, the edges `_target_edges` lists: into the router,
+    the router's balance R_in + R_copied − R_disc == R_fwd + ΣT_sent, and each sink's branch
+    from its target to it. Earlier lives are reported, except that the router's balance and
+    its bounds (`Ledger.router_bounds`: each T_sent ≤ R_in − R_disc, and R_fwd ≤ R_in) are
+    judged in every life a kill didn't end."""
     if _overlapped(data):
         return _per_instance(data, check_ledger_edge)
     led = _ledger(data)
@@ -3338,6 +3508,8 @@ def check_ledger_edge(data):
                  (f"E_B[{hop_in}]", "A", led.E_B, led.A, f"{hop_in} to aggregate", out)]
     elif led.script:
         edges = [("L_sent", "A", led.L_sent, led.A, "script to aggregate", out)]
+    elif led.targeted:
+        edges = _target_edges(led, out)
     else:
         edges = _chain_edges(led, out)
         into = {life: sum(led.into_aggregate(life).values()) for life in led.lives}
@@ -3346,7 +3518,7 @@ def check_ledger_edge(data):
         else:
             edges.append(("ΣE" if not any(led.transforms.values()) else "Σ(sent into aggregate)",
                           "A", into, led.A, "listeners to aggregate", out))
-    for sink in led.sinks:
+    for sink in led.sinks if not led.targeted else ():
         received = led.S_in[sink]
         if led.split == "route":
             target = led.targets.get(sink)
@@ -3358,8 +3530,11 @@ def check_ledger_edge(data):
     lines = []
     parts = []
     off = []
-    # Each edge is judged in the final life of the SUT it runs in, named only across a hop.
-    for left, right, lhs, rhs, what, view in edges:
+    # Each edge is judged in the final life of the SUT it runs in, named only across a hop. An
+    # edge with a seventh element, true, is judged in every life a kill didn't end as well.
+    for edge in edges:
+        left, right, lhs, rhs, what, view = edge[:6]
+        every = len(edge) > 6 and edge[6]
         final = view.final
         where = f"{view.service} " if led.hop is not None else ""
         # A node's edge names its left side and writes it per life (`_node_edge`).
@@ -3370,9 +3545,13 @@ def check_ledger_edge(data):
 
         for life in view.lives:
             a, b = lhs.get(life, 0), rhs.get(life, 0)
+            judged = life == final or (every and life not in view.killed)
             lines.append(f"{what}, {where}life {life}{' (final)' if life == final else ''}: "
-                         f"{side(life, a)}, {right} {_n(b)}, {name} − {right} {_n(a - b)}"
-                         + ("" if life == final else " (reported, not judged)"))
+                         f"{side(life, a)}, {right} {_n(b)}, {name} − {_grouped(right)} {_n(a - b)}"
+                         + ("" if judged else " (reported, not judged)"))
+            if judged and life != final and a != b:
+                off.append(f"life {life}: {side(life, a)} != {right} {_n(b)}, off by "
+                           f"{_n(a - b)} ({what})")
         a, b = lhs.get(final, 0), rhs.get(final, 0)
         lead = f"{where}final life {final}: " if led.hop is not None else ""
         if a != b:
@@ -3380,6 +3559,15 @@ def check_ledger_edge(data):
                        f"({what})")
         else:
             parts.append(f"{lead}{side(final, a)} == {right} {_n(b)} ({what})")
+    if led.targeted:
+        for life in [each for each in out.lives if each == out.final or each not in out.killed]:
+            for text, ok in led.router_bounds(life):
+                where = "" if life == out.final else f"life {life}: "
+                if ok:
+                    if life == out.final:
+                        parts.append(text)
+                else:
+                    off.append(f"{where}{text}, over its bound")
     head = "" if led.hop is not None else f"final life {led.final}: "
     if off:
         return Result("ledger.edge", FAIL, head + "; ".join(off + parts), lines)
@@ -3397,6 +3585,45 @@ def _chain_edges(led, view):
                           f"into {component}", view))
             edges.append(_node_edge(led, component, view))
             left, lhs = f"T_out[{component}]", led.T_out[component]
+    return edges
+
+
+def _target_edges(led, view):
+    """`ledger.edge`'s edges under `split = "target"`, in path order: each source's chain, the
+    listeners' sends into the router (R_in), the router's balance, judged in every life a kill
+    didn't end, and per sink its branch: its target's sends less a closed consumer's drops into
+    its first transform or its `aggregate`, each branch transform's own term (`_node_edge`),
+    the last into the `aggregate` (A), and the `aggregate`'s sends into the sink."""
+    edges = _chain_edges(led, view)
+    into = {life: sum(led.into_aggregate(life).values()) for life in view.lives}
+    single = len(led.listeners) == 1 and not any(led.transforms.values())
+    edges.append(("E" if single else "Σ(sent into router)", f"R_in[{led.router}]", into,
+                  led.R_in, f"listeners to router {led.router}", view))
+    lives = view.lives
+    balance = {life: led.router_balance(life) for life in lives}
+
+    def told(life):
+        return (f"R_in {_n(led.get('R_in', life))} + R_copied {_n(led.get('R_cp', life))} − "
+                f"R_disc {_n(led.get('R_disc', life))} = {_n(balance[life][0])}")
+
+    edges.append((("R_in + R_copied − R_disc", told), "R_fwd + ΣT_sent",
+                  {life: balance[life][0] for life in lives},
+                  {life: balance[life][1] for life in lives},
+                  f"router {led.router} sends each event to every destination it names", view,
+                  True))
+    for sink in led.sinks:
+        target, aggregate = led.targets.get(sink), led.aggregates.get(sink)
+        t_sent, t_x = led.T_sent.get(sink, {}), led.T_x[sink]
+        left = f"T_sent[{target}] − T_x[{target}]"
+        lhs = {life: t_sent.get(life, 0) - t_x.get(life, 0) for life in set(t_sent) | set(t_x)}
+        for component in led.branches.get(sink) or []:
+            edges.append((left, f"T_in[{component}]", lhs, led.T_in[component],
+                          f"into {component}", view))
+            edges.append(_node_edge(led, component, view))
+            left, lhs = f"T_out[{component}]", led.T_out[component]
+        edges.append((left, f"A[{aggregate}]", lhs, led.A_k[sink], f"into {aggregate}", view))
+        edges.append((f"A_sent[{aggregate}]", f"S_in[{sink}]", led.A_sent_k[sink],
+                      led.S_in[sink], f"{aggregate} to {sink}", view))
     return edges
 
 
@@ -3477,16 +3704,39 @@ def check_ledger_script(data):
 
 
 def check_ledger_aggregate(data):
-    """The final life's Ab == A."""
+    """The final life's Ab == A; under `split = "target"` each sink's own `aggregate`'s, one
+    line per sink."""
     if _overlapped(data):
         return _per_instance(data, check_ledger_aggregate)
-    return _final_equality(data, "ledger.aggregate", "Ab", "A", "every event absorbed")
+    led = _ledger(data)
+    if not led.targeted or _skip_without_sut("ledger.aggregate", led):
+        return _final_equality(data, "ledger.aggregate", "Ab", "A", "every event absorbed")
+    status, parts, lines = PASS, [], []
+    life = led.final
+    for sink in led.sinks:
+        aggregate = led.aggregates.get(sink)
+        ab, a = led.Ab_k[sink], led.A_k[sink]
+        for each in led.lives:
+            lines.append(f"{aggregate}, life {each}{' (final)' if each == life else ''}: Ab "
+                         f"{_n(ab.get(each, 0))}, A {_n(a.get(each, 0))}"
+                         + ("" if each == life else " (reported, not judged)"))
+        part = f"{aggregate}: Ab {_n(ab.get(life, 0))}"
+        if ab.get(life, 0) != a.get(life, 0):
+            status = FAIL
+            parts.insert(0, f"{part} != A {_n(a.get(life, 0))}, off by "
+                            f"{_n(ab.get(life, 0) - a.get(life, 0))}")
+        else:
+            parts.append(f"{part} == A {_n(a.get(life, 0))}")
+    return Result("ledger.aggregate", status, f"final life {life}: " + "; ".join(parts)
+                  + " (every event absorbed)", lines)
 
 
 def check_ledger_egress(data):
     """The egress gap per life and per egress group (`Ledger.egress_groups`: each sink under
-    `copy`, the sinks' summed V under `route`), Ab − V for the final life and a killed one, and
-    W − D − B − X − V for a stopped earlier one: 0 passes; a positive gap with a batch that
+    `copy` and `target`, the sinks' summed V under `route`), Ab − V for the final life and a
+    killed one, and W − D − B − X − V for a stopped earlier one, or under `target` the sink's
+    own Ab and, for a stopped earlier life, T_sent − T_x − V from its target
+    (`Ledger.egress`): 0 passes; a positive gap with a batch that
     life's telemetry counts in `batches.dropped`, under any reason, at a node that can explain
     it (`Ledger.drop_credit`) is counted, never reconciled; a killed life's gap passes inside
     `Ledger.kill_band`; any other gap is uncounted loss, or a surplus below a killed life's
@@ -3517,25 +3767,29 @@ def check_ledger_egress(data):
         for life in led.lives:
             verdict_status, verdict, gap = led.egress(life, sinks)
             status = worst([status, verdict_status])
-            ab_v = led.absorbed(life) - led.v(life, sinks)
+            ab_v = led.absorbed(life, sinks) - led.v(life, sinks)
             flush = f" (L_flush {_n(led.get('L_flush', life))})" if led.script else ""
-            absorbed = (f"{led.ab_text} {_n(led.absorbed(life))}{flush} − "
+            ab_text = (f"Ab[{led.aggregates.get(sinks[0])}]" if led.targeted else led.ab_text)
+            absorbed = (f"{ab_text} {_n(led.absorbed(life, sinks))}{flush} − "
                         f"{led.v_text(life, sinks)}")
+            residual_text = (f"{led.branch_text(sinks[0])} − Ab" if led.targeted
+                             else led.residual_text)
             if life == led.final:
                 part = f"life {life} (final): {absorbed} = {_n(gap)}, {verdict}"
             elif life in led.killed:
-                _, _, band = led.kill_band(life)
+                _, _, band = led.kill_band(life, sinks)
                 part = (f"life {life} (killed): {absorbed} = {_n(gap)}, {verdict} ({band}); "
-                        f"residual {led.residual_text} {_n(led.residual(life))} at its last "
-                        "drain, what the kill lost from the receive queue and inbox, by design, "
-                        "not judged here; D has no shutdown part: a SIGKILL counts no "
+                        f"residual {residual_text} {_n(led.residual(life, sinks))} at its "
+                        "last drain, what the kill lost from the receive queue and inbox, by "
+                        "design, not judged here; D has no shutdown part: a SIGKILL counts no "
                         "shutdown drops")
             else:
                 whole = ("E_B − X_B − V" if led.hop is not None
+                         else f"{led.branch_text(sinks[0])} − V" if led.targeted
                          else "W′ − V" if led.reshaped
                          else f"W − D − B − X − {led.discarded_text}V")
                 part = (f"life {life}: {whole} {_n(gap)} = residual "
-                        f"{_n(led.residual(life))} + {led.ab_text} − V {_n(ab_v)}, {verdict}")
+                        f"{_n(led.residual(life, sinks))} + {ab_text} − V {_n(ab_v)}, {verdict}")
             credit = led.drop_credit(life, sinks)
             if gap > 0 and not (life in led.killed and life != led.final):
                 others = ""
@@ -3646,6 +3900,8 @@ def check_ledger_summary(data):
     skipped = _skip_without_sut("ledger.summary", led)
     if skipped:
         return skipped
+    if led.targeted:
+        return _summary_targeted(data, led)
     life = led.final
     g = led.get
     first = led.inn.final
@@ -3733,6 +3989,60 @@ def check_ledger_summary(data):
     if (status == FAIL and (led.hop is not None or bound_text) and judged == 0
             and not uncounted_egress and not faults):
         detail = f"{bound_text}; {detail}"
+    return Result("ledger.summary", status, detail, lines)
+
+
+def _summary_targeted(data, led):
+    """`ledger.summary` under `split = "target"`: the final life's W − D − E − B, then every
+    `_target_edges` term (sent − received), the router's balance among them, then per sink
+    A − Ab and Ab − V. Each term is judged on its own and must be 0, a counted Ab − V aside,
+    so a surplus in one term or at one sink can't net out loss in another; uncounted is the
+    sum of their sizes. The router's term pools its targets: events it sent to one target in
+    place of another leave it 0 and every sink's terms balanced. `ledger.edge`'s
+    `router_bounds` catch only a target receiving more than the router took in. A `FAULT_DROP_REASONS` drop in a sink's credit FAILs the row as it
+    FAILs `ledger.egress`. From a file or HTTP wire, each sink's V over the run is also
+    bounded by what the generators sent less every counted loss (`_end_to_end`): a target
+    receives at most one part of each event."""
+    life = led.final
+    first = led.inn.final
+    g = led.get
+    terms = [("W − D − E − B", g("W", first) - led.D(first) - g("E", first) - g("B", first))]
+    for left, right, lhs, rhs, _, view in (edge[:6] for edge in _target_edges(led, led.out)):
+        name = left[0] if isinstance(left, tuple) else left
+        terms.append((f"{name} − {_grouped(right)}", lhs.get(view.final, 0) - rhs.get(view.final, 0)))
+    for sink in led.sinks:
+        aggregate = led.aggregates.get(sink)
+        terms.append((f"A − Ab[{aggregate}]", led.A_k[sink].get(life, 0)
+                      - led.Ab_k[sink].get(life, 0)))
+    off = [(name, value) for name, value in terms if value]
+    shown = [f"{name} {_n(value)}" for name, value in off]
+    uncounted = sum(abs(value) for _, value in off)
+    faults = []
+    for _, sinks in led.egress_groups():
+        _, verdict, gap = led.egress(life, sinks)
+        counted = verdict == "counted"
+        if gap and not counted:
+            uncounted += abs(gap)
+        fault = led.fault_drops(life, sinks)
+        if fault:
+            faults.append(fault)
+        shown.append(f"Ab[{led.aggregates.get(sinks[0])}] − V[{sinks[0]}] {_n(gap)}"
+                     + (f" {verdict}" if counted else "")
+                     + (f" (FAIL: {fault})" if fault else ""))
+    status = PASS if uncounted == 0 and not faults else FAIL
+    rest = len(terms) - len(off)
+    detail = (f"final life {life}: uncounted {_n(uncounted)}, each term judged on its own: "
+              + "; ".join(shown) + (f"; the other {rest} term(s) 0" if rest else ""))
+    if led.T_disc and led.t_disc(life):
+        detail += f"; the transforms' ΣT_disc {_n(led.t_disc(life))}, counted"
+    if led.gens and not data.external:
+        read = sum(led.W.values()) + sum(led.K.values()) + sum(led.F.values())
+        detail += f"; wire G − (W + K + F) {_n(led.G - read)} over the run; ledger.wire's"
+    if any(source_wire(source) in (FILE_WIRE, HTTP_WIRE) for source in led.sources):
+        bound_status, bound_text = _end_to_end(data, led)
+        status = worst([status, bound_status])
+        detail += f"; {bound_text}"
+    lines = _per_life_lines(led) + [f"{name}: {_n(value)}" for name, value in terms]
     return Result("ledger.summary", status, detail, lines)
 
 
@@ -5698,6 +6008,9 @@ def _balanced_drop(led, service, name, component, reason, batch_drops):
     if (sinks_side and component == led.script and name == "logit.component.events.dropped"
             and reason == "script_error"):
         return True  # L_err
+    if (sinks_side and led.targeted and name == "logit.component.events.dropped"
+            and component in led.targets.values()):
+        return True  # T_x, in `ledger.edge`'s branch and a stopped life's egress gap
     if sinks_side and component in led.sinks and (led.data.external or led.data.kafka
                                                   or led.data.standin_datadog) and name in (
             "logit.output.records.dropped", "logit.output.metrics.dropped"):
