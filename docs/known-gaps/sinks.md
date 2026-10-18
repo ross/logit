@@ -104,3 +104,46 @@ Entry format and the other areas: [the known-gaps index](README.md).
     on the destination: Datadog stores a resent series point once and a resent log twice
     (`docs/known-gaps/datadog.md`).
   - **Revisit trigger:** an operator who needs a crash replay to skip delivered requests.
+
+- **Every sink but `logit_out` sends one request at a time, so over a slow link its throughput is
+  one batch per round trip.** `write_loop` (`crates/logit-pipeline/src/runtime.rs`) takes the
+  head batch, calls the sink's `send`, and takes the next only after `send` returns. It submits
+  several batches together only for a sink whose `Output::window` reads above 1, and the default
+  is 1. Only `logit_out` overrides it (`window:`, [ADR
+  `native-hop-send-window`](../adr/native-hop-send-window.md)). No other sink has a concurrency or
+  pipelining field. The limit holds for `otlp_out` over OTLP/HTTP and OTLP/gRPC alike (the pooled
+  gRPC client could multiplex, but `send` never has two requests outstanding), `influxdb_out`,
+  `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, and `prometheus_out`'s remote-write mode.
+  A batch that needs several requests sends them in turn: `otlp_out` one per signal, and the
+  Datadog and Splunk sinks one per route or body.
+  - **Bound:** a sink moves at most (events per batch) ÷ (round-trip time to a response, plus the
+    destination's processing time) events a second. At 50 events per batch and a 200 ms round
+    trip that is 250 events a second, with the server's own time on top. A batch is whatever the
+    input assembled, because the sink doesn't coalesce.
+  - **Symptom:** once the offered rate passes the bound, the sink's buffer fills. Under
+    `buffer.overflow: drop_newest` (or `drop_oldest`) the sink counts
+    `logit.component.batches.dropped{reason="overflow_newest"}` (`overflow_oldest`), and nothing
+    else reports it. Under the default `block` the sources stall instead, and the loss moves to
+    whatever feeds them.
+  - **Evidence:** the `otlp-fan-out` soak scenario (`docs/plans/soak-harness.md`, "Findings",
+    "W13b: fan-out transforms", run `20261018T043911Z`). The generator's
+    `otlp_out` offered 500 records a second in batches of 50 over OTLP/HTTP to the system under
+    test, with `buffer: { max_batches: 50, overflow: drop_newest }`, and the harness delayed the
+    SUT's egress, which carries the responses, by 200 ms ± 50 ms. The generator counted 2,033
+    batches (101,650 records) as `overflow_newest` over the run, a fifth of the 483,150 it
+    offered, none in the ledger's G. The 10 batches a second offered is twice the 5 a second a
+    200 ms round trip allows. Not all of the 101,650 is the delay: the run's pause, stop, and
+    partition of the SUT also overflowed the 50-batch buffer, and the plan does not split the
+    count by fault.
+  - **Workaround:** put the long link under `logit_out` to a `logit_in`, which keeps up to
+    `window:` frames in flight, and send from the receiving `logit` to the destination over a
+    short hop. Otherwise, move the sink nearer to its destination. Size `buffer.max_batches` and
+    `buffer.max_bytes` to ride out a burst, and pick `overflow` for the loss you accept; none
+    raises the sustained bound. Fewer, larger batches raise it: a listener that takes
+    `receive.batch_max_events` and `batch_max_bytes` assembles them, and an `aggregate` stage
+    sends one batch per window.
+  - **Revisit trigger:** a destination that is a long round trip away and needs more than a
+    batch per round trip, which would mean a window on the shared HTTP driver
+    (`crates/logit-outputs/src/http.rs`) and the `submit`/`await_ack` split for it. Concurrent
+    requests can arrive out of order, so each sink's posture and each destination's tolerance for
+    that need checking first.
