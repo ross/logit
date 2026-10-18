@@ -3436,7 +3436,10 @@ twice `timeout`.
   requires `https://`, or `http://` to a loopback address.
 - **Renewal.** One token serves every connection until 80% of its `expires_in` has passed (or of
   the time to a JWT's `exp` claim when `expires_in` is missing), and a connection dialed after
-  that fetches a new one. A broker with `connections.max.reauth.ms` set ends each session when its
+  that fetches a new one. If that fetch fails, the sink keeps using the cached token until it
+  expires, tries the endpoint again every 10 seconds, and logs a `token_refresh_failed` warning
+  with the token's remaining life; once the token expires, the endpoint's error fails the
+  connection, so an expired token is never sent. A broker with `connections.max.reauth.ms` set ends each session when its
   token expires, so the sink redials, with a new token, before then. A fixed `token:` is never
   renewed, so the broker refuses it once it expires.
 - **Faults.** A token endpoint that's unreachable, times out (the sink's `timeout`), or answers

@@ -988,7 +988,8 @@ pub enum KafkaSasl {
         /// The identity provider's token URL, which receives a client-credentials request with
         /// `client_id` and `client_secret` in HTTP Basic authentication. Must be `https://`, or
         /// `http://` to a loopback address. The token is reused across connections and fetched
-        /// again once 80% of its `expires_in` has passed. The server's certificate is checked
+        /// again once 80% of its `expires_in` has passed; if that fetch fails, the token is used
+        /// until it expires, with a fetch every 10 seconds. The server's certificate is checked
         /// against the bundled Mozilla roots; the `tls:` block applies to brokers only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_endpoint: Option<String>,
