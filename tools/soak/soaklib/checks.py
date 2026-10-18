@@ -2798,6 +2798,14 @@ def _wire_one(data, led, source, instances=None):
         None if instances is None else _overlap_ingest(instances, source)))
     runs = []
     for start, end, kind, label, g, wk, f in buckets:
+        # Judged windows next to each other are one run, whatever their labels: a boundary
+        # between two is no edge of a judged stretch, and splitting there would put the
+        # interpolation's error at it, unbounded by any edge, on both sides.
+        if runs and runs[-1][2] == kind == "judged":
+            labels = runs[-1][3].split("; ")
+            if label not in labels:
+                runs[-1][3] = "; ".join(labels + [label])
+            label = runs[-1][3]
         if runs and runs[-1][2] == kind and runs[-1][3] == label:
             runs[-1][1] = end
             runs[-1][4] += g

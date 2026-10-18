@@ -9827,7 +9827,9 @@ def _fan_out_ledger():
 def _idle_writer():
     """`ledger.wire` on an HTTP source whose writer delivers nothing for a while, a drain with
     no `events.delivered` point, and then its backlog at once, with a judged window's edge in
-    the idle stretch: G holds flat to the burst, so no loss shows at the edge."""
+    the idle stretch: G holds flat to the burst, so no loss shows at the edge. And judged
+    windows that overlap form one run, so a lag of W behind G across a boundary between them
+    nets out."""
     idle = {_stamp(T0 + offset) for offset in range(160, 205, 5)}
     moved = {"in": 0, "out": 0}
 
@@ -9853,6 +9855,26 @@ def _idle_writer():
         wire = {r.id: r for r in checks.run_all(run_dir)}["ledger.wire"]
         expect(wire.status == checks.PASS,
                f"a writer's idle drains hold G flat across the stall, got {wire}")
+
+    # Two judged windows overlapping, with W 140 ahead of G at a boundary between them and
+    # behind it at the next: one judged stretch, whose gap nets to 0.
+    def ahead(record):
+        metric = record["metrics"][0]
+        if (record["attributes"].get("component") == "in"
+                and metric["name"] == "logit.component.events.sent"):
+            metric["value"] += {_stamp(T0 + 195): 140, _stamp(T0 + 200): -140}.get(
+                record["timestamp"], 0)
+        return record
+
+    windows = (_http_fault("x1", "netem", "logit", 140, 150)
+               + _http_fault("x2", "netem", "generator", 190, 200))
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = _http_run(tmp, "judged-stretch", kind="otlp_in", timeline_extra=windows,
+                            sut_edit=ahead)
+        wire = {r.id: r for r in checks.run_all(run_dir)}["ledger.wire"]
+        expect(wire.status == checks.PASS
+               and any(line.startswith("[+100s, +245s] judged (") for line in wire.lines),
+               f"adjacent judged windows are one run, got {wire}")
 
 
 def _fan_out_rules(root):

@@ -1064,7 +1064,9 @@ The rows:
   linearly at each SUT drain timestamp, anchored at every generator drain, one with no G point
   at the running total (W13b), since a counter exports no point for a drain it didn't move
   in; across a run of steady intervals the interpolation telescopes, and each edge of the run
-  errs by at most one batch. Each steady run's gap counts
+  errs by at most one batch. Judged windows that overlap or touch form one run whatever their
+  labels (W13b), since a boundary between two is no edge of a judged stretch and would carry the
+  interpolation's error with no edge to allow it. Each steady run's gap counts
   at 0 when W + K exceeds G in it, so a surplus in one run can't net out loss in another. The
   generator sink's own
   `drop_newest` loss while the SUT is unreachable is counted and never in G; the row shows it
@@ -2432,7 +2434,8 @@ that items 3, 7, and 11 need.
   as counted loss in the residual, the egress gap, `ledger.summary`, and the end-to-end bound,
   with self-test fixtures and the `tail-rotate-stale` scenario.
 - **W13b**: item 13's fan-out: a source's `fan_out`, its term in `ledger.edge`, W′ in every row
-  after it, `ledger.wire`'s G anchored at every generator drain, self-test fixtures for each
+  after it, `ledger.wire`'s G anchored at every generator drain and its adjacent judged windows
+  joined into one run, self-test fixtures for each
   rule, and the `otlp-fan-out` scenario. Its generator sends over OTLP/HTTP, so it lands after
   W14's `http` wire and its `otlp_in` rows.
 - **W14**: item 14, the `http` wire, with rows for `influxdb_in`, which its scenario runs, and
