@@ -2435,9 +2435,8 @@ that items 3, 7, and 11 need.
   with self-test fixtures and the `tail-rotate-stale` scenario.
 - **W13b**: item 13's fan-out: a source's `fan_out`, its term in `ledger.edge`, W′ in every row
   after it, `ledger.wire`'s G anchored at every generator drain and its adjacent judged windows
-  joined into one run, self-test fixtures for each
-  rule, and the `otlp-fan-out` scenario. Its generator sends over OTLP/HTTP, so it lands after
-  W14's `http` wire and its `otlp_in` rows.
+  joined into one run, self-test fixtures for each rule, and the `otlp-fan-out` scenario. Its
+  generator sends over OTLP/HTTP, so it lands after W14's `http` wire and its `otlp_in` rows.
 - **W14**: item 14, the `http` wire, with rows for `influxdb_in`, which its scenario runs, and
   for `otlp_in`, which W13b's generator needs; the generator sink's kind checked at load, the
   wire's fault predicates and judgments, `influxdb_in`'s request identities in
