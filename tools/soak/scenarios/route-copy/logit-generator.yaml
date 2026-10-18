@@ -1,0 +1,24 @@
+# The load source in `script/soak`'s route-copy scenario: 2,000 DogStatsD counter lines a second
+# over UDP to the system under test, one line per datagram, each tagged `shard:0` or `shard:1`.
+# Its `internal` telemetry goes to stdout as NDJSON, so the harness reads what it sent.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 2000
+    batch: 100
+    event:
+      # `seq%2` is `seq%100`'s parity, so each of the 100 series carries one shard throughout.
+      attributes: { shard: "{seq%2}" }
+      metric: { name: "soak_requests_{seq%100}", kind: sum, value: 1 }
+  statsd:
+    type: statsd_out
+    sources: [load]
+    endpoint: logit:8125
+    format: dogstatsd               # writes the attribute as `|#shard:N`
+    # One line per datagram, the ledger's unit: the longest line, `soak_requests_99:1|c|#shard:1`,
+    # is 29 bytes, and two joined by a newline would be 59.
+    max_packet_bytes: "32"
+    buffer: { overflow: drop_newest, retry_max_delay: 1s }   # never stall generate_in
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

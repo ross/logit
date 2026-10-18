@@ -1,0 +1,66 @@
+# The system under test in `script/soak`'s route-signals scenario: syslog lines over UDP, each
+# given one counter increment, so every event carries a log and a metric, then a `route_signals`
+# that splits each event into a log part and a metric part, one per target. Each target feeds its
+# own 10 s cumulative aggregate, remote-write sink, and VictoriaMetrics. The log part carries no
+# number a backend can count, so its branch gives it a counter of its own. Its `internal`
+# telemetry goes to stdout as NDJSON for the harness to read.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  lines: { type: lines_in, transport: udp, bind: 0.0.0.0:5514 }
+  # Every node between `lines` and `split` forwards every event it receives, which
+  # `ledger.edge` checks hop by hop: `kv` passes a line it can't parse through unchanged.
+  parse:
+    type: kv                        # the RFC 5424 header's words carry no `=` and are skipped
+    sources: [lines]
+    pair_sep: " "
+    kv_sep: "="
+  labels: { type: keep, sources: [parse], fields: [id] }
+  count:
+    type: kv_metrics
+    sources: [labels]
+    counters: [{ name: soak_lines }]   # no `field`: +1 per event
+  split:
+    type: route_signals             # strip: true, so each target gets only its own signal
+    sources: [count]
+    signals: { logs: tier_logs, metrics: tier_metrics }
+  tier_logs: { type: target }
+  tier_metrics: { type: target }
+  # The log part's branch: one increment per log, and the log itself left out of `window_logs`,
+  # which would otherwise pass it on to the sink.
+  count_logs:
+    type: kv_metrics
+    sources: [tier_logs]
+    counters: [{ name: soak_log_lines }]
+  logs_metrics_only:
+    type: keep_signals
+    sources: [count_logs]
+    signals: [metrics]
+  window_logs:
+    type: aggregate
+    sources: [logs_metrics_only]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  vm_logs:
+    type: prometheus_out
+    sources: [window_logs]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  window_metrics:
+    type: aggregate
+    sources: [tier_metrics]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360
+  vm_metrics:
+    type: prometheus_out
+    sources: [window_metrics]
+    endpoint: http://victoria-metrics-b:8428/api/v1/write
+    version: 1
+    compression: zstd
+    # Its 1024-batch queue holds every fault's windows, so `drop_oldest` never drops here; one
+    # blocking sink behind the listener keeps `logit validate` quiet.
+    buffer: { overflow: drop_oldest }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

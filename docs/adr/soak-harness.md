@@ -393,6 +393,24 @@ wants a rate bounds it with `[[expect]]`. A discard of a line a kill replays is 
 as its read counts in W again, so the replay band still bounds a file wire's surplus.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "6. The checks", has the rules.
 
+## Amendment: an HTTP wire's G is what the listener answered, and a resend may surplus (2026-10-17)
+
+A source's `wire` can be `http`: a generator `influxdb_out` or `otlp_out` writes to
+`influxdb_in` or `otlp_in`. G is the writer's `events.delivered`, the events of the batches the
+listener answered with a success, and W is the listener's `events.sent`, since neither listener
+counts points before it sends them. The wire compares G with W − X: a batch refused with `503`
+because every consumer had closed is in `events.sent` and its events in X, and the client still
+holds it and resends it, so X is never counted loss on this wire. A busy `503` takes nothing.
+G counts an event only after the listener's batch was in every inbox and W had counted it, so
+only a `kill` or an `exit` of the SUT, which can lose its last unexported interval, is reported;
+every other window is judged. A judged window may show a surplus, W − X above G, of one
+generator batch per attempt the writer counted `logit.output.requests{class="network_error"}`
+in it, plus one per edge: the writer sends one batch per request, one request in flight, and
+resends it after a transport error, when the listener may already have taken it. The same
+allowance, with X left out of the counted loss, bounds `ledger.summary`'s end to end.
+`influxdb_in`'s request identities are judged in `ledger.intake`.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "6. The checks", has the rules.
+
 ## Amendment: a deleting writer's G stands alone (2026-10-18)
 
 A writer that bounds its retention (`file_out`'s `rotate.max_files`) deletes its oldest file at
@@ -415,3 +433,51 @@ rotations in a stop, kill, restart, or `exit`, which close the tailer's files, a
 in a pause, which keeps them open. Reading the loss from that counter instead would miss what a
 file gained after its last checkpoint, so `tail-rotate-delete` expects it at 0 beside the guard.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "6. The checks", has the rules.
+
+## Amendment: a fan-out node's events are carried through its chain, and adjacent judged windows net at their boundary (2026-10-18)
+
+A source's `fan_out` names a `line_protocol` node and the k events it emits per event. Every
+row after the listener then reads W′, each listener's W − D − B − X carried through its chain:
+a fan-out node turns x events into k × x − T_lines + (T_in − T_disc), its children and the
+parents it sent on, and any other node into x − T_disc. W′ takes W − D − B − X − ΣT_disc's place
+in the residual, a stopped life's egress gap, and the end-to-end bound, and R and a killed
+life's ingest grow by each chain's product of k. `ledger.edge` holds the node to children ==
+k × T_in − T_lines with no tolerance, since the count is the ADR `transform-fan-out` count.
+
+`ledger.wire` anchors G at every generator drain, a drain with no G point at the running total.
+On TCP and HTTP, where acknowledgments can bunch, G's interpolation at a boundary between two
+judged windows can err by the G that moved in the generator interval straddling it, and shows
+as an opposite-signed pair in the two runs that touch. So the part of one run's surplus past
+its own allowance nets with the loss across that boundary, up to that G, shown in the detail;
+the part inside the allowance nets nothing, and runs that don't touch never net. Netting more
+widely would let one window's surplus hide another's loss.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "6. The checks", has the rules.
+
+## Amendment: three ways to share the sinks, and a target split for a router that copies (2026-10-18)
+
+A scenario with several sinks names how they share the SUT's events in `[ledger] split`, and
+the ledger follows each `[[ledger.sink]]`. Under `copy`, the default, each sink holds a full
+copy of `aggregate`'s output, so each sink's V is judged alone against Ab. Under `route` a
+`route` after `aggregate` fills one target per sink, so the sinks' V add up to Ab and are
+judged on their sum; `load()` refuses a list-valued `routes:` value and any `route_signals`
+there, because one event can then reach several sinks.
+
+Those routers run under `target`: the router, `[ledger] sut_router`, sits between the listeners
+and one `aggregate` per sink, and each sink is judged from its own target's `events.sent`,
+which the target's `Fanout` counts under the target's id. The listeners' side ends at the
+router: a killed life's residual stays in [0, R], and a stopped life's must be 0, since its
+final drain runs after every data node has exited and nothing downstream judges it. The router
+balances with no tolerance, received + copied − discarded == its forward edge's sends + its
+targets', in the final life and every stopped one. That balance pools the targets, so beside it
+each target's sends may not exceed what the router received less what it discarded, and its
+forward edge's may not exceed what it received: a target receives at most one delivery of each
+event (graph rule 51 for a `route`, one part per target for a `route_signals`). The bound
+catches a target receiving more than the router took in, not events sent to one target in
+place of another below that. Each sink's branch is judged hop by hop, its egress against its
+own Ab, and `ledger.summary` judges every term on its own. `load()` holds the router's targets
+to the sinks' targets, refuses any other router or script that fills one, and refuses the split
+beside `sut_script`, a hop, `vm_every_window`, `[overlap]`, or a non-local target, whose rows
+read one `aggregate`. The alternative, summing the sinks' V against the router's received
+events times a copy factor, needs a factor the config doesn't fix: a `route` copies only the
+events whose value lists several targets. [`docs/plans/soak-harness.md`](../plans/soak-harness.md),
+"The target split (W15)", has the rules.
