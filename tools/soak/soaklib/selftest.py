@@ -160,7 +160,10 @@ a rotate on its own service after a SIGHUP, never inside a lifecycle fault; neit
 making the CA and each first issue and stopping on a failed one, and over synthetic runs:
 `tls.served` reading the generation in force through a broken rotation, a wrong serial, an
 unverified chain, a missing first issue, and a failed probe each FAILing; `self_log` excusing
-`tls_reload_failed` only inside a broken rotation on its service; and the `rise` reducer.
+`tls_reload_failed` inside a broken rotation on its service, and inside another rotation on a
+polling service when a reload follows it there, a torn read, but not with no later reload or on a
+service that doesn't poll; a rotation a later probe reads loaded by a SIGHUP or a start on a SUT
+that doesn't poll; the TLS directory's mode under a narrow umask; and the `rise` reducer.
 
 No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
 suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
@@ -8365,6 +8368,49 @@ def _tls_rules(root):
                  "logit's config reads nothing under /tls/statsd/live/",
                  "a rotate whose path appears only in a comment", roles=_override_roles(loaded))
 
+    # A rotation a later probe reads must be loaded on a SUT that doesn't poll: by a SIGHUP
+    # inside it, or by a start of the SUT before the certificate's next rotation.
+    def extra_rotation(at, signal_at=None):
+        def edit(raw):
+            for index, days in ((5, 40), (8, 41), (12, 42)):
+                raw["step"][index]["days"] = days
+            raw["step"].append({"at": at, "action": "rotate", "on": "logit", "cert": "statsd",
+                                "days": 32, "for": "20s"})
+            if signal_at is not None:
+                raw["step"].append({"at": signal_at, "action": "signal", "on": "logit",
+                                    "signal": "HUP", "for": "5s"})
+        return edit
+
+    def loads(raw, what, at=path):
+        try:
+            scenario.validate(scenario.from_dict(raw, at))
+            expect(True, "")
+        except scenario.ScenarioError as err:
+            expect(False, f"{what}: refused with {err.problems}")
+
+    unloaded = mutate(extra_rotation("3m40s"))
+    _refused(path, unloaded, "logit polls no TLS files (tls_reload_interval: 0s), and nothing "
+             "loads this rotation of statsd before a later probe reads it",
+             "a rotation no SIGHUP or start loads, on a SUT that doesn't poll",
+             roles=_override_roles(loaded))
+    loads(mutate(extra_rotation("1m")), "a rotation the SUT's restart loads before the next one")
+    loads(mutate(extra_rotation("3m40s", signal_at="3m45s")),
+          "a rotation a SIGHUP inside it loads")
+    with tempfile.TemporaryDirectory() as tmp:
+        for name in ("scenario.toml", "logit-generator.yaml", "compose.override.yaml"):
+            shutil.copy(path.parent / name, Path(tmp) / name)
+        (Path(tmp) / "logit-sut.yaml").write_text(
+            (path.parent / "logit-sut.yaml").read_text().replace(
+                "tls_reload_interval: 0s", "tls_reload_interval: 10s"))
+        loads(copy.deepcopy(unloaded), "a rotation on a SUT that polls its files",
+              at=Path(tmp) / "scenario.toml")
+    expect(not scenario.tls_reload_polls("tls_reload_interval: 0s\n")
+           and not scenario.tls_reload_polls("tls_reload_interval: \"0ms\"  # off\n")
+           and scenario.tls_reload_polls("tls_reload_interval: 10s\n")
+           and scenario.tls_reload_polls("components: {}\n")
+           and scenario.tls_reload_polls("# tls_reload_interval: 0s\ncomponents: {}\n"),
+           "a config polls unless its top-level tls_reload_interval is zero")
+
     random_path, random_raw = _random_base(root)
     for action in ("rotate", "probe"):
         raw = copy.deepcopy(random_raw)
@@ -8477,9 +8523,16 @@ def _tls_driver(root):
             driver.Docker = fake
             run = driver.Run(root, loaded, loaded.duration, None, False, tmp, [], "logit:soak",
                              roles=_override_roles(loaded))
-            run.prepare()
+            # A narrow umask, as a host can set: the directory must still be 0755.
+            umask = os.umask(0o077)
+            try:
+                run.prepare()
+            finally:
+                os.umask(umask)
             tls = (run.run_dir / "tls").resolve()
             env = (run.run_dir / "compose.env").read_text()
+            expect((tls.stat().st_mode & 0o777) == 0o755,
+                   f"the TLS directory is 0755 whatever the umask, got {tls.stat().st_mode:o}")
             user = f"{os.getuid()}:{os.getgid()}"
             head = ["--user", user, "-v", f"{tls}:/tls:z", "--entrypoint", "/certs.sh",
                     driver.NETEM_IMAGE]
@@ -8535,16 +8588,34 @@ def _tls_driver(root):
            "files readable, and presents the probe's certificate")
 
 
+def _tls_stderr_line(offset, key):
+    """A stderr line as `Watched::check` logs it for the generator's `statsd` sink: a
+    `tls_reload_failed` WARN or a `tls_reloaded` INFO."""
+    if key == "tls_reloaded":
+        level, message = "INFO", ("reloaded TLS files tls.ca_file /tls/ca.pem, tls.cert_file "
+                                  "/tls/generator/live/cert.pem, tls.key_file "
+                                  "/tls/generator/live/key.pem")
+    else:
+        level, message = "WARN", ("TLS reload failed, still using the previous files: loading "
+                                  "tls.cert_file /tls/statsd/live/cert.pem with tls.key_file "
+                                  "/tls/statsd/live/key.pem: keys may not be consistent: "
+                                  "KeyMismatch (x1, further occurrences suppressed)")
+    return json.dumps({"timestamp": _stamp(T0 + offset), "level": level, "message": message,
+                       "component": "statsd", "key": key, "target": "logit"}) + "\n"
+
+
 def _tls_run(tmp, name, served="B2", verified=True, issued=True, first_broken=False,
-             failed_probe=False, reload_failed_at=None, failed_on="logit"):
+             failed_probe=False, reload_failed_at=None, failed_on="logit", lines=()):
     """A run directory for `tls.served`, `self_log`, and `rise`: statsd first issued as A1
     (notAfter 100), rotated at c0s1 [+100, +140] to gen 2, B2 (notAfter 200), with a SIGHUP
-    c0s2 [+110, +120] and a probe c0s3 [+125, +130], then rotated broken at c0s6 [+200, +240]
-    to gen 3, C3, with a SIGHUP c0s7 and a probe c0s8 [+225, +230] that read `served`.
-    `first_broken` makes c0s1 the broken one, `issued` False leaves out the `tls_issued` phase,
-    `failed_probe` fails c0s8's apply, and `reload_failed_at` puts a `tls_reload_failed` line on
-    `failed_on`'s stderr at that offset. The SUT's not_after gauge reads 100 until +115 and 200
-    after it."""
+    c0s2 [+110, +120] and a probe c0s3 [+125, +130]; the generator's certificate rotated at
+    c0s4 [+150, +190]; then statsd rotated broken at c0s6 [+200, +240] to gen 3, C3, with a
+    SIGHUP c0s7 and a probe c0s8 [+225, +230] that read `served`. The SUT's config sets
+    `tls_reload_interval: 0s` and the generator's `10s`. `first_broken` makes c0s1 the broken
+    one, `issued` False leaves out the `tls_issued` phase, `failed_probe` fails c0s8's apply,
+    `reload_failed_at` puts a `tls_reload_failed` line on `failed_on`'s stderr at that offset,
+    and `lines` adds `(service, offset, key)` lines. The SUT's not_after gauge reads 100 until
+    +115 and 200 after it."""
     timeline = [_phase("start", 0, t0=T0)]
     if issued:
         timeline.append(_phase("tls_issued", -5, certs={"statsd": {
@@ -8559,6 +8630,8 @@ def _tls_run(tmp, name, served="B2", verified=True, issued=True, first_broken=Fa
                                          "serial": "A1" if first_broken else "B2",
                                          "not_after": 100 if first_broken else 200,
                                          "verified": True}),
+            ("c0s4", "rotate", 150, 190, {"cert": "generator", "days": 31, "gen": 2,
+                                          "serial": "G2", "not_after": 250}),
             ("c0s6", "rotate", 200, 240, {"cert": "statsd", "days": 32, "gen": 3,
                                           "serial": "C3", "not_after": 300, "broken": True}),
             ("c0s7", "signal", 210, 220, {"signal": "HUP"}),
@@ -8569,11 +8642,12 @@ def _tls_run(tmp, name, served="B2", verified=True, issued=True, first_broken=Fa
         apply_fields = dict(fields)
         if rc:
             apply_fields = {"cert": "statsd", "port": 8125, "stderr": "served no certificate"}
-        timeline += [_action("apply", step_id, action, "logit", start, start + 0.5, rc=rc,
+        on = "generator" if step_id == "c0s4" else "logit"
+        timeline += [_action("apply", step_id, action, on, start, start + 0.5, rc=rc,
                              **apply_fields),
-                     _action("revert", step_id, action, "logit", end, end + 0.01)]
+                     _action("revert", step_id, action, on, end, end + 0.01)]
         steps.append({"id": step_id, "spec_index": int(step_id[3:]) - 1, "cycle": 0,
-                      "action": action, "on": "logit", "args": "", "start": start, "end": end})
+                      "action": action, "on": on, "args": "", "start": start, "end": end})
     timeline += [_phase("end_begin", 300), _phase("end_end", 330)]
     stdout = []
     for offset in range(5, 301, 5):
@@ -8596,14 +8670,21 @@ def _tls_run(tmp, name, served="B2", verified=True, issued=True, first_broken=Fa
          "attrs": {"component": "statsd", "side": "client"}, "step": 2, "window": "through",
          "reduce": "rise", "min": 0}]
     run_dir = _run_dir(tmp, name, timeline, stdout, suts=["logit"], steps=steps,
-                       expect=expectations)
+                       expect=expectations,
+                       configs={"sut": "logit-sut.yaml", "generator": "logit-generator.yaml"})
+    (run_dir / "configs").mkdir()
+    (run_dir / "configs" / "logit-sut.yaml").write_text(
+        "tls_reload_interval: 0s\ncomponents: {}\n")
+    (run_dir / "configs" / "logit-generator.yaml").write_text(
+        "tls_reload_interval: 10s\ncomponents: {}\n")
+    by_service = {}
     if reload_failed_at is not None:
-        (run_dir / "logs" / f"{failed_on}.stderr").write_text(
-            f'{{"timestamp":"{_stamp(T0 + reload_failed_at)}","level":"WARN","message":"TLS '
-            'reload failed, still using the previous files: loading tls.cert_file '
-            '/tls/statsd/live/cert.pem with tls.key_file /tls/statsd/live/key.pem: keys may '
-            'not be consistent: KeyMismatch (x1, further occurrences suppressed)",'
-            '"component":"statsd","key":"tls_reload_failed","target":"logit"}\n')
+        by_service.setdefault(failed_on, []).append((reload_failed_at, "tls_reload_failed"))
+    for service, offset, key in lines:
+        by_service.setdefault(service, []).append((offset, key))
+    for service, entries in by_service.items():
+        (run_dir / "logs" / f"{service}.stderr").write_text("".join(
+            _tls_stderr_line(offset, key) for offset, key in sorted(entries)))
     return run_dir
 
 
@@ -8616,7 +8697,7 @@ def _tls_checks():
     with tempfile.TemporaryDirectory() as tmp:
         data = checks.RunData(_tls_run(tmp, "clean"))
         expect(not data.faults and sorted(f.step for f in data.events)
-               == ["c0s1", "c0s2", "c0s3", "c0s6", "c0s7", "c0s8"],
+               == ["c0s1", "c0s2", "c0s3", "c0s4", "c0s6", "c0s7", "c0s8"],
                f"a rotate and a probe open no fault window, got {data.faults}")
         rows = {r.id: r for r in checks.check_tls_served(data)}
         expect(set(rows) == {"tls.served.c0s3", "tls.served.c0s8"}
@@ -8671,6 +8752,25 @@ def _tls_checks():
         expect(elsewhere.status == checks.FAIL
                and "outside every broken rotate on generator" in elsewhere.detail,
                f"a broken rotation on one service excuses no other's, got {elsewhere}")
+        torn = checks.check_self_log(checks.RunData(_tls_run(tmp, "torn", lines=(
+            ("generator", 160.2, "tls_reload_failed"), ("generator", 170.2, "tls_reloaded")))))
+        expect(torn.status == checks.PASS
+               and "1 torn read(s) a later reload in their rotation replaced" in torn.detail,
+               f"a polling service's failed reload that a reload follows in its rotate is a "
+               f"torn read, got {torn}")
+        unreplaced = checks.check_self_log(checks.RunData(_tls_run(tmp, "unreplaced", lines=(
+            ("generator", 160.2, "tls_reload_failed"), ("generator", 195.2, "tls_reloaded")))))
+        expect(unreplaced.status == checks.FAIL
+               and "tls_reload_failed at +160s, outside every broken rotate on generator and "
+                   "with no reload after it in its rotate" in unreplaced.detail,
+               f"a failed reload with no later reload in its rotate FAILs, got {unreplaced}")
+        unpolled = checks.check_self_log(checks.RunData(_tls_run(tmp, "unpolled", lines=(
+            ("logit", 110.2, "tls_reload_failed"), ("logit", 112.2, "tls_reloaded")))))
+        expect(unpolled.status == checks.FAIL
+               and "tls_reload_failed at +110s, outside every broken rotate on logit"
+                   in unpolled.detail,
+               f"a failed reload on a service that doesn't poll FAILs, reload or not, got "
+               f"{unpolled}")
 
         rows = {r.id: r for r in checks.check_expect(data)}
         expect(rows["expect.rises"].status == checks.PASS
