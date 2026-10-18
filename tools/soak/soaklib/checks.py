@@ -2760,9 +2760,10 @@ def _boundary_nets(runs, anchors, allowances):
     restart flushes a backlog. The error moves G from one side of the boundary to the other, an
     opposite-signed pair in the two runs that touch. A transfer is capped at the G that moved
     over the generator anchor pair straddling the boundary, and at either gap, so neither run
-    changes sign. Only a surplus past its run's own allowance nets: one inside it is excused
-    already, and netting it too would let it hide a loss next door. A judged-to-steady edge has
-    its one-batch tolerance instead, and a steady run never nets with a judged one."""
+    changes sign. Only the part of a surplus past its run's own allowance nets: the part inside
+    it is excused already, and netting it too would let it hide a loss next door. A
+    judged-to-steady edge has its one-batch tolerance instead, and a steady run never nets with
+    a judged one."""
     nets = [g - wk for _, _, _, _, g, wk, _ in runs]
     netted = {}
     stamps = [t for t, _ in anchors]
@@ -2776,9 +2777,7 @@ def _boundary_nets(runs, anchors, allowances):
             continue
         straddled = anchors[upper][1] - anchors[upper - 1][1]
         loss, surplus = (index, index + 1) if nets[index] > 0 else (index + 1, index)
-        if -nets[surplus] <= allowances[surplus]:
-            continue
-        moved = min(-nets[surplus], nets[loss], straddled)
+        moved = min(-nets[surplus] - allowances[surplus], nets[loss], straddled)
         # An interpolated G leaves fractions; less than one event isn't worth a transfer.
         if moved < 1:
             continue
@@ -2869,8 +2868,8 @@ def _wire_one(data, led, source, instances=None):
     # runs (`_boundary_nets`). G is interpolated there, and when acknowledgments bunch, under
     # one request in flight or a restart's backlog flush, its error is up to the G that moved
     # in the generator interval straddling the boundary, an opposite-signed pair in the two runs
-    # that touch. So a surplus past its run's allowance moves across, up to that G, and no
-    # further.
+    # that touch. So the part of a surplus past its run's allowance moves across, up to that G,
+    # and no further.
     steady_lost = 0.0
     g_steady = 0.0
     edges = 0

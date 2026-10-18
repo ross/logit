@@ -9888,12 +9888,13 @@ def _idle_writer():
             return {r.id: r for r in checks.run_all(run_dir)}["ledger.wire"]
 
     # W 700 ahead of G at the boundary +195 and behind it at the next drain: an opposite-signed
-    # pair past the runs' edge allowances but inside the G that moved over the generator interval
-    # straddling it, 1,000.
+    # pair past the surplus run's allowance of 200 and inside the G that moved over the
+    # generator interval straddling it, 1,000. The 500 past the allowance nets; the 200 it
+    # excuses stays, as does the 200 of loss across from it, inside the pool's 500.
     within = wire_with("boundary-within", {195: 700, 200: -700})
     expect(within.status == checks.PASS
-           and any("700 netted across the boundary at +195s (G moved 1,000 over the generator "
-                   "interval straddling it), net gap 0" in line for line in within.lines),
+           and any("500 netted across the boundary at +195s (G moved 1,000 over the generator "
+                   "interval straddling it), net gap -200" in line for line in within.lines),
            f"an opposite-signed pair at a judged boundary nets inside the straddling G, got "
            f"{within}")
     # The same pair beyond that G: only 1,000 nets, and the rest FAILs both ways.
@@ -9917,6 +9918,14 @@ def _idle_writer():
            and not any("netted" in line for line in excused.lines)
            and excused.detail.startswith("600 lost outside reported HTTP windows"),
            f"a surplus inside its own allowance can't hide a loss next to it, got {excused}")
+    # A loss of 600 next to a surplus of 250, 50 past its run's allowance of 200: only the 50
+    # nets, so the 550 left stands past the pool's 500. Netting the excused 200 too would bring
+    # it to 350 and hide it.
+    past = wire_with("boundary-past", {195: 250, 200: -600})
+    expect(past.status == checks.FAIL
+           and any("50 netted across the boundary at +195s" in line for line in past.lines)
+           and past.detail.startswith("550 lost outside reported HTTP windows"),
+           f"only the surplus past its allowance nets against a loss next to it, got {past}")
     # A loss in one judged window and a surplus in another that doesn't touch it: nothing
     # nets, so the loss and the surplus each FAIL.
     apart = wire_with("boundary-apart", {150: -800, 220: 800})

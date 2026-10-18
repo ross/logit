@@ -1077,9 +1077,10 @@ The rows:
   its own rule (W13b): G's error there is bounded by the G that moved in the generator interval
   straddling it, which is many batches when acknowledgments bunch, under one request in flight
   or a restart's backlog flush, and it shows as an opposite-signed pair in the two runs that
-  touch. A surplus past its run's own allowance (below) nets with the loss across that boundary,
-  up to that G, shown in the detail line; a surplus inside its allowance is excused already and
-  nets nothing, and runs that don't touch never net. A judged run's surplus allowance counts
+  touch. The part of a surplus past its run's own allowance (below) nets with the loss across
+  that boundary, up to that G, shown in the detail line; the part inside the allowance is
+  excused already and nets nothing, so it can't hide a loss next door, and runs that don't
+  touch never net. A judged run's surplus allowance counts
   every edge it has, a boundary with another judged run included. Each steady run's gap counts
   at 0 when W + K exceeds G in it, so a surplus in one run can't net out loss in another. The
   generator sink's own
@@ -4705,7 +4706,8 @@ code changed since `origin/main`'s `9bfc434f`, and `line_protocol`, `otlp_in`, a
 all on `main`. The third run, `perf/results/soak/20261018T043911Z`, from `soak/w13b` at
 `fd3cab7c`, exit 0, every row PASS or SKIP. The table is that run re-scored offline with
 `script/soak check` after `ledger.wire`'s boundary rule replaced a merge of adjacent judged
-windows; only `ledger.wire`'s detail changed, from a loss judged of 82 to 91:
+windows; only `ledger.wire`'s detail changed, from a loss judged of 82 to 582 against a limit
+of 650:
 
 | Check | Status | Detail |
 |---|---|---|
@@ -4718,7 +4720,7 @@ windows; only `ledger.wire`'s detail changed, from a loss judged of 82 to 91:
 | `progress` | PASS | 7 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 7 of 7, 7 freshness sample(s); 180s of 900s after warmup judged (20%; WARN under 5%) |
 | `rss_slope` | PASS | generator PASS: MiB/h life 0 +1.6 (limit 64); 200s of 900s after warmup judged (22%; WARN under 5%) \| logit PASS: MiB/h life 1 +3.4 (limit 64); 190s of 900s after warmup judged (21%; WARN under 5%) |
 | `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +8) \| logit PASS: warmup median 13 -> end 14 (limit +8) |
-| `ledger.wire` | PASS | G 381,500 (acknowledged of 483,150 attempted) = W 381,650 − X 0 + gap -150 (0 in reported windows, -5 in judged HTTP-affecting windows, -114 steady, -31 at the end; loss judged 91, each run at 0 or more, against limit 650); the generator's requests: 22 transport-error attempt(s), 0 answered 5xx and retried; its counted loss, not in G: 101,650 event(s) in 2,033 batch(es) (overflow_newest 2,033) |
+| `ledger.wire` | PASS | G 381,500 (acknowledged of 483,150 attempted) = W 381,650 − X 0 + gap -150 (0 in reported windows, -5 in judged HTTP-affecting windows, -114 steady, -31 at the end; loss judged 582, each run at 0 or more, against limit 650); the generator's requests: 22 transport-error attempt(s), 0 answered 5xx and retried; its counted loss, not in G: 101,650 event(s) in 2,033 batch(es) (overflow_newest 2,033) |
 | `ledger.intake` | PASS | final life 1: W − D 128,700 vs E + B 128,700; final life 1: otlp_in counts no requests: W − D == E + B alone; life 0: W′ − Ab 0 within [0, R] (R 788,000 = (0 + 132 x 1,000) x 4 + 65 x 1,000 x 4; W′ is each listener's W − D − B − X carried through its chain's fan_out and discards) |
 | `ledger.edge` | PASS | final life 1: E[otlp] 128,700 == T_in[points] 128,700 (into points); children[points] = T_out 514,800 − (T_in 128,700 − T_disc 128,700) = 514,800 == 4 x T_in − T_lines[points] 514,800 (points emits 4 per event); T_out[points] 514,800 == T_in[count] 514,800 (into count); T_in[count] 514,800 − T_disc[count] 0 = 514,800 == T_out[count] 514,800 (count sends what it doesn't discard); Σ(sent into aggregate) 514,800 == A 514,800 (listeners to aggregate); A_sent 19,840 == S_in[victoria_metrics] 19,840 (aggregate to victoria_metrics) |
 | `ledger.script` | SKIP | no [ledger] sut_script |
@@ -4755,11 +4757,12 @@ windows; only `ledger.wire`'s detail changed, from a loss judged of 82 to 91:
   140-point surplus in a 20 s run between two overlapping netem windows: the 30% loss on the
   SUT's egress delays answers in bursts, and a run boundary between two judged windows had no
   edge to allow the interpolation's error there. A boundary between two judged runs now nets
-  an opposite-signed pair, up to the G that moved over the generator interval straddling it,
-  when the surplus is past its run's own allowance, and every edge of a judged run allows a
+  the part of a surplus past its run's own allowance with the loss across it, up to the G that
+  moved over the generator interval straddling it, and every edge of a judged run allows a
   batch of surplus. In the third run the SUT's restart at +660 shows the pair at its largest:
-  −1,890 before the +665 boundary and +1,830 after it, 1,830 netted against 4,950 of G in the
-  straddling interval. All three runs, and `http-ingress`'s `20261018T025154Z`, re-score PASS
+  −1,890 before the +665 boundary and +1,830 after it, of which 1,339 netted, the surplus past
+  its run's allowance of 500, against 4,950 of G in the straddling interval; the 492 of loss
+  left counts in the pool. All three runs, and `http-ingress`'s `20261018T025154Z`, re-score PASS
   on every row with `script/soak check`.
 - **The generator lost a fifth of its records, counted.** `otlp_out` sends one request at a
   time, so its rate is a batch per round trip: under the SUT's 200 ms egress delay it
