@@ -1,0 +1,46 @@
+# The system under test in `script/soak`'s tail-rotate-delete scenario, tail-rotate's config:
+# `tail_in` follows the writer's rotating file through the directory they share, `json` parses
+# each line, and each becomes one `soak_lines` increment in a 10 s cumulative aggregate, sent as
+# remote-write 1.0 (zstd) to VictoriaMetrics from a disk spool. Its `internal` telemetry goes to
+# stdout as NDJSON for the harness to read; `script/soak` runs it with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  tail:
+    type: tail_in
+    # The wildcard matches the writer's rotated names (`app.log.1`, `app.log.2`, ...), so a
+    # file renamed away is followed by inode and read to its end, never lost.
+    paths: ["/shared/app.log*"]
+    read_from: beginning
+    # The image creates /var/lib/logit for its unprivileged user. The driver never recreates
+    # the container, so the checkpoint survives a stop and a kill.
+    checkpoint_path: /var/lib/logit/tail.checkpoint
+    checkpoint_interval: 5s
+  # Every node between `tail` and `window` forwards every event it receives, which
+  # `ledger.edge` checks hop by hop: `json` passes a line it can't parse through unchanged.
+  parse: { type: json, sources: [tail] }
+  labels: { type: keep, sources: [parse], fields: [id] }   # no line carries `id`: no labels
+  count:
+    type: kv_metrics
+    sources: [labels]
+    counters: [{ name: soak_lines }]   # no `field`: +1 per event
+  metrics_only:                     # else `window` passes each line's log on to the sink
+    type: keep_signals
+    sources: [count]
+    signals: [metrics]
+  window:
+    type: aggregate
+    sources: [metrics_only]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    # A disk spool keeps the sink's queue through a kill, so the egress band covers only
+    # `aggregate`'s window, as for spool-kill-replay.
+    buffer: { disk: { path: /tmp/soak-spool } }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

@@ -57,8 +57,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
     finds the file, so the entry is never used.
   - After a crash, the lines it had read but not yet flushed are gone too.
 
-  A pattern that also matches the rotated name (`app.log*`) avoids it for a rename, but not for a
-  removal. See [ADR
+  The loss is uncounted: the restart's scan drops the unused entry
+  (`crates/logit-inputs/src/tail/driver.rs`, `Tailer::prune_checkpoint_entries`) with no counter
+  and no diagnostic, so nothing in the telemetry shows the lines never read. A pattern that also
+  matches the rotated name (`app.log*`) avoids the loss for a rename, but not for a removal,
+  such as a rotator's deletion of its oldest file while `tail_in` is down. See [ADR
   `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md),
   decision 6.
 - **A rotated file stays open, read to its end, for as long as a pattern matches its new
@@ -73,7 +76,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     logrotate's `rotate`) bounds them at its retention. One that keeps every file grows them by
     one per rotation, with no bound but the process's descriptor limit. The soak harness's
     `tail-rotate`, keeping every file, saw the SUT's descriptors grow from 16 to 34 across 18
-    rotations (`docs/plans/soak-harness.md`, "W11b: file tailing").
+    rotations (`docs/plans/soak-harness.md`, "W11b: file tailing"). Its `tail-rotate-delete`,
+    whose writer keeps eight files, saw `logit.input.files.open` level off at its retention
+    (`docs/plans/soak-harness.md`, "W18: a deleting rotation").
   - **Workaround:** bound the rotator's retention. A pattern that matches only the active name
     (`app.log`) closes each rotated file once it's read, but loses the file's unread tail at a
     stop or a crash (the entry above).

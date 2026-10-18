@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-17
+updated: 2026-10-18
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -361,12 +361,14 @@ symbols per wire, and its `ledger.wire` row the rules.
 ## Amendment: a file wire's writer and tailer share a directory in the run directory (2026-10-15)
 
 A `file` wire's writer and the SUT that tails it need a directory both can write and read, and
-the harness needs the writer's files after the run, to count G outside both processes. The
+the harness needs the writer's files after the run, to count G outside both processes while
+the writer deletes none (see the 2026-10-18 amendment). The
 driver creates `<run>/shared` with mode 0777, because the image's unprivileged user has a uid
 the host doesn't know, and the scenario's override mounts it into both. This reverses "nothing
 in a container writes to the run directory" for these scenarios only. The alternatives were a
 named volume, which compose removes with the stack and leaves nothing to count, and the
-writer's own telemetry alone, which is the count the shared directory exists to check. A file
+writer's own telemetry alone, which is the count the shared directory exists to check while
+the writer deletes nothing. A file
 wire is judged on the run's W − G against a replay band per SUT life, not per drain interval,
 because a tailer reads behind its writer: a kill replays what was read after the last checkpoint
 and loses the counts of the last drain interval, and a clean stop splits a line held
@@ -390,3 +392,25 @@ counter as given: it needs no per-node scenario key and no expected rate, and a 
 wants a rate bounds it with `[[expect]]`. A discard of a line a kill replays is counted again
 as its read counts in W again, so the replay band still bounds a file wire's surplus.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "6. The checks", has the rules.
+
+## Amendment: a deleting writer's G stands alone (2026-10-18)
+
+A writer that bounds its retention (`file_out`'s `rotate.max_files`) deletes its oldest file at
+every rotation past it, and the shared directory then holds fewer lines than the writer wrote.
+The lines a deleted file held can't be counted at the end, so once the writer has deleted one,
+G, its own `events.delivered`, stands alone: the lines left in the directory must not exceed
+G, and the directory must hold the files the writer keeps, read from its rotation count and
+config. The equality with the count still holds while the writer deletes none. The end
+sequence waits for the tailers' W to reach G, read from the writer's telemetry after it stops,
+rather than the count, which a deleting writer leaves short.
+
+A deleted file the tailer hadn't read is lost, and `tail_in` counts that loss nowhere: a
+restarted tailer drops the checkpoint entry it can't use with no counter and no diagnostic
+([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md), "A file removed or rotated out of
+every pattern loses its unread tail"). The ledger can't see such a loss in W − G, because G
+stands alone, so a retention guard FAILs `ledger.wire` for any SUT fault during which the
+writer rotated often enough to delete a file the tailer hadn't read: `max_files − 2` rotations
+in a stop, kill, restart, or `exit`, which close the tailer's files, and `max_files` in a
+pause, which keeps them open. The alternative, reading the loss from the product, needs a
+counter `tail_in` doesn't have. [`docs/plans/soak-harness.md`](../plans/soak-harness.md),
+"6. The checks", has the rules.

@@ -777,13 +777,17 @@ the operator-facing account of all of this.
   chain (W′).
   `tail-rotate` has a writer `generate_in -> file_out` rotate a file in a directory it shares
   with the SUT's `tail_in` (`wire = "file"`, `<run>/shared` mounted by an override): G is the
-  writer's `events.delivered`, held to the lines the driver counts in that directory at the end,
-  W is `input.lines`, and the run's W − G is judged against a replay band per killed or stopped
+  writer's `events.delivered`, held to the lines the driver counts in that directory at the end
+  when the writer deleted none, W is `input.lines`, and the run's W − G is judged against a replay band per killed or stopped
   SUT life (the plan's `ledger.wire` row). `tail-rotate-stale` puts `timestamp` and
   `drop_stale` in that path, so a stop or kill longer than `max_age` leaves stale lines that
   `drop_stale` discards: `ledger.edge` takes each node's `events.discarded` out of its hop, and
   every later row takes their sum out of what reached `aggregate`, as for a script's discards.
-  `sighup` sends SIGHUPs (a `signal` step) to a SUT whose `stdio_out` file target a `rename`
+  `tail-rotate-delete` runs that path for hours against a writer keeping eight files and
+  deleting the oldest at each rotation, with `[[expect]]` maxima on `logit.input.files.open`
+  and `logit.process.fds`: G bounds the end count, which must find the eight files, and
+  `ledger.wire` FAILs a SUT fault long enough for the writer to delete a file the tailer hadn't
+  read. `sighup` sends SIGHUPs (a `signal` step) to a SUT whose `stdio_out` file target a `rename`
   step moves aside, and `file.reopen` checks each line landed on its side of the reopen.
   `tls-reload` rotates the SUT's server certificate and the generator's client certificate from
   a private CA per run (a `[tls]` table and `rotate` steps), and `tls.served` checks what a
