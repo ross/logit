@@ -404,13 +404,14 @@ config. The equality with the count still holds while the writer deletes none. T
 sequence waits for the tailers' W to reach G, read from the writer's telemetry after it stops,
 rather than the count, which a deleting writer leaves short.
 
-A deleted file the tailer hadn't read is lost, and `tail_in` counts that loss nowhere: a
-restarted tailer drops the checkpoint entry it can't use with no counter and no diagnostic
-([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md), "A file removed or rotated out of
-every pattern loses its unread tail"). The ledger can't see such a loss in W − G, because G
-stands alone, so a retention guard FAILs `ledger.wire` for any SUT fault during which the
-writer rotated often enough to delete a file the tailer hadn't read: `max_files − 2` rotations
-in a stop, kill, restart, or `exit`, which close the tailer's files, and `max_files` in a
-pause, which keeps them open. The alternative, reading the loss from the product, needs a
-counter `tail_in` doesn't have. [`docs/plans/soak-harness.md`](../plans/soak-harness.md),
-"6. The checks", has the rules.
+A deleted file the tailer hadn't read is lost, and `tail_in` counts that loss only as far as the
+last checkpoint knew: a restarted tailer counts the bytes the entry it can't use recorded as
+unread, `logit.input.bytes.dropped{reason="gone"}`, but not what the file gained after that
+checkpoint ([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md), "A file removed or rotated
+out of every pattern before `tail_in` read it to its end"). The ledger can't see such a loss in
+W − G, because G stands alone, so a retention guard FAILs `ledger.wire` for any SUT fault during
+which the writer rotated often enough to delete a file the tailer hadn't read: `max_files − 2`
+rotations in a stop, kill, restart, or `exit`, which close the tailer's files, and `max_files`
+in a pause, which keeps them open. Reading the loss from that counter instead would miss what a
+file gained after its last checkpoint, so `tail-rotate-delete` expects it at 0 beside the guard.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "6. The checks", has the rules.

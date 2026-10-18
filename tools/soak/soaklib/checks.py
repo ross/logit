@@ -3044,8 +3044,9 @@ def _file_retention_problems(data, led, source):
       pause's first rotation, it's deleted at its `max_files + 1`th, so the limit is
       `max_files`.
 
-    A restarted tailer never finds a deleted file, and the loss is counted nowhere
-    (docs/known-gaps/tailing.md), so the ledger can't see it any other way. Each window is
+    A restarted tailer never finds a deleted file, and the loss is counted only as far as the
+    last checkpoint knew (docs/known-gaps/tailing.md), so the ledger can't see all of it any
+    other way. Each window is
     widened by one of the writer's drain intervals on each side, since a rotation is counted at
     the drain after it."""
     gen = led.gens[source.get("service")]
