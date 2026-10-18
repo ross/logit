@@ -1,6 +1,6 @@
 ---
 created: 2026-10-16
-updated: 2026-10-16
+updated: 2026-10-18
 ---
 
 # Native transform fan-out: `Transform::process_into` emits extra events into the same batch
@@ -118,5 +118,7 @@ reasoning behind `flatten`'s uncapped expansion ([ADR `flatten-transform`](flatt
   [`pipeline-graph.md`](../design/pipeline-graph.md)'s "Node kinds and the transform trait question"
   describe the emit path.
 - The soak harness's `ledger.edge` (`tools/soak/soaklib/checks.py`) judges each transform in
-  `sut_transforms` hop by hop from `events.received` and `events.sent`. A scenario that puts a
-  fan-out transform there must account for its children first. No scenario does today.
+  `sut_transforms` hop by hop from `events.received`, `events.sent`, and `events.discarded`. A
+  fan-out node is declared in its source's `fan_out`, and the harness judges its children with
+  the count above against k times the events it received, less its dropped lines;
+  `otlp-fan-out` runs one (`docs/plans/soak-harness.md`, §10 item 13).

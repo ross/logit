@@ -204,13 +204,18 @@ HOP_KEYS = {"from", "sink", "to", "listener"}
 SOURCE_LEDGER_KEYS = ("generator_input", "generator_sink", "sut_listener")
 # A `[[ledger.source]]`: the generator service, its `generate_in` and sink, the SUT listener its
 # lines reach, and, optionally, the wire they cross and the transforms between that listener
-# and `aggregate`, each of which must send every event it receives or count it discarded.
+# and `aggregate`, each of which must send every event it receives or count it discarded, unless
+# `fan_out` gives the events it emits per event.
 # `generator_input` and `generator_sink` may both list components, as many of each, whose counts
 # sum (`source_ids()`), each input feeding the sink at its position (`source_pairs()`): a
 # generator that sends several UDP flows has one input and one sink per flow.
 SOURCE_KEYS = {"service", "generator_input", "generator_sink", "sut_listener"}
 LISTED_SOURCE_KEYS = ("generator_input", "generator_sink")
-OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire"}
+OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire", "fan_out"}
+# The one transform kind `fan_out` may name: it emits one event per point of a parent's message
+# and counts the lines it loses in `logit.transform.lines.dropped` (checks.py's
+# `Ledger.through`).
+FAN_OUT_KIND = "line_protocol"
 # The wires a source's lines can cross into the SUT, each with its own ledger symbols
 # (checks.py's `WIRES`): datagrams, a TCP stream of LF-terminated lines, a file the SUT tails,
 # or HTTP requests a listener answers.
@@ -833,6 +838,7 @@ def from_dict(raw, path):
             sut_text = (path.parent / sut_config).read_text()
             problems += _wire_problems(ledger, sut_text)
             problems += _route_problems(ledger, sut_text)
+            problems += _transform_problems(ledger, sut_text)
         problems += _writer_problems(ledger, configs, path.parent)
         problems += _extra_sut_problems(extra_suts, ledger)
         if overlap is None:
@@ -1257,7 +1263,8 @@ def _source_problems(ledger):
     every required key a component id, a distinct generator `service` that is a slug whose
     `config_env()` is neither `SUT_CONFIG_ENV` nor another source's, a distinct `sut_listener`,
     and an optional `sut_transforms` list of distinct component ids, none of them a listener or
-    on another source's list; and no `sut_transforms` beside `[ledger] sut_script`, whose hop
+    on another source's list, with an optional `fan_out` (`_fan_out_problems()`); and no
+    `sut_transforms` beside `[ledger] sut_script`, whose hop
     `ledger.script` judges from the listeners' summed E. Whether each `service` is a generator
     needs the role map: `service_problems()`."""
     if "source" not in ledger:
@@ -1340,6 +1347,49 @@ def _source_problems(ledger):
         if ledger.get("sut_script") is not None:
             problems.append(f"{where}: `sut_transforms` and [ledger] sut_script can't be "
                             "combined; the script's hop is judged from every listener's E")
+    for index, source in enumerate(sources):
+        problems += _fan_out_problems(source, f"ledger.source {index + 1}")
+    return problems
+
+
+def _fan_out_problems(source, where):
+    """What a source's `fan_out` breaks: a table from a node of the source's `sut_transforms`
+    to the events it emits per event, an integer of at least 2. The kind each node must be
+    needs the SUT config: `_transform_problems()`."""
+    if "fan_out" not in source:
+        return []
+    fan_out = source.get("fan_out")
+    if not isinstance(fan_out, dict) or not fan_out:
+        return [f"{where}: `fan_out` must be a table from a `sut_transforms` node to the "
+                "events it emits per event, such as { points = 4 }"]
+    chain = source.get("sut_transforms")
+    chain = chain if isinstance(chain, list) else []
+    problems = []
+    for node, k in fan_out.items():
+        if node not in chain:
+            problems.append(f"{where}: `fan_out` names {node!r}, which isn't in the source's "
+                            "`sut_transforms`")
+        if isinstance(k, bool) or not isinstance(k, int) or k < 2:
+            problems.append(f"{where}: `fan_out` {node!r} must be an integer of at least 2, "
+                            f"the events it emits per event, not {k!r}")
+    return problems
+
+
+def _transform_problems(ledger, sut_text):
+    """Each source's `fan_out` node must be a `FAN_OUT_KIND` component of the SUT config
+    `sut_text`."""
+    sources = ledger.get("source")
+    if not isinstance(sources, list):
+        return []
+    problems = []
+    for index, source in enumerate(sources):
+        fan_out = source.get("fan_out") if isinstance(source, dict) else None
+        for node in fan_out if isinstance(fan_out, dict) else ():
+            kind = listener_wire(sut_text, node)[1] if _COMPONENT_ID.match(str(node)) else None
+            if kind != FAN_OUT_KIND:
+                problems.append(f"ledger.source {index + 1}: `fan_out` names {node!r}, "
+                                + (f"a {kind}" if kind else "no component of the SUT config")
+                                + f"; only a {FAN_OUT_KIND} emits several events per event")
     return problems
 
 
@@ -1447,6 +1497,10 @@ def _overlap_problems(overlap, ledger, configs, extra_suts, directory):
     if ledger.get("hop") is not None:
         problems.append("[overlap] and [[ledger.hop]] can't be combined: every overlap instance "
                         "runs the whole pipeline")
+    sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
+    if any(isinstance(source, dict) and "fan_out" in source for source in sources):
+        problems.append("[overlap] and a source's `fan_out` can't be combined: the overlap's "
+                        "end-to-end bound counts the generators' lines")
     instances = overlap.get("instances") or []
     label = overlap.get("label")
     for service in extra_suts:
