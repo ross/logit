@@ -201,10 +201,10 @@ HOP_KEYS = {"from", "sink", "to", "listener"}
 SOURCE_LEDGER_KEYS = ("generator_input", "generator_sink", "sut_listener")
 # A `[[ledger.source]]`: the generator service, its `generate_in` and sink, the SUT listener its
 # lines reach, and, optionally, the wire they cross and the transforms between that listener
-# and `aggregate`, each of which must forward every event it receives. `generator_input` and
-# `generator_sink` may both list components, as many of each, whose counts sum (`source_ids()`),
-# each input feeding the sink at its position (`source_pairs()`): a generator that sends several
-# UDP flows has one input and one sink per flow.
+# and `aggregate`, each of which must send every event it receives or count it discarded.
+# `generator_input` and `generator_sink` may both list components, as many of each, whose counts
+# sum (`source_ids()`), each input feeding the sink at its position (`source_pairs()`): a
+# generator that sends several UDP flows has one input and one sink per flow.
 SOURCE_KEYS = {"service", "generator_input", "generator_sink", "sut_listener"}
 LISTED_SOURCE_KEYS = ("generator_input", "generator_sink")
 OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire"}

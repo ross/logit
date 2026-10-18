@@ -4550,8 +4550,68 @@ LINES_SOURCE = {"service": "generator-lines", "generator_input": "load",
                 "generator_sink": "out", "sut_listener": "lines"}
 
 
+def _discard(run_dir, chain, node, offset, n, sent=None):
+    """Makes `node` of `chain` discard `n` events in the SUT drain at `offset`, in place: its
+    `events.discarded`, and `sent` events (default `n`) fewer in its `events.sent`, in each
+    later node's received and sent, in `window`'s received and absorbed, and in `x_0_total`'s
+    samples from `offset` to the end of that SUT life (`STOP` splits the two). A `sent` other
+    than `n` leaves the node off its balance."""
+    sent = n if sent is None else sent
+    later = list(chain[chain.index(node) + 1:])
+    stamp = _stamp(T0 + offset)
+    stdout = run_dir / "logs" / "logit.stdout"
+    out = []
+    for line in stdout.read_text().splitlines():
+        record = json.loads(line)
+        component, metric = record["attributes"]["component"], record["metrics"][0]
+        if record["timestamp"] == stamp and (
+                (component == node and metric["name"] == "logit.component.events.sent")
+                or (component in later and metric["name"] in (
+                    "logit.component.events.received", "logit.component.events.sent"))
+                or (component == "window" and metric["name"] in (
+                    "logit.component.events.received", "logit.transform.metrics.absorbed"))):
+            metric["value"] -= sent
+        out.append(json.dumps(record))
+    out.append(_line(stamp, "logit.component.events.discarded", "sum", n, component=node))
+    stdout.write_text("\n".join(out) + "\n")
+    path = run_dir / "vm-export" / "sink.jsonl"
+    series = vm.parse_export(path.read_text())
+    same_life = (lambda s: s < STOP[1]) if offset < STOP[1] else (lambda s: s >= STOP[1])
+    for one in series:
+        if one["metric"]["__name__"] != "x_0_total":
+            continue
+        one["values"] = [value - sent if offset <= ms / 1000 - T0 and same_life(ms / 1000 - T0)
+                         else value for value, ms in zip(one["values"], one["timestamps"])]
+    _write_export(run_dir, "sink", series)
+    return run_dir
+
+
+def _with_chain(run_dir, nodes):
+    """Puts `nodes` between `_ledger_run`'s listener `in` and `window`, in place: each node
+    receives and sends what `in` sent, and the source names them as its `sut_transforms`."""
+    stdout = run_dir / "logs" / "logit.stdout"
+    out = []
+    for line in stdout.read_text().splitlines():
+        out.append(line)
+        record = json.loads(line)
+        if (record["attributes"]["component"] == "in"
+                and record["metrics"][0]["name"] == "logit.component.events.sent"):
+            for node in nodes:
+                for name in ("logit.component.events.received", "logit.component.events.sent"):
+                    hop = copy.deepcopy(record)
+                    hop["attributes"]["component"] = node
+                    hop["metrics"][0]["name"] = name
+                    out.append(json.dumps(hop))
+    stdout.write_text("\n".join(out) + "\n")
+    resolved_path = run_dir / "scenario.resolved.json"
+    resolved = json.loads(resolved_path.read_text())
+    resolved["ledger"]["source"][0]["sut_transforms"] = list(nodes)
+    resolved_path.write_text(json.dumps(resolved))
+    return run_dir
+
+
 def _sources_run(tmp, name, sut_edit=None, gen_edit=None, transforms=(), sut_config=None,
-                 timeline_extra=(), **kwargs):
+                 timeline_extra=(), discard=(), **kwargs):
     """`_ledger_run`'s two-life run directory with a second source (`LINES_SOURCE`): the
     generator `generator-lines` repeats `generator`'s telemetry, the SUT listener `lines`
     repeats `in`'s lines (its stderr shutdown lines included), and `window`'s received and
@@ -4560,6 +4620,7 @@ def _sources_run(tmp, name, sut_edit=None, gen_edit=None, transforms=(), sut_con
     `sut_edit(record)` may change or drop (return None) each of `lines`' telemetry records, and
     `gen_edit(record)` each of `generator-lines`'. `transforms` names nodes between `lines` and
     `window`, each forwarding what `lines` sent, written as that source's `sut_transforms`;
+    `discard` lists `_discard`'s `(node, offset, n[, sent])` for nodes among them;
     `sut_config` is the SUT config text the run's `configs/` holds."""
     run_dir = _ledger_run(tmp, name, timeline_extra=timeline_extra, **kwargs)
     out = []
@@ -4617,6 +4678,8 @@ def _sources_run(tmp, name, sut_edit=None, gen_edit=None, transforms=(), sut_con
         (run_dir / "configs" / "sut.yaml").write_text(sut_config)
         resolved["configs"] = {"sut": "sut.yaml"}
     (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    for one in discard:
+        _discard(run_dir, transforms, *one)
     return run_dir
 
 
@@ -4716,23 +4779,66 @@ def _sources_ledger():
         expect(oversize["ledger.intake"].status == checks.PASS,
                f"lines_in's oversize drops are B, got {oversize['ledger.intake']}")
 
-        # Transforms between `lines` and `window`: each forwards every event, else the edge
-        # FAILs at the hop.
-        chained = results("sources-transforms", transforms=("parse", "count"))
+        # Transforms between `lines` and `window`: each sends what it doesn't discard, else the
+        # edge FAILs at the hop.
+        chain = ("parse", "count")
+        chained = results("sources-transforms", transforms=chain)
         expect(chained["ledger.edge"].status == checks.PASS
-               and "T_in[count] 34,000 == T_out[count] 34,000 (count forwards every event)"
-               in chained["ledger.edge"].detail,
+               and "T_in[count] 34,000 − T_disc[count] 0 = 34,000 == T_out[count] 34,000 "
+               "(count sends what it doesn't discard)" in chained["ledger.edge"].detail,
                f"ledger.edge walks a source's transforms, got {chained['ledger.edge']}")
         expect("10,000 + 132 x 1,000 (lines)" in chained["ledger.intake"].detail,
                f"each transform adds an inbox and a batch to R, got "
                f"{chained['ledger.intake'].detail}")
-        dropped = results("sources-transforms-drop", transforms=("parse", "count"),
+        dropped = results("sources-transforms-drop", transforms=chain,
                           sut_edit=lambda record: (_at(200, less(
                               "logit.component.events.sent", 3, component="count"))(record)))
         detail = dropped["ledger.edge"].detail
         expect(dropped["ledger.edge"].status == checks.FAIL
-               and "T_in[count] 34,000 != T_out[count] 33,997" in detail,
-               f"a transform that drops events FAILs the edge at its hop, got {detail}")
+               and "T_in[count] 34,000 − T_disc[count] 0 = 34,000 != T_out[count] 33,997"
+               in detail,
+               f"a transform that loses events uncounted FAILs the edge at its hop, got {detail}")
+
+        # `parse` discards 7 events in the final life, counted, and sends 7 fewer: every row
+        # balances, with the discards shown.
+        final = results("sources-discard", transforms=chain, discard=[("parse", 200, 7)])
+        for row in ("ledger.intake", "ledger.edge", "ledger.aggregate", "ledger.egress",
+                    "ledger.summary"):
+            expect(final[row].status == checks.PASS,
+                   f"{row} PASSes a counted discard in the final life, got {final[row]}")
+        expect("T_in[parse] 34,000 − T_disc[parse] 7 = 33,993 == T_out[parse] 33,993"
+               in final["ledger.edge"].detail
+               and "Σ(sent into aggregate) 67,993 == A 67,993" in final["ledger.edge"].detail,
+               f"ledger.edge shows the node's discards, got {final['ledger.edge'].detail}")
+        summary = final["ledger.summary"].detail
+        expect("E − ΣT_disc − A 0" in summary
+               and "the transforms' ΣT_disc 7, counted" in summary,
+               f"ledger.summary takes the discards out of the path term, got {summary}")
+        # A discard counted beside an event sent anyway, and one beside two more events lost.
+        for name, sent, off in (("sources-discard-sent", 0, "-3"),
+                                ("sources-discard-short", 5, "2")):
+            unbalanced = results(name, transforms=chain, discard=[("count", 200, 3, sent)])
+            detail = unbalanced["ledger.edge"].detail
+            expect(unbalanced["ledger.edge"].status == checks.FAIL
+                   and f"T_in[count] 34,000 − T_disc[count] 3 = 33,997 != T_out[count] "
+                   f"{34_000 - sent:,}, off by {off}" in detail,
+                   f"a discard count off the node's sends FAILs the edge, got {detail}")
+            expect(unbalanced["ledger.summary"].status == checks.FAIL
+                   and f"E − ΣT_disc − A {off}" in unbalanced["ledger.summary"].detail,
+                   f"ledger.summary FAILs it too, got {unbalanced['ledger.summary']}")
+        # The same discard in life 0, which a stop ended: its residual and its egress gap
+        # leave the discards out, so neither reads them as loss.
+        stopped = results("sources-discard-stopped", transforms=chain,
+                          discard=[("parse", 50, 7)])
+        egress = stopped["ledger.egress"].detail
+        expect(stopped["ledger.egress"].status == checks.PASS
+               and "life 0: W − D − B − X − ΣT_disc − V 0 = residual 60" in egress,
+               f"a stopped life's egress gap leaves its counted discards out, got {egress}")
+        expect(stopped["ledger.intake"].status == checks.PASS
+               and "life 0: W − D − B − X − ΣT_disc − Ab 60 within [0, R]"
+               in stopped["ledger.intake"].detail,
+               f"a stopped life's residual leaves its counted discards out, got "
+               f"{stopped['ledger.intake']}")
 
         # Each listener's own `receive:` sizes its share of R.
         sized = results("sources-r", sut_config=(
@@ -5434,6 +5540,25 @@ def _file_ledger():
                f"a file source reads input.lines and events.delivered, got {wire}")
         expect(any("life 0 (stopped): [0, +1]" in line for line in clean["ledger.wire"].lines),
                f"a stopped life allows one split line per file, got {clean['ledger.wire'].lines}")
+        # A node between the tailer and `window` discards 7 lines, counted: the end-to-end
+        # bound counts them with the rest of the counted loss, so V 5 above its share FAILs.
+        def discarding(name, surplus=0):
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=30)
+            _discard(_with_chain(run_dir, ("fresh",)), ("fresh",), "fresh", 200, 7)
+            path = run_dir / "vm-export" / "sink.jsonl"
+            series = vm.parse_export(path.read_text())
+            series[0]["values"][-1] += surplus
+            _write_export(run_dir, "sink", series)
+            return {r.id: r for r in checks.run_all(_as_file_wire(run_dir))}
+
+        fresh = discarding("file-discard")
+        expect(fresh["ledger.summary"].status == checks.PASS
+               and "G 54,030 less counted loss 7" in fresh["ledger.summary"].detail,
+               f"the end-to-end bound counts the path's discards, got {fresh['ledger.summary']}")
+        over = discarding("file-discard-surplus", surplus=5)["ledger.summary"]
+        expect(over.status == checks.FAIL
+               and "> G − counted + replay 54,024, a surplus of 4" in over.detail,
+               f"V above G less the counted discards FAILs the end-to-end bound, got {over}")
         split = stopped("file-split", w_minus_g=1)
         expect(split["ledger.wire"].status == checks.PASS,
                f"one split line at a stop is inside the band, got {split['ledger.wire']}")
@@ -5532,6 +5657,10 @@ def _file_rules(root):
     tail = scenario.load(root / "scenarios" / "tail-rotate" / "scenario.toml")
     expect([source["wire"] for source in tail.file_sources] == ["file"],
            f"tail-rotate's one source is a file wire, got {tail.file_sources}")
+    stale = scenario.load(root / "scenarios" / "tail-rotate-stale" / "scenario.toml")
+    expect([source.get("sut_transforms") for source in stale.file_sources] == [
+               ["parse", "stamp", "labels", "count", "metrics_only", "fresh"]],
+           f"tail-rotate-stale lists its discarding node last, got {stale.file_sources}")
     with tempfile.TemporaryDirectory() as tmp:
         tail_dir = Path(tmp) / "tail-rotate"
         shutil.copytree(root / "scenarios" / "tail-rotate", tail_dir)
@@ -7832,7 +7961,7 @@ def _overlap_checks():
                "datagram(s) discarded (loose by up to 104" in lines,
                f"ledger.overlap reports each stop's own numbers, got {lines}")
         detail = rows["ledger.egress"].detail
-        expect("logit: sink: life 0: W − D − B − X − V 0" in detail
+        expect("logit: sink: life 0: W − D − B − X − ΣT_disc − V 0" in detail
                and "life 1 (final): Ab 19,800 − V[sink] 19,800 = 0, ok" in detail
                and "logit-b: sink: life 0 (final): Ab 28,200 − V[sink] 28,200 = 0, ok" in detail,
                f"ledger.egress judges each instance against its labeled series, got {detail}")
