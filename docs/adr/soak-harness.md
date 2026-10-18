@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-15
+updated: 2026-10-17
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -260,6 +260,34 @@ answer as, and under this shape every non-`2xx` step must carry one. A second co
 sink's table in the harness was considered and not kept: it checked the scenario against itself,
 never against `logit`, and could drift from the Rust table unnoticed. A class change in a sink
 updates its stand-in scenario's steps instead.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Stand-in targets", has the rules.
+
+## Amendment: an InfluxDB stand-in overwrites a resend, and its rejected points are the whole gap (2026-10-17)
+
+A stand-in target can play InfluxDB 2.x's write API (`[target] shape = "influxdb"`), and its V
+is the sum of the delta points it stored, one per `(series, timestamp)`. Unlike Datadog's
+`count`, InfluxDB documents an identical `(measurement, tag set, field, timestamp)` write as an
+overwrite, and `influxdb_out` re-encodes a retried batch byte for byte, so the harness treats a
+resend as a rewrite: reported, never counted twice, and permitted under `at_least_once`. A
+resend can't change a value, so a second value at one key FAILs `ledger.standin`. A rewrite
+FAILs under `at_most_once`, which never resends, and under either posture when the write it
+repeats was answered `2xx` in the same SUT life, as a Datadog duplicate does.
+
+Because a cued `rejected` drop credits any positive gap in its life (the amendment above),
+`ledger.egress` alone can't tell a rejected window from a loss beside it. Under this shape,
+every point of a request answered under a step classed `rejected` must be absent from the
+store, and the life's egress gap must equal those points' sum, with no allowance. The writes'
+queries must name one `(org, orgID, bucket)`, because each scenario configures or carries one.
+
+Every non-`2xx` `respond` under this shape must carry a `class`, as under the `datadog` shape,
+for the same reason: it's the only statement of what the sink must do with the answer.
+
+The carried-mode runs stamp the bucket and org carriers with a `set` after `aggregate`, in place
+of a relay through `influxdb_in`. That keeps the generator on UDP statsd, and the classes the
+sink reads depend only on where a value came from, which the carriers decide either way. The
+stand-in compares the request path without its query string, because `influxdb_out` always
+sends one; compared whole, every write would answer `404`, which a carried-mode sink reads as
+`Rejected`, a silent drop.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Stand-in targets", has the rules.
 
 ## Amendment: several SUT services, each scored on its own lives (2026-10-15)
