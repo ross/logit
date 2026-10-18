@@ -129,7 +129,15 @@ value summed), the `series_errors` answer and cue rules on loopback ports, the `
 `series_errors`, and class rules, and the checks over a datadog stand-in run: duplicates
 reported under `at_least_once` and FAILing under `at_most_once` or after a 2xx, the
 `series_errors` and rejected-step reconciliation against `records.dropped`, and `ledger.sent`
-and `drops` with cued and uncued refusals and drops.
+and `drops` with cued and uncued refusals and drops. For the `influxdb` shape, it covers a
+body `influxdb_out` sent and hand-built escape and grammar cases (`standin/influxdb-vectors.json`)
+through the line-protocol parser, the bodies, precisions, encodings, and label clashes refused,
+V as one point per series and timestamp (a rewrite naming both requests, a changed value a
+conflict), the `204` with no length and the query split off the path on loopback ports, the
+class rules, and the checks over an influxdb stand-in run: a rewrite reported, and FAILing
+after a 2xx or under `at_most_once`; a changed resend; a rejected step's points equal to the
+gap, with an unexplained gap and a stored rejected point each FAILing; and two destinations
+FAILing.
 
 For a rolling overlap, it covers every `[overlap]` rule (the table's own, against the ledger and
 each instance's config, the steps on the holder and on the instances, the role map and each
@@ -1254,7 +1262,8 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
     stored `200` request per sample timestamp a second before it (`_standin_record`), the SUT's
     `logit.output.requests` counts each in the drain after it, and `standin_edit(requests)`
     returns the request lines to write, edited. Under `standin_shape` `"datadog"` the record is
-    `_datadog_record`'s, the export's samples as delta points."""
+    `_datadog_record`'s, the export's samples as delta points, and under `"influxdb"`
+    `_influx_record`'s, the same points as line protocol."""
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -1431,6 +1440,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                            "timestamps": [int((T0 + s) * 1000) for s in (50, 100, 200, 300)]})
     if standin_edit is not None:
         record = (_datadog_record(export) if standin_shape == standin.DATADOG
+                  else _influx_record(export) if standin_shape == standin.INFLUXDB
                   else _standin_record(export))
         requests = standin_edit(record)
         _write_standin(run_dir, requests, shape=standin_shape)
@@ -1514,6 +1524,40 @@ def _datadog_record(export):
             by_stamp.setdefault(stamp, []).append((metric, [(stamp // 1000, float(delta))]))
     return [_datadog_request(seq, stamp / 1000 - T0 - 1, series)
             for seq, (stamp, series) in enumerate(sorted(by_stamp.items()), start=1)]
+
+
+INFLUX_QUERY = "org=soak-org&bucket=soak&precision=ns"
+
+
+def _influx_request(seq, offset, points, status=204, stored=True, cue=None, answer="status",
+                    query=INFLUX_QUERY, path="/api/v2/write"):
+    """One `influxdb` stand-in record line at `T0 + offset` whose body is line protocol of
+    `points`, `[(measurement, value, timestamp_ms)]`, each tagged `env=soak` with field
+    `value`."""
+    body = "".join(f"{name},env=soak value={value!r} {stamp * 1_000_000}\n"
+                   for name, value, stamp in points).encode()
+    return {"event": "request", "seq": seq, "t": T0 + offset, "path": path, "query": query,
+            "content_type": "text/plain; charset=utf-8", "content_encoding": None,
+            "bytes": len(body), "cue": cue, "answer": answer,
+            "status": None if answer == "reset" else status, "stored": stored,
+            "body_b64": base64.b64encode(body).decode()}
+
+
+def _influx_record(export):
+    """The requests an `influxdb` stand-in would record for `export`: one stored `204` per
+    sample timestamp, a second before it, holding every series' increment since its previous
+    sample in the same SUT life, as `_datadog_record` builds them."""
+    by_stamp = {}
+    for one in export:
+        metric = one["metric"]["__name__"].removesuffix("_total")
+        previous = {}
+        for stamp, value in zip(one["timestamps"], one["values"]):
+            life = 0 if stamp / 1000 < T0 + STOP[1] else 1
+            delta = value - previous.get(life, 0)
+            previous[life] = value
+            by_stamp.setdefault(stamp, []).append((metric, float(delta), stamp))
+    return [_influx_request(seq, stamp / 1000 - T0 - 1, points)
+            for seq, (stamp, points) in enumerate(sorted(by_stamp.items()), start=1)]
 
 
 def _write_standin(run_dir, requests, extra=(), shape="remote_write"):
@@ -7428,6 +7472,328 @@ def _datadog_checks():
                f"{rows['ledger.standin']}")
 
 
+def _influx_codec(root):
+    """The `influxdb` shape's decoders: a body `influxdb_out` sent, from
+    `standin/influxdb-vectors.json`, through `line_protocol` and `decode_body`; the hand-built
+    escape and grammar cases and the bodies refused; precision, encoding, UTF-8, and label
+    clashes; string and boolean fields; and the destination read from a query."""
+    vectors = json.loads((root / "standin" / "influxdb-vectors.json").read_text())
+    body = vectors["influxdb_out_body"]
+    got = [[m, t, f, ts] for m, t, f, ts in standin.line_protocol(body)]
+    expect(got == vectors["influxdb_out_body_expect"] and len(got) == 3,
+           f"a body influxdb_out sent reads as its 3 points with the escaped tag, got {got}")
+    request = {"body_b64": base64.b64encode(body.encode()).decode(), "content_encoding": None,
+               "query": vectors["influxdb_out_query"]}
+    series = standin.decode_body(request, standin.INFLUXDB)
+    first = vectors["influxdb_out_body_expect"][0]
+    expect(series[0] == ({"__name__": first[0], "field": "value", **first[1]},
+                         [(first[3] // 1_000_000, first[2]["value"])]) and len(series) == 3,
+           f"decode_body names a sample by measurement, field, and tags, in ms, got "
+           f"{series[:1]}")
+    expect(standin.influxdb_destination(request)
+           == ("soak-org", "0123456789abcdef", "soak-carried")
+           and standin.influxdb_destination({}) == (None, None, None),
+           f"the destination is the query's org, orgID, and bucket, got "
+           f"{standin.influxdb_destination(request)}")
+    for case in vectors["cases"]:
+        got = [[m, t, f, ts] for m, t, f, ts in standin.line_protocol(case["body"])]
+        expect(got == case["points"], f"{case['about']}: got {got}")
+    for case in vectors["refused"]:
+        try:
+            standin.line_protocol(case["body"])
+            expect(False, f"line protocol {case['body']!r} was read")
+        except standin.DecodeError as err:
+            expect(case["error"] in str(err),
+                   f"{case['body']!r} is refused with {case['error']!r}, got {err}")
+
+    def decode(text, query="precision=ns", encoding=None):
+        return standin.decode_body({"body_b64": base64.b64encode(text).decode(),
+                                    "content_encoding": encoding, "query": query},
+                                   standin.INFLUXDB)
+
+    expect(decode(b"m value=1 7\n", "precision=s")[0][1] == [(7000, 1.0)]
+           and decode(b"m value=1 7000000\n", "")[0][1] == [(7, 1.0)],
+           "a timestamp is read at the query's precision, ns when absent")
+    mixed = decode(b'm s="x",b=true,n=2i 1000000\n')
+    expect([(labels["field"], samples) for labels, samples in mixed]
+           == [("b", [(1, 1.0)]), ("n", [(1, 2.0)])],
+           f"a string field isn't in V and a boolean reads as 1, got {mixed}")
+    for text, query, encoding, needle in (
+            (b"m value=1 1\n", "precision=h", None, "precision 'h'"),
+            (b"m value=1 1\n", "", "gzip", "sends no compression"),
+            (b"m,field=x value=1 1\n", "", None, "a label the harness names"),
+            (b"m value=1 1\n\xff", "", None, "not UTF-8")):
+        try:
+            decode(text, query, encoding)
+            expect(False, f"{text!r} under {query!r} {encoding} decoded")
+        except standin.DecodeError as err:
+            expect(needle in str(err), f"{text!r} is refused with {needle!r}, got {err}")
+
+
+def _influx_points():
+    """`stored_points` over an `influxdb` record: one term per series and timestamp, a
+    same-value resend a rewrite naming both requests, a changed value a conflict whose last
+    write is stored, an unstored or undecodable request left out of V; and
+    `acknowledged_unstored` naming a 2xx point V lacks."""
+    requests = [
+        _influx_request(1, 10, [("a", 1.0, 1000), ("b", 5.0, 1000)]),
+        _influx_request(2, 11, [("a", 1.0, 1000)], status=503, cue="c0s1"),
+        _influx_request(3, 12, [("b", 6.0, 1000)]),
+        _influx_request(4, 13, [("a", 3.0, 2000)], status=400, stored=False),
+        {**_influx_request(5, 14, [("a", 4.0, 4000)]), "body_b64": "!!"},
+        _influx_request(6, 15, [("a", 9.0, 5000)]),
+    ]
+    counts = standin.stored_points(requests)
+    a = standin.series_key({"__name__": "a", "field": "value", "env": "soak"})
+    b = standin.series_key({"__name__": "b", "field": "value", "env": "soak"})
+    expect(sorted(counts.points) == [(1.0, 1.0), (1.0, 6.0), (5.0, 9.0)],
+           f"V's terms are one per series and timestamp, the last write's, got {counts.points}")
+    expect(counts.rewrites == [(a, 1000, 1.0, 0, 1)] and counts.duplicates == []
+           and counts.conflicts == [(b, 1000, 5.0, 6.0)],
+           f"a same-value resend is a rewrite and a changed one a conflict, got "
+           f"{counts.rewrites} {counts.conflicts}")
+    expect([seq for seq, _ in counts.undecodable] == [5],
+           f"a stored body that doesn't decode is listed, got {counts.undecodable}")
+    lost = standin.acknowledged_unstored(requests, counts.series, standin.INFLUXDB)
+    expect(lost == [], f"every 2xx point is stored, got {lost}")
+    without_a = [one for one in counts.series if one["metric"]["__name__"] != "a"]
+    lost = standin.acknowledged_unstored(requests, without_a, standin.INFLUXDB)
+    expect(sorted(stamp for _, stamp in lost) == [1000, 5000],
+           f"a 2xx point missing from V is named, got {lost}")
+
+
+def _influx_server(root):
+    """The stand-in's `influxdb` shape on loopback ports: the default `204` with no
+    `Content-Length` and no body on `/api/v2/write`, a second request on the same connection,
+    the query split off the path and recorded, a cued status, and `404` off the path."""
+    import http.client
+    import http.server
+    import io
+    import threading
+    server = _load_standin_server(root)
+    state = server.State("influxdb", "/api/v2/write")
+    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
+    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    for one in (data, control):
+        threading.Thread(target=one.serve_forever, daemon=True).start()
+    printed = io.StringIO()
+    real_stdout = server.sys.stdout
+    server.sys.stdout = printed
+    control_base = f"http://127.0.0.1:{control.server_address[1]}"
+    answers = []
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", data.server_address[1], timeout=5)
+        try:
+            for path in ("/api/v2/write?org=o&bucket=b&precision=ns",
+                         "/api/v2/write?bucket=b"):
+                conn.request("POST", path, body=b"m value=1 1\n")
+                response = conn.getresponse()
+                answers.append((response.status, response.getheader("Content-Length"),
+                                response.read()))
+            faults.post_cue(control_base, {"step": "c0s1", "status": 404,
+                                           "body": '{"code":"not found"}'})
+            conn.request("POST", "/api/v2/write?bucket=b", body=b"m value=1 1\n")
+            response = conn.getresponse()
+            answers.append((response.status, response.getheader("Content-Length"),
+                            response.read()))
+            faults.post_cue(control_base, {})
+            conn.request("POST", "/api/v1/write?bucket=b", body=b"x")
+            response = conn.getresponse()
+            answers.append((response.status, None, response.read()[:8]))
+        finally:
+            conn.close()
+        deadline = time.monotonic() + 5
+        while (printed.getvalue().count('"event": "request"') < 4
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+    finally:
+        server.sys.stdout = real_stdout
+        for one in (data, control):
+            one.shutdown()
+            one.server_close()
+    expect(answers[:2] == [(204, None, b""), (204, None, b"")]
+           and answers[2] == (404, "20", b'{"code":"not found"}') and answers[3][0] == 404,
+           f"the influxdb shape answers 204 with no length twice on one connection, then the "
+           f"cued 404 with its body, and 404 off its path, got {answers}")
+    requests = [json.loads(line) for line in printed.getvalue().splitlines()
+                if '"event": "request"' in line]
+    got = [(r["path"], r["query"], r["status"], r["stored"]) for r in requests]
+    expect(got == [("/api/v2/write", "org=o&bucket=b&precision=ns", 204, True),
+                   ("/api/v2/write", "bucket=b", 204, True),
+                   ("/api/v2/write", "bucket=b", 404, False),
+                   ("/api/v1/write", "bucket=b", 404, False)],
+           f"each record line holds the path without its query, and the query, got {got}")
+
+
+def _influx_rules(root):
+    """`[target] shape = "influxdb"` and its `class` rules: required on a respond other than a
+    2xx, refused on a 2xx, and `series_errors` refused; each shipped `standin-influxdb*`
+    scenario loading with its shape and every step classed but the 204."""
+    for name in ("standin-influxdb", "standin-influxdb-carried", "standin-influxdb-mixed"):
+        loaded = scenario.load(root / "scenarios" / name / "scenario.toml")
+        unclassed = [s.status for s in loaded.steps if s.fault_class is None]
+        expect(loaded.standin_shape == "influxdb" and unclassed == [204]
+               and len(loaded.steps) == 19,
+               f"{name} loads as an influxdb stand-in with 19 steps, all classed but the 204, "
+               f"got {loaded.target} {unclassed}")
+    path = root / "scenarios" / "standin-influxdb" / "scenario.toml"
+    base = tomllib.loads(path.read_text())
+
+    def step(index, **changes):
+        raw = copy.deepcopy(base)
+        for key in [k for k, v in changes.items() if v is None]:
+            raw["step"][index].pop(key, None)
+        raw["step"][index].update({k: v for k, v in changes.items() if v is not None})
+        return raw
+
+    for raw, needle, what in (
+            (step(1, **{"class": None}),
+             "under the influxdb shape a respond other than a 2xx needs `class`", "a 400"),
+            (step(17, **{"class": None}),
+             "under the influxdb shape a respond other than a 2xx needs `class`", "a reset"),
+            (step(0, **{"class": "ambiguous"}), "a 2xx isn't a fault, so it takes no `class`",
+             "a class on a 204"),
+            (step(0, series_errors=1), "`series_errors` is for a standin target with shape "
+             "'datadog'", "series_errors")):
+        _refused(path, raw, needle, what)
+
+
+def _influx_checks():
+    """The checks over an `influxdb` stand-in two-life run: V as one stored point per series
+    and timestamp, `ledger.sent` SKIPping, an applied 503's resend reported as a rewrite, a
+    rewrite after a 2xx or under `at_most_once` FAILing, a changed resend FAILing, a rejected
+    step's points absent from the store and equal to the gap, an unexplained gap and a stored
+    rejected point FAILing, and two destinations FAILing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def drop(offset, n=1):
+            return [_line(_stamp(T0 + offset), "logit.component.batches.dropped", "sum", n,
+                          component="sink", attrs={"reason": "rejected"}),
+                    _line(_stamp(T0 + offset), "logit.component.batches.received", "sum", n,
+                          component="sink")]
+
+        def results(name, edit=lambda requests: requests, sut_config=None, **kwargs):
+            run_dir = _ledger_run(tmp, name, standin_edit=edit, standin_shape="influxdb",
+                                  **kwargs)
+            if sut_config is not None:
+                (run_dir / "configs").mkdir(exist_ok=True)
+                (run_dir / "configs" / "sut.yaml").write_text(sut_config)
+                resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+                resolved["configs"] = {"sut": "sut.yaml"}
+                (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        rows = results("influx-clean")
+        for row in ("ledger.egress", "ledger.summary", "ledger.standin", "drops"):
+            expect(rows[row].status == checks.PASS,
+                   f"an influxdb stand-in run that balances PASSes {row}, got {rows[row]}")
+        expect(rows["ledger.sent"].status == checks.SKIP
+               and "shape influxdb" in rows["ledger.sent"].detail,
+               f"ledger.sent SKIPs under the influxdb shape, got {rows['ledger.sent']}")
+        expect("0 point(s) rewritten" in rows["ledger.standin"].detail
+               and "destination org='soak-org', bucket='soak'" in rows["ledger.standin"].detail
+               and "one per series and timestamp" in " ".join(rows["ledger.egress"].lines),
+               f"the row reports rewrites and the one destination, got "
+               f"{rows['ledger.standin'].detail}")
+
+        # A 503 after storing (`apply`), resent: InfluxDB overwrites, so V counts it once.
+        def resent(requests):
+            again = copy.deepcopy(requests[-1])
+            requests[-1].update(status=503, cue="c0s2")
+            again.update(seq=99, t=again["t"] + 0.5)
+            return requests + [again]
+
+        applied = _respond_fault("c0s2", 290, 305, status=503)
+        rows = results("influx-rewrite", resent, timeline_extra=applied)
+        expect(rows["ledger.standin"].status == checks.PASS
+               and rows["ledger.egress"].status == checks.PASS
+               and "2 point(s) rewritten with the same value (life 1 2)"
+               in rows["ledger.standin"].detail,
+               f"a resend after an applied 503 is a reported rewrite, not a duplicate, got "
+               f"{rows['ledger.standin']} {rows['ledger.egress']}")
+        amo = ("components:\n  window: { type: aggregate, interval: 10s }\n"
+               "  sink:\n    type: influxdb_out\n    buffer: { delivery: at_most_once }\n")
+        rows = results("influx-rewrite-amo", resent, timeline_extra=applied, sut_config=amo)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "a resend under at_most_once" in rows["ledger.standin"].detail,
+               f"a rewrite under at_most_once FAILs, got {rows['ledger.standin']}")
+
+        def resent_accepted(requests):
+            again = copy.deepcopy(requests[-1])
+            again.update(seq=99, t=again["t"] + 0.5)
+            return requests + [again]
+
+        rows = results("influx-rewrite-2xx", resent_accepted)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "the sink resent a point it saw accepted" in rows["ledger.standin"].detail,
+               f"a rewrite of a point the stand-in answered 2xx FAILs, got "
+               f"{rows['ledger.standin']}")
+
+        def changed(requests):
+            again = copy.deepcopy(requests[-1])
+            text = base64.b64decode(again["body_b64"]).decode().replace(" value=", " value=7")
+            again.update(seq=99, t=again["t"] + 0.5,
+                         body_b64=base64.b64encode(text.encode()).decode())
+            return requests + [again]
+
+        rows = results("influx-changed", changed)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "a resend changed a sample" in rows["ledger.standin"].detail,
+               f"a resend storing another value FAILs, got {rows['ledger.standin']}")
+
+        # A 400 rejecting the last request inside a step classed rejected: its points are the
+        # final life's whole gap.
+        def rejected(requests):
+            requests[-1].update(status=400, stored=False, cue="c0s2")
+            return requests
+
+        cued = _respond_fault("c0s2", 290, 305, status=400, cls="rejected")
+        rows = results("influx-rejected", rejected, timeline_extra=cued, sut_extra=drop(300))
+        for row in ("ledger.standin", "ledger.egress", "ledger.summary", "drops"):
+            expect(rows[row].status == checks.PASS,
+                   f"a cued rejection the gap equals PASSes {row}, got {rows[row]}")
+        lines = " ".join(rows["ledger.standin"].lines)
+        expect(re.search(r"life 1: egress gap ([0-9,]+), the rejected requests' points sum "
+                         r"\1(?![0-9,])", lines) is not None,
+               f"the row reports the final life's gap equal to the rejected points, got {lines}")
+
+        def rejected_more(requests):
+            requests = rejected(requests)
+            text = base64.b64decode(requests[-1]["body_b64"]).decode()
+            text += f"x_9,env=soak value=5.0 {int((T0 + 299) * 1000) * 1_000_000}\n"
+            requests[-1]["body_b64"] = base64.b64encode(text.encode()).decode()
+            return requests
+
+        rows = results("influx-rejected-gap", rejected_more, timeline_extra=cued,
+                       sut_extra=drop(300))
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "a gap the rejected steps don't explain" in rows["ledger.standin"].detail
+               and rows["ledger.egress"].status == checks.PASS,
+               f"a gap other than the rejected points FAILs ledger.standin, where "
+               f"ledger.egress counts it, got {rows['ledger.standin']} {rows['ledger.egress']}")
+
+        def rejected_stored(requests):
+            again = copy.deepcopy(requests[-1])
+            requests = rejected(requests)
+            again.update(seq=99, t=T0 + 300.5)
+            return requests + [again]
+
+        rows = results("influx-rejected-stored", rejected_stored, timeline_extra=cued,
+                       sut_extra=drop(300))
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "the sink resent a rejected batch" in rows["ledger.standin"].detail,
+               f"a rejected request's point in the store FAILs, got {rows['ledger.standin']}")
+
+        def two_buckets(requests):
+            requests[0]["query"] = "org=soak-org&bucket=other&precision=ns"
+            return requests
+
+        rows = results("influx-two-buckets", two_buckets)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "the writes name 2 destinations, one expected" in rows["ledger.standin"].detail
+               and "bucket='other' (1 write(s))" in rows["ledger.standin"].detail,
+               f"writes to two buckets FAIL, got {rows['ledger.standin']}")
+
+
 # A rolling overlap: two instances, `logit` and `logit-b`, in `sut-net`'s namespace.
 OVERLAP = {"holder": "sut-net", "instances": ["logit", "logit-b"], "label": "soak_instance"}
 OVERLAP_ROLES = {**scenario.BASE_ROLES, "logit-b": "sut", "sut-net": "netns"}
@@ -8830,8 +9196,9 @@ def run(root, quiet=False):
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
                      _standin_server, _respond_rules, _standin_driver, _standin_checks,
                      _class_signatures, _datadog_codec, _datadog_counts, _datadog_server,
-                     _datadog_rules, _datadog_checks, _overlap_rules, _overlap_driver,
-                     _overlap_checks, _signal_rules, _signal_actions, _sighup_driver,
+                     _datadog_rules, _datadog_checks, _influx_codec, _influx_points,
+                     _influx_server, _influx_rules, _influx_checks, _overlap_rules,
+                     _overlap_driver, _overlap_checks, _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
                      _shipped):
             try:
@@ -8843,8 +9210,8 @@ def run(root, quiet=False):
                               _two_sut_driver,
                               _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
-                              _datadog_rules, _overlap_rules, _overlap_driver,
-                              _signal_rules, _sighup_driver, _tls_rules, _tls_driver)
+                              _datadog_rules, _influx_codec, _influx_server, _influx_rules,
+                              _overlap_rules, _overlap_driver, _signal_rules, _sighup_driver, _tls_rules, _tls_driver)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")
