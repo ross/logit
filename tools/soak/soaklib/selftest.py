@@ -2026,7 +2026,7 @@ def _target_ledger():
                and "A_sent[agg_b] 380 == S_in[vm_b] 380" in edge,
                f"edge under target judges the router and each branch, got {edge}")
         expect("life 0 (stopped): W − D − B − X − R_in 0" in clean["ledger.intake"].detail,
-               f"intake under target judges a stopped life's ingress exactly, got "
+               f"intake under target judges a stopped life's ingress with no tolerance, got "
                f"{clean['ledger.intake']}")
         expect("agg_a: Ab 34,000 == A 34,000" in clean["ledger.aggregate"].detail
                and "agg_b: Ab" in clean["ledger.aggregate"].detail,

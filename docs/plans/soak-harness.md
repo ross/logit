@@ -465,12 +465,12 @@ beside `scenario.toml`:
 compose = "compose.override.yaml"   # merged onto tools/soak/compose.yaml
 
 [ledger]
-split = "route"           # copy (the default) or route
+split = "route"           # copy (the default), route, or target (W15)
 # ...
 
 [[ledger.sink]]           # one per SUT sink
 id = "vm_a"               # the sink's component id
-target = "tier_a"         # route only: the target that feeds it
+target = "tier_a"         # route and target only: the target that feeds it
 backend = "victoria-metrics"                                # local only: a backend service
 vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the series V reads
 ```
@@ -481,7 +481,9 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 - `split` says how the sinks share `aggregate`'s output. Under `copy` each sink, fed by a
   fan-out, holds all of it. Under `route` each sink is fed by one `target` that a `route` fills,
   so the sinks hold disjoint shares; `route` needs two or more sinks, each with a distinct
-  `target`, and `copy` refuses `target`.
+  `target`, and `copy` refuses `target`. Under `target` (W15) each sink sits behind its own
+  `target` and `aggregate`, filled by a router that can send one event to several of them;
+  see "The target split (W15)".
 - `compose` names a file beside `scenario.toml`, never a path. Each service it adds needs a
   `soak.role` label, and a backend needs `profiles: [local]`.
 - `load()` checks every rule above that needs no service list. The rest need the merged
@@ -970,7 +972,10 @@ and takes the worst status; `report.py` is unchanged.
 | W′ | with a source's `fan_out` (W13b), each listener's W − D − B − X carried through its chain (`Ledger.through`): a `fan_out` node of k turns x events into k × x − T_lines + (T_in − T_disc), its children and the parents it sent on; any other node into x − T_disc. Summed over the listeners, it takes W − D − B − X − ΣT_disc's place in the residual, a stopped life's egress gap, and the end-to-end bound; R and a killed life's ingest rate grow by each chain's product of k. A fan-out node's own T_disc counts its parents, which went on as children, so it is never loss |
 | A | aggregate `logit.component.events.received` |
 | A_sent | aggregate `logit.component.events.sent` (W7b), counted once per send however many consumers a fan-out reaches |
-| S_in[sink], T_sent[target] | each sink's `logit.component.events.received`, and under `split = "route"` its target's `logit.component.events.sent` (W7b) |
+| S_in[sink], T_sent[target] | each sink's `logit.component.events.received`, and under `split = "route"` or `"target"` its target's `logit.component.events.sent` (W7b), which the target's own `Fanout` counts under the target's id |
+| R_in, R_copied, R_disc, R_fwd | under `split = "target"` (W15), the router `sut_router`'s `logit.component.events.received`, `events.copied` (each delivery past an event's first), `events.discarded` (only `route_signals` counts it: an event carrying no listed signal), and `events.sent`, which counts only its forward edge, a `route`'s ordinary consumer |
+| T_x[target] | under `split = "target"` (W15), a target's `logit.component.events.dropped`, a closed consumer's drop of a send T_sent already counted |
+| A[agg], Ab[agg], A_sent[agg] | under `split = "target"` (W15), A, Ab, and A_sent of each sink's own `aggregate` |
 | Ab | aggregate `logit.transform.metrics.absorbed` |
 | L_in, L_emit, L_drop, L_err, L_flush, L_sent | with `[ledger] sut_script` (W7a), the script's `logit.component.events.received`; `logit.script.events.emitted` summed over its `outcome`s, which counts events, one per event an `emit_many` returns; `logit.component.events.discarded`, one per event `process()` returns `nil` for; `logit.component.events.dropped{reason="script_error"}`, one per event a script error loses, counted beside `logit.component.errors{reason="process"}`; `logit.component.flush.events`; and `logit.component.events.sent`, which counts what `process()` and `flush()` send alike |
 | V[sink] | per sink (W7b), the reset-aware total of `vm-export/<sink>.jsonl`: add each series' first value, then every non-negative step, and on a decrease or at a SUT life start add the new value. V splits per SUT life at each series' decreases and at each life start, placing a sample by its timestamp, which is the SUT's own window time; a restart whose first value isn't below the last one shows no decrease. A series should have one segment per SUT life, else WARN |
@@ -1168,7 +1173,8 @@ The rows:
   `closed_consumer` write requests summing to its `batches.sent`, one request one batch, and
   its `busy` ones equal to its `batches.deferred`, one line per life, a failed identity first;
   a killed life is reported unjudged, and a listener whose kind the SUT config doesn't give is
-  reported.
+  reported. Under `split = "target"` (W15) the residual ends at the router, and a stopped
+  earlier life's must be 0; see "The target split (W15)".
 - `ledger.edge`: E == A, a single-consumer edge, for the final life; from W8b ΣE == A, E summed
   over the listeners, which every source's events reach. A source's `sut_transforms` (W8b) are
   judged hop by hop: its listener's E == T_in[first node], T_in − T_disc == T_out at every node
@@ -1181,14 +1187,19 @@ The rows:
   Σ(sent into aggregate) − A, since a fan-out doesn't telescope. With `sut_script` (W7a),
   L_sent == A, the edge from the script to `aggregate`. From W7b, each sink's edge too: under
   `copy`, A_sent == S_in[sink], since a fan-out counts one send per batch; under `route`,
-  T_sent[target] == S_in[sink] for the target that feeds it.
+  T_sent[target] == S_in[sink] for the target that feeds it. Under `split = "target"` (W15)
+  the path runs into the router, whose balance is judged here too; see "The target split
+  (W15)".
 - `ledger.script` (W7a), with `sut_script`, else SKIP: for the final life, E == L_in (the
   listener's edge into the script), L_in == L_emit + L_drop + L_err (every event emitted,
   dropped, or failed on), and L_sent == L_emit + L_flush. Earlier lives are reported.
-- `ledger.aggregate`: Ab == A, for the final life.
+- `ledger.aggregate`: Ab == A, for the final life; under `split = "target"` (W15) per sink,
+  each `aggregate` on its own line.
 - `ledger.egress`, per life and per egress group (W7b): under `split = "copy"` each sink is a
   group with its own V[sink], since each holds all of `aggregate`'s output; under `route` the
-  sinks form one group whose V is ΣV[sink], since each holds its target's share. Per group: Ab −
+  sinks form one group whose V is ΣV[sink], since each holds its target's share; under
+  `target` (W15) each sink is a group judged from its own target, as "The target split (W15)"
+  says. Per group: Ab −
   V for the final life and a killed one, and W − D − B − X − V for a stopped earlier one, the
   residual plus Ab − V, because `aggregate`'s close-time flush delivers the residual to
   VictoriaMetrics before the final drain. The detail shows both parts. With
@@ -1304,7 +1315,8 @@ The rows:
   exceed G less every counted loss, with the HTTP listener's X left out, since its client
   resends it, plus one generator batch per transport-error attempt. With a `fan_out` (W13b)
   each source's share of that limit is carried through its chain (`Ledger.through`), since V
-  counts k increments per event past the fan-out.
+  counts k increments per event past the fan-out. Under `split = "target"` (W15) the terms are
+  `ledger.edge`'s, each judged on its own; see "The target split (W15)".
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at each sink's own
   telemetry; see "External targets". A Kafka target's sink is judged the same way, and so is a
   `datadog` stand-in's (W9b), with what a `respond` step cued excused; a `remote_write` or
@@ -1348,6 +1360,39 @@ The rows:
   no `tls_issued` phase.
 - `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
   window around one step, or over the whole run (W8c); see "The scenario schema".
+
+**The target split (W15).** A `route` with a list-valued `routes:` value sends one event whole
+to several targets, and a `route_signals` under `strip: true` sends each of an event's signals
+to its own target as a part of its own; `split = "route"` refuses both, since the sinks' V no
+longer add up. Under `split = "target"` the router sits between the listeners and the
+aggregates, one per sink: `[ledger] sut_router` names it in place of `sut_aggregate`, and each
+`[[ledger.sink]]` names its `target`, its own `aggregate`, and optionally the `transforms`
+between them. `load()` holds the router's targets to the sinks' targets, every one, since the
+router's balance sums them all, and refuses the split beside `sut_script`, a hop,
+`vm_every_window`, `[overlap]`, and any target but the local one. The rows change as follows:
+
+- The listeners' rows end at the router. `ledger.edge` judges Σ(sent into router) == R_in, and
+  `ledger.intake`'s residual is W − D − B − X (less ΣT_disc) − R_in: in [0, R] for a killed
+  life, and 0 for a stopped one, whose final drain runs after every data node has exited.
+  Nothing else judges a stopped life's ingress, since each sink's egress starts at its target.
+- The router balances as R_in + R_copied − R_disc == R_fwd + ΣT_sent, in `ledger.edge`, judged
+  in the final life and in every stopped earlier one. A target's T_sent counts every router
+  that fills it, which `load()` holds to one. Under `strip: true` each part past an event's
+  first counts one copy, so a log-and-metric event reads R_in 1, R_copied 1, and T_sent 1 at
+  each target; an event no listed signal claims reads R_disc 1. A `route`'s unrouted event
+  reads R_fwd 1.
+- Each sink's branch is judged hop by hop in `ledger.edge`: T_sent − T_x == the first branch
+  transform's T_in or the sink's A, every branch transform T_in − T_disc == T_out, the last
+  T_out == A, and A_sent == S_in[sink]. `ledger.aggregate` judges each sink's Ab == A on a line
+  of its own.
+- `ledger.egress` judges each sink alone against its own Ab. A stopped earlier life's gap is
+  T_sent − T_x − ΣT_disc over its branch − V, the branch residual plus Ab − V, and a killed
+  life's band takes its ingest from T_sent and its window from the sink's `aggregate`. A drop
+  on another sink's branch, at its transforms, `aggregate`, or sink, doesn't count a gap.
+- `ledger.summary` lists W − D − E − B, every `ledger.edge` term, each A − Ab, and each Ab − V,
+  and judges each on its own: two terms of opposite sign never net to 0, and one sink's surplus
+  never covers another's loss. From a file or HTTP wire, each sink's V over the run is bounded
+  by G less counted loss, since a target receives at most one part of each event.
 
 ### 7. The first scenario's configs (W1a)
 
@@ -2272,16 +2317,24 @@ where it needs them, and a small check extension.
     the generator's `5xx` answers during the backend stop and its transport errors under the
     delay. `datadog_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver come
     later.
-15. **Multi-destination `route` and `route_signals` (81b0befa, 4b86ccc7).** Today
+15. **Multi-destination `route` and `route_signals` (81b0befa, 4b86ccc7), built in W15.**
     `scenario.py`'s `_route_problems` refuses a list-valued `routes:` and any `route_signals`
     under `split = "route"`, because one event can reach several sinks and their V no longer
-    add up. A third split mode will take each sink's expected V from its target's own
-    `events.sent`, with the router balanced as received + copied − discarded
-    (`logit.component.events.copied`, `events.discarded`). Scenario: `generate_in` sending mixed
+    add up. The third split mode, `split = "target"`, takes each sink's expected V from its
+    target's own `events.sent`, with the router balanced as received + copied − discarded
+    (`logit.component.events.copied`, `events.discarded`); §6's "The target split (W15)" has
+    the rules. Scenario: `generate_in` sending mixed
     log and metric events → `route_signals` → two targets, each into its own `aggregate` and
     backend, with one backend stopped. Rows: `ledger.edge` through the router, and
     `ledger.egress` per sink from its target. Needs: the split mode, a per-target `aggregate`
-    in `[[ledger.sink]]`, and self-test fixtures.
+    in `[[ledger.sink]]`, and self-test fixtures. Built as `route-signals`: each syslog line
+    gets a `soak_lines` increment from `kv_metrics` ahead of the router, so it carries a log
+    and a metric, and the log branch's own `kv_metrics` gives each log part a
+    `soak_log_lines` increment, the one count V can read on that branch with the scenario's
+    two VictoriaMetrics; the SUT is also stopped and killed, for the stopped-life and
+    killed-life rules. A list-valued `route` is a second scenario, `route-copy`, which reuses
+    `route-split`'s generator and sends each shard-0 line to both targets, so `events.copied`
+    moves under a `route` too.
 16. **Kafka SASL re-authentication over hours (5da5ab8c), built in W17 for SCRAM.**
     `kafka-sasl-reauth` is `kafka-broker-restart` over SCRAM-SHA-512 to a broker whose SASL
     listener sets `connections.max.reauth.ms` to 30 s. Each session's end retires a connection
@@ -2471,7 +2524,10 @@ that items 3, 7, and 11 need.
   wire's fault predicates and judgments, `influxdb_in`'s request identities in
   `ledger.intake`, the end-to-end bound in `ledger.summary`, self-test fixtures for each rule,
   and the `http-ingress` scenario.
-- **W15**: item 15, a third `split` mode for multi-destination `route` and `route_signals`.
+- **W15**: item 15, a third `split` mode, `target`, for multi-destination `route` and
+  `route_signals`: `[ledger] sut_router`, each sink's own `aggregate` and branch `transforms`,
+  the router's balance, the per-sink rows, self-test fixtures for each rule, and the
+  `route-signals` and `route-copy` scenarios, each run recorded under "Findings".
 - **W16**: item 17: the stand-in's `influxdb` shape (the query split off the path, a `204`
   with no body), a stdlib line-protocol parser and its vectors, V as one stored point per
   series and timestamp, `ledger.standin`'s rules for the shape, the class required on its

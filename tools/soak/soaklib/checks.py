@@ -31,7 +31,10 @@ full copy of `aggregate`'s output, so each sink's V is judged alone; under `spli
 sinks' V add up to it, so the egress gap is judged on their sum. That holds because `load()`
 refuses `split = "route"` over a `route` that can send one event to several targets (a
 list-valued `routes:` value) and over any `route_signals`, so each event reaches
-one sink.
+one sink. Those routers run under `split = "target"`: each sink sits behind its own target and
+`aggregate`, the listeners' rows end at the router (`[ledger] sut_router`), the router balances
+as received + copied − discarded == its forward edge's sends + its targets' (`router_balance`),
+and each sink's rows start at its own target (`branch_fed`), so each sink's V is judged alone.
 
 The ledger also follows each `[[ledger.source]]`, a generator and the SUT listener it reaches
 over the source's `wire` (`WIRES`), which names the counters each symbol reads.
