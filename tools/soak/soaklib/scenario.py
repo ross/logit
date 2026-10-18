@@ -1299,6 +1299,29 @@ def _target_router_problems(ledger, sut_text):
     sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
     followed = [sink.get("target") for sink in sinks if isinstance(sink, dict)]
     problems = []
+    # A target's T_sent counts every component that fills it, so another router, or a script
+    # with `targets:`, filling a sink's target would show sends the router never took in.
+    others = [(name, other) for other in ROUTER_KINDS
+              for name, other_body in _route_blocks(sut_text, other) if name != router
+              for target in router_targets(other_body, other) if target in followed]
+    for script in ("lua", "lua_file"):
+        for name, script_body in _route_blocks(sut_text, script):
+            found_targets = re.search(r"\btargets\s*:(.*)", script_body)
+            if not found_targets:
+                continue
+            start = script_body.rfind("\n", 0, found_targets.start()) + 1
+            indent = found_targets.start() - start
+            listed = [found_targets.group(1)]
+            for line in script_body[found_targets.end():].split("\n")[1:]:
+                if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                    break
+                listed.append(line)
+            words = re.findall(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", "\n".join(listed))
+            others += [(name, script) for target in followed if target in words]
+    for name, other in dict.fromkeys(others):
+        problems.append(f"ledger.split = \"target\": {other} {name!r} also fills a sink's "
+                        f"target, whose events.sent would count sends {router!r} never took in; "
+                        "only the router may fill the sinks' targets")
     unfollowed = [target for target in named if target not in followed]
     if unfollowed:
         problems.append(f"ledger.sut_router {router!r} fills {', '.join(unfollowed)}, which no "

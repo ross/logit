@@ -1391,7 +1391,9 @@ longer add up. Under `split = "target"` the router sits between the listeners an
 aggregates, one per sink: `[ledger] sut_router` names it in place of `sut_aggregate`, and each
 `[[ledger.sink]]` names its `target`, its own `aggregate`, and optionally the `transforms`
 between them. `load()` holds the router's targets to the sinks' targets, every one, since the
-router's balance sums them all, and refuses the split beside `sut_script`, a hop,
+router's balance sums them all; refuses any other `route` or `route_signals`, or `lua` or
+`lua_file` with `targets:`, that fills a sink's target, since a target's T_sent counts every
+component that fills it; and refuses the split beside `sut_script`, a hop,
 `vm_every_window`, `[overlap]`, and any target but the local one. The rows change as follows:
 
 - The listeners' rows end at the router. `ledger.edge` judges Σ(sent into router) == R_in, and
@@ -1399,11 +1401,18 @@ router's balance sums them all, and refuses the split beside `sut_script`, a hop
   life, and 0 for a stopped one, whose final drain runs after every data node has exited.
   Nothing else judges a stopped life's ingress, since each sink's egress starts at its target.
 - The router balances as R_in + R_copied − R_disc == R_fwd + ΣT_sent, in `ledger.edge`, judged
-  in the final life and in every stopped earlier one. A target's T_sent counts every router
-  that fills it, which `load()` holds to one. Under `strip: true` each part past an event's
-  first counts one copy, so a log-and-metric event reads R_in 1, R_copied 1, and T_sent 1 at
+  in the final life and in every stopped earlier one. A target's T_sent counts every
+  component that fills it, which `load()` holds to the router. Under `strip: true` each part
+  past an event's first counts one copy, so a log-and-metric event reads R_in 1, R_copied 1, and T_sent 1 at
   each target; an event no listed signal claims reads R_disc 1. A `route`'s unrouted event
-  reads R_fwd 1.
+  reads R_fwd 1. The balance pools the targets, so events sent to one target in place of
+  another leave it 0, and the same lives judge two bounds beside it: each target's
+  T_sent ≤ R_in − R_disc, since a target receives at most one delivery of each event the
+  router kept (graph rule 51 for a `route`, one part per target for a `route_signals`), and
+  R_fwd ≤ R_in. The router counts R_in and R_disc before a target's `Fanout` counts T_sent, so
+  a drain can't split them the wrong way. The bounds catch a target receiving more than the
+  router took in, not a shift between targets below that: `route-copy`'s `tier_a` carries
+  about half of R_in.
 - Each sink's branch is judged hop by hop in `ledger.edge`: T_sent − T_x == the first branch
   transform's T_in or the sink's A, every branch transform T_in − T_disc == T_out, the last
   T_out == A, and A_sent == S_in[sink]. `ledger.aggregate` judges each sink's Ab == A on a line
@@ -1414,8 +1423,10 @@ router's balance sums them all, and refuses the split beside `sut_script`, a hop
   on another sink's branch, at its transforms, `aggregate`, or sink, doesn't count a gap.
 - `ledger.summary` lists W − D − E − B, every `ledger.edge` term, each A − Ab, and each Ab − V,
   and judges each on its own: two terms of opposite sign never net to 0, and one sink's surplus
-  never covers another's loss. From a file or HTTP wire, each sink's V over the run is bounded
-  by G less counted loss, since a target receives at most one part of each event.
+  never covers another's loss downstream of its target. The router's term pools the targets,
+  which only its bounds in `ledger.edge` partly cover. From a file or HTTP wire, each sink's
+  V over the run is bounded by G less counted loss, since a target receives at most one part of
+  each event.
 
 ### 7. The first scenario's configs (W1a)
 
@@ -5176,7 +5187,7 @@ Overall PASS, every row PASS or SKIP.
 - **W12a** changes no harness code: the self-test passes (1,478 expectations), and the four new
   scenarios pass `self-test` validation, the shipped-config test, and `script/validate`. Met:
   a run of each is recorded under "Findings", every ledger row PASS.
-- **W15**: the self-test passes (1,980 expectations), and each new rule fails it when
+- **W15**: the self-test passes (1,986 expectations), and each new rule fails it when
   reverted (ten reverts, listed in the PR). `route-signals` and `route-copy` pass `self-test`
   validation, the shipped-config test, and `logit validate` in `logit:soak`. Met: a run of each
   is recorded under "Findings", Overall PASS.

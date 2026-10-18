@@ -2045,23 +2045,59 @@ def _target_ledger():
                and "life 0: R_in" in stopped["ledger.edge"].detail
                and "off by 5" in stopped["ledger.edge"].detail,
                f"the router's balance is judged in a stopped life, got {stopped['ledger.edge']}")
-        for name, adds in (("discarded", [(250, copied, 5, "split", None),
-                                          (250, discarded, 5, "split", None)]),
-                           ("forward", [(250, copied, 5, "split", None),
-                                        (250, sent, 5, "split", None)])):
-            balanced = results(f"targets-router-{name}", adds=adds)
+        def shift(sink, delta):
+            """`adds` moving `sink`'s branch by `delta` events at +250, every hop alike."""
+            hops = ([(sent, "t_a"), (received, "agg_a"), (absorbed, "agg_a")] if sink == "vm_a"
+                    else [(sent, "t_b"), (received, "count_b"), (sent, "count_b"),
+                          (received, "agg_b"), (absorbed, "agg_b")])
+            return [(250, name, delta, comp, None) for name, comp in hops]
+
+        def shifted(deltas):
+            """An `export_edit` moving each sink's final-life V by its delta."""
+            def edit(sink, series):
+                return change(sink, 1, deltas.get(sink, 0))(sink, series)
+            return edit
+
+        # 5 events the router kept out of both targets, discarded or sent on its forward edge.
+        for name, counter in (("discarded", discarded), ("forward", sent)):
+            adds = ([(250, copied, -5, "split", None), (250, counter, 5, "split", None)]
+                    + shift("vm_a", -5) + shift("vm_b", -5))
+            balanced = results(f"targets-router-{name}", adds=adds,
+                               export_edit=shifted({"vm_a": -5, "vm_b": -5}))
             expect(balanced["ledger.edge"].status == checks.PASS
                    and balanced["ledger.summary"].status == checks.PASS,
                    f"the router's balance takes its {name} events in, got "
                    f"{balanced['ledger.edge']} / {balanced['ledger.summary']}")
 
+        # The balance pools the targets: 5 events moved from t_b onto t_a, which already carries
+        # every event, leave it and every branch balanced, and only t_a's bound FAILs. A forward
+        # edge sending more than the router took in FAILs its own bound the same way.
+        moved = results("targets-router-moved", adds=shift("vm_a", 5) + shift("vm_b", -5),
+                        export_edit=shifted({"vm_a": 5, "vm_b": -5}))
+        expect(moved["ledger.edge"].status == checks.FAIL
+               and "T_sent[t_a] 34,005 <= R_in − R_disc 34,000, over its bound"
+               in moved["ledger.edge"].detail
+               and all(moved[row].status == checks.PASS
+                       for row in ("ledger.egress", "ledger.aggregate", "ledger.summary")),
+               f"a target sent more than the router took in FAILs its bound alone, got "
+               f"{moved['ledger.edge']}")
+        forward = results("targets-router-forward-over",
+                          adds=[(250, copied, 40000, "split", None),
+                                (250, sent, 40000, "split", None)])
+        expect(forward["ledger.edge"].status == checks.FAIL
+               and "R_fwd 40,000 <= R_in 34,000, over its bound" in forward["ledger.edge"].detail,
+               f"a forward edge sending more than the router took in FAILs, got "
+               f"{forward['ledger.edge']}")
+
         # A closed consumer's drop at a target, in a stopped life and the final one: the
         # target counted the send, its branch never received it.
-        closed = [(offset, delta_name, 5, comp, attrs) for offset in (50, 250)
-                  for delta_name, comp, attrs in ((copied, "split", None), (sent, "t_a", None),
-                                                  (dropped, "t_a",
-                                                   {"reason": "closed_consumer"}))]
-        closed_run = results("targets-closed-consumer", adds=closed)
+        closed = [(offset, name, delta, comp, attrs) for offset in (50, 250)
+                  for name, delta, comp, attrs in (
+                      (dropped, 5, "t_a", {"reason": "closed_consumer"}),
+                      (received, -5, "agg_a", None), (absorbed, -5, "agg_a", None))]
+        closed_run = results("targets-closed-consumer", adds=closed,
+                             export_edit=lambda sink, series: change(
+                                 "vm_a", 0, -5)(sink, change("vm_a", 1, -5)(sink, series)))
         for row in ("ledger.edge", "ledger.egress", "ledger.summary", "drops"):
             expect(closed_run[row].status == checks.PASS,
                    f"{row} takes a target's closed-consumer drop off its sends, got "
@@ -5745,6 +5781,16 @@ def _tcp_rules(root):
              "a router target no sink follows"),
             (single.replace("tier_b", "tier_x"), None, "`target` tier_b isn't one route",
              "a sink target the router doesn't fill"),
+            (by_signals + "  more:\n    type: route\n    by: { attribute: shard }\n"
+             "    routes: { \"0\": [tier_c, tier_b] }\n",
+             None, "route 'more' also fills a sink's target", "a second router"),
+            (by_signals + "  more:\n    type: route_signals\n    signals: { logs: tier_a }\n",
+             None, "route_signals 'more' also fills a sink's target",
+             "a second route_signals"),
+            (by_signals + "  script:\n    type: lua\n    targets:\n      - tier_b\n",
+             None, "lua 'script' also fills a sink's target", "a lua with targets"),
+            (by_signals + "  script: { type: lua_file, path: x.lua, targets: [tier_a] }\n",
+             None, "lua_file 'script' also fills a sink's target", "a lua_file with targets"),
             (by_signals, lambda r: r["ledger"].update(sut_router="other"),
              "ledger.sut_router 'other' isn't a route or route_signals component",
              "a router the SUT config lacks"),

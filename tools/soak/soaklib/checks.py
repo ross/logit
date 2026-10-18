@@ -2181,6 +2181,23 @@ class Ledger:
                                              for sink in self.sinks)
         return out, sent
 
+    def router_bounds(self, life):
+        """Under `target`, `[(text, ok)]` for the bounds the router's pooled balance can't
+        judge: each target's T_sent ≤ R_in − R_disc, and R_fwd ≤ R_in. A target receives at most
+        one delivery of each event the router kept, since a `route` lists a target once per
+        value (graph rule 51) and a `route_signals` sends one part per target. `route_batch`
+        counts R_in and R_disc before a target's `Fanout` counts the send, so a drain can't
+        split them the wrong way. The bounds catch a target receiving more than the router took
+        in; a shift between targets below that passes."""
+        kept = self.get("R_in", life) - self.get("R_disc", life)
+        bounds = [(f"T_sent[{self.targets.get(sink)}] "
+                   f"{_n(self.T_sent.get(sink, {}).get(life, 0))} <= R_in − R_disc {_n(kept)}",
+                   self.T_sent.get(sink, {}).get(life, 0) <= kept) for sink in self.sinks]
+        bounds.append((f"R_fwd {_n(self.get('R_fwd', life))} <= R_in "
+                       f"{_n(self.get('R_in', life))}",
+                       self.get("R_fwd", life) <= self.get("R_in", life)))
+        return bounds
+
     def _router_text(self, life):
         out, sent = self.router_balance(life)
         return (f"R_in {_n(self.get('R_in', life))}, R_copied {_n(self.get('R_cp', life))}, "
@@ -3464,7 +3481,8 @@ def check_ledger_edge(data):
     many consumers it reaches), and under `route` the sink's target's events.sent == the
     sink's events.received. Under `target`, the edges `_target_edges` lists: into the router,
     the router's balance R_in + R_copied − R_disc == R_fwd + ΣT_sent, and each sink's branch
-    from its target to it. Earlier lives are reported, except that the router's balance is
+    from its target to it. Earlier lives are reported, except that the router's balance and
+    its bounds (`Ledger.router_bounds`: each T_sent ≤ R_in − R_disc, and R_fwd ≤ R_in) are
     judged in every life a kill didn't end."""
     if _overlapped(data):
         return _per_instance(data, check_ledger_edge)
@@ -3531,6 +3549,15 @@ def check_ledger_edge(data):
                        f"({what})")
         else:
             parts.append(f"{lead}{side(final, a)} == {right} {_n(b)} ({what})")
+    if led.targeted:
+        for life in [each for each in out.lives if each == out.final or each not in out.killed]:
+            for text, ok in led.router_bounds(life):
+                where = "" if life == out.final else f"life {life}: "
+                if ok:
+                    if life == out.final:
+                        parts.append(text)
+                else:
+                    off.append(f"{where}{text}, over its bound")
     head = "" if led.hop is not None else f"final life {led.final}: "
     if off:
         return Result("ledger.edge", FAIL, head + "; ".join(off + parts), lines)
@@ -3960,7 +3987,9 @@ def _summary_targeted(data, led):
     `_target_edges` term (sent − received), the router's balance among them, then per sink
     A − Ab and Ab − V. Each term is judged on its own and must be 0, a counted Ab − V aside,
     so a surplus in one term or at one sink can't net out loss in another; uncounted is the
-    sum of their sizes. A `FAULT_DROP_REASONS` drop in a sink's credit FAILs the row as it
+    sum of their sizes. The router's term pools its targets: events it sent to one target in
+    place of another leave it 0 and every sink's terms balanced. `ledger.edge`'s
+    `router_bounds` catch only a target receiving more than the router took in. A `FAULT_DROP_REASONS` drop in a sink's credit FAILs the row as it
     FAILs `ledger.egress`. From a file or HTTP wire, each sink's V over the run is also
     bounded by what the generators sent less every counted loss (`_end_to_end`): a target
     receives at most one part of each event."""
