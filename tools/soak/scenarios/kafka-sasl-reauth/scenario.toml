@@ -1,0 +1,187 @@
+# kafka-broker-restart over SCRAM-SHA-512: a generated statsd stream into `logit` and out to a
+# local Kafka broker that ends every SASL session after 30 s (`connections.max.reauth.ms`), and
+# that is restarted, paused, and stopped mid-run. The ledger's V is the topic, read back after
+# the SUT stops (`[target] kind = "kafka"`, tools/soak/README.md's "Kafka targets").
+#
+# `kafka_out` doesn't re-authenticate in band. It stops reusing a connection 20 s after it
+# authenticates (the 30 s session less the sink's 10 s `timeout`) and dials a new one on the next
+# request, counting `logit.output.reconnects`. The run judges that rate, that no attempt was
+# `refused` (no redial's SCRAM exchange was refused), and that nothing was dropped or stored
+# twice: a redial keeps the producer id and sequences, so `ledger.topic` FAILs a duplicate copy
+# in a SUT life with no epoch bump, as it does for kafka-broker-restart.
+#
+# compose.override.yaml starts the broker from kafka-server.properties with the SCRAM user. The
+# schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "kafka-sasl-reauth"
+description = "generator -> statsd_in (UDP) -> aggregate 2s delta -> kafka_out (idempotent, SCRAM-SHA-512) -> Kafka with 30 s sessions, restarted, paused, and stopped; the topic is read back"
+duration = "8m30s"        # warmup + one cycle + cooldown; --duration overrides
+# Ten series make five records a second, so 8 hours is 144,000 records, which the read-back's
+# bound covers (README.md's "Kafka targets").
+max_duration = "8h"
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s, a metadata refresh, and two aggregate windows
+cycle = "6m30s"           # the stop's recovery (5m45s) + one progress window and slack
+compose = "compose.override.yaml"   # the broker's SCRAM listener and user
+
+[target]
+kind = "kafka"
+topic = "soak"
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no VictoriaMetrics query
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]         # one per generator the ledger follows into the SUT
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]           # a Kafka target's one sink: its topic is V, read back at the end
+id = "kafka"
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+[[step]]
+at = "0s"
+action = "restart"
+on = "kafka"
+for = "30s"
+
+# The broker's process stops answering while its sockets stay open, so produce requests sent
+# during the pause time out after the sink's 10 s `timeout` as `Ambiguous`, and their resends
+# carry the same sequences.
+[[step]]
+at = "1m45s"
+action = "pause"
+on = "kafka"
+for = "40s"
+
+# The broker is gone, and its name with it: every connect fails `Clean`, and the sink holds its
+# queue until the broker is back.
+[[step]]
+at = "3m45s"
+action = "stop"
+on = "kafka"
+for = "60s"
+
+# The sink never drops a batch: `block` holds the queue through every fault.
+[[expect]]
+name = "no-drop-restart"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "kafka"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-drop-pause"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "kafka"
+step = "c0s2"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-drop-stop"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "kafka"
+step = "c0s3"
+window = "through"
+reduce = "delta"
+max = 0
+
+# The pause leaves at least one attempt `Ambiguous`, so `ledger.topic`'s no-duplicate verdict
+# rests on resends the broker had to deduplicate.
+[[expect]]
+name = "pause-is-ambiguous"
+service = "logit"
+metric = "logit.output.requests"
+attrs = { component = "kafka", class = "ambiguous" }
+step = "c0s2"
+window = "through"
+reduce = "delta"
+min = 1
+
+# The stop makes the sink retry for certain, and it stops retrying once the broker is back.
+[[expect]]
+name = "retrying-during-stop"
+service = "logit"
+metric = "logit.component.retrying"
+component = "kafka"
+step = "c0s3"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "retrying-clears"
+service = "logit"
+metric = "logit.component.retrying"
+component = "kafka"
+step = "c0s3"
+window = "after"
+reduce = "last"
+max = 0
+
+# The sink renews its sessions. While the broker answers, the leader's connection is redialed at
+# the first 2 s produce slot past its deadline, 20 s after it authenticated, so every 20 to 23 s
+# with the dial. A fault ends the connection, and the first successful dial after it starts the
+# clock again, so the run is up-segments, each opening with one dial and renewing within it, and
+# an up-segment of L seconds holds between 1 + L / 23 and 1 + L / 20 dials. A metadata refresh
+# after a fault, or every 5 minutes, may redial the bootstrap connection too.
+#
+# The run window is warmup's end to the end sequence, a 6.5-minute cycle and the 60 s cooldown,
+# 450 s at the default duration. The three faults keep the broker away for at most about 175 s:
+# the 30 s restart, the 40 s pause and a 10 s response timeout, and the 60 s stop and up to 10 s
+# of `retry_max_delay`, each with a few seconds' redial. That leaves 275 s in three or four
+# up-segments, so at least 275 / 23 renewals less one lost to rounding per segment, plus the
+# segments' opening dials: 12 dials, 96 an hour. At most, with no outage,
+# 450 s / 20 s + 1 renewals and a bootstrap redial per fault and per refresh, 29 dials, 232 an
+# hour. Over a longer run each 390 s cycle gives the same range. The bounds sit outside it, and
+# still separate the two failures that matter: a sink that never renewed would count only the
+# forced redials, about 3 to 6 a cycle, or 28 to 55 an hour, and one that redialed before every
+# send about 1,800.
+[[expect]]
+name = "reauth-rate"
+service = "logit"
+metric = "logit.output.reconnects"
+component = "kafka"
+window = "run"
+reduce = "rate"
+min = 80
+max = 300
+
+# A redial the broker refuses, such as a SCRAM credential lost across the restart, is `refused`
+# and holds the queue. None is.
+[[expect]]
+name = "no-auth-refusal"
+service = "logit"
+metric = "logit.output.requests"
+attrs = { component = "kafka", class = "refused" }
+window = "run"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-drop-run"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "kafka"
+window = "run"
+reduce = "delta"
+max = 0

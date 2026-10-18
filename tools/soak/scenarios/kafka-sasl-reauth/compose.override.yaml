@@ -1,0 +1,22 @@
+# Starts the `kafka` broker from this scenario's kafka-server.properties instead of the image's
+# environment variables, with a SCRAM-SHA-512 user. A relative path here resolves against the
+# project directory, tools/soak/, the base file's, not this file's.
+#
+# `--ignore-formatted` makes the format a no-op on a restart, which keeps the container and its
+# log directory, so the credential the first start wrote stays. The healthcheck is the base
+# file's, on the unauthenticated PLAINTEXT listener.
+services:
+  kafka:
+    environment:
+      # Any base64 UUID; the log directory lives and dies with the container.
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - ./scenarios/kafka-sasl-reauth/kafka-server.properties:/soak/server.properties:ro,z
+    entrypoint:
+      - bash
+      - -c
+      - >-
+        /opt/kafka/bin/kafka-storage.sh format --ignore-formatted -t "$${CLUSTER_ID}"
+        -c /soak/server.properties
+        --add-scram 'SCRAM-SHA-512=[name=logit,password=logit-secret]' >/dev/null
+        && exec /opt/kafka/bin/kafka-server-start.sh /soak/server.properties
