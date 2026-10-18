@@ -2610,7 +2610,7 @@ def wire_judgment(fault, wire):
     return "judged"
 
 
-def _wire_buckets(data, led, source, combined=None):
+def _wire_buckets(data, led, source, combined=None, anchors_out=None):
     """G − (W + K + F) for one source per SUT drain interval, classified `fault`, `judged`,
     `steady`, or `end`: its generator's G against its listener's W + K + F, with the fault
     windows that can affect its wire (`affects_source`), each reported or judged
@@ -2623,7 +2623,8 @@ def _wire_buckets(data, led, source, combined=None):
     intervals the interpolation telescopes; each edge of a run errs by at most one generator
     batch, which is the judgment's tolerance. Returns `[(start, end, kind, label, g, wkf, f)]`,
     `f` the part of `wkf` that is F. Under `[overlap]`, `combined` is every instance's W + K + F
-    at once (`_overlap_ingest`)."""
+    at once (`_overlap_ingest`). `anchors_out`, a list, receives G's `(timestamp, cumulative)`
+    anchors."""
     service, listener = source.get("service"), source.get("sut_listener")
     wire_name = source_wire(source)
     wire = WIRES[wire_name]
@@ -2646,6 +2647,8 @@ def _wire_buckets(data, led, source, combined=None):
             anchors.append((ts, cum))
     anchors.sort(key=lambda item: item[0])
     anchor_ts = [t for t, _ in anchors]
+    if anchors_out is not None:
+        anchors_out.extend(anchors)
 
     def g_at(t):
         if not anchors or t <= anchors[0][0]:
@@ -2745,6 +2748,48 @@ def check_ledger_wire(data):
     return Result("ledger.wire", worst(statuses), " | ".join(details), lines)
 
 
+def _boundary_nets(runs, anchors, allowances):
+    """`(nets, netted)`: each run's gap, G − (W + K + F), after netting across every boundary
+    between two judged runs whose gaps have opposite signs, and `{index: [(moved, at,
+    straddled)]}` for each run a transfer touched. `allowances` is each judged run's surplus
+    allowance, by index.
+
+    G is interpolated between generator drains, so at a SUT drain inside a generator interval
+    its error is up to the G that moved in that interval: one batch while acknowledgments arrive
+    steadily, but many when they bunch, as under netem with one request in flight or when a
+    restart flushes a backlog. The error moves G from one side of the boundary to the other, an
+    opposite-signed pair in the two runs that touch. A transfer is capped at the G that moved
+    over the generator anchor pair straddling the boundary, and at either gap, so neither run
+    changes sign. Only a surplus past its run's own allowance nets: one inside it is excused
+    already, and netting it too would let it hide a loss next door. A judged-to-steady edge has
+    its one-batch tolerance instead, and a steady run never nets with a judged one."""
+    nets = [g - wk for _, _, _, _, g, wk, _ in runs]
+    netted = {}
+    stamps = [t for t, _ in anchors]
+    for index in range(len(runs) - 1):
+        left, right = runs[index], runs[index + 1]
+        if left[2] != "judged" or right[2] != "judged" or nets[index] * nets[index + 1] >= 0:
+            continue
+        at = left[1]
+        upper = bisect.bisect_left(stamps, at)
+        if upper == 0 or upper >= len(anchors):
+            continue
+        straddled = anchors[upper][1] - anchors[upper - 1][1]
+        loss, surplus = (index, index + 1) if nets[index] > 0 else (index + 1, index)
+        if -nets[surplus] <= allowances[surplus]:
+            continue
+        moved = min(-nets[surplus], nets[loss], straddled)
+        # An interpolated G leaves fractions; less than one event isn't worth a transfer.
+        if moved < 1:
+            continue
+        sign = 1 if nets[index] > 0 else -1
+        nets[index] -= sign * moved
+        nets[index + 1] += sign * moved
+        netted.setdefault(index, []).append((moved, at, straddled))
+        netted.setdefault(index + 1, []).append((moved, at, straddled))
+    return nets, netted
+
+
 def _ambiguous_drops(led, source):
     """`[(timestamp, count)]` of what can leave one generator batch in W that G doesn't count,
     so `ledger.wire` and `_end_to_end` allow that much surplus per count: on a TCP wire the
@@ -2794,18 +2839,12 @@ def _wire_one(data, led, source, instances=None):
         lines.append(f"precondition: generator output.datagrams {_n(stats['G_datagrams'])} "
                      "isn't 0, so its sink isn't sending over TCP")
 
+    anchors = []
     buckets = _wire_buckets(data, led, source, combined=(
-        None if instances is None else _overlap_ingest(instances, source)))
+        None if instances is None else _overlap_ingest(instances, source)),
+        anchors_out=anchors)
     runs = []
     for start, end, kind, label, g, wk, f in buckets:
-        # Judged windows next to each other are one run, whatever their labels: a boundary
-        # between two is no edge of a judged stretch, and splitting there would put the
-        # interpolation's error at it, unbounded by any edge, on both sides.
-        if runs and runs[-1][2] == kind == "judged":
-            labels = runs[-1][3].split("; ")
-            if label not in labels:
-                runs[-1][3] = "; ".join(labels + [label])
-            label = runs[-1][3]
         if runs and runs[-1][2] == kind and runs[-1][3] == label:
             runs[-1][1] = end
             runs[-1][4] += g
@@ -2816,8 +2855,22 @@ def _wire_one(data, led, source, instances=None):
     sums = {"fault": 0.0, "judged": 0.0, "steady": 0.0, "end": 0.0}
     batch = stats["batch"]
     ambiguous = _ambiguous_drops(led, source)
+    allowances = {}
+    for index, (start, end, kind, _, _, _, _) in enumerate(runs):
+        if kind == "judged":
+            # A judged run's surplus has no pool to fall into, so every edge it has, a boundary
+            # with another judged run included, allows its one batch of interpolation error.
+            sides = sum(1 for other in (index - 1, index + 1) if 0 <= other < len(runs))
+            drops = sum(v for ts, v in ambiguous if start < ts <= end)
+            allowances[index] = (drops + sides) * batch
+    nets, netted = _boundary_nets(runs, anchors, allowances)
     # Each steady or judged run counts at 0 when W + K + F exceeds G in it, so a surplus in one
-    # run can't net out loss in another.
+    # run can't net out loss in another. The one exception is a boundary between two judged
+    # runs (`_boundary_nets`). G is interpolated there, and when acknowledgments bunch, under
+    # one request in flight or a restart's backlog flush, its error is up to the G that moved
+    # in the generator interval straddling the boundary, an opposite-signed pair in the two runs
+    # that touch. So a surplus past its run's allowance moves across, up to that G, and no
+    # further.
     steady_lost = 0.0
     g_steady = 0.0
     edges = 0
@@ -2832,24 +2885,32 @@ def _wire_one(data, led, source, instances=None):
         else:
             lines.append(f"{span}: G {_n(round(g))}, W {_n(wk - f)}, counted {_n(f)}, gap "
                          f"{_n(round(g - wk))}")
+        for moved, at, straddled in netted.get(index, []):
+            lines[-1] += (f", {_n(round(abs(moved)))} netted across the boundary at "
+                          f"{data.offset(at)} (G moved {_n(round(straddled))} over the "
+                          "generator interval straddling it)")
+        net = nets[index]
+        if index in netted:
+            lines[-1] += f", net gap {_n(round(net))}"
         if kind not in ("steady", "judged"):
             continue
-        steady_lost += max(0.0, g - wk)
+        steady_lost += max(0.0, net)
         g_steady += g
         run_edges = sum(1 for other in (index - 1, index + 1)
                         if 0 <= other < len(runs) and runs[other][2] != kind)
         edges += run_edges
         if kind == "judged":
             drops = sum(v for ts, v in ambiguous if start < ts <= end)
-            allowed = (drops + run_edges) * batch
+            sides = sum(1 for other in (index - 1, index + 1) if 0 <= other < len(runs))
+            allowed = allowances[index]
             what = "transport-error attempt(s)" if http else "ambiguous drop(s)"
             lines[-1] += (f", surplus allowed {_n(allowed)} ({_n(drops)} {what} + "
-                          f"{run_edges} edge(s), x one {_n(batch)}-line batch)")
-            if wk - g > allowed:
+                          f"{sides} edge(s), x one {_n(batch)}-line batch)")
+            if -net > allowed:
                 took = "W − X" if http else "W + counted"
-                surplus.append(f"{span}: {took} exceeds G by {_n(round(wk - g))}, over "
+                surplus.append(f"{span}: {took} exceeds G by {_n(round(-net))}, over "
                                f"the {_n(allowed)} its {_n(drops)} {what} and "
-                               f"{run_edges} edge(s) allow")
+                               f"{sides} edge(s) allow")
     if surplus:
         status = FAIL
         lines[:0] = surplus

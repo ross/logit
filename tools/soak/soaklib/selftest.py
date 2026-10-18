@@ -9676,17 +9676,19 @@ def _tls_checks():
                f"rise with no value in force at the start is None, got {value} {note}")
 
 def _reshape(run_dir, chain, fan_out=None, discard_at=None, lines_at=None, short_at=None,
-             declared=None):
+             forward_at=None, declared=None):
     """Rewrites a one-source `_ledger_run` or `_http_run` directory in place so the nodes
     `chain` sit between the listener `in` and `window`. `fan_out` is `{node: k}`: each event
     into the node leaves as k, its parent discarded; `lines_at` is `{offset: lines}` that node
-    lost at a drain, and `short_at` `{offset: n}` children it sent short with nothing counted.
+    lost at a drain, `short_at` `{offset: n}` children it sent short with nothing counted, and
+    `forward_at` `{offset: n}` parents it sent on beside their children instead of discarding,
+    as `line_protocol` does with a parent that carries metrics.
     `discard_at` is `{(node, offset): n}` events another node discarded at a drain. `window`'s
     received and absorbed counts and each life's V follow what the chain sent, so every
     identity holds; `declared` replaces the source's `fan_out`, which defaults to the
     telemetry's."""
     fan_out, discard_at = fan_out or {}, discard_at or {}
-    lines_at, short_at = lines_at or {}, short_at or {}
+    lines_at, short_at, forward_at = lines_at or {}, short_at or {}, forward_at or {}
     factor = 1
     for node in chain:
         factor *= fan_out.get(node, 1)
@@ -9704,9 +9706,11 @@ def _reshape(run_dir, chain, fan_out=None, discard_at=None, lines_at=None, short
         for node in chain:
             k = fan_out.get(node)
             received = x
-            discarded = received if k else discard_at.get((node, offset), 0)
+            forwarded = forward_at.get(offset, 0) if k else 0
+            discarded = received - forwarded if k else discard_at.get((node, offset), 0)
             lost = lines_at.get(offset, 0) if k else 0
-            x = (k * received - lost - short_at.get(offset, 0)) if k else received - discarded
+            x = ((k * received - lost - short_at.get(offset, 0) + forwarded) if k
+                 else received - discarded)
             for name, value, attrs in (
                     ("logit.component.events.received", received, None),
                     ("logit.component.events.sent", x, None),
@@ -9790,6 +9794,14 @@ def _fan_out_ledger():
             expect(lost[row].status == checks.PASS,
                    f"{row} PASSes children short by the lines the node counted dropped, got "
                    f"{lost[row]}")
+        # Lines dropped and parents forwarded in the stopped life, whose residual and egress gap
+        # read W′: each term of `Ledger.through`'s fan-out arithmetic.
+        for name, kwargs in (("fan-out-lines-stopped", {"lines_at": {60: 3}}),
+                             ("fan-out-forward-stopped", {"forward_at": {60: 5}})):
+            stopped = results(name, chain=["points"], fan_out={"points": 4}, **kwargs)
+            for row in rows:
+                expect(stopped[row].status == checks.PASS,
+                       f"{row} PASSes {name}, got {stopped[row]}")
         short = results("fan-out-short", chain=["points"], fan_out={"points": 4},
                         short_at={200: 3})
         expect(short["ledger.edge"].status == checks.FAIL
@@ -9827,9 +9839,10 @@ def _fan_out_ledger():
 def _idle_writer():
     """`ledger.wire` on an HTTP source whose writer delivers nothing for a while, a drain with
     no `events.delivered` point, and then its backlog at once, with a judged window's edge in
-    the idle stretch: G holds flat to the burst, so no loss shows at the edge. And judged
-    windows that overlap form one run, so a lag of W behind G across a boundary between them
-    nets out."""
+    the idle stretch: G holds flat to the burst, so no loss shows at the edge. And the boundary
+    rule between two judged runs: an opposite-signed pair nets up to the G that moved over the
+    generator interval straddling the boundary, and no further, and runs that don't touch never
+    net."""
     idle = {_stamp(T0 + offset) for offset in range(160, 205, 5)}
     moved = {"in": 0, "out": 0}
 
@@ -9856,25 +9869,63 @@ def _idle_writer():
         expect(wire.status == checks.PASS,
                f"a writer's idle drains hold G flat across the stall, got {wire}")
 
-    # Two judged windows overlapping, with W 140 ahead of G at a boundary between them and
-    # behind it at the next: one judged stretch, whose gap nets to 0.
-    def ahead(record):
-        metric = record["metrics"][0]
-        if (record["attributes"].get("component") == "in"
-                and metric["name"] == "logit.component.events.sent"):
-            metric["value"] += {_stamp(T0 + 195): 140, _stamp(T0 + 200): -140}.get(
-                record["timestamp"], 0)
-        return record
+    # Judged windows that overlap, so their runs touch at +190 and +195, with W shifted between
+    # drains: `shift` is `{offset: events}` added to the listener's `events.sent`.
+    def wire_with(name, shift):
+        def edit(record):
+            metric = record["metrics"][0]
+            if (record["attributes"].get("component") == "in"
+                    and metric["name"] == "logit.component.events.sent"):
+                metric["value"] += shift.get(
+                    round(telemetry.parse_rfc3339(record["timestamp"]) - T0), 0)
+            return record
 
-    windows = (_http_fault("x1", "netem", "logit", 140, 150)
-               + _http_fault("x2", "netem", "generator", 190, 200))
-    with tempfile.TemporaryDirectory() as tmp:
-        run_dir = _http_run(tmp, "judged-stretch", kind="otlp_in", timeline_extra=windows,
-                            sut_edit=ahead)
-        wire = {r.id: r for r in checks.run_all(run_dir)}["ledger.wire"]
-        expect(wire.status == checks.PASS
-               and any(line.startswith("[+100s, +245s] judged (") for line in wire.lines),
-               f"adjacent judged windows are one run, got {wire}")
+        windows = (_http_fault("x1", "netem", "logit", 140, 150)
+                   + _http_fault("x2", "netem", "generator", 190, 200))
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = _http_run(tmp, name, kind="otlp_in", timeline_extra=windows,
+                                sut_edit=edit)
+            return {r.id: r for r in checks.run_all(run_dir)}["ledger.wire"]
+
+    # W 700 ahead of G at the boundary +195 and behind it at the next drain: an opposite-signed
+    # pair past the runs' edge allowances but inside the G that moved over the generator interval
+    # straddling it, 1,000.
+    within = wire_with("boundary-within", {195: 700, 200: -700})
+    expect(within.status == checks.PASS
+           and any("700 netted across the boundary at +195s (G moved 1,000 over the generator "
+                   "interval straddling it), net gap 0" in line for line in within.lines),
+           f"an opposite-signed pair at a judged boundary nets inside the straddling G, got "
+           f"{within}")
+    # The same pair beyond that G: only 1,000 nets, and the rest FAILs both ways.
+    beyond = wire_with("boundary-beyond", {195: 1400, 200: -1400})
+    expect(beyond.status == checks.FAIL
+           and any("1,000 netted across the boundary at +195s" in line
+                   for line in beyond.lines)
+           and "W − X exceeds G by 400" in beyond.detail,
+           f"a pair beyond the straddling G FAILs, got {beyond}")
+    # A surplus of 60 between two judged runs with no opposite-signed neighbour, the run after
+    # it gapping 0: each of its two edges allows a batch of interpolation error.
+    edged = wire_with("boundary-edges", {195: 60, 250: -60})
+    expect(edged.status == checks.PASS
+           and any(line.startswith("[+190s, +195s] judged") and "gap -60" in line
+                   and "2 edge(s)" in line for line in edged.lines),
+           f"a judged run between two others has two edges' allowance, got {edged}")
+    # A loss of 600 next to a surplus of 150 that its run's two edges excuse: the excused
+    # surplus nets nothing, so the loss stands past the pool's 500.
+    excused = wire_with("boundary-excused", {195: 150, 200: -600})
+    expect(excused.status == checks.FAIL
+           and not any("netted" in line for line in excused.lines)
+           and excused.detail.startswith("600 lost outside reported HTTP windows"),
+           f"a surplus inside its own allowance can't hide a loss next to it, got {excused}")
+    # A loss in one judged window and a surplus in another that doesn't touch it: nothing
+    # nets, so the loss and the surplus each FAIL.
+    apart = wire_with("boundary-apart", {150: -800, 220: 800})
+    expect(apart.status == checks.FAIL
+           and not any("netted" in line for line in apart.lines)
+           and "[+195s, +245s] judged (x2 netem on generator): W − X exceeds G by 800"
+           in apart.lines[1]
+           and apart.detail.startswith("800 lost outside reported HTTP windows"),
+           f"a loss next to a surplus in another window FAILs, got {apart}")
 
 
 def _fan_out_rules(root):
