@@ -184,6 +184,20 @@ during the stop and stops retrying after it. The topic is read back at the end a
 `ledger.egress` and `ledger.topic`, which FAILs a record stored twice; see
 [Kafka targets](#kafka-targets).
 
+`kafka-sasl-reauth` (8 minutes 30 seconds, up to 8 hours) is `kafka-broker-restart` with ten
+series instead of 100, over SCRAM-SHA-512 to a broker that ends every session after 30 s
+(`connections.max.reauth.ms`). Its compose override starts the broker from the scenario's
+`kafka-server.properties`, with a SASL listener on 9096 beside the unauthenticated 9092 that the
+healthcheck and the read-back use, and a SCRAM user written at format time. `kafka_out` doesn't
+re-authenticate in band: it stops reusing a connection 20 s after it authenticates and redials,
+counting `logit.output.reconnects`. Beside the base scenario's expectations, it bounds that
+rate over the run (80 to 300 an hour, derived in its `scenario.toml`), which catches a redial
+before every send. A sink that never renewed would still redial, because the broker closes an
+expired session's connection on its next request, so a second rate catches that sink: at most
+40 `ambiguous` attempts an hour, the faults' own. It also asserts that no attempt was `refused`
+and that the sink dropped no batch over the whole run. Ten series keep an 8-hour
+topic at 144,000 records, inside the read-back's bound.
+
 Six scenarios run a sink against a scripted stand-in in place of VictoriaMetrics (see
 [Stand-in targets](#stand-in-targets)):
 
@@ -615,7 +629,10 @@ topic = "soak"             # the topic the SUT's kafka_out writes
 
 What changes for a Kafka target:
 
-- The stack runs `kafka` in place of `victoria-metrics`, and needs no env file. A fault may name
+- The stack runs `kafka` in place of `victoria-metrics`, and needs no env file. A scenario's
+  compose override may replace the broker's entrypoint and configuration, as
+  `kafka-sasl-reauth`'s does, as long as it keeps the PLAINTEXT listener on `localhost:9092`:
+  the healthcheck and the topic read-back connect there unauthenticated. A fault may name
   `kafka` (`netem`, `pause`, `stop`, `restart`, `partition`); a `restart` is a clean broker
   shutdown and start, which keeps the log and the producer state. A fault on `kafka` is refused
   for any other target, and one on `victoria-metrics` for this one.
@@ -626,6 +643,8 @@ What changes for a Kafka target:
 - After the SUT stops, the driver reads the topic in the broker container: each partition's end
   offset (`kafka-offsets.txt`), then that many records from the beginning
   (`kafka-topic.ndjson`). `timeline.jsonl` records a `kafka_read` phase, or `kafka_read_failed`.
+  The consumer gets 180 s (`driver.py`'s `TOPIC_READ_TIMEOUT_S`), so a long run's topic must
+  stay small enough to read in that time: `kafka-broker-restart` read 25,900 records in 4 s.
 - The SUT's `aggregate` must run `temporality: delta`, because V is the sum of every distinct
   record's `sum` values: each record carries one window's increments. Records are deduplicated
   on the value's raw bytes first, so a duplicate can't cancel a loss of the same size. Each
@@ -933,12 +952,13 @@ metric = "logit.component.buffer.batches"
 component = "victoria_metrics"          # and any other attribute under attrs = { ... }
 step = "c0s1"                           # an expanded step id, or a [[step]] index for every cycle
 window = "during"                       # the fault's span; `after`, the recovery_bound after it; `through`, both; `run`, with no step
-reduce = "max"                          # counters: delta, min_delta; gauges: max, min, last, rise, slope
+reduce = "max"                          # counters: delta, min_delta, rate; gauges: max, min, last, rise, slope
 min = 2                                 # min, max, or both
 ```
 
 `min_delta` is the smallest single drain's delta, so `min = 1` asserts a counter rose in every
-drain of the window. A gauge reducer includes the value in force at the window's start, because
+drain of the window. `rate` is the window's delta divided by the window's length in hours, so
+its bounds are a count an hour whatever the run's `--duration`. A gauge reducer includes the value in force at the window's start, because
 `internal` exports a gauge only in a drain after it was set, taken from the SUT life running at
 that start only. A bound that must hold for the whole episode, such as a loss counter that must
 stay 0, uses `through`: a chain blocked behind a sink stays blocked until the sink's next retry,

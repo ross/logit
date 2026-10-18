@@ -286,9 +286,10 @@ EXPECT_KEYS = {"name", "service", "metric", "component", "attrs", "step", "windo
 # `run` is the only window with no step: the whole run after warmup.
 EXPECT_WINDOWS = ("during", "after", "through", "run")
 RUN_WINDOW = "run"
-# Each reducer reads one metric kind: a counter (`sum`, a delta per drain) or a gauge.
-EXPECT_REDUCERS = {"delta": "sum", "min_delta": "sum", "max": "gauge", "min": "gauge",
-                   "last": "gauge", "slope": "gauge", "rise": "gauge"}
+# Each reducer reads one metric kind: a counter (`sum`, a delta per drain) or a gauge. `rate` is
+# a counter's delta per hour of the window.
+EXPECT_REDUCERS = {"delta": "sum", "min_delta": "sum", "rate": "sum", "max": "gauge",
+                   "min": "gauge", "last": "gauge", "slope": "gauge", "rise": "gauge"}
 # The rows an `[expected]` table may set a verdict on: the rows that judge each `logit` service
 # apart, so a verdict names a service. A ledger row's FAIL is loss, never expected.
 EXPECTED_ROWS = ("rss_slope", "fd_slope")
@@ -320,6 +321,7 @@ METRIC_KINDS = {
     "logit.component.buffer.disk.segments": "gauge",
     "logit.component.buffer.disk.truncated": "sum",
     "logit.output.requests": "sum",
+    "logit.output.reconnects": "sum",
     "logit.output.records": "sum",
     "logit.output.records.dropped": "sum",
     "logit.output.file.reopens": "sum",

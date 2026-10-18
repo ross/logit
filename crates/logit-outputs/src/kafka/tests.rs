@@ -8,7 +8,7 @@ use bytes::Bytes;
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::ApiKey;
 use kafka_protocol::records::Compression;
-use logit_pipeline::test_util::{wait_until, RECV_TIMEOUT};
+use logit_pipeline::test_util::{wait_until, TelemetryProbe, RECV_TIMEOUT};
 use logit_pipeline::Fault;
 
 use super::batch::ProducerRecord;
@@ -22,6 +22,7 @@ use super::sasl::{authenticator, msk_iam_with, Endpoints, Env, KafkaSasl, OAuthT
 const TOPIC: &str = "logs";
 /// The first PID the fake broker hands out.
 const FIRST_PID: i64 = 1000;
+const RECONNECTS: &str = "logit.output.reconnects";
 
 fn config(cluster: &FakeCluster) -> ProducerConfig {
     ProducerConfig {
@@ -35,6 +36,7 @@ fn config(cluster: &FakeCluster) -> ProducerConfig {
         tls: None,
         client_id: "logit-test".to_string(),
         sasl: None,
+        telemetry: Default::default(),
     }
 }
 
@@ -540,6 +542,7 @@ async fn a_refused_bootstrap_connect_is_clean() {
         tls: None,
         client_id: "logit-test".to_string(),
         sasl: None,
+        telemetry: Default::default(),
     })
     .unwrap();
     let err = producer.prepare(&mut vec![record(None, "v")]).await.unwrap_err();
@@ -788,6 +791,7 @@ fn idempotence_without_acks_all_is_a_construction_error() {
         tls: None,
         client_id: "logit-test".to_string(),
         sasl: None,
+        telemetry: Default::default(),
     };
     assert!(Producer::new(config).is_err());
 }
@@ -990,8 +994,12 @@ async fn an_expiring_sasl_session_is_redialed_before_the_next_send() {
     // covers the first send's four loopback round trips by far, and the wait below is 2 s.
     cluster.state().sasl.as_mut().unwrap().session_lifetime_ms = 2000;
     let sasl = Some(authenticator(&sasl_settings("SCRAM-SHA-512", SASL_PASSWORD), RECV_TIMEOUT));
-    let mut producer = Producer::new(ProducerConfig { sasl, ..config(&cluster) }).unwrap();
+    let mut probe = TelemetryProbe::new();
+    let telemetry = probe.telemetry("out", "kafka_out", "sink");
+    let mut producer =
+        Producer::new(ProducerConfig { sasl, telemetry, ..config(&cluster) }).unwrap();
     send_expecting(&mut producer, keyed_for(0, 1, 1), &[None]).await;
+    assert_eq!(probe.sum(RECONNECTS, &[]), 0.0, "a first dial to each node isn't a reconnect");
     let authenticated = cluster.state().authentications;
 
     let ends = cluster.state().session_ends.clone();
@@ -1006,6 +1014,9 @@ async fn an_expiring_sasl_session_is_redialed_before_the_next_send() {
     assert_eq!(state.expired_closes, 0, "nothing was written to an expired session");
     assert!(state.authentications > authenticated, "a redial authenticated again");
     assert_eq!(state.partition(TOPIC, 0).records().len(), 2, "each record once");
+    drop(state);
+    // The second send's metadata is fresh, so only the leader's connection is redialed.
+    assert_eq!(probe.sum(RECONNECTS, &[]), 1.0, "the redial counts");
 }
 
 /// One job writes its requests one after another, so the deadline is checked before each: the

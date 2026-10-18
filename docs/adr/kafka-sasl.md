@@ -67,12 +67,17 @@ fetches across connections.
 
 A broker with `connections.max.reauth.ms` set answers `SaslAuthenticate` v1 or later with a
 `session_lifetime_ms`, and closes a connection that sends anything but a re-authentication after
-that lifetime ends (KIP-368). `Conn` records a deadline: the lifetime minus the sink's `timeout`.
+that lifetime ends (KIP-368). `Conn` records a deadline: the lifetime minus the sink's `timeout`,
+or half the lifetime when it's twice `timeout` or less (`conn::reauth_deadline`).
 The producer's reuse check (`Conn::is_open`) reads a connection past its deadline as closed, so
 the producer dials a new one, which is `Clean`. One attempt can write several produce requests to
 a broker in turn, so the deadline is checked again before each one (`Conn::past_deadline`). Once
 it has passed, the partition batches not yet written are `Clean` and the connection is dropped, so
-the next attempt dials a new one. A lifetime of `0` means no deadline.
+the next attempt dials a new one. A lifetime of `0` means no deadline. Each redial counts
+`logit.output.reconnects`, so the renewal rate shows in the sink's telemetry. The count is per
+connection slot (a bootstrap entry, or a broker by node id) the producer dialed before, not every
+dial after the first as the stream sinks count it, because a first send makes two first dials:
+the bootstrap and the leader.
 
 This is safe because `kafka_out` keeps one request in flight per broker, no request is written
 past the deadline, and the `timeout` margin means a request written before the deadline is

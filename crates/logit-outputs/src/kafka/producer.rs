@@ -46,6 +46,7 @@ use kafka_protocol::messages::{
 };
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::Compression;
+use logit_core::Telemetry;
 use logit_pipeline::Fault;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -108,6 +109,8 @@ pub(crate) struct ProducerConfig {
     pub(crate) client_id: String,
     /// Authenticates every connection when set.
     pub(crate) sasl: Option<Arc<dyn Authenticator>>,
+    /// Counts `logit.output.reconnects`.
+    pub(crate) telemetry: Telemetry,
 }
 
 /// A connection's key: a bootstrap entry by its index, or a broker by its node id.
@@ -281,6 +284,8 @@ pub(crate) struct Producer {
     /// renumbered.
     generation: u64,
     next_sequence: HashMap<i32, i32>,
+    /// Every node a dial has succeeded to, so a later dial to one counts as a reconnect.
+    dialed: HashSet<Node>,
 }
 
 /// `seq + count` on the broker's sequence ring, which wraps from `i32::MAX` to 0
@@ -332,6 +337,7 @@ impl Producer {
             bump_due: false,
             generation: 0,
             next_sequence: HashMap::new(),
+            dialed: HashSet::new(),
         })
     }
 
@@ -514,13 +520,16 @@ impl Producer {
             tasks.spawn(job.run());
         }
         while let Some(joined) = tasks.join_next().await {
-            let (broker, conn, answers) = match joined {
+            let (broker, conn, answers, dialed) = match joined {
                 Ok(done) => done,
                 Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
                 Err(err) => {
                     return Err(anyhow!("a Kafka produce task ended: {err}")).context(Fault::Clean)
                 }
             };
+            if dialed {
+                self.count_dial(Node::Broker(broker));
+            }
             if let Some(conn) = conn {
                 self.conns.insert(Node::Broker(broker), conn);
             }
@@ -918,7 +927,10 @@ impl Producer {
         let mut last = None;
         for (node, host, port) in targets {
             match self.dialer.connect(&host, port).await {
-                Ok(conn) => return Ok((node, conn)),
+                Ok(conn) => {
+                    self.count_dial(node);
+                    return Ok((node, conn));
+                }
                 // Every broker answers with the same versions and SASL verdict; another can't
                 // do better.
                 Err(err) if logit_pipeline::classify(&err) == Fault::Refused => return Err(err),
@@ -926,6 +938,19 @@ impl Producer {
             }
         }
         Err(last.expect("at least one bootstrap entry"))
+    }
+
+    /// Records a successful dial to `node`, counting `logit.output.reconnects` when this producer
+    /// has dialed it before: after the broker closed the connection, after its SASL deadline, or
+    /// after a failed request finished it.
+    fn count_dial(&mut self, node: Node) {
+        if !self.dialed.insert(node) {
+            self.config.telemetry.count("logit.output.reconnects", 1.0, &[]);
+        }
+    }
+
+    pub(crate) fn set_telemetry(&mut self, telemetry: &Telemetry) {
+        self.config.telemetry = telemetry.clone();
     }
 }
 
@@ -946,7 +971,9 @@ struct BrokerJob {
 }
 
 impl BrokerJob {
-    async fn run(self) -> (i32, Option<Conn>, Vec<(usize, Outcome)>) {
+    /// Returns the broker, the connection when it takes more requests, each partition batch's
+    /// outcome, and whether the job dialed a new connection.
+    async fn run(self) -> (i32, Option<Conn>, Vec<(usize, Outcome)>, bool) {
         let BrokerJob {
             broker,
             host,
@@ -968,6 +995,7 @@ impl BrokerJob {
                 reused = None;
             }
         }
+        let dialed = reused.is_none();
         let mut conn = match reused {
             Some(conn) => conn,
             None => match dialer.connect(&host, port).await {
@@ -978,7 +1006,7 @@ impl BrokerJob {
                     for (i, _, _) in parts {
                         answers.push((i, Outcome::Unanswered { fault, why: why.clone() }));
                     }
-                    return (broker, None, answers);
+                    return (broker, None, answers, false);
                 }
             },
         };
@@ -991,7 +1019,7 @@ impl BrokerJob {
             for (i, _, _) in parts {
                 answers.push((i, Outcome::Unanswered { fault: Fault::Refused, why: why.clone() }));
             }
-            return (broker, Some(conn), answers);
+            return (broker, Some(conn), answers, dialed);
         }
 
         let mut failed: HashSet<i32> = HashSet::new();
@@ -1040,7 +1068,7 @@ impl BrokerJob {
                 }
             }
         }
-        (broker, finished.is_none().then_some(conn), answers)
+        (broker, finished.is_none().then_some(conn), answers, dialed)
     }
 }
 

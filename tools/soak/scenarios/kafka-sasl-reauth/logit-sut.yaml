@@ -1,0 +1,28 @@
+# The system under test in `script/soak`'s kafka-sasl-reauth scenario: statsd over UDP, a 2 s
+# delta aggregate, and `kafka_out` producing one JSON record per series per window to the stack's
+# broker over SCRAM-SHA-512. The broker ends each session after 30 s, so the sink redials every
+# connection about every 20 s and counts each redial in `logit.output.reconnects`. Delta, so each
+# record carries its window's increments and the ledger sums the topic into V. Its `internal`
+# telemetry goes to stdout as NDJSON for the harness to read.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    interval: 2s
+    temporality: delta
+  kafka:
+    type: kafka_out
+    sources: [window]
+    brokers: ["kafka:9096"]         # the SASL_PLAINTEXT listener
+    topic: soak                     # scenario.toml's [target] topic
+    # A throwaway credential for this stack, written by compose.override.yaml.
+    sasl: { mechanism: scram_sha_512, username: logit, password: logit-secret }
+    # The defaults otherwise: format json, one record per event, acks all, idempotent. A 10 s
+    # bound, under the 30 s session, puts each connection's deadline 20 s after it
+    # authenticates, and under the scenario's 40 s pause of the broker turns the pause into
+    # response timeouts: `Ambiguous` attempts the broker deduplicates when they are resent.
+    timeout: 10s
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
