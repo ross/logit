@@ -6,7 +6,7 @@ it answered (with the raw body, base64), `cue` for each cue it took, and `ready`
 around a life. Decoding happens here, on the host, so `check` re-scores a run from the record
 alone.
 
-Two shapes, each the stand-in's `--shape` and a scenario's `[target] shape`:
+Three shapes, each the stand-in's `--shape` and a scenario's `[target] shape`:
 
 - `remote_write`: a body is a Snappy **block** (never framed) holding a `prometheus.WriteRequest`
   (1.0): `timeseries` is field 1; a `TimeSeries` has `labels` (1) and `samples` (2); a `Label`
@@ -25,8 +25,16 @@ Two shapes, each the stand-in's `--shape` and a scenario's `[target] shape`:
   summed, as `topic.py` does for a Kafka record, so a duplicate can't cancel a loss of the same
   size (`stored_counts`). A `2xx` with `series_errors` N stored every series of its request but
   the first N.
+- `influxdb`: a body is InfluxDB 2.x line protocol, uncompressed, as `influxdb_out` writes it
+  (`crates/logit-proto/src/influxdb/encode.rs`, "Escaping"), at the request query's
+  `precision` (`ns` when absent). Each numeric or boolean field of a point is a sample of the
+  series `{__name__: measurement, field: key, **tags}`; a string field has no number and isn't
+  in V. InfluxDB overwrites an identical `(measurement, tag set, field, timestamp)` and
+  `influxdb_out` re-encodes a retried batch byte for byte, so a resend is a rewrite: V is the
+  sum over distinct `(series, timestamp)` of the stored value, and a resend that stored another
+  value is a conflict (`stored_points`).
 
-Every other field, `metadata` included, is skipped by wire type. V has `/api/v1/export`'s shape,
+Every other protobuf field, `metadata` included, is skipped by wire type. V has `/api/v1/export`'s shape,
 timestamps in milliseconds, so `ledger.windows` reads it as it reads VictoriaMetrics.
 """
 
@@ -34,18 +42,30 @@ import base64
 import gzip
 import json
 import math
+import re
 import struct
+import urllib.parse
 import zlib
 from dataclasses import dataclass, field
 
-REMOTE_WRITE, DATADOG = "remote_write", "datadog"
-SHAPES = (REMOTE_WRITE, DATADOG)
+REMOTE_WRITE, DATADOG, INFLUXDB = "remote_write", "datadog", "influxdb"
+SHAPES = (REMOTE_WRITE, DATADOG, INFLUXDB)
 REMOTE_WRITE_PATH = "/api/v1/write"
 DATADOG_SERIES_PATH = "/api/v2/series"
+INFLUXDB_WRITE_PATH = "/api/v2/write"
 # Each shape's write path and the status it answers with no cue; standin/standin.py's
 # DEFAULT_PATH and DEFAULT_STATUS.
-PATHS = {REMOTE_WRITE: REMOTE_WRITE_PATH, DATADOG: DATADOG_SERIES_PATH}
-DEFAULT_STATUS = {REMOTE_WRITE: 200, DATADOG: 202}
+PATHS = {REMOTE_WRITE: REMOTE_WRITE_PATH, DATADOG: DATADOG_SERIES_PATH,
+         INFLUXDB: INFLUXDB_WRITE_PATH}
+DEFAULT_STATUS = {REMOTE_WRITE: 200, DATADOG: 202, INFLUXDB: 204}
+# What a body of each shape is, for a check's message about one that doesn't decode.
+BODY_NAMES = {REMOTE_WRITE: "a Snappy WriteRequest", DATADOG: "a MetricPayload",
+              INFLUXDB: "InfluxDB line protocol"}
+# Nanoseconds per unit of each `precision` the v2 write API takes.
+INFLUXDB_PRECISION_NS = {"ns": 1, "us": 1_000, "ms": 1_000_000, "s": 1_000_000_000}
+# The labels a line-protocol sample is named by besides its tags; a tag key equal to one would
+# be lost in the label set, so it doesn't decode.
+INFLUXDB_LABELS = ("__name__", "field")
 # `MetricPayload.MetricType`'s names.
 DATADOG_TYPES = {0: "unspecified", 1: "count", 2: "rate", 3: "gauge"}
 
@@ -346,6 +366,168 @@ def decompress(raw, encoding):
     raise DecodeError(f"Content-Encoding {encoding!r}, not gzip, deflate, or none")
 
 
+_LP_INT = re.compile(r"[+-]?[0-9]+")
+_LP_FLOAT = re.compile(r"[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?")
+_LP_TRUE = ("t", "T", "true", "True", "TRUE")
+_LP_FALSE = ("f", "F", "false", "False", "FALSE")
+# What a backslash escapes in a measurement, tag key, tag value, and field key; a field key also
+# escapes `"`. Before any other character a backslash is itself.
+_LP_KEY_ESCAPES = ", ="
+_LP_FIELD_KEY_ESCAPES = ', ="'
+
+
+def _lp_token(text, pos, stops, escapes):
+    """`(token, pos)`: the text from `pos` to the first unescaped character of `stops`, or the
+    end, with each escape resolved."""
+    out = []
+    while pos < len(text):
+        char = text[pos]
+        if char == "\\" and pos + 1 < len(text) and text[pos + 1] in escapes:
+            out.append(text[pos + 1])
+            pos += 2
+            continue
+        if char in stops:
+            break
+        out.append(char)
+        pos += 1
+    return "".join(out), pos
+
+
+def _lp_scalar(raw):
+    """A non-string field value: an `i` integer, a `u` unsigned integer, a boolean, or a
+    float."""
+    if raw.endswith("i") and _LP_INT.fullmatch(raw[:-1]):
+        return int(raw[:-1])
+    if raw.endswith("u") and _LP_INT.fullmatch(raw[:-1]) and not raw.startswith("-"):
+        return int(raw[:-1])
+    if raw in _LP_TRUE:
+        return True
+    if raw in _LP_FALSE:
+        return False
+    if _LP_FLOAT.fullmatch(raw):
+        return float(raw)
+    raise DecodeError(f"field value {raw!r} is no line-protocol number, boolean, or string")
+
+
+def line_protocol(text):
+    """`[(measurement, tags, fields, timestamp)]` from InfluxDB line protocol, one per line in
+    body order: `tags` and `fields` dicts in line order, each field value an `int`, `float`,
+    `bool`, or `str`, and `timestamp` the line's integer at the request's precision. Blank lines
+    and `#` comments are skipped. Raises `DecodeError` for a line this grammar can't read, and
+    for one with no timestamp, since the server would stamp it with a time the record lacks."""
+    points = []
+    pos = 0
+    while pos < len(text):
+        while pos < len(text) and text[pos] in " \t\r\n":
+            pos += 1
+        if pos >= len(text):
+            break
+        if text[pos] == "#":
+            end = text.find("\n", pos)
+            pos = len(text) if end < 0 else end + 1
+            continue
+        line = text.count("\n", 0, pos) + 1
+        measurement, pos = _lp_token(text, pos, ", \n", _LP_KEY_ESCAPES)
+        if not measurement:
+            raise DecodeError(f"line {line}: no measurement")
+        tags = {}
+        while pos < len(text) and text[pos] == ",":
+            key, pos = _lp_token(text, pos + 1, "=, \n", _LP_KEY_ESCAPES)
+            if pos >= len(text) or text[pos] != "=" or not key:
+                raise DecodeError(f"line {line}: a tag with no key or no `=`")
+            value, pos = _lp_token(text, pos + 1, ", \n", _LP_KEY_ESCAPES)
+            if not value:
+                raise DecodeError(f"line {line}: tag {key!r} has no value")
+            tags[key] = value
+        if pos >= len(text) or text[pos] != " ":
+            raise DecodeError(f"line {line}: no field set")
+        while pos < len(text) and text[pos] == " ":
+            pos += 1
+        fields = {}
+        while True:
+            key, pos = _lp_token(text, pos, "=, \n", _LP_FIELD_KEY_ESCAPES)
+            if pos >= len(text) or text[pos] != "=" or not key:
+                raise DecodeError(f"line {line}: a field with no key or no `=`")
+            pos += 1
+            if pos < len(text) and text[pos] == '"':
+                pos += 1
+                out = []
+                while True:
+                    if pos >= len(text):
+                        raise DecodeError(f"line {line}: field {key!r} has an unterminated "
+                                          "string")
+                    char = text[pos]
+                    if char == "\\" and pos + 1 < len(text) and text[pos + 1] in '\\"':
+                        out.append(text[pos + 1])
+                        pos += 2
+                    elif char == '"':
+                        pos += 1
+                        break
+                    else:
+                        out.append(char)
+                        pos += 1
+                fields[key] = "".join(out)
+            else:
+                raw, pos = _lp_token(text, pos, ", \n", "")
+                fields[key] = _lp_scalar(raw)
+            if pos < len(text) and text[pos] == ",":
+                pos += 1
+                continue
+            break
+        while pos < len(text) and text[pos] == " ":
+            pos += 1
+        raw, pos = _lp_token(text, pos, " \t\r\n", "")
+        if not _LP_INT.fullmatch(raw):
+            raise DecodeError(f"line {line}: timestamp {raw!r} isn't an integer"
+                              if raw else f"line {line}: no timestamp")
+        while pos < len(text) and text[pos] in " \t\r":
+            pos += 1
+        if pos < len(text) and text[pos] != "\n":
+            raise DecodeError(f"line {line}: {text[pos:pos + 10]!r} after the timestamp")
+        points.append((measurement, tags, fields, int(raw)))
+    return points
+
+
+def influxdb_query(request):
+    """A request line's query string as `{name: value}`, the first value of each name, or `{}`
+    when it has none."""
+    parsed = urllib.parse.parse_qs(request.get("query") or "", keep_blank_values=True)
+    return {name: values[0] for name, values in parsed.items()}
+
+
+def influxdb_destination(request):
+    """The `(org, orgID, bucket)` a write's query names, each None when absent."""
+    query = influxdb_query(request)
+    return query.get("org"), query.get("orgID"), query.get("bucket")
+
+
+def _influxdb_series(raw, request):
+    encoding = request.get("content_encoding")
+    if encoding not in (None, "", "identity"):
+        raise DecodeError(f"Content-Encoding {encoding!r}; influxdb_out sends no compression")
+    precision = influxdb_query(request).get("precision") or "ns"
+    if precision not in INFLUXDB_PRECISION_NS:
+        raise DecodeError(f"precision {precision!r}, not one of "
+                          f"{', '.join(INFLUXDB_PRECISION_NS)}")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as err:
+        raise DecodeError(f"not UTF-8: {err}") from None
+    series = []
+    for measurement, tags, fields, stamp in line_protocol(text):
+        clash = [key for key in INFLUXDB_LABELS if key in tags]
+        if clash:
+            raise DecodeError(f"{measurement}: tag {clash[0]!r} is a label the harness names "
+                              "a sample by")
+        stamp_ms = stamp * INFLUXDB_PRECISION_NS[precision] // 1_000_000
+        for key, value in fields.items():
+            if isinstance(value, str):
+                continue
+            series.append(({"__name__": measurement, "field": key, **tags},
+                           [(stamp_ms, float(value))]))
+    return series
+
+
 def _raw_body(request):
     try:
         return base64.b64decode(request.get("body_b64") or "", validate=True)
@@ -356,8 +538,13 @@ def _raw_body(request):
 def decode_body(request, shape=REMOTE_WRITE):
     """The series of one request line's body as `[(labels, [(timestamp_ms, value)])]`, raising
     `DecodeError` for a body that isn't the shape's: a Snappy-compressed `WriteRequest` for
-    `remote_write`, a `MetricPayload` under gzip, deflate, or no compression for `datadog`."""
+    `remote_write`, a `MetricPayload` under gzip, deflate, or no compression for `datadog`, and
+    uncompressed line protocol for `influxdb`, one series per numeric or boolean field, a
+    boolean as 1 or 0. Under `influxdb` a timestamp is floored to the millisecond, so two
+    points of one series within a millisecond read as one rewritten sample."""
     raw = _raw_body(request)
+    if shape == INFLUXDB:
+        return _influxdb_series(raw, request)
     if shape == DATADOG:
         decoded = metric_payload(decompress(raw, request.get("content_encoding")))
         return [(datadog_labels(one), [(stamp * 1000, value) for stamp, value in one["points"]])
@@ -380,8 +567,9 @@ def series_key(labels):
     return tuple(sorted(labels.items()))
 
 
-def stored_series(requests):
-    """`(series, rewrites, conflicts, undecodable)` from the record's requests in order.
+def stored_series(requests, shape=REMOTE_WRITE):
+    """`(series, rewrites, conflicts, undecodable)` from the record's requests in order, each
+    body read as `shape`'s.
 
     `series` is export-shaped (`{"metric", "values", "timestamps"}`, timestamps in ms) over the
     stored requests, one sample per `(label set, timestamp)`, the last write's. `rewrites` counts
@@ -396,7 +584,7 @@ def stored_series(requests):
         if not request.get("stored"):
             continue
         try:
-            decoded = decode_body(request)
+            decoded = decode_body(request, shape)
         except DecodeError as err:
             undecodable.append((request.get("seq"), str(err)))
             continue
@@ -422,22 +610,61 @@ def stored_series(requests):
 
 @dataclass
 class Counts:
-    """What a `datadog` stand-in stored (`stored_counts`): `series` export-shaped, each
-    `(series, timestamp)`'s value the sum of its distinct copies; `points` one `(timestamp_s,
-    value)` per distinct copy, V's terms; `duplicates` one `(series key, timestamp_ms, value,
+    """What a `datadog` stand-in (`stored_counts`) or an `influxdb` one (`stored_points`)
+    stored, V's terms for a delta sink. `series` is export-shaped; `points` one `(timestamp_s,
+    value)` per term. Under `datadog` each `(series, timestamp)`'s value is the sum of its
+    distinct copies, a term each, and `duplicates` holds one `(series key, timestamp_ms, value,
     first index, copy index)` per copy of a point already stored, each index the request's place
-    in the record, since `seq` starts again at 1 when the stand-in restarts; `conflicts` one `(series key,
+    in the record, since `seq` starts again at 1 when the stand-in restarts. Under `influxdb` a
+    `(series, timestamp)` holds its last write's value, one term, and `rewrites` holds the same
+    tuple per point stored again with the same value. `conflicts` holds one `(series key,
     timestamp_ms, first value, later value)` per point stored again with another value;
-    `undecodable` one `(seq, reason)` per stored body that doesn't decode; and `named` one
-    `(seq, count, t)` per `series_errors` answer: the series it named and when it was answered,
-    epoch seconds."""
+    `undecodable` one `(seq, reason)` per stored body that doesn't decode; and `named`, under
+    `datadog`, one `(seq, count, t)` per `series_errors` answer: the series it named and when it
+    was answered, epoch seconds."""
 
     series: list = field(default_factory=list)
     points: list = field(default_factory=list)
     duplicates: list = field(default_factory=list)
+    rewrites: list = field(default_factory=list)
     conflicts: list = field(default_factory=list)
     undecodable: list = field(default_factory=list)
     named: list = field(default_factory=list)
+
+
+def stored_points(requests):
+    """An `influxdb` stand-in's record as `Counts`, over the stored requests in record order:
+    one term per `(series, timestamp)`, the last write's value, as InfluxDB overwrites."""
+    counts = Counts()
+    by_series = {}
+    first = {}
+    for index, request in enumerate(requests):
+        if not request.get("stored"):
+            continue
+        try:
+            decoded = decode_body(request, INFLUXDB)
+        except DecodeError as err:
+            counts.undecodable.append((request.get("seq"), str(err)))
+            continue
+        for labels, samples in decoded:
+            key = series_key(labels)
+            points = by_series.setdefault(key, {})
+            for stamp, value in samples:
+                if stamp in points:
+                    kept = points[stamp]
+                    if kept == value or (math.isnan(kept) and math.isnan(value)):
+                        counts.rewrites.append((key, stamp, value, first[(key, stamp)], index))
+                    else:
+                        counts.conflicts.append((key, stamp, kept, value))
+                else:
+                    first[(key, stamp)] = index
+                points[stamp] = value
+    for key, points in sorted(by_series.items()):
+        stamps = sorted(points)
+        counts.series.append({"metric": dict(key), "timestamps": stamps,
+                              "values": [points[stamp] for stamp in stamps]})
+        counts.points += [(stamp / 1000, points[stamp]) for stamp in stamps]
+    return counts
 
 
 def stored_counts(requests):
@@ -481,7 +708,7 @@ def stored_counts(requests):
 
 def acknowledged_unstored(requests, series, shape=REMOTE_WRITE):
     """`(series key, timestamp)` for each sample of a request the stand-in answered `2xx` that
-    `series` (from `stored_series` or `stored_counts`) doesn't hold: a write the sink saw
+    `series` (from `stored_series`, `stored_counts`, or `stored_points`) doesn't hold: a write the sink saw
     accepted that the destination never kept. The series a `series_errors` answer named are
     left out, since the sink saw them dropped, as is a body that doesn't decode, which the
     caller judges."""

@@ -1,0 +1,148 @@
+{
+  "_about": "A body influxdb_out sent to the stand-in (--shape influxdb): logit:soak-w16 sha256:be9724584652, built from 9bfc434f with no Rust change, generate_in at 200/s into a 2 s delta aggregate and a set stamping tags env=soak and `host name`=`a,b=c d\\e` and the three org and bucket carriers, 2026-10-17. The record line's query and its body_b64, decoded. Then hand-built escape and grammar cases, each body with the points line_protocol reads from it, and bodies it refuses with a needle from its error.",
+  "influxdb_out_query": "org=soak-org&orgID=0123456789abcdef&bucket=soak-carried&precision=ns",
+  "influxdb_out_content_type": "text/plain; charset=utf-8",
+  "influxdb_out_body": "soak_requests_2,env=soak,host\\ name=a\\,b\\=c\\ d\\e value=133 1792291063285489498\nsoak_requests_1,env=soak,host\\ name=a\\,b\\=c\\ d\\e value=133 1792291063285489498\nsoak_requests_0,env=soak,host\\ name=a\\,b\\=c\\ d\\e value=134 1792291063285489498\n",
+  "influxdb_out_body_expect": [
+    [
+      "soak_requests_2",
+      {
+        "env": "soak",
+        "host name": "a,b=c d\\e"
+      },
+      {
+        "value": 133.0
+      },
+      1792291063285489498
+    ],
+    [
+      "soak_requests_1",
+      {
+        "env": "soak",
+        "host name": "a,b=c d\\e"
+      },
+      {
+        "value": 133.0
+      },
+      1792291063285489498
+    ],
+    [
+      "soak_requests_0",
+      {
+        "env": "soak",
+        "host name": "a,b=c d\\e"
+      },
+      {
+        "value": 134.0
+      },
+      1792291063285489498
+    ]
+  ],
+  "cases": [
+    {
+      "about": "every field type, the escapes a field key and a string take, and a comment",
+      "body": "# a comment\nm\\,1,t\\ k=v\\=1 f\\\"k=1.5,i=-3i,u=7u,b=t,B=FALSE,s=\"a \\\"q\\\" \\\\ b\\n\" 1000\n",
+      "points": [
+        [
+          "m,1",
+          {
+            "t k": "v=1"
+          },
+          {
+            "f\"k": 1.5,
+            "i": -3,
+            "u": 7,
+            "b": true,
+            "B": false,
+            "s": "a \"q\" \\ b\\n"
+          },
+          1000
+        ]
+      ]
+    },
+    {
+      "about": "a backslash before anything but an escape is itself; `\\\\,` is a backslash and a comma",
+      "body": "m\\x,t=a\\\\,b value=1e3 2\n\nm2 value=-.5 3\r\n",
+      "points": [
+        [
+          "m\\x",
+          {
+            "t": "a\\,b"
+          },
+          {
+            "value": 1000.0
+          },
+          2
+        ],
+        [
+          "m2",
+          {},
+          {
+            "value": -0.5
+          },
+          3
+        ]
+      ]
+    },
+    {
+      "about": "a string field holding a newline and the delimiters stays one line",
+      "body": "m s=\"x,y z\nw=1\" 4\n",
+      "points": [
+        [
+          "m",
+          {},
+          {
+            "s": "x,y z\nw=1"
+          },
+          4
+        ]
+      ]
+    }
+  ],
+  "refused": [
+    {
+      "body": "m 5\n",
+      "error": "a field with no key"
+    },
+    {
+      "body": "m value=1\n",
+      "error": "no timestamp"
+    },
+    {
+      "body": "m value=1 1.5\n",
+      "error": "isn't an integer"
+    },
+    {
+      "body": "m value=nan 1\n",
+      "error": "no line-protocol number"
+    },
+    {
+      "body": "m value=1_0 1\n",
+      "error": "no line-protocol number"
+    },
+    {
+      "body": "m value=-1u 1\n",
+      "error": "no line-protocol number"
+    },
+    {
+      "body": "m s=\"open 1\n",
+      "error": "unterminated string"
+    },
+    {
+      "body": "m,t value=1 1\n",
+      "error": "a tag with no key or no `=`"
+    },
+    {
+      "body": "m,t= value=1 1\n",
+      "error": "has no value"
+    },
+    {
+      "body": "m\n",
+      "error": "no field set"
+    },
+    {
+      "body": "m value=1 1 x\n",
+      "error": "after the timestamp"
+    }
+  ]
+}

@@ -52,9 +52,9 @@ exists or a contract other `logit` processes depend on:
   holds the queue and retries with no budget and no exit, so reading a destination fault as
   `Rejected` loses data and reading a bad batch as `Refused` wedges the sink. A sink's own
   transport timeout is the only bound on an attempt, so every write and acknowledgment wait a sink
-  makes must have one. `prometheus_out`'s and `datadog_out`'s tables are also restated as cued
-  steps in the `standin-*` soak scenarios under `tools/soak/scenarios/`, and a change to either
-  table updates those scenarios' steps in the same PR.
+  makes must have one. `prometheus_out`'s, `datadog_out`'s, and `influxdb_out`'s tables are also
+  restated as cued steps in the `standin-*` soak scenarios under `tools/soak/scenarios/`, and a
+  change to any of them updates those scenarios' steps in the same PR.
 - **Any nonzero `*.dropped` is loss someone should look into**, and it's always tagged `reason`.
   An outcome the config asked for never uses the word: it's `events.discarded`, `*.omitted`,
   `*.skipped`, `*.evicted`, or `input.batches.deferred`. A loss reported only by a diagnostic gets
@@ -793,8 +793,13 @@ the operator-facing account of all of this.
   Datadog-shaped stand-in (`[target] shape = "datadog"`): a `202` whose body names series dropped
   (`series_errors`), every other row of the sink's table, V as the stored delta points' sum with
   each resent copy reported as a duplicate, and `ledger.sent` judging the sink with what each step
-  cued excused. See [tools/soak/README.md](tools/soak/README.md) and
-  [ADR `soak-harness`](docs/adr/soak-harness.md).
+  cued excused. `standin-influxdb`, `standin-influxdb-carried`, and `standin-influxdb-mixed`
+  point `influxdb_out` at an InfluxDB-shaped stand-in (`[target] shape = "influxdb"`) with its
+  bucket and org configured, both carried by a `set`, and the bucket carried beside
+  `default_org:`, cueing every row of its table with the class each configuration expects; V is
+  the stored delta points' sum, one per series and timestamp, since InfluxDB overwrites a
+  resend, and `ledger.standin` holds a rejected step's points to the whole egress gap. See
+  [tools/soak/README.md](tools/soak/README.md) and [ADR `soak-harness`](docs/adr/soak-harness.md).
 - **Differential corpora**: `script/differential <corpus>` regenerates a corpus of generated
   cases under `testdata/differential/`, each committed beside a reference implementation's
   reading of it, and `--check` fails when the committed corpus is stale. `pickle` writes

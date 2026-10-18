@@ -1,0 +1,400 @@
+# standin-influxdb with the bucket, org, and orgID carried on each batch, as influxdb_in would
+# set them, and none configured: every `403` and `404` names this batch's value, so it's
+# `rejected` and never holds the queue. A `401` is the token's, `refused` in either mode. The
+# rest of the table reads as in standin-influxdb. The run takes about 37 minutes. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "standin-influxdb-carried"
+description = "standin-influxdb with bucket, org, and orgID carried on each batch: every 403 and 404 drops the batch"
+duration = "35m40s"       # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "33m40s"          # the last step, its recovery, and two progress windows
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[target]
+kind = "standin"
+shape = "influxdb"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]           # the one sink, whose writes the stand-in records
+id = "influx"
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+[[step]]                  # c0s1: 204, every point written
+at = "0s"
+action = "respond"
+on = "standin"
+status = 204
+for = "20s"
+
+[[step]]                  # c0s2: 400, unparsable line protocol: dropped
+at = "1m45s"
+action = "respond"
+on = "standin"
+status = 400
+body = "{\"code\":\"invalid\",\"message\":\"unable to parse 'soak_requests_0 value=': missing field value\"}"
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s3: 400, no org named: dropped
+at = "3m30s"
+action = "respond"
+on = "standin"
+status = 400
+body = "{\"code\":\"invalid\",\"message\":\"Please provide either orgID or org\"}"
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s4: 401, InfluxDB 2's unknown token: held
+at = "5m15s"
+action = "respond"
+on = "standin"
+status = 401
+body = "{\"code\":\"unauthorized\",\"message\":\"unauthorized access\"}"
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s5: 401, InfluxDB 3's unknown token: held
+at = "7m"
+action = "respond"
+on = "standin"
+status = 401
+body = "{\"error\": \"the request was not authenticated\"}"
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s6: 403, the token can't write the bucket, a carried value: dropped
+at = "8m45s"
+action = "respond"
+on = "standin"
+status = 403
+body = "{\"code\":\"forbidden\",\"message\":\"insufficient permissions for write\"}"
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s7: 404 naming the bucket, a carried bucket: dropped
+at = "10m30s"
+action = "respond"
+on = "standin"
+status = 404
+body = "{\"code\":\"not found\",\"message\":\"bucket \\\"soak-carried\\\" not found\"}"
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s8: 404 naming the org, a carried org: dropped
+at = "12m15s"
+action = "respond"
+on = "standin"
+status = 404
+body = "{\"code\":\"not found\",\"message\":\"organization name \\\"soak-org\\\" not found\"}"
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s9: 404 naming an orgID, a carried org: dropped
+at = "14m"
+action = "respond"
+on = "standin"
+status = 404
+body = "{\"code\":\"not found\",\"message\":\"organization not found\"}"
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s10: 404 with a body naming neither, a value carried: dropped
+at = "15m45s"
+action = "respond"
+on = "standin"
+status = 404
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s11: 413, over the server's limit: dropped
+at = "17m30s"
+action = "respond"
+on = "standin"
+status = 413
+body = "{\"code\":\"request too large\",\"message\":\"unable to read data: points batch is too large\"}"
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s12: 422, a partial write: dropped
+at = "19m15s"
+action = "respond"
+on = "standin"
+status = 422
+body = "{\"code\":\"unprocessable entity\",\"message\":\"failure writing points to database: partial write: points beyond retention policy dropped=100\"}"
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s13: 429, a rate limit: retried
+at = "21m"
+action = "respond"
+on = "standin"
+status = 429
+body = "{\"code\":\"too many requests\",\"message\":\"org exceeded its write rate limit\"}"
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s14: 500: retried
+at = "22m45s"
+action = "respond"
+on = "standin"
+status = 500
+body = "{\"code\":\"internal error\",\"message\":\"unexpected error writing points to database\"}"
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s15: 503 after storing: the resend rewrites the same points
+at = "24m30s"
+action = "respond"
+on = "standin"
+status = 503
+body = "{\"code\":\"unavailable\",\"message\":\"service unavailable\"}"
+apply = true
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s16: 408, a status the table doesn't name: dropped
+at = "26m15s"
+action = "respond"
+on = "standin"
+status = 408
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s17: a redirect, never followed: dropped
+at = "28m"
+action = "respond"
+on = "standin"
+status = 302
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s18: a transport error after the request was sent: retried
+at = "29m45s"
+action = "respond"
+on = "standin"
+answer = "reset"
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s19: a connect failure: held
+at = "31m30s"
+action = "stop"
+on = "standin"
+class = "clean"
+for = "20s"
+
+# One expectation per class, beside ledger.standin's check of every step.
+[[expect]]
+name = "rejected-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "influx"
+attrs = { reason = "rejected" }
+step = "c0s2"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "refused-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "influx"
+step = "c0s4"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "refused-drops-nothing"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "influx"
+step = "c0s4"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "ambiguous-retries"
+service = "logit"
+metric = "logit.component.retries"
+component = "influx"
+step = "c0s13"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "applied-5xx-retries"
+service = "logit"
+metric = "logit.component.retries"
+component = "influx"
+step = "c0s15"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "other-status-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "influx"
+attrs = { reason = "rejected" }
+step = "c0s16"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "clean-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "influx"
+step = "c0s19"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "retrying-clears"
+service = "logit"
+metric = "logit.component.retrying"
+component = "influx"
+step = "c0s19"
+window = "after"
+reduce = "last"
+max = 0
+
+[[expect]]
+name = "forbidden-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "influx"
+attrs = { reason = "rejected" }
+step = "c0s6"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "forbidden-never-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "influx"
+step = "c0s6"
+window = "during"
+reduce = "max"
+max = 0
+
+[[expect]]
+name = "bucket-404-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "influx"
+attrs = { reason = "rejected" }
+step = "c0s7"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "bucket-404-never-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "influx"
+step = "c0s7"
+window = "during"
+reduce = "max"
+max = 0
+
+[[expect]]
+name = "org-404-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "influx"
+attrs = { reason = "rejected" }
+step = "c0s8"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "org-404-never-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "influx"
+step = "c0s8"
+window = "during"
+reduce = "max"
+max = 0
+
+[[expect]]
+name = "org-id-404-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "influx"
+attrs = { reason = "rejected" }
+step = "c0s9"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "org-id-404-never-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "influx"
+step = "c0s9"
+window = "during"
+reduce = "max"
+max = 0
+
+[[expect]]
+name = "other-404-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "influx"
+attrs = { reason = "rejected" }
+step = "c0s10"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "other-404-never-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "influx"
+step = "c0s10"
+window = "during"
+reduce = "max"
+max = 0
+
+[[expect]]
+name = "no-bucket-drops-nothing"
+service = "logit"
+metric = "logit.output.metrics.dropped"
+attrs = { component = "influx", reason = "no_bucket" }
+window = "run"
+reduce = "delta"
+max = 0

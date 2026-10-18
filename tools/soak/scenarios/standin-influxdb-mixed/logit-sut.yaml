@@ -1,0 +1,31 @@
+# The system under test in `script/soak`'s standin-influxdb-mixed scenario: standin-influxdb's
+# SUT with the bucket carried and the org from `default_org:`, so a `404` naming the bucket is
+# the batch's and one naming the org is the operator's. A `set` after `aggregate` stamps the
+# bucket carrier `influxdb_in` would. Its `internal` telemetry goes to stdout as NDJSON for the
+# harness to read; `script/soak` runs it with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    interval: 10s
+    # Delta: each window's increment is one point, and V is the sum of the points the stand-in
+    # stored, so a rejected window is a gap the ledger can count.
+    temporality: delta
+  carriers:
+    type: set
+    sources: [window]
+    # The bucket carrier influxdb_in sets from a write's query. No org carrier, so the sink
+    # sends `default_org:`.
+    resource:
+      _logit.influxdb.bucket: soak-carried
+  influx:
+    type: influxdb_out
+    sources: [carriers]
+    url: http://standin:8080        # the stand-in checks no token
+    token: soak-standin
+    default_org: soak-org           # not org:, which would fix the org in either mode
+    # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
