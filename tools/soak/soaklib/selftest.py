@@ -6093,12 +6093,36 @@ def _file_ledger():
                and tripped["ledger.wire"].detail.startswith(
                    "the writer rotated 6 time(s) while the SUT was down (stop [+101s, +131s]), "
                    "enough to delete a file it hadn't read: out keeps 8 files, so 6 "
-                   "rotation(s) trip the guard"),
+                   "rotation(s) in a stop trip the guard"),
                f"a SUT down for max_files − 2 rotations FAILs, got {tripped['ledger.wire']}")
         del down[130]
         under = stopped("file-retention-under", rotations=down, max_files=8)
         expect(under["ledger.wire"].status == checks.PASS,
                f"five rotations while the SUT is down pass, got {under['ledger.wire']}")
+
+        # A pause keeps the tailer's open files, so only a file created after it began can be
+        # deleted unread, at its ninth rotation with eight files kept: eight trip the guard,
+        # seven, which would trip it in a stop, don't.
+        pause = [_action("apply", "c0s2", "pause", "logit", 200, 201),
+                 _action("revert", "c0s2", "pause", "logit", 260, 260)]
+
+        def paused(name, rotations, **kwargs):
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=30,
+                                  timeline_extra=pause)
+            return {r.id: r for r in checks.run_all(_as_file_wire(
+                run_dir, rotations={o: 1 for o in range(205, 205 + 5 * rotations, 5)},
+                max_files=8, **kwargs))}
+
+        long_pause = paused("file-retention-pause", 8, counted=deleting(files=8))
+        expect(long_pause["ledger.wire"].status == checks.FAIL
+               and long_pause["ledger.wire"].detail.startswith(
+                   "the writer rotated 8 time(s) while the SUT was down (pause [+200s, +260s]), "
+                   "enough to delete a file it hadn't read: out keeps 8 files, so 8 "
+                   "rotation(s) in a pause trip the guard"),
+               f"a pause over max_files rotations FAILs, got {long_pause['ledger.wire']}")
+        short_pause = paused("file-retention-pause-under", 7)
+        expect(short_pause["ledger.wire"].status == checks.PASS,
+               f"seven rotations in a pause pass, got {short_pause['ledger.wire']}")
 
         # A killed life at 200 lines/s, 5 s drains, and a 5 s checkpoint_interval: below, 1,000
         # lost counts; above, 1,000 lines plus two files x 690 lines a 64 KiB read holds at 95

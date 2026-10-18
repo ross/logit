@@ -1170,10 +1170,16 @@ The rows:
   `max_bytes` would hold, never judged. A deleted file the tailer hadn't read is lost and
   counted nowhere (docs/known-gaps/tailing.md), so a **retention guard** FAILs the row for any
   pause, stop, kill, restart, or `exit` of the ingress SUT, widened by one of the writer's
-  drain intervals on each side, during which the writer rotated `max(1, max_files − 2)` times
-  or more: a file rotated to `.1` shortly before the fault, which a tailer one file behind hasn't
-  finished, is deleted at the fault's `max_files − 1`th rotation, so the guard trips one
-  rotation early. `ledger.summary`'s end-to-end bound
+  drain intervals on each side, during which the writer rotated as often as its limit, which
+  trips one rotation before the first unread deletion:
+  - a stop, kill, restart, or `exit`: `max(1, max_files − 2)`. The process closes every file,
+    so a file rotated to `.1` shortly before the fault, which a tailer one file behind hasn't
+    finished, is lost when it's deleted, at the fault's `max_files − 1`th rotation;
+  - a pause: `max_files`. The paused tailer keeps its descriptors, so a file it had open stays
+    readable after a deletion, and only a file the writer created after the pause began is
+    lost: created at the pause's first rotation, it's deleted at its `max_files + 1`th.
+
+  `ledger.summary`'s end-to-end bound
   runs for a file wire too, with the band's upper edge added to its limit, since a replayed line
   is absorbed and stored again. From W13a it counts the path's discards with the counted loss:
   a replayed line a node discards is counted again as its read counts in W again, so the band
@@ -2327,8 +2333,8 @@ where it needs them, and a small check extension.
     should stay at about `max_files`. Built as `tail-rotate-delete`, with these corrections to
     the item as first written:
     - `fd_slope` isn't a slope: it compares the warmup median with the end. The pass is
-      `fd_growth` at about `max_files` + 2, the files the writer keeps plus a deleted one
-      draining and the staged `app.log.rotating`, over the warmup's two, with `[[expect]]`
+      `fd_growth` of 10: the files the writer keeps plus a deleted one draining and the
+      staged `app.log.rotating`, eight more than the warmup's two, plus two to spare, with `[[expect]]`
       maxima on `logit.input.files.open` and `logit.process.fds` over the whole run, a last
       `files.open` of 7 or more, and eight or more writer rotations, so it deleted.
     - The end count isn't replaced: it still gives the replay band its line size, and it

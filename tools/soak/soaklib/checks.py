@@ -3032,24 +3032,32 @@ def _file_writers(data, led, source):
 
 def _file_retention_problems(data, led, source):
     """One problem per window of the ingress SUT's `FILE_RETENTION_ACTIONS` in which a file
-    source's writer rotated often enough to delete a file the tailer hadn't read: at least
-    `max_files − 2` times, and at least once. `file_out` deletes `.{max_files − 1}` at each
-    rotation, so a file rotated to `.1` shortly before the window, which a tailer one file behind
-    hasn't finished, is deleted at the window's `max_files − 1`th rotation, and the active file
-    at its `max_files`th; the guard trips one rotation before the first. A restarted tailer
-    never finds a deleted file, and the loss is counted nowhere (docs/known-gaps/tailing.md),
-    so the ledger can't see it any other way. Each window is widened by one of the writer's
-    drain intervals on each side, since a rotation is counted at the drain after it."""
+    source's writer rotated often enough to delete a file the tailer hadn't read. `file_out`
+    deletes `.{max_files − 1}` at each rotation, and each limit trips one rotation before the
+    first such deletion:
+
+    - A stop, kill, restart, or `exit` closes every file. A file rotated to `.1` shortly before
+      the window, which a tailer one file behind hasn't finished, is deleted at the window's
+      `max_files − 1`th rotation, so the limit is `max_files − 2`, and at least 1.
+    - A pause keeps the tailer's descriptors, so a file it had open stays readable after a
+      deletion. Only a file the writer created after the pause began is lost: created at the
+      pause's first rotation, it's deleted at its `max_files + 1`th, so the limit is
+      `max_files`.
+
+    A restarted tailer never finds a deleted file, and the loss is counted nowhere
+    (docs/known-gaps/tailing.md), so the ledger can't see it any other way. Each window is
+    widened by one of the writer's drain intervals on each side, since a rotation is counted at
+    the drain after it."""
     gen = led.gens[source.get("service")]
     gaps = [b - a for a, b in zip(gen.drains, gen.drains[1:])]
     pad = statistics.median(gaps) if gaps else 0.0
     service = led.inn.service
     problems = []
     for sink, _, max_files, _ in _file_writers(data, led, source):
-        limit = max(1, max_files - 2)
         for fault in data.faults:
             if fault.on != service or fault.action not in FILE_RETENTION_ACTIONS:
                 continue
+            limit = max_files if fault.action == "pause" else max(1, max_files - 2)
             rotated = gen.counter_in("logit.output.file.rotations", fault.start - pad,
                                      fault.end + pad, component=sink)
             if rotated >= limit:
@@ -3057,7 +3065,7 @@ def _file_retention_problems(data, led, source):
                     f"the writer rotated {_n(rotated)} time(s) while the SUT was down "
                     f"({fault.action} [{data.offset(fault.start)}, {data.offset(fault.end)}]), "
                     f"enough to delete a file it hadn't read: {sink} keeps {max_files} files, "
-                    f"so {limit} rotation(s) trip the guard")
+                    f"so {limit} rotation(s) in a {fault.action} trip the guard")
     return problems
 
 

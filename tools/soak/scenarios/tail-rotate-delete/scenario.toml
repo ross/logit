@@ -46,8 +46,8 @@ progress_window = "30s"
 rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
 # fd_slope compares the warmup median to the end. At warmup the writer has rotated about once,
 # so the tailer holds two files; from the eighth rotation on it holds the eight the writer keeps,
-# plus a deleted one it's draining and the writer's `app.log.rotating` mid-rotation: about
-# max_files + 2 more than at warmup, at most.
+# plus a deleted one it's draining and the writer's `app.log.rotating` mid-rotation, at most 10:
+# eight more than at warmup. The limit is that plus two to spare.
 fd_growth = 10
 
 # The tailer stops reading; the writer doesn't, so it catches up after.
