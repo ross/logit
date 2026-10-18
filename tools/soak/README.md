@@ -229,8 +229,8 @@ request, into `influxdb_in`, its source declared `wire = "http"`. Each point car
 string field, so the SUT decodes no gauge, and a `kv_metrics` counts one per point ahead of a
 500 ms `aggregate` and a two-batch blocking sink queue. G is the points the SUT answered `204`
 for, which it does only once their batch is in its pipeline, so every window but a kill's is
-judged. Its 15-minute cycle delays the SUT's egress 6 s, past `influxdb_out`'s 10 s timeout on
-a new connection, so the generator resends batches the SUT took; drops 30% of the SUT's egress
+judged. Its 15-minute cycle delays the SUT's egress 11 s, past `influxdb_out`'s 10 s timeout,
+so the generator resends batches the SUT took; drops 30% of the SUT's egress
 and 10% of the generator's; stops VictoriaMetrics for 90 s, which backs up into the listener's
 busy `503`s; and stops, restarts, and kills the SUT. Its expectations assert deferred batches
 and the generator's `5xx` answers around the backend stop, transport errors under the delay,
@@ -491,7 +491,9 @@ A root qdisc shapes the target's egress only: `netem` on `logit` impairs its rem
 for an external target, all its traffic to the internet), not the statsd arriving at it. To
 impair the UDP into the SUT, put `netem` on a generator, which impairs that generator's source
 alone. On a TCP source the SUT's egress carries the ACKs, so `netem` on `logit` affects that
-wire too, and `netem` on the generator delays or drops segments TCP retransmits. The driver
+wire too, and `netem` on the generator delays or drops segments TCP retransmits. On an HTTP
+source the SUT's egress carries its answers, and `netem` on either end can hold a request or its
+answer past the writer's timeout, so both affect that wire. The driver
 appends `limit 100000` to `args` unless they set a `limit`, so netem's own queue never drops.
 
 ## External targets

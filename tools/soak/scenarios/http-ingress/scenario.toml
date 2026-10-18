@@ -39,15 +39,15 @@ progress_window = "30s"
 rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
 fd_growth = 8
 
-# The SUT's egress carries its answers. Delayed 6 s, a request on a new connection waits 6 s
-# for the handshake and 6 s for its answer, past influxdb_out's 10 s timeout, after the SUT took
-# it: the generator resends a batch the SUT holds, a surplus judged against its transport
-# errors.
+# The SUT's egress carries its answers. Delayed 11 s, past influxdb_out's 10 s timeout, the
+# answer to a request the SUT took arrives after the generator gave up on it, and the generator
+# resends a batch the SUT holds: a surplus judged against its transport errors. A keep-alive
+# connection is needed for that; a new one's handshake times out first and sends nothing.
 [[step]]
 at = "0s"
 action = "netem"
 on = "logit"
-args = "delay 6s"
+args = "delay 11s"
 for = "60s"
 
 [[step]]
