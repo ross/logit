@@ -1,6 +1,6 @@
 ---
 created: 2026-10-11
-updated: 2026-10-12
+updated: 2026-10-17
 ---
 
 # `kafka_out` SASL: PLAIN, SCRAM, OAUTHBEARER, and AWS MSK IAM, authenticated in the dialer and renewed by redial
@@ -353,3 +353,45 @@ W3 built AWS_MSK_IAM and settled these points the decision above left open:
    apply KIP-679's rule that `WriteData` on a topic implies idempotent writes, so the default
    idempotent producer needs `kafka-cluster:WriteDataIdempotently` on the cluster beside
    `Connect`, `DescribeTopic`, and `WriteData` (`docs/deploying.md`).
+
+## Amendment: a failed token refresh keeps a valid token (2026-10-17)
+
+A cached OAUTHBEARER token stays in use when its refresh fails, until the token expires, and
+the endpoint is asked again no more than once every 10 seconds, by the next connection dialed.
+W2's point 3 made a failed refresh fail the dial, so during an identity-provider outage the
+sink stopped authenticating at 80% of the token's lifetime, with a fifth of it still valid.
+
+1. **Fall back until expiry.** A fetch is due at 80% of the lifetime, as before. If it fails
+   for any reason, `Clean` or `Refused`, while the cached token hasn't expired (the request's
+   start plus its `expires_in`, or a JWT's `exp`), the dial uses the cached token. Once it has
+   expired, or with nothing cached, the fetch's error fails the dial as before.
+2. **No fetch for 10 seconds.** For 10 seconds after a failed refresh, while the token is
+   valid, no dial fetches, so dials during an outage don't each wait on the endpoint's timeout
+   first. The first dial after that fetches again. Nothing fetches on a timer, so with no dial
+   there's no request; the reference clients retry on a timer of their own. Dials
+   waiting on the failed fetch get the cached token without a fetch of their own.
+3. **Never send a known-expired token.** Both reference clients keep sending the old token past
+   its expiry and let the broker refuse it. The sink doesn't: a token it knows has expired
+   would draw a broker refusal (`Refused`, an authentication error) in place of the endpoint's
+   own error, which names the real fault.
+4. **A broker's refusal still wins.** A token the broker refuses leaves the cache, as before,
+   and a failed refresh never brings it back, even when the refusal lands while the fetch is in
+   flight.
+5. **Each fallback warns.** It's a `token_refresh_failed` warning, throttled, naming the
+   component, the redacted endpoint, the fetch's error, and the cached token's remaining life,
+   and counted in `logit.component.diagnostics{key="token_refresh_failed"}`. A fallback loses
+   nothing, so it has no `*.dropped` counter.
+
+The reference behavior, read from source:
+
+- Apache Kafka 4.0.0's Java client, `ExpiringCredentialRefreshingLogin`
+  (`clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/expiring/`):
+  a failed refresh restores the previous login context, so new authentications keep the old
+  token, and the refresh is retried every
+  `DELAY_SECONDS_BEFORE_NEXT_RETRY_WHEN_RELOGIN_FAILS` (10 seconds), with no limit. Inside one
+  refresh, the HTTP request is retried with exponential backoff from 100 ms, for at most 10
+  seconds; `kafka_out` makes one request per refresh, bounded by the sink's `timeout`.
+- librdkafka v2.6.1, `rd_kafka_oauthbearer_set_token_failure0` (`src/rdkafka_sasl_oauthbearer.c`):
+  "Leave any existing token because it may have some life left, schedule a refresh for 10
+  seconds later".
+- franz-go and sarama keep no token cache; the application's token provider owns it.

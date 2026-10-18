@@ -3436,17 +3436,21 @@ twice `timeout`.
   requires `https://`, or `http://` to a loopback address.
 - **Renewal.** One token serves every connection until 80% of its `expires_in` has passed (or of
   the time to a JWT's `exp` claim when `expires_in` is missing), and a connection dialed after
-  that fetches a new one. A broker with `connections.max.reauth.ms` set ends each session when its
-  token expires, so the sink redials, with a new token, before then. A fixed `token:` is never
+  that fetches a new one. If that fetch fails, the sink keeps using the cached token until it
+  expires and logs a `token_refresh_failed` warning with the token's remaining life. It fetches
+  again no more than once every 10 seconds, on the next connection dialed. Once the token
+  expires, the endpoint's error fails the connection, so an expired token is never sent. A
+  broker with `connections.max.reauth.ms` set ends each session when its token expires, so the
+  sink redials, with a new token, before then. A fixed `token:` is never
   renewed, so the broker refuses it once it expires.
-- **Faults.** A token endpoint that's unreachable, times out (the sink's `timeout`), or answers
-  `429` or `5xx`, or whose `2xx` body a timeout or closed connection cuts off, is retried as
-  `clean`; any other answer, or a `2xx` without a usable `access_token` in its first 64 KiB, is
-  `refused`. A broker that refuses the token is `refused` too, and the sink fetches a new token
-  for the next attempt. When the broker sends an error challenge, as Kafka does, the error
-  carries its OAuth status (`invalid_token`); Redpanda sends none. Each holds the queue until the endpoint
-  or the broker accepts. The error names the client id and the endpoint, never the secret or the
-  token.
+- **Faults.** With no unexpired cached token, a token endpoint that's unreachable, times out
+  (the sink's `timeout`), or answers `429` or `5xx`, or whose `2xx` body a timeout or closed
+  connection cuts off, is retried as `clean`; any other answer, or a `2xx` without a usable
+  `access_token` in its first 64 KiB, is `refused`. A broker that refuses the token is `refused`
+  too, and the sink fetches a new token for the next attempt. When the broker sends an error
+  challenge, as Kafka does, the error carries its OAuth status (`invalid_token`); Redpanda sends
+  none. Each holds the queue until the endpoint or the broker accepts. The error names the
+  client id and the endpoint, never the secret or the token.
 
 `mechanism: aws_msk_iam` authenticates to Amazon MSK with IAM access control. Point `brokers:`
 at the cluster's IAM bootstrap port (`9098` inside AWS, `9198` for public access) and set
