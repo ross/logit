@@ -61,10 +61,10 @@ needs at the code:
   image's unprivileged user, whatever its uid, can write it, named by `SOAK_SHARED_DIR` in
   `compose.env`; its override mounts it into the services that write or read there, and a
   `rename` moves files inside it on the host. For a file wire the end sequence stops the writer,
-  counts the lines in every file there (`shared_counted`, the G the checks hold telemetry's
-  against), and waits until the tailers' W reaches that count or stops growing
-  (`tail_caught_up`), reading W from a log chunk it captures for the purpose, before it waits
-  on the sinks.
+  counts the lines in every file there (`shared_counted`, which the checks hold the writer's G
+  to while it deleted no file), and waits until the tailers' W reaches G or stops growing
+  (`tail_caught_up`), reading G and W from log chunks it captures for the purpose, before it
+  waits on the sinks.
 - A scenario with a `[tls]` table gets `<run>/tls`, named by `SOAK_TLS_DIR` in `compose.env`,
   which its override mounts read-only at `/tls`. `prepare()` fills it before anything starts,
   through the netem image's certs.sh run as the host user: a private CA, the probe's client
@@ -831,38 +831,53 @@ class Run:
 
     def wait_tailed(self):
         """For a file wire: counts the lines the writer left in `<run>/shared`
-        (`collect.count_lines`, phase `shared_counted`), then waits, bounded at
-        `TAIL_CATCHUP_BOUND_S`, until the tailing listeners' W summed over every life reaches
-        that count or holds for `TAIL_STALL_READS` reads (phase `tail_caught_up`). Each read
+        (`collect.count_lines`, phase `shared_counted`), reads G, the writers' `file_out`
+        `logit.component.events.delivered` summed over every life, then waits, bounded at
+        `TAIL_CATCHUP_BOUND_S`, until the tailing listeners' W summed over every life reaches G
+        or holds for `TAIL_STALL_READS` reads (phase `tail_caught_up`). It waits for G, not the
+        count, because a writer that deleted a file left fewer lines than it wrote, and W
+        reaches that count before the tailers read to the end of the files.
+
+        The writers have stopped, but a log chunk ends `LOG_LAG_NS` before it's taken, so G is
+        read from a chunk of each writer taken that long after the wait began. Each read of W
         captures a log chunk of the ingress SUT, so W is read from the whole of its stdout."""
         sources = self.scenario.file_sources
         if not sources:
             return
         counted = collect.count_lines(self.run_dir / scenario_mod.SHARED_DIR)
         self.phase("shared_counted", **counted)
+        time.sleep(collect.LOG_LAG_NS / 1e9 + 1)
+        g = 0
+        for writer in sorted({source["service"] for source in sources}):
+            self.capture.chunk({writer: self.ids[writer]})
+            tel = telemetry.read_ndjson(self.run_dir / "logs" / f"{writer}.stdout")
+            g += sum(sum(tel.counter_by_life("logit.component.events.delivered",
+                                             component=sink).values())
+                     for source in sources if source["service"] == writer
+                     for sink in scenario_mod.source_ids(source, "generator_sink"))
         listeners = [source["sut_listener"] for source in sources]
         service = scenario_mod.SUT_SERVICE
         deadline = _now() + TAIL_CATCHUP_BOUND_S
         last, unchanged, reads, w = None, 0, 0, None
+        caught = dict(g=g, counted_lines=counted["lines"])
         while _now() < deadline:
             reads += 1
             self.capture.chunk({service: self.ids[service]})
             tel = telemetry.read_ndjson(self.run_dir / "logs" / f"{service}.stdout")
             w = sum(sum(tel.counter_by_life("logit.input.lines", component=listener).values())
                     for listener in listeners)
-            if w >= counted["lines"]:
-                self.phase("tail_caught_up", reached=True, w=w, g=counted["lines"],
-                           reads=reads)
+            if w >= g:
+                self.phase("tail_caught_up", reached=True, w=w, reads=reads, **caught)
                 return
             unchanged = unchanged + 1 if w == last else 0
             last = w
             if unchanged >= TAIL_STALL_READS - 1:
-                self.phase("tail_caught_up", reached=False, held=True, w=w,
-                           g=counted["lines"], reads=reads)
+                self.phase("tail_caught_up", reached=False, held=True, w=w, reads=reads,
+                           **caught)
                 return
             time.sleep(TAIL_CATCHUP_EVERY_S)
-        self.phase("tail_caught_up", reached=False, held=False, w=w, g=counted["lines"],
-                   reads=reads, bound_s=TAIL_CATCHUP_BOUND_S)
+        self.phase("tail_caught_up", reached=False, held=False, w=w, reads=reads,
+                   bound_s=TAIL_CATCHUP_BOUND_S, **caught)
 
     def aggregate_interval(self):
         """The `aggregate` window of the SUT service holding `sut_aggregate`, in seconds, or

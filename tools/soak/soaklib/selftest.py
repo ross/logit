@@ -5901,13 +5901,16 @@ def _http_rules(root):
            f"{http.sources}")
 
 
-def _as_file_wire(run_dir, w_minus_g=0, counted=True, line_bytes=95, files_open=None):
+def _as_file_wire(run_dir, w_minus_g=0, counted=True, line_bytes=95, files_open=None,
+                  rotations=None, max_files=None):
     """Turns a ledger fixture into a file-wire run in place: the listener's datagrams become
     `logit.input.lines`, the generator's `output.messages` its `file_out`'s
     `logit.component.events.delivered`, set so the run's W − G is `w_minus_g`, and the source
     names `wire = "file"`. `counted` records the driver's `shared_counted` phase with G's lines
-    at `line_bytes` each (a dict replaces it). `files_open` is `{offset: n}` of
-    `logit.input.files.open` gauges written for the listener `in`."""
+    at `line_bytes` each (a callable of G, or a dict, replaces it). `files_open` is
+    `{offset: n}` of `logit.input.files.open` gauges written for the listener `in`.
+    `rotations` is `{offset: n}` of the writer's `logit.output.file.rotations`, and `max_files`
+    writes a generator config whose `file_out` `out` keeps that many files."""
     stdout = run_dir / "logs" / "logit.stdout"
     out, w = [], 0
     for line in stdout.read_text().splitlines():
@@ -5935,9 +5938,12 @@ def _as_file_wire(run_dir, w_minus_g=0, counted=True, line_bytes=95, files_open=
                 record["metrics"][0]["value"] = g
                 first = False
         gen.append(json.dumps(record))
+    for offset, n in (rotations or {}).items():
+        gen.append(_line(_stamp(T0 + offset), "logit.output.file.rotations", "sum", n,
+                         component="out"))
     gen_path.write_text("\n".join(gen) + "\n")
     if counted:
-        phase = (counted if isinstance(counted, dict)
+        phase = (counted(g) if callable(counted) else counted if isinstance(counted, dict)
                  else {"files": 3, "lines": g, "bytes": g * line_bytes})
         with open(run_dir / "timeline.jsonl", "a") as timeline:
             timeline.write(json.dumps(_phase("shared_counted", 301, **phase)) + "\n")
@@ -5946,6 +5952,14 @@ def _as_file_wire(run_dir, w_minus_g=0, counted=True, line_bytes=95, files_open=
     resolved_path = run_dir / "scenario.resolved.json"
     resolved = json.loads(resolved_path.read_text())
     resolved["ledger"]["source"] = [{**resolved["ledger"]["source"][0], "wire": "file"}]
+    if max_files is not None:
+        (run_dir / "configs").mkdir(exist_ok=True)
+        (run_dir / "configs" / "logit-generator.yaml").write_text(
+            "components:\n  out:\n    type: file_out\n    path: /shared/app.log\n"
+            "    # a comment's max_files: 99 is ignored\n"
+            f"    rotate: {{ max_bytes: 4MiB, max_files: {max_files} }}\n")
+        resolved["configs"] = {**resolved.get("configs", {}),
+                               "generator": "logit-generator.yaml"}
     resolved_path.write_text(json.dumps(resolved))
     return run_dir
 
@@ -6021,6 +6035,59 @@ def _file_ledger():
                "events.delivered is 54,030" in mismatch["ledger.wire"].detail,
                f"G short of the shared directory's count FAILs, got {mismatch['ledger.wire']}")
 
+        # A writer keeping eight files rotated ten times outside the stop, so it deleted three:
+        # the shared directory holds eight files and fewer lines than G, and G stands alone.
+        steady = {offset: 1 for offset in (20, 40, 60, 80, 160, 180, 200, 220, 240, 260)}
+
+        def deleting(lines_short=500, files=8):
+            return lambda g: {"files": files, "lines": g - lines_short,
+                              "bytes": (g - lines_short) * 95}
+
+        deleted = stopped("file-deleted", rotations=steady, max_files=8, counted=deleting())
+        detail = deleted["ledger.wire"].detail
+        expect(deleted["ledger.wire"].status == checks.PASS
+               and "53,530 lines in 8 files, the writer having deleted 3" in detail
+               and any(line.startswith("the writer deleted 3 file(s); G stands alone, 500 "
+                                       "line(s) above the shared directory's count, against "
+                                       "about 132,452 in 3 file(s)")
+                       for line in deleted["ledger.wire"].lines),
+               f"a writer that deleted files leaves G alone, got {deleted['ledger.wire']} "
+               f"{deleted['ledger.wire'].lines}")
+        short = stopped("file-short-undeleted", rotations={20: 1, 40: 1, 60: 1}, max_files=8,
+                        counted=deleting(files=4))
+        expect(short["ledger.wire"].status == checks.FAIL
+               and "the shared directory holds 53,530 line(s) in 4 file(s), but the writer's "
+               "events.delivered is 54,030" in short["ledger.wire"].detail,
+               f"a short count with no deletion FAILs, got {short['ledger.wire']}")
+        above = stopped("file-deleted-above", rotations=steady, max_files=8,
+                        counted=deleting(lines_short=-1))
+        expect(above["ledger.wire"].status == checks.FAIL
+               and above["ledger.wire"].detail.startswith(
+                   "precondition: the shared directory holds 54,031 line(s), more than the "
+                   "writer's events.delivered 54,030"),
+               f"a count above G FAILs, got {above['ledger.wire']}")
+        wrong = stopped("file-deleted-files", rotations=steady, max_files=8,
+                        counted=deleting(files=7))
+        expect(wrong["ledger.wire"].status == checks.FAIL
+               and wrong["ledger.wire"].detail.startswith(
+                   "precondition: the writer's rotations leave 8 file(s) in the shared "
+                   "directory, and it holds 7"),
+               f"a file count off the writer's retention FAILs, got {wrong['ledger.wire']}")
+        # Six rotations inside the stop at +101 to +131 delete, with eight files kept, a file a
+        # tailer one file behind hadn't finished; five don't trip the guard.
+        down = {offset: 1 for offset in (105, 110, 115, 120, 125, 130)}
+        tripped = stopped("file-retention", rotations=down, max_files=8)
+        expect(tripped["ledger.wire"].status == checks.FAIL
+               and tripped["ledger.wire"].detail.startswith(
+                   "the writer rotated 6 time(s) while the SUT was down (stop [+101s, +131s]), "
+                   "enough to delete a file it hadn't read: out keeps 8 files, so 6 "
+                   "rotation(s) trip the guard"),
+               f"a SUT down for max_files − 2 rotations FAILs, got {tripped['ledger.wire']}")
+        del down[130]
+        under = stopped("file-retention-under", rotations=down, max_files=8)
+        expect(under["ledger.wire"].status == checks.PASS,
+               f"five rotations while the SUT is down pass, got {under['ledger.wire']}")
+
         # A killed life at 200 lines/s, 5 s drains, and a 5 s checkpoint_interval: below, 1,000
         # lost counts; above, 1,000 lines plus two files x 690 lines a 64 KiB read holds at 95
         # bytes a line; the stopped life adds one split.
@@ -6094,6 +6161,14 @@ def _file_rules(root):
     expect([source.get("sut_transforms") for source in stale.file_sources] == [
                ["parse", "stamp", "labels", "count", "metrics_only", "fresh"]],
            f"tail-rotate-stale lists its discarding node last, got {stale.file_sources}")
+    delete = scenario.load(root / "scenarios" / "tail-rotate-delete" / "scenario.toml")
+    expect([source["wire"] for source in delete.file_sources] == ["file"]
+           and delete.max_duration is None and delete.duration == 4 * 3600
+           and [e.name for e in delete.expectations] == [
+               "files-rotated", "no-checkpoint-errors", "files-open-bounded", "fds-bounded",
+               "files-open-plateau", "writer-deletes", "watches-bounded"],
+           f"tail-rotate-delete is a file wire with no max_duration and its expects, got "
+           f"{delete.file_sources} {delete.max_duration}")
     with tempfile.TemporaryDirectory() as tmp:
         tail_dir = Path(tmp) / "tail-rotate"
         shutil.copytree(root / "scenarios" / "tail-rotate", tail_dir)
@@ -6129,36 +6204,51 @@ def _file_rules(root):
         expect(override.count("${SOAK_SHARED_DIR:?") == 2,
                "tail-rotate's override mounts the shared directory into both services")
 
-        # The wait: W read from captured chunks reaches the shared count, or stops growing.
+        # The wait: W read from captured chunks reaches G, the writer's events.delivered read
+        # from its own chunk, or stops growing. The writer deleted a file of two lines, so the
+        # shared directory holds 10 of its 12, and W at 10 hasn't caught up.
         (shared / "app.log").write_text("x\n" * 10)
-        stdout = run.run_dir / "logs" / "logit.stdout"
+        logs = run.run_dir / "logs"
 
         class Capture:
             def __init__(self, deltas):
                 self.deltas = list(deltas)
                 self.offset = 0
+                self.writer_reads = 0
 
             def chunk(self, ids):
-                delta = self.deltas.pop(0) if self.deltas else 0
                 self.offset += 5
-                with open(stdout, "a") as out:
-                    out.write(_line(_stamp(T0 + self.offset), "logit.process.uptime", "gauge",
+                stamp = _stamp(T0 + self.offset)
+                if "generator" in ids:
+                    self.writer_reads += 1
+                    with open(logs / "generator.stdout", "a") as out:
+                        out.write(_line(stamp, "logit.process.uptime", "gauge",
+                                        float(self.offset)) + "\n")
+                        out.write(_line(stamp, "logit.component.events.delivered", "sum", 12,
+                                        component="file") + "\n")
+                    return
+                delta = self.deltas.pop(0) if self.deltas else 0
+                with open(logs / "logit.stdout", "a") as out:
+                    out.write(_line(stamp, "logit.process.uptime", "gauge",
                                     float(self.offset)) + "\n")
-                    out.write(_line(_stamp(T0 + self.offset), "logit.input.lines", "sum",
-                                    delta, component="tail") + "\n")
+                    out.write(_line(stamp, "logit.input.lines", "sum", delta,
+                                    component="tail") + "\n")
 
         clock = [1000.0]
         reals = (driver._now, driver.time.sleep)
         driver._now = lambda: clock[0]
         driver.time.sleep = lambda s: clock.__setitem__(0, clock[0] + s)
         try:
-            run.ids = {"logit": "a"}
+            run.ids = {"logit": "a", "generator": "b"}
             run.t0 = clock[0]
             run.timeline = _Records()
-            run.capture = Capture([4, 4, 2])
+            run.capture = Capture([4, 4, 2, 2])
+            began = clock[0]
             run.wait_tailed()
             reached = run.timeline[-1]
-            stdout.write_text("")
+            writer_reads = run.capture.writer_reads
+            for name in ("logit.stdout", "generator.stdout"):
+                (logs / name).write_text("")
             run.timeline = _Records()
             run.capture = Capture([4, 3])
             run.wait_tailed()
@@ -6169,10 +6259,14 @@ def _file_rules(root):
                and run.timeline[0]["lines"] == 10 and run.timeline[0]["files"] == 1,
                f"the wait counts the shared lines first, got {run.timeline[0]}")
         expect(reached["phase"] == "tail_caught_up" and reached["reached"] is True
-               and reached["w"] == 10 and reached["reads"] == 3,
-               f"the wait ends once W reaches the shared count, got {reached}")
-        expect(held["reached"] is False and held.get("held") is True and held["w"] == 7,
+               and reached["w"] == 12 and reached["g"] == 12 and reached["counted_lines"] == 10
+               and reached["reads"] == 4 and writer_reads == 1,
+               f"the wait ends once W reaches G, not the shared count, got {reached}")
+        expect(held["reached"] is False and held.get("held") is True and held["w"] == 7
+               and held["g"] == 12,
                f"the wait ends once W holds short of it, got {held}")
+        expect(clock[0] - began >= collect.LOG_LAG_NS / 1e9,
+               "the wait reads G from a writer chunk at least a log lag after it began")
 
 
 def _two_sut_dir(root, tmp, interval="7s"):

@@ -1379,6 +1379,14 @@ DEFAULT_TAIL_CHECKPOINT_INTERVAL_S = 5.0
 # seconds leaves at most one inside an interval of a few seconds. A fully read rotated file
 # replays nothing.
 TAIL_REPLAY_FILES = 2
+# `file_out`'s `rotate.max_files` when the config names none (crates/logit-config,
+# `RotateConfig`). It counts the active file.
+DEFAULT_FILE_OUT_MAX_FILES = 5
+# The SUT actions during which a file wire's tailer reads nothing while its writer keeps
+# rotating (`_file_retention_problems`).
+FILE_RETENTION_ACTIONS = ("pause", "stop", "kill", "restart", "exit")
+_SIZE_UNITS = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3,
+               "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3}
 # On a TCP wire the actions that end a SUT or generator process, or a partition that moved an
 # address, can lose lines the generator counted as sent: what sat in either side's socket buffers
 # when the connection reset. Their windows are reported, not judged. Every other TCP-affecting
@@ -2867,12 +2875,77 @@ def _end_allowance(led, source):
     return allowed
 
 
+def _uncommented_text(text):
+    return "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in (text or "").splitlines())
+
+
+def _component_size(text, component, key):
+    """A byte-size field of one component in a YAML text, block or flow style (`4MiB`,
+    `65536`), in bytes, or None."""
+    for block in component_blocks(text, component):
+        found = re.search(rf"\b{key}\s*:\s*[\"']?(\d+)\s*([KMG]i?B|B)?\b", block)
+        if found:
+            return int(found.group(1)) * _SIZE_UNITS[found.group(2) or "B"]
+    return None
+
+
+def _file_writers(data, led, source):
+    """`[(sink, rotations, max_files, max_bytes)]`, one per `file_out` writer of a file source:
+    its `logit.output.file.rotations` over the run, its `rotate.max_files`
+    (`DEFAULT_FILE_OUT_MAX_FILES` when unset), and its `rotate.max_bytes` in bytes, or None."""
+    service = source.get("service")
+    gen = led.gens[service]
+    text = _uncommented_text(_service_config_text(data, service))
+    return [(sink,
+             int(sum(gen.counter_by_life("logit.output.file.rotations", component=sink).values())),
+             component_int(text, sink, "max_files") or DEFAULT_FILE_OUT_MAX_FILES,
+             _component_size(text, sink, "max_bytes"))
+            for sink in source_ids(source, "generator_sink")]
+
+
+def _file_retention_problems(data, led, source):
+    """One problem per window of the ingress SUT's `FILE_RETENTION_ACTIONS` in which a file
+    source's writer rotated often enough to delete a file the tailer hadn't read: at least
+    `max_files − 2` times, and at least once. `file_out` deletes `.{max_files − 1}` at each
+    rotation, so a file rotated to `.1` shortly before the window, which a tailer one file behind
+    hasn't finished, is deleted at the window's `max_files − 1`th rotation, and the active file
+    at its `max_files`th; the guard trips one rotation before the first. A restarted tailer
+    never finds a deleted file, and the loss is counted nowhere (docs/known-gaps/tailing.md),
+    so the ledger can't see it any other way. Each window is widened by one of the writer's
+    drain intervals on each side, since a rotation is counted at the drain after it."""
+    gen = led.gens[source.get("service")]
+    gaps = [b - a for a, b in zip(gen.drains, gen.drains[1:])]
+    pad = statistics.median(gaps) if gaps else 0.0
+    service = led.inn.service
+    problems = []
+    for sink, _, max_files, _ in _file_writers(data, led, source):
+        limit = max(1, max_files - 2)
+        for fault in data.faults:
+            if fault.on != service or fault.action not in FILE_RETENTION_ACTIONS:
+                continue
+            rotated = gen.counter_in("logit.output.file.rotations", fault.start - pad,
+                                     fault.end + pad, component=sink)
+            if rotated >= limit:
+                problems.append(
+                    f"the writer rotated {_n(rotated)} time(s) while the SUT was down "
+                    f"({fault.action} [{data.offset(fault.start)}, {data.offset(fault.end)}]), "
+                    f"enough to delete a file it hadn't read: {sink} keeps {max_files} files, "
+                    f"so {limit} rotation(s) trip the guard")
+    return problems
+
+
 def _file_wire_one(data, led, source):
     """`(status, detail, lines)` of `ledger.wire` for a file source. A tailer reads behind its
     writer, so a drain interval's gap is lag, not loss: the runs are reported, and the row
-    judges the run's W + F − G against `Ledger.replay_band`. G must equal the lines the driver
-    counted in the shared directory at the end (`shared_counted`), and the end sequence's wait
-    for the tailers (`tail_caught_up`) is reported beside it."""
+    judges the run's W + F − G against `Ledger.replay_band`.
+
+    The driver counts the lines left in the shared directory at the end (`shared_counted`).
+    While the writer deleted no file, that count must equal G. Once `file_out` deleted one, at
+    each rotation past its `max_files − 1`th, the deleted lines can't be counted, so G stands
+    alone: the count must not exceed G, and the directory must hold `min(rotations + 1,
+    max_files)` files per writer. The row also FAILs a SUT down long enough for the writer to
+    delete a file it hadn't read (`_file_retention_problems`). The end sequence's wait for the
+    tailers (`tail_caught_up`) is reported beside it."""
     service, listener = source.get("service"), source.get("sut_listener")
     stats = led.gen_stats[service]
     status = PASS
@@ -2880,16 +2953,41 @@ def _file_wire_one(data, led, source):
     W = sum(led.per[listener]["W"].values())
     F = sum(led.per[listener]["F"].values())
     G = stats["G"]
+    writers = _file_writers(data, led, source)
+    deleted = sum(max(0, rotations - (max_files - 1)) for _, rotations, max_files, _ in writers)
+    kept = sum(min(rotations + 1, max_files) for _, rotations, max_files, _ in writers)
     counted = data.phases.get("shared_counted")
+    problems = []
     if counted is None:
+        problems.append("precondition: no shared_counted phase, so G has no count from the "
+                        "shared directory to hold it to")
+    else:
+        got_lines, got_files = counted.get("lines", 0), counted.get("files", 0)
+        if got_lines > G:
+            problems.append(f"precondition: the shared directory holds {_n(got_lines)} "
+                            f"line(s), more than the writer's events.delivered {_n(G)}")
+        elif not deleted and got_lines != G:
+            problems.append(f"precondition: the shared directory holds {_n(got_lines)} "
+                            f"line(s) in {_n(got_files)} file(s), but the writer's "
+                            f"events.delivered is {_n(G)}")
+        if deleted and got_files != kept:
+            problems.append(f"precondition: the writer's rotations leave {_n(kept)} file(s) "
+                            f"in the shared directory, and it holds {_n(got_files)}")
+        if deleted:
+            note = (f"the writer deleted {_n(deleted)} file(s); G stands alone, "
+                    f"{_n(G - got_lines)} line(s) above the shared directory's count")
+            sizes = [max_bytes for _, _, _, max_bytes in writers]
+            if got_lines and all(sizes):
+                line_bytes = counted.get("bytes", 0) / got_lines
+                deleted_bytes = sum(max_bytes * max(0, rotations - (max_files - 1))
+                                    for _, rotations, max_files, max_bytes in writers)
+                note += (f", against about {_n(round(deleted_bytes / line_bytes))} in "
+                         f"{_n(deleted)} file(s) of max_bytes at {line_bytes:,.1f} bytes a "
+                         "line (reported, not judged)")
+            lines.append(note)
+    problems += _file_retention_problems(data, led, source)
+    if problems:
         status = FAIL
-        lines.append("precondition: no shared_counted phase, so G has no count from the "
-                     "shared directory to hold it to")
-    elif counted.get("lines") != G:
-        status = FAIL
-        lines.append(f"precondition: the shared directory holds {_n(counted.get('lines', 0))} "
-                     f"line(s) in {_n(counted.get('files', 0))} file(s), but the writer's "
-                     f"events.delivered is {_n(G)}")
     caught = data.phases.get("tail_caught_up") or {}
     low, high, band_lines = led.replay_band([listener])
     runs = []
@@ -2910,16 +3008,17 @@ def _file_wire_one(data, led, source):
     if not low <= over <= high:
         status = FAIL
         what = "uncounted loss" if over < low else "surplus"
-        lines.insert(0, f"W + F − G {_n(over)} is {what}, outside the replay band "
-                        f"[{_n(low)}, {_n(high)}]")
+        problems.insert(0, f"W + F − G {_n(over)} is {what}, outside the replay band "
+                           f"[{_n(low)}, {_n(high)}]")
+    lines = problems + lines
     wait = ("" if not caught else
             f"; the tailers {'reached G' if caught.get('reached') else 'stopped short'} at the "
             f"end with W {_n(caught.get('w') or 0)}")
-    detail = (f"G {_n(G)} (shared directory: "
-              + (f"{_n(counted.get('lines', 0))} lines in {_n(counted.get('files', 0))} files"
-                 if counted else "uncounted")
-              + f") vs W {_n(W)} + counted {_n(F)}: W + F − G {_n(over)} against the replay band "
-              f"[{_n(low)}, {_n(high)}]" + wait)
+    shared = ("uncounted" if counted is None else
+              f"{_n(counted.get('lines', 0))} lines in {_n(counted.get('files', 0))} files"
+              + (f", the writer having deleted {_n(deleted)}" if deleted else ""))
+    detail = (f"G {_n(G)} (shared directory: {shared}) vs W {_n(W)} + counted {_n(F)}: "
+              f"W + F − G {_n(over)} against the replay band [{_n(low)}, {_n(high)}]" + wait)
     if status != PASS:
         detail = f"{lines[0]}; {detail}"
     return status, detail, lines
