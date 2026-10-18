@@ -60,7 +60,7 @@ from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, NETNS_ROLE, ST
 NETEM_LIMIT = "100000"
 # The timeline key recording, per `[[ledger.source]]` wire, whether a step can affect it.
 INGRESS_KEYS = {"udp": "affects_udp_ingress", "tcp": "affects_tcp_ingress",
-                "file": "affects_file_ingress"}
+                "file": "affects_file_ingress", "http": "affects_http_ingress"}
 # 128 + SIGKILL: the exit code Docker records for a container a `kill` ended.
 KILL_EXIT_CODE = 137
 CUE_TIMEOUT_S = 10
@@ -105,9 +105,11 @@ class Action:
     # The same as `affects_udp_ingress` for a source whose `wire` is `tcp` or `file`
     # (`INGRESS_KEYS`). Netem on a TCP generator affects nothing: TCP retransmits what netem
     # drops, so the wire row judges that loss at 0. Netem on the SUT does affect it, because the
-    # SUT's egress carries the ACKs.
+    # SUT's egress carries the ACKs. On `http` netem on either end can hold a request or its
+    # answer past the client's timeout, which the client resends.
     affects_tcp_ingress: object
     affects_file_ingress: object
+    affects_http_ingress: object
 
     def affects(self, wire, step, roles):
         """Whether the fault can lose lines on a `wire` source's way into the SUT."""
@@ -392,6 +394,7 @@ ACTIONS = {
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_side,
         affects_file_ingress=_never,
+        affects_http_ingress=_on_ingress_sut_or_generator,
     ),
     "pause": Action(
         apply=pause_apply,
@@ -400,6 +403,7 @@ ACTIONS = {
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_sut_or_generator,
         affects_file_ingress=_on_ingress_side,
+        affects_http_ingress=_on_ingress_sut_or_generator,
     ),
     "stop": Action(
         apply=stop_apply,
@@ -408,6 +412,7 @@ ACTIONS = {
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_sut_or_generator,
         affects_file_ingress=_on_ingress_side,
+        affects_http_ingress=_on_ingress_sut_or_generator,
     ),
     "kill": Action(
         apply=kill_apply,
@@ -416,6 +421,7 @@ ACTIONS = {
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_sut_or_generator,
         affects_file_ingress=_on_ingress_side,
+        affects_http_ingress=_on_ingress_sut_or_generator,
     ),
     "restart": Action(
         apply=restart_apply,
@@ -424,6 +430,7 @@ ACTIONS = {
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_sut_or_generator,
         affects_file_ingress=_on_ingress_side,
+        affects_http_ingress=_on_ingress_sut_or_generator,
     ),
     "partition": Action(
         apply=partition_apply,
@@ -432,6 +439,7 @@ ACTIONS = {
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_sut_or_generator,
         affects_file_ingress=_never,
+        affects_http_ingress=_on_ingress_sut_or_generator,
     ),
     # A mark on the SUT holds what it marks, such as a stalled script backing up into the UDP
     # receive queue.
@@ -442,6 +450,7 @@ ACTIONS = {
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_sut,
         affects_file_ingress=_never,
+        affects_http_ingress=_on_ingress_sut,
     ),
     "exit": Action(
         apply=no_op,
@@ -450,6 +459,7 @@ ACTIONS = {
         affects_egress=_always,
         affects_tcp_ingress=_on_ingress_sut,
         affects_file_ingress=_on_ingress_side,
+        affects_http_ingress=_on_ingress_sut,
     ),
     "respond": Action(
         apply=respond_apply,
@@ -458,6 +468,7 @@ ACTIONS = {
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_never,
         affects_file_ingress=_never,
+        affects_http_ingress=_never,
     ),
     "signal": Action(
         apply=signal_apply,
@@ -466,6 +477,7 @@ ACTIONS = {
         affects_egress=_never,
         affects_tcp_ingress=_never,
         affects_file_ingress=_never,
+        affects_http_ingress=_never,
     ),
     "rename": Action(
         apply=rename_apply,
@@ -474,6 +486,7 @@ ACTIONS = {
         affects_egress=_never,
         affects_tcp_ingress=_never,
         affects_file_ingress=_never,
+        affects_http_ingress=_never,
     ),
     "rotate": Action(
         apply=rotate_apply,
@@ -482,6 +495,7 @@ ACTIONS = {
         affects_egress=_never,
         affects_tcp_ingress=_never,
         affects_file_ingress=_never,
+        affects_http_ingress=_never,
     ),
     "probe": Action(
         apply=probe_apply,
@@ -490,6 +504,7 @@ ACTIONS = {
         affects_egress=_never,
         affects_tcp_ingress=_never,
         affects_file_ingress=_never,
+        affects_http_ingress=_never,
     ),
 }
 
