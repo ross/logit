@@ -284,7 +284,7 @@ replays the lines read since the last 5 s checkpoint, which are about 40 s old a
 fresh. Its expectations assert discards after the pause, the stop, and the long kill, none
 through the restart or the short kill, and every line's `timestamp` resolved.
 
-`tail-rotate-delete` (4 hours) is `tail-rotate` against a writer that keeps eight files
+`tail-rotate-delete` (4 hours by default) is `tail-rotate` against a writer that keeps eight files
 (`max_files: 8`) and deletes the oldest at every rotation from its eighth on, about one every 44 s.
 `tail_in` holds a rotated file open until the writer deletes it, so its descriptors must stay
 bounded by that retention over hours. Its cycle is an hour long: the same five faults, then about

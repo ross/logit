@@ -2604,7 +2604,7 @@ that items 3, 7, and 11 need.
 - **W18**: item 18: the writer's deletions in `ledger.wire` (the end count held to G only
   while the writer deleted no file, then as a bound with the writer's file count) and its
   retention guard, the end sequence's wait for G, self-test fixtures for each rule, and the
-  `tail-rotate-delete` scenario, a short run recorded under "Findings".
+  `tail-rotate-delete` scenario, a 20-minute and a 1-hour run recorded under "Findings".
 
 Item 16's OAUTHBEARER and `otlp_proto` halves, and §10's follow-ups to items 11 and 12, have no
 workstream yet.
@@ -4965,13 +4965,34 @@ but `ledger.windows` and `ledger.replay`, which SKIP on a Kafka target with no k
   descriptors went from 13 to 12 (SUT) and 12 to 11 (generator), so no redial left a
   descriptor behind.
 
+Run `20261018T153250Z`: `kafka-sasl-reauth` at `--duration 1h`, from `main` at `c3ca0430` on
+`logit:soak-long` (`sha256:f962a632…`), beside the `tail-rotate-delete` run in W18, on the
+development host. Overall PASS, with only inapplicable SKIPs.
+
+- **The sink renewed on schedule.** `reauth-rate` read 135.3 an hour (133 reconnects over
+  3,540 s), inside [80, 300], and `no-expired-session-sends` read 9.2 an hour against a limit
+  of 40. No attempt was `refused` and no batch was dropped.
+- **Nothing was lost or stored twice.** G, W, and V are each 7,212,100. `ledger.topic` read
+  18,040 distinct records, 0 duplicate copies, and T − A of 0.
+- **Memory and descriptors stayed flat.** The SUT's `rss_slope` read +0.8 MiB/h and its
+  descriptors went from 13 to 13. All 27 faults recovered within the 45 s bound, the slowest
+  in 19 s.
+- **`rss_slope` judged 29% of the time after warmup.** A slope needs steady samples, and the
+  scenario's 9 cycles of 3 faults each hold the broker away or restart it, so the faults and the
+  45 s recovery after each leave about 113 s of every 390 s cycle. The SUT is never restarted,
+  so its one life carries the slope. Coverage is above the 5% WARN floor.
+
+The 1 h runs, here and in W18, are shorter than the 4-hour or 8-hour length the scenarios allow.
+A leak in either path grows per redial or per deletion, not with wall time, and an hour is the
+shortest run whose `rss_slope` gives a verdict instead of a WARN.
+
 ### W18: a deleting rotation (2026-10-18)
 
 `tail-rotate-delete` ran for 20 minutes on the development host, against `logit:soak-w18`
 built from `soak/w18`, whose Rust is `main`'s at `8b99d6db`. The run is
 `perf/results/soak/20261018T141700Z`, exit 0, shown here as `check` re-scores it after the
-merge of `main` at `fa26e870`, which changed nothing in it. The 4-hour run the scenario
-defaults to is pending; it will be recorded here.
+merge of `main` at `fa26e870`, which changed nothing in it. A 1-hour run follows the 20-minute
+run's table; the scenario's default is 4 hours.
 
 | Check | Status | Detail |
 |---|---|---|
@@ -5031,6 +5052,21 @@ defaults to is pending; it will be recorded here.
   8.5 hours: `systemd-inhibit --what=sleep:idle` doesn't block `handle-lid-switch`. `run`
   FAILed it as stalled. A run the host slept through ends at its first stall and exits 3,
   and is rerun once the host is awake rather than kept awake (§5).
+
+Run `20261018T153308Z`: `tail-rotate-delete` at `--duration 1h`, from `main` at `c3ca0430` on
+`logit:soak-long` (`sha256:f962a632…`), beside the `kafka-sasl-reauth` run in W17, on the
+development host. Overall PASS, with only inapplicable SKIPs. It confirms the 20-minute run's
+limits.
+
+- **The writer deleted 74 files, and nothing unread.** G is 3,606,200 and the shared directory
+  held 342,800 lines in 8 files. W + F − G is −100, inside the replay band
+  [−9,999, 12,775]. The 5 SUT exits were all scheduled: 3 stops and 2 kills.
+- **Descriptors stayed at the writer's retention.** `logit.input.files.open` peaked at 9 and
+  ended at 8, `logit.input.watch.watches` peaked at 10, and `logit.process.fds` peaked at 24
+  again, under `fds-bounded`'s 26, which the 20-minute run set. The SUT's `fd_slope` row reads
+  16 to 23 against a limit of +10.
+- **RSS fell.** `rss_slope` read −3.9 MiB/h over the SUT's last life, with 83% of the time after
+  warmup judged.
 
 ### W15: multi-destination routers under a target split (2026-10-18)
 
