@@ -56,7 +56,9 @@ FAIL (`Ledger.cued_rejections`); outside one it FAILs as on any target. Under th
 shape `ledger.sent` SKIPs. Under the `datadog` shape V is the distinct stored points' delta
 sum, judged as a Kafka topic's is (a negative gap is a surplus), and `ledger.sent` judges the
 sink as on an external target, excusing a refusal line, a rejected batch, or a rejected or
-oversize record drop inside a `respond` step that explains it (`_sent_one`).
+oversize record drop inside a `respond` step that explains it (`_sent_one`). Under the
+`influxdb` shape V is the stored delta points' sum, one per `(series, timestamp)` since
+InfluxDB overwrites a resend, judged as the `datadog` shape's is, and `ledger.sent` SKIPs.
 
 A run can have several SUT services (`RunData.suts`, in chain order). Each has its own process
 lives (`SutLives`): the listener rows read the first service's, and every row from `aggregate`
@@ -349,9 +351,10 @@ class RunData:
             except (OSError, ValueError):
                 pass
 
-        # A stand-in target's record, its stdout, and V rebuilt from it for the one sink: under
-        # the `datadog` shape the stored points by copy (`standin_counts`), whose distinct
-        # copies the ledger sums, with their series in the export's shape.
+        # A stand-in target's record, its stdout, and V rebuilt from it for the one sink. A
+        # delta sink's shape keeps the stored points as V's terms (`standin_counts`), with their
+        # series in the export's shape: under `datadog` each distinct copy, under `influxdb`
+        # each `(series, timestamp)`'s last write.
         self.standin_requests, self.standin_cues, self.standin_unparsed = [], [], 0
         self.standin_text = None
         self.standin_store = ([], 0, [], [])
@@ -359,6 +362,7 @@ class RunData:
                               else None)
         self.standin_counts = None
         self.standin_datadog = self.standin_shape == standin.DATADOG
+        self.standin_influxdb = self.standin_shape == standin.INFLUXDB
         if self.standin:
             service = next((name for name, role in self.services.items()
                             if role == STANDIN_ROLE), STANDIN_TARGET)
@@ -372,6 +376,11 @@ class RunData:
                 counts = standin.stored_counts(self.standin_requests)
                 self.standin_counts = counts
                 self.standin_store = (counts.series, 0, counts.conflicts, counts.undecodable)
+            elif self.standin_shape == standin.INFLUXDB:
+                counts = standin.stored_points(self.standin_requests)
+                self.standin_counts = counts
+                self.standin_store = (counts.series, len(counts.rewrites), counts.conflicts,
+                                      counts.undecodable)
             else:
                 self.standin_store = standin.stored_series(self.standin_requests)
             for sink in self.sinks:
@@ -1672,9 +1681,11 @@ class Ledger:
                                                                     self.life_starts)
             self.duplicates = topic.duplicates_by_life(copies, self.life_starts)
             self.resets[sink], self.mismatched[sink] = {}, []
-        # A `datadog` stand-in's one sink has the stored points for its V, distinct copies
-        # only, credited to lives by point timestamp as a Kafka record is; each extra copy is a
-        # duplicate the destination counted again (`ledger.standin` judges them).
+        # A `datadog` or `influxdb` stand-in's one sink has the stored points for its V,
+        # credited to lives by point timestamp as a Kafka record is: under `datadog` distinct
+        # copies only, each extra copy a duplicate the destination counted again, and under
+        # `influxdb` one per `(series, timestamp)`, a resend overwriting (`ledger.standin`
+        # judges both).
         self.counts_sink = (self.sinks[0] if data.standin_counts is not None and self.sinks
                             else None)
         if self.counts_sink is not None:
@@ -2164,9 +2175,10 @@ class Ledger:
 
         On a Kafka target, V counts each distinct record once, so a negative gap in a life that
         wasn't killed is a `surplus`, never a duplicate: increments V holds and Ab doesn't. A
-        `datadog` stand-in's V counts each distinct point copy once, and is judged the same way;
-        its sink's `records.dropped` also counts toward a positive gap, because a request a
-        series `2xx` body partly rejected loses series with no batch dropped."""
+        `datadog` stand-in's V counts each distinct point copy once, and an `influxdb`
+        stand-in's each `(series, timestamp)` once, and both are judged the same way. A
+        `datadog` sink's `records.dropped` also counts toward a positive gap, because a request
+        a series `2xx` body partly rejected loses series with no batch dropped."""
         status, verdict, gap = self._egress(life, sinks)
         if self.fault_drops(life, sinks):
             status = FAIL
@@ -2201,8 +2213,9 @@ class Ledger:
         return drops
 
     def record_drops(self, life, sinks):
-        """`{reason: records}` a `datadog` stand-in's sink among `sinks` dropped in `life`
-        (`logit.output.records.dropped`), or {} for any other sink."""
+        """`{reason: records}` a `datadog` or `influxdb` stand-in's sink among `sinks` dropped
+        in `life` (`logit.output.records.dropped`, which `influxdb_out` never counts), or {}
+        for any other sink."""
         if self.counts_sink not in sinks:
             return {}
         drops = {}
@@ -3306,6 +3319,13 @@ def check_ledger_egress(data):
                          f"{_n(len(led.records))} distinct, {_n(copies)} duplicate copies; V "
                          f"{_n(led.V_total[sink])} (the sum of the distinct records' delta sums)")
             continue
+        if sink == led.counts_sink and data.standin_influxdb:
+            counts = data.standin_counts
+            lines.append(f"{sink}: {_n(len(counts.points))} stored point(s), "
+                         f"{_n(len(counts.rewrites))} rewritten with the same value; V "
+                         f"{_n(led.V_total[sink])} (the sum of the stored points' values, one "
+                         "per series and timestamp)")
+            continue
         if sink == led.counts_sink:
             counts = data.standin_counts
             lines.append(f"{sink}: {_n(len(counts.points) + len(counts.duplicates))} stored "
@@ -4001,7 +4021,7 @@ def check_ledger_sent(data):
     drops, refusals, and request classes. A Kafka target's sink is judged the same way, and its
     ledger goes on to the topic, as is a `datadog` stand-in's, whose ledger goes on to the
     stand-in's record and which excuses what a `respond` step cued (`_sent_one`). A local
-    target and a `remote_write` stand-in SKIP. `docs/plans/soak-harness.md`, "8. External
+    target and a `remote_write` or `influxdb` stand-in SKIP. `docs/plans/soak-harness.md`, "8. External
     targets (W5)", lists each FAIL and WARN."""
     if data.has_vm:
         return Result("ledger.sent", SKIP, "local target: ledger.egress judges delivery against "
@@ -4392,7 +4412,15 @@ def check_ledger_standin(data):
     than a `413`, and `records.dropped{reason="oversize"}` equals the points of the `413`
     requests under such a step; and each duplicate copy of a stored point is reported: permitted
     under `at_least_once` after an answer the sink didn't see accepted, and a FAIL under
-    `at_most_once`, or as a resend within one life of a point the stand-in answered `2xx`."""
+    `at_most_once`, or as a resend within one life of a point the stand-in answered `2xx`.
+
+    Under the `influxdb` shape (`_standin_influxdb`), also: per SUT life, no point of a request
+    answered under the cue of a step classed `rejected` is stored, and the egress gap, Ab − V
+    plus a stopped earlier life's residual as `ledger.egress` adds it, equals those points'
+    sum, credited to lives by timestamp; a killed life's is reported. The record's writes name
+    one `(org, orgID, bucket)`, which the row reports. A point stored again with the same value
+    is a rewrite InfluxDB absorbs, reported, and FAILs only under `at_most_once`, or as a
+    resend within one life of a point the stand-in answered `2xx`."""
     if not data.standin:
         return Result("ledger.standin", SKIP, f"{data.target.get('kind')} target: no stand-in")
     if data.standin_text is None:
@@ -4425,8 +4453,8 @@ def check_ledger_standin(data):
         except standin.DecodeError as err:
             undecodable.append(f"#{request.get('seq')}: {err}")
     if undecodable:
-        what = ("a MetricPayload" if shape == standin.DATADOG else "a Snappy WriteRequest")
-        flag(FAIL, f"{len(undecodable)} request body(ies) don't decode as {what}: "
+        flag(FAIL, f"{len(undecodable)} request body(ies) don't decode as "
+                   f"{standin.BODY_NAMES[shape]}: "
                    f"{'; '.join(undecodable[:3])}")
     for key, stamp, first, last in conflicts[:5]:
         flag(FAIL, f"{dict(key).get('__name__', key)} at {stamp} ms stored {first:g}, then "
@@ -4514,6 +4542,8 @@ def check_ledger_standin(data):
     stored = sum(1 for r in requests if r.get("stored"))
     if data.standin_datadog:
         resent = _standin_datadog(data, led, sink, at_most_once, flag, lines)
+    elif data.standin_influxdb:
+        resent = _standin_influxdb(data, led, sink, at_most_once, flag, lines)
     else:
         resent = f"{_n(rewrites)} resent sample(s) stored again with the same value"
     summary = (f"{_n(len(requests))} request(s) recorded, {_n(stored)} stored, "
@@ -4597,6 +4627,96 @@ def _standin_datadog(data, led, sink, at_most_once, flag, lines):
     return (f"{_n(total)} duplicate copies of stored points ({per_life or 'none'}), "
             f"{_n(amount)} counted twice by the destination, reported; "
             f"{_n(sum(named for _, named, _ in counts.named))} series named by series_errors")
+
+
+def _standin_influxdb(data, led, sink, at_most_once, flag, lines):
+    """`ledger.standin`'s rules for an `influxdb` stand-in (`check_ledger_standin`'s
+    docstring): flags each problem through `flag`, appends its lines, and returns the summary's
+    rewrite clause."""
+    requests = data.standin_requests
+    counts = data.standin_counts
+    classed = {f.step: f for f in data.faults if f.action == "respond" and f.fault_class}
+    stored = {(standin.series_key(one["metric"]), stamp) for one in counts.series
+              for stamp in one["timestamps"]}
+
+    # Every point a rejected step's answer refused: never stored, and the life's whole gap.
+    rejected = {}
+    kept = []
+    for request in requests:
+        fault = classed.get(request.get("cue"))
+        if fault is None or fault.fault_class != "rejected":
+            continue
+        try:
+            decoded = standin.decode_body(request, standin.INFLUXDB)
+        except standin.DecodeError:
+            continue
+        for labels, samples in decoded:
+            key = standin.series_key(labels)
+            for stamp, value in samples:
+                life = vm.life_at(led.life_starts, stamp / 1000)
+                rejected[life] = rejected.get(life, 0.0) + value
+                if (key, stamp) in stored:
+                    kept.append((request, key, stamp))
+    for request, key, stamp in kept[:5]:
+        flag(FAIL, f"{dict(key).get('__name__', key)} at {data.offset(stamp / 1000)} is "
+                   f"stored, though request #{request.get('seq')} under {request.get('cue')}, "
+                   "classed rejected, carried it: the sink resent a rejected batch")
+    if len(kept) > 5:
+        flag(FAIL, f"{len(kept) - 5} more stored point(s) of rejected requests")
+    for life in led.lives:
+        want = rejected.get(life, 0.0)
+        gap = led.absorbed(life) - led.v(life, [sink])
+        if life != led.final:
+            gap += led.residual(life)
+        text = (f"life {life}: egress gap {_n(gap)}, the rejected requests' points sum "
+                f"{_n(want)}")
+        if life in led.killed and life != led.final:
+            lines.append(text + ", reported: a killed life's gap is judged in its band")
+        elif not math.isclose(gap, want, abs_tol=1e-6):
+            flag(FAIL, text + ": a gap the rejected steps don't explain")
+        else:
+            lines.append(text)
+
+    rewritten = {}
+    for key, stamp, value, first_at, copy_at in counts.rewrites:
+        life = vm.life_at(led.life_starts, stamp / 1000)
+        rewritten[life] = rewritten.get(life, 0) + 1
+        first, again = requests[first_at], requests[copy_at]
+        first_seq = f"#{first.get('seq')} (record request {first_at + 1})"
+        copy_seq = f"#{again.get('seq')} (record request {copy_at + 1})"
+        same_life = (vm.life_at(led.life_starts, first.get("t") or 0)
+                     == vm.life_at(led.life_starts, again.get("t") or 0))
+        name = dict(key).get("__name__", key)
+        if standin.status_class(first) == "2xx" and same_life:
+            flag(FAIL, f"request {copy_seq} wrote {name} at {stamp} ms again, which request "
+                       f"{first_seq} stored under a 2xx: the sink resent a point it saw "
+                       "accepted")
+        elif at_most_once:
+            flag(FAIL, f"request {copy_seq} wrote {name} at {stamp} ms again, first stored by "
+                       f"request {first_seq}: a resend under at_most_once")
+    for life, n in sorted(rewritten.items()):
+        lines.append(f"life {life}: {_n(n)} point(s) stored again with the same value, which "
+                     "InfluxDB overwrites")
+
+    destinations = {}
+    for request in requests:
+        if request.get("path") == standin.INFLUXDB_WRITE_PATH:
+            one = standin.influxdb_destination(request)
+            destinations[one] = destinations.get(one, 0) + 1
+
+    def named(one):
+        return ", ".join(f"{name}={value!r}" for name, value in zip(("org", "orgID", "bucket"),
+                                                                    one) if value is not None)
+
+    shown = "; ".join(f"{named(one) or 'none'} ({_n(n)} write(s))"
+                      for one, n in sorted(destinations.items(), key=lambda item: -item[1]))
+    if len(destinations) > 1:
+        flag(FAIL, f"the writes name {len(destinations)} destinations, one expected: {shown}")
+    per_life = ", ".join(f"life {life} {_n(n)}" for life, n in sorted(rewritten.items()))
+    return (f"{_n(len(counts.rewrites))} point(s) rewritten with the same value "
+            f"({per_life or 'none'}), reported; "
+            f"{_n(sum(rejected.values()))} in rejected requests' points; destination "
+            f"{shown or 'none'}")
 
 
 def _step_value(series, t, default=0.0):

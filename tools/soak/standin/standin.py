@@ -5,8 +5,10 @@ Stdlib only; compose runs it in a stock Python image. It serves two ports:
 
 - The data port (`--data-port`) takes the sink's writes on `--path`. With no cue it answers the
   shape's default with an empty body: `200` on `/api/v1/write` for `remote_write`, `202` on
-  `/api/v2/series` for `datadog`. A request to any other path answers `404`, so a
-  misconfigured endpoint can't pass for a stored write.
+  `/api/v2/series` for `datadog`, and `204` on `/api/v2/write` for `influxdb`, with no
+  `Content-Length`, which a `204` mustn't carry. The path is compared without its query string,
+  which `influxdb_out` always sends (`org`, `orgID`, `bucket`, `precision`). A request to any
+  other path answers `404`, so a misconfigured endpoint can't pass for a stored write.
 - The control port (`--control-port`) takes `POST /cue` from the driver: a JSON object with
   `step`, and either `status` (with an optional `body`) or `answer: "reset"`, and an optional
   `apply`. Under the `datadog` shape a `2xx` status can carry `series_errors`, N: the answer's
@@ -15,7 +17,8 @@ Stdlib only; compose runs it in a stock Python image. It serves two ports:
   decode the request, so the entries name series by their place in it; the checks take them to
   be its first N series. An empty object restores the default. `GET /health` answers `OK`.
 
-Each request line records the raw body (`body_b64`) and whether the write counts as stored:
+Each request line records the path and the query string apart (`path`, `query`), the raw body
+(`body_b64`), and whether the write counts as stored:
 `apply` when the cue sets it, else whether the answer is `2xx`. A `reset` reads the whole
 request, then closes the connection with an RST and no response. The line is printed after the
 answer is written, so a request the sink saw answered is in the record unless the process died
@@ -36,9 +39,13 @@ import struct
 import sys
 import threading
 import time
+import urllib.parse
 
-DEFAULT_STATUS = {"remote_write": 200, "datadog": 202}
-DEFAULT_PATH = {"remote_write": "/api/v1/write", "datadog": "/api/v2/series"}
+DEFAULT_STATUS = {"remote_write": 200, "datadog": 202, "influxdb": 204}
+DEFAULT_PATH = {"remote_write": "/api/v1/write", "datadog": "/api/v2/series",
+                "influxdb": "/api/v2/write"}
+# Statuses whose answer has no body and no `Content-Length` (RFC 9110, section 8.6).
+NO_BODY_STATUSES = (204, 304)
 # The cue key only the `datadog` shape takes.
 DATADOG_SHAPE = "datadog"
 # How long a keep-alive connection may sit idle before its thread lets it go, which bounds a
@@ -140,16 +147,18 @@ def data_handler(state):
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else b""
             cue, seq = state.take()
+            split = urllib.parse.urlsplit(self.path)
             record = {
-                "event": "request", "seq": seq, "t": time.time(), "path": self.path,
+                "event": "request", "seq": seq, "t": time.time(), "path": split.path,
+                "query": split.query,
                 "content_type": self.headers.get("Content-Type"),
                 "content_encoding": self.headers.get("Content-Encoding"),
                 "bytes": len(body), "cue": cue.get("step"),
                 "body_b64": base64.b64encode(body).decode(),
             }
-            if self.path != state.path:
+            if split.path != state.path:
                 record.update(answer="status", status=404, stored=False)
-                self._answer(404, f"no write path {self.path}; this stand-in takes {state.path}")
+                self._answer(404, f"no write path {split.path}; this stand-in takes {state.path}")
             elif cue.get("answer") == "reset":
                 record.update(answer="reset", status=None, stored=bool(cue.get("apply", False)))
                 self._reset()
@@ -171,6 +180,10 @@ def data_handler(state):
             if isinstance(payload, str):
                 payload = payload.encode()
             self.send_response(status)
+            if status in NO_BODY_STATUSES or status < 200:
+                self.end_headers()
+                self.wfile.flush()
+                return
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()

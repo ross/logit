@@ -34,8 +34,8 @@ Non-goals:
   them.
 
 Stream key **`soak`**: branches `soak/w0`, `soak/w1a`, `soak/w1b`, then `soak/w2` through
-`soak/w12d`, a linear stack. After it come `soak/w13a`, which branches off `main`, and
-`soak/w14`, `soak/w13b`, and `soak/w15`, stacked in that order. PR stack only: nothing is
+`soak/w12d`, a linear stack. After it come `soak/w13a` and `soak/w16`, which each branch off
+`main`, and `soak/w14`, `soak/w13b`, and `soak/w15`, stacked in that order. PR stack only: nothing is
 merged by this workstream; Ross directs merging.
 
 Settled with Ross (2026-10-08): faults are an iproute2 image with `NET_ADMIN` applying `tc netem`
@@ -348,7 +348,7 @@ for = "20s"
   Under that shape every `respond` other than a `2xx` needs a `class`, and a `2xx` takes none.
   The step's `class` is the harness's only copy of `datadog_out`'s response-class table, so the
   loader checks that one is there, not which one it is; `ledger.standin` judges it against the
-  sink.
+  sink. W16 holds `shape = "influxdb"` to the same rule, for `influxdb_out`'s table.
 
 **Signals and renames (W12c)** drive a `logit` process's SIGHUP handling
 ([ADR `signal-handling`](../adr/signal-handling.md)): the signal bumps the reopen generation,
@@ -1273,8 +1273,8 @@ The rows:
   resends it, plus one generator batch per transport-error attempt.
 - `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at each sink's own
   telemetry; see "External targets". A Kafka target's sink is judged the same way, and so is a
-  `datadog` stand-in's (W9b), with what a `respond` step cued excused; a `remote_write` stand-in
-  target's `ledger.sent` SKIPs (W9a), because `ledger.standin` judges the sink against what the
+  `datadog` stand-in's (W9b), with what a `respond` step cued excused; a `remote_write` or
+  `influxdb` stand-in target's `ledger.sent` SKIPs (W9a, W16), because `ledger.standin` judges the sink against what the
   stand-in recorded. See "Stand-in targets".
 - `ledger.standin` (W9a), for a stand-in target, else SKIP: the stand-in's record against the
   sink; see "Stand-in targets".
@@ -1557,7 +1557,7 @@ expectations: `batches.dropped` 0 through each fault, at least one `ambiguous` r
 the pause, so `ledger.topic`'s no-duplicate verdict rests on resends, and `retrying` above 0
 during the stop and 0 after it.
 
-### 8c. Stand-in targets (W9a, W9b)
+### 8c. Stand-in targets (W9a, W9b, W16)
 
 A `[target]` table with `kind = "standin"` runs a scripted HTTP destination in place of
 VictoriaMetrics, so every row of a sink's response-class table
@@ -1566,7 +1566,7 @@ VictoriaMetrics, so every row of a sink's response-class table
 ```toml
 [target]
 kind = "standin"          # name defaults to "standin"
-shape = "remote_write"    # or "datadog" (W9b); "remote_write" by default
+shape = "remote_write"    # or "datadog" (W9b) or "influxdb" (W16); "remote_write" by default
 
 [[ledger.sink]]           # one sink, with no backend or vm_selector
 id = "remote_write"
@@ -1579,23 +1579,26 @@ connection, and decodes no request `Content-Encoding`. What it would contribute,
 N", is a line of `http.server`, and it would bring Flask and gunicorn into a harness that is
 stdlib-only.
 
-**The stand-in.** `tools/soak/standin/standin.py` is about 290 lines of stdlib Python run in a
+**The stand-in.** `tools/soak/standin/standin.py` is about 300 lines of stdlib Python run in a
 stock `python:3.13.16-alpine3.24` image, so `script/soak` builds nothing for it. Its data port
 takes the sink's writes on the shape's path (`--shape remote_write`: `/api/v1/write`, default
-answer `200`; `--shape datadog`, W9b: `/api/v2/series`, default answer `202`); a write to any
-other path answers `404`. Under `datadog`, a cue's `series_errors` makes a `2xx` answer's body
+answer `200`; `--shape datadog`, W9b: `/api/v2/series`, default answer `202`; `--shape
+influxdb`, W16: `/api/v2/write`, default answer `204` with no body and no `Content-Length`); a
+write to any other path answers `404`. The path is compared without its query string, because
+`influxdb_out` always sends one (`org`, `orgID`, `bucket`, `precision=ns`); compared whole, every
+write would answer `404`, which a carried-mode sink reads as `Rejected`, a silent drop. Under `datadog`, a cue's `series_errors` makes a `2xx` answer's body
 the series route's `errors` list, protobuf field 1 (`repeated string`), with N entries; the
 stand-in decodes nothing, so the entries name series by their place in the request. Its control port takes the driver's
-cues and answers `/health`. It prints one JSON line per request to stdout: the time, path,
-`Content-Encoding`, the cue in force, how it answered (`status` or `reset`), whether it stored
+cues and answers `/health`. It prints one JSON line per request to stdout: the time, the path and the
+query string apart, `Content-Encoding`, the cue in force, how it answered (`status` or `reset`), whether it stored
 the write (`apply`, else whether the status is `2xx`), the cue's `series_errors` when it set one,
 and the raw body, base64. The driver's
 log capture collects that stdout with every other service's, so a `stop` and `start` of the
 stand-in keep one record, and `check` re-scores a run from it. SIGTERM lets each request in
 flight finish before the process exits, so a `stop` doesn't cut off an answer the record holds.
 
-**The schema.** The target takes an optional `name` (a slug) and `shape` (`remote_write` or
-`datadog`), and refuses `env` and `topic`; any other target refuses `shape`. It
+**The schema.** The target takes an optional `name` (a slug) and `shape` (`remote_write`,
+`datadog`, or `influxdb`), and refuses `env` and `topic`; any other target refuses `shape`. It
 needs one `[[ledger.sink]]`, and only one, with no `backend` or `vm_selector`.
 `vm_every_window` is allowed, since V has an export's shape.
 The stack runs the `standin` profile in place of `local`, and the role map must hold the
@@ -1630,10 +1633,22 @@ value at one `(series, timestamp)` is summed and FAILs `ledger.standin`. A `seri
 answer stores every series of its request but the first N, and the sink's `records.dropped`
 counts toward a positive gap, because those series are lost with no batch dropped.
 
+Under `influxdb` (W16) a body is InfluxDB 2.x line protocol, uncompressed, read at the query's
+`precision` by a stdlib parser of `influxdb_out`'s escaping
+(`crates/logit-proto/src/influxdb/encode.rs`, "Escaping") pinned against a body the sink sent and
+hand-built escape cases (`tools/soak/standin/influxdb-vectors.json`). Each numeric or boolean field
+of a point is a sample of `{__name__: measurement, field: key, **tags}`; a string field has no
+number and isn't in V. The SUT's `aggregate` runs `temporality: delta`. InfluxDB overwrites an
+identical `(measurement, tag set, field, timestamp)`, and `influxdb_out`'s retry re-encodes a batch
+byte for byte (its module doc's "Delivery posture"), so a resend is a rewrite, not a duplicate: V is
+the sum over distinct `(series, timestamp)` of the stored value, credited to the SUT life its
+timestamp falls in, and a negative gap is a `surplus`, as under `datadog`. A different value at the
+same key FAILs `ledger.standin`, since the sink's resend can't produce one.
+
 **`ledger.sent` against a `datadog` stand-in (W9b)** judges the sink by the verdicts in
 "External targets", so they run without a real org; that list says which refusals and drops a
 `respond` step's cue excuses. `drops` leaves the sink's `records.dropped` and `metrics.dropped`
-to it, as on an external target. Under `remote_write`, `ledger.sent` SKIPs.
+to it, as on an external target. Under `remote_write` and `influxdb`, `ledger.sent` SKIPs.
 
 **`ledger.standin`** judges the record against the sink:
 
@@ -1665,6 +1680,15 @@ to it, as on an external target. Under `remote_write`, `ledger.sent` SKIPs.
   Each duplicate copy is reported per life with the amount the destination counted twice:
   permitted under `at_least_once`, and a FAIL under `at_most_once`, or when the copy it repeats
   was answered `2xx` in the same life, a point the sink saw accepted and resent.
+- Under `influxdb` (W16), also: per SUT life, no point of a request answered under the cue of a step
+  classed `rejected` is stored, and the egress gap (Ab − V, plus a stopped earlier life's residual
+  as `ledger.egress` adds it) equals those points' sum, with no allowance; a killed life's is
+  reported. A cued rejection's credit lets `ledger.egress` count any positive gap in its life, so
+  this rule is what catches a loss beside one. The row reports the distinct `(org, orgID, bucket)`
+  the writes' queries name and FAILs on more than one. A point stored again with the same value,
+  such as each resend after a `503` with `apply = true`, is reported as a rewrite, and FAILs only
+  under `at_most_once`, or when the write it repeats was answered `2xx` in the same life. As under
+  `datadog`, every `respond` other than a `2xx` needs a `class`.
 
 **The scenarios.**
 
@@ -1683,6 +1707,24 @@ to it, as on an external target. Under `remote_write`, `ledger.sent` SKIPs.
   `408`, `413`, `429`, `500`, `501`, a `503` after storing the write (its resend a duplicate),
   `302`, `422`, a reset, and a `stop` of the stand-in, each but the first with its `class`.
   Under delta temporality a rejected window is a counted gap.
+- `standin-influxdb` (W16): `standin-remote-write`'s generator and statsd-vm's SUT under delta
+  temporality, with `influxdb_out` writing to `url: http://standin:8080` with `bucket:` and
+  `org:` configured. Nineteen 20 s steps, 105 s apart, walk the sink's table: `204`, `400` with
+  a parse error and with `Please provide either orgID or org`, `401` with InfluxDB 2's body and
+  InfluxDB 3's, `403`, `404` naming the bucket, the org by name, an orgID, and neither, `413`,
+  `422`, `429`, `500`, a `503` after storing the write (its resend a rewrite), `408` for "any
+  other status", `302`, a reset, and a `stop` of the stand-in, each but the `204` with its
+  `class`. With no value carried, every `403` and `404` is `refused`. The table's timeout row
+  isn't cued: the sink's 10 s request timeout isn't configurable, and a stand-in that held its
+  answer that long would stall the SUT for longer than a step.
+- `standin-influxdb-carried` (W16): the same steps with no `bucket:`, `org:`, or `default_*`,
+  and a `set` after `aggregate` stamping `_logit.influxdb.bucket`, `_logit.influxdb.org`, and
+  `_logit.influxdb.org_id` on the resource, as `influxdb_in` would from a write's query. Every
+  `403` and `404` is `rejected`; an `[[expect]]` holds `metrics.dropped{reason="no_bucket"}` at
+  0 over the run.
+- `standin-influxdb-mixed` (W16): the bucket carried by the `set` and the org from
+  `default_org:`, so a `403`, a `404` naming the bucket, and a `404` naming neither are
+  `rejected`, and a `404` naming the org or an orgID, the operator's, is `refused`.
 
 The black-hole control is a `2xx` the stand-in doesn't store (`status = 200`, `apply = false`).
 `ledger.standin` FAILs it wherever it falls. Under cumulative temporality the next stored totals
@@ -2209,12 +2251,14 @@ where it needs them, and a small check extension.
     `tools/kafka-interop`'s `mock-oauth2-server`, run for hours: each reauthentication ends a
     connection (`crates/logit-outputs/src/kafka/conn.rs`'s module doc), so the run exercises
     reconnects at a steady rate. Rows: `ledger.topic`, `fd_slope`, and duplicates per life.
-17. **`influxdb_out`'s response-class table on a stand-in (ffe33654, b93cb23a).** W9's stand-in
-    design with InfluxDB's shape, cueing the `403` and `404` rows that split on whether the
-    bucket or org was carried or configured: `Rejected` for a carried value, `Refused` for the
-    operator's (`crates/logit-outputs/src/influxdb.rs`'s module doc). Two runs: one with the
-    sink's `bucket:` and `org:` set, one carrying them from `influxdb_in`. Rows: `ledger.standin`
-    and `[[expect]]` per class.
+17. **`influxdb_out`'s response-class table on a stand-in (ffe33654, b93cb23a), built in W16.**
+    W9's stand-in design with InfluxDB's shape, cueing the `403` and `404` rows that split on
+    whether the bucket or org was carried or configured: `Rejected` for a carried value,
+    `Refused` for the operator's (`crates/logit-outputs/src/influxdb.rs`'s module doc). Three
+    runs: one with the sink's `bucket:` and `org:` set, one carrying the bucket, org, and orgID
+    from a `set` after `aggregate` in place of `influxdb_in`, so the SUT needs no HTTP generator,
+    and one carrying the bucket beside `default_org:`. Rows: `ledger.standin` and `[[expect]]`
+    per class.
 18. **`tail_in` descriptors over hours under a deleting rotation.** `tail-rotate` with a small
     `max_files`, run for hours. A matched rotated file stays open until the writer deletes it
     ([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md)), so the open count should stay at
@@ -2263,6 +2307,7 @@ that items 3, 7, and 11 need.
 | W13b | `soak/w13b` | `soak/w13b: fan-out transforms in the soak ledger, with a line_protocol soak` | M | W14, W13a |
 | W14 | `soak/w14` | `soak/w14: an HTTP-ingress soak into influxdb_in, with an http wire for it and otlp_in` | M | W12d |
 | W15 | `soak/w15` | `soak/w15: multi-destination route and route_signals soaks, with a target split` | M | W13b |
+| W16 | `soak/w16` | `soak/w16: an InfluxDB-shaped stand-in for every influxdb_out response class` | M | W12d |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -2380,10 +2425,15 @@ that items 3, 7, and 11 need.
   `ledger.intake`, the end-to-end bound in `ledger.summary`, self-test fixtures for each rule,
   and the `http-ingress` scenario.
 - **W15**: item 15, a third `split` mode for multi-destination `route` and `route_signals`.
+- **W16**: item 17: the stand-in's `influxdb` shape (the query split off the path, a `204`
+  with no body), a stdlib line-protocol parser and its vectors, V as one stored point per
+  series and timestamp, `ledger.standin`'s rules for the shape, the class required on its
+  `respond` steps, and the `standin-influxdb`, `standin-influxdb-carried`, and
+  `standin-influxdb-mixed` scenarios, each run recorded under "Findings".
 
-Items 16 to 18, and §10's follow-ups to items 11 and 12, have no workstream yet.
+Items 16 and 18, and §10's follow-ups to items 11 and 12, have no workstream yet.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a lands off `main` beside W14. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a and W16 land off `main` beside W14. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
@@ -4404,6 +4454,68 @@ weights each generator sink by its own input's batch:
   reads generation 1 twice in its stderr.
 - The run started before the host was told not to sleep; a `systemd-inhibit --what=sleep:idle`
   lock was held from about 9 minutes in to the end, and the timeline shows no gap.
+
+### W16: an InfluxDB-shaped stand-in for every `influxdb_out` response class (2026-10-17)
+
+W16 adds the stand-in's `influxdb` shape, the line-protocol parser, V as one stored point per
+series and timestamp, `ledger.standin`'s rules for the shape, and the three
+`standin-influxdb*` scenarios. The runs used `logit:soak-w16` `sha256:be9724584652`, built from
+`9bfc434f`'s `Dockerfile` with W16's harness changes (W16 changes no Rust), and
+`python:3.13.16-alpine3.24` `sha256:2d9aefe2fef0`, on the development host (Docker 29.8.2). They
+ran at `3a816a20`, all three at once, 20 s apart under `systemd-inhibit --what=sleep:idle`, each
+from `soak.py run` with `SOAK_IMAGE=logit:soak-w16`, after its self-test and a `logit validate`
+of each config, as `script/soak run` does: other sessions on the host rebuild the shared
+`logit:soak` tag from their own trees. Every row of each run passed.
+
+| Run | Scenario | `ledger.egress` | `ledger.standin` |
+|---|---|---|---|
+| `20261018T024144Z` | `standin-influxdb` | Ab 4,292,600 − V 4,052,600 = 240,000, counted: 12 batches dropped `rejected`, 2 cued by each of `c0s2`, `c0s3`, `c0s11`, `c0s12`, `c0s16`, `c0s17` | 288 requests, 210 stored; 600 points rewritten with the same value; 240,000 in rejected requests' points, the life's whole gap; destination `org='soak-org', bucket='soak'` |
+| `20261018T024204Z` | `standin-influxdb-carried` | Ab 4,292,300 − V 3,852,300 = 440,000, counted: 22 batches dropped `rejected`, 2 by each of the 11 rejected steps | 255 requests, 200 stored; 600 rewritten; 440,000 in rejected requests' points; destination `org='soak-org', orgID='0123456789abcdef', bucket='soak-carried'` |
+| `20261018T024224Z` | `standin-influxdb-mixed` | Ab 4,292,300 − V 3,932,300 = 360,000, counted: 18 batches dropped `rejected`, 2 by each of the 9 rejected steps | 268 requests, 204 stored; 600 rewritten; 360,000 in rejected requests' points; destination `org='soak-org', bucket='soak-carried'` |
+
+`standin-influxdb`'s class signatures, from `ledger.standin`'s lines:
+
+| Step | Answer | Read as |
+|---|---|---|
+| `c0s2`, `c0s3` | `400`, a parse error and `Please provide either orgID or org` | `rejected`: no `retrying` line, 2 batches dropped each |
+| `c0s4`, `c0s5` | `401`, InfluxDB 2's body and InfluxDB 3's | `refused` |
+| `c0s6` to `c0s10` | `403`; `404` naming the bucket, the org, an orgID, and neither | `refused`, nothing carried |
+| `c0s11`, `c0s12` | `413`, `422` | `rejected` |
+| `c0s13` to `c0s15` | `429`, `500`, `503` after storing | `ambiguous` |
+| `c0s16`, `c0s17` | `408`, `302` | `rejected` |
+| `c0s18` | a reset | `ambiguous` |
+| `c0s19` | a stop of the stand-in | `clean` |
+
+In `standin-influxdb-carried`, `c0s6` to `c0s10` each read `rejected` and dropped 2 batches,
+and `[[expect]]` read `retrying` at 0 during each. In `standin-influxdb-mixed`, `c0s6`, `c0s7`,
+and `c0s10` read `rejected`, and `c0s8` and `c0s9`, the `404`s naming the org, `refused`. Every
+`[[expect]]` passed, `no-bucket-drops-nothing` over 416 drains in both carried runs.
+
+What the runs showed about `logit` and the harness:
+
+- **`influxdb_out` reads every cued row of its table as documented, in all three
+  configurations.** Each `403` and `404` split on where the value it names came from, as the
+  module doc's "Response classes" says, and `408`, the "any other status" row, read `rejected`,
+  unlike `datadog_out`, which retries it.
+- **The egress gap is the rejected steps' points, to the increment.** Each rejected step lost
+  two 10 s windows of 100 series at 200 increments, 40,000, and each run's gap is its count of
+  rejected steps times that. No point of a rejected request is in the store.
+- **A resend after an applied `503` rewrites the same points.** The `503` with `apply = true`
+  stored 6 attempts of the held batch before the seventh was accepted, so each run holds 600
+  rewrites, each with the value first stored, and V counts each point once.
+- **A `204` with no `Content-Length` is accepted.** Every default answer was counted `2xx` by
+  the sink, on keep-alive connections.
+- **The sink counted 10 `network_error` requests against the record's 7 resets**; the other 3
+  are connect failures to the stopped stand-in, as in W9a and W9b.
+- **The query reached the stand-in in the form the module doc names**: `org=` alone with
+  `org:` configured, `org=` and `orgID=` when both are carried, and `default_org:`'s `org=`
+  beside a carried bucket, each with `bucket=` and `precision=ns`.
+- **The table's timeout row isn't cued.** `influxdb_out`'s 10 s request timeout
+  (`DEFAULT_TIMEOUT`) isn't configurable, and a stand-in that held its answer that long would
+  stall the sink past a step. Its "DNS failure" row is exercised only by the stopped stand-in's
+  lookups.
+- **Self-test**: 1,773 expectations, from 1,718 on `main` at `9bfc434f`. Each new rule was reverted in turn
+  and failed at least one expectation; the PR lists them.
 
 ### W13a: discarding transforms (2026-10-18)
 

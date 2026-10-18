@@ -172,6 +172,9 @@ TARGET_KEYS = {"kind", "name", "env", "topic", "shape"}
 STANDIN_SHAPES = standin_mod.SHAPES
 STANDIN_DEFAULT_SHAPE = standin_mod.REMOTE_WRITE
 DATADOG_SHAPE = standin_mod.DATADOG
+# The shapes whose `ledger.standin` reads a request's loss from its step's `class` alone, so a
+# respond other than a 2xx must carry one.
+CLASS_REQUIRED_SHAPES = (standin_mod.DATADOG, standin_mod.INFLUXDB)
 # Kafka's legal topic names (`Topic.validate`): ASCII letters, digits, `.`, `_`, and `-`, up to
 # 249 characters.
 _TOPIC_NAME = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
@@ -1992,8 +1995,8 @@ def _respond_problems(spec, where, shape=None):
     `answer` (one of `RESPOND_ANSWERS`), `body` a string with `status` only, `apply` true or false,
     `series_errors` a positive integer with a 2xx `status` and no `body` under the `datadog` shape
     only, none of them on another action; and `class` one of `FAULT_CLASSES`, on a `respond` or a
-    `stop` only, and under the `datadog` shape required on a `respond` other than a 2xx and refused
-    on a 2xx. Whether a `respond`'s or a classed `stop`'s `on` is a stand-in needs the role map:
+    `stop` only, and under the `datadog` and `influxdb` shapes required on a `respond` other than a
+    2xx and refused on a 2xx. Whether a `respond`'s or a classed `stop`'s `on` is a stand-in needs the role map:
     `service_problems()`."""
     problems = []
     if spec.action == "respond":
@@ -2025,16 +2028,16 @@ def _respond_problems(spec, where, shape=None):
             if not (isinstance(spec.status, int) and not isinstance(spec.status, bool)
                     and 200 <= spec.status < 300):
                 problems.append(f"{where}: `series_errors` goes with a 2xx `status`")
-        if shape == DATADOG_SHAPE:
+        if shape in CLASS_REQUIRED_SHAPES:
             success = (isinstance(spec.status, int) and not isinstance(spec.status, bool)
                        and 200 <= spec.status < 300)
             if success and spec.fault_class is not None:
                 problems.append(f"{where}: a 2xx isn't a fault, so it takes no `class`")
             elif not success and spec.fault_class is None:
-                # `ledger.standin` expects a request's dropped records from its step's class
+                # `ledger.standin` expects a request's lost points from its step's class
                 # alone, so a step with none would leave a rejection unexpected.
-                problems.append(f"{where}: under the datadog shape a respond other than a 2xx "
-                                "needs `class`, the class datadog_out must read it as")
+                problems.append(f"{where}: under the {shape} shape a respond other than a 2xx "
+                                f"needs `class`, the class the sink must read it as")
     else:
         for name in RESPOND_KEYS:
             if getattr(spec, name) is not None:
