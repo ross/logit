@@ -40,8 +40,9 @@
 //! | `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, `logit.output.metrics.degraded{metric_kind}` | under an OTLP format, metrics the OTLP mapping skips, drops, or degrades (`logit_proto::otlp::metrics`), once per metric |
 //!
 //! `oversize`, `records.unkeyed`, `events.skipped`, `metrics.omitted`, `spans.omitted`, and the
-//! OTLP mapping's counters are encode-side, counted once per batch; the others follow the
-//! broker's answer, which a retry never meets twice for one partition batch. Each drop but `ambiguous_at_most_once` raises a
+//! OTLP mapping's counters are encode-side, counted once per batch; `requests` and `reconnects`
+//! count per attempt; the others follow the broker's answer, which a retry never meets twice for
+//! one partition batch. Each drop but `ambiguous_at_most_once` raises a
 //! throttled diagnostic of the same name: `oversize` names the record count and the
 //! `max_request_bytes` cap, and `rejected`, `invalid_timestamp`, and `invalid_record` carry the
 //! broker's error code and message.
