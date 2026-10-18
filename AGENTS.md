@@ -754,8 +754,8 @@ the operator-facing account of all of this.
   the hop on run totals, allowing duplicates only where a mechanism forwards them (a kill or a
   pause of `collector`, and a killed `logit`'s spool replay to a `collector` that restarted
   since; the plan's "The native hop (W10b)"), and `ledger.summary` bounds V end to end by what
-  the generators sent. `native-hop-spans` is `native-hop` with every internal span kept on both
-  SUTs. `rolling-overlap` runs two instances on one port under `reuse_port`, in a namespace
+  the generators sent. `native-hop-spans` is `native-hop` with internal spans on at the default
+  rate on both SUTs. `rolling-overlap` runs two instances on one port under `reuse_port`, in a namespace
   holder's network (`[overlap]`, role `netns`), stopped in turn, each judged on its own lives
   and its own labeled series, with `ledger.overlap` bounding the run's wire loss by what each
   socket's close could discard.

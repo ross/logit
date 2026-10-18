@@ -1787,7 +1787,9 @@ where it needs them, and a small check extension.
    with no harness change: `lua-path-jit` rewrites in place
    ([ADR `lua-in-place-edits`](../adr/lua-in-place-edits.md)), with two attribute writes, a
    `pairs` loop over the attribute proxy, and an `= nil` delete, and no log message to write,
-   since a statsd event carries none; `lua-stall-jit` and `lua-memory-jit` keep their verdicts.
+   since a statsd event carries none. The script fails an event whose `pairs` loop misses a
+   written attribute or whose deleted attribute still reads back, and its `[[expect]]` rows pin
+   the script's failures in one step to every 97th event's share, so either fault FAILs them; `lua-stall-jit` and `lua-memory-jit` keep their verdicts.
    The compiler adds no count hook, so a compiled loop is caught only by stall detection, as an
    interpreted one is, and the kept strings are on the Lua heap, which `max_memory` counts with
    the compiler on; only compiled machine code is outside it.
@@ -1865,11 +1867,15 @@ where it needs them, and a small check extension.
    Every shipped SUT config set `span_sample_rate: 0.0` until W12a, so neither internal span
    emission nor the hop frame's trace context
    ([ADR `native-hop-trace-context`](../adr/native-hop-trace-context.md)) ran under faults.
-   W12a adds `native-hop-spans`, `native-hop` at `1.0` on both SUTs. The spans reach each SUT's
-   NDJSON stdout as events with no `metrics`, which `telemetry.py` skips, so the ledger reads
-   the same points; `[[expect]]` rows on `logit.internal.spans.emitted` show both sides record
-   spans. A backlog flushed in one drain passes `internal`'s span buffer, which drops and counts
-   the excess, so `drops` WARNs ("Findings", "W12a").
+   W12a adds `native-hop-spans`, `native-hop` at the product's default rate, `0.1`, on both
+   SUTs. The spans reach each SUT's NDJSON stdout as events with no `metrics`, which
+   `telemetry.py` skips, so the ledger reads the same points; `[[expect]]` rows on
+   `logit.internal.spans.emitted` show both sides record spans, and `drops` judges a span lost
+   from `internal`'s buffer as it judges any other drop. No row yet checks that the hop carries
+   the trace: a future row will join `collector`'s `logit_in send` parent span ids to the span
+   ids `logit` exported, with a miss bound covering `logit`'s counted
+   `logit.internal.spans.dropped{reason="buffer_full"}` and a killed life's last drain interval
+   of spans.
 8. **TCP ingress (built in W11a).** `statsd_in` with `transport: tcp` from the generator's
    `statsd_out` over TCP; a `syslog_in` TCP source and a TCP reset counter are deferred. A
    stalled SUT backs up into the sender
@@ -1994,7 +2000,7 @@ where it needs them, and a small check extension.
       transport (`crates/logit-outputs/src/syslog.rs`, "Injection safety"), and `line_protocol`
       reads that as one line. So the generator will put k lines in one OTLP log body,
       `otlp_out` over HTTP into `otlp_in`, which carries the body unchanged, and the source will
-      need item 14's `http` wire. `syslog_in`'s `framing: datagram` (fdd5b039) stays unsoaked
+      need item 14's `http` wire with `otlp_in`'s rows, which W14 builds. `syslog_in`'s `framing: datagram` (fdd5b039) stays unsoaked
       until a sender can write a multi-line datagram.
     - **Topology.** `otlp_in → line_protocol → count chain → aggregate → prometheus_out`.
     - **Faults.** `statsd-vm`'s schedule, plus a backend stop under `overflow: block` with
@@ -2015,9 +2021,11 @@ where it needs them, and a small check extension.
     stop under `overflow: block`, which backs up into `503`s; netem on the SUT's egress, which
     carries the responses; and a SUT `stop`, `restart`, and `kill`. Rows: `ledger.wire` with
     the surplus allowance, `ledger.intake`, and `[[expect]]` on deferred batches during the
-    stop. The same wire will later cover `otlp_in`, `datadog_in`, `splunk_hec_in`, and
-    `prometheus_in`'s remote-write receiver. Needs: the `http` wire and its listener table
-    rows, and self-test fixtures.
+    stop. W14 will also give the wire `otlp_in`'s rows, which item 13's generator needs: its
+    counters aren't `influxdb_in`'s, so it gets symbols of its own, with W per log record.
+    `datadog_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver come later.
+    Needs: the `http` wire and its listener table rows for both listeners, and self-test
+    fixtures.
 15. **Multi-destination `route` and `route_signals` (81b0befa, 4b86ccc7).** Today
     `scenario.py`'s `_route_problems` refuses a list-valued `routes:` and any `route_signals`
     under `split = "route"`, because one event can reach several sinks and their V no longer
@@ -2085,7 +2093,7 @@ that items 3, 7, and 11 need.
 | W12c | `soak/w12c` | `soak/w12c: a SIGHUP soak, with a signal action and a stdio_out reopen check` | M | W12b |
 | W12d | `soak/w12d` | `soak/w12d: a TLS-reload soak, with a private CA and a rotate action` | M | W12c |
 | W13 | `soak/w13` | `soak/w13: fan-out and discarding transforms in the ledger` | M | W14 |
-| W14 | `soak/w14` | `soak/w14: an HTTP-ingress soak into influxdb_in, with an http wire` | M | W12d |
+| W14 | `soak/w14` | `soak/w14: an HTTP-ingress soak into influxdb_in, with an http wire for it and otlp_in` | M | W12d |
 | W15 | `soak/w15` | `soak/w15: multi-destination route and route_signals soaks, with a target split` | M | W13 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
@@ -2185,14 +2193,15 @@ that items 3, 7, and 11 need.
   `ledger.wire` and the end-to-end bound.
 - **W12a**: §10's items 13 to 18 and these rows; the `docs/known-gaps/tailing.md` entry for the
   descriptors a matching glob keeps open; and four variants with no harness change:
-  `native-hop-spans` (item 7 with every internal span kept) and `lua-path-jit`, `lua-stall-jit`,
+  `native-hop-spans` (item 7 with internal spans at the default rate) and `lua-path-jit`, `lua-stall-jit`,
   and `lua-memory-jit` (item 1 under `jit: true`), each run recorded under "Findings".
 - **W12b**: item 11, the namespace-holder service and per-instance totals.
 - **W12c**: item 12's SIGHUP half, the `signal` action and the `stdio_out` reopen row.
 - **W12d**: item 12's TLS half, a private CA and the certificate-rotation action.
 - **W13**: item 13, `fan_out` and a discard term per transform in `ledger.edge`. Its fan-out
-  generator sends over OTLP/HTTP, so it lands after W14's `http` wire.
-- **W14**: item 14, the `http` wire, with `influxdb_in` as its first listener.
+  generator sends over OTLP/HTTP, so it lands after W14's `http` wire and its `otlp_in` rows.
+- **W14**: item 14, the `http` wire, with rows for `influxdb_in`, which its scenario runs, and
+  for `otlp_in`, which W13's generator needs.
 - **W15**: item 15, a third `split` mode for multi-destination `route` and `route_signals`.
 
 Items 16 to 18, and §10's follow-ups to items 11 and 12, have no workstream yet.
@@ -3919,10 +3928,13 @@ drain-interval rows into runs:
 
 ### W12a: spans across the native hop, and Lua under the trace compiler (2026-10-17)
 
-Every run used `logit:soak` `sha256:99edd881460f`, built with `--no-cache` from `origin/main` at
+The first four runs used `logit:soak` `sha256:99edd881460f`, built with `--no-cache` from `origin/main` at
 `4b86ccc7` (W12a changes no Rust but a doc comment), and `logit-soak-netem:local`
 `sha256:25de6298bd24`, on the development host. The scenarios ran two at a time from `soak/w12a`'s
-working tree, at their own durations. No run found a harness bug or a `logit` defect.
+working tree, at their own durations. No run found a harness bug or a `logit` defect. The
+first `native-hop-spans` run kept every span (`span_sample_rate: 1.0`); review then set both SUTs
+to the product's default, `0.1`, and tightened `lua-path-jit`'s checks, and both were run again
+(below).
 
 | Run | Scenario | Verdict |
 |---|---|---|
@@ -3930,30 +3942,56 @@ working tree, at their own durations. No run found a harness bug or a `logit` de
 | `20261017T165602Z` | `lua-path-jit` | every row PASS |
 | `20261017T171456Z` | `lua-stall-jit` | every row PASS |
 | `20261017T171459Z` | `lua-memory-jit` | WARN: `rss_slope` on `generator`; every other row PASS |
+| `20261017T201853Z` | `native-hop-spans` at `0.1` | every row PASS |
+| `20261017T201907Z` | `lua-path-jit`, `--duration 5m`, the delete removed | FAIL, as intended: `script-errors` and `script-error-loss` |
+| `20261017T202633Z` | `lua-path-jit`, `--duration 5m`, `pairs` made to miss `scratch` | FAIL, as intended: `script-errors` and `script-error-loss` |
+| `20261017T203350Z` | `lua-path-jit` with the pinned expectations | every row PASS |
+
+The last four ran on `logit:soak` `sha256:75c60bba2ff8`, rebuilt at 10:34 local from a later
+branch of this stack, which changes no Rust either, and `logit-soak-netem:local`
+`sha256:094e63b23016`. All four started after the host's 10:54 to
+13:15 local suspend, which none of the W12a runs spans.
 
 What the runs showed:
 
-- **Spans cost the ledger nothing.** `native-hop-spans` passed every `native-hop` row: the hop's
+- **Spans cost the ledger nothing.** At `1.0`, `native-hop-spans` passed every `native-hop` row: the hop's
   `ledger.hop` at −4,000 inside [−77,036, 11,495], both replays in band, and no uncounted loss.
   Each SUT's stdout carried about 19,000 span events, which `telemetry.py` skipped, and
   `logit.internal.spans.emitted` counted 17,595 on `logit` and 17,004 on `collector`.
-- **The hop carries the trace.** Of `collector`'s 9,087 `logit_in send` spans, 9,026 name a
-  parent span recorded in `logit`'s stdout. The other 61 name spans `logit` never exported:
-  dropped from its buffer, or in a killed life's last drain interval.
-- **A backlog drops spans, counted.** `internal` buffers at most 512 spans per component between
+- **The hop carries the trace, measured by hand.** Joining the two stdouts after the run, 9,026
+  of `collector`'s 9,087 `logit_in send` spans name a parent span recorded in `logit`'s stdout.
+  The other 61 name spans `logit` never exported: dropped from its buffer, or in a killed life's
+  last drain interval. No scenario row performs this join; §10's item 7 plans one.
+- **At `1.0`, a backlog drops spans, counted.** This is a stress observation, not the shipped
+  scenario's rate. `internal` buffers at most 512 spans per component between
   drains (`docs/design/internal-telemetry.md`, "Spans"). Two drains passed it on both sides: the
   one right after the 200 ms netem delay was reverted, and the one where the hop drained after
   `collector`'s 90 s stop. `logit`'s `hop` counted
   `logit.internal.spans.dropped{reason="buffer_full"}` 644, and `collector`'s `hop` and `window`
-  624 and 626. `drops` reports a nonzero `*.dropped` outside the ledger as WARN, and `[expected]`
-  takes only `rss_slope` and `fd_slope`, so the scenario WARNs by design.
-- **`collector`'s `rss_slope` WARN is a short fit.** +69.0 MiB/h over its final life's 65 s, the
+  624 and 626. `drops` reported them as WARN, which `[expected]` can't excuse, since it takes
+  only `rss_slope` and `fd_slope`; at the default rate the same backlog keeps about a tenth of
+  those spans.
+- **At the default rate, nothing drops.** The `0.1` rerun passed every row, `drops` included:
+  `logit` emitted 1,752 spans and `collector` 3,389, which adds roots of its own for frames
+  `logit` didn't sample, as a receiver at the sender's rate does. By hand again, 933 of
+  `collector`'s 1,814 `logit_in send` spans carried a parent, and 925 of those name a span in
+  `logit`'s stdout; the other 881 are those roots.
+- **`collector`'s `rss_slope` WARN at `1.0` is a short fit.** +69.0 MiB/h over its final life's 65 s, the
   only judged span long enough; `logit`'s final life fit −135.3 MiB/h over the same span.
 - **`lua-path-jit` balances the script hop under the compiler.** E 646,255 == L_in ==
-  L_emit 627,525 + L_drop 12,193 + L_err 6,537, and L_sent == L_emit + L_flush 34. L_err is every
-  97th event not also a 53rd one, so the `pairs` check in the script never failed: each loop
-  found both written attributes, and every series in VictoriaMetrics carries `stage` alone, so
-  each `= nil` delete held.
+  L_emit 627,525 + L_drop 12,193 + L_err 6,537, and L_sent == L_emit + L_flush 34. That first
+  run's expectations were `min = 1` only, so a failed in-place check would have passed as
+  counted script errors. By hand, L_err is every 97th event not also a 53rd one (about 6,536),
+  and every series in VictoriaMetrics carries `stage` alone. The scenario now fails an event
+  whose deleted attribute still reads back, and pins `script-errors` and `script-error-loss`
+  to [2,200, 2,650] over the first step's 120 s, around the 2,427 every-97th failures expected
+  there, so a check that fails on more than about 1 event in 1,000 FAILs both rows. Two
+  throwaway edits showed it: with the delete removed, the script failed every event ("soak: a
+  deleted attribute still reads back"), and with the `pairs` loop made to miss `scratch`, it
+  failed every event ("soak: pairs found 1 of 2 written attributes"). Each run read 235,472 for
+  both rows, which FAILed against [2,200, 2,650]. The rerun with the script restored read 2,428
+  for both, and its L_err of 6,500 over L_in 642,700 is the every-97th count with no extra
+  failure.
 - **A compiled loop still reads stalled.** In `lua-stall-jit`, the loop on the 360,000th event
   read `stalled` three times from +185 s, `script_stalled` counted once, the receive queue
   filled and evicted 48,000 datagrams, counted as `overflow_oldest`, and the script recovered with
@@ -3966,11 +4004,16 @@ What the runs showed:
 - **`max_memory` still trips under the compiler.** In `lua-memory-jit` the VM held 70,046,127
   bytes and the SUT exited 2 at +267 s inside the `exit` step, started again, and every ledger row
   passed with no script loss.
-- **The generator's RSS rose while the SUT was down.** In `lua-memory-jit`, the generator's
-  resident memory went from 18 to 86 MiB through the SUT's exit window and stayed near 78 MiB for
-  about 40 s after it, which the fit over its judged spans read as +199.5 MiB/h. It held 370
-  `drop_newest` batches, counted, while its sends had no listener. Nothing in the generator runs
-  Lua, so the compiler isn't the cause; `lua-memory`'s recorded W7a run didn't show it.
+- **The generator's RSS rose with its own send queue.** In `lua-memory-jit`, once the SUT
+  exited, compose's DNS stopped resolving `logit`, and the generator's `statsd_out` failed
+  `Clean` ("resolving statsd_out endpoint logit:8125") and held its queue. The queue grew 100
+  batches per 5 s drain to 776, then counted `overflow_newest`, and its allocated bytes rose
+  from 2.2 to 75 MiB with it; resident memory went from 18 to 86 MiB. When the SUT came back
+  the queue drained in one drain and allocated memory fell to 2.3 MiB, but resident stayed near
+  78 to 85 MiB for about 55 s before the allocator returned it, falling to 32 MiB. The fit over
+  the generator's judged spans read that as +199.5 MiB/h. It's the generator's own sending,
+  not the compiler: nothing in the generator runs Lua. No `lua-memory` run data survives to
+  compare, since W7a's run directories were removed with their worktree.
 
 ### W12b: rolling overlap (2026-10-17)
 
