@@ -5187,7 +5187,7 @@ Overall PASS, every row PASS or SKIP.
 - **W12a** changes no harness code: the self-test passes (1,478 expectations), and the four new
   scenarios pass `self-test` validation, the shipped-config test, and `script/validate`. Met:
   a run of each is recorded under "Findings", every ledger row PASS.
-- **W15**: the self-test passes (1,986 expectations), and each new rule fails it when
+- **W15**: the self-test passes (1,990 expectations), and each new rule fails it when
   reverted (ten reverts, listed in the PR). `route-signals` and `route-copy` pass `self-test`
   validation, the shipped-config test, and `logit validate` in `logit:soak`. Met: a run of each
   is recorded under "Findings", Overall PASS.

@@ -2045,17 +2045,18 @@ def _target_ledger():
                and "life 0: R_in" in stopped["ledger.edge"].detail
                and "off by 5" in stopped["ledger.edge"].detail,
                f"the router's balance is judged in a stopped life, got {stopped['ledger.edge']}")
-        def shift(sink, delta):
-            """`adds` moving `sink`'s branch by `delta` events at +250, every hop alike."""
+        def shift(sink, delta, offset=250):
+            """`adds` moving `sink`'s branch by `delta` events at `offset`, every hop alike."""
             hops = ([(sent, "t_a"), (received, "agg_a"), (absorbed, "agg_a")] if sink == "vm_a"
                     else [(sent, "t_b"), (received, "count_b"), (sent, "count_b"),
                           (received, "agg_b"), (absorbed, "agg_b")])
-            return [(250, name, delta, comp, None) for name, comp in hops]
+            return [(offset, name, delta, comp, None) for name, comp in hops]
 
-        def shifted(deltas):
-            """An `export_edit` moving each sink's final-life V by its delta."""
+        def shifted(deltas, life=1):
+            """An `export_edit` moving each sink's V in `life`, the final by default, by its
+            delta."""
             def edit(sink, series):
-                return change(sink, 1, deltas.get(sink, 0))(sink, series)
+                return change(sink, life, deltas.get(sink, 0))(sink, series)
             return edit
 
         # 5 events the router kept out of both targets, discarded or sent on its forward edge.
@@ -2081,6 +2082,17 @@ def _target_ledger():
                        for row in ("ledger.egress", "ledger.aggregate", "ledger.summary")),
                f"a target sent more than the router took in FAILs its bound alone, got "
                f"{moved['ledger.edge']}")
+        # The same move in the stopped life 0 FAILs that life's bound.
+        moved0 = results("targets-router-moved-stopped",
+                         adds=shift("vm_a", 5, 50) + shift("vm_b", -5, 50),
+                         export_edit=shifted({"vm_a": 5, "vm_b": -5}, life=0))
+        expect(moved0["ledger.edge"].status == checks.FAIL
+               and "life 0: T_sent[t_a] 20,005 <= R_in − R_disc 20,000, over its bound"
+               in moved0["ledger.edge"].detail
+               and all(moved0[row].status == checks.PASS
+                       for row in ("ledger.egress", "ledger.aggregate", "ledger.summary")),
+               f"a target sent more than the router took in FAILs its bound in a stopped life, "
+               f"got {moved0['ledger.edge']}")
         forward = results("targets-router-forward-over",
                           adds=[(250, copied, 40000, "split", None),
                                 (250, sent, 40000, "split", None)])
@@ -5774,6 +5786,12 @@ def _tcp_rules(root):
         expect(problems == [] and loaded.split == "target"
                and [s["aggregate"] for s in loaded.sinks] == ["window_a", "window_b"],
                f"{name} loads under split = target, got {problems}")
+    # A `targets:` line inside a script's source isn't the component's key.
+    commented_script = ("  script:\n    type: lua\n    sources: [split]\n    source: |\n"
+                        "      -- targets: tier_b\n      function process(e) return e end\n")
+    problems, _ = target_problems(by_signals + commented_script)
+    expect(not any("also fills" in problem for problem in problems),
+           f"a commented targets line in a lua source isn't refused, got {problems}")
     partial = "components:\n  split:\n    type: route_signals\n" \
               "    signals: { logs: tier_a, metrics: tier_b, traces: tier_c }\n"
     for text, edit, needle, what in (
@@ -5791,6 +5809,12 @@ def _tcp_rules(root):
              None, "lua 'script' also fills a sink's target", "a lua with targets"),
             (by_signals + "  script: { type: lua_file, path: x.lua, targets: [tier_a] }\n",
              None, "lua_file 'script' also fills a sink's target", "a lua_file with targets"),
+            (by_signals + "  script:\n    type: lua\n    targets:\n    - tier_b\n",
+             None, "lua 'script' also fills a sink's target",
+             "a lua whose targets list sits at the key's own indent"),
+            (by_signals + commented_script + "    targets: [tier_a]\n",
+             None, "lua 'script' also fills a sink's target",
+             "a lua with a targets key after a commented one in its source"),
             (by_signals, lambda r: r["ledger"].update(sut_router="other"),
              "ledger.sut_router 'other' isn't a route or route_signals component",
              "a router the SUT config lacks"),

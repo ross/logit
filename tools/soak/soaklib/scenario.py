@@ -1279,6 +1279,32 @@ def _route_problems(ledger, sut_text):
     return problems
 
 
+def _script_targets(body):
+    """The ids a script component's `targets:` key lists in its block `body`, read only at the
+    component's own key indent, the `type:` key's, so a `targets:` inside its `source:` text
+    never counts; in flow style, from the header's `targets: [...]`."""
+    head, _, rest = body.partition("\n")
+    if "{" in head:
+        found = re.search(r"\btargets\s*:\s*\[([^\]]*)\]", head)
+        return re.findall(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", found.group(1)) if found else []
+    kind = re.search(r"^([ \t]*)type\s*:", rest, re.M)
+    if not kind:
+        return []
+    indent = kind.group(1)
+    found = re.search(r"^" + re.escape(indent) + r"targets\s*:(.*)$", rest, re.M)
+    if not found:
+        return []
+    listed = [found.group(1)]
+    for line in rest[found.end():].split("\n")[1:]:
+        if not line.strip():
+            continue
+        deeper = len(line) - len(line.lstrip()) > len(indent)
+        if not deeper and not line.startswith(indent + "- "):
+            break
+        listed.append(line)
+    return re.findall(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", "\n".join(listed))
+
+
 def _target_router_problems(ledger, sut_text):
     """Under `split = "target"`, `sut_router` must be a `ROUTER_KINDS` component of the SUT
     config whose targets are the sinks' targets, every one: the router's balance sums each
@@ -1306,17 +1332,7 @@ def _target_router_problems(ledger, sut_text):
               for target in router_targets(other_body, other) if target in followed]
     for script in ("lua", "lua_file"):
         for name, script_body in _route_blocks(sut_text, script):
-            found_targets = re.search(r"\btargets\s*:(.*)", script_body)
-            if not found_targets:
-                continue
-            start = script_body.rfind("\n", 0, found_targets.start()) + 1
-            indent = found_targets.start() - start
-            listed = [found_targets.group(1)]
-            for line in script_body[found_targets.end():].split("\n")[1:]:
-                if line.strip() and len(line) - len(line.lstrip()) <= indent:
-                    break
-                listed.append(line)
-            words = re.findall(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", "\n".join(listed))
+            words = _script_targets(script_body)
             others += [(name, script) for target in followed if target in words]
     for name, other in dict.fromkeys(others):
         problems.append(f"ledger.split = \"target\": {other} {name!r} also fills a sink's "
