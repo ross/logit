@@ -108,8 +108,10 @@ else
     ${DOCKER} build -q -t "${NETEM_IMAGE}" "${TOOLS_DIR}/netem" >/dev/null
 fi
 
+# SOAK_INSTANCE is a rolling overlap's instance name, which each instance's compose service sets;
+# a placeholder lets `!env` resolve it here.
 for config in "${scenario_dir}"/logit-*.yaml; do
-    ${DOCKER} run --rm "${validate_env[@]}" -v "${config}:/config.yaml:ro,z" "${IMAGE}" validate /config.yaml >/dev/null || {
+    ${DOCKER} run --rm "${validate_env[@]}" -e SOAK_INSTANCE=logit -v "${config}:/config.yaml:ro,z" "${IMAGE}" validate /config.yaml >/dev/null || {
         echo "soak: ${config} failed 'logit validate'" >&2
         exit 1
     }

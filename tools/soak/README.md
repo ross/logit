@@ -109,14 +109,19 @@ keep, because the driver never recreates a container.
 minutes, one at a time, with 2 to 4 minutes of quiet between them. Over 8 hours that is about 113
 faults, and about half the run is judged steady state.
 
-Three scenarios put a `lua` stage between the listener and `aggregate`, with
-`[ledger] sut_script` naming it, so `ledger.script` balances the script's hop:
+Six scenarios put a `lua` stage between the listener and `aggregate`, with
+`[ledger] sut_script` naming it, so `ledger.script` balances the script's hop. A `-jit`
+scenario is the scenario of the same name without the suffix, with LuaJIT's trace compiler on
+(`jit: true`):
 
 | Scenario | Length | What it drives |
 |---|---|---|
 | `lua-path` | 16 minutes | `statsd-vm`'s schedule through a script that rewrites every event, drops every 53rd, fails on every 97th, and returns one rollup event from `flush()` each window; its expectations assert all three outcomes |
 | `lua-stall` | 8 minutes | a busy loop of about 30 s on the 360,000th event: the node reads stalled, `/readyz` answers `503 stalled`, the receive queue fills and evicts, and the script resumes on its own. A `mark` with `ready = "stalled"` covers it |
 | `lua-memory` | 8 minutes 10 seconds | from the 480,000th event the script keeps 1 KB per event until the VM passes `max_memory: 64MiB`: the SUT logs `memory_limit_exceeded`, drains, and exits 2 inside an `exit` step, whose revert starts it again. The run ends before the second life reaches that event |
+| `lua-path-jit` | 16 minutes | `lua-path` under the compiler, rewriting in place: two attribute writes, a `pairs` loop over the attribute proxy, and an `= nil` delete |
+| `lua-stall-jit` | 8 minutes | `lua-stall` under the compiler: the compiled loop runs about 35 s and still reads `stalled`, since stall detection doesn't depend on a hook |
+| `lua-memory-jit` | 8 minutes 10 seconds | `lua-memory` under the compiler: the kept strings are on the Lua heap, which `max_memory` counts either way, so the SUT still exits 2 |
 
 Three scenarios give the SUT two sinks of one kind, each to its own VictoriaMetrics, with one
 `[[ledger.sink]]` table per sink:
@@ -155,9 +160,9 @@ effect with `[[expect]]` tables:
 | `slow-destination` | 7 minutes 45 seconds | the sink's `timeout` is 2 s. A 3 s netem delay on VictoriaMetrics makes it apply each write whose response arrives late, then a 2 kbit rate limit on the SUT's egress makes a request unable to finish. Each counts `network_error` and a retry, and nothing drops |
 | `fanout-stop-outage` | 6 minutes 15 seconds | `fanout-copy`'s two sinks, with the second's queue at 4 batches under `drop_oldest`. VictoriaMetrics B is stopped 150 s and the SUT is stopped for 30 s, 60 s in, so the second sink's queued batches drop at shutdown and are counted while the first sink drops nothing |
 
-The stall and the memory cap depend on the host's speed: `lua-stall`'s loop count and
-`lua-memory`'s event count are calibrated on the development host, and the comments in their
-`logit-sut.yaml` give the timings. On a much slower or faster host the event falls outside its
+The stall and the memory cap depend on the host's speed: the `lua-stall` scenarios' loop count
+and the `lua-memory` scenarios' event count are calibrated on the development host, and the
+comments in their `logit-sut.yaml` give the timings. On a much slower or faster host the event falls outside its
 step's window, and `ready` or `exit` FAILs.
 
 `statsd-datadog` (14 minutes) sends `statsd-vm`'s stream, renamed `logit.soak.requests_0` to
@@ -187,12 +192,23 @@ Three scenarios run a sink against a scripted stand-in in place of VictoriaMetri
 | `standin-at-most-once` | 8 minutes 55 seconds | the same sink under `buffer.delivery: at_most_once`: a `503` and a reset drop the batch, a `401` holds it, a `400` drops it |
 | `standin-datadog` | 30 minutes 25 seconds | `datadog_out` (series, gzip, delta counts) through every row of its response-class table: sixteen 20 s steps, 105 s apart, from a `202` whose body names two series dropped, through `400`, `401`, `403`, `404`, `405`, `408`, `413`, `429`, `500`, `501`, a `503` after storing (its resend a duplicate), `302`, and `422`, to a connection reset and a stop of the stand-in |
 
-`native-hop` runs a second `logit` under test, `collector`, at the far end of the native hop (see
-[Several SUT services](#several-sut-services)):
+Two scenarios run a second `logit` under test, `collector`, at the far end of the native hop
+(see [Several SUT services](#several-sut-services)):
 
 | Scenario | Length | What it drives |
 |---|---|---|
 | `native-hop` | 17 minutes | `logit` takes statsd and forwards it with `logit_out` from a disk spool to `collector`'s `logit_in`, which aggregates into VictoriaMetrics: a netem delay and then 10% loss on `logit`'s sends, a partition, a stop, a pause, and a kill of `collector`, a kill of `logit` with `collector` up, and a kill of `logit` inside a stop of `collector`. `ledger.hop` judges the hop; its expectations assert the replay after the first `logit` kill is deduplicated, `logit` reconnects after the `collector` kill, and the spool holds the hop through the stop |
+| `native-hop-spans` | 17 minutes | `native-hop` with `span_sample_rate` at the product's default, `0.1`, on both SUTs, so internal spans and the hop frame's trace context run under the same faults. The spans go to stdout beside the metrics, where the NDJSON reader skips them; its expectations add that each SUT emitted spans. `internal` buffers at most 512 spans per component between drains and counts the rest `logit.internal.spans.dropped{reason="buffer_full"}`, which `drops` judges like any other drop |
+
+`rolling-overlap` (19 minutes) runs two instances of one SUT, `logit` and `logit-b`, on one UDP
+port under `reuse_port`, in the network namespace of a holder, `sut-net` (see
+[Rolling overlap](#rolling-overlap)). Its generator sends `statsd-vm`'s 2,000 lines a second as
+eight flows, one per `statsd_out`, which the kernel spreads over the instances and moves as they
+stop and start. Each instance stamps its name on its series, aggregates, and spools to
+VictoriaMetrics. Its 16-minute cycle stops `logit`, then `logit-b`, delays the holder's egress,
+stops `logit` inside a stop of VictoriaMetrics, restarts `logit-b`, and stops it again. Its
+expectations assert that each instance reads while the other is down and that neither socket
+queue overflows; `ledger.overlap` bounds what each close discarded.
 
 `tcp-ingress` (20 minutes 30 seconds) is `statsd-vm`'s stream over one TCP connection:
 `statsd_out` with `transport: tcp` into `statsd_in` with `transport: tcp` and a 60 s
@@ -223,6 +239,43 @@ checkpoint fails. The writer's files stay in the run directory, about 80 MB of t
 rotated file open, about one descriptor more every 44 s, which passes `fd_growth`'s 40 at about
 30 minutes, and from about 74 minutes `file_out` deletes the oldest file, whose lines the end
 count then misses.
+
+`sighup` (14 minutes 30 seconds) runs `statsd-vm`'s stream with a second SUT sink off the
+ledger, `archive`: a `stdio_out` writing one `format: json` line per statsd event, straight from
+the listener, to `/shared/archive.log` in `<run>/shared`, which the override mounts into the
+SUT. Its 11.5-minute cycle sends `logit` a SIGHUP three times in steady state, once 10 s after a
+`rename` moves `archive.log` to `archive.log.1`, once during a 90 s VictoriaMetrics stop, and
+once after a second rename to `archive.log.2`, and sends one to the generator. Each SIGHUP makes
+`archive` reopen its path before its next write; the stdout telemetry stream ignores it, so
+every steady-state row judges straight through the signals, which open no fault window.
+`file.reopen` judges each rename, and the expectations assert one reopen through each SIGHUP to
+`logit`, a generator that keeps sending through its own, and an `archive` that drops nothing.
+`archive` is best-effort (`overflow: drop_oldest`), so a stall there can't hold the listener the
+ledger follows. Its files stay in the run directory, about 260 MB of them, and its
+`max_duration` is its own duration, because a second cycle's rename would find
+`archive.log.1` taken. To keep a scored run small, write each file's
+`checks.ndjson_file_lines()` into `<run>/shared-counts.json`, keyed by file name, and delete the
+files: `check` reads a file `shared/` no longer holds from there.
+
+`tls-reload` (15 minutes 30 seconds) sends `tcp-ingress`'s stream over mutual TLS: the
+generator's `statsd_out` presents a client certificate, and the SUT's `statsd_in` requires one
+from the run's private CA (see [TLS certificates](#tls-certificates)). The SUT runs with
+`tls_reload_interval: 0s`, so only a SIGHUP reloads it, and the generator polls every 10 s. Its
+12.5-minute cycle rotates the SUT's server certificate and sends a SIGHUP, then probes what the
+listener serves; rotates the generator's client certificate, which its poll reloads, and
+restarts the SUT so the generator reconnects after the reload; rotates the server
+certificate broken, so the SIGHUP's reload fails and the listener keeps serving the previous
+one; rotates it again, good; and rotates it once more during a 90 s VictoriaMetrics stop. Its
+expectations assert one reload through each SIGHUP after a good rotation and a `notAfter` a
+day later at least, one failed reload and an unchanged `notAfter` through the broken one's,
+the generator's own reload, lines read in every drain after the restart, and no
+`connection_error` in the run. `tls.served` checks each probe's serial. The SUT trusts any
+certificate from the run's CA, so no row tells which generation the generator presents after
+the restart; it presents the loaded one because its resolver hands every handshake the current
+pair (`ReloadingCert` in `crates/logit-pipeline/src/tls.rs`). Its `max_duration` is
+its own duration, because a second cycle's rotations would name the same days. The netem image
+carries the certificate tooling, so a run with `SOAK_SKIP_IMAGE` set needs one built from this
+tree.
 
 ### Several SUT services
 
@@ -272,6 +325,117 @@ loss. A duplicate balances every count after the hop, so the bound catches one o
 exceeds the run's uncounted loss, the wire loss among it; `ledger.hop` judges a smaller one. The
 plan's "The native hop (W10b)" has the rules.
 
+### Rolling overlap
+
+A scenario can run two or more instances of one SUT on one UDP port, as a rolling upgrade
+overlaps them. Each instance runs the whole pipeline. The override adds a namespace holder with
+the role `netns`, which owns the address, since an instance that owned it would take it along
+when it stopped, and puts every instance in it:
+
+```toml
+[overlap]
+holder = "sut-net"                  # the netns service
+instances = ["logit", "logit-b"]    # logit first; each runs [configs] sut unless it has a key
+label = "soak_instance"             # the attribute each instance's `set` stamps on its events
+```
+
+```yaml
+services:
+  sut-net:
+    image: logit-soak-netem:local
+    entrypoint: ["sleep", "infinity"]
+    labels: { soak.role: netns }
+    stop_signal: SIGKILL
+  logit:
+    network_mode: "service:sut-net"
+    environment: { LOGIT_ADMIN: unix:/tmp/admin.sock, SOAK_INSTANCE: logit }
+  logit-b:
+    extends: { file: compose.yaml, service: logit }
+    labels: { soak.role: sut }
+    network_mode: "service:sut-net"
+    environment: { LOGIT_ADMIN: unix:/tmp/admin.sock, SOAK_INSTANCE: logit-b }
+```
+
+The loader holds each instance's config to the overlap: `reuse_port: true` on every listener a
+source names, a `shutdown.delay` that with the drain fits `docker stop -t 30`, an admin
+`socket:` and no `bind:` (the driver probes `logit ready` through the container's
+`LOGIT_ADMIN`), and a `set` stamping `label` that each source's `sut_transforms` lists. The
+generators send to the holder's name, over UDP only. A generator needs several flows to spread:
+`generator_input` and `generator_sink` may both list components, as many of each, each input
+feeding the sink at its position, one sink per flow; their counts sum. Only `netem` and `partition` go on the holder, neither on an instance, and two
+instances may not be held (paused, stopped, killed, restarted, or exited) at once. At the end the
+driver waits once on the backends' totals, then stops each instance.
+
+The rows about a process life judge each instance on its own lives, its V the series whose
+`label` names it, and FAIL a series that names no instance. The wire, `progress`, `recovery`,
+and the new `ledger.overlap` judge the instances together, since flows move between them:
+`progress` counts deliveries from the instances not held, and `ledger.overlap` holds the run's
+wire loss to what the instances' socket closes could discard. The plan's "Rolling overlap
+(W12b)" has the rules.
+
+### TLS certificates
+
+A `[tls]` table gives a run a private CA and the certificates it names. Before the stack starts,
+the driver runs `certs.sh` (in the netem image, as your user) into `<run>/tls`: the CA, a client
+certificate the probe presents, and each named certificate's first generation, valid 30 days.
+Keys are EC P-256, and every file is 0644, readable by the image's `logit` user.
+
+```toml
+[tls.cert.statsd]         # one table per certificate; `probe` is reserved
+san = ["logit"]           # its DNS names, the first one the name a probe verifies
+usage = "server"          # server or client: its extended key usage
+```
+
+Each certificate is `<name>/live/cert.pem` and `<name>/live/key.pem`, and the CA is `ca.pem`.
+`live` is a relative symlink to `<name>/gen-N/`, which a `rotate` step repoints in one rename.
+The swap is atomic per file, not across a set: a reload reads a set's files one at a time, so
+a poll that lands on the rename can read one generation's certificate with the other's key. That
+load fails, and the next poll loads the new pair; `self_log` excuses such a torn read on a
+service that polls when a reload of the same component follows it inside the rotate. The driver names the
+directory in `compose.env` as `SOAK_TLS_DIR`, and the override mounts the whole directory, not
+single files, so the repointed link reaches every container:
+
+```yaml
+services:
+  logit:
+    volumes: ["${SOAK_TLS_DIR:?set by script/soak}:/tls:ro,z"]
+```
+
+```toml
+[[step]]
+at = "0s"
+action = "rotate"         # issues statsd's next generation and repoints statsd/live
+on = "logit"              # the service whose config reads /tls/statsd/live/
+cert = "statsd"
+days = 31                 # above 30 and every earlier rotation's, so notAfter rises
+# broken = true           # a key that doesn't match the certificate: the reload fails
+for = "40s"
+
+[[step]]
+at = "10s"
+action = "signal"
+on = "logit"
+signal = "HUP"
+for = "10s"
+
+[[step]]
+at = "25s"
+action = "probe"          # s_client from the service's own network namespace
+on = "logit"
+cert = "statsd"           # a server certificate
+port = 8125               # the listener's port
+for = "5s"
+```
+
+The loader holds a `rotate` to a service whose config reads its certificate's `live/` files, to
+days above 30 and above every earlier rotation of that certificate, and to one run of the
+cycle, so `max_duration` is one cycle's run. A `probe` starts inside a `rotate` of its
+certificate on its own service, after a SIGHUP there, which a listener with the poll off needs
+before it serves anything new. On such a service every earlier rotate of a probed certificate
+needs a SIGHUP inside it too, or a start of the service before the certificate's next rotate,
+since `tls.served` expects the latest rotation that wasn't broken to be the one loaded. A probe presents the probe certificate, so a listener that
+requires one completes the handshake and logs no `connection_error`.
+
 ### Faults
 
 | Action | What it does | Revert |
@@ -285,9 +449,17 @@ plan's "The native hop (W10b)" has the rules.
 | `mark` | nothing: it marks a window for an event the SUT's own config causes, such as a stalled script. An optional `ready` names a readiness word the SUT must report inside it | nothing |
 | `exit` | nothing: on a SUT service only, it names an exit the SUT makes on its own inside the window, with the `code` it leaves and the `key` of the ERROR line that explains it | `docker start` if the container has exited |
 | `respond` | on a stand-in only: POSTs the step's cue to its control port, so it answers `status` (with an optional `body`) or `answer = "reset"`, storing the write when `apply` says to or, by default, when the status is `2xx`. Under the `datadog` shape a `2xx` can carry `series_errors = N`, a body naming the request's first N series dropped | an empty cue, which restores the default answer |
+| `signal` | `docker kill -s HUP`, on a service that runs `logit`, with `signal = "HUP"`, the one signal it takes: the process reopens its file targets and reloads its TLS material | none |
+| `rename` | on the host, moves `path` to `to` inside `<run>/shared`, both bare names, refusing a `to` that exists. `path` is a `stdio_out` target in `/shared` in the config of the service the step is `on`, and a `signal` step on that service must start inside the rename's `for` | none |
+| `rotate` | issues `cert`'s next generation into `<run>/tls`, valid `days`, with a mismatched key under `broken = true`, and repoints its `live` link; records the new serial and `notAfter`. See [TLS certificates](#tls-certificates) | none |
+| `probe` | from the network namespace of the service it's `on`, handshakes with `127.0.0.1:<port>`, presenting the probe certificate, and records the served serial and `notAfter` and whether they verify against the CA for `cert`'s first DNS name | none |
 
 A `mark`, `exit`, or `respond` window is a fault window like any other, so the checks excuse
-what happens inside it. None of them can go in a `[random]` schedule. A `respond` or a `stop` of
+what happens inside it. A `signal`, `rename`, `rotate`, or `probe` window excuses nothing: none
+can lose data, so every row judges straight through it, and only `[[expect]]`, `file.reopen`,
+`tls.served`, and `self_log`'s excusal of a broken rotation's failed reload read it. A `signal`
+or `probe` may start inside a `rename` or `rotate` on its own service, and no other step may
+overlap one of these on its service. None of these seven can go in a `[random]` schedule. A `respond` or a `stop` of
 a stand-in may name the `class` the sink must read its answers as (`clean`, `ambiguous`,
 `rejected`, or `refused`), which `ledger.standin` judges. Under the `datadog` shape every
 `respond` other than a `2xx` must name one, because its class is the only statement of what the
@@ -583,7 +755,7 @@ generator-lines = "logit-generator-lines.yaml"
 [[ledger.source]]         # one per generator
 service = "generator-lines"                     # a service with soak.role generator
 generator_input = "load"                        # its generate_in
-generator_sink = "syslog"                       # its sink, G's source
+generator_sink = "syslog"                       # its sink, G's source; see "Rolling overlap" for lists
 sut_listener = "lines"                          # the SUT listener it reaches
 wire = "udp"                                    # optional: udp (the default), tcp, or file
 sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional: nodes to aggregate
@@ -613,20 +785,21 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 
 | Check | `FAIL`s when |
 |---|---|
-| `run` | the driver aborted, hit an error, or was interrupted, or the timeline lacks its `start` or `end_end` phase |
+| `run` | the driver aborted, hit an error, or was interrupted, its tick ran more than 120 s late (`stalled`, as when the host sleeps), or the timeline lacks its `start` or `end_end` phase |
 | `timeline` | a fault's apply or revert returned nonzero, the schedule failed fast, or a start or unpause of a `logit` service has no readiness probe; a fault whose apply failed gets no window |
 | `exit` | a `logit` container exits outside a scheduled stop, restart, kill, or `exit` step, or with a code other than the one that action leaves (0, 137 for a kill, the step's `code` for an `exit`); an `exit` step sees no exit; or any container is OOM-killed |
 | `restarts` | a container starts with no scheduled start or restart behind it: the revert of a `stop` or `kill`, an `exit` revert that started it, or a `restart` |
-| `self_log` | stderr has an `exiting` line with a nonzero code, a panic, or an `ERROR` line other than a sink's `retrying`; sink fault lines outside a fault window `WARN`. Inside an `exit` step, its `exiting` line and an `ERROR` line keyed its `key` are expected, and FAIL the row when either is missing |
+| `self_log` | stderr has an `exiting` line with a nonzero code, a panic, or an `ERROR` line other than a sink's `retrying`; sink fault lines outside a fault window `WARN`. Inside an `exit` step, its `exiting` line and an `ERROR` line keyed its `key` are expected, and FAIL the row when either is missing. A `tls_reload_failed` line FAILs too, except inside a `rotate` step with `broken = true` on its service, or, on a service that polls its TLS files, inside any other rotate on it with a `tls_reloaded` of the same component after it in that rotate |
 | `ready` | a `logit` container's readiness word, from each image `HEALTHCHECK` result timed at its start, isn't `ok` outside a fault window; a `mark` with `ready` sees no sample with that word; `degraded` appears outside an `exit` step; or a container isn't ready within 30 s of a start. With no `HEALTHCHECK` results recorded, it judges Docker's health status instead |
 | `progress` | a SUT sink delivers nothing in a `progress_window` outside fault windows with work queued (a hang), a `logit` container's telemetry goes quiet, or a sink's newest stored sample is 30 s old (a local target only); a sink still retrying past `recovery_bound` `WARN`s, and so do windows covering under 5% of the run after warmup |
 | `rss_slope` | a `logit` service's resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead, and so do slopes covering under 5% of the run after warmup. Each service is judged on its own line, and `[expected]` can set its verdict (see [Expected verdicts](#expected-verdicts)) |
 | `fd_slope` | a `logit` service's open file descriptors end, or sit after a recovery, more than `fd_growth` above the warmup median. Each service is judged on its own line, and `[expected]` can set its verdict |
 | `ledger.wire` | for a UDP or TCP source, its generator's lines minus what its listener read, what the kernel dropped, and what its framer dropped, counted (G − (W + K + F)), exceeds `wire_loss_outside_faults` outside the reported fault windows that affect its wire, with one generator batch of tolerance per window edge, each judged run counting at 0 or more; or, on UDP, its generator's sink counts messages and datagrams apart, and on TCP it counts any datagram. On UDP that loss is by design and every affecting window is reported: netem on a generator, and a lifecycle fault or partition of the SUT or of a generator. On TCP only a stop, kill, restart, or `exit`, and a partition that moved the container's address, are reported; every other TCP-affecting window (netem on the SUT, a pause, a partition that kept the address) is judged, and a surplus in it beyond one generator batch per `ambiguous_at_most_once` drop the generator counted there, plus one per edge, FAILs. Netem on a TCP generator affects nothing and is judged as steady state. A file source is judged otherwise: its run's W + F − G against a replay band per SUT life, and G against the lines counted in the shared directory (the plan's §6 `ledger.wire` row). The detail lists the gap per source and per run of drain intervals, and the generator's own counted loss beside it |
+| `ledger.overlap` | under `[overlap]` only, else no row: over the run, the generators' lines minus what every instance read or counted dropped (G − Σ(W + K + F)) exceeds, for each stop or restart of an instance, `ceil(used / 512) + 1` datagrams, `used` being the closing life's last `logit.input.receive_buffer.used.bytes`; or falls below 0 past the generators' end allowance. Each close's own gap is reported, not judged. A kill or `exit` of an instance, which leaves no final sample, or another fault that can lose UDP on its way in makes the row report its numbers and SKIP. See [Rolling overlap](#rolling-overlap) |
 | `ledger.intake` | for any listener, the final SUT life's lines read minus dropped differ from the events sent plus bad lines (B: `messages.dropped{reason="malformed"}`, `frames.dropped{reason="undecodable"}`, and on UDP `lines_in`'s oversize lines); or an earlier life's read-but-unabsorbed residual summed over the listeners (W − D − B − X − Ab, X being the listeners' own counted event drops) falls outside [0, R], R being each UDP listener's receive queue plus 2 batches per listener, 65 more batches for each node between it and `aggregate`, and 65 for `aggregate` |
 | `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listeners' summed events sent (or, with `sut_script`, the script's) differ from those `aggregate` received; a node in a source's `sut_transforms` received a different number from those sent to it, or sent a different number from those it received; a sink received a different number of events from those sent to it (under `copy` `aggregate`'s events sent, which a fan-out counts once per batch, and under `route` its target's); or `aggregate` received a different number from those it absorbed |
 | `ledger.script` | with `[ledger] sut_script` only, else SKIP: in the final SUT life, the listener's events sent differ from those the script received, those it received from those it emitted, discarded (`events.discarded`), and lost to an error (`events.dropped{reason="script_error"}`), or those it sent from those it emitted plus those `flush()` returned |
-| `ledger.egress` | for each sink under `copy`, or for the sinks' sum under `route`: the final SUT life's absorbed increments minus the backend's reset-aware total (Ab − V), or a stopped earlier life's lines read minus dropped, bad lines, the listener's counted event drops, and that total (W − D − B − X − V), is nonzero (SKIP on an external target; on a Kafka target V is the topic's distinct records, and a negative gap is a surplus), other than a positive gap in a life whose telemetry counts a batch `batches.dropped` under any reason at a node that can explain it: any node but a sink outside the group, so under `copy` another sink's drop doesn't count a sink's gap, while one at the sink or upstream of the fan-out does (every reason counts; see "The ledger and identities" in the plan's [6. The checks](../../docs/plans/soak-harness.md#6-the-checks-w1a-w1b)); a `rejected` or `disk_corrupt` batch counts the gap but FAILs the life whatever its size, unless a `respond` step that expects `rejected` explains it; a killed life's Ab − V falls outside its band (below, a surplus: the residual plus one drain interval of ingest; above, uncounted: one aggregate interval plus one drain interval of ingest), with the residual the kill lost reported beside it; or a sink's export matched no series. With a script, its `flush()` events leave Ab, its counted drops and errors leave a stopped life's gap, which the final drain exports because `internal` drains last. A series without one segment per SUT life `WARN`s |
+| `ledger.egress` | for each sink under `copy`, or for the sinks' sum under `route`: the final SUT life's absorbed increments minus the backend's reset-aware total (Ab − V), or a stopped earlier life's lines read minus dropped, bad lines, the listener's counted event drops, and that total (W − D − B − X − V), is nonzero (SKIP on an external target; on a Kafka target V is the topic's distinct records, and a negative gap is a surplus), other than a positive gap in a life whose telemetry counts a batch `batches.dropped` under any reason at a node that can explain it: any node but a sink outside the group, so under `copy` another sink's drop doesn't count a sink's gap, while one at the sink or upstream of the fan-out does (every reason counts; see "The ledger and identities" in the plan's [6. The checks](../../docs/plans/soak-harness.md#6-the-checks-w1a-w1b)); a `rejected` or `disk_corrupt` batch counts the gap but FAILs the life whatever its size, unless a `respond` step that expects `rejected` explains it; a killed life's Ab − V falls outside its band (below, a surplus: the residual plus one drain interval of ingest; above, uncounted: one aggregate interval plus one drain interval of ingest), with the residual the kill lost reported beside it; or a sink's export matched no series. With a script, its `flush()` events leave Ab, its counted drops and errors leave a stopped life's gap, which the final drain exports because `internal` drains last. A series without one segment per SUT life `WARN`s. Under `[overlap]` that is a known `WARN`: an instance the kernel hashes no flow to in a life writes no series in it, which with `rolling-overlap`'s eight flows happens about once in 256 rejoins; a series whose label names no instance `FAIL`s |
 | `ledger.windows` | under `[ledger] vm_every_window = true` only, and SKIPs on an external or Kafka target: a series in a SUT life has two samples more than 1.5 aggregate intervals apart, a killed life's last sample is more than 1.1 intervals before the kill, or a later life's first is more than 2 intervals after its start. The interval comes from the SUT config. A wider gap is excused as idle when the `sut_aggregate` component's `batches.sent` is 0 over the drains from a + (interval + p) / 2 to b − (interval − p) / 2, p being the drain period: no window was emitted, so none was lost. A pause, with no drains at all, counts 0. Any batch there FAILs the gap as windows emitted but not stored, whatever fault was running |
 | `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight; across a native hop, a killed `logit`'s hop sink replays outside a band set by its received and delivered batch rates over its last drain interval, the time from that drain to the kill, and its spool's `checkpoint_interval` |
 | `ledger.hop` | across a native hop only, else no row: over the run, the hop sink's events received, less its counted drops, minus the `logit_in`'s events forwarded isn't 0, beyond the allowance a kill or a pause earns: below, a killed side's last drain interval of counts, one send window of frames for a kill or a pause of the receiving side, and a killed `logit`'s spool replay of the frames it committed after its last cursor persist, when the receiving side restarted between that life's last delivery and the replay; above, a killed `logit`'s one batch in hand and a killed receiving side's last drain interval of counts. The plan's "The native hop (W10b)" has the rules. A `rejected` or `disk_corrupt` batch drop at the hop sink FAILs too |
@@ -637,6 +810,8 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `identity.sink` | at the final life's last drain before its final one, a sink's batches received, plus those a disk spool replayed at open and the one it counts dropped with a torn tail (`batches.dropped{reason="disk_torn"}`, a batch an earlier life received), differ from delivered + dropped + queued by more than one batch in flight |
 | `drops` | the SUT counts a `logit.*.dropped` no other row judges with a `rejected` or `disk_corrupt` reason; any other reason `WARN`s. The ledger's own terms (every `batches.dropped`, a node's `events.dropped` beside a batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B, and the script's `script_error`) and, on an external, Kafka, or `datadog` stand-in target, a sink's `records.dropped` and `metrics.dropped` stay with the rows that balance them, and so does a TCP listener's F, which `ledger.wire` judges, so each drop is counted once. On an external target, where `ledger.egress` SKIPs, a `rejected` or `disk_corrupt` batch drop at a sink is `ledger.sent`'s FAIL, and one at any other node stays in this row |
 | `recovery` | within `recovery_bound` of a fault's end, for any sink, no drain interval clear of other faults shows that sink not retrying, its buffer under 5% full or holding at most one batch, every UDP listener's receive queue under 5% full, and the listeners' summed ingest at 95% of the generators' summed warmup rate; a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN`, and so does a run where no fault had an eligible interval |
+| `file.reopen.<step>` | one row per `rename` step, else one `file.reopen` row that SKIPs: the rename or the SIGHUP inside it didn't apply; the renamed file is missing or has a line stamped more than 2 s after the signal's apply finished; the new file, the next rename's `to` or `path` after the last, is missing or has a line stamped more than 2 s before the signal started; or the lines in every file of the path's renames differ from the target's `events.delivered` over the service's lives, which a `kill` or an `exit` of it leaves reported, not judged. An empty new file `WARN`s. The plan's [6. The checks](../../docs/plans/soak-harness.md#6-the-checks-w1a-w1b) has the bounds |
+| `tls.served.<step>` | one row per `probe` step, else one `tls.served` row that SKIPs: the probe didn't apply; the served serial or `notAfter` isn't the generation in force, the latest rotation of the certificate before the probe that wasn't `broken`, else the first issue; the served chain didn't verify against the run's CA; or the run recorded no first issue |
 | `expect.<name>` | a scenario's own `[[expect]]` bound doesn't hold; see [Expectations](#expectations) |
 
 The plan's "The ledger and identities" defines each symbol. Every SUT config gives `internal` a
@@ -672,7 +847,7 @@ metric = "logit.component.buffer.batches"
 component = "victoria_metrics"          # and any other attribute under attrs = { ... }
 step = "c0s1"                           # an expanded step id, or a [[step]] index for every cycle
 window = "during"                       # the fault's span; `after`, the recovery_bound after it; `through`, both; `run`, with no step
-reduce = "max"                          # counters: delta, min_delta; gauges: max, min, last, slope
+reduce = "max"                          # counters: delta, min_delta; gauges: max, min, last, rise, slope
 min = 2                                 # min, max, or both
 ```
 
@@ -683,6 +858,11 @@ that start only. A bound that must hold for the whole episode, such as a loss co
 stay 0, uses `through`: a chain blocked behind a sink stays blocked until the sink's next retry,
 up to its `retry_max_delay` after the revert. A scenario with no `[[expect]]` gets one `expect`
 row that SKIPs.
+
+`rise` is a gauge's value at the window's end less the value in force at its start, and the row
+FAILs with no value in force there. `logit.tls.certificate.not_after` with `reduce = "rise"`
+and `min = 86400` asserts a reload took a certificate valid a day longer at least, and `min = 0,
+max = 0` that a failed one changed nothing.
 
 `window = "run"` takes no `step`: it runs from the end of warmup to the start of the end
 sequence, fault windows included. `slope` is a gauge's least-squares slope over the window's

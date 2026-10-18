@@ -1,0 +1,128 @@
+# Two instances of one SUT on one UDP port under `reuse_port`, `logit` and `logit-b`, in the
+# network namespace of a holder, `sut-net`, stopped in turn as a rolling upgrade overlaps them.
+# While one is down the other reads every flow, so nothing is lost but what sat in the stopping
+# instance's socket queue when it closed, which `ledger.overlap` bounds. No step partitions the
+# holder or makes netem drop packets: that loss would land in the same run total, and the row
+# couldn't tell it from a close's. The schema is docs/plans/soak-harness.md's "The scenario
+# schema"; the overlap is its "Rolling overlap (W12b)".
+
+name = "rolling-overlap"
+description = "generator (8 flows) -> statsd_in on one port, reuse_port, in two instances swapped in turn -> aggregate 10s cumulative -> prometheus_out RW1 zstd (disk spool) -> VictoriaMetrics"
+duration = "19m"          # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "120s"         # >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "16m"             # >= last recovery (14m45s) + 2 x progress_window
+compose = "compose.override.yaml"   # adds sut-net and logit-b
+
+[configs]
+sut = "logit-sut.yaml"    # both instances' config
+generator = "logit-generator.yaml"
+
+[overlap]
+holder = "sut-net"
+instances = ["logit", "logit-b"]
+label = "soak_instance"   # the attribute the config's `set` stamps, a label on every series
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = ["load_0", "load_1", "load_2", "load_3", "load_4", "load_5", "load_6", "load_7"]
+generator_sink = ["statsd_0", "statsd_1", "statsd_2", "statsd_3", "statsd_4", "statsd_5",
+                  "statsd_6", "statsd_7"]
+sut_listener = "statsd"
+sut_transforms = ["instance"]
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+[[step]]                  # c0s1: logit down, logit-b reads every flow
+at = "0s"
+action = "stop"
+on = "logit"
+for = "60s"
+
+[[step]]                  # c0s2: logit-b down, logit reads every flow
+at = "2m30s"
+action = "stop"
+on = "logit-b"
+for = "60s"
+
+[[step]]                  # c0s3: both instances' remote-write delayed; their ingress isn't shaped
+at = "5m"
+action = "netem"
+on = "sut-net"
+args = "delay 200ms 50ms"
+for = "120s"
+
+[[step]]                  # c0s4: VictoriaMetrics down; both instances spool
+at = "8m"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+[[step]]                  # c0s5: logit down inside c0s4, its spool held across the stop
+at = "8m20s"
+action = "stop"
+on = "logit"
+for = "30s"
+
+[[step]]                  # c0s6: logit-b restarted, back at once
+at = "11m"
+action = "restart"
+on = "logit-b"
+for = "30s"
+
+[[step]]                  # c0s7: logit-b down again
+at = "13m"
+action = "stop"
+on = "logit-b"
+for = "60s"
+
+[[expect]]                # logit-b keeps reading while logit is down
+name = "logit-b-carries-c0s1"
+service = "logit-b"
+metric = "logit.input.datagrams"
+component = "statsd"
+step = "c0s1"
+window = "during"
+reduce = "min_delta"
+min = 1
+
+[[expect]]                # and logit while logit-b is
+name = "logit-carries-c0s2"
+service = "logit"
+metric = "logit.input.datagrams"
+component = "statsd"
+step = "c0s2"
+window = "during"
+reduce = "min_delta"
+min = 1
+
+[[expect]]                # no instance's socket queue overflows: a close's loss is all there is
+name = "logit-kernel-drops"
+service = "logit"
+metric = "logit.input.kernel.dropped"
+component = "statsd"
+window = "run"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "logit-b-kernel-drops"
+service = "logit-b"
+metric = "logit.input.kernel.dropped"
+component = "statsd"
+window = "run"
+reduce = "delta"
+max = 0

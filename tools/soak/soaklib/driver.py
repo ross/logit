@@ -57,12 +57,23 @@ needs at the code:
   `compose.env` carries its `[target] shape` for standin.py's `--shape`.
   The end sequence waits for the sink's queue to empty, as for a Kafka target. Its record is its
   stdout, which the log capture collects with every other service's.
-- A scenario with a `file` wire gets `<run>/shared`, mode 0777 so the image's unprivileged
-  user, whatever its uid, can write it, named by `SOAK_SHARED_DIR` in `compose.env`; its
-  override mounts it into the writer and the SUT. The end sequence stops the writer, counts the
-  lines in every file there (`shared_counted`, the G the checks hold telemetry's against), and
-  waits until the tailers' W reaches that count or stops growing (`tail_caught_up`), reading W
-  from a log chunk it captures for the purpose, before it waits on the sinks.
+- A scenario with a `file` wire or a `rename` step gets `<run>/shared`, mode 0777 so the
+  image's unprivileged user, whatever its uid, can write it, named by `SOAK_SHARED_DIR` in
+  `compose.env`; its override mounts it into the services that write or read there, and a
+  `rename` moves files inside it on the host. For a file wire the end sequence stops the writer,
+  counts the lines in every file there (`shared_counted`, the G the checks hold telemetry's
+  against), and waits until the tailers' W reaches that count or stops growing
+  (`tail_caught_up`), reading W from a log chunk it captures for the purpose, before it waits
+  on the sinks.
+- A scenario with a `[tls]` table gets `<run>/tls`, named by `SOAK_TLS_DIR` in `compose.env`,
+  which its override mounts read-only at `/tls`. `prepare()` fills it before anything starts,
+  through the netem image's certs.sh run as the host user: a private CA, the probe's client
+  certificate, and each certificate's first generation behind its `live` symlink. A `rotate`
+  step issues the next generation, and a `probe` reads what a listener serves (faults.py).
+- Under `[overlap]` the instances share their holder's network namespace, so `prepare()` also
+  reads each service's `network_mode` from compose and checks each instance is in the holder's.
+  Each instance runs the whole pipeline, so the end sequence waits once on every sink's stored
+  total, which holds all of them, and then stops each instance.
 
 Every time in `timeline.jsonl`, `watchdog.jsonl`, `stats.ndjson`, and `vm-freshness.jsonl` is
 epoch seconds (`t`, `started_at`, `finished_at`), with `offset` measured from the timeline's zero:
@@ -85,7 +96,6 @@ NETEM_IMAGE = "logit-soak-netem:local"
 VM_IMAGE = "victoriametrics/victoria-metrics:v1.152.0"
 KAFKA_IMAGE = "apache/kafka:4.2.0"
 STANDIN_IMAGE = "python:3.13.16-alpine3.24"
-ADMIN = "http://127.0.0.1:9600"
 
 INSPECT_EVERY_S = 5
 SLOW_POLL_EVERY_S = 30
@@ -93,6 +103,9 @@ SLOW_POLL_EVERY_S = 30
 # rates; tools/soak/README.md's "Long runs" has the arithmetic.
 LOG_CHUNK_EVERY_S = 300
 POLL_TIMEOUT_S = 15
+# How late the 1 s tick may run before the run is marked `stalled`: past the slowest thing the
+# loop does, a `docker stop` at its timeout (`STOP_TIMEOUT_S` + 15 s) or a log chunk's 60 s.
+STALL_S = checks.STALL_S
 READY_BOUND_S = 60
 FRESHNESS_LOOKBACK_S = 120
 QUIET_BOUND_S = 90
@@ -211,6 +224,9 @@ class Run:
         self.ids = {}
         # `{service: role}`: given (the self-test), else resolved from compose in `prepare()`.
         self.roles = None if roles is None else dict(roles)
+        # `{service: network_mode}` from compose, resolved with the roles; None when the roles
+        # were given.
+        self.modes = None
         # Each backend's base URL, by service, and each stand-in's control URL.
         self.vm_base = {}
         self.standin_base = {}
@@ -222,6 +238,10 @@ class Run:
         self.pending_ready = {}
         self.started_at = {}
         self.fail_fast = None
+        # `<run>/shared`, made in `prepare()` for a file wire or a `rename` step, else None.
+        self.shared_dir = None
+        # `<run>/tls`, made in `prepare()` for a scenario with a `[tls]` table, else None.
+        self.tls_dir = None
 
     # ---- setup ---------------------------------------------------------------------------------
 
@@ -235,11 +255,13 @@ class Run:
             f"{scenario_mod.SUT_CONFIG_ENV}={self.scenario.config_path('sut')}\n"
             + "".join(f"{scenario_mod.config_env(service)}="
                       f"{self.scenario.config_path(service)}\n"
-                      for service in self.scenario.generators + self.scenario.suts[1:])
+                      for service in self.scenario.generators + self.scenario.extra_suts)
             + (f"{scenario_mod.STANDIN_SHAPE_ENV}={self.scenario.standin_shape}\n"
                if self.standin else "")
             + (f"{scenario_mod.SHARED_DIR_ENV}={self.make_shared_dir()}\n"
-               if self.scenario.file_sources else "")
+               if self.scenario.uses_shared_dir else "")
+            + (f"{scenario_mod.TLS_DIR_ENV}={self.make_tls_dir()}\n"
+               if self.scenario.uses_tls_dir else "")
         )
         shutil.copy(self.scenario.path, self.run_dir / "scenario.toml")
         # The checks read the SUT's `receive:` limits from this copy.
@@ -260,18 +282,57 @@ class Run:
         self.docker = Docker(self.project, compose_files, env_files, profiles)
         if self.roles is None:
             self.roles = self.resolve_roles()
-        scenario_mod.check_services(self.scenario, self.roles)
+        scenario_mod.check_services(self.scenario, self.roles, self.modes)
         resolved = self.scenario.to_json(self.duration, self.seed, services=self.roles)
         (self.run_dir / "scenario.resolved.json").write_text(
             json.dumps(resolved, indent=2, sort_keys=True) + "\n"
         )
         self.ctx = faults.Context(docker=self.docker, ids=self.ids, netem_image=NETEM_IMAGE,
-                                  standin_base=self.standin_base)
+                                  standin_base=self.standin_base, shared_dir=self.shared_dir,
+                                  tls_dir=self.tls_dir, tls_certs=dict(self.scenario.tls or {}),
+                                  user=f"{os.getuid()}:{os.getgid()}")
         self.timeline = collect.Jsonl(self.run_dir / "timeline.jsonl")
         self.watchdog = collect.Jsonl(self.run_dir / "watchdog.jsonl")
         self.stats = collect.Jsonl(self.run_dir / "stats.ndjson")
         self.freshness = collect.Jsonl(self.run_dir / "vm-freshness.jsonl")
         self.capture = collect.LogCapture(self.run_dir, self.docker)
+        if self.tls_dir is not None:
+            self.issue_tls()
+
+    def make_tls_dir(self):
+        """Creates `<run>/tls` for the private CA and the `[tls]` certificates and returns its
+        path. certs.sh writes it as the host user; the mode is 0755 whatever the umask, so the
+        image's `logit` user, another uid, can traverse the bind mount. The chmod follows the
+        mkdir because the umask narrows the mode `mkdir` is given."""
+        tls = self.run_dir / scenario_mod.TLS_DIR
+        tls.mkdir()
+        os.chmod(tls, 0o755)
+        self.tls_dir = tls.resolve()
+        return self.tls_dir
+
+    def issue_tls(self):
+        """Makes the run's CA and the probe's client certificate, then issues each `[tls]`
+        certificate's first generation, before anything starts: a config that reads one fails
+        its start without it. Records the first issues as the `tls_issued` phase, which
+        `tls.served` reads as the serial in force before any rotation. Raises `ScenarioError`
+        when certs.sh fails."""
+        issued = {}
+        calls = [("init", [], None)] + [
+            ("issue", faults.issue_args(name, 1, scenario_mod.TLS_INITIAL_DAYS, cert), name)
+            for name, cert in sorted(self.ctx.tls_certs.items())]
+        for command, args, name in calls:
+            result = self.docker.run_oneshot(faults.certs_argv(self.ctx, command, *args))
+            report = faults.cert_report(result)
+            if not result.ok or report is None:
+                shown = " ".join([command, *args])
+                raise scenario_mod.ScenarioError([
+                    f"certs.sh {shown} failed (rc {result.rc}): "
+                    f"{result.stderr.strip()[-500:]}; {NETEM_IMAGE} needs openssl and "
+                    "certs.sh, so rebuild it without SOAK_SKIP_IMAGE"])
+            if name is not None:
+                issued[name] = {"gen": 1, "days": scenario_mod.TLS_INITIAL_DAYS, **report}
+        self.ctx.state[faults.TLS_GEN_KEY] = {name: 1 for name in issued}
+        self.phase("tls_issued", certs=issued)
 
     def make_shared_dir(self):
         """Creates `<run>/shared` for a file wire's writer and tailer and returns its path. The
@@ -279,7 +340,8 @@ class Run:
         shared = self.run_dir / scenario_mod.SHARED_DIR
         shared.mkdir()
         os.chmod(shared, 0o777)
-        return shared.resolve()
+        self.shared_dir = shared.resolve()
+        return self.shared_dir
 
     def resolve_roles(self):
         """`{service: role}` from the merged compose config, raising `ScenarioError` when compose
@@ -289,6 +351,7 @@ class Run:
             raise scenario_mod.ScenarioError([
                 f"docker compose config failed (rc {result.rc}): {result.stderr.strip()[-500:]}"])
         try:
+            self.modes = scenario_mod.network_modes_from_config(result.stdout)
             return scenario_mod.roles_from_config(result.stdout)
         except ValueError as err:
             raise scenario_mod.ScenarioError([f"docker compose config: {err}"]) from None
@@ -388,7 +451,8 @@ class Run:
             info = self.docker.inspect(self.ids[service]) or {}
             self.started_at[service] = (info.get("State") or {}).get("StartedAt")
         self.t0 = _now()
-        self.phase("start", t0=self.t0, ids=dict(self.ids))
+        # `marks_stalls` tells the checks this driver records a late tick as a `stalled` phase.
+        self.phase("start", t0=self.t0, ids=dict(self.ids), marks_stalls=True)
         seed = "" if self.seed is None else f", seed {self.seed}"
         self.say(f"stack up; {len(self.steps)} fault(s) over "
                  f"{scenario_mod.format_duration(self.duration)}{seed}")
@@ -421,6 +485,11 @@ class Run:
         while True:
             now = _now()
             offset = now - self.t0
+            if offset - tick > STALL_S:
+                # Nothing in the loop takes this long: the host slept or the driver was
+                # stopped, and neither the schedule nor the polls ran meanwhile.
+                self.phase("stalled", late_s=round(offset - tick, 3), since=tick)
+                self.say(f"the tick ran {offset - tick:.0f}s late; the run can't be judged")
             if offset >= self.duration:
                 break
             while queue and queue[0][0] <= offset:
@@ -520,8 +589,10 @@ class Run:
         for service, pending in list(self.pending_ready.items()):
             if service in self.paused or service in self.down:
                 continue
-            result = self.docker.exec_(self.ids[service], ["logit", "ready", "--admin", ADMIN],
-                                       timeout=15)
+            # With no `--admin`, `logit ready` probes the container's own `LOGIT_ADMIN`, else
+            # http://127.0.0.1:9600, as the image's HEALTHCHECK does: an overlap instance serves
+            # its admin endpoint on a Unix socket, since the instances share one address.
+            result = self.docker.exec_(self.ids[service], ["logit", "ready"], timeout=15)
             now = _now()
             waited = now - pending["since"]
             if result.ok or waited > READY_BOUND_S:
@@ -622,7 +693,15 @@ class Run:
                        stderr=result.stderr.strip())
 
         self.wait_tailed()
-        suts = self.scenario.suts
+        if self.scenario.overlap is not None:
+            self.stop_instances(self.scenario.suts)
+        else:
+            self.stop_chain(self.scenario.suts)
+        self.finish_end_sequence()
+
+    def stop_chain(self, suts):
+        """Stops each SUT service in chain order: an earlier one once its `[[ledger.hop]]` sink
+        is drained, the last once its sinks' stored totals hold or their queues are empty."""
         for service in suts:
             if service != suts[-1]:
                 self.wait_sink_drained(service, sinks=[hop["sink"] for hop in self.scenario.hops
@@ -631,13 +710,30 @@ class Run:
                 self.wait_quiet()
             else:
                 self.wait_sink_drained(service)
-            result = self.docker.run(["stop", "-t", str(SUT_STOP_T), self.ids[service]],
-                                     timeout=SUT_STOP_T + 15)
-            info = self.docker.inspect(self.ids[service]) or {}
-            self.phase("sut_stopped", service=service, rc=result.rc,
-                       stderr=result.stderr.strip(),
-                       exit_code=(info.get("State") or {}).get("ExitCode"))
+            self.stop_sut(service)
 
+    def stop_sut(self, service):
+        result = self.docker.run(["stop", "-t", str(SUT_STOP_T), self.ids[service]],
+                                 timeout=SUT_STOP_T + 15)
+        info = self.docker.inspect(self.ids[service]) or {}
+        self.phase("sut_stopped", service=service, rc=result.rc,
+                   stderr=result.stderr.strip(),
+                   exit_code=(info.get("State") or {}).get("ExitCode"))
+
+    def stop_instances(self, instances):
+        """A rolling overlap's end: every instance runs the whole pipeline and every sink's
+        backend holds all of them, so one wait covers the instances together, the stored totals
+        holding (or, with no backend, each instance's sinks drained), and then each instance
+        stops, with nothing left arriving to move between them."""
+        if self.has_vm:
+            self.wait_quiet()
+        else:
+            for service in instances:
+                self.wait_sink_drained(service)
+        for service in instances:
+            self.stop_sut(service)
+
+    def finish_end_sequence(self):
         if self.kafka:
             self.read_topic()
         if not self.has_vm:

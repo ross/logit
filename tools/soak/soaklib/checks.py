@@ -63,11 +63,20 @@ SUT, `logit`, both are the same. Two SUT services are joined by a `[[ledger.hop]
 hop on run totals, since a life of one service isn't a life of the other, and
 `ledger.summary` bounds V end to end. Without a hop two services SKIP every ledger row.
 
+A rolling overlap (`[overlap]`) runs several instances of one pipeline on one shared port: the
+rows about a process life judge each instance on its own lives, and the wire, `progress`,
+`recovery`, and `ledger.overlap` judge them together ("a rolling overlap" below).
+
+A `signal`, `rename`, `rotate`, or `probe` step opens no fault window (`RunData.events`): only
+`[[expect]]`, `file.reopen`, `tls.served`, and `self_log`'s excusal of a broken rotation's
+failed reload read it, and every other row judges straight through it.
+
 `rss_slope` and `fd_slope` judge each `logit` service on its own line, and a scenario's
 `[expected]` table can set the verdict a service should get on either (`judge_services`).
 """
 
 import bisect
+import copy
 import json
 import math
 import re
@@ -77,12 +86,18 @@ from pathlib import Path
 
 from . import collect, faults, standin, telemetry, topic, vm
 from .scenario import (DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET, GENERATOR_ROLE,
-                       KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, RUN_WINDOW, STANDIN_ROLE,
-                       STANDIN_TARGET, SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE,
-                       component_blocks, config_env, parse_duration)
+                       KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS, RUN_WINDOW,
+                       SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET, SUT_CONFIG_ENV,
+                       SUT_CONFIG_KEY, SUT_SERVICE, component_blocks, config_env,
+                       parse_duration, source_ids, source_pairs, stdio_shared_targets,
+                       tls_reload_polls)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
+# The self-log keys of a TLS reload that kept the previous files, and of one that loaded
+# (crates/logit-pipeline/src/tls.rs, `Watched::check`).
+TLS_RELOAD_FAILED_KEY = "tls_reload_failed"
+TLS_RELOADED_KEY = "tls_reloaded"
 
 
 def is_start(record):
@@ -117,6 +132,9 @@ SLOPE_MIN_SPAN_S = 60
 COVERAGE_MIN_SHARE = 0.05
 # Phases that mean the driver didn't run the schedule to its end sequence.
 RUN_FAIL_PHASES = ("aborted", "error", "interrupted")
+# How late the driver's tick may run before the run is `stalled` (driver.py's `STALL_S`).
+STALL_S = 120
+POLL_SLACK_S = 5
 
 
 @dataclass
@@ -197,6 +215,23 @@ class Fault:
     # A partition's `{network: IP address}` before its disconnect and after its reconnect.
     ips: object = None
     ips_after: object = None
+    # A `signal`'s signal, and a `rename`'s file and new name; None elsewhere.
+    signal: object = None
+    path: object = None
+    to: object = None
+    # When the apply finished, which for a `signal` is when Docker had sent it.
+    applied: object = None
+    # A `rotate`'s certificate, days, generation, and whether it was issued broken, with the
+    # serial and `notAfter` it issued; a `probe`'s certificate and port, with the serial and
+    # `notAfter` the listener served and whether they verified against the CA. None elsewhere.
+    cert: object = None
+    days: object = None
+    broken: object = None
+    gen: object = None
+    port: object = None
+    serial: object = None
+    not_after: object = None
+    verified: object = None
 
     def affects(self, wire):
         return bool(getattr(self, faults.INGRESS_KEYS[wire]))
@@ -241,6 +276,12 @@ class RunData:
         # `logit` alone.
         self.suts = list(self.resolved.get("suts") or [SUT_SERVICE])
         self.sut_in, self.sut_out = self.suts[0], self.suts[-1]
+        # `[overlap]`: `{holder, instances, label}`, or None. Each instance runs the whole
+        # pipeline, so the per-life rows read each through `instance_view()`.
+        self.overlap = self.resolved.get("overlap") or None
+        self.instances = list((self.overlap or {}).get("instances") or [])
+        # The instance an `instance_view()` reads, or None for the run as a whole.
+        self.overlap_instance = None
         # `{sink: series}`, each from `vm-export/<sink>.jsonl`.
         self.vm_series = {}
         for sink in self.sinks:
@@ -270,8 +311,11 @@ class RunData:
         self.end = phases.get("end_begin", phases.get("fail_fast", {})).get("t") or last
 
         # A fault whose apply returned nonzero gets no window, so nothing after it is excused;
-        # `timeline` FAILs the action itself.
+        # `timeline` FAILs the action itself. A step of `NO_WINDOW_ACTIONS` opens no window, so
+        # it goes in `events`, which only `[[expect]]`, `file.reopen`, `tls.served`, and
+        # `self_log`'s broken-rotation excusal read.
         self.faults = []
+        self.events = []
         applies = {}
         for record in self.timeline:
             if record.get("event") == "apply":
@@ -279,10 +323,10 @@ class RunData:
             elif record.get("event") == "revert" and record["step"] in applies:
                 apply = applies.pop(record["step"])
                 if not apply.get("rc"):
-                    self.faults.append(self._fault(apply, record["finished_at"], record))
+                    self._held(apply).append(self._fault(apply, record["finished_at"], record))
         for apply in applies.values():
             if not apply.get("rc"):
-                self.faults.append(self._fault(apply, self.end))
+                self._held(apply).append(self._fault(apply, self.end))
 
         self.telemetry = {}
         self.stderr = {}
@@ -328,6 +372,9 @@ class RunData:
             for sink in self.sinks:
                 self.vm_series[sink] = self.standin_store[0]
 
+    def _held(self, apply):
+        return self.events if apply.get("action") in NO_WINDOW_ACTIONS else self.faults
+
     @staticmethod
     def _fault(apply, end, revert=None):
         return Fault(
@@ -341,6 +388,11 @@ class RunData:
             affects_tcp_ingress=apply.get("affects_tcp_ingress", False),
             affects_file_ingress=apply.get("affects_file_ingress", False),
             ips=apply.get("ips"), ips_after=(revert or {}).get("ips_after"),
+            signal=apply.get("signal"), path=apply.get("path"), to=apply.get("to"),
+            applied=apply.get("finished_at"),
+            cert=apply.get("cert"), days=apply.get("days"), broken=apply.get("broken"),
+            gen=apply.get("gen"), port=apply.get("port"), serial=apply.get("serial"),
+            not_after=apply.get("not_after"), verified=apply.get("verified"),
         )
 
     def offset(self, t):
@@ -395,19 +447,21 @@ class RunData:
     def in_window(self, t, windows):
         return any(start <= t <= end for start, end in windows)
 
-    def steady(self, t, after_warmup=False):
+    def steady(self, t, after_warmup=False, windows=None):
         """Whether `t` is inside the judged steady state: after the timeline's zero (and the
-        warmup when asked), before the end sequence, and outside every fault window."""
+        warmup when asked), before the end sequence, and outside every fault window, or every
+        one of `windows` when given."""
         if self.t0 is None or t is None:
             return False
         if t < self.t0 + (self.warmup if after_warmup else 0) or t >= self.end:
             return False
-        return not self.in_window(t, self.windows())
+        return not self.in_window(t, self.windows() if windows is None else windows)
 
-    def quiet_intervals(self, start):
-        """[(start, end)] spans from `start` to the end sequence outside every fault window."""
+    def quiet_intervals(self, start, windows=None):
+        """[(start, end)] spans from `start` to the end sequence outside every fault window, or
+        every one of `windows` when given."""
         spans = [(start, self.end)]
-        for w_start, w_end in sorted(self.windows()):
+        for w_start, w_end in sorted(self.windows() if windows is None else windows):
             cut = []
             for s, e in spans:
                 if w_end <= s or w_start >= e:
@@ -426,7 +480,8 @@ class RunData:
 
 def check_run(data):
     """FAILs a run the driver didn't take from `start` through `end_end`: aborted, errored,
-    interrupted, or missing either phase. The driver still exits 130 when interrupted."""
+    interrupted, stalled (its tick ran far late, as across a host suspend), or missing either
+    phase. The driver still exits 130 when interrupted."""
     lines = []
     for name in RUN_FAIL_PHASES:
         record = data.phases.get(name)
@@ -438,6 +493,19 @@ def check_run(data):
             reason = reason[0]
         lines.append(f"{name} at {data.offset(record.get('t'))}" + (f": {reason[:300]}"
                                                                      if reason else ""))
+    stalls = [(record.get("since", 0), record.get("late_s", 0)) for record in data.timeline
+              if record.get("event") == "phase" and record.get("phase") == "stalled"]
+    if not stalls and data.t0 is not None and not data.phases.get("start", {}).get(
+            "marks_stalls"):
+        # A run directory from before the driver recorded the phase: the watchdog's 5 s
+        # inspections stop for the span. The end sequence inspects once as it begins.
+        polled = sorted({r["t"] for r in data.watchdog
+                         if r.get("t") and r["t"] <= data.end + POLL_SLACK_S})
+        stalls = [(a - data.t0, b - a) for a, b in zip(polled, polled[1:])
+                  if b - a > STALL_S]
+    for since, late in stalls:
+        lines.append(f"stalled: the driver's tick ran {late:,.0f}s late from +{since:.0f}s, as "
+                     "when the host sleeps; nothing was scheduled or polled in that span")
     lines += [f"no {name} phase" for name in ("start", "end_end") if name not in data.phases]
     if lines:
         return Result("run", FAIL, "; ".join(lines), lines)
@@ -610,6 +678,10 @@ def check_self_log(data):
     step's code and an ERROR line keyed with its `key`. Each `exit` step must show both, or the
     expected exit didn't happen as named. The `Error: ` text line `main` prints as it returns
     the failure, right after that `exiting` line, has no timestamp and is excused by its place.
+    A `tls_reload_failed` line FAILs too, except inside a `rotate` step on its service that
+    issued a broken certificate, or, on a service that polls its TLS files, inside any other
+    rotate on it with a `tls_reloaded` line of the same component after it in that rotate: a
+    poll can read one file before a rotation's rename and the next after it.
     """
     if not data.stderr:
         return Result("self_log", SKIP, "no logs/*.stderr")
@@ -617,7 +689,30 @@ def check_self_log(data):
     status = PASS
     lines = []
     counts = {"error": 0, "fault_key_inside": 0, "fault_key_outside": 0, "text": 0,
-              "expected": 0}
+              "expected": 0, "tls_expected": 0, "tls_torn": 0}
+    # `{service: [(start, end)]}` of each `rotate` step issued `broken = true` on it, from its
+    # apply to its revert, where a failed TLS reload is expected, and of each other rotate on it.
+    broken, whole = {}, {}
+    for event in data.events:
+        if event.action == "rotate":
+            (broken if event.broken else whole).setdefault(event.on, []).append(
+                (event.start, event.end))
+    polls = {service: tls_reload_polls(_service_config_text(data, service))
+             for service in data.stderr}
+
+    def torn_read(service, entry, entries):
+        """Whether a failed reload on a polling `service` is a poll that read a set between
+        two of a rotation's renames: inside a rotate that wasn't broken, with a reload of the
+        same component after it in that rotate. The rename is atomic per file only, and a
+        set's files are read one at a time (crates/logit-pipeline/src/tls.rs,
+        `Watched::check`)."""
+        if entry.ts is None or not polls.get(service):
+            return False
+        window = next(((start, end) for start, end in whole.get(service, [])
+                       if start <= entry.ts <= end), None)
+        return window is not None and any(
+            later.key == TLS_RELOADED_KEY and later.component == entry.component
+            and later.ts is not None and entry.ts < later.ts <= window[1] for later in entries)
     # {step: {"exiting", "key"}} for each `exit` step: which of its two lines appeared.
     found = {}
     exit_windows = {service: data.exit_windows(service) for service in data.stderr}
@@ -664,6 +759,18 @@ def check_self_log(data):
                 status = FAIL
                 lines.append(f"{service}: thread_panicked: {entry.raw[:200]}")
                 continue
+            if entry.key == TLS_RELOAD_FAILED_KEY:
+                if entry.ts is not None and data.in_window(entry.ts, broken.get(service, [])):
+                    counts["tls_expected"] += 1
+                elif torn_read(service, entry, entries):
+                    counts["tls_torn"] += 1
+                else:
+                    status = FAIL
+                    lines.append(f"{service}: {entry.level} {entry.key} at "
+                                 f"{data.offset(entry.ts)}, outside every broken rotate on "
+                                 f"{service} and with no reload after it in its rotate: "
+                                 f"{entry.message[:160]}")
+                continue
             if is_sink_fault_line(entry):
                 if entry.ts is not None and data.in_window(entry.ts, windows):
                     counts["fault_key_inside"] += 1
@@ -696,7 +803,11 @@ def check_self_log(data):
                                 f"{' and no '.join(missing)} in {fault.step}'s window")
     summary = (f"{counts['fault_key_inside']} sink fault line(s) inside fault windows, "
                f"{counts['fault_key_outside']} outside, {counts['expected']} expected-exit "
-               f"line(s), {counts['error']} other ERROR, {counts['text']} non-JSON")
+               f"line(s), {counts['error']} other ERROR, {counts['text']} non-JSON"
+               + (f", {counts['tls_expected']} tls_reload_failed line(s) inside broken "
+                  "rotations" if counts["tls_expected"] else "")
+               + (f", {counts['tls_torn']} torn read(s) a later reload in their rotation "
+                  "replaced" if counts["tls_torn"] else ""))
     return Result("self_log", status, summary if status == PASS else f"{lines[0]} ({summary})",
                   lines)
 
@@ -799,29 +910,54 @@ def check_ready(data):
 def check_progress(data):
     """Every progress window outside fault windows has a delivery from every sink, read from
     the SUT service holding the sinks, each logit's stdout keeps its drain cadence, and each
-    sink's newest stored sample stays fresh."""
-    sut = data.telemetry.get(data.sut_out)
-    if sut is None or data.t0 is None:
+    sink's newest stored sample stays fresh. Under `[overlap]` a fault that holds one instance
+    (`OVERLAP_HOLD_ACTIONS`) opens no window, since the others carry its flows: each window is
+    judged on the deliveries summed over the instances no such fault holds in it, and skipped
+    when it holds every one."""
+    holders = data.instances if data.overlap else [data.sut_out]
+    tels = {service: data.telemetry.get(service) for service in holders}
+    if any(tel is None for tel in tels.values()) or data.t0 is None:
         return Result("progress", SKIP, "no SUT telemetry or no timeline start")
     window = float(data.thresholds.get("progress_window", 30))
+    held = {service: [] for service in holders}
+    excluded = data.windows()
+    if data.overlap:
+        rb = data.recovery_bound
+        for fault in data.faults:
+            if fault.on in held and fault.action in OVERLAP_HOLD_ACTIONS:
+                held[fault.on].append((fault.start, fault.end + rb))
+        excluded = [(f.start, f.end + rb) for f in data.faults
+                    if not (f.on in held and f.action in OVERLAP_HOLD_ACTIONS)]
     status = PASS
     lines = []
     judged = 0
+    unjudged = 0
     judged_after_warmup_s = 0.0
     stalled = {sink: 0 for sink in data.sinks}
-    for start, end in data.quiet_intervals(data.t0 + window):
+    for start, end in data.quiet_intervals(data.t0 + window, excluded):
         t = start
         while t + window <= end:
+            up = [service for service in holders
+                  if not any(s < t + window and e > t for s, e in held[service])]
+            if not up:
+                unjudged += 1
+                t += window
+                continue
             judged += 1
             if t >= data.t0 + data.warmup:
                 judged_after_warmup_s += window
             for sink in data.sinks:
-                delivered = sut.counter_in("logit.component.batches.delivered", t, t + window,
-                                           component=sink)
+                delivered = sum(tels[service].counter_in(
+                    "logit.component.batches.delivered", t, t + window, component=sink)
+                    for service in up)
                 if delivered <= 0:
                     stalled[sink] += 1
-                    verdict, why = classify_stall(sut, sink, t, t + window)
+                    found = [classify_stall(tels[service], sink, t, t + window)
+                             for service in up]
+                    verdict = worst([one for one, _ in found])
                     status = worst([status, verdict])
+                    why = "; ".join(f"{service}: {text}" if data.overlap else text
+                                    for service, (_, text) in zip(up, found))
                     lines.append(f"no {sink} deliveries in [{data.offset(t)}, "
                                  f"{data.offset(t + window)}): {why}")
             t += window
@@ -845,7 +981,8 @@ def check_progress(data):
     for record in data.freshness:
         t = record.get("t")
         sink = record.get("sink")
-        if record.get("skipped") or t is None or t < data.t0 + window or not data.steady(t):
+        if (record.get("skipped") or t is None or t < data.t0 + window
+                or not data.steady(t, windows=excluded)):
             continue
         fresh_judged[sink] = fresh_judged.get(sink, 0) + 1
         age = record.get("age_s")
@@ -867,8 +1004,13 @@ def check_progress(data):
     lines += per_sink
     backend = (f" ({no_vm_reason(data)})" if not data.has_vm else
                f", each freshness sample under {FRESHNESS_MAX_AGE_S}s")
-    detail = (f"{judged} {window:.0f}s window(s) outside fault windows, judged per sink"
-              f"{backend}: {'; '.join(per_sink)}; {coverage}")
+    if data.overlap:
+        detail = (f"{judged} {window:.0f}s window(s) outside fault windows but an instance's own "
+                  f"hold, judged per sink on the instances running through each ({unjudged} "
+                  f"with none running skipped){backend}: {'; '.join(per_sink)}; {coverage}")
+    else:
+        detail = (f"{judged} {window:.0f}s window(s) outside fault windows, judged per sink"
+                  f"{backend}: {'; '.join(per_sink)}; {coverage}")
     return Result("progress", status, detail if status == PASS else lines[0], lines)
 
 
@@ -1493,24 +1635,35 @@ class Ledger:
             if gen is None:
                 continue
 
-            def total(name, component, gen=gen):
-                return sum(gen.counter_by_life(name, component=component).values())
+            def total(name, components, gen=gen):
+                return sum(sum(gen.counter_by_life(name, component=component).values())
+                           for component in components)
 
-            sink, load = source.get("generator_sink"), source.get("generator_input")
-            sent = total("logit.component.events.sent", load)
-            batches = total("logit.component.batches.sent", load)
+            sinks = source_ids(source, "generator_sink")
             dropped_by = {}
-            for point in gen.matching("logit.component.batches.dropped", component=sink):
-                if isinstance(point.value, (int, float)) and point.value:
-                    reason = point.attributes.get("reason", "?")
-                    dropped_by[reason] = dropped_by.get(reason, 0) + point.value
+            for sink in sinks:
+                for point in gen.matching("logit.component.batches.dropped", component=sink):
+                    if isinstance(point.value, (int, float)) and point.value:
+                        reason = point.attributes.get("reason", "?")
+                        dropped_by[reason] = dropped_by.get(reason, 0) + point.value
+            # Each input's batch. A generator with several inputs sends a batch from each in
+            # about the same tick, so its batch, the wire's edge tolerance, is their sum; a
+            # sink's own batch is its paired input's (`source_pairs()`).
+            input_batch = {}
+            for load in source_ids(source, "generator_input"):
+                sent = total("logit.component.events.sent", [load])
+                batches = total("logit.component.batches.sent", [load])
+                input_batch[load] = sent / batches if batches else 0.0
+            batch = sum(input_batch.values())
             self.gen_stats[service] = {
-                "G": total(self.wires[source.get("sut_listener")].g, sink),
+                "G": total(self.wires[source.get("sut_listener")].g, sinks),
                 "dropped_by": dropped_by,
-                "G_datagrams": total("logit.output.datagrams", sink),
-                "dropped_events": total("logit.component.events.dropped", sink),
-                "dropped_batches": total("logit.component.batches.dropped", sink),
-                "batch": sent / batches if batches else 0.0,
+                "G_datagrams": total("logit.output.datagrams", sinks),
+                "dropped_events": total("logit.component.events.dropped", sinks),
+                "dropped_batches": total("logit.component.batches.dropped", sinks),
+                "batch": batch,
+                "sink_batch": {sink: input_batch.get(load, 0.0)
+                               for load, sink in source_pairs(source)},
             }
         self.G = sum(stats["G"] for stats in self.gen_stats.values())
 
@@ -1615,9 +1768,12 @@ class Ledger:
 
     def _sut_config_text(self, service):
         """SUT `service`'s config: the run directory's copy, else the path `compose.env`
-        names."""
-        key = SUT_CONFIG_KEY if service == SUT_SERVICE else service
-        variable = SUT_CONFIG_ENV if service == SUT_SERVICE else config_env(service)
+        names. An overlap instance with no `[configs]` key of its own runs `sut`'s."""
+        own = service != SUT_SERVICE and (
+            service in (self.data.resolved.get("configs") or {})
+            or service not in self.data.instances)
+        key = service if own else SUT_CONFIG_KEY
+        variable = config_env(service) if own else SUT_CONFIG_ENV
         name = (self.data.resolved.get("configs") or {}).get(key)
         candidates = [self.data.run_dir / "configs" / name] if name else []
         try:
@@ -2037,6 +2193,232 @@ def _skip_without_sut(check_id, led):
     return None
 
 
+# ---- a rolling overlap ---------------------------------------------------------------------------
+#
+# Under `[overlap]` every instance runs the whole pipeline on one shared UDP port (the plan's
+# "Rolling overlap (W12b)"). A row about a process life (`ledger.intake`, `ledger.edge`,
+# `ledger.script`, `ledger.aggregate`, `ledger.egress`, `ledger.windows`, `ledger.replay`,
+# `identity.sink`, and `drops`, and `ledger.summary`'s per-life terms) judges each instance on
+# its own lives through `instance_view()`, V being the series whose `label` names the instance,
+# and takes the worst status. The generators' flows move between the instances, so `ledger.wire`, `progress`,
+# `recovery`, `ledger.summary`'s bound end to end, and `ledger.overlap` judge them together.
+
+# The actions that hold an instance's port: while one holds it, the other instances carry its
+# flows, so `progress` judges only the instances not held.
+OVERLAP_HOLD_ACTIONS = ("stop", "kill", "pause", "restart", "exit")
+# The instance faults that close its socket at a clean shutdown, whose final sample of
+# `receive_buffer.used.bytes` bounds what the close discarded, and those that end the process
+# with no final sample or drain, after which `ledger.overlap` can't be judged.
+OVERLAP_CLOSES = ("stop", "restart")
+OVERLAP_UNJUDGED = ("kill", "exit")
+# The smallest `skb->truesize` the kernel charges one small datagram, so a queue charged `used`
+# bytes holds at most `used / TRUESIZE_FLOOR_B` of them.
+TRUESIZE_FLOOR_B = 512
+USED_BYTES = "logit.input.receive_buffer.used.bytes"
+
+
+def _overlapped(data):
+    """Whether `data` is a whole overlap run, which a per-life row splits by instance."""
+    return bool(data.overlap) and data.overlap_instance is None
+
+
+def instance_view(data, instance):
+    """`data` as one overlap instance's run: that service alone as the SUT, and each sink's
+    series only those whose `label` is the instance's name. Cached on `data`."""
+    views = data.__dict__.setdefault("_views", {})
+    if instance not in views:
+        view = copy.copy(data)
+        view.__dict__.pop("_ledger", None)
+        view.__dict__.pop("_views", None)
+        view.overlap_instance = instance
+        view.suts = [instance]
+        view.sut_in = view.sut_out = instance
+        label = data.overlap.get("label")
+        view.vm_series = {sink: [one for one in series
+                                 if (one.get("metric") or {}).get(label) == instance]
+                          for sink, series in data.vm_series.items()}
+        views[instance] = view
+    return views[instance]
+
+
+def _instance_ledgers(data):
+    """`{instance: Ledger}`, each on its own `instance_view()`, in `[overlap]` order."""
+    return {instance: _ledger(instance_view(data, instance)) for instance in data.instances}
+
+
+def _per_instance(data, check):
+    """`check` run on each instance's view: one detail per instance, the worst status, and
+    SKIP only when every instance SKIPs."""
+    results = {instance: check(instance_view(data, instance)) for instance in data.instances}
+    statuses = [result.status for result in results.values()]
+    judged = [status for status in statuses if status != SKIP]
+    first = next(iter(results.values()))
+    return Result(first.id, worst(judged) if judged else SKIP,
+                  " | ".join(f"{instance}: {result.detail}"
+                             for instance, result in results.items()),
+                  [f"{instance}: {line}" for instance, result in results.items()
+                   for line in result.lines])
+
+
+def _unlabeled(data):
+    """`{sink: [series name]}`: each sink's exported series whose `label` names no instance, so
+    no instance's V holds it."""
+    label = data.overlap.get("label")
+    found = {}
+    for sink, series in data.vm_series.items():
+        names = [vm.series_name(one) for one in series
+                 if (one.get("metric") or {}).get(label) not in data.instances]
+        if names:
+            found[sink] = names
+    return found
+
+
+def _life_cumulative(tel, selections):
+    """A function of time: the running total of the `sum` points `selections`, `[(name,
+    attrs)]`, select, from 0 at the first life's start, held flat from a life's last drain to
+    the next life's start, and linear between drains, so an instance that is down reads
+    flat."""
+    by_ts = {}
+    for name, attrs in selections:
+        for ts, value, _ in tel.counter_points(name, **attrs):
+            by_ts[ts] = by_ts.get(ts, 0) + value
+    marks = sorted([(start, 0) for start in tel.life_starts]
+                   + [(ts, 1) for ts in set(tel.drains) | set(by_ts)])
+    anchors, total = [], 0.0
+    for t, is_drain in marks:
+        if is_drain:
+            total += by_ts.get(t, 0)
+        anchors.append((t, total))
+    stamps = [t for t, _ in anchors]
+
+    def at(t):
+        if not anchors or t <= anchors[0][0]:
+            return 0.0
+        index = bisect.bisect_left(stamps, t)
+        if index >= len(anchors):
+            return anchors[-1][1]
+        (t1, c1), (t2, c2) = anchors[index - 1], anchors[index]
+        return c1 if t2 == t1 else c1 + (c2 - c1) * (t - t1) / (t2 - t1)
+    return at
+
+
+def _overlap_ingest(leds, source):
+    """`(drains, counts, counted, start)` for `_wire_buckets` over every instance at once: each
+    instance's W + K + F for the source's listener, and F alone, as running totals
+    (`_life_cumulative`) summed and differenced at every instance's drains, since the
+    instances drain out of phase. `start` is the earliest instance's first life start."""
+    listener = source.get("sut_listener")
+    wire = WIRES[source_wire(source)]
+    lost = [("logit.input.frames.dropped", {"component": listener, "reason": reason})
+            for reason in wire.counted]
+    read = ([(wire.w, {"component": listener})]
+            + ([(wire.k, {"component": listener})] if wire.k else []) + lost)
+    totals = [_life_cumulative(led.ingress, read) for led in leds]
+    framed = [_life_cumulative(led.ingress, lost) for led in leds]
+    starts = [led.inn.life_starts[0] for led in leds if led.inn.life_starts]
+    start = min(starts) if starts else 0.0
+    drains = sorted({d for led in leds for d in led.ingress.drains if d > start})
+    counts, counted = {}, {}
+    previous = start
+    for drain in drains:
+        counts[drain] = sum(f(drain) for f in totals) - sum(f(previous) for f in totals)
+        counted[drain] = sum(f(drain) for f in framed) - sum(f(previous) for f in framed)
+        previous = drain
+    return drains, counts, counted, start
+
+
+def check_ledger_overlap(data):
+    """Under `[overlap]`, else no row: on run totals, the generators' G less every instance's
+    W + K + F, what no instance read or counted dropped, is at most what the instances' socket
+    closes could discard, each stop's or restart's `ceil(used / TRUESIZE_FLOOR_B) + 1` datagrams,
+    `used` being the closing life's last `receive_buffer.used.bytes`, sampled after its read loop
+    stopped; and no more than the wire's end allowance below 0. The bound is loose by up to about
+    a quarter of `SO_RCVBUF` (`udp_rmem_release` frees a socket's charge in batches), so the
+    kernel can still charge datagrams it has handed over. A run with a kill or an `exit` of an
+    instance, which closes with no final sample, or with another fault that can lose UDP on its
+    way in, is reported and not judged. Each stop's own gap, read from the drain intervals that
+    span it, is reported, never judged: interpolating the instances' out-of-phase drains errs by
+    about a generator batch at each edge."""
+    if not data.overlap:
+        return []
+    leds = _instance_ledgers(data)
+    problems = [problem for led in leds.values() for problem in led.problems]
+    if problems:
+        return Result("ledger.overlap", SKIP, "; ".join(problems))
+    first = leds[data.instances[0]]
+    if not first.gens or any(source.get("service") not in first.gens
+                             for source in first.sources):
+        return Result("ledger.overlap", SKIP, "no generator telemetry")
+    G = first.G
+    read = {instance: sum(sum(led.per[listener][symbol].values()) for listener in led.listeners
+                          for symbol in ("W", "K", "F"))
+            for instance, led in leds.items()}
+    gap = G - sum(read.values())
+    buckets = {source.get("sut_listener"): _wire_buckets(
+        data, first, source, combined=_overlap_ingest(list(leds.values()), source))
+        for source in first.sources}
+    instances = set(data.instances)
+    lines, unjudged = [], []
+    allowance = 0
+    for fault in sorted(data.faults, key=lambda f: f.start):
+        if fault.on in instances and fault.action in OVERLAP_CLOSES + OVERLAP_UNJUDGED:
+            led = leds[fault.on]
+            life = vm.life_at(led.inn.life_starts, fault.start)
+            used, rcvbuf = [], 0
+            for listener in led.listeners:
+                series = [v for _, v, point_life in led.ingress.gauge_series(
+                    USED_BYTES, component=listener) if point_life == life]
+                buffer = [v for _, v, point_life in led.ingress.gauge_series(
+                    "logit.input.receive_buffer.bytes", component=listener)
+                          if point_life == life]
+                used.append(series[-1] if series else None)
+                rcvbuf = max(rcvbuf, buffer[-1] if buffer else 0)
+            own = sum(g - wk for one in buckets.values() for _, _, _, label, g, wk, _ in one
+                      if any(part.startswith(f"{fault.step} ") for part in label.split(", ")))
+            head = (f"{fault.step} {fault.action} on {fault.on} at {data.offset(fault.start)}, "
+                    f"life {life}: gap {_n(round(own))} in the drain intervals across it "
+                    "(reported)")
+            if fault.action in OVERLAP_UNJUDGED:
+                unjudged.append(f"{fault.step} {fault.action} on {fault.on}")
+                lines.append(f"{head}; a {fault.action} ends the process with no final sample, "
+                             "so the close can't be bounded")
+                continue
+            if None in used:
+                unjudged.append(f"{fault.step} {fault.action} on {fault.on} with no "
+                                f"{USED_BYTES} sample in life {life}")
+                lines.append(f"{head}; no {USED_BYTES} sample in the closing life")
+                continue
+            bound = sum(math.ceil(one / TRUESIZE_FLOOR_B) + 1 for one in used)
+            allowance += bound
+            loose = rcvbuf / 4 / TRUESIZE_FLOOR_B
+            lines.append(f"{head}; last {USED_BYTES} {_n(sum(used))} -> at most {_n(bound)} "
+                         f"datagram(s) discarded (loose by up to {_n(loose)} at a quarter of "
+                         "its SO_RCVBUF)")
+        elif any(fault.affects(source_wire(source)) for source in first.sources) and not (
+                fault.on in instances and fault.action == "pause"):
+            unjudged.append(f"{fault.step} {fault.action} on {fault.on}")
+            lines.append(f"{fault.step} {fault.action} on {fault.on} at "
+                         f"{data.offset(fault.start)}: can lose UDP on its way in, so the "
+                         "run's gap isn't the closes' alone")
+    below = sum(_end_allowance(first, source) for source in first.sources)
+    split = ", ".join(f"{instance} {_n(value)}" for instance, value in read.items())
+    totals = f"G {_n(G)} − Σ(W + K + F) {_n(sum(read.values()))} ({split}) = {_n(gap)}"
+    if unjudged:
+        return Result("ledger.overlap", SKIP,
+                      f"{totals}, reported, not judged: {'; '.join(unjudged)}", lines)
+    if gap > allowance:
+        status, verdict = FAIL, f"uncounted, over the closes' {_n(allowance)}"
+    elif gap < -below:
+        status, verdict = FAIL, f"a surplus, past the end allowance {_n(below)}"
+    else:
+        status, verdict = PASS, f"within [-{_n(below)}, {_n(allowance)}]"
+    closes = sum(1 for f in data.faults if f.on in instances and f.action in OVERLAP_CLOSES)
+    return Result("ledger.overlap", status,
+                  f"{totals}, {verdict}: {closes} close(s) of an instance's socket, each at most "
+                  f"ceil(used / {TRUESIZE_FLOOR_B}) + 1 datagrams, loose by up to a quarter of "
+                  "its SO_RCVBUF; below, the generators' end allowance", lines)
+
+
 
 
 def affects_source(data, fault, service, wire=DEFAULT_WIRE):
@@ -2060,7 +2442,7 @@ def wire_judgment(fault, wire):
     return "judged"
 
 
-def _wire_buckets(data, led, source):
+def _wire_buckets(data, led, source, combined=None):
     """G − (W + K + F) for one source per SUT drain interval, classified `fault`, `judged`,
     `steady`, or `end`: its generator's G against its listener's W + K + F, with the fault
     windows that can affect its wire (`affects_source`), each reported or judged
@@ -2071,14 +2453,19 @@ def _wire_buckets(data, led, source):
     interpolation, because the two processes' drains are out of phase. Within a run of steady
     intervals the interpolation telescopes; each edge of a run errs by at most one generator
     batch, which is the judgment's tolerance. Returns `[(start, end, kind, label, g, wkf, f)]`,
-    `f` the part of `wkf` that is F."""
+    `f` the part of `wkf` that is F. Under `[overlap]`, `combined` is every instance's W + K + F
+    at once (`_overlap_ingest`)."""
     service, listener = source.get("service"), source.get("sut_listener")
     wire_name = source_wire(source)
     wire = WIRES[wire_name]
     gen, sut = led.gens[service], led.ingress
     anchors = []
     cum = 0.0
-    points = gen.counter_points(wire.g, component=source.get("generator_sink"))
+    summed = {}
+    for sink in source_ids(source, "generator_sink"):
+        for ts, value, point_life in gen.counter_points(wire.g, component=sink):
+            summed[(ts, point_life)] = summed.get((ts, point_life), 0) + value
+    points = [(ts, value, point_life) for (ts, point_life), value in sorted(summed.items())]
     starts = list(gen.life_starts)
     for life, start in enumerate(starts):
         anchors.append((start, cum))
@@ -2100,16 +2487,21 @@ def _wire_buckets(data, led, source):
         (t1, c1), (t2, c2) = anchors[index - 1], anchors[index]
         return c1 if t2 == t1 else c1 + (c2 - c1) * (t - t1) / (t2 - t1)
 
-    counts, counted = {}, {}
-    for name in [wire.w] + ([wire.k] if wire.k else []):
-        for ts, value, _ in sut.counter_points(name, component=listener):
-            counts[ts] = counts.get(ts, 0) + value
-    for reason in wire.counted:
-        for ts, value, _ in sut.counter_points("logit.input.frames.dropped", component=listener,
-                                               reason=reason):
-            counts[ts] = counts.get(ts, 0) + value
-            counted[ts] = counted.get(ts, 0) + value
-    drains = sorted(set(sut.drains) | set(counts))
+    if combined is not None:
+        drains, counts, counted, previous = combined
+    else:
+        counts, counted = {}, {}
+        for name in [wire.w] + ([wire.k] if wire.k else []):
+            for ts, value, _ in sut.counter_points(name, component=listener):
+                counts[ts] = counts.get(ts, 0) + value
+        for reason in wire.counted:
+            for ts, value, _ in sut.counter_points("logit.input.frames.dropped",
+                                                   component=listener, reason=reason):
+                counts[ts] = counts.get(ts, 0) + value
+                counted[ts] = counted.get(ts, 0) + value
+        drains = sorted(set(sut.drains) | set(counts))
+        sut_starts = led.inn.life_starts
+        previous = sut_starts[0] if sut_starts else (drains[0] if drains else 0)
     windows = []
     for fault in data.faults:
         if affects_source(data, fault, service, wire_name):
@@ -2118,8 +2510,6 @@ def _wire_buckets(data, led, source):
                             f"{fault.step} {fault.action} on {fault.on}"
                             + (f" ({ip})" if ip else ""), wire_judgment(fault, wire_name)))
     buckets = []
-    sut_starts = led.inn.life_starts
-    previous = sut_starts[0] if sut_starts else (drains[0] if drains else 0)
     for drain in drains:
         if drain <= previous:
             continue
@@ -2146,10 +2536,19 @@ def check_ledger_wire(data):
     every other affecting window is judged with a surplus allowed for its ambiguous drops
     (`wire_judgment`). See `_wire_buckets` for the tolerance. One detail per source; the worst
     status wins."""
-    led = _ledger(data)
-    skipped = _skip_without_sut("ledger.wire", led)
-    if skipped:
-        return skipped
+    instances = None
+    if _overlapped(data):
+        leds = _instance_ledgers(data)
+        problems = [problem for one in leds.values() for problem in one.problems]
+        if problems:
+            return Result("ledger.wire", SKIP, "; ".join(problems))
+        instances = list(leds.values())
+        led = instances[0]
+    else:
+        led = _ledger(data)
+        skipped = _skip_without_sut("ledger.wire", led)
+        if skipped:
+            return skipped
     if not led.gens:
         return Result("ledger.wire", SKIP, "no generator telemetry")
     statuses, details, lines = [], [], []
@@ -2159,7 +2558,7 @@ def check_ledger_wire(data):
             statuses.append(FAIL)
             details.append(f"{service}: no generator telemetry")
             continue
-        status, detail, source_lines = _wire_one(data, led, source)
+        status, detail, source_lines = _wire_one(data, led, source, instances)
         statuses.append(status)
         label = f"{service} -> {source.get('sut_listener')}: " if len(led.sources) > 1 else ""
         details.append(label + detail)
@@ -2171,13 +2570,14 @@ def _ambiguous_drops(led, source):
     """`[(timestamp, count)]` of a source's generator sink's `ambiguous_at_most_once` batch
     drops. Each leaves up to one generator batch of whole lines in W that G doesn't count, so
     `ledger.wire` and `_end_to_end` allow that much surplus per drop on a TCP wire."""
-    return [(ts, v) for ts, v, _ in led.gens[source.get("service")].counter_points(
-        "logit.component.batches.dropped", component=source.get("generator_sink"),
-        reason=AMBIGUOUS_DROP)]
+    return sorted((ts, v) for sink in source_ids(source, "generator_sink")
+                  for ts, v, _ in led.gens[source.get("service")].counter_points(
+                      "logit.component.batches.dropped", component=sink, reason=AMBIGUOUS_DROP))
 
 
-def _wire_one(data, led, source):
-    """`(status, detail, lines)` of `ledger.wire` for one source."""
+def _wire_one(data, led, source, instances=None):
+    """`(status, detail, lines)` of `ledger.wire` for one source. Under `[overlap]`,
+    `instances` holds each instance's ledger, and W, K, and F are theirs summed."""
     service, listener = source.get("service"), source.get("sut_listener")
     wire_name = source_wire(source)
     wire = WIRES[wire_name]
@@ -2187,9 +2587,10 @@ def _wire_one(data, led, source):
     stats = led.gen_stats[service]
     status = PASS
     lines = []
-    W = sum(led.per[listener]["W"].values())
-    K = sum(led.per[listener]["K"].values())
-    F = sum(led.per[listener]["F"].values())
+    readers = instances or [led]
+    W = sum(sum(one.per[listener]["W"].values()) for one in readers)
+    K = sum(sum(one.per[listener]["K"].values()) for one in readers)
+    F = sum(sum(one.per[listener]["F"].values()) for one in readers)
     G = stats["G"]
     gap = G - W - K - F
     if udp and G != stats["G_datagrams"]:
@@ -2201,7 +2602,8 @@ def _wire_one(data, led, source):
         lines.append(f"precondition: generator output.datagrams {_n(stats['G_datagrams'])} "
                      "isn't 0, so its sink isn't sending over TCP")
 
-    buckets = _wire_buckets(data, led, source)
+    buckets = _wire_buckets(data, led, source, combined=(
+        None if instances is None else _overlap_ingest(instances, source)))
     runs = []
     for start, end, kind, label, g, wk, f in buckets:
         if runs and runs[-1][2] == kind and runs[-1][3] == label:
@@ -2258,9 +2660,7 @@ def _wire_one(data, led, source):
         lines.insert(0, f"{_n(round(judged))} lost outside {outside}, over "
                         f"{limit:g} x {_n(round(g_steady))} + {edges} edge(s) x one "
                         f"{_n(batch)}-line batch")
-    last_queued = [v for _, v, _ in led.gens[service].gauge_series(
-        "logit.component.buffer.batches", component=source.get("generator_sink"))]
-    end_allow = ((last_queued[-1] if last_queued else 0) + 1) * batch
+    end_allow = _end_allowance(led, source)
     if sums["end"] < -end_allow:
         status = FAIL
         lines.insert(0, f"G falls {_n(round(-sums['end']))} short of W + K at the end, over "
@@ -2274,6 +2674,10 @@ def _wire_one(data, led, source):
                   f"limit {_n(round(allowed))}); the generator's counted drop_newest loss, "
                   f"not in G: {_n(stats['dropped_events'])} event(s) in "
                   f"{_n(stats['dropped_batches'])} batch(es)")
+        if instances is not None:
+            detail += "; W by instance: " + ", ".join(
+                f"{one.service} {_n(sum(one.per[listener]['W'].values()))}"
+                for one in instances)
     else:
         framed = {reason: sum(led.ingress.counter_by_life(
             "logit.input.frames.dropped", component=listener, reason=reason).values())
@@ -2292,6 +2696,19 @@ def _wire_one(data, led, source):
     if status != PASS:
         detail = f"{lines[0]}; {detail}"
     return status, detail, lines
+
+
+def _end_allowance(led, source):
+    """How far a source's G may fall short of W + K at the end: a send each generator sink
+    cancels at shutdown loses its counts, up to that sink's last `buffer.batches` plus one, each
+    a batch of the input that feeds it."""
+    gen = led.gens[source.get("service")]
+    sizes = led.gen_stats[source.get("service")]["sink_batch"]
+    allowed = 0.0
+    for sink in source_ids(source, "generator_sink"):
+        series = gen.gauge_series("logit.component.buffer.batches", component=sink)
+        allowed += ((series[-1][1] if series else 0) + 1) * sizes.get(sink, 0.0)
+    return allowed
 
 
 def _file_wire_one(data, led, source):
@@ -2371,6 +2788,8 @@ def check_ledger_intake(data):
     (`Ledger.residual`), summed over the listeners, in [0, R], a sanity bound. `ledger.egress`
     ties that residual to V. A life whose stderr shutdown lines disagree with telemetry's
     shutdown drops WARNs."""
+    if _overlapped(data):
+        return _per_instance(data, check_ledger_intake)
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.intake", led)
     if skipped:
@@ -2447,6 +2866,8 @@ def check_ledger_edge(data):
     (a fan-out counts one send per batch, however many consumers it reaches), and under `route`
     the sink's target's events.sent == the sink's events.received. Earlier lives are
     reported."""
+    if _overlapped(data):
+        return _per_instance(data, check_ledger_edge)
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.edge", led)
     if skipped:
@@ -2515,6 +2936,8 @@ def check_ledger_script(data):
     listener's edge), L_in == L_emit + L_drop + L_err (every event emitted, discarded, or lost
     to a script error), and L_sent == L_emit + L_flush (what it sent is what `process()` emitted plus what
     `flush()` returned). Earlier lives are reported."""
+    if _overlapped(data):
+        return _per_instance(data, check_ledger_script)
     if not data.ledger.get("sut_script"):
         return Result("ledger.script", SKIP, "no [ledger] sut_script")
     led = _ledger(data)
@@ -2552,6 +2975,8 @@ def check_ledger_script(data):
 
 def check_ledger_aggregate(data):
     """The final life's Ab == A."""
+    if _overlapped(data):
+        return _per_instance(data, check_ledger_aggregate)
     return _final_equality(data, "ledger.aggregate", "Ab", "A", "every event absorbed")
 
 
@@ -2565,6 +2990,8 @@ def check_ledger_egress(data):
     band or below 0 on a Kafka target. A `FAULT_DROP_REASONS` drop in a life's credit FAILs it
     whatever its gap. A sink whose export has no series, or a Kafka topic with no records,
     can't pass."""
+    if _overlapped(data):
+        return _egress_overlap(data)
     if data.external:
         return Result("ledger.egress", SKIP, f"{NO_BACKEND}; ledger.sent judges the sinks")
     if data.kafka and data.phases.get("kafka_read") is None:
@@ -2700,6 +3127,8 @@ def check_ledger_summary(data):
     duplicate never enters the sum. Across a hop, W − D − E − B and E − S_hop are the ingress
     SUT's final life's, E_B − A and the rest the far SUT's, and the row also FAILs any group
     whose V over the run exceeds G less every counted loss (`_end_to_end`)."""
+    if _overlapped(data):
+        return _summary_overlap(data)
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.summary", led)
     if skipped:
@@ -2749,10 +3178,12 @@ def check_ledger_summary(data):
         counted_script = (f"; the script's L_drop {_n(g('L_drop', life))} and L_err "
                           f"{_n(g('L_err', life))}, counted")
     wire = ""
-    if led.gens and not led.streams:
+    # An overlap instance reads part of the generators' lines; `_summary_overlap` adds the wire.
+    whole = data.overlap_instance is None and led.gens
+    if whole and not led.streams:
         wire = (f"; wire G − (W + K) {_n(led.G - sum(led.W.values()) - sum(led.K.values()))} "
                 "over the run, by design")
-    elif led.gens:
+    elif whole:
         wire = (f"; wire G − (W + K + F) "
                 f"{_n(led.G - sum(led.W.values()) - sum(led.K.values()) - sum(led.F.values()))}"
                 f" over the run, F {_n(sum(led.F.values()))} counted; ledger.wire judges the "
@@ -2777,6 +3208,58 @@ def check_ledger_summary(data):
             and not uncounted_egress and not faults):
         detail = f"{bound_text}; {detail}"
     return Result("ledger.summary", status, detail, lines)
+
+
+def _egress_overlap(data):
+    """`ledger.egress` per overlap instance, each against the series its label names; a series
+    whose label names no instance FAILs the row, since no instance's V can hold it."""
+    result = _per_instance(data, check_ledger_egress)
+    if not data.has_vm:
+        return result
+    label = data.overlap.get("label")
+    for sink, names in sorted(_unlabeled(data).items()):
+        result.status = FAIL
+        line = (f"{sink}: {_n(len(names))} series whose {label} names no instance, so no "
+                f"instance's V holds them: {', '.join(names[:3])}")
+        result.lines.insert(0, line)
+        result.detail = f"{line} | {result.detail}"
+    return result
+
+
+def _summary_overlap(data):
+    """`ledger.summary` under `[overlap]`: each instance's final-life terms, then the wire over
+    the run and one bound end to end, which no instance's split can loosen: each egress group's
+    V summed over the instances is at most what the generators sent less every instance's
+    counted loss (K, D, B, X, and F)."""
+    result = _per_instance(data, check_ledger_summary)
+    leds = _instance_ledgers(data)
+    if any(led.problems for led in leds.values()):
+        return result
+    first = leds[data.instances[0]]
+    if not first.gens:
+        return result
+    read = sum(sum(getattr(led, symbol).values()) for led in leds.values()
+               for symbol in ("W", "K", "F"))
+    counted = sum(sum(getattr(led, symbol).values()) for led in leds.values()
+                  for symbol in ("K", "F", "D_tel", "B", "X"))
+    limit = first.G - counted
+    status, parts = PASS, []
+    if not data.external:
+        for label, sinks in first.egress_groups():
+            total = sum(led.V_total.get(sink, 0) for led in leds.values() for sink in sinks)
+            if total > limit:
+                status = FAIL
+                parts.append(f"{label}: ΣV {_n(total)} > G − counted {_n(limit)}, a surplus of "
+                             f"{_n(total - limit)}")
+            else:
+                parts.append(f"{label}: ΣV {_n(total)} <= G − counted {_n(limit)}")
+    bound = (f"wire G − Σ(W + K + F) {_n(first.G - read)} over the run, ledger.overlap's; "
+             f"end to end over the run, G {_n(first.G)} less the instances' counted loss "
+             f"{_n(counted)}: " + ("; ".join(parts) or "no V on this target"))
+    detail = f"{result.detail}; {bound}"
+    if status == FAIL and result.status != FAIL:
+        detail = f"{bound}; {result.detail}"
+    return Result("ledger.summary", worst([result.status, status]), detail, result.lines)
 
 
 def _end_to_end(data, led):
@@ -2998,6 +3481,8 @@ def check_identity_sink(data):
     """For each sink, at the final life's last drain before its shutdown drain:
     batches.received + buffer.disk.replayed + batches.dropped{reason="disk_torn"} ==
     delivered + dropped (every reason) + buffer.batches, one batch in flight allowed."""
+    if _overlapped(data):
+        return _per_instance(data, check_identity_sink)
     led = _ledger(data)
     skipped = _skip_without_sut("identity.sink", led)
     if skipped:
@@ -3079,6 +3564,8 @@ def check_ledger_windows(data):
     `temporality: cumulative` V reads only each life's last value, so a lost middle window
     changes no total and only this row sees it. A stand-in target's V, rebuilt from its record
     in the export's shape, is judged the same way."""
+    if _overlapped(data):
+        return _per_instance(data, check_ledger_windows)
     if not (data.has_vm or data.standin):
         return Result("ledger.windows", SKIP, no_vm_reason(data))
     if data.ledger.get("vm_every_window") is not True:
@@ -3208,6 +3695,8 @@ def check_ledger_replay(data):
     and the highest delivered rate over its last few drain intervals that delivered anything
     (`_commit_rate`), replayed − queued is in [−(delivered rate × t) − 1, received rate × t +
     that commit rate × the checkpoint interval + 1]."""
+    if _overlapped(data):
+        return _per_instance(data, check_ledger_replay)
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.replay", led)
     if skipped:
@@ -3887,11 +4376,22 @@ def check_recovery(data):
     spans two SUT lives, isn't eligible; a fault with no eligible interval is skipped and
     listed. A `rate_behind` diagnostic from any generator turns a throughput shortfall into a
     WARN. Across a hop each SUT's sinks are judged on its own drains: the hop sink against the
-    listeners' W, and the far SUT's sinks against its `logit_in`'s events sent."""
-    led = _ledger(data)
-    skipped = _skip_without_sut("recovery", led)
-    if skipped:
-        return skipped
+    listeners' W, and the far SUT's sinks against its `logit_in`'s events sent. Under
+    `[overlap]` each instance's sinks and receive queue are judged on its own drains, so only
+    while it runs, against the ingest summed over every instance (`_life_cumulative`), since the
+    generators' flows move between them."""
+    leds = None
+    if _overlapped(data):
+        leds = _instance_ledgers(data)
+        problems = [problem for one in leds.values() for problem in one.problems]
+        if problems:
+            return Result("recovery", SKIP, "; ".join(problems))
+        led = leds[data.instances[0]]
+    else:
+        led = _ledger(data)
+        skipped = _skip_without_sut("recovery", led)
+        if skipped:
+            return skipped
     if not data.faults:
         return Result("recovery", PASS, "no faults to recover from")
     if data.t0 is None or any(source.get("service") not in led.gens for source in led.sources):
@@ -3901,16 +4401,17 @@ def check_recovery(data):
     baseline = 0.0
     behind = 0
     for source in led.sources:
-        gen, load = led.gens[source.get("service")], source.get("generator_input")
-        warm = [(ts, v) for ts, v, _ in gen.counter_points("logit.component.events.sent",
-                                                           component=load)
-                if data.t0 <= ts <= data.t0 + data.warmup]
-        if len(warm) < 2 or warm[-1][0] <= warm[0][0]:
-            return Result("recovery", SKIP, f"too few {source.get('service')} drains in warmup "
-                          "for a baseline")
-        baseline += sum(v for _, v in warm[1:]) / (warm[-1][0] - warm[0][0])
-        behind += sum(v for _, v, _ in gen.counter_points("logit.component.diagnostics",
-                                                          component=load, key="rate_behind"))
+        gen = led.gens[source.get("service")]
+        for load in source_ids(source, "generator_input"):
+            warm = [(ts, v) for ts, v, _ in gen.counter_points("logit.component.events.sent",
+                                                               component=load)
+                    if data.t0 <= ts <= data.t0 + data.warmup]
+            if len(warm) < 2 or warm[-1][0] <= warm[0][0]:
+                return Result("recovery", SKIP, f"too few {source.get('service')} drains in "
+                              "warmup for a baseline")
+            baseline += sum(v for _, v in warm[1:]) / (warm[-1][0] - warm[0][0])
+            behind += sum(v for _, v, _ in gen.counter_points(
+                "logit.component.diagnostics", component=load, key="rate_behind"))
     # Only a UDP listener has a receive queue to drain.
     receive_util = {listener: led.ingress.gauge_series("logit.component.receive.utilization",
                                                        component=listener)
@@ -3933,7 +4434,22 @@ def check_recovery(data):
                                                "buffer.batches")} for sink in sinks}}
 
     datagrams = [(listener, led.wires[listener].w) for listener in led.listeners]
-    if led.hop is None:
+    if leds is not None:
+        totals = [_life_cumulative(one.ingress, [(name, {"component": listener})
+                                                 for listener, name in datagrams])
+                  for one in leds.values()]
+
+        def summed(start, end):
+            return sum(f(end) - f(start) for f in totals)
+
+        legs = []
+        for instance, one in leds.items():
+            legs.append({**leg(one.ingress, one.sinks, datagrams, f"{instance} "),
+                         "ingested": summed,
+                         "receive": {listener: one.ingress.gauge_series(
+                             "logit.component.receive.utilization", component=listener)
+                             for listener in receive_util}})
+    elif led.hop is None:
         legs = [leg(sut, led.sinks, datagrams)]
     else:
         legs = [leg(led.ingress, [led.hop.get("sink")], datagrams, f"{led.inn.service} "),
@@ -3941,7 +4457,10 @@ def check_recovery(data):
                     f"{led.service} ")]
 
     def ingested(one, start, end):
-        """What reached `one`'s SUT in its drains in (start, end]."""
+        """What reached `one`'s SUT in its drains in (start, end]: under `[overlap]`, every
+        instance."""
+        if "ingested" in one:
+            return one["ingested"](start, end)
         lo = bisect.bisect_right(one["ingest_ts"], start)
         hi = bisect.bisect_right(one["ingest_ts"], end)
         return sum(one["ingest"][ts] for ts in one["ingest_ts"][lo:hi])
@@ -3956,7 +4475,7 @@ def check_recovery(data):
             problems.append(f"retrying {_step_value(retrying, end):g}")
         receive = [(f"{listener} receive.utilization" if len(receive_util) > 1
                     else "receive.utilization", series)
-                   for listener, series in receive_util.items()]
+                   for listener, series in one.get("receive", receive_util).items()]
         for label, series in ([("buffer.utilization", one["gauges"][sink]["buffer.utilization"])]
                               + receive):
             value = _step_value(series, end)
@@ -4026,6 +4545,261 @@ def check_recovery(data):
     return Result("recovery", status, detail, lines)
 
 
+# ---- file reopens ---------------------------------------------------------------------------------
+#
+# A `rename` moves a `stdio_out` file target aside in `<run>/shared`, and a SIGHUP inside the step
+# makes the target reopen its path. The reopen is lazy: the target checks the reopen generation at
+# the top of each send (crates/logit-outputs/src/stdio.rs, "Reopen on SIGHUP"), so the first batch
+# after the signal opens the new file and every earlier batch is in the renamed one.
+
+# How far a line's timestamp may sit past the signal's end in the renamed file, or before its
+# start in the new one. A line's timestamp is when its listener read the datagram (statsd_in's
+# `received_at`), and stdio_out writes each batch as it arrives: statsd_in sends a batch at least
+# every 100 ms (`batch_flush_interval`), so a line reaches the file about 100 ms after it was
+# read. 2 s is 20 of those, for a loaded host, and far under the minutes between a scenario's
+# signals, so a target that missed the reopen is off by far more.
+REOPEN_TOLERANCE_S = 2.0
+# What stands in for a run's `shared/` files once they are deleted to save space:
+# `{file name: ndjson_file_lines(file)}`, read for a name `shared/` no longer holds.
+SHARED_COUNTS = "shared-counts.json"
+_NDJSON_TIMESTAMP = re.compile(rb'^\{"timestamp":"([^"]+)"')
+
+
+def _service_config_text(data, service):
+    """The config text of `logit` service `service` from the run's `configs/` copy, or ""."""
+    configs = data.resolved.get("configs") or {}
+    key = (service if service in configs and service != SUT_CONFIG_KEY
+           else SUT_CONFIG_KEY if service in data.suts else None)
+    if key is None or key not in configs:
+        return ""
+    try:
+        return (data.run_dir / "configs" / configs[key]).read_text()
+    except OSError:
+        return ""
+
+
+def ndjson_file_lines(path):
+    """`{lines, first, last, unparsed}` for a `format: json` file: its newline-terminated lines,
+    the earliest and latest `timestamp` among them in epoch seconds (None with no lines), and how
+    many lines carry none. None when the file doesn't exist. Each whole second is parsed once,
+    since a file holds thousands of lines a second."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    lines = unparsed = 0
+    first = last = None
+    seconds = {}
+    with open(path, "rb") as handle:
+        for raw in handle:
+            if not raw.endswith(b"\n"):
+                continue
+            lines += 1
+            found = _NDJSON_TIMESTAMP.match(raw)
+            text = found.group(1).decode("ascii", "replace") if found else ""
+            whole, dot, rest = text.partition(".")
+            try:
+                if dot and rest.endswith("Z") and rest[:-1].isdigit():
+                    if whole not in seconds:
+                        seconds[whole] = telemetry.parse_rfc3339(whole + "Z")
+                    ts = seconds[whole] + int(rest[:-1]) / 10 ** len(rest[:-1])
+                else:
+                    ts = telemetry.parse_rfc3339(text)
+            except ValueError:
+                unparsed += 1
+                continue
+            first = ts if first is None or ts < first else first
+            last = ts if last is None or ts > last else last
+    return {"lines": lines, "first": first, "last": last, "unparsed": unparsed}
+
+
+def _reopen_files(data, names):
+    """`{name: ndjson_file_lines()}` for each of `names` in the run's `shared/`, taking a name
+    the directory no longer holds from `SHARED_COUNTS` when the run has one."""
+    try:
+        recorded = json.loads((data.run_dir / SHARED_COUNTS).read_text())
+    except (OSError, ValueError):
+        recorded = {}
+    files = {}
+    for name in names:
+        found = ndjson_file_lines(data.run_dir / SHARED_DIR / name)
+        files[name] = found if found is not None else recorded.get(name)
+    return files
+
+
+def _reopen_count(data, service, path, names, files):
+    """`(status, line)` for the lines in every file of `path`'s renames against the target's
+    `events.delivered` summed over `service`'s lives."""
+    component = stdio_shared_targets(_service_config_text(data, service)).get(path)
+    written = sum(found["lines"] for found in files.values() if found)
+    tel = data.telemetry.get(service)
+    shown = f"lines in {', '.join(names)}: {_n(written)}"
+    if component is None:
+        return FAIL, f"{shown}; {service}'s config has no stdio_out at {SHARED_MOUNT}/{path}"
+    if tel is None:
+        return FAIL, f"{shown}; no {service} telemetry"
+    delivered = sum(tel.counter_by_life("logit.component.events.delivered",
+                                        component=component).values())
+    line = f"{shown}, {component}'s events.delivered over {service}'s lives: {_n(delivered)}"
+    if written == delivered:
+        return PASS, line
+    ended = [f.step for f in data.faults if f.on == service and f.action in ("kill", "exit")]
+    if ended:
+        return PASS, (f"{line} (reported, not judged: {', '.join(ended)} ended a life with no "
+                      "final drain)")
+    return FAIL, f"{line}, off by {_n(written - delivered)}"
+
+
+def check_file_reopen(data):
+    """One `file.reopen.<step>` row per `rename` step, else one `file.reopen` row that SKIPs.
+    A rename moves its target's file `path` to `to` and pairs with the first SIGHUP on its
+    service starting inside its window. The row FAILs when the rename or that SIGHUP never
+    applied; the renamed file is missing or has a line timestamped after the signal's apply
+    finished plus `REOPEN_TOLERANCE_S` (or, after an earlier rename of the same path, before that
+    rename's signal started less it); the new file, the next rename's `to` or `path` after the
+    last, is missing or has a line timestamped before the signal started less it; a line has no
+    timestamp; or the lines in every file of the path's renames differ from the target's
+    `events.delivered` summed over the service's lives, one line per event under
+    `format: json`. A kill or an `exit` of the service loses its last drain's counts, so the
+    count is then reported, not judged. A new file with no lines WARNs."""
+    renames = sorted((f for f in data.events if f.action == "rename"), key=lambda f: f.start)
+    failed = [r for r in data.timeline if r.get("event") == "apply"
+              and r.get("action") == "rename" and r.get("rc")]
+    if not renames and not failed:
+        return [Result("file.reopen", SKIP, "the scenario has no rename step")]
+    results = [Result(f"file.reopen.{r.get('step')}", FAIL,
+                      f"the rename of {r.get('path')} to {r.get('to')} on {r.get('on')} "
+                      f"returned rc {r.get('rc')}: {(r.get('stderr') or '')[:160]}")
+               for r in failed]
+    hups = sorted((f for f in data.events if f.action == "signal" and f.signal == "HUP"),
+                  key=lambda f: f.start)
+    chains = {}
+    for rename in renames:
+        chains.setdefault((rename.on, rename.path), []).append(rename)
+    for (service, path), chain in chains.items():
+        names = [rename.to for rename in chain] + [path]
+        files = _reopen_files(data, names)
+        count = _reopen_count(data, service, path, names, files)
+        previous = None
+        for index, rename in enumerate(chain):
+            hup = next((f for f in hups if f.on == service
+                        and rename.start <= f.start <= rename.end), None)
+            new_name = names[index + 1]
+            old, new = files[rename.to], files[new_name]
+            status, problems, lines = count[0], [], [count[1]]
+            if count[0] == FAIL:
+                problems.append(count[1])
+            if hup is None:
+                problems.append(f"no SIGHUP on {service} applied inside {rename.step}")
+            if old is None:
+                problems.append(f"{rename.to} is missing")
+            elif hup is not None:
+                lines.append(f"{rename.to}: {_n(old['lines'])} line(s), the latest at "
+                             f"{data.offset(old['last'])}; {hup.step}'s SIGHUP finished at "
+                             f"{data.offset(hup.applied)}")
+                if old["last"] is not None and old["last"] > hup.applied + REOPEN_TOLERANCE_S:
+                    problems.append(f"{rename.to} has a line at {data.offset(old['last'])}, "
+                                    f"{old['last'] - hup.applied:.1f}s after {hup.step}'s "
+                                    f"SIGHUP finished, past the {REOPEN_TOLERANCE_S:g}s "
+                                    "tolerance")
+                if (previous is not None and old["first"] is not None
+                        and old["first"] < previous.start - REOPEN_TOLERANCE_S):
+                    problems.append(f"{rename.to} has a line at {data.offset(old['first'])}, "
+                                    f"{previous.start - old['first']:.1f}s before "
+                                    f"{previous.step}'s SIGHUP started")
+            if new is None:
+                problems.append(f"the new file {new_name} is missing: the target never reopened "
+                                "its path")
+            elif hup is not None:
+                lines.append(f"{new_name}: {_n(new['lines'])} line(s), the earliest at "
+                             f"{data.offset(new['first'])}; {hup.step}'s SIGHUP started at "
+                             f"{data.offset(hup.start)}")
+                if new["first"] is None:
+                    status = worst([status, WARN])
+                    lines.insert(0, f"the new file {new_name} has no lines")
+                elif new["first"] < hup.start - REOPEN_TOLERANCE_S:
+                    problems.append(f"{new_name} has a line at {data.offset(new['first'])}, "
+                                    f"{hup.start - new['first']:.1f}s before {hup.step}'s "
+                                    f"SIGHUP started, past the {REOPEN_TOLERANCE_S:g}s "
+                                    "tolerance")
+            for name, found in ((rename.to, old), (new_name, new)):
+                if found and found["unparsed"]:
+                    problems.append(f"{name}: {_n(found['unparsed'])} line(s) with no "
+                                    "timestamp")
+            previous = hup
+            if problems:
+                status = FAIL
+            who = f"{hup.step}'s" if hup else "no"
+            head = f"{service}: {path} -> {rename.to} with {who} SIGHUP"
+            shown = problems or lines
+            results.append(Result(f"file.reopen.{rename.step}", status,
+                                  f"{head}; {'; '.join(shown)}", problems + lines))
+    return results
+
+
+# ---- served certificates --------------------------------------------------------------------------
+#
+# A `rotate` issues a certificate's next generation into `<run>/tls` and repoints its `live`
+# symlink; a SIGHUP makes the listener reload the files, and a `probe` reads what the listener
+# serves after it. A failed reload keeps the previous files, so after a broken rotation the
+# listener still serves the last good generation (docs/adr/tls-certificate-reload.md, "Failure
+# policy: keep serving the old material").
+
+
+def check_tls_served(data):
+    """One `tls.served.<step>` row per `probe` step, else one `tls.served` row that SKIPs. The
+    probe pairs with the generation in force for its certificate: the latest rotation of it
+    that started before the probe and wasn't broken, else the first issue (the driver's
+    `tls_issued` phase). The row FAILs when the probe didn't apply, the served serial or
+    `notAfter` isn't that generation's, the served chain didn't verify against the run's CA for
+    the certificate's name, or no first issue was recorded."""
+    probes = sorted((f for f in data.events if f.action == "probe"), key=lambda f: f.start)
+    failed = [r for r in data.timeline if r.get("event") == "apply"
+              and r.get("action") == "probe" and r.get("rc")]
+    if not probes and not failed:
+        return [Result("tls.served", SKIP, "the scenario has no probe step")]
+    results = [Result(f"tls.served.{r.get('step')}", FAIL,
+                      f"the probe of {r.get('cert')} on {r.get('on')} returned rc "
+                      f"{r.get('rc')}: {(r.get('stderr') or '')[:160]}")
+               for r in failed]
+    issued = (data.phases.get("tls_issued") or {}).get("certs") or {}
+    rotations = sorted((f for f in data.events if f.action == "rotate"), key=lambda f: f.start)
+    for probe in probes:
+        first = issued.get(probe.cert)
+        want = None if first is None else {"what": "the first issue (gen 1)",
+                                           "serial": first.get("serial"),
+                                           "not_after": first.get("not_after")}
+        skipped = []
+        for rotation in rotations:
+            if rotation.cert != probe.cert or rotation.start > probe.start:
+                continue
+            if rotation.broken:
+                skipped.append(rotation.step)
+                continue
+            want = {"what": f"{rotation.step}'s gen {rotation.gen}", "serial": rotation.serial,
+                    "not_after": rotation.not_after}
+        served = (f"{probe.on}:{probe.port} served {probe.cert} serial {probe.serial}, "
+                  f"notAfter {probe.not_after}")
+        if want is None:
+            results.append(Result(f"tls.served.{probe.step}", FAIL,
+                                  f"{served}; no first issue of {probe.cert} recorded "
+                                  "(tls_issued)"))
+            continue
+        line = (f"{served}; want {want['what']}, serial {want['serial']}, notAfter "
+                f"{want['not_after']}"
+                + (f", still in force after broken {', '.join(skipped)}" if skipped else ""))
+        problems = []
+        if probe.serial != want["serial"]:
+            problems.append("serial differs")
+        if probe.not_after != want["not_after"]:
+            problems.append("notAfter differs")
+        if probe.verified is not True:
+            problems.append("the served chain didn't verify against the run's CA")
+        status = FAIL if problems else PASS
+        results.append(Result(f"tls.served.{probe.step}", status,
+                              f"{line}" + (f": {'; '.join(problems)}" if problems else "")))
+    return results
+
+
 # ---- per-scenario expectations --------------------------------------------------------------------
 #
 # A scenario's `[[expect]]` tables, copied into `scenario.resolved.json`'s `expect`. The plan's
@@ -4077,8 +4851,9 @@ def reduce_gauge(tel, metric, attrs, start, end, reduce):
     """`(value, note)` for a gauge over (start, end]: the value in force at `start` and every
     sample in the window. The value in force comes from the life whose drains cover `start`
     only (a gauge is exported only in a drain after it was set), so a gauge a previous process
-    set reads as unset in the next. `last` is the value in force at `end`. `value` is None when
-    the gauge was never set by `end`.
+    set reads as unset in the next. `last` is the value in force at `end`. `rise` is that value
+    less the value in force at `start`, and None with no value in force there. `value` is None
+    when the gauge was never set by `end`.
 
     `slope` is the least-squares slope of the window's own samples, in the metric's unit per
     hour, fitted per process life, since a restart resets a process gauge: `value` is
@@ -4111,6 +4886,10 @@ def reduce_gauge(tel, metric, attrs, start, end, reduce):
     if not values:
         return None, "no sample by the window's end"
     note = f"{len(inside)} sample(s)" + (" and the value in force at its start" if before else "")
+    if reduce == "rise":
+        if not before:
+            return None, f"no value in force at the window's start ({len(inside)} sample(s))"
+        return values[-1] - before[-1], note
     if reduce == "last":
         return values[-1], note
     return (max(values) if reduce == "max" else min(values)), note
@@ -4126,7 +4905,7 @@ def _expect_occurrences(data, exp):
     scheduled = [s["id"] for s in data.resolved.get("steps", [])
                  if s.get("id") == step or (isinstance(step, int) and not isinstance(step, bool)
                                             and s.get("spec_index") == step - 1)]
-    faults = [f for f in data.faults if f.step in scheduled]
+    faults = [f for f in data.faults + data.events if f.step in scheduled]
     return scheduled, faults
 
 
@@ -4263,6 +5042,8 @@ def check_drops(data):
     the name alone (ADR `telemetry-loss-vocabulary`). A `FAULT_DROP_REASONS` reason FAILs, any
     other WARNs. Terms the ledger and the sink rows balance stay with them. With several SUT
     services each line names its service."""
+    if _overlapped(data):
+        return _per_instance(data, check_drops)
     led = _ledger(data)
     skipped = _skip_without_sut("drops", led)
     if skipped:
@@ -4300,11 +5081,11 @@ def check_drops(data):
 
 CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
-    check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_intake,
-    check_ledger_edge, check_ledger_hop, check_ledger_script, check_ledger_aggregate,
+    check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_overlap,
+    check_ledger_intake, check_ledger_edge, check_ledger_hop, check_ledger_script, check_ledger_aggregate,
     check_ledger_egress, check_ledger_windows, check_ledger_replay, check_ledger_summary,
     check_ledger_sent, check_ledger_topic, check_ledger_standin, check_identity_sink, check_drops, check_recovery,
-    check_expect,
+    check_file_reopen, check_tls_served, check_expect,
 )
 
 

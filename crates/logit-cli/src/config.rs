@@ -308,6 +308,9 @@ mod tests {
                 "PROMETHEUS_REMOTE_WRITE_AUTHORIZATION" => {
                     Some("Bearer logit-test-token".to_string())
                 }
+                // `script/soak`'s rolling-overlap instances, which share one config and stamp
+                // their own compose service's name on every event.
+                "SOAK_INSTANCE" => Some("logit".to_string()),
                 _ => None,
             })
             .unwrap_or_else(|err| panic!("{} did not load: {err:#}", path.display()));

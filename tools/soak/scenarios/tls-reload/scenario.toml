@@ -1,0 +1,356 @@
+# A generated statsd stream into `logit` over TCP with mutual TLS and out to VictoriaMetrics,
+# while the run's private CA rotates both ends' certificates. The SUT's server certificate
+# rotates three times and reloads on a SIGHUP each time, with the poll off, and once broken, which
+# the reload refuses while the listener keeps serving the previous one; a probe reads the served
+# certificate after each SIGHUP. The generator's client certificate rotates once and reloads on
+# its own 10 s poll, and a SUT restart then shows it reconnects cleanly after the reload. The SUT
+# trusts any certificate from the run's CA, so no row tells which generation the generator
+# presents; it presents the loaded one because its resolver hands every handshake the current
+# pair (`ReloadingCert`, crates/logit-pipeline/src/tls.rs). The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "tls-reload"
+description = "generator -> statsd_in (TCP, mutual TLS) -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics, under certificate rotations"
+duration = "15m30s"       # warmup + one cycle + cooldown; --duration overrides
+# A second cycle's rotations would name the same days, and a certificate's notAfter must rise.
+max_duration = "15m30s"
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "12m30s"          # >= last step's end (10m30s) + recovery_bound + 2 x progress_window
+compose = "compose.override.yaml"   # mounts <run>/tls into the SUT and the generator
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no rates here
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+wire = "tcp"              # G output.messages, W input.frames, F the framer's counted drops
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# The certificates the driver issues from the run's CA, each first valid for 30 days. The
+# SUT's serves `logit`, the name the generator dials; the generator's is its client one.
+[tls.cert.statsd]
+san = ["logit"]
+usage = "server"
+
+[tls.cert.generator]
+san = ["generator"]
+usage = "client"
+
+# Steps 1 to 3: a rotation, its SIGHUP, and a probe of what the listener then serves.
+[[step]]
+at = "0s"
+action = "rotate"
+on = "logit"
+cert = "statsd"
+days = 31
+for = "40s"
+
+[[step]]
+at = "10s"
+action = "signal"
+on = "logit"
+signal = "HUP"
+for = "10s"
+
+[[step]]
+at = "25s"
+action = "probe"
+on = "logit"
+cert = "statsd"
+port = 8125
+for = "5s"
+
+# Step 4: the generator's client certificate, which its poll reloads with no signal. Its open
+# connection keeps the old one.
+[[step]]
+at = "2m"
+action = "rotate"
+on = "generator"
+cert = "generator"
+days = 31
+for = "40s"
+
+# Step 5: a SUT restart drops the connection, and the generator handshakes again after its
+# reload. A stop can reset the connection with lines in its buffers: reported.
+[[step]]
+at = "3m"
+action = "restart"
+on = "logit"
+for = "30s"
+
+# Steps 6 to 8: a broken rotation, whose key doesn't match its certificate. The SIGHUP's reload
+# fails, counted, and the listener keeps serving the generation of step 1.
+[[step]]
+at = "5m"
+action = "rotate"
+on = "logit"
+cert = "statsd"
+days = 32
+broken = true
+for = "40s"
+
+[[step]]
+at = "5m10s"
+action = "signal"
+on = "logit"
+signal = "HUP"
+for = "10s"
+
+[[step]]
+at = "5m25s"
+action = "probe"
+on = "logit"
+cert = "statsd"
+port = 8125
+for = "5s"
+
+# Steps 9 to 11: a good rotation after the broken one reloads.
+[[step]]
+at = "7m"
+action = "rotate"
+on = "logit"
+cert = "statsd"
+days = 33
+for = "40s"
+
+[[step]]
+at = "7m10s"
+action = "signal"
+on = "logit"
+signal = "HUP"
+for = "10s"
+
+[[step]]
+at = "7m25s"
+action = "probe"
+on = "logit"
+cert = "statsd"
+port = 8125
+for = "5s"
+
+# Steps 12 to 15: a rotation while the ledger's sink holds its queue behind a stopped backend.
+[[step]]
+at = "9m"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+[[step]]
+at = "9m20s"
+action = "rotate"
+on = "logit"
+cert = "statsd"
+days = 34
+for = "40s"
+
+[[step]]
+at = "9m30s"
+action = "signal"
+on = "logit"
+signal = "HUP"
+for = "10s"
+
+[[step]]
+at = "9m45s"
+action = "probe"
+on = "logit"
+cert = "statsd"
+port = 8125
+for = "5s"
+
+# Each SIGHUP after a good rotation reloads the listener once, and its notAfter rises by the
+# extra day at least.
+[[expect]]
+name = "server-reload-1"
+service = "logit"
+metric = "logit.tls.reloads"
+component = "statsd"
+attrs = { outcome = "reloaded" }
+step = 2
+window = "through"
+reduce = "delta"
+min = 1
+max = 1
+
+[[expect]]
+name = "server-expiry-rises-1"
+service = "logit"
+metric = "logit.tls.certificate.not_after"
+component = "statsd"
+attrs = { side = "server" }
+step = 2
+window = "through"
+reduce = "rise"
+min = 86400
+
+[[expect]]
+name = "server-reload-2"
+service = "logit"
+metric = "logit.tls.reloads"
+component = "statsd"
+attrs = { outcome = "reloaded" }
+step = 10
+window = "through"
+reduce = "delta"
+min = 1
+max = 1
+
+[[expect]]
+name = "server-expiry-rises-2"
+service = "logit"
+metric = "logit.tls.certificate.not_after"
+component = "statsd"
+attrs = { side = "server" }
+step = 10
+window = "through"
+reduce = "rise"
+min = 86400
+
+[[expect]]
+name = "server-reload-backend-stopped"
+service = "logit"
+metric = "logit.tls.reloads"
+component = "statsd"
+attrs = { outcome = "reloaded" }
+step = 14
+window = "through"
+reduce = "delta"
+min = 1
+max = 1
+
+[[expect]]
+name = "server-expiry-rises-backend-stopped"
+service = "logit"
+metric = "logit.tls.certificate.not_after"
+component = "statsd"
+attrs = { side = "server" }
+step = 14
+window = "through"
+reduce = "rise"
+min = 86400
+
+# The broken rotation's SIGHUP fails once, reloads nothing, and leaves notAfter where it was.
+[[expect]]
+name = "broken-reload-fails"
+service = "logit"
+metric = "logit.tls.reloads"
+component = "statsd"
+attrs = { outcome = "failed" }
+step = 7
+window = "through"
+reduce = "delta"
+min = 1
+max = 1
+
+[[expect]]
+name = "broken-reloads-nothing"
+service = "logit"
+metric = "logit.tls.reloads"
+component = "statsd"
+attrs = { outcome = "reloaded" }
+step = 7
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "broken-expiry-holds"
+service = "logit"
+metric = "logit.tls.certificate.not_after"
+component = "statsd"
+attrs = { side = "server" }
+step = 7
+window = "through"
+reduce = "rise"
+min = 0
+max = 0
+
+# Over the run: one reload per good rotation, one failure, and nothing the steps didn't cause.
+[[expect]]
+name = "server-reloads-total"
+service = "logit"
+metric = "logit.tls.reloads"
+component = "statsd"
+attrs = { outcome = "reloaded" }
+window = "run"
+reduce = "delta"
+min = 3
+max = 3
+
+[[expect]]
+name = "server-failures-total"
+service = "logit"
+metric = "logit.tls.reloads"
+component = "statsd"
+attrs = { outcome = "failed" }
+window = "run"
+reduce = "delta"
+min = 1
+max = 1
+
+# The generator's poll reloads its client certificate with no signal.
+[[expect]]
+name = "client-reload"
+service = "generator"
+metric = "logit.tls.reloads"
+component = "statsd"
+attrs = { outcome = "reloaded" }
+step = 4
+window = "through"
+reduce = "delta"
+min = 1
+max = 1
+
+[[expect]]
+name = "client-expiry-rises"
+service = "generator"
+metric = "logit.tls.certificate.not_after"
+component = "statsd"
+attrs = { side = "client" }
+step = 4
+window = "through"
+reduce = "rise"
+min = 86400
+
+# After the restart the generator reconnects, and every drain reads lines; a refused handshake
+# would show as a drain with none and as a connection_error.
+[[expect]]
+name = "lines-after-restart"
+service = "logit"
+metric = "logit.input.frames"
+component = "statsd"
+step = 5
+window = "after"
+reduce = "min_delta"
+min = 1
+
+# No handshake fails anywhere in the run: not the generator's after either rotation, and not a
+# probe's, which presents its own client certificate.
+[[expect]]
+name = "no-connection-errors"
+service = "logit"
+metric = "logit.component.diagnostics"
+component = "statsd"
+attrs = { key = "connection_error" }
+window = "run"
+reduce = "delta"
+max = 0

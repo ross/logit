@@ -25,6 +25,23 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
 - A `respond` sets a stand-in's answer: its apply POSTs the step's cue to the stand-in's
   control port and its revert POSTs an empty cue, which restores the default. A refused or
   failed POST is the record's `rc` 1, so `timeline` FAILs it and the step gets no window.
+- A rolling overlap's holder (the role `netns`) owns the network namespace its instances join,
+  so a fault on it is a fault on every instance's network: netem on it shapes their egress, and
+  a partition of it cuts their ingress too. Every instance is an ingress SUT, since the
+  generators send to the address they share.
+- A `signal` is `docker kill -s <signal>` through the same CLI path as a `kill`, and a `rename`
+  is an `os.rename` on the host inside `<run>/shared`, which the containers mount. Neither can
+  lose data on any leg, so every `affects_*` predicate is false, and neither revert does
+  anything. A `rename` refuses to replace a file already at its `to`.
+- A `rotate` and a `probe` run `certs.sh` (tools/soak/netem/certs.sh) in the netem image, as
+  the host user. A `rotate` issues the certificate's next generation into `<run>/tls` and
+  repoints its `live` symlink there in one rename; generations count from the driver's first
+  issue, 1, and a failed issue still uses its number up. A `probe` joins the target's network
+  namespace and handshakes with the listener on its port, presenting the probe's own client
+  certificate, so a listener that requires one completes the handshake. Each records the
+  `serial` and `not_after` its script reports, and a probe whether the served chain verified
+  against the CA for the certificate's first DNS name (`verified`). Neither can lose data, and
+  neither revert does anything.
 - A `mark` and an `exit` name an event the SUT's own config causes, so neither apply makes a
   Docker call. An `exit`'s revert starts the container only when it has exited, and its record
   says whether it did (`started`): a revert that found the process still running starts no new
@@ -32,21 +49,25 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
 """
 
 import json
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, STANDIN_ROLE, SUT_ROLE,
-                       SUT_SERVICE)
+from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, NETNS_ROLE, STANDIN_ROLE,
+                       STOP_TIMEOUT_S, SUT_ROLE, SUT_SERVICE, TLS_MOUNT)
 
 NETEM_LIMIT = "100000"
 # The timeline key recording, per `[[ledger.source]]` wire, whether a step can affect it.
 INGRESS_KEYS = {"udp": "affects_udp_ingress", "tcp": "affects_tcp_ingress",
                 "file": "affects_file_ingress"}
-STOP_TIMEOUT_S = 30
 # 128 + SIGKILL: the exit code Docker records for a container a `kill` ended.
 KILL_EXIT_CODE = 137
 CUE_TIMEOUT_S = 10
+# The netem image's certificate script (tools/soak/netem/certs.sh), and the `Context.state` key
+# holding each certificate's last generation.
+CERTS_ENTRYPOINT = "/certs.sh"
+TLS_GEN_KEY = "tls_gen"
 
 
 @dataclass
@@ -60,6 +81,13 @@ class Context:
     netem_image: str
     state: dict = field(default_factory=dict)
     standin_base: dict = field(default_factory=dict)
+    # `<run>/shared` on the host, for a `rename`; None when the run has none.
+    shared_dir: object = None
+    # `<run>/tls` on the host, the `[tls]` certificates (`{name: {san, usage}}`), and the
+    # `uid:gid` certs.sh runs as, for a `rotate` and a `probe`; None when the run has no [tls].
+    tls_dir: object = None
+    tls_certs: dict = field(default_factory=dict)
+    user: object = None
 
 
 @dataclass
@@ -69,7 +97,8 @@ class Action:
     # Whether the fault can lose UDP between a generator and the SUT, which the ledger's wire
     # row judges only outside such windows. A fault on a generator affects only that generator's
     # own source; checks.py splits it per `[[ledger.source]]` by the step's `on`. Every source's
-    # listener is on `SUT_SERVICE`, so a fault on a further SUT service affects none.
+    # listener is on `SUT_SERVICE`, so a fault on a further SUT service affects none; under a
+    # rolling overlap every instance holds them.
     affects_udp_ingress: object
     # Whether the fault can delay or fail a SUT sink's delivery to a backend or a broker.
     affects_egress: object
@@ -136,6 +165,89 @@ def stop_revert(ctx, step):
 
 def kill_apply(ctx, step):
     return _record(ctx.docker.run(["kill", "-s", "KILL", ctx.ids[step.on]]))
+
+
+def signal_apply(ctx, step):
+    return _record(ctx.docker.run(["kill", "-s", step.signal, ctx.ids[step.on]]),
+                   signal=step.signal)
+
+
+def rename_apply(ctx, step):
+    if ctx.shared_dir is None:
+        return {"rc": 1, "stderr": "the run has no shared directory"}
+    source = os.path.join(ctx.shared_dir, step.path)
+    target = os.path.join(ctx.shared_dir, step.to)
+    if os.path.lexists(target):
+        return {"rc": 1, "stderr": f"{step.to} already exists in the shared directory"}
+    try:
+        os.rename(source, target)
+    except OSError as err:
+        return {"rc": 1, "stderr": str(err)}
+    return {"rc": 0, "stderr": "", "path": step.path, "to": step.to}
+
+
+def certs_argv(ctx, command, *args, network=None, read_only=False):
+    """`docker run --rm` arguments for one `certs.sh` command in the netem image, as the host
+    user so the files it writes in `<run>/tls` are the user's, with `<run>/tls` at
+    `TLS_MOUNT`, inside `network`'s namespace when given."""
+    argv = []
+    if network is not None:
+        argv += ["--network", f"container:{network}"]
+    mode = "ro,z" if read_only else "z"
+    argv += ["--user", ctx.user, "-v", f"{ctx.tls_dir}:{TLS_MOUNT}:{mode}",
+             "--entrypoint", CERTS_ENTRYPOINT, ctx.netem_image, command, *args]
+    return argv
+
+
+def issue_args(name, gen, days, cert, broken=False):
+    """`certs.sh issue`'s arguments: the certificate's name, its generation, its days, its
+    usage, and its DNS names, then `--broken` for a key that doesn't match it."""
+    return ([name, str(gen), str(days), cert["usage"], *cert["san"]]
+            + (["--broken"] if broken else []))
+
+
+def cert_report(result):
+    """`{serial, not_after, verified?}` from the JSON line `certs.sh` prints last, or None."""
+    lines = result.stdout.strip().splitlines()
+    try:
+        report = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        return None
+    return report if isinstance(report, dict) and "serial" in report else None
+
+
+def _certs_record(result):
+    """A timeline record for one `certs.sh` call: rc 1 when it printed no report."""
+    record = _record(result)
+    report = cert_report(result)
+    if report is None:
+        record["rc"] = record["rc"] or 1
+        record["stderr"] = (record["stderr"] or "certs.sh printed no report")
+        return record
+    record.update(report)
+    return record
+
+
+def rotate_apply(ctx, step):
+    if ctx.tls_dir is None or step.cert not in ctx.tls_certs:
+        return {"rc": 1, "stderr": f"the run has no [tls] certificate {step.cert}"}
+    # A failed issue can leave a partial directory, so a generation is never reused.
+    gen = ctx.state.get(TLS_GEN_KEY, {}).get(step.cert, 1) + 1
+    ctx.state.setdefault(TLS_GEN_KEY, {})[step.cert] = gen
+    result = ctx.docker.run_oneshot(certs_argv(
+        ctx, "issue", *issue_args(step.cert, gen, step.days, ctx.tls_certs[step.cert],
+                                  bool(step.broken))))
+    record = _certs_record(result)
+    record["gen"] = gen
+    return record
+
+
+def probe_apply(ctx, step):
+    if ctx.tls_dir is None or step.cert not in ctx.tls_certs:
+        return {"rc": 1, "stderr": f"the run has no [tls] certificate {step.cert}"}
+    server_name = ctx.tls_certs[step.cert]["san"][0]
+    return _certs_record(ctx.docker.run_oneshot(certs_argv(
+        ctx, "probe", str(step.port), server_name, network=ctx.ids[step.on], read_only=True)))
 
 
 def restart_apply(ctx, step):
@@ -232,9 +344,19 @@ def _on_sut(step, roles):
     return roles.get(step.on) == SUT_ROLE
 
 
+def _on_holder(step, roles):
+    return roles.get(step.on) == NETNS_ROLE
+
+
 def _on_ingress_sut(step, roles):
-    """On the SUT service holding every source's listener."""
-    return _on_sut(step, roles) and step.on == SUT_SERVICE
+    """On a SUT service holding every source's listener: `logit`, or under a rolling overlap,
+    whose stack alone has a `netns` holder, any instance."""
+    return _on_sut(step, roles) and (step.on == SUT_SERVICE or NETNS_ROLE in roles.values())
+
+
+def _on_ingress_side(step, roles):
+    """On an ingress SUT or the holder of its namespace."""
+    return _on_ingress_sut(step, roles) or _on_holder(step, roles)
 
 
 def _on_generator(step, roles):
@@ -242,16 +364,16 @@ def _on_generator(step, roles):
 
 
 def _on_sut_or_destination(step, roles):
-    return roles.get(step.on) in (SUT_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE)
+    return roles.get(step.on) in (SUT_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE, NETNS_ROLE)
 
 
 def _lifecycle_on_ingress_sut_or_generator_partition(step, roles):
-    return (_on_ingress_sut(step, roles)
+    return (_on_ingress_side(step, roles)
             or (_on_generator(step, roles) and step.action == "partition"))
 
 
 def _on_ingress_sut_or_generator(step, roles):
-    return _on_ingress_sut(step, roles) or _on_generator(step, roles)
+    return _on_ingress_side(step, roles) or _on_generator(step, roles)
 
 
 def _always(step, roles):
@@ -268,7 +390,7 @@ ACTIONS = {
         revert=netem_revert,
         affects_udp_ingress=_on_generator,
         affects_egress=_on_sut_or_destination,
-        affects_tcp_ingress=_on_ingress_sut,
+        affects_tcp_ingress=_on_ingress_side,
         affects_file_ingress=_never,
     ),
     "pause": Action(
@@ -277,7 +399,7 @@ ACTIONS = {
         affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_sut_or_generator,
-        affects_file_ingress=_on_ingress_sut,
+        affects_file_ingress=_on_ingress_side,
     ),
     "stop": Action(
         apply=stop_apply,
@@ -285,7 +407,7 @@ ACTIONS = {
         affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_sut_or_generator,
-        affects_file_ingress=_on_ingress_sut,
+        affects_file_ingress=_on_ingress_side,
     ),
     "kill": Action(
         apply=kill_apply,
@@ -293,7 +415,7 @@ ACTIONS = {
         affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_sut_or_generator,
-        affects_file_ingress=_on_ingress_sut,
+        affects_file_ingress=_on_ingress_side,
     ),
     "restart": Action(
         apply=restart_apply,
@@ -301,7 +423,7 @@ ACTIONS = {
         affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_sut_or_generator,
-        affects_file_ingress=_on_ingress_sut,
+        affects_file_ingress=_on_ingress_side,
     ),
     "partition": Action(
         apply=partition_apply,
@@ -327,13 +449,45 @@ ACTIONS = {
         affects_udp_ingress=_on_ingress_sut,
         affects_egress=_always,
         affects_tcp_ingress=_on_ingress_sut,
-        affects_file_ingress=_on_ingress_sut,
+        affects_file_ingress=_on_ingress_side,
     ),
     "respond": Action(
         apply=respond_apply,
         revert=respond_revert,
         affects_udp_ingress=_never,
         affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_never,
+        affects_file_ingress=_never,
+    ),
+    "signal": Action(
+        apply=signal_apply,
+        revert=no_op,
+        affects_udp_ingress=_never,
+        affects_egress=_never,
+        affects_tcp_ingress=_never,
+        affects_file_ingress=_never,
+    ),
+    "rename": Action(
+        apply=rename_apply,
+        revert=no_op,
+        affects_udp_ingress=_never,
+        affects_egress=_never,
+        affects_tcp_ingress=_never,
+        affects_file_ingress=_never,
+    ),
+    "rotate": Action(
+        apply=rotate_apply,
+        revert=no_op,
+        affects_udp_ingress=_never,
+        affects_egress=_never,
+        affects_tcp_ingress=_never,
+        affects_file_ingress=_never,
+    ),
+    "probe": Action(
+        apply=probe_apply,
+        revert=no_op,
+        affects_udp_ingress=_never,
+        affects_egress=_never,
         affects_tcp_ingress=_never,
         affects_file_ingress=_never,
     ),

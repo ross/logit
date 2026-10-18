@@ -1,0 +1,38 @@
+# The two instances under test in `script/soak`'s rolling-overlap scenario, `logit` and
+# `logit-b`, run this one config in one network namespace: statsd over UDP on a port both bind
+# with `reuse_port`, each event stamped with the instance's name, a 10 s cumulative aggregate, and
+# remote-write 1.0 (zstd) to VictoriaMetrics from a disk spool. `SOAK_INSTANCE` is the compose
+# service's name, so each instance writes its own series and the harness splits V by the label.
+# Its `internal` telemetry goes to stdout as NDJSON; `script/soak` runs it with
+# `--log-format json`.
+#
+# The instances share an address, so a shared admin port would let one answer the other's probe:
+# each serves a Unix socket in its own filesystem, which `LOGIT_ADMIN` points `logit ready` at.
+# A stop holds the port for `shutdown.delay` while the kernel moves the stopping instance's flows
+# to the other, then closes its socket. The delay plus the drain must fit `docker stop -t 30`.
+admin: { socket: /tmp/admin.sock }
+shutdown: { delay: 5s }
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125, reuse_port: true }   # receive: defaults
+  instance:
+    type: set
+    sources: [statsd]
+    attributes:
+      soak_instance: !env SOAK_INSTANCE
+  window:
+    type: aggregate
+    sources: [instance]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    # Each instance's own filesystem, which a stop keeps: a spool belongs to one process at a
+    # time, and the totals queued while VictoriaMetrics is down survive the instance's stop.
+    buffer: { disk: { path: /tmp/soak-spool } }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

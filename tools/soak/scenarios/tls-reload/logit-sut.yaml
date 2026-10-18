@@ -1,0 +1,30 @@
+# The system under test in `script/soak`'s tls-reload scenario: statsd over TCP with TLS, which
+# requires a client certificate from the run's CA, a 10 s cumulative aggregate, and remote-write
+# 1.0 (zstd) to VictoriaMetrics over plain HTTP. Its certificate files sit behind the `live`
+# symlink a `rotate` step repoints, and with the poll off only a SIGHUP reloads them. Its
+# `internal` telemetry goes to stdout as NDJSON for the harness to read.
+tls_reload_interval: 0s             # a SIGHUP is the one trigger
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd:
+    type: statsd_in
+    transport: tcp                  # no receive queue: the connection is the backpressure
+    bind: 0.0.0.0:8125
+    tls:
+      cert_file: /tls/statsd/live/cert.pem    # the override mounts <run>/tls here
+      key_file: /tls/statsd/live/key.pem
+      client_ca_file: /tls/ca.pem
+  window:
+    type: aggregate
+    sources: [statsd]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
