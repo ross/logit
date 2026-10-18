@@ -373,3 +373,20 @@ and loses the counts of the last drain interval, and a clean stop splits a line 
 unterminated ([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md)). The band belongs on the
 wire and on `ledger.summary`'s end-to-end bound, not on the killed life's egress band, which is
 read from `aggregate`'s window.
+
+## Amendment: a transform's counted discards leave every row of the ledger (2026-10-17)
+
+A node in a source's `sut_transforms` may discard events it counts in
+`logit.component.events.discarded`, as `drop_stale` does. `ledger.edge` judges each node's
+received less discarded against what it sent, with no tolerance, and every row after the edge
+subtracts the nodes' summed discards from what reached `aggregate`, in every SUT life, as it
+subtracts a script's: the residual, a stopped life's egress gap, a killed life's band, the path
+term of `ledger.summary`, and the end-to-end bound, which counts them with the counted loss.
+Subtracting them at the edge alone would leave the residual and the stopped-life gap reading
+each discard as uncounted loss, and an end-to-end bound that ignored them would let a surplus of
+up to their number pass. A discard is an outcome the config asked for, never a `*.dropped` count
+([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)), so the ledger takes the
+counter as given: it needs no per-node scenario key and no expected rate, and a scenario that
+wants a rate bounds it with `[[expect]]`. A discard of a line a kill replays is counted again
+as its read counts in W again, so the replay band still bounds a file wire's surplus.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "6. The checks", has the rules.

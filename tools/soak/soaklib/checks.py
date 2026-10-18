@@ -40,7 +40,10 @@ its wire, of its own generator and of every service that isn't a generator (`aff
 on TCP only a window that can reset the connection is reported, and every other one is judged
 (`wire_judgment`). `ledger.intake` judges each listener's final life alone. From the edge into
 `aggregate` on, every row sums the listeners' symbols, since their events merge there; a
-source's `sut_transforms` are judged hop by hop in `ledger.edge`. `recovery` judges the
+source's `sut_transforms` are judged hop by hop in `ledger.edge`, each node's discards
+(`events.discarded`, T_disc) counted there, and their sum leaves the residual, the stopped-life
+egress gap, `ledger.summary`'s path term, and the end-to-end bound as a script's discards do
+(`Ledger.discarded`). `recovery` judges the
 listeners' summed ingest against the generators' summed warmup rate.
 
 A run against a stand-in target (`[target] kind = "standin"`) has no VictoriaMetrics either: V
@@ -1450,9 +1453,14 @@ class Ledger:
         # How the egress rows write the increments `aggregate` absorbed from the listener's
         # events: with a script, its `flush()` events are absorbed too, and V excludes them.
         self.ab_text = "Ab − L_flush" if self.script else "Ab"
-        self.residual_text = ("W − D − B − X − (L_drop + L_err) − (Ab − L_flush)" if self.script
-                              else "E_B − X_B − Ab" if cfg.get("hop")
-                              else "W − D − B − X − Ab")
+        # How a stopped life's residual and egress gap write the events the path to `aggregate`
+        # removed, counted (`discarded`).
+        chained = any(source.get("sut_transforms") for source in self.sources)
+        self.discarded_text = ("(L_drop + L_err) − " if self.script
+                               else "ΣT_disc − " if chained else "")
+        self.residual_text = ("E_B − X_B − Ab" if cfg.get("hop")
+                              else f"W − D − B − X − {self.discarded_text}"
+                              + ("(Ab − L_flush)" if self.script else "Ab"))
         # `{service: SutLives}` for each SUT service, the one holding the listeners, and the one
         # holding `aggregate` and the sinks.
         self.views = {service: SutLives(data, service) for service in data.suts}
@@ -1624,17 +1632,20 @@ class Ledger:
         self.A_sent = sut.counter_by_life("logit.component.events.sent",
                                           component=self.aggregate)
 
-        # Each source's `sut_transforms`, and every one's events received and sent, which
-        # `ledger.edge` judges hop by hop.
+        # Each source's `sut_transforms`, and every one's events received, sent, and discarded,
+        # which `ledger.edge` judges hop by hop. The runtime counts a Transform node's
+        # `events.discarded` only when nonzero, so an absent count is 0.
         self.transforms = {source.get("sut_listener"): list(source.get("sut_transforms") or [])
                            for source in self.sources}
-        self.T_in, self.T_out = {}, {}
+        self.T_in, self.T_out, self.T_disc = {}, {}, {}
         for chain in self.transforms.values():
             for component in chain:
                 self.T_in[component] = sut.counter_by_life("logit.component.events.received",
                                                            component=component)
                 self.T_out[component] = sut.counter_by_life("logit.component.events.sent",
                                                             component=component)
+                self.T_disc[component] = sut.counter_by_life(
+                    "logit.component.events.discarded", component=component)
 
         # Per source, from its generator's telemetry: G and its wire's precondition, the sink's
         # counted loss (`drop_newest`, and on a stream `ambiguous_at_most_once`) by reason, and
@@ -1890,6 +1901,8 @@ class Ledger:
         if self.script:
             script = "".join(f"{symbol} {_n(self.get(symbol, life))}, " for symbol in (
                 "L_in", "L_emit", "L_drop", "L_err", "L_flush", "L_sent"))
+        elif self.T_disc:
+            script = f"ΣT_disc {_n(self.t_disc(life))}, "
         text = (f"W {_n(self.get('W', life))}, K {_n(self.get('K', life))}, {self._f_text(life)}"
                 f"D {_n(self.D(life))} "
                 f"({_n(self.get('D_shutdown', life))} at shutdown; stderr says "
@@ -1935,28 +1948,33 @@ class Ledger:
         `flush()` events, each of which carries one metric whose series V excludes."""
         return self.get("Ab", life) - (self.get("L_flush", life) if self.script else 0)
 
-    def script_dropped(self, life):
-        """The events a script discarded (`events.discarded`) or lost to an error
-        (`events.dropped{reason="script_error"}`), both counted, 0 with no script."""
-        if not self.script:
-            return 0
-        return self.get("L_drop", life) + self.get("L_err", life)
+    def t_disc(self, life):
+        """ΣT_disc: the events every `sut_transforms` node discarded in `life`."""
+        return sum(per.get(life, 0) for per in self.T_disc.values())
+
+    def discarded(self, life):
+        """The events the path to `aggregate` removed, counted, in `life`: a script's discards
+        and errors (L_drop + L_err), or the `sut_transforms` nodes' discards (ΣT_disc). A scenario
+        has one or the other, so neither counts twice."""
+        script = self.get("L_drop", life) + self.get("L_err", life) if self.script else 0
+        return script + self.t_disc(life)
 
     def residual(self, life):
-        """What a life read but neither absorbed nor dropped, counted, by its last drain:
-        W − D − B − X − Ab, with a script W − D − B − X − (L_drop + L_err) − (Ab − L_flush), and
-        across a hop E_B − X_B − Ab."""
-        return self.fed(life) - self.script_dropped(life) - self.absorbed(life)
+        """What a life read but neither absorbed nor removed, counted, by its last drain:
+        W − D − B − X − Ab, with a script W − D − B − X − (L_drop + L_err) − (Ab − L_flush), with
+        `sut_transforms` W − D − B − X − ΣT_disc − Ab, and across a hop E_B − X_B − Ab."""
+        return self.fed(life) - self.discarded(life) - self.absorbed(life)
 
     def kill_band(self, life):
         """`(low, high, text)`: the Ab − V a killed life may show with nothing lost, from its
         ingest rate over its last drain interval.
 
-        Below: the residual at the last drain and the reads after it, up to one drain interval,
-        are in no Ab, and an `aggregate` flush before the kill can carry them into V. Above: the
-        kill discards `aggregate`'s unflushed window, whose events Ab counts and V never holds,
-        up to one aggregate interval of ingest, plus one drain interval of queue growth after
-        the last drain. The residual itself is reported beside the band and never judged with
+        Below: the residual at the last drain, which leaves out what the path discarded,
+        counted, and the reads after it, up to one drain interval, are in no Ab, and an
+        `aggregate` flush before the kill can carry them into V. Above: the kill discards
+        `aggregate`'s unflushed window, whose events Ab counts and V never holds, up to one
+        aggregate interval of ingest, plus one drain interval of queue growth after the last
+        drain. The residual itself is reported beside the band and never judged with
         it: `ledger.intake` bounds it."""
         drains = self.sut.life_drains(life)
         gaps = [b - a for a, b in zip(drains, drains[1:])]
@@ -2068,10 +2086,11 @@ class Ledger:
         drop in that credit FAILs the life (`fault_drops`), its verdict unchanged.
 
         The final life's gap is Ab − V, and with a script Ab − L_flush − V, here and below. A
-        stopped earlier life's is W − D − B − X − V, less a script's counted drops, the residual
-        plus Ab − V, because `aggregate`'s close-time flush delivers what that life read but
-        hadn't absorbed by its last ordinary drain into V; the final drain runs after that
-        flush, so it exports the shutdown drops and the script's counted drops and errors. A
+        stopped earlier life's is W − D − B − X − V, less what the path to `aggregate` removed,
+        counted (`discarded`), the residual plus Ab − V, because `aggregate`'s close-time flush
+        delivers what that life read but hadn't absorbed by its last ordinary drain into V; the
+        final drain runs after that flush, so it exports the shutdown drops and the script's or
+        the transforms' discards. A
         killed life has no close-time window and no shutdown drops: its gap is Ab − V alone,
         judged inside `kill_band`; below the band it is a surplus, above it uncounted loss. Its
         residual is what the kill lost from the receive queue and inbox, by design, and is
@@ -2874,8 +2893,10 @@ def check_ledger_edge(data):
     """The final life's edges, each `sent == received`: into `aggregate`, ΣE == A over the
     listeners, or with a script L_sent == A, the edge from the script, since `ledger.script`
     judges the listeners'; with a source's `sut_transforms`, each hop from its listener through
-    them, every transform forwarding every event it received (received == sent), and the last
-    transform's sent in place of that listener's E in the sum; and out to each sink, under `copy` `aggregate`'s events.sent == the sink's events.received
+    them, every transform sending each event it received that it didn't discard
+    (received − discarded == sent), and the last transform's sent in place of that listener's
+    E in the sum; and out to each sink, under `copy` `aggregate`'s events.sent == the sink's
+    events.received
     (a fan-out counts one send per batch, however many consumers it reaches), and under `route`
     the sink's target's events.sent == the sink's events.received. Earlier lives are
     reported."""
@@ -2901,9 +2922,7 @@ def check_ledger_edge(data):
             for component in chain:
                 edges.append((left, f"T_in[{component}]", lhs, led.T_in[component],
                               f"into {component}", out))
-                edges.append((f"T_in[{component}]", f"T_out[{component}]",
-                              led.T_in[component], led.T_out[component],
-                              f"{component} forwards every event", out))
+                edges.append(_node_edge(led, component, out))
                 left, lhs = f"T_out[{component}]", led.T_out[component]
         into = {life: sum(led.into_aggregate(life).values()) for life in led.lives}
         if len(led.listeners) == 1 and not any(led.transforms.values()):
@@ -2927,21 +2946,44 @@ def check_ledger_edge(data):
     for left, right, lhs, rhs, what, view in edges:
         final = view.final
         where = f"{view.service} " if led.hop is not None else ""
+        # A node's edge names its left side and writes it per life (`_node_edge`).
+        name, shown = left if isinstance(left, tuple) else (left, None)
+
+        def side(life, a, name=name, shown=shown):
+            return shown(life) if shown else f"{name} {_n(a)}"
+
         for life in view.lives:
             a, b = lhs.get(life, 0), rhs.get(life, 0)
             lines.append(f"{what}, {where}life {life}{' (final)' if life == final else ''}: "
-                         f"{left} {_n(a)}, {right} {_n(b)}, {left} − {right} {_n(a - b)}"
+                         f"{side(life, a)}, {right} {_n(b)}, {name} − {right} {_n(a - b)}"
                          + ("" if life == final else " (reported, not judged)"))
         a, b = lhs.get(final, 0), rhs.get(final, 0)
         lead = f"{where}final life {final}: " if led.hop is not None else ""
         if a != b:
-            off.append(f"{lead}{left} {_n(a)} != {right} {_n(b)}, off by {_n(a - b)} ({what})")
+            off.append(f"{lead}{side(final, a)} != {right} {_n(b)}, off by {_n(a - b)} "
+                       f"({what})")
         else:
-            parts.append(f"{lead}{left} {_n(a)} == {right} {_n(b)} ({what})")
+            parts.append(f"{lead}{side(final, a)} == {right} {_n(b)} ({what})")
     head = "" if led.hop is not None else f"final life {led.final}: "
     if off:
         return Result("ledger.edge", FAIL, head + "; ".join(off + parts), lines)
     return Result("ledger.edge", PASS, head + "; ".join(parts), lines)
+
+
+def _node_edge(led, component, view):
+    """A `sut_transforms` node's hop for `ledger.edge`: T_in − T_disc == T_out, every event it
+    received sent on or counted discarded. The left side is a name and a per-life text beside
+    its per-life values, so a further term joins all three here."""
+    t_in, t_disc = led.T_in[component], led.T_disc[component]
+    lhs = {life: t_in.get(life, 0) - t_disc.get(life, 0) for life in set(t_in) | set(t_disc)}
+    name = f"T_in[{component}] − T_disc[{component}]"
+
+    def text(life):
+        return (f"T_in[{component}] {_n(t_in.get(life, 0))} − T_disc[{component}] "
+                f"{_n(t_disc.get(life, 0))} = {_n(lhs.get(life, 0))}")
+
+    return ((name, text), f"T_out[{component}]", lhs, led.T_out[component],
+            f"{component} sends what it doesn't discard", view)
 
 
 def check_ledger_script(data):
@@ -3041,9 +3083,8 @@ def check_ledger_egress(data):
                         "not judged here; D has no shutdown part: a SIGKILL counts no "
                         "shutdown drops")
             else:
-                whole = ("W − D − B − X − (L_drop + L_err) − V" if led.script
-                         else "E_B − X_B − V" if led.hop is not None
-                         else "W − D − B − X − V")
+                whole = ("E_B − X_B − V" if led.hop is not None
+                         else f"W − D − B − X − {led.discarded_text}V")
                 part = (f"life {life}: {whole} {_n(gap)} = residual "
                         f"{_n(led.residual(life))} + {led.ab_text} − V {_n(ab_v)}, {verdict}")
             credit = led.drop_credit(life, sinks)
@@ -3141,12 +3182,14 @@ def check_ledger_summary(data):
     each must be 0 or counted on its own, so a surplus at one sink can't net out loss at
     another. With a script, E − A becomes its four script terms (`check_ledger_script`'s three
     identities and L_sent − A), the egress term is Ab − L_flush − V, and the script's drops and
-    errors are shown beside it, counted. A counted egress term is shown and not judged, but a
-    `FAULT_DROP_REASONS` drop in its group's credit FAILs the row as it FAILs `ledger.egress`;
-    on an external target the Ab − V term SKIPs, and the row judges the others. On a Kafka target V counts the topic's distinct records, so a
-    duplicate never enters the sum. Across a hop, W − D − E − B and E − S_hop are the ingress
-    SUT's final life's, E_B − A and the rest the far SUT's, and the row also FAILs any group
-    whose V over the run exceeds G less every counted loss (`_end_to_end`)."""
+    errors are shown beside it, counted. With `sut_transforms`, E − A becomes E − ΣT_disc − A,
+    and the transforms' discards are shown beside it, counted. A counted egress term is shown
+    and not judged, but a `FAULT_DROP_REASONS` drop in its group's credit FAILs the row as it
+    FAILs `ledger.egress`; on an external target the Ab − V term SKIPs, and the row judges the
+    others. On a Kafka target V counts the topic's distinct records, so a duplicate never
+    enters the sum. Across a hop, W − D − E − B and E − S_hop are the ingress SUT's final
+    life's, E_B − A and the rest the far SUT's, and the row also FAILs any group whose V over
+    the run exceeds G less every counted loss (`_end_to_end`), as it does from a file wire."""
     if _overlapped(data):
         return _summary_overlap(data)
     led = _ledger(data)
@@ -3169,6 +3212,8 @@ def check_ledger_summary(data):
              - g("L_sent", life)),
             ("L_sent − A", g("L_sent", life) - g("A", life)),
         ]
+    elif led.T_disc:
+        terms.append(("E − ΣT_disc − A", g("E", life) - led.t_disc(life) - g("A", life)))
     else:
         terms.append(("E − A", g("E", life) - g("A", life)))
     terms.append(("A − Ab", g("A", life) - g("Ab", life)))
@@ -3197,6 +3242,8 @@ def check_ledger_summary(data):
     if led.script:
         counted_script = (f"; the script's L_drop {_n(g('L_drop', life))} and L_err "
                           f"{_n(g('L_err', life))}, counted")
+    elif led.T_disc:
+        counted_script = f"; the transforms' ΣT_disc {_n(led.t_disc(life))}, counted"
     wire = ""
     # An overlap instance reads part of the generators' lines; `_summary_overlap` adds the wire.
     whole = data.overlap_instance is None and led.gens
@@ -3250,7 +3297,7 @@ def _summary_overlap(data):
     """`ledger.summary` under `[overlap]`: each instance's final-life terms, then the wire over
     the run and one bound end to end, which no instance's split can loosen: each egress group's
     V summed over the instances is at most what the generators sent less every instance's
-    counted loss (K, D, B, X, and F)."""
+    counted loss (K, D, B, X, F, and the path's counted discards)."""
     result = _per_instance(data, check_ledger_summary)
     leds = _instance_ledgers(data)
     if any(led.problems for led in leds.values()):
@@ -3262,6 +3309,7 @@ def _summary_overlap(data):
                for symbol in ("W", "K", "F"))
     counted = sum(sum(getattr(led, symbol).values()) for led in leds.values()
                   for symbol in ("K", "F", "D_tel", "B", "X"))
+    counted += sum(led.discarded(life) for led in leds.values() for life in led.lives)
     limit = first.G - counted
     status, parts = PASS, []
     if not data.external:
@@ -3285,12 +3333,16 @@ def _summary_overlap(data):
 def _end_to_end(data, led):
     """`(status, text)`: across a hop or from a file wire, each egress group's V over the whole
     run against what the generators sent less every counted loss on the way (K, D, B, X, the
-    hop sink's drops, and X_B; on a TCP or file wire F too), plus on a TCP wire one generator
-    batch per ambiguous drop, as `ledger.wire` allows, and on a file wire the replay band's
-    upper edge. A kill on either side shifts lives but never adds increments, so V above that
-    is a surplus whatever was killed; V below it is the per-life rows' to judge."""
+    hop sink's drops, X_B, and the path's counted discards; on a TCP or file wire F too), plus
+    on a TCP wire one generator batch per ambiguous drop, as `ledger.wire` allows, and on a
+    file wire the replay band's upper edge. A kill on either side shifts lives but never adds
+    increments, so V above that is a surplus whatever was killed; V below it is the per-life
+    rows' to judge."""
     counted = sum(sum(getattr(led, symbol).values())
                   for symbol in ("K", "F", "D_tel", "B", "X"))
+    # A replayed line's discard counts here as its read counts in W, so the band still bounds
+    # the surplus.
+    counted += sum(led.discarded(life) for life in led.lives)
     if led.hop is not None:
         counted += sum(led.hop_dropped.values()) + sum(led.X_B.values())
     partial = sum(sum(v for _, v in _ambiguous_drops(led, source))
