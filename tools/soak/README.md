@@ -820,7 +820,9 @@ scenario with a `rejected` step can't set it.
    doesn't combine with `--keep`. The [ADR's stall amendment](../../docs/adr/soak-harness.md#amendment-a-run-the-host-slept-through-ends-at-its-first-stall-and-exits-3-2026-10-18)
    says why a stall ends the run and gets its own status.
 
-A run writes `perf/results/soak/<UTC stamp>/` (gitignored, or under `SOAK_OUT`):
+A run writes `perf/results/soak/<UTC stamp>/` (gitignored, or under `SOAK_OUT`). When another run
+in the same second has claimed that name, the directory is `<UTC stamp>-2`, then `-3`, and so on;
+the run creates it with `mkdir`, so two runs never share one:
 
 | File | Contents |
 |---|---|
