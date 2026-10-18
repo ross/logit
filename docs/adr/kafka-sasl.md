@@ -1,6 +1,6 @@
 ---
 created: 2026-10-11
-updated: 2026-10-12
+updated: 2026-10-17
 ---
 
 # `kafka_out` SASL: PLAIN, SCRAM, OAUTHBEARER, and AWS MSK IAM, authenticated in the dialer and renewed by redial
@@ -72,7 +72,8 @@ The producer's reuse check (`Conn::is_open`) reads a connection past its deadlin
 the producer dials a new one, which is `Clean`. One attempt can write several produce requests to
 a broker in turn, so the deadline is checked again before each one (`Conn::past_deadline`). Once
 it has passed, the partition batches not yet written are `Clean` and the connection is dropped, so
-the next attempt dials a new one. A lifetime of `0` means no deadline.
+the next attempt dials a new one. A lifetime of `0` means no deadline. Each redial counts
+`logit.output.reconnects`, so the renewal rate shows in the sink's telemetry.
 
 This is safe because `kafka_out` keeps one request in flight per broker, no request is written
 past the deadline, and the `timeout` margin means a request written before the deadline is

@@ -30,6 +30,7 @@
 //! | Point | Meaning |
 //! |---|---|
 //! | `logit.output.requests{class}` | one per attempt, `class` its result across every topic (`crate::count_request`) |
+//! | `logit.output.reconnects` | every successful dial to a broker connection slot (a bootstrap entry, or a broker by its node id) this topic's producer has dialed before: after the broker closed the connection, after its SASL session's deadline, or after a failed request finished it |
 //! | `logit.output.batch.bytes` | the record values' bytes, before compression, once per batch |
 //! | `logit.output.records` | records the broker accepted |
 //! | `logit.output.records.dropped{reason}` | `oversize` (one record over `max_request_bytes`; under `record: batch` one event whose value alone is over it; under an OTLP format one per signal record an event too large alone would have formed; never sent), `rejected` (a partition batch the broker rejected), `invalid_timestamp` or `invalid_record` (records the broker named), or `ambiguous_at_most_once` (records left unsettled when `at_most_once` drops an `Ambiguous` batch, or an `Ambiguous` partition batch beside a `Refused` one, on any topic) |
@@ -233,6 +234,7 @@ impl KafkaOutput {
             tls: None,
             client_id: settings.client_id,
             sasl: settings.sasl.as_ref().map(|sasl| sasl::authenticator(sasl, settings.timeout)),
+            telemetry: Telemetry::default(),
         };
         let headers = settings
             .headers
@@ -267,6 +269,7 @@ impl KafkaOutput {
 
     /// Attaches the telemetry handle, also threaded, gated, into the encoder's OTLP mapping.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.producer.set_telemetry(&telemetry);
         self.telemetry = telemetry;
         self.encoder =
             self.encoder.with_counters(&self.telemetry, &self.diag, self.accounting.gate());

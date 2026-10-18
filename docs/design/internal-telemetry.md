@@ -2332,6 +2332,7 @@ spans, or metrics it holds.
 |---|---|---|
 | `logit.output.requests{class}` | count | one per attempt, `class` its fault class (`ok`, `clean`, `ambiguous`, `rejected`, or `refused`) across every topic, however many produce requests the attempt sent |
 | `logit.output.batch.bytes` | count | the record values' bytes, before compression, once per batch |
+| `logit.output.reconnects` | count | every successful dial to a connection slot (a bootstrap entry, or a broker by its node id) the topic's producer has dialed before: after the broker closed the connection, after its SASL session's deadline (`connections.max.reauth.ms`), or after a failed request finished it. With re-authentication on at the broker, it climbs at about one per broker connection per session lifetime |
 | `logit.output.records` | count | records in a partition batch the broker accepted |
 | `logit.output.records.dropped{reason="oversize"}` | count | a record over `max_request_bytes` alone, under `record: batch` an event whose value alone is over it, or under `format: otlp_proto` or `otlp_json` one per signal record an event too large alone would have formed, never sent, once per batch |
 | `logit.output.records.dropped{reason="rejected"}` | count | the records of a partition batch the broker rejected |
@@ -2346,7 +2347,7 @@ spans, or metrics it holds.
 `max_request_bytes` cap, and `rejected`, `invalid_timestamp`, and `invalid_record`, each carrying
 the broker's error code name and message. The broker settles a
 partition batch once per `logit` batch, and a retry never resends a settled one, so every count
-but `requests` is met once per batch.
+but `requests` and `reconnects` is met once per batch.
 
 ##### `logit_out`
 

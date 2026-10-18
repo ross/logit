@@ -229,6 +229,7 @@ async fn at_most_once_drops_an_ambiguous_batch_and_the_next_bumps_the_epoch() {
         2.0
     );
     assert_eq!(sum(&sums, "logit.output.records", &[]), 3.0);
+    assert_eq!(sum(&sums, "logit.output.reconnects", &[]), 1.0, "the closed leader's redial");
     let last = received(&cluster).pop().expect("the second batch");
     assert_eq!((last.records, last.producer_epoch, last.base_sequence), (3, 1, 0));
 }

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use anyhow::{anyhow, Context};
+use logit_core::Telemetry;
 use logit_pipeline::Fault;
 
 use super::batch::ProducerRecord;
@@ -121,6 +122,14 @@ impl MultiProducer {
     pub(crate) fn set_tls(&mut self, tls: Option<Arc<rustls::ClientConfig>>) {
         self.template.tls = tls;
         self.producers.clear();
+    }
+
+    /// Replaces the template's telemetry handle, and each open producer's.
+    pub(crate) fn set_telemetry(&mut self, telemetry: &Telemetry) {
+        self.template.telemetry = telemetry.clone();
+        for producer in self.producers.values_mut() {
+            producer.set_telemetry(telemetry);
+        }
     }
 
     /// The topics a producer has been opened for, in name order.
