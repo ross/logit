@@ -1,6 +1,6 @@
-# The far SUT in `script/soak`'s native-hop-spans scenario: native-hop's, with every internal span
-# kept. Its rate is at least the sender's, so it records a span for every trace the hop carries
-# (docs/adr/native-hop-trace-context.md). Its `internal` telemetry, spans included, goes to
+# The far SUT in `script/soak`'s native-hop-spans scenario: native-hop's, with internal spans at
+# the product's default `span_sample_rate`. Its rate is the sender's, so it records a span for
+# every trace the hop carries (docs/adr/native-hop-trace-context.md). Its `internal` telemetry, spans included, goes to
 # stdout as NDJSON for the harness to read; `script/soak` runs it with `--log-format json`.
 admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
 components:
@@ -18,5 +18,5 @@ components:
     version: 1
     compression: zstd
     buffer: { disk: { path: /tmp/soak-spool } }
-  self: { type: internal, interval: 5s, span_sample_rate: 1.0, logs: off }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.1, logs: off }
   telemetry: { type: stdio_out, sources: [self], format: json }
