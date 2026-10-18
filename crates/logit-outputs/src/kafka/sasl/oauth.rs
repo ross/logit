@@ -21,15 +21,21 @@
 //!   request, the Java client's `sasl.login.refresh.window.factor` default. Without
 //!   `expires_in`, a token that is a JWT is kept until 80% of the time to its `exp` claim, and
 //!   any other token is fetched again for every connection.
+//! - A failed refresh leaves the cached token in use until it expires, as the Java client and
+//!   librdkafka do, with one `token_refresh_failed` warning per failure (throttled). No dial
+//!   fetches for `RETRY_DELAY` after it, so dials during an endpoint outage don't each wait on its
+//!   timeout; the first dial after that fetches again. Nothing fetches on a timer. Unlike
+//!   both, the sink never sends a token past its expiry: the endpoint's error is reported instead
+//!   of a broker's refusal of a token known to have expired.
 //! - Concurrent dials wait on one fetch. A broker's refusal of a fetched token drops it from the
 //!   cache, whether it's an error challenge (Kafka) or a bare `SASL_AUTHENTICATION_FAILED`
 //!   (Redpanda), so the next dial fetches a new one rather than resending a token the broker
 //!   refused.
 //!
-//! An endpoint fault's class follows `super::super`'s response-class table: unreachable, timed
-//! out, `429`, or `5xx` is `Clean`, and so is a `2xx` whose body is cut off by the timeout or a
-//! closed connection; any other answer but a `2xx` is `Refused`, and so is a `2xx` whose body,
-//! read up to `MAX_RESPONSE_BYTES`, holds no usable `access_token`. No message carries the token
+//! An endpoint fault that fails the dial takes its class from `super::super`'s response-class
+//! table: unreachable, timed out, `429`, or `5xx` is `Clean`, and so is a `2xx` whose body is cut
+//! off by the timeout or a closed connection; any other answer but a `2xx` is `Refused`, and so
+//! is a `2xx` whose body, read up to `MAX_RESPONSE_BYTES`, holds no usable `access_token`. No message carries the token
 //! or the client secret, and the endpoint is printed through `logit_core::redact::url`.
 
 use std::sync::{Arc, Mutex};
@@ -38,7 +44,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
-use logit_core::redact;
+use logit_core::{redact, Diagnostics};
 use logit_pipeline::Fault;
 use tokio::time::Instant;
 
@@ -49,6 +55,11 @@ const KVSEP: u8 = 0x01;
 
 /// The share of a token's lifetime it's reused for.
 const REFRESH_FACTOR: f64 = 0.8;
+
+/// How long after a failed refresh no dial fetches while the cached token is still valid: the
+/// Java client's `DELAY_SECONDS_BEFORE_NEXT_RETRY_WHEN_RELOGIN_FAILS` and librdkafka's
+/// delay after `rd_kafka_oauthbearer_set_token_failure`.
+const RETRY_DELAY: Duration = Duration::from_secs(10);
 
 /// How much of a token endpoint's answer is read. A token response is a few kilobytes at most.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -88,6 +99,9 @@ impl OAuthBearer {
             timeout,
             cache: Mutex::new(None),
             fetching: tokio::sync::Mutex::new(()),
+            diag: Mutex::new(Diagnostics::default()),
+            #[cfg(test)]
+            skew: Mutex::new(Duration::ZERO),
         };
         Self { source: Source::Endpoint(Arc::new(endpoint)), extensions }
     }
@@ -107,6 +121,12 @@ impl Authenticator for OAuthBearer {
                 endpoint.client_id,
                 redact::url(&endpoint.url)
             ),
+        }
+    }
+
+    fn set_diagnostics(&self, diag: &Diagnostics) {
+        if let Source::Endpoint(endpoint) = &self.source {
+            *endpoint.diag.lock().unwrap() = diag.clone();
         }
     }
 
@@ -215,27 +235,74 @@ struct Endpoint {
     cache: Mutex<Option<Cached>>,
     /// Held across a fetch, so concurrent dials wait on one request.
     fetching: tokio::sync::Mutex<()>,
+    /// The sink's, once attached, for the failed-refresh warning.
+    diag: Mutex<Diagnostics>,
+    /// Added to the clock, so a test can move past a refresh or an expiry without waiting.
+    #[cfg(test)]
+    skew: Mutex<Duration>,
 }
 
 struct Cached {
     token: String,
     refresh_at: Instant,
+    expires_at: Instant,
+    /// Set by a failed refresh: no fetch before it while the token is still valid.
+    retry_at: Option<Instant>,
 }
 
 impl Endpoint {
-    /// The cached token, or a fresh one once the cached one is due for refresh.
+    /// The cached token, or a fresh one once the cached one is due for refresh. A failed
+    /// refresh returns the cached token while it's valid, and its error once it isn't.
     async fn token(&self) -> anyhow::Result<String> {
         let _fetching = self.fetching.lock().await;
         if let Some(cached) = self.cache.lock().unwrap().as_ref() {
-            if Instant::now() < cached.refresh_at {
+            let now = self.now();
+            let retrying = cached.retry_at.is_some_and(|at| now < at);
+            if now < cached.refresh_at || (retrying && now < cached.expires_at) {
                 return Ok(cached.token.clone());
             }
         }
-        let asked = Instant::now();
-        let (token, lifetime) = self.fetch().await?;
-        *self.cache.lock().unwrap() =
-            lifetime.map(|lifetime| Cached { token: token.clone(), refresh_at: asked + lifetime });
-        Ok(token)
+        let asked = self.now();
+        let err = match self.fetch().await {
+            Ok((token, lifetime)) => {
+                *self.cache.lock().unwrap() = lifetime.map(|lifetime| Cached {
+                    token: token.clone(),
+                    refresh_at: asked + lifetime.mul_f64(REFRESH_FACTOR),
+                    expires_at: asked + lifetime,
+                    retry_at: None,
+                });
+                return Ok(token);
+            }
+            Err(err) => err,
+        };
+        // Read again after the fetch, so a token `forget` dropped meanwhile isn't brought back.
+        let mut cache = self.cache.lock().unwrap();
+        let now = self.now();
+        let Some(cached) = cache.as_mut().filter(|cached| now < cached.expires_at) else {
+            return Err(err);
+        };
+        cached.retry_at = Some(now + RETRY_DELAY);
+        let remaining = Duration::from_millis(
+            u64::try_from((cached.expires_at - now).as_millis()).unwrap_or(u64::MAX),
+        );
+        let quiet = RETRY_DELAY.min(remaining);
+        self.diag.lock().unwrap().clone().warn_throttled(
+            "token_refresh_failed",
+            format_args!(
+                "refreshing the OAUTHBEARER token from {} failed; the cached token, valid for \
+                 another {remaining:?}, stays in use, with no fetch for {quiet:?}: \
+                 {err:#}",
+                redact::url(&self.url)
+            ),
+        );
+        Ok(cached.token.clone())
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        return Instant::now() + *self.skew.lock().unwrap();
+        #[cfg(not(test))]
+        Instant::now()
     }
 
     /// Drops `token` from the cache, unless another connection has replaced it already.
@@ -246,7 +313,7 @@ impl Endpoint {
         }
     }
 
-    /// One client-credentials request: the token and how long to reuse it.
+    /// One client-credentials request: the token and how long it's valid.
     async fn fetch(&self) -> anyhow::Result<(String, Option<Duration>)> {
         let shown = redact::url(&self.url);
         let response = self
@@ -323,8 +390,8 @@ fn oauth_error(body: &[u8]) -> String {
     }
 }
 
-/// The access token of an RFC 6749 §5.1 response, and how long to reuse it, given the wall
-/// clock `now` for a JWT's `exp`.
+/// The access token of an RFC 6749 §5.1 response, and how long it's valid, given the wall clock
+/// `now` for a JWT's `exp`.
 pub(crate) fn parse_token_response(
     body: &[u8],
     now: SystemTime,
@@ -352,10 +419,10 @@ pub(crate) fn parse_token_response(
             Some(exp - now)
         }),
     };
-    let reuse = lifetime
+    let lifetime = lifetime
         .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
-        .map(|seconds| Duration::from_secs_f64((seconds * REFRESH_FACTOR).min(1e9)));
-    Ok((token.to_string(), reuse))
+        .map(|seconds| Duration::from_secs_f64(seconds.min(1e9)));
+    Ok((token.to_string(), lifetime))
 }
 
 /// The `exp` claim of a JWT, in seconds since the epoch; `None` for a token that isn't a JWT.
@@ -409,6 +476,8 @@ pub(crate) fn form_urlencode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kafka::fake_broker::TokenEndpoint;
+    use logit_pipeline::test_util::RECV_TIMEOUT;
 
     /// Kafka's `OAuthBearerClientInitialResponse::toBytes` writes
     /// `String.format("n,%s,%sauth=Bearer %s%s%s%s", authzid, SEPARATOR, tokenValue, extensions,
@@ -471,23 +540,23 @@ mod tests {
     }
 
     #[test]
-    fn a_token_response_is_reused_for_80_percent_of_its_lifetime() {
+    fn a_token_response_carries_its_lifetime() {
         let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let parse = |body: &str| parse_token_response(body.as_bytes(), now);
         assert_eq!(
             parse(r#"{"access_token":"t","token_type":"Bearer","expires_in":100}"#).unwrap(),
-            ("t".to_string(), Some(Duration::from_secs(80)))
+            ("t".to_string(), Some(Duration::from_secs(100)))
         );
         assert_eq!(
             parse(r#"{"access_token":"t","expires_in":"100"}"#).unwrap().1,
-            Some(Duration::from_secs(80))
+            Some(Duration::from_secs(100))
         );
         // No `expires_in`: a JWT's `exp`, 50 s from `now`.
         let claims = URL_SAFE_NO_PAD.encode(br#"{"sub":"logit","exp":1800000050}"#);
         let jwt = format!("eyJhbGciOiJub25lIn0.{claims}.sig");
         assert_eq!(
             parse(&format!(r#"{{"access_token":"{jwt}"}}"#)).unwrap(),
-            (jwt, Some(Duration::from_secs(40)))
+            (jwt, Some(Duration::from_secs(50)))
         );
         // Neither: not reused.
         assert_eq!(parse(r#"{"access_token":"opaque"}"#).unwrap().1, None);
@@ -525,5 +594,142 @@ mod tests {
     #[test]
     fn a_long_quote_is_cut_on_a_character_boundary() {
         assert_eq!(quoted("é".repeat(200).as_str(), 5), format!("{:?}...", "éé"));
+    }
+
+    /// The fake endpoint's default token lives an hour: due for refresh at 48 minutes.
+    const DUE: Duration = Duration::from_secs(2880);
+    const LIFETIME: Duration = Duration::from_secs(3600);
+
+    /// An authenticator on `endpoint`, its token cache, and the diagnostics it reports to.
+    fn client(endpoint: &TokenEndpoint) -> (OAuthBearer, Arc<Endpoint>, Diagnostics) {
+        let auth = OAuthBearer::client_credentials(
+            endpoint.url.clone(),
+            "logit",
+            "s3cr3t",
+            None,
+            Vec::new(),
+            RECV_TIMEOUT,
+        );
+        let diag = Diagnostics::new("out");
+        auth.set_diagnostics(&diag);
+        let Source::Endpoint(cache) = &auth.source else { unreachable!() };
+        let cache = cache.clone();
+        (auth, cache, diag)
+    }
+
+    fn advance(cache: &Endpoint, by: Duration) {
+        *cache.skew.lock().unwrap() += by;
+    }
+
+    fn fail(endpoint: &TokenEndpoint) {
+        endpoint.state().answer = Box::new(|_| (503, String::new()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_valid_cached_token() {
+        let endpoint = TokenEndpoint::start().await;
+        let (auth, cache, diag) = client(&endpoint);
+        assert_eq!(cache.token().await.unwrap(), "token-0");
+        advance(&cache, DUE);
+        fail(&endpoint);
+
+        let mut session = auth.start("broker").await.unwrap();
+        assert_eq!(session.first().unwrap(), client_message("token-0", &[]));
+        assert_eq!(endpoint.fetches(), 2, "the refresh was tried");
+        assert_eq!(diag.occurrences("token_refresh_failed"), 1);
+    }
+
+    /// No fetch for `RETRY_DELAY` after a failed one, including for dials that waited on it.
+    #[tokio::test]
+    async fn a_failed_refresh_is_retried_after_ten_seconds() {
+        let endpoint = TokenEndpoint::start().await;
+        let (_auth, cache, diag) = client(&endpoint);
+        cache.token().await.unwrap();
+        advance(&cache, DUE);
+        fail(&endpoint);
+        assert_eq!(cache.token().await.unwrap(), "token-0");
+        assert_eq!(endpoint.fetches(), 2);
+
+        assert_eq!(cache.token().await.unwrap(), "token-0");
+        advance(&cache, RETRY_DELAY - Duration::from_millis(100));
+        assert_eq!(cache.token().await.unwrap(), "token-0");
+        assert_eq!(endpoint.fetches(), 2, "inside the retry window");
+
+        advance(&cache, Duration::from_millis(100));
+        let mut dials = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let cache = cache.clone();
+            dials.spawn(async move { cache.token().await.unwrap() });
+        }
+        while let Some(token) = dials.join_next().await {
+            assert_eq!(token.unwrap(), "token-0");
+        }
+        assert_eq!(endpoint.fetches(), 3, "one retry for every dial waiting on it");
+        assert_eq!(diag.occurrences("token_refresh_failed"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_past_expiry_is_an_error() {
+        let endpoint = TokenEndpoint::start().await;
+        let (_auth, cache, diag) = client(&endpoint);
+        cache.token().await.unwrap();
+        advance(&cache, LIFETIME);
+        fail(&endpoint);
+
+        let err = cache.token().await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
+        assert!(format!("{err:#}").contains("503"), "{err:#}");
+        assert_eq!(diag.occurrences("token_refresh_failed"), 0);
+
+        // A token kept by a failed refresh is dropped once it expires.
+        let endpoint = TokenEndpoint::start().await;
+        let (_auth, cache, _diag) = client(&endpoint);
+        cache.token().await.unwrap();
+        advance(&cache, DUE);
+        fail(&endpoint);
+        assert_eq!(cache.token().await.unwrap(), "token-0");
+        advance(&cache, LIFETIME - DUE);
+        assert!(cache.token().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_refresh_after_a_failed_one_replaces_the_token() {
+        let endpoint = TokenEndpoint::start().await;
+        let (_auth, cache, _diag) = client(&endpoint);
+        cache.token().await.unwrap();
+        advance(&cache, DUE);
+        fail(&endpoint);
+        assert_eq!(cache.token().await.unwrap(), "token-0");
+
+        advance(&cache, RETRY_DELAY);
+        endpoint.state().answer =
+            Box::new(|n| (200, format!(r#"{{"access_token":"token-{n}","expires_in":3600}}"#)));
+        assert_eq!(cache.token().await.unwrap(), "token-2");
+        assert_eq!(cache.token().await.unwrap(), "token-2");
+        assert_eq!(endpoint.fetches(), 3);
+    }
+
+    /// A token the broker refused stays forgotten when the refresh after it fails, whether it
+    /// was forgotten before the fetch or while the fetch was in flight.
+    #[tokio::test]
+    async fn a_failed_refresh_doesnt_bring_back_a_forgotten_token() {
+        let endpoint = TokenEndpoint::start().await;
+        let (_auth, cache, _diag) = client(&endpoint);
+        cache.token().await.unwrap();
+        cache.forget("token-0");
+        fail(&endpoint);
+        assert!(cache.token().await.is_err());
+
+        let endpoint = TokenEndpoint::start().await;
+        let (_auth, cache, diag) = client(&endpoint);
+        cache.token().await.unwrap();
+        advance(&cache, DUE);
+        let during = cache.clone();
+        endpoint.state().answer = Box::new(move |_| {
+            during.forget("token-0");
+            (503, String::new())
+        });
+        assert!(cache.token().await.is_err());
+        assert_eq!(diag.occurrences("token_refresh_failed"), 0);
     }
 }
