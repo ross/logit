@@ -16,7 +16,10 @@ needs at the code:
 - Logs are captured in chunks every `LOG_CHUNK_EVERY_S` (collect.py's `LogCapture` has the
   boundary rules), and collection at the end fetches only the tail.
 - A `logit` container leaving `running`, or changing `StartedAt`, with no step behind it ends the
-  schedule at once (fail fast). The end sequence, collection, and scoring still run. Inside an
+  schedule at once (fail fast). The end sequence, collection, and scoring still run. A tick more
+  than `STALL_S` late, as after a host suspend, ends the schedule the same way, before any
+  further step: the run can't be judged, so the loop records `stalled` and `aborted`, and the
+  script exits `STALLED_EXIT` so a caller knows to rerun it. Inside an
   `exit` step the container may be `running` or `exited`; its revert starts it only if it
   exited, and only then is it a start, with a readiness probe.
 - `docker exec` into a paused container blocks, so readiness is never probed while a step holds
@@ -106,6 +109,12 @@ POLL_TIMEOUT_S = 15
 # How late the 1 s tick may run before the run is marked `stalled`: past the slowest thing the
 # loop does, a `docker stop` at its timeout (`STOP_TIMEOUT_S` + 15 s) or a log chunk's 60 s.
 STALL_S = checks.STALL_S
+# The exit status of a run that stalled, apart from a FAIL's 1: a rerun once the host is awake
+# can pass, while a FAIL needs someone to read it.
+STALLED_EXIT = 3
+# How long `--retry-stalled` waits before a rerun: past the run directory's 1 s stamp, and long
+# enough for the previous project's `down` to settle on the daemon.
+RETRY_WAIT_S = 30
 READY_BOUND_S = 60
 FRESHNESS_LOOKBACK_S = 120
 QUIET_BOUND_S = 90
@@ -185,10 +194,14 @@ def profiles_for(scenario):
 
 
 def exit_code(results, ended=None):
-    """130 for an interrupted run, 1 for an aborted or errored one or any `FAIL` row, else 0.
-    `ended` is the phase the driver ended on: `interrupted`, `aborted`, `error`, or None."""
+    """130 for an interrupted run, `STALLED_EXIT` for one whose `run` row reads a stall, 1 for an
+    aborted or errored one or any `FAIL` row, else 0. `ended` is the phase the driver ended on:
+    `interrupted`, `aborted`, `error`, or None. A stall wins over every status but 130, because
+    nothing else in a stalled run can be judged."""
     if ended == "interrupted":
         return 130
+    if checks.stalled(results):
+        return STALLED_EXIT
     if ended in ("aborted", "error"):
         return 1
     return 1 if any(result.status == checks.FAIL for result in results) else 0
@@ -388,7 +401,7 @@ class Run:
                    "daemon.\n  Not this run's to stop. If it is yours, run:\n"
                    f"  {' '.join(self.docker.prefix)} compose -p {self.project} "
                    + "".join(f"-f {path} " for path in self.docker.compose_files) + "down -v")
-            return 1
+            return 2
         images = ([self.image, NETEM_IMAGE] + ([VM_IMAGE] if self.has_vm else [])
                   + ([KAFKA_IMAGE] if self.kafka else [])
                   + ([STANDIN_IMAGE] if self.standin else []))
@@ -487,9 +500,14 @@ class Run:
             offset = now - self.t0
             if offset - tick > STALL_S:
                 # Nothing in the loop takes this long: the host slept or the driver was
-                # stopped, and neither the schedule nor the polls ran meanwhile.
+                # stopped, and neither the schedule nor the polls ran meanwhile. Every step
+                # overdue now would run back to back, so none runs; the end sequence reverts
+                # the open ones.
                 self.phase("stalled", late_s=round(offset - tick, 3), since=tick)
-                self.say(f"the tick ran {offset - tick:.0f}s late; the run can't be judged")
+                self.phase("aborted", reason=checks.STALL_ABORT_REASON, since=tick)
+                self.say(f"the tick ran {offset - tick:.0f}s late; the run can't be judged, so "
+                         "the schedule stops here")
+                return
             if offset >= self.duration:
                 break
             while queue and queue[0][0] <= offset:
@@ -957,6 +975,24 @@ class Run:
             for jsonl in (self.timeline, self.watchdog, self.stats, self.freshness,
                           self.capture):
                 jsonl.close()
+
+
+def run_retrying(retries, root, scenario_path, duration, seed, keep, out_dir, argv, image,
+                 external_env=None):
+    """`run()`, rerun up to `retries` times while it returns `STALLED_EXIT`, `RETRY_WAIT_S`
+    apart, each in a new run directory with the same duration and seed. Returns the last run's
+    exit code, or 130 when interrupted during a wait."""
+    for attempt in range(retries + 1):
+        code = run(root, scenario_path, duration, seed, keep, out_dir, argv, image, external_env)
+        if code != STALLED_EXIT or attempt == retries:
+            return code
+        _print(f"soak: the run stalled; rerunning in {RETRY_WAIT_S}s "
+               f"(retry {attempt + 1} of {retries})")
+        try:
+            time.sleep(RETRY_WAIT_S)
+        except KeyboardInterrupt:
+            return 130
+    return code
 
 
 def run(root, scenario_path, duration, seed, keep, out_dir, argv, image, external_env=None):

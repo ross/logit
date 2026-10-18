@@ -38,6 +38,10 @@ run's; the schedule rules against hand-built schedules; and where the seed is re
 covers the chunked log capture against a fake `docker logs` with out-of-order and late lines
 and a failed chunk whose record keeps the CLI's error, the polls' absolute deadlines, a hung
 daemon ending an inspect round, and a SIGTERM or SIGHUP inherited as ignored staying ignored.
+A whole `execute()` against a Docker stand-in, on a fake clock that jumps past `STALL_S` inside
+a fault, stops the schedule, reverts the open fault early, runs the end sequence, and exits
+`STALLED_EXIT`, as `check` does on its directory; `run_retrying` reruns only that status, with
+the same arguments.
 
 For an external target, it covers every `[target]` validation rule and what such a target
 refuses (a VictoriaMetrics ledger key, a fault on `victoria-metrics`), that compose.yaml passes
@@ -958,6 +962,153 @@ def _stalled(root):
                f"a run whose driver records stalls is read by the phase alone, got {result}")
 
 
+class _AnswerDocker:
+    """Answers every call `execute()` makes with success and records each command: every
+    container running since its first start, and no daemon."""
+
+    def __init__(self):
+        self.calls = []
+
+    def _ok(self, args):
+        self.calls.append(list(args))
+        return docker.Result(0, "", "")
+
+    def project_containers(self):
+        return []
+
+    def run(self, args, timeout=None, stdout=None, stderr=None):
+        return self._ok(args)
+
+    def compose(self, *args, timeout=None):
+        return self._ok(["compose", *args])
+
+    def run_oneshot(self, args, timeout=None):
+        return self._ok(["run", "--rm", *args])
+
+    def exec_(self, container, argv, timeout=None):
+        return self._ok(["exec", container, *argv])
+
+    def logs_tail(self, container, lines, timeout=None):
+        return self._ok(["logs", "--tail", str(lines), container])
+
+    def logs_to(self, container, stdout_path, stderr_path, since=None, until=None,
+                timeout=None):
+        Path(stdout_path).write_text("")
+        Path(stderr_path).write_text("")
+        return self._ok(["logs", container])
+
+    def container_id(self, service):
+        return f"id-{service}"
+
+    def port(self, service, private_port):
+        return "127.0.0.1:1"
+
+    def inspect(self, container, timeout=None):
+        return {"State": {"Status": "running", "StartedAt": "first", "ExitCode": 0}}
+
+    def stats(self, containers, timeout=None):
+        return []
+
+
+def _stall_abort(root):
+    """A run whose clock jumps more than `STALL_S` while a fault is open stops the schedule at
+    once: no step applies after the stall, the end sequence reverts the open one early and runs
+    to `end_end`, `results.md` names the abort, and both `run` and a re-`check` exit
+    `STALLED_EXIT`."""
+    loaded = scenario.load(root / "scenarios" / "statsd-vm" / "scenario.toml")
+    with tempfile.TemporaryDirectory() as tmp:
+        run = driver.Run(root, loaded, loaded.duration, None, False, Path(tmp) / "out", [],
+                         "logit:soak", roles=scenario.BASE_ROLES)
+        run.prepare()
+        fake = _AnswerDocker()
+        run.docker = run.ctx.docker = run.capture.docker = fake
+        clock = [1000.0]
+        # c0s1, netem on logit, is open from +60 s to +180 s, and c0s2 is due at +240 s. The
+        # host sleeps at +90 s for 200 s, so both are overdue when the driver wakes.
+        jumped = []
+
+        def sleep(seconds):
+            clock[0] += seconds
+            if not jumped and clock[0] >= 1090.0:
+                jumped.append(clock[0])
+                clock[0] += 200.0
+
+        reals = (driver._now, driver.time.sleep, driver._print, vm._get)
+        driver._now = lambda: clock[0]
+        driver.time.sleep = sleep
+        driver._print = lambda text, stream=None: None
+        vm._get = lambda base, path, params=None, timeout=None: (
+            "OK" if path == "/health" else "")
+        try:
+            code = run.execute()
+        finally:
+            driver._now, driver.time.sleep, driver._print, vm._get = reals
+        timeline = collect.read_jsonl(run.run_dir / "timeline.jsonl")
+        phases = [r["phase"] for r in timeline if r.get("event") == "phase"]
+        stall = next((r for r in timeline if r.get("phase") == "stalled"), None)
+        expect(stall is not None and phases.count("stalled") == 1
+               and phases[phases.index("stalled"):phases.index("stalled") + 3]
+               == ["stalled", "aborted", "end_begin"]
+               and "end_end" in phases and "down" in phases,
+               f"a stall records stalled and aborted, then runs the end sequence to end_end, "
+               f"got {phases}")
+        late = [r for r in timeline if r.get("event") in ("apply", "revert")
+                and stall is not None and r["started_at"] >= stall["t"]]
+        expect([(r["event"], r["step"], bool(r.get("early"))) for r in late]
+               == [("revert", "c0s1", True)],
+               f"after a stall nothing applies, and the open step reverts early, got "
+               f"{[(r['event'], r['step'], r.get('early')) for r in late]}")
+        ended = next((r for r in timeline if r.get("phase") == "end_end"), None)
+        expect(stall is not None and ended is not None and ended["t"] - stall["t"] < 600,
+               f"the end sequence after a stall finishes inside 10 minutes, got "
+               f"{None if ended is None or stall is None else ended['t'] - stall['t']}")
+        expect(code == driver.STALLED_EXIT,
+               f"run exits STALLED_EXIT after a stall, got {code}")
+        text = (run.run_dir / "results.md").read_text()
+        expect(checks.STALL_ABORT_REASON in text and "stalled: the driver's tick ran 20" in text,
+               "results.md names the stall and why the run ended early")
+        rescored = driver.exit_code(checks.run_all(run.run_dir))
+        expect(rescored == driver.STALLED_EXIT,
+               f"check exits STALLED_EXIT on a stalled run directory, got {rescored}")
+
+
+def _retry_stalled():
+    """`run_retrying` reruns a stalled run with the same arguments, waiting between attempts,
+    and stops at the first other status or after its retries."""
+
+    def attempt(codes, retries):
+        calls, waits = [], []
+        reals = (driver.run, driver.time.sleep, driver._print)
+
+        def fake_run(*args):
+            calls.append(args)
+            return codes[len(calls) - 1]
+
+        driver.run = fake_run
+        driver.time.sleep = waits.append
+        driver._print = lambda text, stream=None: None
+        try:
+            code = driver.run_retrying(retries, "root", "path", 600.0, 7, False, "out", [],
+                                       "image", "env")
+        finally:
+            driver.run, driver.time.sleep, driver._print = reals
+        return code, calls, waits
+
+    stalled = driver.STALLED_EXIT
+    code, calls, waits = attempt([stalled, 0], 2)
+    expect(code == 0 and len(calls) == 2 and calls[0] == calls[1]
+           and waits == [driver.RETRY_WAIT_S],
+           f"a stalled run reruns with the same duration and seed, got {code} {calls} {waits}")
+    code, calls, _ = attempt([stalled, stalled, stalled], 2)
+    expect(code == stalled and len(calls) == 3,
+           f"retries stop after N, with the stalled status, got {code} {len(calls)}")
+    code, calls, _ = attempt([1], 2)
+    expect(code == 1 and len(calls) == 1, f"a FAIL isn't retried, got {code} {len(calls)}")
+    code, calls, waits = attempt([stalled], 0)
+    expect(code == stalled and len(calls) == 1 and waits == [],
+           f"no retry by default, got {code} {len(calls)} {waits}")
+
+
 def _ndjson():
     stamp = "2026-10-08T12:00:%02d.123456789Z"
     lines = [
@@ -1152,6 +1303,10 @@ def _checks():
         expect(driver.exit_code(passing, "error") == 1, "run exits 1 on a driver error")
         expect(driver.exit_code(passing, "interrupted") == 130, "run exits 130 when interrupted")
         expect(driver.exit_code(passing) == 0, "run exits 0 with no FAIL")
+        stall_row = [checks.Result("run", checks.FAIL, "", ["stalled: the tick ran late"])]
+        expect(driver.exit_code(stall_row, "aborted") == driver.STALLED_EXIT
+               and driver.exit_code(stall_row, "interrupted") == 130,
+               "a stalled run exits STALLED_EXIT, unless it was interrupted")
 
         # c0s1's recovery ends at +145, inside c0s2's window, where the fds rise; the
         # after-recovery sample must come from steady state, at +250.
@@ -4165,8 +4320,8 @@ def _target_rules(root):
             code = run.execute()
         finally:
             driver._print = real_print
-        expect(code == 1 and not private.exists() and not private.parent.exists(),
-               "execute() removes the private env copy, an early return included")
+        expect(code == 2 and not private.exists() and not private.parent.exists(),
+               "execute() exits 2 on a busy project, and removes the private env copy")
         vm_run = driver.Run(root, local, local.duration, None, False, Path(tmp) / "vm", [],
                             "logit:soak", roles=scenario.BASE_ROLES)
         vm_run.prepare()
@@ -10543,7 +10698,8 @@ def run(root, quiet=False):
     os.environ["DOCKER"] = _NO_DAEMON
     try:
         for part in (_isolated, _durations, _rules, _expect_rules, _expand, _random,
-                     _log_capture, _signals, _deadlines, _stalled, _hung_inspect, _inspect_redacted,
+                     _log_capture, _signals, _deadlines, _stalled, _stall_abort,
+                     _retry_stalled, _hung_inspect, _inspect_redacted,
                      _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks,
                      _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
@@ -10563,7 +10719,7 @@ def run(root, quiet=False):
                      _fan_out_ledger, _idle_writer, _fan_out_rules, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
-                              _stalled,
+                              _stalled, _stall_abort,
                               _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
                               _fanin_driver, _tcp_rules, _http_rules, _file_rules, _two_sut_rules,

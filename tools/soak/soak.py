@@ -9,6 +9,12 @@ Environment: `DOCKER` (the command prefix, `sudo docker` by default), `SOAK_OUT`
 directories go, default `perf/results/soak`), `SOAK_IMAGE` (the `logit` image tag,
 `logit:soak`), and `SOAK_EXTERNAL_ENV` (the env file an external target's variables come from,
 default `perf/results/soak-external.env`).
+
+`run` exits 0 when every row passes, 1 on any FAIL (an aborted or errored run included), 2 when
+the run never started (a scenario, argument, or setup error, a failed self-test included), 3
+when the host slept or the driver was stopped mid-run (`stalled`, which `--retry-stalled N`
+reruns), and 130 when interrupted. `check` exits 0, 1, or 3 the same way, and 2 for a directory
+with no `timeline.jsonl`. docs/adr/soak-harness.md's stall amendment has the reasoning.
 """
 
 import argparse
@@ -46,15 +52,23 @@ def scenario_path(name):
 
 
 def cmd_run(args):
+    if args.retry_stalled < 0:
+        print("soak: --retry-stalled can't be negative", file=sys.stderr)
+        return 2
+    if args.retry_stalled and args.keep:
+        # A kept project's containers make the rerun refuse to start.
+        print("soak: --retry-stalled and --keep don't combine", file=sys.stderr)
+        return 2
     if selftest.run(TOOLS, quiet=True) != 0:
         print("soak: self-test failed; not running", file=sys.stderr)
-        return 1
+        return 2
     try:
         duration = None if args.duration is None else scenario.parse_duration(args.duration)
         out = Path(args.out or os.environ.get("SOAK_OUT") or ROOT / "perf/results/soak")
-        return driver.run(
-            TOOLS, scenario_path(args.scenario), duration, args.seed, args.keep, out.resolve(),
-            sys.argv, os.environ.get("SOAK_IMAGE", "logit:soak"), external_env(),
+        return driver.run_retrying(
+            args.retry_stalled, TOOLS, scenario_path(args.scenario), duration, args.seed,
+            args.keep, out.resolve(), sys.argv, os.environ.get("SOAK_IMAGE", "logit:soak"),
+            external_env(),
         )
     except (ValueError, scenario.ScenarioError) as err:
         print(f"soak: {err}", file=sys.stderr)
@@ -138,6 +152,10 @@ def main(argv=None):
                      help="draw a [random] scenario's schedule with this seed instead of its "
                           "own; refused for a fixed schedule")
     run.add_argument("--keep", action="store_true", help="leave the compose project up")
+    run.add_argument("--retry-stalled", type=int, default=0, metavar="N",
+                     help="rerun a run that stalled, as across a host suspend, up to N times, "
+                          "each in a new run directory with the same duration and seed "
+                          "(default 0)")
     run.add_argument("--out", help="where run directories go (default perf/results/soak)")
     run.set_defaults(func=cmd_run)
 
