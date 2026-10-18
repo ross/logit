@@ -35,7 +35,8 @@ Non-goals:
 
 Stream key **`soak`**: branches `soak/w0`, `soak/w1a`, `soak/w1b`, then `soak/w2` through
 `soak/w12d`, a linear stack. After it come `soak/w13a`, `soak/w16`, and `soak/w17`, which each
-branch off `main`, and `soak/w14`, `soak/w13b`, and `soak/w15`, stacked in that order. PR stack only: nothing is
+branch off `main`, `soak/w14`, `soak/w13b`, and `soak/w15`, stacked in that order, and
+`soak/w18`, which branches off `main` after W14 merged. PR stack only: nothing is
 merged by this workstream; Ross directs merging.
 
 Settled with Ross (2026-10-08): faults are an iproute2 image with `NET_ADMIN` applying `tc netem`
@@ -807,9 +808,12 @@ ticket with `${DOCKER} version` first.
      behind it ends the timeline at once. The end sequence and collection still run. Inside an
      `exit` step (W7a) the container may be `running` or `exited`.
 4. End (for an external target, W5, see "External targets"): revert active faults; `docker stop -t 30` every generator; with a `file` wire (W11b), count the
-   newline-terminated lines in every file of `<run>/shared` (phase `shared_counted`) and wait,
-   up to 180 s, until the tailers' W, read from a log chunk the driver captures every 5 s,
-   reaches that count or holds for four reads (phase `tail_caught_up`); wait until every sink's stored
+   newline-terminated lines in every file of `<run>/shared` (phase `shared_counted`), read G,
+   the writers' `events.delivered`, from a log chunk of each writer taken 6 s later, past the
+   chunk's 5 s lag, and wait, up to 180 s, until the tailers' W, read from a log chunk the
+   driver captures every 5 s, reaches G or holds for four reads (phase `tail_caught_up`, which
+   records G and the count); G, not the count, since a writer that deleted a file (W18) left
+   fewer lines than it wrote, and W reaches that count before the tailers read to the end; wait until every sink's stored
    total holds across two aggregate windows (90 s bound); `docker stop -t 60` the SUT, expecting
    exit 0; call each backend's `/internal/force_flush`; write each sink's
    `vm-export/<sink>.jsonl` from its backend's `/api/v1/export` with `match[]=<vm_selector>`
@@ -1148,7 +1152,8 @@ The rows:
     read file replays nothing, and rotations tens of seconds apart leave at most one inside an
     interval of seconds); below, rate × the life's drain interval, the counts a SIGKILL never
     exports. The rate is the life's `input.lines` over its last drain interval, the line size
-    the shared directory's bytes over its lines. A killed life with one drain has no drain
+    the shared directory's bytes over its lines, from the files that survive the writer's
+    retention. A killed life with one drain has no drain
     interval, and its last checkpoint can be the previous life's, so its allowance above is that
     drain's W, all of which can replay, plus the same reads, and that W below, about one drain
     interval of reads a checkpoint after the drain committed and the kill never exported;
@@ -1160,8 +1165,26 @@ The rows:
   - the final life adds nothing: the end sequence waits until the tailers have read what the
     writer wrote (§5).
 
-  G must also equal the lines the driver counted in the shared directory at the end
-  (`shared_counted`), else the row FAILs its precondition. `ledger.summary`'s end-to-end bound
+  While the writer deleted no file, G must also equal the lines the driver counted in the
+  shared directory at the end (`shared_counted`), else the row FAILs its precondition. From
+  W18, `file_out` deletes `.{max_files − 1}` at each rotation, so a writer deleted
+  max(0, rotations − (max_files − 1)) files, its `logit.output.file.rotations` read against
+  its config's `rotate.max_files`. Once it deleted one, G stands alone: the count must not
+  exceed G, and the directory must hold min(rotations + 1, max_files) files, else the
+  precondition FAILs. G less the count is reported beside the lines the deleted files'
+  `max_bytes` would hold, never judged. A deleted file the tailer hadn't read is lost and
+  counted nowhere (docs/known-gaps/tailing.md), so a **retention guard** FAILs the row for any
+  pause, stop, kill, restart, or `exit` of the ingress SUT, widened by one of the writer's
+  drain intervals on each side, during which the writer rotated as often as its limit, which
+  trips one rotation before the first unread deletion:
+  - a stop, kill, restart, or `exit`: `max(1, max_files − 2)`. The process closes every file,
+    so a file rotated to `.1` shortly before the fault, which a tailer one file behind hasn't
+    finished, is lost when it's deleted, at the fault's `max_files − 1`th rotation;
+  - a pause: `max_files`. The paused tailer keeps its descriptors, so a file it had open stays
+    readable after a deletion, and only a file the writer created after the pause began is
+    lost: created at the pause's first rotation, it's deleted at its `max_files + 1`th.
+
+  `ledger.summary`'s end-to-end bound
   runs for a file wire too, with the band's upper edge added to its limit, since a replayed line
   is absorbed and stored again. From W13a it counts the path's discards with the counted loss:
   a replayed line a node discards is counted again as its read counts in W again, so the band
@@ -2357,12 +2380,27 @@ where it needs them, and a small check extension.
     from a `set` after `aggregate` in place of `influxdb_in`, so the SUT needs no HTTP generator,
     and one carrying the bucket beside `default_org:`. Rows: `ledger.standin` and `[[expect]]`
     per class.
-18. **`tail_in` descriptors over hours under a deleting rotation.** `tail-rotate` with a small
-    `max_files`, run for hours. A matched rotated file stays open until the writer deletes it
-    ([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md)), so the open count should stay at
-    about `max_files`, and `fd_slope` flat is the pass. Needs: `ledger.wire`'s end count across
-    the shared directory replaced by the writer's `events.delivered` alone, since deleted files
-    can't be counted at the end, and the scenario's `max_duration` lifted.
+18. **`tail_in` descriptors over hours under a deleting rotation (built in W18).** `tail-rotate`
+    with `max_files: 8`, run for hours. A matched rotated file stays open until the writer
+    deletes it ([`docs/known-gaps/tailing.md`](../known-gaps/tailing.md)), so the open count
+    should stay at about `max_files`. Built as `tail-rotate-delete`, with these corrections to
+    the item as first written:
+    - `fd_slope` isn't a slope: it compares the warmup median with the end. The pass is
+      `fd_growth` of 10: the files the writer keeps plus a deleted one draining and the
+      staged `app.log.rotating`, eight more than the warmup's two, plus two to spare, with `[[expect]]`
+      maxima on `logit.input.files.open` and `logit.process.fds` over the whole run, a last
+      `files.open` of 7 or more, and eight or more writer rotations, so it deleted.
+    - The end count isn't replaced: it still gives the replay band its line size, and it
+      cross-checks G as an equality while the writer deleted no file and as a bound with the file
+      count after (§6's `ledger.wire` row), beside a retention guard for a SUT down long enough
+      to lose an unread file.
+    - The end sequence's wait needed G: against the count it returned at once once the writer
+      had deleted a file (§5).
+    - A short repeating cycle hides a leak, since a restart resets one, so the cycle is an hour
+      with about 50 minutes of one quiet life in it, run for 4 hours with no `max_duration`.
+    - An inode a deletion freed while the SUT was down can be reused by the writer's next file,
+      and the restart then counts `resume_rejected` correctly, so the scenario drops
+      `tail-rotate`'s expectation of none.
 
 Two follow-ups have no item yet. An overlap of TCP listeners, item 11 over `transport: tcp`,
 will need `net.ipv4.tcp_migrate_req`, without which the connections still in the old socket's
@@ -2407,6 +2445,7 @@ that items 3, 7, and 11 need.
 | W15 | `soak/w15` | `soak/w15: multi-destination route and route_signals soaks, with a target split` | M | W13b |
 | W16 | `soak/w16` | `soak/w16: an InfluxDB-shaped stand-in for every influxdb_out response class` | M | W12d |
 | W17 | `soak/w17` | `soak/w17: a Kafka SASL re-authentication soak` | M | W16 |
+| W18 | `soak/w18` | `soak/w18: a tail_in descriptor soak under a deleting rotation` | M | W14 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -2537,11 +2576,15 @@ that items 3, 7, and 11 need.
   gains the `rate` reducer, and the `kafka-sasl-reauth` scenario, whose compose override starts
   the broker from its own `kafka-server.properties` with a SCRAM user, with a run recorded under
   "Findings".
+- **W18**: item 18: the writer's deletions in `ledger.wire` (the end count held to G only
+  while the writer deleted no file, then as a bound with the writer's file count) and its
+  retention guard, the end sequence's wait for G, self-test fixtures for each rule, and the
+  `tail-rotate-delete` scenario, a short run recorded under "Findings".
 
-Item 16's OAUTHBEARER and `otlp_proto` halves, item 18, and §10's follow-ups to items 11 and
-12 have no workstream yet.
+Item 16's OAUTHBEARER and `otlp_proto` halves, and §10's follow-ups to items 11 and 12, have no
+workstream yet.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18 off `main` after it. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
@@ -4897,6 +4940,72 @@ but `ledger.windows` and `ledger.replay`, which SKIP on a Kafka target with no k
   descriptors went from 13 to 12 (SUT) and 12 to 11 (generator), so no redial left a
   descriptor behind.
 
+### W18: a deleting rotation (2026-10-18)
+
+`tail-rotate-delete` ran for 20 minutes on the development host, against `logit:soak-w18`
+built from `soak/w18`, whose Rust is `main`'s at `8b99d6db`. The run is
+`perf/results/soak/20261018T141700Z`, exit 0, shown here as `check` re-scores it after the
+merge of `main` at `fa26e870`, which changed nothing in it. The 4-hour run the scenario
+defaults to is pending; it will be recorded here.
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 10 apply/revert action(s) returned 0; 5 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 5 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (2 kill(s)) |
+| `restarts` | PASS | 4 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 0 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 134 readiness sample(s) read ok outside fault windows; 5 start(s) or unpause(s) ready in time, slowest ready 0.2s |
+| `progress` | PASS | 19 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 19 of 19, 19 freshness sample(s); 540s of 1140s after warmup judged (47%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +0.6 (limit 64); 590s of 1140s after warmup judged (52%; WARN under 5%) \| logit PASS: MiB/h life 4 -265.1 (limit 64); 545s of 1140s after warmup judged (48%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +10) \| logit PASS: warmup median 16 -> end 23 (limit +10) |
+| `ledger.wire` | PASS | G 1,206,200 (shared directory: 324,200 lines in 8 files, the writer having deleted 20) vs W 1,206,000 + counted 0: W + F − G -200 against the replay band [-10,000, 12,777]; the tailers stopped short at the end with W 1,206,000 |
+| `ledger.intake` | PASS | final life 4: W − D 754,900 vs E + B 754,900; life 0: W − D − B − X − ΣT_disc − Ab 0 within [0, R]; life 1: W − D − B − X − ΣT_disc − Ab 0 within [0, R]; life 2: W − D − B − X − ΣT_disc − Ab 0 within [0, R]; life 3: W − D − B − X − ΣT_disc − Ab 100 within [0, R] (R 327,000 = 0 + 262 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 4: E[tail] 754,900 == T_in[parse] 754,900 (into parse); T_in[parse] 754,900 − T_disc[parse] 0 = 754,900 == T_out[parse] 754,900 (parse sends what it doesn't discard); T_out[parse] 754,900 == T_in[labels] 754,900 (into labels); T_in[labels] 754,900 − T_disc[labels] 0 = 754,900 == T_out[labels] 754,900 (labels sends what it doesn't discard); T_out[labels] 754,900 == T_in[count] 754,900 (into count); T_in[count] 754,900 − T_disc[count] 0 = 754,900 == T_out[count] 754,900 (count sends what it doesn't discard); T_out[count] 754,900 == T_in[metrics_only] 754,900 (into metrics_only); T_in[metrics_only] 754,900 − T_disc[metrics_only] 0 = 754,900 == T_out[metrics_only] 754,900 (metrics_only sends what it doesn't discard); Σ(sent into aggregate) 754,900 == A 754,900 (listeners to aggregate); A_sent 61 == S_in[victoria_metrics] 61 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 4: Ab 754,900 == A 754,900 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − ΣT_disc − V 0 = residual 0 + Ab − V 0, ok; life 1: W − D − B − X − ΣT_disc − V 0 = residual 0 + Ab − V 0, ok; life 2 (killed): Ab 85,300 − V[victoria_metrics] 80,300 = 5,000, within band (band [-5,000, 15,001]: ingest 1,000/s over the last drain interval; below, the residual 0 plus one 4.99957s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − ΣT_disc − Ab 0 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 3 (killed): Ab 89,700 − V[victoria_metrics] 84,800 = 4,900, within band (band [-5,100, 15,001]: ingest 1,000/s over the last drain interval; below, the residual 100 plus one 4.99989s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − ΣT_disc − Ab 100 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 4 (final): Ab 754,900 − V[victoria_metrics] 754,900 = 0, ok (split copy; R 327,000 = 0 + 262 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | PASS | 1 series over 1 sink(s) x 5 life/lives, widest gap 10.003s (gaps <= 15s (1.5 x the 10s aggregate interval) or idle, with no window batches.sent from a + 7.5s to b - 2.5s (5s drains); a killed life's last sample within 11s (1.1 x) of the kill, a later life's first within 20s (2 x) of its start; 1 idle gap(s) excused: life 0 +59s to +120s (61.137s, 1 series), window sent 0 batch(es) over 0 drain(s) from +66s to +118s) |
+| `ledger.replay` | PASS | victoria_metrics: life 3's first drain replayed 0 vs killed life 2's last-drain buffer.batches 0; victoria_metrics: life 4's first drain replayed 0 vs killed life 3's last-drain buffer.batches 0 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 4: uncounted 0 = W − D − E − B 0 + E − ΣT_disc − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; the transforms' ΣT_disc 0, counted; wire G − (W + K + F) 200 over the run, F 0 counted; ledger.wire judges the rest; end to end over the run, G 1,206,200 less counted loss 0 plus the replay band's 12,777: victoria_metrics: V 1,196,000 <= G − counted + replay 1,218,977 |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 4 at +1240s: victoria_metrics: received 61 vs delivered 61 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 5 of 5 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 1,000/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served` | SKIP | the scenario has no probe step |
+| `expect.files-rotated` | PASS | delta of logit.input.files.rotated{component=tail} on logit, run: run (+60s, +1200s]: 114 (over 184 drain(s)), want >= 1 |
+| `expect.no-checkpoint-errors` | PASS | delta of logit.input.checkpoint.errors{component=tail} on logit, run: run (+60s, +1200s]: 0 (over 184 drain(s)), want <= 0 |
+| `expect.files-open-bounded` | PASS | max of logit.input.files.open{component=tail} on logit, run: run (+60s, +1200s]: 9 (173 sample(s) and the value in force at its start), want <= 10 |
+| `expect.fds-bounded` | PASS | max of logit.process.fds on logit, run: run (+60s, +1200s]: 24 (184 sample(s) and the value in force at its start), want <= 26 |
+| `expect.files-open-plateau` | PASS | last of logit.input.files.open{component=tail} on logit, run: run (+60s, +1200s]: 8 (173 sample(s) and the value in force at its start), want >= 7 |
+| `expect.writer-deletes` | PASS | delta of logit.output.file.rotations{component=file} on generator, run: run (+60s, +1200s]: 26 (over 228 drain(s)), want >= 8 |
+| `expect.watches-bounded` | PASS | max of logit.input.watch.watches{component=tail} on logit, run: run (+60s, +1200s]: 10 (173 sample(s) and the value in force at its start), want <= 11 |
+
+- **The writer deleted 20 files, and nothing unread.** It rotated 27 times, 26 after warmup,
+  and kept eight files. G is 1,206,200 and the shared directory held 324,200 lines in 8 files,
+  so 882,000 lines went with the deleted files, against about 883,942 that 20 files of 4 MiB
+  hold at the surviving files' 94.9 bytes a line. W − G is −200, as in W11b's runs: each kill
+  loses about one drain interval of counts and replays about as much. The 150 s kill spanned
+  three rotations, half the retention guard's six.
+- **Descriptors level off at the writer's retention.** `logit.input.files.open` rose from 2
+  at the end of warmup to 9 at most and ended at 8; `logit.input.watch.watches` peaked at 10;
+  the SUT's `logit.process.fds` went from a warmup median of 16 to 24 at most and 23 at the
+  end. `fds` less `files.open` was 15 at nearly every drain, so the process holds 15
+  descriptors besides its files, and `fds-bounded`'s 26 is 15 plus `files-open-bounded`'s 10
+  plus one.
+- **The wait for G held 200 short.** The end sequence read G from the writer's chunk, and the
+  tailers' W stopped at 1,206,000 after four reads, the kills' net −200. Against the shared
+  count of 324,200 it would have returned at its first read.
+- **No `resume_rejected` in this run**: no inode was freed and reused while the SUT was down.
+  The scenario still drops `tail-rotate`'s expectation of none, since a deletion during a
+  longer fault can free one.
+- **An earlier attempt, `20261018T053350Z`, ran while the host suspended** on a lid close for
+  8.5 hours: `systemd-inhibit --what=sleep:idle` doesn't block `handle-lid-switch`. `run`
+  FAILed it as stalled. Run a long soak under `--what=sleep:idle:handle-lid-switch`.
+
 ### W15: multi-destination routers under a target split (2026-10-18)
 
 `route-copy` and `route-signals` ran once each, side by side, on the development host (`trout`,
@@ -5067,7 +5176,7 @@ Overall PASS, every row PASS or SKIP.
 - **W12a** changes no harness code: the self-test passes (1,478 expectations), and the four new
   scenarios pass `self-test` validation, the shipped-config test, and `script/validate`. Met:
   a run of each is recorded under "Findings", every ledger row PASS.
-- **W15**: the self-test passes (1,969 expectations), and each new rule fails it when
+- **W15**: the self-test passes (1,980 expectations), and each new rule fails it when
   reverted (ten reverts, listed in the PR). `route-signals` and `route-copy` pass `self-test`
   validation, the shipped-config test, and `logit validate` in `logit:soak`. Met: a run of each
   is recorded under "Findings", Overall PASS.

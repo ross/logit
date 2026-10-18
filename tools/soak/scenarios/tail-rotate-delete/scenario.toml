@@ -1,0 +1,162 @@
+# tail-rotate's pipeline and faults against a writer that keeps eight files and deletes the
+# oldest at each rotation after that, run for hours: `tail_in` holds a rotated file open until
+# the writer deletes it, so its descriptors and `logit.input.files.open` must stay bounded by
+# the writer's retention. The writer rotates about every 44 s and deletes a file about every
+# 44 s from its eighth rotation on, so `ledger.wire` holds the shared directory's line count to
+# the writer's G only as a bound, and FAILs a SUT down long enough for the writer to delete a
+# file the tailer hadn't read. The schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "tail-rotate-delete"
+description = "writer -> file_out (rotating, max_files 8) -> tail_in -> json -> aggregate 10s cumulative -> prometheus_out RW1 zstd (disk spool) -> VictoriaMetrics"
+# No max_duration: the writer's retention bounds the shared directory and the tailer's
+# descriptors, so a run can last as long as the host's disk allows for logs.
+duration = "4h"           # --duration overrides
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+# One cycle an hour, so each hour holds one long quiet life after the faults: a leak that a
+# restart resets shows there, where a short repeating cycle would hide it.
+cycle = "1h"
+compose = "compose.override.yaml"   # mounts the shared directory into the writer and the SUT
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+vm_every_window = true    # one series, written in every window the tailer reads in
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "file"   # a file_out: G is its events.delivered
+sut_listener = "tail"
+wire = "file"             # W is input.lines; judged against the replay band
+sut_transforms = ["parse", "labels", "count", "metrics_only"]   # tail to aggregate, in order
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__="soak_lines_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+# fd_slope compares the warmup median to the end. At warmup the writer has rotated about once,
+# so the tailer holds two files; from the eighth rotation on it holds the eight the writer keeps,
+# plus a deleted one it's draining and the writer's `app.log.rotating` mid-rotation, at most 10:
+# eight more than at warmup. The limit is that plus two to spare.
+fd_growth = 10
+
+# The tailer stops reading; the writer doesn't, so it catches up after.
+[[step]]
+at = "0s"
+action = "pause"
+on = "logit"
+for = "60s"
+
+# A clean stop writes a final checkpoint: nothing replays, and a line held unterminated splits.
+[[step]]
+at = "2m"
+action = "stop"
+on = "logit"
+for = "30s"
+
+[[step]]
+at = "3m30s"
+action = "restart"
+on = "logit"
+for = "30s"
+
+# A SIGKILL writes no final checkpoint: what was read after the last one replays.
+[[step]]
+at = "5m"
+action = "kill"
+on = "logit"
+for = "30s"
+
+# The longer kill spans about three rotations, and as many deletions: the files the writer
+# deletes were read before the kill, and the restarted tailer finds the rest under their new
+# names. A deletion of a file it hadn't read takes about six rotations of downtime, which
+# ledger.wire's retention guard FAILs.
+[[step]]
+at = "6m30s"
+action = "kill"
+on = "logit"
+for = "150s"
+
+[[expect]]
+name = "files-rotated"
+service = "logit"
+metric = "logit.input.files.rotated"
+component = "tail"
+window = "run"
+reduce = "delta"
+min = 1
+
+# No `no-resume-rejected`, as tail-rotate has: an inode a deletion freed while the SUT is down
+# can be reused by the writer's next file, and the restarted tailer then counts
+# `resume_rejected` for the checkpoint entry whose head no longer matches, which is correct.
+
+[[expect]]
+name = "no-checkpoint-errors"
+service = "logit"
+metric = "logit.input.checkpoint.errors"
+component = "tail"
+window = "run"
+reduce = "delta"
+max = 0
+
+# The eight files the writer keeps, a deleted one still draining, and the staged file of a
+# rotation in progress, which the `app.log*` glob also matches.
+[[expect]]
+name = "files-open-bounded"
+service = "logit"
+metric = "logit.input.files.open"
+component = "tail"
+window = "run"
+reduce = "max"
+max = 10
+
+# Those files plus the process's other descriptors: `logit.process.fds` less `files.open` was 15
+# at nearly every drain of a 20-minute run, so 15 + files-open-bounded's 10 + 1 to spare.
+[[expect]]
+name = "fds-bounded"
+service = "logit"
+metric = "logit.process.fds"
+window = "run"
+reduce = "max"
+max = 26
+
+# The writer reaches its retention long before the end, so the tailer holds about its eight
+# files at the last drain.
+[[expect]]
+name = "files-open-plateau"
+service = "logit"
+metric = "logit.input.files.open"
+component = "tail"
+window = "run"
+reduce = "last"
+min = 7
+
+# Eight rotations after warmup put the writer past its retention, so it deleted a file.
+[[expect]]
+name = "writer-deletes"
+service = "generator"
+metric = "logit.output.file.rotations"
+component = "file"
+window = "run"
+reduce = "delta"
+min = 8
+
+# One watch on the shared directory and one per file open.
+[[expect]]
+name = "watches-bounded"
+service = "logit"
+metric = "logit.input.watch.watches"
+component = "tail"
+window = "run"
+reduce = "max"
+max = 11
