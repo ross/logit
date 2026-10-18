@@ -22,8 +22,9 @@
 //!   `expires_in`, a token that is a JWT is kept until 80% of the time to its `exp` claim, and
 //!   any other token is fetched again for every connection.
 //! - A failed refresh leaves the cached token in use until it expires, as the Java client and
-//!   librdkafka do, with one `token_refresh_failed` warning per failure (throttled) and no fetch
-//!   for `RETRY_DELAY`, so dials during an endpoint outage don't each wait on its timeout. Unlike
+//!   librdkafka do, with one `token_refresh_failed` warning per failure (throttled). No dial
+//!   fetches for `RETRY_DELAY` after it, so dials during an endpoint outage don't each wait on its
+//!   timeout; the first dial after that fetches again. Nothing fetches on a timer. Unlike
 //!   both, the sink never sends a token past its expiry: the endpoint's error is reported instead
 //!   of a broker's refusal of a token known to have expired.
 //! - Concurrent dials wait on one fetch. A broker's refusal of a fetched token drops it from the
@@ -31,10 +32,10 @@
 //!   (Redpanda), so the next dial fetches a new one rather than resending a token the broker
 //!   refused.
 //!
-//! An endpoint fault that fails the dial takes its class from `super::super`'s response-class table: unreachable, timed
-//! out, `429`, or `5xx` is `Clean`, and so is a `2xx` whose body is cut off by the timeout or a
-//! closed connection; any other answer but a `2xx` is `Refused`, and so is a `2xx` whose body,
-//! read up to `MAX_RESPONSE_BYTES`, holds no usable `access_token`. No message carries the token
+//! An endpoint fault that fails the dial takes its class from `super::super`'s response-class
+//! table: unreachable, timed out, `429`, or `5xx` is `Clean`, and so is a `2xx` whose body is cut
+//! off by the timeout or a closed connection; any other answer but a `2xx` is `Refused`, and so
+//! is a `2xx` whose body, read up to `MAX_RESPONSE_BYTES`, holds no usable `access_token`. No message carries the token
 //! or the client secret, and the endpoint is printed through `logit_core::redact::url`.
 
 use std::sync::{Arc, Mutex};
@@ -55,8 +56,8 @@ const KVSEP: u8 = 0x01;
 /// The share of a token's lifetime it's reused for.
 const REFRESH_FACTOR: f64 = 0.8;
 
-/// How long a failed refresh waits before the next one while the cached token is still valid:
-/// the Java client's `DELAY_SECONDS_BEFORE_NEXT_RETRY_WHEN_RELOGIN_FAILS` and librdkafka's
+/// How long after a failed refresh no dial fetches while the cached token is still valid: the
+/// Java client's `DELAY_SECONDS_BEFORE_NEXT_RETRY_WHEN_RELOGIN_FAILS` and librdkafka's
 /// delay after `rd_kafka_oauthbearer_set_token_failure`.
 const RETRY_DELAY: Duration = Duration::from_secs(10);
 
@@ -284,11 +285,12 @@ impl Endpoint {
         let remaining = Duration::from_millis(
             u64::try_from((cached.expires_at - now).as_millis()).unwrap_or(u64::MAX),
         );
+        let quiet = RETRY_DELAY.min(remaining);
         self.diag.lock().unwrap().clone().warn_throttled(
             "token_refresh_failed",
             format_args!(
                 "refreshing the OAUTHBEARER token from {} failed; the cached token, valid for \
-                 another {remaining:?}, stays in use, and the next refresh is in {RETRY_DELAY:?}: \
+                 another {remaining:?}, stays in use, with no fetch for {quiet:?}: \
                  {err:#}",
                 redact::url(&self.url)
             ),

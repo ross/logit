@@ -357,16 +357,18 @@ W3 built AWS_MSK_IAM and settled these points the decision above left open:
 ## Amendment: a failed token refresh keeps a valid token (2026-10-17)
 
 A cached OAUTHBEARER token stays in use when its refresh fails, until the token expires, and
-the refresh is tried again every 10 seconds. W2's point 3 made a failed refresh fail the dial,
-so during an identity-provider outage the sink stopped authenticating at 80% of the token's
-lifetime, with a fifth of it still valid.
+the endpoint is asked again no more than once every 10 seconds, by the next connection dialed.
+W2's point 3 made a failed refresh fail the dial, so during an identity-provider outage the
+sink stopped authenticating at 80% of the token's lifetime, with a fifth of it still valid.
 
 1. **Fall back until expiry.** A fetch is due at 80% of the lifetime, as before. If it fails
    for any reason, `Clean` or `Refused`, while the cached token hasn't expired (the request's
    start plus its `expires_in`, or a JWT's `exp`), the dial uses the cached token. Once it has
    expired, or with nothing cached, the fetch's error fails the dial as before.
-2. **Retry every 10 seconds.** A failed refresh sets no fetch for 10 seconds while the token is
-   valid, so dials during an outage don't each wait on the endpoint's timeout first. Dials
+2. **No fetch for 10 seconds.** For 10 seconds after a failed refresh, while the token is
+   valid, no dial fetches, so dials during an outage don't each wait on the endpoint's timeout
+   first. The first dial after that fetches again. Nothing fetches on a timer, so with no dial
+   there's no request; the reference clients retry on a timer of their own. Dials
    waiting on the failed fetch get the cached token without a fetch of their own.
 3. **Never send a known-expired token.** Both reference clients keep sending the old token past
    its expiry and let the broker refuse it. The sink doesn't: a token it knows has expired
