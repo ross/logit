@@ -244,7 +244,7 @@ Enough to prove the framework on every kind of transition, not to cover the matr
 
 | Flow | What it proves |
 |---|---|
-| `statsd_in -> statsd_out` | a like pair reads as `exact` throughout, under `format: dogstatsd` |
+| `statsd_in -> statsd_out` | a like pair reads as `exact` or a named normalization, under `format: dogstatsd` |
 | `statsd_in -> aggregate -> statsd_out` | raw kinds through a stage, in each `distributions:` and `sets:` mode |
 | `influxdb_in -> prometheus_out` | typed scalars, a Gauge per field, the measurement carrier, Ross's motivating example |
 | `influxdb_in -> aggregate(cumulative) -> prometheus_out` | a delta sum that `prometheus_out` drops bare and carries cumulative |
@@ -252,7 +252,8 @@ Enough to prove the framework on every kind of transition, not to cover the matr
 | `statsd_in -> otlp_out` | samples as a summary, set members skipped |
 
 Sources: `statsd_in`, `influxdb_in`, `prometheus_in`. Sinks: `statsd_out`, `prometheus_out`,
-`influxdb_out`, `otlp_out`. Later pairs follow the README's "Adding a pair" steps, one PR each.
+`influxdb_out`, `otlp_out`. Later pairs follow `spec/transit/README.md`'s "Adding a sink
+column" and "Adding a source" steps, one PR each.
 
 ### 8. Not in this stack
 
@@ -341,6 +342,15 @@ Recorded per workstream as each lands.
   - An integer `sum` or `gauge` keeps every digit on the wire, but `statsd_in` reads every value
     as an `f64`, so one above 2^53 rounds on the way back (`i64`/`u64`: `normalized`,
     `f64_value`).
+  - `statsd_out` counts `events.skipped` only for an event with no metrics. A log or a span on an
+    event that also carries metrics is left off uncounted (`log/beside_metrics`,
+    `span/beside_metrics`: `lost`, `uncounted`). A `*.skipped` or `*.omitted` counter for that loss
+    is a candidate for a later PR.
+
+  The review added two flows that set the options no other flow did, `statsd-relay-skip`
+  (`multi_value: skip`, with `statsd-aggregate-skip` for the kinds only `aggregate` makes) and
+  `statsd-relay-relative` (`relative_gauges: true`), and `coverage.md` now lists each cell no
+  flow reaches; none is left. Every cell they reached agreed with the table.
 
   The schema grew where the cases needed it: `lost` as a field-level class beside the plan's five,
   `when:` lists for config-dependent cells, a `counter` field beside `reason`, and rows for the

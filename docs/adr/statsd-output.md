@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-18
+updated: 2026-10-19
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -841,3 +841,11 @@ counts `statsd.type` with it
 `a_statsd_timer_counts_only_its_own_tag_as_having_no_wire_form`). There's no alias and no decode
 path for the old names. A DogStatsD tag can no longer spell a carrier key, because the decoder
 omits every tag key under `_logit.`.
+
+## Amendment (2026-10-19): the negative-gauge pair reads back as two records
+
+"Negative absolute gauges" holds at a statsd server, which applies `0` and then `-n` and ends at
+`-n`. `statsd_in`, reading the same pair, decodes a `Gauge(0)` and a `GaugeDelta(-n)`, uncounted,
+so a `logit` downstream of this sink receives two records, the second of which a sink without
+`relative_gauges: true` drops. The transit spec's `gauge/negative` row records it as degraded
+([ADR `transit-spec`](transit-spec.md)).

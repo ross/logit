@@ -37,8 +37,10 @@
 //! the line, not normalized.
 //!
 //! A metric value is the statsd wire's one number: an `F64` prints as a float, an `I64` or `U64`
-//! as its exact integer digits (so `2^53 + 1` survives), and a `Bool` as `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}`
-//! (`docs/adr/typed-metric-scalar.md`).
+//! as its exact integer digits (so `2^53 + 1` survives on the wire), and a `Bool` as `1` or `0`,
+//! counted `logit.output.metrics.normalized{reason="bool_value"}`
+//! (`docs/adr/typed-metric-scalar.md`). `statsd_in` reads every value back as an `F64`, so an
+//! integer beyond 2^53 rounds on a `statsd_in -> statsd_out` relay's far side.
 //!
 //! ## Sanitization
 //!
@@ -108,8 +110,11 @@
 //! `Samples`/`SetMembers` are the raw shapes `statsd_in` decodes losslessly
 //! (`docs/adr/lossless-transit.md`'s "summarization is opt-in and named"), so a
 //! `statsd_in -> statsd_out` relay with no `aggregate`, or with `aggregate`'s
-//! `distributions: samples` and `sets: members`, round-trips a timer or set line intact. They
-//! never expand, under either `multi_value` setting.
+//! `distributions: samples` and `sets: members`, round-trips a timer line intact. A
+//! `SetMembers` record leaves as one `name:<member>|s` line per member, uncounted, so a
+//! multi-member line (`users:a:b|s`) reads back as one record per member; a statsd server counts
+//! the same distinct members either way. Neither kind expands, under either `multi_value`
+//! setting.
 //!
 //! Every other kind exists only after some stage summarized, and has no single statsd line:
 //! `Distribution`, `Set`, `Histogram`, `ExponentialHistogram`, `Summary`, and a cumulative or

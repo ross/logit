@@ -345,3 +345,13 @@ protocol's sink and never crosses a foreign wire as a tag, label, field, or attr
 real codecs check the code against it, and each codec's module-doc mapping table and
 `docs/known-gaps/mappings.md`'s cross-protocol table are rendered from it. Like-pair fixed points
 and the permitted-normalization lists stay as this ADR describes them.
+
+## Amendment: a statsd set leaves one line per member (2026-10-19)
+
+The "Per pair" entry for `statsd_in -> statsd_out` says timers and sets round-trip byte for byte
+under `format: dogstatsd`. Sets don't: `statsd_out` writes a `SetMembers` record as one
+`name:<member>|s` line per member, so `users:a:b|s` leaves as `users:a|s` and `users:b|s` and
+reads back as two records. A statsd server counts the same distinct members either way, so this is
+a permitted normalization, the per-member form of "multi-value lines split", and it applies under
+both dialects. The transit spec's `set_members` row records it
+([ADR `transit-spec`](transit-spec.md)).
