@@ -128,3 +128,28 @@ above the encoder). The driver lives in a `#[cfg(test)]` module of the `logit` b
 generator will be a `#[test]` in the same module, rewriting the expectations under
 `TRANSIT_UPDATE=1` and comparing them otherwise: a test reaches `build_spec` where a script or a
 separate binary can't, and the `--check` mode is the same test with the variable unset.
+
+## Amendment: the table's field level and the class check (2026-10-19)
+
+Filling the first column, `statsd_out`, settled four things about the table the decision above
+left open:
+
+- **A sixth class, `lost`, at a second level.** A record's class (`exact`, `normalized`,
+  `degraded`, `skipped`, `dropped`) can't say that a gauge reached the wire but its `unit` didn't.
+  Rows for a record's own fields and for attribute shapes are field-level, and their class is
+  `exact`, `normalized`, or `lost`, the last naming its counter or saying it's `uncounted`.
+- **A cell can depend on the sink's config.** `statsd_out`'s `format:`, `multi_value:`, and
+  `relative_gauges:` each change a row's outcome, so a sink's entry in a row may be a list of
+  cells, each but the last guarded by a `when:` map of config fields. A column per sink
+  configuration was the alternative; it multiplies columns by every option a sink has.
+- **A cell names its counter series**, not only a reason, and the check requires every loss
+  counter a run moved to be named by a cell the case reached. A counter no cell names is a
+  finding, as an unexplained record is.
+- **A bound passes an improvement once, not forever.** A `normalized` cell also accepts a record
+  that reads back `exact`, since a normalization rewrites only the shapes it names, and a field
+  may read back better than its cell. Across the whole run, each such cell a record reached must
+  be observed at its own class at least once, so a fix that removes the normalization or the loss
+  fails the check until the table follows.
+
+`crates/logit-cli/src/transit/mapping.rs`'s and `classes.rs`'s module docs are the schema and the
+check's rules.

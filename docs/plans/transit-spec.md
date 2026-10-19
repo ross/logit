@@ -84,18 +84,20 @@ spec/transit/
   README.md                     what this is, how to add a case, a flow, or a pair
   mapping.yaml                  the table: kind × feature rows, one column per sink
   features/<system>.yaml        the wire features a source system's cases can exercise
+  cases/<system>/<case>.meta.yaml  the features the case exercises, its wire file, its tolerances
   cases/<system>/<case>.json    one lossless event JSON file per case, as <system>_in produces it
   cases/<system>/<case>.<wire>  the wire bytes a generated case decodes from (optional)
   cases/<system>/<case>.headers the request headers beside an HTTP wire file (optional)
   flows/<flow>.yaml             a runnable logit config: replay_in -> [stages] -> <sink>
   expected/<flow>/<case>.json   the re-decoded output and the counters, generated
+  coverage.md                   each system's features and the cases exercising them, generated
 ```
 
 A case's wire file is the authoring form where one exists: statsd lines, line protocol,
 exposition text, carbon plaintext, and OTLP/JSON are readable text; collectd, pickle, remote-write,
 and Datadog protobuf are `.bin` with a `.headers` sidecar, as `testdata/interop/` does. A
-recorded capture under `testdata/interop/` joins by reference from the case's JSON, not by copy.
-A hand-written edge case is the JSON alone. Both are "as `X_in` would produce it," so a flow
+recorded capture under `testdata/interop/` joins by reference, as the `wire:` path in the case's
+`.meta.yaml`, not by copy. A hand-written edge case is the JSON alone. Both are "as `X_in` would produce it," so a flow
 reads one form.
 
 Each case names the features it exercises from `features/<system>.yaml`, so coverage is a
@@ -184,26 +186,34 @@ unset it compares, with `script/transit gen|check` wrapping the two.
 | temporality | `delta`, `cumulative` (sum, histogram) |
 | monotonic | `true`, `false` (sum) |
 | scalar | `f64`, `i64`, `u64`, `bool` (sum, gauge, gauge_delta) |
-| record fields | `unit`, `description`, `start_timestamp`, `exemplars`, `flags.no_recorded_value` |
-| attribute shapes | an `Array` value, a `_logit.` carrier, a resource attribute |
+| record fields | `unit`, `description`, `start_timestamp`, `exemplars` (field level) |
+| record features | `flags.no_recorded_value`, a service check's carriers, a name the sink must sanitize (record level) |
+| attribute shapes | a string, boolean, number, or `Array` value, the sink's own `_logit.` carrier, another protocol's, a resource attribute |
+| logs | a DogStatsD event, any other log |
 
-A column is a sink. A cell is a class and a reason:
+A column is a sink. A cell is a class, a reason, and the counter it counts under:
 
-| Class | Meaning |
-|---|---|
-| `exact` | the pair's decoder reads back the same kind and value |
-| `normalized` | a permitted normalization applied (named) |
-| `degraded` | the value survives in a lesser kind (a sketch as five quantiles) |
-| `skipped` | the record leaves no wire form, counted `skipped{reason}` |
-| `dropped` | the record is lost for a reason the config didn't ask for, counted `dropped{reason}` |
+| Class | Level | Meaning |
+|---|---|---|
+| `exact` | both | the pair's decoder reads back the same kind and value |
+| `normalized` | both | a permitted normalization applied (named) |
+| `degraded` | record | the value survives in a lesser kind (a sketch as five quantiles) |
+| `lost` | field | a field the record loses while the record survives, counted or named `uncounted` |
+| `skipped` | record | the record leaves no wire form, counted `skipped{reason}` |
+| `dropped` | record | the record is lost for a reason the config didn't ask for, counted `dropped{reason}` |
 
-Each cell carries a sentence of operator-facing text: what a consumer of that sink sees, and what
-they lose. That text is what the docs are generated from.
+A sink whose outcome depends on its config (`statsd_out`'s `format:`, `multi_value:`,
+`relative_gauges:`) gets a list of cells, each but the last with a `when:` map matched against the
+flow's sink config. Each cell carries a sentence of operator-facing text: what a consumer of that
+sink sees, and what they lose. That text is what the docs are generated from.
 
-The generator checks every flow result against the table: the re-decoded kind and the counters a
-case produced must land in its cell's class, or the run fails with the case, the cell, and the
-observed outcome. A disagreement is a finding, never a regenerate: either the code is wrong, or
-the table is, and a person decides which.
+The generator checks every flow result against the table: it pairs each record that reached the
+sink with what the pair's decoder read back, and the observed class must equal the worst
+record-level cell the record reaches (a `normalized` cell also accepting `exact`), each field may
+read back no worse than its cell, and every loss counter the sink moved must be named by a cell the
+case reached. A disagreement fails the run with the case, the row, the cell, and the observed
+outcome, and is a finding, never a regenerate: either the code is wrong, or the table is, and a
+person decides which. `crates/logit-cli/src/transit/classes.rs`'s module doc has the rules.
 
 Rows for log and span fields (severity, timestamp precedence, body format, structured data, trace
 state) are added when a flow carries them. The table's schema doesn't change for them.
@@ -215,8 +225,8 @@ is stale, the pattern `script/schema` and `schema/logit.schema.json` already use
 
 - each codec's module-doc mapping table (`crates/logit-proto/src/<codec>/mod.rs`), the column
   of the table for that sink, rendered as it reads today;
-- `docs/known-gaps/mappings.md`'s cross-protocol table, every `degraded`, `skipped`, and
-  `dropped` cell, grouped by kind.
+- `docs/known-gaps/mappings.md`'s cross-protocol table, every `degraded`, `lost`, `skipped`,
+  and `dropped` cell, grouped by kind.
 
 The permitted-normalization lists stay prose: they're per-codec policy, not per-cell outcomes.
 Each relay ADR's mapping table stays as written, with a note that the table was the decision at
@@ -275,7 +285,10 @@ Sources: `statsd_in`, `influxdb_in`, `prometheus_in`. Sinks: `statsd_out`, `prom
 - **W4**: `spec/transit/` (§1), `mapping.yaml` and its schema (§5), `script/transit
   gen|check|coverage`, the `--check` test, the features lists and cases for the three sources,
   the six flows (§7) and their expectations, and the AGENTS.md "Harnesses" entry and Environment
-  table row.
+  table row. It lands as two PRs: W4a (`transit/w4a`) builds the framework on the statsd pair,
+  with five `statsd_in -> [aggregate] -> statsd_out` flows and the `statsd_out` column; W4b
+  (`transit/w4b`) adds the `influxdb_in` and `prometheus_in` sources, the other three sink
+  columns, and the four cross flows.
 - **W5**: `script/transit docs` and the drift test (§6), the marked regions in each codec's module
   doc and in `mappings.md`, and the note in each relay ADR.
 
@@ -305,3 +318,27 @@ Recorded per workstream as each lands.
   OpenMetrics by default. `statsd_out` under `multi_value: skip` counts a skipped record's tags
   as `tags.omitted{reason="dialect"}` too, since it walks the tags before it skips; the counters
   section adds `*.omitted` to §4's list so W4's table sees that.
+- **W4a**: the statsd column is filled from the module docs and `docs/known-gaps/statsd.md`, and
+  the class check agreed with all of it except what follows, each now a cell of its own. Four
+  outcomes neither doc states:
+  - `statsd_out` writes a multi-member `SetMembers` record as one `|s` line per member under
+    either dialect, uncounted, so `users:alice:bob|s` reads back as two records. The module doc's
+    "round-trips a timer or set line intact" holds for the value at a statsd server, not for the
+    record (`set_members`: `normalized`, `member_per_line`). Only the encoder's function doc says
+    so.
+  - A negative absolute gauge, which `aggregate` produces from relative adjustments, leaves as the
+    documented `0|g` then `-v|g` pair, and `statsd_in` reads that pair as a gauge of 0 and a
+    `GaugeDelta`, uncounted (`gauge/negative`: `degraded`). A statsd server ends at the right
+    value; a `logit` relay downstream receives two records.
+  - Under `format: statsd`, splitting a multi-value timer line isn't counted;
+    `messages.normalized{reason="dialect"}` counts only the `h`/`d`-to-`ms` rename.
+  - An integer `sum` or `gauge` keeps every digit on the wire, but `statsd_in` reads every value
+    as an `f64`, so one above 2^53 rounds on the way back (`i64`/`u64`: `normalized`,
+    `f64_value`).
+
+  The schema grew where the cases needed it: `lost` as a field-level class beside the plan's five,
+  `when:` lists for config-dependent cells, a `counter` field beside `reason`, and rows for the
+  sink's own carrier against a foreign one, typed attribute values, a service check, a name the
+  sink sanitizes, and logs. A flow's `replay_in` names one case file rather than a directory, so
+  `logit run` can run it by hand; the file's directory is the flow's source. Coverage is a
+  generated, committed `coverage.md`, checked like the expectations, rather than a printout.
