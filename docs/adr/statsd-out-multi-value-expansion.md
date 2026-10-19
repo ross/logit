@@ -1,6 +1,6 @@
 ---
 created: 2026-10-07
-updated: 2026-10-13
+updated: 2026-10-19
 ---
 
 # `statsd_out` multi-value expansion: summarized kinds leave as dotted counter and gauge lines by default
@@ -194,7 +194,9 @@ and, for a `Distribution` or `Set`, `aggregate`'s `distributions: samples` or `s
 ### What doesn't expand
 `Samples` and `SetMembers` keep their native `|ms`/`|h`/`|d` and `|s` lines under both settings.
 They're the raw shapes `statsd_in` decodes, and a `statsd_in -> statsd_out` relay with no
-`aggregate`, or with raw retention, still round-trips a timer or set line intact. A `Gauge`,
+`aggregate`, or with raw retention, still round-trips a timer line intact, and writes a set as one
+`|s` line per member, which reads back as one record each (ADR `lossless-transit`'s 2026-10-19
+amendment). A `Gauge`,
 `GaugeDelta`, and delta monotonic `Sum` render as they do today.
 
 So the expansion renders only components an upstream summary already held, whether an explicit

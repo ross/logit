@@ -312,7 +312,8 @@ Per pair:
   tags round-tripped through the real decoder. It encodes `Sum` (delta, monotonic),
   `Gauge`/`GaugeDelta`, `Samples`, `SetMembers`, and DogStatsD events/service checks. A relay with
   no `aggregate` in between, or one configured `distributions: samples`/`sets: members`,
-  round-trips timers and sets byte-for-byte under `format: dogstatsd`. Under `format: statsd` it's
+  round-trips timers byte-for-byte under `format: dogstatsd`, and writes a set as one `|s` line per
+  member, read back as one record each. Under `format: statsd` it's
   lossless modulo the ADR's permitted normalizations: multi-value lines split, and `h`/`d`
   normalize to `ms`. Post-sketch kinds
   (`Distribution`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary`, and a cumulative or

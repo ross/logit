@@ -326,13 +326,13 @@ Recorded per workstream as each lands.
   as `tags.omitted{reason="dialect"}` too, since it walks the tags before it skips; the counters
   section adds `*.omitted` to §4's list so W4's table sees that.
 - **W4a**: the statsd column is filled from the module docs and `docs/known-gaps/statsd.md`, and
-  the class check agreed with all of it except what follows, each now a cell of its own. Four
-  outcomes neither doc states:
+  the class check agreed with all of it except what follows, each now a cell of its own. Five
+  outcomes neither doc stated:
   - `statsd_out` writes a multi-member `SetMembers` record as one `|s` line per member under
     either dialect, uncounted, so `users:alice:bob|s` reads back as two records. The module doc's
     "round-trips a timer or set line intact" holds for the value at a statsd server, not for the
-    record (`set_members`: `normalized`, `member_per_line`). Only the encoder's function doc says
-    so.
+    record (`set_members`: `normalized`, `member_per_line`). Only the encoder's function doc said
+    so; the module doc now does too.
   - A negative absolute gauge, which `aggregate` produces from relative adjustments, leaves as the
     documented `0|g` then `-v|g` pair, and `statsd_in` reads that pair as a gauge of 0 and a
     `GaugeDelta`, uncounted (`gauge/negative`: `degraded`). A statsd server ends at the right
