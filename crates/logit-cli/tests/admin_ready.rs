@@ -5,34 +5,49 @@
 
 mod support;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use support::{
-    ephemeral_addr, logit_ready, logit_ready_env, logit_ready_url, wait_until_probe_succeeds,
-    wait_until_ready, KillOnDrop, TempConfig, PROCESS_DEADLINE,
+    logit_ready, logit_ready_env, logit_ready_url, spawn_run, wait_until_probe_succeeds,
+    wait_until_ready, KillOnDrop, TempConfig, ADMIN, ANY_PORT, PROCESS_DEADLINE,
 };
+
+/// Port `0` in the config, for the admin endpoint and a TCP listener alike, reads back as the
+/// port the child bound, and both answer on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_port_0_bind_reports_the_port_the_child_bound() {
+    let config = TempConfig::write(
+        "admin-any-port",
+        format!(
+            "admin:\n  bind: \"{ANY_PORT}\"\ncomponents:\n  in:\n    type: statsd_in\n    \
+             transport: tcp\n    bind: \"{ANY_PORT}\"\n  out:\n    type: null_out\n    \
+             sources: [in]\n"
+        ),
+    );
+    let (_child, stderr) = spawn_run(&config, Stdio::null());
+    let [admin_addr, statsd_addr] =
+        <[String; 2]>::try_from(stderr.wait_for_bound(&[ADMIN, "in"])).expect("two addresses");
+    for addr in [&admin_addr, &statsd_addr] {
+        let parsed: std::net::SocketAddr = addr.parse().expect("an IP address and port");
+        assert_ne!(parsed.port(), 0, "{addr} names the requested port, not the bound one");
+    }
+    assert_eq!(wait_until_ready(&admin_addr).await, "ok");
+    std::net::TcpStream::connect(&statsd_addr).expect("statsd_in listens on the reported address");
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn logit_ready_reflects_a_real_runs_readiness_then_fails_once_it_exits() {
-    let admin_addr = ephemeral_addr().await;
-    let statsd_addr = ephemeral_addr().await;
     let config = TempConfig::write(
         "admin-ready-e2e",
         format!(
-            "admin:\n  bind: \"{admin_addr}\"\ncomponents:\n  in:\n    type: statsd_in\n    bind: \"{statsd_addr}\"\n  out:\n    type: stdio_out\n    sources: [in]\n"
+            "admin:\n  bind: \"{ANY_PORT}\"\ncomponents:\n  in:\n    type: statsd_in\n    bind: \"{ANY_PORT}\"\n  out:\n    type: stdio_out\n    sources: [in]\n"
         )
         .as_bytes(),
     );
 
-    let child = Command::new(env!("CARGO_BIN_EXE_logit"))
-        .arg("run")
-        .arg(&config.0)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawning logit run");
-    let mut child = KillOnDrop(child);
+    let (mut child, stderr) = spawn_run(&config, Stdio::null());
+    let admin_addr = stderr.wait_for_bound(&[ADMIN]).remove(0);
 
     // Retry the probe under test as its own readiness signal rather than a fixed sleep.
     let word = wait_until_ready(&admin_addr).await;
@@ -76,12 +91,11 @@ async fn readyz_answers_draining_for_the_whole_drain_after_a_sigterm() {
 
     let influx = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let influx_addr = influx.local_addr().unwrap();
-    let admin_addr = ephemeral_addr().await;
     let grace_secs = SHUTDOWN_GRACE.as_secs();
     let config = TempConfig::write(
         "admin-draining-e2e",
         format!(
-            "admin:\n  bind: \"{admin_addr}\"\ncomponents:\n  self:\n    type: internal\n    \
+            "admin:\n  bind: \"{ANY_PORT}\"\ncomponents:\n  self:\n    type: internal\n    \
              interval: 100ms\n  out:\n    type: influxdb_out\n    sources: [self]\n    url: \
              \"http://{influx_addr}\"\n    org: o\n    bucket: b\n    token: t\n    buffer:\n      \
              delivery: at_least_once\n      shutdown_grace: {grace_secs}s\n"
@@ -89,15 +103,8 @@ async fn readyz_answers_draining_for_the_whole_drain_after_a_sigterm() {
         .as_bytes(),
     );
 
-    let child = Command::new(env!("CARGO_BIN_EXE_logit"))
-        .arg("run")
-        .arg(&config.0)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawning logit run");
-    let child = KillOnDrop(child);
-
+    let (child, stderr) = spawn_run(&config, Stdio::null());
+    let admin_addr = stderr.wait_for_bound(&[ADMIN]).remove(0);
     wait_until_ready(&admin_addr).await;
 
     // The sink's first request, held unanswered for the rest of the test: the drain SIGTERM
@@ -149,23 +156,16 @@ fn logit_ready_against_nothing_listening_exits_1() {
 /// `statsd_in` into a `stdio_out`, and spawns `logit run` on it. `shutdown.delay` keeps the
 /// process draining after a SIGTERM for longer than any test waits.
 #[cfg(unix)]
-async fn spawn_with_admin(name: &str, admin: &str) -> (TempConfig, KillOnDrop) {
-    let statsd_addr = ephemeral_addr().await;
+async fn spawn_with_admin(name: &str, admin: &str) -> (TempConfig, KillOnDrop, support::Lines) {
     let config = TempConfig::write(
         name,
         format!(
             "admin:\n{admin}shutdown:\n  delay: 60s\ncomponents:\n  in:\n    type: statsd_in\n    \
-             bind: \"{statsd_addr}\"\n  out:\n    type: stdio_out\n    sources: [in]\n"
+             bind: \"{ANY_PORT}\"\n  out:\n    type: stdio_out\n    sources: [in]\n"
         ),
     );
-    let child = Command::new(env!("CARGO_BIN_EXE_logit"))
-        .arg("run")
-        .arg(&config.0)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawning logit run");
-    (config, KillOnDrop(child))
+    let (child, stderr) = spawn_run(&config, Stdio::null());
+    (config, child, stderr)
 }
 
 /// Polls `probe` until its stderr says `draining`, or panics after [`PROCESS_DEADLINE`].
@@ -186,7 +186,7 @@ async fn logit_ready_over_a_unix_socket_reflects_readiness_and_draining() {
     let dir = logit_pipeline::test_util::scratch_dir("admin-socket");
     let path = dir.join("admin.sock");
     let url = format!("unix:{}", path.display());
-    let (_config, child) =
+    let (_config, child, _stderr) =
         spawn_with_admin("admin-socket", &format!("  socket: \"{}\"\n", path.display())).await;
 
     let word = wait_until_probe_succeeds(|| logit_ready_url(&url)).await;
@@ -207,7 +207,7 @@ async fn logit_ready_reads_a_unix_socket_endpoint_from_logit_admin() {
     let dir = logit_pipeline::test_util::scratch_dir("admin-socket-env");
     let path = dir.join("admin.sock");
     let url = format!("unix:{}", path.display());
-    let (_config, child) =
+    let (_config, child, _stderr) =
         spawn_with_admin("admin-socket-env", &format!("  socket: \"{}\"\n", path.display())).await;
 
     let word = wait_until_probe_succeeds(|| logit_ready_env(&url)).await;
@@ -228,11 +228,31 @@ async fn a_stale_admin_socket_file_is_replaced() {
     drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
     assert!(path.exists());
     let url = format!("unix:{}", path.display());
-    let (_config, _child) =
+    let (_config, _child, _stderr) =
         spawn_with_admin("admin-socket-stale", &format!("  socket: \"{}\"\n", path.display()))
             .await;
 
     assert_eq!(wait_until_probe_succeeds(|| logit_ready_url(&url)).await, "ok");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// With `admin.bind` and `admin.socket` both set, the child logs `admin bound` twice, the TCP
+/// address first. [`support::Lines::wait_for_bound`] keeps that first address for [`ADMIN`] while
+/// it reads on for `in`'s line, which follows both.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_for_bound_keeps_the_admin_tcp_address_beside_a_socket() {
+    let dir = logit_pipeline::test_util::scratch_dir("admin-socket-first-address");
+    let path = dir.join("admin.sock");
+    let (_config, _child, stderr) = spawn_with_admin(
+        "admin-socket-first-address",
+        &format!("  bind: \"{ANY_PORT}\"\n  socket: \"{}\"\n", path.display()),
+    )
+    .await;
+    let addrs = stderr.wait_for_bound(&[ADMIN, "in"]);
+    let admin: std::net::SocketAddr =
+        addrs[0].parse().expect("the TCP address, not the socket path");
+    assert_ne!(admin.port(), 0, "{admin}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -242,12 +262,12 @@ async fn admin_bind_and_socket_together_both_serve() {
     let dir = logit_pipeline::test_util::scratch_dir("admin-socket-both");
     let path = dir.join("admin.sock");
     let url = format!("unix:{}", path.display());
-    let admin_addr = ephemeral_addr().await;
-    let (_config, child) = spawn_with_admin(
+    let (_config, child, stderr) = spawn_with_admin(
         "admin-socket-both",
-        &format!("  bind: \"{admin_addr}\"\n  socket: \"{}\"\n", path.display()),
+        &format!("  bind: \"{ANY_PORT}\"\n  socket: \"{}\"\n", path.display()),
     )
     .await;
+    let admin_addr = stderr.wait_for_bound(&[ADMIN]).remove(0);
 
     assert_eq!(wait_until_ready(&admin_addr).await, "ok");
     assert_eq!(wait_until_probe_succeeds(|| logit_ready_url(&url)).await, "ok");

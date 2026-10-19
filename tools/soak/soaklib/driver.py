@@ -796,7 +796,8 @@ class Run:
     def read_topic(self):
         """Reads the Kafka target's topic back from the broker after the SUT stopped: each
         partition's end offset into `kafka-offsets.txt`, then that many records from the
-        beginning into `kafka-topic.ndjson`, one record value per line, the ledger's V. Records
+        beginning into `kafka-topic.ndjson`, one record value per line in the target's
+        `format` (topic.py), the ledger's V. Records
         `kafka_read` with both counts, or `kafka_read_failed` when either read fails or the two
         disagree."""
         name = self.scenario.target["topic"]
@@ -815,7 +816,8 @@ class Run:
                        stderr=result.stderr.strip()[-2000:])
             return
         expected = sum(offsets.values())
-        result = self.docker.exec_(container, topic.consumer_argv(name, expected),
+        fmt = self.scenario.target.get("format", topic.JSON)
+        result = self.docker.exec_(container, topic.consumer_argv(name, expected, fmt),
                                    timeout=TOPIC_READ_TIMEOUT_S)
         topic_path.write_text(result.stdout)
         records = len(topic.record_lines(result.stdout))
