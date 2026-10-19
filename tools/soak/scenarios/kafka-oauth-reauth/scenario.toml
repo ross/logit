@@ -92,8 +92,11 @@ on = "idp"
 for = "2m"
 
 # The token endpoint hangs: a token request waits the sink's 10 s `timeout`, then fails `Clean`.
-# A steady redial comes 10 s before its token expires, so the wait outlasts the token and leaves
-# nothing to fall back to: this step asserts the hold, not the fallback.
+# A steady redial comes about 10 s before its token expires, so the wait outlasts the token in
+# most cycles. The sink's expiry is the request's start plus `expires_in`, later than the JWT's
+# whole-second `exp` the broker's deadline follows, and the redial waits for the next send after
+# the deadline, so a fetch can fail with under 1 s of the token left and fall back. That is
+# rare, so this step asserts the hold, not the fallback.
 [[step]]
 at = "10m"
 action = "pause"

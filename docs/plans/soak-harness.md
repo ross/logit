@@ -2459,8 +2459,11 @@ where it needs them, and a small check extension.
         no `refused` attempt.
       - The fallback covers a refused endpoint, not a hung one. A redial comes `timeout` before
         its token expires and fetches the next token then, since nothing fetches on a timer.
-        Against a hung endpoint, the fetch waits that same `timeout` and returns with the token
-        expired, so the pause step asserts the hold alone.
+        Against a hung endpoint, the fetch waits that same `timeout` and almost always returns
+        with the token expired. The sink's expiry, the request's start plus `expires_in`, can
+        sit up to a second past the JWT's whole-second `exp` that sets the deadline, so a fetch
+        can still fail with under a second left and fall back. That is rare, so the pause step
+        asserts the hold alone.
     - **An `otlp_proto` topic (2969c24e).** `ledger.topic` reads `format: json` records only;
       V from an OTLP topic needs a stdlib protobuf walker for the export requests.
 17. **`influxdb_out`'s response-class table on a stand-in (ffe33654, b93cb23a), built in W16.**
