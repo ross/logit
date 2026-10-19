@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+thread_local! { static MINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 pub static PHASE: AtomicU8 = AtomicU8::new(0);
 static ACTIVE: AtomicU8 = AtomicU8::new(0);
 static LAST_NS: AtomicU64 = AtomicU64::new(0);
@@ -32,7 +33,7 @@ pub fn name(p: u8) -> &'static str {
 }
 /// Called from every heartbeat update.
 pub fn on_update() {
-    if ACTIVE.load(Relaxed) == 0 {
+    if ACTIVE.load(Relaxed) == 0 || !MINE.with(|m| m.get()) {
         return;
     }
     let now = now_ns();
@@ -52,10 +53,12 @@ pub fn begin() {
     LAST_PHASE.store(1, Relaxed);
     PHASE.store(1, Relaxed);
     ACTIVE.store(1, Relaxed);
+    MINE.with(|m| m.set(true));
 }
 pub fn end(total_start_ns: u64) {
     on_update();
     ACTIVE.store(0, Relaxed);
+    MINE.with(|m| m.set(false));
     let line = format!(
         "GAPREPORT longest_gap_ms={:.1} phase={}->{} sort_ms={:.1} flush_total_ms={:.1}",
         MAX_GAP.load(Relaxed) as f64 / 1e6,
