@@ -1689,6 +1689,27 @@ the epoch (`rejected`, `invalid_timestamp`, `invalid_record`, `ambiguous_at_most
 `checks.py`'s `EPOCH_BUMP_REASONS`), as [`docs/known-gaps/kafka.md`](../known-gaps/kafka.md)
 permits. Every other target's `ledger.topic` SKIPs.
 
+**An `otlp_proto` topic.** `load()` reads the `format:` of the `kafka_out` the sink names
+from the SUT config, `json` when it sets none, and records it as the resolved target's `format`.
+It refuses a format other than `json` or `otlp_proto`, and a sink that doesn't write the
+target's `topic`: its `topic:`, or under `otlp_proto` with none, the `metrics:` topic of
+`topics:`, else `otlp_metrics`. The consumer prints a value as text, so under `otlp_proto` it
+reads through `--value-deserializer org.apache.kafka.common.serialization.BytesDeserializer`,
+whose `Bytes.toString` writes each printable ASCII byte but the backslash as itself and every
+other byte as `\xHH`, one record per line. `otlp.py` unescapes each line and walks it as an
+`ExportMetricsServiceRequest`, as prost reads protobuf: unknown fields are skipped, a scalar
+or a oneof keeps its last value, and a truncated field, an over-long varint, or a known field
+under the wrong wire type is a record that doesn't decode. Each record holds every series of a
+batch, so T and the duplicate copies stay counted on raw bytes, the unit of
+`logit.output.records`, but V counts each `Sum` data point once per series (the resource, the
+metric name, and the attributes) and `time_unix_nano`. A point a byte-distinct record repeats,
+a resend split another way, adds nothing to V, and `ledger.topic` judges it per life as it
+judges a duplicate copy. Each record is credited to the life its latest point time falls in.
+The walker is checked against `tools/soak/vectors/kafka-otlp-metrics.hex`, a record of int,
+double, and negative `Sum` points, a `Gauge`, and a histogram with packed fields, which a test
+in `crates/logit-outputs/src/kafka/encode.rs` holds equal to what the encoder writes; the
+self-test derives its variants from those bytes. `format: otlp_json` isn't read.
+
 **The scenario.** `kafka-broker-restart` is `statsd-vm`'s generator at 2,000 lines/s through a
 2 s delta `aggregate` into `kafka_out` (`format: json`, `acks: all`, idempotent, `timeout:
 10s`), topic `soak`. Its 6.5-minute cycle restarts the broker, pauses it for 40 s, and stops it
@@ -1696,7 +1717,8 @@ for 60 s, each followed by at least 75 s. The 10 s `timeout`, under the pause, t
 into response timeouts, `Ambiguous` attempts the broker deduplicates on the resend. Its
 expectations: `batches.dropped` 0 through each fault, at least one `ambiguous` request through
 the pause, so `ledger.topic`'s no-duplicate verdict rests on resends, and `retrying` above 0
-during the stop and 0 after it.
+during the stop and 0 after it. `kafka-otlp-broker-restart` is the same run under `format:
+otlp_proto`, `topics: {metrics: soak}`, with the same expectations: one record per window.
 
 ### 8c. Stand-in targets (W9a, W9b, W16)
 
@@ -2409,8 +2431,9 @@ where it needs them, and a small check extension.
       `mock-oauth2-server` in the stack, under a new `idp` role, and a namespace holder, because
       `kafka_out` takes a `token_endpoint` only over loopback HTTP or HTTPS with a public CA's
       certificate.
-    - **An `otlp_proto` topic (2969c24e).** `ledger.topic` reads `format: json` records only;
-      V from an OTLP topic needs a stdlib protobuf walker for the export requests.
+    - **An `otlp_proto` topic (2969c24e), built in W20.** A stdlib protobuf walker reads each
+      record's metrics export request, and V counts each `Sum` data point once per series and
+      time. Built as `kafka-otlp-broker-restart`; §8b's "An `otlp_proto` topic" has the rules.
 17. **`influxdb_out`'s response-class table on a stand-in (ffe33654, b93cb23a), built in W16.**
     W9's stand-in design with InfluxDB's shape, cueing the `403` and `404` rows that split on
     whether the bucket or org was carried or configured: `Rejected` for a carried value,
@@ -2485,6 +2508,7 @@ that items 3, 7, and 11 need.
 | W16 | `soak/w16` | `soak/w16: an InfluxDB-shaped stand-in for every influxdb_out response class` | M | W12d |
 | W17 | `soak/w17` | `soak/w17: a Kafka SASL re-authentication soak` | M | W16 |
 | W18 | `soak/w18` | `soak/w18: a tail_in descriptor soak under a deleting rotation` | M | W14 |
+| W20 | `soak/w20` | `soak/w20: an otlp_proto Kafka topic in the soak ledger` | M | W17 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -2619,11 +2643,15 @@ that items 3, 7, and 11 need.
   while the writer deleted no file, then as a bound with the writer's file count) and its
   retention guard, the end sequence's wait for G, self-test fixtures for each rule, and the
   `tail-rotate-delete` scenario, a 20-minute and a 1-hour run recorded under "Findings".
+- **W20**: item 16's `otlp_proto` half: the target's format read from the sink's config, the
+  consumer's `BytesDeserializer`, a stdlib protobuf walker (`otlp.py`) checked against a vector
+  the Rust encoder pins, V per data point and the repeated points `ledger.topic` judges,
+  self-test fixtures for each rule, and the `kafka-otlp-broker-restart` scenario, a 20-minute
+  and a 1-hour run recorded under "Findings".
 
-Item 16's OAUTHBEARER and `otlp_proto` halves, and §10's follow-ups to items 11 and 12, have no
-workstream yet.
+Item 16's OAUTHBEARER half and §10's follow-ups to items 11 and 12 have no workstream yet.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18 off `main` after it. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18 and W20 off `main` after it. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings

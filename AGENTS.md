@@ -808,7 +808,9 @@ the operator-facing account of all of this.
   stack (a `kafka` target) that it restarts, pauses, and stops, and reads the topic back as the
   ledger's egress total (`ledger.topic`). `kafka-sasl-reauth` is the same over SCRAM-SHA-512 to
   a broker that ends each session after 30 s, and bounds the sink's redial rate
-  (`logit.output.reconnects`, a `rate` expectation). `standin-remote-write` and
+  (`logit.output.reconnects`, a `rate` expectation). `kafka-otlp-broker-restart` is
+  `kafka-broker-restart` under `format: otlp_proto`, its topic walked by a stdlib protobuf
+  reader (`tools/soak/soaklib/otlp.py`) with V counted per data point. `standin-remote-write` and
   `standin-at-most-once` point `prometheus_out` at a scripted HTTP stand-in (a `standin` target, `tools/soak/standin/`) that
   `respond` steps cue through every row of the sink's response-class table, each step naming the
   fault class the sink must read; the stand-in's stdout records every request, raw body included,

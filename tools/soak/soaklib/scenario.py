@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import standin as standin_mod
+from . import topic as topic_mod
 
 # The compose label naming a service's role, and the roles. A `sut` and a `generator` run
 # `logit`; a `backend` stores what a sink delivers and answers the checks' queries; a `broker`
@@ -570,8 +571,8 @@ class Scenario:
     steps: list = field(default_factory=list)
     expectations: list = field(default_factory=list)
     random: object = None
-    # `{kind, name, env}`, plus `topic` for a Kafka target; kind `victoria-metrics` (the
-    # default), `external`, `kafka`, or `standin`.
+    # `{kind, name, env}`, plus `topic` and `format` for a Kafka target; kind `victoria-metrics`
+    # (the default), `external`, `kafka`, or `standin`.
     target: dict = field(default_factory=lambda: {"kind": LOCAL_TARGET, "name": LOCAL_TARGET,
                                                   "env": []})
     # The compose override file beside scenario.toml, or None.
@@ -866,6 +867,8 @@ def from_dict(raw, path):
             problems += _wire_problems(ledger, sut_text)
             problems += _route_problems(ledger, sut_text)
             problems += _transform_problems(ledger, sut_text)
+            if target["kind"] == KAFKA_TARGET:
+                target["format"] = kafka_format(ledger, sut_text, target["topic"], problems)
         problems += _writer_problems(ledger, configs, path.parent)
         problems += _extra_sut_problems(extra_suts, ledger)
         if overlap is None:
@@ -1021,10 +1024,10 @@ def _parse_expected(table, problems):
 
 
 def target_json(target):
-    """The resolved scenario's `target`: `{kind, name, env}`, plus `topic` for Kafka and
-    `shape` for a stand-in."""
+    """The resolved scenario's `target`: `{kind, name, env}`, plus `topic` and `format` for
+    Kafka and `shape` for a stand-in."""
     out = {"kind": target["kind"], "name": target["name"], "env": list(target["env"])}
-    for key in ("topic", "shape"):
+    for key in ("topic", "format", "shape"):
         if key in target:
             out[key] = target[key]
     return out
@@ -1192,6 +1195,48 @@ def listener_wire(text, component):
         wire = default if transport is None else by_transport.get(transport)
         return wire, kind.group(1), transport
     return None, None, None
+
+
+def kafka_format(ledger, sut_text, topic, problems):
+    """The `format:` of the `kafka_out` a Kafka target's `[[ledger.sink]]` names in the SUT
+    config `sut_text`, `json` when it sets none: how the ledger reads the topic back. Appends to
+    `problems` when the sink isn't a `kafka_out`, when its format is one the ledger can't read
+    (`topic.FORMATS`), or when the sink doesn't write the topic the ledger reads: its `topic:`,
+    or under `otlp_proto` with no `topic:`, the metrics topic `topics:` names, else
+    `otlp_metrics`. Comments are ignored."""
+    sinks = ledger.get("sink")
+    first = sinks[0] if isinstance(sinks, list) and sinks else None
+    sink = first.get("id") if isinstance(first, dict) else None
+    if not isinstance(sink, str) or not _COMPONENT_ID.match(sink):
+        return topic_mod.JSON
+    for block in component_blocks(sut_text, sink):
+        body = "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in block.splitlines())
+        kind = re.search(r"\btype\s*:\s*[\"']?([a-z_]+)", body)
+        if not kind:
+            continue
+        if kind.group(1) != "kafka_out":
+            problems.append(f"ledger.sink {sink!r} is a {kind.group(1)}; a kafka target's sink "
+                            "is the kafka_out whose topic the ledger reads back")
+            return topic_mod.JSON
+        found = re.search(r"\bformat\s*:\s*[\"']?([a-z_]+)", body)
+        fmt = found.group(1) if found else topic_mod.JSON
+        if fmt not in topic_mod.FORMATS:
+            problems.append(f"ledger.sink {sink!r} writes format {fmt}; the ledger reads a "
+                            f"topic in {' or '.join(topic_mod.FORMATS)} only")
+            return topic_mod.JSON
+        name = r"[\"']?([A-Za-z0-9._-]+)"
+        found = re.search(rf"\btopic\s*:\s*{name}", body)
+        written = found.group(1) if found else None
+        if written is None and fmt == topic_mod.OTLP_PROTO:
+            found = re.search(rf"\bmetrics\s*:\s*{name}", body)
+            written = found.group(1) if found else "otlp_metrics"
+        if topic and written != topic:
+            where = "its metrics to " if fmt == topic_mod.OTLP_PROTO else ""
+            problems.append(f"target.topic is {topic!r}, but ledger.sink {sink!r} writes "
+                            f"{where}{written!r}")
+        return fmt
+    problems.append(f"ledger.sink {sink!r} isn't a component of the SUT config")
+    return topic_mod.JSON
 
 
 def _route_blocks(text, kind="route"):
@@ -1896,7 +1941,8 @@ def _parse_target(table, problems):
             problems.append("target.topic must be a legal Kafka topic name: ASCII letters, "
                             "digits, `.`, `_`, or `-`, up to 249 characters")
             topic = ""
-        return {"kind": kind, "name": name, "env": [], "topic": topic}
+        return {"kind": kind, "name": name, "env": [], "topic": topic,
+                "format": topic_mod.JSON}
     if "topic" in table:
         problems.append("target.topic is for a kafka target")
     name = table.get("name")
