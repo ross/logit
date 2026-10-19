@@ -1,0 +1,41 @@
+#!/bin/bash
+# Usage: script/transit gen|check|coverage
+#   gen       regenerate every generated file under spec/transit/: each wire case's .json, each
+#             expected/<flow>/<case>.json, and coverage.md; then run the class check
+#   check     compare them and run the class check, failing on anything stale (what script/test
+#             runs)
+#   coverage  regenerate spec/transit/coverage.md, each system's features and the cases that
+#             exercise them, and print it
+#
+# The spec's generator is a test in the `logit` binary's transit module
+# (crates/logit-cli/src/transit/spec.rs), since only the binary's tests reach the kind registry;
+# TRANSIT_UPDATE=1 turns its comparisons into rewrites. A class check failure is never rewritten:
+# fix the code or mapping.yaml. Review `git diff spec/transit/` after `gen` and commit. See
+# spec/transit/README.md.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+spec_tests() {
+    run "$@" cargo nextest run -p logit-cli --bin logit --no-tests=fail \
+        -E 'test(=transit::spec::transit_spec) | test(=transit::spec::transit_coverage)'
+}
+
+case "${1:-}" in
+    gen)
+        spec_tests env TRANSIT_UPDATE=1
+        ;;
+    check)
+        spec_tests env
+        ;;
+    coverage)
+        run env TRANSIT_UPDATE=1 cargo nextest run -p logit-cli --bin logit --no-tests=fail \
+            -E 'test(=transit::spec::transit_coverage)'
+        cat spec/transit/coverage.md
+        ;;
+    *)
+        sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' >&2
+        exit 2
+        ;;
+esac

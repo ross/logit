@@ -50,6 +50,9 @@ http.workspace = true
 http-body-util.workspace = true
 
 [dev-dependencies]
+# The transit spec's `#[cfg(test)]` readers of `spec/transit/mapping.yaml` and each case's
+# `.meta.yaml` (`src/transit/`). Already a dependency via `logit-config`.
+serde.workspace = true
 # Compiles `logit_pipeline::test_util` for the integration tests. Dev-only, so the release binary
 # never has it; `script/lint` checks that.
 logit-pipeline = { workspace = true, features = ["test-util"] }

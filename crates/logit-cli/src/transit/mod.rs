@@ -41,8 +41,15 @@
 //!
 //! Exposition has no configured dialect: a scraper negotiates one, so the driver takes it as
 //! [`Options::dialect`], OpenMetrics by default, which is what a Prometheus scrape negotiates.
+//!
+//! `spec` runs `spec/transit/`'s cases through its flows with this driver, and `classes` checks
+//! each run against `spec/transit/mapping.yaml` (`mapping`); `spec/transit/README.md` is the
+//! reader's account.
 
+mod classes;
+mod mapping;
 mod report;
+mod spec;
 mod tests;
 mod wire;
 
@@ -99,8 +106,25 @@ struct Stage {
     emitted: Vec<logit_core::Event>,
 }
 
+/// What a run reached and read back, beside its document: what the spec's class check
+/// (`spec`) compares.
+pub(crate) struct Traced {
+    pub outcome: Outcome,
+    /// The batches that reached the sink, after every stage.
+    pub sunk: Vec<EventBatch>,
+    /// The pair decoder's reading of the sink's bytes.
+    pub decoded: Vec<EventBatch>,
+    /// The sink's config as `ComponentKind` serializes it, every default filled in.
+    pub sink: serde_json::Value,
+}
+
 /// Runs `case` through `flow` (module doc).
 pub(crate) fn run(flow: &Path, case: &Path, options: Options) -> anyhow::Result<Outcome> {
+    run_traced(flow, case, options).map(|traced| traced.outcome)
+}
+
+/// [`run`], keeping what reached the sink and what its pair decoder read back.
+pub(crate) fn run_traced(flow: &Path, case: &Path, options: Options) -> anyhow::Result<Traced> {
     let config = crate::config::load(flow)?;
     let graph = graph::resolve(config)?;
     let chain = chain(&graph)?;
@@ -167,7 +191,9 @@ pub(crate) fn run(flow: &Path, case: &Path, options: Options) -> anyhow::Result<
         .with_context(|| format!("round-tripping through '{}'", chain.sink))?;
 
     let mut probe = probe;
-    Ok(Outcome::new(&decoded, probe.poll()))
+    let outcome = Outcome::new(&decoded, probe.poll());
+    let sink = serde_json::to_value(&sink.kind).context("serializing the sink's config")?;
+    Ok(Traced { outcome, sunk: out, decoded, sink })
 }
 
 /// Passes `batch` through `stages[from..]`, as the node runtime would, and returns what reaches

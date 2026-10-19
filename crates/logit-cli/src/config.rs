@@ -248,6 +248,15 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
+        // The transit spec's flows (`spec/transit/README.md`), which the spec's own test runs
+        // through the flow driver rather than `logit run`.
+        let transit_flows_dir = root.join("spec/transit/flows");
+        configs.extend(
+            std::fs::read_dir(&transit_flows_dir)
+                .unwrap_or_else(|err| panic!("reading {}: {err}", transit_flows_dir.display()))
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
+        );
         let shape_survey_dir = root.join("tools/shape-survey/configs");
         configs.extend(
             std::fs::read_dir(&shape_survey_dir)
