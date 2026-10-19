@@ -121,6 +121,13 @@ reads back at that instant. The flow driver's module doc, `crates/logit-cli/src/
 lists what a flow may hold and what it rejects: a fan-out or fan-in, `lua`, a router or target,
 `has_stale` and `drop_stale`, and a sink it has no encoder arm for.
 
+`format: json` writes an attribute map in the order the process interned its keys, so the same
+event would write its attributes in another order once another source's cases had interned some
+of those keys first. Every case `.json` the generator writes or compares, and every expectation
+document, sorts each map under an `attributes` key by key, recursively (nested map values
+included), and the `types` table by pointer. Every other object keeps the grammar's order, and no
+value is re-spelled.
+
 Where a value can move between runs for a reason the code can't remove, a case's meta declares a
 tolerance: `tolerance: [{path: /metrics/0/estimate, abs: 1}]` lets the number at that RFC 6901
 pointer, in each event of the document, differ from the committed one by up to `abs`.

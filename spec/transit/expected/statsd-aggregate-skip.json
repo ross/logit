@@ -1,6 +1,6 @@
 {
   "carriers": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","_logit.statsd.container_id":"in-82046","_logit.statsd.external_data":"it-false,cn-web","_logit.statsd.cardinality":"high","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.cardinality":"high","_logit.statsd.container_id":"in-82046","_logit.statsd.external_data":"it-false,cn-web","_logit.statsd.timestamp":1799999970,"env":"prod"},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"_logit.statsd.container_id":"ci-abc","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}}
   ], "counters": {
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 3,
@@ -20,7 +20,7 @@
   }},
   "event": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"abc"},"attributes":{"_logit.statsd.event.title":"Plain"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline"},"attributes":{"env":"prod","_logit.statsd.event.title":"Hello","_logit.statsd.event.host":"web-07","_logit.statsd.event.priority":"low","_logit.statsd.event.aggregation_key":"deploy","_logit.statsd.event.source_type":"ci","_logit.statsd.event.alert_type":"warning"}}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline"},"attributes":{"_logit.statsd.event.aggregation_key":"deploy","_logit.statsd.event.alert_type":"warning","_logit.statsd.event.host":"web-07","_logit.statsd.event.priority":"low","_logit.statsd.event.source_type":"ci","_logit.statsd.event.title":"Hello","env":"prod"}}
   ], "counters": {}},
   "gauge": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":234.0}]},
@@ -36,12 +36,12 @@
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 5
   }},
   "interop-dogstatsd-buffered": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","_logit.statsd.container_id":"in-82046","service":"checkout-api","region":"us-east-1","host":"web-07","endpoint":"/api/v1/orders","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","_logit.statsd.container_id":"in-82046","service":"checkout-api","region":"us-east-1","host":"web-07","endpoint":"/healthz","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.render.calls.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","_logit.statsd.container_id":"in-82046","service":"checkout-api","region":"us-east-1","host":"web-07","endpoint":"/api/v1/orders","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":110.0}],"attributes":{"env":"prod","_logit.statsd.container_id":"in-82046","service":"checkout-api","region":"us-east-1","host":"web-07","queue":"email"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":210.0}],"attributes":{"env":"prod","_logit.statsd.container_id":"in-82046","service":"checkout-api","region":"us-east-1","host":"web-07","queue":"reindex"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":90.0}],"attributes":{"env":"prod","_logit.statsd.container_id":"in-82046","service":"checkout-api","region":"us-east-1","host":"web-07","queue":"webhooks"}}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.container_id":"in-82046","endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.container_id":"in-82046","endpoint":"/healthz","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.render.calls.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.container_id":"in-82046","endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":110.0}],"attributes":{"_logit.statsd.container_id":"in-82046","env":"prod","host":"web-07","queue":"email","region":"us-east-1","service":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":210.0}],"attributes":{"_logit.statsd.container_id":"in-82046","env":"prod","host":"web-07","queue":"reindex","region":"us-east-1","service":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":90.0}],"attributes":{"_logit.statsd.container_id":"in-82046","env":"prod","host":"web-07","queue":"webhooks","region":"us-east-1","service":"checkout-api"}}
   ], "counters": {
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 11,
     "logit.output.metrics.skipped{component=out,kind=statsd_out,metric_kind=distribution,role=sink}": 4,
@@ -67,10 +67,10 @@
     "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 1
   }},
   "mixed": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"_logit.statsd.container_id":"in-82046","_logit.statsd.external_data":"it-false","_logit.statsd.cardinality":"low","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"info","format":"raw","message":"v1.2"},"attributes":{"_logit.statsd.event.title":"Deploy","_logit.statsd.event.alert_type":"info"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"_logit.statsd.cardinality":"low","_logit.statsd.container_id":"in-82046","_logit.statsd.external_data":"it-false","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"info","format":"raw","message":"v1.2"},"attributes":{"_logit.statsd.event.alert_type":"info","_logit.statsd.event.title":"Deploy"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"connections","kind":"gauge","value":2.0}]},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":1.0}],"attributes":{"_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":1,"_logit.statsd.service_check.message":"slow"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":1.0}],"attributes":{"_logit.statsd.service_check.message":"slow","_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":1},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"hits","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/api","team":["a","b"]}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"room":"lab"}}
@@ -103,8 +103,8 @@
     "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=no_recorded_value,role=transform}": 1
   }},
   "service-check": {"events": [
-    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"env":"prod","_logit.statsd.timestamp":1799999970,"_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"_logit.statsd.service_check.host":"web-07","_logit.statsd.service_check.message":"all good"},"types":{"/attributes/_logit.statsd.timestamp":"u64","/attributes/_logit.statsd.service_check.status":"u64"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cache.up","kind":"gauge","value":2.0}],"attributes":{"_logit.statsd.service_check.name":"cache.up","_logit.statsd.service_check.status":2,"_logit.statsd.service_check.message":"down"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}}
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"_logit.statsd.service_check.host":"web-07","_logit.statsd.service_check.message":"all good","_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"_logit.statsd.timestamp":1799999970,"env":"prod"},"types":{"/attributes/_logit.statsd.service_check.status":"u64","/attributes/_logit.statsd.timestamp":"u64"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cache.up","kind":"gauge","value":2.0}],"attributes":{"_logit.statsd.service_check.message":"down","_logit.statsd.service_check.name":"cache.up","_logit.statsd.service_check.status":2},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}}
   ], "counters": {
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2
   }},

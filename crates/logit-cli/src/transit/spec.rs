@@ -24,12 +24,20 @@
 //! has no `wire:`, and its `.json` must read back to itself through `logit_proto::event_json`
 //! and `format: json`, so each case has one spelling.
 //!
+//! **Attribute order.** `format: json` writes an attribute map in the process interner's order, so
+//! a case or a document written after another source's cases interned their keys would order the
+//! same attributes differently. Every case `.json` the generator writes or compares and every
+//! document the driver renders sorts each map under an `attributes` key by key, recursively, and
+//! the `types` table by pointer (`super::report::canonical_line`); the rest keeps the grammar's
+//! order.
+//!
 //! **Flows.** A flow is `flows/<flow>.yaml` whose one `replay_in`'s `path:` names a case; the
 //! directory holding that case is the flow's source, and every case in it runs through the flow
 //! with [`Options::default`]. The flow driver's module doc (`super`) lists what a flow may hold.
 
 use super::classes::{self, At, Ledger};
 use super::mapping::{self, Mapping};
+use super::report::canonical_line;
 use super::{run_traced, Options};
 use anyhow::{bail, ensure, Context};
 use bytes::Bytes;
@@ -195,12 +203,13 @@ fn cases(spec: &Path, system: &str) -> anyhow::Result<Vec<Case>> {
     Ok(cases)
 }
 
+/// `batches` as `format: json` lines, each in [`canonical_line`]'s key order.
 fn render(batches: &[EventBatch]) -> String {
     let mut text = String::new();
     for batch in batches {
         render_ndjson(&mut text, batch);
     }
-    text
+    text.lines().map(|line| canonical_line(line) + "\n").collect()
 }
 
 /// What a case's `.json` should hold: decoded from its wire file, or its own text read back.
@@ -826,6 +835,40 @@ mod tests {
         let want = "mapping row sum/delta_nonmonotonic, statsd_out cell 0: when: names \
                     \"multivalue\", which isn't a statsd_out config field";
         assert!(failures.iter().any(|f| f.contains(want)), "{failures:#?}");
+    }
+
+    /// A case written after another interner history reads the same: an event's attributes,
+    /// nested map, resource attributes, and type table come out in key order however the
+    /// process interned the keys.
+    #[test]
+    fn attribute_order_doesnt_follow_the_interner() {
+        let line = |p: &str| {
+            format!(
+                "{{\"timestamp\":\"2027-01-15T08:00:00.000000000Z\",\"metrics\":[{{\"name\":\"g\",\
+                 \"kind\":\"gauge\",\"value\":1.0}}],\"attributes\":{{\"{p}1\":\"a\",\"{p}2\":5,\
+                 \"{p}3\":{{\"{p}5\":\"x\",\"{p}4\":\"y\"}}}},\"resource\":{{\"attributes\":\
+                 {{\"{p}6\":\"r\",\"{p}7\":\"s\"}}}},\"types\":{{\"/attributes/{p}2\":\"u64\"}}}}\n"
+            )
+        };
+        let decode = |text: &str| {
+            EventJsonDecoder::new().decode_batches(text.as_bytes()).expect("the line decodes")
+        };
+        // The first set is interned in written order; the second, in reverse, before decoding.
+        let forward = decode(&line("transit.order.a"));
+        for i in (1..=7).rev() {
+            logit_core::interner::intern(&format!("transit.order.b{i}"));
+        }
+        let reverse = decode(&line("transit.order.b"));
+
+        let rename = |text: String| text.replace("transit.order.b", "transit.order.a");
+        assert_eq!(render(&forward), rename(render(&reverse)));
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let (a, b) = (
+            super::super::Outcome::new(&forward, probe.poll()).document(),
+            super::super::Outcome::new(&reverse, probe.poll()).document(),
+        );
+        assert_eq!(a, rename(b));
+        assert!(render(&forward).contains("\"transit.order.a4\":\"y\",\"transit.order.a5\""));
     }
 
     /// A tolerance lets a number at its pointer move by up to its bound, and no further.

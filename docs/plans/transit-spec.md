@@ -363,3 +363,10 @@ Recorded per workstream as each lands.
   name, rather than one file per flow and case. The per-case layout grows as flows times cases,
   224 files already, and reaches thousands once every source meets every sink column; one file
   per flow grows with the flows alone, and a diff inside it still shows which case changed.
+
+  `format: json` writes attributes in the process interner's order, so adding cases for another
+  source reordered attributes in the statsd cases and expectations and failed the hand-written
+  ones. The spec sorts every map under an `attributes` key, and the `types` table, by key wherever
+  it writes or compares JSON; the encoder, `AttrMap`, and the interner are unchanged. Pre-interning
+  every key in the committed cases at the start of `generate` was rejected: it depends on global
+  interner state and on scanning the whole case set.

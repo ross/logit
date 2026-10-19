@@ -1,4 +1,4 @@
 {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.duration","kind":"gauge","value":0.25,"unit":"s","description":"Request time","start_timestamp":"2027-01-15T07:59:50.000000000Z"}],"resource":{"attributes":{"service.name":"checkout"}}}
 {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":4.0,"temporality":"delta","monotonic":true,"exemplars":[{"timestamp":"2027-01-15T07:59:59.000000000Z","value":1.0,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","trace_flags":0}]}]}
 {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"stale.gauge","kind":"gauge","value":0.0,"flags":1,"no_recorded_value":true}]}
-{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}],"attributes":{"host":"web-07","_logit.influxdb.measurement":"cpu"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}],"attributes":{"_logit.influxdb.measurement":"cpu","host":"web-07"}}
