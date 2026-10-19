@@ -238,27 +238,25 @@ pub(crate) fn validated_sequence_len_ticking(
     if probe {
         crate::gapprobe::PHASE.store(2, Relaxed);
     }
-    let mut keys: Vec<i64> = Vec::new();
+    let (mut count, mut max) = (0usize, 0i64);
     for pair in table.clone().pairs::<LuaValue, LuaValue>() {
         if let Some(heartbeat) = heartbeat {
             heartbeat.tick();
         }
         let (key, _value) = pair?;
         match key {
-            LuaValue::Integer(i) if i >= 1 => keys.push(i),
+            LuaValue::Integer(i) if i >= 1 => {
+                count += 1;
+                max = max.max(i);
+            }
             _ => return Ok(None),
         }
     }
     if probe {
         crate::gapprobe::PHASE.store(3, Relaxed);
+        crate::gapprobe::SORT_NS.store(0, Relaxed);
     }
-    let t0 = crate::gapprobe::now_ns();
-    keys.sort_unstable();
-    if probe {
-        crate::gapprobe::SORT_NS.store(crate::gapprobe::now_ns() - t0, Relaxed);
-    }
-    let is_contiguous_from_one = keys.iter().enumerate().all(|(idx, &k)| k == idx as i64 + 1);
-    Ok(is_contiguous_from_one.then_some(keys.len()))
+    Ok((max == count as i64).then_some(count))
 }
 
 /// `table`, found `depth` tables below the attribute value; its children convert at `depth + 1`.
