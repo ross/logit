@@ -464,7 +464,9 @@ listener and `aggregate`, and adds the script hop to the ledger ("The ledger and
 **Compose overrides, service roles, and sinks (W7b).** Every compose service carries a
 `soak.role` label: `sut`, `generator`, `backend`, `broker` (a Kafka target's broker; see
 "Kafka targets"), `standin` (W9a, a stand-in target's destination; see "Stand-in
-targets"), or `netns` (W12b, a rolling overlap's namespace holder; see "Rolling overlap"). The harness knows a service by its role, never its name. Its ingress SUT is `logit`,
+targets"), `idp` (W19, a token endpoint the SUT reaches on loopback; see "A token endpoint in
+the SUT's namespace"), or `netns` (W12b, a namespace holder: a rolling overlap's, see "Rolling
+overlap", or from W19 the one `logit` and an `idp` share). The harness knows a service by its role, never its name. Its ingress SUT is `logit`,
 and from W10a an override can add further SUT services (see "Several SUT services").
 The base stack's generator is `generator`; from W8b an override can add more (see "Sources"). A scenario adds services with an optional top-level key naming an override file
 beside `scenario.toml`:
@@ -2018,8 +2020,9 @@ that every source's `sut_transforms` lists. Two instance configs may differ only
 that set `label`. With the steps: only `netem` and `partition` on the holder, neither on an
 instance, and no two of `pause`, `stop`, `kill`, `restart`, or `exit` on different instances
 overlapping. With the role map: the holder is the stack's one `netns` service, a `netns` service
-needs an `[overlap]`, and each instance's `network_mode` names the holder (read from
-`docker compose config` beside the roles).
+needs an `[overlap]` or, from W19, an `idp` ("A token endpoint in the SUT's namespace"), and
+each instance's `network_mode` names the holder (read from `docker compose config` beside the
+roles).
 
 **The faults.** A netem on the holder shapes every instance's egress, and a partition of it cuts
 their ingress too. Every instance is an ingress SUT, so a lifecycle fault on any of them is
@@ -2068,6 +2071,39 @@ the rest judge them together:
 partitions the holder or drops packets, whose loss `ledger.overlap` couldn't tell from a close's.
 Its `[[expect]]` tables assert that each instance reads while the other is stopped and that
 neither counts a kernel drop.
+
+### 8f. A token endpoint in the SUT's namespace (W19)
+
+`kafka_out` takes an OAUTHBEARER `token_endpoint` over plain HTTP on loopback only, and over
+HTTPS only with a certificate from a public CA, so a token server in the stack must share the
+SUT's network namespace. `tools/kafka-interop` puts the SUT in the token server's namespace,
+which a soak can't: a stop of the server would take the SUT's network with it.
+
+**The stack.** An override adds a namespace holder with the role `netns`, as in "Rolling
+overlap", and a token server with the role `idp`, and puts `logit` and the `idp` in the holder
+with `network_mode: "service:<holder>"`. The SUT reaches the `idp` at `127.0.0.1`. Every other
+service reaches either at the holder's name: the generator sends there, and the broker fetches
+the JWKS there. The SUT keeps its own container, so its restarts, RSS, descriptors, and logs
+resolve as for any SUT.
+
+**The schema.** With no `[overlap]`, the role map holds one `netns` service only beside an
+`idp`, and an `idp` only beside one, with no SUT but `logit`; an `idp` and `[overlap]` can't be
+combined. `logit`'s and each `idp`'s `network_mode` names the holder. The holder takes `netem`
+and `partition` only, and `logit` and the `idp` take neither, as for an overlap: a netem or a
+partition of a member is one of the holder, and a lifecycle fault of the holder takes every
+member's network away.
+
+**The faults.** A netem or a partition of the holder is one of the SUT's network, ingress and
+egress, as on `logit` itself in any other stack; the `idp`'s loopback traffic isn't shaped. A
+lifecycle fault on the `idp` affects egress only: the sink holds its queue while it can't
+authenticate.
+
+**The rows.** `self_log` counts a `token_refresh_failed` warning inside a fault window on an
+`idp`, `recovery_bound` included, and WARNs one outside every such window. A failed refresh that
+keeps a valid token loses nothing, so it has no `*.dropped` counter, and none is added: it is
+counted in `logit.component.diagnostics{key="token_refresh_failed"}`
+([ADR `kafka-sasl`](../adr/kafka-sasl.md)'s fallback amendment), which an `[[expect]]` reads like
+any other counter.
 
 ### 9. Not in this stack
 
@@ -2404,11 +2440,26 @@ where it needs them, and a small check extension.
     rate, which `kafka_out` counts in `logit.output.reconnects` from W17 on and a `rate`
     expectation bounds. Rows: `ledger.topic`, `fd_slope`, duplicates per life, and
     `[[expect]]` on the redial rate, the `ambiguous` rate, `refused` attempts, and dropped
-    batches. Two halves remain:
-    - **OAUTHBEARER with short-lived tokens.** It needs `tools/kafka-interop`'s
-      `mock-oauth2-server` in the stack, under a new `idp` role, and a namespace holder, because
-      `kafka_out` takes a `token_endpoint` only over loopback HTTP or HTTPS with a public CA's
-      certificate.
+    batches. The two halves after SCRAM:
+    - **OAUTHBEARER with short-lived tokens (built in W19).** `kafka-oauth-reauth` is
+      `kafka-sasl-reauth` over the client-credentials grant, with `tools/kafka-interop`'s
+      `mock-oauth2-server` in the stack under the `idp` role, in a namespace holder it shares
+      with `logit` ("A token endpoint in the SUT's namespace"). Each token lives 60 s and the
+      broker's session ends when it expires, so the sink fetches a token and redials about
+      every 50 s. Beside the broker's faults, the endpoint is stopped and paused for 2 minutes
+      each, longer than a token lives. Rows: W17's, and `[[expect]]` on the
+      `token_refresh_failed` diagnostic inside the stop, which shows the fallback to the cached
+      token, `clean` attempts and `retrying` inside both endpoint faults, and `retrying`
+      clearing after each. Two corrections to the item as first planned:
+      - The expired-token phase is `Clean`, not `Refused`. An endpoint that refuses the
+        connection or times out is `Clean`
+        (`crates/logit-outputs/src/kafka/sasl/oauth.rs`'s module doc), and the sink never
+        sends a token it knows has expired, so the broker refuses nothing, and the run asserts
+        no `refused` attempt.
+      - The fallback covers a refused endpoint, not a hung one. A redial comes `timeout` before
+        its token expires and fetches the next token then, since nothing fetches on a timer.
+        Against a hung endpoint, the fetch waits that same `timeout` and returns with the token
+        expired, so the pause step asserts the hold alone.
     - **An `otlp_proto` topic (2969c24e).** `ledger.topic` reads `format: json` records only;
       V from an OTLP topic needs a stdlib protobuf walker for the export requests.
 17. **`influxdb_out`'s response-class table on a stand-in (ffe33654, b93cb23a), built in W16.**
@@ -2485,6 +2536,7 @@ that items 3, 7, and 11 need.
 | W16 | `soak/w16` | `soak/w16: an InfluxDB-shaped stand-in for every influxdb_out response class` | M | W12d |
 | W17 | `soak/w17` | `soak/w17: a Kafka SASL re-authentication soak` | M | W16 |
 | W18 | `soak/w18` | `soak/w18: a tail_in descriptor soak under a deleting rotation` | M | W14 |
+| W19 | `soak/w19` | `soak/w19: a Kafka OAUTHBEARER soak with short-lived tokens` | M | W17 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -2619,11 +2671,14 @@ that items 3, 7, and 11 need.
   while the writer deleted no file, then as a bound with the writer's file count) and its
   retention guard, the end sequence's wait for G, self-test fixtures for each rule, and the
   `tail-rotate-delete` scenario, a 20-minute and a 1-hour run recorded under "Findings".
+- **W19**: item 16's OAUTHBEARER half: the `idp` role and a `netns` holder outside
+  `[overlap]` ("A token endpoint in the SUT's namespace"), with their rules in `scenario.py`,
+  `faults.py`, and `self_log`, self-test fixtures for each, and the `kafka-oauth-reauth`
+  scenario, a 20-minute and a 1-hour run recorded under "Findings".
 
-Item 16's OAUTHBEARER and `otlp_proto` halves, and §10's follow-ups to items 11 and 12, have no
-workstream yet.
+Item 16's `otlp_proto` half, and §10's follow-ups to items 11 and 12, have no workstream yet.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18 off `main` after it. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18 and W19 off `main` after it. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
@@ -5260,6 +5315,10 @@ Overall PASS, every row PASS or SKIP.
   reverted. The self-test passes (1,797 expectations), and the `rate` fixtures fail with the
   reducer reverted. `kafka-sasl-reauth` passes `self-test` validation, the shipped-config test,
   and `logit validate` in its image. Met: its run is recorded under "Findings", Overall PASS.
+- **W19**: the self-test passes (2,088 expectations), and the `idp` namespace and
+  `token_refresh_failed` fixtures fail with their rules reverted. `kafka-oauth-reauth` passes
+  `self-test` validation and the shipped-config test. Open: a 20-minute and a 1-hour run
+  recorded under "Findings".
 
 ### `rss_settle`: a settle window for `rss_slope` (2026-10-18)
 

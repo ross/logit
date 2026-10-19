@@ -1,0 +1,35 @@
+# The system under test in `script/soak`'s kafka-oauth-reauth scenario: statsd over UDP, a 2 s
+# delta aggregate, and `kafka_out` producing one JSON record per series per window to the stack's
+# broker over OAUTHBEARER, with tokens from the client-credentials grant. Each token lives 60 s
+# and ends its broker session when it expires, so the sink redials every connection about every
+# 50 s, fetching a new token for each, and counts each redial in `logit.output.reconnects`.
+# Delta, so each record carries its window's increments and the ledger sums the topic into V.
+# Its `internal` telemetry goes to stdout as NDJSON for the harness to read.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    interval: 2s
+    temporality: delta
+  kafka:
+    type: kafka_out
+    sources: [window]
+    brokers: ["kafka:9096"]         # the OAUTHBEARER listener
+    topic: soak                     # scenario.toml's [target] topic
+    sasl:
+      mechanism: oauthbearer
+      # `idp` shares this process's network namespace (compose.override.yaml), so the token
+      # endpoint is plain HTTP on loopback, which `token_endpoint` allows. The server takes any
+      # client secret; this one is a throwaway.
+      token_endpoint: http://127.0.0.1/default/token
+      client_id: logit
+      client_secret: logit-secret
+    # The defaults otherwise: format json, one record per event, acks all, idempotent. The 10 s
+    # bound puts each connection's deadline 10 s before its token expires, and under the
+    # scenario's 40 s pause of the broker turns the pause into response timeouts: `Ambiguous`
+    # attempts the broker deduplicates when they are resent. It also bounds a token request.
+    timeout: 10s
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

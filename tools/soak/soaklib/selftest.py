@@ -9635,6 +9635,133 @@ def _overlap_checks():
                f"{stalled['progress']}")
 
 
+IDP_ROLES = {"logit": "sut", "generator": "generator", "kafka": "broker", "sut-net": "netns",
+             "idp": "idp"}
+IDP_MODES = {"logit": "service:sut-net", "idp": "service:sut-net"}
+
+
+def _idp_rules(root):
+    """An `idp`'s namespace: the role map's rules (a holder only beside an idp, an idp only
+    beside one holder, never with `[overlap]` or a further SUT), `logit` and the idp in the
+    holder's namespace, netem and partition on the holder only, no lifecycle fault on it, and
+    the fault predicates, under which an idp's lifecycle faults affect egress alone."""
+    path = root / "scenarios" / "kafka-oauth-reauth" / "scenario.toml"
+    raw = tomllib.loads(path.read_text())
+    loaded = scenario.load(path)
+    expect(scenario.service_problems(loaded, IDP_ROLES, IDP_MODES) == [],
+           f"kafka-oauth-reauth's stack holds, got "
+           f"{scenario.service_problems(loaded, IDP_ROLES, IDP_MODES)}")
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    def step(**fields):
+        return lambda r: r["step"].append({"for": "20s", **fields})
+
+    def refused(edit, needle, what, roles=IDP_ROLES):
+        _refused(path, mutate(edit), needle, what, roles=roles)
+
+    refused(step(at="12m40s", action="netem", on="logit", args="delay 10ms"),
+            "logit shares sut-net's network namespace, so put netem on sut-net",
+            "netem on the SUT beside an idp")
+    refused(step(at="12m40s", action="partition", on="idp"),
+            "idp shares sut-net's network namespace, so put partition on sut-net",
+            "a partition of the idp")
+    refused(step(at="12m40s", action="stop", on="sut-net"),
+            "the holder takes netem and partition only; any other fault on it takes logit, "
+            "idp's network away", "a stop of the holder")
+    refused(lambda r: None, "an idp shares logit's network namespace through a netns holder, "
+            "and the stack has none", "an idp with no holder",
+            roles={k: v for k, v in IDP_ROLES.items() if k != "sut-net"})
+    refused(lambda r: None, "shares logit's namespace through one netns holder, and the stack "
+            "has sut-net, sut-net-b", "two holders beside an idp",
+            roles={**IDP_ROLES, "sut-net-b": "netns"})
+    for edit, what in ((step(at="12m40s", action="netem", on="sut-net", args="delay 10ms"),
+                        "netem"),
+                       (step(at="12m40s", action="partition", on="sut-net"), "a partition"),
+                       (step(at="12m40s", action="restart", on="idp"), "a restart of the idp")):
+        try:
+            changed = scenario.from_dict(mutate(edit), path)
+            scenario.validate(changed)
+            expect(scenario.service_problems(changed, IDP_ROLES, IDP_MODES) == [],
+                   f"{what} on the holder or the idp is allowed, got "
+                   f"{scenario.service_problems(changed, IDP_ROLES, IDP_MODES)}")
+        except scenario.ScenarioError as err:
+            expect(False, f"{what} on the holder or the idp is refused: {err.problems}")
+    for member in ("logit", "idp"):
+        problems = scenario.service_problems(loaded, IDP_ROLES, {**IDP_MODES, member: "bridge"})
+        expect(any(f'{member} needs network_mode "service:sut-net", so logit reaches idp on '
+                   "loopback, and has bridge" in p for p in problems),
+               f"{member} outside the holder's namespace is refused, got {problems}")
+    overlap_path = root / "scenarios" / "rolling-overlap" / "scenario.toml"
+    _refused(overlap_path, tomllib.loads(overlap_path.read_text()),
+             "an idp and [overlap] can't be combined", "an idp beside an overlap",
+             roles={**OVERLAP_ROLES, "idp": "idp"})
+    hop_path = root / "scenarios" / "native-hop" / "scenario.toml"
+    _refused(hop_path, tomllib.loads(hop_path.read_text()),
+             "an idp's namespace holds logit alone, and the scenario has the SUT services "
+             "logit, collector", "an idp beside a further SUT",
+             roles={**TWO_SUT_ROLES, "sut-net": "netns", "idp": "idp"})
+
+    for action, on, udp, tcp, egress in (
+            ("stop", "idp", False, False, True), ("pause", "idp", False, False, True),
+            ("restart", "idp", False, False, True), ("netem", "sut-net", False, True, True),
+            ("partition", "sut-net", True, True, True)):
+        one = scenario.Step("c0s1", 0, 0, action, on, "", 0, 1)
+        got = (faults.ACTIONS[action].affects_udp_ingress(one, IDP_ROLES),
+               faults.ACTIONS[action].affects_tcp_ingress(one, IDP_ROLES),
+               faults.ACTIONS[action].affects_egress(one, IDP_ROLES))
+        expect(tuple(map(bool, got)) == (udp, tcp, egress),
+               f"a {action} on {on} beside an idp affects UDP {udp}, TCP {tcp}, egress "
+               f"{egress}, got {got}")
+
+
+def _refresh_stderr_line(offset):
+    """A `token_refresh_failed` WARN as `Endpoint::token` logs it for the `kafka` sink."""
+    return json.dumps({
+        "timestamp": _stamp(T0 + offset), "level": "WARN", "component": "kafka",
+        "key": "token_refresh_failed", "target": "logit",
+        "message": "refreshing the OAUTHBEARER token from http://127.0.0.1/default/token "
+                   "failed; the cached token, valid for another 9.9s, stays in use, with no "
+                   "fetch for 9.9s: requesting a token from http://127.0.0.1/default/token: "
+                   "error sending request (x1, further occurrences suppressed)"})
+
+
+def _refresh_checks():
+    """`self_log` counts a `token_refresh_failed` line inside a fault window on an `idp`,
+    `recovery_bound` included, and WARNs one outside every such window, a broker fault's
+    included."""
+    timeline = [_phase("start", 0, t0=T0),
+                _action("apply", "c0s1", "stop", "kafka", 50),
+                _action("revert", "c0s1", "stop", "kafka", 79, 80),
+                _action("apply", "c0s2", "stop", "idp", 200),
+                _action("revert", "c0s2", "stop", "idp", 319, 320),
+                _phase("end_begin", 450), _phase("end_end", 480)]
+    services = {**IDP_ROLES}
+
+    def run(tmp, name, offsets):
+        run_dir = _run_dir(tmp, name, timeline, services=services)
+        (run_dir / "logs" / "logit.stderr").write_text(
+            "".join(_refresh_stderr_line(offset) + "\n" for offset in offsets))
+        return checks.check_self_log(checks.RunData(run_dir))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inside = run(tmp, "inside", (210, 350))
+        expect(inside.status == checks.PASS
+               and "2 token_refresh_failed line(s) inside idp faults" in inside.detail,
+               f"self_log counts a refresh failure inside an idp stop and its recovery, got "
+               f"{inside}")
+        outside = run(tmp, "outside", (210, 60))
+        expect(outside.status == checks.WARN and "+60s" in outside.detail
+               and "outside every fault window on an idp" in outside.detail,
+               f"self_log WARNs a refresh failure inside a broker fault only, got {outside}")
+        late = run(tmp, "late", (400,))
+        expect(late.status == checks.WARN and "+400s" in late.detail,
+               f"self_log WARNs a refresh failure past an idp stop's recovery, got {late}")
+
+
 def _sighup_base(root):
     path = root / "scenarios" / "sighup" / "scenario.toml"
     return path, tomllib.loads(path.read_text())
@@ -10874,7 +11001,8 @@ def run(root, quiet=False):
                      _class_signatures, _datadog_codec, _datadog_counts, _datadog_server,
                      _datadog_rules, _datadog_checks, _influx_codec, _influx_points,
                      _influx_server, _influx_rules, _influx_checks, _overlap_rules,
-                     _overlap_driver, _overlap_checks, _signal_rules, _signal_actions, _sighup_driver,
+                     _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
+                     _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
                      _fan_out_ledger, _idle_writer, _fan_out_rules, _shipped):
             try:
@@ -10887,7 +11015,8 @@ def run(root, quiet=False):
                               _rss_settle_rules, _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
                               _datadog_rules, _influx_codec, _influx_server, _influx_rules,
-                              _overlap_rules, _overlap_driver, _signal_rules, _sighup_driver,
+                              _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
+                              _sighup_driver,
                               _tls_rules, _tls_driver, _fan_out_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going

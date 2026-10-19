@@ -101,7 +101,7 @@ from pathlib import Path
 from . import collect, faults, standin, telemetry, topic, vm
 from .scenario import (DEFAULT_RSS_SETTLE_S, DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET, GENERATOR_ROLE,
                        HTTP_WIRE, KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS,
-                       RUN_WINDOW, SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET,
+                       IDP_ROLE, RUN_WINDOW, SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET,
                        SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE, TARGET_SPLIT,
                        component_blocks, config_env,
                        listener_wire, parse_duration, source_ids, source_pairs,
@@ -113,6 +113,9 @@ _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
 # (crates/logit-pipeline/src/tls.rs, `Watched::check`).
 TLS_RELOAD_FAILED_KEY = "tls_reload_failed"
 TLS_RELOADED_KEY = "tls_reloaded"
+# The self-log key of a failed OAUTHBEARER token refresh that kept the cached token
+# (crates/logit-outputs/src/kafka/sasl/oauth.rs, `Endpoint::token`).
+TOKEN_REFRESH_FAILED_KEY = "token_refresh_failed"
 
 
 def is_start(record):
@@ -724,6 +727,8 @@ def check_self_log(data):
     issued a broken certificate, or, on a service that polls its TLS files, inside any other
     rotate on it with a `tls_reloaded` line of the same component after it in that rotate: a
     poll can read one file before a rotation's rename and the next after it.
+    A `token_refresh_failed` warning is counted inside a fault window on an `idp` service and
+    WARNs outside every one: it loses nothing, but with the endpoint up it shouldn't happen.
     """
     if not data.stderr:
         return Result("self_log", SKIP, "no logs/*.stderr")
@@ -731,7 +736,9 @@ def check_self_log(data):
     status = PASS
     lines = []
     counts = {"error": 0, "fault_key_inside": 0, "fault_key_outside": 0, "text": 0,
-              "expected": 0, "tls_expected": 0, "tls_torn": 0}
+              "expected": 0, "tls_expected": 0, "tls_torn": 0, "refresh_inside": 0}
+    idp_windows = [window for name, role in data.services.items() if role == IDP_ROLE
+                   for window in data.windows(on=name)]
     # `{service: [(start, end)]}` of each `rotate` step issued `broken = true` on it, from its
     # apply to its revert, where a failed TLS reload is expected, and of each other rotate on it.
     broken, whole = {}, {}
@@ -813,6 +820,15 @@ def check_self_log(data):
                                  f"{service} and with no reload after it in its rotate: "
                                  f"{entry.message[:160]}")
                 continue
+            if entry.key == TOKEN_REFRESH_FAILED_KEY:
+                if entry.ts is not None and data.in_window(entry.ts, idp_windows):
+                    counts["refresh_inside"] += 1
+                else:
+                    status = worst([status, WARN])
+                    lines.append(f"{service}: {entry.level} {entry.key} at "
+                                 f"{data.offset(entry.ts)}, outside every fault window on an "
+                                 f"{IDP_ROLE}: {entry.message[:160]}")
+                continue
             if is_sink_fault_line(entry):
                 if entry.ts is not None and data.in_window(entry.ts, windows):
                     counts["fault_key_inside"] += 1
@@ -849,7 +865,9 @@ def check_self_log(data):
                + (f", {counts['tls_expected']} tls_reload_failed line(s) inside broken "
                   "rotations" if counts["tls_expected"] else "")
                + (f", {counts['tls_torn']} torn read(s) a later reload in their rotation "
-                  "replaced" if counts["tls_torn"] else ""))
+                  "replaced" if counts["tls_torn"] else "")
+               + (f", {counts['refresh_inside']} {TOKEN_REFRESH_FAILED_KEY} line(s) inside "
+                  f"{IDP_ROLE} faults" if counts["refresh_inside"] else ""))
     return Result("self_log", status, summary if status == PASS else f"{lines[0]} ({summary})",
                   lines)
 

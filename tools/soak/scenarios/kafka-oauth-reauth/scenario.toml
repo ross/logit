@@ -1,0 +1,331 @@
+# kafka-sasl-reauth over OAUTHBEARER: a generated statsd stream into `logit` and out to a local
+# Kafka broker that validates client-credentials tokens from an OAuth 2.0 server in the stack,
+# `idp`, each living 60 s. The broker ends a session when its token expires, so the sink fetches
+# a token and redials on a steady cadence. The broker is restarted, paused, and stopped, as in
+# kafka-sasl-reauth, and the token endpoint is stopped and paused for longer than a token lives.
+# The ledger's V is the topic, read back after the SUT stops (`[target] kind = "kafka"`,
+# tools/soak/README.md's "Kafka targets").
+#
+# `kafka_out` stops reusing a connection 10 s before its session ends (the sink's `timeout`) and
+# dials a new one on the next request. A token is due for refresh at 80% of its life, 48 s, so
+# every redial fetches one. When the fetch fails and the cached token hasn't expired, the dial
+# uses it and the sink warns `token_refresh_failed`; once the token has expired, the dial fails
+# `Clean` and the sink holds its queue until the endpoint is back
+# (crates/logit-outputs/src/kafka/sasl/oauth.rs's module doc). The sink never sends a token it
+# knows has expired, so the broker refuses nothing.
+#
+# `logit` and `idp` share the network namespace of a holder, `sut-net`, because `kafka_out` takes
+# a plain-HTTP `token_endpoint` on loopback only; compose.override.yaml has the stack. The schema
+# is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "kafka-oauth-reauth"
+description = "generator -> statsd_in (UDP) -> aggregate 2s delta -> kafka_out (idempotent, OAUTHBEARER client credentials, 60 s tokens) -> Kafka, restarted, paused, and stopped, and its token endpoint stopped and paused; the topic is read back"
+duration = "15m30s"       # warmup + one cycle + cooldown; --duration overrides
+# Ten series make five records a second, so 8 hours is 144,000 records, which the read-back's
+# bound covers (README.md's "Kafka targets").
+max_duration = "8h"
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "60s"          # >= recovery_bound
+# retry_max_delay 10s, the token endpoint's start, a metadata refresh, and two aggregate windows
+recovery_bound = "45s"
+cycle = "13m30s"          # the endpoint pause's recovery (12m45s) + one progress window and slack
+compose = "compose.override.yaml"   # the holder, the token endpoint, and the broker's listener
+
+[target]
+kind = "kafka"
+topic = "soak"
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no VictoriaMetrics query
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]         # one per generator the ledger follows into the SUT
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]           # a Kafka target's one sink: its topic is V, read back at the end
+id = "kafka"
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+[[step]]
+at = "0s"
+action = "restart"
+on = "kafka"
+for = "30s"
+
+# The broker's process stops answering while its sockets stay open, so produce requests sent
+# during the pause time out after the sink's 10 s `timeout` as `Ambiguous`, and their resends
+# carry the same sequences.
+[[step]]
+at = "1m45s"
+action = "pause"
+on = "kafka"
+for = "40s"
+
+# The broker is gone, and its name with it: every connect fails `Clean`, and the sink holds its
+# queue until the broker is back.
+[[step]]
+at = "3m45s"
+action = "stop"
+on = "kafka"
+for = "60s"
+
+# The token endpoint is gone: a token request is refused at once on loopback. A steady redial
+# comes 50 to 54 s into a token's life, past its 48 s refresh point, and fetches the next token,
+# so no token in use is older than that, and the stop's first 55 s hold a redial whose fetch
+# fails. That redial falls back to the cached token, with 6 to 10 s of it left. The token
+# expires within 65 s, and from then the sink's dials fail `Clean` until the endpoint is back.
+[[step]]
+at = "6m30s"
+action = "stop"
+on = "idp"
+for = "2m"
+
+# The token endpoint hangs: a token request waits the sink's 10 s `timeout`, then fails `Clean`.
+# A steady redial comes 10 s before its token expires, so the wait outlasts the token and leaves
+# nothing to fall back to: this step asserts the hold, not the fallback.
+[[step]]
+at = "10m"
+action = "pause"
+on = "idp"
+for = "2m"
+
+# The sink never drops a batch: `block` holds the queue through every fault.
+[[expect]]
+name = "no-drop-restart"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "kafka"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-drop-pause"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "kafka"
+step = "c0s2"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-drop-stop"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "kafka"
+step = "c0s3"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-drop-idp-stop"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "kafka"
+step = "c0s4"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-drop-idp-pause"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "kafka"
+step = "c0s5"
+window = "through"
+reduce = "delta"
+max = 0
+
+# The pause leaves at least one attempt `Ambiguous`, so `ledger.topic`'s no-duplicate verdict
+# rests on resends the broker had to deduplicate.
+[[expect]]
+name = "pause-is-ambiguous"
+service = "logit"
+metric = "logit.output.requests"
+attrs = { component = "kafka", class = "ambiguous" }
+step = "c0s2"
+window = "through"
+reduce = "delta"
+min = 1
+
+# The stop makes the sink retry for certain, and it stops retrying once the broker is back.
+[[expect]]
+name = "retrying-during-stop"
+service = "logit"
+metric = "logit.component.retrying"
+component = "kafka"
+step = "c0s3"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "retrying-clears"
+service = "logit"
+metric = "logit.component.retrying"
+component = "kafka"
+step = "c0s3"
+window = "after"
+reduce = "last"
+max = 0
+
+# A failed refresh hands the dial the cached token: the warning is written on that path only.
+# `no-auth-refusal` below shows the broker took every token it was handed. A sink that failed
+# the dial at the refresh point, with a fifth of the token's life left, writes none.
+[[expect]]
+name = "idp-stop-falls-back"
+service = "logit"
+metric = "logit.component.diagnostics"
+attrs = { component = "kafka", key = "token_refresh_failed" }
+step = "c0s4"
+window = "during"
+reduce = "delta"
+min = 1
+
+# Once the token has expired, the endpoint's refusal fails each dial `Clean`, so the sink holds
+# its queue and retries, and it stops retrying once the endpoint is back.
+[[expect]]
+name = "idp-stop-is-clean"
+service = "logit"
+metric = "logit.output.requests"
+attrs = { component = "kafka", class = "clean" }
+step = "c0s4"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "retrying-during-idp-stop"
+service = "logit"
+metric = "logit.component.retrying"
+component = "kafka"
+step = "c0s4"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "retrying-clears-idp-stop"
+service = "logit"
+metric = "logit.component.retrying"
+component = "kafka"
+step = "c0s4"
+window = "after"
+reduce = "last"
+max = 0
+
+# A token request that times out is `Clean` too.
+[[expect]]
+name = "idp-pause-is-clean"
+service = "logit"
+metric = "logit.output.requests"
+attrs = { component = "kafka", class = "clean" }
+step = "c0s5"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "retrying-during-idp-pause"
+service = "logit"
+metric = "logit.component.retrying"
+component = "kafka"
+step = "c0s5"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "retrying-clears-idp-pause"
+service = "logit"
+metric = "logit.component.retrying"
+component = "kafka"
+step = "c0s5"
+window = "after"
+reduce = "last"
+max = 0
+
+# The sink renews its sessions. While the broker answers and a token can be had, the leader's
+# connection is redialed at the first 2 s produce slot past its deadline, 10 s before its token
+# expires, so every 49 to 53 s with the dial: the token's `exp` is in whole seconds. A fault ends
+# the connection, and the first successful dial after it starts the clock again, so the run is
+# up-segments, each opening with one dial and renewing within it, and an up-segment of L seconds
+# holds between 1 + L / 53 and 1 + L / 49 dials. A metadata refresh after a fault, or every 5
+# minutes, may redial the bootstrap connection too. A fallback to the cached token adds about
+# three short sessions before the token expires, each lasting half the life left.
+#
+# The run window is warmup's end to the end sequence, a 13.5-minute cycle and the 60 s cooldown,
+# 870 s at the default duration. The broker faults keep it away for at most about 175 s, as in
+# kafka-sasl-reauth. Each endpoint fault holds the sink from its token's expiry, at least 6 s
+# into the fault, to the endpoint's return and up to 10 s of `retry_max_delay`: at most 124 s
+# each. That leaves at least 447 s up, so at least 447 / 53 dials, 8, 33 an hour. At most, with no
+# outage, 870 s / 49 s + 1 renewals, a bootstrap redial per fault and per refresh, and six
+# fallback dials per endpoint fault, 39 dials, 161 an hour. Over a longer run each 810 s cycle
+# gives the same range. The bounds sit outside it.
+#
+# This band catches a sink that redials before every send, about 1,800 an hour. It can't catch
+# one that never renews: the broker closes an expired session's connection on its next request
+# without answering it, the sink reads that as `Ambiguous` and redials, and those redials come
+# every 60 to 62 s of broker uptime, inside the band. `no-expired-session-sends` below catches
+# that sink.
+[[expect]]
+name = "reauth-rate"
+service = "logit"
+metric = "logit.output.reconnects"
+component = "kafka"
+window = "run"
+reduce = "rate"
+min = 25
+max = 220
+
+# No request reaches an expired session. A sink that renews meets `Ambiguous` only from a broker
+# fault: the pause's response timeout, and at most one request in flight when the restart or the
+# stop closes the connection, so at most 3 a 810 s cycle, 14 an hour (13 an hour over the default
+# 870 s window). An endpoint fault fails a dial before anything is written. The bound allows one
+# more a cycle, 18 an hour. A sink that wrote to its expired sessions would add one `Ambiguous`
+# per session in each of the cycle's five up-segments, each longer than a session, and the
+# pause's own: 6 or more a cycle, 27 an hour or more.
+[[expect]]
+name = "no-expired-session-sends"
+service = "logit"
+metric = "logit.output.requests"
+attrs = { component = "kafka", class = "ambiguous" }
+window = "run"
+reduce = "rate"
+max = 20
+
+# A redial the broker refuses is `refused` and holds the queue. None is: the sink sends no token
+# past its expiry, where the Java client and librdkafka keep sending the old one and let the
+# broker refuse it, and the endpoint serves one signing key across its stop.
+[[expect]]
+name = "no-auth-refusal"
+service = "logit"
+metric = "logit.output.requests"
+attrs = { component = "kafka", class = "refused" }
+window = "run"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-drop-run"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "kafka"
+window = "run"
+reduce = "delta"
+max = 0
