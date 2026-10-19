@@ -4,7 +4,7 @@
 `script/record-fixtures splunk-otel` runs this after its capture, against the same Collector,
 whose `logs/hec_receiver` pipeline prints what the receiver made of the body through the `debug`
 exporter. It settles whether that receiver decodes the exporter's span objects back to spans
-(`docs/plans/splunk-relay.md`, "Settled by W5", item 6). The body goes as
+(ADR `splunk-hec-relay`, "Splunk Enterprise 10.4.3 (2026-09-25)", item 6). The body goes as
 recorded, with its `Content-Encoding`, so the receiver sees the exporter's bytes.
 
 Usage: splunk_hec_receiver_probe.py <capture dir> <receiver URL>

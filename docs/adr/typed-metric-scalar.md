@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # Typed metric scalar: `MetricValue { F64, I64, U64, Bool }` replaces the `f64` in `Gauge`, `GaugeDelta`, and `Sum`
@@ -156,7 +156,6 @@ replay into a newer one. `docs/design/wire-protocol.md` and the bake-off's wire 
   [ADR `lua-event-constructor`](lua-event-constructor.md), and
   [ADR `stream-json-format`](stream-json-format.md). `docs/design/internal-telemetry.md` gains the
   `widened`, `inexact_read`, and `bool_value` reasons, and `docs/design/lua-api.md` the `type` key.
-- [`docs/plans/influxdb-relay.md`](../plans/influxdb-relay.md)'s `influx/w1` builds this.
 
 ## Amendment: Datadog APM stats counts are a typed wire (2026-10-13)
 

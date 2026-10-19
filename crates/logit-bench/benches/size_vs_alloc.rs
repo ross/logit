@@ -41,7 +41,8 @@
 //! - [`attr_clone`]: cloning a real `AttrMap` inline (8 entries) against spilled (9 and 12), the
 //!   fan-out cost `data-shapes.md` §6 says the sizing arms should be judged on.
 //!
-//! **Arm letters** (P, S, R) are `docs/plans/event-sizing.md`'s "Bake-off arms".
+//! **Arm letters** (P, S, R) are `docs/adr/event-sizing-and-allocation-strategy.md`'s "Bake-off
+//! arms and instruments".
 //!
 //! **divan's time column is per iteration.** A bench with an `ItemsCount` counter still reports
 //! the whole iteration's time (64 blocks, or 1000 elements); divide by the batch size by hand.

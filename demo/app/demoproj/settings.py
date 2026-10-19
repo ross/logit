@@ -1,4 +1,4 @@
-"""Settings for the demo's app tier (docs/plans/demo-tracing-stack.md), shared by the gunicorn
+"""Settings for the demo's app tier, shared by the gunicorn
 web workers and the Celery `worker` service.
 
 Deliberately close to `django-admin startproject`'s defaults: the point of this tier is to show a
@@ -26,7 +26,7 @@ ALLOWED_HOSTS = ["*"]
 
 # No `django.contrib.staticfiles`: this tier's one template is inline-styled and serves no static
 # assets of its own. `graph.svg`/`architecture.svg` are dynamic views reading a shared volume, and
-# `telemetry.js` (docs/plans/browser-tracing.md) is a dynamic view reading the bundle esbuild
+# `telemetry.js` is a dynamic view reading the bundle esbuild
 # produced at image-build time. A whole app plus `STATIC_URL`/`STATIC_ROOT`/`collectstatic` for
 # one bundled JS file would be more machinery than the thing it serves.
 INSTALLED_APPS = [
@@ -54,7 +54,7 @@ TEMPLATES = [
             "context_processors": [
                 "django.template.context_processors.debug",
                 "django.template.context_processors.request",
-                # Renders the page's <meta name="traceparent"> (docs/plans/browser-tracing.md);
+                # Renders the page's <meta name="traceparent">;
                 # see pages/context_processors.py's module docstring.
                 "pages.context_processors.traceparent",
             ],
@@ -64,7 +64,7 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "demoproj.wsgi.application"
 
-# Real state (`docs/plans/demo-richer-traces.md`), with a real driver-level CLIENT span per
+# Real state, with a real driver-level CLIENT span per
 # statement (opentelemetry-instrumentation-psycopg, demo/app/demoproj/telemetry.py). Django
 # auto-selects the psycopg 3 backend when `psycopg` (not `psycopg2`) is the importable driver
 # (Django 4.2+); it's still spelled `django.db.backends.postgresql` either way.
@@ -84,7 +84,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 USE_TZ = True
 
 # `logit`'s syslog listeners for this app, one per tier (demo/logit.yaml's `app_in`, :5142, and
-# `worker_in`, :5143; docs/plans/demo-richer-traces.md), distinct from haproxy's :5140.
+# `worker_in`, :5143), distinct from haproxy's :5140.
 # `set`'s `resource:` block stamps a whole *batch*, so each tier needs its own listener, or they'd
 # interleave into one batch with one wrong `service.name`. This settings module is shared by both
 # processes (gunicorn's workers and the `worker` service, demo/compose.yaml). Each only logs

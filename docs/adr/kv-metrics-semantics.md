@@ -1,6 +1,6 @@
 ---
 created: 2026-08-30
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # `kv_metrics`: skip rules, numeric coercion, and no `tags:` field
@@ -11,7 +11,7 @@ Accepted
 
 ## Context
 
-`docs/plans/nginx-integration.md`'s workstream E needs a way to turn attributes already on an
+A real nginx workload needs a way to turn attributes already on an
 event -- typically merged there by `json` from an nginx access-log line -- into metrics on that
 *same* event: `nginx.requests` (a per-request counter), `nginx.bytes_sent` (from
 `$body_bytes_sent`), `nginx.request_time` (a distribution from `$request_time`). Nothing in
@@ -91,8 +91,8 @@ concrete consumer would need escaping rules for a literal dot in a real attribut
 complexity with no requirement driving it.
 
 **Distributions produce a raw, single-observation `MetricKind::Samples`**, exactly as
-`crates/logit-proto/src/statsd/` does for its `ms`/`h`/`d` metric types since
-[lossless-transit](lossless-transit.md)'s W3 — the value rides verbatim (one `f64`, inline in
+`crates/logit-proto/src/statsd/` does for its `ms`/`h`/`d` metric types
+([ADR `lossless-transit`](lossless-transit.md)'s "Realization") — the value rides verbatim (one `f64`, inline in
 `Samples`' own `SmallVec`, no allocation), left for `aggregate` to sketch and merge across events
 the same way statsd-sourced timings already are. This replaced the original single-sample
 `DdSketch` (one `DdSketch::new()` plus one `add` per distribution per event, i.e. one heap `bins`

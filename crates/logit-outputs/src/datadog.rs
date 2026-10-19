@@ -2,9 +2,8 @@
 //! needs. It mirrors `logit_inputs::datadog` (`datadog_in`), and the pair is a like-protocol relay
 //! under [ADR `lossless-transit`](../../../docs/adr/lossless-transit.md)
 //! ([ADR `datadog-agent-and-intake-relay`](../../../docs/adr/datadog-agent-and-intake-relay.md),
-//! decisions 2, 7, 9, and 10; [`docs/plans/datadog-relay.md`](../../../docs/plans/datadog-relay.md)
-//! §2, §11, §12). Every body comes from [`DatadogEncoder`], whose module doc holds the mappings;
-//! this module owns HTTP: which events go to which route, what isn't sent at all, how a route's
+//! decisions 2, 7, 9, and 10, and its "Verified destination behavior"). Every body comes from
+//! [`DatadogEncoder`], whose module doc holds the mappings; this module owns HTTP: which events go to which route, what isn't sent at all, how a route's
 //! events are cut into requests, and what a response means.
 //!
 //! Like `prometheus_out`, this sink is outside the three encoder shapes: Datadog has several
@@ -89,8 +88,8 @@
 //! through a long outage can reach the intake with a point past its window.
 //!
 //! The series window is the documented one, and stricter than the intake, which stored older
-//! points in a trial-org run (`docs/plans/datadog-relay.md`, "Verification"). That plan's
-//! "Timestamp windows" section has what the intake stored and how it treats a point too far ahead.
+//! points in a trial-org run. ADR `datadog-agent-and-intake-relay`'s "Timestamp windows and what
+//! a `202` drops" has what the intake stored and how it treats a point too far ahead.
 //!
 //! **Traces an Agent hasn't processed** (ADR decision 2). The intake's trace route expects what an
 //! Agent sends: normalized, obfuscated, `_top_level`-marked spans, with the Agent's stats beside

@@ -40,17 +40,12 @@
 # http_access, trace_context, kv_metrics, keep_signals, route_signals, keep, aggregate, internal,
 # prometheus_out (remote-write), and otlp_out over both HTTP and gRPC.
 #
-# Background: docs/plans/demo-stack.md, docs/plans/demo-tracing-stack.md,
-# docs/plans/otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md,
-# docs/plans/access-log-spans.md, docs/plans/file-tailing.md, docs/plans/demo-richer-traces.md,
-# docs/plans/operator-surface.md, docs/plans/browser-tracing.md.
-#
 # Topology:
 #
 #   One listener per tier, because `set` stamps a resource onto the whole BATCH, not per event:
 #   three tiers sharing one listener would interleave into one batch and get one wrong
-#   service.name (docs/plans/demo-tracing-stack.md). nginx's listener is `docker_in`, not
-#   `syslog_in` (docs/adr/file-tailing-and-docker-json-logs.md, docs/plans/file-tailing.md); this
+#   service.name. nginx's listener is `docker_in`, not
+#   `syslog_in` (docs/adr/file-tailing-and-docker-json-logs.md); this
 #   demo is that ADR's end-to-end proof. `nginx_stdout` (`lua`) drops the container's own
 #   error_log lines (`log.iostream: stderr`), which would otherwise reach
 #   `nginx_identity`/`nginx_json` as if they were access lines.
@@ -118,12 +113,12 @@
 #   nginx's span (nginx mints and forwards its own span id, docs/adr/trace-context-span-lifting.md),
 #   because the default W3C propagator extracts whichever `traceparent` it's given, regardless of
 #   which backend the span is headed for. demo-worker sends to the same tempo:4318: its Celery
-#   CONSUMER span parents to demo-app's Celery PRODUCER span (`.delay()`,
-#   docs/plans/demo-richer-traces.md), which parents to the request that enqueued it. The same
+#   CONSUMER span parents to demo-app's Celery PRODUCER span (`.delay()`),
+#   which parents to the request that enqueued it. The same
 #   propagator does it, with no code on either side of that hop.
 #
 #   Four more legs, separate from the diagram above because none touches haproxy/nginx/app's
-#   listeners (docs/plans/demo-richer-traces.md):
+#   listeners:
 #
 #   postgres --jsonlog file--> tail(tail_in)--> postgres_in -> postgres_identity (set)
 #             -> postgres_json (json) -> postgres_trace_lift (regex, extracts a `traceparent` out
@@ -149,7 +144,7 @@
 #
 #   `logit`'s own self-diagnostics (warn and above, `internal`'s default `logs:` threshold) ride
 #   the `self` -> self_by_signal -> self_loki_out leg, alongside `self`'s own points and spans
-#   (docs/plans/operator-surface.md). They're ordinary `LogRecord`-carrying events. `self` has
+#   (docs/adr/tracing-for-self-logging.md). They're ordinary `LogRecord`-carrying events. `self` has
 #   sinks of its own, with none shared with a data path, so at shutdown it drains again after
 #   every data node has stopped and exports the counts recorded during the drain
 #   (docs/deploying.md's "Self-logging").
@@ -177,7 +172,7 @@ components:
     read_from: beginning
     checkpoint_path: /var/lib/logit/nginx.checkpoint
 
-  # Redis's own server log (Celery's broker, docs/plans/demo-richer-traces.md), read by `docker_in`
+  # Redis's own server log (Celery's broker), read by `docker_in`
   # like `nginx_in` above, against the fixed `container_name` demo/compose.yaml gives the `redis`
   # service. There's no `nginx_stdout`-style iostream filter: Redis writes every log line to
   # stdout, so there's no second stream to tell apart. Redis has no per-command log, so this is
@@ -213,7 +208,7 @@ components:
     bind: 0.0.0.0:5142
 
   # The `worker` service's log line for `pages/tasks.py`'s one task
-  # (docs/plans/demo-richer-traces.md). It's a separate listener from `app_in` for the same reason
+  # It's a separate listener from `app_in` for the same reason
   # as every other tier: one `service.name` per batch. The worker's OTel spans (Celery CONSUMER,
   # psycopg CLIENT) go straight to Tempo like `app`'s, so this listener only ever sees the one log
   # line `pages/tasks.py`'s `worker_logger` emits per task run.
@@ -221,7 +216,7 @@ components:
     type: syslog_in
     bind: 0.0.0.0:5143
 
-  # The demo's plain-file tail (docs/plans/demo-richer-traces.md); every other log tier is
+  # The demo's plain-file tail; every other log tier is
   # `syslog_in` or `docker_in`, `tail_in`'s Docker-specific sibling. `paths`' `*` is permitted only
   # in the final path component (`crates/logit-config/src/lib.rs`), which matches Postgres's jsonlog
   # rotation exactly: a fresh `postgresql-<timestamp>.json` file every `log_rotation_age`
@@ -235,7 +230,7 @@ components:
     read_from: beginning
     checkpoint_path: /var/lib/logit/postgres.checkpoint
 
-  # Browser-facing OTLP ingress (docs/plans/demo-tracing-stack.md, docs/plans/browser-tracing.md).
+  # Browser-facing OTLP ingress (docs/adr/browser-tracing-sdk.md).
   # The landing page's browser SDK reaches it through `haproxy`'s `is_otlp` ACL on its published
   # `:8080` (demo/haproxy/haproxy.cfg's `/v1/*` route); it isn't published directly
   # (demo/README.md's "`otlp_in` from the browser"). A browser SDK needs a same-origin endpoint,
@@ -504,9 +499,8 @@ components:
     sources: [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace, redis_parse]
     signals: [logs]
 
-  # Logs to Loki, direct over OTLP with no relay service in between (docs/plans/
-  # otlp-logs-and-resource-identity.md; Loki accepts OTLP logs natively as of 3.7.7, the version
-  # this stack pins). `protocol: http`, not `grpc` like `tempo_out` below, because Loki's OTLP
+  # Logs to Loki, direct over OTLP with no relay service in between (Loki accepts OTLP logs
+  # natively as of 3.7.7, the version this stack pins). `protocol: http`, not `grpc` like `tempo_out` below, because Loki's OTLP
   # ingestion is HTTP-only. `endpoint` is a URL base for HTTP (unlike gRPC's bare authority):
   # `http://loki:3100/otlp` resolves to exactly `/otlp/v1/logs`
   # (`crates/logit-proto/src/lib.rs`'s hardcoded per-signal path). Loki's default index-label set

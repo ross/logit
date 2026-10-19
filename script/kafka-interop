@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: script/kafka-interop
 #
-# Runs every leg of docs/plans/kafka-output.md's "Interop plan (W4)" against a real Apache Kafka
+# Runs every leg in tools/kafka-interop/README.md's "What it runs" against a real Apache Kafka
 # and a real Redpanda, reads each topic back with the Java client and kcat, and prints one pass,
 # gap, or fail row per leg. See tools/kafka-interop/README.md for what it runs and what it writes.
 #

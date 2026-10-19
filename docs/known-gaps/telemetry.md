@@ -29,7 +29,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
      `metrics_generator` (`service-graphs`/`span-metrics` processors) with `remote_write` to a
      Prometheus-compatible store, that store as a Grafana datasource, and
      `serviceMap.datasourceUid` on the Tempo datasource. A real multi-service trace exists to draw:
-     [demo-tracing-stack.md](../plans/demo-tracing-stack.md)'s HAProxy → nginx → app chain, plus
+     the demo's HAProxy → nginx → app chain, plus
      [ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md)'s `span:` block.
      It's extra stack for one panel, not a `logit`-side gap. Whether `logit` should compute a
      service graph itself as a component is unexplored.

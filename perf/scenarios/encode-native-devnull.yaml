@@ -2,7 +2,7 @@
 # (logit_proto::native's dictionary-first wire encoder, docs/adr/file-output-native-format.md).
 # `file_out` has three formats, `human`, `json`, and `native` (docs/adr/stream-json-format.md);
 # encode-human-devnull and encode-json-devnull measure the other two. Scenario table:
-# docs/plans/load-test-harness.md, "Scenarios".
+# docs/design/performance.md, "Scenarios".
 #
 #   script/perf run --scenario encode-native-devnull
 #

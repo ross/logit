@@ -9128,7 +9128,7 @@ mod tests {
         );
     }
 
-    // -- `Input::bind`, readiness, exit codes (docs/plans/operator-surface.md) --
+    // -- `Input::bind`, readiness, exit codes (docs/adr/admin-readiness-endpoint.md) --
 
     /// Fails every `bind()`; `run()` must never be reached.
     struct FailingBindInput;

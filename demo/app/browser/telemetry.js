@@ -1,5 +1,5 @@
 // Real browser-side OpenTelemetry tracing for the demo's landing page
-// (docs/plans/browser-tracing.md; ADR `browser-tracing-sdk`). Bundled by esbuild
+// (ADR `browser-tracing-sdk`). Bundled by esbuild
 // (../Dockerfile's `bundle` stage) into one minified file, served by demo/app/pages/views.py's
 // `browser_telemetry_js` view, and loaded from pages/templates/pages/index.html with
 // `<script type="module" defer>`. Spans go through HAProxy's `/v1/*` route to `logit`'s
@@ -7,8 +7,8 @@
 //
 // Every API shape below was checked against the pinned versions in package.json (npm registry
 // metadata plus each package's GitHub source), not assumed from documentation that may have
-// drifted. The comments mark each place this differs from what docs/plans/browser-tracing.md
-// originally sketched.
+// drifted. The comments mark each place the packages' behavior differs from what the OpenTelemetry
+// spec leads one to expect.
 
 import { TraceFlags } from "@opentelemetry/api";
 import { resourceFromAttributes } from "@opentelemetry/resources";
@@ -62,7 +62,7 @@ provider.register({
 // HAProxy stamps every response, this bundle's own load included, with
 // `Server-Timing: traceparent;desc="00-<trace>-<span>-01"` (demo/haproxy/haproxy.cfg's
 // `Server-Timing` comment). That header is for SUB-RESOURCES, not the document itself
-// (docs/plans/browser-tracing.md's "Correction 5"): the document's trace context comes from the
+// (the instrumentation doesn't read it for the document): the document's trace context comes from the
 // <meta name="traceparent"> tag instead, because Server-Timing on the *navigation* entry is set
 // too late for anything to read before the browser starts painting. It's exposed to JS as
 // `PerformanceResourceTiming.serverTiming` (`Timing-Allow-Origin: *`, also set by HAProxy, is
@@ -71,8 +71,7 @@ provider.register({
 // that served this resource, in a DIFFERENT trace than the one this resourceFetch span lives in.
 //
 // `Span.addLink()` is present on `@opentelemetry/api@1.9.1`'s `Span` interface (added in 1.9.0),
-// so this uses a real link, not the attribute fallback docs/plans/browser-tracing.md left open as
-// a contingency. A `SpanContext` is built by hand from the parsed ids rather than through
+// so this uses a real link, not a `server.trace_id`/`server.span_id` attribute fallback. A `SpanContext` is built by hand from the parsed ids rather than through
 // `propagation.extract`, because that API extracts into a `Context` (for making a span a CHILD
 // of), and there's no public "parse a traceparent into a bare SpanContext" helper. The regex below
 // is the same one other tiers in this stack hand-parse a traceparent with
@@ -118,7 +117,7 @@ registerInstrumentations({
 
 // --- documentLoad is parented to the server span, not linked --------------------------------
 //
-// docs/plans/browser-tracing.md says (correctly, per the OTel spec) that the `documentLoad` span
+// The OTel spec says that the `documentLoad` span
 // *should* link to the server-side span named by <meta name="traceparent">: the server's span has
 // already ended by the time the browser can report anything, so a parent edge is semantically
 // backwards. But @opentelemetry/instrumentation-document-load@0.67.0's source

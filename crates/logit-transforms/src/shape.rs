@@ -1,7 +1,7 @@
 //! `shape`: an observer that rewrites each event in place into a measurement of its shape
 //! (attribute counts, nesting, key and value lengths, value types, metric and span widths), and on
 //! its flush interval emits the per-batch and cumulative facts `process` has nowhere to put.
-//! `docs/adr/shape-observer-component.md` is the design; `docs/plans/data-shape-survey.md` is
+//! `docs/adr/shape-observer-component.md` is the design; `docs/design/data-shapes.md` records
 //! the survey it instruments.
 //!
 //! Tapped off a flow by ordinary fan-out, never placed in it:
@@ -739,8 +739,8 @@ mod tests {
     }
 
     /// `logit-bench`'s `nginx_event` shape (this crate can't depend on it): ten top-level
-    /// attributes and four derived metrics, the counts `docs/plans/data-shape-survey.md`'s
-    /// acceptance check relies on.
+    /// attributes and four derived metrics, so a test can check `shape`'s counts against a known
+    /// fixture.
     fn nginx_shaped_event() -> Event {
         let mut event = Event::log(
             0,

@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-15
+updated: 2026-10-18
 ---
 
 # Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink
@@ -30,24 +30,14 @@ PR #522 built an intermediate design: hold the head after a 60 s streak of `Perm
 once a minute. Review found that a held batch rejected for its own content wedges the sink forever,
 because the probe resends the same batch. The PR is closed unmerged.
 
-[docs/plans/sink-fault-model.md](../plans/sink-fault-model.md), "Survey: what eleven peers do with
-a destination that rejects", compares Vector, the OpenTelemetry Collector, Fluent Bit, Fluentd,
-Logstash, libbeat, Prometheus remote write, Grafana Alloy, Telegraf, the Datadog Agent forwarder,
-and Kafka Connect. Five points hold across all eleven:
-
-1. Nobody holds a positively rejected batch and retries it. A final rejection is dropped and
-   counted, diverted to a dead-letter path, or stops the one task. The two that retry a rejection
-   forever are the subjects of user complaints, and each grew an opt-out.
-2. Nobody keeps a sustained-history state or a circuit breaker, and nobody exits the process.
-3. Where the batch-or-destination ambiguity is resolved, the response resolves it, not history.
-   The Datadog Agent treats `403` as credentials and `400`/`413` as the batch; Telegraf and the
-   remote-write and Loki specifications define a `4xx` other than `429` as "about this request".
-   The two that don't resolve it, Vector and the Collector, have open issues from operators asking
-   for a hold on `403` instead of a drop.
-4. The poison tools in use are a size split, per-item isolation where the wire reports it, and a
-   dead-letter path. None is a probe strategy.
-5. Ordering is what makes a held head fatal. The two peers without head-of-line blocking gave up
-   order to get it.
+The [survey below](#survey-what-eleven-peers-do-with-a-destination-that-rejects) compares Vector,
+the OpenTelemetry Collector, Fluent Bit, Fluentd, Logstash, libbeat, Prometheus remote write,
+Grafana Alloy, Telegraf, the Datadog Agent forwarder, and Kafka Connect. Five points hold across
+all eleven: nobody holds a positively rejected batch and retries it; nobody keeps a
+sustained-history state or a circuit breaker, and nobody exits the process; the response resolves
+the batch-or-destination ambiguity, not history; the poison tools in use are a size split, per-item
+isolation, and a dead-letter path, none of them a probe strategy; and ordering is what makes a held
+head fatal.
 
 ## Decision
 
@@ -217,6 +207,43 @@ not acknowledging is the backpressure, as today. The wire form is [ADR
 `native-hop-named-acks`](native-hop-named-acks.md); there is no compatibility shim
 ([ADR `native-hop-no-compatibility`](native-hop-no-compatibility.md)).
 
+## Survey: what eleven peers do with a destination that rejects
+
+Collected 2026-10-04 from primary sources (docs, source, specs, issues). The table carries only
+the claims that bear on the decisions.
+
+| System | Final rejection (`4xx` not `429`) | Retryable (`5xx`/`429`/connect) | Holds a head? | Breaker or exit | Poison tools |
+|---|---|---|---|---|---|
+| Vector | `RetryAction::DontRetry`: drop, `component_discarded_events_total{intentional=false}` | Fibonacci backoff, `retry_attempts` default `isize::MAX`, 1..30 s between | No: retry occupies a per-request slot, ARC up to 200 concurrent | None; ARC ignores `4xx`; never exits | `batch.max_bytes` up front; ES `retry_partial`; no 413 split; no DLQ (issues #10870, #20266 open) |
+| OTel Collector `exporterhelper` | `consumererror.NewPermanent`: retry sender returns at once, "Exporting failed. Dropping data." | exponential 5 s to 30 s, `max_elapsed_time` 300 s (`0` forever) | No: `num_consumers` 10; strict order only with 1 | None; never exits | `sending_queue.batch.max_size`; partial_success log-only; no DLQ |
+| Fluent Bit | `out_http`: `4xx` except 408/429 is `FLB_ERROR`, dropped; `out_es` retries any non-200/201 | per-chunk, `Retry_Limit` default 1, `False` forever, 5 s to 2000 s | No: each chunk its own task | None | opt-in DLQ `storage.keep.rejected`; ES per-item; `storage.total_limit_size` drops oldest |
+| Fluentd | `out_http`: any non-2xx not in `retryable_response_codes` (default `[503]`) is `UnrecoverableError`: `<secondary>` or backup file | per-output state, `retry_timeout` 72 h, `retry_forever` | One retry state per output | None; retry exhaustion drops the whole queue | `<secondary>`; `overflow_action`; oversize record skipped at enqueue |
+| Logstash ES output | 400/404 to DLQ or dropped; 409 dropped; everything else, 413 included, retried forever | forever, worker blocks, PQ back-pressures inputs | Yes | None | pre-split over 20 MB; per-item; `dlq_custom_codes` |
+| libbeat (Filebeat) | ES per-item: `4xx` dropped or `dead_letter_index`; 409 dropped | forever ("ignores `max_retries`"), `backoff.init/max` 1 s/60 s | No, but the queue fills | None | 413: `SplitRetry` halves to one event, then drop; per-item |
+| Prometheus remote write | spec: MUST NOT retry `4xx` other than 429: dropped, `prometheus_remote_storage_samples_failed_total` | forever, `min_backoff`/`max_backoff`, shard blocks, WAL backs up, `sample_age_limit` the only bound | Yes per shard (in order per series) | None | RW 2.0 `X-Prometheus-Remote-Write-*-Written` headers |
+| Grafana Alloy `loki.write` / Promtail | "Only retry 429s, 500s and connection-level errors"; 400, 401, 413 dropped, `dropped_entries_total` | `max_backoff_retries` 10 (`0` forever), 500 ms to 5 m | One batch at a time per client | None; opt-in WAL `max_segment_age` | none beyond drop |
+| Telegraf | `influxdb_v2`: 400 is `Retryable: false`, rejected; v1: any `4xx` dropped except database not found | every flush, forever; `metric_buffer_limit` drops oldest; `retryTime` gate after 429/`5xx` | Yes, bounded by drop-oldest | None | 413: `splitAndWrite`; `PartialWriteError` accept/reject sets |
+| Datadog Agent forwarder | 400 and 413 dropped; 403 refreshes the secret once, then drops; 404 and other `4xx` retried | exponential with jitter, 2 s to 64 s (logs 120 s, indefinitely); retry queue spills to disk | Transactions, not a head | None documented | none beyond classification |
+| Kafka Connect sinks | `errors.tolerance=none` (default): task FAILED, stays stopped; `all`: DLQ topic, converter/transform stage only (KIP-298) | `RetriableException` from `put()`: same call again, unbounded | Yes | Stops the one task, not the worker | KIP-610 `ErrantRecordReporter` per record |
+
+What the peers agree on:
+
+1. **Nobody holds a positively rejected batch and retries it.** A final rejection is dropped and
+   counted, diverted, or stops the one task. The two that retry a rejection forever (Logstash on
+   413, Fluent Bit `out_es` under `Retry_Limit False`) are the subjects of user complaints, and
+   each grew an opt-out.
+2. **Nobody has a sustained-history state or a circuit breaker, and nobody exits the process.**
+3. **Where the destination/batch ambiguity is resolved, it's by the response, not by history.**
+   Datadog treats 403 as credentials and 400/413 as the batch. Telegraf and the remote-write and
+   Loki specs define a `4xx` other than 429 as "about this request". Vector and the OTel Collector
+   don't resolve it, and Vector #10870 ("dropped on 403/404 with invalid credentials") and #20266
+   ("backpressure instead of drop on 403") are operators asking for the hold this record gives a
+   refused destination.
+4. **The poison tools in use** are a size split, per-item isolation where the wire reports it, and
+   a dead-letter path. None is a probe strategy.
+5. **Ordering is what makes a held head fatal.** The two peers without head-of-line blocking gave
+   up order to get it.
+
 ## Alternatives considered
 
 - **Keep `Permanent`, a retry budget, and the 60 s exit (the previous design).** Rejected: the
@@ -255,8 +282,7 @@ not acknowledging is the backpressure, as today. The wire form is [ADR
   destination's documentation, a test per row, and the body-aware mappings that turn a `400` into
   `Refused` where the body says so.
 - W3 is the `Ack` status, W4 makes `otlp_out` report per signal so a `Rejected` signal drops alone,
-  and W5 sweeps the operator docs. [docs/plans/sink-fault-model.md](../plans/sink-fault-model.md)
-  has each.
+  and W5 sweeps the operator docs.
 - A destination down for hours holds a sink's queue for hours. An operator who would rather drop
   than hold sizes `buffer:` with `overflow: drop_oldest` or `drop_newest`, or chooses
   `at_most_once` for the `Ambiguous` case. Memory and disk cost follow `buffer:`, which already

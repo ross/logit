@@ -2506,12 +2506,12 @@ that items 3, 7, and 11 need.
 - **W2**: `[[expect]]` tables in the scenario schema and the `expect` check that scores them
   (§2), with self-test fixtures for every validation rule and reducer; `recovery` accepts a sink
   queue holding one batch. Four scenarios: `sink-outage-block` and `sink-outage-drop-oldest`, the
-  verification [`buffered-sink-delivery.md`](buffered-sink-delivery.md) describes (a 90 s stop
-  under `block`, then `drop_oldest` with a small `max_batches`), and `udp-flood-sink-stop` and
-  `udp-flood-sink-stop-block`, [`decoupled-listener-io.md`](decoupled-listener-io.md)'s deferred
-  soak. A run of each is recorded under "Findings". No scenario needed per-peer `tc filter`.
+  verification [ADR `buffered-sink-delivery`](../adr/buffered-sink-delivery.md) calls for (a 90 s
+  stop under `block`, then `drop_oldest` with a small `max_batches`), and `udp-flood-sink-stop` and
+  `udp-flood-sink-stop-block`, [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)'s
+  deferred soak. A run of each is recorded under "Findings". No scenario needed per-peer `tc filter`.
 - **W3**: disk-spool `kill -9` replay, the manual soak
-  [`durable-sink-buffer.md`](durable-sink-buffer.md)'s "Verification" describes: a `kill` action
+  [ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md) calls for: a `kill` action
   (§2) on the SUT and its watchdog rules; SIGKILL lives in the ledger, judged within a band
   because up to one `internal` interval of a killed life's telemetry is lost; `ledger.windows`
   and `ledger.replay`, which judge every spooled window; self-test fixtures for the

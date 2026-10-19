@@ -24,7 +24,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `404`.
   - **Workaround:** same-origin export through a reverse proxy in front of both the page and
     `otlp_in`, as `demo/haproxy/haproxy.cfg` routes `/v1/traces` to `logit`; see
-    `docs/plans/browser-tracing.md`.
+    [ADR `browser-tracing-sdk`](../adr/browser-tracing-sdk.md).
   - **To close:** a `cors:` config surface (allowed origins, an `OPTIONS` handler, response
     headers), which is a config and security design of its own (the allowed-origins list, whether
     a reflexive `*` is ever appropriate).
@@ -59,8 +59,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **VictoriaTraces's OTLP/gRPC listener fails a request that races its connection close.**
   VictoriaTraces v0.11.1 closes every gRPC connection about 5 seconds after it opens, with a TCP
   FIN and no HTTP/2 `GOAWAY`
-  ([`docs/plans/victoriametrics-interop.md`](../plans/victoriametrics-interop.md)'s "Findings", leg
-  7). A request in flight at that moment gets no response frame and fails `Fault::Ambiguous`,
+  ([`tools/victoria-interop/README.md`](../../tools/victoria-interop/README.md)'s "Recorded run",
+  leg 7). A request in flight at that moment gets no response frame and fails `Fault::Ambiguous`,
   because the server may have processed it.
   - **Consequence:** under the default posture, `at_least_once`, `otlp_out` retries it, at the cost
     of a duplicate span when the first attempt was stored. Under `buffer.delivery: at_most_once` it

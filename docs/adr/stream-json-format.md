@@ -1,6 +1,6 @@
 ---
 created: 2026-09-28
-updated: 2026-10-15
+updated: 2026-10-18
 ---
 
 # `stdio_out`/`file_out` gain `format: json`, and every machine reader of the text render moves to it
@@ -19,7 +19,7 @@ extension point if a machine consumer ever needed one.
 Five did. The human render is the one sink that carries raw `Samples` and every `internal`
 counter to a plain file with no service in the way, so the out-of-CI harnesses read it:
 `tools/shape-survey/summarize.py` and `check_interop.py` (the data-shape survey's readout and its
-acceptance test, [`docs/plans/data-shape-survey.md`](../plans/data-shape-survey.md)), the Python
+acceptance test, [`tools/shape-survey/README.md`](../../tools/shape-survey/README.md#the-acceptance-test)), the Python
 in `tools/shape-survey/producers/oteldemo.sh`, and the `telemetry_sum` readers in
 `tools/splunk-interop/check.py` and `tools/victoria-interop/check.py`. Each carried a hand parser
 for the text grammar, three of them independent by design, and any change to the human render

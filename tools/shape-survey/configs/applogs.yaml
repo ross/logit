@@ -15,8 +15,8 @@
 #                                                       its nested objects as nested maps)
 #
 #    `json` merges only the top level, so pino-http's `req`/`res` and semantic_logger's `payload`
-#    stay nested maps inside one attribute, the quantity docs/plans/data-shape-survey.md wants a
-#    distribution of.
+#    stay nested maps inside one attribute, the quantity docs/design/data-shapes.md's
+#    "Dimensions and their weight units" wants a distribution of.
 #
 # B. The Django + OpenTelemetry leg. `otlp_in` receives traces, metrics and logs straight from the
 #    SDK with no Collector in between, so the resource width measured is the Python SDK's own. One

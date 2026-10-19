@@ -3,10 +3,10 @@
 `script/splunk-interop` checks `splunk_hec_out` and `splunk_hec_in` against a real Splunk
 Enterprise container, or a Splunk Cloud stack in [Splunk Cloud mode](#splunk-cloud-mode), then
 probes that Splunk directly for what
-[`docs/plans/splunk-relay.md`](../../docs/plans/splunk-relay.md) listed as unverified. It prints
-one row per leg and one per probe. [What the run showed](#what-the-run-showed) records a Splunk
-Enterprise run and a Splunk Cloud run; the plan's "Settled by W5" and "Settled by the Cloud run"
-sections and ADR `splunk-hec-relay`'s two amendments carry the decisions they settled.
+[ADR `splunk-hec-relay`'s protocol survey](../../docs/adr/splunk-hec-relay.md#verified-destination-behavior)
+couldn't confirm from Splunk's docs. It prints one row per leg and one per probe. [What the run
+showed](#what-the-run-showed) records a Splunk Enterprise run and a Splunk Cloud run; that ADR's
+"Verified destination behavior" and its two run amendments carry the decisions they settled.
 
 The script runs on the host and drives docker (`$DOCKER`, `sudo docker` by default), like
 `script/victoria-interop` and `script/record-fixtures`. It isn't part of `script/cibuild`, and no

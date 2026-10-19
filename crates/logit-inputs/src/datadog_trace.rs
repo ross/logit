@@ -1,8 +1,7 @@
 //! `datadog_trace_in`: a stand-in for the Datadog Agent's APM receiver, what a dd-trace tracer's
 //! `DD_TRACE_AGENT_URL` (or `DD_AGENT_HOST` and `DD_TRACE_AGENT_PORT`) points at
-//! ([ADR `datadog-agent-and-intake-relay`](../../../../docs/adr/datadog-agent-and-intake-relay.md),
-//! [`docs/plans/datadog-relay.md`](../../../../docs/plans/datadog-relay.md) §2). It serves
-//! HTTP/1.1 and h2c through [`hyper_util::server::conn::auto::Builder`] on a TCP listener
+//! ([ADR `datadog-agent-and-intake-relay`](../../../../docs/adr/datadog-agent-and-intake-relay.md)).
+//! It serves HTTP/1.1 and h2c through [`hyper_util::server::conn::auto::Builder`] on a TCP listener
 //! (`bind`, the Agent's `:8126`, optionally TLS), a Unix stream socket (`socket`, the Agent's
 //! `receiver_socket`), or both at once, and every body decodes through
 //! [`logit_proto::datadog::DatadogDecoder`]. The payload mappings live in that codec's module doc;

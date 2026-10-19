@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-10-14
+updated: 2026-10-18
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -8,9 +8,10 @@ updated: 2026-10-14
 ## Status
 Accepted
 
-Realized as of 2026-09-24: the plan's W1 through W8b built both pairs and the `statsd`
-additions this record decides; see [`docs/plans/datadog-relay.md`](../plans/datadog-relay.md)'s
-closing assessment for the proof and what stays open.
+Realized as of 2026-09-24: both pairs and the `statsd` additions this record decides are built,
+and relay losslessly modulo the permitted normalizations `crates/logit-proto/src/datadog/mod.rs`
+lists. [Verified destination behavior](#verified-destination-behavior) has the evidence, and
+[`docs/known-gaps/datadog.md`](../known-gaps/datadog.md) what stays open.
 
 ## Context
 
@@ -20,7 +21,7 @@ to stand in two places: in front of applications, where the Datadog Agent listen
 `:8125`, the APM API on `:8126`), and behind a fleet of Agents, where Datadog's intake listens
 (`dd_url`, `additional_endpoints` dual-shipping). Both are Datadog's own protocols, and the Agent
 is open source, so the protocols are readable even where Datadog documents nothing.
-[`docs/plans/datadog-relay.md`](../plans/datadog-relay.md) has the survey and the workstreams,
+[Verified destination behavior](#verified-destination-behavior) has the protocol survey,
 [`docs/datadog.md`](../datadog.md) the trade-offs and the best-practice recommendation; this
 record holds the decisions.
 
@@ -125,8 +126,8 @@ Three facts from the survey drive the shape of the decision:
     never from per-sink fields; an upstream `set` supplies them. It drops and counts points older
     than Datadog's documented windows (1 h for metrics, 18 h for logs, 10 min for checks) before
     sending. The metrics window is the documented one and stricter than the intake
-    ([the plan's §11](../plans/datadog-relay.md#11-timestamp-windows-w5) has what the intake
-    stored).
+    ([Timestamp windows and what a `202` drops](#timestamp-windows-and-what-a-202-drops) has
+    what the intake stored).
 
 11. **`datadog_trace_in` shares decision 5's bounded-wait-then-`503` mechanism, but a `503` there
     is deferral for about 15 s, not minutes, and the bound is shorter.** Delivery is the same
@@ -196,7 +197,7 @@ Three facts from the survey drive the shape of the decision:
       requests.
 
 14. **`datadog_out` sends events uncompressed and stays not duplicate-safe** (amendment,
-    2026-09-24, from the trial-org run in the plan's W7b). Datadog's `/api/v1/events` answers any
+    2026-09-24, from the trial-org run). Datadog's `/api/v1/events` answers any
     gzip or deflate body `400 Invalid JSON structure`, so that route goes out with no
     `Content-Encoding` whatever `compression:` says. The intake stores a resent series point once
     (the last write wins at its `(series, timestamp)`) but a resent log twice, and a batch is
@@ -257,8 +258,8 @@ Three facts from the survey drive the shape of the decision:
 - The Agent-equivalent trace processor (normalization, `_top_level`, sampler tags, a stats
   concentrator) for the no-Agent topology is a follow-up plan, not this one; until it exists the
   tracer-direct topology runs through `datadog_trace_out` and a real Agent.
-- The plan's W7a settled the survey facts a real Agent and tracer could (amendment below), and
-  W7b the ones that needed a trial org: sketches, distribution points (gzip or zlib, not raw
+- The recorded corpus settled the survey facts a real Agent and tracer could (amendment below),
+  and the trial-org run the ones that needed Datadog's backend: sketches, distribution points (gzip or zlib, not raw
   deflate), `/api/v0.2/traces` and `/api/v0.2/stats` from a sender that isn't an Agent, the
   series size cap, deduplication, and the stale windows. One changed a decision (decision 14).
   Whether the intake accepts a stats sketch whose gamma isn't 1.0202 stays open, because nothing
@@ -272,6 +273,125 @@ Three facts from the survey drive the shape of the decision:
   Decision 11 gives the window.
 - A `unix` `statsd_out` whose receiver restarts mid-batch fails that batch under the sink's usual
   rules; only a restart between batches is absorbed.
+
+## Verified destination behavior
+
+What Datadog accepts and emits, surveyed on 2026-09-23 from Datadog's OpenAPI specs
+(`github.com/DataDog/datadog-api-client-go/.generator/schemas/{v1,v2}/openapi.yaml`), the
+`datadog-agent` and `agent-payload` sources on `main`, and `docs.datadoghq.com`. Recorded traffic
+from Agent 7.83.3 and dd-trace-py 4.15.2 ([`testdata/interop/datadog/`](../../testdata/interop/datadog/README.md))
+and two trial-org runs, on 2026-09-24 and 2026-10-08, then checked it; a "trial org" note below
+names what a run measured. An item marked UNVERIFIED wasn't confirmed by a current official page,
+the corpus, or a trial org.
+
+### Public intake API (no Agent)
+
+| Endpoint | Body and limits | Notes |
+|---|---|---|
+| `POST api.<site>/api/v2/series` | JSON `{series:[{metric, type, points:[{timestamp s, value}], interval, unit, tags[], resources:[{name,type}], source_type_name, metadata.origin}]}`; 512,000 B compressed, 5,242,880 B decompressed; `Content-Encoding: deflate \| zstd1 \| gzip`; header `DD-API-KEY` | `type`: 0 unspecified, 1 count, 2 rate, 3 gauge. No histogram, set, or distribution type. Points must be no more than 1 h in the past or 10 min in the future ([Timestamp windows and what a `202` drops](#timestamp-windows-and-what-a-202-drops)). A series with more than 100 tags is dropped the same way. A body over 512 kB compressed gets `413`. A resent point overwrites: one value per `(series, timestamp)`, the last write winning (trial org) |
+| `POST /api/v1/distribution_points` | JSON `{series:[{metric, host, tags, type:"distribution", points:[[ts,[v…]]]}]}`; `deflate` only | Raw values; Datadog sketches them server side. Limits undocumented; the trial org took 1,052,533 B gzip (150,000 values) with `202` and every value counted. gzip and zlib deflate are both accepted, raw deflate is `400` |
+| `POST /api/beta/sketches` | protobuf `SketchPayload` | What Agents send. Not in the public spec; Vector's `datadog_metrics` sink sends it with an API key, and so does `datadog_out`: in the trial org, `aggregate`'s locally built sketches are queryable (`avg`, `count`, `max`) |
+| `POST http-intake.logs.<site>/api/v2/logs` | JSON array of `{message, ddsource, ddtags, hostname, service, status, …}`; 1,000 entries, 5 MB decompressed, 1 MB per log (cut, still 2xx); up to 18 h in the past; `gzip`/`deflate`/`identity`; 202 accepted, retry 408/429/500/503 | Other keys are attributes, nested maps included. Trace correlation auto-detects OTel `trace_id`/`span_id` (32-/16-char lowercase hex) and Datadog `dd.trace_id`/`dd.span_id` (decimal). A resent log is stored twice (trial org) |
+| `POST /api/v1/events` | `title`, `text` (≤4,000 chars), `date_happened` (≤18 h old), `priority: normal \| low`, `alert_type`, `aggregation_key` (≤100), `host`, `tags`, `source_type_name`; uncompressed only (trial org: gzip and deflate get `400 Invalid JSON structure`) | v2 events (`event-management-intake.<site>`) are a different product surface; v1 is what DogStatsD events map to |
+| `POST /api/v1/check_run` | array of `{check, host_name, status 0–3, tags, message?, timestamp?}`; ≤10 min old; message cut at 500 chars, discarded on OK | |
+| Traces | No documented native-span API, but the Agent's own outbound protocol is open source (`pkg/trace/writer`) and Vector's `datadog_traces` sink is a working third-party sender of it: see [Agent outbound surfaces](#agent-outbound-surfaces-what-agents-send-to-datadog) | Trace metrics (`trace.*`, service pages) are not derived from `/api/v0.2/traces`; the sender must also send `/api/v0.2/stats` (inferred from `metrics_namespace` docs and the Agent's concentrator; the backend is closed source) |
+| `POST otlp.<site>/v1/{traces,metrics,logs}` | OTLP/HTTP protobuf (traces and metrics also JSON); header `dd-api-key`; 512 KiB compressed metrics, 5.1 MiB logs, 15 MiB traces; 413 when over | HTTP only, no gRPC. Metrics must be delta temporality; cumulative is an error. Optional `dd-otel-metric-config` (`histograms.mode`, `summaries.mode`, `resource_attributes_as_tags`) and `dd-otel-span-mapping` headers; `compute_stats=true` to get trace metrics. No Preview banner on any of the three pages, no explicit GA statement either |
+
+Sites: `datadoghq.com`, `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`,
+`ap1.datadoghq.com`, `ap2.datadoghq.com`, `uk1.datadoghq.com`, `ddog-gov.com`,
+`us2.ddog-gov.com`; every host above is `<prefix>.<site>`.
+
+### Agent listening surfaces (what apps send to an Agent)
+
+- **DogStatsD**: UDP `:8125`, a datagram Unix socket at `dogstatsd_socket`
+  (default `/var/run/datadog/dsd.socket`; what Kubernetes clients use), and an optional stream
+  Unix socket (`dogstatsd_stream_socket`; a 4-byte little-endian length per packet, recorded in
+  `testdata/interop/datadog/README.md`). Buffer 8,192 B. Grammar as
+  [`telemetry-landscape.md`](../design/telemetry-landscape.md)'s DogStatsD section, plus two
+  suffixes: `|e:<external data>` (v1.5, Agent 7.57+) and `|card:none|low|orchestrator|high`
+  (v1.6, 7.64+). Agent semantics: `c` is time-normalized into a rate over the 10 s flush; `s`
+  becomes a gauge of distinct values; `h`/`ms` become
+  `.avg`/`.count`/`.median`/`.95percentile`/`.max` per `histogram_aggregates` and
+  `histogram_percentiles`; `d` goes to Datadog as a sketch.
+- **APM on `:8126`** (`pkg/trace/api/endpoints.go`): `/v0.3/traces` (msgpack or JSON),
+  `/v0.4/traces` (msgpack, array of arrays of span maps), `/v0.5/traces` (msgpack, a string table
+  plus 12-element span arrays), `/v0.7/traces` (msgpack `TracerPayload`, not protobuf),
+  `/v1.0/traces` (msgpack, streaming string table), `/info`, `/v0.6/stats`,
+  `/v0.1/pipeline_stats`, `/telemetry/proxy/`, `/v0.7/config`, `/evp_proxy/v1`–`v4`,
+  `/profiling/v1/input`, `/debugger/*`, `/tracer_flare/v1`, and an optional
+  `receiver_socket` (`/var/run/datadog/apm.socket`). Response `{"rate_by_service": {...}}`.
+  Request headers: `X-Datadog-Trace-Count`, `Datadog-Meta-Lang`, `Datadog-Meta-Tracer-Version`,
+  `Datadog-Container-ID`, `Datadog-Entity-ID`, `Datadog-External-Env`, `Datadog-Client-Computed-Stats`,
+  `Datadog-Client-Computed-Top-Level`, `Datadog-Client-Dropped-P0-{Traces,Spans}`. Span schema
+  (`span.proto`): `service`, `name`, `resource`, `type` strings; `trace_id`, `span_id`,
+  `parent_id` uint64; `start`, `duration` int64 ns; `error` int32; `meta` string→string;
+  `metrics` string→f64; `meta_struct` string→bytes; `span_links`; `span_events`. 128-bit trace
+  ids carry their high 64 bits as 16 lowercase hex chars in `meta["_dd.p.tid"]` on the first
+  span of a chunk. Limits: `service`/`name` ≤100 chars, `resource` ≤5,000, meta key ≤200, meta
+  value ≤25,000.
+- **OTLP receiver**: gRPC `:4317`, HTTP `:4318`; `metrics` and `traces` enabled, `logs`
+  disabled by default. Metric options: `histograms.mode: distributions | counters | nobuckets`,
+  `sums.cumulative_monotonic_mode: to_delta | raw_value`, `summaries.mode: gauges | noquantiles`,
+  `resource_attributes_as_tags` (false), `instrumentation_scope_metadata_as_tags` (true). Span
+  mapping honors the attributes `operation.name`, `resource.name`, `span.type`, and
+  `service.name`; without them it derives operation and resource names from semconv.
+- **dd-trace SDKs can export OTLP** (Preview): `DD_TRACE_OTEL_ENABLED=true` with
+  `OTEL_TRACES_EXPORTER=otlp` (Java 1.62+, Python 4.8+, Node 5.98+, Go 2.8+, .NET 3.41+) and
+  `DD_METRICS_OTEL_ENABLED=true`. Spans keep Datadog semantics.
+- **Logs**: a `logs` integration `type: tcp | udp` listener taking raw, JSON, or syslog lines,
+  one per `\n`. No HTTP logs endpoint other than OTLP (UNVERIFIED as a negative).
+
+### Agent outbound surfaces (what Agents send to Datadog)
+
+Redirected by `dd_url` (metrics, events, checks, metadata only), `logs_config.logs_dd_url`,
+`apm_config.apm_dd_url`, or dual-shipped with `additional_endpoints`,
+`logs_config.additional_endpoints`, and `apm_config.additional_endpoints`.
+
+| Route | Body | Notes |
+|---|---|---|
+| `/api/v2/series` | protobuf `MetricPayload` (`agent-payload` `metrics/agent_payload.proto`); `Content-Type: application/x-protobuf` | zstd level 1 by default (`serializer_compressor_kind`), one setting for every endpoint. 512,000 B compressed, 5 MiB decompressed, 10,000 points. v1 JSON only if `use_v2_api.series: false`. v3 columnar (`/api/intake/metrics/v3/series`) only to Datadog URLs (`use_v3_api.series.enabled: datadog_only`); a recorded 7.83 Agent redirected elsewhere sent v2, and the trial org's Agent 7.83.3, with `dd_url` at a `datadog_in`, sent v2 protobuf only |
+| `/api/beta/sketches` | protobuf `SketchPayload`: `{metric, host, tags, dogsketches:[{ts, cnt, min, max, avg, sum, k: sint32[], n: uint32[]}]}` | DDSketch with `eps = 1/128` (gamma 1.015625), `min = 1e-9`, bias, 4,096-bin collapsing, int16 keys (`pkg/util/quantile`). No mapping parameters on the wire: the receiver assumes them |
+| `/api/v1/check_run` | JSON | |
+| `/intake/` | JSON: events and host metadata in one route | |
+| `agent-http-intake.logs.<site>/api/v2/logs` | JSON array, zstd (the Agent's one compression setting; the recorded corpus shows `content-encoding: zstd`); ≤1 MB and ≤1,000 logs per batch; headers `DD-API-KEY`, `DD-PROTOCOL: agent-json`, `DD-EVP-ORIGIN: agent`, `dd-message-timestamp` | Legacy TCP `agent-intake.logs.<site>:10516`: `<api-key> <json>\n`, or 4-byte length-prefixed protobuf `Log` |
+| `trace.agent.<site>/api/v0.2/traces` | protobuf `AgentPayload{hostName, env, tracerPayloads, tags, agentVersion, targetTPS, errorTPS, rareSamplerEnabled}`; headers `DD-Api-Key`, `Content-Type: application/x-protobuf`, `Content-Encoding` (zstd `BestSpeed` by default; gzip in other builds), `User-Agent: Datadog Trace Agent/<ver>/<commit>`, `X-Datadog-Reported-Languages`; 3,200,000 B uncompressed max; flush every 5 s; retries 408, 429, 5xx, and transport errors with full-jitter backoff, 4 retries (`pkg/trace/writer/{trace,sender}.go`) | Vector sends the same payload with `DD-API-KEY` and gzip only, empty `tags`, and its own `hostName`/`env`/`agentVersion` (`src/sinks/datadog/traces/request_builder.rs`) |
+| `trace.agent.<site>/api/v0.2/stats` | msgpack + gzip `StatsPayload{agentHostname, agentEnv, agentVersion, clientComputed, stats: [ClientStatsPayload{hostname, env, version, containerID, lang, …, stats: [bucket{start, duration, stats: [group{service, name, resource, type, spanKind, HTTPStatusCode, synthetics, peerTags, hits, errors, duration, topLevelHits, okSummary, errorSummary}]}]}]}`; ≤4,000 groups per payload; 10 s buckets | `okSummary`/`errorSummary` are protobuf DDSketches from `sketches-go` (`LogCollapsingLowestDenseDDSketch(0.01, 2048)`, gamma 1.0202) and carry their mapping on the wire, unlike the metrics sketches. The Agent computes them from every span before sampling (`pkg/trace/stats/concentrator.go`): eligible spans are `_top_level == 1`, `_dd.measured == 1`, or server/client/producer/consumer `span.kind`; weight `1/_sample_rate` |
+| `/api/v1/validate`, `/api/v2/host_metadata`, `/api/v1/metadata` | | Answered 200/204, contents dropped and counted |
+
+Vector's `datadog_agent` source (`src/sources/datadog_agent`) implements the same set minus
+`/api/v1/check_run` and `/intake/`. Vector drops `/api/v0.2/stats` on receipt and recomputes
+stats in its sink, a partial reimplementation of the Agent's concentrator (no `span.kind`, peer
+tags, or gRPC/HTTP keys; "beta"; requires Agent sampling to be off). `logit` relays the stats
+instead (decision 2). What the Agent does to a span between the tracer and the intake is in
+[`docs/known-gaps/datadog.md`](../known-gaps/datadog.md)'s Agent-equivalent trace processor
+entry.
+
+### Timestamp windows and what a `202` drops
+
+`datadog_out`'s 1 h series window (decision 10) is the documented one, and stricter than the
+intake: the 2026-09-24 trial-org run stored gauge points 2 h and 3 h old, and none 6 h or older.
+A point more than 10 min ahead was dropped alone, with `202` and an `errors` entry naming it,
+while the rest of its request was stored.
+
+The 2026-10-08 run measured what the intake drops from a request it answers `202`:
+
+- **Series, over protobuf** (what `datadog_out` sends): always `202` with
+  `Content-Type: application/x-protobuf`. A clean request's body is empty. Otherwise it's a
+  protobuf whose field 1, `repeated string errors`, holds one entry per dropped series, naming the
+  metric and never a tag: `Payload validation failed: too many tags in series <metric>: limit=100
+  tags=101`, or `Payload validation failed: series <metric> contains N data points too far in the
+  future`, where N counts that series' future points and a series with other valid points keeps
+  them. Over JSON the same strings come as `{"errors": [...]}`.
+- **The tag limit** counts only the `tags` strings, repeats included; `resources` (host, device,
+  and others) don't count. 100 tags were stored and 101 dropped.
+- **Distribution points and sketches** drop a series with more than 100 tags, or a point too far
+  in the future, silently, answering `202 {"status": "ok"}`. Distribution points answer
+  `400 Payload is empty` when every series in the request was dropped.
+- **Check runs and logs** with 101 tags drew `202` (`{"status": "ok"}` and `{}`); whether either
+  stored them wasn't checked.
+- **A point 2 h old** drew no `errors` entry.
+
+"Amendment: what an accepted request drops (2026-10-08)" has what `datadog_out` does with it.
 
 ## Amendment: what W7a's recorded traffic settled
 

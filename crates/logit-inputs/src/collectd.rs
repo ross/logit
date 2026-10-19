@@ -342,7 +342,7 @@ mod tests {
     //
     // Real datagrams from a real collectd's `network` plugin, recorded by
     // `script/record-fixtures collectd`; provenance in testdata/interop/collectd/README.md,
-    // rationale in docs/plans/recorded-interop-fixtures.md.
+    // rationale in testdata/interop/README.md.
     //
     // Assertions are on decoded, identifiable values (the host, which plugins arrived, a list's
     // data-source count and kinds, the interval), never on the bytes: a re-record changes every

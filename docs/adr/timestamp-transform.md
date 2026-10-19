@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-09
+updated: 2026-10-18
 ---
 
 # `timestamp`: resolving `event.timestamp` from an attribute, with jiff for calendar time
@@ -188,5 +188,5 @@ minute, uses `%Z`, `%Q`, or `%:Q`, or fails to parse its own rendering of a refe
   [ADR `syslog-structured-data-convention`](syslog-structured-data-convention.md),
   [ADR `trace-context-span-lifting`](trace-context-span-lifting.md),
   [ADR `file-tailing-and-docker-json-logs`](file-tailing-and-docker-json-logs.md),
-  `docs/plans/lossless-transit.md`, and the module docs of `crates/logit-proto/src/syslog/mod.rs`
+  [ADR `lossless-transit`](lossless-transit.md)'s "Residual debt", and the module docs of `crates/logit-proto/src/syslog/mod.rs`
   and `crates/logit-outputs/src/syslog.rs`.

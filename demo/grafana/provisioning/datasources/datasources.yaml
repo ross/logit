@@ -24,7 +24,7 @@ datasources:
     url: http://loki:3100
     jsonData:
       # Two derived fields, both linking to the same Tempo trace. The label matcher is the one
-      # that fires against real data (docs/plans/demo-tracing-stack.md): demo/logit.yaml's
+      # that fires against real data: demo/logit.yaml's
       # `trace_context` transforms lift each tier's trace_id/span_id onto LogRecord.trace with
       # `keep_source` at its default `false`, so the id leaves the log body and becomes Loki's
       # *native* trace_id structured metadata via OTLP ingestion, not text in the message. The

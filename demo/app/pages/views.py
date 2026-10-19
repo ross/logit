@@ -1,4 +1,4 @@
-"""The views this tier serves (docs/plans/demo-tracing-stack.md): the landing page, its two
+"""The views this tier serves: the landing page, its two
 live-rendered diagrams, the browser telemetry bundle, a health check for demo/compose.yaml's
 `traffic` generator, and the `/work`, `/inner`, and `/boom` routes that give the demo's traces
 their shape. Every request gets `opentelemetry-instrumentation-django`'s automatic request span
@@ -18,7 +18,7 @@ from pages.tasks import background_work
 
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "http://localhost:3000")
 
-# nginx, not haproxy (`docs/plans/demo-richer-traces.md`), so this hop takes a different path
+# nginx, not haproxy, so this hop takes a different path
 # than the request that triggered it, while still landing on a tier whose access log `logit` turns
 # into a real span (`nginx_trace`'s `span:` block, demo/logit.yaml) rather than routing straight
 # back to app. `RequestsInstrumentor` (demo/app/demoproj/telemetry.py) injects a fresh
@@ -34,7 +34,7 @@ GRAPH_SVG_PATH = os.environ.get("GRAPH_SVG", "/graph/logit.svg")
 ARCH_SVG_PATH = os.environ.get("ARCH_SVG", "/graph/architecture.svg")
 
 # ../Dockerfile's `bundle` stage's only output: the real @opentelemetry/sdk-trace-web SDK,
-# esbuild-bundled from browser/telemetry.js (docs/plans/browser-tracing.md). The image's
+# esbuild-bundled from browser/telemetry.js. The image's
 # `WORKDIR` is `/app`, so this is relative to this tier's own root, unlike GRAPH_SVG_PATH/
 # ARCH_SVG_PATH above (a shared volume another service writes into).
 BROWSER_BUNDLE_PATH = os.environ.get("BROWSER_BUNDLE_PATH", "browser/telemetry.bundle.js")
@@ -99,7 +99,7 @@ def health(request):
 
 
 # `work` and `boom` below exist to give the demo's traces a real *shape*: some latency spread and
-# some real errors (`docs/plans/demo-richer-traces.md`). Without them, `traffic`
+# some real errors. Without them, `traffic`
 # (demo/compose.yaml) only produces flat 200s, and two of the shipped dashboard panels
 # ("Loki: 5xx lines/sec", the `web.request_time` p50/p99 pair) plot nothing or a flat line.
 
@@ -121,7 +121,7 @@ def work(request):
     if random.random() < 0.08:
         return HttpResponse(b"temporarily overloaded\n", status=503)
 
-    # A real write and a real read against Postgres (`docs/plans/demo-richer-traces.md`), each its
+    # A real write and a real read against Postgres, each its
     # own driver-level CLIENT span (opentelemetry-instrumentation-psycopg,
     # demo/app/demoproj/telemetry.py). The same instrumentation's sqlcommenter puts a
     # `traceparent` in the SQL text itself, which `demo/logit.yaml`'s `postgres_trace` stage lifts
@@ -130,7 +130,7 @@ def work(request):
     count = WorkRecord.objects.count()
 
     # Hands the rest of the "work" to a real background worker over Redis
-    # (`docs/plans/demo-richer-traces.md`). `.delay()` is fire-and-forget (this view never waits on
+    # `.delay()` is fire-and-forget (this view never waits on
     # the result), but it's still a real Celery PRODUCER span (opentelemetry-instrumentation-celery,
     # demoproj/telemetry.py) parented to this request's span, with a real Redis CLIENT span
     # (opentelemetry-instrumentation-redis) underneath it for the publish. The `worker` service
@@ -139,7 +139,7 @@ def work(request):
     # does.
     background_work.delay()
 
-    # The re-entrant hop (`docs/plans/demo-richer-traces.md`): back through nginx (not haproxy;
+    # The re-entrant hop: back through nginx (not haproxy;
     # see `INNER_URL`'s comment above), giving one trace a real subtree instead of a single chain.
     # A failure here (nginx or `/inner` down, or the timeout below) is reported, not swallowed: a
     # 502 is the honest status for "this tier's own upstream call failed."

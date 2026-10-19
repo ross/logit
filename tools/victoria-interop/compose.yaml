@@ -1,6 +1,6 @@
 # The stack `script/victoria-interop` drives: VictoriaMetrics, VictoriaLogs, VictoriaTraces,
-# vmagent, and one `logit` per leg from the release image. See README.md here, and
-# docs/plans/victoriametrics-interop.md's "W1's legs" for what each leg proves.
+# vmagent, and one `logit` per leg from the release image. See README.md here, "The legs", for
+# what each leg proves.
 #
 # `script/victoria-interop` runs this under the compose project `victoria-interop` with an
 # `--env-file` it writes, which sets:

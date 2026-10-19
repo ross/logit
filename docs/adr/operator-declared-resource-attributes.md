@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-10-14
+updated: 2026-10-18
 ---
 
 # Operator-declared resource attributes: a `set` transform, not a per-input config field
@@ -14,8 +14,8 @@ PR #60 settled a rule for `internal`'s own telemetry: `service.name` names the p
 telemetry, not the source of ingested data — `syslog_in`/`statsd_in` must not invent one for
 traffic they merely receive (`docs/design/internal-telemetry.md`'s "Resource identity" section).
 That's correct as far as it goes, but it left a real gap: **nothing in `logit` lets an operator
-declare a resource identity either.** `docs/plans/otlp-logs-and-resource-identity.md`'s workstream
-A found this while investigating a Loki-direct log leg for the demo — every OTLP-native backend
+declare a resource identity either.** Investigating a Loki-direct log leg for the demo found
+this — every OTLP-native backend
 keys behavior off resource attributes (Loki's `index_label` action, for one, applies only to
 resource attributes, never log-record ones), so `syslog_in` traffic with no configured identity
 reaches such a backend as `{service_name="unknown_service"}`, indistinguishable from every other
@@ -108,9 +108,12 @@ never touches it costs nothing. `docs/design/lua-api.md` has the full contract.
   approximation is gone — [ADR `lua-flush-root-context`](lua-flush-root-context.md) resets
   `resource` to empty before every `flush()`, so a write inside `flush()` is now the *only* way a
   flush-driven emission carries a resource.)
-- Demo-stack workstream B (`docs/plans/otlp-logs-and-resource-identity.md`) landed on this: the
-  demo's log leg now sets `service.name`/`service.namespace` via `set`, giving Loki real index
-  labels with no `demo/loki/loki.yaml` change (both are already in Loki's default index-label set).
+- The demo's Loki-direct log leg landed on this: it sets `service.name`/`service.namespace` via
+  `set`, giving Loki real index labels with no `demo/loki/loki.yaml` change. Both are already in
+  Loki's default index-label set, which also holds `service.instance.id`,
+  `deployment.environment`, `deployment.environment.name`, `cloud.region`,
+  `cloud.availability_zone`, and a run of `k8s.*` keys and `container.name`. Every other resource
+  attribute becomes structured metadata, never a label, unless `otlp_config` says otherwise.
 - `otlp_in` gets no special treatment and needs none: an operator simply doesn't put a `set` after
   it, since it already carries a real resource off the wire.
 

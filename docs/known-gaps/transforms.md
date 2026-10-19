@@ -262,7 +262,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   behind a public IP, while the lean `access_semconv` format (`fixtures/nginx/nginx.conf`) sizes
   its fixed fields well under nginx's syslog message cap.
 
-  Measured against nginx 1.31.4 (`docs/plans/nginx-integration.md`): under default settings an
+  Measured against nginx 1.31.4: under default settings an
   oversized `Host` never reaches nginx's syslog writer. `large_client_header_buffers` (4 8k by
   default) rejects any request whose request line plus headers exceed ~8180 bytes with a 400
   *before* nginx builds a log line, and every `Host` value nginx will log (measured up to 8180

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-21
-updated: 2026-09-21
+updated: 2026-10-18
 ---
 
 # Event sizing: `AttrMap`'s inline capacity stays 8, and attribute maps are not pre-sized
@@ -13,8 +13,7 @@ Accepted
 [`docs/design/memory.md`](../design/memory.md) §8 deferred two sizing questions — `AttrMap`'s
 inline capacity (8 entries × 48 B, 384 B of every 864 B `Event`) and whether to go further —
 until a real distribution of event shapes existed. [`docs/design/data-shapes.md`](../design/data-shapes.md)
-supplied one, and [`docs/plans/event-sizing.md`](../plans/event-sizing.md) turned it into a
-bake-off: fixtures and scenarios at the surveyed widths, instruments for the allocation-versus-copy
+supplied one, and a plan turned it into a bake-off: fixtures and scenarios at the surveyed widths, instruments for the allocation-versus-copy
 ratio, candidate designs as real binaries and as bench mirrors, all measured on the perf VM
 ([ADR `disposable-azure-perf-vm`](disposable-azure-perf-vm.md)) before anything was decided.
 
@@ -121,6 +120,126 @@ VM (8 × AMD EPYC 9V74, 2026-09-21); run-to-run spread was 0.4–6%, round-to-ro
   faster; no clone candidate won at realistic string shares. **None of this is evidence for
   adoption.** The central lesson of this workstream is that a micro-benchmark win (arm P had one)
   did not predict the pipeline; these numbers say where a future prototype might look, no more.
+
+## Bake-off arms and instruments
+
+The bake-off replaced "X% of events allocation-free", which pools a bimodal population into one
+number and optimizes allocation count, a proxy that inverts against copy cost at this magnitude,
+with three pinned invariants:
+
+- **I1.** A metric-class event costs 0 attribute allocations. True today; defended.
+- **I2.** A log, span, or access-log event costs at most one attribute allocation, sized to fit,
+  per building stage, with no realloc chain, at any width. False today past 16 attributes.
+- **I3.** `size_of::<Event>()` changes only on a measured per-signal-class CPU µs/event result,
+  clone-inclusive, on the perf VM, with no class regressing beyond noise.
+
+The arm letters that bench sources and comments cite are:
+
+- **P: exact and learned pre-sizing.** `AttrMap::reserve`/`with_capacity` plus a bulk build from a
+  sortable scratch, which also retires the O(k²) build. Count-knowing decoders reserve their count;
+  `json`/`logfmt`/`kv` reserve at the merge; declared-width components (`csv`, `regex`, `set`,
+  `keep`, prometheus, collectd) reserve at construction; anything else keeps a per-instance
+  high-water hint. No config, no representation change, and a wrong guess degrades to today's
+  behavior.
+- **S: static N sweep.** N of 0 (heap-only, `Event` under 500 B), 4, 8, and 16, each with P
+  applied. Pre-registered kill criterion: N=16 costing the statsd leg 5% or more CPU µs/event ends
+  large static N.
+- **E: per-embedding N** (`AttrMap<const N: usize>`). `Scope`, `Resource`, `SeriesKey`,
+  `Value::Map`, `SpanEvent`, and `SpanLink` each sized independently of `Event`'s own map. No kill
+  criterion; the const-generic question was answered as an assessment of how many signatures and
+  crates it would ripple through, not an implementation. `Resource` is `Arc`-shared per batch, so P
+  alone may be the answer for it.
+- **K: shared key-set plus a values vector**, bench-only. A per-source learned `Arc<KeySet>`,
+  looked up once per event at the merge. The case against: interned 4-byte symbols already banked
+  most of the win, and clone cost barely moves. Pre-registered kill criterion: a win under 10% on
+  the 12-attribute log's build plus clone, against P's bulk build, drops it. It also had to hold
+  on the 196-key-set gateway shape and preserve sorted-`Symbol` `iter()` and borrowed `&Value`
+  (`attrs::merged`, `SeriesKey`, `keep`, the native encoder, Lua's `AttrsProxy`).
+- **R: recycling the batch `Vec<Event>`** (864 KB at 1000 events: a jemalloc large allocation,
+  freed cross-thread). Orthogonal to the rest and measured as an add-on. Not spill pooling, because
+  jemalloc's thread cache already covers small same-size allocations.
+- **C: the clone path**, added during the bake-off. The clone, not the build, is what a fan-out
+  pays, and `AttrMap::clone` measured an order of magnitude over its byte cost. Four candidate
+  replacements for `SmallVec`'s element-at-a-time clone: a write loop sized to fit, a one-branch
+  scalar clone, a detected bitwise copy, and a per-map "every value is a scalar" flag, plus floor
+  and measurement-shape controls. No kill criterion: it either explains the clone cost with a fix
+  or shows the number was an artifact.
+
+Arms K, E, and C are bench-only mirrors under `crates/logit-bench/src/bakeoff/attr_arms/`, built
+on the native-wire-format bake-off's pattern: a local mirror of the shipped type, every
+simplification stated in the mirror's module doc, nothing changed in `logit-core`.
+`crates/logit-bench/tests/attr_arms.rs` gates the timings: every arm must produce the same sorted
+`(Symbol, Value)` sequence the shipped `AttrMap` does from the same input, duplicate keys included
+(last write wins). Writing it showed that a bulk build equals repeated `insert` only if it sorts
+stably and collapses each run of equal keys to its last entry, which `size_vs_alloc.rs`'s simpler
+`append_then_sort` mirror does not do.
+
+**Fixtures (W1).** `crates/logit-bench/src/fixtures.rs` holds six survey-derived shapes: a
+12-attribute flat JSON log, a pino-http nested record, a 17-attribute server span, a 30-field access
+log, a 3-record collectd event, and a 17-attribute resource over a 5-event batch. Each cites the
+survey row it models and says what is modelled rather than captured.
+`perf/scenarios/json-parse-{app-log,nested-log,access-log}.yaml` render the same bodies through
+`generate_in`. Two results shaped the later work:
+
+- A spilled `AttrMap` clones in one allocation whatever its width, so allocation count barely
+  separates the 12-attribute and 30-attribute logs.
+- The nested 10-attribute pino-http record costs five allocations to build and five to clone, more
+  than either flat log. The allocation-count proxy inverts on measured shapes, not only in
+  principle.
+
+**Instruments (W2).** None changed production code.
+
+- `crates/logit-bench/benches/size_vs_alloc.rs` isolates the allocation-versus-copy ratio under real
+  jemalloc installed as that bench binary's own `#[global_allocator]` ([ADR
+  `jemalloc-global-allocator`](jemalloc-global-allocator.md)), not `benches/pipeline.rs`'s
+  `divan::AllocProfiler`, which wraps the system allocator and counts every request from inside the
+  timed region. That is the right trade for an allocation-count bench and the wrong one when the
+  cost of an allocation is the question, so the file reports no allocation column. Its six groups
+  are an alloc/free pair at the sizes `AttrMap`'s ladder asks for (432, 576, 768, 1440, 1536, 3072
+  bytes), same-thread and cross-thread in steady state; the 768, 1536, 3072 realloc ladder against
+  one exact allocation; today's sorted `insert` against an append-then-sort mirror at k of 9, 12,
+  17, and 30; one `Event`-sized move at each candidate `size_of::<Event>()` (496 to 1632, a padded
+  struct); a 1000-event batch scan at each stride over 8 rotated batches, plus dropping and cloning
+  the batch buffer; and `AttrMap::clone` inline (8) against spilled (9, 12).
+- `logit-perf flamegraph --folded PATH` tees `inferno-collapse-perf`'s output beside the SVG, and
+  `perf/folded_share.py` reports the share of samples whose stack contains a jemalloc, memcpy,
+  `AttrMap`/`SmallVec`, drop-glue, clone, interner, or `serde_json` frame. It counts containment
+  once per stack, so the groups overlap.
+
+To reproduce on the perf VM (`script/vm up`, then in the checkout there):
+
+```sh
+# 1. The micro-benches, pinned to one core.
+taskset -c 2 cargo bench -p logit-bench --bench size_vs_alloc
+
+# 2. Share of samples under the allocator, per scenario.
+for s in json-parse-app-log json-parse-nested-log json-parse-access-log passthrough; do
+    script/perf flamegraph --scenario "$s" --folded "perf/results/$s.folded"
+done
+python3 perf/folded_share.py perf/results/*.folded
+python3 perf/folded_share.py perf/results/passthrough.folded --explain alloc
+
+# 3. Arms C, E, and K, then their allocation counts.
+taskset -c 2 cargo bench -p logit-bench --bench attr_arms
+cargo nextest run -p logit-bench --test attr_arms --no-capture
+```
+
+Two caveats apply to anything these produce:
+
+- `perf stat` measures the whole process, and divan's per-stride setup (8 batches of 1000
+  elements) dominates it. Attributing cache counters to the scan alone needs `perf record -e
+  cache-misses` plus symbol filtering. Azure's guest exposes no virtualized PMU ([ADR
+  `disposable-azure-perf-vm`](disposable-azure-perf-vm.md)), so on the VM the cache counters can
+  read `<not supported>`, and the stride comparison has to come from the micro-bench's own timings.
+- The `memmove` column reads 0.00% on every capture, because LLVM inlines `Event`-sized copies into
+  SIMD stores attributed to their caller. The release binary never calls libc `memcpy`, so the copy
+  side of the ratio is invisible to a flamegraph by construction. That is why the micro-bench
+  exists.
+
+Pre-sizing was built for real on two branches (`sizing/w3a`, #270, and `sizing/w3c`, #272) and
+both are closed unmerged. An independent review of the first found no correctness bug but found
+that eager reservation spilled maps that fit inline, which became a lazy reservation. Neither
+survived the VM session.
 
 ## Consequences
 

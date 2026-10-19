@@ -1,10 +1,10 @@
-# The demo's app tier (docs/plans/demo-tracing-stack.md): a real Django app, served by gunicorn,
+# The demo's app tier: a real Django app, served by gunicorn,
 # that also runs as the Celery `worker` and the one-shot `app-migrate` (demo/compose.yaml).
 #
 # **The `bundle` stage below is the demo's only client-side build step.** Everything else in this
 # stack is either a stock image or a `pip install` against PyPI, so `docker compose up --build`
 # needs npm registry access for this stage, on top of PyPI/crates.io/apt
-# (docs/plans/browser-tracing.md; demo/README.md's "Quick start").
+# (docs/adr/browser-tracing-sdk.md; demo/README.md's "Quick start").
 
 # Bundles browser/telemetry.js (the real @opentelemetry/sdk-trace-web SDK, not a hand-rolled
 # script) into one minified file with esbuild: a single static Go binary pulled from npm with no

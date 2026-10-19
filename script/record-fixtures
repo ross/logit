@@ -9,7 +9,7 @@
 #
 # Captures wire traffic from real third-party producers into testdata/interop/, so decoders are
 # checked against real senders, not only against a reading of the spec. See
-# docs/plans/recorded-interop-fixtures.md. Review `git diff --stat testdata/interop/` (or
+# testdata/interop/README.md. Review `git diff --stat testdata/interop/` (or
 # `git status`, for a new fixture) and commit.
 #
 # Not part of script/cibuild: recording pulls live third-party images and isn't deterministic.
@@ -84,7 +84,7 @@ cleanup() {
 # ---- producers ----------------------------------------------------------------------------------
 
 # logger(1) from util-linux; busybox's applet can't send to a remote server (see
-# docs/plans/recorded-interop-fixtures.md's "Findings worth recording" section). Three messages:
+# testdata/interop/README.md's "Findings worth recording" section). Three messages:
 # RFC 3164, RFC 5424, and RFC 3164 with UTF-8 multibyte content.
 record_logger() {
     echo "== recording: logger(1) (util-linux, debian:bookworm-slim) =="
@@ -126,7 +126,7 @@ record_python_syslog_handler() {
 
 # rsyslog, forwarding one message over UDP. There's no official rsyslog image, so this installs
 # Debian's `rsyslogd` package into debian:bookworm-slim at record time (see
-# docs/plans/recorded-interop-fixtures.md's "Findings worth recording" section). The apt layer
+# testdata/interop/README.md's "Findings worth recording" section). The apt layer
 # adds 20-30s and can flake; if it stops working reliably, drop this producer from `all`.
 record_rsyslog() {
     echo "== recording: rsyslog =="
@@ -163,7 +163,7 @@ record_rsyslog_tcp() {
 # Three datagrams: the `network` plugin packs value lists until the next wouldn't fit under
 # `MaxPacketSize` (1452), eliding repeated identity parts, so three datagrams capture that elision
 # and a read cycle split across a datagram boundary. The capture stops on its count, so no
-# shutdown flush is in the corpus (docs/plans/recorded-interop-fixtures.md's collectd amendment).
+# shutdown flush is in the corpus (testdata/interop/README.md's "Findings worth recording").
 # The 90s timeout covers the apt-get install.
 #
 # The `threshold` notification is a second capture under the `collectd-notification` prefix, so

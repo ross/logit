@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-10-05
+updated: 2026-10-18
 ---
 
 # Native transport: handshake, implicit sequencing, and per-batch acknowledgement
@@ -28,9 +28,8 @@ past its decode budget, which is now a rejected `Ack` naming the frame, with the
 [ADR `native-wire-format-encoding`](native-wire-format-encoding.md) settled the payload format;
 [`docs/design/wire-protocol.md`](../design/wire-protocol.md) sketched the connection protocol's
 shape (TCP, TLS via `rustls`, a version/codec/compression handshake, credit-based flow control) but
-left it as future work. `docs/plans/native-transport.md` is the enabling plan that turned that
-sketch into `logit_in`/`logit_out`, real, running `ComponentKind`s. This ADR records the specific
-choices that plan made and this repo now runs, per `AGENTS.md`'s "don't pick a design in passing
+left it as future work. `logit_in`/`logit_out` turned that sketch into real, running
+`ComponentKind`s. This ADR records the specific choices this repo now runs, per `AGENTS.md`'s "don't pick a design in passing
 while implementing something else, record the outcome as an ADR" rule — those choices are narrow
 enough (how one connection's frames are numbered and acknowledged) not to need their own design
 doc, but consequential enough to want a yes/no record of what was decided.
@@ -300,9 +299,9 @@ recognizes a resend and doesn't forward it.
 
 "Sequence numbers are implicit" and the rejected alternative "An explicit `seq` field on every
 data frame" describe the wire as built. A follow-up record decides the new layout and supersedes
-both: [ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md). Until its
-implementation lands (`docs/plans/delivery-semantics.md`, W5), `Ack.seq` counts frames on one
-connection and restarts on a reconnect, and `logit_in` forwards a resend.
+both: [ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md). Before that
+record's implementation, `Ack.seq` counted frames on one connection and restarted on a
+reconnect, and `logit_in` forwarded a resend.
 
 "Ack point" keeps its rule for a frame above its sender's mark, and that record's item 3 adds
 that `logit_in` doesn't acknowledge a batch no consumer took. The follow-up record adds the

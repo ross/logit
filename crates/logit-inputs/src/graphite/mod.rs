@@ -1256,7 +1256,7 @@ mod tests {
     // ---- recorded interop fixtures (testdata/interop/graphite/) --------------------------------
     //
     // Real producers' bytes, recorded by `script/record-fixtures graphite`; provenance in
-    // testdata/interop/graphite/README.md, rationale in docs/plans/recorded-interop-fixtures.md.
+    // testdata/interop/graphite/README.md, rationale in testdata/interop/README.md.
     // Both producers write `logit-fixture.`-prefixed paths (collectd's `Hostname`, the Python
     // producer's hard-coded prefix). Assertions are on decoded values, never raw bytes. They
     // live here, not in `logit-proto`, because this is the component an operator points a real

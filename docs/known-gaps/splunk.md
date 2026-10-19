@@ -4,8 +4,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 - **No Splunk-to-Splunk (S2S) listener.** A universal forwarder speaks only S2S, over `:9997` or
   `[httpout]` to `/services/collector/s2s`, and the protocol has no public specification: Splunk
-  9.1+ requires v4, the open implementations stop at v3, and Cribl's is proprietary
-  ([plan §9](../plans/splunk-relay.md#9-not-in-this-stack)).
+  9.1+ requires v4, the open implementations stop at v3, and Cribl's is proprietary.
   - **Consequence:** a universal forwarder can't point at `logit`, so a forwarder-fed Splunk
     can't be teed through `splunk_hec_in`.
   - **Workaround:** a heavy forwarder's `outputs.conf [syslog]` stanza into `syslog_in` (RFC 3164
@@ -32,10 +31,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   describe the HEC destination only for Splunk targets, with acknowledgment off on the destination
   token. Edge Processor runs in Splunk Cloud and in a Splunk Enterprise 10.x edition that the
   `splunk/splunk` image isn't, so the Enterprise runs exercised none
-  ([plan, "Settled by W5"](../plans/splunk-relay.md#settled-by-w5-2026-09-25), item 3). The Splunk
-  Cloud trial stack has none provisioned either, because enabling it takes Splunk's support or
-  account team
-  ([plan, "Settled by the Cloud run"](../plans/splunk-relay.md#settled-by-the-cloud-run-2026-09-26),
+  ([ADR `splunk-hec-relay`, "Splunk Enterprise 10.4.3"](../adr/splunk-hec-relay.md#splunk-enterprise-1043-2026-09-25),
+  item 3). The Splunk Cloud trial stack has none provisioned either, because enabling it takes
+  Splunk's support or account team
+  ([ADR `splunk-hec-relay`, "Splunk Cloud Platform 10.5.2605.9"](../adr/splunk-hec-relay.md#splunk-cloud-platform-10526059-2026-09-26),
   item 8). Ingest Processor sends only to Splunk indexes, S3, and Observability Cloud, so it has no
   destination that reaches `logit`.
   - **Consequence:** the one Splunk-side HEC sender that could tee a forwarder-fed Splunk into
@@ -45,7 +44,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **Acknowledgment on Splunk Cloud depends on the stack.** Splunk documents HEC indexer
   acknowledgment on Splunk Cloud Platform only for its Firehose path, but the 10.5.2605.9 trial
   stack offered it on its tokens and acknowledged `splunk_hec_out`'s requests with none timed out
-  ([plan, "Settled by the Cloud run"](../plans/splunk-relay.md#settled-by-the-cloud-run-2026-09-26),
+  ([ADR `splunk-hec-relay`, "Splunk Cloud Platform 10.5.2605.9"](../adr/splunk-hec-relay.md#splunk-cloud-platform-10526059-2026-09-26),
   item 3). A customer stack may differ, so `ack: true` stays opt-in. Against a token that doesn't
   acknowledge, each request counts as delivered on its `200`, and
   `logit.output.acks{result="unsupported"}` counts it.
@@ -108,8 +107,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** a `Retry-After`-carrying sink that needs it honored, which would give
     `Fault` or `deliver_with_retry` a delay hint every HTTP sink could use.
 - **Four `splunk_hec_out` behaviors Vector's HEC sinks have are deferred.** A comparison with
-  Vector's `splunk_hec_logs` and `splunk_hec_metrics` sinks
-  ([plan, "What's left"](../plans/splunk-relay.md#whats-left)) found them, and none has a user yet:
+  Vector's `splunk_hec_logs` and `splunk_hec_metrics` sinks on 2026-09-25 found them, and none
+  has a user yet:
   - acknowledgment blocks a batch until its ids are acknowledged, within `ack_timeout` (30 s),
     where Vector keeps a window of pending batches for up to 300 s;
   - every attribute becomes an indexed field in `fields`, as the OTel exporter writes it, where
@@ -129,8 +128,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   10.4.3 showed `/event` runs a sourcetype's `TRANSFORMS-*` (index routing, sourcetype renaming)
   and skips only timestamp extraction, which `/event?auto_extract_timestamp=true` restores
   (`tools/splunk-interop/README.md`, "What the run showed"). So a `/raw` egress mode would add
-  only line-breaking props, and the follow-up is that query parameter, not `/raw`
-  ([plan, "Reassessed: `/raw` egress"](../plans/splunk-relay.md#reassessed-raw-egress)).
+  only line-breaking props, at the cost of a partition by envelope and a second encoding, and the
+  follow-up is that query parameter, not `/raw`.
   - **Consequence:** Splunk indexes what `splunk_hec_out` sends at the event's own `time`, never
     at a time its sourcetype's `TIME_PREFIX`/`TIME_FORMAT` would extract from the text.
   - **Revisit trigger:** a user whose sourcetype's extracted time should win over the event's.

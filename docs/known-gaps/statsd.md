@@ -24,9 +24,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `logit.output.metrics.skipped{metric_kind}` with a throttled `unsupported_metric_kind`
     warning.
 
-  Tracked as debt against [ADR `lossless-transit`](../adr/lossless-transit.md); the closing
-  assessment's residual-debt list is in
-  [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md).
+  Tracked as debt against [ADR `lossless-transit`](../adr/lossless-transit.md)'s "Residual debt".
 
 - **`statsd_out` has no `unit` and no metric renaming/prefixing, and carries an egress timestamp
   only on a `|T`-marked line.**
@@ -47,9 +45,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `event.metrics[i].name` is writable on every kind (`docs/design/lua-api.md`'s "Reading and
     writing `event.metrics`").
 
-  Tracked as debt against [ADR `lossless-transit`](../adr/lossless-transit.md); the closing
-  assessment's residual-debt list is in
-  [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md).
+  Tracked as debt against [ADR `lossless-transit`](../adr/lossless-transit.md)'s "Residual debt".
 
 - **Relative gauge adjustments: three by-design residuals.** `statsd_in` decodes a leading `+`/`-`
   on a `g` value into an unresolved `MetricKind::GaugeDelta`. `aggregate` resolves it against its

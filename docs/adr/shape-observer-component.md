@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-10-16
+updated: 2026-10-18
 ---
 
 # `shape`: an observer component that turns each event into measurements of its own shape
@@ -12,8 +12,8 @@ Accepted
 ## Context
 
 [`docs/design/memory.md`](../design/memory.md) §8 defers two inline-capacity decisions as needing
-"a real distribution of attribute/metric counts," and
-[`docs/plans/data-shape-survey.md`](../plans/data-shape-survey.md) is the effort to collect one. A
+"a real distribution of attribute/metric counts," and the survey recorded in
+[`docs/design/data-shapes.md`](../design/data-shapes.md) is the effort to collect one. A
 survey needs an instrument, and nothing in the repo could be one: `internal` reports how the
 *pipeline* behaves, not what the events flowing through it look like; `logit-perf attribute` folds
 `internal`'s own points, keyed on a `component` attribute only those carry; a `lua` stage can read

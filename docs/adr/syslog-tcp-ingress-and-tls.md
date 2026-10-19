@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-16
+updated: 2026-10-18
 ---
 
 # `syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS
@@ -337,6 +337,29 @@ a differently-shaped metric for the same event.
   rsyslog-tcp-000.raw`) closes `testdata/interop/syslog/README.md`'s existing "TCP framing... not
   covered (yet)" note. TLS interop is proven in-process against `testdata/tls/`, the same way
   `logit_in`/`logit_out`'s own TLS tests are, rather than via a second recorded fixture.
+
+## Verification against a real forwarder
+
+A manual run on 2026-09-14 pointed rsyslog 8.2302.0 (Debian bookworm's package, with
+`rsyslog-gnutls` for the `gtls` netstream driver) at a TLS `syslog_in`
+(`transport: tcp`, `tls:` over `testdata/tls/server.*`) feeding `stdio_out`. Each run sent two
+`logger` messages:
+
+- **TLS, default LF framing** (`omfwd` with `StreamDriver="gtls"`, `StreamDriverMode="1"`,
+  `StreamDriverAuthMode="x509/certvalid"`, `DefaultNetstreamDriverCAFile` set to
+  `testdata/tls/ca.pem`): the handshake completed, both messages arrived intact with correct
+  `syslog.*` attributes, and the listener logged one `connection_error` at teardown (the peer
+  closed without a TLS `close_notify`) and dropped the connection. `x509/name` wasn't reachable
+  because the server certificate's SANs (`localhost`, `127.0.0.1`) don't cover the container's
+  hostname; `x509/certvalid` still validates the chain, which `anon` doesn't.
+- **TLS, `TCP_Framing="octet-counted"`:** both messages arrived byte-correct and in order with no
+  framing diagnostic. A mis-parsed octet count would have desynchronized the stream or raised a
+  framing error.
+- **Plaintext TCP control:** both messages arrived with no diagnostics.
+
+`logger` escapes an embedded newline (`\n` becomes `#012`) before `omfwd` sees it, so this setup
+can't distinguish the two framings by an embedded-newline probe. The round-trip tests in
+`crates/logit-cli/tests/syslog_round_trip.rs` cover a multiline octet-counted message.
 
 ## Amendment: the driver serves more than one listener now (2026-09-14)
 

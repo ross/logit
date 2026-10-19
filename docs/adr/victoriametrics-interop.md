@@ -1,6 +1,6 @@
 ---
 created: 2026-09-24
-updated: 2026-09-24
+updated: 2026-10-18
 ---
 
 # VictoriaMetrics interop: existing components, plus zstd on Prometheus remote-write
@@ -16,9 +16,8 @@ v2, Graphite plaintext, OpenTSDB, DataDog and New Relic series, and OTLP metrics
 VictoriaLogs adds syslog, Loki push, Elasticsearch bulk, OTLP logs, and JSON lines.
 VictoriaTraces takes OTLP traces over HTTP and gRPC and nothing else. Every one of those wires is
 one `logit` already speaks, so each of the three products is reachable today with no new
-component. [`docs/plans/victoriametrics-interop.md`](../plans/victoriametrics-interop.md)'s
-"What VictoriaMetrics accepts and emits" section is the survey; its "Coverage by signal" table
-maps every surface to the component that serves it.
+component. [Verified behavior](#verified-behavior) below is the survey of what each product
+accepts and emits, checked against the real software.
 
 Two of VictoriaMetrics's wires are its own:
 
@@ -136,6 +135,92 @@ Compression is a sink-configured transport choice, so under
   is outside `script/cibuild`, like `script/shape-survey`. The recorded vmagent requests it
   captures, on the zstd wire and the Snappy one, join `testdata/interop/prometheus/` and the interop test
   that replays that corpus.
-- Every remaining unknown, from vmagent's header requirements to what VictoriaMetrics does with
-  a delta OTLP sum, is listed in the plan's "Unverified, settled by W1" section and
-  answered there, not here.
+- [Verified behavior](#verified-behavior) records the answers to every unknown, from vmagent's
+  header requirements to what VictoriaMetrics does with a delta OTLP sum.
+
+## Verified behavior
+
+Surveyed 2026-09-24 from `docs.victoriametrics.com` and the VictoriaMetrics repository, and
+checked against VictoriaMetrics and vmagent v1.152.0, VictoriaLogs v1.52.0, and VictoriaTraces
+v0.11.1 by `script/victoria-interop`. "Leg N" is a row in
+[`tools/victoria-interop/README.md`](../../tools/victoria-interop/README.md)'s "Recorded run".
+
+### VictoriaMetrics
+
+Single-node listens on `:8428`, vmagent on `:8429`, and a cluster's `vminsert` on `:8480` under
+`/insert/<accountID>[:<projectID>]/prometheus/...` (from v1.143.0,
+`-enableMultitenancyViaHeaders` takes `AccountID` and `ProjectID` headers instead).
+
+| Ingest | Behavior |
+|---|---|
+| `POST /api/v1/write` | Remote-write 1.0, Snappy. Remote-write 2.0 isn't supported and isn't refused: v1.152.0 answers it `204` with an empty body and stores nothing, with nothing logged and `vm_http_request_errors_total` unchanged (leg 2). Native histograms are accepted (v1.143.0+) and converted to `vmrange` series |
+| The VictoriaMetrics remote write protocol | The 1.0 `WriteRequest` with `Content-Encoding: zstd` and `X-VictoriaMetrics-Remote-Write-Version: 1`. vmagent sends it first and, on a `415` or `400`, repacks the block as Snappy and stays on Snappy for that remote (`-remoteWrite.forceVMProto` disables the downgrade, `-remoteWrite.forcePromProto` the attempt; `app/vmagent/remotewrite/client.go`). VictoriaMetrics requires no version header and ignores `X-Prometheus-Remote-Write-Version` on a zstd body. It doesn't choose a decompressor from `Content-Encoding`: a zstd body labelled `snappy` or unlabelled, and a Snappy body labelled `zstd`, are all stored with a `204` (the probes). So `RESERVED_REMOTE_WRITE_HEADERS` needs no VictoriaMetrics header |
+| `POST /api/v1/import` | JSON lines with parallel `values` and `timestamps` arrays, millisecond timestamps, gzip accepted |
+| `POST /api/v1/import/native` | VictoriaMetrics's binary format, unstable between releases |
+| `POST /api/v1/import/prometheus`, `/api/v1/import/csv` | Prometheus text exposition; CSV columns mapped by `format=` |
+| `POST /write`, `POST /api/v2/write` | InfluxDB line protocol. The metric name is `<measurement>_<field>`, tags become labels, and timestamp precision is auto-detected and truncated to ms. `org` and `bucket` become no label (leg 4); `db` is read only from `/write?db=` (`-influxDBLabel`), which `influxdb_out` doesn't send. A bool is stored as 1/0 and a string field as `0`, and an exact duplicate point as a second sample at the same timestamp (leg 11) |
+| `-graphiteListenAddr` | Carbon plaintext over TCP and UDP, off by default; `;tag=value` segments become labels (leg 5). No pickle: `-help` has no pickle flag, so `graphite_out` stays `protocol: plaintext` |
+| `-opentsdbListenAddr`, `-opentsdbHTTPListenAddr` | OpenTSDB telnet `put` and HTTP `/api/put` |
+| `/datadog/api/v1/series`, `/datadog/api/v2/series`, `/datadog/api/beta/sketches` | Datadog series and sketches; no `/datadog/intake` |
+| `POST /newrelic/infra/v2/metrics/events/bulk` | New Relic infrastructure events |
+| `POST /opentelemetry/v1/metrics` | OTLP metrics over HTTP only, gzip accepted; `-help` has no gRPC flag. A delta `Sum` is stored as its raw points, so `rate()` and `increase()` over it are wrong (leg 6). An `ExponentialHistogram` becomes `_bucket` series with a `vmrange` label (the zero bucket as `-0.000e+00...0.000e+00`) plus `_count` and `_sum`. An empty OTLP scope gains `scope.name="unknown"` and `scope.version="unknown"` labels (`-opentelemetry.promoteScopeMetadata`), and `service.name` becomes a label |
+
+Limits: `-maxLabelsPerTimeseries` defaults to 40 (a series over it is dropped and counted in
+`vm_rows_ignored_total`), `-maxLabelValueLen` to 4 KiB, and `-maxLabelNameLen` to 256 bytes
+(counted `vm_rows_ignored_total{reason="too_long_label_name"}`). There's no metric-name flag:
+the name is the `__name__` label's value.
+
+Data model: a series is a label set, a millisecond timestamp, and a float, with no stored metric
+type, so `_bucket`, `_sum`, and `_count` are ordinary series told apart by name. `HELP`, `TYPE`,
+and `UNIT` are ignored, and exemplars aren't stored. Stale markers are honored and exported as
+JSON `null`. Out-of-order samples and backfill are accepted with no flag. Histograms use a fixed
+log-spaced bucket set under `vmrange`, each bucket holding its own count rather than a cumulative
+`le` count; MetricsQL's `prometheus_buckets()` bridges the two. Floats lose precision past about
+12 significant digits.
+
+| Egress | Behavior |
+|---|---|
+| `GET /api/v1/export` | The `/api/v1/import` JSON-lines shape; `match[]` required; bounded by `-search.maxExportDuration`. `/api/v1/export/csv` and `/api/v1/export/native` are CSV and the unstable binary format |
+| `GET /federate` | Prometheus text exposition for `match[]` (or `match`) with no `# TYPE` or `# HELP`: the last point of each series in the window, with its millisecond timestamp. It also takes `start`, `end`, `max_lookback` (default `5m`, or `step` under `-search.setLookbackToStep`), `extra_label`, `extra_filters[]`, and `timeout`, and returns at most `-search.maxFederateSeries` series (`app/vmselect/prometheus/prometheus.go`'s `FederateHandler`). `prometheus_in` scrapes it as-is, each series a `Gauge` tagged `prometheus.type="untyped"` with its wire timestamp kept (leg 9) |
+| `/api/v1/query`, `/api/v1/query_range` | MetricsQL, a PromQL superset with different `rate` and `increase` extrapolation |
+| vmagent `-remoteWrite.url` | Remote-write 1.0 to any receiver, zstd first as above; `-streamAggr.config` pre-aggregates by rule |
+
+### VictoriaLogs
+
+Listens on `:9428`. Ingest: `/insert/jsonline` (NDJSON), `/insert/elasticsearch/_bulk`,
+`/insert/loki/api/v1/push` (JSON confirmed; protobuf unverified, since no leg sends it),
+`/insert/opentelemetry/v1/logs` (HTTP protobuf only; no gRPC flag), syslog through
+`-syslog.listenAddr.tcp`, `.udp`, and `.unix` (RFC 3164 and 5424 auto-detected, octet counting
+and non-transparent framing both accepted, TLS through `-syslog.tls*`), Datadog logs, journald,
+and the unstable `/insert/native`.
+
+A record has `_msg` (required; `-defaultMsgValue` fills an absent one), `_time` (ingest time when
+absent), and `_stream`, the label-style rendering of the stream fields. Query parameters or
+`VL-*` headers set the field mapping per request, the query string winning: `VL-Msg-Field`,
+`VL-Time-Field`, `VL-Stream-Fields`, and `VL-Ignore-Fields`, plus `extra_fields`,
+`decolorize_fields`, and `preserve_json_keys`. An OTLP log body maps to `_msg` with no
+`VL-Msg-Field` (leg 6), and an empty scope gains `scope.name` and `scope.version` of `unknown`.
+Query is `/select/logsql/query` (also the export path) and `/select/logsql/tail`; there's no push
+egress.
+
+### VictoriaTraces
+
+Not GA ("currently a work in progress"; first release 2025-07-28). Ingest is OTLP only:
+`/insert/opentelemetry/v1/traces` over HTTP on `:10428`, and gRPC on `-otlpGRPCListenAddr`, off
+by default with `:4317` recommended. `-otlpGRPC.tls` defaults to `true` and then requires
+`-otlpGRPC.tlsCertFile` and `-otlpGRPC.tlsKeyFile`, so plaintext gRPC also needs
+`-otlpGRPC.tls=false`. The gRPC listener closes each connection about 5 s after it opens, with a
+TCP FIN and no HTTP/2 `GOAWAY` (leg 7). Query is the Jaeger HTTP API under `/select/jaeger/api/`,
+plus an experimental Tempo API; there's no push egress.
+
+### `ruzstd` 0.9.0
+
+Its frame-header reader sits in a `pub(crate)` module. What's reachable:
+`decoding::FrameDecoder::init(reader)` reads and validates one frame header without decoding a
+block, after which `content_size()` returns the declared content size (`0` when none);
+`set_max_window_size` caps the window (default 100 MiB), and a frame declaring more fails `init`
+with `FrameDecoderError::WindowSizeTooBig`. `StreamingDecoder` decodes one frame per instance,
+and `FrameDecoder::decode_all_to_vec` decodes every frame into memory with no bound. The encoder
+implements `CompressionLevel::Uncompressed` and `Fastest` only. vmagent's frames set
+`Single_Segment_Flag` and declare their content size. `logit_proto::prometheus::compression`'s
+three guards rest on these.

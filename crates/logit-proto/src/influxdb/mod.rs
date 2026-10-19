@@ -6,8 +6,8 @@
 //! tests, and examples point at.
 //! [ADR `influxdb-line-protocol-relay`](../../../../docs/adr/influxdb-line-protocol-relay.md) is
 //! the decision record; it carries the normalization list with identical numbering. The grammar
-//! below is what a real influxd 2.9.1 accepts, settled by probe; each [`line`] test cites its
-//! probe row.
+//! below is what a real influxd 2.9.1 accepts, settled by probe; each [`line`] test cites the
+//! ADR's "Verified `influxd` behavior" item that records it.
 //!
 //! ## Grammar
 //!

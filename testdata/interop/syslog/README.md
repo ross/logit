@@ -37,7 +37,7 @@ To regenerate, run `script/record-fixtures logger python-syslog-handler rsyslog 
 ## What isn't covered here (yet)
 
 - **syslog-ng.** Not attempted: there's no fixture and no harness support yet. See
-  `docs/plans/recorded-interop-fixtures.md`'s follow-on list.
+  [`../README.md`](../README.md#not-yet-recorded)'s "Not yet recorded".
 - **Octet-counted TCP framing** (RFC 6587 §3.4.1, rsyslog's `TCP_Framing="octet-counted"`). Only
   rsyslog's *default* non-transparent TCP framing is captured so far (`rsyslog-tcp-000.raw` above).
   A `record_rsyslog_tcp_octet_counted`-shaped producer (`rsyslog-tcp.conf` plus
