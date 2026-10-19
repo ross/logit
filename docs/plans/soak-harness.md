@@ -5230,6 +5230,48 @@ Overall PASS, every row PASS or SKIP.
 | `expect.router-copies-every-event` | PASS | delta of logit.component.events.copied{component=split} on logit, during c0s1: c0s1 (+60s, +150s]: 180,000 (over 18 drain(s)), want >= 100000 |
 | `expect.router-discards-nothing` | PASS | delta of logit.component.events.discarded{component=split} on logit, run: run (+60s, +780s]: 0 (over 131 drain(s)), want <= 0 |
 
+### W19: Kafka OAUTHBEARER with short-lived tokens (2026-10-19)
+
+Run `20261019T004958Z`: `kafka-oauth-reauth` at `--duration 20m`, from `soak/w19` at
+`e0372670`, on the development host, against `logit:soak` (`sha256:10a901b97a16`, built from
+that tree), `apache/kafka:4.2.0` (`sha256:9516fb7634ba`), and `mock-oauth2-server` 6.0.2 at its
+pinned digest. Overall PASS: every row passed but `ledger.windows` and `ledger.replay`, which
+SKIP on a Kafka target with no kill, and the rows for steps the scenario doesn't have.
+
+- **Nothing was lost or stored twice.** G, W, and V are each 2,413,200. `ledger.topic` read
+  6,040 distinct records, 0 duplicate copies, and T − A of 0. No batch was dropped.
+- **The fallback worked as predicted.** The endpoint stopped at +450 s. 12.7 s later a redial's
+  refresh failed and kept the cached token, "valid for another 8.998s", and the token's
+  diagnostic counted 1. 10 s after that, with the token expired, the dials began to fail
+  `Clean`: 15 `clean` attempts in the stop, `retrying` at 1, and the sink caught up 8 s after the
+  endpoint came back.
+- **The hung endpoint left nothing to fall back to.** In the pause, the first failure came
+  26.7 s in: a redial's token request timed out after the sink's 10 s `timeout`, with the
+  token expired by then. No `token_refresh_failed` was written, 7 attempts were `clean`, and the
+  sink caught up 14 s after the endpoint resumed.
+- **The sink renewed on schedule.** `reauth-rate` read 69.5 an hour (22 over 1,140 s), inside
+  [25, 220], and `no-expired-session-sends` read 6.3 an hour (2, the broker pauses'), under 20.
+  No attempt was `refused`.
+- **Every fault recovered within the 45 s bound**, the slowest the broker stop at 18 s. RSS
+  slopes were +0.3 MiB/h (SUT) and −0.3 MiB/h (generator), and descriptors went from 14 to 13
+  (SUT).
+
+Run `20261019T011140Z`: `kafka-oauth-reauth` at `--duration 1h`, from the same tree and images.
+Overall PASS, with only inapplicable SKIPs.
+
+- **Nothing was lost or stored twice.** G, W, and V are each 7,213,200, and `ledger.topic`
+  read 18,040 distinct records with 0 duplicate copies. Of 1,967 attempts, 158 were `clean`, 5
+  `ambiguous`, and none `refused`.
+- **Each of the 4 endpoint stops fell back once.** The diagnostic counted 1 in each. The
+  self-log shows 3 of them, 4.7 s to 8.7 s after the stop began, each with 9 s of the token
+  left: the warning is throttled to its 1st, 2nd, and 4th occurrence, which is why the scenario
+  reads the counter. The 4 pauses wrote none.
+- **The rates held.** `reauth-rate` read 66.1 an hour (65 over 3,540 s), and
+  `no-expired-session-sends` 5.1 an hour.
+- **Memory and descriptors stayed flat.** The SUT's `rss_slope` read +0.2 MiB/h over 25% of
+  the time after warmup, and its descriptors went from 14 to 14. All 22 faults recovered within
+  the bound, each endpoint fault in 8 s to 13 s.
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
@@ -5317,8 +5359,8 @@ Overall PASS, every row PASS or SKIP.
   and `logit validate` in its image. Met: its run is recorded under "Findings", Overall PASS.
 - **W19**: the self-test passes (2,088 expectations), and the `idp` namespace and
   `token_refresh_failed` fixtures fail with their rules reverted. `kafka-oauth-reauth` passes
-  `self-test` validation and the shipped-config test. Open: a 20-minute and a 1-hour run
-  recorded under "Findings".
+  `self-test` validation and the shipped-config test. Met: a 20-minute and a 1-hour run are
+  recorded under "Findings", each Overall PASS.
 
 ### `rss_settle`: a settle window for `rss_slope` (2026-10-18)
 
