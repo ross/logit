@@ -4,8 +4,8 @@
 
 # The class vocabulary, the canonical copy. A record-level row's class is one of exact,
 # normalized, degraded, skipped, or dropped, best to worst; a field-level row's (`record` rows for
-# unit, description, start_timestamp, and exemplars, and every `attributes` row) is one of exact,
-# normalized, or lost.
+# unit, description, start_timestamp, exemplars, and min_max, and every `attributes` row) is one
+# of exact, normalized, or lost.
 classes:
   exact: The pair's decoder reads back the same kind, value, and field.
   normalized: >-
@@ -18,11 +18,11 @@ classes:
     A field the record loses while the record itself survives; the cell names the counter that
     counts it, or says it's uncounted.
   skipped: >-
-    The record leaves no wire form, because the sink has none for it or the config chose none,
-    counted under the cell's skipped counter.
+    The record leaves no wire form, because the sink has none for it or the config chose none;
+    the cell names the counter that counts it, or says it's uncounted.
   dropped: >-
-    The record is lost for a reason the config didn't ask for, counted under the cell's dropped
-    counter.
+    The record is lost for a reason the config didn't ask for; the cell names the counter that
+    counts it, or says it's uncounted.
 
 sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out]
 
@@ -588,8 +588,8 @@ rows:
         text: >-
           A `histogram` family of running-sum buckets and `_sum` when it has one, or a
           `gaugehistogram` under the type carrier. `+Inf` states the total, so a histogram whose
-          last bound is finite reads back with an empty `+Inf` bucket; `min` and `max` aren't
-          written.
+          last bound is finite reads back with an empty `+Inf` bucket. `min` and `max` are
+          `record/min_max`'s.
   - kind: exponential_histogram
     feature: delta
     cells:
@@ -676,12 +676,6 @@ rows:
         class: lost
         reason: uncounted
         text: statsd has no unit; it isn't written or counted.
-      prometheus_out:
-        class: lost
-        counter: logit.output.metrics.degraded{reason=unit_not_suffix}
-        text: >-
-          OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left
-          off, counted.
       influxdb_out:
         class: lost
         reason: uncounted
@@ -689,6 +683,15 @@ rows:
       otlp_out:
         class: exact
         text: The `Metric`'s `unit`.
+      prometheus_out:
+        - when: {bind: null}
+          class: exact
+          text: Remote-write carries the unit in its metadata.
+        - class: lost
+          counter: logit.output.metrics.degraded{reason=unit_not_suffix}
+          text: >-
+            OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's
+            left off, counted.
   - kind: record
     feature: description
     cells:
@@ -746,6 +749,18 @@ rows:
         text: >-
           In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at
           most one per line. One with no line to sit on, such as a gauge's, is left off, counted.
+  # statsd_out and influxdb_out write a histogram only as dotted series or fields, a lesser kind,
+  # so its fields are never compared there and neither has a cell.
+  - kind: record
+    feature: min_max
+    cells:
+      prometheus_out:
+        class: lost
+        reason: uncounted
+        text: A histogram's `min` and `max` have no Prometheus series and aren't written, uncounted.
+      otlp_out:
+        class: exact
+        text: The data point's `min` and `max`.
   - kind: record
     feature: no_recorded_value
     cells:
@@ -753,10 +768,6 @@ rows:
         class: skipped
         counter: logit.output.messages.skipped{reason=no_recorded_value}
         text: A point flagged as holding no recorded value has no statsd line.
-      prometheus_out:
-        class: skipped
-        counter: logit.output.metrics.skipped{reason=no_recorded_value}
-        text: A point flagged as holding no recorded value isn't exposed.
       influxdb_out:
         class: skipped
         counter: logit.output.metrics.skipped{reason=no_recorded_value}
@@ -764,6 +775,16 @@ rows:
       otlp_out:
         class: exact
         text: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept.
+      prometheus_out:
+        - when: {bind: null}
+          class: exact
+          text: >-
+            Remote-write writes a flagged `Gauge` or `Sum` as Prometheus's stale marker, read back
+            flagged. A flagged histogram, summary, or sketch is skipped, counted
+            `logit.output.metrics.skipped{reason=no_recorded_value}`.
+        - class: skipped
+          counter: logit.output.metrics.skipped{reason=no_recorded_value}
+          text: A point flagged as holding no recorded value isn't exposed.
   - kind: record
     feature: service_check
     cells:
@@ -818,14 +839,64 @@ rows:
           text: >-
             The exposition registry holds one sample per series, so a later record of the series
             replaces an earlier one before a scrape reads it, uncounted.
-      influxdb_out:
-        class: exact
-        text: >-
-          Each point is its own line; one sharing a series and a timestamp with a point already in
-          the batch takes the next free nanosecond.
       otlp_out:
         class: exact
         text: Each record is its own data point.
+      influxdb_out:
+        class: exact
+        text: Each point is its own line at its own timestamp.
+  - kind: record
+    feature: same_instant
+    cells:
+      statsd_out:
+        class: exact
+        text: Each record is its own line.
+      prometheus_out:
+        - when: {bind: null}
+          class: dropped
+          reason: uncounted
+          text: >-
+            One series can't hold two samples at one timestamp, so the later point wins and the
+            earlier is dropped, uncounted.
+        - class: skipped
+          reason: uncounted
+          text: >-
+            The exposition registry holds one sample per series, so the later point replaces this
+            one, uncounted.
+      influxdb_out:
+        class: normalized
+        reason: next_nanosecond
+        text: >-
+          A point sharing a series and a timestamp with one already in the batch takes the next
+          free nanosecond, so both are kept.
+      otlp_out:
+        class: exact
+        text: Each record is its own data point.
+  - kind: record
+    feature: same_millisecond
+    cells:
+      statsd_out:
+        class: exact
+        text: Each record is its own line.
+      prometheus_out:
+        - when: {bind: null}
+          class: dropped
+          counter: logit.output.metrics.degraded{reason=sub_ms_collapsed}
+          text: >-
+            A remote-write sample's timestamp is in milliseconds, and one series can't hold two
+            samples at one timestamp, so the later reading wins and the earlier is dropped,
+            counted under a `degraded` series.
+        - class: skipped
+          reason: uncounted
+          text: >-
+            The exposition registry holds one sample per series, so the later point replaces this
+            one, uncounted.
+      influxdb_out:
+        class: exact
+        text: Each point is its own line at its own nanosecond.
+      otlp_out:
+        class: exact
+        text: Each record is its own data point, at its own nanosecond.
   - kind: record
     feature: non_finite
     cells:

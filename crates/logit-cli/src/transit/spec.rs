@@ -282,7 +282,8 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 /// - `statsd`: one datagram through `StatsdDecoder`, under an empty resource.
 /// - `influxdb`: one write body through `InfluxDecoder::decode_body`, under the resource
 ///   `influxdb_in` builds from `path:`'s `org`, `orgID`, and `bucket`, at its `precision` (`ns`
-///   when absent). A bucket and an org or org ID are required, as `influxdb_in` requires them.
+///   when absent), gunzipped first under `content-encoding: gzip`. A bucket and an org or org ID
+///   are required, as `influxdb_in` requires them.
 /// - `prometheus`: one scrape body through `text::parse_with` and `families_to_events`, in the
 ///   dialect `content-type:` selects (text 0.0.4 when absent), under the resource
 ///   `prometheus_in` stamps for the target [`SCRAPE_URL`]: `instance` and
@@ -313,6 +314,19 @@ fn decode_wire(system: &str, bytes: Vec<u8>, headers: &Headers) -> anyhow::Resul
             ensure!(org.is_some() || org_id.is_some(), "the .headers path: names no org or orgID");
             let bucket = headers.query("bucket").context("the .headers path: names no bucket")?;
             let resource = Arc::new(write_resource(org, org_id, bucket));
+            let bytes = match headers.get("content-encoding") {
+                None | Some("identity") => bytes,
+                Some("gzip") => {
+                    let mut body = Vec::new();
+                    std::io::Read::read_to_end(
+                        &mut flate2::read::GzDecoder::new(&bytes[..]),
+                        &mut body,
+                    )
+                    .context("the gzip body doesn't decompress")?;
+                    body
+                }
+                Some(other) => bail!("influxdb_in refuses content-encoding {other:?}"),
+            };
             let batch = InfluxDecoder::new()
                 .with_telemetry(telemetry)
                 .decode_body(Bytes::from(bytes), precision, RECEIVED_AT, resource)

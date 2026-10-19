@@ -32,12 +32,19 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.q0_95","kind":"gauge","value":15.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.q0_99","kind":"gauge","value":15.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.sum","kind":"sum","value":27.0,"temporality":"delta","monotonic":true}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"payload.size.bucket_100","kind":"gauge","value":3.0}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"payload.size.bucket_inf","kind":"gauge","value":1.0}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"payload.size.count","kind":"gauge","value":4.0}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"payload.size.max","kind":"gauge","value":150.0}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"payload.size.min","kind":"gauge","value":10.0}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"payload.size.sum","kind":"gauge","value":250.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"users.count","kind":"gauge","value":2.0}]}
   ], "counters": {
     "logit.output.messages.dropped{component=out,kind=statsd_out,reason=unencodable_value,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=distribution,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=set,role=sink}": 1,
     "logit.output.tags.omitted{component=out,kind=statsd_out,reason=dialect,role=sink}": 3
   }},
@@ -158,6 +165,10 @@
   "span-only": {"events": [], "counters": {
     "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 1
   }},
+  "sub-millisecond": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000500Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}]},
+    {"timestamp":"2027-01-15T08:00:01.000000500Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}]}
+  ], "counters": {}},
   "sum-shapes": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"active.sessions","kind":"gauge","value":14.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"balance.change","kind":"sum","value":-4.0,"temporality":"delta","monotonic":true}]},

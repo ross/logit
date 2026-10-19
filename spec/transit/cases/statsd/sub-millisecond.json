@@ -1,0 +1,2 @@
+{"timestamp":"2027-01-15T08:00:00.000000100Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}]}
+{"timestamp":"2027-01-15T08:00:00.000000500Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}]}

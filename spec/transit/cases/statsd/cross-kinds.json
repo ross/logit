@@ -2,5 +2,6 @@
 {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"users","kind":"set","estimate":2,"hll":"BNRrtwOaNaoA"}]}
 {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"jobs.done","kind":"sum","value":12.0,"temporality":"cumulative","monotonic":true,"exemplars":[{"timestamp":"2027-01-15T07:59:59.000000000Z","value":1.0,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","trace_flags":0}]}]}
 {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"balance","kind":"gauge","value":-3.5,"exemplars":[{"timestamp":"2027-01-15T07:59:59.000000000Z","value":-3.5,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","trace_flags":0}]}]}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"payload.size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":3},{"bound":"inf","count":1}],"sum":250.0,"min":10.0,"max":150.0}]}
 {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"NaN"}]}
 {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"_logit.prometheus.type":"untyped","shards":["a","b"]}}

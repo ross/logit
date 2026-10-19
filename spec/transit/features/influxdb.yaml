@@ -38,6 +38,8 @@
     `_logit.influxdb.bucket` resource carriers.
 - name: org_id
   text: The write's `orgID`, stamped as the `_logit.influxdb.org_id` resource carrier.
+- name: gzip
+  text: A write body sent with `Content-Encoding` `gzip`, decompressed before it's parsed.
 - name: reserved_tag_key
   text: >-
     A tag key under `_logit.` or `influxdb.field.`, omitted at decode and counted

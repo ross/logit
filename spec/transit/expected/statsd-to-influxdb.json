@@ -16,6 +16,7 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"balance.value","kind":"gauge","value":-3.5}],"attributes":{"_logit.influxdb.measurement":"balance"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"jobs.done.value","kind":"gauge","value":12.0}],"attributes":{"_logit.influxdb.measurement":"jobs.done"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency.count","kind":"gauge","value":2},{"name":"latency.sum","kind":"gauge","value":27.0},{"name":"latency.p50","kind":"gauge","value":12.0},{"name":"latency.p90","kind":"gauge","value":15.0},{"name":"latency.p99","kind":"gauge","value":15.0}],"attributes":{"_logit.influxdb.measurement":"latency","route":"/api"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}},"types":{"/metrics/0/value":"u64"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"payload.size.bucket_100","kind":"gauge","value":3}],"attributes":{"_logit.influxdb.measurement":"payload.size"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}},"types":{"/metrics/0/value":"u64"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth.value","kind":"gauge","value":7.0}],"attributes":{"_logit.influxdb.measurement":"queue.depth","shards":"b"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"users.value","kind":"gauge","value":2}],"attributes":{"_logit.influxdb.measurement":"users"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}},"types":{"/metrics/0/value":"u64"}}
   ], "counters": {
@@ -111,6 +112,10 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.inflight.value","kind":"gauge","value":3.0}],"attributes":{"_logit.influxdb.measurement":"requests.inflight"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}},
   "span-only": {"events": [], "counters": {}},
+  "sub-millisecond": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000100Z","metrics":[{"name":"queue.depth.value","kind":"gauge","value":3.0}],"attributes":{"_logit.influxdb.measurement":"queue.depth"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000500Z","metrics":[{"name":"queue.depth.value","kind":"gauge","value":4.0}],"attributes":{"_logit.influxdb.measurement":"queue.depth"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
+  ], "counters": {}},
   "sum-shapes": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"active.sessions.value","kind":"gauge","value":14.0}],"attributes":{"_logit.influxdb.measurement":"active.sessions"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"balance.change.value","kind":"gauge","value":-4.0}],"attributes":{"_logit.influxdb.measurement":"balance.change"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},

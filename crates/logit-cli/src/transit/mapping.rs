@@ -10,8 +10,8 @@
 //! | `gauge_delta` | `f64`, `i64`, `u64`, `bool` | record |
 //! | `histogram`, `exponential_histogram` | `delta`, `cumulative` | record |
 //! | `samples`, `set_members`, `distribution`, `set`, `summary` | none | record |
-//! | `record` | `no_recorded_value`, `service_check`, `name_unsafe`, `non_finite`, `superseded` | record |
-//! | `record` | `unit`, `description`, `start_timestamp`, `exemplars` | field |
+//! | `record` | `no_recorded_value`, `service_check`, `name_unsafe`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
+//! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `min_max` | field |
 //! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `foreign_carrier`, `resource_attribute`, `scope` | field |
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics) | record |
 //! | `span` | `alone` (on an event with no metrics) | record |
@@ -23,8 +23,16 @@
 //! attribute does, not `resource_attribute`. `record/non_finite` is a `sum` or `gauge` holding
 //! `NaN` or an infinity, a value some wires can't write. `record/superseded` is a metric record a
 //! later record of the same series (name, kind, and public attributes) follows in the same run,
-//! which a sink holding one value per series replaces. `record/name_unsafe` is a name holding a
-//! character the sink's wire rewrites, which differs by sink.
+//! which a sink holding one value per series replaces; `record/same_instant` is one whose later
+//! point shares its timestamp, and `record/same_millisecond` one whose later point falls at
+//! another nanosecond of its millisecond, which a wire stamping milliseconds can't tell apart.
+//! `record/name_unsafe` is a name holding a character the sink's wire rewrites, which differs by
+//! sink. `record/min_max` is a histogram's `min` and `max`, which the record's own comparison
+//! leaves to this row.
+//!
+//! A row may have no cell for a sink no record can reach it at, such as `name_unsafe` at a sink
+//! that rewrites no name, or a field row at a sink that writes the kind only in a lesser form, so
+//! its fields are never compared; `mapping.yaml` says why beside the row.
 //!
 //! A record-level row's class is `exact`, `normalized`, `degraded`, `skipped`, or `dropped`; a
 //! field-level row's is `exact`, `normalized`, or `lost`.
@@ -81,10 +89,13 @@ const KINDS: [(&str, &[&str]); 14] = [
             "name_unsafe",
             "non_finite",
             "superseded",
+            "same_instant",
+            "same_millisecond",
             "unit",
             "description",
             "start_timestamp",
             "exemplars",
+            "min_max",
         ],
     ),
     (
@@ -242,7 +253,8 @@ pub(super) fn row_label(kind: &str, feature: Option<&str>) -> String {
 pub(super) fn is_field_row(kind: &str, feature: Option<&str>) -> bool {
     feature == Some("beside_metrics")
         || kind == "attributes"
-        || (kind == "record" && feature.is_some_and(|f| RECORD_FIELDS.contains(&f)))
+        || (kind == "record"
+            && feature.is_some_and(|f| RECORD_FIELDS.contains(&f) || f == "min_max"))
 }
 
 /// What the table holds for one row and one sink under one config.

@@ -18,6 +18,7 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"balance","kind":"gauge","value":-3.5,"exemplars":[{"timestamp":"2027-01-15T07:59:59.000000000Z","value":-3.5,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","trace_flags":0}]}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"jobs.done","kind":"sum","value":12.0,"temporality":"cumulative","monotonic":true,"exemplars":[{"timestamp":"2027-01-15T07:59:59.000000000Z","value":1.0,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","trace_flags":0}]}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"summary","count":2,"sum":27.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":15.0},{"quantile":0.9,"value":15.0},{"quantile":0.95,"value":15.0},{"quantile":0.99,"value":15.0}]}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"payload.size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":3},{"bound":"inf","count":1}],"sum":250.0,"min":10.0,"max":150.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"shards":["a","b"]}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"NaN"}]}
   ], "counters": {
@@ -125,6 +126,10 @@
   ], "counters": {}},
   "span-only": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","span":{"name":"GET /api","trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","kind":"server","status":"ok","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.250000000Z","duration_ns":250000000}}
+  ], "counters": {}},
+  "sub-millisecond": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000100Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}]},
+    {"timestamp":"2027-01-15T08:00:00.000000500Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}]}
   ], "counters": {}},
   "sum-shapes": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"active.sessions","kind":"sum","value":14.0,"temporality":"cumulative","monotonic":false}]},

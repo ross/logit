@@ -16,6 +16,7 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"balance","kind":"gauge","value":-3.5}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"jobs_done_total","kind":"sum","value":12.0,"temporality":"cumulative","monotonic":true,"exemplars":[{"timestamp":"2027-01-15T07:59:59.000000000Z","value":1.0,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","trace_flags":0}]}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","count":2,"sum":27.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":15.0},{"quantile":0.9,"value":15.0},{"quantile":0.95,"value":15.0},{"quantile":0.99,"value":15.0}]}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"payload_size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":3},{"bound":"inf","count":1}],"sum":250.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":7.0}],"attributes":{"_logit.prometheus.type":"unknown","shards":"b"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"NaN"}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"users","kind":"gauge","value":2.0}]}
@@ -118,6 +119,9 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests_inflight","kind":"gauge","value":3.0}]}
   ], "counters": {}},
   "span-only": {"events": [], "counters": {}},
+  "sub-millisecond": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000500Z","metrics":[{"name":"queue_depth","kind":"gauge","value":4.0}]}
+  ], "counters": {}},
   "sum-shapes": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"active_sessions","kind":"gauge","value":14.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests_total","kind":"sum","value":120.0,"temporality":"cumulative","monotonic":true}]}

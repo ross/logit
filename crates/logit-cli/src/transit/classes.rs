@@ -14,7 +14,11 @@
 //! `service_check` when it carries `_logit.statsd.service_check.name`, `name_unsafe` when the
 //! sink's wire rewrites a character of its name ([`Spelling`]), `non_finite` for a `sum` or
 //! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
-//! another point of its series (the same name, kind, and public attributes). It reaches an
+//! another point of its series (the same name, kind, and public attributes), with `same_instant`
+//! when that point shares its timestamp or else `same_millisecond` when it shares its
+//! millisecond. A `histogram` or `exponential_histogram` reaches the field row `record/min_max`
+//! for its `min` and `max`, which its own comparison leaves out, as a flagged point's leaves out
+//! its value: a stale marker reads back as `NaN`. It reaches an
 //! `attributes` row for each attribute, event or resource: a `_logit.<protocol>.` carrier of the
 //! sink's own protocol is `private_carrier`, any other `_logit.` key `foreign_carrier`, an event
 //! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
@@ -49,6 +53,9 @@
 //! input's, or failing any that do, be a subset of them. An input left unpaired was skipped or
 //! dropped: the class is the one whose counter moved, or the cell's when it says the loss is
 //! `uncounted`. A read-back record no input claims fails the check with both sides printed.
+//!
+//! The check compares no timestamp but one: a `same_instant` record paired `exact` whose read-back
+//! instant differs from its twin's reads `normalized`, since the sink moved them apart.
 //!
 //! **Record level.** The expected class is the worst (`exact < normalized < degraded < skipped
 //! < dropped`) over the record-level cells it reaches, and the observed class must equal it; a
@@ -112,6 +119,8 @@ struct Rec {
     resource_types: BTreeMap<String, String>,
     /// The batch's scope object, when it has one.
     scope: Option<Value>,
+    /// The event's RFC 3339 timestamp.
+    timestamp: String,
 }
 
 impl Rec {
@@ -155,12 +164,23 @@ impl Rec {
             if self.is_metric() {
                 object.remove("name");
             }
+            // A point flagged as holding no recorded value has no value to compare: a stale
+            // marker reads back as `NaN`.
+            if self.body["no_recorded_value"] == Value::Bool(true) {
+                object.remove("value");
+            }
+            // A histogram's extremes are a field row of their own (`record/min_max`).
+            if matches!(self.kind.as_str(), "histogram" | "exponential_histogram") {
+                object.remove("min");
+                object.remove("max");
+            }
         }
         let types = self
             .types
             .iter()
             .filter(|(pointer, _)| {
                 !FIELD_KEYS.iter().any(|key| pointer.starts_with(&format!("/{key}")))
+                    && (body.get("value").is_some() || pointer.as_str() != "/value")
             })
             .map(|(pointer, tag)| (pointer.clone(), tag.clone()))
             .collect();
@@ -383,6 +403,7 @@ fn records(batches: &[EventBatch]) -> Vec<Rec> {
             resource: resource.clone(),
             resource_types: resource_types.clone(),
             scope: scope.clone(),
+            timestamp: event["timestamp"].as_str().unwrap_or("").to_string(),
         };
         if let Some(log) = event.get("log") {
             let name = log.get("message").map(text).unwrap_or_default();
@@ -704,6 +725,21 @@ fn same_series(rec: &Rec, later: &Rec) -> bool {
         && later.public() == rec.public()
 }
 
+/// Whether `later`, another point of `rec`'s series, falls in the same millisecond.
+fn same_millisecond(rec: &Rec, later: &Rec) -> bool {
+    // An RFC 3339 timestamp through its milliseconds: `2027-01-15T08:00:00.000`.
+    let millis = |rec: &Rec| rec.timestamp.get(..23).map(str::to_string);
+    millis(rec).is_some() && millis(rec) == millis(later)
+}
+
+/// Whether inputs `i` and `j`, which share an instant, read back at different ones.
+fn moved_apart(pairing: &Pairing, i: usize, j: usize, outs: &[Rec]) -> bool {
+    let (Some(&a), Some(&b)) = (pairing.claimed[i].first(), pairing.claimed[j].first()) else {
+        return false;
+    };
+    outs[a].timestamp != outs[b].timestamp
+}
+
 /// Where a field row looks.
 #[derive(Debug, Clone)]
 enum Field {
@@ -722,6 +758,17 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         for key in mapping::RECORD_FIELDS {
             if rec.body.get(key).is_some() {
                 rows.push(("record".to_string(), Some(key.to_string()), Field::Body(key)));
+            }
+        }
+        if matches!(rec.kind.as_str(), "histogram" | "exponential_histogram") {
+            for key in ["min", "max"] {
+                if rec.body.get(key).is_some() {
+                    rows.push((
+                        "record".to_string(),
+                        Some("min_max".to_string()),
+                        Field::Body(key),
+                    ));
+                }
             }
         }
     }
@@ -1017,8 +1064,18 @@ pub(super) fn check(
         let mut rows: Vec<(String, Option<String>)> =
             kind_features(input).into_iter().map(|f| (input.kind.clone(), f)).collect();
         let mut features = record_features(input, spelling);
-        if input.is_metric() && ins[i + 1..].iter().any(|later| same_series(input, later)) {
+        let later: Vec<usize> = (i + 1..ins.len())
+            .filter(|&j| input.is_metric() && same_series(input, &ins[j]))
+            .collect();
+        if !later.is_empty() {
             features.push("superseded");
+        }
+        // The later point of its series at this record's instant, if any.
+        let twin = later.iter().copied().find(|&j| ins[j].timestamp == input.timestamp);
+        if twin.is_some() {
+            features.push("same_instant");
+        } else if later.iter().any(|&j| same_millisecond(input, &ins[j])) {
+            features.push("same_millisecond");
         }
         rows.extend(features.into_iter().map(|f| ("record".to_string(), Some(f.to_string()))));
         let mut cells = Vec::new();
@@ -1055,6 +1112,11 @@ pub(super) fn check(
         let expected = cells.iter().map(|(_, cell, _)| cell.class).fold(Class::Exact, worse);
         let deciding = cells.iter().find(|(_, cell, _)| cell.class == expected);
         let observed = match pairing.seen[i] {
+            // Two points sharing an instant that read back at different instants were moved
+            // apart, which only a timestamp comparison shows: the check compares no other.
+            Some(Class::Exact) if twin.is_some_and(|j| moved_apart(&pairing, i, j, &outs)) => {
+                Some(Class::Normalized)
+            }
             Some(class) => Some(class),
             None => {
                 let loss = deciding
@@ -1319,5 +1381,54 @@ mod tests {
             r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":2},{"bound":"inf","count":0}]}]}"#,
         ]);
         assert_eq!(pair(&ins, &outs, Spelling::Prometheus).seen, [Some(Class::Normalized)]);
+    }
+
+    /// A point flagged as holding no recorded value pairs with its stale marker, whose value is
+    /// `NaN`.
+    #[test]
+    fn a_flagged_point_pairs_whatever_value_it_reads_back() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":0.0,"flags":1,"no_recorded_value":true}]}"#,
+        ]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":"NaN","flags":1,"no_recorded_value":true}]}"#,
+        ]);
+        assert_eq!(pair(&ins, &outs, Spelling::Prometheus).seen, [Some(Class::Exact)]);
+    }
+
+    /// A histogram's `min` and `max` are `record/min_max`'s to compare, so a sink that drops them
+    /// still writes the same histogram.
+    #[test]
+    fn a_histograms_extremes_are_left_to_their_own_row() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":"inf","count":2}],"sum":3.0,"min":1.0,"max":2.0}]}"#,
+        ]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":"inf","count":2}],"sum":3.0}]}"#,
+        ]);
+        assert_eq!(pair(&ins, &outs, Spelling::Prometheus).seen, [Some(Class::Exact)]);
+        let rows = field_rows(&ins[0], "prometheus");
+        let min_max: Vec<&Field> =
+            rows.iter().filter(|(_, f, _)| f.as_deref() == Some("min_max")).map(|r| &r.2).collect();
+        assert_eq!(min_max.len(), 2);
+        for field in min_max {
+            assert_eq!(observe_field(field, &ins[0], &outs[0], Spelling::Prometheus), Class::Lost);
+        }
+    }
+
+    /// Two points sharing an instant that read back at different instants were moved apart.
+    #[test]
+    fn two_points_of_one_instant_read_back_apart_were_moved() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}]}"#,
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":2.0}]}"#,
+        ]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"g.value","kind":"gauge","value":1.0}]}"#,
+            r#"{"timestamp":"2027-01-15T08:00:00.000000001Z","metrics":[{"name":"g.value","kind":"gauge","value":2.0}]}"#,
+        ]);
+        let pairing = pair(&ins, &outs, Spelling::Influxdb);
+        assert!(moved_apart(&pairing, 0, 1, &outs));
+        assert!(!moved_apart(&pairing, 0, 0, &outs));
     }
 }

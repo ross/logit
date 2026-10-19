@@ -58,10 +58,10 @@ is one nothing checks: add a case or a flow that reaches it.
 
 - **Record level**, for a metric kind, a log or span on an event with no metrics, and the
   `record` rows that decide a record's fate (`no_recorded_value`, `service_check`,
-  `name_unsafe`, `non_finite`, `superseded`): `exact`, `normalized`, `degraded`, `skipped`, or
-  `dropped`, best to worst.
-- **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, and
-  `exemplars`, every `attributes` row, and a log or span beside metrics (`beside_metrics`), which
+  `name_unsafe`, `non_finite`, `superseded`, `same_instant`, `same_millisecond`): `exact`,
+  `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
+- **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`,
+  `exemplars`, and `min_max`, every `attributes` row, and a log or span beside metrics (`beside_metrics`), which
   is a field of its event: `exact`, `normalized`, or `lost`.
 
 ## The mapping table
@@ -153,7 +153,8 @@ pointer, in each event of the document, differ from the committed one by up to `
    `<case>.headers` beside its wire file whose `path:` names a `bucket` and an `org` or `orgID`,
    as `influxdb_in` requires; a Prometheus case reads text 0.0.4 unless its `.headers` gives an
    OpenMetrics `content-type:`. A `wire:` path may point at a capture under `testdata/interop/`
-   instead of copying it, and its `.headers` comes with it. Run `script/transit gen` to write
+   instead of copying it, and its `.headers` comes with it; an InfluxDB body sent with
+   `content-encoding: gzip` is decompressed first, as `influxdb_in` does. Run `script/transit gen` to write
    `<case>.json`.
 3. For an edge case no producer sends, write `<case>.json` by hand and leave `wire:` out. The check
    requires it to read back to itself through `format: json`, and prints the form to use when it
@@ -174,7 +175,8 @@ flow.
 Add the sink to `sinks:`, give it a cell in every row, and add a flow that ends in it. The flow
 driver must have an encoder arm for it (`crate::pipeline::sink_encoder`, and the pair decoder in
 `crates/logit-cli/src/transit/wire.rs`). A row left without the sink's cell reads as not yet
-specified.
+specified. Leave a row without the sink's cell only when no record can reach it there, and say
+why in a comment beside the row, as `name_unsafe` and `min_max` do.
 
 ## Adding a source
 
