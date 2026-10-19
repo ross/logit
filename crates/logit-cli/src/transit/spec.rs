@@ -822,7 +822,8 @@ mod tests {
 
     /// A record nothing reads back fails when the cell names a counter that didn't move and no
     /// other sink counter says why: `prometheus_out` skips a log uncounted, so a cell claiming a
-    /// counter for it is wrong.
+    /// counter for it is wrong. It pins that path only: the flagged-record rule in `classes.rs`'s
+    /// "Counters" is pinned by the `flagged-kinds` case across the statsd flows.
     #[test]
     fn a_loss_no_counter_explains_fails_the_class_check() {
         let spec = spec_dir();

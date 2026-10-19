@@ -85,7 +85,10 @@
 //! flag before the kind, so a flagged `gauge_delta` is skipped there rather than dropped, and
 //! remote-write writes a flagged delta `sum` as a stale marker rather than dropping it. A sink
 //! that tests the kind first moves the kind cell's counter, and that cell decides as before
-//! (`otlp_out` drops a flagged `gauge_delta` under `unresolved_gauge_delta`).
+//! (`otlp_out` drops a flagged `gauge_delta` under `unresolved_gauge_delta`). A case doesn't mix
+//! flagged and unflagged records of one kind: counters are flow-wide, so an unflagged record's
+//! loss would move the counter a flagged one's kind cell names, and the check would misread the
+//! flagged one. Telling the two apart would take a table of which sinks test the flag first.
 //!
 //! A `when:` key that names no field of the sink's serialized config fails, naming the row, the
 //! cell, and the key: a misspelled key would otherwise never match.
