@@ -25,19 +25,30 @@
 //! | `magic` | bytes that don't start a frame, up to the next frame magic: one count per run |
 //! | `version` | a frame header of a version this build doesn't read |
 //! | `too_large` | a frame header declaring a body over the frame cap |
-//! | `crc` | a frame whose body fails its CRC |
+//! | `crc` | a frame whose body fails its CRC, a frame torn mid-file among them |
 //! | `codec` | a frame that isn't a bare batch: a spool's hop batch, or a control frame |
 //! | `decode_budget` | a batch that would decode past its budget |
 //! | `malformed` | any other frame or batch that doesn't parse |
-//! | `truncated` | a frame cut short by the end of the file, which ends the read |
+//! | `truncated` | a frame whose declared length runs past the end of the file |
 //!
 //! Each native fault but `truncated` has the `bad_frame` diagnostic, with the frame's byte
-//! offset. A header fault leaves no trustworthy length, so the read resumes at the next frame
-//! magic past it. A batch no consumer took is counted
-//! `logit.input.batches.dropped{reason="closed_consumer"}` and ends the read.
+//! offset. After any fault but `codec`, `decode_budget`, or `malformed` on a decoded body, the
+//! read resumes at the next frame magic past the faulty frame's own magic, not past its declared
+//! length: a frame torn by a killed writer, with a later run's frames appended behind it
+//! (`file_out` opens its file to append), declares a length that reaches into those frames. So a
+//! whole frame anywhere after a fault is read, and only a `truncated` frame with no magic behind
+//! it ends the read. A false magic inside a payload costs one more CRC check.
+//!
+//! One fault is counted per unreadable run: from a counted fault until a frame passes its CRC,
+//! nothing more is counted, except that a frame or header the end of the file cuts short, magic
+//! included, is always counted `truncated`.
+//!
+//! A batch no consumer took is counted `logit.input.batches.dropped{reason="closed_consumer"}`
+//! and ends the read.
 //!
 //! The read side records `logit.input.lines`/`.line.bytes` per non-blank JSON line, and
-//! `logit.input.frames`/`.frame.bytes` per whole native frame, each before it's decoded.
+//! `logit.input.frames`/`.frame.bytes` per native frame that passes its CRC, each before it's
+//! decoded.
 
 use bytes::{Buf, Bytes, BytesMut};
 use logit_core::{Diagnostics, EventBatch, Scope, Telemetry};
@@ -189,21 +200,15 @@ impl ReplayInput {
         let mut buf = BytesMut::with_capacity(64 * 1024);
         // The file offset of `buf[0]`, for diagnostics.
         let mut offset: u64 = 0;
-        // Set while skipping to the next magic after a counted fault, so the skip isn't counted
-        // again as `magic`.
+        // Set from a counted fault until a frame passes its CRC: the bytes in between are one
+        // unreadable run, so a false magic inside them isn't counted again.
         let mut skipping = false;
         loop {
             if !fill(&mut reader, &mut buf, HEADER_LEN).await? {
-                if !buf.is_empty() {
-                    self.telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", "truncated")]);
-                    self.diag.warn_throttled(
-                        "truncated",
-                        format_args!(
-                            "{} ends {} bytes into a frame header at offset {offset}",
-                            self.path.display(),
-                            buf.len()
-                        ),
-                    );
+                // Leftover bytes after a counted fault are part of its run, unless a resync
+                // landed on a magic: then they're a torn header of their own.
+                if !buf.is_empty() && (!skipping || buf.starts_with(&MAGIC)) {
+                    self.truncated(offset, buf.len());
                 }
                 break;
             }
@@ -230,7 +235,6 @@ impl ReplayInput {
                 }
                 continue;
             }
-            skipping = false;
             let header = match FrameHeader::read(&mut Bytes::copy_from_slice(&buf[..HEADER_LEN])) {
                 Ok(header) => header,
                 Err(err) => {
@@ -249,32 +253,49 @@ impl ReplayInput {
             }
             let len = HEADER_LEN + header.compressed_len as usize;
             if !fill(&mut reader, &mut buf, len).await? {
-                self.telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", "truncated")]);
-                self.diag.warn_throttled(
-                    "truncated",
-                    format_args!(
-                        "{} ends inside the {len}-byte frame at offset {offset}",
-                        self.path.display()
-                    ),
-                );
-                break;
+                // A frame torn mid-file, with a later write appended after it, declares a body
+                // that runs into the frames behind it and past the end. Those frames are whole,
+                // so read on from the next magic; only a frame with none behind it ends the read.
+                let next = frame::resync(&buf[MAGIC.len()..]);
+                if next.is_none() || !skipping {
+                    self.truncated(offset, buf.len());
+                }
+                let Some(at) = next else { break };
+                buf.advance(MAGIC.len() + at);
+                offset += (MAGIC.len() + at) as u64;
+                skipping = true;
+                continue;
             }
-            let mut whole = buf.split_to(len).freeze();
+            let consumed = buf.split_to(len).freeze();
             let at = offset;
             offset += len as u64;
-            self.telemetry.count("logit.input.frames", 1.0, &[]);
-            self.telemetry.count("logit.input.frame.bytes", len as f64, &[]);
+            let mut whole = consumed.clone();
             let (header, mut payload) = match frame::read_frame_with_header(&mut whole) {
                 Ok(read) => read,
-                Err(CodecError::Malformed(msg)) if msg.contains("crc32c") => {
-                    self.frame_fault("crc", at, msg);
-                    continue;
-                }
                 Err(err) => {
-                    self.frame_fault("malformed", at, err);
+                    // A torn frame followed by a later write fails here, its declared length
+                    // reaching into the frames behind it. Rescan from the byte after its magic, so a
+                    // whole frame inside those bytes is still read; a false magic in a payload
+                    // costs one more CRC check.
+                    if !skipping {
+                        let reason = match &err {
+                            CodecError::Malformed(msg) if msg.contains("crc32c") => "crc",
+                            _ => "malformed",
+                        };
+                        self.frame_fault(reason, at, err);
+                        skipping = true;
+                    }
+                    let mut rest = BytesMut::with_capacity(len - MAGIC.len() + buf.len());
+                    rest.extend_from_slice(&consumed[MAGIC.len()..]);
+                    rest.extend_from_slice(&buf);
+                    buf = rest;
+                    offset = at + MAGIC.len() as u64;
                     continue;
                 }
             };
+            skipping = false;
+            self.telemetry.count("logit.input.frames", 1.0, &[]);
+            self.telemetry.count("logit.input.frame.bytes", len as f64, &[]);
             if header.codec != CODEC_BATCH || header.flags & FLAG_CONTROL != 0 {
                 self.frame_fault(
                     "codec",
@@ -305,6 +326,17 @@ impl ReplayInput {
         Ok(())
     }
 
+    fn truncated(&mut self, offset: u64, have: usize) {
+        self.telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", "truncated")]);
+        self.diag.warn_throttled(
+            "truncated",
+            format_args!(
+                "{} holds only {have} bytes of the frame at offset {offset}",
+                self.path.display()
+            ),
+        );
+    }
+
     fn frame_fault(&mut self, reason: &'static str, offset: u64, err: impl std::fmt::Display) {
         self.telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", reason)]);
         self.diag.warn_throttled(
@@ -313,8 +345,8 @@ impl ReplayInput {
         );
     }
 
-    /// Counts a header fault and steps past its magic: with no trustworthy length, the read
-    /// resumes at the next magic.
+    /// Counts a header fault, unless it's inside a run already counted, and steps past its
+    /// magic: with no trustworthy length, the read resumes at the next magic.
     fn skip_header(
         &mut self,
         reason: &'static str,
@@ -323,7 +355,9 @@ impl ReplayInput {
         skipping: &mut bool,
         err: impl std::fmt::Display,
     ) {
-        self.frame_fault(reason, *offset, err);
+        if !*skipping {
+            self.frame_fault(reason, *offset, err);
+        }
         buf.advance(MAGIC.len());
         *offset += MAGIC.len() as u64;
         *skipping = true;
@@ -565,8 +599,8 @@ mod tests {
         assert_eq!(out.probe.sum(FRAMES_DROPPED, &[("reason", "truncated")]), 1.0);
     }
 
-    /// A bad CRC skips that frame by its length; a hop batch is the wrong codec; garbage between
-    /// frames is one `magic` run. Every frame after each is still read.
+    /// A CRC failure, a hop batch, and garbage between frames are each counted once under their
+    /// reason, and every whole frame after each is still read.
     #[tokio::test]
     async fn bad_native_frames_are_skipped_and_counted_by_reason() {
         let written = three_runs();
@@ -575,16 +609,98 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xff;
         bytes.extend_from_slice(&corrupt);
-        bytes.extend_from_slice(b"not a frame at all, and longer than a header");
         let hop = write_frame(native::CODEC_HOP_BATCH, Compression::None, b"whatever").unwrap();
         bytes.extend_from_slice(&hop);
+        bytes.extend_from_slice(b"not a frame at all, and longer than a header");
         bytes.extend_from_slice(&native_frames(&written[2..], Compression::None));
         let mut out = replay(&bytes, ReplayFormat::Native, 1000).await;
         assert_eq!(shape(&out.batches), [("web".into(), 5), ("web".into(), 1)]);
         let totals = out.probe.poll();
         assert_eq!(totals.sum(FRAMES_DROPPED, &[("reason", "crc")]), 1.0);
-        assert_eq!(totals.sum(FRAMES_DROPPED, &[("reason", "magic")]), 1.0);
         assert_eq!(totals.sum(FRAMES_DROPPED, &[("reason", "codec")]), 1.0);
+        assert_eq!(totals.sum(FRAMES_DROPPED, &[("reason", "magic")]), 1.0);
+        assert_eq!(totals.sum(FRAMES_DROPPED, &[("reason", "truncated")]), 0.0);
+    }
+
+    fn dropped(probe: &mut TelemetryProbe) -> Vec<(&'static str, f64)> {
+        let totals = probe.poll();
+        ["magic", "version", "too_large", "crc", "codec", "decode_budget", "malformed", "truncated"]
+            .into_iter()
+            .map(|reason| (reason, totals.sum(FRAMES_DROPPED, &[("reason", reason)])))
+            .filter(|(_, n)| *n > 0.0)
+            .collect()
+    }
+
+    /// A frame torn mid-file, with a later run's frames appended behind it (`file_out` opens its
+    /// file to append), declares a length reaching into those frames. It fails its CRC, and the
+    /// whole frames inside the bytes it claimed are still read.
+    #[tokio::test]
+    async fn a_torn_frame_with_frames_appended_behind_it_loses_only_itself() {
+        let written = three_runs();
+        let mut bytes = native_frames(&written[..1], Compression::None);
+        let db = native_frames(&written[1..2], Compression::None);
+        let body = db.len() - HEADER_LEN;
+        bytes.extend_from_slice(&db[..HEADER_LEN + body / 2]);
+        bytes.extend_from_slice(&native_frames(&written[..1], Compression::None));
+        bytes.extend_from_slice(&native_frames(&written[2..], Compression::None));
+        let mut out = replay(&bytes, ReplayFormat::Native, 1000).await;
+        assert_eq!(shape(&out.batches), [("web".into(), 5), ("web".into(), 5), ("web".into(), 1)]);
+        assert_eq!(dropped(&mut out.probe), [("crc", 1.0)]);
+    }
+
+    /// A torn frame whose declared length runs past the end of the file, with whole frames
+    /// behind it, doesn't end the read.
+    #[tokio::test]
+    async fn a_torn_frame_declaring_more_than_the_file_holds_loses_only_itself() {
+        let written = three_runs();
+        let big = EventBatch {
+            resource: resource("db"),
+            scope: None,
+            events: (0..500)
+                .map(|i| log_event(i, "a long enough message to pad the frame"))
+                .collect(),
+        };
+        let mut bytes = native_frames(&written[..1], Compression::None);
+        let torn = native_frames(std::slice::from_ref(&big), Compression::None);
+        bytes.extend_from_slice(&torn[..HEADER_LEN + 64]);
+        bytes.extend_from_slice(&native_frames(&written[1..], Compression::None));
+        let mut out = replay(&bytes, ReplayFormat::Native, 1000).await;
+        assert_eq!(shape(&out.batches), [("web".into(), 5), ("db".into(), 1), ("web".into(), 1)]);
+        assert_eq!(dropped(&mut out.probe), [("truncated", 1.0)]);
+    }
+
+    /// Trailing bytes of a garbage run already counted aren't counted again as `truncated`.
+    #[tokio::test]
+    async fn the_end_of_a_garbage_run_is_not_counted_again() {
+        // Longer than one 64 KiB read, so the run ends with a short remainder.
+        let mut out = replay(&vec![b'x'; 65_546], ReplayFormat::Native, 1000).await;
+        assert!(out.batches.is_empty());
+        assert_eq!(dropped(&mut out.probe), [("magic", 1.0)]);
+    }
+
+    /// A last frame of a version this build doesn't read, with an empty body, is one `version`.
+    #[tokio::test]
+    async fn an_unknown_version_last_frame_is_counted_once() {
+        let mut bytes = native_frames(&three_runs()[..1], Compression::None);
+        let mut header =
+            native_frames(&three_runs()[..1], Compression::None)[..HEADER_LEN].to_vec();
+        header[4..6].copy_from_slice(&99u16.to_le_bytes());
+        header[16..20].copy_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&header);
+        let mut out = replay(&bytes, ReplayFormat::Native, 1000).await;
+        assert_eq!(shape(&out.batches), [("web".into(), 5)]);
+        assert_eq!(dropped(&mut out.probe), [("version", 1.0)]);
+    }
+
+    /// A torn header a resync lands on is counted, beside the garbage run before it.
+    #[tokio::test]
+    async fn a_torn_header_after_garbage_is_counted_truncated() {
+        let mut bytes = native_frames(&three_runs()[..1], Compression::None);
+        bytes.extend_from_slice(&[b'x'; 30]);
+        bytes.extend_from_slice(&native_frames(&three_runs()[2..], Compression::None)[..12]);
+        let mut out = replay(&bytes, ReplayFormat::Native, 1000).await;
+        assert_eq!(shape(&out.batches), [("web".into(), 5)]);
+        assert_eq!(dropped(&mut out.probe), [("magic", 1.0), ("truncated", 1.0)]);
     }
 
     #[tokio::test]

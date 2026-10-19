@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-09-09
+updated: 2026-10-19
 ---
 
 # `stdio_out`/`file_out` gain a `native` wire-format option
@@ -118,3 +118,8 @@ own triggers.
 - `schema/logit.schema.json` regenerated.
 - `docs/known-gaps/sinks.md`'s `file_out`/`stdio_out` entries narrow: `format:` is no longer fixed
   to human-readable text, though reading a native-formatted file back remains unbuilt.
+
+## Amendment: a reader (2026-10-19)
+
+`replay_in` reads a `format: native` file back, frame by frame, the "decode-side reader" the
+last alternative above left as follow-up ([ADR `replay-input`](replay-input.md)).

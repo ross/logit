@@ -1521,7 +1521,7 @@ those values as *fields*, not as a rendered message.
 | Name | Kind | Meaning |
 |---|---|---|
 | `logit.input.lines` / `.line.bytes` | count | every non-blank `format: json` line read, a refused one included |
-| `logit.input.frames` / `.frame.bytes` | count | every whole `format: native` frame read, before its CRC and decode |
+| `logit.input.frames` / `.frame.bytes` | count | every `format: native` frame that passes its CRC, before it's decoded |
 | `logit.input.frames.dropped{reason}` | count | a skipped line or frame: `undecodable` for a JSON line, and `magic`, `version`, `too_large`, `crc`, `codec`, `decode_budget`, `malformed`, or `truncated` for a frame. The module doc's table says what each covers |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | a batch no consumer took, after which the read stops |
 

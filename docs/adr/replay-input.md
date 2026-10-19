@@ -78,12 +78,19 @@ replay:
      for a frame its decoder rejected whole. Its `bad_line` diagnostic names the line number.
    - A native frame is `magic`, `version`, `too_large`, `crc`, `codec`, `decode_budget`, or
      `malformed`, the reasons `logit_in` counts under `logit.proto.errors`. A `CODEC_HOP_BATCH`
-     frame, the disk spool's shape and not a file's, is `codec`. A header fault leaves no length
-     to trust, so the read resumes at the next frame magic; a body fault skips the frame by its
-     header's length.
-   - A frame or header the end of the file cuts short is `truncated` and ends the read, as
-     `decode_dump` tolerates a torn final frame. A JSON line cut short fails to parse and is
-     `undecodable`.
+     frame, the disk spool's shape and not a file's, is `codec`.
+   - A frame whose declared length runs past the end of the file is `truncated`.
+   - A JSON line cut short fails to parse and is `undecodable`.
+
+   A frame's declared length isn't trusted past its CRC. `file_out` opens its file to append, so
+   a writer killed mid-frame leaves a torn frame with the next run's whole frames behind it, and
+   the torn frame's length reaches into them. After a header fault, a CRC fault, or a `truncated`
+   frame, the read resumes at the next frame magic past the faulty frame's own, not past its
+   length. Only a `truncated` frame with no magic behind it ends the read, as `decode_dump`
+   tolerates a torn final frame. A false magic inside a payload costs one more CRC check. One
+   fault is counted per unreadable run, from a counted fault until a frame passes its CRC, except
+   that a frame or header the end of the file cuts short, magic included, is always counted
+   `truncated`.
 
    The module doc's table is the canonical list.
 7. **A batch no consumer took** is counted `logit.input.batches.dropped{reason="closed_consumer"}`
