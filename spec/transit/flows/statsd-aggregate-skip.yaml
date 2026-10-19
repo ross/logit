@@ -1,0 +1,18 @@
+# statsd_in's cases through a 10s `aggregate` in its default modes into statsd_out under
+# `multi_value: skip`, so the distributions and set estimates the window makes are skipped.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/statsd/mixed.json
+  window:
+    type: aggregate
+    sources: [case]
+    interval: 10s
+  out:
+    type: statsd_out
+    sources: [window]
+    endpoint: 127.0.0.1:8125
+    format: dogstatsd
+    multi_value: skip

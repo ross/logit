@@ -1,0 +1,15 @@
+{"events": [
+  {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"_logit.statsd.container_id":"in-82046","_logit.statsd.external_data":"it-false","_logit.statsd.cardinality":"low","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"info","format":"raw","message":"v1.2"},"attributes":{"_logit.statsd.event.title":"Deploy","_logit.statsd.event.alert_type":"info"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"bytes","kind":"samples","values":[60196.0],"sample_rate":0.5}],"attributes":{"_logit.statsd.type":"d"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"connections","kind":"gauge_delta","delta":2.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":1.0}],"attributes":{"_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":1,"_logit.statsd.service_check.message":"slow"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"hits","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"hits","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[12.0,15.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms","route":"/api"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/api","team":["a","b"]}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"size","kind":"samples","values":[512.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"h"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"room":"lab"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"users","kind":"set_members","members":["alice"]}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"users","kind":"set_members","members":["bob"]}]}
+], "counters": {}}

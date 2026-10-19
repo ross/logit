@@ -5,3 +5,5 @@
 {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"bytes.sent","kind":"sum","value":9007199254740993,"temporality":"delta","monotonic":true}],"types":{"/metrics/0/value":"u64"}}
 {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"flag.flips","kind":"sum","value":true,"temporality":"delta","monotonic":true}]}
 {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"pool.size","kind":"gauge_delta","delta":-3}]}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.slots","kind":"gauge_delta","delta":4}],"types":{"/metrics/0/delta":"u64"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"leader","kind":"gauge_delta","delta":true}]}

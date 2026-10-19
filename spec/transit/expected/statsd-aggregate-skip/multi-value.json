@@ -1,0 +1,8 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"hits","kind":"sum","value":6.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"level","kind":"gauge","value":5.0}]}
+], "counters": {
+  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 7,
+  "logit.output.metrics.skipped{component=out,kind=statsd_out,metric_kind=distribution,role=sink}": 1,
+  "logit.output.metrics.skipped{component=out,kind=statsd_out,metric_kind=set,role=sink}": 1
+}}

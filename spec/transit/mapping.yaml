@@ -208,8 +208,8 @@ rows:
           reason: dialect
           counter: logit.output.messages.normalized{reason=dialect}
           text: >-
-            Under `format: statsd`, a multi-value line splits into one line per value and an `h`
-            or `d` timer is written as `ms`, counted per line it renames.
+            Under `format: statsd`, a multi-value line splits into one line per value, uncounted,
+            and an `h` or `d` timer is written as `ms`, counted once per record it renames.
         - class: exact
           text: >-
             One `|ms`, `|h`, or `|d` line holding every value, the type letter from the
@@ -219,10 +219,12 @@ rows:
       statsd_out:
         class: normalized
         reason: member_per_line
+        counter: logit.output.messages.normalized{reason=member_sanitized}
         text: >-
           One `|s` line per member, under either dialect and uncounted, so a multi-member set
           line reads back as one record per member; a statsd server counts the same distinct
-          members either way.
+          members either way. A member holding `:`, `|`, or a control character is written with
+          `_` in its place, counted once per member.
 
   # --- summarized kinds ------------------------------------------------------------------------
   - kind: distribution
@@ -424,8 +426,8 @@ rows:
           counter: logit.output.fields.omitted{reason=dialect}
           text: >-
             Plain statsd has no `|c:`, `|e:`, `|card:`, or `|T` segment, so those carriers are
-            omitted, counted per line; the type carrier survives as the line's type, `h` and `d`
-            as `ms`.
+            omitted, counted once per carrier per line; the type carrier survives as the line's
+            type, `h` and `d` as `ms`.
         - class: exact
           text: >-
             A `_logit.statsd.*` carrier is written as its own segment or field and statsd_in
@@ -469,4 +471,31 @@ rows:
       statsd_out:
         class: skipped
         counter: logit.output.events.skipped
-        text: Any other log has no statsd form and isn't written.
+        text: Any other log on an event with no metrics has no statsd form and isn't written.
+  - kind: log
+    feature: beside_metrics
+    cells:
+      statsd_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          A log on an event that also carries metrics is left off while the metrics are written,
+          uncounted.
+
+  # --- spans -----------------------------------------------------------------------------------
+  - kind: span
+    feature: alone
+    cells:
+      statsd_out:
+        class: skipped
+        counter: logit.output.events.skipped
+        text: A span on an event with no metrics has no statsd form and isn't written.
+  - kind: span
+    feature: beside_metrics
+    cells:
+      statsd_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          A span on an event that also carries metrics is left off while the metrics are written,
+          uncounted.

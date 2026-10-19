@@ -1,0 +1,6 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"visitors.count","kind":"gauge","value":2.0}]}
+], "counters": {
+  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1,
+  "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=set,role=sink}": 1
+}}

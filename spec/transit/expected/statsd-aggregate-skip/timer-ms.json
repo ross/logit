@@ -1,0 +1,4 @@
+{"events": [], "counters": {
+  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2,
+  "logit.output.metrics.skipped{component=out,kind=statsd_out,metric_kind=distribution,role=sink}": 1
+}}

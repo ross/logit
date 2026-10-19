@@ -1,0 +1,4 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[12.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms","route":"/api"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[7.5],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms","route":"/api"}}
+], "counters": {}}

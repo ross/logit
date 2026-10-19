@@ -1,0 +1,6 @@
+{"events": [], "counters": {
+  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1,
+  "logit.output.metrics.skipped{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 2,
+  "logit.output.metrics.skipped{component=out,kind=statsd_out,metric_kind=non_monotonic_delta_sum,role=sink}": 1,
+  "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=no_merge_rule,role=transform}": 2
+}}

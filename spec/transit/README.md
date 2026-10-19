@@ -23,7 +23,7 @@ limits, and [the plan](../../docs/plans/transit-spec.md) the workstreams.
 | `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from, such as `.statsd` |
 | `flows/<flow>.yaml` | A runnable config: `replay_in -> [stages] -> <sink>` |
 | `expected/<flow>/<case>.json` | The run's document: the events read back and the counters moved (generated) |
-| `coverage.md` | Each system's features and the cases that exercise them (generated) |
+| `coverage.md` | Each system's features and the cases that exercise them, and each sink's cells no flow reaches (generated) |
 
 ## Running it
 
@@ -32,21 +32,23 @@ The spec's generator is an ordinary test, so `script/test` and CI run it. Three 
 - `script/transit check` compares every generated file and runs the class check.
 - `script/transit gen` rewrites every generated file, then runs the class check. Review
   `git diff spec/transit/` and commit the result.
-- `script/transit coverage` rewrites `coverage.md` and prints it.
+- `script/transit coverage` does what `gen` does, then prints `coverage.md`.
 
-`gen` never rewrites over a class check failure. A failure means the code or the table is wrong,
-and a person decides which.
+`gen` never rewrites an expectation whose run fails the class check. A failure means the code or
+the table is wrong, and a person decides which. A cell `coverage.md` lists as reached by no flow
+is one nothing checks: add a case or a flow that reaches it.
 
 ## The classes
 
 `mapping.yaml`'s `classes:` is the canonical vocabulary: `exact`, `normalized`, `degraded`, `lost`,
 `skipped`, and `dropped`. They apply at two levels:
 
-- **Record level**, for a metric kind, a log, and the `record` rows that decide a record's fate
-  (`no_recorded_value`, `service_check`, `name_unsafe`): `exact`, `normalized`, `degraded`,
-  `skipped`, or `dropped`, best to worst.
+- **Record level**, for a metric kind, a log or span on an event with no metrics, and the
+  `record` rows that decide a record's fate (`no_recorded_value`, `service_check`,
+  `name_unsafe`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, and
-  `exemplars`, and every `attributes` row: `exact`, `normalized`, or `lost`.
+  `exemplars`, every `attributes` row, and a log or span beside metrics (`beside_metrics`), which
+  is a field of its event: `exact`, `normalized`, or `lost`.
 
 ## The mapping table
 
@@ -87,6 +89,22 @@ once.
 
 `crates/logit-cli/src/transit/classes.rs`'s module doc has the rules in full: which rows a record
 reaches, how records pair, and what each failure message names.
+
+### Counters no row names yet
+
+The check fails on a sink counter no reached cell names, so these `statsd_out` series have no row
+because no case can reach them through the like pair: each needs input `statsd_in` never decodes.
+
+| Series | Why no case reaches it |
+|---|---|
+| `messages.dropped{reason=unencodable_value}` | a non-finite value, which `statsd_in` refuses |
+| `messages.dropped{reason=empty_name}` | a name that sanitizes to nothing, which `statsd_in` refuses |
+| `messages.dropped{reason=invalid_service_check}` | a service check carrier out of range, which `statsd_in` never stamps |
+| `messages.dropped{reason=oversize_line}` | a line over `max_packet_bytes`, a transport bound the row model has no feature for; `statsd_in` reads lines up to its own datagram size |
+| `tags.omitted{reason=unrepresentable}` | a `Bytes`, `Timestamp`, `Map`, or nested `Array` attribute value |
+| `fields.omitted{reason=invalid_value}` | a `_logit.statsd.*` carrier of the wrong type |
+
+A cross-protocol source or a hand-written case can reach each; the row comes with that case.
 
 ## Determinism
 
