@@ -1,0 +1,1 @@
+{"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":1.5}],"attributes":{"_logit.influxdb.measurement":"cpu","host":"web-01"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}

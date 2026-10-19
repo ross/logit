@@ -3054,8 +3054,10 @@ surveyor's.
 - **Invariants to verify:**
   - Rotation is always decided before the write; a batch is written whole into exactly one file.
   - Under `format: native`, each file (rotated and active) contains only whole, independently decodable frames
-    *except* possibly a torn tail from a crash — and nothing reads these files back today, so the torn tail is
-    unrecoverable by any shipped tool.
+    *except* possibly a torn frame from a crash, at the tail or, after a restart appends to the file, mid-file.
+    `replay_in` (`format: native`) reads the files back: it counts a torn frame
+    `logit.input.frames.dropped{reason="truncated"}` (or `crc`, when the next run's frames fill its declared
+    length) and reads every whole frame after it (ADR `replay-input`).
   - `bytes.len()` is counted in `logit.output.batch.bytes` exactly once even when the rotation path errors.
   - A cancelled `send` (shutdown grace) can leave a partial `write_all` on disk; verify the batch is then
     replayed/redelivered or counted, not silently both.

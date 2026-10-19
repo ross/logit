@@ -318,6 +318,8 @@
 //!     its targets: a mixed event reaches both whole, so that component would receive it twice.
 //!     Under `strip: true` each target receives disjoint payloads, so reading several is legal
 //!     (`docs/adr/route-signals.md`).
+//! 93. A `replay_in` with an empty `path`, which names no file, or a `batch` of `0`, which could
+//!     send nothing (`docs/adr/replay-input.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -399,7 +401,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | LogitIn { .. }
         | Internal { .. }
         | PrometheusIn { .. }
-        | GenerateIn { .. } => Role::Listener,
+        | GenerateIn { .. }
+        | ReplayIn { .. } => Role::Listener,
         Lua { .. }
         | LuaFile { .. }
         | Aggregate { .. }
@@ -475,6 +478,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Internal { .. } => "internal",
         PrometheusIn { .. } => "prometheus_in",
         GenerateIn { .. } => "generate_in",
+        ReplayIn { .. } => "replay_in",
         Lua { .. } => "lua",
         LuaFile { .. } => "lua_file",
         Aggregate { .. } => "aggregate",
@@ -649,6 +653,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::GraphiteOut { .. }
             | ComponentKind::PrometheusOut { .. }
             | ComponentKind::GenerateIn { .. }
+            | ComponentKind::ReplayIn { .. }
             | ComponentKind::NullOut { .. }
             | ComponentKind::Target { .. }
             | ComponentKind::Route { .. }
@@ -2338,6 +2343,20 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 );
             }
             check_generate_template(id, "event.metric.name", &metric.name, Rendering::Interned)?;
+        }
+    }
+
+    // Rule 93: a `replay_in`'s path and batch bound. The file itself is opened by `Input::bind`
+    // at `logit run`, so `logit validate` passes a config whose file isn't there yet.
+    for (id, component) in &components {
+        let ComponentKind::ReplayIn { path, batch, .. } = &component.kind else { continue };
+        if path.is_empty() {
+            anyhow::bail!("component '{id}': 'path' is empty -- name the file to replay");
+        }
+        if *batch == 0 {
+            anyhow::bail!(
+                "component '{id}': batch: 0 would send nothing -- use a positive batch size"
+            );
         }
     }
 
@@ -14040,6 +14059,41 @@ mod tests {
     fn a_null_out_with_no_sources_is_rejected() {
         let err = expect_err(cfg(vec![("sink", vec![], null_out())]));
         assert!(err.contains("'sink'") && err.contains("sink"), "got: {err}");
+    }
+
+    fn replay_in(path: &str, batch: usize) -> ComponentKind {
+        ComponentKind::ReplayIn {
+            path: path.to_string(),
+            format: logit_config::ReplayFormat::Json,
+            batch,
+        }
+    }
+
+    /// Rule 93 passes a file that isn't there: `bind` opens it at `logit run`, not here.
+    #[test]
+    fn a_replay_in_into_a_sink_resolves_without_its_file() {
+        let graph = resolve(cfg(vec![
+            ("replay", vec![], replay_in("no/such/file.json", 1000)),
+            ("sink", vec!["replay"], null_out()),
+        ]))
+        .expect("validation never opens the file");
+        assert_eq!(graph.components["replay"].role(), Role::Listener);
+        assert_eq!(graph.components["replay"].kind_name(), "replay_in");
+    }
+
+    /// Rule 93.
+    #[test]
+    fn a_replay_in_with_an_empty_path_or_a_zero_batch_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("replay", vec![], replay_in("", 1000)),
+            ("sink", vec!["replay"], null_out()),
+        ]));
+        assert!(err.contains("'replay'") && err.contains("'path' is empty"), "got: {err}");
+        let err = expect_err(cfg(vec![
+            ("replay", vec![], replay_in("events.json", 0)),
+            ("sink", vec!["replay"], null_out()),
+        ]));
+        assert!(err.contains("'replay'") && err.contains("batch: 0"), "got: {err}");
     }
 
     #[test]

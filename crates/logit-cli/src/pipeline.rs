@@ -31,6 +31,7 @@ use logit_inputs::lines::LinesInput;
 use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::prometheus::{PrometheusInput, PrometheusReceiver};
+use logit_inputs::replay::{ReplayFormat, ReplayInput};
 use logit_inputs::splunk::SplunkHecInput;
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
@@ -440,7 +441,7 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<Vec<String>> {
 /// `hostname` is the process hostname (`logit_pipeline::host`). `internal` stamps it as
 /// `host.name`, and `syslog_out`, `splunk_hec_out`, and `datadog_out` fill it in for an event that
 /// carries no host of its own.
-fn build_spec(
+pub(crate) fn build_spec(
     id: &str,
     component: &ResolvedComponent,
     base_dir: &Path,
@@ -968,6 +969,17 @@ fn build_spec(
                     metric.value,
                 )?;
             }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+
+        ReplayIn { path, format, batch } => {
+            let format = match format {
+                logit_config::ReplayFormat::Json => ReplayFormat::Json,
+                logit_config::ReplayFormat::Native => ReplayFormat::Native,
+            };
+            let input = ReplayInput::new(base_dir.join(path), format, *batch)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
 
@@ -1512,9 +1524,7 @@ fn build_spec(
                     StatsdOutput::unix_stream(endpoint.clone(), *connect_timeout)
                 }
             };
-            let encoder = StatsdEncoder::new(statsd_format(*format))
-                .with_relative_gauges(*relative_gauges)
-                .with_multi_value(statsd_multi_value(*multi_value));
+            let encoder = statsd_encoder(*format, *relative_gauges, *multi_value);
             let mut output = output
                 .with_encoder(encoder)
                 .with_max_packet_bytes(*max_packet_bytes as usize)
@@ -1662,6 +1672,99 @@ fn build_spec(
         ),
     };
     Ok((spec, telemetry))
+}
+
+/// The encoder a sink kind writes its wire with, configured as [`build_spec`] configures that
+/// sink's, for a caller that needs the bytes a sink would send without its transport (the transit
+/// flow driver, `crate::transit`). One variant per encoder shape.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum SinkEncoder {
+    /// `statsd_out`: one line per [`logit_proto::MessageBuf`] entry, line-capped as the sink's
+    /// transport caps it.
+    Framed(StatsdEncoder),
+    /// `influxdb_out`: one line-protocol body per batch, written to the org and bucket the sink
+    /// resolves for it (`logit_outputs::influxdb::destination`).
+    Blob {
+        encoder: logit_proto::influxdb::encode::InfluxLineEncoder,
+        organization: Organization,
+        destination: Destination,
+    },
+    /// `otlp_out`: one protobuf request per signal.
+    Signal(logit_proto::otlp::OtlpEncoder),
+    /// `prometheus_out` with `bind:`: an exposition body, in the dialect a scraper negotiates
+    /// (`logit_outputs::prometheus::render_batches`), held to `max_series`. The config doesn't
+    /// choose a dialect.
+    PrometheusExpose { encoder: logit_proto::prometheus::PrometheusEncoder, max_series: usize },
+    /// `prometheus_out` with `endpoint:`: one compressed request per batch
+    /// (`logit_outputs::prometheus::encode_remote_write`).
+    PrometheusRemoteWrite {
+        encoder: logit_proto::prometheus::PrometheusEncoder,
+        version: logit_proto::prometheus::remote_write::Version,
+        compression: logit_proto::prometheus::compression::Encoding,
+    },
+}
+
+/// The [`SinkEncoder`] for `kind`, its codec counting through `telemetry` and `diag`. Every
+/// config field it reads goes through the mapping `build_spec` uses, so the two can't drift.
+/// Fails for a kind with no arm here.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn sink_encoder(
+    kind: &logit_config::ComponentKind,
+    telemetry: &Telemetry,
+    diag: &Diagnostics,
+) -> anyhow::Result<SinkEncoder> {
+    use logit_config::ComponentKind::*;
+    Ok(match kind {
+        StatsdOut { transport, format, relative_gauges, multi_value, max_packet_bytes, .. } => {
+            let tcp = matches!(transport, logit_config::StatsdTransport::Tcp);
+            SinkEncoder::Framed(
+                statsd_encoder(*format, *relative_gauges, *multi_value)
+                    .with_max_packet_bytes(logit_outputs::statsd::line_cap(
+                        tcp,
+                        *max_packet_bytes as usize,
+                    ))
+                    .with_diagnostics(diag.clone()),
+            )
+        }
+        InfluxDbOut { org, default_org, bucket, default_bucket, .. } => SinkEncoder::Blob {
+            encoder: logit_proto::influxdb::encode::InfluxLineEncoder::default()
+                .with_diagnostics(diag.clone()),
+            organization: Organization::from_config(org.clone(), default_org.clone()),
+            destination: Destination::from_config(bucket.clone(), default_bucket.clone()),
+        },
+        OtlpOut { .. } => SinkEncoder::Signal(
+            logit_proto::otlp::OtlpEncoder::new()
+                .with_telemetry(telemetry.clone())
+                .with_diagnostics(diag.clone()),
+        ),
+        PrometheusOut { bind: Some(_), max_series, .. } => SinkEncoder::PrometheusExpose {
+            encoder: logit_proto::prometheus::PrometheusEncoder::new()
+                .with_telemetry(telemetry.clone())
+                .with_diagnostics(diag.clone()),
+            max_series: *max_series,
+        },
+        PrometheusOut { bind: None, version, compression, .. } => {
+            SinkEncoder::PrometheusRemoteWrite {
+                encoder: logit_outputs::prometheus::sender_encoder()
+                    .with_telemetry(telemetry.clone())
+                    .with_diagnostics(diag.clone()),
+                version: to_remote_write_version(*version),
+                compression: to_remote_write_encoding(*compression),
+            }
+        }
+        other => anyhow::bail!("{} has no encoder this driver reaches", graph::kind_name(other)),
+    })
+}
+
+/// `statsd_out`'s encoder from its config fields, before the sink applies its line cap.
+fn statsd_encoder(
+    format: logit_config::StatsdFormat,
+    relative_gauges: bool,
+    multi_value: logit_config::StatsdMultiValue,
+) -> StatsdEncoder {
+    StatsdEncoder::new(statsd_format(format))
+        .with_relative_gauges(relative_gauges)
+        .with_multi_value(statsd_multi_value(multi_value))
 }
 
 /// A sink's `SinkStoreConfig` from its `BufferConfig` (`docs/adr/buffered-sink-delivery.md`,

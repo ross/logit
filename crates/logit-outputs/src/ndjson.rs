@@ -2,6 +2,11 @@
 //! program to read. `kafka_out`'s `format: json` sends each object as one record's value, or a
 //! run of these lines as one record under `record: batch`. This doc is the canonical grammar.
 //!
+//! The form is lossless: a line reads back to the [`Event`], [`Resource`], and [`Scope`] that
+//! wrote it, through `logit_proto::event_json` (whose module doc has the reader's side), and
+//! `docs/adr/stream-json-format.md` records why. Every key a reader read before still means
+//! what it meant; the lossless additions are keys of their own.
+//!
 //! Each line is one [`Event`] of an [`EventBatch`], in batch order, terminated by `\n`, with no
 //! pretty-printing and nothing between batches. Every populated field of the event model
 //! (`docs/design/data-model.md`) appears; a field that is `None`, empty, or `0` is omitted, never
@@ -15,7 +20,7 @@
 //!   `dropped_attributes_count`
 //! - `metrics`: an array, each `name`, `kind`, the kind's fields (table below), `unit`,
 //!   `description`, `start_timestamp`, `flags` (the raw bitmask), `no_recorded_value: true` when
-//!   `flags` bit 0 is set (the kind's fields are then omitted; `kind` stays), `exemplars` (each
+//!   `flags` bit 0 is set (the kind's fields are still written, as decoded), `exemplars` (each
 //!   `timestamp`, `value`, `trace_id`, `span_id`, `trace_flags`, `attributes`)
 //! - `span`: `name`, `trace_id`, `span_id`, `parent_span_id`, `kind`, `status`,
 //!   `status_message`, `trace_state`, `flags`, `start` (the event's timestamp), `end`,
@@ -28,34 +33,62 @@
 //!   `dropped_attributes_count`; omitted when all three are
 //! - `scope` (the batch's, when it has one): `name`, `version`, `attributes`, `schema_url`,
 //!   `dropped_attributes_count`
+//! - `types`: the type table below, when the line has an entry for it
 //!
 //! | `kind` | fields, in order |
 //! |---|---|
 //! | `sum` | `value`, `temporality` (`delta`/`cumulative`), `monotonic` |
 //! | `gauge` | `value` |
-//! | `gauge_delta` | `delta` (a negative zero writes `-0`) |
+//! | `gauge_delta` | `delta` (a negative zero writes `-0.0`) |
 //! | `samples` | `values` (array), `sample_rate` |
 //! | `set_members` | `members` (array of strings, invalid bytes as `\xHH`) |
-//! | `distribution` | `count`, `sum`; then `min`, `max`, `avg` (`sum / count`), `p50`, `p90`, `p95`, `p99` when the sketch is non-empty |
-//! | `set` | `estimate` |
+//! | `distribution` | `count`, `sum`; then `min`, `max`, `avg` (`sum / count`), `p50`, `p90`, `p95`, `p99` when the sketch is non-empty; then `sketch` (below) |
+//! | `set` | `estimate`, `hll` (the `HyperLogLog`'s `to_bytes`, standard base64) |
 //! | `histogram` | `temporality`, `buckets` (`[{"bound": b, "count": n}]` in wire order, each count the bucket's own), then `sum`, `min`, `max` when present |
-//! | `exponential_histogram` | `scale`, `temporality`, `count`, `zero_count`, `zero_threshold`, `positive`, `negative` (each `{"offset": o, "counts": [..]}`, omitted when its counts are empty), then `sum`, `min`, `max` when present |
+//! | `exponential_histogram` | `scale`, `temporality`, `count`, `zero_count`, `zero_threshold`, `positive`, `negative` (each `{"offset": o, "counts": [..]}`, omitted when its counts are empty and its offset `0`), then `sum`, `min`, `max` when present |
 //! | `summary` | `count`, `sum`, `quantiles` (`[{"quantile": q, "value": v}]` in wire order) |
+//!
+//! A distribution's `sketch` is the `DdSketch` as stored, which the statistics above are read
+//! from: `mapping` (`agent`, or `logarithmic` followed by its `gamma`, `index_offset`, and
+//! `bin_limit`), `stats_exact`, the stored `count` (an `f64`, unrounded), `min` and `max` (`"inf"`
+//! and `"-inf"` when the sketch is empty), `zero_count` (omitted when `0`), then `positive` and
+//! `negative`, each `[{"key": k, "count": c}]` ascending by key and omitted when empty. The
+//! distribution's `sum` is the stored one.
 //!
 //! A `sum`'s `value`, a `gauge`'s `value`, a `gauge_delta`'s `delta`, and an exemplar's `value`
 //! are a `MetricValue` (`docs/adr/typed-metric-scalar.md`), written in its own JSON type: a
-//! number for `F64` (the non-finite rule below applies), an integer for `I64` and `U64` (a `U64`
-//! above 2^53 keeps every digit), and a boolean for `Bool`. A whole-number `F64` and an `I64` of
-//! the same value both write the same digits.
+//! number for `F64` (the number rule below applies), an integer for `I64` and `U64` (a `U64`
+//! above 2^53 keeps every digit), and a boolean for `Bool`.
 //!
-//! Values: `Null`, `Bool`, `I64`, `U64` are JSON's own; `F64` is a JSON number, except that a
-//! non-finite one, which JSON has no form for, is the string `"NaN"`, `"inf"`, or `"-inf"` (the
-//! rule for every `f64` in the object, bucket bounds included); `Str` is a JSON string; `Timestamp`
-//! is an RFC 3339 string; `Array` an array; `Map` an object in `AttrMap` order. `Bytes` is a JSON
-//! string holding the text `b"..."`: valid UTF-8 runs as text, each invalid byte as `\xHH`. Byte
-//! fields that are text by convention (`status_message`, `trace_state`, `schema_url`, scope
-//! `name`/`version`) are strings with invalid bytes as `\xHH` and no `b` prefix. Every timestamp
-//! is RFC 3339 UTC with nine fractional digits; every trace and span id is lowercase hex.
+//! Every `f64` in the object is a JSON number with a fraction or an exponent (`3.0`, `0.25`,
+//! `1e21`, `-0.0`), the shortest that parses back to the same bits, so its spelling never
+//! matches an integer's. A non-finite one, which JSON has no number for, is the string `"NaN"`,
+//! `"inf"`, or `"-inf"`, bucket bounds included.
+//!
+//! Values: `Null`, `Bool`, `I64`, `U64` are JSON's own; `F64` is a number under the rule above;
+//! `Str` is a JSON string; `Timestamp` is an RFC 3339 string; `Array` an array; `Map` an object in
+//! `AttrMap` order. `Bytes` is a JSON string holding the text `b"..."`: valid UTF-8 runs as text,
+//! each invalid byte and each backslash as `\xHH`. Byte fields that are text by convention
+//! (`status_message`, `trace_state`, `schema_url`, scope `name`/`version`, a set member) are
+//! strings under the same escaping, with no `b` prefix. Every timestamp is RFC 3339 UTC with nine
+//! fractional digits; every trace and span id is lowercase hex.
+//!
+//! **The `types` table** names the type of each value whose spelling doesn't: an object from an
+//! RFC 6901 JSON Pointer into the line (`/attributes/count`, `/metrics/0/value`,
+//! `/span/events/1/attributes/k`, `/attributes/tags/2`) to one of these tags, each pointer once,
+//! in walk order. The line omits it when no value needs an entry.
+//!
+//! | Tag | Written for |
+//! |---|---|
+//! | `u64` | a `Value::U64`, and a `MetricValue::U64` in a `value` or `delta` |
+//! | `f64` | a non-finite `Value::F64`, which is a string |
+//! | `bytes` | a `Value::Bytes` |
+//! | `timestamp` | a `Value::Timestamp` |
+//!
+//! It covers the values under `attributes` (the event's, the resource's, the scope's, an
+//! exemplar's, a span event's or link's), `log`'s `message`, `span`'s and a span event's `name`,
+//! and the metric values above. A field with one type in the model needs no entry: a count is a
+//! `u64` and a bound an `f64` whatever their spelling.
 //!
 //! Strings follow RFC 8259: `\"`, `\\`, `\n`, `\r`, `\t`, `\b`, `\f`, every other control
 //! character as `\u00XX`; DEL and non-ASCII are written raw as UTF-8.
@@ -70,12 +103,14 @@
 //! change to the keys here changes that format too. [`Json`] writes straight into the caller's
 //! `String` with `push_str`/`write!`: no per-field `String`, no serde (`docs/design/memory.md`).
 
+use base64::Engine;
 use logit_core::interner::resolve;
 use logit_core::time::write_rfc3339_utc;
 use logit_core::trace::push_hex;
 use logit_core::{
-    AttrMap, Event, EventBatch, Exemplar, ExpHistogram, LogRecord, MetricKind, MetricRecord,
-    MetricValue, Resource, Scope, SpanEvent, SpanLink, SpanRecord, Temporality, TraceRef, Value,
+    AttrMap, DdSketch, Event, EventBatch, Exemplar, ExpHistogram, LogRecord, MappingKind,
+    MetricKind, MetricRecord, MetricValue, Resource, Scope, SpanEvent, SpanLink, SpanRecord,
+    Temporality, TraceRef, Value,
 };
 use std::fmt::Write;
 
@@ -136,6 +171,54 @@ pub(crate) trait TreeWriter {
     fn timestamp(&mut self, nanos: i64);
     /// A trace or span id.
     fn hex(&mut self, bytes: &[u8]);
+    /// Starts an entry of the `types` table under `path` as an RFC 6901 JSON Pointer.
+    fn pointer_key(&mut self, map: &mut Self::Map, path: &Path<'_>);
+}
+
+/// One step of a JSON Pointer into the event's object: an object key or an array index.
+#[derive(Clone, Copy)]
+pub(crate) enum Seg<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+/// A JSON Pointer as a chain of segments on the stack, so building one allocates nothing.
+pub(crate) struct Path<'a> {
+    parent: Option<&'a Path<'a>>,
+    seg: Seg<'a>,
+}
+
+impl<'a> Path<'a> {
+    fn child(&'a self, seg: Seg<'a>) -> Path<'a> {
+        Path { parent: Some(self), seg }
+    }
+
+    /// Calls `f` with each segment, root first.
+    pub(crate) fn for_each(&self, f: &mut impl FnMut(Seg<'_>)) {
+        if let Some(parent) = self.parent {
+            parent.for_each(f);
+        }
+        f(self.seg);
+    }
+}
+
+/// `seg`'s pointer text: `/`, then an index's digits or a key with `~` as `~0` and `/` as `~1`.
+pub(crate) fn push_pointer_seg(out: &mut String, seg: Seg<'_>) {
+    out.push('/');
+    match seg {
+        Seg::Index(i) => {
+            let _ = write!(out, "{i}");
+        }
+        Seg::Key(key) => {
+            for c in key.chars() {
+                match c {
+                    '~' => out.push_str("~0"),
+                    '/' => out.push_str("~1"),
+                    c => out.push(c),
+                }
+            }
+        }
+    }
 }
 
 /// The JSON writer: this module's grammar, into a `String`.
@@ -208,11 +291,12 @@ impl TreeWriter for Json<'_> {
     }
 
     /// A JSON number, or `"NaN"`/`"inf"`/`"-inf"` for the values JSON has no number for.
-    /// `Display` never uses exponent notation, so every finite value is a valid JSON number as
-    /// written.
+    /// `Debug` writes the shortest text that parses back to `v` and always includes a `.` or an
+    /// `e` (`3.0`, `1e21`, `-0.0`), so a reader tells an `F64` from an integer by its spelling.
+    /// Every form it writes is a valid JSON number.
     fn f64(&mut self, v: f64) {
         if v.is_finite() {
-            let _ = write!(self.0, "{v}");
+            let _ = write!(self.0, "{v:?}");
         } else if v.is_nan() {
             self.0.push_str("\"NaN\"");
         } else if v > 0.0 {
@@ -249,6 +333,29 @@ impl TreeWriter for Json<'_> {
         self.0.push('"');
         push_hex(self.0, bytes);
         self.0.push('"');
+    }
+
+    fn pointer_key(&mut self, first: &mut bool, path: &Path<'_>) {
+        self.separate(first);
+        self.0.push('"');
+        path.for_each(&mut |seg| match seg {
+            Seg::Index(i) => {
+                let _ = write!(self.0, "/{i}");
+            }
+            Seg::Key(key) => {
+                self.0.push('/');
+                for part in key.split_inclusive(['~', '/']) {
+                    let (text, special) = match part.as_bytes().last() {
+                        Some(b'~') => (&part[..part.len() - 1], "~0"),
+                        Some(b'/') => (&part[..part.len() - 1], "~1"),
+                        _ => (part, ""),
+                    };
+                    push_json_escaped(self.0, text);
+                    self.0.push_str(special);
+                }
+            }
+        });
+        self.0.push_str("\":");
     }
 }
 
@@ -316,6 +423,7 @@ pub(crate) fn walk_event<W: TreeWriter>(
         push_nonzero(w, &mut sc, "dropped_attributes_count", scope.dropped_attributes_count);
         w.close_map(sc);
     }
+    walk_types(w, &mut obj, resource, scope, event);
     w.close_map(obj);
 }
 
@@ -377,9 +485,7 @@ fn walk_metric<W: TreeWriter>(w: &mut W, metric: &MetricRecord) {
     w.str(resolve(metric.name));
     w.key(&mut obj, "kind");
     w.str(kind_name(&metric.kind));
-    if !metric.is_no_recorded_value() {
-        walk_kind_fields(w, &mut obj, &metric.kind);
-    }
+    walk_kind_fields(w, &mut obj, &metric.kind);
     if let Some(unit) = metric.unit {
         w.key(&mut obj, "unit");
         w.str(resolve(unit));
@@ -487,8 +593,14 @@ fn walk_kind_fields<W: TreeWriter>(w: &mut W, obj: &mut W::Map, kind: &MetricKin
                     }
                 }
             }
+            w.key(obj, "sketch");
+            walk_sketch(w, sketch);
         }
-        MetricKind::Set(hll) => push_u64(w, obj, "estimate", hll.estimate()),
+        MetricKind::Set(hll) => {
+            push_u64(w, obj, "estimate", hll.estimate());
+            w.key(obj, "hll");
+            w.str(&base64::engine::general_purpose::STANDARD.encode(hll.to_bytes()));
+        }
         MetricKind::Histogram(h) => {
             push_temporality(w, obj, h.temporality);
             w.key(obj, "buckets");
@@ -515,6 +627,47 @@ fn walk_kind_fields<W: TreeWriter>(w: &mut W, obj: &mut W::Map, kind: &MetricKin
     }
 }
 
+/// A distribution's sketch as stored, which [`walk_kind_fields`]' statistics are read from:
+/// enough to rebuild it bin for bin.
+fn walk_sketch<W: TreeWriter>(w: &mut W, sketch: &DdSketch) {
+    let mut obj = w.open_map();
+    let mapping = sketch.mapping();
+    w.key(&mut obj, "mapping");
+    match mapping.kind() {
+        MappingKind::Agent => w.str("agent"),
+        MappingKind::Logarithmic => {
+            w.str("logarithmic");
+            push_f64(w, &mut obj, "gamma", mapping.gamma());
+            push_f64(w, &mut obj, "index_offset", mapping.index_offset());
+            push_u64(w, &mut obj, "bin_limit", u64::from(mapping.bin_limit()));
+        }
+    }
+    w.key(&mut obj, "stats_exact");
+    w.bool(sketch.stats_exact());
+    let stats = sketch.stored_stats();
+    push_f64(w, &mut obj, "count", stats.count);
+    push_f64(w, &mut obj, "min", stats.min);
+    push_f64(w, &mut obj, "max", stats.max);
+    if sketch.zero_count() != 0.0 {
+        push_f64(w, &mut obj, "zero_count", sketch.zero_count());
+    }
+    for (key, bins) in [("positive", sketch.positive_bins()), ("negative", sketch.negative_bins())]
+    {
+        if bins.is_empty() {
+            continue;
+        }
+        w.key(&mut obj, key);
+        walk_array(w, bins.iter(), |w, bin| {
+            let mut b = w.open_map();
+            w.key(&mut b, "key");
+            w.i64(i64::from(bin.key));
+            push_f64(w, &mut b, "count", bin.count);
+            w.close_map(b);
+        });
+    }
+    w.close_map(obj);
+}
+
 fn walk_exp_histogram<W: TreeWriter>(w: &mut W, obj: &mut W::Map, e: &ExpHistogram) {
     w.key(obj, "scale");
     w.i64(i64::from(e.scale));
@@ -523,7 +676,7 @@ fn walk_exp_histogram<W: TreeWriter>(w: &mut W, obj: &mut W::Map, e: &ExpHistogr
     push_u64(w, obj, "zero_count", e.zero_count);
     push_f64(w, obj, "zero_threshold", e.zero_threshold);
     for (key, (offset, counts)) in [("positive", &e.positive), ("negative", &e.negative)] {
-        if counts.is_empty() {
+        if counts.is_empty() && *offset == 0 {
             continue;
         }
         w.key(obj, key);
@@ -686,11 +839,119 @@ fn walk_value<W: TreeWriter>(w: &mut W, value: &Value) {
     }
 }
 
-/// `bytes`' valid UTF-8 runs JSON-escaped, each invalid byte as the text `\xHH`, with no quotes.
-/// In JSON source that text is `\\xHH`, so a reader decodes the string to `\xHH`.
+/// The `types` table: one entry per value whose JSON spelling alone doesn't name its type,
+/// written after every other key and only when there is one. See the module doc.
+struct Types<'w, 'o, W: TreeWriter> {
+    w: &'w mut W,
+    obj: &'o mut W::Map,
+    table: Option<W::Map>,
+}
+
+impl<W: TreeWriter> Types<'_, '_, W> {
+    fn tag(&mut self, path: &Path<'_>, tag: &'static str) {
+        if self.table.is_none() {
+            self.w.key(self.obj, "types");
+            self.table = Some(self.w.open_map());
+        }
+        let table = self.table.as_mut().expect("opened above");
+        self.w.pointer_key(table, path);
+        self.w.str(tag);
+    }
+
+    fn metric_value(&mut self, path: &Path<'_>, v: MetricValue) {
+        if let MetricValue::U64(_) = v {
+            self.tag(path, "u64");
+        }
+    }
+
+    fn value(&mut self, path: &Path<'_>, value: &Value) {
+        match value {
+            Value::U64(_) => self.tag(path, "u64"),
+            Value::F64(f) if !f.is_finite() => self.tag(path, "f64"),
+            Value::Bytes(_) => self.tag(path, "bytes"),
+            Value::Timestamp(_) => self.tag(path, "timestamp"),
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    self.value(&path.child(Seg::Index(i)), item);
+                }
+            }
+            Value::Map(map) => self.attrs(path, map),
+            Value::Null | Value::Bool(_) | Value::I64(_) | Value::F64(_) | Value::Str(_) => {}
+        }
+    }
+
+    fn attrs(&mut self, path: &Path<'_>, attrs: &AttrMap) {
+        for (key, value) in attrs.iter() {
+            self.value(&path.child(Seg::Key(resolve(key))), value);
+        }
+    }
+}
+
+fn walk_types<W: TreeWriter>(
+    w: &mut W,
+    obj: &mut W::Map,
+    resource: &Resource,
+    scope: Option<&Scope>,
+    event: &Event,
+) {
+    let mut t = Types { w, obj, table: None };
+    if let Some(log) = &event.log {
+        let log_path = Path { parent: None, seg: Seg::Key("log") };
+        t.value(&log_path.child(Seg::Key("message")), &log.message);
+    }
+    let metrics = Path { parent: None, seg: Seg::Key("metrics") };
+    for (i, metric) in event.metrics.iter().enumerate() {
+        let m = metrics.child(Seg::Index(i));
+        match &metric.kind {
+            MetricKind::Sum(sum) => t.metric_value(&m.child(Seg::Key("value")), sum.value),
+            MetricKind::Gauge(v) => t.metric_value(&m.child(Seg::Key("value")), *v),
+            MetricKind::GaugeDelta(v) => t.metric_value(&m.child(Seg::Key("delta")), *v),
+            _ => {}
+        }
+        let exemplars = m.child(Seg::Key("exemplars"));
+        for (j, exemplar) in metric.exemplars.iter().enumerate() {
+            let e = exemplars.child(Seg::Index(j));
+            t.metric_value(&e.child(Seg::Key("value")), exemplar.value);
+            t.attrs(&e.child(Seg::Key("attributes")), &exemplar.filtered_attributes);
+        }
+    }
+    if let Some(span) = &event.span {
+        let sp = Path { parent: None, seg: Seg::Key("span") };
+        t.value(&sp.child(Seg::Key("name")), &span.name);
+        let events = sp.child(Seg::Key("events"));
+        for (j, span_event) in span.events.iter().enumerate() {
+            let e = events.child(Seg::Index(j));
+            t.value(&e.child(Seg::Key("name")), &span_event.name);
+            t.attrs(&e.child(Seg::Key("attributes")), &span_event.attributes);
+        }
+        let links = sp.child(Seg::Key("links"));
+        for (j, link) in span.links.iter().enumerate() {
+            t.attrs(&links.child(Seg::Index(j)).child(Seg::Key("attributes")), &link.attributes);
+        }
+    }
+    t.attrs(&Path { parent: None, seg: Seg::Key("attributes") }, &event.attributes);
+    let res = Path { parent: None, seg: Seg::Key("resource") };
+    t.attrs(&res.child(Seg::Key("attributes")), &resource.attributes);
+    if let Some(scope) = scope {
+        let sc = Path { parent: None, seg: Seg::Key("scope") };
+        t.attrs(&sc.child(Seg::Key("attributes")), &scope.attributes);
+    }
+    if let Some(table) = t.table {
+        t.w.close_map(table);
+    }
+}
+
+/// `bytes`' valid UTF-8 runs JSON-escaped, each invalid byte and each backslash as the text
+/// `\xHH`, with no quotes. In JSON source that text is `\\xHH`, so a reader decodes the string
+/// to `\xHH`. Escaping the backslash too is what makes the text decode back to the same bytes.
 fn push_lossless_bytes_body(out: &mut String, bytes: &[u8]) {
     for chunk in bytes.utf8_chunks() {
-        push_json_escaped(out, chunk.valid());
+        for (i, part) in chunk.valid().split('\\').enumerate() {
+            if i > 0 {
+                out.push_str("\\\\x5c");
+            }
+            push_json_escaped(out, part);
+        }
         for b in chunk.invalid() {
             let _ = write!(out, "\\\\x{b:02x}");
         }
@@ -791,11 +1052,16 @@ mod tests {
         body.strip_suffix("]}\n").expect("metric line suffix").to_string()
     }
 
+    /// A log message's rendering, without the `types` entry a tagged one carries.
     fn value(v: Value) -> String {
         let out = render_events(vec![Event::log(0, AttrMap::new(), log(v))]);
         let prefix = format!("{{\"timestamp\":\"{T0}\",\"log\":{{\"format\":\"raw\",\"message\":");
         let body = out.strip_prefix(&prefix).expect("log line prefix");
-        body.strip_suffix("}}\n").expect("log line suffix").to_string()
+        let body = match body.find("},\"types\":{\"/log/message\":") {
+            Some(at) => &body[..at + 1],
+            None => body.strip_suffix("}\n").expect("log line suffix"),
+        };
+        body.strip_suffix('}').expect("log object close").to_string()
     }
 
     fn span_record() -> SpanRecord {
@@ -872,7 +1138,7 @@ mod tests {
                 temporality: Temporality::Cumulative,
                 monotonic: false
             })),
-            "{\"name\":\"m\",\"kind\":\"sum\",\"value\":1,\"temporality\":\"cumulative\",\
+            "{\"name\":\"m\",\"kind\":\"sum\",\"value\":1.0,\"temporality\":\"cumulative\",\
              \"monotonic\":false}"
         );
     }
@@ -893,8 +1159,15 @@ mod tests {
         );
         // 2^53 + 1 has no `f64`; every digit survives.
         assert_eq!(
-            metric(MetricKind::Gauge(MetricValue::U64((1 << 53) + 1))),
-            "{\"name\":\"m\",\"kind\":\"gauge\",\"value\":9007199254740993}"
+            render_events(vec![Event::metric(
+                0,
+                AttrMap::new(),
+                MetricRecord::new(intern("m"), MetricKind::Gauge(MetricValue::U64((1 << 53) + 1)))
+            )]),
+            format!(
+                "{{\"timestamp\":\"{T0}\",\"metrics\":[{{\"name\":\"m\",\"kind\":\"gauge\",\
+                 \"value\":9007199254740993}}],\"types\":{{\"/metrics/0/value\":\"u64\"}}}}\n"
+            )
         );
         assert_eq!(
             metric(MetricKind::Gauge(MetricValue::Bool(true))),
@@ -914,7 +1187,7 @@ mod tests {
         );
         assert_eq!(
             metric(MetricKind::GaugeDelta(logit_core::MetricValue::F64(-0.0))),
-            "{\"name\":\"m\",\"kind\":\"gauge_delta\",\"delta\":-0}"
+            "{\"name\":\"m\",\"kind\":\"gauge_delta\",\"delta\":-0.0}"
         );
     }
 
@@ -924,7 +1197,7 @@ mod tests {
         samples.sample_rate = 0.5;
         assert_eq!(
             metric(MetricKind::Samples(samples)),
-            "{\"name\":\"m\",\"kind\":\"samples\",\"values\":[1.5,2],\"sample_rate\":0.5}"
+            "{\"name\":\"m\",\"kind\":\"samples\",\"values\":[1.5,2.0],\"sample_rate\":0.5}"
         );
     }
 
@@ -945,8 +1218,10 @@ mod tests {
         }
         assert_eq!(
             metric(MetricKind::Distribution(sketch)),
-            "{\"name\":\"m\",\"kind\":\"distribution\",\"count\":4,\"sum\":20,\"min\":5,\
-             \"max\":5,\"avg\":5,\"p50\":5,\"p90\":5,\"p95\":5,\"p99\":5}"
+            "{\"name\":\"m\",\"kind\":\"distribution\",\"count\":4,\"sum\":20.0,\"min\":5.0,\
+             \"max\":5.0,\"avg\":5.0,\"p50\":5.0,\"p90\":5.0,\"p95\":5.0,\"p99\":5.0,\
+             \"sketch\":{\"mapping\":\"agent\",\"stats_exact\":true,\"count\":4.0,\"min\":5.0,\
+             \"max\":5.0,\"positive\":[{\"key\":1442,\"count\":4.0}]}}"
         );
     }
 
@@ -954,7 +1229,9 @@ mod tests {
     fn an_empty_distribution_writes_count_and_sum_only() {
         assert_eq!(
             metric(MetricKind::Distribution(DdSketch::new())),
-            "{\"name\":\"m\",\"kind\":\"distribution\",\"count\":0,\"sum\":0}"
+            "{\"name\":\"m\",\"kind\":\"distribution\",\"count\":0,\"sum\":0.0,\
+             \"sketch\":{\"mapping\":\"agent\",\"stats_exact\":true,\"count\":0.0,\
+             \"min\":\"inf\",\"max\":\"-inf\"}}"
         );
     }
 
@@ -964,8 +1241,11 @@ mod tests {
         hll.insert(b"a");
         hll.insert(b"b");
         assert_eq!(
-            metric(MetricKind::Set(hll)),
-            "{\"name\":\"m\",\"kind\":\"set\",\"estimate\":2}"
+            metric(MetricKind::Set(hll.clone())),
+            format!(
+                "{{\"name\":\"m\",\"kind\":\"set\",\"estimate\":2,\"hll\":\"{}\"}}",
+                base64::engine::general_purpose::STANDARD.encode(hll.to_bytes())
+            )
         );
     }
 
@@ -982,7 +1262,7 @@ mod tests {
             metric(MetricKind::Histogram(h)),
             "{\"name\":\"m\",\"kind\":\"histogram\",\"temporality\":\"delta\",\
              \"buckets\":[{\"bound\":0.5,\"count\":3},{\"bound\":\"inf\",\"count\":1}],\
-             \"sum\":2.5,\"min\":0.1,\"max\":9}"
+             \"sum\":2.5,\"min\":0.1,\"max\":9.0}"
         );
     }
 
@@ -1003,14 +1283,14 @@ mod tests {
         assert_eq!(
             metric(MetricKind::ExponentialHistogram(e)),
             "{\"name\":\"m\",\"kind\":\"exponential_histogram\",\"scale\":3,\
-             \"temporality\":\"cumulative\",\"count\":9,\"zero_count\":1,\"zero_threshold\":0,\
+             \"temporality\":\"cumulative\",\"count\":9,\"zero_count\":1,\"zero_threshold\":0.0,\
              \"positive\":{\"offset\":-2,\"counts\":[1,2]},\"negative\":{\"offset\":4,\"counts\":[5]},\
-             \"sum\":1.5,\"max\":8}"
+             \"sum\":1.5,\"max\":8.0}"
         );
     }
 
     #[test]
-    fn an_exponential_histogram_omits_an_empty_side() {
+    fn an_exponential_histogram_omits_an_empty_side_at_offset_zero() {
         let e = ExpHistogram {
             scale: 0,
             zero_count: 0,
@@ -1026,7 +1306,8 @@ mod tests {
         assert_eq!(
             metric(MetricKind::ExponentialHistogram(e)),
             "{\"name\":\"m\",\"kind\":\"exponential_histogram\",\"scale\":0,\
-             \"temporality\":\"delta\",\"count\":0,\"zero_count\":0,\"zero_threshold\":0}"
+             \"temporality\":\"delta\",\"count\":0,\"zero_count\":0,\"zero_threshold\":0.0,\
+             \"positive\":{\"offset\":1,\"counts\":[]}}"
         );
     }
 
@@ -1035,8 +1316,8 @@ mod tests {
         let s = Summary { quantiles: vec![(0.5, 1.0), (0.99, 4.25)], count: 10, sum: 12.0 };
         assert_eq!(
             metric(MetricKind::Summary(s)),
-            "{\"name\":\"m\",\"kind\":\"summary\",\"count\":10,\"sum\":12,\
-             \"quantiles\":[{\"quantile\":0.5,\"value\":1},{\"quantile\":0.99,\"value\":4.25}]}"
+            "{\"name\":\"m\",\"kind\":\"summary\",\"count\":10,\"sum\":12.0,\
+             \"quantiles\":[{\"quantile\":0.5,\"value\":1.0},{\"quantile\":0.99,\"value\":4.25}]}"
         );
     }
 
@@ -1050,7 +1331,7 @@ mod tests {
         let out = render_events(vec![Event::metric(0, AttrMap::new(), record)]);
         assert!(
             out.contains(
-                "\"value\":1,\"unit\":\"ms\",\"description\":\"Latency\",\
+                "\"value\":1.0,\"unit\":\"ms\",\"description\":\"Latency\",\
                  \"start_timestamp\":\"1970-01-01T00:00:00.000000001Z\",\"flags\":2}"
             ),
             "got: {out}"
@@ -1058,7 +1339,7 @@ mod tests {
     }
 
     #[test]
-    fn no_recorded_value_suppresses_the_kinds_fields_and_writes_raw_flags() {
+    fn no_recorded_value_keeps_the_kinds_fields_and_writes_raw_flags() {
         let mut record = MetricRecord::new(
             intern("m"),
             MetricKind::Sum(Sum {
@@ -1074,6 +1355,7 @@ mod tests {
             out,
             format!(
                 "{{\"timestamp\":\"{T0}\",\"metrics\":[{{\"name\":\"m\",\"kind\":\"sum\",\
+                 \"value\":0.0,\"temporality\":\"delta\",\"monotonic\":true,\
                  \"unit\":\"1\",\"flags\":3,\"no_recorded_value\":true}}]}}\n"
             )
         );
@@ -1105,7 +1387,7 @@ mod tests {
         let out = render_events(vec![Event::metric(0, AttrMap::new(), record)]);
         assert!(
             out.contains(&format!(
-                "\"value\":1,\"exemplars\":[{{\"timestamp\":\"1970-01-01T00:00:00.000000005Z\",\
+                "\"value\":1.0,\"exemplars\":[{{\"timestamp\":\"1970-01-01T00:00:00.000000005Z\",\
                  \"value\":0.25,\"trace_id\":\"{}\",\"span_id\":\"{}\",\"trace_flags\":0,\
                  \"attributes\":{{\"exemplar.key\":\"v\"}}}},\
                  {{\"timestamp\":\"{T0}\",\"value\":\"NaN\"}},\
@@ -1297,7 +1579,9 @@ mod tests {
                 "{{\"timestamp\":\"{T0}\",\"attributes\":{{\
                  \"nested_test.sd\":{{\"nested_test.sdid\":{{\"nested_test.iut\":\"3\"}}}},\
                  \"nested_test.tags\":[\"a\",2,null],\
-                 \"nested_test.at\":\"1970-01-01T00:00:00.000000003Z\"}}}}\n"
+                 \"nested_test.at\":\"1970-01-01T00:00:00.000000003Z\"}},\
+                 \"types\":{{\"/attributes/nested_test.tags/1\":\"u64\",\
+                 \"/attributes/nested_test.at\":\"timestamp\"}}}}\n"
             )
         );
     }
@@ -1307,8 +1591,10 @@ mod tests {
         assert_eq!(value(Value::Null), "null");
         assert_eq!(value(Value::Bool(false)), "false");
         assert_eq!(value(Value::I64(-7)), "-7");
-        assert_eq!(value(Value::U64(u64::MAX)), "18446744073709551615");
-        assert_eq!(value(Value::F64(1e21)), "1000000000000000000000");
+        assert_eq!(value(Value::F64(1e21)), "1e21");
+        assert_eq!(value(Value::F64(3.0)), "3.0");
+        assert_eq!(value(Value::F64(-0.0)), "-0.0");
+        assert_eq!(value(Value::F64(f64::MAX)), "1.7976931348623157e308");
     }
 
     #[test]
@@ -1319,6 +1605,32 @@ mod tests {
             "\"b\\\"a\\\\xff\\u0000\\\"z\\\"\""
         );
         assert_eq!(value(Value::Bytes(Bytes::new())), "\"b\\\"\\\"\"");
+        // A backslash is escaped too, so a literal `\x41` in the data reads back as itself.
+        assert_eq!(value(Value::Bytes(Bytes::from_static(b"\\x41"))), "\"b\\\"\\\\x5cx41\\\"\"");
+    }
+
+    #[test]
+    fn the_types_table_names_each_value_its_spelling_does_not() {
+        let event = Event::empty(
+            0,
+            attrs(&[
+                ("types_test.i", Value::I64(5)),
+                ("types_test.u", Value::U64(5)),
+                ("types_test.f", Value::F64(5.0)),
+                ("types_test.a/b~\"c", Value::F64(f64::NAN)),
+                ("types_test.b", Value::Bytes(Bytes::from_static(b"x"))),
+                ("types_test.s", Value::str("b\"x\"")),
+            ]),
+        );
+        assert_eq!(
+            render_events(vec![event]),
+            format!(
+                "{{\"timestamp\":\"{T0}\",\"attributes\":{{\"types_test.i\":5,\"types_test.u\":5,\
+                 \"types_test.f\":5.0,\"types_test.a/b~\\\"c\":\"NaN\",\"types_test.b\":\"b\\\"x\\\"\",\
+                 \"types_test.s\":\"b\\\"x\\\"\"}},\"types\":{{\"/attributes/types_test.u\":\"u64\",\
+                 \"/attributes/types_test.a~1b~0\\\"c\":\"f64\",\"/attributes/types_test.b\":\"bytes\"}}}}\n"
+            )
+        );
     }
 
     #[test]
@@ -1410,7 +1722,7 @@ mod tests {
                 "{{\"timestamp\":\"2026-09-28T12:34:56.789012345Z\",\
                  \"log\":{{\"severity\":\"info\",\"format\":\"raw\",\
                  \"message\":\"GET /index.html HTTP/1.1\"}},\
-                 \"metrics\":[{{\"name\":\"mixed_test.requests\",\"kind\":\"sum\",\"value\":1,\
+                 \"metrics\":[{{\"name\":\"mixed_test.requests\",\"kind\":\"sum\",\"value\":1.0,\
                  \"temporality\":\"delta\",\"monotonic\":true}}],\
                  \"span\":{{\"name\":\"GET /\",\"trace_id\":\"{}\",\"span_id\":\"{}\",\
                  \"kind\":\"server\",\"status\":\"ok\",\

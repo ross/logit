@@ -1,0 +1,13 @@
+# statsd_in's cases sent by prometheus_out as remote-write 1.0, with nothing between: a flagged
+# gauge as a stale marker, the unit in metadata, and two points of a series in one millisecond
+# collapsed.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/statsd/mixed.json
+  out:
+    type: prometheus_out
+    sources: [case]
+    endpoint: http://127.0.0.1:9090/api/v1/write

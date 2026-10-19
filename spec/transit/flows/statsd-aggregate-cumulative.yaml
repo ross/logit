@@ -1,0 +1,18 @@
+# statsd_in's cases through a 10s cumulative `aggregate`, so counters become running totals, into
+# statsd_out, which writes a running total as a gauge.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/statsd/mixed.json
+  window:
+    type: aggregate
+    sources: [case]
+    interval: 10s
+    temporality: cumulative
+  out:
+    type: statsd_out
+    sources: [window]
+    endpoint: 127.0.0.1:8125
+    format: dogstatsd

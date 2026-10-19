@@ -301,22 +301,7 @@ impl InfluxDbOutput {
     /// outcome and attaches it as `.context(fault)`.
     async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let Some(params) = resolve(&self.organization, &self.destination, &batch.resource) else {
-            let metrics: usize = batch.events.iter().map(|event| event.metrics.len()).sum();
-            if metrics > 0 {
-                self.telemetry.count(
-                    "logit.output.metrics.dropped",
-                    metrics as f64,
-                    &[("reason", "no_bucket")],
-                );
-                self.diag.warn_throttled(
-                    "no_bucket",
-                    format_args!(
-                        "dropped a batch of {metrics} metrics that names no bucket: no 'bucket' \
-                         or 'default_bucket' is configured and it didn't come from an \
-                         influxdb_in"
-                    ),
-                );
-            }
+            drop_no_bucket(&self.telemetry, &mut self.diag, batch);
             return Ok(());
         };
         let (first, body) = self.accounting.encode(0, || self.encoder.encode(batch));
@@ -383,6 +368,33 @@ impl InfluxDbOutput {
     }
 }
 
+/// Counts and reports a batch [`resolve`] found no bucket for, which this sink drops unsent.
+/// Public so a caller that encodes as this sink does without it counts the drop as it would.
+pub fn drop_no_bucket(telemetry: &Telemetry, diag: &mut Diagnostics, batch: &EventBatch) {
+    let metrics: usize = batch.events.iter().map(|event| event.metrics.len()).sum();
+    if metrics > 0 {
+        telemetry.count("logit.output.metrics.dropped", metrics as f64, &[("reason", "no_bucket")]);
+        diag.warn_throttled(
+            "no_bucket",
+            format_args!(
+                "dropped a batch of {metrics} metrics that names no bucket: no 'bucket' or \
+                 'default_bucket' is configured and it didn't come from an influxdb_in"
+            ),
+        );
+    }
+}
+
+/// The `org`, `orgID`, and `bucket` this sink writes a batch under `resource` to, or `None`
+/// when it drops the batch for naming no bucket ([`drop_no_bucket`]). Public so a caller can
+/// resolve as this sink does without it.
+pub fn destination<'a>(
+    organization: &'a Organization,
+    destination: &'a Destination,
+    resource: &'a Resource,
+) -> Option<(Option<&'a str>, Option<&'a str>, &'a str)> {
+    resolve(organization, destination, resource).map(|p| (p.org, p.org_id, p.bucket))
+}
+
 /// One batch's query parameters (the module doc's "Destination resolution"), or `None` for a
 /// carried-mode batch with no bucket carried and no `default_bucket`.
 fn resolve<'a>(
@@ -430,8 +442,9 @@ impl Output for InfluxDbOutput {
 }
 
 /// Emits one batch's [`EncodeStats`] as `logit.output.*` counters, each only when non-zero so an
-/// ordinary batch doesn't upsert a permanent zero series.
-fn emit_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
+/// ordinary batch doesn't upsert a permanent zero series. Public so a caller that runs
+/// [`InfluxLineEncoder`] without this sink counts what the sink would.
+pub fn emit_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     const TAGS_NORMALIZED: &str = "logit.output.tags.normalized";
     const TAGS_OMITTED: &str = "logit.output.tags.omitted";
     const NORMALIZED: &str = "logit.output.metrics.normalized";

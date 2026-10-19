@@ -1,0 +1,2 @@
+wire: event.statsd
+exercises: [event, tags]

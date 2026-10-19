@@ -1,0 +1,1 @@
+{"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"my measurement.field one","kind":"gauge","value":1.5}],"attributes":{"_logit.influxdb.measurement":"my measurement","eq=key":"a=b","tag key":"tag,value"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}

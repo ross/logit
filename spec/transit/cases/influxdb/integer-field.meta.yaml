@@ -1,0 +1,2 @@
+wire: integer-field.lp
+exercises: [measurement, tags, integer_field, multi_field, carriers]

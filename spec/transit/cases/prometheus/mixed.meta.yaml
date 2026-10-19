@@ -1,0 +1,2 @@
+wire: mixed.prom
+exercises: [counter, gauge, info, stateset, gaugehistogram, unknown, total_suffix, openmetrics, target]

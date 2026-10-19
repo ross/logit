@@ -1,0 +1,2 @@
+wire: timer-ms.statsd
+exercises: [timer_ms, tags]

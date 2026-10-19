@@ -1,0 +1,3 @@
+# Attribute values no statsd wire produces (a map, bytes, a timestamp) and a batch scope,
+# so the sinks this source reaches show what they do with each.
+exercises: []

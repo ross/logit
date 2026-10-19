@@ -1,0 +1,2 @@
+wire: escaped-names.lp
+exercises: [measurement, tags, float_field, escaped_names, carriers]

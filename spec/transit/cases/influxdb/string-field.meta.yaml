@@ -1,0 +1,2 @@
+wire: string-field.lp
+exercises: [measurement, tags, string_field, integer_field, carriers]

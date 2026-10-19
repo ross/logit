@@ -1,0 +1,18 @@
+# Replays fixtures/replay/events.json, nine hand-written `format: json` lines across two resources
+# (a log, a span, and sum, gauge, distribution, and histogram metrics), and writes each event back
+# out as a JSON line. `replay_in` reads the file once, so the process exits after the last event
+# reaches stdout: `logit run fixtures/replay-json.yaml`.
+#
+# To replay an archive instead, point `path:` at a file a `format: json` stdio_out or file_out
+# wrote, or set `format: native` for one a `format: native` sink wrote.
+components:
+  replay:
+    type: replay_in
+    path: replay/events.json   # resolved against this config file's directory
+    # format: json             # json (the default) | native
+    # batch: 1000              # the most events in one batch
+
+  stdout:
+    type: stdio_out
+    sources: [replay]
+    format: json

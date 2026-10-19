@@ -12,9 +12,80 @@
 //! name, consumers (this decoder included) read them as more points of one series, and it keeps
 //! encode a per-record function.
 //!
-//! Per kind:
-//! - `Sum{value,temporality,monotonic}` → `Sum`: exact; carries `record.exemplars`.
-//! - `Gauge(v)` → `Gauge`: exact; carries exemplars.
+//! The tables below are generated from `otlp_out`'s column of `spec/transit/mapping.yaml`, the
+//! canonical copy, by `script/transit docs`, and a test fails when they're stale: change the
+//! table there, not here. "Consumer" means `otlp_in` reading the request back.
+//!
+//! <!-- transit:doc:otlp_out -->
+//!
+//! Per metric kind, and per record feature that decides a record's fate:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `sum/delta_monotonic` | exact | -- | An OTLP `Sum` with delta temporality and the monotonic flag. |
+//! | `sum/delta_nonmonotonic` | exact | -- | An OTLP `Sum` with delta temporality, not monotonic. |
+//! | `sum/cumulative_monotonic` | exact | -- | An OTLP `Sum` with cumulative temporality and the monotonic flag. |
+//! | `sum/cumulative_nonmonotonic` | exact | -- | An OTLP `Sum` with cumulative temporality, not monotonic. |
+//! | `sum/f64` | exact | -- | The data point's `as_double`. |
+//! | `sum/i64` | exact | -- | The data point's `as_int`. |
+//! | `sum/u64` | normalized | `u64_as_int`; `logit.output.metrics.normalized{reason=u64_as_double}` | OTLP has one signed integer, so a `u64` that fits an `int64` is `as_int` and reads back as an `i64`; one above `i64::MAX` is `as_double`, counted, and reads back as an `f64`. |
+//! | `sum/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is `as_int` `1` or `0` and reads back as that integer. |
+//! | `gauge/f64` | exact | -- | An OTLP `Gauge`, `as_double`. |
+//! | `gauge/i64` | exact | -- | An OTLP `Gauge`, `as_int`. |
+//! | `gauge/u64` | normalized | `u64_as_int`; `logit.output.metrics.normalized{reason=u64_as_double}` | A `u64` that fits an `int64` is `as_int` and reads back as an `i64`; one above `i64::MAX` is `as_double`, counted, and reads back as an `f64`. |
+//! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is `as_int` `1` or `0` and reads back as that integer. |
+//! | `gauge/negative` | exact | -- | A negative data point, written as is. |
+//! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | An unresolved relative adjustment is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
+//! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
+//! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
+//! | `gauge_delta/bool` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
+//! | `samples` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | Sketched, each value weighted by its inverse sample rate, then an OTLP `Summary` of fixed quantiles. |
+//! | `set_members` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | OTLP has no cardinality type, so set members aren't written, with a throttled `otlp_set_members_metric_skipped` warning. |
+//! | `distribution` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | An OTLP `Summary` of fixed quantiles with the sketch's own count and sum; OTLP has no mergeable sketch. |
+//! | `set` | skipped | `logit.output.metrics.skipped{metric_kind=set}` | OTLP has no cardinality type, so a set estimate isn't written, with a throttled `otlp_set_metric_skipped` warning. |
+//! | `histogram/delta` | exact | -- | An OTLP `Histogram` with delta temporality. |
+//! | `histogram/cumulative` | exact | -- | An OTLP `Histogram` with cumulative temporality. |
+//! | `exponential_histogram/delta` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
+//! | `exponential_histogram/cumulative` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
+//! | `summary` | exact | -- | An OTLP `Summary`. |
+//! | `record/no_recorded_value` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
+//! | `record/no_recorded_value_delta_sum` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
+//! | `record/no_recorded_value_other_kind` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
+//! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't attributes. |
+//! | `record/superseded` | exact | -- | Each record is its own data point. |
+//! | `record/same_instant` | exact | -- | Each record is its own data point. |
+//! | `record/same_millisecond` | exact | -- | Each record is its own data point, at its own nanosecond. |
+//! | `record/non_finite` | exact | -- | The non-finite `as_double`. |
+//! | `log/dogstatsd_event` | normalized | `observed_timestamp` | An OTLP log record. Its `_logit.statsd.event.*` carriers aren't attributes; otlp_out stamps an observed time on a log that has none, and otlp_in stamps the `_logit.otel.severity_*` carriers. |
+//! | `log/plain` | normalized | `observed_timestamp` | An OTLP log record. otlp_out stamps an observed time on a log that has none, and otlp_in stamps the `_logit.otel.severity_*` carriers. |
+//! | `span/alone` | exact | -- | An OTLP span. |
+//!
+//! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `record/unit` | exact | -- | The `Metric`'s `unit`. |
+//! | `record/description` | exact | -- | The `Metric`'s `description`. |
+//! | `record/start_timestamp` | exact | -- | The data point's `start_time_unix_nano`. |
+//! | `record/exemplars` | exact | -- | The data point's exemplars. |
+//! | `record/exemplars_on_summary` | lost | uncounted | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off, uncounted. |
+//! | `record/min_max` | exact | -- | The data point's `min` and `max`. |
+//! | `attributes/string_value` | exact | -- | A string attribute. |
+//! | `attributes/bool_value` | exact | -- | A boolean attribute. |
+//! | `attributes/number_value` | normalized | `u64_as_int` | An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53, uncounted. |
+//! | `attributes/array_value` | exact | -- | An array attribute. |
+//! | `attributes/map_value` | exact | -- | A key-value list attribute. |
+//! | `attributes/bytes_value` | exact | -- | A bytes attribute. |
+//! | `attributes/timestamp_value` | normalized | `timestamp_as_int` | OTLP has no timestamp value, so it's an integer of Unix nanoseconds. |
+//! | `attributes/foreign_carrier` | lost | uncounted | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
+//! | `attributes/resource_attribute` | exact | -- | A resource attribute. |
+//! | `attributes/scope` | exact | -- | The `InstrumentationScope` of the batch. |
+//! | `log/beside_metrics` | normalized | `observed_timestamp` | An OTLP log record in the logs request, beside the metrics in theirs, with an observed time stamped when it has none. |
+//! | `span/beside_metrics` | exact | -- | An OTLP span in the traces request, beside the metrics in theirs. |
+//!
+//! <!-- transit:end -->
+//!
+//! What follows is hand-written: details the spec's cells don't state.
 //!
 //! A `Sum` or `Gauge` value is a `NumberDataPoint`'s `as_int` or `as_double` by its
 //! `MetricValue` type: `F64` → `as_double`, `I64` → `as_int`, a `U64` that fits an `int64` →
@@ -22,31 +93,18 @@
 //! `logit.output.metrics.normalized{reason="u64_as_double"}`; a `Bool` leaves as `as_int` `0` or
 //! `1`, counted `logit.output.metrics.normalized{reason="bool_value"}`. An `Exemplar`'s value
 //! follows the same rule, counted the same way, once per exemplar.
-//! - `Histogram{buckets,temporality,sum,min,max}` → `Histogram`: exact. `buckets` holds per-bucket
+//!
+//! - `Histogram{buckets,temporality,sum,min,max}` → `Histogram`: `buckets` holds per-bucket
 //!   counts, not cumulative ones, and a trailing `f64::INFINITY` bound becomes the implicit final
-//!   bucket `explicit_bounds` expects. Carries exemplars.
-//! - `ExponentialHistogram(e)` → `ExponentialHistogram`: exact, field for field, so
-//!   `otlp_in -> otlp_out` is a fixed point. Carries exemplars.
-//! - `Summary{quantiles,count,sum}` → `Summary`: exact, **but `record.exemplars` is dropped**:
-//!   `SummaryDataPoint` has no `exemplars` field. A `Samples` or `Distribution` degraded into a
-//!   `Summary` loses its exemplars the same way.
-//!   A quantile outside `[0, 1]` is written as is; `docs/known-gaps/mappings.md`'s "Cross-protocol
-//!   semantic gaps" section has the row.
-//! - `Samples(s)` → `Summary` of `DISTRIBUTION_QUANTILES`: **lossy**. Sketched first
-//!   (`Samples::sketch`, each value weighted by `Samples::weight`), then degraded like
-//!   `Distribution`. Counts `logit.output.metrics.degraded{metric_kind="samples"}`.
-//! - `Distribution(sketch)` → `Summary` of `DISTRIBUTION_QUANTILES`: **lossy** (see "Lossy
-//!   metric kinds" below). The point's `count` and `sum` are the sketch's own; `sum` is
+//!   bucket `explicit_bounds` expects.
+//! - `Summary{quantiles,count,sum}` → `Summary`: a quantile outside `[0, 1]` is written as is;
+//!   `docs/known-gaps/mappings.md`'s "Cross-protocol semantic gaps" section has the row.
+//! - `Samples(s)` and `Distribution(sketch)` → `Summary` of `DISTRIBUTION_QUANTILES` (see "Lossy
+//!   metric kinds" below). A `Samples` is sketched first (`Samples::sketch`, each value weighted
+//!   by `Samples::weight`). The point's `count` and `sum` are the sketch's own; `sum` is
 //!   `DdSketch::sum`, exact unlike a quantile (approximate only when `DdSketch::stats_exact` is
-//!   `false`, i.e. the sketch's stats were derived from its bins). Counts
-//!   `logit.output.metrics.degraded{metric_kind="distribution"}`.
-//! - `SetMembers(members)`, `Set(hll)`: **skipped**; OTLP has no cardinality type to carry a set
-//!   or an estimate. Counts `logit.output.metrics.skipped{metric_kind="set_members"|"set"}` and
-//!   warns, throttled.
-//! - `GaugeDelta`: **dropped**. It's an unresolved relative adjustment (ADR
-//!   `relative-gauge-adjustments`), never an absolute value. Counts
-//!   `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` and warns under
-//!   `gauge_delta_unresolved`.
+//!   `false`, i.e. the sketch's stats were derived from its bins). Its exemplars are left off,
+//!   uncounted, as a `Summary`'s are (`record/exemplars_on_summary` above).
 //!
 //! **Lossy metric kinds.** OTLP has no mergeable-sketch type. `ExponentialHistogram` is the nearest
 //! shape, but its base is `2^(2^-scale)` and a `DdSketch`'s γ isn't (1.015625 under

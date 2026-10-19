@@ -1528,6 +1528,7 @@ Which listener takes which field:
 | `influxdb_in` | HTTP over TCP | Yes | Yes | Yes | |
 | `prometheus_in` | The remote-write receiver (`bind:`) | Yes | Yes | Yes | Receiver mode only: each is rejected beside `scrape_targets:` |
 | `logit_in` | TCP | No | No | No | See [runtime gaps](known-gaps/runtime.md) |
+| `replay_in` | A file | No | No | No | A file has no sender; events carry what the file holds |
 
 `logit validate` rejects `proxy_protocol: true` on any transport but TCP (rule 79).
 

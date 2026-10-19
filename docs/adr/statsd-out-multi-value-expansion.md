@@ -1,6 +1,6 @@
 ---
 created: 2026-10-07
-updated: 2026-10-13
+updated: 2026-10-19
 ---
 
 # `statsd_out` multi-value expansion: summarized kinds leave as dotted counter and gauge lines by default
@@ -119,6 +119,12 @@ Everything else is a gauge (`|g`).
 | `.count`, `.sum`, `.bucket_<b>`, `.zero_count` | `\|c` | `\|g` |
 | `.q<q>`, `.min`, `.max` | `\|g` | `\|g` |
 
+**Note:** This table recorded the decision when it was made.
+[`spec/transit/mapping.yaml`](../../spec/transit/mapping.yaml)'s `statsd_out` column is the
+current statement of what the sink does with each kind and feature, checked against the code by
+the transit spec's flows and rendered into the codec's module doc and
+`docs/known-gaps/mappings.md` ([ADR `transit-spec`](transit-spec.md)).
+
 Three cases fall outside the table:
 
 - **A `Set`'s `.count` is `|g`.** It's a cardinality estimate, and two estimates don't add.
@@ -194,7 +200,9 @@ and, for a `Distribution` or `Set`, `aggregate`'s `distributions: samples` or `s
 ### What doesn't expand
 `Samples` and `SetMembers` keep their native `|ms`/`|h`/`|d` and `|s` lines under both settings.
 They're the raw shapes `statsd_in` decodes, and a `statsd_in -> statsd_out` relay with no
-`aggregate`, or with raw retention, still round-trips a timer or set line intact. A `Gauge`,
+`aggregate`, or with raw retention, still round-trips a timer line intact, and writes a set as one
+`|s` line per member, which reads back as one record each (ADR `lossless-transit`'s 2026-10-19
+amendment). A `Gauge`,
 `GaugeDelta`, and delta monotonic `Sum` render as they do today.
 
 So the expansion renders only components an upstream summary already held, whether an explicit

@@ -1,0 +1,2 @@
+wire: ../../../../testdata/interop/statsd/statsd-plain-pipeline-000.raw
+exercises: [counter, counter_sample_rate, gauge, timer_ms]

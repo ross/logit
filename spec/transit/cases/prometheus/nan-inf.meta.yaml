@@ -1,0 +1,2 @@
+wire: nan-inf.prom
+exercises: [gauge, non_finite, target]

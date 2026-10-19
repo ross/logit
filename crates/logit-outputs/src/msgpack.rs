@@ -15,7 +15,8 @@
 //! | `Bytes` | bin, the bytes as they are; JSON writes the text `b"..."` instead |
 //! | A timestamp | str, RFC 3339 UTC with nine fractional digits, as in JSON |
 //! | A trace or span id | str, lowercase hex, as in JSON |
-//! | A byte field that is text by convention (`status_message`, `trace_state`, `schema_url`, scope `name` and `version`, a set member) | str, each invalid UTF-8 byte as the four characters `\xHH`, the string a JSON reader decodes from the NDJSON line |
+//! | A byte field that is text by convention (`status_message`, `trace_state`, `schema_url`, scope `name` and `version`, a set member) | str, each invalid UTF-8 byte and each backslash as the four characters `\xHH`, the string a JSON reader decodes from the NDJSON line |
+//! | The `types` table | a map of str to str, as in JSON: the smallest int format doesn't tell a `U64` from an `I64` either |
 //!
 //! So a consumer reads the same keys and, outside the `Bytes` and non-finite rows, the same
 //! values it would from `format: json`. Under `record: batch` a record's value is several of
@@ -28,7 +29,7 @@ use logit_core::trace::push_hex;
 use logit_core::{Event, Resource, Scope};
 use logit_proto::msgpack::{MapStart, Writer};
 
-use crate::ndjson::TreeWriter;
+use crate::ndjson::{push_pointer_seg, Path, TreeWriter};
 
 /// Appends one event's map to `out`. `scratch` holds a timestamp's or an id's text before it's
 /// written as a str; it's reused across calls.
@@ -117,10 +118,10 @@ impl TreeWriter for Msgpack<'_> {
 
     fn text_bytes(&mut self, bytes: &[u8]) {
         match std::str::from_utf8(bytes) {
-            Ok(text) => self.out.write_str(text),
-            Err(_) => self.str_from(|s| {
+            Ok(text) if !text.contains('\\') => self.out.write_str(text),
+            _ => self.str_from(|s| {
                 for chunk in bytes.utf8_chunks() {
-                    s.push_str(chunk.valid());
+                    s.push_str(&chunk.valid().replace('\\', "\\x5c"));
                     for b in chunk.invalid() {
                         let _ = write!(s, "\\x{b:02x}");
                     }
@@ -135,6 +136,11 @@ impl TreeWriter for Msgpack<'_> {
 
     fn hex(&mut self, bytes: &[u8]) {
         self.str_from(|s| push_hex(s, bytes));
+    }
+
+    fn pointer_key(&mut self, map: &mut Self::Map, path: &Path<'_>) {
+        map.1 += 1;
+        self.str_from(|s| path.for_each(&mut |seg| push_pointer_seg(s, seg)));
     }
 }
 
@@ -443,7 +449,7 @@ pub(crate) mod tests {
             (Tree::Str(s), Tree::Bin(b)) => {
                 let mut text = String::new();
                 for chunk in b.utf8_chunks() {
-                    text.push_str(chunk.valid());
+                    text.push_str(&chunk.valid().replace('\\', "\\x5c"));
                     for byte in chunk.invalid() {
                         text.push_str(&format!("\\x{byte:02x}"));
                     }

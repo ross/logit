@@ -1,0 +1,2 @@
+wire: service-check.statsd
+exercises: [service_check, tags, timestamp_T]

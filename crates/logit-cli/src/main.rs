@@ -6,6 +6,8 @@ mod config;
 mod dot;
 mod pipeline;
 mod signals;
+#[cfg(test)]
+mod transit;
 mod undrained;
 
 /// jemalloc rather than glibc malloc (the `debian:bookworm-slim` runtime image's default): a

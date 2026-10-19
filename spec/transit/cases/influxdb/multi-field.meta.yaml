@@ -1,0 +1,2 @@
+wire: multi-field.lp
+exercises: [measurement, tags, float_field, integer_field, unsigned_field, boolean_field, multi_field, carriers]

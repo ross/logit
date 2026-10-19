@@ -9,6 +9,7 @@
 pub mod buffer;
 pub mod collectd;
 pub mod datadog;
+pub mod event_json;
 pub mod forwarded;
 pub mod frame;
 pub mod framing;

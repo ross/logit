@@ -1,0 +1,4 @@
+# A recorded Telegraf write, gzip-compressed, read in place from testdata/interop/ with its
+# .headers.
+wire: ../../../../testdata/interop/influxdb/telegraf-api-v2-write-001.bin
+exercises: [measurement, tags, float_field, unsigned_field, multi_field, carriers, gzip]

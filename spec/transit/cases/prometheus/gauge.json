@@ -1,0 +1,2 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge","value":-4.5}],"attributes":{"room":"cold"},"resource":{"attributes":{"_logit.prometheus.target":"http://transit:9100/metrics","instance":"transit:9100"}}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge","value":21.5}],"attributes":{"room":"lab"},"resource":{"attributes":{"_logit.prometheus.target":"http://transit:9100/metrics","instance":"transit:9100"}}}

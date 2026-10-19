@@ -1,0 +1,1 @@
+cpu,host=web-01 usage_idle=80.0 1799999990000000000

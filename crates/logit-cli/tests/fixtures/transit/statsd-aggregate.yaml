@@ -1,0 +1,15 @@
+# replay_in -> aggregate -> statsd_out, for the transit driver's own test
+# (crates/logit-cli/src/transit/tests.rs). The driver reads the case it's handed, not `path:`.
+components:
+  case:
+    type: replay_in
+    path: statsd-kinds.json
+  window:
+    type: aggregate
+    sources: [case]
+    interval: 10s
+  out:
+    type: statsd_out
+    sources: [window]
+    endpoint: 127.0.0.1:8125
+    format: dogstatsd

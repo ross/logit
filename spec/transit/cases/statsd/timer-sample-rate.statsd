@@ -1,0 +1,2 @@
+db.query:3.2|ms|@0.5
+render.time:40|h|@0.25|#route:/home

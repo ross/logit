@@ -1,0 +1,2 @@
+wire: exemplars.prom
+exercises: [counter, histogram, exemplars, total_suffix, openmetrics, target]

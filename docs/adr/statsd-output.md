@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-18
+updated: 2026-10-19
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -98,6 +98,12 @@ writes each summarized kind as one dotted line per component under `multi_value:
 default, and drops it, counted, only under `multi_value: skip`. Neither candidate above was
 chosen as written: there's no synthesized population, and the quantile lines sit beside `.count`
 and `.sum` counters.]
+
+**Note:** This section recorded the decision when it was made.
+[`spec/transit/mapping.yaml`](../../spec/transit/mapping.yaml)'s `statsd_out` column is the
+current statement of what the sink does with each kind and feature, checked against the code by
+the transit spec's flows and rendered into the codec's module doc and
+`docs/known-gaps/mappings.md` ([ADR `transit-spec`](transit-spec.md)).
 
 ### Relative gauges: opt-in native encoding, off by default
 
@@ -841,3 +847,11 @@ counts `statsd.type` with it
 `a_statsd_timer_counts_only_its_own_tag_as_having_no_wire_form`). There's no alias and no decode
 path for the old names. A DogStatsD tag can no longer spell a carrier key, because the decoder
 omits every tag key under `_logit.`.
+
+## Amendment (2026-10-19): the negative-gauge pair reads back as two records
+
+"Negative absolute gauges" holds at a statsd server, which applies `0` and then `-n` and ends at
+`-n`. `statsd_in`, reading the same pair, decodes a `Gauge(0)` and a `GaugeDelta(-n)`, uncounted,
+so a `logit` downstream of this sink receives two records, the second of which a sink without
+`relative_gauges: true` drops. The transit spec's `gauge/negative` row records it as degraded
+([ADR `transit-spec`](transit-spec.md)).

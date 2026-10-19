@@ -1,0 +1,3 @@
+# A summary carrying an exemplar, which no statsd wire produces: a summary has no line or field
+# for one at most sinks.
+exercises: []

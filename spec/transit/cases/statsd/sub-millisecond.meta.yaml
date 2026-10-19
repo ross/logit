@@ -1,0 +1,3 @@
+# Two points of one series at different nanoseconds of one millisecond, which no statsd wire
+# states but a wire stamping milliseconds can't tell apart.
+exercises: []

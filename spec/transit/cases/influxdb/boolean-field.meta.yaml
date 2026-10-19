@@ -1,0 +1,2 @@
+wire: boolean-field.lp
+exercises: [measurement, tags, boolean_field, multi_field, carriers]

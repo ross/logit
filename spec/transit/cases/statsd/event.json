@@ -1,0 +1,2 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline"},"attributes":{"_logit.statsd.event.aggregation_key":"deploy","_logit.statsd.event.alert_type":"warning","_logit.statsd.event.host":"web-07","_logit.statsd.event.priority":"low","_logit.statsd.event.source_type":"ci","_logit.statsd.event.title":"Hello","env":"prod"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"abc"},"attributes":{"_logit.statsd.event.title":"Plain"}}

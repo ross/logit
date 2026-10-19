@@ -1,0 +1,8 @@
+# TYPE hits counter
+hits_total 10 # {trace_id="0102030405060708090a0b0c0d0e0f10",span_id="0102030405060708"} 1.0 1799999989.5
+# TYPE latency histogram
+latency_bucket{le="0.1"} 2 # {trace_id="0102030405060708090a0b0c0d0e0f10",span_id="0102030405060708"} 0.05
+latency_bucket{le="+Inf"} 3
+latency_sum 0.4
+latency_count 3
+# EOF

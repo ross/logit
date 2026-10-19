@@ -1,0 +1,11 @@
+requests:2|c|@0.5|#route:/api,team:a,team:b
+hits:1:1|c
+temperature:21.5|g|#room:lab
+connections:+2|g
+latency:12:15|ms|#route:/api
+size:512|h
+bytes:60196|d|@0.5
+users:alice:bob|s
+queue.depth:7|g|c:in-82046|e:it-false|card:low|T1799999970
+_sc|db.up|1|m:slow
+_e{6,4}:Deploy|v1.2|t:info

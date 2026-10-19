@@ -1,0 +1,4 @@
+# Records flagged as holding no recorded value whose kind a sink drops when unflagged: a relative
+# gauge adjustment, an exponential histogram, and a delta sum. A sink that tests the flag first
+# skips or stale-marks each instead.
+exercises: []

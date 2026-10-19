@@ -962,17 +962,6 @@ impl RemoteWriteOutput {
         self
     }
 
-    /// The batch's events grouped by `Event::timestamp`, ascending, stable within a group; the
-    /// partition [`remote_write::encode`] merges back into one `TimeSeries` per label set. A
-    /// `BTreeMap`, not a sort: a real batch has one or two distinct timestamps.
-    fn partition(batch: &EventBatch) -> BTreeMap<i64, Vec<&Event>> {
-        let mut groups: BTreeMap<i64, Vec<&Event>> = BTreeMap::new();
-        for event in &batch.events {
-            groups.entry(event.timestamp).or_default().push(event);
-        }
-        groups
-    }
-
     /// The operator's headers with the protocol's four `insert`ed over them, so a protocol name
     /// always wins. `insert` and one `.headers(..)` at the call site, never `RequestBuilder`'s
     /// appending `.header(..)`, which would undo that (`otlp_out::send_http` has the same).
@@ -1006,12 +995,84 @@ fn new_sender_encoder(
     diag: &Diagnostics,
     gate: &logit_core::CountGate,
 ) -> PrometheusEncoder {
+    sender_encoder().with_telemetry(telemetry.gated(gate)).with_diagnostics(diag.gated(gate))
+}
+
+/// The sender's encoder settings ([`new_sender_encoder`]), with no telemetry or diagnostics
+/// handles, for a caller that encodes as this sink does without one.
+pub fn sender_encoder() -> PrometheusEncoder {
     PrometheusEncoder::new()
         .with_destination(Destination::RemoteWrite)
         .with_stale_markers(true)
         .with_timestamps_always(true)
-        .with_telemetry(telemetry.gated(gate))
-        .with_diagnostics(diag.gated(gate))
+}
+
+/// The batch's events grouped by `Event::timestamp`, ascending, stable within a group; the
+/// partition [`remote_write::encode`] merges back into one `TimeSeries` per label set. A
+/// `BTreeMap`, not a sort: a real batch has one or two distinct timestamps.
+fn partition(batch: &EventBatch) -> BTreeMap<i64, Vec<&Event>> {
+    let mut groups: BTreeMap<i64, Vec<&Event>> = BTreeMap::new();
+    for event in &batch.events {
+        groups.entry(event.timestamp).or_default().push(event);
+    }
+    groups
+}
+
+/// One remote-write request body for `batch`, compressed, and the samples it carries: what
+/// [`RemoteWriteOutput`] posts, with `encoder` counting the codec's drops. `None` for a batch
+/// that produced nothing, which gets no request. Public so a caller can reach the bytes this sink
+/// sends without a receiver.
+///
+/// Errors only on a Snappy body past `u32::MAX`.
+pub fn encode_remote_write(
+    batch: &EventBatch,
+    version: remote_write::Version,
+    encoding: Encoding,
+    encoder: &mut PrometheusEncoder,
+) -> Result<Option<(Vec<u8>, u64)>, compression::CompressError> {
+    let resource = batch.resource.as_ref();
+    let groups: Vec<Vec<MetricFamily>> = partition(batch)
+        .into_values()
+        .map(|events| {
+            events_to_families(events.into_iter().map(|event| (resource, event)), encoder)
+        })
+        .collect();
+    // No request for a batch that produced nothing: an empty `WriteRequest` is legal, but it
+    // would count a `requests{class="2xx"}` an operator reads as a delivery.
+    if groups.iter().all(Vec::is_empty) {
+        return Ok(None);
+    }
+    let (body, samples) = remote_write::encode_counted(&groups, version, encoder);
+    compression::compress(encoding, &body).map(|compressed| Some((compressed, samples)))
+}
+
+/// The exposition body a scrape in `dialect` would read after `batches` were sent, in order, to
+/// a fresh [`ExposeOutput`] with `max_series`: each upserted, latest wins, then held to the cap
+/// as `send` holds it. No expiry: `expire_after` reads a clock. `encoder` counts the
+/// conversion's and the render's drops, `telemetry` the registry's. Public so a caller can reach
+/// the bytes this sink serves without a listener.
+pub fn render_batches(
+    batches: &[EventBatch],
+    dialect: Dialect,
+    max_series: usize,
+    encoder: &mut PrometheusEncoder,
+    telemetry: &Telemetry,
+) -> Vec<u8> {
+    let mut registry = Registry::default();
+    let start = Instant::now();
+    for (i, batch) in batches.iter().enumerate() {
+        // A later batch is newer, as each `send` reads the clock again, so the cap evicts by age
+        // before it breaks a tie by name.
+        let now = start + Duration::from_nanos(i as u64);
+        let resource = batch.resource.as_ref();
+        for family in
+            events_to_families(batch.events.iter().map(|event| (resource, event)), encoder)
+        {
+            registry.upsert(family, now, telemetry);
+        }
+        registry.enforce_cap(max_series, telemetry);
+    }
+    registry.render(dialect, encoder)
 }
 
 impl RemoteWriteOutput {
@@ -1020,24 +1081,9 @@ impl RemoteWriteOutput {
     async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let (version, encoding) = (self.version, self.encoding);
         let encoder = &mut self.encoder;
-        let (_, encoded) = self.accounting.encode(0, || {
-            let resource = batch.resource.as_ref();
-            let groups: Vec<Vec<MetricFamily>> = Self::partition(batch)
-                .into_values()
-                .map(|events| {
-                    events_to_families(events.into_iter().map(|event| (resource, event)), encoder)
-                })
-                .collect();
-            // No request for a batch that produced nothing: an empty `WriteRequest` is legal, but
-            // it would count a `requests{class="2xx"}` an operator reads as a delivery.
-            if groups.iter().all(Vec::is_empty) {
-                return Ok(None);
-            }
-            let (body, samples) = remote_write::encode_counted(&groups, version, encoder);
-            // Errors only on a Snappy body past `u32::MAX`; reported, not unwrapped, so an absurd
-            // batch fails alone.
-            compression::compress(encoding, &body).map(|compressed| Some((compressed, samples)))
-        });
+        // An error is reported, not unwrapped, so an absurd batch fails alone.
+        let (_, encoded) =
+            self.accounting.encode(0, || encode_remote_write(batch, version, encoding, encoder));
         let Some((compressed, samples)) = encoded? else {
             return Ok(());
         };

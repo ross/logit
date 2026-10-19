@@ -1,0 +1,2 @@
+wire: counter.prom
+exercises: [counter, help, sample_timestamp, target]

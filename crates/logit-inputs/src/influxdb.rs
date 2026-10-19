@@ -88,7 +88,7 @@ use http_body_util::{Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use logit_core::{Diagnostics, Resource, Telemetry, Value};
+use logit_core::{Diagnostics, Resource, Telemetry};
 use logit_pipeline::listen::BindOptions;
 use logit_pipeline::Fanout;
 use logit_proto::forwarded::ForwardedHeader;
@@ -96,9 +96,7 @@ use logit_proto::influxdb::response::{
     error_body, parse_error_body, CODE_INVALID, CODE_NOT_FOUND, CODE_REQUEST_TOO_LARGE,
     CODE_UNAUTHORIZED, CODE_UNAVAILABLE, CODE_UNSUPPORTED_MEDIA_TYPE,
 };
-use logit_proto::influxdb::{
-    InfluxDecoder, Precision, RESOURCE_ATTR_BUCKET, RESOURCE_ATTR_ORG, RESOURCE_ATTR_ORG_ID,
-};
+use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -561,15 +559,7 @@ impl ResourceCache {
             entries.clear();
         }
         let (org, org_id, bucket) = &key;
-        let mut resource = Resource::default();
-        if let Some(org) = org {
-            resource.attributes.insert(RESOURCE_ATTR_ORG, Value::str(org.as_str()));
-        }
-        if let Some(org_id) = org_id {
-            resource.attributes.insert(RESOURCE_ATTR_ORG_ID, Value::str(org_id.as_str()));
-        }
-        resource.attributes.insert(RESOURCE_ATTR_BUCKET, Value::str(bucket.as_str()));
-        let resource = Arc::new(resource);
+        let resource = Arc::new(write_resource(org.as_deref(), org_id.as_deref(), bucket));
         entries.insert(key, Arc::clone(&resource));
         resource
     }
@@ -980,7 +970,7 @@ impl Query {
 mod tests {
     use super::*;
     use logit_core::interner::resolve;
-    use logit_core::{EventBatch, MetricKind, MetricValue};
+    use logit_core::{EventBatch, MetricKind, MetricValue, Value};
     use logit_pipeline::test_util::{recv_batch, Totals};
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::CertificateDer;

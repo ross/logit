@@ -10,8 +10,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   counted `logit.output.metrics.degraded{metric_kind}`
   ([ADR `statsd-out-multi-value-expansion`](../adr/statsd-out-multi-value-expansion.md)).
   - **What round-trips:** a `statsd_in -> statsd_out` relay with no `aggregate`, or with one
-    configured `distributions: samples`/`sets: members`, relays a timer or set line intact:
-    `Samples` and `SetMembers` never expand.
+    configured `distributions: samples`/`sets: members`, relays a timer line intact, and a set
+    line as one `|s` line per member, which reads back as one record per member: `Samples` and
+    `SetMembers` never expand.
   - **What degrades:** `aggregate`'s defaults (`distributions: sketch`/`sets: estimate`) turn every
     timer and set into a sketch or an estimate, which leaves expanded. Counts and sums merge
     correctly across senders at a statsd server; quantiles, extremes, and set estimates are

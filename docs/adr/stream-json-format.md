@@ -1,6 +1,6 @@
 ---
 created: 2026-09-28
-updated: 2026-10-18
+updated: 2026-10-19
 ---
 
 # `stdio_out`/`file_out` gain `format: json`, and every machine reader of the text render moves to it
@@ -43,9 +43,9 @@ module doc is the canonical grammar. The rules it follows:
 3. **Three things JSON can't carry get a fixed spelling.** A non-finite `f64` is the string
    `"NaN"`, `"inf"`, or `"-inf"`, since JSON has no number for it. `Bytes` is a string holding
    the text `b"..."`, valid UTF-8 runs as text and each invalid byte as `\xHH`, so the content is
-   visible without a base64 step. That spelling is for reading, not round-tripping: a literal
-   `\x` in the data reads the same as an escaped byte, and `format: native` is the lossless form. A timestamp is an RFC 3339 UTC string with nine fractional
-   digits, the same form the human render uses.
+   visible without a base64 step. (Superseded by the lossless amendment below: a backslash in
+   the data is written `\x5c`, so the spelling round-trips.) A timestamp is an RFC 3339 UTC
+   string with nine fractional digits, the same form the human render uses.
 4. **Hand-written, into the sink's one output buffer**, like every other encoder in
    `logit-outputs` (`docs/design/memory.md`). No `serde` derive on `Event`: the model's types
    are shaped for the pipeline, not for a serializer, and the omission rule above is not what a
@@ -91,7 +91,8 @@ A `Sum`'s or `Gauge`'s `value` and a `GaugeDelta`'s `delta` are a `MetricValue`
 ([ADR `typed-metric-scalar`](typed-metric-scalar.md)). `format: json` writes `I64` and `U64` as JSON
 integers, so a `U64` above 2^53 keeps every digit, and `Bool` as a JSON boolean. `F64` is unchanged,
 including the non-finite spellings, and a whole-number `F64` still writes the same digits as an
-`I64` of that value. A reader that did `float(item["value"])` on a number still works; one that
+`I64` of that value (superseded by the lossless amendment below, under which an `F64` always
+carries a fraction or an exponent). A reader that did `float(item["value"])` on a number still works; one that
 treats the value as a float must now accept a boolean. `kafka_out`'s `format: msgpack` follows
 the same walker and writes MessagePack integers and booleans. `ndjson.rs`'s module doc is the
 grammar.
@@ -102,3 +103,43 @@ An exemplar's `value` is a `MetricValue` too ([ADR `typed-metric-scalar`](typed-
 exemplar amendment). `format: json` writes it as a `Sum`'s value is written: `I64` and `U64` as
 JSON integers, `Bool` as a JSON boolean, and `F64` unchanged. `kafka_out`'s `format: msgpack`
 follows.
+
+## Amendment: the form is lossless (2026-10-19)
+
+**A `format: json` line now reads back to the exact `Event`, `Resource`, and `Scope` that wrote
+it**, so an archive `file_out` writes can be replayed, and the transit spec authors its cases in
+this form ([ADR `transit-spec`](transit-spec.md)). `logit_proto::event_json` is the reader. Its
+module doc states the reading rules, and `ndjson.rs`'s module doc stays the grammar.
+
+Before this, four things didn't survive a line. A whole-number `F64` and an `I64` wrote the same
+digits, and an `I64` and a `U64` of one value always did. A `distribution` wrote statistics
+derived from its sketch, and a `set` wrote an estimate, and neither can be merged again. A
+no-recorded-value metric omitted its kind's fields. And `Bytes` wasn't reversible, as rule 3
+records. The additions:
+
+- **Every `f64` spells a fraction or an exponent**: `3.0`, `1e21`, `-0.0`. It's the shortest form
+  that parses back to the same bits (Rust's `{:?}`). The earlier spelling came from `Display`,
+  not from a decision, and only a reader that tested for a JSON integer could notice the change.
+  `json.loads` returns the same number either way.
+- **A `types` table** closes each line that needs one: an object mapping an RFC 6901 JSON Pointer
+  to a tag (`u64`, `f64`, `bytes`, `timestamp`) for each value whose spelling doesn't name its
+  type. Untagged, an integer is an `I64` and a string is a `Str`. A table instead of an inline
+  wrapper leaves every existing value where and as it was, and most lines have no entry.
+- **A distribution's `sketch`** (its mapping, `stats_exact`, the stored count, min, and max, the
+  zero count, and the bins) and **a set's `hll`** (`HyperLogLog::to_bytes` in base64) sit beside
+  the statistics and the estimate, which stay. The sketch is spelled out because the spec's cases
+  are written by hand. The `HyperLogLog`'s bytes have no readable form, and they're the native
+  codec's form, so a set reads back unchanged in the same `logit` build.
+- **A no-recorded-value metric writes its kind's fields** as decoded, beside
+  `no_recorded_value: true`, since OTLP relays the value under the flag.
+- **A backslash in `Bytes` and in the text-by-convention byte fields is `\x5c`**, so `\xHH` always
+  means one byte. This supersedes rule 3's "for reading, not round-tripping". An exponential
+  histogram's empty side is written when its offset isn't `0`, for the same reason.
+
+Each addition is a key of its own or a respelling of the same JSON value, so the six readers that
+mirror the grammar kept working unchanged. Each was checked against the new output, and
+`summarize.py --self-test`, `check_interop.py --self-test`, and the soak harness's self-test pass.
+A `SpanExt` with every field empty reads back as none, the form every decoder already builds.
+MessagePack writes the same `types` table, since its smallest-int encoding doesn't tell a `U64`
+from an `I64` either. `crates/logit-outputs/tests/ndjson_round_trip.rs` pins the round trip over
+every kind, scalar type, and field, and a property test over generated values.

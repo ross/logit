@@ -1,0 +1,4 @@
+# HELP http_requests_total Requests served.
+# TYPE http_requests_total counter
+http_requests_total{method="get",code="200"} 1027
+http_requests_total{method="post",code="200"} 3 1799999990000

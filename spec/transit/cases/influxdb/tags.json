@@ -1,0 +1,1 @@
+{"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.requests","kind":"gauge","value":5}],"attributes":{"_logit.influxdb.measurement":"http","host":"web-01","method":"GET","status":"200"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}

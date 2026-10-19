@@ -1,0 +1,2 @@
+wire: help-unit.prom
+exercises: [gauge, help, unit, openmetrics, target]

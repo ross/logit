@@ -1,0 +1,2 @@
+wire: counter-sample-rate.statsd
+exercises: [counter, counter_sample_rate, tags]

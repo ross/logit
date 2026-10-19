@@ -1,0 +1,2 @@
+wire: mixed.statsd
+exercises: [counter, counter_sample_rate, gauge, gauge_delta, timer_ms, timer_h, timer_d, timer_sample_rate, set, multi_value_line, tags, tags_repeated_key, container_id, external_data, cardinality, timestamp_T, service_check, event]
