@@ -61,7 +61,9 @@ Four wrappers drive them:
 - `script/transit gen` rewrites every generated file and docs region, then runs the class check.
   Review `git diff` and commit the result. Each kind of test reads what the one before it writes,
   so `gen` runs `cases`, then every `flow::`, then `ledger` and the docs test, as three nextest
-  runs.
+  runs. A failing run doesn't stop the next, so one `gen` reports every failure and rewrites what
+  it can, then exits with the first failure; a failing `flow::` leaves `ledger` reading that
+  flow's committed file.
 - `script/transit docs` rewrites only the docs regions ("Generated docs" below).
 - `script/transit coverage` does what `gen` does, then prints `coverage.md`.
 

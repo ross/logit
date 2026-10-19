@@ -219,5 +219,6 @@ and names the failing flow, with two more tests beside them:
   inside `ledger` was the alternative; it would restore the single slow test.
 - **`gen` runs in three phases.** Under `TRANSIT_UPDATE=1` a flow reads the case files `cases`
   rewrites, and `ledger` reads the files the flows rewrite, so `script/transit gen` runs `cases`,
-  then every flow, then `ledger` and the docs test, each as its own nextest run. `check` compares
+  then every flow, then `ledger` and the docs test, each as its own nextest run, running every
+  phase and every test even when one fails so one run reports every failure. `check` compares
   only, so it runs everything at once.
