@@ -28,7 +28,10 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
 - A rolling overlap's holder (the role `netns`) owns the network namespace its instances join,
   so a fault on it is a fault on every instance's network: netem on it shapes their egress, and
   a partition of it cuts their ingress too. Every instance is an ingress SUT, since the
-  generators send to the address they share.
+  generators send to the address they share. With no overlap, a holder's namespace holds
+  `logit` and an `idp`, a token endpoint the SUT's sink reaches on loopback: a fault on the
+  holder is one on `logit`'s network, and a lifecycle fault on the `idp` affects egress only,
+  since the sink holds its queue while it can't authenticate.
 - A `signal` is `docker kill -s <signal>` through the same CLI path as a `kill`, and a `rename`
   is an `os.rename` on the host inside `<run>/shared`, which the containers mount. Neither can
   lose data on any leg, so every `affects_*` predicate is false, and neither revert does
@@ -54,8 +57,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, NETNS_ROLE, STANDIN_ROLE,
-                       STOP_TIMEOUT_S, SUT_ROLE, SUT_SERVICE, TLS_MOUNT)
+from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, IDP_ROLE, NETNS_ROLE,
+                       STANDIN_ROLE, STOP_TIMEOUT_S, SUT_ROLE, SUT_SERVICE, TLS_MOUNT)
 
 NETEM_LIMIT = "100000"
 # The timeline key recording, per `[[ledger.source]]` wire, whether a step can affect it.
@@ -351,8 +354,9 @@ def _on_holder(step, roles):
 
 
 def _on_ingress_sut(step, roles):
-    """On a SUT service holding every source's listener: `logit`, or under a rolling overlap,
-    whose stack alone has a `netns` holder, any instance."""
+    """On a SUT service holding every source's listener: `logit`, or under a rolling overlap
+    any instance. A stack with a `netns` holder runs an overlap's instances or `logit` alone
+    beside an `idp`, so every SUT in it holds the listeners."""
     return _on_sut(step, roles) and (step.on == SUT_SERVICE or NETNS_ROLE in roles.values())
 
 
@@ -366,7 +370,8 @@ def _on_generator(step, roles):
 
 
 def _on_sut_or_destination(step, roles):
-    return roles.get(step.on) in (SUT_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE, NETNS_ROLE)
+    return roles.get(step.on) in (SUT_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE, NETNS_ROLE,
+                                  IDP_ROLE)
 
 
 def _lifecycle_on_ingress_sut_or_generator_partition(step, roles):

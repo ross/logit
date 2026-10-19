@@ -195,12 +195,15 @@ pub async fn run_pipelines(
             .await
             .with_context(|| format!("admin: binding '{bind}'"))
             .map_err(RunError::Startup)?;
+        let address = logit_pipeline::listen::bound_display(listener.local_addr(), bind);
+        tracing::info!(target: "logit", address = %address, "admin bound");
         admin_listeners.push(AdminListener::Tcp(listener));
     }
     if let Some(socket) = &admin.socket {
         let mode = admin.socket_mode.map_or(logit_inputs::unix::DEFAULT_SOCKET_MODE, |m| m.bits());
         let listener = logit_inputs::unix::bind_listener("admin", Path::new(socket), mode)
             .map_err(RunError::Startup)?;
+        tracing::info!(target: "logit", address = %socket, "admin bound");
         admin_listeners.push(AdminListener::Unix(listener));
     }
     let (readiness, admin_servers) = if admin_listeners.is_empty() {

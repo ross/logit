@@ -309,7 +309,8 @@ impl Input for InfluxDbInput {
             return Ok(()); // idempotent, per `Input::bind`'s contract
         }
         let listener = logit_pipeline::listen::bind_tcp(&self.bind, self.bind_options).await?;
-        self.diag.info("bound", format_args!("listening on {}", self.bind));
+        let addr = logit_pipeline::listen::bound_display(listener.local_addr(), &self.bind);
+        self.diag.info("bound", format_args!("listening on {addr}"));
         self.listener = Some(listener);
         Ok(())
     }
