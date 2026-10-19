@@ -1,6 +1,6 @@
 ---
 created: 2026-09-28
-updated: 2026-09-28
+updated: 2026-10-19
 ---
 
 # Test timing: wait on an observable, size every sleep, and share one set of helpers
@@ -41,7 +41,8 @@ Tests follow these rules. A reviewer can check each one on a diff.
    names the interval it covers, and it is at least 3x that interval.
 2. **Bind before spawn.** A test calls `bind().await`, reads `local_addr()`, then spawns the
    input. It never binds a port, drops it, and binds it again. An exception (a boxed `dyn Input`
-   with no `local_addr`, a port handed to a child process) says so in a comment.
+   with no `local_addr`) says so in a comment. A child process binds port `0` and reports the
+   port it got; see "Amendment: a child process picks its own port".
 3. **A timing constant states its interval, its margin, and what each side of the margin
    protects.** Commit 47142b7b's comment is the model. A wall-clock bound over work that scales
    with CPU is at least 10x a gap measured under load, or it bounds progress instead of time.
@@ -92,3 +93,34 @@ tests read from need `tokio-rustls` and a server TLS config, so they belong in `
 - Existing tests move to the helpers in later changes, one crate or one cause at a time; this
   record doesn't change any of them.
 - A new test module reaches for `test_util` before writing its own wait or reader.
+
+## Amendment: a child process picks its own port (2026-10-19)
+
+Rule 2 no longer has a child-process exception. A test that spawns `logit run` writes port `0`
+into the config and reads the bound address back from the child's `--log-format json` self-log.
+It never picks a port itself.
+
+The exception let a test bind `127.0.0.1:0`, read the port, drop the socket, and write the port
+into the child's config. Between the drop and the child's bind, any other test process in the
+parallel nextest run could take the port. CI run 39319040280 failed that way: a `signals.rs`
+test's child exited at startup with `admin: binding '127.0.0.1:33821'` and `Address already in
+use`. Every test that used the helper, `ephemeral_addr`, could fail the same way, whether the port
+went to `admin.bind` or to a listener.
+
+The child now reports each address it binds:
+
+- Every listener's `bound` line names the socket's own address, so a `:0` bind reports the
+  assigned port.
+- The admin endpoint logs `admin bound` with an `address` field, one line per socket.
+
+`docs/deploying.md`'s "Self-logging" table lists both. In `crates/logit-cli/tests/support/mod.rs`,
+`spawn_run` starts the child with JSON self-logging, and `Lines::wait_for_bound` reads the
+addresses back. `ephemeral_addr` is gone.
+
+A test that needs a port that refuses connections, such as `exit_codes.rs`'s held socket, still
+holds that socket for the whole test. Only bind-and-release is retired.
+
+A retry at the spawn was the alternative: re-pick every port and respawn when the child exits with
+`Address already in use`. It keeps the race and hides it behind a bounded retry, and every test
+would need its config built from a closure over the ports. Reporting the bound address removes
+the window, and an operator gets the same line for a `:0` bind outside tests.

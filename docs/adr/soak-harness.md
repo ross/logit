@@ -215,6 +215,19 @@ duplicate copies on their own: one FAILs in a SUT life with no producer epoch bu
 broker discards a resend within an epoch, and WARNs after a bump, as `at_least_once` permits.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Kafka targets", has the rules.
 
+## Amendment: an `otlp_proto` topic is read per data point (2026-10-18)
+
+A Kafka target's topic can hold `kafka_out`'s `format: otlp_proto` records. The harness takes
+the format from the sink's own config rather than a scenario key, so the two can't disagree.
+The broker image's console consumer prints a binary value through Kafka's `BytesDeserializer`,
+whose escaped form keeps each record on one line, and a stdlib protobuf walker decodes it, so
+the harness stays stdlib-only. One record holds a whole batch, so records stay the unit of T
+and of duplicate copies, which `logit.output.records` counts, but V counts each `Sum` data
+point once per series and time: a resend that splits a batch another way stores different
+bytes holding the same points. `ledger.topic` judges such a repeated point as it judges a
+duplicate copy. The walker is held to a vector that a Rust test pins to the encoder's output,
+not to a hand-written encoding.
+
 ## Amendment: a stand-in's oracle is its record, and a cued rejection is counted (2026-10-15)
 
 A scenario can point its sink at a scripted HTTP stand-in (`[target] kind = "standin"`), so every

@@ -478,14 +478,15 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
             &mut self.diag,
         )
         .await?;
+        let addr = logit_pipeline::listen::bound_display(socket.local_addr(), bind);
         match multicast_group {
             Some(group) => self.diag.info(
                 "bound",
                 format_args!(
-                    "listening on {bind} -- joined multicast group {group} on the default interface"
+                    "listening on {addr} -- joined multicast group {group} on the default interface"
                 ),
             ),
-            None => self.diag.info("bound", format_args!("listening on {bind}")),
+            None => self.diag.info("bound", format_args!("listening on {addr}")),
         }
         self.socket = Some(BoundSocket::Udp(socket));
         Ok(())
