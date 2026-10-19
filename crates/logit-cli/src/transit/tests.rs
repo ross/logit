@@ -297,27 +297,54 @@ fn influxdb_out_follows_a_carried_bucket() {
     let carried = r#","resource":{"attributes":{"_logit.influxdb.bucket":"carried"}}}"#;
     let case: String =
         case.lines().map(|line| format!("{}{carried}\n", &line[..line.len() - 1])).collect();
-    let flow = influxdb_flow("transit-influx-carried", "");
+    let flow = influxdb_flow("transit-influx-carried", ", org: o");
     let path = flow.with_file_name("case.json");
     std::fs::write(&path, case).expect("write the case");
     let outcome = run(&flow, &path, Options::default()).expect("the flow runs");
     let doc: Value = serde_json::from_str(&outcome.document()).expect("JSON");
-    assert_eq!(resources(&doc), vec![json!({"_logit.influxdb.bucket": "carried"}); 3], "{doc}");
+    let carriers = json!({"_logit.influxdb.org": "o", "_logit.influxdb.bucket": "carried"});
+    assert_eq!(resources(&doc), vec![carriers; 3], "{doc}");
 }
 
-/// Exposition holds the registry to `max_series:` as the sink does: of the series the case
-/// leaves on the wire, one reads back and the rest are counted evicted.
+/// A bucket with no org anywhere is a write `influxdb_in` refuses, so nothing reads back and the
+/// sink counts the batch rejected.
+#[test]
+fn influxdb_out_with_a_bucket_and_no_org_is_refused_counted() {
+    let flow = influxdb_flow("transit-influx-no-org", ", bucket: b");
+    let want = json!({
+        "events": [],
+        "counters": {
+            "logit.component.batches.dropped{component=out,kind=influxdb_out,reason=rejected,role=sink}": 1,
+            "logit.component.events.dropped{component=out,kind=influxdb_out,reason=rejected,role=sink}": 4,
+            "logit.output.metrics.skipped{component=out,kind=influxdb_out,metric_kind=set_members,role=sink}": 1,
+        },
+    });
+    assert_eq!(document(&flow), want);
+}
+
+/// Exposition holds the registry to `max_series:` as the sink does, evicting the oldest series:
+/// one batch per event, in the case's order reversed, leaves `temperature` newest, where name
+/// order would keep `users`.
 #[test]
 fn exposition_reads_back_what_max_series_leaves() {
     let flow = flow(
         "transit-expose-cap",
         "components:
-  case: {type: replay_in, path: case.json}
+  case: {type: replay_in, path: case.json, batch: 1}
   out: {type: prometheus_out, bind: '127.0.0.1:0', max_series: 1, sources: [case]}
 ",
     );
-    let doc = document(&flow);
-    assert_eq!(doc["events"].as_array().expect("events").len(), 1, "{doc}");
+    let case = std::fs::read_to_string(fixture(CASE)).expect("read the case");
+    let reversed: String = case.lines().rev().map(|line| format!("{line}\n")).collect();
+    let path = flow.with_file_name("case.json");
+    std::fs::write(&path, reversed).expect("write the case");
+    let outcome = run(&flow, &path, Options::default()).expect("the flow runs");
+    let doc: Value = serde_json::from_str(&outcome.document()).expect("JSON");
+    let survivor = metric_event(
+        json!({"name": "temperature", "kind": "gauge", "value": 21.5}),
+        Some(json!({"room": "lab"})),
+    );
+    assert_eq!(doc["events"], json!([survivor]), "{doc}");
     let evicted = "logit.output.series.evicted{component=out,kind=prometheus_out,\
                    reason=cardinality,role=sink}";
     assert_eq!(doc["counters"][evicted], 2, "{doc}");

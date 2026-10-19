@@ -1059,8 +1059,11 @@ pub fn render_batches(
     telemetry: &Telemetry,
 ) -> Vec<u8> {
     let mut registry = Registry::default();
-    let now = Instant::now();
-    for batch in batches {
+    let start = Instant::now();
+    for (i, batch) in batches.iter().enumerate() {
+        // A later batch is newer, as each `send` reads the clock again, so the cap evicts by age
+        // before it breaks a tie by name.
+        let now = start + Duration::from_nanos(i as u64);
         let resource = batch.resource.as_ref();
         for family in
             events_to_families(batch.events.iter().map(|event| (resource, event)), encoder)
