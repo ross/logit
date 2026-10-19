@@ -4,7 +4,7 @@
 //! | Encoder | Bytes | Decoder |
 //! |---|---|---|
 //! | `statsd_out` | each `MessageBuf` entry: one line, or an event's indivisible lines | `StatsdDecoder`, one entry at a time |
-//! | `influxdb_out` | one body per batch, to the org and bucket the sink resolves for it, `precision=ns`; a batch with no bucket is dropped and counted as the sink drops it | `InfluxDecoder::decode_body`, under the resource `influxdb_in` builds from that org and bucket |
+//! | `influxdb_out` | one body per batch, to the org and bucket the sink resolves for it, `precision=ns`; a batch with no bucket is dropped and counted as the sink drops it | `InfluxDecoder::decode_body`, under the resource `influxdb_in` builds from that org and bucket; a write naming no org or an empty bucket is refused as `influxdb_in` refuses it, counted as the sink's write loop counts a `Rejected` batch (`batches.dropped`/`events.dropped{reason="rejected"}`), since the listener's own count needs its server |
 //! | `otlp_out` | one protobuf request per signal per batch | `OtlpDecoder::decode_signal` |
 //! | `prometheus_out`, `bind:` | one scrape after the last batch, in the run's dialect, held to `max_series:` (no expiry: it reads a clock) | `text::parse_with`, then `families_to_events` |
 //! | `prometheus_out`, `endpoint:` | one compressed request per batch | `decompress_bounded`, `remote_write::decode`, then `families_to_events` per timestamp group |
@@ -95,6 +95,15 @@ pub(super) fn round_trip(
                 let body = encoder.encode(batch)?;
                 logit_outputs::influxdb::emit_encode_stats(sink, encoder.stats());
                 if body.is_empty() {
+                    continue;
+                }
+                // `influxdb_in` answers a write naming no org, or an empty value it reads as
+                // none, with influxd's `400`, which the sink reads as `Rejected`.
+                let named = |value: Option<&str>| value.is_some_and(|v| !v.is_empty());
+                if (!named(org) && !named(org_id)) || bucket.is_empty() {
+                    sink.count("logit.component.batches.dropped", 1.0, &[("reason", "rejected")]);
+                    let events = batch.events.len() as f64;
+                    sink.count("logit.component.events.dropped", events, &[("reason", "rejected")]);
                     continue;
                 }
                 let batch = decoder

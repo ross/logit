@@ -154,7 +154,7 @@ under `logit run` for a look at what a sink emits. The driver runs it in-process
    bytes through the pair's real `Decoder`.
 5. Record the re-decoded batch as lossless event JSON, and the counters the sink and stages
    incremented, with reasons (`degraded`, `skipped`, `dropped`, `normalized`,
-   `passed_through`, `discarded`, `omitted`).
+   `passed_through`, `discarded`, `omitted`, `evicted`).
 
 Where output is nondeterministic for a reason the code can't remove (a `Set`'s estimate moves by
 one with merge order past 128 members), the case declares a tolerance on the field, and the
@@ -166,9 +166,15 @@ registry's `sink_encoder` returns the encoder a sink kind writes with, configure
 config mapping `build_spec` uses (`statsd_encoder`, `to_remote_write_version`,
 `to_remote_write_encoding`). The steps between an encoder and the wire are public functions on
 the sink module: `logit_outputs::prometheus::encode_remote_write`, which the remote-write sender
-calls; `render_batches`, which renders through the exposition sink's own registry; and the statsd
-and InfluxDB sinks' stats-to-telemetry functions, which both sinks call. So the driver and the
-sink can't drift. The driver is a `#[cfg(test)]` module of the
+calls; `render_batches`, which renders through the exposition sink's own registry and
+`max_series:` cap; the statsd and InfluxDB sinks' stats-to-telemetry functions, which both sinks
+call; and `logit_outputs::influxdb::destination`, a wrapper over the `resolve` the sink calls for
+a batch's org and bucket, with `drop_no_bucket`, which the sink calls for a batch with none. So
+the driver and the sink can't drift. The driver decodes an InfluxDB write under the resource
+`influxdb_in` builds from that org and bucket (`logit_proto::influxdb::write_resource`), and
+refuses one naming no org as `influxdb_in` does. Two things it doesn't reproduce: `has_stale` and
+`drop_stale`, which read the wall clock per batch, so it rejects them; and `prometheus_out`'s
+`expire_after:`, which reads a clock, so exposition reads back every series `max_series:` keeps. The driver is a `#[cfg(test)]` module of the
 `logit` binary rather than a library target or an integration test, since only the binary's own
 tests can reach `build_spec`. W4's generator follows the `script/differential --check` pattern
 as a `#[test]` in the same module: with `TRANSIT_UPDATE=1` it rewrites the expectations, and
