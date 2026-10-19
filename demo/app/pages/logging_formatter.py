@@ -2,7 +2,7 @@
 over syslog to `logit`: the same shape demo/haproxy/haproxy.cfg and demo/nginx/nginx.conf emit for
 their access lines. `TraceContextJSONFormatter` is the shared base. Each subclass only names which
 record attributes become which JSON keys (`FIELDS`); the trace-field logic is identical everywhere,
-so it lives here once (`docs/plans/demo-richer-traces.md`).
+so it lives here once.
 
 Trace fields come from `LoggingInstrumentor` (opentelemetry-instrumentation-logging, wired in
 `demoproj/telemetry.py`, shared by both processes this app forks workers in). It stamps every

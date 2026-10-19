@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -127,7 +127,7 @@ inside `flush()` — rather than inheriting the last batch's.
 
 [ADR `multi-payload-events`](multi-payload-events.md) replaces `Event`'s one-of `Payload` with independent
 `log`/`metrics`/`span` fields, so an event can now carry a log *and* metrics at once (the
-`kv_metrics` shape planned in `docs/plans/nginx-integration.md`'s workstream E). This ADR's
+`kv_metrics` shape, [ADR `kv-metrics-semantics`](kv-metrics-semantics.md)). This ADR's
 "Pass through, never drop" decision above was written against the one-of model, where "pass through"
 and "absorb" were mutually exclusive properties of a whole event. They no longer are.
 
@@ -260,8 +260,7 @@ series; and `flush` never emitting an empty `(resource, events)` pair.
 half of `Distribution`/`Set`'s raw-vs-summarized pairs, but left them with no producer and no
 merge rule — "`aggregate` and the sinks treat `Samples`/`SetMembers`/`ExponentialHistogram`/a
 non-delta-monotonic `Sum` as pass-through or explicitly unsupported, not as a real feature, until
-W2/W3/W4" (that ADR's Consequences). [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s
-W2 is the workstream that closes the `aggregate` half of that gap. This ADR's original "Decision"
+W2/W3/W4" (that ADR's Consequences). This amendment closes the `aggregate` half of that gap. This ADR's original "Decision"
 section, above, declared: "`Set` has no merge implemented here because `HyperLogLog`
 (`crates/logit-core/src/metric.rs`) is still a method-less stub — a design gap, not a decision this
 ADR is re-litigating," and its "Pass through, never drop" rule named "any metric kind with no
@@ -354,7 +353,7 @@ groups under it. `Transform::flush`'s return type, `FlushOutput`, grew a matchin
 what scope actually fed it (`crates/logit-pipeline/src/runtime.rs`'s `run_flush` had nowhere to get
 one from); it is now `Vec<(Arc<Resource>, Option<Arc<Scope>>, Vec<FlushedEvent>)>`, one entry per
 `(resource, scope)` group, each carrying the scope every series in it shares. This closes the
-`otlp_in -> aggregate -> otlp_out` scope-loss gap `docs/plans/lossless-transit.md`'s W2 tracked:
+`otlp_in -> aggregate -> otlp_out` scope-loss gap:
 before this, an `aggregate` stage between two OTLP legs silently dropped which instrumentation scope
 a metric came from, even though nothing about tumbling-window aggregation requires losing it. Two
 batches sharing a resource but carrying different scopes now flush as two distinct groups, each

@@ -4,8 +4,8 @@ This harness measures what real telemetry looks like: how many attributes an eve
 long its keys and values are, how deeply they nest, how many events ride in a batch, and how many
 distinct key-sets a source produces. It runs real software, or replays recorded traffic from it,
 through `logit`'s own [`shape`](../../docs/adr/shape-observer-component.md) component and folds the
-result into a summary. It's the capture half of
-[`docs/plans/data-shape-survey.md`](../../docs/plans/data-shape-survey.md).
+result into a summary. It's the capture half of the survey recorded in
+[`docs/design/data-shapes.md`](../../docs/design/data-shapes.md).
 
 [`script/shape-survey`](../../script/shape-survey) drives it. Like `script/record-fixtures` and
 `script/perf`, it runs on the host and drives docker. It's **deliberately not part of

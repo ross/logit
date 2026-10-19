@@ -3948,8 +3948,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   `a_lua_node_finishing_on_its_own_reaches_finished`,
   `a_sustained_permanent_sink_failure_returns_runtime_not_startup`,
   `readiness_disabled_never_panics_across_a_full_run`; `crates/logit-cli/tests/admin_ready.rs`,
-  `crates/logit-cli/tests/exit_codes.rs`. Governed by `docs/adr/admin-readiness-endpoint.md`,
-  `docs/plans/operator-surface.md`.
+  `crates/logit-cli/tests/exit_codes.rs`. Governed by `docs/adr/admin-readiness-endpoint.md`.
 - **Priority:** **P2** — well contained, the monotonicity rules live in the type rather than in caller ordering,
   and a wrong answer misroutes traffic rather than losing it.
 
@@ -4638,7 +4637,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   that sends nothing releases its permit), and
   `a_tls_listener_at_its_connection_cap_rejects_over_tls_not_in_the_clear` (a TLS listener at
   its cap rejects over TLS, not in the clear). ADR `native-transport-handshake-and-ack`,
-  `docs/adr/service-lifecycle-and-output-retry.md`, `docs/plans/operator-surface.md` workstream B.
+  `docs/adr/service-lifecycle-and-output-retry.md`, `docs/adr/admin-readiness-endpoint.md`.
 - **Suggested verification approach:** targeted review plus a fault-injection test that panics
   inside `serve_connection` and asserts the gauge returns to zero (it currently will not);
   a connection-flood test measuring task/socket counts past the cap.
@@ -6639,7 +6638,7 @@ the telemetry buffers are `std::collections::HashMap`.
   - `Visitor::record_str` (in `on_event`) does `value.trim_matches('"')` — `trim_matches` strips **all** leading and trailing `"` characters, not one pair. A self-diagnostic message that legitimately begins or ends with a quote (e.g. a warning quoting a bad config value, `bad key "x"`) is silently mangled in the captured log while the stderr copy is intact. Medium confidence this is real and low severity; worth a targeted test.
   - `record_debug` allocates a `String` per field via `format!("{value:?}")` in `Visitor::record_debug` on every captured event, then allocates again in `record_str`. Only on the warn+ path, so cost is bounded — but it is on the path a log flood takes.
   - `Registry::push_log`'s silent no-op when `component_id` names no registered buffer drops the event with **no counter at all** — the one loss in this subsystem that self-telemetry can't see. Documented as "should not happen"; medium confidence it's genuinely unreachable.
-- **Existing coverage:** `crates/logit-core/src/telemetry.rs`'s `tests` module (includes capture/threshold/fallback tests); `crates/logit-core/src/diag.rs`'s `tests` module. Governed by `docs/design/internal-telemetry.md` ("Logs"), `docs/adr/tracing-for-self-logging.md`, `docs/plans/operator-surface.md` workstream D.
+- **Existing coverage:** `crates/logit-core/src/telemetry.rs`'s `tests` module (includes capture/threshold/fallback tests); `crates/logit-core/src/diag.rs`'s `tests` module. Governed by `docs/design/internal-telemetry.md` ("Logs"), `docs/adr/tracing-for-self-logging.md`.
 - **Suggested verification approach:** targeted review of the whole capture path for any `tracing!` call; a test emitting a warn whose message starts and ends with quotes; a flood test asserting `logit.internal.logs.dropped` reconciles.
 - **Priority:** P1 — feedback-loop class plus a concrete (small) message-corruption finding.
 
@@ -6726,7 +6725,7 @@ the telemetry buffers are `std::collections::HashMap`.
   - `render` allocates nothing beyond growing `out`.
   - The three error offsets are byte offsets into the original input and are accurate.
 - **Observed concerns (unverified):** none spotted.
-- **Existing coverage:** `crates/logit-core/src/template.rs`'s `tests` module. Governed by `docs/plans/load-test-harness.md`, `docs/adr/load-test-harness.md`.
+- **Existing coverage:** `crates/logit-core/src/template.rs`'s `tests` module. Governed by `docs/adr/load-test-harness.md`.
 - **Priority:** P2 — small, self-contained, dev/load-test-facing today.
 
 ---
@@ -8115,7 +8114,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     plaintext zero-byte write) therefore **double-counts every encode-side drop** —
     `logit.output.messages.dropped{reason=…}`, `logit.output.tags.omitted`,
     `logit.output.batch.bytes`. I found no ADR or known-gaps entry acknowledging this; grepping
-    `buffered-sink-delivery.md` and `known-gaps/` for re-encode/double-count turned up nothing.
+    `docs/adr/buffered-sink-delivery.md` and `known-gaps/` for re-encode/double-count turned up nothing.
     High confidence on the mechanism; unverified whether anyone has measured it.
   - Symmetrically, a cancelled attempt records the drops but no `requests{class=…}`, so
     `messages + messages.dropped` need not reconcile against `requests` in either direction.

@@ -4,7 +4,8 @@
 //! sequence in hand by then, unlike a general object model where every insert is a potential shape
 //! transition.
 //!
-//! The case against (`docs/plans/event-sizing.md`'s "Bake-off arms"): interned 4-byte symbols
+//! The case against (`docs/adr/event-sizing-and-allocation-strategy.md`'s "Bake-off arms and
+//! instruments"): interned 4-byte symbols
 //! already bank most of what a key-set saves, and the clone, the operation this should help,
 //! barely moves, since `Vec<Value>` still clones every value. Hence the **pre-registered kill
 //! criterion**: K must beat the append-then-sort bulk build by **≥10% on the 12-attribute log's

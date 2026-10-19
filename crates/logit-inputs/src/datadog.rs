@@ -1,8 +1,8 @@
 //! `datadog_in`: a stand-in for Datadog's intake API, the receiving end of a Datadog Agent's
 //! `dd_url`, `logs_config.logs_dd_url`, `apm_config.apm_dd_url`, or `additional_endpoints`
-//! ([ADR `datadog-agent-and-intake-relay`](../../../../docs/adr/datadog-agent-and-intake-relay.md),
-//! [`docs/plans/datadog-relay.md`](../../../../docs/plans/datadog-relay.md) §2). One TCP listener,
-//! optionally TLS, serves HTTP/1.1 and h2c through [`hyper_util::server::conn::auto::Builder`],
+//! ([ADR `datadog-agent-and-intake-relay`](../../../../docs/adr/datadog-agent-and-intake-relay.md)).
+//! One TCP listener, optionally TLS, serves HTTP/1.1 and h2c through
+//! [`hyper_util::server::conn::auto::Builder`],
 //! and every body decodes through [`logit_proto::datadog::DatadogDecoder`]. The payload mappings
 //! live in that codec's module doc; this module owns HTTP: routing, authentication, compression,
 //! size caps, and backpressure.

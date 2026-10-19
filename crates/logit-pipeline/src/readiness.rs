@@ -3,8 +3,7 @@
 //! `logit-cli`'s admin server (`docs/adr/admin-readiness-endpoint.md`).
 //!
 //! Readiness is true only while the pipeline can accept and forward, and false as soon as it
-//! can't; never a static "the process is up." See `docs/plans/operator-surface.md`'s "The
-//! constraint everything is designed around".
+//! can't; never a static "the process is up."
 
 use std::collections::HashMap;
 use std::sync::Arc;

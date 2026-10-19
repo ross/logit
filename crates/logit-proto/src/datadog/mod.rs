@@ -1,6 +1,6 @@
 //! Datadog's intake API and the Datadog Agent's own payloads: the codecs behind `datadog_in` and
 //! `datadog_out` ([ADR `datadog-agent-and-intake-relay`](../../../../docs/adr/datadog-agent-and-intake-relay.md),
-//! [`docs/plans/datadog-relay.md`](../../../../docs/plans/datadog-relay.md)). One submodule per
+//! whose "Verified destination behavior" is the protocol survey). One submodule per
 //! payload family, each documenting its own wire ↔ model mapping table in the format
 //! [`crate::collectd`]'s module doc set; this doc holds what they share.
 //!

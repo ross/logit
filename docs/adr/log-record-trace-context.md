@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-10-16
+updated: 2026-10-18
 ---
 
 # `LogRecord` gains a native application trace/span reference
@@ -26,8 +26,7 @@ itself decoded both signals from one OTLP request into one `Event`. It says noth
 that arrives with its own trace reference already on it (a real OTLP producer's `LogRecord`), or
 about an application that puts a `trace_id` in its log body as plain JSON (`{"trace_id":
 "4bf92f...", ...}`), which is common practice for anything not emitting OTLP directly. Both cases
-made every OTLP log sink — Loki included, per `docs/plans/otlp-logs-and-resource-identity.md`'s
-workstream D — permanently unable to get native trace correlation from `logit`, regardless of what
+made every OTLP log sink — Loki included — permanently unable to get native trace correlation from `logit`, regardless of what
 the source actually knew.
 
 `docs/design/data-model.md` states the model has to be "a strict superset of what OTLP can
@@ -104,9 +103,8 @@ script copying one onto the other (`event.log.trace_id = trace.trace_id`, stampi
   would leave on long-term, and it overwrites whatever application trace the log carried. The
   one-line Lua script above covers it without a native flag.
 - **Demo-stack wiring** (a second Grafana `derivedFields` entry keyed on Loki's `trace_id`
-  structured metadata instead of the existing body regex). Deferred to the demo app's own tracing
-  rework, a separate, already-planned piece of work — this ADR only lands the model/codec/Lua/
-  transform pieces.
+  structured metadata instead of the existing body regex). Not part of this ADR, which lands the
+  model/codec/Lua/transform pieces; the demo's Grafana datasource has since gained that entry.
 
 ## Consequences
 
@@ -131,7 +129,7 @@ decimal uint64 strings, or `dd.trace_id` as 32 lowercase hex when the tracer gen
 ids. A Datadog span carries a 128-bit id's high half separately, in `_dd.p.tid` (1 to 16 hex).
 `trace_context` accepted only 32-hex trace ids and 16-hex span ids, so a Datadog-instrumented
 application's logs never got a `TraceRef`
-([`docs/plans/datadog-relay.md`](../plans/datadog-relay.md) §9).
+([ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md), decision 9).
 
 **`format:` selects the id grammar; nothing is inferred from the value.** `trace_context` gains
 `format: otel | datadog`, `otel` by default and unchanged. Under `datadog`:

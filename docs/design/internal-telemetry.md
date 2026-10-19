@@ -1510,7 +1510,7 @@ become a throughput one, which nothing else can distinguish.
 
 Separately, and not telemetry: on finishing its `count`, it logs one `generation complete` line at
 `info` carrying `events`/`batches`/`elapsed`. The perf harness reads wall time and the events/s
-divisor from that line (`docs/plans/load-test-harness.md`). It's the one component that emits a
+divisor from that line ([`performance.md`](performance.md)'s §0). It's the one component that emits a
 structured `tracing` event directly rather than through `Diagnostics`, because the harness needs
 those values as *fields*, not as a rendered message.
 
@@ -2487,7 +2487,7 @@ retry, and in sender mode one `send` is one attempt by design, with `write_loop`
 
 ##### `null_out`
 
-`crates/logit-outputs/src/null.rs`, `docs/plans/load-test-harness.md`.
+`crates/logit-outputs/src/null.rs`, `docs/adr/load-test-harness.md`.
 
 **Layer 2 only.** `send` does no encoding and no I/O, so it has nothing of its own to report. The
 generic write loop's `logit.component.batches.received`/`events.received`/`send.duration` already

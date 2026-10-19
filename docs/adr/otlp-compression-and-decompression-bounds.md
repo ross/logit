@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-09-25
+updated: 2026-10-18
 ---
 
 # `otlp_out`/`otlp_in` gzip: client never accepts a compressed response, server bounds decompressed size
@@ -9,7 +9,7 @@ updated: 2026-09-25
 Accepted
 
 ## Context
-`docs/plans/otlp-logs-and-resource-identity.md`'s workstream E found `otlp_out` never sets gzip's
+Checking `otlp_out` against Loki found that it never sets gzip's
 compressed flag on either transport (`crates/logit-outputs/src/otlp.rs`'s frame encoder). The
 matching gap on the receiving side was already filed and explained why it hadn't been closed:
 `otlp_in` rejects any `Content-Encoding`/`grpc-encoding` other than `identity` outright, because

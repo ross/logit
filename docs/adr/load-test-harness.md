@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-10-02
+updated: 2026-10-18
 ---
 
 # A load-test harness: the real binary, a declarative event template, and CPU per event as the signal
@@ -31,9 +31,8 @@ node in a graph is the bottleneck currently means attaching a profiler by hand.
 
 This ADR decides how `logit` closes that gap: a repeatable, out-of-CI harness that runs the real
 release binary against ordinary YAML configs, measures throughput and CPU cost, attributes time
-per node, and makes a flamegraph a one-liner. The concrete build-out — file layout, workstream
-order, scenario list — is [`docs/plans/load-test-harness.md`](../plans/load-test-harness.md); this
-record is about the decisions that plan is built on, not the schedule.
+per node, and makes a flamegraph a one-liner. The scenario list is
+[`docs/design/performance.md`](../design/performance.md#scenarios)'s "Scenarios".
 
 ## Decision
 
@@ -190,7 +189,7 @@ Enforcing) needed a third: `--security-opt label=disable`. With the default cont
 SELinux denies the `perf_event` class outright regardless of capabilities — `perf record` still
 runs and still exits 0, but writes a zero-sample `perf.data`, which reads exactly like the
 `kernel.perf_event_paranoid` capability problem the first two flags exist for and isn't. Nothing
-in this ADR's "Alternatives considered" or `docs/plans/load-test-harness.md`'s risk list predicted
+in this ADR's "Alternatives considered" predicted
 an SELinux-specific denial; `script/perf`'s own comment on the `flamegraph` path now carries the
 full account, verified on this repo's actual dev box rather than assumed from precedent.
 

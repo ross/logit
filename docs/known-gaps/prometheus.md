@@ -119,8 +119,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **VictoriaMetrics discards remote-write 2.0 silently, and `prometheus_out` can't tell.**
   VictoriaMetrics v1.152.0 answers a 2.0 request `204` with an empty body and stores nothing, with
   nothing in its log and `vm_http_request_errors_total` unchanged
-  ([`docs/plans/victoriametrics-interop.md`](../plans/victoriametrics-interop.md)'s "Findings", leg
-  2). A `204` is success under both specs, and the sink doesn't read the 2.0
+  ([`tools/victoria-interop/README.md`](../../tools/victoria-interop/README.md)'s "Recorded run",
+  leg 2). A `204` is success under both specs, and the sink doesn't read the 2.0
   `X-Prometheus-Remote-Write-*-Written` headers, so `prometheus_out` `version: 2` counts every
   batch delivered while all of it is lost.
   - **Workaround:** use `version: 1` for VictoriaMetrics (`docs/deploying.md`'s "Choosing

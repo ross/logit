@@ -624,9 +624,9 @@ pub fn flatten() -> Flatten {
 }
 
 /// Line protocol as a Prusa Buddy firmware metrics datagram carries it: the four points of
-/// `docs/plans/prusa-metrics.md`'s captured datagram excerpt, plus that plan's string-field
-/// example, with each boot-relative timestamp rewritten to absolute nanoseconds and the header
-/// line removed, as the plan's Lua stage does before `line_protocol`. One point per shape: a
+/// a captured datagram excerpt (firmware `7.0.0+16903`, `examples/prusa/README.md`), plus a
+/// string-field example, with each boot-relative timestamp rewritten to absolute nanoseconds and
+/// the header line removed, as `examples/prusa/prusa.lua` does before `line_protocol`. One point per shape: a
 /// tagged integer, a one-field point, two multi-field points (two integers, three floats), and a
 /// string field.
 pub const LINE_PROTOCOL_MESSAGE: &str = "ttemp_noz,n=0,a=1 value=0i 1792167827767000000\n\

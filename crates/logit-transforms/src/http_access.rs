@@ -1,7 +1,33 @@
 //! `http_access`: normalizes a web server's access line, logged under raw OTel semconv attribute
 //! names with the untouched value, into its conformant form, and fills in a small set of derived
 //! attributes the producer left out. See `docs/adr/http-access-normalization.md` for the design
-//! and `docs/plans/http-access-normalization.md` for the step list `process` runs.
+//! and the list of steps `process` runs, in order, below.
+//!
+//! 0. **De-alias.** A dashed name (`http-response-status_code`) is removed and written under its
+//!    dotted name, only when the dotted one is absent.
+//! 1. **Decompose** `http.request.line` (three space-separated tokens; a bad shape is left in
+//!    place and diagnosed) and `url.original` (split at the first `?`), each writing only the
+//!    atomic fields that are absent, then removed.
+//! 2. **Coerce numerics** from an integer, a float, or a quoted numeric string (`"000"` becomes
+//!    `0`). An unparseable value is left in place and counted `invalid`. `upstream.status` is
+//!    coerced only when it is a single integer; a per-attempt list stays verbatim.
+//! 3. **Merge durations** (`_us`, `_ms`, or unsuffixed nanoseconds) into `_s` as `F64`, removing
+//!    the source. `_s` wins when several are present.
+//! 4. **Method**: a name outside the known set is kept as `http.request.method_original` and
+//!    replaced with `_OTHER`. Matching is case-sensitive.
+//! 5. **Version**: strip `HTTP/`; `2.0` becomes `2` and `3.0` becomes `3`.
+//! 6. **Query**: strip a leading `?`, then replace the value of each sensitive key with
+//!    `REDACTED`, matching keys ASCII-case-insensitively.
+//! 7. **Cap and clean** every capped field to its length limit (counted `truncated`), then replace
+//!    control bytes with `_` (counted `cleaned`).
+//! 8. **Classify**: `user_agent.class` from the uncapped value and `http.route` from the capped
+//!    `url.path`. A value the producer sent is kept and nothing is derived for it.
+//! 9. **Derive**: `error.type`, `span.status`, `span.name`, the `span.duration_s` mirror, and,
+//!    under `forwarded:`, `client.address`, each only when absent except the last.
+//!
+//! Never touched: `traceparent`, `trace.*`, `span.id`, `span.parent_id`, `span.kind`,
+//! `span.start*`, `span.end*`, `event.log`, `event.metrics`, `event.span`, `event.timestamp`, and
+//! the batch `Resource`.
 //!
 //! Placed between `json` (or whatever parsed the line) and `trace_context`: this component only
 //! emits `span.name`/`span.status`/`span.duration_s` for `trace_context` to lift, and never mints
@@ -197,8 +223,8 @@ const SPAN_METHOD_OTHER: &str = "HTTP";
 
 /// `(class, pattern)`, in priority order: a UA claiming both `Mozilla/` and `bot` is a crawler,
 /// which is why `browser` comes last and why this is an ordered scan, not a `RegexSet` (the ADR's
-/// Alternatives). Verified against the 62 sourced UA strings in this module's corpus test
-/// (`docs/plans/http-access-normalization.md`). Pattern choices a maintainer would otherwise undo:
+/// Alternatives). Verified against the 62 sourced UA strings in this module's corpus test.
+/// Pattern choices a maintainer would otherwise undo:
 ///
 /// - `\bbot\b`, not `bot\b`, which matches phone models like `CUBOT`.
 /// - Bare `bot/` alongside it, not `\bbot/` (a `/` is always a boundary, so `\bbot/` adds
@@ -1874,8 +1900,7 @@ mod tests {
     }
 
     // -- UA corpus: 62 real UA strings, each sourced from a vendor doc, the project's own
-    // source, or corroborated captured-traffic write-ups, never invented
-    // (`docs/plans/http-access-normalization.md`). Two entries (a nikto default, `l9explore`)
+    // source, or corroborated captured-traffic write-ups, never invented. Two entries (a nikto default, `l9explore`)
     // are accepted gaps that no table can fix.
     const UA_CORPUS: &[(&str, &str)] = &[
         // -- Tools / HTTP clients --

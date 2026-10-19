@@ -1,4 +1,4 @@
-# The nginx reference example (docs/plans/nginx-integration.md):
+# The nginx reference example:
 # syslog_in -> json -> http_access -> trace_context -> kv_metrics -> keep -> keep_values ->
 # aggregate -> influxdb_out, plus `stdio_out` taps, against the real nginx in fixtures/nginx/ in
 # the dev stack (`script/server`).

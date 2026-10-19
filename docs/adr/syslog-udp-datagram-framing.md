@@ -1,6 +1,6 @@
 ---
 created: 2026-10-16
-updated: 2026-10-16
+updated: 2026-10-18
 ---
 
 # `syslog_in` UDP framing: `framing: lines | datagram`, with today's per-line split as the default
@@ -16,7 +16,7 @@ its `escape=json` guarantees no raw newline inside one message.
 
 A sender whose single message has a multi-line MSG loses every line after the first. Prusa's
 Buddy firmware sends one RFC 5424 message per datagram whose MSG is a header and about 37 InfluxDB
-line-protocol points, one per line ([`prusa-metrics`](../plans/prusa-metrics.md) has the capture).
+line-protocol points, one per line ([`examples/prusa/`](../../examples/prusa/README.md) describes the capture).
 After the split, only the first piece starts with `<PRI>`, so the rest are counted
 `logit.input.messages.dropped{reason="malformed"}`. The same split already cuts a binary MSG at any
 `0x0A` byte ([syslog known gaps](../known-gaps/syslog.md)), whose only workaround is

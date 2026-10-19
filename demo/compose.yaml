@@ -57,7 +57,7 @@ services:
       - victoriametrics_data:/victoria-metrics-data
     networks: [demo]
 
-  # `demo/app`'s database (`docs/plans/demo-richer-traces.md`), and the source `logit`'s `tail_in`
+  # `demo/app`'s database, and the source `logit`'s `tail_in`
   # reads (`crates/logit-inputs/src/tail/`; demo/README.md's "Postgres"). Settings:
   #   - `jsonlog` (Postgres 15+), not the plain-text default, so `logit`'s `json` transform reads
   #     it unchanged, like every other tier's access line.
@@ -97,7 +97,7 @@ services:
       - postgres_logs:/var/log/postgresql
     networks: [demo]
 
-  # Celery's broker (`docs/plans/demo-richer-traces.md`): `app`'s `.delay()` and `worker`'s
+  # Celery's broker: `app`'s `.delay()` and `worker`'s
   # consumption both go through here. No persistence is configured, because nothing on the broker
   # side is worth surviving a restart, unlike `postgres_data` above. It logs to stdout only, which
   # `redis_in` (demo/logit.yaml) tails straight off the host with `docker_in`, the same mechanism
@@ -135,7 +135,7 @@ services:
     networks: [demo]
 
   # Log backend. `logit`'s `loki_out` and `self_loki_out` are the only paths in: logs arrive over
-  # OTLP/HTTP with no relay service in between (demo/logit.yaml, docs/plans/otlp-logs-and-resource-identity.md). Not
+  # OTLP/HTTP with no relay service in between (demo/logit.yaml). Not
   # published on the host; Grafana queries it over the `demo` network.
   loki:
     image: docker.io/grafana/loki:3.7.7
@@ -163,7 +163,7 @@ services:
   # the query API (:3200) is reached through Grafana.
   tempo:
     # Pinned to 2.10.x, not the current 3.0.x: Tempo 3.0 removed the legacy ingester write path
-    # and reworked config wholesale (docs/plans/demo-stack.md). 2.10's monolithic mode is
+    # and reworked config wholesale. 2.10's monolithic mode is
     # the well-trodden config below.
     image: docker.io/grafana/tempo:2.10.8
     command: ["-config.file=/etc/tempo/tempo.yaml"]
@@ -342,8 +342,8 @@ services:
       <<: *postgres-env
     networks: [demo]
 
-  # Step 3: `app`, the innermost tier a request reaches, behind `nginx` below
-  # (docs/plans/demo-tracing-stack.md). A real Django app built from `demo/app/Dockerfile`.
+  # Step 3: `app`, the innermost tier a request reaches, behind `nginx` below.
+  # A real Django app built from `demo/app/Dockerfile`.
   #   - Its access log goes to `logit` over syslog (`app_in`, :5142), on its own listener like
   #     every other tier.
   #   - Its OTel request spans bypass `logit` and go straight to `tempo`'s OTLP/HTTP receiver.
@@ -396,7 +396,7 @@ services:
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf # documentation -- see gunicorn.conf.py's comment
       # `/work` (pages/views.py) calls back into nginx's `/inner`, by container-network name,
       # unlike GRAFANA_URL above, because this call never leaves the `demo` network
-      # (`docs/plans/demo-richer-traces.md`). It targets nginx, not haproxy, so this hop takes a
+      # It targets nginx, not haproxy, so this hop takes a
       # different path than the request that triggered it, while still landing on a tier `logit`
       # mints a real span from (demo/logit.yaml's `nginx_trace`).
       INNER_URL: http://nginx/inner
@@ -412,7 +412,7 @@ services:
     restart: unless-stopped
     networks: [demo]
 
-  # The demo's async tier (`docs/plans/demo-richer-traces.md`): runs `pages/tasks.py`'s one task,
+  # The demo's async tier: runs `pages/tasks.py`'s one task,
   # never in a gunicorn worker. It reuses `logit-demo-app:latest` with no `build:` of its own, like
   # `app-migrate`/`graph-dot`. Its real OTel spans (`demoproj/telemetry.py`) go straight to Tempo,
   # like `app`'s; `logit` isn't in this leg either, consistent with every other SDK-carried span
@@ -507,7 +507,7 @@ services:
     # line break a real newline, which the shell treats as a statement separator like `;`.
     #
     # `/work` is repeated three times so it's the majority of the loop's traffic
-    # (`docs/plans/demo-richer-traces.md`). Enough `/work` traces (jittered latency, an occasional
+    # Enough `/work` traces (jittered latency, an occasional
     # real 503) fill in `web.request_time`'s p50/p99 spread and the "Loki: 5xx lines/sec" panel
     # without `/boom` (a guaranteed 500, kept rare here) dominating either one.
     command:

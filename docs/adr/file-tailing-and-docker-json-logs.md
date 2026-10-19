@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -420,8 +420,7 @@ trade-off, not hidden in a compose file comment alone.
   rename`, json-file-driver-only, `(dev, ino)` checkpoint identity, `inotify` on network/FUSE
   mounts, non-Linux poll-only, `docker_in`'s single deviation from read-time timestamps, per-input
   stream filtering, `config.v2.json`'s undocumented-format risk, named output ports as a deferred
-  future idea) all need updating — tracked PR by PR in
-  [`docs/plans/file-tailing.md`](../plans/file-tailing.md).
+  future idea) were all updated with the tailing implementation.
 - The demo (`demo/`) reworks nginx to log to stdout only
   (`NGINX_ENTRYPOINT_QUIET_LOGS: "1"`, dropping its `syslog:` `access_log` destination) and adds a
   `docker_in` leg reading it, replacing the `syslog_in` leg that previously carried it — the

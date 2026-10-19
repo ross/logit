@@ -13,14 +13,15 @@ Accepted
 `logit` has harnesses for throughput (`script/perf`,
 [ADR `load-test-harness`](load-test-harness.md)), interop (`script/victoria-interop`,
 `script/splunk-interop`, [ADR `victoriametrics-interop`](victoriametrics-interop.md)), and data
-shape (`script/shape-survey`). None runs `logit` for long under faults. Three plans describe
-soaks that were never run: stopping a sink for 90 s
-([`buffered-sink-delivery`](../plans/buffered-sink-delivery.md)), a `kill -9` with a disk spool
-and a replay check ([`durable-sink-buffer`](../plans/durable-sink-buffer.md)), and flooding
+shape (`script/shape-survey`). None runs `logit` for long under faults. Three soaks were
+designed and never run: stopping a sink for 90 s
+([`buffered-sink-delivery`](buffered-sink-delivery.md)), a `kill -9` with a disk spool
+and a replay check ([`disk-backed-sink-buffer`](disk-backed-sink-buffer.md)), and flooding
 `statsd_in` while its sink is stopped
-([`decoupled-listener-io`](../plans/decoupled-listener-io.md)). `tc netem` appears in the repo
+([`decoupled-listener-io`](decoupled-listener-io.md)). `tc netem` appears in the repo
 only as a hand-run latency measurement
-([`native-send-window`](../plans/native-send-window.md)).
+([`docs/design/performance.md`](../design/performance.md) §1, "`native-relay`: window 32 against
+window 1 under a 10 ms round trip").
 
 The goal is robustness: a repeatable way to run real `logit` containers against real or
 generated sources and real targets, inject network and lifecycle faults on a timeline, and

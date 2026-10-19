@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<!-- docs/plans/browser-tracing.md's Workstream C: this request's own server span, handed back to
+<!-- This request's own server span, handed back to
      the page so @opentelemetry/instrumentation-document-load (browser/telemetry.js) can associate
      its documentLoad span with this same trace -- rendered by
      pages/context_processors.py's `traceparent`. Not Server-Timing: that header is for
@@ -18,7 +18,7 @@
   button { font: inherit; padding: 0.4em 0.8em; }
 </style>
 <!-- The real OTel browser SDK, esbuild-bundled from browser/telemetry.js
-     (docs/plans/browser-tracing.md's Workstream C) -- served by pages.views.browser_telemetry_js,
+     -- served by pages.views.browser_telemetry_js,
      not django.contrib.staticfiles (demoproj/settings.py's own comment on why). `type="module"`:
      telemetry.js is bundled with esbuild's `--format=esm`; `defer` either way, so this never
      blocks the page's own render. -->

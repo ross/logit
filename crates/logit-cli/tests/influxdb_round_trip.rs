@@ -30,8 +30,8 @@
 //! |---|---|---|
 //! | `canonical` | none ([`SAME_AS_INPUT`]) | the baseline: one typed point with a string field |
 //! | `telegraf-system` | **2**, **4** | Telegraf's `cpu`, `mem`, and `system` samples; `system`'s three same-instant points merge into one |
-//! | `escaping` | **3**, **6** | probe rows 1 and 2: escapes dropped before `,`, space, and `=`; `\\` and `\` before a letter kept; a measurement's `\=` leaves as a bare `=` |
-//! | `trailing-backslash` | none, refused | probe row 3: a tag value ending in `\` is a `400` naming the line, and the valid line before it isn't delivered |
+//! | `escaping` | **3**, **6** | ADR items 1 and 2: escapes dropped before `,`, space, and `=`; `\\` and `\` before a letter kept; a measurement's `\=` leaves as a bare `=` |
+//! | `trailing-backslash` | none, refused | ADR item 3: a tag value ending in `\` is a `400` naming the line, and the valid line before it isn't delivered |
 //! | `duplicates` | **2**, **4**, **13** | tags in another order still merge, a later field overwrites across types or appends, a different timestamp is another point, and a repeated field key keeps its last value |
 //! | `numbers` | **5** | `5.`, `.5`, `1.5e+3`, `007i`, `t`, and `FALSE` leave in their shortest spelling; `-0`, `u64::MAX`, and `i64::MIN` survive |
 //! | `field-order` | **4** | string fields leave after the numeric ones |
@@ -302,7 +302,7 @@ fn every_corpus_file_has_a_test() {
     }
 }
 
-/// Probe row 3: a tag value ending in a backslash has no spelling, so the line fails; influxd's
+/// ADR item 3: a tag value ending in a backslash has no spelling, so the line fails; influxd's
 /// `400` names the line, and the valid line before it isn't delivered either (one request, one
 /// batch, all or nothing).
 #[tokio::test]

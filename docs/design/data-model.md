@@ -201,7 +201,7 @@ repeated tag key) produce this shape; see
 | `span.duration_{us,ms}` | integer | haproxy's `%Ta` → `span.duration_ms`. |
 | `span.duration_s` | decimal seconds (number or `Str`) | nginx's `$request_time`. |
 | `span.{start,end}_rfc3339` | RFC 3339 string | Parsed by `logit_core::parse_rfc3339_to_nanos`, up to 9 fractional digits. |
-| `dd.trace_id` | `Value::Str`, a decimal uint64 or 32 hex; or `Value::U64`/`I64`, non-zero | **Datadog.** The trace id a Datadog tracer injects into its logs, read by `trace_context` under `format: datadog` ([plan §9](../plans/datadog-relay.md#9-trace-ids-w2b-w8)). A decimal id is the low 64 bits, high half zero; `trace_id_high` can name an attribute holding the high half in `_dd.p.tid`'s 1-16 hex form. A 16-digit string here is decimal, never hex. |
+| `dd.trace_id` | `Value::Str`, a decimal uint64 or 32 hex; or `Value::U64`/`I64`, non-zero | **Datadog.** The trace id a Datadog tracer injects into its logs, read by `trace_context` under `format: datadog` ([ADR `log-record-trace-context`'s Datadog amendment](../adr/log-record-trace-context.md#amendment-datadog-id-formats-2026-09-24)). A decimal id is the low 64 bits, high half zero; `trace_id_high` can name an attribute holding the high half in `_dd.p.tid`'s 1-16 hex form. A 16-digit string here is decimal, never hex. |
 | `dd.span_id` | `Value::Str`, a decimal uint64; or `Value::U64`/`I64`, non-zero | **Datadog.** This line's own span, as `span.id` is for the OTel names; decimal only. |
 | `syslog.sd` | `Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" -> Value::Str \| Value::Array<Value::Str> } }` | `syslog_in`'s parsed RFC 5424 STRUCTURED-DATA (absent when the wire carried the nil `-`); a repeated PARAM-NAME within one SD-ELEMENT becomes the `Array` form, in order. `syslog_out` re-emits every element, escaped per RFC 5424 §6.3.3; see [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md). |
 | *(any DogStatsD tag key)* | `Value::Str`\|`Value::Bool`, or `Value::Array` of either when the key repeated | `statsd_in`'s `insert_tags` folds a repeated `\|#` tag key into a `Value::Array` in wire order (`#team:a,team:b` -> `Array[Str("a"), Str("b")]`), the same multiset fold `syslog.sd` above uses; an exact-duplicate token dedupes at decode instead, so a non-repeated tag's shape is unchanged (`Value::Str` for `key:value`, `Value::Bool(true)` for a bare `key`). `statsd_out` expands an `Array` back into one wire tag per element. See [ADR `statsd-output`](../adr/statsd-output.md)'s amendment. |
@@ -477,8 +477,7 @@ script explicitly set. `logit`'s own code never invents one. See
 **Metric kinds are mergeable**, because in the split-collection topology
 ([overview](../OVERVIEW.md)) two edge nodes' aggregates may combine into one downstream, and the
 result has to be correct, not approximate. [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)
-shaped these kinds to close the gaps [ADR `lossless-transit`](../adr/lossless-transit.md) named, per
-[docs/plans/lossless-transit.md](../plans/lossless-transit.md)'s target model: raw-sample
+shaped these kinds to close the gaps [ADR `lossless-transit`](../adr/lossless-transit.md) named: raw-sample
 (`Samples`) and raw-member (`SetMembers`) representations alongside the sketch and HyperLogLog
 ones, temporality and monotonicity on `Sum`, and sum/count/min/max on
 `Histogram`/`ExponentialHistogram`/`Summary`.
@@ -582,7 +581,7 @@ demand ([ADR `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-ex
 **The model must be a strict superset of what every `_in`/`_out` protocol can express**, or that
 protocol's relay becomes lossy ([ADR `lossless-transit`](../adr/lossless-transit.md)). See
 [docs/design/telemetry-landscape.md](telemetry-landscape.md) for what each protocol can express and
-[docs/plans/lossless-transit.md](../plans/lossless-transit.md) for the resulting target shape.
+[ADR `lossless-transit`](../adr/lossless-transit.md)'s "Realization" for the resulting shape.
 
 ## Open question
 

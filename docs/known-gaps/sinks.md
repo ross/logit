@@ -148,3 +148,14 @@ Entry format and the other areas: [the known-gaps index](README.md).
     (`crates/logit-outputs/src/http.rs`) and the `submit`/`await_ack` split for it. Concurrent
     requests can arrive out of order, so each sink's posture and each destination's tolerance for
     that need checking first.
+- **A `Rejected` batch has no dead-letter path, and no sink splits an oversize batch.** A batch
+  the destination rejects for its own content drops at once
+  ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md)) and is visible only in
+  `batches.dropped{reason="rejected"}` and a throttled log event carrying the destination's text.
+  Nothing keeps the batch for inspection or replay. A `413` or equivalent drops the whole batch,
+  where Telegraf and libbeat halve it and retry. Only `splunk_hec_out` splits, and only for Splunk
+  Cloud's oversize answer.
+  - **Workaround:** size the listener's batch bounds below the destination's limit, and read the
+    diagnostic for the rejection text.
+  - **To close:** a dead-letter sink for rejected batches and a split-and-retry step in the shared
+    HTTP driver, each with its own ADR.

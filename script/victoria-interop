@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: script/victoria-interop
 #
-# Runs every leg of docs/plans/victoriametrics-interop.md's "W1's legs" against real
+# Runs every leg in tools/victoria-interop/README.md's "The legs" against real
 # VictoriaMetrics, VictoriaLogs, VictoriaTraces, and vmagent, and prints one pass, gap, or fail row
 # per leg. See tools/victoria-interop/README.md for what it runs and what it writes.
 #

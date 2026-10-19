@@ -1,6 +1,6 @@
 ---
 created: 2026-10-11
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # `kafka_out`: a pure-Rust producer on `kafka-protocol`, with the Java producer's semantics and named divergences
@@ -28,7 +28,8 @@ The repository is rustls-only, with no OpenSSL and no C toolchain in the build (
 The facts below were checked against the Java client's source (Kafka 4.x trunk), librdkafka's, and
 the `kafka-protocol` 0.18.0 crate, and recorded against a real broker:
 [testdata/interop/kafka/README.md](../../testdata/interop/kafka/README.md) has the corpus and what
-it shows. [docs/plans/kafka-output.md](../plans/kafka-output.md) is the workstream.
+it shows. [tools/kafka-interop/README.md](../../tools/kafka-interop/README.md) has the interop
+legs and what each run against Apache Kafka and Redpanda found.
 
 ## Decision
 

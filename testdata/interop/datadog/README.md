@@ -67,8 +67,8 @@ straight into this directory.
 
 ## What this settled
 
-Each item below was UNVERIFIED in `docs/plans/datadog-relay.md` or ADR
-`datadog-agent-and-intake-relay` before these captures.
+Each item below was UNVERIFIED in ADR `datadog-agent-and-intake-relay`'s protocol survey before
+these captures.
 
 - **The DogStatsD stream socket frames each packet as a 4-byte little-endian length.** The payload
   is one datagram's worth of `LF`-terminated lines, and a buffered client packs several into one
@@ -163,10 +163,10 @@ Each item below was UNVERIFIED in `docs/plans/datadog-relay.md` or ADR
 
 ## What isn't covered here (yet)
 
-- **Anything Datadog's intake decides.** Nothing here reached Datadog. The plan's W7b trial-org
-  run settled most of it (sketches and traces from a sender that isn't an Agent, zlib on
-  distribution points, the size limits, series dedupe), recorded in
-  `docs/plans/datadog-relay.md` and ADR `datadog-agent-and-intake-relay` rather than as fixtures. Whether the intake
+- **Anything Datadog's intake decides.** Nothing here reached Datadog. A trial-org run settled
+  most of it (sketches and traces from a sender that isn't an Agent, zlib on distribution points,
+  the size limits, series dedupe), recorded in ADR `datadog-agent-and-intake-relay`'s "Verified
+  destination behavior" rather than as fixtures. Whether the intake
   takes a stats sketch that isn't on gamma 1.0202 is still open (`docs/known-gaps/datadog.md`).
 - **v0.7 traces, a `PUT`, and a second tracer language.** dd-trace-py sends neither v0.7 nor
   `PUT`; dd-trace-java and dd-trace-go would. The codec's fixed-point tests cover both forms.

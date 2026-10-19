@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-10-07
+updated: 2026-10-18
 ---
 
 # TLS for `otlp_out`/`otlp_in`, and a pooled gRPC client to carry it
@@ -20,8 +20,7 @@ bundled Mozilla root set. What doesn't work:
   ([ADR `hand-rolled-grpc-over-hyper`](hand-rolled-grpc-over-hyper.md)) drives a raw `TcpStream`
   with no TLS layer at all. Filed as a known gap ("`otlp_out` has no gRPC TLS",
   `docs/known-gaps/otlp.md`) while evaluating whether `otlp_out` could replace the demo's
-  `syslog_out` → Alloy → Loki log leg
-  ([docs/plans/otlp-logs-and-resource-identity.md](../plans/otlp-logs-and-resource-identity.md)).
+  `syslog_out` → Alloy → Loki log leg.
 - Neither transport can trust a private CA, present a client certificate for mutual TLS, or
   (deliberately, for a throwaway/pre-production endpoint) skip verification.
 - `otlp_in` terminates nothing -- plaintext HTTP/1.1, h2c, and h2 only.

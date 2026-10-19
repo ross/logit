@@ -2,8 +2,8 @@
 # line of eleven flat fields, `json` merges them onto tail_in's `log.file.path` for a 12-attribute
 # event, null_out discards. Twelve is the p50 width docs/design/data-shapes.md §5.3 measured across
 # eight logging libraries in their documented production configuration, a width json-parse.yaml's
-# six-field nginx body does not reach. Scenario table: docs/plans/load-test-harness.md,
-# "Scenarios"; first run: docs/design/performance.md §8.
+# six-field nginx body does not reach. Scenario table: docs/design/performance.md,
+# "Scenarios"; first run: its §8.
 #
 #   script/perf run --scenario json-parse-app-log
 #

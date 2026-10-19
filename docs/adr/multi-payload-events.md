@@ -1,6 +1,6 @@
 ---
 created: 2026-08-30
-updated: 2026-10-16
+updated: 2026-10-18
 ---
 
 # `Event` carries a log, metrics, and a span at once, not one of the three
@@ -18,7 +18,7 @@ source of several metrics. Under the one-of model those two things can't live on
 either a transform has to fabricate a second, unrelated event to carry the derived metrics (losing
 the "these came from the same access-log line" relation a downstream sink or correlated-tagging use
 case needs), or the model has to change. This ADR is the change, driven by planning the concrete
-`kv_metrics` transform (`docs/plans/nginx-integration.md`'s workstream E) that needs to add
+`kv_metrics` transform ([ADR `kv-metrics-semantics`](kv-metrics-semantics.md)) that needs to add
 metrics to an event that already has a log body.
 
 ## Decision

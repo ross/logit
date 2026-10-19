@@ -1,6 +1,6 @@
 ---
 created: 2026-09-18
-updated: 2026-09-20
+updated: 2026-10-18
 ---
 
 # A disposable Azure VM for perf measurement: `up`/`down` only, no stop and no snapshot
@@ -61,7 +61,7 @@ say this, so it's the documented workflow rather than something rediscovered per
 
 The single biggest cost the first real session on this box paid was choreography, not compute:
 every perf question this repo asks is "ref A vs ref B, interleaved, in one sitting"
-(`docs/plans/udp-intake.md`'s baseline/delta protocol), but the tooling gave a session no way to
+(`docs/design/performance.md` §7's "Measurement protocol"), but the tooling gave a session no way to
 build a second binary without inventing one by hand -- build each ref, stash the binary, `docker
 cp` the chosen one into the target volume before each run, checksum to prove the right one landed.
 That choreography nearly produced a wrong number: three source trees extracted around the same

@@ -1,6 +1,6 @@
 # A synthetic load: `generate_in` renders a fixed number of events from a template, a `json`
 # stage parses their bodies, and `null_out` drops the result. Every perf scenario takes this shape
-# (docs/plans/load-test-harness.md). Run it directly to see the generator's completion line:
+# (docs/design/performance.md, "Scenarios"). Run it directly to see the generator's completion line:
 #
 #   logit --log-format json run fixtures/generate-to-null.yaml
 #

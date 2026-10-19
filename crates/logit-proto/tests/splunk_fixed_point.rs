@@ -178,7 +178,7 @@ fn raw_lines_relay_through_event() {
 }
 
 /// A body in the OpenTelemetry Collector `splunk_hec` exporter's shape, one object per record
-/// (its `use_multi_metric_format` default), written by hand from `docs/plans/splunk-relay.md`'s
+/// (its `use_multi_metric_format` default), written by hand from ADR `splunk-hec-relay`'s
 /// "Third-party HEC conventions" table. It carries what the recorded exporter captures in
 /// `testdata/interop/splunk/` don't (`otel.log.name`, a summary quantile, a span event);
 /// `tests/splunk_interop.rs` holds the codec to the recorded ones.

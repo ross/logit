@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-10
+updated: 2026-10-18
 ---
 
 # OTLP/JSON decoding: hand-written against `serde_json::Value`, not generated
@@ -143,7 +143,7 @@ in JSON as in protobuf (`json/metrics.rs`), so both encodings carry them.
   separately in `docs/known-gaps/otlp.md` rather than folded into this change.
 - Cross-origin browser access to `otlp_in` is still not possible after this change: `handle_http`
   answers any non-POST method, `OPTIONS` included, with a 404, so there is no CORS preflight
-  support. A same-origin reverse proxy (what `docs/plans/browser-tracing.md` describes) remains the
+  support. A same-origin reverse proxy (what [ADR `browser-tracing-sdk`](browser-tracing-sdk.md) describes) remains the
   supported path for a browser client; a dedicated `cors:` config surface is a separate feature,
   tracked in `docs/known-gaps/otlp.md`.
 - `docs/adr/committed-pregenerated-otlp-protobuf.md`'s line "the only new *runtime* dependency this

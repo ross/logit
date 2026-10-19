@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-04
+updated: 2026-10-18
 ---
 
 # Native hop send window: several frames in flight, acknowledged in frame order
@@ -380,8 +380,8 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
 
 - **Code.** The store's `peek_at` and `max_in_flight`, the `Output` methods and
   `deliver_window`, `logit_out`'s window and `logit_in`'s clamp and lingering close, the config
-  field and graph rule 75, and the tests and allocation pins each workstream adds are listed
-  once, in [`docs/plans/native-send-window.md`](../plans/native-send-window.md).
+  field and graph rule 75 are the surface; the code's tests and `docs/design/memory.md` carry the
+  pins. [`docs/design/performance.md`](../design/performance.md) §1 has the measurements.
 - **Telemetry.** `logit.component.send.duration` records one sample per windowed round, not per
   batch, for a `logit_out` with a window above 1. `logit.output.requests` counts a `submit` `Err`
   that carries a fault (a `Permanent` only at the head, a drift once) and every other

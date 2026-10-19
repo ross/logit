@@ -1,6 +1,6 @@
 ---
 created: 2026-09-15
-updated: 2026-10-16
+updated: 2026-10-18
 ---
 
 # `Event.new(t)`: Lua constructs events from the table shape `event:to_table()` already emits
@@ -181,7 +181,6 @@ Concretely:
   `trace_id`/`span_id`/`parent_span_id`/link id is all-zero (both decoders check length only) is
   rejected by the constructor's rules above, so a rebuilding script must fix or drop that field.
   In-place `event.log.message`/`severity`/`body_format` writes are the named follow-up.
-- Landed by [plan `lua-event-constructor`](../plans/lua-event-constructor.md), stream key `mint`.
 
 ## Amendment: counts round-trip at every magnitude (2026-09-26)
 

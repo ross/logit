@@ -67,8 +67,8 @@ shape is recorded under "What this settled".
 
 ## What this settled
 
-Each item was UNVERIFIED in `docs/plans/splunk-relay.md` or ADR `splunk-hec-relay` before these
-captures, or is something the captures showed that nobody had written down.
+Each item was UNVERIFIED in ADR `splunk-hec-relay`'s protocol survey before these captures, or is
+something the captures showed that nobody had written down.
 
 - **The exporter's span object is `hecSpan` in member order, with the protobuf enum names.**
   `otel-services-collector-000` writes `trace_id`, `span_id`, `parent_span_id`, `name`,
@@ -129,7 +129,7 @@ captures, or is something the captures showed that nobody had written down.
 
 - **Anything a real Splunk decides.** The capture sink answers every request `200`. What Splunk
   Enterprise 10.4.3 accepts, rejects, and indexes is `script/splunk-interop`'s job, recorded in
-  `tools/splunk-interop/README.md` and `docs/plans/splunk-relay.md`.
+  `tools/splunk-interop/README.md` and ADR `splunk-hec-relay`'s "Verified destination behavior".
 - **Summary and exponential histogram from the exporter.** telemetrygen has no Summary
   generator; its ExponentialHistogram the exporter drops. The codec's Summary shape
   (`<n>_<q>` with `qt`) is still from the exporter's source.

@@ -1,4 +1,4 @@
-"""Wires OpenTelemetry tracing into each gunicorn worker (docs/plans/demo-tracing-stack.md).
+"""Wires OpenTelemetry tracing into each gunicorn worker.
 
 This runs in `post_fork`, not at module import time, and not via the `opentelemetry-instrument` CLI
 wrapper. The `BatchSpanProcessor` this sets up owns a background export thread, and a thread does
@@ -34,8 +34,8 @@ def post_fork(server, worker):
     from demoproj.telemetry import setup
 
     # Everything but Django's request-span instrumentation is shared with the Celery worker's
-    # equivalent hook (`demoproj/celery.py`'s `worker_process_init`,
-    # `docs/plans/demo-richer-traces.md`) through `demoproj/telemetry.py`. See that module for
+    # equivalent hook (`demoproj/celery.py`'s `worker_process_init`)
+    # through `demoproj/telemetry.py`. See that module for
     # what each instrumentor call is for.
     setup(default_service_name="demo-app")
 

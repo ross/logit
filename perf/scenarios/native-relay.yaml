@@ -4,7 +4,7 @@
 # default send window of frames in flight, answered by `relay_in`'s Acks, one per run of frames,
 # so this measures the whole transport round trip (encode, one loopback TCP hop, decode, ack),
 # unlike encode-native-devnull's one-way encode. native-relay-window1 is the same graph with one
-# frame in flight. Scenario table: docs/plans/load-test-harness.md, "Scenarios".
+# frame in flight. Scenario table: docs/design/performance.md, "Scenarios".
 #
 #   script/perf run --scenario native-relay
 #

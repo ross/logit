@@ -1,6 +1,6 @@
-# Leg 1z of `script/victoria-interop` (docs/plans/victoriametrics-interop.md, "W1's legs"): a copy
+# Leg 1z of `script/victoria-interop` (tools/victoria-interop/README.md, "The legs"): a copy
 # of leg 1's `prometheus_out` remote-write 1.0 into VictoriaMetrics's `/api/v1/write`, with
-# `compression: zstd` in place of the default Snappy, proving W2's sender-side codec against real
+# `compression: zstd` in place of the default Snappy, proving the sender-side codec against real
 # VictoriaMetrics (the VictoriaMetrics remote write protocol vmagent itself sends by default).
 #
 # One gauge straight from `generate_in`, and one counter through `aggregate` with

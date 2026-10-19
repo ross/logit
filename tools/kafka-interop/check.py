@@ -24,8 +24,8 @@ script has already written, under /out (the run directory):
     redpanda-oidc.txt                   `ok` once Redpanda took OAUTHBEARER, else `failed`
     logs/<service>.log                  each service's log
 
-Prints one row per leg and broker (docs/plans/kafka-output.md, "Interop plan (W4)"). A row is
-PASS (the leg did what the plan expects), GAP (the broker behaves differently from Apache Kafka in
+Prints one row per leg and broker (tools/kafka-interop/README.md, "What it runs"). A row is
+PASS (the leg did what that table says it checks), GAP (the broker behaves differently from Apache Kafka in
 a way docs/known-gaps/kafka.md records), or FAIL. Exits 1 on any FAIL.
 """
 

@@ -126,7 +126,7 @@ fn init_logging(
 ///
 /// Uses `hyper_util`'s legacy client for HTTP and `hyper`'s connection-level client for a Unix
 /// socket, not `reqwest`: the crate takes no new HTTP client dependency
-/// (docs/plans/operator-surface.md).
+/// (docs/adr/admin-readiness-endpoint.md).
 ///
 /// Bounded by [`PROBE_TIMEOUT`]: a connect to a process that has stopped accepting still lands
 /// in the kernel's backlog, and an unbounded probe would then wait forever for a reply.

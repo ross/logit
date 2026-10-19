@@ -19,6 +19,14 @@ heap free=61088i,total=79012i 128900
 esp_out sent=4171237i 676222
 ```
 
+The format comes from a capture of one printer running firmware `7.0.0+16903` on 2026-10-16: 40
+datagrams in 25 seconds, each 962 to 989 bytes, holding 1,470 points, about 58 points per second.
+Prusa's reference collector is `utils/metrics/collect.py` in the
+[Prusa-Firmware-Buddy repository](https://github.com/prusa3d/Prusa-Firmware-Buddy). The capture
+holds no point with a NaN `value` and no line that fails to parse. Prusa's collector skips
+`value too long` lines without a warning, which suggests some firmware emits them; this example
+leaves any such line to `line_protocol`, which skips and counts it.
+
 ## The pipeline
 
 | Node | What it does |

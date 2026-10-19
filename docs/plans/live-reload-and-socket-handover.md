@@ -224,5 +224,5 @@ Smaller than either reload shape and independent of both.
 - [ADR `deployment-threat-model`](../adr/deployment-threat-model.md): every listener is on a
   private network, which is what makes a reuseport group or a handover socket a question about a
   cooperating neighbor rather than a hostile one.
-- [Operator surface plan](operator-surface.md), which set config reload aside as needing its own
-  design.
+- [ADR `admin-readiness-endpoint`](../adr/admin-readiness-endpoint.md), which set config reload
+  aside as needing its own design.

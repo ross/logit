@@ -262,7 +262,6 @@ what the component does to an event, the way `set`/`keep`/`scale` do. `event:to(
   `memory.md`, `known-gaps/`, `deploying.md` (the `alias` node state) updated;
   `fixtures/fan-out-central.yaml` rewritten onto `route` + targets with `fan-out-edge.yaml`
   untouched -- the same edge config, a central config that no longer clones.
-- **Build-out:** [`docs/plans/target-components.md`](../plans/target-components.md).
 
 ## Amendment (2026-10-13): a router needs an ordinary consumer
 

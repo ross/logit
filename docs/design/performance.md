@@ -1,8 +1,7 @@
 # Performance: the load-test harness's recorded numbers
 
 This is the hand-curated record of what the out-of-CI load-test harness measured
-([ADR `load-test-harness`](../adr/load-test-harness.md),
-[`docs/plans/load-test-harness.md`](../plans/load-test-harness.md)). The harness spawns the real,
+([ADR `load-test-harness`](../adr/load-test-harness.md)). The harness spawns the real,
 release-profile `logit run <config>` process against `perf/scenarios/*.yaml` and measures
 throughput, CPU cost, and peak RSS: the end-to-end question [`memory.md`](memory.md) §7 left open.
 `perf/results/` is gitignored, per-machine JSON; this file is where a run's numbers get written
@@ -125,6 +124,50 @@ prints a warning to that repeat's stderr rather than silently reporting a startu
   `flamegraph` there is a `cpu-clock` profile, not `cycles` (§5). The ADR's "Consequences" section
   has the full account.
 
+### Scenarios
+
+`perf/scenarios/*.yaml` are ordinary, shipped `logit` configs with no `!env` and any Lua inline,
+validated like every other shipped config. Each file's header comment says what it isolates and
+which scenario to read it against; §1 has each one's committed `count` and numbers.
+
+| Scenario | Graph | Measures |
+|---|---|---|
+| `passthrough` | `generate_in` (6 attributes, no log) → `null_out` | Runtime floor: scheduling, channel hops, no parsing |
+| `json-parse` | `generate_in` (JSON body) → `json` → `kv_metrics` → `null_out` | The parse-into-attributes path |
+| `json-parse-x3` | `json-parse`'s `generate_in` → 3 × `json` → 3 × `null_out` | Three parsers contending on the process-wide interner, read against `json-parse` |
+| `json-parse-app-log` | `generate_in` (`fixtures::FLAT_JSON_LOG_BODY` plus `tail_in`'s `log.file.path`) → `json` → `null_out` | The parse at the commonest measured log width, 12 attributes ([`data-shapes.md`](data-shapes.md) §5.3) |
+| `json-parse-nested-log` | `generate_in` (`fixtures::PINO_HTTP_LOG_BODY` plus the same path) → `json` → `null_out` | A nested record: 10 attributes, four of them boxed `Value::Map`s |
+| `json-parse-access-log` | `generate_in` (`fixtures::POSTGRES_JSONLOG_BODY` plus the same path) → `json` → `null_out` | The widest log class, 30 attributes, the one scenario whose `AttrMap` reallocates |
+| `logfmt-parse` | `generate_in` (`fixtures::LOGFMT_LINE`) → `logfmt` → `null_out` | The logfmt parse alone |
+| `aggregate` | `generate_in` (distribution metric, `host: h{seq%1000}`) → `aggregate` (1 s window) → `null_out` | Aggregation and flush-tick cost |
+| `aggregate-groups` | `generate_in` (one gauge per event, a fresh resource per batch of 100, cycling 1000) → `aggregate` → `null_out` | The `(resource, scope)` group lookup across 1000 groups, read against `aggregate` |
+| `lua` | `generate_in` → `lua` (inline enrichment script) → `null_out` | The Lua hop and its event proxy |
+| `fanout` | `passthrough`'s `generate_in` → 3 × `null_out` | `Arc` fan-out to several sinks, read against `passthrough` |
+| `route` | `passthrough`'s `generate_in` → `route` (by `host`) → 3 × `target` → 3 × `null_out`, plus an unrouted `null_out` | The router hop and `target` delivery, read against `passthrough` |
+| `native-relay` | `generate_in` → `logit_out` → `logit_in` → `null_out`, in one process | Native encode, decode, and ack round trip |
+| `native-relay-window1` | `native-relay` with `window: 1` on `logit_out` | The same round trip with one frame in flight |
+| `encode-human-devnull`, `encode-json-devnull`, `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: human`, `json`, or `native`) | Each encoder in situ |
+| `buffered` | `passthrough`'s graph with `buffer.disk:` on the sink | Disk spool cost |
+| `buffered-small-segments` | `buffered` with `segment_bytes: 1MiB` | Segment-roll cost (a durable cursor persist and an unlink per roll), read against `buffered` |
+| `tail`, `tail-rotate` | a file `logit-perf` writes first → `tail_in` → `null_out` | The tail read path, and the rotation path on top of it ([File scenarios](#file-scenarios-tail-ends-on-a-delivered-count-not-a-log-line)) |
+| `udp-statsd`, `-small`, `-packed` | real UDP load from `perf/load/` → `statsd_in` → `null_out` | UDP intake ([Driven scenarios](#driven-scenarios-udp-statsd-is-measured-differently-on-purpose)) |
+
+Rules a new or retuned scenario follows:
+
+- **A `count` targets 5–10 s of wall per repeat on the perf VM.** CPU µs/event doesn't depend on
+  the count, so a retune changes no comparison. A first-estimate count is a guess: the three
+  `json-parse-*-log` counts, scaled from `json-parse`'s by key count, all overshot by 1–4 s on
+  their first run (§8) and were lowered to fit.
+- **`passthrough`, `fanout`, and `route` share one event template and one count**, so they differ
+  only in the graph after the generator. A `fanout` that once generated a one-attribute event at a
+  higher count read as cheaper per event than `passthrough` (0.466 against 0.478 µs on a quiet
+  laptop run), which was the lighter generator, not cheap delivery. Change all three together.
+- **`native-relay` never exits by itself**, because `logit_in` is a listener. It's the scenario
+  that exercises the harness's settle-then-SIGTERM path; every `generate_in` scenario ends on its
+  generator's `generation complete` line.
+- **`buffered` does real disk I/O**, so expect its wall time to vary more than any in-memory
+  scenario's. §3 has the variance account.
+
 ### Driven scenarios: `udp-statsd*` is measured differently, on purpose
 
 The `udp-statsd`/`-small`/`-packed` family ([ADR
@@ -216,7 +259,7 @@ scenario. B0 and D- ran the same command against their own binaries (`--label su
 no binary always ran first. One throwaway `--repeat 1` of `passthrough` per binary ran first and
 is excluded. Rows follow `script/perf list`'s alphabetical order. `count` is each scenario's
 committed `generate_in.count`. Most counts give the 5–10 s of wall per repeat that
-`docs/plans/load-test-harness.md` targets; the two `buffered*` rows, `aggregate-groups`, and
+§0's [Scenarios](#scenarios) targets; the two `buffered*` rows, `aggregate-groups`, and
 `native-relay` (3.34 s) run shorter. **events/s (min–max)** is the spread of the same five repeats
 the median came from; the noise sub-section after the readings explains what a wide range means.
 
@@ -479,6 +522,27 @@ binds, and changing it moves the ratio only slightly. The gap comes from burst h
 coalesced `Ack`, not from the cap. On loopback at window 32 the variants don't separate from M
 (CPU µs/event 0.858 for M, 0.868 for M/8, 0.838 for M/16, all inside M's 12-repeat range of
 0.823–0.882), so the constant needs no change.
+
+### `native-relay`: window 32 against window 1 under a 10 ms round trip
+
+This is a laptop measurement from 2026-10-02 (AMD Ryzen AI 9 HX 370, 24 logical CPUs of mixed Zen 5
+and Zen 5c cores, 62 GiB, Linux 7.2.7, on battery under the `powersave` governor, runs unpinned)
+and the VM didn't re-run it. It shows what the send window ([ADR
+`native-hop-send-window`](../adr/native-hop-send-window.md)) buys under latency. `netem` added
+`delay 5ms` on `lo` in a throwaway `logit-dev:local` container with `--cap-add NET_ADMIN`; the
+measured RTT was 10.1/11.9/15.3 ms min/avg/max. The scenarios are temporary copies of
+`native-relay` with `buffer.max_batches: 64`, so the queue left at "generation complete" drains
+inside `--settle 2s`, at 3M events for window 32 and 200k for window 1, `--repeat 2`.
+`generate_in` batches are 100 events, so batches/s is events/s divided by 100.
+
+| Arm | Events/s | Batches/s | CPU µs/event | Peak RSS |
+|---|---|---|---|---|
+| `window: 32` | 312,734 | ~3,127 | 1.811 | 60.7 MiB |
+| `window: 1` | 9,133 | ~91 | 5.724 | 42.3 MiB |
+
+Window 32 is 34.2× window 1 on batch rate at a 10 ms RTT, against the ADR's expected ~30×. Window 32
+reaches about 98% of its ceiling of 32 frames per RTT (3,200 batches/s), and window 1 about 91% of
+its one per RTT (100 batches/s). Window 1's CPU per event is inflated by idle wake-ups per batch.
 
 ### Reading the rows
 
@@ -1029,13 +1093,41 @@ see the ADR's "Representative traffic, calibrated against a recorded real-client
 
 ### Measurement protocol
 
-Every table in this section follows `docs/plans/udp-intake.md`'s "Baseline/delta recording
-protocol" and `perf/load/README.md`'s "Box state"/"Pinning" sections, because a box's numbers move
-for reasons that have nothing to do with the code:
+Every table in this section follows the protocol below and `perf/load/README.md`'s "Box
+state"/"Pinning" sections, because a box's numbers move for reasons that have nothing to do with the
+code. A stored baseline from another session is not a control, it is a second variable. On the
+original laptop, the same specs, commit, and pins re-run 90 minutes into a session moved CPU
+µs/event by about 23% and `udp-statsd-small`'s drop rate from 3.1% to 12.4%. Re-running the earlier
+commit straight afterwards reproduced the later numbers, so the machine had settled into a lower
+sustained power state and the code was not the cause. A drop rate is especially exposed, being the
+difference between two nearly equal rates.
+
+Every number traces back to a real `perf/results/*.json` file and states which CPUs it pinned to.
+Results files and flamegraphs stay out of the repository; a table cites the file's name.
+
+To record a delta:
+
+1. Run the three scenarios on the parent, then on the branch, then repeat that pair at least once
+   more (parent, branch, parent, branch). Consistency across pairs is the evidence the delta is
+   real.
+2. Run `script/perf compare <parent.json> <branch.json>` within that session only. `compare` warns
+   on a host or CPU-model mismatch, but it can't see a change in the box's power state.
+3. Leave `receive_buffer_bytes` and each spec's `rate` unchanged across a pair, so the comparison
+   isolates the code change. `--rate-scale` reads a different operating point without editing a
+   spec; the results file records the effective rate, and `compare` warns when two runs used
+   different ones.
+4. Check the box's state against `perf/load/README.md`'s "Box state" table before writing a number
+   down. `logit-perf run` records governor, energy-performance preference, platform profile, and AC
+   power into the results file's preamble and warns on `powersave` or battery.
+5. Label each table of this document by session: which pair, taken when, on what box state. Don't
+   present tables from different days as one running series.
+
+The rules behind those steps:
 
 - **A delta is a parent/branch pair taken in one sitting, interleaved**: parent, branch, parent,
   branch. Never diff a branch against a results file from another day. Two unbroken blocks would put
-  one side on the cool half of a session and the other on the warm half.
+  one side on the cool half of a session and the other on the warm half, because the drift is
+  monotonic within a session.
 - **Sender and child are pinned to distinct physical cores** with `--pin-sender`/`--pin-child`
   (§0's "Driven scenarios"), so they don't contend for one core's time. Every table states its pins:
   `--pin-sender 0,1 --pin-child 2,3` throughout, leaving cores 4–7 free (the original 4-core session
@@ -1919,9 +2011,7 @@ binary):
 All three overshot the 5–10 s band, `json-parse-nested-log` most. **Their shipped counts have since
 been lowered** (12M → 9M, 8M → 4.5M, 5M → 3M), each scaled to ~8 s from the wall time above. §1's
 2026-09-28 run measured 8.0–9.0 s at those counts. CPU µs/event, which every table in this section reports, doesn't
-depend on the count. The first estimates were too generous across the board: the first real data
-point for the "the first session that runs them should expect to retune them" line these
-scenarios' YAML and `docs/plans/load-test-harness.md` already carried.
+depend on the count. The first estimates were too generous across the board.
 
 ## 9. Datadog stack: the sparse sketch store and serde_json's float_roundtrip (2026-09-24)
 

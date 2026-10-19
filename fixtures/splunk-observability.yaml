@@ -1,7 +1,7 @@
 # Sends OTLP traces and metrics on to Splunk Observability Cloud (the former SignalFx):
 # `otlp_out` over OTLP/HTTP protobuf, with `paths:` pointed at Observability Cloud's per-signal
 # ingest routes and an `X-SF-Token` header carrying an org access token
-# (docs/plans/splunk-relay.md's "Observability Cloud ingest"). Observability Cloud has no log
+# (docs/adr/splunk-hec-relay.md's "Observability Cloud ingest"). Observability Cloud has no log
 # store — Log Observer Connect reads logs from the Platform instead — so this leg only ever
 # carries metrics and traces; `keep_signals` in front of `otlp_out` is the guard that stops a
 # batch's logs from being posted to a metrics/traces-only endpoint. Send logs to the Platform
@@ -15,8 +15,9 @@
 # keep one `otlp_out`.
 #
 # This leg is unverified against a real Observability Cloud org: no trial-org run has confirmed
-# either path (docs/plans/splunk-relay.md's "Settled by W5" covers Splunk Enterprise over HEC,
-# not Observability Cloud). Check the first batch lands in the org before relying on this in
+# either path (the Splunk runs in docs/adr/splunk-hec-relay.md's "Verified destination behavior"
+# cover Splunk Enterprise and Cloud Platform over HEC, not Observability Cloud). Check the first
+# batch lands in the org before relying on this in
 # production.
 components:
   otlp_in:

@@ -1658,7 +1658,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------------------------
-    // Recorded interop fixtures (testdata/interop/statsd/, docs/plans/recorded-interop-fixtures.md)
+    // Recorded interop fixtures (testdata/interop/statsd/, testdata/interop/README.md)
     //
     // Real UDP datagrams from two real clients, Datadog's `datadog` package and the plain-statsd
     // `statsd` package, recorded by `script/record-fixtures statsd`. The tests above check this
