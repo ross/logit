@@ -76,23 +76,95 @@
 //! `resource` attributes merged with event attributes (event wins), private `_logit.*` keys
 //! skipped.
 //!
+//! The tables below are generated from `prometheus_out`'s column of `spec/transit/mapping.yaml`,
+//! the canonical copy, by `script/transit docs`, and a test fails when they're stale: change the
+//! table there, not here. "Consumer" means `prometheus_in` reading the exposition, or the
+//! remote-write receiver reading a request, back. A cell under "with `bind:` unset" is
+//! remote-write's; the others are exposition's, in OpenMetrics.
+//!
+//! <!-- transit:doc:prometheus_out -->
+//!
+//! Per metric kind, and per record feature that decides a record's fate:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `sum/delta_monotonic` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | Prometheus has no delta counter, so a bare delta sum is dropped, with a throttled `delta_temporality_unresolved` warning; an `aggregate` with `temporality: cumulative` upstream turns it into a counter. |
+//! | `sum/delta_nonmonotonic` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | A bare delta sum is dropped, as for a monotonic one. |
+//! | `sum/cumulative_monotonic` | normalized | `total_suffix` | A `counter` family. Its sample is named with `_total`, appended when the record's name lacks it, so such a record reads back under the longer name. |
+//! | `sum/cumulative_nonmonotonic` | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}` | Prometheus has no non-monotonic counter, so the running total is a `gauge`. |
+//! | `sum/f64` | exact | -- | The sample's double. |
+//! | `sum/i64` | normalized | `f64_value` | A sample is a double, so an integer is written as its nearest `f64` and reads back as a float, rounded beyond 2^53. |
+//! | `sum/u64` | normalized | `f64_value` | A sample is a double, so an integer is written as its nearest `f64` and reads back as a float, rounded beyond 2^53. |
+//! | `sum/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is the sample `1` or `0` and reads back as that number. |
+//! | `gauge/f64` | exact | -- | A `gauge` family, or the family type the `_logit.prometheus.type` carrier names (`untyped`, `unknown`, `info`, `stateset`). |
+//! | `gauge/i64` | normalized | `f64_value` | A sample is a double, so an integer is written as its nearest `f64` and reads back as a float, rounded beyond 2^53. |
+//! | `gauge/u64` | normalized | `f64_value` | A sample is a double, so an integer is written as its nearest `f64` and reads back as a float, rounded beyond 2^53. |
+//! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is the sample `1` or `0` and reads back as that number. |
+//! | `gauge/negative` | exact | -- | A negative sample, written as is. |
+//! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | An unresolved relative adjustment has no absolute value to expose and is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
+//! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
+//! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
+//! | `gauge_delta/bool` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
+//! | `samples` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | Sketched, each value weighted by its inverse sample rate, then a `summary` of fixed quantiles with `_sum` and `_count`. |
+//! | `set_members` | degraded | `logit.output.metrics.degraded{metric_kind=set_members}` | A `gauge` of the distinct member count; the members are gone. |
+//! | `distribution` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | A `summary` of fixed quantiles with the sketch's exact `_sum` and `_count`; the sketch is gone, so quantiles from two senders don't merge. |
+//! | `set` | degraded | `logit.output.metrics.degraded{metric_kind=set}` | A `gauge` of the estimate; the registers are gone. |
+//! | `histogram/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | A delta histogram is dropped, with a throttled `delta_temporality_unresolved` warning; an `aggregate` with `temporality: cumulative` upstream makes it a running one. |
+//! | `histogram/cumulative` | normalized | `inf_bucket` | A `histogram` family of running-sum buckets and `_sum` when it has one, or a `gaugehistogram` under the type carrier. `+Inf` states the total, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. `min` and `max` are `record/min_max`'s. |
+//! | `exponential_histogram/delta`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Remote-write carries native histograms, but the sender doesn't map them yet, so one is dropped. |
+//! | `exponential_histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
+//! | `exponential_histogram/cumulative`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Dropped, as for a delta one. |
+//! | `exponential_histogram/cumulative`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
+//! | `summary` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
+//! | `record/no_recorded_value`, with `bind:` unset | exact | -- | Remote-write writes a flagged `Gauge` or `Sum` as Prometheus's stale marker, read back flagged. A flagged histogram, summary, or sketch is skipped, counted `logit.output.metrics.skipped{reason=no_recorded_value}`. |
+//! | `record/no_recorded_value`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
+//! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't labels. |
+//! | `record/name_unsafe` | normalized | `name_sanitized` | A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record reads back under the sanitized name, uncounted. |
+//! | `record/superseded`, with `bind:` unset | exact | -- | Remote-write sends each sample with its own timestamp. |
+//! | `record/superseded`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so a later record of the series replaces an earlier one before a scrape reads it, uncounted. |
+//! | `record/same_instant`, with `bind:` unset | dropped | uncounted | One series can't hold two samples at one timestamp, so the later point wins and the earlier is dropped, uncounted. |
+//! | `record/same_instant`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so the later point replaces this one, uncounted. |
+//! | `record/same_millisecond`, with `bind:` unset | dropped | `logit.output.metrics.degraded{reason=sub_ms_collapsed}` | A remote-write sample's timestamp is in milliseconds, and one series can't hold two samples at one timestamp, so the later reading wins and the earlier is dropped, counted under a `degraded` series. |
+//! | `record/same_millisecond`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so the later point replaces this one, uncounted. |
+//! | `record/non_finite` | exact | -- | `NaN`, `+Inf`, or `-Inf`, as the sample. |
+//! | `log/dogstatsd_event` | skipped | uncounted | A log has no Prometheus form and isn't written, uncounted. |
+//! | `log/plain` | skipped | uncounted | A log has no Prometheus form and isn't written, uncounted. |
+//! | `span/alone` | skipped | uncounted | A span has no Prometheus form and isn't written, uncounted. |
+//!
+//! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `record/unit`, with `bind:` unset | exact | -- | Remote-write carries the unit in its metadata. |
+//! | `record/unit`, otherwise | lost | `logit.output.metrics.degraded{reason=unit_not_suffix}` | OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left off, counted. |
+//! | `record/description` | exact | -- | The family's `# HELP` line. |
+//! | `record/start_timestamp` | lost | uncounted | OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge's start time is left off, uncounted. |
+//! | `record/exemplars` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at most one per line. One with no line to sit on, such as a gauge's, is left off, counted. |
+//! | `record/min_max` | lost | uncounted | A histogram's `min` and `max` have no Prometheus series and aren't written, uncounted. |
+//! | `attributes/string_value` | normalized | `label_sanitized` | A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or another character reads back under the sanitized name. |
+//! | `attributes/bool_value` | normalized | `stringified` | A label of `true` or `false`, read back as the string. |
+//! | `attributes/number_value` | normalized | `stringified` | A label of the number's decimal text, read back as the string. |
+//! | `attributes/array_value` | normalized | `multi_value`; `logit.output.labels.normalized{reason=multi_value}` | A label set is a map, so only the last representable element is written, counted. |
+//! | `attributes/map_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A map has no label form and is left off, counted. |
+//! | `attributes/bytes_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A bytes value has no label form and is left off, counted. |
+//! | `attributes/timestamp_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A timestamp value has no label form and is left off, counted. |
+//! | `attributes/private_carrier` | normalized | `dialect` | A `_logit.prometheus.*` carrier is consumed into the wire form (the family type, the sample's timestamp) and prometheus_in stamps it back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. |
+//! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a label and is left off, uncounted. |
+//! | `attributes/resource_attribute` | normalized | `resource_merged` | A label, the event's value winning on a shared key, read back as an event attribute. |
+//! | `attributes/scope` | lost | uncounted | Prometheus has no instrumentation scope; it isn't written or counted. |
+//! | `log/beside_metrics` | lost | uncounted | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
+//! | `span/beside_metrics` | lost | uncounted | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
+//!
+//! <!-- transit:end -->
+//!
+//! The rest of the encode mapping is hand-written: rules the spec has no row for, and details its
+//! cells don't state.
+//!
 //! | Model | Wire |
 //! |---|---|
-//! | `Sum{Cumulative, monotonic}` | `counter` |
-//! | `Sum{Cumulative, !monotonic}` | `gauge` -- Prometheus has no non-monotonic counter; `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}` |
 //! | a `Sum` or `Gauge` value, or an exemplar's value, of `I64`/`U64`/`Bool` | the sample's double, on both wires: an integer's nearest `f64`, a `Bool` `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}` |
-//! | `Sum{Delta}` / `Histogram{Delta}` | **dropped**, `logit.output.metrics.dropped{reason="unresolved_delta"}` + `warn_throttled("delta_temporality_unresolved")` -- put an `aggregate` with `temporality: cumulative` in front of the sink |
-//! | `Gauge` | `gauge`, or whatever `_logit.prometheus.type` says (consumed): `untyped`/`unknown`/`info`/`stateset` |
-//! | `GaugeDelta` | **dropped**, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` + `warn_throttled("gauge_delta_unresolved")` (the same counter and greppable key every other sink uses) |
-//! | `Histogram{Cumulative}` | `histogram`: running-sum buckets, `+Inf` = total, `_sum` only when `Some`; `min`/`max` dropped (known-gaps row); `_logit.prometheus.type: "gaugehistogram"` → `_gsum`/`_gcount` |
-//! | `Summary` | `summary` + `_created` (OM) |
 //! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_sum` + `_count`; `_sum` is [`DdSketch::sum`], exact unlike a quantile (approximate only when [`DdSketch::stats_exact`] is `false`, i.e. the sketch's stats were derived from its bins) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
-//! | `Samples` | `Samples::sketch()`, then exactly as above -- `degraded{metric_kind="samples"}` |
-//! | `Set` / `SetMembers` | `gauge` of `estimate()` / the distinct member count -- `degraded{metric_kind="set"\|"set_members"}` |
-//! | `ExponentialHistogram` | for exposition, **skipped**, `logit.output.metrics.skipped{metric_kind="exponential_histogram"}`: neither text dialect has native-histogram syntax. For remote-write ([`PrometheusEncoder::with_destination`]), **dropped**, `logit.output.metrics.dropped{reason="native_histogram"}`: the wire carries native histograms, and this codec doesn't map them yet |
-//! | `flags & NO_RECORDED_VALUE` | **skipped**, `logit.output.metrics.skipped{reason="no_recorded_value"}` (`MetricRecord::flags`' own doc: every non-OTLP sink must treat a flagged point as carrying no reading) -- unless [`PrometheusEncoder::with_stale_markers`]`(true)`, see the row below |
-//! | `flags & NO_RECORDED_VALUE` on a `Gauge` or `Sum`, with [`PrometheusEncoder::with_stale_markers`]`(true)` | [`Point::Stale`] in the family the kind would have chosen anyway (`Sum{monotonic}` → `counter`, `Sum{!monotonic}` → `gauge` + `degraded{metric_kind="non_monotonic_sum"}`, `Gauge` → `gauge` or whatever `_logit.prometheus.type` says). Temporality is ignored on this path: a stale marker has no value to be delta about. A flagged `Histogram`/`Summary`/`ExponentialHistogram`/sketch/set stays on the skip row above -- those expand to several derived series and one flag says nothing about which of them existed (`docs/known-gaps/mappings.md`) |
-//! | exemplars | carried onto the family; [`text`] emits them on `_total`/`_bucket` lines in OpenMetrics only, at most one per line, each on the bucket its own value falls in. One that has no line left to sit on -- a counter's second exemplar, two in one bucket's range, one over OpenMetrics' 128-code-point label budget -- is dropped, `logit.output.metrics.degraded{reason="exemplar_omitted"}` (text 0.0.4 drops all of them uncounted: that is the operator's dialect choice, not a lossy mapping) |
+//! | `flags & NO_RECORDED_VALUE` on a `Gauge` or `Sum`, with [`PrometheusEncoder::with_stale_markers`]`(true)` | [`Point::Stale`] in the family the kind would have chosen anyway (`Sum{monotonic}` → `counter`, `Sum{!monotonic}` → `gauge` + `degraded{metric_kind="non_monotonic_sum"}`, `Gauge` → `gauge` or whatever `_logit.prometheus.type` says). Temporality is ignored on this path: a stale marker has no value to be delta about. A flagged `Histogram`/`Summary`/`ExponentialHistogram`/sketch/set is skipped, `skipped{reason="no_recorded_value"}`, under stale markers too -- those expand to several derived series and one flag says nothing about which of them existed (`docs/known-gaps/mappings.md`) |
 //! | `Event::timestamp` | emitted only when `_logit.prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.omitted{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `omitted{reason="unrepresentable"}` path |
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.omitted{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is omitted -- `logit.output.labels.omitted{reason="reserved"}` |

@@ -169,3 +169,28 @@ The cross-protocol columns settled two more things:
   field row at a sink that writes the kind only in a lesser form, so the field is never compared.
   A field row is reached only where its record is compared. A cell nothing is compared against
   would sit in `coverage.md`'s unreached list forever.
+
+## Amendment: the generated regions (2026-10-19)
+
+Rendering the table into the docs settled what a region is and how much of a doc it replaces:
+
+- **Two forms per sink.** A `doc:<sink>` region in the sink's codec or sink module doc holds the
+  whole column, `exact` cells included, since a reader there wants the whole mapping. A
+  `gaps:<sink>` region in `docs/known-gaps/mappings.md` holds only the `degraded`, `lost`,
+  `skipped`, and `dropped` cells, in that file's row format. A region is an HTML comment pair,
+  `<!-- transit:doc:<sink> -->` to `<!-- transit:end -->`, so one marker works in a `//!` module
+  doc and in Markdown, and renders as nothing in either.
+- **The renderer reads the table only.** It doesn't look at the code; the class check ties the
+  table to the code. A cell's `text` is rendered verbatim, so a text that reads wrong in a doc is
+  fixed in `mapping.yaml`. A `when:` cell is its own row, its condition rendered from the `when:`
+  map.
+- **A hand-written row goes only when the region states all of it.** A row of a codec's encode
+  table, or of `mappings.md`, that also states something the table doesn't (a diagnostic key the
+  cell text lacks, a drop with no row of its own, a decode-side fact) stays, verbatim, beside the
+  region. Moving those facts into the table is a row or a text at a time, not a rewrite of the
+  prose.
+- **Every sink column has both regions.** The test fails for a sink in `sinks:` with no region
+  of either form, so adding a column adds its docs in the same PR.
+
+`crates/logit-cli/src/transit/docs.rs`'s module doc has the rules, and
+[`spec/transit/README.md`](../../spec/transit/README.md)'s "Generated docs" the reader's account.

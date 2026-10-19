@@ -185,7 +185,7 @@ pub(super) enum Cells {
 }
 
 impl Cells {
-    fn as_slice(&self) -> &[Cell] {
+    pub(super) fn as_slice(&self) -> &[Cell] {
         match self {
             Cells::One(cell) => std::slice::from_ref(cell),
             Cells::Many(cells) => cells,

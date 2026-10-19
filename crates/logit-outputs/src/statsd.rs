@@ -166,6 +166,107 @@
 //! are per-sender values (`docs/adr/statsd-out-multi-value-expansion.md`; the debt is in
 //! `docs/known-gaps/statsd.md`).
 //!
+//! ## What each kind and feature becomes
+//!
+//! The tables below are generated from `statsd_out`'s column of `spec/transit/mapping.yaml`, the
+//! canonical copy, by `script/transit docs`, and a test fails when they're stale: change the
+//! table there, not here. "Consumer" means `statsd_in` reading the lines back. Every other
+//! section of this module doc is hand-written: the grammar, dialects, sanitization, packing, and
+//! the mechanics behind each cell.
+//!
+//! <!-- transit:doc:statsd_out -->
+//!
+//! Per metric kind, and per record feature that decides a record's fate:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `sum/delta_monotonic` | exact | -- | A `\|c` counter line, with its sample rate divided out when statsd_in decoded it, so no `@rate` is written. |
+//! | `sum/delta_nonmonotonic`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=non_monotonic_delta_sum}` | Under `multi_value: skip`, no line is written. |
+//! | `sum/delta_nonmonotonic`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=non_monotonic_delta_sum}` | A signed `\|c` increment. A statsd counter has no monotonic flag, so it reads back monotonic. |
+//! | `sum/cumulative_monotonic`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=cumulative_sum}` | Under `multi_value: skip`, no line is written. |
+//! | `sum/cumulative_monotonic`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=cumulative_sum}` | The running total as a bare `\|g` gauge, never `\|c`, which a statsd server would add to itself on every flush. |
+//! | `sum/cumulative_nonmonotonic`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=cumulative_sum}` | Under `multi_value: skip`, no line is written. |
+//! | `sum/cumulative_nonmonotonic`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=cumulative_sum}` | The running total as a bare `\|g` gauge. |
+//! | `sum/f64` | exact | -- | The value is written as the shortest float that reads back to the same bits. |
+//! | `sum/i64` | normalized | `f64_value` | statsd_out writes every digit, and statsd_in reads the number back as an f64, so an integer reads back as a float and one beyond 2^53 rounds. |
+//! | `sum/u64` | normalized | `f64_value` | statsd_out writes every digit, and statsd_in reads the number back as an f64, so an integer reads back as a float and one beyond 2^53 rounds. |
+//! | `sum/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is written as `1` or `0` and reads back as that number. |
+//! | `gauge/f64` | exact | -- | An absolute `\|g` gauge line. |
+//! | `gauge/i64` | normalized | `f64_value` | statsd_out writes every digit, and statsd_in reads the number back as an f64, so an integer reads back as a float and one beyond 2^53 rounds. |
+//! | `gauge/u64` | normalized | `f64_value` | statsd_out writes every digit, and statsd_in reads the number back as an f64, so an integer reads back as a float and one beyond 2^53 rounds. |
+//! | `gauge/bool` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A boolean is written as `1` or `0` and reads back as that number. |
+//! | `gauge/negative` | degraded | -- | statsd has no negative absolute gauge, so statsd_out writes `0\|g` then `-v\|g` in one datagram. A statsd server ends at the right value, but statsd_in reads the pair as a gauge of 0 and a relative adjustment, uncounted. |
+//! | `gauge_delta/f64`, under `relative_gauges: true` | exact | -- | A relative `+v\|g` or `-v\|g` line. |
+//! | `gauge_delta/f64`, otherwise | dropped | `logit.output.messages.dropped{reason=unresolved_gauge_delta}` | An unresolved relative adjustment is dropped unless `relative_gauges: true`, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
+//! | `gauge_delta/i64`, under `relative_gauges: true` | normalized | `f64_value` | A relative line, read back as an f64. |
+//! | `gauge_delta/i64`, otherwise | dropped | `logit.output.messages.dropped{reason=unresolved_gauge_delta}` | Dropped unless `relative_gauges: true`, as for a float adjustment. |
+//! | `gauge_delta/u64`, under `relative_gauges: true` | normalized | `f64_value` | A relative line, read back as an f64. |
+//! | `gauge_delta/u64`, otherwise | dropped | `logit.output.messages.dropped{reason=unresolved_gauge_delta}` | Dropped unless `relative_gauges: true`, as for a float adjustment. |
+//! | `gauge_delta/bool`, under `relative_gauges: true` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A relative line of `1` or `0`. |
+//! | `gauge_delta/bool`, otherwise | dropped | `logit.output.messages.dropped{reason=unresolved_gauge_delta}` | Dropped unless `relative_gauges: true`, as for a float adjustment. |
+//! | `samples`, under `format: statsd` | normalized | `dialect`; `logit.output.messages.normalized{reason=dialect}` | Under `format: statsd`, a multi-value line splits into one line per value, uncounted, and an `h` or `d` timer is written as `ms`, counted once per record it renames. |
+//! | `samples`, otherwise | exact | -- | One `\|ms`, `\|h`, or `\|d` line holding every value, the type letter from the `_logit.statsd.type` carrier and `@rate` written when it isn't 1. |
+//! | `set_members` | normalized | `member_per_line`; `logit.output.messages.normalized{reason=member_sanitized}` | One `\|s` line per member, under either dialect and uncounted, so a multi-member set line reads back as one record per member; a statsd server counts the same distinct members either way. A member holding `:`, `\|`, or a control character is written with `_` in its place, counted once per member. |
+//! | `distribution`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=distribution}` | Under `multi_value: skip`, no line is written. |
+//! | `distribution`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | Dotted `.count` and `.sum` counters and `.min`, `.max`, and `.q0_5` to `.q0_99` gauges. Counts and sums merge across senders at a statsd server; quantiles and extremes are the last sender's. |
+//! | `set`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=set}` | Under `multi_value: skip`, no line is written. |
+//! | `set`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=set}` | The estimate as a `.count` gauge; two senders' estimates don't add, and the registers are gone. |
+//! | `histogram/delta`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, no line is written. |
+//! | `histogram/delta`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | Dotted `.count`, `.sum`, and `.bucket_<bound>` counters and `.min` and `.max` gauges. |
+//! | `histogram/cumulative`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=histogram}` | Under `multi_value: skip`, no line is written. |
+//! | `histogram/cumulative`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=histogram}` | The same dotted series, every one a gauge, since a running total sent as `\|c` would be added to itself. |
+//! | `exponential_histogram/delta`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, no line is written. |
+//! | `exponential_histogram/delta`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | Dotted `.count`, `.sum`, and `.zero_count` counters and `.min` and `.max` gauges. Its buckets aren't written, since each scale would mint its own series names. |
+//! | `exponential_histogram/cumulative`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Under `multi_value: skip`, no line is written. |
+//! | `exponential_histogram/cumulative`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=exponential_histogram}` | The same dotted series, every one a gauge, and no buckets. |
+//! | `summary`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=summary}` | Under `multi_value: skip`, no line is written. |
+//! | `summary`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=summary}` | Dotted `.count`, `.sum`, and per-quantile gauges. |
+//! | `record/no_recorded_value` | skipped | `logit.output.messages.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value has no statsd line. |
+//! | `record/service_check`, under `format: statsd` | skipped | `logit.output.messages.skipped{reason=dialect}` | Plain statsd has no service check, so none is written. |
+//! | `record/service_check`, otherwise | exact | -- | A gauge carrying the `_logit.statsd.service_check.*` carriers is a DogStatsD `_sc` line again. |
+//! | `record/name_unsafe` | normalized | `name_sanitized` | Every `:`, `\|`, `@`, `#`, `,`, control, and whitespace character in a name is written as `_`, so the record reads back under the sanitized name, uncounted. |
+//! | `record/superseded` | exact | -- | Each record is its own line; a statsd server applies them in order. |
+//! | `record/same_instant` | exact | -- | Each record is its own line. |
+//! | `record/same_millisecond` | exact | -- | Each record is its own line. |
+//! | `record/non_finite` | dropped | `logit.output.messages.dropped{reason=unencodable_value}` | statsd has no non-finite value, so the line isn't written. |
+//! | `log/dogstatsd_event`, under `format: statsd` | skipped | `logit.output.messages.skipped{reason=dialect}` | Plain statsd has no event, so none is written. |
+//! | `log/dogstatsd_event`, otherwise | exact | -- | A log carrying the `_logit.statsd.event.*` carriers is a DogStatsD `_e` line again. |
+//! | `log/plain` | skipped | `logit.output.events.skipped` | Any other log on an event with no metrics has no statsd form and isn't written. |
+//! | `span/alone` | skipped | `logit.output.events.skipped` | A span on an event with no metrics has no statsd form and isn't written. |
+//!
+//! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `record/unit` | lost | uncounted | statsd has no unit; it isn't written or counted. |
+//! | `record/description` | lost | uncounted | statsd has no description; it isn't written or counted. |
+//! | `record/start_timestamp` | lost | uncounted | statsd has no start time; it isn't written or counted. |
+//! | `record/exemplars` | lost | uncounted | statsd has no exemplars; they aren't written or counted. |
+//! | `attributes/string_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
+//! | `attributes/string_value`, otherwise | exact | -- | A DogStatsD `key:value` tag. |
+//! | `attributes/bool_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
+//! | `attributes/bool_value`, otherwise | normalized | `bool_tag` | `true` is a bare tag and reads back `true`; `false` is `key:false` and reads back as the string. |
+//! | `attributes/number_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
+//! | `attributes/number_value`, otherwise | normalized | `stringified` | A number is a `key:digits` tag and reads back as a string. |
+//! | `attributes/array_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each element is counted as a wire tag. |
+//! | `attributes/array_value`, otherwise | exact | -- | One tag per element in order, which statsd_in folds back into the same array. |
+//! | `attributes/map_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
+//! | `attributes/map_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A map has no tag form and is left off, counted. |
+//! | `attributes/bytes_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
+//! | `attributes/bytes_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A bytes value has no tag form and is left off, counted. |
+//! | `attributes/timestamp_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
+//! | `attributes/timestamp_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
+//! | `attributes/private_carrier`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:`, `\|e:`, `\|card:`, or `\|T` segment, so those carriers are omitted, counted once per carrier per line; the type carrier survives as the line's type, `h` and `d` as `ms`. |
+//! | `attributes/private_carrier`, otherwise | exact | -- | A `_logit.statsd.*` carrier is written as its own segment or field and statsd_in stamps it back. |
+//! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
+//! | `attributes/resource_attribute`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
+//! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged` | A resource attribute is written as a tag, the event's value winning on a shared key, and reads back as an event attribute. |
+//! | `attributes/scope` | lost | uncounted | statsd has no instrumentation scope; it isn't written or counted. |
+//! | `log/beside_metrics` | lost | uncounted | A log on an event that also carries metrics is left off while the metrics are written, uncounted. |
+//! | `span/beside_metrics` | lost | uncounted | A span on an event that also carries metrics is left off while the metrics are written, uncounted. |
+//!
+//! <!-- transit:end -->
+//!
 //! ## Relative gauges
 //!
 //! statsd is the one protocol with a native *relative* gauge adjustment (`name:+5|g`/`name:-5|g`),

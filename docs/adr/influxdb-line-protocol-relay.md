@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-18
+updated: 2026-10-19
 ---
 
 # InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write
@@ -93,6 +93,12 @@ convention between writer and reader, so the decoder doesn't guess one.
 
 `crates/logit-proto/src/influxdb/mod.rs`'s module doc holds the canonical decode and encode tables
 once `influx/w2` lands, with every skip and its counter. This ADR doesn't repeat them.
+
+**Note:** The table above recorded the decision when it was made.
+[`spec/transit/mapping.yaml`](../../spec/transit/mapping.yaml)'s `influxdb_out` column is the
+current statement of what the sink does with each kind and feature, checked against the code by
+the transit spec's flows and rendered into the codec's module doc and
+`docs/known-gaps/mappings.md` ([ADR `transit-spec`](transit-spec.md)).
 
 ### The `_logit.influxdb.*` carrier
 

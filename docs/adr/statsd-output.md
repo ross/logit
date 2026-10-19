@@ -99,6 +99,12 @@ default, and drops it, counted, only under `multi_value: skip`. Neither candidat
 chosen as written: there's no synthesized population, and the quantile lines sit beside `.count`
 and `.sum` counters.]
 
+**Note:** This section recorded the decision when it was made.
+[`spec/transit/mapping.yaml`](../../spec/transit/mapping.yaml)'s `statsd_out` column is the
+current statement of what the sink does with each kind and feature, checked against the code by
+the transit spec's flows and rendered into the codec's module doc and
+`docs/known-gaps/mappings.md` ([ADR `transit-spec`](transit-spec.md)).
+
 ### Relative gauges: opt-in native encoding, off by default
 
 statsd is the one protocol that natively expresses a *relative* gauge adjustment (`+n|g`/`-n|g`)

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-10-18
+updated: 2026-10-19
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -266,6 +266,12 @@ Exemplars map through the existing `Exemplar` conversion in both directions, inc
 `_bucket` series only, exactly as the OpenMetrics writer already does — not because remote-write
 forbids them elsewhere, but because the exemplar's place in the model is already decided by that
 mapping and this transport has no reason to widen it.
+
+**Note:** The mapping in this section and the three before it recorded the decision when it was
+made. [`spec/transit/mapping.yaml`](../../spec/transit/mapping.yaml)'s `prometheus_out` column is
+the current statement of what the sink does with each kind and feature, in both modes, checked
+against the code by the transit spec's flows and rendered into the codec's module doc and
+`docs/known-gaps/mappings.md` ([ADR `transit-spec`](transit-spec.md)).
 
 ### A constant 4 MiB decompressed body cap
 

@@ -229,17 +229,27 @@ state) are added when a flow carries them. The table's schema doesn't change for
 
 ### 6. Generated docs (W5)
 
-`script/transit docs` rewrites marked regions from `mapping.yaml`, and a test fails when a region
-is stale, the pattern `script/schema` and `schema/logit.schema.json` already use:
+`script/transit docs` rewrites marked regions from `mapping.yaml`, and the test
+`transit::docs::transit_docs`, part of `script/transit check` and so of `script/test`, fails
+naming the file and the region when one is stale, the pattern `script/schema` and
+`schema/logit.schema.json` already use. The renderer, `crates/logit-cli/src/transit/docs.rs`,
+reads the table alone. Each sink column has two regions:
 
-- each codec's module-doc mapping table (`crates/logit-proto/src/<codec>/mod.rs`), the column
-  of the table for that sink, rendered as it reads today;
-- `docs/known-gaps/mappings.md`'s cross-protocol table, every `degraded`, `lost`, `skipped`,
-  and `dropped` cell, grouped by kind.
+- `doc:<sink>`, the whole column, in the module doc that holds the sink's encode mapping:
+  `crates/logit-outputs/src/statsd.rs`, `crates/logit-proto/src/prometheus/mod.rs`,
+  `crates/logit-proto/src/influxdb/mod.rs`, and `crates/logit-proto/src/otlp/metrics.rs`. A
+  table of the record-level rows, then one of the field-level rows, each a row label, the class,
+  the reason and counter, and the cell's text; a `when:` cell is its own row.
+- `gaps:<sink>`, in `docs/known-gaps/mappings.md`: every `degraded`, `lost`, `skipped`, and
+  `dropped` cell in that file's row format, the field-level rows labeled `field`, in the
+  table's row order, which groups them by kind.
 
-The permitted-normalization lists stay prose: they're per-codec policy, not per-cell outcomes.
-Each relay ADR's mapping table stays as written, with a note that the table was the decision at
-the time and `spec/transit/mapping.yaml` is current.
+A hand-written row the region states in full is gone; one that also states something the table
+doesn't stays beside the region, and each module doc says which part is generated. The
+permitted-normalization lists stay prose: they're per-codec policy, not per-cell outcomes. Each
+relay ADR's mapping table stays as written, with a note that the table was the decision at the
+time and `spec/transit/mapping.yaml` is current; `prometheus-remote-write` has no table, so its
+note sits after its mapping sections.
 
 ### 7. The first pairs (W4)
 
@@ -276,14 +286,14 @@ influxdb_out`, so every kind the statsd cases hold reaches each new column in ea
 
 ## Workstreams
 
-| # | Branch | PR title | Size | Depends on |
-|---|---|---|---|---|
-| W0 | `transit/w0` | `transit/w0: ADR and plan for a transit spec` | S | — |
-| W1 | `transit/w1` | `transit/w1: a lossless format: json, with a reader` | M | W0 |
-| W2 | `transit/w2` | `transit/w2: replay_in, reading format: json lines and native frames` | M | W1 |
-| W3 | `transit/w3` | `transit/w3: the in-process flow driver` | M | W2 |
-| W4 | `transit/w4` | `transit/w4: spec/transit, the mapping table, and the first pairs` | L | W3 |
-| W5 | `transit/w5` | `transit/w5: module-doc and known-gaps tables generated from the spec` | M | W4 |
+| # | Branch | PR title | Size | Depends on | Status |
+|---|---|---|---|---|---|
+| W0 | `transit/w0` | `transit/w0: ADR and plan for a transit spec` | S | — | done |
+| W1 | `transit/w1` | `transit/w1: a lossless format: json, with a reader` | M | W0 | done |
+| W2 | `transit/w2` | `transit/w2: replay_in, reading format: json lines and native frames` | M | W1 | done |
+| W3 | `transit/w3` | `transit/w3: the in-process flow driver` | M | W2 | done |
+| W4 | `transit/w4` | `transit/w4: spec/transit, the mapping table, and the first pairs` | L | W3 | done (W4a, W4b) |
+| W5 | `transit/w5` | `transit/w5: module-doc and known-gaps tables generated from the spec` | M | W4 | done |
 
 - **W0**: [ADR `transit-spec`](../adr/transit-spec.md) (the spec is the canonical copy of every
   transition's class; docs are generated regions; ADR tables are decision records), this plan,
@@ -423,4 +433,51 @@ Recorded per workstream as each lands.
     The encode table and `mappings.md` both name it; the table records it as a field row of its
     own, since the rest of the histogram survives.
 
-  None of the first five is in `docs/known-gaps/mappings.md`, which W5 generates from the table.
+  None of the first five was in `docs/known-gaps/mappings.md`. W5's `gaps:` regions now state the
+  first four there; the fifth is `normalized`, which those regions leave out, and is in
+  `prometheus_out`'s module-doc region.
+- **W5**: the four `doc:` regions and the four `gaps:` regions render every cell of the four
+  columns, and the drift test fails on a hand edit inside one (checked by editing a rendered row
+  in each form). Writing them settled what a region holds and how much prose it replaces
+  ([ADR `transit-spec`](../adr/transit-spec.md)'s generated-regions amendment): a hand-written
+  row goes only when the region states all of it, so a row that also names something the table
+  doesn't stays beside the region.
+
+  Removing hand rows found two places where the table said less than the prose, each fixed in
+  `mapping.yaml`'s text, with no class changed:
+  - The diagnostic keys: `delta_temporality_unresolved`, `gauge_delta_unresolved`,
+    `encode_error`, and `no_recorded_value` were named only in the rows being replaced, so the
+    cells that warn under them now say so.
+  - `otlp_out`'s `attributes/number_value` said a `u64` reads back as an `i64`. One above
+    `i64::MAX` leaves as a double (`crates/logit-proto/src/otlp/common.rs`), as `mappings.md`'s
+    hand row says, and the cell now says so too.
+
+  No hand-written row contradicted a cell's class except one already recorded: `influxdb_out`
+  dropping a `Sum`'s temporality, which the codec's permitted-normalization list calls
+  normalization 10 and the table reads `degraded`, since the kind changes. The list is prose and
+  keeps it; the `gaps:` region states the `degraded` reading. ADR `prometheus-scrape-and-exposition`'s
+  encode table says a delta `Sum` or `Histogram` is skipped under `skipped{metric_kind="delta_sum"}`;
+  the code and the table drop it under `dropped{reason="unresolved_delta"}`. The ADR's table
+  stays as written, under its new note.
+
+  Hand-written rows kept because the table has no row or cell for what they state, each a
+  candidate for a row with a case:
+  - `otlp_out` drops a `Summary`'s exemplars, and those of a `Samples` or `Distribution`
+    written as one, uncounted. The `record/exemplars` cell is `exact` and says so only in its
+    text; no case reaches a summary with exemplars.
+  - Remote-write skips a flagged histogram, summary, or sketch, counted
+    `skipped{reason=no_recorded_value}`; the `record/no_recorded_value` cell is `exact` and says
+    so only in its text.
+  - `influxdb_out`'s `no_fields` drop (a histogram with no finite bound, a summary with no finite
+    quantile), and its uncounted omission of a non-finite component of a `Distribution`,
+    `Histogram`, or `Summary`.
+  - A `Null` attribute, omitted as unrepresentable at `prometheus_out` and `influxdb_out`; the
+    table has no `null_value` row.
+  - `prometheus_out`'s label and name collisions, its type conflicts, its `# UNIT` character
+    rule, and `Resource::schema_url` and `dropped_attributes_count` at three sinks.
+
+  Rows the table states that no hand-written doc did, now in the regions: the five W4b findings
+  above; `statsd_out`'s negative-gauge pair read back as two records (`gauge/negative`), its
+  uncounted loss of a log or span beside metrics, of the instrumentation scope, and of a foreign
+  carrier; `otlp_out`'s uncounted loss of a `_logit.` carrier; and each sink's `when:` variants,
+  such as `statsd_out`'s `format: statsd` tag and carrier omissions, side by side.

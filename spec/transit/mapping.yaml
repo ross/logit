@@ -40,8 +40,9 @@ rows:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_delta}
         text: >-
-          Prometheus has no delta counter, so a bare delta sum is dropped; an `aggregate` with
-          `temporality: cumulative` upstream turns it into a counter.
+          Prometheus has no delta counter, so a bare delta sum is dropped, with a throttled
+          `delta_temporality_unresolved` warning; an `aggregate` with `temporality: cumulative`
+          upstream turns it into a counter.
       influxdb_out:
         class: degraded
         text: >-
@@ -333,26 +334,28 @@ rows:
         - class: dropped
           counter: logit.output.messages.dropped{reason=unresolved_gauge_delta}
           text: >-
-            An unresolved relative adjustment is dropped unless `relative_gauges: true`; an
-            `aggregate` upstream resolves it into a gauge.
+            An unresolved relative adjustment is dropped unless `relative_gauges: true`, with a
+            throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a
+            gauge.
       prometheus_out:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
         text: >-
-          An unresolved relative adjustment has no absolute value to expose and is dropped; an
-          `aggregate` upstream resolves it into a gauge.
+          An unresolved relative adjustment has no absolute value to expose and is dropped, with
+          a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a
+          gauge.
       influxdb_out:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
         text: >-
-          An unresolved relative adjustment is dropped; an `aggregate` upstream resolves it into
-          a gauge.
+          An unresolved relative adjustment is dropped, with a throttled `gauge_delta_unresolved`
+          warning; an `aggregate` upstream resolves it into a gauge.
       otlp_out:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
         text: >-
-          An unresolved relative adjustment is dropped; an `aggregate` upstream resolves it into
-          a gauge.
+          An unresolved relative adjustment is dropped, with a throttled `gauge_delta_unresolved`
+          warning; an `aggregate` upstream resolves it into a gauge.
   - kind: gauge_delta
     feature: i64
     cells:
@@ -474,7 +477,9 @@ rows:
       influxdb_out:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=set_members}
-        text: Line protocol has no set, so set members aren't written.
+        text: >-
+          Line protocol has no set, so set members aren't written, with a throttled
+          `encode_error` warning.
       otlp_out:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=set_members}
@@ -551,8 +556,8 @@ rows:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_delta}
         text: >-
-          A delta histogram is dropped; an `aggregate` with `temporality: cumulative` upstream
-          makes it a running one.
+          A delta histogram is dropped, with a throttled `delta_temporality_unresolved` warning;
+          an `aggregate` with `temporality: cumulative` upstream makes it a running one.
       influxdb_out:
         class: degraded
         text: >-
@@ -616,7 +621,9 @@ rows:
       influxdb_out:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
-        text: Line protocol has no form for an exponential histogram, so none is written.
+        text: >-
+          Line protocol has no form for an exponential histogram, so none is written, with a
+          throttled `encode_error` warning.
       otlp_out:
         class: exact
         text: An OTLP `ExponentialHistogram`, field for field.
@@ -642,7 +649,9 @@ rows:
       influxdb_out:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
-        text: Line protocol has no form for an exponential histogram, so none is written.
+        text: >-
+          Line protocol has no form for an exponential histogram, so none is written, with a
+          throttled `encode_error` warning.
       otlp_out:
         class: exact
         text: An OTLP `ExponentialHistogram`, field for field.
@@ -771,7 +780,9 @@ rows:
       influxdb_out:
         class: skipped
         counter: logit.output.metrics.skipped{reason=no_recorded_value}
-        text: A point flagged as holding no recorded value isn't written.
+        text: >-
+          A point flagged as holding no recorded value isn't written, with a throttled
+          `no_recorded_value` warning.
       otlp_out:
         class: exact
         text: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept.
@@ -987,7 +998,9 @@ rows:
       otlp_out:
         class: normalized
         reason: u64_as_int
-        text: An integer or double attribute; a `u64` reads back as an `i64`.
+        text: >-
+          An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`,
+          as a double, approximate beyond 2^53, uncounted.
   - kind: attributes
     feature: array_value
     cells:

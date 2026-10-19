@@ -119,6 +119,12 @@ Everything else is a gauge (`|g`).
 | `.count`, `.sum`, `.bucket_<b>`, `.zero_count` | `\|c` | `\|g` |
 | `.q<q>`, `.min`, `.max` | `\|g` | `\|g` |
 
+**Note:** This table recorded the decision when it was made.
+[`spec/transit/mapping.yaml`](../../spec/transit/mapping.yaml)'s `statsd_out` column is the
+current statement of what the sink does with each kind and feature, checked against the code by
+the transit spec's flows and rendered into the codec's module doc and
+`docs/known-gaps/mappings.md` ([ADR `transit-spec`](transit-spec.md)).
+
 Three cases fall outside the table:
 
 - **A `Set`'s `.count` is `|g`.** It's a cardinality estimate, and two estimates don't add.

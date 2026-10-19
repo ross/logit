@@ -39,11 +39,13 @@ key, a stale document, and a key no case has each fail naming the flow and the c
 
 ## Running it
 
-The spec's generator is an ordinary test, so `script/test` and CI run it. Three wrappers drive it:
+The spec's generator and the docs renderer are ordinary tests, so `script/test` and CI run them.
+Four wrappers drive them:
 
-- `script/transit check` compares every generated file and runs the class check.
-- `script/transit gen` rewrites every generated file, then runs the class check. Review
-  `git diff spec/transit/` and commit the result.
+- `script/transit check` compares every generated file and docs region, and runs the class check.
+- `script/transit gen` rewrites every generated file and docs region, then runs the class check.
+  Review `git diff` and commit the result.
+- `script/transit docs` rewrites only the docs regions ("Generated docs" below).
 - `script/transit coverage` does what `gen` does, then prints `coverage.md`.
 
 `gen` writes a flow's expectations only after every case in the flow has run, and only when none
@@ -145,6 +147,39 @@ Where a value can move between runs for a reason the code can't remove, a case's
 tolerance: `tolerance: [{path: /metrics/0/estimate, abs: 1}]` lets the number at that RFC 6901
 pointer, in each event of the document, differ from the committed one by up to `abs`.
 
+## Generated docs
+
+The mapping tables in the docs are rendered from `mapping.yaml`, so the table is the one copy.
+Each sink column has two regions:
+
+| Region | File | What it holds |
+|---|---|---|
+| `doc:statsd_out` | `crates/logit-outputs/src/statsd.rs` | Every cell of the column |
+| `doc:prometheus_out` | `crates/logit-proto/src/prometheus/mod.rs` | Every cell of the column |
+| `doc:influxdb_out` | `crates/logit-proto/src/influxdb/mod.rs` | Every cell of the column |
+| `doc:otlp_out` | `crates/logit-proto/src/otlp/metrics.rs` | Every cell of the column |
+| `gaps:<sink>`, one per sink | `docs/known-gaps/mappings.md` | The column's `degraded`, `lost`, `skipped`, and `dropped` cells, in that file's row format |
+
+A region opens on a line ending `<!-- transit:doc:<sink> -->` or `<!-- transit:gaps:<sink> -->`
+and closes on the next line ending `<!-- transit:end -->`. Whatever precedes the opening marker
+(`//! ` in a module doc, a list item's indentation in Markdown) starts every rendered line. Write
+the two marker lines by hand and run `script/transit docs` to fill them. Everything between them
+is generated, and `script/transit check` fails naming the file and the region when it differs from
+the rendering, so a row changes in `mapping.yaml`, never in the region.
+
+A `doc:` region holds two tables, the record-level rows and then the field-level ones. Each row
+gives the cell's class, its reason and counter, and its `text` verbatim. Each cell of a `when:`
+list is its own row, with its condition after the row's name: `under format: statsd`,
+`with bind: unset` for a `null`, and `otherwise` for the last cell. A `gaps:` region leaves out
+`exact` and `normalized` cells and labels a field-level row `field`.
+
+Everything outside the regions stays hand-written: each codec's decode tables, its grammar, its
+permitted-normalization list (per-codec policy, not per-cell outcomes), and the encode rules and
+details the spec has no row for, such as `prometheus_out`'s name collisions or `influxdb_out`'s
+`no_fields` drop. Each module doc says which part is which. A new sink column needs both regions
+and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
+`crates/logit-cli/src/transit/docs.rs`'s module doc has the rules.
+
 ## Adding a case
 
 1. Pick the source system's directory under `cases/`.
@@ -172,7 +207,8 @@ flow.
 
 ## Adding a sink column
 
-Add the sink to `sinks:`, give it a cell in every row, and add a flow that ends in it. The flow
+Add the sink to `sinks:`, give it a cell in every row, and add a flow that ends in it. Add its
+`doc:` and `gaps:` regions ("Generated docs") and run `script/transit docs`. The flow
 driver must have an encoder arm for it (`crate::pipeline::sink_encoder`, and the pair decoder in
 `crates/logit-cli/src/transit/wire.rs`). A row left without the sink's cell reads as not yet
 specified. Leave a row without the sink's cell only when no record can reach it there, and say

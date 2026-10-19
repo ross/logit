@@ -70,11 +70,11 @@ const REGENERATE: &str = "script/transit gen";
 const RECEIVED_AT: i64 = 1_800_000_000_000_000_000;
 
 /// `spec/transit/`.
-fn spec_dir() -> PathBuf {
+pub(super) fn spec_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/transit")
 }
 
-fn updating() -> bool {
+pub(super) fn updating() -> bool {
     std::env::var(UPDATE).is_ok_and(|value| value == "1")
 }
 
@@ -361,7 +361,7 @@ fn decode_wire(system: &str, bytes: Vec<u8>, headers: &Headers) -> anyhow::Resul
 }
 
 /// Up to five lines where `actual` and `expected` differ.
-fn diff(actual: &str, expected: &str) -> String {
+pub(super) fn diff(actual: &str, expected: &str) -> String {
     let (a, e): (Vec<&str>, Vec<&str>) = (actual.lines().collect(), expected.lines().collect());
     let mut out = Vec::new();
     for i in 0..a.len().max(e.len()) {

@@ -44,10 +44,11 @@
 //! [`Options::dialect`], OpenMetrics by default, which is what a Prometheus scrape negotiates.
 //!
 //! `spec` runs `spec/transit/`'s cases through its flows with this driver, and `classes` checks
-//! each run against `spec/transit/mapping.yaml` (`mapping`); `spec/transit/README.md` is the
-//! reader's account.
+//! each run against `spec/transit/mapping.yaml` (`mapping`); `docs` renders the table into the
+//! module docs and `docs/known-gaps/mappings.md`. `spec/transit/README.md` is the reader's account.
 
 mod classes;
+mod docs;
 mod mapping;
 mod report;
 mod spec;

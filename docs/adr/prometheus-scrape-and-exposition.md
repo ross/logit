@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-18
+updated: 2026-10-19
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -137,6 +137,12 @@ can't carry natively:
 | names | see "Names and sanitization" below |
 | `unit` / `description` | `# UNIT` (OM only) / `# HELP` |
 | `EventBatch::scope`, `Resource.schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
+
+**Note:** This table recorded the decision when it was made.
+[`spec/transit/mapping.yaml`](../../spec/transit/mapping.yaml)'s `prometheus_out` column is the
+current statement of what the sink does with each kind and feature, checked against the code by
+the transit spec's flows and rendered into the codec's module doc and
+`docs/known-gaps/mappings.md` ([ADR `transit-spec`](transit-spec.md)).
 
 **Cross-dialect family types.** `_logit.prometheus.type` and `gaugehistogram` cover model kinds that
 have no wire type of their own, but the two output dialects don't have the same *set* of wire types

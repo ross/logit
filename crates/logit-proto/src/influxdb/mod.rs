@@ -75,13 +75,12 @@
 //! of the body; one that changed is a copy. `_time` and `_value` arrive as ordinary tags: influxd
 //! accepts them at write and its Flux reads then fail on them.
 //!
-//! <!-- encode-table:start -->
 //! ## Encode: model → wire
 //!
 //! [`encode::InfluxLineEncoder`] writes one body per batch for `precision=ns`. Its module doc has
 //! the escaping rules and the keys they can't spell; [`encode::EncodeStats`] names each counter,
-//! which `influxdb_out` emits once per batch. The tables write each counter without its
-//! `logit.output.` prefix.
+//! which `influxdb_out` emits once per batch. The hand-written tables write each counter without
+//! its `logit.output.` prefix.
 //!
 //! **Which path.** An event whose attribute [`ATTR_MEASUREMENT`] is a non-empty UTF-8 `Str` takes
 //! the carrier path; any other event, or a carrier of any other value, takes the per-record path.
@@ -99,22 +98,85 @@
 //!   the private `_logit.` namespace or [`FIELD_ATTR_PREFIX`] is skipped as a tag, uncounted
 //!   ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
 //!
+//! The tables below are generated from `influxdb_out`'s column of `spec/transit/mapping.yaml`,
+//! the canonical copy, by `script/transit docs`, and a test fails when they're stale: change the
+//! table there, not here. "Consumer" means `influxdb_in` reading the write back.
+//!
+//! <!-- transit:doc:influxdb_out -->
+//!
+//! Per metric kind, and per record feature that decides a record's fate:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `sum/delta_monotonic` | degraded | -- | A `value` field of a measurement named for the record, its temporality and monotonicity dropped, which influxdb_in reads back as a gauge named `<name>.value`. |
+//! | `sum/delta_nonmonotonic` | degraded | -- | A `value` field, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`. |
+//! | `sum/cumulative_monotonic` | degraded | -- | A `value` field holding the running total, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`. |
+//! | `sum/cumulative_nonmonotonic` | degraded | -- | A `value` field, its temporality and monotonicity dropped, read back as a gauge named `<name>.value`. |
+//! | `sum/f64` | exact | -- | A float field, written as the shortest string that reads back to the same bits. |
+//! | `sum/i64` | exact | -- | An `<n>i` integer field, read back as an `i64`. |
+//! | `sum/u64` | exact | -- | An `<n>u` unsigned field, read back as a `u64`. |
+//! | `sum/bool` | exact | -- | A `true` or `false` field, read back as a boolean. |
+//! | `gauge/f64` | normalized | `value_field` | A `value` field of a measurement named for the record, read back as a gauge named `<name>.value`; an event carrying the `_logit.influxdb.measurement` carrier writes its gauges as that measurement's fields instead, under their own names. |
+//! | `gauge/i64` | normalized | `value_field` | An `<n>i` `value` field, read back as an `i64` gauge named `<name>.value`. |
+//! | `gauge/u64` | normalized | `value_field` | An `<n>u` `value` field, read back as a `u64` gauge named `<name>.value`. |
+//! | `gauge/bool` | normalized | `value_field` | A `true` or `false` `value` field, read back as a gauge named `<name>.value`. |
+//! | `gauge/negative` | normalized | `value_field` | A negative `value` field, read back as a gauge named `<name>.value`. |
+//! | `gauge_delta/f64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | An unresolved relative adjustment is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
+//! | `gauge_delta/i64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
+//! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
+//! | `gauge_delta/bool` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
+//! | `samples` | degraded | -- | Sketched, each value weighted by its inverse sample rate, then `count`, `sum`, `p50`, `p90`, and `p99` fields, read back as one gauge each under `<name>.`, uncounted. |
+//! | `set_members` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | Line protocol has no set, so set members aren't written, with a throttled `encode_error` warning. |
+//! | `distribution` | degraded | -- | `count`, `sum`, `p50`, `p90`, and `p99` fields, read back as one gauge each under `<name>.`, uncounted. |
+//! | `set` | degraded | -- | A `value=<estimate>u` field, read back as a gauge named `<name>.value`, uncounted. |
+//! | `histogram/delta` | degraded | -- | A `bucket_<bound>` field per finite bound, each read back as a gauge under `<name>.`; `sum`, `min`, `max`, and the `+Inf` bucket aren't written, uncounted. |
+//! | `histogram/cumulative` | degraded | -- | A `bucket_<bound>` field per finite bound, each read back as a gauge under `<name>.`; `sum`, `min`, `max`, and the `+Inf` bucket aren't written, uncounted. |
+//! | `exponential_histogram/delta` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Line protocol has no form for an exponential histogram, so none is written, with a throttled `encode_error` warning. |
+//! | `exponential_histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Line protocol has no form for an exponential histogram, so none is written, with a throttled `encode_error` warning. |
+//! | `summary` | degraded | -- | A `q<quantile>` field per finite quantile, each read back as a gauge under `<name>.`; `count` and `sum` aren't written, uncounted. |
+//! | `record/no_recorded_value` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
+//! | `record/service_check` | normalized | `value_field` | The status gauge as a `value` field; the check's carriers aren't tags. |
+//! | `record/superseded` | exact | -- | Each point is its own line at its own timestamp. |
+//! | `record/same_instant` | normalized | `next_nanosecond` | A point sharing a series and a timestamp with one already in the batch takes the next free nanosecond, so both are kept. |
+//! | `record/same_millisecond` | exact | -- | Each point is its own line at its own nanosecond. |
+//! | `record/non_finite` | dropped | `logit.output.metrics.dropped{reason=unencodable_value}` | Line protocol has no non-finite float, so the record is dropped. |
+//! | `log/dogstatsd_event` | skipped | uncounted | A log has no line-protocol form and isn't written, uncounted. |
+//! | `log/plain` | skipped | uncounted | A log has no line-protocol form and isn't written, uncounted. |
+//! | `span/alone` | skipped | uncounted | A span has no line-protocol form and isn't written, uncounted. |
+//!
+//! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
+//!
+//! | Row | Class | Reason or counter | What a consumer sees |
+//! |---|---|---|---|
+//! | `record/unit` | lost | uncounted | Line protocol has no unit; it isn't written or counted. |
+//! | `record/description` | lost | uncounted | Line protocol has no description; it isn't written or counted. |
+//! | `record/start_timestamp` | lost | uncounted | Line protocol has no start time; it isn't written or counted. |
+//! | `record/exemplars` | lost | uncounted | Line protocol has no exemplars; they aren't written or counted. |
+//! | `attributes/string_value` | lost | `logit.output.tags.omitted{reason=unencodable}` | A tag. A value holding a line break, ending in `\`, or with `\` before a space has no spelling and is left off, counted. |
+//! | `attributes/bool_value` | normalized | `stringified` | A tag of `true` or `false`, read back as the string. |
+//! | `attributes/number_value` | normalized | `stringified` | A tag of the number's decimal text, read back as the string. |
+//! | `attributes/array_value` | normalized | `multi_value`; `logit.output.tags.normalized{reason=multi_value}` | A tag holds one value, so only the last representable element is written, counted. |
+//! | `attributes/map_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A map has no tag form and is left off, counted. |
+//! | `attributes/bytes_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A bytes value has no tag form and is left off, counted. |
+//! | `attributes/timestamp_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
+//! | `attributes/private_carrier` | exact | -- | A `_logit.influxdb.*` carrier is consumed into the wire form (the measurement, the write's org and bucket) and influxdb_in stamps it back. |
+//! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
+//! | `attributes/resource_attribute` | normalized | `resource_merged` | A tag, the event's value winning on a shared key, read back as an event attribute. |
+//! | `attributes/scope` | lost | uncounted | Line protocol has no instrumentation scope; it isn't written or counted. |
+//! | `log/beside_metrics` | lost | uncounted | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
+//! | `span/beside_metrics` | lost | uncounted | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
+//!
+//! <!-- transit:end -->
+//!
+//! The rest of the encode mapping is hand-written: rules the spec has no row for, and details its
+//! cells don't state.
+//!
 //! | Model | Wire | Counter |
 //! |---|---|---|
-//! | `Gauge`/`Sum` `F64` | `value=` (or `<key>=`) and the shortest string that round-trips | -- |
-//! | `Gauge`/`Sum` `I64` / `U64` / `Bool` | `<n>i` / `<n>u` / `true` or `false` | -- |
-//! | `Gauge`/`Sum` non-finite `F64` | dropped | `metrics.dropped{reason="unencodable_value"}` |
-//! | `Sum` temporality and monotonicity | dropped (normalization 10) | -- |
-//! | `GaugeDelta` | dropped: the pipeline lacks an `aggregate` | `metrics.dropped{reason="unresolved_gauge_delta"}`, diagnostic `gauge_delta_unresolved` |
 //! | `Distribution` | `count=<n>u,sum=,p50=,p90=,p99=`, a non-finite component omitted | -- |
-//! | `Samples` | sketched with each value weighted by its inverse sample rate, then as `Distribution` | -- |
 //! | `Histogram` | `bucket_<bound>=<n>u` per finite bound; `sum`, `min`, `max`, and the `+Inf` bucket dropped | `metrics.dropped{reason="no_fields"}` when no bound is finite |
 //! | `Summary` | `q<quantile>=<v>` per finite quantile; `count` and `sum` dropped | `metrics.dropped{reason="no_fields"}` when none is finite |
-//! | `Set` | `value=<estimate>u` | -- |
-//! | `SetMembers`, `ExponentialHistogram` | skipped | `metrics.skipped{metric_kind="set_members" \| "exponential_histogram"}`, diagnostic `encode_error` |
-//! | a record flagged `NO_RECORDED_VALUE` | skipped | `metrics.skipped{reason="no_recorded_value"}`, diagnostic `no_recorded_value` |
 //! | `unit`, `description`, `start_timestamp`, exemplars; `EventBatch::scope`; `Resource::schema_url` | dropped | -- |
-//! | a log or span payload | skipped | -- |
 //! | a measurement starting `#` | dropped: influxd reads the line as a comment | `metrics.dropped{reason="comment_measurement"}`, diagnostic `encode_error` |
 //! | a measurement or carrier field key with no spelling (encode.rs's "Escaping"), such as a measurement starting with a tab or NUL, or a line whose every field key does | dropped, once per field | `metrics.dropped{reason="unencodable_key"}` |
 //! | carrier field key `time` | dropped: influxd answers `422` | `metrics.dropped{reason="reserved_key"}` |
@@ -125,16 +187,11 @@
 //!
 //! | Attribute value | Tag | Counter |
 //! |---|---|---|
-//! | `Str` (UTF-8) | as is, escaped | -- |
-//! | `Bool`, `I64`, `U64`, `F64` | its decimal text | -- |
-//! | `Array` | its last representable element | `tags.normalized{reason="multi_value"}` (lossy) |
 //! | `Null`, `Bytes`, `Timestamp`, `Map`, a non-UTF-8 `Str`, an `Array` with no representable element | omitted | `tags.omitted{reason="unrepresentable"}` |
 //! | an empty key or value | omitted | `tags.omitted{reason="empty"}` |
 //! | a key or value with a line break, ending in `\`, or with `\` directly before a space | omitted | `tags.omitted{reason="unencodable"}` |
 //! | key `_measurement`, `_field`, or `time` | omitted: influxd rejects the whole write | `tags.omitted{reason="reserved"}` |
 //! | key under `_logit.` or `influxdb.field.` | not a tag | -- |
-//!
-//! <!-- encode-table:end -->
 //!
 //! ## Permitted normalizations
 //!

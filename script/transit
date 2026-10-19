@@ -1,40 +1,50 @@
 #!/bin/bash
-# Usage: script/transit gen|check|coverage
-#   gen       run the class check and regenerate every generated file under spec/transit/: each
-#             wire case's .json, each flow's expected/<flow>.json, and coverage.md
+# Usage: script/transit gen|check|docs|coverage
+#   gen       run the class check and regenerate every generated file: under spec/transit/, each
+#             wire case's .json, each flow's expected/<flow>.json, and coverage.md; and every
+#             generated docs region
 #   check     run the class check and compare them, failing on anything stale (what script/test
 #             runs)
+#   docs      rewrite only the generated docs regions: each spec'd sink's module-doc mapping
+#             table and docs/known-gaps/mappings.md's tables, rendered from mapping.yaml
 #   coverage  as gen, then print spec/transit/coverage.md: each system's features and the cases
 #             that exercise them, and each sink's cells no flow reaches
 #
-# The spec's generator is a test in the `logit` binary's transit module
-# (crates/logit-cli/src/transit/spec.rs), since only the binary's tests reach the kind registry;
-# TRANSIT_UPDATE=1 turns its comparisons into rewrites. A flow's expectations are written only
-# when no case in the flow fails the class check: fix the code or mapping.yaml. Review
-# `git diff spec/transit/` after `gen` and commit. See spec/transit/README.md.
+# The spec's generator and the docs renderer are tests in the `logit` binary's transit module
+# (crates/logit-cli/src/transit/spec.rs and docs.rs), since only the binary's tests reach the
+# kind registry; TRANSIT_UPDATE=1 turns their comparisons into rewrites. A flow's expectations are
+# written only when no case in the flow fails the class check: fix the code or mapping.yaml.
+# Review `git diff` after `gen` or `docs` and commit. See spec/transit/README.md.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
-spec_test() {
-    run "$@" cargo nextest run -p logit-cli --bin logit --no-tests=fail \
-        -E 'test(=transit::spec::transit_spec)'
+SPEC='test(=transit::spec::transit_spec)'
+DOCS='test(=transit::docs::transit_docs)'
+
+transit_test() {
+    local filter="$1"
+    shift
+    run "$@" cargo nextest run -p logit-cli --bin logit --no-tests=fail -E "${filter}"
 }
 
 case "${1:-}" in
     gen)
-        spec_test env TRANSIT_UPDATE=1
+        transit_test "${SPEC} | ${DOCS}" env TRANSIT_UPDATE=1
         ;;
     check)
-        spec_test env
+        transit_test "${SPEC} | ${DOCS}" env
+        ;;
+    docs)
+        transit_test "${DOCS}" env TRANSIT_UPDATE=1
         ;;
     coverage)
-        spec_test env TRANSIT_UPDATE=1
+        transit_test "${SPEC} | ${DOCS}" env TRANSIT_UPDATE=1
         cat spec/transit/coverage.md
         ;;
     *)
-        sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' >&2
+        sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' >&2
         exit 2
         ;;
 esac
