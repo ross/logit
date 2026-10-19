@@ -1,0 +1,2 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"legacy_value","kind":"gauge","value":7.0}],"attributes":{"_logit.prometheus.type":"untyped","source":"old"},"resource":{"attributes":{"_logit.prometheus.target":"http://transit:9100/metrics","instance":"transit:9100"}}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"no_metadata","kind":"gauge","value":1.5}],"attributes":{"_logit.prometheus.type":"untyped"},"resource":{"attributes":{"_logit.prometheus.target":"http://transit:9100/metrics","instance":"transit:9100"}}}

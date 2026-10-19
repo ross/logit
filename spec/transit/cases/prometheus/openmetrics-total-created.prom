@@ -1,0 +1,5 @@
+# TYPE jobs counter
+# HELP jobs Jobs run.
+jobs_total 42
+jobs_created 1799999000.0
+# EOF

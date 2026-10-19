@@ -1,0 +1,3 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"NaN"}],"attributes":{"k":"nan"},"resource":{"attributes":{"_logit.prometheus.target":"http://transit:9100/metrics","instance":"transit:9100"}}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"-inf"}],"attributes":{"k":"ninf"},"resource":{"attributes":{"_logit.prometheus.target":"http://transit:9100/metrics","instance":"transit:9100"}}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"inf"}],"attributes":{"k":"pinf"},"resource":{"attributes":{"_logit.prometheus.target":"http://transit:9100/metrics","instance":"transit:9100"}}}

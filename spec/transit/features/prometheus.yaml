@@ -1,0 +1,66 @@
+# The Prometheus exposition wire features a case under cases/prometheus/ can exercise, from
+# crates/logit-proto/src/prometheus/mod.rs's "Family naming" and "Decode: families → events"
+# tables and crates/logit-proto/src/prometheus/text.rs's grammar. A case names the ones it
+# exercises in its `.meta.yaml`. Remote-write cases aren't written yet, so native histograms,
+# which only remote-write carries, have no feature here.
+- name: counter
+  text: A `counter` family, decoded to a cumulative monotonic sum named with its `_total`.
+- name: gauge
+  text: A `gauge` family, decoded to a gauge.
+- name: histogram
+  text: >-
+    A `histogram` family's `_bucket{le}`, `+Inf`, `_sum`, and `_count` samples, decoded to one
+    cumulative histogram of per-bucket counts.
+- name: summary
+  text: >-
+    A `summary` family's `{quantile}`, `_sum`, and `_count` samples, decoded to one summary.
+- name: untyped
+  text: >-
+    A text 0.0.4 `untyped` family, decoded to a gauge with the `_logit.prometheus.type` carrier
+    `untyped`.
+- name: no_type
+  text: A sample with no `# TYPE` line, decoded as an untyped family.
+- name: unknown
+  text: An OpenMetrics `unknown` family, decoded to a gauge with the type carrier `unknown`.
+- name: info
+  text: >-
+    An OpenMetrics `info` family, decoded to a gauge of 1 named without `_info`, with the type
+    carrier `info`.
+- name: stateset
+  text: >-
+    An OpenMetrics `stateset` family, decoded to one gauge of 0 or 1 per state, with the type
+    carrier `stateset`.
+- name: gaugehistogram
+  text: >-
+    An OpenMetrics `gaugehistogram` family's `_gcount` and `_gsum`, decoded to a histogram with
+    the type carrier `gaugehistogram`.
+- name: help
+  text: A `# HELP` line, decoded to the record's description.
+- name: unit
+  text: An OpenMetrics `# UNIT` line, decoded to the record's unit.
+- name: total_suffix
+  text: >-
+    An OpenMetrics counter family named without `_total` whose sample carries it; the record is
+    named with the sample's `_total`.
+- name: created
+  text: An OpenMetrics `_created` sample, decoded to the record's start timestamp.
+- name: exemplars
+  text: >-
+    An OpenMetrics exemplar on a counter or a bucket line, decoded to the record's exemplars with
+    its trace and span ids.
+- name: sample_timestamp
+  text: >-
+    A sample's own timestamp, which sets the event timestamp and stamps the
+    `_logit.prometheus.timestamp` carrier.
+- name: non_finite
+  text: A `NaN`, `+Inf`, or `-Inf` sample value.
+- name: label_escaping
+  text: A label value holding an escaped backslash, double quote, or newline.
+- name: openmetrics
+  text: >-
+    A body in the OpenMetrics dialect, chosen by an `application/openmetrics-text`
+    `content-type`, ending in `# EOF`.
+- name: target
+  text: >-
+    The scrape target's identity on the resource: an `instance` label and the
+    `_logit.prometheus.target` carrier.

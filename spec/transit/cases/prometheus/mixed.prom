@@ -1,0 +1,17 @@
+# TYPE build info
+build_info{version="1.2.3"} 1
+# TYPE feature stateset
+feature{feature="a"} 1
+feature{feature="b"} 0
+# TYPE queue gaugehistogram
+queue_bucket{le="1.0"} 2
+queue_bucket{le="+Inf"} 5
+queue_gcount 5
+queue_gsum 7.5
+# TYPE mystery unknown
+mystery 3
+# TYPE up gauge
+up 1
+# TYPE reqs counter
+reqs_total 5
+# EOF

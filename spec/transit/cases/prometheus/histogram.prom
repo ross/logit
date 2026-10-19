@@ -1,0 +1,6 @@
+# TYPE request_duration_seconds histogram
+request_duration_seconds_bucket{le="0.1"} 3
+request_duration_seconds_bucket{le="0.5"} 7
+request_duration_seconds_bucket{le="+Inf"} 9
+request_duration_seconds_sum 2.75
+request_duration_seconds_count 9

@@ -1,0 +1,2 @@
+wire: precision-s.lp
+exercises: [measurement, tags, float_field, precision, carriers]

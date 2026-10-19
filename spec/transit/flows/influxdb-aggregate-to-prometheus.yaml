@@ -1,0 +1,16 @@
+# influxdb_in's cases through a 10s cumulative `aggregate` into prometheus_out's exposition.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/influxdb/mixed.json
+  window:
+    type: aggregate
+    sources: [case]
+    interval: 10s
+    temporality: cumulative
+  out:
+    type: prometheus_out
+    sources: [window]
+    bind: 127.0.0.1:9464

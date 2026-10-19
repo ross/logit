@@ -1,0 +1,15 @@
+# prometheus_in's scrape cases into influxdb_out, a wire with one number per field, writing to
+# the bucket and org the flow sets.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/prometheus/mixed.json
+  out:
+    type: influxdb_out
+    sources: [case]
+    url: http://127.0.0.1:8086
+    token: unused
+    bucket: metrics
+    org: acme

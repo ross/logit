@@ -1,0 +1,12 @@
+# influxdb_in's cases exposed by prometheus_out for a scrape, with nothing between: typed
+# scalars, a gauge per field, and the measurement carrier into a wire that names each series.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/influxdb/mixed.json
+  out:
+    type: prometheus_out
+    sources: [case]
+    bind: 127.0.0.1:9464

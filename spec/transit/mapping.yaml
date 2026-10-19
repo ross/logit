@@ -24,7 +24,7 @@ classes:
     The record is lost for a reason the config didn't ask for, counted under the cell's dropped
     counter.
 
-sinks: [statsd_out]
+sinks: [statsd_out, prometheus_out, influxdb_out, otlp_out]
 
 rows:
   # --- sum: temporality and monotonicity -------------------------------------------------------
@@ -36,6 +36,20 @@ rows:
         text: >-
           A `|c` counter line, with its sample rate divided out when statsd_in decoded it, so no
           `@rate` is written.
+      prometheus_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_delta}
+        text: >-
+          Prometheus has no delta counter, so a bare delta sum is dropped; an `aggregate` with
+          `temporality: cumulative` upstream turns it into a counter.
+      influxdb_out:
+        class: degraded
+        text: >-
+          A `value` field of a measurement named for the record, its temporality and monotonicity
+          dropped, which influxdb_in reads back as a gauge named `<name>.value`.
+      otlp_out:
+        class: exact
+        text: An OTLP `Sum` with delta temporality and the monotonic flag.
   - kind: sum
     feature: delta_nonmonotonic
     cells:
@@ -49,6 +63,18 @@ rows:
           text: >-
             A signed `|c` increment. A statsd counter has no monotonic flag, so it reads back
             monotonic.
+      prometheus_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_delta}
+        text: A bare delta sum is dropped, as for a monotonic one.
+      influxdb_out:
+        class: degraded
+        text: >-
+          A `value` field, its temporality and monotonicity dropped, read back as a gauge named
+          `<name>.value`.
+      otlp_out:
+        class: exact
+        text: An OTLP `Sum` with delta temporality, not monotonic.
   - kind: sum
     feature: cumulative_monotonic
     cells:
@@ -62,6 +88,20 @@ rows:
           text: >-
             The running total as a bare `|g` gauge, never `|c`, which a statsd server would add to
             itself on every flush.
+      prometheus_out:
+        class: normalized
+        reason: total_suffix
+        text: >-
+          A `counter` family. Its sample is named with `_total`, appended when the record's name
+          lacks it, so such a record reads back under the longer name.
+      influxdb_out:
+        class: degraded
+        text: >-
+          A `value` field holding the running total, its temporality and monotonicity dropped,
+          read back as a gauge named `<name>.value`.
+      otlp_out:
+        class: exact
+        text: An OTLP `Sum` with cumulative temporality and the monotonic flag.
   - kind: sum
     feature: cumulative_nonmonotonic
     cells:
@@ -73,6 +113,18 @@ rows:
         - class: degraded
           counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
           text: The running total as a bare `|g` gauge.
+      prometheus_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=non_monotonic_sum}
+        text: Prometheus has no non-monotonic counter, so the running total is a `gauge`.
+      influxdb_out:
+        class: degraded
+        text: >-
+          A `value` field, its temporality and monotonicity dropped, read back as a gauge named
+          `<name>.value`.
+      otlp_out:
+        class: exact
+        text: An OTLP `Sum` with cumulative temporality, not monotonic.
 
   # --- sum: scalar type ------------------------------------------------------------------------
   - kind: sum
@@ -81,6 +133,15 @@ rows:
       statsd_out:
         class: exact
         text: The value is written as the shortest float that reads back to the same bits.
+      prometheus_out:
+        class: exact
+        text: The sample's double.
+      influxdb_out:
+        class: exact
+        text: A float field, written as the shortest string that reads back to the same bits.
+      otlp_out:
+        class: exact
+        text: The data point's `as_double`.
   - kind: sum
     feature: i64
     cells:
@@ -90,6 +151,18 @@ rows:
         text: >-
           statsd_out writes every digit, and statsd_in reads the number back as an f64, so an
           integer reads back as a float and one beyond 2^53 rounds.
+      prometheus_out:
+        class: normalized
+        reason: f64_value
+        text: >-
+          A sample is a double, so an integer is written as its nearest `f64` and reads back as a
+          float, rounded beyond 2^53.
+      influxdb_out:
+        class: exact
+        text: An `<n>i` integer field, read back as an `i64`.
+      otlp_out:
+        class: exact
+        text: The data point's `as_int`.
   - kind: sum
     feature: u64
     cells:
@@ -99,6 +172,22 @@ rows:
         text: >-
           statsd_out writes every digit, and statsd_in reads the number back as an f64, so an
           integer reads back as a float and one beyond 2^53 rounds.
+      prometheus_out:
+        class: normalized
+        reason: f64_value
+        text: >-
+          A sample is a double, so an integer is written as its nearest `f64` and reads back as a
+          float, rounded beyond 2^53.
+      influxdb_out:
+        class: exact
+        text: An `<n>u` unsigned field, read back as a `u64`.
+      otlp_out:
+        class: normalized
+        reason: u64_as_int
+        counter: logit.output.metrics.normalized{reason=u64_as_double}
+        text: >-
+          OTLP has one signed integer, so a `u64` that fits an `int64` is `as_int` and reads back
+          as an `i64`; one above `i64::MAX` is `as_double`, counted, and reads back as an `f64`.
   - kind: sum
     feature: bool
     cells:
@@ -107,6 +196,19 @@ rows:
         reason: bool_value
         counter: logit.output.metrics.normalized{reason=bool_value}
         text: A boolean is written as `1` or `0` and reads back as that number.
+      prometheus_out:
+        class: normalized
+        reason: bool_value
+        counter: logit.output.metrics.normalized{reason=bool_value}
+        text: A boolean is the sample `1` or `0` and reads back as that number.
+      influxdb_out:
+        class: exact
+        text: A `true` or `false` field, read back as a boolean.
+      otlp_out:
+        class: normalized
+        reason: bool_value
+        counter: logit.output.metrics.normalized{reason=bool_value}
+        text: A boolean is `as_int` `1` or `0` and reads back as that integer.
 
   # --- gauge -----------------------------------------------------------------------------------
   - kind: gauge
@@ -115,6 +217,21 @@ rows:
       statsd_out:
         class: exact
         text: An absolute `|g` gauge line.
+      prometheus_out:
+        class: exact
+        text: >-
+          A `gauge` family, or the family type the `_logit.prometheus.type` carrier names
+          (`untyped`, `unknown`, `info`, `stateset`).
+      influxdb_out:
+        class: normalized
+        reason: value_field
+        text: >-
+          A `value` field of a measurement named for the record, read back as a gauge named
+          `<name>.value`; an event carrying the `_logit.influxdb.measurement` carrier writes its
+          gauges as that measurement's fields instead, under their own names.
+      otlp_out:
+        class: exact
+        text: An OTLP `Gauge`, `as_double`.
   - kind: gauge
     feature: i64
     cells:
@@ -124,6 +241,19 @@ rows:
         text: >-
           statsd_out writes every digit, and statsd_in reads the number back as an f64, so an
           integer reads back as a float and one beyond 2^53 rounds.
+      prometheus_out:
+        class: normalized
+        reason: f64_value
+        text: >-
+          A sample is a double, so an integer is written as its nearest `f64` and reads back as a
+          float, rounded beyond 2^53.
+      influxdb_out:
+        class: normalized
+        reason: value_field
+        text: An `<n>i` `value` field, read back as an `i64` gauge named `<name>.value`.
+      otlp_out:
+        class: exact
+        text: An OTLP `Gauge`, `as_int`.
   - kind: gauge
     feature: u64
     cells:
@@ -133,6 +263,23 @@ rows:
         text: >-
           statsd_out writes every digit, and statsd_in reads the number back as an f64, so an
           integer reads back as a float and one beyond 2^53 rounds.
+      prometheus_out:
+        class: normalized
+        reason: f64_value
+        text: >-
+          A sample is a double, so an integer is written as its nearest `f64` and reads back as a
+          float, rounded beyond 2^53.
+      influxdb_out:
+        class: normalized
+        reason: value_field
+        text: An `<n>u` `value` field, read back as a `u64` gauge named `<name>.value`.
+      otlp_out:
+        class: normalized
+        reason: u64_as_int
+        counter: logit.output.metrics.normalized{reason=u64_as_double}
+        text: >-
+          A `u64` that fits an `int64` is `as_int` and reads back as an `i64`; one above
+          `i64::MAX` is `as_double`, counted, and reads back as an `f64`.
   - kind: gauge
     feature: bool
     cells:
@@ -141,6 +288,20 @@ rows:
         reason: bool_value
         counter: logit.output.metrics.normalized{reason=bool_value}
         text: A boolean is written as `1` or `0` and reads back as that number.
+      prometheus_out:
+        class: normalized
+        reason: bool_value
+        counter: logit.output.metrics.normalized{reason=bool_value}
+        text: A boolean is the sample `1` or `0` and reads back as that number.
+      influxdb_out:
+        class: normalized
+        reason: value_field
+        text: A `true` or `false` `value` field, read back as a gauge named `<name>.value`.
+      otlp_out:
+        class: normalized
+        reason: bool_value
+        counter: logit.output.metrics.normalized{reason=bool_value}
+        text: A boolean is `as_int` `1` or `0` and reads back as that integer.
   - kind: gauge
     feature: negative
     cells:
@@ -150,6 +311,16 @@ rows:
           statsd has no negative absolute gauge, so statsd_out writes `0|g` then `-v|g` in one
           datagram. A statsd server ends at the right value, but statsd_in reads the pair as a
           gauge of 0 and a relative adjustment, uncounted.
+      prometheus_out:
+        class: exact
+        text: A negative sample, written as is.
+      influxdb_out:
+        class: normalized
+        reason: value_field
+        text: A negative `value` field, read back as a gauge named `<name>.value`.
+      otlp_out:
+        class: exact
+        text: A negative data point, written as is.
 
   # --- gauge_delta -----------------------------------------------------------------------------
   - kind: gauge_delta
@@ -164,6 +335,24 @@ rows:
           text: >-
             An unresolved relative adjustment is dropped unless `relative_gauges: true`; an
             `aggregate` upstream resolves it into a gauge.
+      prometheus_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: >-
+          An unresolved relative adjustment has no absolute value to expose and is dropped; an
+          `aggregate` upstream resolves it into a gauge.
+      influxdb_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: >-
+          An unresolved relative adjustment is dropped; an `aggregate` upstream resolves it into
+          a gauge.
+      otlp_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: >-
+          An unresolved relative adjustment is dropped; an `aggregate` upstream resolves it into
+          a gauge.
   - kind: gauge_delta
     feature: i64
     cells:
@@ -175,6 +364,18 @@ rows:
         - class: dropped
           counter: logit.output.messages.dropped{reason=unresolved_gauge_delta}
           text: 'Dropped unless `relative_gauges: true`, as for a float adjustment.'
+      prometheus_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: Dropped, as for a float adjustment.
+      influxdb_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: Dropped, as for a float adjustment.
+      otlp_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: Dropped, as for a float adjustment.
   - kind: gauge_delta
     feature: u64
     cells:
@@ -186,6 +387,18 @@ rows:
         - class: dropped
           counter: logit.output.messages.dropped{reason=unresolved_gauge_delta}
           text: 'Dropped unless `relative_gauges: true`, as for a float adjustment.'
+      prometheus_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: Dropped, as for a float adjustment.
+      influxdb_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: Dropped, as for a float adjustment.
+      otlp_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: Dropped, as for a float adjustment.
   - kind: gauge_delta
     feature: bool
     cells:
@@ -198,6 +411,18 @@ rows:
         - class: dropped
           counter: logit.output.messages.dropped{reason=unresolved_gauge_delta}
           text: 'Dropped unless `relative_gauges: true`, as for a float adjustment.'
+      prometheus_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: Dropped, as for a float adjustment.
+      influxdb_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: Dropped, as for a float adjustment.
+      otlp_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+        text: Dropped, as for a float adjustment.
 
   # --- raw multi-value kinds -------------------------------------------------------------------
   - kind: samples
@@ -214,6 +439,23 @@ rows:
           text: >-
             One `|ms`, `|h`, or `|d` line holding every value, the type letter from the
             `_logit.statsd.type` carrier and `@rate` written when it isn't 1.
+      prometheus_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=samples}
+        text: >-
+          Sketched, each value weighted by its inverse sample rate, then a `summary` of fixed
+          quantiles with `_sum` and `_count`.
+      influxdb_out:
+        class: degraded
+        text: >-
+          Sketched, each value weighted by its inverse sample rate, then `count`, `sum`, `p50`,
+          `p90`, and `p99` fields, read back as one gauge each under `<name>.`, uncounted.
+      otlp_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=samples}
+        text: >-
+          Sketched, each value weighted by its inverse sample rate, then an OTLP `Summary` of fixed
+          quantiles.
   - kind: set_members
     cells:
       statsd_out:
@@ -225,6 +467,18 @@ rows:
           line reads back as one record per member; a statsd server counts the same distinct
           members either way. A member holding `:`, `|`, or a control character is written with
           `_` in its place, counted once per member.
+      prometheus_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=set_members}
+        text: A `gauge` of the distinct member count; the members are gone.
+      influxdb_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{metric_kind=set_members}
+        text: Line protocol has no set, so set members aren't written.
+      otlp_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{metric_kind=set_members}
+        text: OTLP has no cardinality type, so set members aren't written.
 
   # --- summarized kinds ------------------------------------------------------------------------
   - kind: distribution
@@ -240,6 +494,23 @@ rows:
             Dotted `.count` and `.sum` counters and `.min`, `.max`, and `.q0_5` to `.q0_99`
             gauges. Counts and sums merge across senders at a statsd server; quantiles and
             extremes are the last sender's.
+      prometheus_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=distribution}
+        text: >-
+          A `summary` of fixed quantiles with the sketch's exact `_sum` and `_count`; the sketch
+          is gone, so quantiles from two senders don't merge.
+      influxdb_out:
+        class: degraded
+        text: >-
+          `count`, `sum`, `p50`, `p90`, and `p99` fields, read back as one gauge each under
+          `<name>.`, uncounted.
+      otlp_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=distribution}
+        text: >-
+          An OTLP `Summary` of fixed quantiles with the sketch's own count and sum; OTLP has no
+          mergeable sketch.
   - kind: set
     cells:
       statsd_out:
@@ -252,6 +523,17 @@ rows:
           text: >-
             The estimate as a `.count` gauge; two senders' estimates don't add, and the registers
             are gone.
+      prometheus_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{metric_kind=set}
+        text: A `gauge` of the estimate; the registers are gone.
+      influxdb_out:
+        class: degraded
+        text: A `value=<estimate>u` field, read back as a gauge named `<name>.value`, uncounted.
+      otlp_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{metric_kind=set}
+        text: OTLP has no cardinality type, so a set estimate isn't written.
   - kind: histogram
     feature: delta
     cells:
@@ -265,6 +547,20 @@ rows:
           text: >-
             Dotted `.count`, `.sum`, and `.bucket_<bound>` counters and `.min` and `.max`
             gauges.
+      prometheus_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unresolved_delta}
+        text: >-
+          A delta histogram is dropped; an `aggregate` with `temporality: cumulative` upstream
+          makes it a running one.
+      influxdb_out:
+        class: degraded
+        text: >-
+          A `bucket_<bound>` field per finite bound, each read back as a gauge under `<name>.`;
+          `sum`, `min`, `max`, and the `+Inf` bucket aren't written, uncounted.
+      otlp_out:
+        class: exact
+        text: An OTLP `Histogram` with delta temporality.
   - kind: histogram
     feature: cumulative
     cells:
@@ -278,6 +574,22 @@ rows:
           text: >-
             The same dotted series, every one a gauge, since a running total sent as `|c` would
             be added to itself.
+      influxdb_out:
+        class: degraded
+        text: >-
+          A `bucket_<bound>` field per finite bound, each read back as a gauge under `<name>.`;
+          `sum`, `min`, `max`, and the `+Inf` bucket aren't written, uncounted.
+      otlp_out:
+        class: exact
+        text: An OTLP `Histogram` with cumulative temporality.
+      prometheus_out:
+        class: normalized
+        reason: inf_bucket
+        text: >-
+          A `histogram` family of running-sum buckets and `_sum` when it has one, or a
+          `gaugehistogram` under the type carrier. `+Inf` states the total, so a histogram whose
+          last bound is finite reads back with an empty `+Inf` bucket; `min` and `max` aren't
+          written.
   - kind: exponential_histogram
     feature: delta
     cells:
@@ -291,6 +603,23 @@ rows:
           text: >-
             Dotted `.count`, `.sum`, and `.zero_count` counters and `.min` and `.max` gauges. Its
             buckets aren't written, since each scale would mint its own series names.
+      prometheus_out:
+        - when: {bind: null}
+          class: dropped
+          counter: logit.output.metrics.dropped{reason=native_histogram}
+          text: >-
+            Remote-write carries native histograms, but the sender doesn't map them yet, so one
+            is dropped.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+          text: Neither exposition dialect has native-histogram syntax, so none is written.
+      influxdb_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+        text: Line protocol has no form for an exponential histogram, so none is written.
+      otlp_out:
+        class: exact
+        text: An OTLP `ExponentialHistogram`, field for field.
   - kind: exponential_histogram
     feature: cumulative
     cells:
@@ -302,6 +631,21 @@ rows:
         - class: degraded
           counter: logit.output.metrics.degraded{metric_kind=exponential_histogram}
           text: The same dotted series, every one a gauge, and no buckets.
+      prometheus_out:
+        - when: {bind: null}
+          class: dropped
+          counter: logit.output.metrics.dropped{reason=native_histogram}
+          text: Dropped, as for a delta one.
+        - class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+          text: Neither exposition dialect has native-histogram syntax, so none is written.
+      influxdb_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+        text: Line protocol has no form for an exponential histogram, so none is written.
+      otlp_out:
+        class: exact
+        text: An OTLP `ExponentialHistogram`, field for field.
   - kind: summary
     cells:
       statsd_out:
@@ -312,6 +656,17 @@ rows:
         - class: degraded
           counter: logit.output.metrics.degraded{metric_kind=summary}
           text: Dotted `.count`, `.sum`, and per-quantile gauges.
+      prometheus_out:
+        class: exact
+        text: A `summary` family of its quantiles, `_sum`, and `_count`.
+      influxdb_out:
+        class: degraded
+        text: >-
+          A `q<quantile>` field per finite quantile, each read back as a gauge under `<name>.`;
+          `count` and `sum` aren't written, uncounted.
+      otlp_out:
+        class: exact
+        text: An OTLP `Summary`.
 
   # --- record fields ---------------------------------------------------------------------------
   - kind: record
@@ -321,6 +676,19 @@ rows:
         class: lost
         reason: uncounted
         text: statsd has no unit; it isn't written or counted.
+      prometheus_out:
+        class: lost
+        counter: logit.output.metrics.degraded{reason=unit_not_suffix}
+        text: >-
+          OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left
+          off, counted.
+      influxdb_out:
+        class: lost
+        reason: uncounted
+        text: Line protocol has no unit; it isn't written or counted.
+      otlp_out:
+        class: exact
+        text: The `Metric`'s `unit`.
   - kind: record
     feature: description
     cells:
@@ -328,6 +696,16 @@ rows:
         class: lost
         reason: uncounted
         text: statsd has no description; it isn't written or counted.
+      prometheus_out:
+        class: exact
+        text: The family's `# HELP` line.
+      influxdb_out:
+        class: lost
+        reason: uncounted
+        text: Line protocol has no description; it isn't written or counted.
+      otlp_out:
+        class: exact
+        text: The `Metric`'s `description`.
   - kind: record
     feature: start_timestamp
     cells:
@@ -335,6 +713,19 @@ rows:
         class: lost
         reason: uncounted
         text: statsd has no start time; it isn't written or counted.
+      influxdb_out:
+        class: lost
+        reason: uncounted
+        text: Line protocol has no start time; it isn't written or counted.
+      otlp_out:
+        class: exact
+        text: The data point's `start_time_unix_nano`.
+      prometheus_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge's
+          start time is left off, uncounted.
   - kind: record
     feature: exemplars
     cells:
@@ -342,6 +733,19 @@ rows:
         class: lost
         reason: uncounted
         text: statsd has no exemplars; they aren't written or counted.
+      influxdb_out:
+        class: lost
+        reason: uncounted
+        text: Line protocol has no exemplars; they aren't written or counted.
+      otlp_out:
+        class: exact
+        text: The data point's exemplars, except on a `Summary`, which has none.
+      prometheus_out:
+        class: lost
+        counter: logit.output.metrics.degraded{reason=exemplar_omitted}
+        text: >-
+          In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at
+          most one per line. One with no line to sit on, such as a gauge's, is left off, counted.
   - kind: record
     feature: no_recorded_value
     cells:
@@ -349,6 +753,17 @@ rows:
         class: skipped
         counter: logit.output.messages.skipped{reason=no_recorded_value}
         text: A point flagged as holding no recorded value has no statsd line.
+      prometheus_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{reason=no_recorded_value}
+        text: A point flagged as holding no recorded value isn't exposed.
+      influxdb_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{reason=no_recorded_value}
+        text: A point flagged as holding no recorded value isn't written.
+      otlp_out:
+        class: exact
+        text: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept.
   - kind: record
     feature: service_check
     cells:
@@ -361,6 +776,18 @@ rows:
           text: >-
             A gauge carrying the `_logit.statsd.service_check.*` carriers is a DogStatsD `_sc`
             line again.
+      prometheus_out:
+        class: exact
+        text: The status gauge; the check's carriers aren't labels.
+      influxdb_out:
+        class: normalized
+        reason: value_field
+        text: The status gauge as a `value` field; the check's carriers aren't tags.
+      otlp_out:
+        class: exact
+        text: The status gauge; the check's carriers aren't attributes.
+  # influxdb_out escapes any name and otlp_out writes it as is, so no record reaches this row there
+  # and neither has a cell.
   - kind: record
     feature: name_unsafe
     cells:
@@ -370,6 +797,52 @@ rows:
         text: >-
           Every `:`, `|`, `@`, `#`, `,`, control, and whitespace character in a name is written as
           `_`, so the record reads back under the sanitized name, uncounted.
+      prometheus_out:
+        class: normalized
+        reason: name_sanitized
+        text: >-
+          A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record
+          reads back under the sanitized name, uncounted.
+  - kind: record
+    feature: superseded
+    cells:
+      statsd_out:
+        class: exact
+        text: Each record is its own line; a statsd server applies them in order.
+      prometheus_out:
+        - when: {bind: null}
+          class: exact
+          text: Remote-write sends each sample with its own timestamp.
+        - class: skipped
+          reason: uncounted
+          text: >-
+            The exposition registry holds one sample per series, so a later record of the series
+            replaces an earlier one before a scrape reads it, uncounted.
+      influxdb_out:
+        class: exact
+        text: >-
+          Each point is its own line; one sharing a series and a timestamp with a point already in
+          the batch takes the next free nanosecond.
+      otlp_out:
+        class: exact
+        text: Each record is its own data point.
+  - kind: record
+    feature: non_finite
+    cells:
+      statsd_out:
+        class: dropped
+        counter: logit.output.messages.dropped{reason=unencodable_value}
+        text: statsd has no non-finite value, so the line isn't written.
+      prometheus_out:
+        class: exact
+        text: '`NaN`, `+Inf`, or `-Inf`, as the sample.'
+      influxdb_out:
+        class: dropped
+        counter: logit.output.metrics.dropped{reason=unencodable_value}
+        text: Line protocol has no non-finite float, so the record is dropped.
+      otlp_out:
+        class: exact
+        text: The non-finite `as_double`.
 
   # --- attributes ------------------------------------------------------------------------------
   - kind: attributes
@@ -382,6 +855,21 @@ rows:
           text: Plain statsd has no tags; each is counted once per wire tag.
         - class: exact
           text: A DogStatsD `key:value` tag.
+      prometheus_out:
+        class: normalized
+        reason: label_sanitized
+        text: >-
+          A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or
+          another character reads back under the sanitized name.
+      otlp_out:
+        class: exact
+        text: A string attribute.
+      influxdb_out:
+        class: lost
+        counter: logit.output.tags.omitted{reason=unencodable}
+        text: >-
+          A tag. A value holding a line break, ending in `\`, or with `\` before a space has no
+          spelling and is left off, counted.
   - kind: attributes
     feature: bool_value
     cells:
@@ -395,6 +883,17 @@ rows:
           text: >-
             `true` is a bare tag and reads back `true`; `false` is `key:false` and reads back as
             the string.
+      prometheus_out:
+        class: normalized
+        reason: stringified
+        text: A label of `true` or `false`, read back as the string.
+      influxdb_out:
+        class: normalized
+        reason: stringified
+        text: A tag of `true` or `false`, read back as the string.
+      otlp_out:
+        class: exact
+        text: A boolean attribute.
   - kind: attributes
     feature: number_value
     cells:
@@ -406,6 +905,18 @@ rows:
         - class: normalized
           reason: stringified
           text: A number is a `key:digits` tag and reads back as a string.
+      prometheus_out:
+        class: normalized
+        reason: stringified
+        text: A label of the number's decimal text, read back as the string.
+      influxdb_out:
+        class: normalized
+        reason: stringified
+        text: A tag of the number's decimal text, read back as the string.
+      otlp_out:
+        class: normalized
+        reason: u64_as_int
+        text: An integer or double attribute; a `u64` reads back as an `i64`.
   - kind: attributes
     feature: array_value
     cells:
@@ -417,6 +928,86 @@ rows:
         - class: exact
           text: >-
             One tag per element in order, which statsd_in folds back into the same array.
+      prometheus_out:
+        class: normalized
+        reason: multi_value
+        counter: logit.output.labels.normalized{reason=multi_value}
+        text: A label set is a map, so only the last representable element is written, counted.
+      influxdb_out:
+        class: normalized
+        reason: multi_value
+        counter: logit.output.tags.normalized{reason=multi_value}
+        text: A tag holds one value, so only the last representable element is written, counted.
+      otlp_out:
+        class: exact
+        text: An array attribute.
+  - kind: attributes
+    feature: map_value
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags.
+        - class: lost
+          counter: logit.output.tags.omitted{reason=unrepresentable}
+          text: A map has no tag form and is left off, counted.
+      prometheus_out:
+        class: lost
+        counter: logit.output.labels.omitted{reason=unrepresentable}
+        text: A map has no label form and is left off, counted.
+      influxdb_out:
+        class: lost
+        counter: logit.output.tags.omitted{reason=unrepresentable}
+        text: A map has no tag form and is left off, counted.
+      otlp_out:
+        class: exact
+        text: A key-value list attribute.
+  - kind: attributes
+    feature: bytes_value
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags.
+        - class: lost
+          counter: logit.output.tags.omitted{reason=unrepresentable}
+          text: A bytes value has no tag form and is left off, counted.
+      prometheus_out:
+        class: lost
+        counter: logit.output.labels.omitted{reason=unrepresentable}
+        text: A bytes value has no label form and is left off, counted.
+      influxdb_out:
+        class: lost
+        counter: logit.output.tags.omitted{reason=unrepresentable}
+        text: A bytes value has no tag form and is left off, counted.
+      otlp_out:
+        class: exact
+        text: A bytes attribute.
+  - kind: attributes
+    feature: timestamp_value
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags.
+        - class: lost
+          counter: logit.output.tags.omitted{reason=unrepresentable}
+          text: A timestamp value has no tag form and is left off, counted.
+      prometheus_out:
+        class: lost
+        counter: logit.output.labels.omitted{reason=unrepresentable}
+        text: A timestamp value has no label form and is left off, counted.
+      influxdb_out:
+        class: lost
+        counter: logit.output.tags.omitted{reason=unrepresentable}
+        text: A timestamp value has no tag form and is left off, counted.
+      otlp_out:
+        class: normalized
+        reason: timestamp_as_int
+        text: OTLP has no timestamp value, so it's an integer of Unix nanoseconds.
   - kind: attributes
     feature: private_carrier
     cells:
@@ -432,6 +1023,18 @@ rows:
           text: >-
             A `_logit.statsd.*` carrier is written as its own segment or field and statsd_in
             stamps it back.
+      influxdb_out:
+        class: exact
+        text: >-
+          A `_logit.influxdb.*` carrier is consumed into the wire form (the measurement, the
+          write's org and bucket) and influxdb_in stamps it back.
+      prometheus_out:
+        class: normalized
+        reason: dialect
+        text: >-
+          A `_logit.prometheus.*` carrier is consumed into the wire form (the family type, the
+          sample's timestamp) and prometheus_in stamps it back; OpenMetrics has no `untyped`, so
+          that type reads back as `unknown`.
   - kind: attributes
     feature: foreign_carrier
     cells:
@@ -439,6 +1042,18 @@ rows:
         class: lost
         reason: uncounted
         text: Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted.
+      prometheus_out:
+        class: lost
+        reason: uncounted
+        text: Another protocol's `_logit.` carrier isn't a label and is left off, uncounted.
+      influxdb_out:
+        class: lost
+        reason: uncounted
+        text: Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted.
+      otlp_out:
+        class: lost
+        reason: uncounted
+        text: A `_logit.` carrier is private and isn't an OTLP attribute, uncounted.
   - kind: attributes
     feature: resource_attribute
     cells:
@@ -452,6 +1067,36 @@ rows:
           text: >-
             A resource attribute is written as a tag, the event's value winning on a shared key,
             and reads back as an event attribute.
+      prometheus_out:
+        class: normalized
+        reason: resource_merged
+        text: >-
+          A label, the event's value winning on a shared key, read back as an event attribute.
+      influxdb_out:
+        class: normalized
+        reason: resource_merged
+        text: A tag, the event's value winning on a shared key, read back as an event attribute.
+      otlp_out:
+        class: exact
+        text: A resource attribute.
+  - kind: attributes
+    feature: scope
+    cells:
+      statsd_out:
+        class: lost
+        reason: uncounted
+        text: statsd has no instrumentation scope; it isn't written or counted.
+      prometheus_out:
+        class: lost
+        reason: uncounted
+        text: Prometheus has no instrumentation scope; it isn't written or counted.
+      influxdb_out:
+        class: lost
+        reason: uncounted
+        text: Line protocol has no instrumentation scope; it isn't written or counted.
+      otlp_out:
+        class: exact
+        text: The `InstrumentationScope` of the batch.
 
   # --- logs ------------------------------------------------------------------------------------
   - kind: log
@@ -465,6 +1110,21 @@ rows:
         - class: exact
           text: >-
             A log carrying the `_logit.statsd.event.*` carriers is a DogStatsD `_e` line again.
+      prometheus_out:
+        class: skipped
+        reason: uncounted
+        text: A log has no Prometheus form and isn't written, uncounted.
+      influxdb_out:
+        class: skipped
+        reason: uncounted
+        text: A log has no line-protocol form and isn't written, uncounted.
+      otlp_out:
+        class: normalized
+        reason: observed_timestamp
+        text: >-
+          An OTLP log record. Its `_logit.statsd.event.*` carriers aren't attributes; otlp_out
+          stamps an observed time on a log that has none, and otlp_in stamps the
+          `_logit.otel.severity_*` carriers.
   - kind: log
     feature: plain
     cells:
@@ -472,6 +1132,20 @@ rows:
         class: skipped
         counter: logit.output.events.skipped
         text: Any other log on an event with no metrics has no statsd form and isn't written.
+      prometheus_out:
+        class: skipped
+        reason: uncounted
+        text: A log has no Prometheus form and isn't written, uncounted.
+      influxdb_out:
+        class: skipped
+        reason: uncounted
+        text: A log has no line-protocol form and isn't written, uncounted.
+      otlp_out:
+        class: normalized
+        reason: observed_timestamp
+        text: >-
+          An OTLP log record. otlp_out stamps an observed time on a log that has none, and
+          otlp_in stamps the `_logit.otel.severity_*` carriers.
   - kind: log
     feature: beside_metrics
     cells:
@@ -481,6 +1155,20 @@ rows:
         text: >-
           A log on an event that also carries metrics is left off while the metrics are written,
           uncounted.
+      prometheus_out:
+        class: lost
+        reason: uncounted
+        text: A log on an event that carries metrics is left off while the metrics are written, uncounted.
+      influxdb_out:
+        class: lost
+        reason: uncounted
+        text: A log on an event that carries metrics is left off while the metrics are written, uncounted.
+      otlp_out:
+        class: normalized
+        reason: observed_timestamp
+        text: >-
+          An OTLP log record in the logs request, beside the metrics in theirs, with an observed
+          time stamped when it has none.
 
   # --- spans -----------------------------------------------------------------------------------
   - kind: span
@@ -490,6 +1178,17 @@ rows:
         class: skipped
         counter: logit.output.events.skipped
         text: A span on an event with no metrics has no statsd form and isn't written.
+      otlp_out:
+        class: exact
+        text: An OTLP span.
+      prometheus_out:
+        class: skipped
+        reason: uncounted
+        text: A span has no Prometheus form and isn't written, uncounted.
+      influxdb_out:
+        class: skipped
+        reason: uncounted
+        text: A span has no line-protocol form and isn't written, uncounted.
   - kind: span
     feature: beside_metrics
     cells:
@@ -499,3 +1198,14 @@ rows:
         text: >-
           A span on an event that also carries metrics is left off while the metrics are written,
           uncounted.
+      prometheus_out:
+        class: lost
+        reason: uncounted
+        text: A span on an event that carries metrics is left off while the metrics are written, uncounted.
+      influxdb_out:
+        class: lost
+        reason: uncounted
+        text: A span on an event that carries metrics is left off while the metrics are written, uncounted.
+      otlp_out:
+        class: exact
+        text: An OTLP span in the traces request, beside the metrics in theirs.

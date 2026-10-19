@@ -1,0 +1,5 @@
+# TYPE disk_bytes gauge
+# UNIT disk_bytes bytes
+# HELP disk_bytes Disk usage.
+disk_bytes{dev="sda"} 1024
+# EOF

@@ -1,0 +1,2 @@
+wire: mixed.lp
+exercises: [measurement, tags, float_field, unsigned_field, boolean_field, string_field, multi_field, no_timestamp, duplicate_point, carriers]

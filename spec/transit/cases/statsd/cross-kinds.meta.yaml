@@ -1,0 +1,4 @@
+# Records no statsd wire produces but a cross-protocol sink treats on its own terms: a sketch
+# and a set estimate (what `aggregate` makes), a running counter and a negative gauge with
+# exemplars, a non-finite gauge, and a gauge with another protocol's carrier and an array value.
+exercises: []

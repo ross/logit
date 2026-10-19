@@ -1,0 +1,1 @@
+cpu,host=web-01 usage_user=12.5 1799999990000000000

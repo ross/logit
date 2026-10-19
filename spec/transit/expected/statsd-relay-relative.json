@@ -12,6 +12,27 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cache.lookups","kind":"sum","value":10.0,"temporality":"delta","monotonic":true}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.calls","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/home"}}
   ], "counters": {}},
+  "cross-kinds": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"balance","kind":"gauge","value":0.0}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"balance","kind":"gauge_delta","delta":-3.5}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"jobs.done","kind":"gauge","value":12.0}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.max","kind":"gauge","value":15.0}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.min","kind":"gauge","value":12.0}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.q0_5","kind":"gauge","value":12.0}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.q0_75","kind":"gauge","value":15.0}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.q0_9","kind":"gauge","value":15.0}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.q0_95","kind":"gauge","value":15.0}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.q0_99","kind":"gauge","value":15.0}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.sum","kind":"sum","value":27.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"shards":["a","b"]}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"users.count","kind":"gauge","value":2.0}]}
+  ], "counters": {
+    "logit.output.messages.dropped{component=out,kind=statsd_out,reason=unencodable_value,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=distribution,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=set,role=sink}": 1
+  }},
   "event": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"abc"},"attributes":{"_logit.statsd.event.title":"Plain"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline"},"attributes":{"_logit.statsd.event.aggregation_key":"deploy","_logit.statsd.event.alert_type":"warning","_logit.statsd.event.host":"web-07","_logit.statsd.event.priority":"low","_logit.statsd.event.source_type":"ci","_logit.statsd.event.title":"Hello","env":"prod"}}
@@ -168,6 +189,11 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.query","kind":"samples","values":[3.2],"sample_rate":0.5}],"attributes":{"_logit.statsd.type":"ms"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.time","kind":"samples","values":[40.0],"sample_rate":0.25}],"attributes":{"_logit.statsd.type":"h","route":"/home"}}
   ], "counters": {}},
+  "typed-attributes": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"count":"7","room":"lab"}}
+  ], "counters": {
+    "logit.output.tags.omitted{component=out,kind=statsd_out,reason=unrepresentable,role=sink}": 3
+  }},
   "typed-scalars": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"bytes.sent","kind":"sum","value":9007199254740992.0,"temporality":"delta","monotonic":true}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"disk.bytes","kind":"gauge","value":1.8446744073709552e19}]},

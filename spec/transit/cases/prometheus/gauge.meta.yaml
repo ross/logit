@@ -1,0 +1,2 @@
+wire: gauge.prom
+exercises: [gauge, target]

@@ -1,0 +1,4 @@
+# TYPE reading gauge
+reading{k="nan"} NaN
+reading{k="pinf"} +Inf
+reading{k="ninf"} -Inf

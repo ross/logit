@@ -1,0 +1,2 @@
+wire: label-escaping.prom
+exercises: [gauge, label_escaping, target]

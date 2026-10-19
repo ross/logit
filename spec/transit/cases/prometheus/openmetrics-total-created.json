@@ -1,0 +1,1 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"jobs_total","kind":"sum","value":42.0,"temporality":"cumulative","monotonic":true,"description":"Jobs run.","start_timestamp":"2027-01-15T07:43:20.000000000Z"}],"resource":{"attributes":{"_logit.prometheus.target":"http://transit:9100/metrics","instance":"transit:9100"}}}

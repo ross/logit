@@ -1,0 +1,2 @@
+wire: openmetrics-total-created.prom
+exercises: [counter, help, total_suffix, created, openmetrics, target]

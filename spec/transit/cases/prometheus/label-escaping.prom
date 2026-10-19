@@ -1,0 +1,2 @@
+# TYPE escaped gauge
+escaped{path="C:\\dir",quote="say \"hi\"",nl="a\nb"} 1

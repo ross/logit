@@ -1,0 +1,44 @@
+# The InfluxDB line-protocol wire features a case under cases/influxdb/ can exercise, from
+# crates/logit-proto/src/influxdb/mod.rs's "Grammar" and "Decode: wire → model" tables. A case
+# names the ones it exercises in its `.meta.yaml`.
+- name: measurement
+  text: The measurement, stamped as the `_logit.influxdb.measurement` carrier.
+- name: tags
+  text: A `,tag=value` set, each tag an event attribute holding a string.
+- name: float_field
+  text: A float field, decoded to a gauge named `<measurement>.<field>` holding an `f64`.
+- name: integer_field
+  text: An `<n>i` integer field, decoded to a gauge holding an `i64`.
+- name: unsigned_field
+  text: An `<n>u` unsigned field, decoded to a gauge holding a `u64`.
+- name: boolean_field
+  text: A `true` or `false` field in any of its spellings, decoded to a gauge holding a boolean.
+- name: string_field
+  text: A quoted string field, stamped as the public event attribute `influxdb.field.<key>`.
+- name: multi_field
+  text: Several fields on one line, one gauge record each on the one event, in wire order.
+- name: escaped_names
+  text: >-
+    A measurement, tag key, tag value, and field key holding an escaped space, comma, or `=`,
+    read as the literal character.
+- name: precision
+  text: >-
+    A `precision` of `s`, `ms`, or `us` in the write's query string, scaling the timestamp to
+    nanoseconds.
+- name: no_timestamp
+  text: >-
+    A point with no timestamp, stamped with the request's arrival truncated to the precision.
+- name: duplicate_point
+  text: >-
+    A later point with the same measurement, tag set, and timestamp, merged into the earlier
+    event.
+- name: carriers
+  text: >-
+    The write's `org` and `bucket`, stamped as the `_logit.influxdb.org` and
+    `_logit.influxdb.bucket` resource carriers.
+- name: org_id
+  text: The write's `orgID`, stamped as the `_logit.influxdb.org_id` resource carrier.
+- name: reserved_tag_key
+  text: >-
+    A tag key under `_logit.` or `influxdb.field.`, omitted at decode and counted
+    `logit.input.tags.omitted{reason="reserved_prefix"}`.
