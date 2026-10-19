@@ -8,55 +8,42 @@
 
 mod support;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use logit_pipeline::test_util::wait_until_within;
 use support::{
-    ephemeral_addr, logit_ready, send_signal, wait_for_exit, wait_until_ready, KillOnDrop, Lines,
-    TempConfig, PROCESS_DEADLINE,
+    logit_ready, send_signal, wait_for_exit, wait_until_ready, KillOnDrop, Lines, TempConfig,
+    ADMIN, ANY_PORT, PROCESS_DEADLINE,
 };
 
-/// A free loopback UDP port for `statsd_in`, bound and released like
-/// [`support::ephemeral_addr`]'s TCP one.
-fn ephemeral_udp_addr() -> String {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.local_addr().unwrap().to_string()
-}
-
 /// `admin:`, `shutdown.delay`, and `statsd_in` into a `stdio_out` writing JSON lines to stdout.
-fn config(name: &str, admin_addr: &str, statsd_addr: &str, delay: &str) -> TempConfig {
+fn config(name: &str, delay: &str) -> TempConfig {
     TempConfig::write(
         name,
         format!(
-            "admin:\n  bind: \"{admin_addr}\"\nshutdown:\n  delay: {delay}\ncomponents:\n  in:\n    \
-             type: statsd_in\n    bind: \"{statsd_addr}\"\n  out:\n    type: stdio_out\n    \
+            "admin:\n  bind: \"{ANY_PORT}\"\nshutdown:\n  delay: {delay}\ncomponents:\n  in:\n    \
+             type: statsd_in\n    bind: \"{ANY_PORT}\"\n  out:\n    type: stdio_out\n    \
              sources: [in]\n    format: json\n"
         ),
     )
 }
 
-/// Spawns `logit run` with stdout and stderr piped, returning the child and both line readers.
-fn spawn_run(config: &TempConfig) -> (KillOnDrop, Lines, Lines) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_logit"))
-        .args(["--log-format", "json", "run"])
-        .arg(&config.0)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawning logit run");
-    let stdout = Lines::spawn(child.stdout.take().expect("piped stdout"));
-    let stderr = Lines::spawn(child.stderr.take().expect("piped stderr"));
-    (KillOnDrop(child), stdout, stderr)
+/// Spawns `logit run` with stdout and stderr piped, returning the child, both line readers, and
+/// the admin and `statsd_in` addresses it bound.
+fn spawn_run(config: &TempConfig) -> (KillOnDrop, Lines, Lines, String, String) {
+    let (mut child, stderr) = support::spawn_run(config, Stdio::piped());
+    let stdout = Lines::spawn(child.0.stdout.take().expect("piped stdout"));
+    let mut addrs = stderr.wait_for_bound(&[ADMIN, "in"]).into_iter();
+    let (admin_addr, statsd_addr) = (addrs.next().unwrap(), addrs.next().unwrap());
+    (child, stdout, stderr, admin_addr, statsd_addr)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_datagram_sent_after_sigterm_is_delivered_during_the_delay_and_a_second_sigterm_exits_130(
 ) {
-    let admin_addr = ephemeral_addr().await;
-    let statsd_addr = ephemeral_udp_addr();
     // Long enough that the test never reaches its end: the second SIGTERM ends the run.
-    let config = config("shutdown-delay-serves", &admin_addr, &statsd_addr, "60s");
-    let (mut child, stdout, stderr) = spawn_run(&config);
+    let config = config("shutdown-delay-serves", "60s");
+    let (mut child, stdout, stderr, admin_addr, statsd_addr) = spawn_run(&config);
     wait_until_ready(&admin_addr).await;
     let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
 
@@ -81,11 +68,9 @@ async fn a_datagram_sent_after_sigterm_is_delivered_during_the_delay_and_a_secon
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_drain_starts_once_the_shutdown_delay_elapses_and_exits_0() {
-    let admin_addr = ephemeral_addr().await;
-    let statsd_addr = ephemeral_udp_addr();
     // The 1 s is the delay under test, not a wait: the test reads the lines it produces.
-    let config = config("shutdown-delay-drains", &admin_addr, &statsd_addr, "1s");
-    let (mut child, _stdout, stderr) = spawn_run(&config);
+    let config = config("shutdown-delay-drains", "1s");
+    let (mut child, _stdout, stderr, admin_addr, _) = spawn_run(&config);
     wait_until_ready(&admin_addr).await;
 
     let signalled_at = std::time::Instant::now();

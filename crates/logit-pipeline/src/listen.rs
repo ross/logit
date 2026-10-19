@@ -46,6 +46,12 @@ fn bind_tcp_first(addrs: &[SocketAddr], opts: BindOptions) -> io::Result<tokio::
     }))
 }
 
+/// The address a listener's `bound` log line names: the socket's own, so a `:0` bind reports the
+/// port the kernel assigned, else `configured` when the socket can't say.
+pub fn bound_display(local: io::Result<SocketAddr>, configured: &str) -> String {
+    local.map_or_else(|_| configured.to_string(), |addr| addr.to_string())
+}
+
 /// Creates, configures, binds, and listens on one TCP socket at `addr`.
 fn bind_tcp_one(addr: SocketAddr, opts: BindOptions) -> io::Result<tokio::net::TcpListener> {
     let socket = if addr.is_ipv4() {
