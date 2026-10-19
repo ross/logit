@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch
@@ -25,8 +25,7 @@ new crate dependency**: the pickle writer and restricted reader are hand-rolled,
 `script/audit` stay unchanged, and `crates/logit-core/tests/type_sizes.rs` is untouched by this
 pair.
 
-Decisions settled with Ross (2026-09-13), recorded in full in
-[`docs/plans/graphite-carbon-relay.md`](../plans/graphite-carbon-relay.md): both directions ship as
+Decisions settled with Ross (2026-09-13), recorded below: both directions ship as
 one lossless pair; both wire protocols (plaintext and the pickle batch protocol) are supported, the
 pickle reader accepting only a bounded opcode subset; multi-value metric kinds are a `graphite_out`
 switch (`skip`/`expand`), not a fixed behavior; tags default on (`carbon`) with a `drop` escape
@@ -137,8 +136,8 @@ quantiles are `crate::otlp::metrics::DISTRIBUTION_QUANTILES`
 `logit-proto/src/graphite/` exactly as `prometheus/mod.rs`'s own `use` of it already reaches it).
 `DdSketch::sum()` (`metric.rs`) is exact, so `.sum` is emitted for sketches under `expand` —
 Prometheus's own "a sketch has no sum" doc claim (the module doc's "Encode: events → families"
-table's `Distribution(sketch)` row in `prometheus/mod.rs`) is stale and is left alone
-here; noted as a follow-up in this plan's W4b closeout, not fixed by this effort. influxdb's
+table's `Distribution(sketch)` row in `prometheus/mod.rs`) was stale and was corrected
+separately ([ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)). influxdb's
 `[0.5,0.9,0.99]` quantile set is left alone; Graphite's own `expand` uses the same
 `DISTRIBUTION_QUANTILES` set Prometheus uses, not influxdb's.
 
@@ -355,18 +354,14 @@ hand after the fact; this pair starts with one list, not two):
 
 - `graphite_in`/`graphite_out` become the **sixth** like-protocol pair under
   [ADR `lossless-transit`](lossless-transit.md), alongside `statsd`, `otlp`, `syslog`, `prometheus`,
-  and `collectd` — see [`docs/plans/graphite-carbon-relay.md`](../plans/graphite-carbon-relay.md)'s
-  Workstreams table for the files each workstream (codec, `graphite_in`, `graphite_out`, recorded
-  interop, round-trip closeout) touches.
+  and `collectd`.
 - Known-gaps rows this commits to, added alongside the codec's own workstream: `unit`/`description`/
   `start_timestamp`/exemplars/`scope`/`schema_url` dropped on encode with no wire form to carry
   them; Whisper's 255-byte filesystem path-component limit is not enforced (no path truncation is
   done — Carbon's own wire format has no length bound); resource attributes becoming tags is a
   cross-protocol behavior, not a normalization this pair's fixed point relies on (a bare `graphite_in`
-  resource is always empty); Prometheus's stale "a sketch has no sum" doc claim (the module doc's
-  "Encode: events → families" table's `Distribution(sketch)` row in `prometheus/mod.rs`), left
-  uncorrected by this effort and noted as a follow-up in this plan's
-  W4b closeout; no shared `logit_inputs::tcp` driver yet, with the extraction trigger named above.
+  resource is always empty); no shared `logit_inputs::tcp` driver yet, with the extraction trigger
+  named above.
 - **The reader's conformance evidence is a differential corpus**:
   `testdata/differential/graphite-pickle/` holds payloads CPython 3.12 and Python 2.7 wrote, each
   with CPython's reading, carbon's receiver's reading, and the verdict the reader must give, and

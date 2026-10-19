@@ -41,12 +41,33 @@ Entry format and the other areas: [the known-gaps index](README.md).
     loses its traces.
   - **Revisit trigger:** a tracer that sends v1.0 whatever `/info` says. dd-trace-py 4.15 reads
     `/info` and sends v0.5.
-- **`datadog_trace_in` does none of the Agent's processing.** Spans relay as the tracer wrote them:
-  no obfuscation, normalization, `_top_level` marking, sampling, or stats computation
-  ([plan §14](../plans/datadog-relay.md#14-not-in-this-stack-an-agent-equivalent-trace-processor)).
-  - **Consequence:** its output must reach Datadog through a real Agent (`datadog_trace_out`) or go
-    to an OTLP backend. Fed straight to `datadog_out`, its spans are skipped as not yet processed.
-  - **Revisit trigger:** the Agent-equivalent trace processor the plan defers.
+- **`datadog_trace_in` does none of the Agent's processing, and no Agent-equivalent trace
+  processor exists.** Spans relay as the tracer wrote them. Between tracer and intake, the Agent
+  (`pkg/trace/agent/agent.go`, `Process`) does what Datadog's trace intake expects to have been
+  done:
+  - normalization: `service`/`name` at most 100 chars with `unnamed-service`/`unnamed_operation`
+    fallbacks, an empty `resource` set to `name`, `env` normalized, an invalid `http.status_code`
+    removed;
+  - obfuscation by `span.type` (SQL, Redis, memcached, HTTP URLs, MongoDB, Elasticsearch), unless
+    the tracer sent `Datadog-Obfuscation-Version`;
+  - truncation: `resource` at most 5,000 chars, meta values at most 25,000;
+  - `_top_level` marking of root, orphan, and service-boundary spans, or the tracer's
+    `_dd.top_level` when `Datadog-Client-Computed-Top-Level` is set;
+  - sampler tags (`_dd.agent_psr`, `_dd.rule_psr`, chunk `_dd.p.dm`, `_dd1.sr.rcusr`), and the
+    chunk's `priority` and `origin` lifted from the root span's `_sampling_priority_v1` and
+    `_dd.origin`;
+  - a stats concentrator: 10 s buckets keyed by service, name, resource, type, kind, and status,
+    DDSketch durations, and `1/_sample_rate` weights, computed from every span before sampling.
+
+  A transform of its own (`datadog_apm`, say) between `datadog_trace_in` and `datadog_out` could
+  do this, with obfuscation as an operator choice. Its output would be ready to send because it
+  writes the same `_top_level` mark `datadog_out` keys on
+  ([ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md), decision 2).
+  - **Consequence:** `datadog_trace_in`'s output must reach Datadog through a real Agent
+    (`datadog_trace_out`) or go to an OTLP backend. Fed straight to `datadog_out`, its spans are
+    skipped as not yet processed. OTel-origin spans reach Datadog through `otlp_out`.
+  - **Revisit trigger:** a deployment that needs tracer spans in Datadog with no Agent in the
+    path.
 - **A libdatadog tracer sends `datadog_trace_in` no client stats.** dd-trace-py 4.x computes them
   only when `/info` says `client_drop_p0s: true`, and `datadog_trace_in` says `false` so the
   tracer drops no span before the relay sees it (`testdata/interop/datadog/README.md`).
@@ -90,8 +111,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     needs the replay to be duplicate-free.
 - **`datadog_out` drops metric points older than 1 hour, which Datadog would store.** The sink
   uses the documented series window, which is stricter than the intake;
-  [the plan's "Timestamp windows" section](../plans/datadog-relay.md#11-timestamp-windows-w5) has
-  what a trial org stored.
+  [ADR `datadog-agent-and-intake-relay`'s "Timestamp windows and what a `202` drops"](../adr/datadog-agent-and-intake-relay.md#timestamp-windows-and-what-a-202-drops)
+  has what a trial org stored.
   - **Consequence:** a `buffer.disk:` replay after an outage longer than 1 hour drops metrics
     the intake might still have stored, counted `records.dropped{reason="stale"}`. To discard or archive old
     events upstream of the sink, use `drop_stale` or `has_stale`
@@ -101,7 +122,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   sketch whose `tags` list holds more than 100 strings is dropped before sending, counted
   `records.dropped{reason="too_many_tags"}`, because the intake drops it and only the series
   route says so (measured on a trial org on 2026-10-08;
-  [the plan's "Timestamp windows" section](../plans/datadog-relay.md#11-timestamp-windows-w5)).
+  [ADR `datadog-agent-and-intake-relay`'s "Timestamp windows and what a `202` drops"](../adr/datadog-agent-and-intake-relay.md#timestamp-windows-and-what-a-202-drops)).
   - **Consequence:** if Datadog raises the limit, or an org has a higher one, the sink still drops
     what Datadog would store.
   - **Workaround:** keep metrics under 100 tags with `keep` or `remove` upstream.
@@ -129,8 +150,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `type` empty, and the Agent computes no stats for it.
   - **Consequence:** OTel-origin spans through this sink show up in Datadog poorly named.
   - **Workaround:** send OTel spans with `otlp_out`, to the Agent's OTLP receiver or to Datadog.
-  - **Revisit trigger:** the Agent-equivalent trace processor the plan defers
-    ([plan §14](../plans/datadog-relay.md#14-not-in-this-stack-an-agent-equivalent-trace-processor)).
+  - **Revisit trigger:** the Agent-equivalent trace processor (the `datadog_trace_in` entry
+    above).
 - **`datadog_trace_out` sends every numeric span attribute as a Datadog `metrics` entry.** The
   span encoder puts each `F64`, `I64`, and `U64` attribute in the span's `metrics` map, each
   `Bytes` attribute in `meta_struct`, and strings, bools (as `"true"` or `"false"`), and every
@@ -159,7 +180,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     when the same metrics arrive through `aggregate` and `datadog_out`; query the distribution
     instead. An OTLP explicit-bucket histogram reaches Datadog only through `otlp_out`.
   - **Revisit trigger:** an operator who needs the Agent's five series, or a `Histogram` as
-    Datadog's `.bucket` counters ([plan §2](../plans/datadog-relay.md#2-kinds-and-config-w3w6)).
+    Datadog's `.bucket` counters.
 - **Whether an Agent's TCP `logs` listener parses a JSON body from `syslog_out` is untested.** An
   Agent's TCP `logs` listener takes `syslog_out`'s syslog-formatted lines, but no run has checked
   that it parses a JSON body into attributes.
@@ -170,7 +191,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   tests, but no real sender or Datadog org has checked it:
   - Whether the intake accepts an APM stats sketch whose gamma isn't 1.0202. A relayed stats
     sketch keeps its own gamma, and dd-trace-py 4.15 computes on 1.015625; nothing in `logit`
-    sends one to Datadog yet ([plan §4](../plans/datadog-relay.md#4-sketch-compatibility-w1-settled)).
+    sends one to Datadog yet ([ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)'s
+    "Consequences").
   - Service checks sent by `datadog_out`, which got `202` but which Datadog has no API to query.
   - What the check and logs routes drop from a request they answer `202`. A check and a log with
     101 tags each drew `202` (`{"status":"ok"}` and `{}`) on 2026-10-08, and `datadog_out` reads
@@ -181,7 +203,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** a failure here shows up in a deployment first, as `datadog_out` request
     errors or a listener's `rejected` counters.
   - **Revisit trigger:** re-record with `script/record-fixtures datadog` against another tracer,
-    or repeat the plan's trial-org run (W7b) for the item in question.
+    or repeat the trial-org run for the item in question.
 - **The hand-rolled `DdSketch` store costs about 4% CPU on a sketch-heavy stage.** `aggregate`
   sketches every series, and `kv_metrics` sketches a `Samples` metric at the sink on
   `json-parse`'s path, so both pay for it. Measured before and after the store landed, `aggregate`

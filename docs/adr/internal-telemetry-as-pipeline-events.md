@@ -1,6 +1,6 @@
 ---
 created: 2026-08-31
-updated: 2026-09-12
+updated: 2026-10-18
 ---
 
 # Internal telemetry as ordinary pipeline events, drained from a component-level buffer
@@ -157,7 +157,7 @@ visible instead of quietly leaking.
 
 *2026-09-12*
 
-[`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W1/W3 gave `MetricKind` a real
+[ADR `metrics-model-v2`](metrics-model-v2.md) gave `MetricKind` a real
 raw-sample representation, `MetricKind::Samples` — the "`logit`'s `MetricKind` has no raw-sample
 representation at all" claim in this ADR's Decision section above is no longer true as a statement
 about the model. The decision this ADR made stands anyway: `internal`'s buffer still sketches every

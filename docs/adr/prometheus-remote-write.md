@@ -1,25 +1,20 @@
 ---
 created: 2026-09-17
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
 
 ## Status
 
-Accepted — and built. Every workstream in
-[`docs/plans/prometheus-remote-write.md`](../plans/prometheus-remote-write.md) has landed on its
-stacked branch: **W0 #234, W1 #235, W2 #236, W3 #238, W4 #237, W5 #243, W6 #246**. Per Ross's
-direction the stack is not merged to `main` by this workstream, so "landed" means complete and
-pushed; that plan's own status paragraph is the authority. W5 landing is what makes the
+Accepted — and built (W0 #234 through W6 #246). W5 landing is what makes the
 "stateless receiver" section below a record of the sequencing decision rather than of today's
 behaviour — the bounded metadata cache exists, and `prometheus_in`'s module doc is its spec.
 
 ## Context
 
 [ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md) shipped the
-`prometheus_in`/`prometheus_out` pair on 2026-09-12 (`docs/plans/prometheus-scrape-and-exposition.md`
-W0–W5) with exactly one transport each: `prometheus_in` scrapes `/metrics` from configured targets
+`prometheus_in`/`prometheus_out` pair on 2026-09-12 with one transport each: `prometheus_in` scrapes `/metrics` from configured targets
 on an interval, `prometheus_out` serves `/metrics` on a bound address. Its "Remote-write forward
 compatibility" section deliberately left the seam for this ADR rather than designing it in passing,
 and fixed three things that this one now inherits instead of re-deciding: the semantic mapping
@@ -68,8 +63,7 @@ wrote. The two share a transport — `POST`, protobuf body, Snappy **block** com
 | Start timestamp | none | `Sample.start_timestamp` (field 3) / `Histogram.start_timestamp`, ms, `0` = unset |
 | Response on 2xx/4xx | body ignored | `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` |
 
-Decisions settled with Ross (2026-09-17) and recorded in full in
-[`docs/plans/prometheus-remote-write.md`](../plans/prometheus-remote-write.md): an explicit sender
+Decisions settled with Ross (2026-09-17): an explicit sender
 `version`, no auto-negotiation; a stateless receiver first with the metadata cache as its own later
 workstream; server TLS on the receiver now, with `prometheus_in`'s TLS keys prefixed by the mode
 they serve; native histograms deferred.

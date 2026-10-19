@@ -3,7 +3,7 @@
 # (logit_in, listening). The same graph as native-relay with `window: 1` on `relay_out`: each
 # batch waits for `relay_in`'s Ack before the next is sent. It is the one-frame-in-flight
 # comparison point for native-relay, which runs the default window
-# (docs/adr/native-hop-send-window.md). Scenario table: docs/plans/load-test-harness.md,
+# (docs/adr/native-hop-send-window.md). Scenario table: docs/design/performance.md,
 # "Scenarios".
 #
 #   script/perf run --scenario native-relay-window1

@@ -84,7 +84,7 @@ socket2 = { version = "0.6.5", features = ["all"] }
 base64 = "0.22.1"
 clap = { version = "4", features = ["derive", "env"] }
 serde_norway = "0.9"
-# `logit-core::metric::HyperLogLog` (docs/plans/lossless-transit.md's W2) -- a real, mergeable
+# `logit-core::metric::HyperLogLog` -- a real, mergeable
 # cardinality estimator for `MetricKind::Set`, replacing the stub. Apache-2.0, in `deny.toml`'s
 # allowlist. Its `CardinalityEstimator` has no `as_bytes`/`to_bytes` of its own -- only a
 # tuple-shaped `serde::Serialize`/`Deserialize` impl behind the `with_serde` feature -- so
@@ -93,7 +93,7 @@ serde_norway = "0.9"
 # data-format crate like `postcard`/`serde_json`) just to get bytes out.
 cardinality-estimator = { version = "1.0.3", features = ["with_serde"] }
 # Snappy **block** compression (not framed), two uses: Prometheus remote-write mandates it for the
-# request body (docs/plans/prometheus-remote-write.md), and `kafka_out` writes a record batch's
+# request body (docs/adr/prometheus-remote-write.md), and `kafka_out` writes a record batch's
 # snappy payload as one raw block, as librdkafka does (docs/adr/kafka-output.md, item 2).
 # BSD-3-Clause, allowed in `deny.toml`.
 snap = "1"
@@ -180,8 +180,7 @@ regex = "1"
 # tail_in/docker_in's newline search (`LineSplitter::push`). Already in the lock via `serde_json`
 # and `regex`, so a direct dependency adds no new crate version to the graph.
 memchr = "2"
-# Leveled structured self-logging (docs/plans/operator-surface.md, ADR
-# `tracing-for-self-logging.md`), replacing `logit-core::diag::Diagnostics`'s bare `eprintln!`.
+# Leveled structured self-logging (ADR `tracing-for-self-logging.md`), replacing `logit-core::diag::Diagnostics`'s bare `eprintln!`.
 # Already present transitively (via `hyper`/`tokio`'s own instrumentation) at this exact version --
 # promoting it to a direct dependency adds no new crate version to the graph.
 tracing = "0.1"
@@ -199,8 +198,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"]
 # run. MIT OR Apache-2.0; adds `crc` and `crc-catalog`, same licenses.
 kafka-protocol = { version = "=0.18.0", default-features = false, features = ["client", "broker"] }
 # Property tests, dev-only everywhere it's used: `logit-proto`'s OTLP suite
-# (`crates/logit-proto/tests/otlp_fixed_point.rs`, `docs/plans/lossless-transit.md`'s W4) and
-# `crates/logit-outputs/src/syslog.rs`'s RFC 5424 STRUCTURED-DATA grammar suite (W5), both
+# (`crates/logit-proto/tests/otlp_fixed_point.rs`) and
+# `crates/logit-outputs/src/syslog.rs`'s RFC 5424 STRUCTURED-DATA grammar suite, both
 # asserting `decode(encode(decode(x))) == decode(x)`, and `logit-pipeline`'s disk spool recovery
 # suite (`crates/logit-pipeline/src/disk_queue_verification.rs`), which mutates real segments.
 # MIT OR Apache-2.0, covered by deny.toml's allowlist (`script/audit` confirms, not assumes).

@@ -76,3 +76,12 @@ the decoder differs from `influxd`.
   `influxdb_in` bounds the body with `max_request_bytes`, a `logit` choice.
   - **Consequence:** a body larger than the limit that `influxd` would take is refused.
   - **Workaround:** raise `max_request_bytes`, or split the batch at the producer.
+- **The pair hasn't been compared end to end against a real InfluxDB.** The evidence is a
+  recorded Telegraf corpus, the fixed-point suite, and a probe of `influxd` 2.9.1. No run has
+  sent one Telegraf through two `outputs.influxdb_v2`, one writing direct to a bucket `direct` and
+  one through `logit run fixtures/influxdb-relay.yaml` to a bucket `relayed`, and checked that a
+  Flux `from(bucket:)` over both returns identical tables, field types included.
+  - **Consequence:** a difference that only a real Telegraf and `influxd` together expose, such
+    as a field type the corpus doesn't hold, would go unnoticed.
+  - **Revisit trigger:** a change to the codec's typed fields or escaping, or a user report of a
+    relayed table that differs from a direct one.

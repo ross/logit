@@ -1,6 +1,6 @@
 """The Celery app. `pages/tasks.py`'s task runs here, inside the `worker` service
-(`demo/compose.yaml`), a separate process from every gunicorn worker
-(`docs/plans/demo-richer-traces.md`). Started as `celery -A demoproj.celery worker`.
+(`demo/compose.yaml`), a separate process from every gunicorn worker.
+Started as `celery -A demoproj.celery worker`.
 
 `django.setup()` runs at import time, in the master process before Celery forks its worker pool.
 Unlike telemetry setup below, that's safe: it only populates Django's app registry

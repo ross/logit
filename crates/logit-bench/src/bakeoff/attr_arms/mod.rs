@@ -1,8 +1,8 @@
 //! The attribute-sizing bake-off's **bench-only arms**: the evidence behind the key-set, thin
 //! `Value::Map`, and clone-path entry in ADR `event-sizing-and-allocation-strategy`'s
-//! "Alternatives considered". Arm letters are `docs/plans/event-sizing.md`'s "Bake-off arms",
-//! except arm C: added during the bake-off, once the clone, not the build, proved to be what a
-//! fan-out pays.
+//! "Alternatives considered". Arm letters are that ADR's "Bake-off arms and instruments", which
+//! also explains arm C: added during the bake-off, once the clone, not the build, proved to be
+//! what a fan-out pays.
 //!
 //! No arm changes a production type. Each is a local mirror measured against the shipped
 //! `logit_core::AttrMap`, the pattern [`bakeoff::wire_mirror`](super::wire_mirror) set for the

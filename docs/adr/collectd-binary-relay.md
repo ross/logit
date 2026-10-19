@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder
@@ -22,8 +22,7 @@ carries an N-data-source value list in wire order on one `Event`, and `FLAG_NO_R
 already gives a NaN gauge somewhere to live. So `crates/logit-core/tests/type_sizes.rs` is untouched
 by this pair, and no new crate dependency is needed.
 
-Decisions settled with Ross (2026-09-11/12), recorded in full in
-[`docs/plans/collectd-binary-relay.md`](../plans/collectd-binary-relay.md): notifications
+Decisions settled with Ross (2026-09-11/12): notifications
 (`Message`/`Severity`) are in scope but land as a trailing workstream (W5); `types.db` DS naming is
 operator-opt-in via a `types_db:` config field, never embedded (collectd's own file is GPL); the
 shared UDP listener grows multicast support as part of `collectd_in`, with no new config field, and
@@ -489,8 +488,7 @@ unchanged.
 
 - `collectd_in`/`collectd_out` become the fifth like-protocol pair under
   [ADR `lossless-transit`](lossless-transit.md), alongside `statsd`, `otlp`, `syslog`, and
-  `prometheus` — see [`docs/plans/collectd-binary-relay.md`](../plans/collectd-binary-relay.md) for
-  the workstreams that build it.
+  `prometheus`.
 - Known-gaps rows, added by W1 (`docs/known-gaps/mappings.md`): non-integral or
   out-of-range `Sum` values dropped rather than rounded on encode;
   `Samples`/`Distribution`/`SetMembers`/`Set`/ `Histogram`/`ExponentialHistogram`/`Summary`

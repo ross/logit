@@ -99,7 +99,7 @@ fn typed() -> EventBatch {
 }
 
 /// Every escapable character in a measurement, tag key, tag value, and field key, and a literal
-/// backslash before a letter, which no escape touches (probe row 1).
+/// backslash before a letter, which no escape touches (item 1 of the ADR's "Verified `influxd` behavior").
 fn escaped() -> EventBatch {
     seed(concat!(
         r"disk\ io\,x=y,tag\ key\,a\=b=v\ 1\,2\=3,path=C:\temp,z=first\x ",

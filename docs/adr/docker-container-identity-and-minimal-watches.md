@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-09-17
+updated: 2026-10-18
 ---
 
 # `docker_in`: live container identity, and a minimal `inotify` watch set
@@ -179,4 +179,3 @@ container matches.
   diagnostics (`Diagnostics::info`, not `warn_throttled` — a rename is normal operation).
 - No config surface changes. `poll_interval` is the refresh cadence for everything this record
   moves off `inotify`; `schema/logit.schema.json` is untouched.
-- `docs/plans/docker-container-identity.md` tracks the workstreams landing this.

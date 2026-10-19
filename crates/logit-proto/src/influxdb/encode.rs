@@ -703,7 +703,7 @@ fn render_sketch_fields(out: &mut String, sketch: &DdSketch) {
 ///   collision-free (0.991 and 0.994 both round to "p99" and would overwrite each other).
 /// - `Set`: its `HyperLogLog` estimate as an unsigned `value`.
 /// - `SetMembers` (raw members, no scalar to render) and `ExponentialHistogram` (no line-protocol
-///   shape; `docs/plans/lossless-transit.md`) are skipped, and an unresolved `GaugeDelta` is
+///   shape) are skipped, and an unresolved `GaugeDelta` is
 ///   dropped.
 ///
 /// **Field names are written unescaped.** Each is a literal (`value`, `count`, `sum`) or built from
@@ -1211,10 +1211,11 @@ mod tests {
 
     /// A backslash is written as itself in a measurement, tag key, tag value, and field key.
     /// `influxd` 2.9.1 keeps `\\` there as two backslashes, so doubling one on egress doubles it
-    /// at every hop. Provenance, `docs/plans/influxdb-relay.md`'s "Settled by probe":
-    /// `p01c\\x f=1i` stored measurement `p01c\\x` (row 1.3); `p02d,t\\k=v\\x f=1i` stored tag
-    /// `t\\k`=`v\\x` (row 2.4); `f\\k=4i` stored field key `f\\k` (row 2.7); `p21_d,a=v\\=x`
-    /// stored `v\=x` (row 2.13).
+    /// at every hop. Provenance, ADR `influxdb-line-protocol-relay`'s "Verified `influxd`
+    /// behavior":
+    /// `p01c\\x f=1i` stored measurement `p01c\\x` (item 1); `p02d,t\\k=v\\x f=1i` stored tag
+    /// `t\\k`=`v\\x` (item 1); `f\\k=4i` stored field key `f\\k` (item 1); `p21_d,a=v\\=x`
+    /// stored `v\=x` (the "Escaping" section).
     #[test]
     fn a_backslash_is_written_as_itself_outside_a_string_value() {
         let out = encode(vec![metric_event(
@@ -1230,7 +1231,7 @@ mod tests {
     }
 
     /// `=` needs no escape in a measurement, and `\=` there stores a series no query reads
-    /// (probe rows 1.4 `p01d=e f=1i` readable and 1.5 `p01e\=f f=1i` unreadable).
+    /// (item 2: `p01d=e f=1i` readable and `p01e\=f f=1i` unreadable).
     #[test]
     fn an_equals_sign_in_a_measurement_is_written_unescaped() {
         let out = encode(vec![metric_event("p01d=e", MetricKind::counter(1.0), &[])]);
@@ -1239,10 +1240,10 @@ mod tests {
         assert_eq!(out, "p01b\\ c\\,d value=1 1700000000000000000\n");
     }
 
-    /// A key ending in `\` has no spelling: the backslash would escape the delimiter. Probe rows
-    /// 2.6 `p02f,tk=v\ f=1i` (400 `invalid tag format`), 1.6/1.7 (a measurement ending in `\`,
-    /// 400 `missing fields`), and 2.8 `f\\=1i` (400 `invalid value`). A measurement with `\`
-    /// before `,`, space, or `=` is stored unreadable (rows 1.5, 1.8). A tag key or value with `\`
+    /// A key ending in `\` has no spelling: the backslash would escape the delimiter. Item 3:
+    /// `p02f,tk=v\ f=1i` (400 `invalid tag format`), a measurement ending in `\`
+    /// (400 `missing fields`), and `f\\=1i` (400 `invalid value`). A measurement with `\`
+    /// before `,`, space, or `=` is stored unreadable (item 2). A tag key or value with `\`
     /// before a space would leave a `\\` pair and a bare space that desyncs the line splitter;
     /// `\` before `,` or `=` in a tag reads back as written. The tag drops alone; the measurement
     /// or field key drops its point or field.
@@ -1285,7 +1286,7 @@ mod tests {
         assert_eq!(stats.dropped_unencodable_key, 2);
     }
 
-    /// A field key writes `"` as `\"` (probe row 2.11 `f\"k` stored `f"k`). A `\` before a
+    /// A field key writes `"` as `\"` (the "Escaping" section `f\"k` stored `f"k`). A `\` before a
     /// character the key escapes is skipped: written, it makes a `\\` pair `influxd`'s line
     /// splitter skips, leaving a bare `=` or `"` that breaks the line.
     #[test]
@@ -1308,7 +1309,7 @@ mod tests {
     }
 
     /// Inside quotes, `\` is written `\\` and `"` is `\"`; `,`, space, and `=` need nothing
-    /// (probe rows 3.1 `f="a\"b\\c"` stored `a"b\c`, 3.3 `f="a, b=c d"`, 3.6 `f="trail\\"`
+    /// (item 4: `f="a\"b\\c"` stored `a"b\c`, `f="a, b=c d"`, and `f="trail\\"`
     /// stored `trail\`).
     #[test]
     fn a_string_field_escapes_backslash_and_quote_only() {
@@ -1332,8 +1333,8 @@ mod tests {
         assert_eq!(stats.tags_omitted_unrepresentable, 2);
     }
 
-    /// `influxd` rejects the whole write for a reserved tag key (probe rows 7.1 to 7.3), and a
-    /// `time` field is a `422` (row 7.4), which `influxdb_out` reads as a rejected batch.
+    /// `influxd` rejects the whole write for a reserved tag key (item 10), and a
+    /// `time` field is a `422` (item 10), which `influxdb_out` reads as a rejected batch.
     #[test]
     fn reserved_tag_and_field_keys_are_omitted_or_dropped_and_counted() {
         let (out, stats) = encode_stats(vec![metric_event(
@@ -1858,7 +1859,7 @@ mod tests {
         assert_eq!(encode(vec![a, b]), "m f=1i 1700000000000000000\nm f=2i 1700000000000000001\n");
     }
 
-    /// A string field over `influxd`'s 1 MiB cap is a `422` (probe row 11.4), which would cost
+    /// A string field over `influxd`'s 1 MiB cap is a `422` (item 13), which would cost
     /// the whole batch at `influxdb_out`; it drops alone.
     #[test]
     fn an_oversize_string_field_is_dropped_and_counted() {
@@ -1871,7 +1872,7 @@ mod tests {
         assert_eq!(stats.dropped_oversize_value, 1);
     }
 
-    /// A string value with a raw newline goes raw: `influxd` keeps it in the value (probe row 3.4).
+    /// A string value with a raw newline goes raw: `influxd` keeps it in the value (item 4).
     #[test]
     fn a_string_field_keeps_a_raw_newline() {
         let mut event = carrier_event("p03d", &[]);

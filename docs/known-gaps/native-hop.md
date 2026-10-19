@@ -238,8 +238,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Unexplained:** `native-relay-window1`, where nothing coalesces, also reads +2.3% from the
     pre-named-ack binary to this one (1.150 → 1.177 µs/event), under the 5% gate.
   - **Numbers:** [`design/performance.md`](../design/performance.md) §1, "`native-relay` under a
-    10 ms round trip"; the plan is
-    [`plans/native-hop-named-acks.md`](../plans/native-hop-named-acks.md) "Findings".
+    10 ms round trip".
 
 - **A disk-backed sink replays delivered and dropped batches after a crash, under either
   posture.** `commit` moves the read cursor in memory. The cursor reaches disk on a commit once

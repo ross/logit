@@ -79,8 +79,7 @@ contract" below).
 - `event.metrics` is an array-like proxy over the event's metric list. It is writable only on the
   fields a script can change without breaking a kind's invariants (a `sum`/`gauge`'s `value`, a
   `sum`'s `temporality`/`monotonic`) and read-only everywhere else. See "Reading and writing
-  `event.metrics`" below. Both it and `event.span` were added once a concrete consumer needed them
-  ([`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)).
+  `event.metrics`" below.
 - `event.span` is entirely read-only in place, the same posture `provenance` takes. A script that
   wants a different span builds a whole one with `Event.new`. See "Reading `event.span`" below.
 
@@ -591,7 +590,7 @@ To stamp constant values without Lua, use the `set` native transform
 which also explains why this is a graph component rather than a per-input config field.
 
 **`schema_url` and `dropped_attributes_count` mirror OTLP's own `Resource` fields**
-([`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)):
+([ADR `lossless-transit`](../adr/lossless-transit.md)'s "The model"):
 
 - `schema_url` is read/write, a string or `nil`. Assigning `nil` clears it, as `nil` deletes an
   attribute.
@@ -735,7 +734,7 @@ The fields are independent. Writing `message` doesn't change `body_format`, and 
 a string. Set both when a rewrite changes what the body is.
 
 **`event_name`, `observed_timestamp`, and `dropped_attributes_count`** are real `LogRecord` fields
-([`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)).
+([ADR `lossless-transit`](../adr/lossless-transit.md)'s "The model").
 
 - `event_name` is read/write, a plain string or `nil`. `event.log.event_name = "request.completed"`
   interns the string, as an attribute key is. **Use a name from a fixed, bounded
@@ -813,8 +812,7 @@ against a future surface that *can* shrink the list, such as an `event.metrics:r
 
 `kind` names every metric kind: `"sum"`, `"gauge"`, `"gauge_delta"`, `"samples"`,
 `"distribution"`, `"set_members"`, `"set"`, `"histogram"`, `"exponential_histogram"`, `"summary"`
-(`crates/logit-core/src/metric.rs`'s `MetricKind`, [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s
-target model). Every field is readable on every kind (`nil` when the kind doesn't carry it), but
+(`crates/logit-core/src/metric.rs`'s `MetricKind`, [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)). Every field is readable on every kind (`nil` when the kind doesn't carry it), but
 **only a handful are writable, and only on the kind that makes them meaningful**:
 
 | Field | Type | Read/write | Present on |

@@ -1,7 +1,7 @@
 # The stack `script/kafka-interop` drives: Apache Kafka (KRaft) and Redpanda, each with a plain,
 # a TLS, a mutual-TLS, a SASL_PLAINTEXT, and a SASL_SSL listener (and on Kafka an OAUTHBEARER
 # one), an OAuth 2.0 token server, one `logit` per leg per broker from the release image, and
-# one OpenTelemetry Collector per broker that reads the OTLP legs' topics. See README.md here, and docs/plans/kafka-output.md's "Interop plan (W4)" for what each leg proves.
+# one OpenTelemetry Collector per broker that reads the OTLP legs' topics. See README.md here, "What it runs", for what each leg proves.
 #
 # `script/kafka-interop` runs this under the compose project `kafka-interop` with an
 # `--env-file` it writes, which sets:

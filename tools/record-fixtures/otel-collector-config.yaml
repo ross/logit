@@ -5,7 +5,7 @@
 #
 # That JSON is the fixture, not a raw byte capture: pdata's marshaler is the normative OTLP/JSON
 # implementation, and the result doesn't depend on the sender's transport or encoding. See
-# docs/plans/recorded-interop-fixtures.md's "How captures are recorded, reproducibly" section.
+# testdata/interop/otlp/README.md.
 receivers:
   otlp:
     protocols:

@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-15
+updated: 2026-10-18
 ---
 
 # Native hop: two payload shapes named by shape, every hop frame sequenced, and strict control messages
@@ -37,8 +37,8 @@ spool written before the change is skipped as corrupt, with no compatibility pat
 ## Context
 
 `logit` is pre-release and keeps no compatibility with its own earlier builds
-([`docs/plans/lossless-transit.md`](../plans/lossless-transit.md), "Pre-release, no backward
-compatibility"). The native `logit_out` to `logit_in` hop and the disk spool still tolerate
+([ADR `lossless-transit`](lossless-transit.md#pre-release-no-backward-compatibility)'s
+"Pre-release, no backward compatibility"). The native `logit_out` to `logit_in` hop and the disk spool still tolerate
 older peers and older records:
 
 - `Hello.codecs` offers `[CODEC_NATIVE_V2, CODEC_NATIVE_V1]` and `logit_in` falls back to v1, a

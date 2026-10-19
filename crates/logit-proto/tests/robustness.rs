@@ -5,7 +5,7 @@
 //! remote-write body `prometheus_in` receives, and `framing::Framer`, which frames every TCP and
 //! Unix-stream listener's bytes in all five modes. Pickle is the highest-risk parser in the repo:
 //! a format built for arbitrary object construction, read from a socket. A network-facing decoder
-//! must pass this suite (`docs/plans/native-transport.md`). The OTLP section pins the limits OTLP
+//! must pass this suite. The OTLP section pins the limits OTLP
 //! decoding relies on instead of caps of its own: each parser's nesting limit, timestamp
 //! saturation, and OTLP/JSON's peak memory per input byte. The framing section also pins the
 //! drain state's single `drained` count and the table of what a FIN and an RST count. The statsd

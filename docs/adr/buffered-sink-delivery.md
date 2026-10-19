@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-10-04
+updated: 2026-10-18
 ---
 
 # Buffered, decoupled sink delivery
@@ -30,9 +30,6 @@ anticipated this directly, naming "Implement `Buffer` now" as the rejected-for-s
 and calling it *"the actual fix for the retry-vs-backpressure tension."* This ADR is that fix,
 scoped to the sink side of the decoupling gap — the listener side (`StatsdInput::run` still
 interleaving `recv_from`/decode/`Fanout::send`) is untouched and stays a documented, open gap.
-
-`docs/plans/buffered-sink-delivery.md` is the workstream breakdown; this ADR records the
-decisions that breakdown depends on.
 
 ## Decision
 

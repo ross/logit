@@ -10,58 +10,11 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
-| [Enabling plan: in-place log body, severity, and attribute edits from Lua](lua-in-place-edits.md) | 2026-10-16 | 2026-10-16 |
-| [Enabling plan: Prusa Buddy printer metrics over syslog, through generic pieces](prusa-metrics.md) | 2026-10-16 | 2026-10-16 |
 | [Enabling plan: native encode without per-field scratch buffers](native-encode-allocations.md) | 2026-10-15 | 2026-10-15 |
-| [Enabling plan: `influxdb_in`/`influxdb_out` — a lossless InfluxDB line-protocol relay](influxdb-relay.md) | 2026-10-13 | 2026-10-13 |
-| [Enabling plan: `kafka_out` — a pure-Rust Kafka producer](kafka-output.md) | 2026-10-11 | 2026-10-11 |
-| [Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger](soak-harness.md) | 2026-10-08 | 2026-10-17 |
-| [Enabling plan: sender addresses on the HTTP listeners — `peer:`, `proxy_protocol:`, and `forwarded:`](http-listener-peer-address.md) | 2026-10-05 | 2026-10-05 |
-| [Research note: live reload, socket handover, and what each deployment world needs](live-reload-and-socket-handover.md) | 2026-10-05 | 2026-10-05 |
-| [Enabling plan: sink fault model — a bad batch drops, a non-functional destination holds, the process never exits](sink-fault-model.md) | 2026-10-04 | 2026-10-05 |
-| [Enabling plan: native hop named acks — a cumulative `Ack { id, seq }`, coalesced at `logit_in`, and a resume mark](native-hop-named-acks.md) | 2026-10-02 | 2026-10-02 |
-| [Enabling plan: a native hop send window — several frames in flight, acknowledged in frame order](native-send-window.md) | 2026-10-01 | 2026-10-02 |
-| [Enabling plan: delivery semantics — at-least-once per hop, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-02 |
-| [Enabling plan: VictoriaMetrics — existing components verified, and zstd on remote-write](victoriametrics-interop.md) | 2026-09-24 | 2026-09-24 |
+| [Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger](soak-harness.md) | 2026-10-08 | 2026-10-18 |
+| [Research note: live reload, socket handover, and what each deployment world needs](live-reload-and-socket-handover.md) | 2026-10-05 | 2026-10-07 |
 | [Enabling plan: SigNoz — OTLP-native, verified, no new kind](signoz-relay.md) | 2026-09-24 | 2026-09-24 |
 | [Enabling plan: OpenSearch — SS4O documents over `_bulk`](opensearch-relay.md) | 2026-09-24 | 2026-10-05 |
 | [Enabling plan: Dynatrace — OTLP and the ingest APIs, OneAgent-local stand-in, intake stand-in](dynatrace-relay.md) | 2026-09-24 | 2026-09-24 |
-| [Enabling plan: Splunk — HEC in both directions, and Observability Cloud over OTLP](splunk-relay.md) | 2026-09-24 | 2026-09-26 |
 | [Enabling plan: New Relic — direct APIs and OTLP, shipper-intake stand-in, APM collector stand-in](newrelic-relay.md) | 2026-09-24 | 2026-10-05 |
-| [Enabling plan: Datadog — direct API, Agent stand-in, intake stand-in](datadog-relay.md) | 2026-09-23 | 2026-09-24 |
-| [Enabling plan: `http_access` — access-log normalization from raw semconv fields](http-access-normalization.md) | 2026-09-22 | 2026-09-22 |
-| [Enabling plan: `flatten` — dotted-key expansion of nested attributes](flatten-transform.md) | 2026-09-21 | 2026-09-21 |
-| [Enabling plan: `Event` sizing and allocation strategy — a measured bake-off, then an ADR](event-sizing.md) | 2026-09-21 | 2026-09-21 |
-| [Verification plan: critical sections inventory](critical-sections-inventory.md) | 2026-09-20 | 2026-10-05 |
-| [Enabling plan: a data-shape survey, and the `shape` component that measures it](data-shape-survey.md) | 2026-09-20 | 2026-09-20 |
-| [Enabling plan: UDP intake batching and socket visibility](udp-intake.md) | 2026-09-18 | 2026-10-02 |
-| [Enabling plan: Prometheus remote-write — receive on `prometheus_in`, send on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-09-18 |
-| [Enabling plan: `docker_in` live container identity and a minimal `inotify` watch set](docker-container-identity.md) | 2026-09-17 | 2026-09-17 |
-| [Enabling plan: `Transform::process` in place — `&mut Event -> bool`](in-place-transform-process.md) | 2026-09-17 | 2026-09-17 |
-| [Enabling plan: `keep_values` — clamping tag-value cardinality against an allow-list](value-allowlist-cardinality-clamp.md) | 2026-09-15 | 2026-09-15 |
-| [Enabling plan: `Event.new(t)` — constructing events from Lua](lua-event-constructor.md) | 2026-09-15 | 2026-09-15 |
-| [Enabling plan: TLS and TCP ingress for `syslog_in`/`syslog_out`](syslog-tls.md) | 2026-09-13 | 2026-09-14 |
-| [Enabling plan: `target` components and routers](target-components.md) | 2026-09-13 | 2026-09-13 |
-| [Enabling plan: `graphite_in`/`graphite_out` — a lossless Graphite/Carbon relay](graphite-carbon-relay.md) | 2026-09-13 | 2026-10-09 |
-| [Enabling plan: a load-test harness for the real `logit` binary](load-test-harness.md) | 2026-09-12 | 2026-10-02 |
-| [Enabling plan: `collectd_in`/`collectd_out` — a lossless collectd binary-protocol relay](collectd-binary-relay.md) | 2026-09-12 | 2026-09-12 |
-| [Enabling plan: Prometheus scrape ingestion and exposition](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-09-12 |
-| [Closing plan: lossless like-protocol transit](lossless-transit.md) | 2026-09-10 | 2026-09-12 |
-| [Recorded interop fixtures: real producers, captured once, replayed as tests forever](recorded-interop-fixtures.md) | 2026-09-10 | 2026-09-18 |
-| [Enabling plan: `logit_out`/`logit_in` — the native transport](native-transport.md) | 2026-09-09 | 2026-09-09 |
-| [Closing plan: durable, disk-backed sink buffering](durable-sink-buffer.md) | 2026-09-09 | 2026-09-09 |
-| [Enabling plan: operator surface — readiness/liveness, leveled structured self-logging, internal logs](operator-surface.md) | 2026-09-09 | 2026-09-09 |
-| [Enabling plan: richer traces in the demo stack](demo-richer-traces.md) | 2026-09-07 | 2026-09-07 |
-| [Enabling plan: file tailing and Docker json-file container logs](file-tailing.md) | 2026-09-06 | 2026-09-06 |
-| [Enabling plan: access log lines become trace spans](access-log-spans.md) | 2026-09-04 | 2026-09-04 |
-| [Enabling plan: browser tracing for the demo](browser-tracing.md) | 2026-09-03 | 2026-09-10 |
-| [Enabling plan: a traced demo stack — HAProxy → nginx → app](demo-tracing-stack.md) | 2026-09-03 | 2026-09-04 |
-| [Closing plan: TLS for `otlp_out`/`otlp_in`](otlp-tls.md) | 2026-09-03 | 2026-09-03 |
-| [Closing plan: signal-aware filter components, and `otlp_out`'s remaining config gaps](signal-filtering-and-otlp-out-config-gaps.md) | 2026-09-03 | 2026-09-03 |
-| [Closing plan: OTLP end-to-end — internal spans, an OTLP codec, `otlp_in`/`otlp_out`, and the demo](otlp-end-to-end.md) | 2026-09-02 | 2026-09-11 |
-| [Closing plan: decoupled listener I/O](decoupled-listener-io.md) | 2026-09-02 | 2026-09-11 |
-| [Enabling plan: operator-declared resource identity, and a Loki-direct log leg](otlp-logs-and-resource-identity.md) | 2026-09-02 | 2026-09-03 |
-| [Enabling plan: a user-facing demo stack](demo-stack.md) | 2026-09-01 | 2026-09-03 |
-| [Closing plan: buffered, decoupled sink delivery](buffered-sink-delivery.md) | 2026-09-01 | 2026-09-02 |
-| [Enabling plan: a real nginx workload](nginx-integration.md) | 2026-08-30 | 2026-08-30 |
-| [Implementation plan: component graph pipeline](component-graph-implementation.md) | 2026-08-29 | 2026-08-29 |
+| [Verification plan: critical sections inventory](critical-sections-inventory.md) | 2026-09-20 | 2026-10-11 |

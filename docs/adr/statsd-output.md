@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -243,9 +243,9 @@ three are recorded in `docs/known-gaps/statsd.md`.
 [ADR `lossless-transit`](lossless-transit.md) commits `logit` to a lossless `statsd_in ->
 statsd_out` relay; [ADR `metrics-model-v2`](metrics-model-v2.md) is what gives the model the
 raw-vs-summarized pair (`Samples`/`Distribution`, `SetMembers`/`Set`) this ADR's original deferral
-had nowhere to land against. [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W3
-is the workstream landing the statsd side of both, once W1 (the model) and W2 (`aggregate`'s absorb
-rules) were in place.
+had nowhere to land against. This amendment lands the statsd side of both, on top of that model
+and `aggregate`'s absorb rules
+([ADR `aggregation-window-semantics`](aggregation-window-semantics.md)).
 
 This ADR's "Metric-kind coverage" decision said: "Only `Counter` (`|c`) and `Gauge`/`GaugeDelta`
 (`|g`) are encoded. `Distribution`, `Set`, `Histogram`, and `Summary` are dropped with a clear 'not
@@ -410,13 +410,12 @@ fixed point (`mod fixed_point::decode_encode_decode_is_a_fixed_point`, 200 gener
 `malformed_timestamp_segment_rejects_only_that_line`, and
 `container_id_timestamp_rate_and_tags_combine_in_any_order`.
 `crates/logit-cli/tests/statsd_round_trip.rs` (mirroring `syslog_round_trip.rs`'s real-UDP-socket
-harness, landing alongside this amendment per `docs/plans/lossless-transit.md`'s W3 phase B)
+harness, landing alongside this amendment)
 extends the same coverage end to end through real sockets.
 
 ## Amendment: DogStatsD events and service checks relay
 
-[`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W6 closes the last gap this
-ADR's original Decision section left unaddressed: DogStatsD's two non-metric line shapes,
+This amendment closes the last gap this ADR's original Decision section left unaddressed: DogStatsD's two non-metric line shapes,
 `_e{tlen,xlen}:title|text|...` (an **event**) and `_sc|name|status|...` (a **service check**),
 which `statsd_in` used to reject outright as malformed (any line starting with `_` fell into the
 generic "unknown metric type" error path). Both now decode and re-encode losslessly, the same
@@ -579,7 +578,7 @@ guarantee this ADR's previous amendment already pins for `|T` on an ordinary cou
 
 ## Amendment: a repeated tag key is a multi-value tag, not a collapse
 
-[`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W9 closes the residual-debt item
+This amendment closes the residual-debt item
 this ADR's first amendment recorded and deliberately left untouched: a repeated DogStatsD tag key
 (`#team:a,team:b`) silently collapsing to its last value inside `statsd_in`, before this sink ever
 saw the event. `#` is a **list** of `key[:value]` tokens, not a map — the Datadog agent keeps every

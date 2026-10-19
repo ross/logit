@@ -200,7 +200,8 @@ for = "45s"
 An optional top-level `rss_settle` (default `0s`) is how long past `recovery_bound` the
 `rss_slope` row alone keeps excusing each fault (§6). Every other row's recovery is
 `recovery_bound`. It's opt-in: most schedules leave so little past `recovery_bound` that a
-settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`.
+settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, and
+`partition-rss` `120s`.
 
 `validate()` enforces these rules:
 
@@ -2529,12 +2530,12 @@ that items 3, 7, and 11 need.
 - **W2**: `[[expect]]` tables in the scenario schema and the `expect` check that scores them
   (§2), with self-test fixtures for every validation rule and reducer; `recovery` accepts a sink
   queue holding one batch. Four scenarios: `sink-outage-block` and `sink-outage-drop-oldest`, the
-  verification [`buffered-sink-delivery.md`](buffered-sink-delivery.md) describes (a 90 s stop
-  under `block`, then `drop_oldest` with a small `max_batches`), and `udp-flood-sink-stop` and
-  `udp-flood-sink-stop-block`, [`decoupled-listener-io.md`](decoupled-listener-io.md)'s deferred
-  soak. A run of each is recorded under "Findings". No scenario needed per-peer `tc filter`.
+  verification [ADR `buffered-sink-delivery`](../adr/buffered-sink-delivery.md) calls for (a 90 s
+  stop under `block`, then `drop_oldest` with a small `max_batches`), and `udp-flood-sink-stop` and
+  `udp-flood-sink-stop-block`, [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)'s
+  deferred soak. A run of each is recorded under "Findings". No scenario needed per-peer `tc filter`.
 - **W3**: disk-spool `kill -9` replay, the manual soak
-  [`durable-sink-buffer.md`](durable-sink-buffer.md)'s "Verification" describes: a `kill` action
+  [ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md) calls for: a `kill` action
   (§2) on the SUT and its watchdog rules; SIGKILL lives in the ledger, judged within a band
   because up to one `internal` interval of a killed life's telemetry is lost; `ledger.windows`
   and `ledger.replay`, which judge every spooled window; self-test fixtures for the
@@ -5202,6 +5203,81 @@ Overall PASS, every row PASS or SKIP.
 | `expect.metrics-drop-nothing` | PASS | delta of logit.component.batches.dropped{component=vm_metrics} on logit, through c0s1: c0s1 (+60s, +195s]: 0 (over 27 drain(s)), want <= 0 |
 | `expect.router-copies-every-event` | PASS | delta of logit.component.events.copied{component=split} on logit, during c0s1: c0s1 (+60s, +150s]: 180,000 (over 18 drain(s)), want >= 100000 |
 | `expect.router-discards-nothing` | PASS | delta of logit.component.events.discarded{component=split} on logit, run: run (+60s, +780s]: 0 (over 131 drain(s)), want <= 0 |
+
+### `partition-rss`: the generator's RSS after a partition (2026-10-18)
+
+After a 45 s partition, the generator's RSS fell back to its pre-partition baseline within 44 s
+of the revert and held flat there for the remaining 12 minutes: no plateau above baseline, and
+no growth. Run `20261019T002831Z`: `script/soak run partition-rss --retry-stalled 1` at the
+scenario's 15 minutes 45 seconds, from `soak/partition-rss` at `b6154b9b`, with `logit:soak`
+`sha256:18799368c79d`, on host `trout` (24 cores, Docker 29.8.2). Overall PASS:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 4 apply/revert action(s) returned 0; 0 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 2 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 0 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 1 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 170 readiness sample(s) read ok outside fault windows; 0 start(s) or unpause(s) ready in time |
+| `progress` | PASS | 27 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 27 of 27, 28 freshness sample(s); 780s of 885s after warmup judged (88%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +0.5 (limit 64); 665s of 885s after warmup judged (75%; WARN under 5%) \| logit PASS: MiB/h life 0 +1.3 (limit 64); 665s of 885s after warmup judged (75%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 11 (limit +8) \| logit PASS: warmup median 12 -> end 12 (limit +8) |
+| `ledger.wire` | PASS | G 1,888,800 = W 1,888,800 + K 0 + wire 0 (by design: 2 in UDP-affecting windows, -53 steady, 51 at the end; steady loss judged 1, each run at 0 or more, against limit 300); the generator's counted drop_newest loss, not in G: 13,600 event(s) in 136 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 1,888,800 vs E + B 1,888,800 (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E 1,888,800 == A 1,888,800 (listener to aggregate); A_sent 9,300 == S_in[victoria_metrics] 9,300 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 0: Ab 1,888,800 == A 1,888,800 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0 (final): Ab 1,888,800 − V[victoria_metrics] 1,888,800 = 0, ok (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K) 0 over the run, by design |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 0 at +969s: victoria_metrics: received 93 vs delivered 93 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 1 of 1 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served` | SKIP | the scenario has no probe step |
+| `expect.generator-rss-plateau` | PASS | rise of logit.process.memory.resident.bytes on generator, during 2: c0s2 (+330s, +720s]: -196,608 (78 sample(s) and the value in force at its start), want <= 8.38861e+06 |
+
+The generator's `logit.process.memory.resident.bytes`, at the run's offsets. The partition ran
+from +120 s to +165 s; during it the sink failed to resolve `logit:8125`, queued, and dropped
+13,600 events under `drop_newest`, counted.
+
+| When | RSS |
+|---|---|
+| Warmup and before the partition, +4 s to +119 s | 17.1 to 18.7 MiB, 18.2 MiB at +119 s |
+| Partition, +124 s to +159 s | up about 8.7 MiB per 5 s drain |
+| Peak, +164 s | 85.6 MiB |
+| +169 s | 83.0 MiB |
+| +174 s | 62.2 MiB |
+| +184 s | 56.4 MiB |
+| +189 s | 51.5 MiB |
+| +194 s | 48.5 MiB |
+| +199 s | 40.7 MiB |
+| +209 s, 44 s after the revert | 18.3 MiB |
+| +269 s, +329 s, +389 s, +449 s | 18.8, 19.0, 18.3, 18.8 MiB |
+| +509 s, +569 s, +629 s, +689 s | 18.8, 19.0, 18.3, 19.1 MiB |
+| +749 s, +809 s, +869 s, +929 s | 18.5, 18.5, 18.7, 18.7 MiB |
+| +944 s, the last sample before the end sequence | 18.5 MiB |
+
+From +209 s to the end the samples stay between 18.25 and 19.16 MiB. `rss_slope` fit +0.5
+MiB/h over 135 samples, the warmup's tail and the plateau after +330 s, and the plateau
+expectation read a rise of −0.19 MiB (−196,608 bytes) from +330 s to +720 s, against a bound of
+8 MiB.
+
+`docker stats` and the host show no contention. The generator's CPU averaged 1% to 3% in each
+of minutes 0 to 3, which hold warmup, the partition, and the release, 4% to 8% in minutes 4 to
+8, and 2% to 3% after. The host's 1-minute load average, sampled every 15 s from minute 4 to the
+end, stayed between 14.6 and 15.9, and read 14.8 at minute 3. It came from 14 idle `ioq-*` kernel
+threads in uninterruptible sleep, with 2 or 3 runnable tasks and CPU pressure at 0.
+
+In this run the partition's memory came back whole, which suggests the 32 MiB plateau in
+`fanin`'s `20261018T190542Z` was a slower release, not a floor; one run of each doesn't show why
+they differ. Here the release ended inside `recovery_bound`, so this run didn't need
+`rss_settle`; `fanin` keeps its 60 s because its own release took about 104 s.
 
 ## Verification
 

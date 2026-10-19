@@ -1,6 +1,6 @@
 ---
 created: 2026-10-16
-updated: 2026-10-16
+updated: 2026-10-18
 ---
 
 # `line_protocol`: parse a log message as InfluxDB line protocol into one event per point, skipping bad lines
@@ -11,7 +11,7 @@ Accepted
 ## Context
 Some producers put InfluxDB line protocol inside another protocol rather than POSTing it to a write
 API. Prusa's Buddy firmware sends one RFC 5424 syslog message per UDP datagram whose MSG is a
-header line and about 37 points ([`prusa-metrics`](../plans/prusa-metrics.md)). With
+header line and about 37 points ([capture details](../../examples/prusa/README.md)). With
 `framing: datagram` ([ADR `syslog-udp-datagram-framing`](syslog-udp-datagram-framing.md)),
 `syslog_in` delivers that MSG as one log event. Nothing turns its body into metrics:
 

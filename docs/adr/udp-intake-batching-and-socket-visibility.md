@@ -1,17 +1,14 @@
 ---
 created: 2026-09-18
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # UDP intake batching and socket visibility
 
 ## Status
 
-Accepted — and built. Every workstream in [`docs/plans/udp-intake.md`](../plans/udp-intake.md) has
-landed on its stacked branch: **W0 #250, W1 #251, W2 #252, W3 #253, W4 #254, W5 (this closeout)**.
-Per Ross's direction the stack is not merged to `main` by this workstream, so "landed" means complete
-and pushed, not merged; that plan's own status paragraph is the authority. See "As built" below for
-where the implementation sharpened or corrected this record as it went.
+Accepted — and built. See "As built" below for where the implementation sharpened or corrected
+this record as it went.
 
 ## Context
 
@@ -38,9 +35,9 @@ untouched is the *syscall and bookkeeping* side underneath it, shared by all fou
   in-process; nothing exercises a UDP socket, so none of the above can be measured today.
 
 This ADR is the decision record for closing all four, plus the load-test-harness extension needed
-to measure the result. [`docs/plans/udp-intake.md`](../plans/udp-intake.md) is the workstream
-schedule and baseline/delta protocol this record is built on; this document is about the decisions,
-not the sequencing.
+to measure the result. [`docs/design/performance.md`](../design/performance.md) §7 holds the
+baseline/delta protocol this record is built on; this document is about the decisions, not the
+sequencing.
 
 **This revises [ADR `decoupled-listener-io`](decoupled-listener-io.md)'s "Alternatives considered"
 section**, specifically its `recvmmsg`/`SO_REUSEPORT` bullet and its kernel-drop-counter bullet
@@ -543,12 +540,12 @@ flight per turn of the loop. Worth recording, not worth acting on: the receive q
 `push_many` holds a `Peekable<std::vec::Drain<'_, T>>` across its internal `.await` points
 specifically so a cancellation (the caller's future dropped mid-call — `read_loop`'s own shutdown
 race in `crates/logit-inputs/src/udp.rs`, the same shape
-[`docs/plans/decoupled-listener-io.md`](../plans/decoupled-listener-io.md)'s single-item
-cancellation correction already described) leaves the caller's `Vec` **empty**, not partially
+as [ADR `decoupled-listener-io`](decoupled-listener-io.md)'s single-item
+cancellation case) leaves the caller's `Vec` **empty**, not partially
 drained: whatever was already accepted into the queue stays accepted, and whatever hadn't yet been
 reached is dropped along with the `Drain` iterator, uncounted. This is a direct widening of the
 loss `decoupled-listener-io` already accepted for a single in-flight datagram at shutdown
-(`docs/plans/decoupled-listener-io.md`'s "drops the one datagram it was holding, uncounted") from
+(the one datagram it was holding, dropped uncounted) from
 exactly one datagram to at most `read_batch` datagrams — still bounded, still shutdown-path-only
 (ordinary operation never cancels a `push_many` call mid-flight), and named here explicitly rather
 than left implicit in the widened bound.
@@ -620,19 +617,19 @@ numbers, so it was the box settling into a lower sustained power state rather th
 code. A drop rate is especially exposed to this, being the difference between two nearly-equal
 rates. So a delta is a parent/branch pair taken back to back and interleaved (parent, branch,
 parent, branch …) within one session, and a results file from another day is not a control.
-`docs/plans/udp-intake.md`'s "Baseline/delta recording protocol" is the procedure; `logit-perf run`
+`docs/design/performance.md` §7's "Measurement protocol" is the procedure; `logit-perf run`
 records what it can of the box's power state into the results file and warns on `powersave` or
 battery, because a number whose conditions aren't recorded can't be re-read later.
 
 ### Representative traffic, calibrated against a recorded real-client capture
 
 "Real statsd traffic" is a *traffic model calibrated against a recorded real-client capture*, not N
-copies of one line. No recorded statsd producer corpus exists in this repo today —
-`crates/logit-cli/tests/fixtures/statsd/` is hand-made round-trip cases (one line, one expected
-decode, no volume or mix), `demo/` has no statsd producer, and
-[`docs/plans/recorded-interop-fixtures.md`](../plans/recorded-interop-fixtures.md) already lists real
-statsd/DogStatsD producer captures as owed, un-built future work. `tools/record-fixtures/raw_capture.py`
-is extended with a real DogStatsD client and a plain-statsd client (buffered and unbuffered) emitting
+copies of one line. When this ADR was decided, no recorded statsd producer corpus existed in the repo:
+`crates/logit-cli/tests/fixtures/statsd/` was hand-made round-trip cases (one line, one expected
+decode, no volume or mix), `demo/` had no statsd producer, and the recorded interop corpus
+([`testdata/interop/`](../../testdata/interop/README.md)) had no real statsd/DogStatsD captures.
+The captures now live in [`testdata/interop/statsd/`](../../testdata/interop/statsd/README.md).
+`tools/record-fixtures/raw_capture.py` was extended with a real DogStatsD client and a plain-statsd client (buffered and unbuffered) emitting
 an app-like workload; the captured traffic becomes the model's ground truth (line shapes, tag
 cardinality, datagram-size distribution derived from it, documented in `perf/load/README.md`) rather
 than replayed directly — this is a load *generator* calibrated by a capture, not a replay engine, so
@@ -760,8 +757,8 @@ ahead of evidence this same plan is about to produce.
   and every existing call site unchanged.
 - New `crates/logit-perf` module (`load.rs`) and a real-socket `Workload::Driven` scenario kind,
   alongside today's `Workload::Generated`; new `perf/load/*.yaml` sidecar directory and
-  `perf/load/README.md`; a small committed real-client capture and its provenance, partly paying
-  down `docs/plans/recorded-interop-fixtures.md`'s owed statsd producer fixtures.
+  `perf/load/README.md`; a small committed real-client capture and its provenance
+  (`testdata/interop/statsd/`).
 - [`docs/known-gaps/intake.md`](../known-gaps/intake.md#udp-intake): the kernel-drop-visibility
   entry and the one-datagram-per-syscall entry close as their respective workstreams land (W1, W4);
   the gauge-update-contention entry closes at W3.
@@ -1075,8 +1072,8 @@ contradicts a sentence above, this section is the current record.
   checked including the per-NUMA rework on `master`: `sk_get_meminfo` does
   `mem[SK_MEMINFO_DROPS] = atomic_read(&sk->sk_drops)` and `udp4_format_sock` prints
   `atomic_read(&sp->sk_drops)` as its last column (v6.12; `__ip6_dgram_sock_seq_show` the same for
-  udp6). That identity is now an automated equality test rather than the manual check
-  [`docs/plans/udp-intake.md`](../plans/udp-intake.md) recorded — and it is the only in-repo test
+  udp6). That identity is now an automated equality test rather than a manual check
+  — and it is the only in-repo test
   that pins the `SK_MEMINFO_DROPS` *index* against an independently-produced number.
 - **The signed-to-unsigned boundary is a non-event.** `sk_drops` is an `atomic_t` (signed `int`)
   stored into a `u32` slot, bit-preserving on every Linux target, so userspace sees a plain

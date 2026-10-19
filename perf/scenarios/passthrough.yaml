@@ -1,7 +1,7 @@
 # Runtime floor: generate_in with no log body and six plain attributes straight into null_out. No
 # parsing, no encoding; the only cost is scheduling, the fanout channel hop, and the sink's own
 # telemetry, so every other scenario's numbers are read relative to this one. Scenario table:
-# docs/plans/load-test-harness.md, "Scenarios".
+# docs/design/performance.md, "Scenarios".
 #
 # An ordinary logit config like anything under fixtures/: `logit run perf/scenarios/passthrough.yaml`
 # works, as does the harness:

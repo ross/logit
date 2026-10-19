@@ -1635,7 +1635,7 @@ mod tests {
     //
     // Real captured traffic from util-linux `logger(1)`, Python's
     // `logging.handlers.SysLogHandler`, and rsyslog, recorded by `script/record-fixtures`
-    // (testdata/interop/README.md, docs/plans/recorded-interop-fixtures.md). Asserted on decoded
+    // (testdata/interop/README.md). Asserted on decoded
     // values, not bytes, which a re-record changes (that README's "Consuming these fixtures").
 
     /// `testdata/interop/syslog/<name>` as a `String`; every fixture here is UTF-8 text.

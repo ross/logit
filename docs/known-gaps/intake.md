@@ -227,6 +227,14 @@ Entry format and the other areas: [the known-gaps index](README.md).
     ([ADR `release-build-profile`](../adr/release-build-profile.md)). It may also bear on
     `native-relay`'s build-to-build swing ("`native-relay` is code-layout-sensitive",
     `performance.md` §1).
+- **The `receive_buffer_bytes` clamp warning has no end-to-end run.** A UDP listener that asks for
+  more than `net.core.rmem_max` gets the clamped size and a startup warning that names the
+  sysctl. Unit tests cover the warning's logic, but no run lowers `rmem_max` on a host and
+  confirms the warning and the granted size. The `udp-flood-sink-stop` soak scenarios cover the
+  flood side and don't touch the sysctl.
+  - **To close:** a soak step or an interop script that sets `net.core.rmem_max` in the SUT's
+    network namespace, starts a listener with a larger `receive_buffer_bytes`, and reads the
+    warning and `logit.input.receive_buffer.*` gauges.
 
 ## TLS and connection lifecycle
 

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # Disk-backed durable buffering for a sink's delivery queue
@@ -25,8 +25,8 @@ from `stdio_out`/`file_out`. `docs/known-gaps/native-hop.md`'s "No durable (disk
 named this as real, unblocked follow-up work. This ADR designs and closes it for the sink side; the
 listener side (`ReceiveQueue`) stays in-memory and is a separate, still-open gap.
 
-`docs/plans/durable-sink-buffer.md` is the original design sketch this ADR implements, with five
-corrections made against the actual code (see "Corrections to the sketch" below) and one seam
+This ADR started from a design sketch, corrected in five places against the actual code (see
+"Corrections to the design sketch" below), with one seam
 (`crate::queue::SinkStore`) that replaced the sketch's proposed `pub enum SinkStore` shape with a
 slightly different, narrower method surface once the implementation showed what `write_loop` and
 `drain_inbox` actually call.
@@ -162,8 +162,8 @@ section flagged when it deferred disk backing rather than force-fitting it throu
 
 ## Corrections to the design sketch
 
-`docs/plans/durable-sink-buffer.md` proposed five things that didn't survive contact with the
-actual code; each is resolved as follows.
+The sketch proposed five things that didn't survive contact with the actual code; each is
+resolved as follows.
 
 1. **No `len`/`is_empty` on the seam.** `BoundedQueue` (the in-memory queue's own async wrapper)
    has neither, and nothing in `drain_inbox`/`write_loop`/`finish_and_flush` calls them. The
@@ -218,8 +218,7 @@ actual code; each is resolved as follows.
 ## Consequences
 
 - `crates/logit-proto`: `CodecError::Truncated { needed }`, `FrameHeader::read` and
-  `MAX_SANE_UNCOMPRESSED_LEN` now `pub` — shared prerequisite with `docs/plans/native-transport.md`
-  workstream A.
+  `MAX_SANE_UNCOMPRESSED_LEN` now `pub`, which the native transport shares.
 - `crates/logit-pipeline`: new `disk_queue.rs` (`DiskQueue`, `DiskQueueConfig`); `queue.rs` gains
   `SinkStore`/`SinkStoreConfig`; `runtime.rs`'s `NodeSpec::Output`, `run_output`, `drain_inbox`,
   `write_loop`, `finish_and_flush` operate on `SinkStore` instead of `SinkQueue` directly;

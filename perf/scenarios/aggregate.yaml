@@ -2,7 +2,7 @@
 # (`host: h{seq%1000}`), `aggregate` sketches each into a 1s window, null_out discards the flushed
 # windows. The cardinality is what makes the flush tick's own work (walking the series map,
 # building one output batch per window) visible alongside the per-event `DdSketch::add`.
-# Scenario table: docs/plans/load-test-harness.md, "Scenarios"; numbers: docs/design/performance.md §1.
+# Scenario table: docs/design/performance.md, "Scenarios"; numbers: its §1.
 #
 #   script/perf run --scenario aggregate
 components:

@@ -6,8 +6,7 @@ Collector's own `file` exporter (`tools/record-fixtures/otel-collector-config.ya
 exporter's default marshaler *is* pdata's JSON marshaler, the normative implementation of
 OTLP/JSON. There's no more "real" OTLP/JSON to capture underneath it, and recording it this way
 means the fixture is valid whether the original sender used gRPC or HTTP, protobuf or JSON, on the
-wire to the Collector. `docs/plans/recorded-interop-fixtures.md`'s "How captures are recorded"
-section has the full reasoning.
+wire to the Collector.
 
 To regenerate, run `script/record-fixtures otlp`. See `../README.md` and the header comment in
 `script/record-fixtures`.
@@ -40,8 +39,7 @@ differ between runs. `../README.md`'s "Consuming these fixtures" section explain
 - `crates/logit-proto/tests/robustness.rs`'s `otlp_json_peak_memory_per_input_byte_is_documented`
   measures decoding `logs.json`.
 
-No `interop_fixture_*`-style test checks the `EventBatch` these files decode to;
-`docs/plans/recorded-interop-fixtures.md`'s "Explicitly deferred" list tracks that test.
+No `interop_fixture_*`-style test checks the `EventBatch` these files decode to yet.
 
 ## What isn't covered here (yet)
 

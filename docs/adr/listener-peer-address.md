@@ -1,6 +1,6 @@
 ---
 created: 2026-10-05
-updated: 2026-10-05
+updated: 2026-10-18
 ---
 
 # Listener peer address: opt-in `network.peer.*` on the shared drivers, and PROXY protocol on TCP
@@ -167,8 +167,55 @@ the stamp happens differs:
 
 An L7 proxy puts the client in a forwarding header rather than a PROXY header. [ADR
 `forwarded-header-parsing`](forwarded-header-parsing.md) decides how these listeners read one, and
-how its `client.*` relates to a PROXY origin. [The `hpeer` plan](../plans/http-listener-peer-address.md)
-has the per-listener stamp points.
+how its `client.*` relates to a PROXY origin.
+
+Every HTTP listener stamps once per request, after decode and before delivery, where all of that
+request's batches exist:
+
+| Listener | Stamp point | Batches per request |
+|---|---|---|
+| `otlp_in` HTTP | `handle_http`, after decode | One per resource |
+| `otlp_in` gRPC | `handle_grpc`, after decode | One per resource |
+| `datadog_in` | `respond`, before `deliver_with_deadline` | One, or one per `TracerPayload` or stats payload |
+| `datadog_trace_in` | `respond`, beside `apply_tracer_headers` | One |
+| `splunk_hec_in` | `respond`, before the split into a deadline-bound first batch and detached rest | One per envelope |
+| Remote-write receiver | `write_response`, before building the batch | One |
+
+`splunk_hec_in` stamps before its split because a code 6 can follow a delivered prefix. A handler
+that consumes the request with `req.into_body()` reads the forwarding header, or splits the
+request with `into_parts`, before it collects the body. The stamp itself stays after decode.
+
+## Verification of the HTTP listeners
+
+Run on 2026-10-05 against a release build, each leg in a throwaway compose project, with
+`haproxy:3.2-alpine`, `nginx:1.27-alpine`, and `envoyproxy/envoy:v1.33-latest` in front of the
+listeners. No leg ran `tls:`; the TLS health-check rule in
+[docs/deploying.md](../deploying.md)'s "Recording the sender" comes from the code and its tests.
+
+- **HAProxy `mode tcp` with `send-proxy-v2`** in front of `otlp_in` HTTP and gRPC, both
+  `peer: true` and `proxy_protocol: true`: `client.*` named the real client and `network.peer.*`
+  named HAProxy. Each health check, with or without `check-send-proxy`, was a 16-byte version 2
+  `LOCAL` header and then an RST. Over about 100 seconds of checks every 500 ms, both servers
+  stayed `UP` and `logit` counted no `connections.rejected`.
+- **nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`** in front of
+  `otlp_in` HTTP and `splunk_hec_in`, both `forwarded: x_forwarded_for`: `client.address` and no
+  `client.port`. `X-Forwarded-For: unknown` gave no `client.*` and one `forwarded` diagnostic
+  naming the socket peer, not the value. A client-supplied `X-Forwarded-For: 192.0.2.1` became
+  `client.address`, because `$proxy_add_x_forwarded_for` appends. That is the spoofed-header
+  non-goal.
+- **Envoy with `use_remote_address: true`** in front of `otlp_in` gRPC: the same result, and
+  Envoy also appends to a client's own header.
+- **Precedence**: with nginx setting the header behind HAProxy `send-proxy-v2`, `client.*` was
+  the header's address with no port and `network.peer.*` was HAProxy. With nginx clearing the
+  header, or a client sending `unknown`, `client.*` was the PROXY origin. HAProxy in TCP mode
+  into nginx sends `logit` no PROXY header, so it can't test precedence.
+- **A direct connection to a `proxy_protocol: true` port**, and a plain TCP health check with no
+  header, counted `logit.input.connections.rejected{reason="proxy_header"}` once each, with one
+  `proxy_header` diagnostic.
+- **The "Recording the sender" recipe** (HAProxy `mode tcp` with `send-proxy-v2 check`, then
+  nginx on `listen 8080 proxy_protocol` with `proxy_set_header X-Forwarded-For
+  $proxy_protocol_addr`, then `otlp_in`): a client's own `X-Forwarded-For` was overwritten by
+  nginx, and HAProxy's check against nginx stayed `UP`.
 
 ## Verification of the datagram read
 `script/unsafe-check`'s `udp-peer-eintr-retry` scenario, run on 2026-10-05 against

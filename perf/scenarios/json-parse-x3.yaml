@@ -2,8 +2,8 @@
 # nodes, each into its own null_out, no `kv_metrics`. json-parse has one node interning keys, so a
 # change to the interner's lock or hash traffic shows up there only as one node's probe cost; here
 # the same probes contend on the same DashMap shards from three tasks, which is what a graph with
-# several parsing inputs looks like. Scenario table: docs/plans/load-test-harness.md, "Scenarios";
-# numbers: docs/design/performance.md §1.
+# several parsing inputs looks like. Scenario table: docs/design/performance.md, "Scenarios";
+# numbers: its §1.
 #
 #   script/perf run --scenario json-parse-x3
 #

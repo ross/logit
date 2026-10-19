@@ -21,8 +21,9 @@ Related docs:
 
 - [ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md): the design
   decisions, including why Datadog-origin traces never go to Datadog as OTLP.
-- [`docs/plans/datadog-relay.md`](plans/datadog-relay.md): the protocol survey, what Datadog
-  accepts and emits, and how each Datadog concept maps onto `logit`'s event model.
+- [The ADR's "Verified destination behavior"](adr/datadog-agent-and-intake-relay.md#verified-destination-behavior):
+  the protocol survey, what Datadog accepts and emits. `crates/logit-proto/src/datadog/mod.rs`'s
+  module doc maps each Datadog concept onto `logit`'s event model.
 - [`docs/known-gaps/datadog.md`](known-gaps/datadog.md): what isn't built or isn't verified.
 
 ## Topologies
@@ -112,7 +113,7 @@ Sending directly needs no Agent: it's one hop, and it works wherever HTTPS does.
   with the stats their Agent computed. OTLP carries OTel-origin spans, but Datadog computes
   their trace metrics (`compute_stats=true`) from the spans that arrive, so after any sampling,
   and Datadog's OTLP mapping loses parts of a Datadog span
-  ([the plan's §12](plans/datadog-relay.md#12-traces-to-datadog-the-agents-protocol-not-otlp-for-datadog-origin-spans-w5-w7)).
+  ([the ADR's "Context"](adr/datadog-agent-and-intake-relay.md#context)).
 
 ### From Datadog: dual-ship, tee, then cut over
 
@@ -154,7 +155,7 @@ ahead, logs and events older than 18 hours, and service checks older than 10 min
 `buffer.disk:` holds batches through a Datadog outage, but on replay after an outage longer than
 an hour, the metrics are dropped as stale, not delivered late. The 1-hour window is the documented
 one and stricter than what the intake stored in testing
-([the plan's "Timestamp windows"](plans/datadog-relay.md#11-timestamp-windows-w5)). The windows are
+([the ADR's "Timestamp windows and what a `202` drops"](adr/datadog-agent-and-intake-relay.md#timestamp-windows-and-what-a-202-drops)). The windows are
 measured from one send time per batch, read when the batch is first tried, so every retry of it
 drops the same points and each counts once. A batch held across retries can therefore
 send a point that far past the end of its window.

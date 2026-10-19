@@ -17,7 +17,7 @@ HEC at `SPLUNK_INTEROP_HEC_URL`, and `SPLUNK_INTEROP_SEARCH` picks how a leg is 
 bounded by index time to `SPLUNK_INTEROP_SINCE` rather than by event time, since the relay leg's
 recorded events carry their recorded timestamps; an `mstats` or `mcatalog` query is unbounded.
 
-A leg is PASS (Splunk holds what the leg sent, in the shape docs/plans/splunk-relay.md expects),
+A leg is PASS (Splunk holds what the leg sent, in the shape docs/adr/splunk-hec-relay.md expects),
 GAP (it arrived, with a difference the README records), SENT (under `none`: the sink's
 telemetry shows requests answered 2xx with records and nothing dropped, and the row carries the
 SPL that would confirm arrival), SKIP (the target can't run it),

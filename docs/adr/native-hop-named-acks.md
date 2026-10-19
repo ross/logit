@@ -1,6 +1,6 @@
 ---
 created: 2026-10-02
-updated: 2026-10-04
+updated: 2026-10-18
 ---
 
 # Native hop acks: a named cumulative `Ack`, coalesced at `logit_in`, and a resume mark in `HelloAck`
@@ -239,8 +239,8 @@ code accounts for it.
 - **Code.** `control.rs` gains `Ack`'s two fields, `Hello.senders`, and `HelloAck.marks`;
   `serve_frames` gains the pending ack and its flush points; `logit_out` gains the in-flight
   list, prefix marking, and the mark check in `submit`; `Output::submit` loses `in_flight`;
-  `SenderTable` gains a read-only mark lookup. The workstreams, files, tests, and pins are listed
-  once, in [`docs/plans/native-hop-named-acks.md`](../plans/native-hop-named-acks.md).
+  `SenderTable` gains a read-only mark lookup. [`docs/design/performance.md`](../design/performance.md)
+  §1 has the measurements.
 - **Telemetry.** `logit.input.acks` and `logit.output.batches.resumed`, recorded in
   `docs/design/internal-telemetry.md`. `logit.output.ack.duration` records one sample per wire
   read, not per `await_ack` that returned from the list.

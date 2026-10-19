@@ -615,7 +615,7 @@ mod tests {
     }
 
     /// SC4S 3.40.0's own metrics, one object as it posted them: no `event`, every value a string.
-    /// A 10.4.3 Splunk indexed this shape as a metric (`docs/plans/splunk-relay.md`, W5's run).
+    /// A 10.4.3 Splunk indexed this shape as a metric (ADR `splunk-hec-relay`, "Metrics over HEC").
     #[test]
     fn sc4s_metrics_with_no_event_and_string_values_decode() {
         let batches = decode(

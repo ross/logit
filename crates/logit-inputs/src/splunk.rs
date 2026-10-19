@@ -1,8 +1,7 @@
 //! `splunk_hec_in`: a stand-in for Splunk's HTTP Event Collector (HEC), the receiving end of any
 //! HEC client (Docker's `splunk` log driver, Splunk's logging libraries, the OpenTelemetry
 //! Collector's `splunk_hec` exporter, Vector)
-//! ([ADR `splunk-hec-relay`](../../../../docs/adr/splunk-hec-relay.md),
-//! [`docs/plans/splunk-relay.md`](../../../../docs/plans/splunk-relay.md) §2). One TCP listener,
+//! ([ADR `splunk-hec-relay`](../../../../docs/adr/splunk-hec-relay.md)). One TCP listener,
 //! optionally TLS, serves HTTP/1.1 and h2c through [`crate::http::auto_builder`], and every
 //! body decodes through [`logit_proto::splunk::SplunkDecoder`]. The payload mappings
 //! live in that codec's module doc; this module owns HTTP: routing, authentication, compression,

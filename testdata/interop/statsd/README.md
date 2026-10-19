@@ -4,10 +4,7 @@ Real UDP datagrams from two real statsd clients, captured by
 [`script/record-fixtures statsd`](../../../script/record-fixtures) through
 `tools/record-fixtures/raw_capture.py --proto udp`: one file per datagram, byte for byte, with no
 re-encoding. This corpus is the ground truth that
-[`perf/load/README.md`](../../../perf/load/README.md)'s traffic model is calibrated against. It
-closes the "statsd/DogStatsD producer fixtures" gap that
-[`docs/plans/recorded-interop-fixtures.md`](../../../docs/plans/recorded-interop-fixtures.md)
-carried open since that corpus started.
+[`perf/load/README.md`](../../../perf/load/README.md)'s traffic model is calibrated against.
 
 `crates/logit-cli/tests/fixtures/statsd/` already holds 44 hand-written line/expectation pairs for
 `statsd_in` → `statsd_out` round-tripping. Those cover the *grammar*. Because this team wrote them,
@@ -87,13 +84,11 @@ file" property.
 
 ## What isn't covered here (yet)
 
-- **DogStatsD events (`_e{...}`) and service checks (`_sc|...`).** Neither client's high-level API
-  emits them in an ordinary application workload, and `crates/logit-cli/tests/fixtures/statsd/`
-  already has hand-written cases for both. A capture would need a producer written specifically to
-  call `client.event()`/`client.service_check()`, which is a different kind of fixture from these.
-- **`|T<timestamp>` point timestamps.** These are DogStatsD v1.3+ only, and `datadog` 0.53.0's
-  Python API doesn't expose them on the metric helpers used here.
-- **Unix-domain-socket transport.** This is DogStatsD's other transport. `logit`'s `statsd_in` is
-  UDP and TCP only, so nothing here could check a UDS capture.
+- **DogStatsD events (`_e{...}`), service checks (`_sc|...`), `|T<timestamp>` point timestamps, and
+  the Unix-domain-socket transport.** These captures come from `datadog` 0.54.0's `DogStatsd` over
+  `unix` and `unix_stream` sockets and live in `testdata/interop/datadog/`
+  (`dogstatsd-unix-*.raw`, `dogstatsd-unix-stream-*.raw`; see that directory's README). The
+  clients captured here don't emit them, and `datadog` 0.53.0's Python API doesn't expose `|T` on
+  the metric helpers used here.
 - **A statsd server's own relay output.** These are *client* captures. What another statsd server
   (gostatsd, statsite, or the Datadog Agent) forwards is a separate producer worth capturing later.

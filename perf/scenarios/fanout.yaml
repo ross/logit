@@ -3,7 +3,7 @@
 # scenarios is the consumer count. Read against passthrough, the gap is the Fanout's per-edge Arc
 # clone (crates/logit-pipeline/src/fanout.rs) plus two more sink-side hops
 # (drain_inbox -> SinkQueue -> write_loop, crates/logit-pipeline/src/runtime.rs). Scenario table:
-# docs/plans/load-test-harness.md, "Scenarios".
+# docs/design/performance.md, "Scenarios".
 #
 #   script/perf run --scenario fanout
 #

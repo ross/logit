@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-15
+updated: 2026-10-18
 ---
 
 # InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write
@@ -34,13 +34,12 @@ Two things in today's model and sink stand in the way:
 
 Scope is InfluxDB 2.x line protocol over the v2 write API. The v1 `/write` endpoint, the query and
 delete APIs, and InfluxDB 3's own write endpoints are out of scope. The decisions below were settled
-with Ross on 2026-10-13 and are recorded in full, with the workstreams that build them, in
-[`docs/plans/influxdb-relay.md`](../plans/influxdb-relay.md).
+with Ross on 2026-10-13.
 
-On 2026-10-13 the `influx/w2` probe checked this ADR's wire claims against `influxd` 2.9.1. The
-plan's "Settled by probe" section lists the answers, and this ADR states each as verified: the
-escaping rules, the error JSON without a `line` field, and the listener's responses. "Deviations
-from `influxd`" lists where `influxdb_in` chooses differently.
+On 2026-10-13 a probe checked this ADR's wire claims against `influxd` 2.9.1.
+[Verified `influxd` behavior](#verified-influxd-behavior) lists the answers, and this ADR states
+each as verified: the escaping rules, the error JSON without a `line` field, and the listener's
+responses. "Deviations from `influxd`" lists where `influxdb_in` chooses differently.
 
 ## Decision
 
@@ -288,8 +287,8 @@ tag key, tag value, and field key:
   tag key, tag value, and field key, and a backslash before it is dropped. `=` isn't special in a
   measurement, so the encoder writes it bare there. `\=` in a measurement is accepted by `influxd`
   with `204` and the data is unreadable afterward, so the encoder never writes it.
-- A field key also unescapes `\"` to a quote (probe row 2.11). A tag value, tag key, and
-  measurement keep a backslash before `"` literal (probe row 2.9).
+- A field key also unescapes `\"` to a quote. A tag value, tag key, and
+  measurement keep a backslash before `"` literal.
 - A backslash before anything else, another backslash included, stays a literal backslash. `\\`
   is not an escape: it decodes to two backslashes. The encoder writes a backslash as itself and
   escapes only `,`, space, and (outside a measurement) `=`, each with one backslash.
@@ -303,7 +302,7 @@ tag key, tag value, and field key:
   backslash before a space, written as a `\\` pair that leaves the space bare and ends the tag
   section early. A backslash before `,` or `=` in a tag is written as `\\,` or `\\=`
   and reads back as written, because `influxd`'s line splitter counts `,` and `=` only after a bare
-  space has ended the tag section (probe row 2.13). The encoder drops the point (a measurement, a
+  space has ended the tag section. The encoder drops the point (a measurement, a
   field key) or omits the tag (a tag key or value), counting a point or field
   `metrics.dropped{reason="unencodable_key"}` and a tag `tags.omitted{reason="unencodable"}`. The decoder reads a trailing backslash before a delimiter
   as escaping it, which fails as it does at `influxd`.
@@ -387,8 +386,90 @@ list; this section summarizes it. Each deviation is a choice or a consequence of
   delete API, org and bucket not routed, and destination faults not reaching the producer. [The
   org and bucket row is replaced by the gaps that "Amendment: `influxdb_out` follows the carried
   destination (2026-10-15)" lists.]
-- The pair's evidence is a recorded Telegraf corpus and a probe of a real `influxd`, listed in the
-  plan's "Verification".
+- The pair's evidence is a recorded Telegraf corpus and a probe of a real `influxd`, listed in
+  [Verified `influxd` behavior](#verified-influxd-behavior).
+
+## Verified `influxd` behavior
+
+On 2026-10-13 a probe wrote each case to `docker.io/library/influxdb:2` (the tag `compose.yaml`
+uses), digest `sha256:f75e48af0598e8aec7986e991a848d19a119101a7d563a2e5db1dfaac9c45daa`, which
+reports `version: v2.9.1` (commit `d4fa1941fd`), and read it back with Flux or InfluxQL. These
+facts bind the codec and the listener:
+
+1. **Escaping outside a string field value.** In a measurement, tag key, tag value, and field key,
+   a backslash before `,`, space, or `=` is dropped and the character is literal. A backslash
+   before anything else, another backslash included, stays a literal backslash. `\\` is not an
+   escape: `p\\x` is stored with two backslashes. So the encoder writes a backslash as itself and
+   escapes only `,`, space, and (outside a measurement) `=`, each with one backslash.
+2. **`=` in a measurement.** A bare `=` is stored as written (`p=e`). `\=` is accepted with `204`,
+   the name appears in the index, and no row is readable, so the data is lost without an error. The
+   encoder never writes `\=` in a measurement.
+3. **A trailing backslash is unwritable.** A key or tag value that ends in a backslash, or has one
+   before a delimiter, makes that delimiter escaped, and `influxd` answers `400` (`invalid tag
+   format`, `missing fields`, or `invalid value: field-key=...`). The grammar has no spelling for
+   it.
+4. **String field values.** Inside the quotes, `\"` is a quote and `\\` is one backslash. Any other
+   `\x` is two literal characters. A raw newline inside the quotes is part of the value, so a body
+   splits into lines only with quote tracking. `,`, space, and `=` need no escape inside quotes.
+   An unterminated quote is `400` `unbalanced quotes`.
+5. **Numbers and booleans.** A bare number is a float, including `1`, `5.`, `.5`, `1.5e+3`, and
+   `-0`. `Ni` is an `i64` and `Nu` a `u64`; `007i` and `0u` are fine. These are `400`: `+1`, `+1i`,
+   `inf`, `NaN`, `0x10`, `1_000i`, `-1u`, `1.0i`, `1e3i`, `1e`, `1e309`, and an `i64` or `u64`
+   overflow. Booleans are only `t T true True TRUE f F false False FALSE`; `tRUE` and `TrUe`
+   are `400`.
+6. **Whitespace, line endings, and comments.** A line that starts with `#` after optional spaces is
+   a comment, and blank lines, leading spaces, trailing spaces, and runs of spaces between
+   sections are accepted. CRLF is `400`, because the `\r` stays on the last token (`invalid
+   number`). A tab is not a separator (`missing fields`). A `# comment` after the fields is `400`
+   (`bad timestamp`). A space after a field comma, or a trailing comma, is `400`
+   (`invalid field format`). An empty, whitespace-only, or comment-only body is `204`.
+7. **`precision` and an absent timestamp.** `ns`, `us`, `ms`, and `s` are valid and an empty value
+   means `ns`; anything else (`h`, `n`, `NS`, `millisecond`) is `400` with `invalid precision; valid
+   precision units are ns, us, ms, and s`. A point with no timestamp gets the request's arrival
+   time truncated to `precision`, and every such point in one request shares that instant.
+8. **Timestamp range.** After scaling to nanoseconds, a value must lie in -9223372036854775806 to
+   9223372036854775806; outside it is `400` `time outside range ...`. Negative values and `0` are
+   fine. A decimal point, a leading `+`, a non-number, or a second trailing token is `400`
+   (`bad timestamp`, `point is invalid`).
+9. **Duplicates.** Points with the same measurement, tag set, and timestamp merge into one point,
+   and the last write wins per field, within one body and across requests. Tag order doesn't matter
+   because `influxd` sorts the series key. A duplicate tag key in one line is `400`
+   (`duplicate tags`). A duplicate field key in one line (`f=1i,f=2i`) keeps the last value.
+10. **Reserved names.** A tag key of `_measurement`, `_field`, or `time` is `400`. A field key of
+    `time` is `422` (`invalid field name`). A measurement may start with `_`. A tag key of `_time`
+    or `_value` is accepted at write but breaks every Flux read that includes it, and a full-bucket
+    scan panicked, so those arrive from a sender as ordinary tags.
+11. **Error JSON.** The body is `{"code":"invalid","message":"unable to parse '<line>': <reason>"}`
+    for `400` and `{"code":"unprocessable entity","message":"..."}` for `422`. There is no `line`
+    field. When several lines fail to parse, one message joins their `unable to parse` clauses
+    with `\n`. The message repeats the whole offending line, including any raw bytes.
+12. **Parse error against type conflict.** A parse error is `400` and rejects the whole request;
+    nothing from the body is stored. A field type conflict (`is type float, already exists as type
+    integer`) is a `422` partial write: the other points are stored, the conflicting point is
+    dropped whole (`dropped=1`), and the message names the first conflict. The check spans lines in
+    one body and spans requests, because the type lives in the bucket.
+13. **Limits.** No body-size limit exists up to the 256 MiB tried, and v2.9.1 has no flag to set
+    one. A string field value over 1,048,576 bytes is a `422` partial write. A series key over
+    65,535 bytes (measurement, tag keys and values, escapes counted) is `400` `max key length
+    exceeded: <n> > 65535`.
+14. **`Content-Encoding`.** Only lowercase `gzip` is decompressed. `deflate`, `zstd`, `br`, and
+    `GZIP` pass through undecoded and the raw bytes are parsed as line protocol, so a compressed
+    body fails as `missing fields` and a plain-text body with `br` succeeds. `influxd` never
+    answers `415`. A body labeled `gzip` that isn't gzip is `500`. `Content-Type` is ignored.
+    `Transfer-Encoding: chunked` with no `Content-Length` is accepted.
+15. **Authentication.** `Authorization: Token <t>` and `Bearer <t>` both work, and the scheme
+    matches case-insensitively. A missing token, a wrong token, HTTP Basic, a `u`/`p` query pair,
+    and a bare token are all `401` `{"code":"unauthorized","message":"unauthorized access"}`.
+16. **Query parameters.** A missing or empty `bucket` is `404` `bucket not found`. A missing `org`
+    and `orgID` is `400` `Please provide either orgID or org`. `orgID` wins when both are given.
+    An unknown bucket or org is `404`. A malformed `orgID` is `400`. `rp` and `consistency` are
+    ignored. A trailing slash on the route is a `308` redirect.
+17. **`/ping`, `/health`, and v1.** `GET /ping` and `HEAD /ping` need no token and answer `204`
+    with `X-Influxdb-Version` and `X-Influxdb-Build` headers. `GET /health` needs no token and
+    answers `200` with a JSON body (`name`, `message`, `status`, `checks`, `version`, `commit`).
+    Every response carries `X-Influxdb-Version`. A wrong method on the write route is `405` with
+    `Allow: OPTIONS, POST`. The v1 `POST /write?db=` route works only when a DBRP mapping for `db`
+    exists; otherwise it is `404` `no dbrp mapping found`. It stays out of scope here.
 
 ## Amendment: the carriers move under `_logit.influxdb.` (2026-10-13)
 

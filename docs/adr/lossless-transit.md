@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
@@ -8,8 +8,8 @@ updated: 2026-10-13
 ## Status
 Accepted
 
-Realized as of 2026-09-12: W1-W7 closed every named loss this ADR requires closed for like-to-like
-transit; see [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s closing assessment.
+Realized as of 2026-09-12: every named loss this ADR requires closed for like-to-like transit is
+closed; see [Realization](#realization-2026-09-12).
 
 ## Context
 
@@ -83,8 +83,7 @@ round-trip test can assert equality against a concrete expectation rather than "
 
 **The internal model is a superset of every supported protocol's data model, not only OTLP's.**
 A field or semantic a protocol can carry that `Event`/`EventBatch` cannot represent at all is a
-model gap, tracked as debt against this ADR (in [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)
-and `docs/known-gaps/mappings.md`), not something a codec is free to accept quietly. This
+model gap, tracked as debt against this ADR (in `docs/known-gaps/`), not something a codec is free to accept quietly. This
 generalizes and amends `native-wire-format-with-otlp-bridge`'s Consequences from "must be a superset
 of OTLP" to "must be a superset of every protocol this project ships an `_in`/`_out` pair for."
 
@@ -159,9 +158,8 @@ fixture, not after.
 ## Consequences
 
 - `MetricKind`, `MetricRecord`, `LogRecord`, and `SpanRecord` are reshaped to close the gaps this
-  ADR names as debt rather than accepted loss — the concrete target shapes, sizes, and ordered
-  workstreams are in [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md), informed by
-  the field-by-field survey in [`docs/design/telemetry-landscape.md`](../design/telemetry-landscape.md).
+  ADR names as debt rather than accepted loss — [Realization](#realization-2026-09-12) records
+  what landed, informed by the field-by-field survey in [`docs/design/telemetry-landscape.md`](../design/telemetry-landscape.md).
   `Event`'s exact-size test (`crates/logit-core/tests/type_sizes.rs`) and
   [`docs/design/memory.md`](../design/memory.md)'s table move as a result — expected and accepted,
   per [AGENTS.md](../../AGENTS.md)'s "when one fails, that's the test working."
@@ -179,33 +177,96 @@ fixture, not after.
   metric, and a span each exist with roughly the right shape — it becomes a per-field fixed-point
   assertion once the model changes it's meant to protect exist.
 
+## Realization (2026-09-12)
+
+The model and codec work this ADR called for closed every loss it named on the first three pairs.
+
+### Pre-release, no backward compatibility
+
+`logit` is pre-release, so `MetricKind`, the native wire format, and config are reshaped in place:
+no version negotiation, dual-read path, or decode shim kept for an older build. The native codec
+keeps its skip-unknown TLV framing as hygiene, not because anything reads an old frame.
+
+### The model
+
+[ADR `metrics-model-v2`](metrics-model-v2.md) has the shapes and
+[`docs/design/memory.md`](../design/memory.md) §1 their measured sizes. In summary:
+
+- `Sum { value, temporality, monotonic }` replaces `Counter`, with `MetricKind::counter(v)` for
+  the delta-monotonic case.
+- Raw and summarized pairs: `Samples` (statsd `ms`/`h`/`d`, values plus `sample_rate`) beside
+  `Distribution`, and `SetMembers` beside `Set`. A decoder produces the raw kind; only `aggregate`
+  produces the summarized one.
+- `ExponentialHistogram` is its own variant, so `otlp_in -> otlp_out` is a fixed point for it;
+  `Histogram` carries `sum`, `min`, and `max`, and `Summary` carries `count` and `sum`.
+- `MetricRecord` gains `description`, `start_timestamp`, `exemplars`, and `flags` (OTLP's
+  `NO_RECORDED_VALUE`).
+- `LogRecord` gains `event_name`, `observed_timestamp`, and `dropped_attributes_count`.
+- `SpanRecord` gains `flags` and a boxed `SpanExt` (`status_message`, `trace_state`, and the
+  dropped counts); `SpanLink` gains `flags`, `trace_state`, and a dropped count.
+- `EventBatch` gains a batch-level `Scope` (name, version, attributes, dropped count,
+  `schema_url`), and `Resource` gains a dropped count and `schema_url`. `otlp_in` makes one batch
+  per distinct resource and scope; `otel.scope.*`, `otel.temporality`, and `otel.status_message`
+  attributes are retired.
+
+### Per pair
+
+- **`statsd_in -> statsd_out`.** Timers and sets decode to `Samples` and `SetMembers` with the
+  sample rate carried verbatim, and round-trip byte for byte under `format: dogstatsd`; under
+  `format: statsd` multi-value lines split and `h`/`d` normalize to `ms`. `|c:` and `|T` ride
+  carriers and round-trip under `format: dogstatsd`. DogStatsD events and service checks relay
+  ([ADR `statsd-output`](statsd-output.md)'s "DogStatsD events and service checks relay"), and a
+  repeated tag key decodes to a `Value::Array` and re-expands.
+- **`otlp_in -> otlp_out`.** Every metric, log, and span field the model gained above round-trips.
+  `observed_timestamp` is kept when the wire set it and re-stamped only when unset, and
+  `otel.severity_number`/`otel.severity_text` carriers outrank the normalized `Severity`. A batch
+  with no scope encodes an empty `InstrumentationScope`; `internal` stamps its own `logit` scope.
+  A `NumberDataPoint`'s int or double kind collapsed to `f64` until
+  [ADR `typed-metric-scalar`](typed-metric-scalar.md), and a log-and-span `Event` still splits
+  into two wire records, a permitted regroup (`otlp/logs.rs`'s module doc).
+- **`syslog_in -> syslog_out`.** RFC 5424 STRUCTURED-DATA parses into `syslog.sd` and re-emits
+  ([ADR `syslog-structured-data-convention`](syslog-structured-data-convention.md)), a non-numeric
+  PROCID survives as `Value::Str`, a non-UTF-8 MSG decodes to `Value::Bytes`, and `syslog_out`'s
+  TIMESTAMP follows that ADR's precedence table.
+- **Native `logit_in -> logit_out`.** Lossless by design, and the codec `file_out format: native`
+  and `buffer.disk:` share, so every model addition lands there too.
+
+Each fixed point has a test suite: `crates/logit-cli/tests/{statsd,syslog,otlp}_round_trip.rs`
+over real sockets with per-field equality, `crates/logit-proto/tests/otlp_fixed_point.rs` at the
+pure-codec level, and `proptest` fixed points in `crates/logit-outputs/src/statsd.rs` and
+`syslog.rs` (`mod fixed_point`) and `crates/logit-proto/src/otlp/metrics.rs`.
+
+### Residual debt
+
+Tracked in `docs/known-gaps/`, beside the cross-protocol table in
+[`docs/known-gaps/mappings.md`](../known-gaps/mappings.md) that the best-effort clause accepts:
+
+- [`docs/known-gaps/statsd.md`](../known-gaps/statsd.md): post-sketch kinds leave `statsd_out` as
+  per-component lines whose quantiles and set estimates don't merge downstream, and `statsd_out`
+  has no `unit`, no native rename, and an egress timestamp only on a `|T`-marked line.
+- `Summary` has no exemplars on the OTLP wire (`docs/known-gaps/mappings.md`).
+
 ## Amendment: a fourth like pair (2026-09-11)
 
 `prometheus_in -> prometheus_out` is a fourth like-protocol pair in scope under this ADR, alongside
 `statsd`, `otlp`, and `syslog` — the first one designed against the model *after* it became the
 superset this ADR requires, rather than retrofitted onto it. See
 [ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md) for the transports,
-dialect negotiation, model mapping, and permitted normalizations, and
-[`docs/plans/prometheus-scrape-and-exposition.md`](../plans/prometheus-scrape-and-exposition.md)
-for the workstreams closing it.
+dialect negotiation, model mapping, and permitted normalizations.
 
 ## Amendment: a fifth like pair (2026-09-12)
 
 `collectd_in -> collectd_out` is a fifth like-protocol pair in scope under this ADR, alongside
 `statsd`, `otlp`, `syslog`, and `prometheus`. See
 [ADR `collectd-binary-relay`](collectd-binary-relay.md) for the transport, the model mapping,
-the `collectd.*` attribute convention, and the permitted normalizations, and
-[`docs/plans/collectd-binary-relay.md`](../plans/collectd-binary-relay.md) for the workstreams
-closing it.
+the `collectd.*` attribute convention, and the permitted normalizations.
 
 ## Amendment: a sixth like pair (2026-09-13)
 
 `graphite_in -> graphite_out` is a sixth like-protocol pair in scope under this ADR, alongside
 `statsd`, `otlp`, `syslog`, `prometheus`, and `collectd`. See
 [ADR `graphite-carbon-relay`](graphite-carbon-relay.md) for the transports (plaintext and pickle,
-over TCP or UDP), the model mapping, the restricted pickle codec, and the permitted normalizations,
-and [`docs/plans/graphite-carbon-relay.md`](../plans/graphite-carbon-relay.md) for the workstreams
-closing it.
+over TCP or UDP), the model mapping, the restricted pickle codec, and the permitted normalizations.
 
 ## Amendment: a seventh and an eighth like pair (2026-09-23)
 
@@ -214,14 +275,13 @@ closing it.
 ADR, alongside `statsd`, `otlp`, `syslog`, `prometheus`, `collectd`, and `graphite`. See
 [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md) for the two protocols,
 the `datadog.*` attribute convention, the Datadog-mapped `DdSketch` that makes sketch relay
-bin-for-bin, and why traces relay over the Agent's protocol rather than OTLP, and
-[`docs/plans/datadog-relay.md`](../plans/datadog-relay.md) for the workstreams closing them and
-their permitted normalizations (a batch boundary per `TracerPayload`; `avg` recomputed from
-`sum`/`cnt`; Datadog's own name and tag sanitization).
+bin-for-bin, and why traces relay over the Agent's protocol rather than OTLP. Their permitted
+normalizations include a batch boundary per `TracerPayload`, `avg` recomputed from `sum`/`cnt`,
+and Datadog's own name and tag sanitization.
 
-Realized as of 2026-09-24: both pairs relay losslessly modulo the normalizations their codec's
-module doc lists; see [`docs/plans/datadog-relay.md`](../plans/datadog-relay.md)'s closing
-assessment.
+Realized as of 2026-09-24: both pairs relay losslessly modulo the normalizations
+`crates/logit-proto/src/datadog/mod.rs`'s module doc lists; what stays open is in
+[`docs/known-gaps/datadog.md`](../known-gaps/datadog.md).
 
 ## Amendment: OTLP timestamp saturation is a permitted normalization (2026-09-25)
 
@@ -239,16 +299,13 @@ the normalization touches only malformed or hostile input.
 in scope under this ADR, alongside `statsd`, `otlp`, `syslog`, `prometheus`, `collectd`,
 `graphite`, and the two Datadog pairs. See [ADR `splunk-hec-relay`](splunk-hec-relay.md) for the
 protocol, the OpenTelemetry exporter's attribute vocabulary it adopts in place of a `splunk.*`
-namespace, the metric and span mappings, and acknowledgment, and
-[`docs/plans/splunk-relay.md`](../plans/splunk-relay.md) for the workstreams closing it. Its
-permitted normalizations are listed in `crates/logit-proto/src/splunk/mod.rs`'s module doc (framing
+namespace, the metric and span mappings, and acknowledgment. Its permitted normalizations are listed in `crates/logit-proto/src/splunk/mod.rs`'s module doc (framing
 and batching by resource; number spelling; the single-metric form leaving as multi-metric, with
 `metric_type`; a nested `fields` value leaving flattened; hex ids leaving lowercase; `/raw` split
 into one event per line).
 
 Realized as of 2026-09-25: the pair relays losslessly modulo the normalizations its codec's
-module doc lists; see [`docs/plans/splunk-relay.md`](../plans/splunk-relay.md)'s closing
-assessment.
+module doc lists; what stays open is in [`docs/known-gaps/splunk.md`](../known-gaps/splunk.md).
 
 ## Amendment: a tenth like pair (2026-10-13)
 
@@ -257,10 +314,9 @@ like-protocol pair in scope under this ADR, alongside `statsd`, `otlp`, `syslog`
 `collectd`, `graphite`, the two Datadog pairs, and `splunk_hec`. See
 [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md) for the protocol, the
 `influxdb.*` carrier (the measurement, string fields, and the request's org and bucket), fields as
-typed `Gauge` records on one event, the all-or-nothing write, and the listener's responses, and
-[`docs/plans/influxdb-relay.md`](../plans/influxdb-relay.md) for the workstreams closing it. Its
+typed `Gauge` records on one event, the all-or-nothing write, and the listener's responses. Its
 permitted normalizations are numbered in that ADR, and
-`crates/logit-proto/src/influxdb/mod.rs`'s module doc will carry the same numbers.
+`crates/logit-proto/src/influxdb/mod.rs`'s module doc carries the same numbers.
 
 The pair needs a typed metric scalar, which the model didn't have:
 [ADR `typed-metric-scalar`](typed-metric-scalar.md) replaces the `f64` in `Gauge`, `GaugeDelta`,

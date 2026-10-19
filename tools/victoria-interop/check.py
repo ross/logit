@@ -9,9 +9,9 @@ directory. Mounts:
                `logit-vmagent-in.yaml` write; results.md and results.json land here
     /fixtures  testdata/interop/prometheus, read-only, for the replay probes
 
-Prints one row per leg (docs/plans/victoriametrics-interop.md, "W1's legs") and one per probe.
-A leg is PASS (it did what the plan expects), GAP (the backend or `logit` behaves in a way the
-plan's "Findings" records as a gap), or FAIL (nothing arrived, or something unexpected did). Exits
+Prints one row per leg (tools/victoria-interop/README.md, "The legs") and one per probe.
+A leg is PASS (it did what that list says), GAP (the backend or `logit` behaves in a way the
+README's "Recorded run" records as a gap), or FAIL (nothing arrived, or something unexpected did). Exits
 1 on any FAIL.
 """
 

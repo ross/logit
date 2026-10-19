@@ -7,9 +7,8 @@
 //!
 //! **The escape-scanning rule.** A delimiter in a measurement, tag key, tag value, or field key is
 //! escaped when the byte before it is a backslash, whatever came before that backslash. That's
-//! influxd's scanner, and it's why `v\\` followed by a space escapes the space (probe rows 1.7 and
-//! 2.5): a key can't end in a backslash. Unescaping then drops a backslash only before `,`, `=`,
-//! or a space, so `\\` stays two backslashes (probe row 1.3).
+//! influxd's scanner, and it's why `v\\` followed by a space escapes the space (item 3): a key can't end in a backslash. Unescaping then drops a backslash only before `,`, `=`,
+//! or a space, so `\\` stays two backslashes (item 1).
 
 use bytes::Bytes;
 use std::borrow::Cow;
@@ -17,7 +16,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 /// The latest instant influxd stores, in nanoseconds; the earliest is its negation. A timestamp
-/// outside the range is a parse error (probe rows 10.7 and 10.14).
+/// outside the range is a parse error (item 8).
 pub const MAX_TIMESTAMP_NS: i64 = i64::MAX - 1;
 /// See [`MAX_TIMESTAMP_NS`].
 pub const MIN_TIMESTAMP_NS: i64 = -MAX_TIMESTAMP_NS;
@@ -95,7 +94,7 @@ impl std::error::Error for LineError {}
 /// Splits `body` into logical lines, yielding each with its 1-based index.
 ///
 /// A newline ends a line unless it's escaped by the backslash before it or sits inside a quoted
-/// string field value (probe row 3.4). This is influxd's own `scanLine`: quote tracking starts
+/// string field value (item 4). This is influxd's own `scanLine`: quote tracking starts
 /// at the line's first space, and a `"` opens a string only after an unquoted `=` that no later
 /// unquoted `,` has answered, so a quote in a measurement or tag value toggles nothing. One
 /// consequence, kept for fidelity: a comment line holding `="` swallows the lines after it until
@@ -173,8 +172,8 @@ fn line_end(buf: &[u8], start: usize) -> usize {
 }
 
 /// Whether `b` is whitespace influxd skips (`skipWhitespace` in `models/points.go`): a space, a
-/// tab, or NUL. A tab or NUL never ends a section (probe row 4.3); only a run that a space starts,
-/// or the line's leading run, may contain one (row 4.5).
+/// tab, or NUL. A tab or NUL never ends a section (item 6); only a run that a space starts,
+/// or the line's leading run, may contain one (item 6).
 fn is_skippable(b: u8) -> bool {
     b == b' ' || b == b'\t' || b == 0
 }
@@ -360,7 +359,7 @@ impl<'a> Fields<'a> {
     }
 
     /// Appends a field, or overwrites a same-line repeat in place: the last value wins at the
-    /// first position when the types match (probe row 6.2); differing types are influxd's `422`,
+    /// first position when the types match (item 9); differing types are influxd's `422`,
     /// which the decoder answers as a parse error.
     fn push(
         &mut self,
@@ -400,7 +399,7 @@ impl<'a> Fields<'a> {
 
 /// The bytes a backslash escapes in a measurement, tag key, and tag value.
 const KEY_ESCAPES: &[u8] = b",= ";
-/// A field key's: influxd also unescapes `\"` there, and only there (probe rows 2.9 and 2.11).
+/// A field key's: influxd also unescapes `\"` there, and only there (the "Escaping" section).
 const FIELD_KEY_ESCAPES: &[u8] = b",= \"";
 
 /// Unescapes a measurement, tag key, tag value, or field key: a backslash before one of
@@ -432,7 +431,7 @@ fn unescape_key<'a>(
 
 /// A quoted string value starting after its opening quote at `from`: returns the unescaped value
 /// and the index past the closing quote. `\"` is a quote and `\\` one backslash; any other
-/// backslash is a literal character (probe rows 3.1 to 3.8).
+/// backslash is a literal character (item 4).
 fn parse_string(s: &[u8], from: usize) -> Result<(FieldValue<'_>, usize), Reason> {
     let mut i = from;
     let mut escaped = false;
@@ -616,7 +615,7 @@ mod tests {
 
     // -- 1. measurement escaping ---------------------------------------------------------------
 
-    // probe: influxd 2.9.1, rows 1.1 to 1.4
+    // influxd 2.9.1, item 1
     #[test]
     fn measurement_escapes() {
         assert_eq!(ok(r"p01a\,c f=1i").measurement, "p01a,c");
@@ -625,14 +624,14 @@ mod tests {
         assert_eq!(ok("p01d=e f=1i").measurement, "p01d=e", "= needs no escape");
     }
 
-    // probe: influxd 2.9.1, rows 1.5 and 1.8 (accepted, unreadable at influxd)
+    // influxd 2.9.1, item 2 (accepted, unreadable at influxd)
     #[test]
     fn an_escaped_equals_in_a_measurement_unescapes() {
         assert_eq!(ok(r"p01e\=f f=1i").measurement, "p01e=f");
         assert_eq!(ok(r"p01h\\\,x f=1i").measurement, r"p01h\\,x");
     }
 
-    // probe: influxd 2.9.1, rows 1.6 and 1.7
+    // influxd 2.9.1, item 3
     #[test]
     fn a_trailing_backslash_escapes_the_space() {
         assert_eq!(err(r"p01f\ f=1i"), "missing fields");
@@ -641,7 +640,7 @@ mod tests {
 
     // -- 2. tag keys, tag values, field keys ---------------------------------------------------
 
-    // probe: influxd 2.9.1, rows 2.1 to 2.4
+    // influxd 2.9.1, item 1
     #[test]
     fn tag_escapes() {
         let line = ok(r"p02a,t\,k=v\,x f=1i");
@@ -654,7 +653,7 @@ mod tests {
         assert_eq!(tag(&line, r"t\\k"), r"v\\x");
     }
 
-    // probe: influxd 2.9.1, rows 2.5, 2.6, 2.10, 2.12
+    // influxd 2.9.1, items 1 and 3
     #[test]
     fn a_tag_value_cannot_end_in_a_backslash_or_hold_a_raw_equals() {
         assert_eq!(err(r"p02e,tk=v\\ f=1i"), "invalid tag format");
@@ -663,31 +662,31 @@ mod tests {
         assert_eq!(err(r"p21_a,a=v\\,b=2 f=1i"), "invalid tag format");
     }
 
-    // probe: influxd 2.9.1, row 2.7
+    // influxd 2.9.1, item 1
     #[test]
     fn field_key_escapes() {
         let line = ok(r"p02g,tk=v f\,k=1i,f\=k=2i,f\ k=3i,f\\k=4i");
         assert_eq!(keys(&line), ["f,k", "f=k", "f k", r"f\\k"]);
     }
 
-    // probe: influxd 2.9.1, rows 2.8 and 2.16
+    // influxd 2.9.1, items 1 and 3
     #[test]
     fn a_field_key_cannot_end_in_a_backslash() {
         assert_eq!(err(r"p02h,tk=v f\\=1i"), "invalid field format");
         assert_eq!(err(r"p21_e,a=v f=1i,g\\=2i"), "invalid field format");
     }
 
-    // probe: influxd 2.9.1, rows 2.9, 2.11, 2.13, 2.14
+    // influxd 2.9.1, the "Escaping" section
     #[test]
     fn a_backslash_before_anything_else_is_kept() {
         assert_eq!(tag(&ok(r#"p02i,tk=v\"q f=1i"#), "tk"), r#"v\"q"#);
-        // A field key also unescapes `\"` (row 2.11); a tag value doesn't (row 2.9).
+        // A field key also unescapes `\"` ; a tag value doesn't (the "Escaping" section).
         assert_eq!(keys(&ok(r#"p02k,tk=v f\"k=1i"#)), [r#"f"k"#]);
         assert_eq!(tag(&ok(r"p21_d,a=v\\=x f=1i"), "a"), r"v\=x");
         assert_eq!(tag(&ok(r"p21_h,a=b\x f=1i"), "a"), r"b\x");
     }
 
-    // probe: influxd 2.9.1, row 2.15
+    // influxd 2.9.1, item 1
     #[test]
     fn utf8_round_trips_in_every_position() {
         let line = ok("p21_f,a=é😀 é😀=\"é😀\" 1700000000000000000");
@@ -714,7 +713,7 @@ mod tests {
 
     // -- 3. string fields ----------------------------------------------------------------------
 
-    // probe: influxd 2.9.1, rows 3.1 to 3.8
+    // influxd 2.9.1, item 4
     #[test]
     fn string_field_escapes() {
         let s = |raw: &str| match field(&ok(raw), "f") {
@@ -731,7 +730,7 @@ mod tests {
         assert_eq!(s(r#"p21_i f="a\xb""#), r"a\xb");
     }
 
-    // probe: influxd 2.9.1, row 3.4: a raw newline inside quotes doesn't end the line
+    // influxd 2.9.1, item 4: a raw newline inside quotes doesn't end the line
     #[test]
     fn the_splitter_keeps_a_quoted_newline_in_its_line() {
         assert_eq!(
@@ -746,7 +745,7 @@ mod tests {
 
     // -- 4. whitespace, comments, line endings -------------------------------------------------
 
-    // probe: influxd 2.9.1, row 4.1
+    // influxd 2.9.1, item 6
     #[test]
     fn comments_and_blank_lines_are_skipped() {
         let body = "# comment\np04a f=1i\n   # indented comment\np04b f=1i\n\np04c f=1i\n";
@@ -756,7 +755,7 @@ mod tests {
         assert_eq!(names, ["p04a", "p04b", "p04c"]);
     }
 
-    // probe: influxd 2.9.1, row 4.2: CR is not stripped
+    // influxd 2.9.1, item 6: CR is not stripped
     #[test]
     fn crlf_is_an_error() {
         let body = "p04d f=1i\r\np04e f=2i\r\n";
@@ -765,13 +764,13 @@ mod tests {
         assert!(errors.iter().all(|r| r.as_ref().unwrap_err() == "invalid number"));
     }
 
-    // probe: influxd 2.9.1, row 4.3
+    // influxd 2.9.1, item 6
     #[test]
     fn a_tab_is_not_a_separator() {
         assert_eq!(err("p04f\tf=1i"), "missing fields");
     }
 
-    // probe: influxd 2.9.1, rows 4.4 to 4.7 and 4.11
+    // influxd 2.9.1, item 6
     #[test]
     fn runs_of_spaces_and_surrounding_whitespace_are_accepted() {
         assert_eq!(
@@ -784,7 +783,7 @@ mod tests {
         assert_eq!(body_lines("p04n f=1i\n\n\n\n").len(), 4);
     }
 
-    // probe: influxd 2.9.1, rows 4.8 to 4.10
+    // influxd 2.9.1, item 6
     #[test]
     fn malformed_field_lists_and_trailing_comments_fail() {
         assert_eq!(err("p04k f=1i,  g=2i"), "invalid field format");
@@ -825,7 +824,7 @@ mod tests {
 
     // -- 5. empty and comment-only bodies ------------------------------------------------------
 
-    // probe: influxd 2.9.1, rows 5.1 to 5.3
+    // influxd 2.9.1, item 6
     #[test]
     fn empty_and_comment_only_bodies_have_no_points() {
         for body in ["", "   \n\t\n", "# only\n# comments\n"] {
@@ -838,7 +837,7 @@ mod tests {
 
     // -- 6. duplicates in one line -------------------------------------------------------------
 
-    // probe: influxd 2.9.1, rows 6.1, 6.2, 6.4
+    // influxd 2.9.1, item 9
     #[test]
     fn duplicate_keys_in_one_line() {
         assert_eq!(err("p06a,k=1,k=2 f=1i"), "duplicate tags");
@@ -850,7 +849,7 @@ mod tests {
         assert_eq!(keys(&ok("m a=1i,b=1i,a=2i")), ["a", "b"]);
     }
 
-    // probe: influxd 2.9.1, row 6.3 (influxd answers 422; `logit` answers 400)
+    // influxd 2.9.1, item 12 (influxd answers 422; `logit` answers 400)
     #[test]
     fn a_same_line_type_conflict_fails() {
         assert_eq!(
@@ -873,7 +872,7 @@ mod tests {
 
     // -- 7. reserved names ---------------------------------------------------------------------
 
-    // probe: influxd 2.9.1, rows 7.1 to 7.3
+    // influxd 2.9.1, item 10
     #[test]
     fn reserved_tag_keys_fail() {
         assert_eq!(err("p07a,_measurement=x f=1i"), "cannot use reserved tag key \"_measurement\"");
@@ -881,7 +880,7 @@ mod tests {
         assert_eq!(err("p07c,time=x f=1i"), "cannot use reserved tag key \"time\"");
     }
 
-    // probe: influxd 2.9.1, row 7.4 (influxd answers 422; `logit` answers 400)
+    // influxd 2.9.1, item 10 (influxd answers 422; `logit` answers 400)
     #[test]
     fn a_time_field_key_fails() {
         assert_eq!(
@@ -890,7 +889,7 @@ mod tests {
         );
     }
 
-    // probe: influxd 2.9.1, rows 7.5 to 7.11
+    // influxd 2.9.1, item 10
     #[test]
     fn other_underscore_names_are_ordinary() {
         assert_eq!(ok("_p07e f=1i").measurement, "_p07e");
@@ -906,7 +905,7 @@ mod tests {
 
     // -- 8. booleans ---------------------------------------------------------------------------
 
-    // probe: influxd 2.9.1, rows 8.1 to 8.15
+    // influxd 2.9.1, item 5
     #[test]
     fn boolean_spellings() {
         for t in ["t", "T", "true", "True", "TRUE"] {
@@ -924,7 +923,7 @@ mod tests {
 
     // -- 9. numbers ----------------------------------------------------------------------------
 
-    // probe: influxd 2.9.1, the accepted rows of section 9
+    // influxd 2.9.1, item 5: accepted numbers
     #[test]
     fn accepted_numbers() {
         let v = |tok: &str| -> FieldValue<'static> {
@@ -961,7 +960,7 @@ mod tests {
         assert_eq!(v("0u"), FieldValue::U64(0));
     }
 
-    // probe: influxd 2.9.1, the refused rows of section 9, with influxd's reasons
+    // influxd 2.9.1, item 5: refused numbers, with influxd's reasons
     #[test]
     fn refused_numbers() {
         for (tok, reason) in [
@@ -1000,8 +999,8 @@ mod tests {
 
     // -- 10. timestamps ------------------------------------------------------------------------
 
-    // probe: influxd 2.9.1, rows 10.1, 10.6, 10.8, 10.13, 10.16 to 10.20 (range and precision
-    // are the decoder's: `decode.rs`'s tests cover rows 10.2 to 10.5, 10.7, 10.9 to 10.15)
+    // influxd 2.9.1, items 7 and 8 (range and precision
+    // are the decoder's: `decode.rs`'s tests cover them)
     #[test]
     fn timestamp_tokens() {
         assert_eq!(
@@ -1026,7 +1025,7 @@ mod tests {
 
     // -- 18. malformed shapes ------------------------------------------------------------------
 
-    // probe: influxd 2.9.1, section 18's malformed shapes and rows 13.1, 13.2
+    // influxd 2.9.1, item 12 and the malformed shapes
     #[test]
     fn malformed_shapes() {
         for (raw, reason) in [

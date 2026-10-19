@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-14
+updated: 2026-10-18
 ---
 
 # RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission
@@ -16,8 +16,7 @@ relay, modulo a named list of permitted normalizations. Before this decision, `s
 (`crates/logit-inputs/src/syslog.rs`) only balanced-and-skipped RFC 5424 STRUCTURED-DATA
 (`skip_structured_data`) — its contents never reached an attribute — and `syslog_out`
 (`crates/logit-outputs/src/syslog.rs`) always wrote the NILVALUE `-`, regardless of what an event
-carried. [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W5 workstream closes
-that gap: a real, quote-aware STRUCTURED-DATA parser and its exact encoder inverse, plus an opt-in
+carried. This decision closes that gap: a real, quote-aware STRUCTURED-DATA parser and its exact encoder inverse, plus an opt-in
 element for attributes that didn't originate as `syslog.sd` at all.
 
 That plan's own "Attribute conventions" section originally justified the nested `syslog.sd` shape
