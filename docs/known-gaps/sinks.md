@@ -14,14 +14,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
     the boundary, not at the boundary. The rolled file still holds the previous period's contents;
     only its on-disk appearance is late.
   - **Retention and compression:** retention is a plain `max_files` count, with no age-based
-    eviction. Compression is `format: native`'s `compression: lz4` or nothing: `format: human`'s
-    text render has no compression option, and nothing compresses already-rotated files after the
-    fact. Both are left to an external tool.
+    eviction. Compression is `format: native`'s `compression: lz4` or nothing: `format: human` and
+    `format: json` have no compression option, and nothing compresses already-rotated files after
+    the fact. Both are left to an external tool. A gzipped JSON archive also has no reader
+    ([`replay_in`'s gaps](tailing.md#replay_in)).
   - **Format:** `stdio_out` shares `format:` (`human`, ADR `human-render-block-format`; `json`,
     ADR `stream-json-format`; or `native`, ADR `file-output-native-format`) and `message:`. A
-    `format:` *template* over `human` is the one unbuilt extension point. Reading a
-    `format: native` file back, with a decoder-side reader/verifier or by wiring `NativeDecoder`
-    into `tail_in`, is unblocked, undesigned follow-up work.
+    `format:` *template* over `human` is the one unbuilt extension point. `replay_in` reads a
+    `format: json` or `format: native` file back once ([ADR `replay-input`](../adr/replay-input.md));
+    nothing follows a growing `format: native` file.
   - **Restart:** `FileTarget::open` seeds the calendar period from an existing file's mtime
     (`RotationState::seed_period`). If the mtime is unreadable (a failed `metadata()` call) or the
     clock jumps backward across the restart, the sink learns the period fresh on the first write

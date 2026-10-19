@@ -1,4 +1,4 @@
-# Known gaps: File tailing and Docker logs
+# Known gaps: File tailing, Docker logs, and replay
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
@@ -270,3 +270,28 @@ Entry format and the other areas: [the known-gaps index](README.md).
   or unparseable file degrades gracefully: a `container.id`-only resource, diagnosed
   `metadata_error`. The residual risk is a *silently reshaped* file that still parses but means
   something different.
+
+## `replay_in`
+
+- **`replay_in` reads one finished file once, with no follow mode, no directory or glob, no rate
+  pacing, and no checkpoint** ([ADR `replay-input`](../adr/replay-input.md)). It stops at the end
+  of the file even if a writer is still appending, sends events as fast as downstream takes them,
+  and a restart reads the file from its start.
+  - **Consequence:** a restarted replay sends every event again, and a replay into a rate-limited
+    destination meets that destination's limits at full speed.
+  - **Workaround:** follow a growing file with `tail_in` and a `json` stage. Run one `replay_in`
+    per file, and put the restart decision in whatever starts `logit`.
+  - **Revisit trigger:** an operator replaying archives too large to resend after a failure, or a
+    flow that needs pacing.
+- **Neither side of the archive pair handles a compressed JSON file.** `file_out` compresses only
+  `format: native`, as lz4 inside each frame, and never compresses a `format: json` file, rotated
+  or not. `replay_in` reads no compressed file: no `.gz`, and no lz4-framed JSON. A
+  `format: native` archive written with `compression: lz4` replays, since its compression is per
+  frame.
+  - **Consequence:** a JSON archive takes its full size on disk, and one an external tool gzipped
+    after rotation has to be decompressed before `replay_in` can read it.
+  - **Workaround:** archive as `format: native` with `compression: lz4`, or decompress to a file
+    (or a named pipe) before replaying.
+  - **Remedy:** one follow-up that adds both sides together, gzip on `file_out`'s `format: json`
+    rotation and `replay_in` reading a `.gz` file by its extension, so archiving and replaying
+    stay one story.

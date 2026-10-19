@@ -131,12 +131,11 @@ A new `ComponentKind`, `replay_in`, reads a file once and emits its contents as 
 when the file does, as `generate_in` does under `count`, which ends the process. Its ADR records
 the use cases: replaying an archive `file_out` wrote, injecting hand-written events, and the
 spec's flows. Timestamps are the file's; a line or frame it can't read is skipped and counted
-(`logit.input.lines.dropped{reason}` or the frame equivalent), and a torn final frame ends the
-file as `logit-perf`'s `decode_dump` already tolerates.
+(`logit.input.frames.dropped{reason}`), and a torn final frame ends the file as `logit-perf`'s
+`decode_dump` already tolerates.
 
-Open: whether a `batch:` size groups lines into batches, or each line's resource boundary does
-(the JSON repeats the resource on every line, so consecutive lines with the same resource and
-scope are one batch). The ADR decides.
+Both bound a batch: consecutive lines with the same resource and scope form one, cut at
+`batch:` events ([ADR `replay-input`](../adr/replay-input.md)).
 
 ### 4. The flow driver (W3)
 
@@ -239,6 +238,8 @@ Sources: `statsd_in`, `influxdb_in`, `prometheus_in`. Sinks: `statsd_out`, `prom
 - `kafka_out` and `splunk_hec_out` columns: their metric forms are JSON documents with their own
   readers, and neither has a `_in` pair that reads metrics back the same way (`splunk_hec_in`
   does; it joins when a flow asks).
+- Compressed JSON archives: gzip on `file_out`'s `format: json` rotation and `replay_in` reading a
+  `.gz` file by its extension, added together in one follow-up (`docs/known-gaps/tailing.md`).
 
 ## Workstreams
 
@@ -281,3 +282,8 @@ Recorded per workstream as each lands.
   offset was dropped with its empty counts, and a sketch's fractional count rounded away. All are
   fixed additively; [ADR `stream-json-format`](../adr/stream-json-format.md)'s lossless
   amendment lists them.
+- **W2**: the plan's `logit.input.lines.dropped` doesn't exist. Every line-framed listener counts a
+  lost line under `logit.input.frames.dropped`, so a refused JSON line is
+  `frames.dropped{reason="undecodable"}`, the stream driver's reason for a unit its decoder
+  refused. No graph rule was needed for finiteness: the runtime already treats an input's `Ok`
+  return as that node finishing, and only rule 93's field bounds are new.
