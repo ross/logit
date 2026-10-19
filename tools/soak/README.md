@@ -82,6 +82,13 @@ VictoriaMetrics is down, with a 1 s sink `shutdown_grace`, so its first life's l
 shutdown. A correct ledger reports that life's `ledger.egress` gap as counted, never as a
 `FAIL`.
 
+`partition-rss` (15 minutes 45 seconds) runs `statsd-vm`'s stack with one fault, a 45 s
+partition of the generator 2 minutes in, then 13 minutes with no fault. It asks whether the
+generator gives back the memory the partition's backlog took and then holds flat. Its
+`rss_settle` of `120s` puts `rss_slope`'s fit on the plateau after the release, and an
+expectation bounds the generator's RSS rise over that plateau to 8 MiB. A SIGHUP step on the
+generator, which opens no fault window, marks the plateau's span for that expectation.
+
 Four scenarios of about 5 minutes each run one fault and assert its effect with `[[expect]]`
 tables (see [Expectations](#expectations)):
 
@@ -842,7 +849,8 @@ Each check skips fault windows, a fault's span plus the scenario's `recovery_bou
 rule only holds in steady state. `rss_slope` alone skips a further `rss_settle` after each
 window, an optional top-level duration (default `0s`). Set it when a service gives back a
 fault's backlog memory in steps over minutes, so a fit over those plateaus beside the pre-fault
-baseline slopes upward with no leak; `fanin` and `tcp-ingress` set `60s`. Keep it short enough
+baseline slopes upward with no leak; `fanin` and `tcp-ingress` set `60s`, and
+`partition-rss` `120s`. Keep it short enough
 to leave each life a fit, 6 samples over 60 s: a window that swallows a life's every gap leaves
 nothing to judge, and the row's coverage `WARN` says so. The plan's "The checks" has the full
 rules.
