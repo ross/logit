@@ -272,3 +272,12 @@ Sources: `statsd_in`, `influxdb_in`, `prometheus_in`. Sinks: `statsd_out`, `prom
 ## Findings
 
 Recorded per workstream as each lands.
+
+- **W1**: §2 named two gaps that weren't the whole list, and one that wasn't a gap. A `U64` above
+  `i64::MAX` already read back unambiguously; `U64(5)` against `I64(5)` was the case to tag. The
+  work also found `Bytes`, `Timestamp`, and non-finite `F64` values indistinguishable
+  from strings in a value position, a backslash in `Bytes` that collided with the `\xHH` escape, a
+  no-recorded-value metric that omitted its value, an exponential histogram side whose nonzero
+  offset was dropped with its empty counts, and a sketch's fractional count rounded away. All are
+  fixed additively; [ADR `stream-json-format`](../adr/stream-json-format.md)'s lossless
+  amendment lists them.
