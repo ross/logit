@@ -5,7 +5,9 @@ It covers the duration parser, every `validate()` rejection rule, `expand()`'s c
 repetition, the NDJSON reducers (counters per life split where uptime decreases, gauge series),
 the stderr classifier (a raw `thread '...' panicked at` line included), the slope function, and
 the checks against small synthetic run directories: a failed fault action, an aborted run and its
-exit code, an fd sample inside a later fault, and a steady state too thin to judge. For the
+exit code, an fd sample inside a later fault, a steady state too thin to judge, and
+`rss_settle`: its rules, a stepped recovery inside it, a whole-run leak FAILing through it, and
+coverage WARNing where it excuses everything. For the
 ledger, it covers the reset-aware VictoriaMetrics total and its split per life, at a decrease
 and at a life start with none, and a two-life run whose final life balances and whose earlier
 life's residual reaches V, each rule broken in turn: a shutdown drop telemetry and stderr both
@@ -3407,6 +3409,146 @@ def _slope_edges():
         result = _status(silent, checks.check_fd_slope)
         expect(result.status == checks.FAIL and "logit" in result.detail,
                f"fd_slope FAILs an expectation on a service with no fd samples, got {result}")
+
+
+def _rss_settle_rules(root):
+    """`rss_settle` defaults to 0 s, loads a duration, reaches the resolved scenario, and is
+    refused negative or unparsable."""
+    path, base = _base(root)
+
+    def with_settle(value):
+        raw = copy.deepcopy(base)
+        raw["rss_settle"] = value
+        return raw
+
+    loaded = scenario.from_dict(copy.deepcopy(base), path)
+    expect(loaded.rss_settle == scenario.DEFAULT_RSS_SETTLE_S == 0.0
+           and loaded.to_json()["rss_settle"] == 0.0,
+           f"rss_settle defaults to 0s in the resolved scenario, got {loaded.rss_settle}")
+    for value, seconds in (("90s", 90.0), ("0s", 0.0), ("2m30s", 150.0)):
+        loaded = scenario.from_dict(with_settle(value), path)
+        expect(loaded.rss_settle == seconds and loaded.to_json()["rss_settle"] == seconds,
+               f"rss_settle = {value!r} loads as {seconds:g}s, got {loaded.rss_settle}")
+    for value in ("-30s", "soon", "30", 30):
+        _refused(path, with_settle(value), "scenario.rss_settle: not a duration",
+                 f"rss_settle = {value!r}")
+    # Only these schedules opt in; every other shipped scenario keeps recovery_bound alone.
+    opted_in = {"fanin": 60.0, "tcp-ingress": 60.0}
+    for path_one in sorted((root / "scenarios").glob("*/scenario.toml")):
+        name = path_one.parent.name
+        want = opted_in.get(name, 0.0)
+        shipped = scenario.load(path_one)
+        expect(shipped.rss_settle == want and shipped.to_json()["rss_settle"] == want,
+               f"{name} loads rss_settle = {want:g}s, got {shipped.rss_settle}")
+    loaded = scenario.from_dict(copy.deepcopy(base), path)
+    loaded.rss_settle = -1.0
+    try:
+        scenario.validate(loaded)
+        expect(False, "validate() accepts a negative rss_settle")
+    except scenario.ScenarioError as err:
+        expect(any("rss_settle must be 0s or more" in p for p in err.problems),
+               f"validate() refuses a negative rss_settle, got {err.problems}")
+
+
+def _settle_run(tmp, name, steps, end_s, sut, gen, warmup=60.0, **resolved):
+    """A run directory of `end_s` seconds with `steps`, `[(step, action, on, start, end)]`,
+    and `logit` and `generator` NDJSON whose resident bytes are `sut(offset)` and
+    `gen(offset)`."""
+    timeline = [_phase("start", 0, t0=T0)]
+    for step, action, on, start, end in steps:
+        timeline += [_action("apply", step, action, on, start, start + 1),
+                     _action("revert", step, action, on, end, end)]
+    timeline += [_phase("end_begin", end_s), _phase("end_end", end_s + 50)]
+    flat = {"fds": lambda o: 10, "strings": lambda o: 100}
+    run_dir = _run_dir(tmp, name, timeline, _service_stdout(end_s + 50, rss=sut, **flat),
+                       duration=float(end_s), warmup=warmup, **resolved)
+    (run_dir / "logs" / "generator.stdout").write_text(
+        "\n".join(_service_stdout(end_s + 50, rss=gen, **flat)) + "\n")
+    return run_dir
+
+
+def _rss_settle_checks():
+    """`rss_slope` excuses `rss_settle` past `recovery_bound` after each fault: a backlog's RSS
+    returned in steps inside it PASSes, the same run with `rss_settle = 0s` doesn't, growth
+    across the whole run still FAILs, and a schedule the window covers whole WARNs on
+    coverage rather than SKIPping."""
+    mib = 2 ** 20
+
+    def flat(o):
+        return 50 * mib
+    with tempfile.TemporaryDirectory() as tmp:
+        # fanin's generator around its partition (20261018T190542Z): 18 MiB, 86 MiB at the
+        # revert, a 62.6 MiB plateau from +14 s, 52.6 MiB from +84 s, 32 MiB from +94 s, and
+        # back at 18 MiB from +100 s, inside recovery_bound 45 s + rss_settle 60 s.
+        def stepped(o):
+            after = o - 375
+            if 330 <= o < 389:
+                return 86 * mib
+            if 0 <= after < 84:
+                return 62.6 * mib
+            if 84 <= after < 94:
+                return 52.6 * mib
+            if 94 <= after < 100:
+                return 32 * mib
+            return 18 * mib
+        partition = [("c0s1", "partition", "generator", 330, 375)]
+        settled = _settle_run(tmp, "settle-bump", partition, 600, flat, stepped,
+                              rss_settle=60.0)
+        result = _status(settled, checks.check_rss_slope)
+        expect(result.status == checks.PASS and "generator PASS" in result.detail,
+               f"a fault's RSS returned within rss_settle PASSes, got {result}")
+        unsettled = _settle_run(tmp, "settle-bump-off", partition, 600, flat, stepped,
+                                rss_settle=0.0)
+        result = _status(unsettled, checks.check_rss_slope)
+        expect(result.status == checks.WARN and "generator WARN" in result.detail,
+               f"the same RSS with rss_settle 0s WARNs on its slope, got {result}")
+        # A run directory recorded before the key scores as it did then, with no settle.
+        unkeyed = _settle_run(tmp, "settle-bump-unkeyed", partition, 600, flat, stepped)
+        data = checks.RunData(unkeyed)
+        result = checks.check_rss_slope(data)
+        expect(data.rss_settle == 0.0 and result.status == checks.WARN,
+               f"a run directory with no rss_settle reads 0s, got {data.rss_settle}, {result}")
+
+        # cardinality's leak (20261012T215005Z): the SUT +73 and the generator +61 MiB/h for
+        # 75 minutes against a 48 MiB/h limit, its five faults each adding 40 MiB that comes
+        # back inside the settle window.
+        faults_at = [("c0s1", "netem", "logit", 300, 420),
+                     ("c0s2", "stop", "victoria-metrics", 900, 990),
+                     ("c1s1", "netem", "logit", 2100, 2220),
+                     ("c1s2", "stop", "victoria-metrics", 2700, 2790),
+                     ("c2s1", "netem", "logit", 3900, 4020)]
+
+        def leaking(base, per_hour):
+            def rss(o):
+                bump = any(start <= o < end + 90 for _, _, _, start, end in faults_at)
+                return base * mib + per_hour * mib * o / 3600 + (40 * mib if bump else 0)
+            return rss
+        thresholds = {**RESOLVED["thresholds"], "rss_growth_mib_per_hour": 48}
+        leak = _settle_run(tmp, "settle-leak", faults_at, 4500, leaking(50, 73),
+                           leaking(30, 61), warmup=120.0, cooldown=180.0,
+                           thresholds=thresholds, rss_settle=60.0)
+        data = checks.RunData(leak)
+        result = checks.check_rss_slope(data)
+        expect(data.rss_settle == 60.0 and result.status == checks.FAIL
+               and "logit FAIL: MiB/h life 0 +73.0" in result.detail
+               and "generator FAIL: MiB/h life 0 +61.0" in result.detail,
+               f"growth across the whole run FAILs with rss_settle in force, got {result}")
+
+        # Faults every 150 s for 30 s: rss_settle leaves 15 s after each, two samples, so a
+        # life fits over 30 s judged of the 900 s after warmup.
+        dense = [(f"c{i}s1", "netem", "generator", start, start + 30)
+                 for i, start in enumerate(range(60, 811, 150))]
+        covered = _settle_run(tmp, "settle-dense", dense, 960, flat, flat, rss_settle=60.0)
+        result = _status(covered, checks.check_rss_slope)
+        expect(result.status == checks.WARN and "cover little" in " ".join(result.lines)
+               and "every sample after warmup in a fault window" not in result.detail,
+               f"a schedule rss_settle leaves too little of WARNs on coverage, got {result}")
+        whole = [("c0s1", "netem", "generator", 60, 1000)]
+        excused = _settle_run(tmp, "settle-whole", whole, 1000, flat, flat, rss_settle=60.0)
+        result = _status(excused, checks.check_rss_slope)
+        expect(result.status == checks.WARN
+               and "every sample after warmup in a fault window" in result.detail,
+               f"a service with every sample excused WARNs rather than SKIPs, got {result}")
 
 
 def _expected_rules(root):
@@ -10726,6 +10868,7 @@ def run(root, quiet=False):
                      _http_ledger, _http_rules, _file_ledger, _file_rules,
                      _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _per_service, _slope_edges,
+                     _rss_settle_rules, _rss_settle_checks,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
                      _standin_server, _respond_rules, _standin_driver, _standin_checks,
                      _class_signatures, _datadog_codec, _datadog_counts, _datadog_server,
@@ -10741,7 +10884,7 @@ def run(root, quiet=False):
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
                               _fanin_driver, _tcp_rules, _http_rules, _file_rules, _two_sut_rules,
                               _two_sut_driver,
-                              _expected_rules, _standin_codec, _standin_server,
+                              _rss_settle_rules, _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_driver, _datadog_codec, _datadog_server,
                               _datadog_rules, _influx_codec, _influx_server, _influx_rules,
                               _overlap_rules, _overlap_driver, _signal_rules, _sighup_driver,

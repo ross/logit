@@ -84,6 +84,9 @@ failed reload read it, and every other row judges straight through it.
 
 `rss_slope` and `fd_slope` judge each `logit` service on its own line, and a scenario's
 `[expected]` table can set the verdict a service should get on either (`judge_services`).
+`rss_slope` alone widens each fault window by the scenario's `rss_settle` past
+`recovery_bound` (`RunData.rss_windows`): a backlog's memory comes back in steps over minutes,
+and a fit over the plateaus beside the pre-fault baseline slopes upward with no leak.
 """
 
 import bisect
@@ -96,7 +99,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import collect, faults, standin, telemetry, topic, vm
-from .scenario import (DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET, GENERATOR_ROLE,
+from .scenario import (DEFAULT_RSS_SETTLE_S, DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET, GENERATOR_ROLE,
                        HTTP_WIRE, KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS,
                        RUN_WINDOW, SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET,
                        SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE, TARGET_SPLIT,
@@ -279,6 +282,9 @@ class RunData:
         self.stats = collect.read_jsonl(self.run_dir / "stats.ndjson")
         self.freshness = collect.read_jsonl(self.run_dir / "vm-freshness.jsonl")
         self.recovery_bound = float(self.resolved.get("recovery_bound", 0))
+        # A run directory from before `rss_settle` existed takes the default, 0 s, and scores as
+        # it did then.
+        self.rss_settle = float(self.resolved.get("rss_settle", DEFAULT_RSS_SETTLE_S))
         self.warmup = float(self.resolved.get("warmup", 0))
         self.thresholds = self.resolved.get("thresholds", {})
         self.ledger = self.resolved.get("ledger", {})
@@ -446,6 +452,10 @@ class RunData:
         return [(f.start, f.end + extra) for f in self.faults
                 if (on is None or f.on == on) and (actions is None or f.action in actions)]
 
+    def rss_windows(self):
+        """`windows()` widened by `rss_settle` past `recovery_bound`, for `rss_slope` only."""
+        return [(start, end + self.rss_settle) for start, end in self.windows()]
+
     def post_warmup_s(self):
         """Seconds from the end of warmup to the end sequence, or 0 with no timeline start."""
         if self.t0 is None:
@@ -462,10 +472,11 @@ class RunData:
         return share, (f"{judged_s:.0f}s of {post:.0f}s after warmup judged ({share:.0%}; WARN "
                        f"under {COVERAGE_MIN_SHARE:.0%})")
 
-    def steady_span(self, points):
-        """Seconds between consecutive [(ts, value)] points with no fault window between them:
-        a life's samples can sit on both sides of a fault that took most of the run."""
-        windows = self.windows()
+    def steady_span(self, points, windows=None):
+        """Seconds between consecutive [(ts, value)] points with no fault window, or none of
+        `windows` when given, between them: a life's samples can sit on both sides of a fault
+        that took most of the run."""
+        windows = self.windows() if windows is None else windows
         return sum(b - a for (a, _), (b, _) in zip(points, points[1:])
                    if not any(start < b and end > a for start, end in windows))
 
@@ -1061,22 +1072,30 @@ def classify_stall(tel, sink, start, end):
     return FAIL, "nothing delivered and nothing queued"
 
 
-def _rss_points(data, service):
+def _rss_points(data, service, windows):
+    """`(by_life, source, sampled)`: `{life: [(ts, bytes)]}` outside `windows` after warmup,
+    where they came from, and whether the service had any sample after warmup at all, so a
+    service whose every sample sat in a fault window reads as unjudged rather than unsampled."""
     tel = data.telemetry.get(service)
     by_life = {}
+    sampled = False
     if tel is not None:
         for ts, value, life in tel.gauge_series("logit.process.memory.resident.bytes"):
-            if data.steady(ts, after_warmup=True):
+            sampled = sampled or data.steady(ts, after_warmup=True, windows=[])
+            if data.steady(ts, after_warmup=True, windows=windows):
                 by_life.setdefault(life, []).append((ts, value))
-    if by_life:
-        return by_life, "telemetry"
+    if by_life or sampled:
+        return by_life, "telemetry", sampled
     for record in data.stats:
         if record.get("svc") != service:
             continue
         value = parse_mem(record.get("MemUsage"))
-        if value is not None and data.steady(record.get("t"), after_warmup=True):
+        if value is None:
+            continue
+        sampled = sampled or data.steady(record.get("t"), after_warmup=True, windows=[])
+        if data.steady(record.get("t"), after_warmup=True, windows=windows):
             by_life.setdefault(0, []).append((record["t"], value))
-    return by_life, "docker stats"
+    return by_life, "docker stats", sampled
 
 
 def judge_services(data, check_id, judged):
@@ -1109,16 +1128,18 @@ def judge_services(data, check_id, judged):
 def check_rss_slope(data):
     """Per `logit` service: the least-squares RSS slope of each life over steady samples after
     warmup, against `rss_growth_mib_per_hour`, a growth WARNing under an hour's run and FAILing
-    from one; WARN when the judged slopes cover under `COVERAGE_MIN_SHARE` of the run. Each
-    service is judged apart and `[expected]` can set its verdict (`judge_services`)."""
+    from one; WARN when the judged slopes cover under `COVERAGE_MIN_SHARE` of the run. Steady
+    here excludes `rss_windows()`, each fault's window plus `rss_settle`. Each service is
+    judged apart and `[expected]` can set its verdict (`judge_services`)."""
     limit = float(data.thresholds.get("rss_growth_mib_per_hour", 64))
+    windows = data.rss_windows()
     over = WARN if data.duration < SECONDS_PER_HOUR else FAIL
     judged = {}
     extra = []
     fitted = False
     for service in data.logit_services:
-        by_life, source = _rss_points(data, service)
-        if not by_life:
+        by_life, source, sampled = _rss_points(data, service, windows)
+        if not by_life and not sampled:
             judged[service] = (SKIP, "no steady-state RSS samples")
             continue
         status = PASS
@@ -1130,7 +1151,7 @@ def check_rss_slope(data):
                 extra.append(f"{service} life {life}: {len(points)} sample(s) over {span:.0f}s, "
                              "too few to judge")
                 continue
-            judged_s += data.steady_span(points)
+            judged_s += data.steady_span(points, windows)
             per_hour = slope(points) * SECONDS_PER_HOUR / MIB
             slopes.append(f"life {life} {per_hour:+.1f}")
             extra.append(f"{service} life {life}: {per_hour:+.1f} MiB/h over {len(points)} "
@@ -1144,11 +1165,16 @@ def check_rss_slope(data):
         if share is not None and share < COVERAGE_MIN_SHARE:
             status = worst([status, WARN])
             extra.append(f"{service}: slopes cover little of the run: {text}")
-        fits = f"MiB/h {', '.join(slopes)}" if slopes else "no life with enough samples"
+        fits = (f"MiB/h {', '.join(slopes)}" if slopes
+                else "no life with enough samples" if by_life
+                else "every sample after warmup in a fault window")
         judged[service] = (status, f"{fits} (limit {limit:g}); {text}")
     expected = (data.resolved.get("expected") or {}).get("rss_slope")
     status, lines = judge_services(data, "rss_slope", judged)
-    if status == SKIP or not (fitted or expected):
+    # With no life fitted, the row SKIPs only when the run after warmup was too short to hold
+    # a fit; a longer run whose fault windows left nothing to judge keeps the coverage WARN.
+    could_fit = data.post_warmup_s() >= SLOPE_MIN_SPAN_S
+    if status == SKIP or not (fitted or expected or could_fit):
         return Result("rss_slope", SKIP, "no life with enough steady-state samples",
                       lines + extra)
     return Result("rss_slope", status, " | ".join(lines), lines + extra)
