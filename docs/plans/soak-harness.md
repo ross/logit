@@ -465,7 +465,9 @@ listener and `aggregate`, and adds the script hop to the ledger ("The ledger and
 **Compose overrides, service roles, and sinks (W7b).** Every compose service carries a
 `soak.role` label: `sut`, `generator`, `backend`, `broker` (a Kafka target's broker; see
 "Kafka targets"), `standin` (W9a, a stand-in target's destination; see "Stand-in
-targets"), or `netns` (W12b, a rolling overlap's namespace holder; see "Rolling overlap"). The harness knows a service by its role, never its name. Its ingress SUT is `logit`,
+targets"), `idp` (W19, a token endpoint the SUT reaches on loopback; see "A token endpoint in
+the SUT's namespace"), or `netns` (W12b, a namespace holder: a rolling overlap's, see "Rolling
+overlap", or from W19 the one `logit` and an `idp` share). The harness knows a service by its role, never its name. Its ingress SUT is `logit`,
 and from W10a an override can add further SUT services (see "Several SUT services").
 The base stack's generator is `generator`; from W8b an override can add more (see "Sources"). A scenario adds services with an optional top-level key naming an override file
 beside `scenario.toml`:
@@ -1690,6 +1692,27 @@ the epoch (`rejected`, `invalid_timestamp`, `invalid_record`, `ambiguous_at_most
 `checks.py`'s `EPOCH_BUMP_REASONS`), as [`docs/known-gaps/kafka.md`](../known-gaps/kafka.md)
 permits. Every other target's `ledger.topic` SKIPs.
 
+**An `otlp_proto` topic.** `load()` reads the `format:` of the `kafka_out` the sink names
+from the SUT config, `json` when it sets none, and records it as the resolved target's `format`.
+It refuses a format other than `json` or `otlp_proto`, and a sink that doesn't write the
+target's `topic`: its `topic:`, or under `otlp_proto` with none, the `metrics:` topic of
+`topics:`, else `otlp_metrics`. The consumer prints a value as text, so under `otlp_proto` it
+reads through `--value-deserializer org.apache.kafka.common.serialization.BytesDeserializer`,
+whose `Bytes.toString` writes each printable ASCII byte but the backslash as itself and every
+other byte as `\xHH`, one record per line. `otlp.py` unescapes each line and walks it as an
+`ExportMetricsServiceRequest`, as prost reads protobuf: unknown fields are skipped, a scalar
+or a oneof keeps its last value, and a truncated field, an over-long varint, or a known field
+under the wrong wire type is a record that doesn't decode. Each record holds every series of a
+batch, so T and the duplicate copies stay counted on raw bytes, the unit of
+`logit.output.records`, but V counts each `Sum` data point once per series (the resource, the
+metric name, and the attributes) and `time_unix_nano`. A point a byte-distinct record repeats,
+a resend split another way, adds nothing to V, and `ledger.topic` judges it per life as it
+judges a duplicate copy. Each record is credited to the life its latest point time falls in.
+The walker is checked against `tools/soak/vectors/kafka-otlp-metrics.hex`, a record of int,
+double, and negative `Sum` points, a `Gauge`, and a histogram with packed fields, which a test
+in `crates/logit-outputs/src/kafka/encode.rs` holds equal to what the encoder writes; the
+self-test derives its variants from those bytes. `format: otlp_json` isn't read.
+
 **The scenario.** `kafka-broker-restart` is `statsd-vm`'s generator at 2,000 lines/s through a
 2 s delta `aggregate` into `kafka_out` (`format: json`, `acks: all`, idempotent, `timeout:
 10s`), topic `soak`. Its 6.5-minute cycle restarts the broker, pauses it for 40 s, and stops it
@@ -1697,7 +1720,8 @@ for 60 s, each followed by at least 75 s. The 10 s `timeout`, under the pause, t
 into response timeouts, `Ambiguous` attempts the broker deduplicates on the resend. Its
 expectations: `batches.dropped` 0 through each fault, at least one `ambiguous` request through
 the pause, so `ledger.topic`'s no-duplicate verdict rests on resends, and `retrying` above 0
-during the stop and 0 after it.
+during the stop and 0 after it. `kafka-otlp-broker-restart` is the same run under `format:
+otlp_proto`, `topics: {metrics: soak}`, with the same expectations: one record per window.
 
 ### 8c. Stand-in targets (W9a, W9b, W16)
 
@@ -2019,8 +2043,9 @@ that every source's `sut_transforms` lists. Two instance configs may differ only
 that set `label`. With the steps: only `netem` and `partition` on the holder, neither on an
 instance, and no two of `pause`, `stop`, `kill`, `restart`, or `exit` on different instances
 overlapping. With the role map: the holder is the stack's one `netns` service, a `netns` service
-needs an `[overlap]`, and each instance's `network_mode` names the holder (read from
-`docker compose config` beside the roles).
+needs an `[overlap]` or, from W19, an `idp` ("A token endpoint in the SUT's namespace"), and
+each instance's `network_mode` names the holder (read from `docker compose config` beside the
+roles).
 
 **The faults.** A netem on the holder shapes every instance's egress, and a partition of it cuts
 their ingress too. Every instance is an ingress SUT, so a lifecycle fault on any of them is
@@ -2069,6 +2094,39 @@ the rest judge them together:
 partitions the holder or drops packets, whose loss `ledger.overlap` couldn't tell from a close's.
 Its `[[expect]]` tables assert that each instance reads while the other is stopped and that
 neither counts a kernel drop.
+
+### 8f. A token endpoint in the SUT's namespace (W19)
+
+`kafka_out` takes an OAUTHBEARER `token_endpoint` over plain HTTP on loopback only, and over
+HTTPS only with a certificate from a public CA, so a token server in the stack must share the
+SUT's network namespace. `tools/kafka-interop` puts the SUT in the token server's namespace,
+which a soak can't: a stop of the server would take the SUT's network with it.
+
+**The stack.** An override adds a namespace holder with the role `netns`, as in "Rolling
+overlap", and a token server with the role `idp`, and puts `logit` and the `idp` in the holder
+with `network_mode: "service:<holder>"`. The SUT reaches the `idp` at `127.0.0.1`. Every other
+service reaches either at the holder's name: the generator sends there, and the broker fetches
+the JWKS there. The SUT keeps its own container, so its restarts, RSS, descriptors, and logs
+resolve as for any SUT.
+
+**The schema.** With no `[overlap]`, the role map holds one `netns` service only beside an
+`idp`, and an `idp` only beside one, with no SUT but `logit`; an `idp` and `[overlap]` can't be
+combined. `logit`'s and each `idp`'s `network_mode` names the holder. The holder takes `netem`
+and `partition` only, and `logit` and the `idp` take neither, as for an overlap: a netem or a
+partition of a member is one of the holder, and a lifecycle fault of the holder takes every
+member's network away.
+
+**The faults.** A netem or a partition of the holder is one of the SUT's network, ingress and
+egress, as on `logit` itself in any other stack; the `idp`'s loopback traffic isn't shaped. A
+lifecycle fault on the `idp` affects egress only: the sink holds its queue while it can't
+authenticate.
+
+**The rows.** `self_log` counts a `token_refresh_failed` warning inside a fault window on an
+`idp`, `recovery_bound` included, and WARNs one outside every such window. A failed refresh that
+keeps a valid token loses nothing, so it has no `*.dropped` counter, and none is added: it is
+counted in `logit.component.diagnostics{key="token_refresh_failed"}`
+([ADR `kafka-sasl`](../adr/kafka-sasl.md)'s fallback amendment), which an `[[expect]]` reads like
+any other counter.
 
 ### 9. Not in this stack
 
@@ -2405,13 +2463,32 @@ where it needs them, and a small check extension.
     rate, which `kafka_out` counts in `logit.output.reconnects` from W17 on and a `rate`
     expectation bounds. Rows: `ledger.topic`, `fd_slope`, duplicates per life, and
     `[[expect]]` on the redial rate, the `ambiguous` rate, `refused` attempts, and dropped
-    batches. Two halves remain:
-    - **OAUTHBEARER with short-lived tokens.** It needs `tools/kafka-interop`'s
-      `mock-oauth2-server` in the stack, under a new `idp` role, and a namespace holder, because
-      `kafka_out` takes a `token_endpoint` only over loopback HTTP or HTTPS with a public CA's
-      certificate.
-    - **An `otlp_proto` topic (2969c24e).** `ledger.topic` reads `format: json` records only;
-      V from an OTLP topic needs a stdlib protobuf walker for the export requests.
+    batches. The two halves after SCRAM:
+    - **OAUTHBEARER with short-lived tokens (built in W19).** `kafka-oauth-reauth` is
+      `kafka-sasl-reauth` over the client-credentials grant, with `tools/kafka-interop`'s
+      `mock-oauth2-server` in the stack under the `idp` role, in a namespace holder it shares
+      with `logit` ("A token endpoint in the SUT's namespace"). Each token lives 60 s and the
+      broker's session ends when it expires, so the sink fetches a token and redials about
+      every 50 s. Beside the broker's faults, the endpoint is stopped and paused for 2 minutes
+      each, longer than a token lives. Rows: W17's, and `[[expect]]` on the
+      `token_refresh_failed` diagnostic inside the stop, which shows the fallback to the cached
+      token, `clean` attempts and `retrying` inside both endpoint faults, and `retrying`
+      clearing after each. Two corrections to the item as first planned:
+      - The expired-token phase is `Clean`, not `Refused`. An endpoint that refuses the
+        connection or times out is `Clean`
+        (`crates/logit-outputs/src/kafka/sasl/oauth.rs`'s module doc), and the sink never
+        sends a token it knows has expired, so the broker refuses nothing, and the run asserts
+        no `refused` attempt.
+      - The fallback covers a refused endpoint, not a hung one. A redial comes `timeout` before
+        its token expires and fetches the next token then, since nothing fetches on a timer.
+        Against a hung endpoint, the fetch waits that same `timeout` and almost always returns
+        with the token expired. The sink's expiry, the request's start plus `expires_in`, can
+        sit up to a second past the JWT's whole-second `exp` that sets the deadline, so a fetch
+        can still fail with under a second left and fall back. That is rare, so the pause step
+        asserts the hold alone.
+    - **An `otlp_proto` topic (2969c24e), built in W20.** A stdlib protobuf walker reads each
+      record's metrics export request, and V counts each `Sum` data point once per series and
+      time. Built as `kafka-otlp-broker-restart`; §8b's "An `otlp_proto` topic" has the rules.
 17. **`influxdb_out`'s response-class table on a stand-in (ffe33654, b93cb23a), built in W16.**
     W9's stand-in design with InfluxDB's shape, cueing the `403` and `404` rows that split on
     whether the bucket or org was carried or configured: `Rejected` for a carried value,
@@ -2486,6 +2563,8 @@ that items 3, 7, and 11 need.
 | W16 | `soak/w16` | `soak/w16: an InfluxDB-shaped stand-in for every influxdb_out response class` | M | W12d |
 | W17 | `soak/w17` | `soak/w17: a Kafka SASL re-authentication soak` | M | W16 |
 | W18 | `soak/w18` | `soak/w18: a tail_in descriptor soak under a deleting rotation` | M | W14 |
+| W19 | `soak/w19` | `soak/w19: a Kafka OAUTHBEARER soak with short-lived tokens` | M | W17 |
+| W20 | `soak/w20` | `soak/w20: an otlp_proto Kafka topic in the soak ledger` | M | W17 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -2620,11 +2699,19 @@ that items 3, 7, and 11 need.
   while the writer deleted no file, then as a bound with the writer's file count) and its
   retention guard, the end sequence's wait for G, self-test fixtures for each rule, and the
   `tail-rotate-delete` scenario, a 20-minute and a 1-hour run recorded under "Findings".
+- **W19**: item 16's OAUTHBEARER half: the `idp` role and a `netns` holder outside
+  `[overlap]` ("A token endpoint in the SUT's namespace"), with their rules in `scenario.py`,
+  `faults.py`, and `self_log`, self-test fixtures for each, and the `kafka-oauth-reauth`
+  scenario, a 20-minute and a 1-hour run recorded under "Findings".
+- **W20**: item 16's `otlp_proto` half: the target's format read from the sink's config, the
+  consumer's `BytesDeserializer`, a stdlib protobuf walker (`otlp.py`) checked against a vector
+  the Rust encoder pins, V per data point and the repeated points `ledger.topic` judges,
+  self-test fixtures for each rule, and the `kafka-otlp-broker-restart` scenario, a 20-minute
+  and a 1-hour run recorded under "Findings".
 
-Item 16's OAUTHBEARER and `otlp_proto` halves, and §10's follow-ups to items 11 and 12, have no
-workstream yet.
+§10's follow-ups to items 11 and 12 have no workstream yet.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18 off `main` after it. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18, W19, and W20 off `main` after it. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
@@ -5176,6 +5263,48 @@ Overall PASS, every row PASS or SKIP.
 | `expect.router-copies-every-event` | PASS | delta of logit.component.events.copied{component=split} on logit, during c0s1: c0s1 (+60s, +150s]: 180,000 (over 18 drain(s)), want >= 100000 |
 | `expect.router-discards-nothing` | PASS | delta of logit.component.events.discarded{component=split} on logit, run: run (+60s, +780s]: 0 (over 131 drain(s)), want <= 0 |
 
+### W19: Kafka OAUTHBEARER with short-lived tokens (2026-10-19)
+
+Run `20261019T004958Z`: `kafka-oauth-reauth` at `--duration 20m`, from `soak/w19` at
+`e0372670`, on the development host, against `logit:soak` (`sha256:10a901b97a16`, built from
+that tree), `apache/kafka:4.2.0` (`sha256:9516fb7634ba`), and `mock-oauth2-server` 6.0.2 at its
+pinned digest. Overall PASS: every row passed but `ledger.windows` and `ledger.replay`, which
+SKIP on a Kafka target with no kill, and the rows for steps the scenario doesn't have.
+
+- **Nothing was lost or stored twice.** G, W, and V are each 2,413,200. `ledger.topic` read
+  6,040 distinct records, 0 duplicate copies, and T − A of 0. No batch was dropped.
+- **The fallback worked as predicted.** The endpoint stopped at +450 s. 12.7 s later a redial's
+  refresh failed and kept the cached token, "valid for another 8.998s", and the token's
+  diagnostic counted 1. 10 s after that, with the token expired, the dials began to fail
+  `Clean`: 15 `clean` attempts in the stop, `retrying` at 1, and the sink caught up 8 s after the
+  endpoint came back.
+- **The hung endpoint left nothing to fall back to.** In the pause, the first failure came
+  26.7 s in: a redial's token request timed out after the sink's 10 s `timeout`, with the
+  token expired by then. No `token_refresh_failed` was written, 7 attempts were `clean`, and the
+  sink caught up 14 s after the endpoint resumed.
+- **The sink renewed on schedule.** `reauth-rate` read 69.5 an hour (22 over 1,140 s), inside
+  [25, 220], and `no-expired-session-sends` read 6.3 an hour (2, the broker pauses'), under 20.
+  No attempt was `refused`.
+- **Every fault recovered within the 45 s bound**, the slowest the broker stop at 18 s. RSS
+  slopes were +0.3 MiB/h (SUT) and −0.3 MiB/h (generator), and descriptors went from 14 to 13
+  (SUT).
+
+Run `20261019T011140Z`: `kafka-oauth-reauth` at `--duration 1h`, from the same tree and images.
+Overall PASS, with only inapplicable SKIPs.
+
+- **Nothing was lost or stored twice.** G, W, and V are each 7,213,200, and `ledger.topic`
+  read 18,040 distinct records with 0 duplicate copies. Of 1,967 attempts, 158 were `clean`, 5
+  `ambiguous`, and none `refused`.
+- **Each of the 4 endpoint stops fell back once.** The diagnostic counted 1 in each. The
+  self-log shows 3 of them, 4.7 s to 8.7 s after the stop began, each with 9 s of the token
+  left: the warning is throttled to its 1st, 2nd, and 4th occurrence, which is why the scenario
+  reads the counter. The 4 pauses wrote none.
+- **The rates held.** `reauth-rate` read 66.1 an hour (65 over 3,540 s), and
+  `no-expired-session-sends` 5.1 an hour.
+- **Memory and descriptors stayed flat.** The SUT's `rss_slope` read +0.2 MiB/h over 25% of
+  the time after warmup, and its descriptors went from 14 to 14. All 22 faults recovered within
+  the bound, each endpoint fault in 8 s to 13 s.
+
 ### `partition-rss`: the generator's RSS after a partition (2026-10-18)
 
 After a 45 s partition, the generator's RSS fell back to its pre-partition baseline within 44 s
@@ -5336,6 +5465,10 @@ they differ. Here the release ended inside `recovery_bound`, so this run didn't 
   reverted. The self-test passes (1,797 expectations), and the `rate` fixtures fail with the
   reducer reverted. `kafka-sasl-reauth` passes `self-test` validation, the shipped-config test,
   and `logit validate` in its image. Met: its run is recorded under "Findings", Overall PASS.
+- **W19**: the self-test passes (2,088 expectations), and the `idp` namespace and
+  `token_refresh_failed` fixtures fail with their rules reverted. `kafka-oauth-reauth` passes
+  `self-test` validation and the shipped-config test. Met: a 20-minute and a 1-hour run are
+  recorded under "Findings", each Overall PASS.
 
 ### `rss_settle`: a settle window for `rss_slope` (2026-10-18)
 
@@ -5397,3 +5530,67 @@ What the work showed about the harness:
   the whole run, the `cardinality`-shaped leak fixture WARNed instead of FAILing; with the old
   SKIP rule, the all-excused fixture SKIPped; with a missing key read as 60 s, the unkeyed run
   directory fixture PASSed; and with `fanin`'s key removed, its load expectation failed.
+
+### W20: an `otlp_proto` topic (2026-10-19)
+
+`kafka-otlp-broker-restart` ran for 20 minutes on the development host, against `logit:soak`
+(`sha256:10a901b9…`) built from `soak/w20` at `3c370071`, whose release binary is `main`'s at
+`33da7d62`: the branch's Rust change is a test. The run is
+`perf/results/soak/20261019T010146Z`, exit 0. A 1-hour run follows the table.
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 18 apply/revert action(s) returned 0; 0 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 2 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 6 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 9 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 80 readiness sample(s) read ok outside fault windows; 0 start(s) or unpause(s) ready in time |
+| `progress` | PASS | 7 30s window(s) outside fault windows, judged per sink (kafka target: no VictoriaMetrics): kafka: deliveries in 7 of 7, no freshness samples; 180s of 1140s after warmup judged (16%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +3.7 (limit 64); 300s of 1140s after warmup judged (26%; WARN under 5%) \| logit PASS: MiB/h life 0 -0.6 (limit 64); 300s of 1140s after warmup judged (26%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 12 (limit +8) \| logit PASS: warmup median 13 -> end 13 (limit +8) |
+| `ledger.wire` | PASS | G 2,412,100 = W 2,412,100 + K 0 + wire 0 (by design: 0 in UDP-affecting windows, -1 steady, 1 at the end; steady loss judged 0, each run at 0 or more, against limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 2,412,100 vs E + B 2,412,100 (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E 2,412,100 == A 2,412,100 (listener to aggregate); A_sent 60,400 == S_in[kafka] 60,400 (aggregate to kafka) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 0: Ab 2,412,100 == A 2,412,100 (every event absorbed) |
+| `ledger.egress` | PASS | kafka: life 0 (final): Ab 2,412,100 − V[kafka] 2,412,100 = 0, ok (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | kafka target: no VictoriaMetrics |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[kafka] 0; wire G − (W + K) 0 over the run, by design |
+| `ledger.sent` | PASS | to kafka: every batch received ended in an accepted response; kafka: requests ambiguous 3, clean 40, ok 604; records accepted 604; kafka life 0 at +1209s: received 604 vs delivered 604 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed); ledger.egress and ledger.topic read the topic back |
+| `ledger.topic` | PASS | T 604 distinct records in the topic (604 read, 0 duplicate copies) vs A 604 records the sink saw accepted, T − A 0 |
+| `ledger.standin` | SKIP | kafka target: no stand-in |
+| `identity.sink` | PASS | final life 0 at +1209s: kafka: received 604 vs delivered 604 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 9 of 9 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served` | SKIP | the scenario has no probe step |
+| `expect.no-drop-restart` | PASS | delta of logit.component.batches.dropped{component=kafka} on logit, through c0s1: c0s1 (+60s, +135s]: 0 (over 15 drain(s)), want <= 0 |
+| `expect.no-drop-pause` | PASS | delta of logit.component.batches.dropped{component=kafka} on logit, through c0s2: c0s2 (+165s, +250s]: 0 (over 17 drain(s)), want <= 0 |
+| `expect.no-drop-stop` | PASS | delta of logit.component.batches.dropped{component=kafka} on logit, through c0s3: c0s3 (+285s, +390s]: 0 (over 21 drain(s)), want <= 0 |
+| `expect.pause-is-ambiguous` | PASS | delta of logit.output.requests{class=ambiguous, component=kafka} on logit, through c0s2: c0s2 (+165s, +250s]: 1 (over 17 drain(s)), want >= 1 |
+| `expect.retrying-during-stop` | PASS | max of logit.component.retrying{component=kafka} on logit, during c0s3: c0s3 (+285s, +345s]: 1 (1 sample(s) and the value in force at its start), want >= 1 |
+| `expect.retrying-clears` | PASS | last of logit.component.retrying{component=kafka} on logit, after c0s3: c0s3 (+345s, +390s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
+
+- **The escaped read-back holds.** The consumer printed 604 records on 604 lines through
+  `BytesDeserializer`, every one unescaped and decoded, none unparsed. Each line averaged
+  11,593 characters for a 4,600-byte request: the escaped form is 2.5 times the request,
+  because most of a protobuf request's bytes aren't printable.
+- **V matched to the event.** The topic's `Sum` points summed to 2,412,100, Ab, with no
+  duplicate copy and no repeated point. One record per 2 s window, holding all 100 series,
+  so T is 604 records against `kafka-broker-restart`'s one record per series per window.
+- **The pauses still left resends.** The run counted three `ambiguous` attempts over its three
+  pauses, and the topic held no copy of any of them.
+
+Run `20261019T012708Z`: the same scenario at `--duration 1h`, on the same image, on the
+development host. Overall PASS, with only inapplicable SKIPs. It confirms the 20-minute run.
+
+- **No loss and no duplicate across 27 faults.** Ab and V are both 7,212,200, and T and A both
+  1,804 records. Nine `ambiguous` attempts over nine pauses left no duplicate copy and no
+  repeated point.
+- **The read-back is fast at this size.** 1,804 records, 20.9 MB of escaped text, read in about
+  6 s after the SUT stopped. At the escaped size an 8-hour run's topic would be about 167 MB,
+  which the 180 s consumer bound should still cover, but no run has measured it.
+- **RSS and descriptors were flat.** `rss_slope` read +1.7 MiB/h on the SUT and −0.0 on the
+  generator, and both kept their descriptor count.

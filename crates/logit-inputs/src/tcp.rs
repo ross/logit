@@ -644,7 +644,8 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         let listener = match &self.target {
             StreamTarget::Tcp(bind) => {
                 let listener = logit_pipeline::listen::bind_tcp(bind, self.bind_options).await?;
-                self.diag.info("bound", format_args!("listening on {bind}"));
+                let addr = logit_pipeline::listen::bound_display(listener.local_addr(), bind);
+                self.diag.info("bound", format_args!("listening on {addr}"));
                 BoundListener::Tcp(listener)
             }
             StreamTarget::Unix { kind, .. } if self.proxy_protocol => {

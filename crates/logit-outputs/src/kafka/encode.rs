@@ -1227,4 +1227,54 @@ mod tests {
             assert_eq!(out[0].1.key.as_deref(), Some(&b"abc"[..]), "{format:?}");
         }
     }
+
+    /// The soak harness's protobuf walker (`tools/soak/soaklib/otlp.py`) is checked against
+    /// this batch's `otlp_proto` record, committed as hex. The hex must be what the encoder
+    /// writes; on a mismatch the message holds the encoder's hex to commit in its place.
+    #[test]
+    fn the_soak_otlp_metrics_vector_is_what_the_encoder_writes() {
+        use logit_core::{Histogram, MetricKind, MetricRecord, MetricValue, Sum, Temporality};
+        const TS: i64 = 1_791_720_000_250_000_000;
+        let metric = |name: &str, attributes: AttrMap, kind: MetricKind| {
+            Event::metric(TS, attributes, MetricRecord::new(intern(name), kind))
+        };
+        let sum = |value, monotonic| {
+            MetricKind::Sum(Sum { value, temporality: Temporality::Delta, monotonic })
+        };
+        let mut shard = AttrMap::new();
+        shard.insert("shard", Value::str("b"));
+        let mut resource = AttrMap::new();
+        resource.insert("host.name", Value::str("soak"));
+        let b = batch(
+            resource,
+            vec![
+                metric("soak_requests_1", AttrMap::new(), sum(MetricValue::I64(30), true)),
+                metric("soak_requests_2", shard, sum(MetricValue::F64(2.5), true)),
+                metric("soak_gauge", AttrMap::new(), MetricKind::gauge(9.0)),
+                metric(
+                    "soak_latency",
+                    AttrMap::new(),
+                    MetricKind::Histogram(Histogram {
+                        buckets: vec![(1.0, 2), (f64::INFINITY, 3)],
+                        temporality: Temporality::Delta,
+                        sum: Some(4.0),
+                        min: None,
+                        max: None,
+                    }),
+                ),
+                metric("soak_requests_3", AttrMap::new(), sum(MetricValue::I64(-4), false)),
+            ],
+        );
+        let mut encoder = encoder(RecordFormat::OtlpProto, RecordMode::Request, usize::MAX);
+        let (out, _) = records(&mut encoder, &b);
+        assert_eq!(out.len(), 1, "one metrics request");
+        let hex: String = out[0].0.iter().map(|byte| format!("{byte:02x}")).collect();
+        let committed: String =
+            include_str!("../../../../tools/soak/vectors/kafka-otlp-metrics.hex")
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .flat_map(str::split_whitespace)
+                .collect();
+        assert_eq!(hex, committed, "commit the encoder's hex: {hex}");
+    }
 }

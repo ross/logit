@@ -14,18 +14,36 @@ bytes before they're summed, because a resend re-encodes the same event to the s
 two distinct windows of one series never share a timestamp. Summing the copies instead would let
 a duplicate cancel a loss of the same size in V. Each record, and each extra copy, is credited to
 the SUT life its event `timestamp` (the window's flush time) falls in.
+
+Under `format: otlp_proto` each record holds one `ExportMetricsServiceRequest` for every series
+of a batch, so the consumer reads values through Kafka's `BytesDeserializer`, which prints a
+value's bytes in an escaped form with no newline in it, and `otlp.py` walks each one. T and the
+duplicate copies are counted on records' raw bytes as for JSON, because `logit.output.records`
+counts records. V is the sum of the `Sum` data points' values under `prefix`, each counted once
+per series and `time_unix_nano`, and each record is credited to the SUT life its latest point
+time falls in. A resend whose bytes differ, a batch split another way, repeats points a distinct
+record already holds: those points add nothing to V and count as point copies, credited by
+their own time.
 """
 
 import datetime
 import json
 import re
+from typing import NamedTuple
 
-from . import vm
+from . import otlp, vm
 
 TOPIC_FILE = "kafka-topic.ndjson"
 OFFSETS_FILE = "kafka-offsets.txt"
 BOOTSTRAP = "localhost:9092"
 BIN = "/opt/kafka/bin"
+# The `kafka_out` formats the ledger reads a topic in: one event per record as a JSON object, or
+# one OTLP metrics export request per record in protobuf.
+JSON, OTLP_PROTO = "json", "otlp_proto"
+FORMATS = (JSON, OTLP_PROTO)
+# What the consumer reads an `otlp_proto` value through: `Bytes.toString` escapes every byte
+# outside printable ASCII, so a binary value prints on one line (`otlp.unescape`).
+BYTES_DESERIALIZER = "org.apache.kafka.common.serialization.BytesDeserializer"
 # The consumer's idle bound once it has read what the offsets promised, and its whole bound.
 CONSUMER_TIMEOUT_MS = 30000
 
@@ -37,9 +55,11 @@ def offsets_argv(topic):
     return [f"{BIN}/kafka-get-offsets.sh", "--bootstrap-server", BOOTSTRAP, "--topic", topic]
 
 
-def consumer_argv(topic, max_messages=None):
+def consumer_argv(topic, max_messages=None, fmt=JSON):
     argv = [f"{BIN}/kafka-console-consumer.sh", "--bootstrap-server", BOOTSTRAP, "--topic",
             topic, "--from-beginning", "--timeout-ms", str(CONSUMER_TIMEOUT_MS)]
+    if fmt == OTLP_PROTO:
+        argv += ["--value-deserializer", BYTES_DESERIALIZER]
     if max_messages is not None:
         argv += ["--max-messages", str(max_messages)]
     return argv
@@ -82,11 +102,23 @@ def parse_time(text):
     return stamp.timestamp() + fraction
 
 
-def parse_records(text, prefix=""):
-    """The topic read as `(records, unparsed, duplicates)`: `records` is one `(epoch seconds,
-    amount)` per distinct record value that parses as a JSON object, `amount` the sum of its
-    `sum` metrics whose name starts with `prefix`; `unparsed` counts the lines that don't parse;
-    `duplicates` is one epoch-seconds timestamp per extra copy of a value already seen."""
+class TopicRead(NamedTuple):
+    """The topic as the ledger reads it. `records` is one `(epoch seconds, amount)` per distinct
+    record value; `unparsed` counts the values that don't decode; `duplicates` is one
+    epoch-seconds timestamp per extra copy of a value already seen; `point_copies` one per data
+    point a distinct `otlp_proto` record repeats."""
+    records: list
+    unparsed: int
+    duplicates: list
+    point_copies: list
+
+
+def parse_records(text, prefix="", fmt=JSON):
+    """The topic `text`, one record value per line, read in `fmt`: under `json`, each value
+    that parses as a JSON object is a record whose amount is the sum of its `sum` metrics whose
+    name starts with `prefix`; under `otlp_proto`, see `parse_otlp_records`."""
+    if fmt == OTLP_PROTO:
+        return parse_otlp_records(text, prefix)
     records = []
     duplicates = []
     seen = set()
@@ -112,7 +144,45 @@ def parse_records(text, prefix=""):
                     and isinstance(metric.get("value"), (int, float))):
                 amount += metric["value"]
         records.append((t, amount))
-    return records, unparsed, duplicates
+    return TopicRead(records, unparsed, duplicates, [])
+
+
+def parse_otlp_records(text, prefix=""):
+    """The topic read under `otlp_proto`: each line unescaped (`otlp.unescape`) and walked as an
+    `ExportMetricsServiceRequest`. A record's amount is the sum of its `Sum` points under
+    `prefix` not already counted for their series and `time_unix_nano`, and its time is its
+    latest point's, or None with no point. A line that doesn't unescape or decode is unparsed."""
+    records = []
+    duplicates = []
+    point_copies = []
+    seen = set()
+    counted = set()
+    unparsed = 0
+    for line in record_lines(text):
+        try:
+            points = otlp.metric_points(otlp.unescape(line))
+        except otlp.ProtoError:
+            unparsed += 1
+            continue
+        times = [p.time_unix_nano for p in points if p.time_unix_nano]
+        t = max(times) / 1e9 if times else None
+        if line in seen:
+            duplicates.append(t)
+            continue
+        seen.add(line)
+        amount = 0
+        for point in points:
+            if point.kind != otlp.SUM or not point.name.startswith(prefix):
+                continue
+            key = (point.series, point.time_unix_nano)
+            if key in counted:
+                point_copies.append(point.time_unix_nano / 1e9 if point.time_unix_nano
+                                    else None)
+                continue
+            counted.add(key)
+            amount += point.value
+        records.append((t, amount))
+    return TopicRead(records, unparsed, duplicates, point_copies)
 
 
 def duplicates_by_life(duplicates, life_starts):

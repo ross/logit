@@ -757,7 +757,7 @@ the operator-facing account of all of this.
   `events.sent`, and the router as received + copied − discarded against its forward edge's
   and its targets' sends. The
   harness knows each compose service by its `soak.role` label (`sut`, `generator`, `backend`,
-  `broker`, `standin`, `netns`). `fanin` adds a second generator the same way, `syslog_out` over
+  `broker`, `standin`, `netns`, `idp`). `fanin` adds a second generator the same way, `syslog_out` over
   UDP into `lines_in` beside statsd, with one `[[ledger.source]]` per generator: the wire is judged per
   source and the intake per listener. `native-hop` adds a second SUT, `collector`, behind the
   native hop (`[[ledger.hop]]`), each SUT scored on its own process lives: `ledger.hop` judges
@@ -812,7 +812,14 @@ the operator-facing account of all of this.
   stack (a `kafka` target) that it restarts, pauses, and stops, and reads the topic back as the
   ledger's egress total (`ledger.topic`). `kafka-sasl-reauth` is the same over SCRAM-SHA-512 to
   a broker that ends each session after 30 s, and bounds the sink's redial rate
-  (`logit.output.reconnects`, a `rate` expectation). `standin-remote-write` and
+  (`logit.output.reconnects`, a `rate` expectation). `kafka-oauth-reauth` is that over
+  OAUTHBEARER with 60 s client-credentials tokens from a `mock-oauth2-server` (role `idp`) in a
+  namespace holder it shares with the SUT, since `token_endpoint` takes plain HTTP only on
+  loopback, and stops and pauses the endpoint past a token's life: the `token_refresh_failed`
+  diagnostic shows the fallback to the cached token, and the expired phase holds the queue
+  `Clean`. `kafka-otlp-broker-restart` is `kafka-broker-restart` under `format: otlp_proto`,
+  its topic walked by a stdlib protobuf reader (`tools/soak/soaklib/otlp.py`) with V counted
+  per data point. `standin-remote-write` and
   `standin-at-most-once` point `prometheus_out` at a scripted HTTP stand-in (a `standin` target, `tools/soak/standin/`) that
   `respond` steps cue through every row of the sink's response-class table, each step naming the
   fault class the sink must read; the stand-in's stdout records every request, raw body included,

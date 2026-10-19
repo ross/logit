@@ -453,7 +453,8 @@ impl Input for DatadogTraceInput {
         if let Some(bind) = &self.bind {
             if self.listener.is_none() {
                 let listener = logit_pipeline::listen::bind_tcp(bind, self.bind_options).await?;
-                self.diag.info("bound", format_args!("listening on {bind}"));
+                let addr = logit_pipeline::listen::bound_display(listener.local_addr(), bind);
+                self.diag.info("bound", format_args!("listening on {addr}"));
                 self.listener = Some(listener);
             }
         }
