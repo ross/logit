@@ -17,12 +17,13 @@ ledger at the sinks' own telemetry instead. A local run's `ledger.sent` SKIPs.
 
 A run against a Kafka target (`[target] kind = "kafka"`) has no VictoriaMetrics: the freshness
 samples and `ledger.windows` SKIP, `ledger.sent` judges the sink as for an external target, and
-V comes from the topic's distinct records, read back by the driver and deduplicated on their
-raw bytes (topic.py), so `ledger.egress` and `ledger.summary` judge Ab − V against it, and a
+V comes from the topic's distinct records, read back by the driver in the sink's `format`
+and deduplicated on their raw bytes, and under `otlp_proto` on each data point's series and time
+too (topic.py), so `ledger.egress` and `ledger.summary` judge Ab − V against it, and a
 surplus FAILs as on any target. A Kafka target has one sink, whose V the topic is.
 `ledger.topic` judges the topic's distinct record count against the records the sink saw
-accepted, and its duplicate copies per life against `EPOCH_BUMP_REASONS`; it SKIPs for every
-other target.
+accepted, and its duplicate copies and repeated data points per life against
+`EPOCH_BUMP_REASONS`; it SKIPs for every other target.
 
 The ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`, `identity.sink`,
 `recovery`, `ledger.egress`, `ledger.windows`, `ledger.replay`, `ledger.sent`) keeps its id,
@@ -101,7 +102,7 @@ from pathlib import Path
 from . import collect, faults, standin, telemetry, topic, vm
 from .scenario import (DEFAULT_RSS_SETTLE_S, DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET, GENERATOR_ROLE,
                        HTTP_WIRE, KAFKA_TARGET, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS,
-                       RUN_WINDOW, SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET,
+                       IDP_ROLE, RUN_WINDOW, SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET,
                        SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE, TARGET_SPLIT,
                        component_blocks, config_env,
                        listener_wire, parse_duration, source_ids, source_pairs,
@@ -113,6 +114,9 @@ _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
 # (crates/logit-pipeline/src/tls.rs, `Watched::check`).
 TLS_RELOAD_FAILED_KEY = "tls_reload_failed"
 TLS_RELOADED_KEY = "tls_reloaded"
+# The self-log key of a failed OAUTHBEARER token refresh that kept the cached token
+# (crates/logit-outputs/src/kafka/sasl/oauth.rs, `Endpoint::token`).
+TOKEN_REFRESH_FAILED_KEY = "token_refresh_failed"
 
 
 def is_start(record):
@@ -724,6 +728,8 @@ def check_self_log(data):
     issued a broken certificate, or, on a service that polls its TLS files, inside any other
     rotate on it with a `tls_reloaded` line of the same component after it in that rotate: a
     poll can read one file before a rotation's rename and the next after it.
+    A `token_refresh_failed` warning is counted inside a fault window on an `idp` service and
+    WARNs outside every one: it loses nothing, but with the endpoint up it shouldn't happen.
     """
     if not data.stderr:
         return Result("self_log", SKIP, "no logs/*.stderr")
@@ -731,7 +737,9 @@ def check_self_log(data):
     status = PASS
     lines = []
     counts = {"error": 0, "fault_key_inside": 0, "fault_key_outside": 0, "text": 0,
-              "expected": 0, "tls_expected": 0, "tls_torn": 0}
+              "expected": 0, "tls_expected": 0, "tls_torn": 0, "refresh_inside": 0}
+    idp_windows = [window for name, role in data.services.items() if role == IDP_ROLE
+                   for window in data.windows(on=name)]
     # `{service: [(start, end)]}` of each `rotate` step issued `broken = true` on it, from its
     # apply to its revert, where a failed TLS reload is expected, and of each other rotate on it.
     broken, whole = {}, {}
@@ -813,6 +821,15 @@ def check_self_log(data):
                                  f"{service} and with no reload after it in its rotate: "
                                  f"{entry.message[:160]}")
                 continue
+            if entry.key == TOKEN_REFRESH_FAILED_KEY:
+                if entry.ts is not None and data.in_window(entry.ts, idp_windows):
+                    counts["refresh_inside"] += 1
+                else:
+                    status = worst([status, WARN])
+                    lines.append(f"{service}: {entry.level} {entry.key} at "
+                                 f"{data.offset(entry.ts)}, outside every fault window on an "
+                                 f"{IDP_ROLE}: {entry.message[:160]}")
+                continue
             if is_sink_fault_line(entry):
                 if entry.ts is not None and data.in_window(entry.ts, windows):
                     counts["fault_key_inside"] += 1
@@ -849,7 +866,9 @@ def check_self_log(data):
                + (f", {counts['tls_expected']} tls_reload_failed line(s) inside broken "
                   "rotations" if counts["tls_expected"] else "")
                + (f", {counts['tls_torn']} torn read(s) a later reload in their rotation "
-                  "replaced" if counts["tls_torn"] else ""))
+                  "replaced" if counts["tls_torn"] else "")
+               + (f", {counts['refresh_inside']} {TOKEN_REFRESH_FAILED_KEY} line(s) inside "
+                  f"{IDP_ROLE} faults" if counts["refresh_inside"] else ""))
     return Result("self_log", status, summary if status == PASS else f"{lines[0]} ({summary})",
                   lines)
 
@@ -1769,13 +1788,17 @@ class Ledger:
         self.records = []
         self.unparsed = 0
         self.duplicates = {}
+        self.point_copies = {}
+        self.topic_format = data.target.get("format", topic.JSON)
         self.kafka_sink = self.sinks[0] if data.kafka and self.sinks else None
         if self.kafka_sink is not None:
             sink = self.kafka_sink
-            self.records, self.unparsed, copies = topic.parse_records(data.topic_text or "")
+            read = topic.parse_records(data.topic_text or "", fmt=self.topic_format)
+            self.records, self.unparsed = read.records, read.unparsed
             self.V[sink], self.V_total[sink] = topic.totals_by_life(self.records,
                                                                     self.life_starts)
-            self.duplicates = topic.duplicates_by_life(copies, self.life_starts)
+            self.duplicates = topic.duplicates_by_life(read.duplicates, self.life_starts)
+            self.point_copies = topic.duplicates_by_life(read.point_copies, self.life_starts)
             self.resets[sink], self.mismatched[sink] = {}, []
         # A `datadog` or `influxdb` stand-in's one sink has the stored points for its V,
         # credited to lives by point timestamp as a Kafka record is: under `datadog` distinct
@@ -3846,7 +3869,9 @@ def check_ledger_egress(data):
                 parts.insert(0, f"no records in {topic.TOPIC_FILE}")
             if led.unparsed:
                 status = FAIL
-                parts.insert(0, f"{_n(led.unparsed)} topic record(s) aren't JSON objects")
+                shape = ("OTLP metrics requests" if led.topic_format == topic.OTLP_PROTO
+                         else "JSON objects")
+                parts.insert(0, f"{_n(led.unparsed)} topic record(s) aren't {shape}")
         for sink in empty:
             status = FAIL
             if data.standin:
@@ -3868,7 +3893,9 @@ def check_ledger_egress(data):
             copies = sum(led.duplicates.values())
             lines.append(f"{sink}: {_n(len(led.records) + copies)} topic record(s), "
                          f"{_n(len(led.records))} distinct, {_n(copies)} duplicate copies; V "
-                         f"{_n(led.V_total[sink])} (the sum of the distinct records' delta sums)")
+                         f"{_n(led.V_total[sink])} (the sum of the distinct "
+                         + ("data points' delta sums" if led.topic_format == topic.OTLP_PROTO
+                            else "records' delta sums") + ")")
             continue
         if sink == led.counts_sink and data.standin_influxdb:
             counts = data.standin_counts
@@ -4912,13 +4939,14 @@ def _sent_one(data, led, sink, flag, lines):
 def check_ledger_topic(data):
     """For a Kafka target: the topic's distinct record count T against the records `kafka_out`
     saw accepted, A (`logit.output.records`, summed over every SUT life), and the topic's
-    duplicate copies per life. T below A FAILs, records the broker acknowledged and no longer
+    duplicate copies per life, with, under `otlp_proto`, the data points a distinct record
+    repeats. T below A FAILs, records the broker acknowledged and no longer
     holds, and T above A FAILs, records the sink never saw accepted, unless the sink dropped an
     attempt it never saw answered (an `ambiguous_at_most_once` record drop or any batch drop),
     which may have landed: a WARN. When a scheduled kill ended a SUT life, a T − A difference
     in either direction WARNs and names the killed lives: the kill loses that life's last
     telemetry interval of A, and a spooled batch counted before the kill and replayed after it
-    is in A twice but stored once. A duplicate copy FAILs when the life
+    is in A twice but stored once. A duplicate copy or a repeated point FAILs when the life
     it's credited to has no epoch-bumping event: it isn't the final life, so no later producer id
     resent it, and the sink counted no `EPOCH_BUMP_REASONS` drop in it. Within one epoch the
     broker discards a resend. Duplicates after an epoch bump WARN, which docs/known-gaps/kafka.md
@@ -4939,13 +4967,19 @@ def check_ledger_topic(data):
     copies = sum(led.duplicates.values())
     by_life = led.sut.counter_by_life("logit.output.records", component=led.kafka_sink)
     accepted = sum(by_life.values())
-    lines = [f"topic {data.target.get('topic')!r}: end offsets {read.get('offsets')}, "
-             f"{_n(t_count + copies)} record(s) read back, {_n(t_count)} distinct",
+    lines = [f"topic {data.target.get('topic')!r} ({led.topic_format}): end offsets "
+             f"{read.get('offsets')}, {_n(t_count + copies)} record(s) read back, "
+             f"{_n(t_count)} distinct",
              "records accepted by life: " + ", ".join(
                  f"life {life} {_n(value)}" for life, value in sorted(by_life.items()))]
     status = PASS
     problems = []
-    for life, count in sorted(led.duplicates.items()):
+    for life in sorted(set(led.duplicates) | set(led.point_copies)):
+        count = led.duplicates.get(life, 0)
+        points = led.point_copies.get(life, 0)
+        what = " and ".join(part for part in (
+            f"{_n(count)} duplicate copies" if count else "",
+            f"{_n(points)} data point(s) a distinct record repeats" if points else "") if part)
         bumps = led.epoch_bumps(life)
         why = []
         if life != led.final:
@@ -4953,11 +4987,11 @@ def check_ledger_topic(data):
         why += [f"{_n(value)} record(s) dropped {reason}" for reason, value in bumps.items()]
         if why:
             status = worst([status, WARN])
-            problems.append(f"life {life}: {_n(count)} duplicate copies after an epoch bump "
+            problems.append(f"life {life}: {what} after an epoch bump "
                             f"({'; '.join(why)}), which at_least_once permits")
         else:
             status = FAIL
-            problems.append(f"life {life}: {_n(count)} duplicate copies with no epoch bump: "
+            problems.append(f"life {life}: {what} with no epoch bump: "
                             "the broker stored a resend it should have discarded")
     gap = t_count - accepted
     detail = (f"T {_n(t_count)} distinct records in the topic ({_n(t_count + copies)} read, "
