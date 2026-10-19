@@ -29,7 +29,8 @@
 //! name, then their rendered line, so batching and reordering, both permitted normalizations,
 //! don't change the document. One part of a sink isn't reproduced: `prometheus_out`'s
 //! `expire_after:`, which reads a clock, so exposition reads back every series not evicted by
-//! `max_series:`. Every component counts into a `TelemetryProbe` registry under its
+//! `max_series:`. One is rewritten: `otlp_out` stamps a log with no observed time with the wall
+//! clock, and `wire` reads that stamp back as the run's clock. Every component counts into a `TelemetryProbe` registry under its
 //! real id, kind, and role; the pair decoder counts under the id `transit.decode` and its own
 //! kind, as a listener.
 //!

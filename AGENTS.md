@@ -850,7 +850,7 @@ the operator-facing account of all of this.
   (`classes.rs`'s module doc). `script/transit gen|check|coverage` wraps it; `script/test` runs it.
   Cases come from `statsd_in`, `influxdb_in`, and `prometheus_in`'s scrape; the columns are
   `statsd_out`, `prometheus_out`, `influxdb_out`, and `otlp_out`, through the statsd like pair and
-  seven cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
+  eight cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
 
 ### Not yet built
 

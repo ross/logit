@@ -153,3 +153,18 @@ left open:
 
 `crates/logit-cli/src/transit/mapping.rs`'s and `classes.rs`'s module docs are the schema and the
 check's rules.
+
+## Amendment: uncounted losses and cells a sink can't reach (2026-10-19)
+
+The cross-protocol columns settled two more things:
+
+- **A `skipped` or `dropped` cell may say its loss is `uncounted`**, as a `lost` cell already
+  could. `prometheus_out` and `influxdb_out` skip a log or span without counting it, and
+  `prometheus_out` replaces an earlier point of a series without counting it. The table records a
+  sink as it behaves, so an uncounted loss needs a cell that says so; refusing the cell would hide
+  the loss instead. The check accepts such a cell's class for a record nothing reads back. Each
+  is a finding for the sink, not an endorsement.
+- **A row may omit a sink's cell when no record can reach it there**, and `mapping.yaml` says why
+  beside the row: `name_unsafe` at a sink that rewrites no name, or a field row at a sink that
+  writes the kind only in a lesser form, so the field is never compared. A cell nothing can reach
+  would sit in `coverage.md`'s unreached list forever.

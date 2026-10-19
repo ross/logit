@@ -176,7 +176,10 @@ the driver and the sink can't drift. The driver decodes an InfluxDB write under 
 `influxdb_in` builds from that org and bucket (`logit_proto::influxdb::write_resource`), and
 refuses one naming no org as `influxdb_in` does. Two things it doesn't reproduce: `has_stale` and
 `drop_stale`, which read the wall clock per batch, so it rejects them; and `prometheus_out`'s
-`expire_after:`, which reads a clock, so exposition reads back every series `max_series:` keeps. The driver is a `#[cfg(test)]` module of the
+`expire_after:`, which reads a clock, so exposition reads back every series `max_series:` keeps.
+One thing it rewrites: `otlp_out` stamps a log with no observed time with the wall clock, and the
+driver reads that stamp back as the run's clock, so an expectation doesn't change between runs.
+The driver is a `#[cfg(test)]` module of the
 `logit` binary rather than a library target or an integration test, since only the binary's own
 tests can reach `build_spec`. W4's generator follows the `script/differential --check` pattern
 as a `#[test]` in the same module: with `TRANSIT_UPDATE=1` it rewrites the expectations, and
@@ -192,9 +195,9 @@ unset it compares, with `script/transit gen|check` wrapping the two.
 | temporality | `delta`, `cumulative` (sum, histogram) |
 | monotonic | `true`, `false` (sum) |
 | scalar | `f64`, `i64`, `u64`, `bool` (sum, gauge, gauge_delta) |
-| record fields | `unit`, `description`, `start_timestamp`, `exemplars` (field level) |
-| record features | `flags.no_recorded_value`, a service check's carriers, a name the sink must sanitize (record level) |
-| attribute shapes | a string, boolean, number, or `Array` value, the sink's own `_logit.` carrier, another protocol's, a resource attribute |
+| record fields | `unit`, `description`, `start_timestamp`, `exemplars`, a histogram's `min` and `max` (field level) |
+| record features | `flags.no_recorded_value`, a service check's carriers, a name the sink must sanitize, a non-finite value, a later point of the series in the run, at the same instant, or in the same millisecond (record level) |
+| attribute shapes | a string, boolean, number, `Array`, `Map`, bytes, or timestamp value, the sink's own `_logit.` carrier, another protocol's, a resource attribute, the batch's scope |
 | logs | a DogStatsD event, any other log |
 
 A column is a sink. A cell is a class, a reason, and the counter it counts under:
@@ -205,8 +208,8 @@ A column is a sink. A cell is a class, a reason, and the counter it counts under
 | `normalized` | both | a permitted normalization applied (named) |
 | `degraded` | record | the value survives in a lesser kind (a sketch as five quantiles) |
 | `lost` | field | a field the record loses while the record survives, counted or named `uncounted` |
-| `skipped` | record | the record leaves no wire form, counted `skipped{reason}` |
-| `dropped` | record | the record is lost for a reason the config didn't ask for, counted `dropped{reason}` |
+| `skipped` | record | the record leaves no wire form, counted `skipped{reason}` or named `uncounted` |
+| `dropped` | record | the record is lost for a reason the config didn't ask for, counted `dropped{reason}` or named `uncounted` |
 
 A sink whose outcome depends on its config (`statsd_out`'s `format:`, `multi_value:`,
 `relative_gauges:`) gets a list of cells, each but the last with a `when:` map matched against the
@@ -255,9 +258,9 @@ Sources: `statsd_in`, `influxdb_in`, `prometheus_in`. Sinks: `statsd_out`, `prom
 `influxdb_out`, `otlp_out`. Later pairs follow `spec/transit/README.md`'s "Adding a sink
 column" and "Adding a source" steps, one PR each.
 
-W4b landed these with three more flows: `influxdb_in -> prometheus_out` as remote-write 2.0, and
-`statsd_in -> prometheus_out` and `statsd_in -> influxdb_out`, so every kind the statsd cases
-hold reaches each new column.
+W4b landed these with four more flows: `influxdb_in -> prometheus_out` as remote-write 2.0,
+`statsd_in -> prometheus_out` both as exposition and as remote-write 1.0, and `statsd_in ->
+influxdb_out`, so every kind the statsd cases hold reaches each new column in each mode.
 
 ### 8. Not in this stack
 
@@ -374,19 +377,20 @@ Recorded per workstream as each lands.
   it writes or compares JSON; the encoder, `AttrMap`, and the interner are unchanged. Pre-interning
   every key in the committed cases at the start of `generate` was rejected: it depends on global
   interner state and on scanning the whole case set.
-- **W4b**: `influxdb_in` (15 cases) and `prometheus_in`'s scrape (12 cases) joined `statsd_in` (30
-  cases, two of them new), and `prometheus_out`, `influxdb_out`, and `otlp_out` joined
-  `statsd_out` in all 51 rows: 15 flows, 387 expectations. Every cell is reached but
-  `prometheus_out`'s two remote-write cells for an exponential histogram, since no remote-write
-  flow reads a source that makes one. Prometheus remote-write cases aren't written: a protobuf body
-  can't be hand-written, and no feature needs one until a native histogram can be decoded.
+- **W4b**: `influxdb_in` (16 cases, one a gzip Telegraf capture read in place) and
+  `prometheus_in`'s scrape (12 cases) joined `statsd_in` (31 cases, three of them new), and
+  `prometheus_out`, `influxdb_out`, and `otlp_out` joined `statsd_out` in all 54 rows: 16 flows,
+  432 expectations, and every cell reached. Prometheus remote-write source cases aren't written: a
+  protobuf body can't be hand-written, and no feature needs one until a native histogram can be
+  decoded.
 
   The class check now reads each sink's spelling (`classes.rs`'s "Pairing"): `prometheus_out`'s
   sanitized names, `_total`, and label keys, `influxdb_out`'s `<name>.value`, the last element of
   an array for both, and `otlp_out`'s timestamp attribute as an integer. The schema gained
-  `record/non_finite`, `record/superseded`, `attributes/map_value`, `bytes_value`,
-  `timestamp_value`, and `attributes/scope`; a resource attribute under `_logit.` now reaches the
-  carrier rows; and a `skipped` or `dropped` cell may say its loss is `uncounted`. The `otlp_out`
+  `record/non_finite`, `record/superseded`, `record/same_instant`, `record/same_millisecond`,
+  `record/min_max`, `attributes/map_value`, `bytes_value`, `timestamp_value`, and
+  `attributes/scope`; a resource attribute under `_logit.` now reaches the carrier rows; and a
+  `skipped` or `dropped` cell may say its loss is `uncounted` (the ADR's third amendment). The `otlp_out`
   driver arm reads the wall-clock observed time the encoder stamps on a log back as the run's
   clock. The attribute-order churn the new cases caused is W4a's fix above.
 
@@ -398,7 +402,12 @@ Recorded per workstream as each lands.
     InfluxDB's table writes it with no counter.
   - `prometheus_out`'s exposition registry holds one sample per series, so an earlier point of a
     series in the same run is replaced, uncounted (`record/superseded`: `skipped`, `uncounted`).
-    Remote-write sends each. Neither the codec's normalization list nor `mappings.md` names it.
+    Neither the codec's normalization list nor `mappings.md` names it.
+  - Remote-write sends each point of a series, but two at one instant reach `events_to_families`
+    in one group, which keeps the later and drops the earlier, uncounted (`record/same_instant`:
+    `dropped`, `uncounted`). Two at different nanoseconds of one millisecond are collapsed the
+    same way and counted, under `metrics.degraded{reason="sub_ms_collapsed"}`, a `degraded`
+    series for a reading that's gone (`record/same_millisecond`: `dropped`).
   - `prometheus_out` writes no start time for a gauge: `_created` is a counter's, histogram's,
     or summary's, so a gauge's `start_timestamp` is lost uncounted. The encode table doesn't say.
   - Under OpenMetrics, `prometheus_out` writes a gauge whose `_logit.prometheus.type` is
@@ -411,4 +420,7 @@ Recorded per workstream as each lands.
     `influxdb_in` decodes every field to a gauge, so the window emits each series' latest value.
     `statsd_in -> prometheus_out` reaches the delta-sum rows instead.
 
-  None of the first four is in `docs/known-gaps/mappings.md`, which W5 generates from the table.
+  - `prometheus_out` writes no histogram `min` or `max`, uncounted (`record/min_max`: `lost`);
+    the encode table says so, `mappings.md` doesn't.
+
+  None of the first five is in `docs/known-gaps/mappings.md`, which W5 generates from the table.
