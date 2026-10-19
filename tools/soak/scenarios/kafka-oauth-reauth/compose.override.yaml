@@ -1,0 +1,75 @@
+# kafka-oauth-reauth's stack, merged onto tools/soak/compose.yaml: a namespace holder, `sut-net`,
+# that owns the network namespace the SUT, `logit`, and the token endpoint, `idp`, share. The SUT
+# reaches the token endpoint at `http://127.0.0.1`, since `kafka_out` takes a plain-HTTP
+# `token_endpoint` on loopback only. The holder owns the address, so a stop of `idp` takes only
+# the token endpoint away, and a netem or a partition of `sut-net` is one of the SUT's network.
+# A service with an address of its own reaches `idp` at `sut-net`: the broker's JWKS fetch and the
+# generator's statsd both go there. A relative path here resolves against the project directory,
+# tools/soak/, the base file's, not this file's.
+services:
+  # Runs nothing: the netem image, asleep, killed at once by a stop. Its healthcheck probes the
+  # token endpoint's port in the namespace it shares with `idp`, so the broker, which fetches the
+  # JWKS when it starts, waits for the endpoint to listen.
+  sut-net:
+    image: logit-soak-netem:local
+    entrypoint: ["sleep", "infinity"]
+    labels: { soak.role: netns }
+    stop_signal: SIGKILL
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/80"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+      start_interval: 1s
+
+  # tools/kafka-interop's OAuth 2.0 server, pinned by digest. Every client-credentials token it
+  # issues names the subject `logit`, the audience `soak`, and the issuer
+  # `http://sut-net/default`, whichever host it was asked on, and lives 60 s. It takes any client
+  # id and secret. It signs for the issuer `default` with the first key bundled in the image, so a
+  # stop and start serves the same JWKS, and the broker's cached copy stays valid.
+  idp:
+    image: ghcr.io/navikt/mock-oauth2-server:6.0.2@sha256:b538810afd589d42fbfb856c588c2065eaeed1dc528d6c532972048e67fc2aff
+    labels: { soak.role: idp }
+    network_mode: "service:sut-net"
+    depends_on:
+      sut-net: { condition: service_started }
+    restart: "no"
+    environment:
+      SERVER_PORT: "80"
+      JSON_CONFIG: >-
+        {"tokenCallbacks": [{"issuerId": "default", "tokenExpiry": 60, "requestMappings": [
+        {"requestParam": "grant_type", "match": "client_credentials", "claims": {"sub": "logit",
+        "aud": ["soak"], "iss": "http://sut-net/default"}}]}]}
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5", compress: "true" }
+
+  # Started from this scenario's kafka-server.properties instead of the image's environment
+  # variables. `--ignore-formatted` makes the format a no-op on a restart, which keeps the
+  # container and its log directory. The healthcheck is the base file's, on the unauthenticated
+  # PLAINTEXT listener.
+  kafka:
+    depends_on:
+      sut-net: { condition: service_healthy }
+    environment:
+      # Any base64 UUID; the log directory lives and dies with the container.
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      # Kafka 4.x fetches no OAuth URL this system property doesn't list.
+      KAFKA_OPTS: -Dorg.apache.kafka.sasl.oauthbearer.allowed.urls=http://sut-net/default/jwks
+    volumes:
+      - ./scenarios/kafka-oauth-reauth/kafka-server.properties:/soak/server.properties:ro,z
+    entrypoint:
+      - bash
+      - -c
+      - >-
+        /opt/kafka/bin/kafka-storage.sh format --ignore-formatted -t "$${CLUSTER_ID}"
+        -c /soak/server.properties >/dev/null
+        && exec /opt/kafka/bin/kafka-server-start.sh /soak/server.properties
+
+  logit:
+    network_mode: "service:sut-net"
+    depends_on:
+      sut-net: { condition: service_healthy }
+      idp: { condition: service_started }
