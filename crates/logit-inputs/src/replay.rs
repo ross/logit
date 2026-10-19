@@ -24,16 +24,16 @@
 //! | `undecodable` | a JSON line [`EventJsonDecoder`] refused (diagnostic `bad_line`, with its line number) |
 //! | `magic` | bytes that don't start a frame, up to the next frame magic: one count per run |
 //! | `version` | a frame header of a version this build doesn't read |
-//! | `too_large` | a frame header declaring a body over the frame cap |
+//! | `too_large` | a frame header declaring a body, compressed or not, over the frame cap |
 //! | `crc` | a frame whose body fails its CRC, a frame torn mid-file among them |
 //! | `codec` | a frame that isn't a bare batch: a spool's hop batch, or a control frame |
 //! | `decode_budget` | a batch that would decode past its budget |
-//! | `malformed` | any other frame or batch that doesn't parse |
+//! | `malformed` | any other frame or batch that doesn't parse, a CRC-valid body that doesn't decompress or uses a compression this build doesn't decode among them |
 //! | `truncated` | a frame whose declared length runs past the end of the file |
 //!
 //! Each native fault but `truncated` has the `bad_frame` diagnostic, with the frame's byte
-//! offset. After any fault but `codec`, `decode_budget`, or `malformed` on a decoded body, the
-//! read resumes at the next frame magic past the faulty frame's own magic, not past its declared
+//! offset. A frame that passes its CRC and then fails is skipped by its length. After a header
+//! fault, a CRC fault, or a `truncated` frame, the read resumes at the next frame magic past the faulty frame's own magic, not past its declared
 //! length: a frame torn by a killed writer, with a later run's frames appended behind it
 //! (`file_out` opens its file to append), declares a length that reaches into those frames. So a
 //! whole frame anywhere after a fault is read, and only a `truncated` frame with no magic behind
@@ -41,7 +41,7 @@
 //!
 //! One fault is counted per unreadable run: from a counted fault until a frame passes its CRC,
 //! nothing more is counted, except that a frame or header the end of the file cuts short, magic
-//! included, is always counted `truncated`.
+//! included, is counted `truncated` once.
 //!
 //! A batch no consumer took is counted `logit.input.batches.dropped{reason="closed_consumer"}`
 //! and ends the read.
@@ -203,11 +203,14 @@ impl ReplayInput {
         // Set from a counted fault until a frame passes its CRC: the bytes in between are one
         // unreadable run, so a false magic inside them isn't counted again.
         let mut skipping = false;
+        // Set from a counted `truncated` until a frame passes its CRC: a false magic inside the
+        // torn frame's payload is cut short by the same end of file, and isn't counted again.
+        let mut truncated = false;
         loop {
             if !fill(&mut reader, &mut buf, HEADER_LEN).await? {
                 // Leftover bytes after a counted fault are part of its run, unless a resync
                 // landed on a magic: then they're a torn header of their own.
-                if !buf.is_empty() && (!skipping || buf.starts_with(&MAGIC)) {
+                if !buf.is_empty() && !truncated && (!skipping || buf.starts_with(&MAGIC)) {
                     self.truncated(offset, buf.len());
                 }
                 break;
@@ -246,8 +249,13 @@ impl ReplayInput {
                     continue;
                 }
             };
-            if header.compressed_len > compressed_bound(MAX_SANE_UNCOMPRESSED_LEN) {
-                let err = format!("a {}-byte body is over the frame cap", header.compressed_len);
+            if header.compressed_len > compressed_bound(MAX_SANE_UNCOMPRESSED_LEN)
+                || header.uncompressed_len > MAX_SANE_UNCOMPRESSED_LEN
+            {
+                let err = format!(
+                    "a body of {} bytes ({} uncompressed) is over the frame cap",
+                    header.compressed_len, header.uncompressed_len
+                );
                 self.skip_header("too_large", &mut buf, &mut offset, &mut skipping, err);
                 continue;
             }
@@ -257,8 +265,9 @@ impl ReplayInput {
                 // that runs into the frames behind it and past the end. Those frames are whole,
                 // so read on from the next magic; only a frame with none behind it ends the read.
                 let next = frame::resync(&buf[MAGIC.len()..]);
-                if next.is_none() || !skipping {
+                if !truncated && (next.is_none() || !skipping) {
                     self.truncated(offset, buf.len());
+                    truncated = true;
                 }
                 let Some(at) = next else { break };
                 buf.advance(MAGIC.len() + at);
@@ -270,19 +279,30 @@ impl ReplayInput {
             let at = offset;
             offset += len as u64;
             let mut whole = consumed.clone();
-            let (header, mut payload) = match frame::read_frame_with_header(&mut whole) {
+            let read = frame::read_frame_with_header(&mut whole);
+            // The header's caps are checked above, so a failure other than the CRC comes after
+            // it: a body that doesn't decompress, or a compression this build doesn't decode.
+            let crc_failed =
+                matches!(&read, Err(CodecError::Malformed(msg)) if msg.contains("crc32c"));
+            if !crc_failed {
+                skipping = false;
+                truncated = false;
+                self.telemetry.count("logit.input.frames", 1.0, &[]);
+                self.telemetry.count("logit.input.frame.bytes", len as f64, &[]);
+            }
+            let (header, mut payload) = match read {
                 Ok(read) => read,
+                Err(err) if !crc_failed => {
+                    self.frame_fault("malformed", at, err);
+                    continue;
+                }
                 Err(err) => {
                     // A torn frame followed by a later write fails here, its declared length
-                    // reaching into the frames behind it. Rescan from the byte after its magic, so a
-                    // whole frame inside those bytes is still read; a false magic in a payload
+                    // reaching into the frames behind it. Rescan from the byte after its magic, so
+                    // a whole frame inside those bytes is still read; a false magic in a payload
                     // costs one more CRC check.
                     if !skipping {
-                        let reason = match &err {
-                            CodecError::Malformed(msg) if msg.contains("crc32c") => "crc",
-                            _ => "malformed",
-                        };
-                        self.frame_fault(reason, at, err);
+                        self.frame_fault("crc", at, err);
                         skipping = true;
                     }
                     let mut rest = BytesMut::with_capacity(len - MAGIC.len() + buf.len());
@@ -293,9 +313,6 @@ impl ReplayInput {
                     continue;
                 }
             };
-            skipping = false;
-            self.telemetry.count("logit.input.frames", 1.0, &[]);
-            self.telemetry.count("logit.input.frame.bytes", len as f64, &[]);
             if header.codec != CODEC_BATCH || header.flags & FLAG_CONTROL != 0 {
                 self.frame_fault(
                     "codec",
@@ -701,6 +718,42 @@ mod tests {
         let mut out = replay(&bytes, ReplayFormat::Native, 1000).await;
         assert_eq!(shape(&out.batches), [("web".into(), 5)]);
         assert_eq!(dropped(&mut out.probe), [("magic", 1.0), ("truncated", 1.0)]);
+    }
+
+    /// A torn final frame whose payload holds a false magic near its end is counted once: the
+    /// false magic is cut short by the same end of file.
+    #[tokio::test]
+    async fn a_false_magic_in_a_torn_final_frame_is_not_counted_again() {
+        let mut bytes = native_frames(&three_runs()[..1], Compression::None);
+        let mut header =
+            native_frames(&three_runs()[2..], Compression::None)[..HEADER_LEN].to_vec();
+        header[16..20].copy_from_slice(&1000u32.to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&[b'a'; 100]);
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&[b'b'; 10]);
+        let mut out = replay(&bytes, ReplayFormat::Native, 1000).await;
+        assert_eq!(shape(&out.batches), [("web".into(), 5)]);
+        assert_eq!(dropped(&mut out.probe), [("truncated", 1.0)]);
+    }
+
+    /// A frame that passes its CRC and then fails to decompress, read in the run after a torn
+    /// frame, is counted under its own reason and as a frame read.
+    #[tokio::test]
+    async fn a_crc_valid_frame_that_fails_to_decompress_is_counted_on_its_own() {
+        let written = three_runs();
+        let db = native_frames(&written[1..2], Compression::None);
+        let mut bytes = db[..HEADER_LEN + (db.len() - HEADER_LEN) / 2].to_vec();
+        // The CRC covers the stored bytes, so relabeling an uncompressed body as lz4 keeps it
+        // valid and makes the body fail to decompress.
+        let mut bad = write_frame(CODEC_BATCH, Compression::None, &[0xf0; 256]).unwrap().to_vec();
+        bad[9] = Compression::Lz4 as u8;
+        bytes.extend_from_slice(&bad);
+        bytes.extend_from_slice(&native_frames(&written[2..], Compression::None));
+        let mut out = replay(&bytes, ReplayFormat::Native, 1000).await;
+        assert_eq!(shape(&out.batches), [("web".into(), 1)]);
+        assert_eq!(dropped(&mut out.probe), [("crc", 1.0), ("malformed", 1.0)]);
+        assert_eq!(out.probe.sum("logit.input.frames", &[]), 2.0);
     }
 
     #[tokio::test]

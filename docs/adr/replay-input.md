@@ -82,15 +82,16 @@ replay:
    - A frame whose declared length runs past the end of the file is `truncated`.
    - A JSON line cut short fails to parse and is `undecodable`.
 
-   A frame's declared length isn't trusted past its CRC. `file_out` opens its file to append, so
-   a writer killed mid-frame leaves a torn frame with the next run's whole frames behind it, and
-   the torn frame's length reaches into them. After a header fault, a CRC fault, or a `truncated`
-   frame, the read resumes at the next frame magic past the faulty frame's own, not past its
-   length. Only a `truncated` frame with no magic behind it ends the read, as `decode_dump`
-   tolerates a torn final frame. A false magic inside a payload costs one more CRC check. One
-   fault is counted per unreadable run, from a counted fault until a frame passes its CRC, except
-   that a frame or header the end of the file cuts short, magic included, is always counted
-   `truncated`.
+   A frame's declared length isn't trusted until its CRC passes. `file_out` opens its file to
+   append, so a writer killed mid-frame leaves a torn frame with the next run's whole frames
+   behind it, and the torn frame's length reaches into them. After a header fault, a CRC fault,
+   or a `truncated` frame, the read resumes at the next frame magic past the faulty frame's own,
+   not past its length. Only a `truncated` frame with no magic behind it ends the read, as
+   `decode_dump` tolerates a torn final frame. A false magic inside a payload costs one more CRC
+   check. A frame that passes its CRC and then fails, a body that doesn't decompress included, is
+   counted under its own reason and skipped by its length. One fault is counted per unreadable
+   run, from a counted fault until a frame passes its CRC, except that a frame or header the end
+   of the file cuts short, magic included, is counted `truncated` once.
 
    The module doc's table is the canonical list.
 7. **A batch no consumer took** is counted `logit.input.batches.dropped{reason="closed_consumer"}`
