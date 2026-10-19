@@ -192,7 +192,8 @@ topic `soak`. Its 6.5-minute cycle restarts the broker, pauses it for 40 s, and 
 least one attempt `Ambiguous`, so the broker has resends to deduplicate, and the sink retries
 during the stop and stops retrying after it. The topic is read back at the end and judged by
 `ledger.egress` and `ledger.topic`, which FAILs a record stored twice; see
-[Kafka targets](#kafka-targets).
+[Kafka targets](#kafka-targets). `kafka-otlp-broker-restart` is the same run with `kafka_out`
+under `format: otlp_proto`: one OTLP metrics export request per window, holding every series.
 
 `kafka-sasl-reauth` (8 minutes 30 seconds, up to 8 hours) is `kafka-broker-restart` with ten
 series instead of 100, over SCRAM-SHA-512 to a broker that ends every session after 30 s
@@ -723,12 +724,20 @@ What changes for a Kafka target:
   record's `sum` values: each record carries one window's increments. Records are deduplicated
   on the value's raw bytes first, so a duplicate can't cancel a loss of the same size. Each
   record, and each duplicate copy, counts toward the SUT life its timestamp falls in.
+- The ledger reads the topic in the sink's `format:`, taken from the SUT config: `json`, the
+  default, or `otlp_proto`. Any other format, or a sink that doesn't write the target's
+  `topic`, is refused at load. Under `otlp_proto` the consumer prints each value escaped
+  (Kafka's `BytesDeserializer`), and `soaklib/otlp.py` walks it as a metrics export request.
+  V counts each `Sum` data point once per series and time, so a resend split another way
+  can't count twice, and `ledger.topic` judges such a repeated point as it judges a duplicate
+  copy. `format: otlp_json` isn't read.
 - `ledger.egress` and `ledger.summary` judge Ab − V against the topic's distinct records. A
   surplus FAILs, as on any target. `ledger.windows` SKIPs.
 - `ledger.sent` judges the sink's batches, drops, and refusals as for an external target, with
   `kafka_out`'s request classes (`ok` accepted).
 - `ledger.topic` compares the topic's distinct record count with the records the sink saw
-  accepted, and judges duplicate copies per SUT life. Within one producer epoch the broker
+  accepted, and judges duplicate copies, and under `otlp_proto` repeated data points, per SUT
+  life. Within one producer epoch the broker
   discards a resend, so a duplicate FAILs unless its life ended in a restart or kill, or the
   sink counted a drop that bumps the epoch there (`rejected`, `invalid_timestamp`,
   `invalid_record`, `ambiguous_at_most_once`). Those duplicates WARN, as

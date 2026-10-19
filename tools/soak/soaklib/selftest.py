@@ -198,6 +198,7 @@ import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -207,7 +208,8 @@ import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (checks, collect, docker, driver, faults, report, scenario, standin, telemetry,
+from . import (checks, collect, docker, driver, faults, otlp, report, scenario, standin,
+               telemetry,
                topic, vm)
 
 _FAILURES = []
@@ -1413,6 +1415,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 script=None, l_in_short=0, l_err_unreported=0, l_sent_short=0,
                 sut_end="stop", shutdown_in=("telemetry", "stderr"), dropped_at="sink",
                 dropped_reason="shutdown", kafka=False, topic_extra=(), topic_read=True, topic_records=None,
+                topic_format="json",
                 standin_edit=None, standin_shape="remote_write", **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
@@ -1435,7 +1438,9 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
     With `kafka`, the target is a Kafka topic: the same V lands as four delta records in
     `kafka-topic.ndjson`, two per life, plus `topic_extra` lines, and the timeline records the
     read unless `topic_read` is false. `topic_records(v0, v1)`, when given, returns the
-    `(offset, amount)` records to write in place of the four.
+    `(offset, amount)` records to write in place of the four. Under `topic_format`
+    `"otlp_proto"` each record is an escaped OTLP metrics request holding one `x_0` data point
+    (`_otlp_topic_record`).
 
     With `standin_edit`, the target is a stand-in: the same export becomes its record, one
     stored `200` request per sample timestamp a second before it (`_standin_record`), the SUT's
@@ -1559,7 +1564,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
         ledger = resolved.pop("ledger", {**LEDGER, "sink": [{"id": "sink"}]})
     elif kafka:
         resolved.setdefault("target", {"kind": "kafka", "name": "kafka", "env": [],
-                                       "topic": "soak"})
+                                       "topic": "soak", "format": topic_format})
         ledger = {**LEDGER, "sink": [{"id": "sink"}]}
         if topic_read:
             timeline.append(_phase("kafka_read", 325, topic="soak", offsets={"0": 4},
@@ -1633,7 +1638,8 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
         shares = ((50, v0 // 2), (100, v0 - v0 // 2), (200, v1 // 2), (300, v1 - v1 // 2))
         if topic_records is not None:
             shares = topic_records(v0, v1)
-        records = [_topic_record(T0 + offset, amount) for offset, amount in shares]
+        write = _otlp_topic_record if topic_format == topic.OTLP_PROTO else _topic_record
+        records = [write(T0 + offset, amount) for offset, amount in shares]
         (run_dir / topic.TOPIC_FILE).write_text(
             "\n".join(records + list(topic_extra)) + "\n")
     return run_dir
@@ -4948,7 +4954,8 @@ def _kafka_rules(root):
 
     loaded = scenario.from_dict(copy.deepcopy(base), path)
     expect(loaded.kafka and not loaded.external and not loaded.has_vm
-           and loaded.target == {"kind": "kafka", "name": "kafka", "env": [], "topic": "soak"},
+           and loaded.target == {"kind": "kafka", "name": "kafka", "env": [], "topic": "soak",
+                                 "format": "json"},
            f"kafka-broker-restart loads as a Kafka target, got {loaded.target}")
     roles = scenario.base_roles(loaded)
     expect(roles == {"logit": "sut", "generator": "generator", "kafka": "broker"},
@@ -4957,6 +4964,45 @@ def _kafka_rules(root):
            f"kafka-broker-restart's one sink names no backend, got {loaded.sinks}")
     expect(loaded.to_json()["target"]["topic"] == "soak",
            "the resolved scenario records the topic")
+    otlp_path = root / "scenarios" / "kafka-otlp-broker-restart" / "scenario.toml"
+    otlp_loaded = scenario.load(otlp_path)
+    expect(otlp_loaded.to_json()["target"]["format"] == topic.OTLP_PROTO
+           and loaded.to_json()["target"]["format"] == topic.JSON,
+           "the resolved target records the format its sink's config writes")
+    sinks = {"sink": [{"id": "kafka"}]}
+
+    def fmt(body, topic_name="soak"):
+        problems = []
+        found = scenario.kafka_format(sinks, f"components:\n  kafka:\n{body}", topic_name,
+                                      problems)
+        return found, problems
+    head = "    type: kafka_out\n    brokers: [\"kafka:9092\"]\n"
+    format_cases = [
+        (head + "    topic: soak\n", topic.JSON, None, "no format: is json"),
+        (head + "    format: otlp_proto  # format: json\n    topics: { metrics: soak }\n",
+         topic.OTLP_PROTO, None, "otlp_proto writing its metrics topic"),
+        (head + "    format: otlp_proto\n    topic: soak\n", topic.OTLP_PROTO, None,
+         "otlp_proto with every signal on one topic"),
+        (head + "    format: otlp_proto\n", topic.OTLP_PROTO,
+         "writes its metrics to 'otlp_metrics'", "otlp_proto's default metrics topic"),
+        (head + "    topic: other\n", topic.JSON, "but ledger.sink 'kafka' writes 'other'",
+         "a json sink on another topic"),
+        (head + "    topic: soak\n    format: msgpack\n", topic.JSON,
+         "writes format msgpack; the ledger reads a topic in json or otlp_proto only",
+         "a format the ledger can't read"),
+        (head + "    format: otlp_json\n    topic: soak\n", topic.JSON,
+         "writes format otlp_json", "otlp_json, which the ledger doesn't read"),
+        ("    type: stdio_out\n", topic.JSON, "is a stdio_out", "a sink that isn't kafka_out"),
+    ]
+    for body, want, needle, what in format_cases:
+        found, problems = fmt(body)
+        expect(found == want and (any(needle in p for p in problems) if needle
+                                  else not problems),
+               f"{what}: format {found}, problems {problems}")
+    missing = []
+    scenario.kafka_format({"sink": [{"id": "gone"}]}, "components:\n" + head, "soak", missing)
+    expect(any("'gone' isn't a component" in p for p in missing),
+           f"a sink the SUT config doesn't hold is refused, got {missing}")
     local = scenario.from_dict(copy.deepcopy(vm_base), vm_path)
     external = scenario.from_dict(copy.deepcopy(ext_base), ext_path)
     expect(scenario.base_roles(local) == scenario.BASE_ROLES
@@ -5057,10 +5103,10 @@ def _kafka_topic():
              _topic_record(2500, 70), "not json", "[1, 2]",
              json.dumps({"timestamp": _stamp(2600), "metrics": [
                  {"name": "x_0", "kind": "gauge", "value": 9}]})]
-    records, unparsed, copies = topic.parse_records("\n".join(lines) + "\n\n")
+    records, unparsed, copies, _ = topic.parse_records("\n".join(lines) + "\n\n")
     expect(len(records) == 4 and unparsed == 2 and copies == [],
            f"two of six lines aren't JSON objects, got {records} {unparsed} {copies}")
-    prefixed, _, _ = topic.parse_records("\n".join(lines), prefix="x_")
+    prefixed, _, _, _ = topic.parse_records("\n".join(lines), prefix="x_")
     expect([amount for _, amount in prefixed] == [30, 0, 70, 0],
            f"only sums under the prefix count, got {prefixed}")
     by_life, total = topic.totals_by_life(records, [900, 2000])
@@ -5068,12 +5114,265 @@ def _kafka_topic():
            f"each record goes to the life its timestamp falls in; a gauge adds 0, got "
            f"{by_life} {total}")
     resent = lines[:3] + [lines[2], lines[0], lines[2]]
-    records, _, copies = topic.parse_records("\n".join(resent))
+    records, _, copies, _ = topic.parse_records("\n".join(resent))
     by_life, total = topic.totals_by_life(records, [900, 2000])
     expect(len(records) == 3 and total == 105
            and topic.duplicates_by_life(copies, [900, 2000]) == {0: 1, 1: 2},
            f"a record's copies count once in V and per life as duplicates, got {records} "
            f"{copies}")
+
+
+def _pb(number, wire, payload):
+    """One protobuf field: `payload` an int for a varint, else the raw bytes of a 64-bit,
+    32-bit, or length-delimited field, whose length this writes."""
+    def varint(value):
+        out = bytearray()
+        value &= (1 << 64) - 1
+        while value > 0x7F:
+            out.append(value & 0x7F | 0x80)
+            value >>= 7
+        out.append(value)
+        return bytes(out)
+    key = varint(number << 3 | wire)
+    if wire == otlp.VARINT:
+        return key + varint(payload)
+    if wire == otlp.LEN:
+        return key + varint(len(payload)) + payload
+    return key + payload
+
+
+def _pb_kv(key, value):
+    """An OTLP `KeyValue` holding a string."""
+    return _pb(1, otlp.LEN, key.encode()) + _pb(2, otlp.LEN, _pb(1, otlp.LEN, value.encode()))
+
+
+def _otlp_point(time_ns, value, attrs=(), extra=b""):
+    """A `NumberDataPoint`: `as_double` for a float `value`, `as_int` for an int, neither for
+    None."""
+    body = b"".join(_pb(7, otlp.LEN, _pb_kv(k, v)) for k, v in attrs)
+    body += _pb(3, otlp.I64, struct.pack("<Q", time_ns))
+    if isinstance(value, float):
+        body += _pb(4, otlp.I64, struct.pack("<d", value))
+    elif value is not None:
+        body += _pb(6, otlp.I64, struct.pack("<q", value))
+    return body + extra
+
+
+def _otlp_metric(name, points, kind="sum", monotonic=True, extra=b""):
+    """A `Metric` holding a delta `Sum` or a `Gauge` of `points`."""
+    data = b"".join(_pb(1, otlp.LEN, point) for point in points)
+    if kind == "sum":
+        data += _pb(2, otlp.VARINT, otlp.DELTA) + (_pb(3, otlp.VARINT, 1) if monotonic else b"")
+        return _pb(1, otlp.LEN, name.encode()) + _pb(7, otlp.LEN, data) + extra
+    return _pb(1, otlp.LEN, name.encode()) + _pb(5, otlp.LEN, data) + extra
+
+
+def _otlp_request(metrics, resource=(("host.name", "soak"),), extra=b""):
+    """An `ExportMetricsServiceRequest` of `metrics` under one resource and an empty scope."""
+    res = b"".join(_pb(1, otlp.LEN, _pb_kv(k, v)) for k, v in resource)
+    scope = _pb(1, otlp.LEN, b"") + b"".join(_pb(2, otlp.LEN, m) for m in metrics)
+    return _pb(1, otlp.LEN, _pb(1, otlp.LEN, res) + _pb(2, otlp.LEN, scope)) + extra
+
+
+def _otlp_topic_record(t, amount, name="x_0"):
+    """One `kafka_out` `format: otlp_proto` record as the consumer prints it: an `aggregate`
+    delta window's one series as an escaped metrics request."""
+    point = _otlp_point(int(round(t * 1e9)), amount)
+    return otlp.escape(_otlp_request([_otlp_metric(name, [point])]))
+
+
+# The `otlp_proto` record `kafka_out` writes for the batch in
+# `crates/logit-outputs/src/kafka/encode.rs`'s
+# `the_soak_otlp_metrics_vector_is_what_the_encoder_writes`, which pins this file to the encoder.
+OTLP_VECTOR = "kafka-otlp-metrics.hex"
+OTLP_VECTOR_TS = 1_791_720_000_250_000_000
+
+
+def _otlp_vector(root):
+    text = (root / "vectors" / OTLP_VECTOR).read_text()
+    return bytes.fromhex("".join(line for line in text.splitlines()
+                                 if not line.startswith("#")))
+
+
+def _otlp_walker(root):
+    """The protobuf walker against the encoder's own bytes: a delta `Sum` of `as_int` and of
+    `as_double`, a negative non-monotonic one, a `Gauge`, and a histogram whose packed fields
+    are skipped; then fields it doesn't know at every level, unpacked repeated fields, a oneof's
+    last member, a merged message, the consumer's escaped form, and bytes it must reject."""
+    vector = _otlp_vector(root)
+    points = otlp.metric_points(vector)
+    got = [(p.kind, p.name, p.value, type(p.value).__name__, p.time_unix_nano, p.temporality,
+            p.monotonic) for p in points]
+    want = [("sum", "soak_requests_1", 30, "int", OTLP_VECTOR_TS, otlp.DELTA, True),
+            ("sum", "soak_requests_2", 2.5, "float", OTLP_VECTOR_TS, otlp.DELTA, True),
+            ("gauge", "soak_gauge", 9.0, "float", OTLP_VECTOR_TS, 0, False),
+            ("sum", "soak_requests_3", -4, "int", OTLP_VECTOR_TS, otlp.DELTA, False)]
+    expect(got == want, f"the encoder's request walks to its four number points, the "
+                        f"histogram skipped, got {got}")
+    series = [p.series for p in points]
+    expect(len(set(series)) == 4 and series[1][2] and not series[0][2]
+           and all(s[0] == series[0][0] and s[0] for s in series),
+           f"each point's series is its resource, name, and attributes, got {series}")
+    line = otlp.escape(vector)
+    expect("\n" not in line and otlp.unescape(line) == vector
+           and all(" " <= ch <= "~" for ch in line),
+           "the consumer's escaped form is one printable line that unescapes to the bytes")
+    expect(otlp.unescape("a\\x5Cb\\x0A") == b"a\\b\n" and otlp.escape(b"\\") == "\\x5C",
+           "a backslash is always escaped, so every escape is unambiguous")
+    for bad in ("\\x5c", "\\x0", "\\y00", "café"):
+        try:
+            otlp.unescape(bad)
+            expect(False, f"{bad!r} isn't the escaped form")
+        except otlp.ProtoError:
+            pass
+
+    t = 1_000_000_000
+    plain = _otlp_request([
+        _otlp_metric("a", [_otlp_point(t, 5, [("k", "v")])]),
+        _otlp_metric("b", [_otlp_point(t, 1.5)], kind="gauge")])
+    unknown = _otlp_request([
+        _otlp_metric("a", [_otlp_point(t, 5, [("k", "v")],
+                                       extra=_pb(20, otlp.I64, b"\0" * 8)
+                                       + _pb(21, otlp.I32, b"\1\2\3\4"))],
+                     extra=_pb(15, otlp.LEN, b"xyz") + _pb(16, otlp.VARINT, 300)),
+        _otlp_metric("b", [_otlp_point(t, 1.5)], kind="gauge")],
+        extra=_pb(99, otlp.VARINT, 7))
+
+    def shape(buf):
+        return [(p.kind, p.name, p.value, p.time_unix_nano, p.series[1:]) for p in
+                otlp.metric_points(buf)]
+    expect(shape(unknown) == shape(plain) and len(shape(plain)) == 2,
+           f"fields the walker doesn't read are skipped at every level, got {shape(unknown)}")
+    histogram = lambda counts: _pb(1, otlp.LEN, b"h") + _pb(9, otlp.LEN, _pb(1, otlp.LEN, (
+        _pb(3, otlp.I64, struct.pack("<Q", t)) + counts)))
+    packed = _pb(6, otlp.LEN, struct.pack("<QQ", 2, 3))
+    unpacked = _pb(6, otlp.I64, struct.pack("<Q", 2)) + _pb(6, otlp.I64, struct.pack("<Q", 3))
+    beside = _otlp_metric("a", [_otlp_point(t, 5)])
+    expect(shape(_otlp_request([histogram(packed), beside]))
+           == shape(_otlp_request([histogram(unpacked), beside]))
+           == shape(_otlp_request([beside])),
+           "a histogram's packed and unpacked bucket counts are both skipped")
+    last = _pb(1, otlp.LEN, b"m") + _pb(5, otlp.LEN, _pb(1, otlp.LEN, _otlp_point(t, 1))) + _pb(
+        7, otlp.LEN, _pb(1, otlp.LEN, _otlp_point(t, 2)) + _pb(2, otlp.VARINT, otlp.DELTA))
+    expect([(p.kind, p.value) for p in otlp.metric_points(_otlp_request([last]))] == [("sum", 2)],
+           "a oneof keeps its last member")
+    both = _otlp_point(t, 7) + _pb(4, otlp.I64, struct.pack("<d", 0.25))
+    merged = _pb(1, otlp.LEN, b"m") + _pb(7, otlp.LEN, _pb(1, otlp.LEN, both)) + _pb(
+        7, otlp.LEN, _pb(1, otlp.LEN, _otlp_point(t, 3)) + _pb(3, otlp.VARINT, 1))
+    got = [(p.value, p.monotonic) for p in otlp.metric_points(_otlp_request([merged]))]
+    expect(got == [(0.25, True), (3, True)],
+           f"a point's value keeps its last field, and a repeated `sum` merges, got {got}")
+    expect([p.value for p in otlp.metric_points(_otlp_request([_otlp_metric(
+        "m", [_otlp_point(t, None)])]))] == [0], "a point with no value reads as 0")
+
+    rejects = [
+        (vector[:-1], "the encoder's request one byte short"),
+        (vector[:len(vector) // 2], "the encoder's request cut in half"),
+        (_pb(1, otlp.LEN, b"\x0a\x05ab"), "a resource cut inside its length"),
+        (b"\x08" + b"\xff" * 10 + b"\x01", "an eleven-byte varint"),
+        (b"\x0b", "a group wire type"),
+        (b"\x00\x00", "field number 0"),
+        (_otlp_request([_pb(1, otlp.LEN, b"m") + _pb(7, otlp.LEN, _pb(1, otlp.LEN, _pb(
+            3, otlp.VARINT, 5)))]), "a time_unix_nano sent as a varint"),
+        (_otlp_request([_pb(1, otlp.LEN, b"\xff")]), "a metric name that isn't UTF-8"),
+    ]
+    for buf, what in rejects:
+        try:
+            otlp.metric_points(buf)
+            expect(False, f"the walker rejects {what}")
+        except otlp.ProtoError:
+            pass
+
+
+def _otlp_topic():
+    """The topic read under `otlp_proto`: the consumer's deserializer, records deduplicated on
+    raw bytes, points on series and time, the prefix, life credit by latest point time, and
+    what doesn't decode."""
+    argv = topic.consumer_argv("soak", 9, topic.OTLP_PROTO)
+    expect("--value-deserializer" in argv
+           and argv[argv.index("--value-deserializer") + 1] == topic.BYTES_DESERIALIZER
+           and argv[-2:] == ["--max-messages", "9"]
+           and "--value-deserializer" not in topic.consumer_argv("soak", 9),
+           "an otlp_proto topic is read through BytesDeserializer, a json one as text")
+    t = lambda seconds: int(seconds * 1e9)
+    window = lambda at, a, b: _otlp_request([
+        _otlp_metric("x_0", [_otlp_point(t(at), a)]),
+        _otlp_metric("x_1", [_otlp_point(t(at), b, [("shard", "1")])]),
+        _otlp_metric("other", [_otlp_point(t(at), 1000)]),
+        _otlp_metric("x_g", [_otlp_point(t(at), 50)], kind="gauge")])
+    first, second = window(1000, 3, 4), window(2500, 10, 0.5)
+    # A different split of `second`: its x_1 point alone.
+    resplit = _otlp_request([_otlp_metric("x_1", [_otlp_point(t(2500), 0.5, [("shard", "1")])])])
+    lines = [otlp.escape(first), otlp.escape(second), otlp.escape(first), otlp.escape(resplit),
+             "not\\escaped", otlp.escape(b"\x0a\x03"), ""]
+    read = topic.parse_records("\n".join(lines), prefix="x_", fmt=topic.OTLP_PROTO)
+    expect(read.unparsed == 2 and len(read.records) == 3 and read.duplicates == [1000.0]
+           and read.point_copies == [2500.0],
+           f"one byte copy, one repeated point, two lines that don't decode, got {read}")
+    expect([amount for _, amount in read.records] == [7, 10.5, 0],
+           f"only Sum points under the prefix count, each series and time once, got "
+           f"{read.records}")
+    by_life, total = topic.totals_by_life(read.records, [900, 2000])
+    expect(by_life == {0: 7, 1: 10.5} and total == 17.5,
+           f"each record goes to the life its points' time falls in, got {by_life} {total}")
+    empty = topic.parse_records(otlp.escape(_otlp_request([])), fmt=topic.OTLP_PROTO)
+    expect(empty.records == [(None, 0)] and not empty.unparsed,
+           f"a request with no points is a record with no time, got {empty}")
+
+
+def _otlp_checks():
+    """The checks over a Kafka two-life run whose topic is `otlp_proto`: V from the distinct
+    data points, a byte copy and a repeated point each FAILing `ledger.topic` with no epoch
+    bump while V counts them once, and a record that doesn't decode FAILing `ledger.egress`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            kwargs.setdefault("sut_extra", _kafka_lines())
+            run_dir = _ledger_run(tmp, name, kafka=True, topic_format=topic.OTLP_PROTO,
+                                  **kwargs)
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        clean = results("otlp-clean")
+        for check_id in ("ledger.egress", "ledger.summary", "ledger.topic"):
+            expect(clean[check_id].status == checks.PASS,
+                   f"{check_id} PASSes a balanced otlp_proto run, got {clean[check_id]}")
+        expect("(otlp_proto)" in clean["ledger.topic"].lines[0]
+               and "data points' delta sums" in "\n".join(clean["ledger.egress"].lines),
+               f"the rows name the format, got {clean['ledger.topic'].lines} "
+               f"{clean['ledger.egress'].lines}")
+        led = checks.Ledger(checks.RunData(Path(tmp) / "otlp-clean"))
+        expect(led.V == {"sink": {0: led.get("Ab", 0) + 30, 1: led.get("Ab", 1)}},
+               f"V is the topic's data points per life, got {led.V}")
+
+        def shares(v0, v1):
+            return [(50, v0 // 2), (100, v0 - v0 // 2), (200, v1 // 2), (300, v1 - v1 // 2)]
+        copied = results("otlp-copy", topic_records=lambda v0, v1: shares(v0, v1)
+                         + [shares(v0, v1)[3]])
+        expect(copied["ledger.egress"].status == checks.PASS
+               and copied["ledger.topic"].status == checks.FAIL
+               and "life 1: 1 duplicate copies with no epoch bump"
+               in copied["ledger.topic"].detail,
+               f"a byte copy counts once in V and FAILs ledger.topic, got "
+               f"{copied['ledger.egress']} {copied['ledger.topic']}")
+        # The same x_0 point as the record at +300, in a record whose bytes differ.
+        run_dir = _ledger_run(tmp, "otlp-resplit", kafka=True, topic_format=topic.OTLP_PROTO,
+                              sut_extra=_kafka_lines(accepted=5))
+        path = run_dir / topic.TOPIC_FILE
+        lines = path.read_text().splitlines()
+        stored = otlp.unescape(lines[3])
+        lines.append(otlp.escape(stored + _pb(99, otlp.VARINT, 1)))
+        path.write_text("\n".join(lines) + "\n")
+        resplit = {r.id: r for r in checks.run_all(run_dir)}
+        expect(resplit["ledger.egress"].status == checks.PASS
+               and resplit["ledger.topic"].status == checks.FAIL
+               and "life 1: 1 data point(s) a distinct record repeats with no epoch bump"
+               in resplit["ledger.topic"].detail,
+               f"a point a distinct record repeats counts once in V and FAILs ledger.topic, "
+               f"got {resplit['ledger.egress']} {resplit['ledger.topic']}")
+        garbled = results("otlp-garbled", topic_extra=["\\x0A\\x05ab"])
+        expect(garbled["ledger.egress"].status == checks.FAIL
+               and "1 topic record(s) aren't OTLP metrics requests"
+               in garbled["ledger.egress"].detail,
+               f"a record that doesn't decode FAILs, got {garbled['ledger.egress']}")
 
 
 def _kafka_lines(accepted=4, ok=True):
@@ -10989,6 +11288,7 @@ def run(root, quiet=False):
                      _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks,
                      _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
+                     _otlp_walker, _otlp_topic, _otlp_checks,
                      _report, _expected_event_rules, _exit_driver, _ready_words, _exit_watchdog,
                      _script_ledger, _sink_ledger, _target_ledger, _roles, _sink_rules, _driver_roles,
                      _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
@@ -11008,7 +11308,8 @@ def run(root, quiet=False):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _stalled, _stall_abort,
-                              _target_rules, _sink_drain, _kafka_rules, _expected_event_rules,
+                              _target_rules, _sink_drain, _kafka_rules, _otlp_walker,
+                              _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
                               _fanin_driver, _tcp_rules, _http_rules, _file_rules, _two_sut_rules,
                               _two_sut_driver,

@@ -817,7 +817,9 @@ the operator-facing account of all of this.
   namespace holder it shares with the SUT, since `token_endpoint` takes plain HTTP only on
   loopback, and stops and pauses the endpoint past a token's life: the `token_refresh_failed`
   diagnostic shows the fallback to the cached token, and the expired phase holds the queue
-  `Clean`. `standin-remote-write` and
+  `Clean`. `kafka-otlp-broker-restart` is `kafka-broker-restart` under `format: otlp_proto`,
+  its topic walked by a stdlib protobuf reader (`tools/soak/soaklib/otlp.py`) with V counted
+  per data point. `standin-remote-write` and
   `standin-at-most-once` point `prometheus_out` at a scripted HTTP stand-in (a `standin` target, `tools/soak/standin/`) that
   `respond` steps cue through every row of the sink's response-class table, each step naming the
   fault class the sink must read; the stand-in's stdout records every request, raw body included,
