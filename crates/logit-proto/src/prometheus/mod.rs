@@ -117,8 +117,10 @@
 //! | `exponential_histogram/cumulative`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Dropped, as for a delta one. |
 //! | `exponential_histogram/cumulative`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
 //! | `summary` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
-//! | `record/no_recorded_value`, with `bind:` unset | exact | -- | Remote-write writes a flagged `Gauge` or `Sum` as Prometheus's stale marker, read back flagged. |
+//! | `record/no_recorded_value`, with `bind:` unset | exact | -- | Remote-write writes a flagged `Gauge` or cumulative `Sum` as Prometheus's stale marker, read back flagged; a flagged non-monotonic `Sum`'s goes on a `gauge`, as its value would. |
 //! | `record/no_recorded_value`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
+//! | `record/no_recorded_value_delta_sum`, with `bind:` unset | degraded | -- | Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored, since a marker holds no reading to be delta about: a monotonic one on a `counter`, read back as a flagged cumulative counter, uncounted, and a non-monotonic one on a `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An unflagged delta `Sum` is dropped. |
+//! | `record/no_recorded_value_delta_sum`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A flagged record of a kind other than `Gauge` or `Sum` isn't written in either mode. It would be several series, and the flag doesn't say which of them existed, so a stale marker would name a series that may never have been sent. |
 //! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't labels. |
 //! | `record/name_unsafe` | normalized | `name_sanitized` | A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record reads back under the sanitized name, uncounted. |

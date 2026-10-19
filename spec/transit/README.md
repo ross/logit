@@ -59,16 +59,20 @@ is one nothing checks: add a case or a flow that reaches it.
 `skipped`, and `dropped`. They apply at two levels:
 
 - **Record level**, for a metric kind, a log or span on an event with no metrics, and the
-  `record` rows that decide a record's fate (`no_recorded_value`, `no_recorded_value_other_kind`,
-  `service_check`, `name_unsafe`, `non_finite`, `superseded`, `same_instant`,
-  `same_millisecond`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
+  `record` rows that decide a record's fate (`no_recorded_value`, `no_recorded_value_delta_sum`,
+  `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `non_finite`, `superseded`,
+  `same_instant`, `same_millisecond`): `exact`, `normalized`, `degraded`, `skipped`, or
+  `dropped`, best to worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
   `exemplars_on_summary`, and `min_max`, every `attributes` row, and a log or span beside metrics
   (`beside_metrics`), which is a field of its event: `exact`, `normalized`, or `lost`.
 
 Where a sink's outcome depends on the record's kind, the kind is in the feature's name, since a
-`when:` key names sink config only: `no_recorded_value` is a flagged `sum` or `gauge`, and
-`exemplars_on_summary` a summary's exemplars.
+`when:` key names sink config only: `no_recorded_value` is a flagged cumulative `sum` or
+`gauge`, `no_recorded_value_delta_sum` a flagged delta `sum`, and `exemplars_on_summary` a
+summary's exemplars. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
+loss where that loss's counter didn't move, since most sinks test the flag first
+(`classes.rs`'s "Counters").
 
 ## The mapping table
 

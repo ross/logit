@@ -49,6 +49,7 @@
 //! | `exponential_histogram/cumulative` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `summary` | exact | -- | An OTLP `Summary`. |
 //! | `record/no_recorded_value` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
+//! | `record/no_recorded_value_delta_sum` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
 //! | `record/no_recorded_value_other_kind` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
 //! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't attributes. |
 //! | `record/superseded` | exact | -- | Each record is its own data point. |

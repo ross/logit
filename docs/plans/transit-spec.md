@@ -470,6 +470,21 @@ Recorded per workstream as each lands.
   several reached cells at the record's worst class, the class check now lets the one whose
   counter moved decide (`classes.rs`'s "Counters").
 
+  A second review round found the same order breaking the worst-class rule outright, since
+  `statsd_out`, `influxdb_out`, and `prometheus_out` test the flag before the kind: a flagged
+  `gauge_delta` is skipped there rather than dropped, a flagged exponential histogram under
+  remote-write is skipped rather than dropped as `native_histogram`, and a flagged delta `sum`
+  under remote-write is a stale marker rather than dropped as `unresolved_delta`. A flagged
+  record's `no_recorded_value` row now goes ahead of a kind row's counted loss whose counter
+  didn't move; `otlp_out`, which tests a `gauge_delta`'s kind first, moves that counter and the
+  kind row decides as before. The flagged delta `sum` reads back as a flagged cumulative counter,
+  since `stale_point` ignores temporality, so it has its own row,
+  `record/no_recorded_value_delta_sum`, `degraded` under remote-write, uncounted, and the
+  `prometheus_out` spelling gives a flagged monotonic `sum` its `_total` whatever its temporality
+  (case `flagged-kinds`). A flagged non-monotonic delta `sum` under remote-write goes on a
+  `gauge` counted `degraded{metric_kind=non_monotonic_sum}`, which the row's text states but no
+  case reaches, so no cell names that counter for it yet.
+
   No hand-written row contradicted a cell's class except one already recorded: `influxdb_out`
   dropping a `Sum`'s temporality, which the codec's permitted-normalization list calls
   normalization 10 and the table reads `degraded`, since the kind changes. The list is prose and

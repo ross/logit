@@ -11,8 +11,8 @@
 //! type, and `negative` for a gauge below zero; for a `histogram` or `exponential_histogram`,
 //! its temporality; any other kind, its kind's one row. It also reaches a `record` row for each of
 //! `unit`, `description`, `start_timestamp`, `exemplars` (`exemplars_on_summary` for a
-//! `summary`), and `no_recorded_value` (`no_recorded_value_other_kind` for a kind other than
-//! `sum` and `gauge`) it carries,
+//! `summary`), and `no_recorded_value` (`no_recorded_value_delta_sum` for a delta `sum`,
+//! `no_recorded_value_other_kind` for a kind other than `sum` and `gauge`) it carries,
 //! `service_check` when it carries `_logit.statsd.service_check.name`, `name_unsafe` when the
 //! sink's wire rewrites a character of its name ([`Spelling`]), `non_finite` for a `sum` or
 //! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
@@ -79,6 +79,13 @@
 //! Where a record reaches several cells at its worst class, the one whose counter moved decides:
 //! a sink counts a record it skips once, under whichever reason it meets first (`statsd_out`
 //! skips a flagged histogram as `no_recorded_value` before `multi_value: skip` sees its kind).
+//! For a record flagged as holding no recorded value, its `record/no_recorded_value*` cell goes
+//! ahead of a kind row's counted `degraded`, `skipped`, or `dropped` cell whose counter didn't
+//! move: `statsd_out`, `influxdb_out`, and `prometheus_out` test the
+//! flag before the kind, so a flagged `gauge_delta` is skipped there rather than dropped, and
+//! remote-write writes a flagged delta `sum` as a stale marker rather than dropping it. A sink
+//! that tests the kind first moves the kind cell's counter, and that cell decides as before
+//! (`otlp_out` drops a flagged `gauge_delta` under `unresolved_gauge_delta`).
 //!
 //! A `when:` key that names no field of the sink's serialized config fails, naming the row, the
 //! cell, and the key: a misspelled key would otherwise never match.
@@ -264,8 +271,11 @@ impl Spelling {
         match self {
             Spelling::Prometheus => {
                 let mut name = self.sanitize(&rec.name);
+                // A flagged monotonic sum is a stale marker on a counter whatever its
+                // temporality (`prometheus::stale_point`).
                 let counter = rec.kind == "sum"
-                    && rec.body["temporality"] == "cumulative"
+                    && (rec.body["temporality"] == "cumulative"
+                        || rec.body["no_recorded_value"] == Value::Bool(true))
                     && rec.body["monotonic"] == Value::Bool(true);
                 if counter && !name.ends_with("_total") {
                     name.push_str("_total");
@@ -707,6 +717,7 @@ fn record_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
     }
     if rec.body["no_recorded_value"] == Value::Bool(true) {
         features.push(match rec.kind.as_str() {
+            "sum" if rec.body["temporality"] == "delta" => "no_recorded_value_delta_sum",
             "sum" | "gauge" => "no_recorded_value",
             _ => "no_recorded_value_other_kind",
         });
@@ -1121,6 +1132,20 @@ pub(super) fn check(
         for (label, _, index) in &cells {
             ledger.reached.insert((sink.clone(), label.clone(), *index));
         }
+        // A sink that tests the flag before the kind skips or stale-marks a flagged record without
+        // reaching the kind's loss, so a counted loss cell whose counter didn't move doesn't
+        // count against it (module doc's "Counters").
+        let flagged =
+            cells.iter().any(|(label, _, _)| label.starts_with("record/no_recorded_value"));
+        let cells: Vec<_> = cells
+            .into_iter()
+            .filter(|(label, cell, _)| {
+                !flagged
+                    || label.starts_with("record/no_recorded_value")
+                    || !matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped)
+                    || cell.counter.as_deref().is_none_or(&did_move)
+            })
+            .collect();
         let expected = cells.iter().map(|(_, cell, _)| cell.class).fold(Class::Exact, worse);
         // A sink skips or drops a record once and counts it once, under whichever reason it meets
         // first, so of several cells at the worst class the one whose counter moved decides.

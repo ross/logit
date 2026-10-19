@@ -136,6 +136,7 @@
 //! | `exponential_histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Line protocol has no form for an exponential histogram, so none is written, with a throttled `encode_error` warning. |
 //! | `summary` | degraded | -- | A `q<quantile>` field per finite quantile, each read back as a gauge under `<name>.`; `count` and `sum` aren't written, uncounted. |
 //! | `record/no_recorded_value` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
+//! | `record/no_recorded_value_delta_sum` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
 //! | `record/service_check` | normalized | `value_field` | The status gauge as a `value` field; the check's carriers aren't tags. |
 //! | `record/superseded` | exact | -- | Each point is its own line at its own timestamp. |

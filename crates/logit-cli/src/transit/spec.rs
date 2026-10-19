@@ -820,6 +820,45 @@ mod tests {
         assert!(failures.iter().any(|f| f.contains(want)), "{failures:#?}");
     }
 
+    /// A record nothing reads back fails when the cell names a counter that didn't move and no
+    /// other sink counter says why: `prometheus_out` skips a log uncounted, so a cell claiming a
+    /// counter for it is wrong.
+    #[test]
+    fn a_loss_no_counter_explains_fails_the_class_check() {
+        let spec = spec_dir();
+        let text = std::fs::read_to_string(spec.join("mapping.yaml")).expect("the table");
+        let right =
+            "      prometheus_out:\n        class: skipped\n        reason: uncounted\n        \
+                     text: A log has no Prometheus form and isn't written, uncounted.\n";
+        assert_eq!(text.matches(right).count(), 2, "the table's two log rows moved");
+        let wrong = text.replacen(
+            right,
+            &right.replace("reason: uncounted", "counter: logit.output.events.skipped"),
+            2,
+        );
+        let flow = flow(&spec, &spec.join("flows/statsd-to-prometheus.yaml")).expect("the flow");
+        let case = cases(&spec, "statsd")
+            .expect("statsd cases")
+            .into_iter()
+            .find(|c| c.name == "log-only")
+            .expect("the log-only case");
+        let traced = run_traced(&flow.path, &case.json(), Options::default()).expect("runs");
+        let at = At { flow: &flow.name, case: &case.name };
+
+        let right = mapping::parse(&text).expect("the table parses");
+        assert_eq!(
+            classes::check(&right, &at, &traced, &mut Ledger::default()),
+            Vec::<String>::new()
+        );
+
+        let wrong = mapping::parse(&wrong).expect("the edited table parses");
+        let failures = classes::check(&wrong, &at, &traced, &mut Ledger::default());
+        assert!(
+            failures.iter().any(|f| f.contains("isn't read back and no sink counter says why")),
+            "{failures:#?}"
+        );
+    }
+
     /// The counter case's document through the relay flow, keyed for [`sync_flow`].
     fn counter_docs() -> BTreeMap<String, (String, Vec<Tolerance>)> {
         let (flow, case) = relay();

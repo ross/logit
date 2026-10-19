@@ -811,8 +811,37 @@ rows:
         - when: {bind: null}
           class: exact
           text: >-
-            Remote-write writes a flagged `Gauge` or `Sum` as Prometheus's stale marker, read back
-            flagged.
+            Remote-write writes a flagged `Gauge` or cumulative `Sum` as Prometheus's stale
+            marker, read back flagged; a flagged non-monotonic `Sum`'s goes on a `gauge`, as its
+            value would.
+        - class: skipped
+          counter: logit.output.metrics.skipped{reason=no_recorded_value}
+          text: A point flagged as holding no recorded value isn't exposed.
+  - kind: record
+    feature: no_recorded_value_delta_sum
+    cells:
+      statsd_out:
+        class: skipped
+        counter: logit.output.messages.skipped{reason=no_recorded_value}
+        text: A point flagged as holding no recorded value has no statsd line.
+      influxdb_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{reason=no_recorded_value}
+        text: >-
+          A point flagged as holding no recorded value isn't written, with a throttled
+          `no_recorded_value` warning.
+      otlp_out:
+        class: exact
+        text: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept.
+      prometheus_out:
+        - when: {bind: null}
+          class: degraded
+          text: >-
+            Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored,
+            since a marker holds no reading to be delta about: a monotonic one on a `counter`, read
+            back as a flagged cumulative counter, uncounted, and a non-monotonic one on a `gauge`,
+            counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An unflagged
+            delta `Sum` is dropped.
         - class: skipped
           counter: logit.output.metrics.skipped{reason=no_recorded_value}
           text: A point flagged as holding no recorded value isn't exposed.

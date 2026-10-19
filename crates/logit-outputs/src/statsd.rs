@@ -222,6 +222,7 @@
 //! | `summary`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=summary}` | Under `multi_value: skip`, no line is written. |
 //! | `summary`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=summary}` | Dotted `.count`, `.sum`, and per-quantile gauges. |
 //! | `record/no_recorded_value` | skipped | `logit.output.messages.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value has no statsd line. |
+//! | `record/no_recorded_value_delta_sum` | skipped | `logit.output.messages.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value has no statsd line. |
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.messages.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value has no statsd line. |
 //! | `record/service_check`, under `format: statsd` | skipped | `logit.output.messages.skipped{reason=dialect}` | Plain statsd has no service check, so none is written. |
 //! | `record/service_check`, otherwise | exact | -- | A gauge carrying the `_logit.statsd.service_check.*` carriers is a DogStatsD `_sc` line again. |

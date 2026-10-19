@@ -10,7 +10,7 @@
 //! | `gauge_delta` | `f64`, `i64`, `u64`, `bool` | record |
 //! | `histogram`, `exponential_histogram` | `delta`, `cumulative` | record |
 //! | `samples`, `set_members`, `distribution`, `set`, `summary` | none | record |
-//! | `record` | `no_recorded_value`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
+//! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
 //! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `min_max` | field |
 //! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `foreign_carrier`, `resource_attribute`, `scope` | field |
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics) | record |
@@ -32,8 +32,9 @@
 //!
 //! A `when:` key names sink config only, so where a sink's outcome for a feature depends on the
 //! record's kind, the kind is in the feature's name and only that kind reaches the row:
-//! `record/no_recorded_value` is a flagged `sum` or `gauge`, `record/no_recorded_value_other_kind`
-//! a flagged record of any other kind, and `record/exemplars_on_summary` a `summary`'s exemplars,
+//! `record/no_recorded_value` is a flagged cumulative `sum` or a flagged `gauge`,
+//! `record/no_recorded_value_delta_sum` a flagged delta `sum`,
+//! `record/no_recorded_value_other_kind` a flagged record of any other kind, and `record/exemplars_on_summary` a `summary`'s exemplars,
 //! where `record/exemplars` is every other kind's.
 //!
 //! A row may have no cell for a sink where no record is compared against it, such as
@@ -92,6 +93,7 @@ const KINDS: [(&str, &[&str]); 14] = [
         "record",
         &[
             "no_recorded_value",
+            "no_recorded_value_delta_sum",
             "no_recorded_value_other_kind",
             "service_check",
             "name_unsafe",
