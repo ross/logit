@@ -43,9 +43,9 @@ module doc is the canonical grammar. The rules it follows:
 3. **Three things JSON can't carry get a fixed spelling.** A non-finite `f64` is the string
    `"NaN"`, `"inf"`, or `"-inf"`, since JSON has no number for it. `Bytes` is a string holding
    the text `b"..."`, valid UTF-8 runs as text and each invalid byte as `\xHH`, so the content is
-   visible without a base64 step. That spelling is for reading, not round-tripping: a literal
-   `\x` in the data reads the same as an escaped byte, and `format: native` is the lossless form. A timestamp is an RFC 3339 UTC string with nine fractional
-   digits, the same form the human render uses.
+   visible without a base64 step. (Superseded by the lossless amendment below: a backslash in
+   the data is written `\x5c`, so the spelling round-trips.) A timestamp is an RFC 3339 UTC
+   string with nine fractional digits, the same form the human render uses.
 4. **Hand-written, into the sink's one output buffer**, like every other encoder in
    `logit-outputs` (`docs/design/memory.md`). No `serde` derive on `Event`: the model's types
    are shaped for the pipeline, not for a serializer, and the omission rule above is not what a
@@ -91,7 +91,8 @@ A `Sum`'s or `Gauge`'s `value` and a `GaugeDelta`'s `delta` are a `MetricValue`
 ([ADR `typed-metric-scalar`](typed-metric-scalar.md)). `format: json` writes `I64` and `U64` as JSON
 integers, so a `U64` above 2^53 keeps every digit, and `Bool` as a JSON boolean. `F64` is unchanged,
 including the non-finite spellings, and a whole-number `F64` still writes the same digits as an
-`I64` of that value. A reader that did `float(item["value"])` on a number still works; one that
+`I64` of that value (superseded by the lossless amendment below, under which an `F64` always
+carries a fraction or an exponent). A reader that did `float(item["value"])` on a number still works; one that
 treats the value as a float must now accept a boolean. `kafka_out`'s `format: msgpack` follows
 the same walker and writes MessagePack integers and booleans. `ndjson.rs`'s module doc is the
 grammar.

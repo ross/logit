@@ -39,7 +39,7 @@
 //! |---|---|
 //! | `sum` | `value`, `temporality` (`delta`/`cumulative`), `monotonic` |
 //! | `gauge` | `value` |
-//! | `gauge_delta` | `delta` (a negative zero writes `-0`) |
+//! | `gauge_delta` | `delta` (a negative zero writes `-0.0`) |
 //! | `samples` | `values` (array), `sample_rate` |
 //! | `set_members` | `members` (array of strings, invalid bytes as `\xHH`) |
 //! | `distribution` | `count`, `sum`; then `min`, `max`, `avg` (`sum / count`), `p50`, `p90`, `p95`, `p99` when the sketch is non-empty; then `sketch` (below) |
