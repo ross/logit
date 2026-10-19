@@ -141,12 +141,12 @@ Both bound a batch: consecutive lines with the same resource and scope form one,
 
 A flow is a `logit` config under `spec/transit/flows/`, validated by `script/validate` and
 `every_shipped_config_loads_and_validates` like every other shipped config, and runnable by hand
-under `logit run` for a look at what a sink emits. The driver runs it in-process, in
-`crates/logit-cli/tests/`, because the kind registry (`logit_cli::pipeline`) is what builds
-components from a config:
+under `logit run` for a look at what a sink emits. The driver runs it in-process, in the
+`#[cfg(test)]` module `crates/logit-cli/src/transit/`, because the kind registry
+(`crates/logit-cli/src/pipeline.rs`) is what builds components from a config:
 
-1. Build the flow's components from its config, substituting the case file for `replay_in`'s
-   path and a capture for the sink's transport.
+1. Build the flow's transforms from its config, and its sink's encoder, reading the case file in
+   place of `replay_in`'s path.
 2. Decode the case with a fixed `received_at`.
 3. Run each stage with its real `Transform::process`, then `flush(now)` at a fixed `now`, so a
    window-driven stage emits once and deterministically.
@@ -154,16 +154,25 @@ components from a config:
    bytes through the pair's real `Decoder`.
 5. Record the re-decoded batch as lossless event JSON, and the counters the sink and stages
    incremented, with reasons (`degraded`, `skipped`, `dropped`, `normalized`,
-   `passed_through`).
+   `passed_through`, `discarded`, `omitted`).
 
 Where output is nondeterministic for a reason the code can't remove (a `Set`'s estimate moves by
 one with merge order past 128 members), the case declares a tolerance on the field, and the
 comparison applies it.
 
-Open: how the driver reaches a sink's encoder through its `Output` without a socket. The in-process
-round-trip tests bind a real listener; the driver should not. Either the registry exposes the
-encoder a sink was built with, or the sink's transport takes an in-memory capture. W3 decides
-and records it in the README.
+The driver reaches each sink's encoder, not its `Output`: no sink has a transport seam, and
+adding an in-memory capture to every `Output` would put test plumbing in each sink. The
+registry's `sink_encoder` returns the encoder a sink kind writes with, configured from the same
+config mapping `build_spec` uses (`statsd_encoder`, `to_remote_write_version`,
+`to_remote_write_encoding`). The steps between an encoder and the wire are public functions on
+the sink module: `logit_outputs::prometheus::encode_remote_write`, which the remote-write sender
+calls; `render_batches`, which renders through the exposition sink's own registry; and the statsd
+and InfluxDB sinks' stats-to-telemetry functions, which both sinks call. So the driver and the
+sink can't drift. The driver is a `#[cfg(test)]` module of the
+`logit` binary rather than a library target or an integration test, since only the binary's own
+tests can reach `build_spec`. W4's generator follows the `script/differential --check` pattern
+as a `#[test]` in the same module: with `TRANSIT_UPDATE=1` it rewrites the expectations, and
+unset it compares, with `script/transit gen|check` wrapping the two.
 
 ### 5. The mapping table (W4)
 
@@ -261,7 +270,7 @@ Sources: `statsd_in`, `influxdb_in`, `prometheus_in`. Sinks: `statsd_out`, `prom
 - **W2**: `replay_in` (§3): the `ComponentKind` variant and its config docs, `script/schema`,
   the input, graph rules for a finite input, its ADR, and a `fixtures/` config that replays a
   `file_out` archive.
-- **W3**: the flow driver (§4) in `crates/logit-cli/tests/`, with the encoder-reach decision
+- **W3**: the flow driver (§4) in `crates/logit-cli/src/transit/`, with the encoder-reach decision
   recorded, and a fixed-clock run of one flow as its own test.
 - **W4**: `spec/transit/` (§1), `mapping.yaml` and its schema (§5), `script/transit
   gen|check|coverage`, the `--check` test, the features lists and cases for the three sources,
@@ -287,3 +296,12 @@ Recorded per workstream as each lands.
   `frames.dropped{reason="undecodable"}`, the stream driver's reason for a unit its decoder
   refused. No graph rule was needed for finiteness: the runtime already treats an input's `Ok`
   return as that node finishing, and only rule 93's field bounds are new.
+- **W3**: §4's open question resolved as above, with no change to what `build_spec` builds. The
+  driver runs every sink's encoder shape, both Prometheus modes and remote-write 1.0 and 2.0
+  included, and each round trip already reads like a cell of §5's table: through `aggregate`, a
+  timer reaches `statsd_out` as dotted lines counted `metrics.degraded`, `prometheus_out` drops a
+  bare delta sum counted `metrics.dropped{reason="unresolved_delta"}`, and `influxdb_out` skips a
+  set member. Exposition has no configured dialect, so the driver takes one as a parameter,
+  OpenMetrics by default. `statsd_out` under `multi_value: skip` counts a skipped record's tags
+  as `tags.omitted{reason="dialect"}` too, since it walks the tags before it skips; the counters
+  section adds `*.omitted` to §4's list so W4's table sees that.

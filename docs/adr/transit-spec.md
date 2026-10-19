@@ -115,3 +115,15 @@ once and ends, and is the replay half of `file_out` as well as the spec's source
   expectations. Coverage grows one pair at a time, and the feature listing shows what no case
   exercises.
 - The plan is [`docs/plans/transit-spec.md`](../plans/transit-spec.md).
+
+## Amendment: the driver reaches the encoder, not the sink (2026-10-19)
+
+The flow driver builds a flow's transforms through `build_spec`, but not its sink: it takes the
+sink kind's encoder from the registry's `sink_encoder`, which configures it through the same
+config mapping `build_spec` uses, and calls the public functions the sink itself calls for any
+step between the encoder and the wire. Giving every `Output` an in-memory transport was the
+alternative; it puts test plumbing into each sink for a layer the spec excludes (sink behavior
+above the encoder). The driver lives in a `#[cfg(test)]` module of the `logit` binary,
+`crates/logit-cli/src/transit/`, since only the binary's own tests reach the registry, and the
+generator that writes the expectations is a test in that module, rewriting under
+`TRANSIT_UPDATE=1` and comparing otherwise.
