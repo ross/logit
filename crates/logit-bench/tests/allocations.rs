@@ -3883,20 +3883,20 @@ fn lua_process_one_event_constructing_a_log_event() {
 /// the shape a `flush(now)` tick emits. Measured as
 /// [`lua_process_one_event_constructing_a_log_event`] is.
 ///
-/// 16, each piece isolated against a narrower script:
+/// 15, each piece isolated against a narrower script:
 ///
 /// - **11**: the log row's first three terms (4 baseline, +6 `Event.new`, +1 `Box`).
 /// - **+1** for the `metrics` array table (`metrics = {}` lands at 12; `with_capacity(0)` and a
 ///   one-record list both stay inline).
-/// - **+4** for the one metric: its sub-table; `validated_sequence_len`'s key `Vec` over the array
-///   (once per event: a second metric adds 3 plus the `MetricList` spill, 20 in all); the
-///   `format!`'d `metrics[i]` path field errors are prefixed with (a static path lands at 15; the
-///   one per-metric cost, cheaper than threading the index through every helper); and the 1 every
-///   non-empty record sub-table carries beyond its table and fields (`log = {message = 1}` lands
-///   at 13 against 12 for an empty one, and a second field adds nothing).
+/// - **+3** for the one metric: its sub-table; the `format!`'d `metrics[i]` path field errors are
+///   prefixed with (a static path lands at 14; the one per-metric cost, cheaper than threading the
+///   index through every helper); and the 1 every non-empty record sub-table carries beyond its
+///   table and fields (`log = {message = 1}` lands at 13 against 12 for an empty one, and a second
+///   field adds nothing). A second metric adds 3 plus the `MetricList` spill, 19 in all.
 ///
-/// `intern("tick")`, `kind`'s borrowed `to_string_lossy`, the `expect_keys` walk, and nil-defaulted
-/// fields allocate nothing; `unit = "ms"` adds 0 and an empty `exemplars = {}` adds 1 (the table).
+/// `intern("tick")`, `kind`'s borrowed `to_string_lossy`, the `expect_keys` walk,
+/// `validated_sequence_len`'s check of the array, and nil-defaulted fields allocate nothing;
+/// `unit = "ms"` adds 0 and an empty `exemplars = {}` adds 1 (the table).
 #[test]
 fn lua_process_one_event_constructing_a_gauge_event() {
     let worker =
@@ -3906,7 +3906,7 @@ fn lua_process_one_event_constructing_a_gauge_event() {
     let event = fixtures::nginx_event();
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
     assert!(matches!(outcome, ProcessOutcome::Emit(..)));
-    expect_allocs("lua: Event.new gauge event from a literal table", stats, 16);
+    expect_allocs("lua: Event.new gauge event from a literal table", stats, 15);
 }
 
 /// `Event.new{timestamp = "1", span = {trace_id = <hex>, span_id = <hex>, name = "GET /"}}`
@@ -3928,9 +3928,9 @@ fn lua_process_one_event_constructing_a_gauge_event() {
 ///
 /// Beyond the pin: `status_message = "boom"` adds 2 (the `Box<SpanExt>` and the `Bytes`); an
 /// empty `events = {}` or `links = {}` adds 1 (the Lua table); one span event
-/// `{timestamp = "1", name = "e"}` adds 7 (the `events` table, its row table, the key `Vec`, the
-/// `format!`'d path, the name's `Bytes`, the `Vec<SpanEvent>`, and the per-record 1); one link
-/// with only its ids adds 6 (the same minus the `Bytes`).
+/// `{timestamp = "1", name = "e"}` adds 6 (the `events` table, its row table, the `format!`'d
+/// path, the name's `Bytes`, the `Vec<SpanEvent>`, and the per-record 1); one link with only its
+/// ids adds 5 (the same minus the `Bytes`).
 #[test]
 fn lua_process_one_event_constructing_a_span_event() {
     let worker =
