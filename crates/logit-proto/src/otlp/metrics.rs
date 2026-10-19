@@ -40,15 +40,16 @@
 //! | `gauge_delta/u64` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `gauge_delta/bool` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Dropped, as for a float adjustment. |
 //! | `samples` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | Sketched, each value weighted by its inverse sample rate, then an OTLP `Summary` of fixed quantiles. |
-//! | `set_members` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | OTLP has no cardinality type, so set members aren't written. |
+//! | `set_members` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | OTLP has no cardinality type, so set members aren't written, with a throttled `otlp_set_members_metric_skipped` warning. |
 //! | `distribution` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | An OTLP `Summary` of fixed quantiles with the sketch's own count and sum; OTLP has no mergeable sketch. |
-//! | `set` | skipped | `logit.output.metrics.skipped{metric_kind=set}` | OTLP has no cardinality type, so a set estimate isn't written. |
+//! | `set` | skipped | `logit.output.metrics.skipped{metric_kind=set}` | OTLP has no cardinality type, so a set estimate isn't written, with a throttled `otlp_set_metric_skipped` warning. |
 //! | `histogram/delta` | exact | -- | An OTLP `Histogram` with delta temporality. |
 //! | `histogram/cumulative` | exact | -- | An OTLP `Histogram` with cumulative temporality. |
 //! | `exponential_histogram/delta` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `exponential_histogram/cumulative` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `summary` | exact | -- | An OTLP `Summary`. |
 //! | `record/no_recorded_value` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
+//! | `record/no_recorded_value_other_kind` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
 //! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't attributes. |
 //! | `record/superseded` | exact | -- | Each record is its own data point. |
 //! | `record/same_instant` | exact | -- | Each record is its own data point. |
@@ -65,7 +66,8 @@
 //! | `record/unit` | exact | -- | The `Metric`'s `unit`. |
 //! | `record/description` | exact | -- | The `Metric`'s `description`. |
 //! | `record/start_timestamp` | exact | -- | The data point's `start_time_unix_nano`. |
-//! | `record/exemplars` | exact | -- | The data point's exemplars, except on a `Summary`, which has none. |
+//! | `record/exemplars` | exact | -- | The data point's exemplars. |
+//! | `record/exemplars_on_summary` | lost | uncounted | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off, uncounted. |
 //! | `record/min_max` | exact | -- | The data point's `min` and `max`. |
 //! | `attributes/string_value` | exact | -- | A string attribute. |
 //! | `attributes/bool_value` | exact | -- | A boolean attribute. |
@@ -94,16 +96,14 @@
 //! - `Histogram{buckets,temporality,sum,min,max}` → `Histogram`: `buckets` holds per-bucket
 //!   counts, not cumulative ones, and a trailing `f64::INFINITY` bound becomes the implicit final
 //!   bucket `explicit_bounds` expects.
-//! - `Summary{quantiles,count,sum}` → `Summary`: **`record.exemplars` is dropped**, uncounted:
-//!   `SummaryDataPoint` has no `exemplars` field. A `Samples` or `Distribution` degraded into a
-//!   `Summary` loses its exemplars the same way.
-//!   A quantile outside `[0, 1]` is written as is; `docs/known-gaps/mappings.md`'s "Cross-protocol
-//!   semantic gaps" section has the row.
+//! - `Summary{quantiles,count,sum}` → `Summary`: a quantile outside `[0, 1]` is written as is;
+//!   `docs/known-gaps/mappings.md`'s "Cross-protocol semantic gaps" section has the row.
 //! - `Samples(s)` and `Distribution(sketch)` → `Summary` of `DISTRIBUTION_QUANTILES` (see "Lossy
 //!   metric kinds" below). A `Samples` is sketched first (`Samples::sketch`, each value weighted
 //!   by `Samples::weight`). The point's `count` and `sum` are the sketch's own; `sum` is
 //!   `DdSketch::sum`, exact unlike a quantile (approximate only when `DdSketch::stats_exact` is
-//!   `false`, i.e. the sketch's stats were derived from its bins).
+//!   `false`, i.e. the sketch's stats were derived from its bins). Its exemplars are left off,
+//!   uncounted, as a `Summary`'s are (`record/exemplars_on_summary` above).
 //!
 //! **Lossy metric kinds.** OTLP has no mergeable-sketch type. `ExponentialHistogram` is the nearest
 //! shape, but its base is `2^(2^-scale)` and a `DdSketch`'s γ isn't (1.015625 under

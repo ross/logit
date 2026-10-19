@@ -2,8 +2,9 @@
 //! body into one batch, [`encode`] packs a batch of events back into lines, [`line`] is the
 //! decoder's lexer, and [`response`] writes the error JSON an InfluxDB client expects.
 //!
-//! **This module doc is the codec's canonical mapping table and normalization list**, which docs,
-//! tests, and examples point at.
+//! **This module doc is the codec's canonical decode table, grammar, and normalization list**,
+//! which docs, tests, and examples point at. Its encode mapping is generated from
+//! `influxdb_out`'s column of `spec/transit/mapping.yaml`, the canonical copy ("Encode" below).
 //! [ADR `influxdb-line-protocol-relay`](../../../../docs/adr/influxdb-line-protocol-relay.md) is
 //! the decision record; it carries the normalization list with identical numbering. The grammar
 //! below is what a real influxd 2.9.1 accepts, settled by probe; each [`line`] test cites the
@@ -135,6 +136,7 @@
 //! | `exponential_histogram/cumulative` | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Line protocol has no form for an exponential histogram, so none is written, with a throttled `encode_error` warning. |
 //! | `summary` | degraded | -- | A `q<quantile>` field per finite quantile, each read back as a gauge under `<name>.`; `count` and `sum` aren't written, uncounted. |
 //! | `record/no_recorded_value` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
+//! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
 //! | `record/service_check` | normalized | `value_field` | The status gauge as a `value` field; the check's carriers aren't tags. |
 //! | `record/superseded` | exact | -- | Each point is its own line at its own timestamp. |
 //! | `record/same_instant` | normalized | `next_nanosecond` | A point sharing a series and a timestamp with one already in the batch takes the next free nanosecond, so both are kept. |

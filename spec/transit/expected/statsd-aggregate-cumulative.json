@@ -64,6 +64,10 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"abc"},"attributes":{"_logit.statsd.event.title":"Plain"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline"},"attributes":{"_logit.statsd.event.aggregation_key":"deploy","_logit.statsd.event.alert_type":"warning","_logit.statsd.event.host":"web-07","_logit.statsd.event.priority":"low","_logit.statsd.event.source_type":"ci","_logit.statsd.event.title":"Hello","env":"prod"}}
   ], "counters": {}},
+  "flagged-histogram": {"events": [], "counters": {
+    "logit.output.messages.skipped{component=out,kind=statsd_out,reason=no_recorded_value,role=sink}": 1,
+    "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=no_recorded_value,role=transform}": 1
+  }},
   "gauge": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":234.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"room":"lab"}}
@@ -311,6 +315,15 @@
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 2,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=summary,role=sink}": 1,
     "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=no_merge_rule,role=transform}": 4
+  }},
+  "summary-exemplars": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc.latency.count","kind":"gauge","value":4.0}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc.latency.q0_5","kind":"gauge","value":0.4}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc.latency.q0_99","kind":"gauge","value":0.9}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc.latency.sum","kind":"gauge","value":2.0}]}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=summary,role=sink}": 1,
+    "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=no_merge_rule,role=transform}": 1
   }},
   "tags": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"gauge","value":1.0}],"attributes":{"env":"prod","service":"api","urgent":true}}

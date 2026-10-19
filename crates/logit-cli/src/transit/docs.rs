@@ -18,7 +18,9 @@
 //!   condition after the label ([`condition`]); the last cell of such a list reads "otherwise".
 //! - **`gaps:<sink>`** is the sink's `degraded`, `lost`, `skipped`, and `dropped` cells in
 //!   `mappings.md`'s row format: `encode (<Protocol>)`, the row and class (a field-level row
-//!   prefixed `field`), the counter, and the `text`. `exact` and `normalized` cells are left out.
+//!   prefixed `field`), the counter, and the `text`. `exact` and `normalized` cells are left out,
+//!   and the last cell of a `when:` list whose earlier cell was left out names the negation of the
+//!   earlier conditions ([`negation`]) in place of "otherwise".
 //!
 //! Rendering reads the table alone; the class check (`super::classes`) is what ties the table to
 //! the code. Rows keep `mapping.yaml`'s order, which groups them by kind.
@@ -168,6 +170,27 @@ fn condition(when: &BTreeMap<String, serde_json::Value>) -> String {
         .join(" and ")
 }
 
+/// The negation of each `when:` map in `earlier`: `with bind: set` for a null, `not under
+/// format: statsd` otherwise. What the last cell of a list covers, for a `gaps:` region that left
+/// an earlier cell out.
+fn negation(earlier: &[&Cell]) -> String {
+    earlier
+        .iter()
+        .map(|cell| {
+            cell.when
+                .iter()
+                .map(|(field, value)| match value {
+                    serde_json::Value::Null => format!("with `{field}:` set"),
+                    serde_json::Value::String(s) => format!("not under `{field}: {s}`"),
+                    other => format!("not under `{field}: {other}`"),
+                })
+                .collect::<Vec<_>>()
+                .join(" or ")
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 /// Text for a table cell: one line, `|` escaped.
 fn cell_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").replace('|', "\\|")
@@ -238,10 +261,20 @@ fn render_gaps(mapping: &Mapping, sink: &str, protocol: &str) -> Vec<String> {
     ];
     for row in &mapping.rows {
         let field = mapping::is_field_row(&row.kind, row.feature.as_deref());
-        for (when, cell) in cells(row, sink) {
+        let row_cells = cells(row, sink);
+        let mut left_out = false;
+        for (i, (when, cell)) in row_cells.iter().enumerate() {
             if matches!(cell.class, Class::Exact | Class::Normalized) {
+                left_out = true;
                 continue;
             }
+            // A bare "otherwise" would name no condition once the cell before it is left out.
+            let when = match (when.as_str(), left_out) {
+                ("otherwise", true) => {
+                    negation(&row_cells[..i].iter().map(|(_, c)| *c).collect::<Vec<_>>())
+                }
+                _ => when.clone(),
+            };
             let kind = match field {
                 true => format!("field {}", label(row, &when)),
                 false => label(row, &when),
@@ -472,6 +505,24 @@ mod tests {
             rows[0].starts_with("| `exponential_histogram/delta`, with `bind:` unset | dropped |")
         );
         assert!(rows[1].starts_with("| `exponential_histogram/delta`, otherwise | skipped |"));
+    }
+
+    #[test]
+    fn a_gaps_row_after_a_left_out_cell_names_the_negated_condition() {
+        let lines = render_gaps(&table(), "prometheus_out", "Prometheus");
+        let unit: Vec<&String> = lines.iter().filter(|l| l.contains("`record/unit`")).collect();
+        assert_eq!(unit.len(), 1, "{unit:?}");
+        assert!(
+            unit[0].contains("field `record/unit`, with `bind:` set → **lost**"),
+            "{}",
+            unit[0]
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("`record/superseded`, with `bind:` set → **skipped**")),
+            "{lines:#?}"
+        );
+        let statsd = render_gaps(&table(), "statsd_out", "statsd");
+        assert!(statsd.iter().any(|l| l.contains("`distribution`, otherwise → **degraded**")));
     }
 
     #[test]

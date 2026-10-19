@@ -4,8 +4,8 @@
 
 # The class vocabulary, the canonical copy. A record-level row's class is one of exact,
 # normalized, degraded, skipped, or dropped, best to worst; a field-level row's (`record` rows for
-# unit, description, start_timestamp, exemplars, and min_max, and every `attributes` row) is one
-# of exact, normalized, or lost.
+# unit, description, start_timestamp, exemplars, exemplars_on_summary, and min_max, and every
+# `attributes` row) is one of exact, normalized, or lost.
 classes:
   exact: The pair's decoder reads back the same kind, value, and field.
   normalized: >-
@@ -483,7 +483,9 @@ rows:
       otlp_out:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=set_members}
-        text: OTLP has no cardinality type, so set members aren't written.
+        text: >-
+          OTLP has no cardinality type, so set members aren't written, with a throttled
+          `otlp_set_members_metric_skipped` warning.
 
   # --- summarized kinds ------------------------------------------------------------------------
   - kind: distribution
@@ -538,7 +540,9 @@ rows:
       otlp_out:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=set}
-        text: OTLP has no cardinality type, so a set estimate isn't written.
+        text: >-
+          OTLP has no cardinality type, so a set estimate isn't written, with a throttled
+          `otlp_set_metric_skipped` warning.
   - kind: histogram
     feature: delta
     cells:
@@ -751,13 +755,30 @@ rows:
         text: Line protocol has no exemplars; they aren't written or counted.
       otlp_out:
         class: exact
-        text: The data point's exemplars, except on a `Summary`, which has none.
+        text: The data point's exemplars.
       prometheus_out:
         class: lost
         counter: logit.output.metrics.degraded{reason=exemplar_omitted}
         text: >-
           In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at
           most one per line. One with no line to sit on, such as a gauge's, is left off, counted.
+  # statsd_out and influxdb_out write a summary only as dotted series or fields, a lesser kind, so
+  # its fields are never compared there and neither has a cell.
+  - kind: record
+    feature: exemplars_on_summary
+    cells:
+      otlp_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off,
+          uncounted.
+      prometheus_out:
+        class: lost
+        counter: logit.output.metrics.degraded{reason=exemplar_omitted}
+        text: >-
+          A summary has no `_total` or bucket line for an exemplar to sit on, so its exemplars are
+          left off, counted.
   # statsd_out and influxdb_out write a histogram only as dotted series or fields, a lesser kind,
   # so its fields are never compared there and neither has a cell.
   - kind: record
@@ -791,11 +812,33 @@ rows:
           class: exact
           text: >-
             Remote-write writes a flagged `Gauge` or `Sum` as Prometheus's stale marker, read back
-            flagged. A flagged histogram, summary, or sketch is skipped, counted
-            `logit.output.metrics.skipped{reason=no_recorded_value}`.
+            flagged.
         - class: skipped
           counter: logit.output.metrics.skipped{reason=no_recorded_value}
           text: A point flagged as holding no recorded value isn't exposed.
+  - kind: record
+    feature: no_recorded_value_other_kind
+    cells:
+      statsd_out:
+        class: skipped
+        counter: logit.output.messages.skipped{reason=no_recorded_value}
+        text: A point flagged as holding no recorded value has no statsd line.
+      influxdb_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{reason=no_recorded_value}
+        text: >-
+          A point flagged as holding no recorded value isn't written, with a throttled
+          `no_recorded_value` warning.
+      otlp_out:
+        class: exact
+        text: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept.
+      prometheus_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{reason=no_recorded_value}
+        text: >-
+          A flagged record of a kind other than `Gauge` or `Sum` isn't written in either mode. It
+          would be several series, and the flag doesn't say which of them existed, so a stale
+          marker would name a series that may never have been sent.
   - kind: record
     feature: service_check
     cells:

@@ -27,6 +27,9 @@
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=exemplar_omitted,role=sink}": 1
   }},
   "event": {"events": [], "counters": {}},
+  "flagged-histogram": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=prometheus_out,reason=no_recorded_value,role=sink}": 1
+  }},
   "gauge": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":234.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"room":"lab"}}
@@ -136,6 +139,11 @@
   ], "counters": {
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=native_histogram,role=sink}": 2,
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
+  }},
+  "summary-exemplars": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"rpc_latency","kind":"summary","count":4,"sum":2.0,"quantiles":[{"quantile":0.5,"value":0.4},{"quantile":0.99,"value":0.9}]}]}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=exemplar_omitted,role=sink}": 1
   }},
   "tags": {"events": [], "counters": {
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1

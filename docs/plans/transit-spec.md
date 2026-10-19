@@ -446,11 +446,29 @@ Recorded per workstream as each lands.
   Removing hand rows found two places where the table said less than the prose, each fixed in
   `mapping.yaml`'s text, with no class changed:
   - The diagnostic keys: `delta_temporality_unresolved`, `gauge_delta_unresolved`,
-    `encode_error`, and `no_recorded_value` were named only in the rows being replaced, so the
-    cells that warn under them now say so.
+    `encode_error`, `no_recorded_value`, `otlp_set_metric_skipped`, and
+    `otlp_set_members_metric_skipped` were named only in the rows being replaced, so the cells
+    that warn under them now say so.
   - `otlp_out`'s `attributes/number_value` said a `u64` reads back as an `i64`. One above
     `i64::MAX` leaves as a double (`crates/logit-proto/src/otlp/common.rs`), as `mappings.md`'s
     hand row says, and the cell now says so too.
+
+  Review found two cells classed `exact` for an outcome the encoder doesn't produce, each the
+  table's error, each fixed with a row and a hand-written `statsd` case that reaches it:
+  - `record/exemplars` at `otlp_out` was `exact` with "except on a `Summary`, which has none",
+    but a model `Summary` can carry exemplars and `SummaryDataPoint` has no field for them. The
+    new field row `record/exemplars_on_summary` is `lost`, uncounted, at `otlp_out`, and `lost`,
+    counted `exemplar_omitted`, at `prometheus_out` (case `summary-exemplars`).
+  - `record/no_recorded_value` at `prometheus_out` under remote-write was `exact`, but only a
+    flagged `Gauge` or `Sum` becomes a stale marker; any other flagged kind is skipped, counted,
+    in both modes. The row now covers a flagged `sum` or `gauge`, and
+    `record/no_recorded_value_other_kind` every other kind (case `flagged-histogram`).
+
+  A `when:` key names sink config, so both rows put the kind in the feature's name. The flagged
+  histogram also showed a sink counting a record once under the first reason it meets:
+  `statsd_out` under `multi_value: skip` counts it `no_recorded_value`, not `histogram`, so of
+  several reached cells at the record's worst class, the class check now lets the one whose
+  counter moved decide (`classes.rs`'s "Counters").
 
   No hand-written row contradicted a cell's class except one already recorded: `influxdb_out`
   dropping a `Sum`'s temporality, which the codec's permitted-normalization list calls
@@ -462,12 +480,6 @@ Recorded per workstream as each lands.
 
   Hand-written rows kept because the table has no row or cell for what they state, each a
   candidate for a row with a case:
-  - `otlp_out` drops a `Summary`'s exemplars, and those of a `Samples` or `Distribution`
-    written as one, uncounted. The `record/exemplars` cell is `exact` and says so only in its
-    text; no case reaches a summary with exemplars.
-  - Remote-write skips a flagged histogram, summary, or sketch, counted
-    `skipped{reason=no_recorded_value}`; the `record/no_recorded_value` cell is `exact` and says
-    so only in its text.
   - `influxdb_out`'s `no_fields` drop (a histogram with no finite bound, a summary with no finite
     quantile), and its uncounted omission of a non-finite component of a `Distribution`,
     `Histogram`, or `Summary`.

@@ -10,8 +10,8 @@
 //! | `gauge_delta` | `f64`, `i64`, `u64`, `bool` | record |
 //! | `histogram`, `exponential_histogram` | `delta`, `cumulative` | record |
 //! | `samples`, `set_members`, `distribution`, `set`, `summary` | none | record |
-//! | `record` | `no_recorded_value`, `service_check`, `name_unsafe`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
-//! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `min_max` | field |
+//! | `record` | `no_recorded_value`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
+//! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `min_max` | field |
 //! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `foreign_carrier`, `resource_attribute`, `scope` | field |
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics) | record |
 //! | `span` | `alone` (on an event with no metrics) | record |
@@ -29,6 +29,12 @@
 //! `record/name_unsafe` is a name holding a character the sink's wire rewrites, which differs by
 //! sink. `record/min_max` is a histogram's `min` and `max`, which the record's own comparison
 //! leaves to this row.
+//!
+//! A `when:` key names sink config only, so where a sink's outcome for a feature depends on the
+//! record's kind, the kind is in the feature's name and only that kind reaches the row:
+//! `record/no_recorded_value` is a flagged `sum` or `gauge`, `record/no_recorded_value_other_kind`
+//! a flagged record of any other kind, and `record/exemplars_on_summary` a `summary`'s exemplars,
+//! where `record/exemplars` is every other kind's.
 //!
 //! A row may have no cell for a sink where no record is compared against it, such as
 //! `name_unsafe` at a sink that rewrites no name, or a field row at a sink that writes the kind
@@ -86,6 +92,7 @@ const KINDS: [(&str, &[&str]); 14] = [
         "record",
         &[
             "no_recorded_value",
+            "no_recorded_value_other_kind",
             "service_check",
             "name_unsafe",
             "non_finite",
@@ -96,6 +103,7 @@ const KINDS: [(&str, &[&str]); 14] = [
             "description",
             "start_timestamp",
             "exemplars",
+            "exemplars_on_summary",
             "min_max",
         ],
     ),
@@ -255,7 +263,9 @@ pub(super) fn is_field_row(kind: &str, feature: Option<&str>) -> bool {
     feature == Some("beside_metrics")
         || kind == "attributes"
         || (kind == "record"
-            && feature.is_some_and(|f| RECORD_FIELDS.contains(&f) || f == "min_max"))
+            && feature.is_some_and(|f| {
+                RECORD_FIELDS.contains(&f) || f == "exemplars_on_summary" || f == "min_max"
+            }))
 }
 
 /// What the table holds for one row and one sink under one config.

@@ -29,6 +29,9 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"abc","observed_timestamp":"2027-01-15T08:00:01.000000000Z"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"_logit.otel.severity_number":13,"_logit.otel.severity_text":"Warn","env":"prod"}}
   ], "counters": {}},
+  "flagged-histogram": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":0},{"bound":1000.0,"count":0}],"flags":1,"no_recorded_value":true}]}
+  ], "counters": {}},
   "gauge": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":234.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"room":"lab"}}
@@ -142,6 +145,9 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.size","kind":"histogram","temporality":"delta","buckets":[{"bound":100.0,"count":3},{"bound":1000.0,"count":1}],"sum":850.0,"min":10.0,"max":400.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":30},{"bound":1000.0,"count":12}],"sum":9000.0}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"rpc.duration","kind":"summary","count":10,"sum":55.0,"quantiles":[{"quantile":0.5,"value":5.0},{"quantile":0.99,"value":9.9}]}]}
+  ], "counters": {}},
+  "summary-exemplars": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"rpc.latency","kind":"summary","count":4,"sum":2.0,"quantiles":[{"quantile":0.5,"value":0.4},{"quantile":0.99,"value":0.9}]}]}
   ], "counters": {}},
   "tags": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","service":"api","urgent":true}}

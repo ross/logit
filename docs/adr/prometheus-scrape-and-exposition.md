@@ -552,8 +552,10 @@ names, so that every count of loss is a `*.dropped`:
 
 An exposition's `ExponentialHistogram` stays `skipped{metric_kind="exponential_histogram"}`, and a
 flagged or stale record stays `skipped{reason="no_recorded_value"|"stale"}`: neither text dialect
-has a form for them. The canonical tables are `crates/logit-proto/src/prometheus/mod.rs`'s and
-`text.rs`'s module docs.
+has a form for them. The canonical decode tables are `crates/logit-proto/src/prometheus/mod.rs`'s
+and `text.rs`'s module docs; the encode mapping is
+[`spec/transit/mapping.yaml`](../../spec/transit/mapping.yaml)'s `prometheus_out` column, rendered
+into the first.
 
 ## Amendment (2026-10-13): the carriers are private
 

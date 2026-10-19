@@ -91,8 +91,10 @@ would defeat batch accumulation, which keys on the resource's pointer. N fields 
 Every field is a `Gauge`. Line protocol has no metric kind: whether a field is a counter is a
 convention between writer and reader, so the decoder doesn't guess one.
 
-`crates/logit-proto/src/influxdb/mod.rs`'s module doc holds the canonical decode and encode tables
-once `influx/w2` lands, with every skip and its counter. This ADR doesn't repeat them.
+`crates/logit-proto/src/influxdb/mod.rs`'s module doc holds the canonical decode table, and its
+encode table is generated from [`spec/transit/mapping.yaml`](../../spec/transit/mapping.yaml)'s
+`influxdb_out` column, the canonical copy, with every skip and its counter. This ADR doesn't
+repeat them.
 
 **Note:** The table above recorded the decision when it was made.
 [`spec/transit/mapping.yaml`](../../spec/transit/mapping.yaml)'s `influxdb_out` column is the

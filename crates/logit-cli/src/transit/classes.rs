@@ -10,7 +10,9 @@
 //! temporality and monotonicity and its scalar type; for a `gauge` or `gauge_delta`, its scalar
 //! type, and `negative` for a gauge below zero; for a `histogram` or `exponential_histogram`,
 //! its temporality; any other kind, its kind's one row. It also reaches a `record` row for each of
-//! `unit`, `description`, `start_timestamp`, `exemplars`, and `no_recorded_value` it carries,
+//! `unit`, `description`, `start_timestamp`, `exemplars` (`exemplars_on_summary` for a
+//! `summary`), and `no_recorded_value` (`no_recorded_value_other_kind` for a kind other than
+//! `sum` and `gauge`) it carries,
 //! `service_check` when it carries `_logit.statsd.service_check.name`, `name_unsafe` when the
 //! sink's wire rewrites a character of its name ([`Spelling`]), `non_finite` for a `sum` or
 //! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
@@ -74,6 +76,9 @@
 //! `degraded`, `normalized`, `omitted`, or `evicted` must be named by a cell the case reached. A
 //! `degraded`, `skipped`, `dropped`, or `lost` cell observed at its class must see its counter
 //! move. A `normalized` cell's counter needn't, since not every record it covers is rewritten.
+//! Where a record reaches several cells at its worst class, the one whose counter moved decides:
+//! a sink counts a record it skips once, under whichever reason it meets first (`statsd_out`
+//! skips a flagged histogram as `no_recorded_value` before `multi_value: skip` sees its kind).
 //!
 //! A `when:` key that names no field of the sink's serialized config fails, naming the row, the
 //! cell, and the key: a misspelled key would otherwise never match.
@@ -701,7 +706,10 @@ fn record_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
         return features;
     }
     if rec.body["no_recorded_value"] == Value::Bool(true) {
-        features.push("no_recorded_value");
+        features.push(match rec.kind.as_str() {
+            "sum" | "gauge" => "no_recorded_value",
+            _ => "no_recorded_value_other_kind",
+        });
     }
     if rec.attributes.contains_key("_logit.statsd.service_check.name") {
         features.push("service_check");
@@ -757,7 +765,11 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
     if rec.is_metric() {
         for key in mapping::RECORD_FIELDS {
             if rec.body.get(key).is_some() {
-                rows.push(("record".to_string(), Some(key.to_string()), Field::Body(key)));
+                let feature = match key {
+                    "exemplars" if rec.kind == "summary" => "exemplars_on_summary",
+                    key => key,
+                };
+                rows.push(("record".to_string(), Some(feature.to_string()), Field::Body(key)));
             }
         }
         if matches!(rec.kind.as_str(), "histogram" | "exponential_histogram") {
@@ -1110,7 +1122,14 @@ pub(super) fn check(
             ledger.reached.insert((sink.clone(), label.clone(), *index));
         }
         let expected = cells.iter().map(|(_, cell, _)| cell.class).fold(Class::Exact, worse);
-        let deciding = cells.iter().find(|(_, cell, _)| cell.class == expected);
+        // A sink skips or drops a record once and counts it once, under whichever reason it meets
+        // first, so of several cells at the worst class the one whose counter moved decides.
+        let worst: Vec<_> = cells.iter().filter(|(_, cell, _)| cell.class == expected).collect();
+        let deciding = worst
+            .iter()
+            .find(|(_, cell, _)| cell.counter.as_deref().is_some_and(&did_move))
+            .or(worst.first())
+            .copied();
         let observed = match pairing.seen[i] {
             // Two points sharing an instant that read back at different instants were moved
             // apart, which only a timestamp comparison shows: the check compares no other.

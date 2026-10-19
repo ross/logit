@@ -2,8 +2,9 @@
 //! `Point`) and its two conversions to and from `logit`'s own event model. The text syntax for both
 //! dialects lives next door in [`text`]; nothing in this file knows what a line looks like.
 //!
-//! **This module doc is the mapping table and the canonical "Permitted normalizations" list**;
-//! docs, tests, and examples point here.
+//! **This module doc is the canonical decode table and "Permitted normalizations" list**; docs,
+//! tests, and examples point here. Its encode mapping is generated from `prometheus_out`'s column
+//! of `spec/transit/mapping.yaml`, the canonical copy ("Encode" below).
 //!
 //! **Why the split.** [`MetricFamily`] is the seam: [`text`] maps exposition bytes ↔ families,
 //! [`remote_write`] maps prompb 1.0/2.0 ↔ families, [`assemble`] holds the flat-sample reassembly
@@ -116,8 +117,9 @@
 //! | `exponential_histogram/cumulative`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Dropped, as for a delta one. |
 //! | `exponential_histogram/cumulative`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
 //! | `summary` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
-//! | `record/no_recorded_value`, with `bind:` unset | exact | -- | Remote-write writes a flagged `Gauge` or `Sum` as Prometheus's stale marker, read back flagged. A flagged histogram, summary, or sketch is skipped, counted `logit.output.metrics.skipped{reason=no_recorded_value}`. |
+//! | `record/no_recorded_value`, with `bind:` unset | exact | -- | Remote-write writes a flagged `Gauge` or `Sum` as Prometheus's stale marker, read back flagged. |
 //! | `record/no_recorded_value`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
+//! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A flagged record of a kind other than `Gauge` or `Sum` isn't written in either mode. It would be several series, and the flag doesn't say which of them existed, so a stale marker would name a series that may never have been sent. |
 //! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't labels. |
 //! | `record/name_unsafe` | normalized | `name_sanitized` | A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record reads back under the sanitized name, uncounted. |
 //! | `record/superseded`, with `bind:` unset | exact | -- | Remote-write sends each sample with its own timestamp. |
@@ -140,6 +142,7 @@
 //! | `record/description` | exact | -- | The family's `# HELP` line. |
 //! | `record/start_timestamp` | lost | uncounted | OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge's start time is left off, uncounted. |
 //! | `record/exemplars` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at most one per line. One with no line to sit on, such as a gauge's, is left off, counted. |
+//! | `record/exemplars_on_summary` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | A summary has no `_total` or bucket line for an exemplar to sit on, so its exemplars are left off, counted. |
 //! | `record/min_max` | lost | uncounted | A histogram's `min` and `max` have no Prometheus series and aren't written, uncounted. |
 //! | `attributes/string_value` | normalized | `label_sanitized` | A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or another character reads back under the sanitized name. |
 //! | `attributes/bool_value` | normalized | `stringified` | A label of `true` or `false`, read back as the string. |
@@ -164,7 +167,6 @@
 //! |---|---|
 //! | a `Sum` or `Gauge` value, or an exemplar's value, of `I64`/`U64`/`Bool` | the sample's double, on both wires: an integer's nearest `f64`, a `Bool` `1` or `0`, counted `logit.output.metrics.normalized{reason="bool_value"}` |
 //! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_sum` + `_count`; `_sum` is [`DdSketch::sum`], exact unlike a quantile (approximate only when [`DdSketch::stats_exact`] is `false`, i.e. the sketch's stats were derived from its bins) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
-//! | `flags & NO_RECORDED_VALUE` on a `Gauge` or `Sum`, with [`PrometheusEncoder::with_stale_markers`]`(true)` | [`Point::Stale`] in the family the kind would have chosen anyway (`Sum{monotonic}` → `counter`, `Sum{!monotonic}` → `gauge` + `degraded{metric_kind="non_monotonic_sum"}`, `Gauge` → `gauge` or whatever `_logit.prometheus.type` says). Temporality is ignored on this path: a stale marker has no value to be delta about. A flagged `Histogram`/`Summary`/`ExponentialHistogram`/sketch/set is skipped, `skipped{reason="no_recorded_value"}`, under stale markers too -- those expand to several derived series and one flag says nothing about which of them existed (`docs/known-gaps/mappings.md`) |
 //! | `Event::timestamp` | emitted only when `_logit.prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.omitted{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `crate::statsd::decode::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `omitted{reason="unrepresentable"}` path |
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.omitted{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is omitted -- `logit.output.labels.omitted{reason="reserved"}` |

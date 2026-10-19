@@ -59,12 +59,16 @@ is one nothing checks: add a case or a flow that reaches it.
 `skipped`, and `dropped`. They apply at two levels:
 
 - **Record level**, for a metric kind, a log or span on an event with no metrics, and the
-  `record` rows that decide a record's fate (`no_recorded_value`, `service_check`,
-  `name_unsafe`, `non_finite`, `superseded`, `same_instant`, `same_millisecond`): `exact`,
-  `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
-- **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`,
-  `exemplars`, and `min_max`, every `attributes` row, and a log or span beside metrics (`beside_metrics`), which
-  is a field of its event: `exact`, `normalized`, or `lost`.
+  `record` rows that decide a record's fate (`no_recorded_value`, `no_recorded_value_other_kind`,
+  `service_check`, `name_unsafe`, `non_finite`, `superseded`, `same_instant`,
+  `same_millisecond`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
+- **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
+  `exemplars_on_summary`, and `min_max`, every `attributes` row, and a log or span beside metrics
+  (`beside_metrics`), which is a field of its event: `exact`, `normalized`, or `lost`.
+
+Where a sink's outcome depends on the record's kind, the kind is in the feature's name, since a
+`when:` key names sink config only: `no_recorded_value` is a flagged `sum` or `gauge`, and
+`exemplars_on_summary` a summary's exemplars.
 
 ## The mapping table
 
@@ -171,7 +175,9 @@ A `doc:` region holds two tables, the record-level rows and then the field-level
 gives the cell's class, its reason and counter, and its `text` verbatim. Each cell of a `when:`
 list is its own row, with its condition after the row's name: `under format: statsd`,
 `with bind: unset` for a `null`, and `otherwise` for the last cell. A `gaps:` region leaves out
-`exact` and `normalized` cells and labels a field-level row `field`.
+`exact` and `normalized` cells and labels a field-level row `field`. Where it leaves out an
+earlier cell of a list, the last cell names the negation of the earlier conditions, such as
+`with bind: set`, in place of `otherwise`.
 
 Everything outside the regions stays hand-written: each codec's decode tables, its grammar, its
 permitted-normalization list (per-codec policy, not per-cell outcomes), and the encode rules and

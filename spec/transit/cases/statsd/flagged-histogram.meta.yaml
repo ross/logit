@@ -1,0 +1,3 @@
+# A cumulative histogram flagged as holding no recorded value, which no statsd wire produces: a
+# sink that writes a flagged gauge or sum as a stale marker still skips it.
+exercises: []

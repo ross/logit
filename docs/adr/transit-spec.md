@@ -184,11 +184,13 @@ Rendering the table into the docs settled what a region is and how much of a doc
   table to the code. A cell's `text` is rendered verbatim, so a text that reads wrong in a doc is
   fixed in `mapping.yaml`. A `when:` cell is its own row, its condition rendered from the `when:`
   map.
-- **A hand-written row goes only when the region states all of it.** A row of a codec's encode
-  table, or of `mappings.md`, that also states something the table doesn't (a diagnostic key the
-  cell text lacks, a drop with no row of its own, a decode-side fact) stays, verbatim, beside the
-  region. Moving those facts into the table is a row or a text at a time, not a rewrite of the
-  prose.
+- **A hand-written row goes when the region states its mapping and its counter.** A row of a
+  codec's encode table, or of `mappings.md`, that also states an outcome the table doesn't (a
+  drop with no row of its own, a decode-side fact) stays, verbatim, beside the region; a
+  diagnostic key a removed row named moves into the cell's text. The reasoning behind a mapping,
+  why a wire has no form for something or why a destination refuses it, isn't an outcome: it
+  stays in the sink's or codec's module doc prose, and a region doesn't repeat it. Moving the
+  remaining outcomes into the table is a row or a text at a time, not a rewrite of the prose.
 - **Every sink column has both regions.** The test fails for a sink in `sinks:` with no region
   of either form, so adding a column adds its docs in the same PR.
 
