@@ -10,12 +10,21 @@
 //! | `gauge_delta` | `f64`, `i64`, `u64`, `bool` | record |
 //! | `histogram`, `exponential_histogram` | `delta`, `cumulative` | record |
 //! | `samples`, `set_members`, `distribution`, `set`, `summary` | none | record |
-//! | `record` | `no_recorded_value`, `service_check`, `name_unsafe` | record |
+//! | `record` | `no_recorded_value`, `service_check`, `name_unsafe`, `non_finite`, `superseded` | record |
 //! | `record` | `unit`, `description`, `start_timestamp`, `exemplars` | field |
-//! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `private_carrier`, `foreign_carrier`, `resource_attribute` | field |
+//! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `foreign_carrier`, `resource_attribute`, `scope` | field |
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics) | record |
 //! | `span` | `alone` (on an event with no metrics) | record |
 //! | `log`, `span` | `beside_metrics` (on an event that carries metrics) | field |
+//!
+//! `attributes/scope` is the batch's instrumentation scope, a field of every record in the batch
+//! like a resource attribute, so it's an `attributes` row rather than a kind of its own. A
+//! resource attribute under `_logit.` reaches `private_carrier` or `foreign_carrier`, as an event
+//! attribute does, not `resource_attribute`. `record/non_finite` is a `sum` or `gauge` holding
+//! `NaN` or an infinity, a value some wires can't write. `record/superseded` is a metric record a
+//! later record of the same series (name, kind, and public attributes) follows in the same run,
+//! which a sink holding one value per series replaces. `record/name_unsafe` is a name holding a
+//! character the sink's wire rewrites, which differs by sink.
 //!
 //! A record-level row's class is `exact`, `normalized`, `degraded`, `skipped`, or `dropped`; a
 //! field-level row's is `exact`, `normalized`, or `lost`.
@@ -28,8 +37,8 @@
 //! - `text`, one operator-facing sentence or two, always;
 //! - `reason`, the normalization's name, on a `normalized` cell;
 //! - `counter`, the series it counts under (`name{tag=value,...}`, the tags a subset of the
-//!   series'), on a `skipped` or `dropped` cell, and on a `lost` cell unless `reason` is
-//!   `uncounted`.
+//!   series'), on a `skipped`, `dropped`, or `lost` cell, unless `reason` is `uncounted`: a loss
+//!   the sink doesn't count, which the class check accepts for a record nothing reads back.
 
 use anyhow::{bail, ensure, Context};
 use serde::Deserialize;
@@ -70,6 +79,8 @@ const KINDS: [(&str, &[&str]); 14] = [
             "no_recorded_value",
             "service_check",
             "name_unsafe",
+            "non_finite",
+            "superseded",
             "unit",
             "description",
             "start_timestamp",
@@ -83,9 +94,13 @@ const KINDS: [(&str, &[&str]); 14] = [
             "bool_value",
             "number_value",
             "array_value",
+            "map_value",
+            "bytes_value",
+            "timestamp_value",
             "private_carrier",
             "foreign_carrier",
             "resource_attribute",
+            "scope",
         ],
     ),
     ("log", &["dogstatsd_event", "plain", "beside_metrics"]),
@@ -364,8 +379,8 @@ impl Mapping {
                             )
                         }
                         Class::Skipped | Class::Dropped => ensure!(
-                            cell.counter.is_some(),
-                            "{at}: a {} cell names its counter",
+                            cell.counter.is_some() || cell.reason.as_deref() == Some("uncounted"),
+                            "{at}: a {} cell names its counter, or its reason is uncounted",
                             cell.class.as_str()
                         ),
                         Class::Lost => ensure!(

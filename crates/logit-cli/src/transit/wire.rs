@@ -5,7 +5,7 @@
 //! |---|---|---|
 //! | `statsd_out` | each `MessageBuf` entry: one line, or an event's indivisible lines | `StatsdDecoder`, one entry at a time |
 //! | `influxdb_out` | one body per batch, to the org and bucket the sink resolves for it, `precision=ns`; a batch with no bucket is dropped and counted as the sink drops it | `InfluxDecoder::decode_body`, under the resource `influxdb_in` builds from that org and bucket; a write naming no org or an empty bucket is refused as `influxdb_in` refuses it, counted as the sink's write loop counts a `Rejected` batch (`batches.dropped`/`events.dropped{reason="rejected"}`), since the listener's own count needs its server |
-//! | `otlp_out` | one protobuf request per signal per batch | `OtlpDecoder::decode_signal` |
+//! | `otlp_out` | one protobuf request per signal per batch; a log with no observed time is stamped with the wall clock, which the driver reads back as the run's clock | `OtlpDecoder::decode_signal` |
 //! | `prometheus_out`, `bind:` | one scrape after the last batch, in the run's dialect, held to `max_series:` (no expiry: it reads a clock) | `text::parse_with`, then `families_to_events` |
 //! | `prometheus_out`, `endpoint:` | one compressed request per batch | `decompress_bounded`, `remote_write::decode`, then `families_to_events` per timestamp group |
 //!
@@ -46,6 +46,12 @@ impl Decode<'_> {
         let diag = Diagnostics::new(DECODE_ID).with_telemetry(telemetry.clone());
         (telemetry, diag)
     }
+}
+
+/// The wall clock in Unix nanoseconds.
+fn wall_clock() -> i64 {
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    since.map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
 /// Encodes `batches` with `encoder` and decodes the bytes back (module doc).
@@ -116,13 +122,24 @@ pub(super) fn round_trip(
             let (telemetry, diag) = decode.handles("otlp_in");
             let mut decoder = OtlpDecoder::new().with_telemetry(telemetry).with_diagnostics(diag);
             for batch in batches {
-                for payload in encoder.encode_signals(batch)? {
+                let before = wall_clock();
+                let payloads = encoder.encode_signals(batch)?;
+                let after = wall_clock();
+                for payload in payloads {
                     let signal = payload.signal.as_str();
-                    out.extend(
-                        decoder
-                            .decode_signal(payload.signal, payload.bytes)
-                            .with_context(|| format!("otlp_in refused a {signal} request"))?,
-                    );
+                    let mut decoded = decoder
+                        .decode_signal(payload.signal, payload.bytes)
+                        .with_context(|| format!("otlp_in refused a {signal} request"))?;
+                    // The encoder stamps a log with no observed time with the wall clock
+                    // (`crates/logit-proto/src/otlp/logs.rs`); the run's clock stands in for it.
+                    for event in decoded.iter_mut().flat_map(|b| b.events.iter_mut()) {
+                        if let Some(log) = event.log.as_mut() {
+                            if (before..=after).contains(&log.observed_timestamp) {
+                                log.observed_timestamp = decode.received_at;
+                            }
+                        }
+                    }
+                    out.extend(decoded);
                 }
             }
         }

@@ -11,11 +11,15 @@
 //! type, and `negative` for a gauge below zero; for a `histogram` or `exponential_histogram`,
 //! its temporality; any other kind, its kind's one row. It also reaches a `record` row for each of
 //! `unit`, `description`, `start_timestamp`, `exemplars`, and `no_recorded_value` it carries,
-//! `service_check` when it carries `_logit.statsd.service_check.name`, and `name_unsafe` when its
-//! name holds a character outside `[A-Za-z0-9._/-]`; and an `attributes` row for each attribute:
-//! a `_logit.<protocol>.` carrier of the sink's own protocol is `private_carrier`, any other
-//! `_logit.` key `foreign_carrier`, and the rest by value (`string_value`, `bool_value`,
-//! `number_value`, `array_value`), plus `resource_attribute` for each resource attribute. A log
+//! `service_check` when it carries `_logit.statsd.service_check.name`, `name_unsafe` when the
+//! sink's wire rewrites a character of its name ([`Spelling`]), `non_finite` for a `sum` or
+//! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
+//! another point of its series (the same name, kind, and public attributes). It reaches an
+//! `attributes` row for each attribute, event or resource: a `_logit.<protocol>.` carrier of the
+//! sink's own protocol is `private_carrier`, any other `_logit.` key `foreign_carrier`, an event
+//! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
+//! `map_value`, `bytes_value`, `timestamp_value`), and any other resource attribute
+//! `resource_attribute`; and `attributes/scope` when its batch has a scope. A log
 //! record on an event with no metrics reaches `log/dogstatsd_event` when it carries
 //! `_logit.statsd.event.title`, else `log/plain`, and its attribute rows; a span there reaches
 //! `span/alone`. A log or span on an event that carries metrics is a field of that event: it
@@ -27,13 +31,24 @@
 //! passes, each claiming a read-back record at most once: (1) the same name and the same kind,
 //! value, and type tags (`exact`); (2) the same name, kind, temporality, and monotonicity and the
 //! same value read as a number, or for `samples` and `set_members` several read-back records whose
-//! values together are the input's (`normalized`); (3) the same name in another kind, or names
-//! under `<name>.`, the dotted series of an expansion (`degraded`). Passes (1) to (3) run once
-//! by name and again by the name with each character outside `[A-Za-z0-9._/-]` read as `_`, where
-//! an `exact` pairing reads as `normalized`. A candidate's public attributes (no `_logit.` key,
-//! values compared as text) must equal the input's, or failing any that do, be a subset of them.
-//! An input left unpaired was skipped or dropped: the class is the one whose counter moved. A
-//! read-back record no input claims fails the check with both sides printed.
+//! values together are the input's (`normalized`); a histogram that gained an empty `+Inf`
+//! bucket is the same value; (3) the same name in another kind, or names under `<name>.`, the
+//! dotted series of an expansion, one of each dotted name per record when several points of a
+//! series expand (`degraded`). Passes (1) and (2) run by name and then by the name as the sink
+//! writes it, where an `exact` pairing reads as `normalized`, before pass (3) runs either way, so
+//! a dotted expansion never claims a record a respelling reads back whole. Within a pass the
+//! latest record goes first, so where a sink keeps one point per series, the earlier point is the
+//! one left over.
+//!
+//! [`Spelling`] holds each sink's rewrites, from its codec's module doc: `statsd_out`'s reserved
+//! characters as `_`; `prometheus_out`'s `sanitize_metric_name`, `_total` on a counter, a label
+//! key's `sanitize_label_name`, and an array's last element; `influxdb_out`'s `<name>.value` for
+//! a `sum`, `gauge`, or `set` off the carrier path, and an array's last element; `otlp_out`'s
+//! timestamp value as an integer of nanoseconds. A candidate's public attributes (no `_logit.`
+//! key, values compared as text, each key and value as the sink writes it) must equal the
+//! input's, or failing any that do, be a subset of them. An input left unpaired was skipped or
+//! dropped: the class is the one whose counter moved, or the cell's when it says the loss is
+//! `uncounted`. A read-back record no input claims fails the check with both sides printed.
 //!
 //! **Record level.** The expected class is the worst (`exact < normalized < degraded < skipped
 //! < dropped`) over the record-level cells it reaches, and the observed class must equal it; a
@@ -42,7 +57,8 @@
 //!
 //! **Field level.** For a record observed `exact` or `normalized`, each field row compares the
 //! input's field with its first pairing's: the same value in the same place is `exact`, present
-//! but changed or moved (a resource attribute read back as an event attribute) is `normalized`,
+//! but changed, moved (a resource attribute read back as an event attribute), or under the
+//! sink's spelling of its key is `normalized`,
 //! and absent is `lost`. The observed class may be better than the cell's but never worse. A
 //! degraded record's fields aren't checked: the carriers that describe its wire form describe a
 //! shape that's gone.
@@ -63,6 +79,8 @@ use super::mapping::{self, Class, Lookup, Mapping, Series};
 use super::Traced;
 use logit_core::EventBatch;
 use logit_outputs::ndjson::render_ndjson;
+use logit_proto::influxdb::ATTR_MEASUREMENT;
+use logit_proto::prometheus::{sanitize_label_name, sanitize_metric_name};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -92,6 +110,8 @@ struct Rec {
     attribute_types: BTreeMap<String, String>,
     resource: Map<String, Value>,
     resource_types: BTreeMap<String, String>,
+    /// The batch's scope object, when it has one.
+    scope: Option<Value>,
 }
 
 impl Rec {
@@ -131,6 +151,10 @@ impl Rec {
             for key in FIELD_KEYS {
                 object.remove(key);
             }
+            // Pairing has matched the names already, respelled where the sink respells them.
+            if self.is_metric() {
+                object.remove("name");
+            }
         }
         let types = self
             .types
@@ -150,13 +174,128 @@ impl Rec {
 
     /// Public attributes, the resource's first and the event's over them, as text.
     fn public(&self) -> BTreeMap<String, String> {
+        self.public_as(Spelling::Verbatim)
+    }
+
+    /// [`Rec::public`], each key and value as `spelling` writes it.
+    fn public_as(&self, spelling: Spelling) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
-        for (key, value) in self.resource.iter().chain(self.attributes.iter()) {
-            if !key.starts_with("_logit.") {
-                out.insert(key.clone(), text(value));
+        let resource = self.resource.iter().map(|(k, v)| (k, v, self.resource_types.get(k)));
+        let event = self.attributes.iter().map(|(k, v)| (k, v, self.attribute_types.get(k)));
+        for (name, value, tags) in resource.chain(event) {
+            if !name.starts_with("_logit.") {
+                let tags = tags.map(String::as_str).unwrap_or("");
+                out.insert(spelling.key(name), spelling.value(value, tags));
             }
         }
         out
+    }
+}
+
+/// How a sink spells a record's name and an attribute's key and value, so pairing can find what
+/// it wrote (module doc's "Pairing"). One per sink kind; every respelling here is a fact of that
+/// sink's encoder and its pair's decoder, cited from the codec's module doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spelling {
+    /// `statsd_out`: a name with each character outside `[A-Za-z0-9._/-]` as `_`, on both sides.
+    Statsd,
+    /// `prometheus_out`: `sanitize_metric_name`, plus `_total` on a counter that lacks it;
+    /// `sanitize_label_name` on every key; an array's last element as its label value.
+    Prometheus,
+    /// `influxdb_out`: a `sum`, `gauge`, or `set` off the carrier path leaves as field `value`
+    /// of a measurement named for the record, which `influxdb_in` reads back as `<name>.value`;
+    /// an array's last element as its tag value.
+    Influxdb,
+    /// `otlp_out`: names and keys as written; a timestamp value as an integer of Unix
+    /// nanoseconds.
+    Otlp,
+    /// Any other sink: names, keys, and values as written.
+    Verbatim,
+}
+
+impl Spelling {
+    fn of(sink: &str) -> Self {
+        match sink {
+            "statsd_out" => Spelling::Statsd,
+            "prometheus_out" => Spelling::Prometheus,
+            "influxdb_out" => Spelling::Influxdb,
+            "otlp_out" => Spelling::Otlp,
+            _ => Spelling::Verbatim,
+        }
+    }
+
+    /// `name` with the characters the sink's wire can't carry rewritten; a record whose name this
+    /// changes reaches `record/name_unsafe`.
+    fn sanitize(self, name: &str) -> String {
+        match self {
+            Spelling::Statsd => sanitized(name),
+            Spelling::Prometheus => sanitize_metric_name(name).into_owned(),
+            Spelling::Influxdb | Spelling::Otlp | Spelling::Verbatim => name.to_string(),
+        }
+    }
+
+    /// The name the sink's pair decoder reads `rec`, a sink input, back under.
+    fn written(self, rec: &Rec) -> String {
+        match self {
+            Spelling::Prometheus => {
+                let mut name = self.sanitize(&rec.name);
+                let counter = rec.kind == "sum"
+                    && rec.body["temporality"] == "cumulative"
+                    && rec.body["monotonic"] == Value::Bool(true);
+                if counter && !name.ends_with("_total") {
+                    name.push_str("_total");
+                }
+                name
+            }
+            Spelling::Influxdb => {
+                let measurement = rec.attributes.get(ATTR_MEASUREMENT).and_then(Value::as_str);
+                let carried = measurement.is_some_and(|m| {
+                    let field = rec.name.strip_prefix(m).and_then(|f| f.strip_prefix('.'));
+                    !m.is_empty() && field.is_some_and(|f| !f.is_empty())
+                });
+                let valued = matches!(rec.kind.as_str(), "sum" | "gauge" | "set");
+                if valued && !carried {
+                    format!("{}.value", rec.name)
+                } else {
+                    rec.name.clone()
+                }
+            }
+            _ => self.sanitize(&rec.name),
+        }
+    }
+
+    /// The name a read-back record is compared under.
+    fn read(self, rec: &Rec) -> String {
+        match self {
+            Spelling::Statsd => sanitized(&rec.name),
+            _ => rec.name.clone(),
+        }
+    }
+
+    /// The key the sink's pair decoder reads attribute `key` back under.
+    fn key(self, key: &str) -> String {
+        match self {
+            // A `_logit.` carrier is never a label: it rides as itself or not at all.
+            Spelling::Prometheus if !key.starts_with("_logit.") => {
+                sanitize_label_name(key).into_owned()
+            }
+            _ => key.to_string(),
+        }
+    }
+
+    /// An attribute value as text, as the sink's pair decoder reads it back; `tags` is its
+    /// `types` entry (`/=timestamp`), empty when it has none.
+    fn value(self, value: &Value, tags: &str) -> String {
+        match (self, value) {
+            (Spelling::Prometheus | Spelling::Influxdb, Value::Array(items)) => {
+                items.last().map(text).unwrap_or_default()
+            }
+            (Spelling::Otlp, Value::String(s)) if tags.contains("=timestamp") => {
+                logit_core::time::parse_rfc3339_to_nanos(s)
+                    .map_or_else(|_| s.clone(), |nanos| nanos.to_string())
+            }
+            _ => text(value),
+        }
     }
 }
 
@@ -232,6 +371,7 @@ fn records(batches: &[EventBatch]) -> Vec<Rec> {
         let attribute_types = tagged("/attributes/");
         let resource_types = tagged("/resource/attributes/");
         let beside_metrics = event["metrics"].as_array().is_some_and(|m| !m.is_empty());
+        let scope = event.get("scope").cloned();
         let rec = |kind: String, name: String, body: Value, types| Rec {
             kind,
             name,
@@ -242,6 +382,7 @@ fn records(batches: &[EventBatch]) -> Vec<Rec> {
             attribute_types: attribute_types.clone(),
             resource: resource.clone(),
             resource_types: resource_types.clone(),
+            scope: scope.clone(),
         };
         if let Some(log) = event.get("log") {
             let name = log.get("message").map(text).unwrap_or_default();
@@ -292,33 +433,40 @@ struct Pairing {
 }
 
 /// The module doc's passes.
-fn pair(ins: &[Rec], outs: &[Rec]) -> Pairing {
+fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
     let mut used = vec![false; outs.len()];
     let mut seen: Vec<Option<Class>> = vec![None; ins.len()];
     let mut claimed: Vec<Vec<usize>> = vec![Vec::new(); ins.len()];
-    for by_sanitized in [false, true] {
-        let name = |s: &str| if by_sanitized { sanitized(s) } else { s.to_string() };
+    // Passes (1) and (2) run under both spellings before pass (3) runs under either, so a dotted
+    // expansion never claims a record that a respelling reads back whole.
+    for (respelled, expansions) in [(false, false), (true, false), (false, true), (true, true)] {
+        let in_names: Vec<String> = ins
+            .iter()
+            .map(|rec| if respelled { spelling.written(rec) } else { rec.name.clone() })
+            .collect();
+        let out_names: Vec<String> = outs
+            .iter()
+            .map(|rec| if respelled { spelling.read(rec) } else { rec.name.clone() })
+            .collect();
         let candidates = |i: usize, used: &[bool]| -> Vec<usize> {
             let input = &ins[i];
             let scored: Vec<(usize, u8)> = outs
                 .iter()
                 .enumerate()
                 .filter(|(o, out)| {
-                    !used[*o]
-                        && out.family() == input.family()
-                        && name(&out.name) == name(&input.name)
+                    !used[*o] && out.family() == input.family() && out_names[*o] == in_names[i]
                 })
-                .map(|(o, out)| (o, score(input, out)))
+                .map(|(o, out)| (o, score(input, out, spelling)))
                 .filter(|(_, s)| *s > 0)
                 .collect();
             let best = scored.iter().map(|(_, s)| *s).max().unwrap_or(0);
             scored.into_iter().filter(|(_, s)| *s == best).map(|(o, _)| o).collect()
         };
         let renamed =
-            |i: usize, o: usize| name(&ins[i].name) != ins[i].name || outs[o].name != ins[i].name;
+            |i: usize, o: usize| in_names[i] != ins[i].name || outs[o].name != ins[i].name;
 
-        for i in 0..ins.len() {
-            if seen[i].is_some() {
+        for i in (0..ins.len()).rev() {
+            if expansions || seen[i].is_some() {
                 continue;
             }
             let core = ins[i].core();
@@ -329,8 +477,8 @@ fn pair(ins: &[Rec], outs: &[Rec]) -> Pairing {
             }
         }
 
-        for i in 0..ins.len() {
-            if seen[i].is_some() {
+        for i in (0..ins.len()).rev() {
+            if expansions || seen[i].is_some() {
                 continue;
             }
             let input = &ins[i];
@@ -353,9 +501,9 @@ fn pair(ins: &[Rec], outs: &[Rec]) -> Pairing {
 
         // Longer names first, so `latency.exp` claims `latency.exp.count` before `latency` could.
         let mut order: Vec<usize> = (0..ins.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(ins[i].name.len()));
+        order.sort_by_key(|&i| (std::cmp::Reverse(ins[i].name.len()), std::cmp::Reverse(i)));
         for i in order {
-            if seen[i].is_some() {
+            if !expansions || seen[i].is_some() {
                 continue;
             }
             let input = &ins[i];
@@ -363,24 +511,37 @@ fn pair(ins: &[Rec], outs: &[Rec]) -> Pairing {
             let sharing = (0..ins.len())
                 .filter(|&j| {
                     seen[j].is_none()
-                        && name(&ins[j].name) == name(&input.name)
+                        && in_names[j] == in_names[i]
                         && ins[j].public() == input.public()
                 })
                 .count();
             let mut picked: Vec<usize> =
                 if sharing == 1 { direct } else { direct.into_iter().take(1).collect() };
-            let prefix = format!("{}.", name(&input.name));
+            // A dotted expansion hangs off the record's own name, before any respelling of the
+            // whole record (`influxdb_out`'s `.value`).
+            let base = if respelled && spelling == Spelling::Statsd {
+                sanitized(&input.name)
+            } else {
+                input.name.clone()
+            };
+            let prefix = format!("{base}.");
             let dotted: Vec<usize> = (0..outs.len())
                 .filter(|&o| {
                     !used[o]
                         && !picked.contains(&o)
                         && outs[o].is_metric()
                         && input.is_metric()
-                        && name(&outs[o].name).starts_with(&prefix)
-                        && score(input, &outs[o]) > 0
+                        && out_names[o].starts_with(&prefix)
+                        && out_names[o] != in_names[i]
+                        && score(input, &outs[o], spelling) > 0
                 })
                 .collect();
-            picked.extend(dotted);
+            // Several points of one series each expand to one record per dotted name, so each
+            // claims one of each.
+            let mut names = BTreeSet::new();
+            picked.extend(
+                dotted.into_iter().filter(|&o| sharing == 1 || names.insert(&out_names[o])),
+            );
             if !picked.is_empty() {
                 for &o in &picked {
                     used[o] = true;
@@ -394,9 +555,10 @@ fn pair(ins: &[Rec], outs: &[Rec]) -> Pairing {
     Pairing { seen, claimed, unclaimed }
 }
 
-/// 2 when `out`'s public attributes equal `input`'s, 1 when they're a subset, else 0.
-fn score(input: &Rec, out: &Rec) -> u8 {
-    let (want, have) = (input.public(), out.public());
+/// 2 when `out`'s public attributes equal `input`'s as the sink spells their keys, 1 when
+/// they're a subset, else 0.
+fn score(input: &Rec, out: &Rec, spelling: Spelling) -> u8 {
+    let (want, have) = (input.public_as(spelling), out.public());
     if want == have {
         2
     } else if have.iter().all(|(k, v)| want.get(k) == Some(v)) {
@@ -412,6 +574,21 @@ fn same_value(a: &Rec, b: &Rec) -> bool {
         "sum" | "gauge" => same_number(&a.body["value"], &b.body["value"]),
         "gauge_delta" => same_number(&a.body["delta"], &b.body["delta"]),
         "log" => a.body["message"] == b.body["message"],
+        // A histogram whose last bound is finite gains an empty `+Inf` bucket on a wire that
+        // states the total as one (Prometheus).
+        "histogram" => {
+            let (mut a, mut b) = (a.core().0, b.core().0);
+            for body in [&mut a, &mut b] {
+                if let Some(buckets) = body["buckets"].as_array_mut() {
+                    let empty_inf =
+                        |bucket: &Value| bucket["bound"] == "inf" && bucket["count"] == 0;
+                    if buckets.last().is_some_and(empty_inf) {
+                        buckets.pop();
+                    }
+                }
+            }
+            a == b
+        }
         _ => a.core().0 == b.core().0,
     }
 }
@@ -497,7 +674,7 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
 }
 
 /// The record-level `record` features `rec` reaches.
-fn record_features(rec: &Rec) -> Vec<&'static str> {
+fn record_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
     let mut features = Vec::new();
     if !rec.is_metric() {
         return features;
@@ -508,10 +685,23 @@ fn record_features(rec: &Rec) -> Vec<&'static str> {
     if rec.attributes.contains_key("_logit.statsd.service_check.name") {
         features.push("service_check");
     }
-    if !rec.name.chars().all(safe) {
+    if spelling.sanitize(&rec.name) != rec.name {
         features.push("name_unsafe");
     }
+    let non_finite = |value: &Value| matches!(value.as_str(), Some("NaN" | "inf" | "-inf"));
+    if matches!(rec.kind.as_str(), "sum" | "gauge") && non_finite(&rec.body["value"]) {
+        features.push("non_finite");
+    }
     features
+}
+
+/// Whether `later` is another point of `rec`'s series: the same name, kind, and public attributes,
+/// the resource's included.
+fn same_series(rec: &Rec, later: &Rec) -> bool {
+    later.is_metric()
+        && later.name == rec.name
+        && later.identity() == rec.identity()
+        && later.public() == rec.public()
 }
 
 /// Where a field row looks.
@@ -521,6 +711,8 @@ enum Field {
     Body(&'static str),
     /// An event attribute, or a resource attribute.
     Attribute { key: String, resource: bool },
+    /// The batch's scope.
+    Scope,
 }
 
 /// The field rows `rec` reaches, for a sink of `protocol`.
@@ -534,12 +726,19 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         }
     }
     let own = format!("_logit.{protocol}.");
+    let carrier = |key: &str| {
+        if key.starts_with(&own) {
+            Some("private_carrier")
+        } else if key.starts_with("_logit.") {
+            Some("foreign_carrier")
+        } else {
+            None
+        }
+    };
     for (key, value) in &rec.attributes {
         let tags = rec.attribute_types.get(key).map(String::as_str).unwrap_or("");
-        let feature = if key.starts_with(&own) {
-            "private_carrier"
-        } else if key.starts_with("_logit.") {
-            "foreign_carrier"
+        let feature = if let Some(feature) = carrier(key) {
+            feature
         } else if tags.contains("=bytes") {
             "bytes_value"
         } else if tags.contains("=timestamp") {
@@ -558,15 +757,24 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
     for key in rec.resource.keys() {
+        let feature = carrier(key).unwrap_or("resource_attribute");
         let field = Field::Attribute { key: key.clone(), resource: true };
-        rows.push(("attributes".to_string(), Some("resource_attribute".to_string()), field));
+        rows.push(("attributes".to_string(), Some(feature.to_string()), field));
+    }
+    if rec.scope.is_some() {
+        rows.push(("attributes".to_string(), Some("scope".to_string()), Field::Scope));
     }
     rows
 }
 
 /// What a field reads back as in `out`.
-fn observe_field(field: &Field, input: &Rec, out: &Rec) -> Class {
+fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> Class {
     match field {
+        Field::Scope => match &out.scope {
+            Some(scope) if Some(scope) == input.scope.as_ref() => Class::Exact,
+            Some(_) => Class::Normalized,
+            None => Class::Lost,
+        },
         Field::Body(key) => match out.body.get(*key) {
             Some(value) if *value == input.body[*key] => Class::Exact,
             Some(_) => Class::Normalized,
@@ -578,13 +786,19 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec) -> Class {
             } else {
                 (&input.attributes[key], input.attribute_types.get(key))
             };
+            // A key the sink respells reads back under its wire spelling, which is a change.
+            let wire = spelling.key(key);
+            let respelled = wire != *key;
+            let key = &wire;
             let (same, same_tags, other) = if *resource {
                 (out.resource.get(key), out.resource_types.get(key), out.attributes.get(key))
             } else {
                 (out.attributes.get(key), out.attribute_types.get(key), out.resource.get(key))
             };
             match (same, other) {
-                (Some(value), _) if value == want && same_tags == want_tags => Class::Exact,
+                (Some(value), _) if !respelled && value == want && same_tags == want_tags => {
+                    Class::Exact
+                }
                 (Some(_), _) | (None, Some(_)) => Class::Normalized,
                 (None, None) => Class::Lost,
             }
@@ -753,7 +967,8 @@ pub(super) fn check(
     let did_move = |counter: &str| {
         Series::parse(counter).is_ok_and(|cell| moved.iter().any(|series| cell.names(series)))
     };
-    let pairing = pair(&ins, &outs);
+    let spelling = Spelling::of(&sink);
+    let pairing = pair(&ins, &outs, spelling);
     let mut failures = mapping.unknown_when_keys(&sink, &traced.sink);
     let mut named: Vec<Series> = Vec::new();
     let here = format!("{} × {}", at.flow, at.case);
@@ -801,9 +1016,11 @@ pub(super) fn check(
         // Record level.
         let mut rows: Vec<(String, Option<String>)> =
             kind_features(input).into_iter().map(|f| (input.kind.clone(), f)).collect();
-        rows.extend(
-            record_features(input).into_iter().map(|f| ("record".to_string(), Some(f.to_string()))),
-        );
+        let mut features = record_features(input, spelling);
+        if input.is_metric() && ins[i + 1..].iter().any(|later| same_series(input, later)) {
+            features.push("superseded");
+        }
+        rows.extend(features.into_iter().map(|f| ("record".to_string(), Some(f.to_string()))));
         let mut cells = Vec::new();
         let mut unspecified = false;
         for (kind, feature) in &rows {
@@ -840,11 +1057,15 @@ pub(super) fn check(
         let observed = match pairing.seen[i] {
             Some(class) => Some(class),
             None => {
-                let counted = deciding
-                    .filter(|(_, cell, _)| matches!(cell.class, Class::Skipped | Class::Dropped))
-                    .and_then(|(_, cell, _)| cell.counter.as_deref())
-                    .is_some_and(&did_move);
-                if counted {
+                let loss = deciding
+                    .filter(|(_, cell, _)| matches!(cell.class, Class::Skipped | Class::Dropped));
+                let counted =
+                    loss.and_then(|(_, cell, _)| cell.counter.as_deref()).is_some_and(&did_move);
+                // A cell that says its loss is uncounted accounts for a record no counter does.
+                let uncounted = loss.is_some_and(|(_, cell, _)| {
+                    cell.counter.is_none() && cell.reason.as_deref() == Some("uncounted")
+                });
+                if counted || uncounted {
                     Some(expected)
                 } else if moved.iter().any(|s| s.name.ends_with(".skipped")) {
                     Some(Class::Skipped)
@@ -936,7 +1157,7 @@ pub(super) fn check(
                 Lookup::Cell(cell, index) => (cell, index),
             };
             let Some(first) = first.filter(|_| checked) else { continue };
-            let seen = observe_field(&field, input, &outs[first]);
+            let seen = observe_field(&field, input, &outs[first], spelling);
             let fits = if cell.class == Class::Exact {
                 seen == Class::Exact
             } else {
@@ -984,4 +1205,119 @@ pub(super) fn check(
         }
     }
     failures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use logit_proto::event_json::EventJsonDecoder;
+
+    /// The records of `format: json` lines, each holding `{T}` for a fixed timestamp.
+    fn recs(lines: &[&str]) -> Vec<Rec> {
+        let text: String = lines
+            .iter()
+            .map(|line| line.replace("{T}", "\"timestamp\":\"2027-01-15T08:00:00.000000000Z\""))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        records(&EventJsonDecoder::new().decode_batches(text.as_bytes()).expect("JSON lines"))
+    }
+
+    /// `prometheus_out` writes a dotted name and label key with `_`, and a counter's sample with
+    /// `_total`; read as written, nothing pairs.
+    #[test]
+    fn prometheus_pairs_a_sanitized_name_and_key_and_a_total_suffix() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"cpu.usage","kind":"gauge","value":1.5}],"attributes":{"influxdb.field.note":"x"}}"#,
+            r#"{{T},"metrics":[{"name":"jobs","kind":"sum","value":3.0,"temporality":"cumulative","monotonic":true}]}"#,
+        ]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"cpu_usage","kind":"gauge","value":1.5}],"attributes":{"influxdb_field_note":"x"}}"#,
+            r#"{{T},"metrics":[{"name":"jobs_total","kind":"sum","value":3.0,"temporality":"cumulative","monotonic":true}]}"#,
+        ]);
+        let pairing = pair(&ins, &outs, Spelling::Prometheus);
+        assert_eq!(pairing.seen, [Some(Class::Normalized), Some(Class::Normalized)]);
+        assert!(pairing.unclaimed.is_empty());
+        let note = Field::Attribute { key: "influxdb.field.note".to_string(), resource: false };
+        assert_eq!(
+            observe_field(&note, &ins[0], &outs[0], Spelling::Prometheus),
+            Class::Normalized
+        );
+
+        let verbatim = pair(&ins, &outs, Spelling::Verbatim);
+        assert_eq!(verbatim.seen, [None, None]);
+    }
+
+    /// `influxdb_out` writes a gauge with no measurement carrier as field `value`, read back as
+    /// `<name>.value`: the same gauge renamed, not a dotted expansion of it.
+    #[test]
+    fn influxdb_pairs_a_value_field_as_the_same_gauge() {
+        let ins =
+            recs(&[r#"{{T},"metrics":[{"name":"temperature","kind":"gauge","value":21.5}]}"#]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"temperature.value","kind":"gauge","value":21.5}],"attributes":{"_logit.influxdb.measurement":"temperature"}}"#,
+        ]);
+        assert_eq!(pair(&ins, &outs, Spelling::Influxdb).seen, [Some(Class::Normalized)]);
+        assert_eq!(pair(&ins, &outs, Spelling::Verbatim).seen, [Some(Class::Degraded)]);
+    }
+
+    /// Two points of one series that each expand into dotted fields claim one of each, so
+    /// neither is left unpaired.
+    #[test]
+    fn two_points_of_a_series_each_claim_one_expansion() {
+        let samples = r#"{{T},"metrics":[{"name":"latency","kind":"samples","values":[7.5],"sample_rate":1.0}]}"#;
+        let ins = recs(&[samples, samples]);
+        let field = |name: &str| {
+            r#"{{T},"metrics":[{"name":"latency.NAME","kind":"gauge","value":1.0}]}"#
+                .replace("NAME", name)
+        };
+        let outs = recs(&[&field("count"), &field("sum"), &field("count"), &field("sum")]);
+        let pairing = pair(&ins, &outs, Spelling::Influxdb);
+        assert_eq!(pairing.seen, [Some(Class::Degraded), Some(Class::Degraded)]);
+        assert_eq!(pairing.claimed.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2]);
+    }
+
+    /// `otlp_out` writes a timestamp attribute as an integer of nanoseconds.
+    #[test]
+    fn otlp_pairs_a_timestamp_attribute_read_back_as_nanoseconds() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"t","kind":"gauge","value":1.0}],"attributes":{"seen":"2027-01-15T07:00:00.000000000Z"},"types":{"/attributes/seen":"timestamp"}}"#,
+        ]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"t","kind":"gauge","value":1.0}],"attributes":{"seen":1799996400000000000}}"#,
+        ]);
+        assert_eq!(pair(&ins, &outs, Spelling::Otlp).seen, [Some(Class::Exact)]);
+        assert_eq!(pair(&ins, &outs, Spelling::Verbatim).seen, [None]);
+    }
+
+    /// `statsd_out` writes a reserved character in a name as `_`.
+    #[test]
+    fn statsd_pairs_a_sanitized_name() {
+        let ins = recs(&[r#"{{T},"metrics":[{"name":"a:b","kind":"gauge","value":1.0}]}"#]);
+        let outs = recs(&[r#"{{T},"metrics":[{"name":"a_b","kind":"gauge","value":1.0}]}"#]);
+        assert_eq!(pair(&ins, &outs, Spelling::Statsd).seen, [Some(Class::Normalized)]);
+        assert_eq!(pair(&ins, &outs, Spelling::Verbatim).seen, [None]);
+    }
+
+    /// The latest point of a series claims what a sink holding one value per series read back,
+    /// so the earlier one is the record left over.
+    #[test]
+    fn the_latest_point_of_a_series_pairs_first() {
+        let gauge = r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}]}"#;
+        let ins = recs(&[gauge, gauge]);
+        let outs = recs(&[gauge]);
+        assert_eq!(pair(&ins, &outs, Spelling::Prometheus).seen, [None, Some(Class::Exact)]);
+        assert!(same_series(&ins[0], &ins[1]));
+    }
+
+    /// A histogram whose last bound is finite reads back the same with an empty `+Inf` bucket.
+    #[test]
+    fn an_added_empty_inf_bucket_is_the_same_histogram() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":2}]}]}"#,
+        ]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"h","kind":"histogram","temporality":"cumulative","buckets":[{"bound":1.0,"count":2},{"bound":"inf","count":0}]}]}"#,
+        ]);
+        assert_eq!(pair(&ins, &outs, Spelling::Prometheus).seen, [Some(Class::Normalized)]);
+    }
 }
