@@ -16,8 +16,12 @@
 //! a `_logit.<protocol>.` carrier of the sink's own protocol is `private_carrier`, any other
 //! `_logit.` key `foreign_carrier`, and the rest by value (`string_value`, `bool_value`,
 //! `number_value`, `array_value`), plus `resource_attribute` for each resource attribute. A log
-//! record reaches `log/dogstatsd_event` when it carries `_logit.statsd.event.title`, else
-//! `log/plain`, and its attribute rows.
+//! record on an event with no metrics reaches `log/dogstatsd_event` when it carries
+//! `_logit.statsd.event.title`, else `log/plain`, and its attribute rows; a span there reaches
+//! `span/alone`. A log or span on an event that carries metrics is a field of that event: it
+//! reaches `log/beside_metrics` or `span/beside_metrics` alone, read as `exact` when it pairs
+//! unchanged, `normalized` when it pairs changed, and `lost` when nothing read back pairs with
+//! it.
 //!
 //! **Pairing.** Each input record is paired with the records read back that account for it, in
 //! passes, each claiming a read-back record at most once: (1) the same name and the same kind,
@@ -48,8 +52,12 @@
 //! `degraded`, `skipped`, `dropped`, or `lost` cell observed at its class must see its counter
 //! move. A `normalized` cell's counter needn't, since not every record it covers is rewritten.
 //!
+//! A `when:` key that names no field of the sink's serialized config fails, naming the row, the
+//! cell, and the key: a misspelled key would otherwise never match.
+//!
 //! **Across the whole run** ([`Ledger`]), every `normalized` or `lost` cell some record reached
-//! must be observed at its class at least once, so a bound can't hide an improvement forever.
+//! must be observed at its class at least once, so a bound can't hide an improvement forever, and
+//! `coverage.md` lists every cell no record was checked against.
 
 use super::mapping::{self, Class, Lookup, Mapping, Series};
 use super::Traced;
@@ -65,15 +73,18 @@ const FIELD_KEYS: [&str; 6] =
 /// Series name suffixes a run's sink counters are checked for.
 const OUTCOMES: [&str; 6] = ["dropped", "skipped", "degraded", "normalized", "omitted", "evicted"];
 
-/// One metric or log record, as `format: json` writes it.
+/// One metric, log, or span record, as `format: json` writes it.
 #[derive(Debug, Clone)]
 struct Rec {
-    /// The metric kind, or `log`.
+    /// The metric kind, `log`, or `span`.
     kind: String,
-    /// The metric name, or the log's message.
+    /// The metric name, the log's message, or the span's name.
     name: String,
-    /// The metric object, or the `log` object.
+    /// The metric object, or the `log` or `span` object.
     body: Value,
+    /// Whether the record's event also carries metrics: a log or span beside them is a field of
+    /// that event, not a record of its own.
+    beside_metrics: bool,
     /// The line's type tags under the record, keyed by the pointer below it (`/value`).
     types: BTreeMap<String, String>,
     attributes: Map<String, Value>,
@@ -84,8 +95,17 @@ struct Rec {
 }
 
 impl Rec {
-    fn is_log(&self) -> bool {
-        self.kind == "log"
+    fn is_metric(&self) -> bool {
+        !matches!(self.kind.as_str(), "log" | "span")
+    }
+
+    /// `metric`, `log`, or `span`: only records of one family pair.
+    fn family(&self) -> &str {
+        if self.is_metric() {
+            "metric"
+        } else {
+            &self.kind
+        }
     }
 
     /// The record for a failure message.
@@ -211,10 +231,12 @@ fn records(batches: &[EventBatch]) -> Vec<Rec> {
         let resource = event["resource"]["attributes"].as_object().cloned().unwrap_or_default();
         let attribute_types = tagged("/attributes/");
         let resource_types = tagged("/resource/attributes/");
+        let beside_metrics = event["metrics"].as_array().is_some_and(|m| !m.is_empty());
         let rec = |kind: String, name: String, body: Value, types| Rec {
             kind,
             name,
             body,
+            beside_metrics,
             types,
             attributes: attributes.clone(),
             attribute_types: attribute_types.clone(),
@@ -230,6 +252,16 @@ fn records(batches: &[EventBatch]) -> Vec<Rec> {
                 })
                 .collect();
             out.push(rec("log".to_string(), name, log.clone(), types));
+        }
+        if let Some(span) = event.get("span") {
+            let name = span.get("name").map(text).unwrap_or_default();
+            let types = types
+                .iter()
+                .filter_map(|(p, t)| {
+                    p.strip_prefix("/span").map(|rest| (rest.to_string(), t.clone()))
+                })
+                .collect();
+            out.push(rec("span".to_string(), name, span.clone(), types));
         }
         for (i, metric) in event["metrics"].as_array().into_iter().flatten().enumerate() {
             let prefix = format!("/metrics/{i}");
@@ -273,7 +305,7 @@ fn pair(ins: &[Rec], outs: &[Rec]) -> Pairing {
                 .enumerate()
                 .filter(|(o, out)| {
                     !used[*o]
-                        && out.is_log() == input.is_log()
+                        && out.family() == input.family()
                         && name(&out.name) == name(&input.name)
                 })
                 .map(|(o, out)| (o, score(input, out)))
@@ -342,8 +374,8 @@ fn pair(ins: &[Rec], outs: &[Rec]) -> Pairing {
                 .filter(|&o| {
                     !used[o]
                         && !picked.contains(&o)
-                        && !outs[o].is_log()
-                        && !input.is_log()
+                        && outs[o].is_metric()
+                        && input.is_metric()
                         && name(&outs[o].name).starts_with(&prefix)
                         && score(input, &outs[o]) > 0
                 })
@@ -387,8 +419,14 @@ fn same_value(a: &Rec, b: &Rec) -> bool {
 /// Read-back `samples` or `set_members` records whose values together are `input`'s, or none.
 fn gather(input: &Rec, candidates: &[usize], outs: &[Rec]) -> Vec<usize> {
     let field = if input.kind == "samples" { "values" } else { "members" };
+    // A member compares by its sanitized text, since a sink may rewrite a reserved character.
     let values = |rec: &Rec| -> Vec<String> {
-        rec.body[field].as_array().into_iter().flatten().map(Value::to_string).collect()
+        rec.body[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|v| sanitized(&v.to_string()))
+            .collect()
     };
     let mut want = values(input);
     let mut picked = Vec::new();
@@ -448,6 +486,8 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
         }
         "gauge_delta" => vec![Some(scalar("delta"))],
         "histogram" | "exponential_histogram" => vec![Some(temporality())],
+        "log" | "span" if rec.beside_metrics => vec![Some("beside_metrics".to_string())],
+        "span" => vec![Some("alone".to_string())],
         "log" if rec.attributes.contains_key("_logit.statsd.event.title") => {
             vec![Some("dogstatsd_event".to_string())]
         }
@@ -459,7 +499,7 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
 /// The record-level `record` features `rec` reaches.
 fn record_features(rec: &Rec) -> Vec<&'static str> {
     let mut features = Vec::new();
-    if rec.is_log() {
+    if !rec.is_metric() {
         return features;
     }
     if rec.body["no_recorded_value"] == Value::Bool(true) {
@@ -486,7 +526,7 @@ enum Field {
 /// The field rows `rec` reaches, for a sink of `protocol`.
 fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)> {
     let mut rows = Vec::new();
-    if !rec.is_log() {
+    if rec.is_metric() {
         for key in mapping::RECORD_FIELDS {
             if rec.body.get(key).is_some() {
                 rows.push(("record".to_string(), Some(key.to_string()), Field::Body(key)));
@@ -552,6 +592,39 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec) -> Class {
     }
 }
 
+/// Whether a field observed as `seen` fits `cell`, and its counter moved if it's lost.
+fn field_verdict(
+    here: &str,
+    input: &Rec,
+    label: &str,
+    cell: &mapping::Cell,
+    seen: Class,
+    did_move: &impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let fits = if cell.class == Class::Exact {
+        seen == Class::Exact
+    } else {
+        field_rank(seen) <= field_rank(cell.class)
+    };
+    if !fits {
+        return vec![format!(
+            "{here}: {} {:?}: the table's row {label} says {}, the flow reads {}\n  sink input: {}",
+            input.kind,
+            input.name,
+            cell.class.as_str(),
+            seen.as_str(),
+            input.show()
+        )];
+    }
+    match (cell.class, seen, &cell.counter) {
+        (Class::Lost, Class::Lost, Some(counter)) if !did_move(counter) => vec![format!(
+            "{here}: {} {:?} is lost under row {label}, but its counter {counter} didn't move",
+            input.kind, input.name
+        )],
+        _ => Vec::new(),
+    }
+}
+
 /// A record-level order: `exact < normalized < degraded < skipped < dropped`.
 fn worse(a: Class, b: Class) -> Class {
     let rank = |c: Class| match c {
@@ -591,10 +664,13 @@ pub(super) struct Ledger {
     cells: BTreeMap<(String, String, usize), (Class, BTreeSet<Class>)>,
     /// Rows a sink has no cell in yet, and the cases that reached them.
     unspecified: BTreeMap<(String, String), BTreeSet<String>>,
+    /// Every `(sink, row, cell index)` some record was checked against.
+    reached: BTreeSet<(String, String, usize)>,
 }
 
 impl Ledger {
     fn saw(&mut self, sink: &str, row: &str, index: usize, cell: Class, observed: Class) {
+        self.reached.insert((sink.to_string(), row.to_string(), index));
         let entry = self
             .cells
             .entry((sink.to_string(), row.to_string(), index))
@@ -616,6 +692,26 @@ impl Ledger {
             }
         }
         failures
+    }
+
+    /// Per sink, each cell of `mapping` no record was checked against: its row, its index among
+    /// the sink's cells in the row, and its `when:`.
+    pub(super) fn unreached(
+        &self,
+        mapping: &Mapping,
+    ) -> BTreeMap<String, Vec<(String, usize, String)>> {
+        let mut out: BTreeMap<String, Vec<(String, usize, String)>> = BTreeMap::new();
+        for (sink, row, index, cell) in mapping.cells() {
+            if !self.reached.contains(&(sink.clone(), row.clone(), index)) {
+                let when = if cell.when.is_empty() {
+                    "otherwise".to_string()
+                } else {
+                    serde_json::to_string(&cell.when).unwrap_or_default()
+                };
+                out.entry(sink).or_default().push((row, index, when));
+            }
+        }
+        out
     }
 
     /// The rows each sink hasn't specified yet, one line each.
@@ -658,7 +754,7 @@ pub(super) fn check(
         Series::parse(counter).is_ok_and(|cell| moved.iter().any(|series| cell.names(series)))
     };
     let pairing = pair(&ins, &outs);
-    let mut failures = Vec::new();
+    let mut failures = mapping.unknown_when_keys(&sink, &traced.sink);
     let mut named: Vec<Series> = Vec::new();
     let here = format!("{} × {}", at.flow, at.case);
 
@@ -671,6 +767,35 @@ pub(super) fn check(
             {
                 named.extend(cell.counter.as_deref().and_then(|c| Series::parse(c).ok()));
             }
+        }
+
+        // A log or span beside metrics is a field of its event (module doc).
+        if !input.is_metric() && input.beside_metrics {
+            let label = mapping::row_label(&input.kind, Some("beside_metrics"));
+            match mapping.lookup(&input.kind, Some("beside_metrics"), &sink, &traced.sink) {
+                Lookup::NoRow => failures.push(format!(
+                    "{here}: {} {:?} reaches row {label}, which mapping.yaml doesn't have",
+                    input.kind, input.name
+                )),
+                Lookup::NotSpecified => {
+                    ledger
+                        .unspecified
+                        .entry((sink.clone(), label))
+                        .or_default()
+                        .insert(here.clone());
+                }
+                Lookup::Cell(cell, index) => {
+                    named.extend(cell.counter.as_deref().and_then(|c| Series::parse(c).ok()));
+                    let seen = match pairing.seen[i] {
+                        Some(Class::Exact) => Class::Exact,
+                        Some(_) => Class::Normalized,
+                        None => Class::Lost,
+                    };
+                    failures.extend(field_verdict(&here, input, &label, cell, seen, &did_move));
+                    ledger.saw(&sink, &label, index, cell.class, seen);
+                }
+            }
+            continue;
         }
 
         // Record level.
@@ -706,6 +831,9 @@ pub(super) fn check(
         }
         if unspecified || cells.len() < rows.len() {
             continue;
+        }
+        for (label, _, index) in &cells {
+            ledger.reached.insert((sink.clone(), label.clone(), *index));
         }
         let expected = cells.iter().map(|(_, cell, _)| cell.class).fold(Class::Exact, worse);
         let deciding = cells.iter().find(|(_, cell, _)| cell.class == expected);

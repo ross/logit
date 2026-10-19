@@ -13,7 +13,9 @@
 //! | `record` | `no_recorded_value`, `service_check`, `name_unsafe` | record |
 //! | `record` | `unit`, `description`, `start_timestamp`, `exemplars` | field |
 //! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `private_carrier`, `foreign_carrier`, `resource_attribute` | field |
-//! | `log` | `dogstatsd_event`, `plain` | record |
+//! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics) | record |
+//! | `span` | `alone` (on an event with no metrics) | record |
+//! | `log`, `span` | `beside_metrics` (on an event that carries metrics) | field |
 //!
 //! A record-level row's class is `exact`, `normalized`, `degraded`, `skipped`, or `dropped`; a
 //! field-level row's is `exact`, `normalized`, or `lost`.
@@ -39,7 +41,7 @@ pub(super) const CLASSES: [&str; 6] =
     ["exact", "normalized", "degraded", "lost", "skipped", "dropped"];
 
 /// Each row kind and its features (module doc).
-const KINDS: [(&str, &[&str]); 13] = [
+const KINDS: [(&str, &[&str]); 14] = [
     (
         "sum",
         &[
@@ -86,7 +88,8 @@ const KINDS: [(&str, &[&str]); 13] = [
             "resource_attribute",
         ],
     ),
-    ("log", &["dogstatsd_event", "plain"]),
+    ("log", &["dogstatsd_event", "plain", "beside_metrics"]),
+    ("span", &["alone", "beside_metrics"]),
 ];
 
 /// The `record` features that are field-level (module doc).
@@ -222,7 +225,8 @@ pub(super) fn row_label(kind: &str, feature: Option<&str>) -> String {
 
 /// Whether `kind`/`feature` is a field-level row (module doc).
 pub(super) fn is_field_row(kind: &str, feature: Option<&str>) -> bool {
-    kind == "attributes"
+    feature == Some("beside_metrics")
+        || kind == "attributes"
         || (kind == "record" && feature.is_some_and(|f| RECORD_FIELDS.contains(&f)))
 }
 
@@ -261,6 +265,40 @@ impl Mapping {
         }
         // `validate` requires a last cell with no `when:`, which matches every config.
         Lookup::NotSpecified
+    }
+
+    /// Every `(sink, row, cell index, cell)` in the table.
+    pub(super) fn cells(&self) -> Vec<(String, String, usize, &Cell)> {
+        let mut out = Vec::new();
+        for row in &self.rows {
+            let label = row_label(&row.kind, row.feature.as_deref());
+            for (sink, cells) in &row.cells {
+                for (i, cell) in cells.as_slice().iter().enumerate() {
+                    out.push((sink.clone(), label.clone(), i, cell));
+                }
+            }
+        }
+        out
+    }
+
+    /// One failure per `when:` key in `sink`'s cells that `config`, the sink's serialized config
+    /// with every default filled in, has no field for: a misspelled key would never match.
+    pub(super) fn unknown_when_keys(&self, sink: &str, config: &serde_json::Value) -> Vec<String> {
+        let mut failures = Vec::new();
+        for (cell_sink, row, index, cell) in self.cells() {
+            if cell_sink != sink {
+                continue;
+            }
+            for key in cell.when.keys() {
+                if config.get(key).is_none() {
+                    failures.push(format!(
+                        "mapping row {row}, {sink} cell {index}: when: names {key:?}, which isn't \
+                         a {sink} config field"
+                    ));
+                }
+            }
+        }
+        failures
     }
 
     /// Every rule in the module doc.

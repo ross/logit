@@ -1,37 +1,36 @@
 #!/bin/bash
 # Usage: script/transit gen|check|coverage
-#   gen       regenerate every generated file under spec/transit/: each wire case's .json, each
-#             expected/<flow>/<case>.json, and coverage.md; then run the class check
-#   check     compare them and run the class check, failing on anything stale (what script/test
+#   gen       run the class check and regenerate every generated file under spec/transit/: each
+#             wire case's .json, each expected/<flow>/<case>.json, and coverage.md
+#   check     run the class check and compare them, failing on anything stale (what script/test
 #             runs)
-#   coverage  regenerate spec/transit/coverage.md, each system's features and the cases that
-#             exercise them, and print it
+#   coverage  as gen, then print spec/transit/coverage.md: each system's features and the cases
+#             that exercise them, and each sink's cells no flow reaches
 #
 # The spec's generator is a test in the `logit` binary's transit module
 # (crates/logit-cli/src/transit/spec.rs), since only the binary's tests reach the kind registry;
-# TRANSIT_UPDATE=1 turns its comparisons into rewrites. A class check failure is never rewritten:
-# fix the code or mapping.yaml. Review `git diff spec/transit/` after `gen` and commit. See
+# TRANSIT_UPDATE=1 turns its comparisons into rewrites. An expectation whose run fails the class
+# check is never rewritten: fix the code or mapping.yaml. Review `git diff spec/transit/` after `gen` and commit. See
 # spec/transit/README.md.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
-spec_tests() {
+spec_test() {
     run "$@" cargo nextest run -p logit-cli --bin logit --no-tests=fail \
-        -E 'test(=transit::spec::transit_spec) | test(=transit::spec::transit_coverage)'
+        -E 'test(=transit::spec::transit_spec)'
 }
 
 case "${1:-}" in
     gen)
-        spec_tests env TRANSIT_UPDATE=1
+        spec_test env TRANSIT_UPDATE=1
         ;;
     check)
-        spec_tests env
+        spec_test env
         ;;
     coverage)
-        run env TRANSIT_UPDATE=1 cargo nextest run -p logit-cli --bin logit --no-tests=fail \
-            -E 'test(=transit::spec::transit_coverage)'
+        spec_test env TRANSIT_UPDATE=1
         cat spec/transit/coverage.md
         ;;
     *)
