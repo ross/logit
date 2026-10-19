@@ -11,8 +11,9 @@
 //! **Expectations.** `expected/<flow>.json` is one JSON object mapping each case's name to its
 //! driver document (`super::report`), keys sorted, each document's lines indented under its key so
 //! a diff stays inside the case that changed ([`render_flow`]). One file per flow grows with the
-//! flows alone, where a file per case would grow with flows times cases. A missing file, a missing
-//! or stale case, and a key no case has each fail, naming the flow and the case. `gen` writes a
+//! flows alone, where a file per case would grow with flows times cases. A missing file fails
+//! naming the flow and its path; a missing or stale case and a key no case has each fail naming
+//! the flow and the case. `gen` writes a
 //! flow's file once every case in the flow has run, and only when none of them failed the class
 //! check: a class failure leaves the whole file untouched.
 //!
@@ -386,7 +387,7 @@ fn sync_flow(
             std::fs::write(path, &generated).expect("write a flow's expectations");
             return Vec::new();
         }
-        return vec![format!("{} is missing; run `{REGENERATE}`", path.display())];
+        return vec![format!("{flow}: {} is missing; run `{REGENERATE}`", path.display())];
     };
     if committed == generated {
         return Vec::new();
@@ -744,7 +745,12 @@ mod tests {
         let docs = counter_docs();
         let path = logit_pipeline::test_util::scratch_dir("transit-keys").join("relay.json");
         let missing = sync_flow(&path, "statsd-relay", &docs, false);
-        assert!(missing.iter().any(|f| f.contains("is missing") && f.contains(REGENERATE)));
+        assert!(
+            missing.iter().any(|f| f.starts_with("statsd-relay: ")
+                && f.contains("is missing")
+                && f.contains(REGENERATE)),
+            "{missing:#?}"
+        );
 
         let other = BTreeMap::from([("gone".to_string(), docs["counter"].0.clone())]);
         std::fs::write(&path, render_flow(&other)).expect("write a file without the case");
