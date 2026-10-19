@@ -3956,6 +3956,47 @@
           "additionalProperties": false
         },
         {
+          "description": "Reads a file once, from start to end, and sends its events downstream, then stops. The file is an archive a `stdio_out` or `file_out` wrote, or events written by hand in the same form. Events keep the timestamps the file gives them. When every input has stopped, the process flushes its sinks and exits.\n\nA line or frame that can't be read is skipped and counted, and the rest of the file is still sent. There's no follow mode, no checkpoint, and no pacing: a restart reads the file from the start, and events go out as fast as the components downstream take them.",
+          "type": "object",
+          "required": [
+            "path",
+            "type"
+          ],
+          "properties": {
+            "batch": {
+              "description": "The most events sent in one batch. Defaults to `1000`; `0` is rejected. Under `format: json`, consecutive lines with the same resource and scope form one batch, up to this many. Under `format: native`, each frame is one batch, split only when it holds more than this many events.",
+              "default": 1000,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "buffer": true,
+            "format": {
+              "description": "How the file is written: `json` (the default), one event per line as a `format: json` sink writes it; or `native`, the frames a `format: native` sink writes.",
+              "default": "json",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ReplayFormat"
+                }
+              ]
+            },
+            "path": {
+              "description": "The file to read, relative to the config file unless absolute. It's opened at startup, so a missing or unreadable file stops `logit run` before anything else starts.",
+              "type": "string"
+            },
+            "receive": true,
+            "sources": true,
+            "targets": true,
+            "type": {
+              "type": "string",
+              "enum": [
+                "replay_in"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "Prometheus metrics, in one of two sink modes chosen by which field is set. `bind:` serves an exposition endpoint: a registry of current series rendered on demand, in whichever text dialect the scraping client's `Accept` negotiates. `endpoint:` sends remote-write: each batch is POSTed to a remote-write receiver, with no retry in the sink. Set exactly one of the two; a non-default field belonging to the other mode is rejected rather than ignored. Delta metrics are dropped and counted; put an `aggregate` with `temporality: cumulative` upstream.",
           "type": "object",
           "required": [
@@ -5275,6 +5316,14 @@
             "zstd"
           ]
         }
+      ]
+    },
+    "ReplayFormat": {
+      "description": "How a `replay_in` file is written: `json` (the default) is one event per line, as a `format: json` stream sink writes it; `native` is the frames a `format: native` stream sink writes.",
+      "type": "string",
+      "enum": [
+        "json",
+        "native"
       ]
     },
     "RotateConfig": {

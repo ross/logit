@@ -31,6 +31,7 @@ use logit_inputs::lines::LinesInput;
 use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::prometheus::{PrometheusInput, PrometheusReceiver};
+use logit_inputs::replay::{ReplayFormat, ReplayInput};
 use logit_inputs::splunk::SplunkHecInput;
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
@@ -965,6 +966,17 @@ fn build_spec(
                     metric.value,
                 )?;
             }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+
+        ReplayIn { path, format, batch } => {
+            let format = match format {
+                logit_config::ReplayFormat::Json => ReplayFormat::Json,
+                logit_config::ReplayFormat::Native => ReplayFormat::Native,
+            };
+            let input = ReplayInput::new(base_dir.join(path), format, *batch)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
 

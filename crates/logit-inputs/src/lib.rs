@@ -31,6 +31,7 @@ pub mod otlp;
 pub mod peer;
 mod procstat;
 pub mod prometheus;
+pub mod replay;
 pub mod splunk;
 pub mod statsd;
 pub mod syslog;

@@ -69,6 +69,9 @@ prost.workspace = true
 # `prometheus_in`'s receiver tests Snappy-compress request bodies directly, the way a sender does,
 # rather than through the receiver's own `logit_proto::prometheus::compression`.
 snap.workspace = true
+# `replay.rs`'s tests read what `stdio_out`/`file_out` write, through their own encoders.
+# Dev-only: the library never depends on `logit-outputs`.
+logit-outputs.workspace = true
 # tests/statsd_to_aggregate.rs needs a real `Aggregator` to prove a decoded `GaugeDelta`
 # resolves. Dev-only: the library never depends on `logit-transforms`.
 logit-transforms.workspace = true

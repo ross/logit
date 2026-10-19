@@ -3903,6 +3903,29 @@ pub enum ComponentKind {
         #[serde(default)]
         resource: std::collections::BTreeMap<String, String>,
     },
+    /// Reads a file once, from start to end, and sends its events downstream, then stops. The
+    /// file is an archive a `stdio_out` or `file_out` wrote, or events written by hand in the
+    /// same form. Events keep the timestamps the file gives them. When every input has stopped,
+    /// the process flushes its sinks and exits.
+    ///
+    /// A line or frame that can't be read is skipped and counted, and the rest of the file is
+    /// still sent. There's no follow mode, no checkpoint, and no pacing: a restart reads the file
+    /// from the start, and events go out as fast as the components downstream take them.
+    ReplayIn {
+        /// The file to read, relative to the config file unless absolute. It's opened at startup,
+        /// so a missing or unreadable file stops `logit run` before anything else starts.
+        path: String,
+        /// How the file is written: `json` (the default), one event per line as a `format: json`
+        /// sink writes it; or `native`, the frames a `format: native` sink writes.
+        #[serde(default)]
+        format: ReplayFormat,
+        /// The most events sent in one batch. Defaults to `1000`; `0` is rejected. Under
+        /// `format: json`, consecutive lines with the same resource and scope form one batch, up
+        /// to this many. Under `format: native`, each frame is one batch, split only when it
+        /// holds more than this many events.
+        #[serde(default = "default_replay_batch")]
+        batch: usize,
+    },
     /// Prometheus metrics, in one of two sink modes chosen by which field is set. `bind:` serves
     /// an exposition endpoint: a registry of current series rendered on demand, in whichever text
     /// dialect the scraping client's `Accept` negotiates. `endpoint:` sends remote-write: each
@@ -4143,6 +4166,10 @@ pub fn default_prometheus_write_path() -> String {
 
 fn default_generate_batch() -> usize {
     100
+}
+
+fn default_replay_batch() -> usize {
+    1000
 }
 
 fn default_generate_metric_value() -> f64 {
@@ -5071,6 +5098,17 @@ pub enum RotateInterval {
 pub enum StreamFormat {
     #[default]
     Human,
+    Json,
+    Native,
+}
+
+/// How a `replay_in` file is written: `json` (the default) is one event per line, as a
+/// `format: json` stream sink writes it; `native` is the frames a `format: native` stream sink
+/// writes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayFormat {
+    #[default]
     Json,
     Native,
 }
@@ -9534,6 +9572,38 @@ mod tests {
             }
             other => panic!("expected PrometheusIn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn replay_in_defaults_to_json_and_a_batch_of_1000() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "replay_in", "path": "events.json"}"#).unwrap();
+        match component.kind {
+            ComponentKind::ReplayIn { path, format, batch } => {
+                assert_eq!(path, "events.json");
+                assert_eq!(format, ReplayFormat::Json);
+                assert_eq!(batch, 1000);
+            }
+            other => panic!("expected ReplayIn, got {other:?}"),
+        }
+        let component: Component = serde_json::from_str(
+            r#"{"type": "replay_in", "path": "a.native", "format": "native", "batch": 5}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            component.kind,
+            ComponentKind::ReplayIn { format: ReplayFormat::Native, batch: 5, .. }
+        ));
+    }
+
+    #[test]
+    fn replay_in_requires_a_path_and_rejects_an_unknown_field() {
+        assert!(serde_json::from_str::<Component>(r#"{"type": "replay_in"}"#).is_err());
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "replay_in", "path": "a.json", "follow": true}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("follow"), "got: {err}");
     }
 
     #[test]
