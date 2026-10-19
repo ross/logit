@@ -19,7 +19,8 @@
 //! **Cases.** A case is `cases/<system>/<case>.meta.yaml` beside `<case>.json`. The meta names
 //! the features from `features/<system>.yaml` the case `exercises`, an optional `wire:` file
 //! (relative to the case's directory) the `.json` is decoded from by `<system>_in`'s decoder at
-//! [`RECEIVED_AT`], and optional `tolerance:` entries (`{path, abs}`: an RFC 6901 pointer into
+//! [`RECEIVED_AT`] (with the request's `name: value` headers from a `.headers` sidecar beside
+//! the wire file, as [`decode_wire`] reads them), and optional `tolerance:` entries (`{path, abs}`: an RFC 6901 pointer into
 //! each event of the document, and the most the number there may differ by). A hand-written case
 //! has no `wire:`, and its `.json` must read back to itself through `logit_proto::event_json`
 //! and `format: json`, so each case has one spelling.
@@ -46,6 +47,10 @@ use logit_core::{Diagnostics, EventBatch, Resource};
 use logit_outputs::ndjson::render_ndjson;
 use logit_pipeline::test_util::TelemetryProbe;
 use logit_proto::event_json::EventJsonDecoder;
+use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
+use logit_proto::prometheus::{
+    families_to_events, text, Dialect, PrometheusDecoder, ATTR_TARGET, LABEL_INSTANCE,
+};
 use logit_proto::statsd::StatsdDecoder;
 use logit_proto::Decoder;
 use serde::Deserialize;
@@ -222,12 +227,66 @@ fn canonical(case: &Case) -> anyhow::Result<String> {
     };
     let path = case.dir.join(wire);
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    decode_wire(&case.system, bytes).with_context(|| format!("decoding {}", path.display()))
+    let sidecar = path.with_extension("headers");
+    let headers = match std::fs::read_to_string(&sidecar) {
+        Ok(text) => Headers::parse(&text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Headers::default(),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", sidecar.display())),
+    };
+    decode_wire(&case.system, bytes, &headers)
+        .with_context(|| format!("decoding {}", path.display()))
 }
 
-/// `system`'s wire bytes as its listener's decoder reads them, at [`RECEIVED_AT`]. A source
-/// system joins with an arm here.
-fn decode_wire(system: &str, bytes: Vec<u8>) -> anyhow::Result<String> {
+/// A wire file's `.headers` sidecar: one `name: value` per line, as `testdata/interop/` records
+/// a request, with `path:` holding the request target and its query string.
+#[derive(Debug, Default)]
+struct Headers(Vec<(String, String)>);
+
+impl Headers {
+    fn parse(text: &str) -> Self {
+        let pairs = text
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        Self(pairs)
+    }
+
+    /// The first value of header `name`.
+    fn get(&self, name: &str) -> Option<&str> {
+        self.0.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+    }
+
+    /// The first value of query parameter `key` in `path:`, `None` when absent or empty, as
+    /// `influxdb_in` reads it. The cases' query strings hold no percent-escapes, so none is
+    /// decoded.
+    fn query(&self, key: &str) -> Option<&str> {
+        let (_, query) = self.get("path")?.split_once('?')?;
+        let value = query.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (k == key).then_some(v)
+        })?;
+        (!value.is_empty()).then_some(value)
+    }
+}
+
+/// The scrape URL a `prometheus` case reads as coming from, and the `instance` label
+/// `prometheus_in` derives from it.
+const SCRAPE_URL: &str = "http://transit:9100/metrics";
+const SCRAPE_INSTANCE: &str = "transit:9100";
+
+/// `system`'s wire bytes as its listener's decoder reads them, at [`RECEIVED_AT`], under the
+/// resource the listener would stamp. A source system joins with an arm here:
+///
+/// - `statsd`: one datagram through `StatsdDecoder`, under an empty resource.
+/// - `influxdb`: one write body through `InfluxDecoder::decode_body`, under the resource
+///   `influxdb_in` builds from `path:`'s `org`, `orgID`, and `bucket`, at its `precision` (`ns`
+///   when absent). A bucket and an org or org ID are required, as `influxdb_in` requires them.
+/// - `prometheus`: one scrape body through `text::parse_with` and `families_to_events`, in the
+///   dialect `content-type:` selects (text 0.0.4 when absent), under the resource
+///   `prometheus_in` stamps for the target [`SCRAPE_URL`]: `instance` and
+///   `_logit.prometheus.target`.
+fn decode_wire(system: &str, bytes: Vec<u8>, headers: &Headers) -> anyhow::Result<String> {
     let mut probe = TelemetryProbe::new();
     let id = "transit.case";
     let batches = match system {
@@ -241,6 +300,37 @@ fn decode_wire(system: &str, bytes: Vec<u8>) -> anyhow::Result<String> {
             let (resource, scope) =
                 decoder.decode_into(Bytes::from(bytes), RECEIVED_AT, &mut events)?;
             vec![EventBatch { resource, scope, events }]
+        }
+        "influxdb" => {
+            let telemetry = probe.telemetry(id, "influxdb_in", "listener");
+            let precision = match headers.query("precision") {
+                None => Precision::Ns,
+                Some(unit) => Precision::from_query(unit)
+                    .with_context(|| format!("precision {unit:?} isn't ns, us, ms, or s"))?,
+            };
+            let (org, org_id) = (headers.query("org"), headers.query("orgID"));
+            ensure!(org.is_some() || org_id.is_some(), "the .headers path: names no org or orgID");
+            let bucket = headers.query("bucket").context("the .headers path: names no bucket")?;
+            let resource = Arc::new(write_resource(org, org_id, bucket));
+            let batch = InfluxDecoder::new()
+                .with_telemetry(telemetry)
+                .decode_body(Bytes::from(bytes), precision, RECEIVED_AT, resource)
+                .map_err(|err| anyhow::anyhow!("influxdb_in refused the body: {err}"))?;
+            vec![batch]
+        }
+        "prometheus" => {
+            let telemetry = probe.telemetry(id, "prometheus_in", "listener");
+            let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
+            let dialect =
+                headers.get("content-type").map_or(Dialect::Text0_0_4, Dialect::from_content_type);
+            let mut decoder =
+                PrometheusDecoder::new().with_telemetry(telemetry).with_diagnostics(diag);
+            let families = text::parse_with(&bytes, dialect, &mut decoder)?;
+            let events = families_to_events(&families, RECEIVED_AT, &mut decoder);
+            let mut resource = Resource::default();
+            resource.attributes.insert(LABEL_INSTANCE, logit_core::Value::str(SCRAPE_INSTANCE));
+            resource.attributes.insert(ATTR_TARGET, logit_core::Value::str(SCRAPE_URL));
+            vec![EventBatch { resource: Arc::new(resource), scope: None, events }]
         }
         other => bail!("no wire decoder for a {other} case yet"),
     };
