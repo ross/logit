@@ -430,8 +430,9 @@ impl Output for InfluxDbOutput {
 }
 
 /// Emits one batch's [`EncodeStats`] as `logit.output.*` counters, each only when non-zero so an
-/// ordinary batch doesn't upsert a permanent zero series.
-fn emit_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
+/// ordinary batch doesn't upsert a permanent zero series. Public so a caller that runs
+/// [`InfluxLineEncoder`] without this sink counts what the sink would.
+pub fn emit_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     const TAGS_NORMALIZED: &str = "logit.output.tags.normalized";
     const TAGS_OMITTED: &str = "logit.output.tags.omitted";
     const NORMALIZED: &str = "logit.output.metrics.normalized";

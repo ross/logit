@@ -1917,15 +1917,10 @@ impl StatsdOutput {
         .with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES)
     }
 
-    /// The encoder's per-line cap for this transport: `max_packet_bytes` wherever lines are packed
-    /// into packets (UDP and both Unix transports), uncapped on TCP. Applied by the builders, so
+    /// The encoder's per-line cap for this transport ([`line_cap`]). Applied by the builders, so
     /// `send` never mutates the encoder.
     fn encoder_cap(&self) -> usize {
-        if matches!(self.conn, Conn::Tcp { .. }) {
-            usize::MAX
-        } else {
-            self.max_packet_bytes
-        }
+        line_cap(matches!(self.conn, Conn::Tcp { .. }), self.max_packet_bytes)
     }
 
     /// Installs `encoder`, overriding its line cap and diagnostics with this sink's (gated),
@@ -2011,11 +2006,22 @@ impl StatsdOutput {
     }
 }
 
+/// The longest line the encoder may write for a transport: `max_packet_bytes` wherever lines are
+/// packed into packets (UDP and both Unix transports), uncapped over TCP.
+pub fn line_cap(tcp: bool, max_packet_bytes: usize) -> usize {
+    if tcp {
+        usize::MAX
+    } else {
+        max_packet_bytes
+    }
+}
+
 /// Counts one `encode_into` call's [`EncodeStats`]. Each name follows
 /// `docs/adr/telemetry-loss-vocabulary.md`: a line that should have left and didn't is
 /// `messages.dropped`, a line the dialect or a flagged point leaves nothing to write for is
 /// `messages.skipped`, and a field left off a line that is still sent is `fields.omitted`.
-fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
+/// Public so a caller that runs [`StatsdEncoder`] without this sink counts what the sink would.
+pub fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     telemetry.count("logit.output.events.skipped", stats.skipped_no_metrics as f64, &[]);
     let counts: [(&str, &str, usize); 14] = [
         ("logit.output.messages.dropped", "unresolved_gauge_delta", stats.dropped_gauge_delta),
