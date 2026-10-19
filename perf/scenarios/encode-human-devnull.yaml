@@ -1,7 +1,7 @@
 # The human-readable encoder in situ: generate_in straight into file_out at /dev/null under the
 # default `format: human` (logit_outputs::stdio::EventDump), a real sink doing real encode-and-write
 # work. Pairs with encode-native-devnull on the identical event stream; the gap from passthrough is
-# the encoder's own cost. Scenario table: docs/plans/load-test-harness.md, "Scenarios".
+# the encoder's own cost. Scenario table: docs/design/performance.md, "Scenarios".
 #
 #   script/perf run --scenario encode-human-devnull
 #

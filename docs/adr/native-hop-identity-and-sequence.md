@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-15
+updated: 2026-10-18
 ---
 
 # Native hop identity and sequence: a per-store sender identity and sequence on every hop frame, and a high-water mark at `logit_in`
@@ -280,11 +280,15 @@ is unchanged.]
 
 ## Consequences
 
-- **Code.** The trailer tags, `SeqId` through the store and `Output::observe_batch`, store
-  numbering, the emptied `Ack`, the per-component table, the counters, the stale text to fix,
-  and the allocation and size pins each change trips are listed once, in
-  [`docs/plans/delivery-semantics.md`](../plans/delivery-semantics.md), W5, with that
-  workstream's tests. A tripped pin is updated in the same commit as `docs/design/memory.md`.
+- **Code.** The trailer tags 3 (sender identity, 16 bytes) and 4 (sequence, a uvarint whose
+  first value is 1) live in `crates/logit-proto/src/native/mod.rs`, with the unsequenced rule on
+  decode. `SeqId { id, seq }` is `Copy` and travels through `SinkStore::push`, `peek`, and
+  `Output::observe_batch`, never on `BatchContext` or `Delivered`. Store numbering is in
+  `crates/logit-pipeline/src/queue.rs` and `crates/logit-pipeline/src/disk_queue.rs`; the emptied
+  `Ack` is in `crates/logit-proto/src/native/control.rs`; and `logit_in` builds one table per
+  component in `run_until_shutdown`. The counters are `logit.input.batches.resends`,
+  `logit.input.senders`, and `logit.input.senders.evicted`. A tripped allocation or size pin is
+  updated in the same commit as `docs/design/memory.md`.
 - **The breaking change.** An older `logit_out` against a newer `logit_in` doesn't work, and no
   version bump marks it: it decodes the empty `Ack` as `seq` 0, which fails its equality check,
   so it reads every attempt as `Ambiguous`. The other direction works without deduplication: an

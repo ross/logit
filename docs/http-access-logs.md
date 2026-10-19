@@ -10,7 +10,6 @@ Related docs:
 
 - [ADR `http-access-normalization`](adr/http-access-normalization.md): why the work lives in the
   pipeline rather than on the server.
-- [`docs/plans/http-access-normalization.md`](plans/http-access-normalization.md): the build-out.
 - [`docs/deploying.md`](deploying.md)'s "The nginx-side recipe": the operational side of running
   `logit` against a real server (keeping the old log line during cutover, the syslog
   message-size limit, the startup-ordering rule). This doc is the schema half that recipe points
@@ -548,7 +547,9 @@ Log-format aliases (`%HM`, `%HU`, `%ST`, `%B`, `%Ta`, `%ci`, `%si`, `%tsc`, …)
 a named item. A `log-format` rejects a bracketed `[expr]` fetch of a request header ("may not be
 reliably used here"), so Host, User-Agent, Referer, `X-Forwarded-For` (XFF), `traceparent`, and
 the scheme are captured into `txn` vars first. `%si` is the backend IP HAProxy connected to; `%s`
-would be the configured server *name*.
+would be the configured server *name*. `%Ta` (request received to response fully sent) is the
+duration to log, not `%Tt`, which includes idle time before the request started; `%Ta` is the
+counterpart of nginx's `$request_time`.
 
 **Cannot provide:** `http.response.body.size` (`%B` is total bytes, headers included);
 `upstream.status` (indistinguishable from `%ST`, which may be HAProxy's own status);

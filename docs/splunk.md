@@ -17,8 +17,9 @@ Related docs:
 
 - [ADR `splunk-hec-relay`](adr/splunk-hec-relay.md): the design decisions, including why
   `logit` uses the OTel exporter's attribute names rather than a `splunk.*` namespace.
-- [`docs/plans/splunk-relay.md`](plans/splunk-relay.md): the protocol survey, what Splunk accepts
-  and emits, and how each Splunk concept maps onto `logit`'s event model.
+- [The ADR's "Verified destination behavior"](adr/splunk-hec-relay.md#verified-destination-behavior):
+  the protocol survey, what Splunk accepts and emits, and what the Splunk Enterprise and Splunk
+  Cloud runs settled.
 - `crates/logit-proto/src/splunk/mod.rs`'s module doc: the canonical mapping tables and the
   permitted normalizations of the `splunk_hec_in -> splunk_hec_out` relay.
 - [`docs/known-gaps/splunk.md`](known-gaps/splunk.md): what isn't built or isn't verified.

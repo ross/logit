@@ -2,7 +2,7 @@
 # attributes, `kv_metrics` derives metrics from them, null_out discards. Measures what
 # `syslog_in -> json -> kv_metrics` pays in the reference nginx pipeline
 # (fixtures/nginx-to-influxdb.yaml), without the syslog framing or the network hop. Scenario table:
-# docs/plans/load-test-harness.md, "Scenarios".
+# docs/design/performance.md, "Scenarios".
 #
 #   script/perf run --scenario json-parse
 #

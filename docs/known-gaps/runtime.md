@@ -310,20 +310,20 @@ Entry format and the other areas: [the known-gaps index](README.md).
   ([ADR `signal-handling`](../adr/signal-handling.md)); `types_db:` and `lua_file` scripts are
   read once at startup too. TLS certificate, key, and CA files do reload
   ([ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md)). Hot reload is out of scope
-  for `docs/plans/operator-surface.md`, because it needs its own design (diffing the old and new
-  resolved `Graph`, deciding which components to reuse versus tear down and rebuild), not a small
-  addition to the readiness/exit-code work.
+  for the readiness and exit-code work, because it needs its own design (diffing the old and new
+  resolved `Graph`, deciding which components to reuse versus tear down and rebuild; see
+  [the live-reload plan](../plans/live-reload-and-socket-handover.md)).
 - **No `logit stats` command reading a live `Registry` out-of-process.** You can see `internal`'s
   telemetry only *through* the pipeline, with a sink attached downstream. There's no out-of-band
   read path like `/readyz`/`/healthz` for lifecycle state. It's set aside alongside the admin
-  endpoint (`docs/plans/operator-surface.md`) as speculative until an operator asks, for the
+  endpoint ([ADR `admin-readiness-endpoint`](../adr/admin-readiness-endpoint.md)) as speculative until an operator asks, for the
   reason ADR `internal-telemetry-as-pipeline-events` gives for not building a `Registry`
   addressable outside the pipeline.
 
 ## Admin endpoint, readiness, and release image
 
-- **The admin endpoint has no TLS and no auth** (`docs/plans/operator-surface.md`, ADR
-  `admin-readiness-endpoint`) — anyone who can reach `admin.bind`, or write to `admin.socket`, can
+- **The admin endpoint has no TLS and no auth** ([ADR
+  `admin-readiness-endpoint`](../adr/admin-readiness-endpoint.md)) — anyone who can reach `admin.bind`, or write to `admin.socket`, can
   read the pipeline's lifecycle phase and every component's coarse state. It's not deferred:
   `/readyz`/`/healthz` are loopback/pod-local by design, not meant to cross a real network
   boundary. Either feature would

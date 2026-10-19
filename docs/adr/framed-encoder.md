@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # `FramedEncoder`: a third codec trait for sinks that need per-message framing, over a shared `MessageBuf`
@@ -139,14 +139,12 @@ warm-then-measure call.
   buffer, the trait, and the bench harness for free; what it still writes by hand is its own
   `Stats` and the `send`-side telemetry mapping, which this ADR deliberately leaves per sink.~~
   The Graphite/Carbon half is now designed, not yet built: [ADR `graphite-carbon-relay`](graphite-carbon-relay.md)'s
-  `graphite_out` implements `FramedEncoder<Meta = usize>` exactly as anticipated here (`docs/plans/graphite-carbon-relay.md`'s
-  W1/W3), reusing `MessageBuf<usize>` the same way `collectd_out` does. The Kafka half is now
+  `graphite_out` implements `FramedEncoder<Meta = usize>` as anticipated here, reusing `MessageBuf<usize>` the same way `collectd_out` does. The Kafka half is now
   designed, not yet built: [ADR `kafka-output`](kafka-output.md)'s `kafka_out` produces one
   record per framed message. A NATS producer remains unbuilt.
 - [ADR `syslog-output`](syslog-output.md), [ADR `statsd-output`](statsd-output.md), and
   [ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md) each carry an
-  amendment pointing here; `docs/known-gaps/`'s entry and `docs/plans/lossless-transit.md`'s
-  residual item are closed.
+  amendment pointing here; `docs/known-gaps/`'s entry is closed.
 
 ## Amendment (2026-10-13): `statsd_out`'s stats fields
 

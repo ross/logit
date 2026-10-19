@@ -685,7 +685,8 @@ mod keyset_k {
 
 /// **Arm K's pre-registered kill criterion**, separate so it can't be misread off a table: the
 /// build plus one clone of the 12-attribute log, arm K against arm P's bulk build. K must win by
-/// **≥10%** or it is dropped (`docs/plans/event-sizing.md`'s "Bake-off arms").
+/// **≥10%** or it is dropped (`docs/adr/event-sizing-and-allocation-strategy.md`'s "Bake-off arms
+/// and instruments").
 ///
 /// Both arms take the same pre-built scratch, build a map from it, clone that map once, and drop
 /// both inside the timed region. "Build + clone" is one number because that is how the criterion is

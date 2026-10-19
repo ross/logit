@@ -1,6 +1,6 @@
 ---
 created: 2026-08-30
-updated: 2026-10-07
+updated: 2026-10-18
 ---
 
 # Service lifecycle: signal-driven shutdown and bounded output retry
@@ -9,7 +9,7 @@ updated: 2026-10-07
 Accepted
 
 ## Context
-`docs/plans/nginx-integration.md`'s workstream B works backward from one property of the
+A real nginx workload works backward from one property of the
 target deployment: `logit` runs unattended, behind a restart policy, with no operator watching it.
 Two gaps in v0.1 make that combination actively harmful rather than merely incomplete:
 

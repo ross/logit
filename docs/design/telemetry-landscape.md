@@ -4,8 +4,8 @@ What each wire protocol `logit` implements or intends to implement
 ([`docs/OVERVIEW.md`](../OVERVIEW.md)'s "Ingest"/"Emit" scope) can express, per signal. It gives
 [ADR `lossless-transit`](../adr/lossless-transit.md)'s rule, "the internal model is a superset of
 every supported protocol", concrete edges to check a new codec against. This document describes
-only the protocols. [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md) assesses
-`logit`'s model and codecs against these matrices.
+only the protocols. [ADR `lossless-transit`](../adr/lossless-transit.md)'s "Realization" records
+how `logit`'s model and codecs meet these matrices.
 
 Every field list was checked against the protocol's specification or reference implementation at
 the URL given. A detail that couldn't be verified from a primary source says so.
@@ -176,9 +176,9 @@ The pair's fixture corpus must cover each of these wire features:
 - duplicate points (same measurement, tag set, and timestamp) in one body;
 - a gzip-compressed body.
 
-How `influxd` itself reads the edge cases (a backslash before a non-special character, boolean
-spellings, number forms) is to be verified against a real server; see
-[`docs/plans/influxdb-relay.md`](../plans/influxdb-relay.md)'s "Open risks".
+How `influxd` 2.9.1 reads the edge cases (a backslash before a non-special character, boolean
+spellings, number forms) is recorded in
+[ADR `influxdb-line-protocol-relay`'s "Verified `influxd` behavior"](../adr/influxdb-line-protocol-relay.md#verified-influxd-behavior).
 
 ### collectd binary/network protocol
 
@@ -514,10 +514,9 @@ support the claim that OTLP is the superset among trace formats `logit` might br
 
 ## Superset requirements
 
-These properties, derived from the matrices above, are what
-[`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s target model is checked against.
-That plan's "Closing assessment" records how the landed model (2026-09-12) meets them and names
-the residual debt, which `docs/known-gaps/` tracks.
+These properties, derived from the matrices above, are what `logit`'s model is checked against.
+[ADR `lossless-transit`](../adr/lossless-transit.md)'s "Realization" records how the landed model
+(2026-09-12) meets them and names the residual debt, which `docs/known-gaps/` tracks.
 
 1. A metric point carries temporality (delta/cumulative) and monotonicity, and an optional series
    start time.

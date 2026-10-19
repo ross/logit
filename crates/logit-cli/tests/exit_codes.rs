@@ -46,8 +46,7 @@ fn a_port_already_in_use_exits_1() {
 
 /// `generate_in` returns after `count` events, its senders drop, the listener-exit cascade
 /// flushes downstream, and the process exits 0 with no signal or timeout involved: the contract a
-/// perf scenario depends on (`docs/plans/load-test-harness.md`;
-/// `crates/logit-pipeline/src/runtime.rs`'s
+/// perf scenario depends on (`crates/logit-pipeline/src/runtime.rs`'s
 /// `run_returns_once_the_only_input_finishes_instead_of_hanging`).
 ///
 /// The sink is `stdio_out` to `/dev/null`, not `null_out`: a sink that opens, writes, and flushes

@@ -3,7 +3,8 @@
 //! `datadog_trace_in -> datadog_trace_out` pair, a like-protocol relay under
 //! [ADR `lossless-transit`](../../../docs/adr/lossless-transit.md), and the last hop of the
 //! tracer-direct topology (tracer → `datadog_trace_in` → `datadog_trace_out` → a real Agent;
-//! [`docs/plans/datadog-relay.md`](../../../docs/plans/datadog-relay.md) §14). The decisions are
+//! [`docs/known-gaps/datadog.md`](../../../docs/known-gaps/datadog.md) has why no Agent-equivalent
+//! processor replaces the Agent). The decisions are
 //! [ADR `datadog-agent-and-intake-relay`](../../../docs/adr/datadog-agent-and-intake-relay.md)'s
 //! 1, 2, and 13. Every body comes from [`DatadogEncoder`], whose module doc holds the mappings;
 //! this module owns HTTP: routes, headers, request splitting, the two transports, and what a

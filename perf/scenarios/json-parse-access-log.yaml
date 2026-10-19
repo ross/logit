@@ -3,7 +3,7 @@
 # null_out discards. docs/design/data-shapes.md §7 flags this class as having no capture behind it
 # (access and audit logs run 15-34 fields at the survey's highest event rates, all desk-counted);
 # demo/logit.yaml's `postgres_in` tails this format. Scenario table:
-# docs/plans/load-test-harness.md, "Scenarios"; first run: docs/design/performance.md §8.
+# docs/design/performance.md, "Scenarios"; first run: its §8.
 #
 #   script/perf run --scenario json-parse-access-log
 #

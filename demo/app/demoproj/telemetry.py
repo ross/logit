@@ -1,6 +1,6 @@
 """OpenTelemetry setup shared by both processes this app forks workers in:
-`demo/app/gunicorn.conf.py`'s web workers and `demo/app/demoproj/celery.py`'s task workers
-(`docs/plans/demo-richer-traces.md`). Both need the identical `TracerProvider`/exporter/instrumentor
+`demo/app/gunicorn.conf.py`'s web workers and `demo/app/demoproj/celery.py`'s task workers.
+Both need the identical `TracerProvider`/exporter/instrumentor
 setup; they differ only in the `service.name` default and, for gunicorn alone, Django's
 request-span instrumentation layered on top afterward.
 
@@ -63,14 +63,14 @@ def setup(default_service_name):
         inject_trace_context=True, enable_log_auto_instrumentation=False
     )
 
-    # `pages/views.py`'s `work` calls back into `nginx` (`docs/plans/demo-richer-traces.md`) via
+    # `pages/views.py`'s `work` calls back into `nginx` via
     # the `requests` library. This turns every such call into a real CLIENT span and injects a
     # fresh `traceparent` onto the outbound request via the default W3C propagator, with no code at
     # the call site. Harmless, if unused, in the worker: nothing in `pages/tasks.py` makes an
     # outbound HTTP call.
     RequestsInstrumentor().instrument()
 
-    # A real driver-level CLIENT span per SQL statement (`docs/plans/demo-richer-traces.md`), and,
+    # A real driver-level CLIENT span per SQL statement, and,
     # via `enable_commenter`, a `traceparent` appended to the SQL text itself (sqlcommenter,
     # https://google.github.io/sqlcommenter/), injected by the same default W3C propagator.
     # Postgres logs the whole statement verbatim (`log_min_duration_statement=0`,
@@ -81,7 +81,7 @@ def setup(default_service_name):
     PsycopgInstrumentor().instrument(enable_commenter=True)
 
     # A CLIENT span around every broker interaction Celery makes over Redis
-    # (`docs/plans/demo-richer-traces.md`): publishing a task (gunicorn's workers, `work`'s
+    # publishing a task (gunicorn's workers, `work`'s
     # `.delay()`) and consuming one (the worker). It instruments the `redis` package directly, so
     # any *other* direct Redis use in either process would get spans too, though nothing here
     # makes one.

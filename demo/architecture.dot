@@ -46,7 +46,7 @@ digraph architecture {
   redis           [shape=cylinder, style=filled];
 
   // -- Web: the request path, plus the re-entrant hop `/work` adds -------------------------
-  // (docs/plans/demo-richer-traces.md): app calling back into nginx's /inner is a second,
+  // app calling back into nginx's /inner is a second,
   // independent "web" edge in the opposite direction from nginx -> app, not a reuse of it. The
   // request genuinely re-enters the chain partway rather than looping in place.
   client  -> haproxy [label="web"];
@@ -59,7 +59,7 @@ digraph architecture {
   // haproxy's, app's, and worker's over syslog. nginx's, redis's, and postgres's are tailed by
   // `logit` directly off the host: nginx's and redis's Docker json-file logs
   // (docs/adr/file-tailing-and-docker-json-logs.md, this demo's end-to-end proof for that ADR)
-  // and postgres's rotating jsonlog directory (`tail_in`, docs/plans/demo-richer-traces.md).
+  // and postgres's rotating jsonlog directory (`tail_in`).
   // Either way it's one "logging" edge: the transport is a detail this diagram doesn't draw
   // (demo/logit.yaml's topology comment has it).
   haproxy  -> logit [label="logging"];
@@ -72,8 +72,8 @@ digraph architecture {
 
   // -- db: reads/writes against Postgres, from either app-tier process ---------------------
   // Distinct from "query" below, which is Grafana reading back what this stack wrote. This is
-  // `app`/`worker` reading and writing their own state over `psycopg`
-  // (docs/plans/demo-richer-traces.md). Both processes write: `pages/tasks.py`'s task runs in
+  // `app`/`worker` reading and writing their own state over `psycopg`.
+  // Both processes write: `pages/tasks.py`'s task runs in
   // the `worker` process.
   app    -> postgres [label="db"];
   worker -> postgres [label="db"];
@@ -81,7 +81,7 @@ digraph architecture {
   // -- queue: Celery's broker traffic -------------------------------------------------------
   // `app` publishes (`.delay()`, pages/views.py's `work`); `worker` consumes. Two directed edges
   // for one exchange, like `nginx -> app`/`app -> nginx` above, rather than implying a single
-  // bidirectional one (docs/plans/demo-richer-traces.md).
+  // bidirectional one.
   app    -> redis [label="queue"];
   worker -> redis [label="queue"];
 
@@ -98,9 +98,8 @@ digraph architecture {
   // from the same log line the "logging" edges above already show: one wire, two signals, no new
   // edge. `app`'s request/database-client/Celery-producer spans and `worker`'s
   // Celery-consumer/database-client spans go straight to Tempo's OTLP receiver instead,
-  // deliberately bypassing `logit` (docs/plans/demo-tracing-stack.md's "Decisions already
-  // settled"). Not every telemetry leg needs `logit` in front of it, and this diagram shows that
-  // honestly rather than drawing an edge through `logit` that doesn't exist. `postgres` and
+  // bypassing `logit`. Not every telemetry leg needs `logit` in front of it, and
+  // this diagram shows that honestly rather than drawing an edge through `logit` that doesn't exist. `postgres` and
   // `redis` get no edge into `tempo`, because neither runs an SDK: postgres's trace id reaches
   // Loki only, via its "logging" edge, and redis's log carries none (its "logging" edge is server
   // lines only; the broker traffic is traced from both client ends, `app`'s and `worker`'s Redis

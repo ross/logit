@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -20,7 +20,7 @@ full `_in`/`_out` pair.
 
 [ADR `lossless-transit`](lossless-transit.md) requires every `P_in`/`P_out` pair to be a lossless
 relay modulo a named list of permitted normalizations, and the model work it drove
-([`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W1/W2/W4/W5, all landed) gave
+([ADR `lossless-transit`](lossless-transit.md)'s "Realization") gave
 `Event`/`MetricRecord` exactly what Prometheus needs: `Sum { value, temporality, monotonic }`,
 `Histogram { buckets, sum, min, max }`, `ExponentialHistogram`, `Summary { count, sum }`,
 exemplars, `start_timestamp`, `description`, `unit`, `flags`, and batch-level `Scope`. This is the
@@ -37,8 +37,7 @@ types `logit` doesn't otherwise need. Building the text-format semantic mapping 
 remote-write can reuse without touching it, is the smaller first step that still covers the common
 case end to end.
 
-Decisions settled with Ross (2026-09-11), recorded in full in
-[`docs/plans/prometheus-scrape-and-exposition.md`](../plans/prometheus-scrape-and-exposition.md):
+Decisions settled with Ross (2026-09-11):
 scrape-and-exposition now, remote-write as a non-breaking future addition to the same two kinds;
 both text dialects negotiated on `Accept`/`Content-Type`; delta temporality resolved by `aggregate`,
 not the sink; `prometheus_in` always synthesizes `up`/`scrape_duration_seconds`/

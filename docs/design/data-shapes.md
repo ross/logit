@@ -8,8 +8,7 @@ It exists because `memory.md` §8 defers two inline-capacity decisions until the
 distribution of attribute/metric counts," and because fixtures, perf scenarios, examples, and
 priorities should be built from that same distribution instead of from one reference pipeline.
 
-The data was collected on 2026-09-20 under
-[`docs/plans/data-shape-survey.md`](../plans/data-shape-survey.md), from two sources:
+The data was collected on 2026-09-20 from two sources:
 
 - A desk survey of about 300 rows counted from pinned sources and specifications, condensed to the
   132 in [`data-shapes-rows.md`](data-shapes-rows.md), each with its citation.
@@ -130,6 +129,31 @@ Results are read per deployment archetype, and each says what stands behind it:
 | Prometheus-centric infrastructure | scrape and remote-write; few logs through `logit` | Measured/Default (six exporters, a recorded remote-write sender); cluster-scale series counts Estimated |
 | Edge / access-log heavy | very high-rate, fixed-schema log lines | **Counted only** — no capture of a load balancer, CDN, or ingress |
 | Wide-event shop | one deliberately wide structured event per unit of work | **Reported only** — one vendor's observation, no capture |
+
+### Desk survey
+
+The desk survey ran as six parallel tracks, each boxed to 40 rows and a page of notes and covering
+Python, JS/TS, Go, Java, Ruby, Rust, and .NET at the top few frameworks per language. Gaps were
+recorded rather than chased; §7's follow-ups list them.
+
+| Track | Scope |
+|---|---|
+| Schemas and limits | OpenTelemetry semantic conventions (a triple per group), ECS, Datadog standard attributes, OCSF, Splunk CIM; vendor and SDK limits as proxies for the tail |
+| OpenTelemetry instrumentation | the highest-adoption instrumentations per language; default resource detectors; SDK batch and limit defaults |
+| Vendor agents | Datadog `integrations-core` `metadata.csv`, Agent host and container tagging, `dd-trace` span tags; New Relic, Sentry, and Elastic APM attributes from public docs and open-source agents |
+| Logging libraries | default and typically configured records: `logging`, structlog, loguru; slog, zap, zerolog; pino, winston; lograge, semantic_logger; logback and log4j2 JSON and ECS layouts; Serilog, MEL; `tracing-subscriber`; monolog |
+| Infrastructure | Prometheus exporters' exposition output; Telegraf plugins; collectd `types.db`; access-log formats; cloud audit and flow logs; journald; collector-side enrichment (`k8sattributes`, Fluent Bit's kubernetes filter, Vector, Filebeat) |
+| Peers and published numbers | how Vector, the Collector's `pdata`, Fluent Bit, Prometheus, and `tracing` size the same structures, and on what evidence; production-derived figures from posts and papers; adoption surveys for signal mix |
+
+Every row carries a checkable citation, and its counts come from the real source by script, never
+from memory. An unverifiable figure is recorded as unverified. §7's "How far to trust the desk
+rows" has the verification pass.
+
+Two capture candidates were dropped outright rather than substituted: Loghub's log samples, which
+would have measured only body length that live producers already measure, from anonymized files
+whose provenance can't be stated in a line; and an OpenTelemetry overlay on `demo/`'s Django and
+Celery tiers, replaced by `applogs`' standalone auto-instrumented Django app, which yields the
+static-to-runtime correction factor instead.
 
 ### Provenance
 

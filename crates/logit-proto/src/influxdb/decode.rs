@@ -4,7 +4,7 @@
 //!
 //! - [`InfluxDecoder::decode_body`], `influxdb_in`'s, is **all or nothing**. Every line is parsed
 //!   before any event is built, and the first bad line fails the body, as influxd rejects a write
-//!   with a parse error (probe row 13.1). Nothing is counted for a failed body: none of it was
+//!   with a parse error (item 12). Nothing is counted for a failed body: none of it was
 //!   taken.
 //! - [`InfluxDecoder::decode_skipping`], the `line_protocol` transform's, skips a bad line and
 //!   decodes the rest, starts each event from the caller's base attributes, and counts nothing
@@ -111,7 +111,7 @@ impl InfluxDecoder {
     /// reserved-prefix tags as `logit.input.tags.omitted`.
     ///
     /// `received_at` is the request's arrival in Unix nanoseconds; a point with no timestamp gets
-    /// it truncated to `precision`, one instant for every such point in the body (probe row 10.5).
+    /// it truncated to `precision`, one instant for every such point in the body (item 7).
     pub fn decode_body(
         &mut self,
         body: Bytes,
@@ -404,7 +404,7 @@ mod tests {
         assert_eq!(str_attr(&events[0], "influxdb.field.msg"), Some("started"));
     }
 
-    // probe: influxd 2.9.1, rows 18.1 to 18.3 and 6.2
+    // influxd 2.9.1, item 9
     #[test]
     fn duplicate_points_merge_last_write_wins_in_first_appearance_order() {
         let events = decode(
@@ -424,7 +424,7 @@ mod tests {
         assert_eq!(events[2].timestamp, 6);
     }
 
-    // probe: influxd 2.9.1, row 18.3: tag order is irrelevant to the series key
+    // influxd 2.9.1, item 9: tag order is irrelevant to the series key
     #[test]
     fn tag_order_does_not_split_a_series() {
         let events = decode("m,b=2,a=1 x=1i 5\nm,a=1,b=2 y=1i 5");
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(events[0].attributes.get("influxdb.field.g"), None);
     }
 
-    // probe: influxd 2.9.1, rows 10.2 to 10.4
+    // influxd 2.9.1, item 7
     #[test]
     fn precision_scales_timestamps_to_nanoseconds() {
         for (precision, ts) in [
@@ -462,7 +462,7 @@ mod tests {
         }
     }
 
-    // probe: influxd 2.9.1, rows 10.5 and 18.5: one truncated arrival instant per body
+    // influxd 2.9.1, items 7 and 9: one truncated arrival instant per body
     #[test]
     fn an_absent_timestamp_is_the_arrival_truncated_to_precision() {
         let batch = decode_at("a f=1i\nb f=1i\na,t=1 f=2i", Precision::Ms).unwrap();
@@ -470,13 +470,13 @@ mod tests {
         assert_eq!(batch.events.len(), 3);
         let batch = decode_at("a f=1i", Precision::S).unwrap();
         assert_eq!(batch.events[0].timestamp, 1_700_000_000_000_000_000);
-        // Two timestamp-less points of one series merge (row 18.5).
+        // Two timestamp-less points of one series merge (item 9).
         let batch = decode_at("p18_g x=1i\np18_g,t=1 x=1i\np18_g x=2i", Precision::Ns).unwrap();
         assert_eq!(batch.events.len(), 2);
         assert_eq!(metrics(&batch.events[0]), [("p18_g.x", g(MetricValue::I64(2)))]);
     }
 
-    // probe: influxd 2.9.1, rows 10.7, 10.9 to 10.15, 10.17
+    // influxd 2.9.1, item 8
     #[test]
     fn the_timestamp_range_is_checked_after_scaling() {
         let outside = "time outside range -9223372036854775806 - 9223372036854775806";
@@ -500,7 +500,7 @@ mod tests {
         }
     }
 
-    // probe: influxd 2.9.1, rows 13.1 and 13.4
+    // influxd 2.9.1, item 12
     #[test]
     fn one_bad_line_fails_the_whole_body_naming_the_first_bad_line() {
         let err =

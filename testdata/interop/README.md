@@ -22,9 +22,7 @@ Without them, a decoder is checked only against this team's reading of RFC 3164/
 `network.c`, the OTLP spec, or the remote-write spec, and against `logit`'s own encoder. An encoder
 and decoder that share a misunderstanding agree with each other and pass.
 
-For the design and rationale, see
-[`docs/plans/recorded-interop-fixtures.md`](../../docs/plans/recorded-interop-fixtures.md). This
-file and the READMEs below it are the provenance record for committed, regeneratable test
+This file and the READMEs below it are the provenance record for committed, regeneratable test
 artifacts that [ADR `committed-pregenerated-otlp-protobuf`](../../docs/adr/committed-pregenerated-otlp-protobuf.md)
 and `testdata/tls/README.md` both establish.
 
@@ -127,6 +125,75 @@ every value collectd measured, and telemetrygen's synthetic OTLP attribute value
 between runs. collectd's packing also changes which value lists land in which datagram, so file
 sizes move too. That's expected: a fixture is *a* real capture from *a* real producer, not a
 byte-stable golden file. See [Consuming these fixtures](#consuming-these-fixtures).
+
+## Producer conventions
+
+- **A producer is one `record_<name>()` function** in `script/record-fixtures`, on the shared
+  `start_capture`/`finish_capture` plumbing, plus its name in `all`. Its helpers live in
+  `tools/record-fixtures/`.
+- **The capture sink is `tools/record-fixtures/raw_capture.py`** for every wire corpus: it writes
+  whatever arrives with no parsing or re-encoding, one file per UDP datagram, per TCP connection,
+  or per HTTP request. OTLP is the exception: the Collector's `file` exporter writes pdata's JSON
+  marshaler output, the normative OTLP/JSON, valid whatever wire the sender used
+  (`otlp/README.md`).
+- **The producer is real third-party software, installed fresh at record time** when no runnable
+  official image exists (`apt-get install` for rsyslog and collectd, `pip install` for the statsd
+  clients). A re-record picks up the current version, so update the provenance table from the
+  producer's own version output, never from memory.
+- **A hand-rolled producer is acceptable only when the library under test is the thing
+  hand-rolled around.** `python_graphite_pickle_producer.py` frames `pickle.dumps(...)` with the
+  stdlib alone, because CPython's `pickle` is what a real carbon client runs; getting carbon's own
+  Twisted client into a throwaway container would cost far more than it proves.
+- **A fixed count bounds every capture**, never a duration, so a slow container start can't grow a
+  fixture.
+- **Each subdirectory's README carries a provenance table** (producer and version, invocation,
+  date, and the construct each fixture exercises) and a "What isn't covered here (yet)" section,
+  so absence is stated rather than inferred. A table, not a per-fixture sidecar, while the corpus
+  stays at a handful of fixtures per producer.
+
+## Findings worth recording
+
+Obstacles hit while building producers, so they needn't be rediscovered:
+
+- **Busybox's `logger` applet can't send to a remote server**: it rejects `-n` and `-P`. The
+  `logger` producer uses util-linux's `logger` from `debian:bookworm-slim`.
+- **SELinux blocks an unrelabeled bind mount** even when the host directory is world-writable.
+  Every bind mount in `script/record-fixtures` carries `:z`, as `script/protogen`'s does.
+- **`otel/opentelemetry-collector-contrib` runs as uid 10001**, so its `file` exporters fail with
+  `permission denied` on a mode-755 output directory. `record_otlp` makes the directory mode 777
+  first.
+- **No official rsyslog or collectd image exists.** `rsyslog/rsyslog_deb12` doesn't exist, and
+  the collectd project's one Docker Hub repository, `collectd/ci`, is a build environment.
+  Both producers install the Debian package at record time.
+- **Mounting a config over a package's own conffile stops `apt-get install` on dpkg's conffile
+  prompt**, which `DEBIAN_FRONTEND=noninteractive` doesn't suppress (it reaches debconf, not dpkg).
+  The rsyslog config mounts at `/etc/rsyslog-fixture.conf` and passes `-f`. Its ruleset filters on
+  `$programname == 'logit-fixture'`, so rsyslogd's own startup notice stays out of the capture.
+- **collectd's `network` plugin sends a datagram only when the next value list wouldn't fit under
+  `MaxPacketSize` (1452), or at shutdown.** So a datagram is not a read cycle: each capture packs
+  about 25 lists from several cycles, with identity elided and a cycle split across a boundary.
+  Which lists land in which datagram changes on every re-record, so the tests assert identity,
+  kinds, and interval, never a per-file list count. `Interval 1` fills the buffer in seconds.
+- **collectd's `write_graphite` keeps one TCP connection open**, so `write-graphite-000.raw` is
+  one connection's stream across three read cycles, bounded by `collectd-entrypoint.sh`'s
+  `RUN_SECONDS`.
+- **Pickle `protocol=-1` resolved to protocol 5** on `python:3.12-slim`; it's the capture that
+  exercises `FRAME`, `SHORT_BINUNICODE`, and `MEMOIZE`.
+- **The statsd corpus records packing, not grammar.** Both clients pack to their own buffer size
+  (1,432 B and 512 B), not to an MTU, and neither splits a line. Its metric-type mix comes from the
+  producer script's synthetic workload, not from production; `perf/load/README.md` picks its own
+  type weights for that reason.
+- **Telegraf streams every `/api/v2/write` body chunked**, so `raw_capture.py --accept-chunked`
+  removes the chunk framing and keeps the payload verbatim.
+
+## Not yet recorded
+
+Producers this corpus doesn't cover yet. Each subdirectory's "What isn't covered here (yet)"
+lists the constructs a covered producer still misses.
+
+- **syslog-ng**, over any transport. A `record_syslog_ng` following `record_rsyslog`'s shape is
+  the next step.
+- **Docker json-file across Docker versions**, for `docker_in`.
 
 ## Size discipline
 

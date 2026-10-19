@@ -6,9 +6,7 @@
 //! **This module doc is the codec's canonical mapping table and normalization list**, which docs,
 //! tests, and examples point at.
 //! [ADR `graphite-carbon-relay`](../../../../docs/adr/graphite-carbon-relay.md) is the decision
-//! record. It and
-//! [`docs/plans/graphite-carbon-relay.md`](../../../../docs/plans/graphite-carbon-relay.md) carry
-//! the normalization list with identical numbering; keep all three in step.
+//! record. It carries the normalization list with identical numbering; keep the two in step.
 //!
 //! ## Wire shape, in one paragraph
 //!

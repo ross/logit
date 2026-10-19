@@ -1,6 +1,6 @@
 ---
 created: 2026-09-04
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # `trace_context` grows a `span:` block, and a native `traceparent` parser
@@ -15,7 +15,7 @@ Accepted
 an event's attributes onto it. That closes "this log line belongs to trace X" — it says nothing
 about turning the line itself into a span. An access log line (haproxy, nginx, any reverse proxy
 or web server) carries everything `crate::span::SpanRecord` needs: an id, a start, an end or
-duration, a status. `docs/plans/demo-tracing-stack.md`'s HAProxy → nginx → app chain already mints
+duration, a status. The demo's HAProxy → nginx → app chain already mints
 and propagates a W3C `traceparent` end to end, and the app already emits real OTel spans — but
 haproxy and nginx, which do all the same work of receiving a request and forwarding it, produce
 only logs. The goal here is the same one `docs/OVERVIEW.md` states for the project generally: see
@@ -28,8 +28,8 @@ deliberately refuses to parse a `traceparent` header, because the header's flags
 the standalone `flags` field is decimal, and conflating them would silently parse `"08"` as either
 8 or 0x08 depending on where it came from. That reasoning is sound for the two-values-collide
 case, but it argued for refusing the whole header, not just its flags octet — the trace id and
-parent id inside a `traceparent` are unambiguous regardless. `docs/plans/demo-tracing-stack.md`'s
-own workaround (every tier logs `trace_id`/`span_id`/`trace_flags` as separate decimal-flags JSON
+parent id inside a `traceparent` are unambiguous regardless. The demo's earlier
+workaround (every tier logged `trace_id`/`span_id`/`trace_flags` as separate decimal-flags JSON
 fields, split by hand in HAProxy vars or an nginx `map`) exists entirely because of that gap —
 config-and-server-side plumbing standing in for four lines for a parser inside `logit`.
 
@@ -63,8 +63,7 @@ hex octet, used only as a fallback when no standalone `trace.flags` attribute is
 never combine, and an explicit field always wins. This narrows, rather than reverses, the original
 transform's reasoning: the problem was never "a `traceparent` exists," it was "two representations
 of flags must never be treated as interchangeable." Splitting a `traceparent` string by hand in a
-proxy config, as `docs/plans/demo-tracing-stack.md`'s workstream A did, is no longer necessary —
-see the follow-up note in that plan.
+proxy config, as the demo's first HAProxy and nginx configs did, is no longer necessary.
 
 **A well-known attribute table, in `docs/design/data-model.md`.** `traceparent`, `trace.id`,
 `trace.flags`, `span.id`, `span.parent_id`, `span.name`, `span.kind`, `span.status`, and
@@ -236,7 +235,5 @@ breakdown haproxy's finer timers do, for the same not-built-here reason.
   mint a span (and a log, and every reconstructible metric kind) from the table shape
   `event:to_table()` emits. The `span:` block here remains the no-Lua path for lifting a span out
   of an access line; in-place mutation of an existing `event.span` is still not offered.
-- `docs/plans/demo-tracing-stack.md`'s workstream A description of `logit` having no `traceparent`
-  parser, and its per-tier decimal-flags-JSON-fields workaround, are now historical rather than
-  current — a follow-up note there points here rather than rewriting that plan's own account of
-  what it built at the time.
+- The demo no longer needs a `traceparent` split by hand or a per-tier decimal-flags JSON field:
+  `trace_context` parses the header itself.

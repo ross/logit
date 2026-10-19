@@ -45,7 +45,7 @@ pub fn parse_error_body(err: &LineError) -> Bytes {
 mod tests {
     use super::*;
 
-    // probe: influxd 2.9.1, row 14.4
+    // influxd 2.9.1, item 11
     #[test]
     fn an_error_body_is_byte_exact() {
         assert_eq!(
@@ -54,7 +54,7 @@ mod tests {
         );
     }
 
-    // probe: influxd 2.9.1, row 1.7: the message JSON-escapes the line's backslashes
+    // influxd 2.9.1, item 11: the message JSON-escapes the line's backslashes
     #[test]
     fn a_parse_error_body_quotes_the_line() {
         let err = LineError {
@@ -70,7 +70,7 @@ mod tests {
         );
     }
 
-    // probe: influxd 2.9.1, row 4.2: control bytes and quotes escape
+    // influxd 2.9.1, item 11: control bytes and quotes escape
     #[test]
     fn control_bytes_and_quotes_escape() {
         let err = LineError {

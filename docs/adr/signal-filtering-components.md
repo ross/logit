@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-10-16
+updated: 2026-10-18
 ---
 
 # Signal filtering is two transform components, not a sink field
@@ -9,7 +9,7 @@ updated: 2026-10-16
 Accepted
 
 ## Context
-`docs/plans/otlp-logs-and-resource-identity.md`'s workstream E found that `otlp_out` has no way to
+Checking `otlp_out` against Loki found that it has no way to
 say "logs only" (or metrics-only, or traces-only) at the sink — it sends whatever signals a batch's
 events happen to carry. This is more than a demo inconvenience: `demo/logit.yaml`'s `trace_out`
 (Tempo, a traces-only OTLP receiver) is fed from `internal`, whose drains also carry this process's

@@ -2945,9 +2945,9 @@ sketch whose `tags` list holds more than 100 strings, so `datadog_out` drops it 
 **A disk buffer can't deliver an outage's metrics late.** A `buffer.disk:` on this sink holds
 batches through a Datadog outage, but on replay, the metrics that aged past 1 hour and the logs
 past 18 hours are dropped as stale, not sent. The metrics window is Datadog's documented one, and
-stricter than the intake; the
-[Datadog plan's "Timestamp windows" section](plans/datadog-relay.md#11-timestamp-windows-w5) has
-what a trial org stored. Watch `records.dropped{reason="stale"}` after a replay to see how much.
+stricter than the intake;
+[ADR `datadog-agent-and-intake-relay`'s "Timestamp windows and what a `202` drops"](adr/datadog-agent-and-intake-relay.md#timestamp-windows-and-what-a-202-drops)
+has what a trial org stored. Watch `records.dropped{reason="stale"}` after a replay to see how much.
 
 **Traces must have been through an Agent.** Datadog's trace intake expects spans an Agent has
 normalized, obfuscated, and marked, with the Agent's APM stats sent beside them. `datadog_out`
@@ -3765,9 +3765,8 @@ There's no VictoriaMetrics-specific component. All three products ingest standar
 existing components speak, and each row below was checked against VictoriaMetrics and vmagent
 v1.152.0, VictoriaLogs v1.52.0, and VictoriaTraces v0.11.1 by `script/victoria-interop`
 ([`tools/victoria-interop/README.md`](../tools/victoria-interop/README.md)).
-[ADR `victoriametrics-interop`](adr/victoriametrics-interop.md) records why, and
-[`docs/plans/victoriametrics-interop.md`](plans/victoriametrics-interop.md)'s "Findings" section
-has what each check showed. The default ports are VictoriaMetrics `:8428`, VictoriaLogs `:9428`,
+[ADR `victoriametrics-interop`](adr/victoriametrics-interop.md) records why, and that README's
+"Recorded run" section has what each check showed. The default ports are VictoriaMetrics `:8428`, VictoriaLogs `:9428`,
 and VictoriaTraces `:10428`.
 
 | Surface | Component | Configuration | What to know |

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -48,7 +48,6 @@ None says what `logit` aims for, so behavior follows from defaults nobody chose:
 - **"Lossless" has two meanings.** [ADR `lossless-transit`](lossless-transit.md) uses it for field
   fidelity. `docs/OVERVIEW.md`'s "lossless transport between nodes" reads as a delivery claim.
 
-[`docs/plans/delivery-semantics.md`](../plans/delivery-semantics.md) is the workstream breakdown.
 This record changes no code.
 
 ## Decision
@@ -354,9 +353,8 @@ bounded resends a sink may make inside one attempt. This record adds none.
 
 ## Consequences
 
-Each of these is a workstream in
-[`docs/plans/delivery-semantics.md`](../plans/delivery-semantics.md). Until it lands, the gap is
-an entry in [`docs/known-gaps/README.md`](../known-gaps/README.md).
+Until each is built, the gap is an entry in
+[`docs/known-gaps/README.md`](../known-gaps/README.md).
 
 - `Output::duplicate_safe()` goes away, `at_least_once` becomes the runtime's default posture,
   and nine sinks change default: `otlp_out`, `splunk_hec_out`, `datadog_out`,

@@ -4,7 +4,7 @@
 # discards. docs/design/data-shapes.md §5.3 measured pino-http at 9 attributes with 4 nested maps;
 # §6 names nested maps as the thing that multiplies whatever inline capacity is chosen, since every
 # `Value::Map` pays the full inline footprint again. Scenario table:
-# docs/plans/load-test-harness.md, "Scenarios"; first run: docs/design/performance.md §8.
+# docs/design/performance.md, "Scenarios"; first run: its §8.
 #
 #   script/perf run --scenario json-parse-nested-log
 #

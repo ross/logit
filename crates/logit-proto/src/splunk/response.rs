@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 /// The largest request body, before compression, that Splunk Cloud Platform is known to accept:
 /// 5 MiB. A 10.5.2605.9 trial stack indexed a 5,242,881-byte body and answered one of 6,000,000
 /// bytes with `400` `{"text":"Invalid data format","code":6,"invalid-event-number":0}`, not
-/// `413` (`docs/plans/splunk-relay.md`, "Settled by the Cloud run (2026-09-26)", item 6). Splunk
+/// `413` (ADR `splunk-hec-relay`, "Splunk Cloud Platform 10.5.2605.9 (2026-09-26)", item 6). Splunk
 /// Enterprise 10.4.3's `max_content_length` is 838,860,800 bytes, so the cap is Cloud's alone.
 pub const SPLUNK_CLOUD_BODY_CAP: usize = 5 * 1024 * 1024;
 
@@ -57,7 +57,7 @@ impl HecStatus {
     // Codes 18 through 27: the codes and HTTP statuses are Splunk's documented ones; each `text`
     // is the best reading of Splunk's documentation. No run against a real Splunk has provoked
     // one, so the texts are unverified (ADR `splunk-hec-relay`, "Amendment: what W5's recorded
-    // traffic and the Splunk run settled"; `docs/plans/splunk-relay.md`, "Settled by W5"), as are
+    // traffic and the Splunk run settled", and "Splunk Enterprise 10.4.3 (2026-09-25)"), as are
     // 21, 22, 24, and 25, from Splunk's "Troubleshoot HTTP Event Collector" table.
     pub const UNHEALTHY_QUEUES_FULL: HecStatus =
         HecStatus { code: 18, http: 503, text: "HEC is unhealthy, queues are full" };
@@ -88,7 +88,7 @@ impl HecStatus {
         HecStatus { code: 27, http: 429, text: "Performance limit reached" };
     /// Splunk Cloud Platform's answer to a request without a channel on a `useACK` token, where
     /// Splunk Enterprise answers code 10. The text is verbatim from Splunk Cloud 10.5.2605.9
-    /// (`docs/plans/splunk-relay.md`, "Settled by the Cloud run (2026-09-26)").
+    /// (ADR `splunk-hec-relay`, "Splunk Cloud Platform 10.5.2605.9 (2026-09-26)").
     pub const CHANNEL_MISSING_STICKY_LB: HecStatus = HecStatus {
         code: 28,
         http: 400,

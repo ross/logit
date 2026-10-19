@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # Attribute filtering is two transform components, and a bounded matcher is not a predicate language
@@ -18,7 +18,7 @@ connections" into ordinary composition: tag each branch with `set` (`docs/adr/
 operator-declared-resource-attributes.md`), then merge them into one `logit_out`. The native wire
 format preserves both an event's own attributes and the batch's `Resource` end to end, one frame
 per batch -- batches are never merged in flight, so each branch's tag survives the hop intact
-(`docs/plans/native-transport.md`).
+([ADR `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md)).
 
 What has no spelling is the far side. Graph fan-out is *unconditional*: every consumer of a
 component receives every batch it produces (`docs/design/pipeline-graph.md`'s runtime model), so

@@ -2,8 +2,8 @@
 //! sending half of the `splunk_hec_in -> splunk_hec_out` pair under
 //! [ADR `lossless-transit`](../../../docs/adr/lossless-transit.md)
 //! ([ADR `splunk-hec-relay`](../../../docs/adr/splunk-hec-relay.md), decisions 2, 5, 10, 17, and
-//! 18; [`docs/plans/splunk-relay.md`](../../../docs/plans/splunk-relay.md) §2, §4, §5). Every
-//! object comes from [`SplunkEncoder::encode_objects`], whose module doc holds the mappings; this
+//! 18). Every object comes from [`SplunkEncoder::encode_objects`], whose module doc holds the
+//! mappings; this
 //! module owns HTTP: how objects are cut into requests, what a response means, and
 //! acknowledgment.
 //!
@@ -65,15 +65,15 @@
 //! name one object. The code decides where Splunk's table gives one; the status decides
 //! otherwise ([`crate::http::classify_status`]). HEC is [the code table][hec-codes] in Splunk's
 //! "Troubleshoot HTTP Event Collector"; what Splunk does around a code that the table doesn't say
-//! is from the runs in `docs/plans/splunk-relay.md`.
+//! is from the runs in ADR `splunk-hec-relay`'s "Verified destination behavior".
 //!
 //! | Response | Class | Why | Evidence |
 //! |---|---|---|---|
 //! | `2xx` code 0 (or 24, 25: taken, with a capacity warning) | `Ok` (then acknowledgment, below, under `ack: true`) | taken | [HEC codes][hec-codes] |
 //! | `401` or `403` (codes 1 to 4), or any status with code 21 or 22 (the `400` twins of 4 and 1) | `Refused`, with a throttled `token_rejected` diagnostic | a disabled, missing, or invalid token: every request carries it | [HEC codes][hec-codes] |
-//! | `400` code 10 or 28 (no channel), 11 (invalid channel), or 16 (query-string authorization off) | `Refused`, with a throttled `request_refused` diagnostic | every request carries the same channel header and authorization, so every request gets the same answer: a code 10 or 28 means something between the sink and Splunk stripped the channel, since the sink always sends one | [HEC codes][hec-codes], `docs/plans/splunk-relay.md`, "Settled by the Cloud run (2026-09-26)" |
-//! | `400` code 6, 7 (incorrect index), 12, 13 (event field required, or blank), or 15 (indexed fields) naming an object of the body (`invalid-event-number` in range), except the row below | `Rejected` for that object: dropped, counted `records.dropped{reason="invalid_event"}` with a throttled `invalid_event` diagnostic, and the rest resent once ([`after_invalid_event`]); a second such answer is `Rejected` for the batch | Splunk indexes the objects before the bad one and none from it on; a code 7 names the object after the one with the bad index. A code 7 is read as the object's, not the sink's config: the index comes from the batch's `com.splunk.index`, which a relay carries from its sender, so holding on it would wedge the sink on one stray index | [HEC codes][hec-codes], `docs/plans/splunk-relay.md`, "Settled by W5 (2026-09-25)", `tools/splunk-interop/README.md` |
-//! | `400` code 6 naming object 0 of a body over [`SPLUNK_CLOUD_BODY_CAP`] before compression | `Rejected` for its size: a body of several objects is split in two and each half sent, with a throttled `oversize` diagnostic; a half answered so again is `Rejected`. A body of one object is dropped, counted `records.dropped{reason="oversize"}` | Splunk Cloud's answer to an oversize body | `docs/plans/splunk-relay.md`, "Settled by the Cloud run (2026-09-26)" |
+//! | `400` code 10 or 28 (no channel), 11 (invalid channel), or 16 (query-string authorization off) | `Refused`, with a throttled `request_refused` diagnostic | every request carries the same channel header and authorization, so every request gets the same answer: a code 10 or 28 means something between the sink and Splunk stripped the channel, since the sink always sends one | [HEC codes][hec-codes], ADR `splunk-hec-relay`, "Splunk Cloud Platform 10.5.2605.9 (2026-09-26)" |
+//! | `400` code 6, 7 (incorrect index), 12, 13 (event field required, or blank), or 15 (indexed fields) naming an object of the body (`invalid-event-number` in range), except the row below | `Rejected` for that object: dropped, counted `records.dropped{reason="invalid_event"}` with a throttled `invalid_event` diagnostic, and the rest resent once ([`after_invalid_event`]); a second such answer is `Rejected` for the batch | Splunk indexes the objects before the bad one and none from it on; a code 7 names the object after the one with the bad index. A code 7 is read as the object's, not the sink's config: the index comes from the batch's `com.splunk.index`, which a relay carries from its sender, so holding on it would wedge the sink on one stray index | [HEC codes][hec-codes], ADR `splunk-hec-relay`, "Splunk Enterprise 10.4.3 (2026-09-25)", `tools/splunk-interop/README.md` |
+//! | `400` code 6 naming object 0 of a body over [`SPLUNK_CLOUD_BODY_CAP`] before compression | `Rejected` for its size: a body of several objects is split in two and each half sent, with a throttled `oversize` diagnostic; a half answered so again is `Rejected`. A body of one object is dropped, counted `records.dropped{reason="oversize"}` | Splunk Cloud's answer to an oversize body | ADR `splunk-hec-relay`, "Splunk Cloud Platform 10.5.2605.9 (2026-09-26)" |
 //! | `429` (codes 26, 27), or `503` code 9 or with no HEC body, before any `/event` request of this `send` was accepted | `Clean` | Splunk didn't take the body: its queue or ack channel is full, or it's busy ([`is_busy`]) | [HEC codes][hec-codes] |
 //! | the same after one was | `Ambiguous` | Splunk holds part of the batch ([`after_delivery`]) | -- |
 //! | `500` code 8, `503` codes 18 to 20 and 23, `408`, any other `5xx`, `501` included | `Ambiguous` | may have indexed: code 8 says nothing either way, and 18 to 20 and 23 are `/health` and shutdown answers Splunk doesn't document on `/event` | [HEC codes][hec-codes] |
@@ -285,8 +285,8 @@ fn split_point(objects: &[Object<'_>]) -> usize {
 /// to send again, or `None` when `n` names no object of the body. The bad object is `n`, except
 /// under code 7, whose `n` is the object after the one with the bad index. Splunk indexes every
 /// object before the bad one and none from it on, which it doesn't document
-/// (`docs/plans/splunk-relay.md`, "Settled by W5" item 8), and `splunk_hec_in` delivers the same
-/// prefix. This function is the one place that rule lives.
+/// (ADR `splunk-hec-relay`, "Splunk Enterprise 10.4.3 (2026-09-25)" item 8), and `splunk_hec_in`
+/// delivers the same prefix. This function is the one place that rule lives.
 fn after_invalid_event(objects: usize, code: u16, n: u64) -> Option<(usize, Range<usize>)> {
     let n = if code == 7 { n.checked_sub(1)? } else { n };
     let n = usize::try_from(n).ok().filter(|&n| n < objects)?;

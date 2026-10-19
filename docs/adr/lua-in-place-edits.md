@@ -1,6 +1,6 @@
 ---
 created: 2026-10-16
-updated: 2026-10-16
+updated: 2026-10-18
 ---
 
 # Lua in-place edits: writable log fields, `= nil` deletes an attribute, and `pairs` enumerates a proxy
@@ -22,7 +22,6 @@ event proxy:
 - No proxy can be enumerated. `mlua::MetaMethod::Pairs` needs Lua 5.2, and the build uses mlua's
   `luajit` feature.
 
-The [plan](../plans/lua-in-place-edits.md) has the workstreams.
 
 ## Decision
 A script edits an event in place: the three log fields are writable, assigning `nil` to an

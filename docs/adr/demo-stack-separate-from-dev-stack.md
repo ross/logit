@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-09-01
+updated: 2026-10-18
 ---
 
 # A separate demo stack, not an extension of the dev stack
@@ -9,7 +9,7 @@ updated: 2026-09-01
 Accepted
 
 ## Context
-`docs/plans/demo-stack.md` builds a "clone and `docker compose up`" path for someone with no
+The demo stack is a "clone and `docker compose up`" path for someone with no
 Rust toolchain and no familiarity with this repo to see `logit` work. The existing root
 `compose.yaml` already runs InfluxDB and Grafana, seeded and provisioned — extending it to also
 run Loki, Tempo, a synthetic traffic source, and `logit` itself was the obvious-looking option.
@@ -65,8 +65,8 @@ it requires nothing this repo provides beyond the compose file itself.
   `docs/deploying.md`) — several minutes before anything appears. Publishing an image to a
   registry would fix this and is a natural follow-up, out of scope here.
 - `fixtures/nginx/` remains real and runnable for the dev stack's sake even though it is no longer
-  anyone's onboarding path — see `docs/plans/demo-stack.md` workstream E for why deleting it
-  isn't free.
+  anyone's onboarding path, because the root `compose.yaml`'s `nginx` service and
+  `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE` provenance depend on it.
 - Reusing the release image for a second purpose (`logit graph`, in `graph-dot`) works only
   because the `logit` service is given an explicit `image: logit-demo:latest` tag rather than
   Compose's derived `<project>-logit` default — a second `build:` block for the identical image

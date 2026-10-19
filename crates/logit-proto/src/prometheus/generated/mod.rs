@@ -55,9 +55,7 @@ pub mod io {
 #[cfg(test)]
 mod tests {
     // Remote-write's body is Snappy **block** (not framed) compressed protobuf
-    // (docs/plans/prometheus-remote-write.md) -- `snap` isn't wired into a codec yet (that's W2's
-    // `remote_write.rs`), so this sanity-checks the dependency round-trips before anything depends
-    // on it.
+    // (docs/adr/prometheus-remote-write.md); this checks the dependency round-trips.
     #[test]
     fn snap_block_round_trip() {
         use prost::Message;

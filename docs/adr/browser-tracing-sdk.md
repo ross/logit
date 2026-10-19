@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-23
+updated: 2026-10-18
 ---
 
 # Browser tracing: the real OTel-JS SDK, `addLink` for sub-resources, and living with document-load's parent (not link) behaviour
@@ -10,13 +10,30 @@ Accepted
 
 ## Context
 
-[browser-tracing.md](../plans/browser-tracing.md) laid out two shapes for extending the demo's
-already-correlated server-side trace into the browser -- a hand-rolled beacon script, or the real
-`@opentelemetry/sdk-trace-web` SDK -- and left the SDK route blocked on `otlp_in` accepting
-OTLP/JSON. [ADR `otlp-json-decoding`](otlp-json-decoding.md) closed that blocker. This ADR is the
-follow-on: implementing the SDK route (`demo/app/browser/telemetry.js`, bundled by a new `esbuild`
-stage in `demo/app/Dockerfile`), and settling three things `browser-tracing.md` explicitly left
-open pending empirical verification against the pinned package versions.
+The demo's HAProxy mints a W3C `traceparent` that flows through nginx and the app. Extending that
+trace into the browser had two shapes: a hand-rolled beacon script, or the real
+`@opentelemetry/sdk-trace-web` SDK. The SDK route was blocked on `otlp_in` accepting OTLP/JSON,
+because OpenTelemetry's browser exporters emit JSON and `@opentelemetry/exporter-trace-otlp-proto`
+is Node-only. [ADR `otlp-json-decoding`](otlp-json-decoding.md) closed that blocker. This ADR
+implements the SDK route (`demo/app/browser/telemetry.js`, bundled by a new `esbuild` stage in
+`demo/app/Dockerfile`) and settles three questions that needed verification against the pinned
+package versions.
+
+Background that shapes the design:
+
+- **The initial HTML request can't carry a `traceparent`**, because no script runs before the
+  browser asks for the document. The server hands its context back in a
+  `<meta name="traceparent">` tag that `@opentelemetry/instrumentation-document-load` reads.
+- **Sub-resources get a fresh trace id from HAProxy**, because a `<script src>` or `<img>` request
+  can't carry an outbound `traceparent` either. HAProxy's
+  `Server-Timing: traceparent;desc="00-<trace>-<span>-01"` response header is the stitch: it's
+  exposed to JS as `PerformanceResourceTiming.serverTiming`, and `Timing-Allow-Origin: *` makes
+  that entry readable. The instrumentation doesn't read `Server-Timing` itself. Upstream is
+  standardizing the header in
+  [opentelemetry-specification#3811](https://github.com/open-telemetry/opentelemetry-specification/issues/3811).
+- **Export is same-origin.** The browser posts to `/v1/traces` on HAProxy's own origin, and HAProxy
+  routes that path to `logit:4318`, so no CORS preflight happens. This stays necessary because
+  `otlp_in` answers `OPTIONS` with `404` (`docs/known-gaps/otlp.md`).
 
 ## Decision
 
@@ -35,7 +52,7 @@ assumed:
    PerformanceResourceTiming)`** -- confirmed against
    `instrumentation-document-load@0.67.0`'s `_addCustomAttributesOnResourceSpan`. Used to read
    `resource.serverTiming` for the traceparent HAProxy stamped on that sub-resource's response
-   (`demo/haproxy/haproxy.cfg`'s `Server-Timing` header, "Foundation for browser-tracing.md") and
+   (`demo/haproxy/haproxy.cfg`'s `Server-Timing` header) and
    turn it into a span link to the exact `haproxy_trace`/`nginx_trace`-minted span that served it.
 
 2. **`Span.addLink()` is real and used, not the attribute fallback.** Confirmed present on
@@ -48,7 +65,7 @@ assumed:
    confirmed to exist by querying Tempo directly for it.
 
 3. **`documentLoad` is a CHILD of the server span, not linked to it -- contradicting this repo's own
-   prior (spec-correct) expectation.** `browser-tracing.md` argued the causal edge should be a
+   prior (spec-correct) expectation.** The expectation was that the causal edge should be a
    link, since the server's own span has already ended by the time the browser can report
    anything. Checked directly against `instrumentation-document-load@0.67.0`'s
    `_collectPerformance`: it does
@@ -74,8 +91,11 @@ one `fetch()` call (`/work`, same-origin through HAProxy) doesn't need it.
 
 ## Alternatives considered
 
-- **The beacon script** (`browser-tracing.md`'s cheaper alternative). Rejected per that document's
-  own updated recommendation: the blocker that originally motivated it is closed, and a demo whose
+- **The beacon script**, the cheaper alternative: a small script that reads
+  `PerformanceNavigationTiming`/`PerformanceResourceTiming` plus the `<meta>` traceparent and posts
+  a JSON beacon to an app endpoint, which logs it as a correlated line. It needs no bundler and no
+  `logit` change, but delivers correlated logs, not client-side spans. Rejected: the blocker that
+  originally motivated it is closed, and a demo whose
   purpose is showing OTel end-to-end should show the real SDK, not a hand-rolled substitute.
 - **Forcing `documentLoad` into a link** by bypassing `instrumentation-document-load`'s own
   traceparent handling (e.g. disabling it and manually creating the root span with `links:` at
@@ -86,7 +106,7 @@ one `fetch()` call (`/work`, same-origin through HAProxy) doesn't need it.
   path that drifts further from what a real integration looks like.
 - **webpack/rollup/vite** instead of `esbuild` for the bundler. Rejected: `esbuild` is a single
   static Go binary with no further transitive npm tooling, matching this demo's general bias
-  toward the smallest thing that actually does the job (`browser-tracing.md` assumed it too).
+  toward the smallest thing that does the job.
 
 ## Consequences
 
@@ -96,6 +116,6 @@ one `fetch()` call (`/work`, same-origin through HAProxy) doesn't need it.
   `instrumentation-document-load` ships it that way -- a future upstream change (or a documented
   workaround) could flip this; nothing in this repo depends on it being a link today.
 - `resourceFetch` spans for anything logit-fronted (the bundle itself, the two SVGs) carry a real,
-  followable link into a different trace -- the mechanism `browser-tracing.md` called this
-  workstream's most interesting trick, now real and verified against a running Tempo rather than
+  followable link into a different trace -- the mechanism designed
+  for this work, now real and verified against a running Tempo rather than
   only designed.

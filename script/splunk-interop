@@ -2,7 +2,7 @@
 # Usage: script/splunk-interop
 #
 # Runs every leg of tools/splunk-interop/ against a real Splunk Enterprise container, then probes
-# that Splunk directly for what docs/plans/splunk-relay.md left unverified, and prints one pass,
+# that Splunk directly for HEC behavior Splunk doesn't document, and prints one pass,
 # gap, or fail row per leg and one row per probe. See tools/splunk-interop/README.md for what it
 # runs and what it writes.
 #

@@ -1,6 +1,6 @@
 //! Splunk's HTTP Event Collector (HEC): the codec behind `splunk_hec_in` and `splunk_hec_out`
-//! ([ADR `splunk-hec-relay`](../../../../docs/adr/splunk-hec-relay.md),
-//! [`docs/plans/splunk-relay.md`](../../../../docs/plans/splunk-relay.md)). This doc is the
+//! ([ADR `splunk-hec-relay`](../../../../docs/adr/splunk-hec-relay.md), whose "Verified
+//! destination behavior" is the protocol survey). This doc is the
 //! canonical mapping table and permitted-normalization list; the submodules hold one signal each
 //! ([`logs`], [`metrics`], [`spans`]), the timestamp rule ([`time`]), and the response bodies
 //! ([`response`]).

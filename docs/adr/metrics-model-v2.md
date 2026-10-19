@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-13
+updated: 2026-10-18
 ---
 
 # Metrics model v2: `Sum` replaces `Counter`, raw/summarized pairs, boxed span fidelity, batch-level `Scope`
@@ -15,8 +15,9 @@ like-protocol pair and names the concrete gap: `MetricKind`, `MetricRecord`, `Lo
 `SpanRecord`, and `EventBatch` can't represent fields OTLP, statsd, and syslog all carry today —
 aggregation temporality, monotonicity, raw (unsummarized) statsd samples and set members, a metric's
 start time/description/exemplars, a log's `event_name`/`observed_timestamp`, a span's `flags`/
-`trace_state`/status message, and the batch-level OTLP instrumentation scope. `docs/plans/lossless-transit.md`
-(W0) surveyed the gap field by field and proposed a target model; this ADR is workstream W1 landing
+`trace_state`/status message, and the batch-level OTLP instrumentation scope. A field-by-field
+survey of the gap proposed a target model
+([ADR `lossless-transit`](lossless-transit.md)'s "Realization" records what landed); this ADR lands
 that model plus the native wire codec reshape it forces, and it records the concrete shape decisions
 — each one specific enough that "was this followed?" has a yes/no answer, per this project's own ADR
 convention.
@@ -164,8 +165,7 @@ are unchanged. See [ADR `typed-metric-scalar`](typed-metric-scalar.md).
   `otel.scope.version` riding as ordinary event attributes means every event on a batch repeats the
   same two strings, and — more importantly — decoding scope into attributes and re-encoding a
   hardcoded `{name: "logit", version: CARGO_PKG_VERSION}` scope on every `otlp_out` batch is a real
-  identity loss, not a permitted regroup (`docs/plans/lossless-transit.md`'s assessment section
-  named this explicitly). A batch-level field is the only representation that survives a decode/
+  identity loss, not a permitted regroup. A batch-level field is the only representation that survives a decode/
   re-encode round trip without inventing a scope that was never there.
 - **Positional wire field additions instead of TLV framing**, i.e. keep appending new fixed-offset
   fields to each record's existing layout. Rejected: a positional layout has no way to skip a field
@@ -222,7 +222,7 @@ are unchanged. See [ADR `typed-metric-scalar`](typed-metric-scalar.md).
   **`otel.scope.*` and `otel.status_message` are retired in W4**, not this PR — `otlp_in`/`otlp_out`
   still stamp/read those attributes today, since `EventBatch.scope`/`SpanExt.status_message` don't
   have real producers on the OTLP side yet.
-- **Follow-on workstreams, per [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md):**
+- **Follow-on workstreams:**
   W2 (`aggregate` sketches `Samples`→`Distribution`/unions `SetMembers`→`Set`, wiring a real
   `HyperLogLog`), W3 (statsd produces `Samples`/`SetMembers`, `|c:`/`|T`, sample-rate retention on
   timers), W4 (the rest of the OTLP mapping this PR deferred), W7 (expose the new fields through the
@@ -241,8 +241,7 @@ are unchanged. See [ADR `typed-metric-scalar`](typed-metric-scalar.md).
   `SpanExt.status_message` are real producers on both sides of the OTLP codec now, and neither
   attribute is stamped or read anywhere in the codec any more.
 - **(2026-09-11) W2 landed, closing this ADR's own "pass-through... until W2/W3/W4" qualification
-  for `HyperLogLog`/`Set`.** [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W2
-  gave `HyperLogLog` (`crates/logit-core/src/metric.rs`) a real implementation, wrapping
+  for `HyperLogLog`/`Set`.** W2 gave `HyperLogLog` (`crates/logit-core/src/metric.rs`) a real implementation, wrapping
   `cardinality_estimator::CardinalityEstimator<[u8]>` (the `cardinality-estimator` crate, pinned at
   `1.0.3`, permitted by `deny.toml`'s license allowlist) instead of the "still a unit-payload stub"
   this ADR's Decision section described above. `HyperLogLog::to_bytes`/`from_bytes` hand-roll a
@@ -269,7 +268,7 @@ are unchanged. See [ADR `typed-metric-scalar`](typed-metric-scalar.md).
   aggregation-window-semantics.md`'s own amendment for `aggregate`'s side of W2 (the `distributions`/
   `sets` modes, their caps, and the fallback-and-count rule).
 - **(2026-09-12) W3 landed, giving `Samples`/`SetMembers` their first producer.**
-  [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W3 gave the two raw variants
+  W3 gave the two raw variants
   this ADR introduced their first real producer and consumer: `statsd_in`'s decoder (now
   `crates/logit-proto/src/statsd/`) decodes `ms`/`h`/`d`/`s` lines straight to
   `MetricKind::Samples`/`SetMembers` — no sketching, no sample-rate extrapolation, at decode

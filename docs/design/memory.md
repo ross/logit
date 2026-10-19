@@ -171,8 +171,8 @@ it would with the sketch boxed. Picking a number needs real per-event metric cou
 synthetic fixtures. See §8 item 13.
 
 **What a spill costs is measured, not inferred** (`attr_map_spills_to_double_its_inline_
-capacity_then_reallocs`, `crates/logit-bench/tests/allocations.rs`; `docs/plans/event-sizing.md`'s
-W1), instead of resting on smallvec 1.x's documented amortized doubling. Building a map one sorted
+capacity_then_reallocs`, `crates/logit-bench/tests/allocations.rs`; [ADR
+`event-sizing-and-allocation-strategy`](../adr/event-sizing-and-allocation-strategy.md)), instead of resting on smallvec 1.x's documented amortized doubling. Building a map one sorted
 `insert` at a time:
 
 | Attributes | allocs | reallocs | heap bytes | capacity |
@@ -800,7 +800,7 @@ current behavior.
 
 The native format is a hop between processes, not a stage in the reference pipeline, so it gets its
 own table. `NativeEncoder`/`NativeDecoder` write and read the bare batch, the file format.
-`logit_out`/`logit_in` (`docs/plans/native-transport.md`) carry the hop batch, the bare batch
+`logit_out`/`logit_in` ([ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)) carry the hop batch, the bare batch
 behind a sender-pair prefix and ahead of a trailer of provenance and a trace-context field: `logit_out` calls `encode_hop_batch` and
 `write_frame_with_flags` directly, to frame with whatever compression the connection negotiated;
 `logit_in` calls `decode_hop_batch` directly, since `Fanout::send` takes the `EventBatch` it
@@ -814,7 +814,8 @@ returns. (The disk buffer's encode cost is §2's `disk_queue` row.) One event
 | `NativeDecoder::decode_into`, 1 event | **7** | the decoded `Vec<Event>` is moved into the caller's empty `Vec`, not copied, so this matches `logit_in` below; dictionary re-intern + `AttrMap`/`Event` construction; no intermediate object graph, unlike the bake-off's `rkyv`/`postcard` arms, which run through a `WireBatch` mirror first (`docs/adr/native-wire-format-encoding.md`'s finding 4) |
 | `logit_in`: read + decode, 1 event | **7** | `read_frame_with_header` + `decode_hop_batch` directly, with a provenance, a trace-context field, and a sender pair: the trailer's strings intern to symbols already held, so it costs what `decode_batch` does; the decoded batch's own freshly allocated `Vec` is what `Fanout::send` takes as-is |
 
-The same pair over the six survey-derived shapes (`docs/plans/event-sizing.md` W1), one event per
+The same pair over the six survey-derived shapes ([ADR
+`event-sizing-and-allocation-strategy`](../adr/event-sizing-and-allocation-strategy.md)), one event per
 batch except the last:
 
 | Shape | encode | decode | Notes |
@@ -1151,7 +1152,7 @@ It is an admission-control estimate, not allocator accounting, so unlike §1's n
 deliberately *not* asserted exactly: a `MetricKind::Distribution`'s `DDSketch` is a fixed constant
 instead of a bin-by-bin walk, and `Value`'s inline numeric/bool/null variants contribute nothing.
 Every sink's in-memory queue (`crates/logit-pipeline/src/queue.rs`,
-`docs/adr/buffered-sink-delivery.md`, `docs/plans/buffered-sink-delivery.md`) bounds itself on
+`docs/adr/buffered-sink-delivery.md`) bounds itself on
 batch count and this estimate, whichever trips first.
 
 A sink opted into `buffer.disk:` (`docs/adr/disk-backed-sink-buffer.md`) bounds on-disk bytes
@@ -1292,8 +1293,9 @@ timings, so the two layers cross-check each other.
 **`crates/logit-bench/benches/size_vs_alloc.rs`** answers what the three layers above can't: *what
 does an allocation cost, against what the bytes it saves cost?*
 [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md)
-assumes that ratio without measuring it; [`event-sizing.md`](../plans/event-sizing.md)'s W2 is the
-measurement. It isolates a jemalloc alloc/free pair at the sizes `AttrMap`'s growth ladder asks for,
+assumes that ratio without measuring it; [ADR
+`event-sizing-and-allocation-strategy`](../adr/event-sizing-and-allocation-strategy.md)'s
+"Bake-off arms and instruments" describes the measurement. It isolates a jemalloc alloc/free pair at the sizes `AttrMap`'s growth ladder asks for,
 same-thread and **cross-thread** (a spilled buffer is built on a listener or transform task and
 freed on a sink's); the 768→1536→3072 realloc ladder against one exact allocation; the O(k²) sorted
 build against append-then-sort; an `Event`-sized move and a 1000-event batch scan at every candidate
@@ -1305,7 +1307,7 @@ every request inside the timed region, which suits a bench whose output is a cou
 whose output is what a jemalloc call costs. So it reports no allocation column, which is fine since
 counts are allocator-independent and pinned in `allocations.rs`. Its numbers aren't recorded here:
 this document and [`performance.md`](performance.md) take recorded figures from the perf VM, and
-`event-sizing.md`'s W2 section names the commands that reproduce them there.
+that ADR's "Bake-off arms and instruments" section names the commands that reproduce them there.
 
 **Before adding a bench, know that divan's `AllocProfiler` only counts allocations on threads it
 controls.** Almost every bench calls decoders, transforms, and encoders **directly**, never touching
@@ -1368,8 +1370,8 @@ call after the first returns a `.clone()` of the same, already-promoted buffer, 
 zero-arg `-> Event` signature. Skipping this makes a transform's first touch of a message look like
 it costs an allocation it doesn't, in every measurement.
 
-**The six survey-derived shapes** (`crates/logit-bench/src/fixtures.rs`, added 2026-09-21 by
-[`docs/plans/event-sizing.md`](../plans/event-sizing.md)'s W1) are what
+**The six survey-derived shapes** (`crates/logit-bench/src/fixtures.rs`, added 2026-09-21 by the
+[event-sizing work](../adr/event-sizing-and-allocation-strategy.md)) are what
 [`data-shapes.md`](data-shapes.md) §7's follow-up 2 asked for. Its §6 found the existing fixtures
 held up better than their caveats suggested, but had nothing at the commonest measured log width,
 no nested record, and no span at the measured ceiling:
@@ -1521,7 +1523,8 @@ parsed structured logs at 9 and up with 100% of them past 8, spans across both),
 puts 17.7% of its events at 2–3 metrics and none higher. It decides nothing itself, and its §7 is
 explicit that none of it is production traffic.
 
-**So does a baseline.** [`docs/plans/event-sizing.md`](../plans/event-sizing.md)'s W1 added the six
+**So does a baseline.** The event-sizing work ([ADR
+`event-sizing-and-allocation-strategy`](../adr/event-sizing-and-allocation-strategy.md)) added the six
 shapes data-shapes.md §6 asked for, pinned their numbers (§2's `json`/`Event::clone`/native rows),
 and measured the growth ladder §1 used to infer. Two of those numbers shape how these items should
 be argued: a spilled `AttrMap` clones in **one** allocation whatever its width, so allocation count

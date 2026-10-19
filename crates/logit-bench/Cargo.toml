@@ -66,7 +66,7 @@ harness = false
 name = "size_vs_alloc"
 harness = false
 
-# The attribute-sizing arms (`docs/plans/event-sizing.md`). Installs jemalloc as
+# The attribute-sizing arms (`docs/adr/event-sizing-and-allocation-strategy.md`). Installs jemalloc as
 # `#[global_allocator]`, as `size_vs_alloc` does and for the same reason: they measure what a clone
 # and an allocation *cost*. The matching allocation counts live in `tests/attr_arms.rs`, which wraps
 # `System` instead.

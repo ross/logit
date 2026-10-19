@@ -604,7 +604,7 @@ fn generate_render_literal_100_events() {
 /// per event. The scratch `String` has already grown to its widest rendering, so it never
 /// reallocates (`logit_core::template::Compiled::render`, pinned by
 /// `rendering_into_a_cleared_scratch_string_reallocates_nothing`). Literal fields cost nothing.
-/// Each placeholder costs an allocation per event (`docs/plans/load-test-harness.md`).
+/// Each placeholder costs an allocation per event (`docs/adr/load-test-harness.md`).
 #[test]
 fn generate_render_templated_100_events() {
     let mut input = fixtures::generate_templated();
@@ -4146,11 +4146,11 @@ fn re_interning_an_existing_string_is_free() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// AttrMap growth (docs/plans/event-sizing.md)
+// AttrMap growth (docs/adr/event-sizing-and-allocation-strategy.md)
 // ---------------------------------------------------------------------------------------------
 
-/// `AttrMap`'s spill-and-grow ladder, which every sizing argument in `docs/plans/event-sizing.md`
-/// rests on. Per attribute count `k`, building one map a sorted `insert_sym` at a time:
+/// `AttrMap`'s spill-and-grow ladder, which every sizing argument in
+/// `docs/adr/event-sizing-and-allocation-strategy.md` rests on. Per attribute count `k`, building one map a sorted `insert_sym` at a time:
 ///
 /// | k | allocs | reallocs | heap bytes | capacity |
 /// |--:|--:|--:|--:|--:|
@@ -4204,7 +4204,8 @@ fn attr_map_spills_to_double_its_inline_capacity_then_reallocs() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Survey-derived shapes (docs/design/data-shapes.md, docs/plans/event-sizing.md)
+// Survey-derived shapes (docs/design/data-shapes.md,
+// docs/adr/event-sizing-and-allocation-strategy.md)
 // ---------------------------------------------------------------------------------------------
 //
 // The six shapes the data-shape survey measured. Each fixture's doc comment

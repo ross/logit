@@ -4,9 +4,10 @@ A self-contained stack for trying `logit`: no Rust toolchain, no `script/*`, and
 rest of this repo. Real traffic crosses a three-hop request path (haproxy → nginx → app) tied
 together by a W3C trace context, and `logit` carries the resulting logs, metrics, and traces into
 Loki, VictoriaMetrics, and Tempo, with a pre-built Grafana dashboard over all three.
-[docs/plans/demo-stack.md](../docs/plans/demo-stack.md) explains why the demo exists, and
-[docs/plans/demo-tracing-stack.md](../docs/plans/demo-tracing-stack.md) covers its tracing design
-and what's still to come.
+[ADR `demo-stack-separate-from-dev-stack`](../docs/adr/demo-stack-separate-from-dev-stack.md)
+explains why the demo exists apart from the dev stack, and
+[ADR `trace-context-span-lifting`](../docs/adr/trace-context-span-lifting.md) covers how the access
+log tiers become spans.
 
 **This is a demo, not a production example.** It shows a large portion of `logit`'s functionality
 in a way that's quick to spin up, and takes several shortcuts that don't belong in a real
@@ -62,7 +63,7 @@ These services are internal-only, reached through other services rather than pub
 host:
 
 - `nginx` and `app` (the landing-page app), reached through `haproxy`.
-- `postgres`, `app`'s own database (`docs/plans/demo-richer-traces.md`), reached only from
+- `postgres`, `app`'s own database, reached only from
   `app`/`worker` and from `logit`'s own `postgres_in`, which tails its jsonlog.
 - `redis` and `worker`: Celery's broker and the background worker process that consumes from it
   (same doc, workstream D).
@@ -111,8 +112,7 @@ context onto `LogRecord.trace`, parsing the `traceparent` header natively as wel
 well-known `trace.id`/`span.id`/`trace.flags` attributes each access line also carries
 (`../docs/design/data-model.md`'s "Well-known attribute names"). All three tiers then fan into a
 shared `stdout` (`stdio_out`) and, filtered down to logs only, a shared `loki_out` (`otlp_out`
-over HTTP straight to Loki, with no relay service in between,
-`../docs/plans/otlp-logs-and-resource-identity.md`).
+over HTTP straight to Loki, with no relay service in between).
 
 Each tier's `set` (or, for `app`'s spans, its own OTel resource) stamps a real
 `service.name`/`service.namespace` (`haproxy`/`nginx`/`demo-app`, all under `demo`), so Loki gets
@@ -203,8 +203,7 @@ two different Tempo receivers, not `logit`'s internal spans alone.
 ### Richer traces: `/work` and `/boom`
 
 Without them, every request would take the same chain with the same latency and the same `200`.
-Two routes on `app` exist purely to give the traces real shape
-(`docs/plans/demo-richer-traces.md`):
+Two routes on `app` exist purely to give the traces real shape:
 
 - `/work` sleeps a jittered amount and occasionally answers a real `503`.
 - `/boom` always fails with an uncaught exception, so its OTel span carries a real `exception`
@@ -227,8 +226,7 @@ guaranteed `500` on every cycle would swamp the dashboard's error panel.
 
 ### Postgres
 
-`/work` also writes to, and counts rows in, a real Postgres (`docs/plans/demo-richer-traces.md`'s
-workstream C) through `app`'s own `psycopg` driver. It's instrumented the same way `requests` is,
+`/work` also writes to, and counts rows in, a real Postgres through `app`'s own `psycopg` driver. It's instrumented the same way `requests` is,
 so every statement gets a real CLIENT span sent straight to Tempo, the app's usual path.
 
 Postgres's own log line for that statement still reaches Loki carrying the *same* trace id, with
@@ -248,7 +246,7 @@ It's checkpointed on the same `logit_state` volume `nginx_in` uses.
 
 ### Celery worker and Redis
 
-`/work`'s last step (`docs/plans/demo-richer-traces.md`'s workstream D) hands off to a real
+`/work`'s last step hands off to a real
 background worker over Redis rather than doing everything inline: `.delay()` enqueues a task and
 returns immediately, well before that task runs. `opentelemetry-instrumentation-celery` turns that
 into a real Celery PRODUCER span in `app` (parented to the request that called `.delay()`, like
@@ -324,11 +322,9 @@ different log format entirely.
 
 The real `@opentelemetry/sdk-trace-web` SDK runs on the landing page itself
 (`app/browser/telemetry.js`, bundled by an `esbuild` stage in `app/Dockerfile`, this demo's only
-client-side build step; see the "Quick start" note above). This closes out
-[docs/plans/browser-tracing.md](../docs/plans/browser-tracing.md)'s workstream C.
+client-side build step; see the "Quick start" note above).
 [ADR `browser-tracing-sdk`](../docs/adr/browser-tracing-sdk.md) has the implementation decisions,
-including two places the real SDK's behavior didn't match that plan's original, spec-derived
-expectations.
+including a place where the real SDK's behavior didn't match the spec-derived expectation.
 
 - A page load produces a `documentLoad` span, parented (confirmed empirically — not linked, see
   the ADR) to the request's own server span via a `<meta name="traceparent">` tag

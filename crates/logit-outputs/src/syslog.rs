@@ -3255,7 +3255,7 @@ mod tests {
         );
     }
 
-    // -- Pure-codec fixed point (`docs/plans/lossless-transit.md`'s "Tests") -------------------
+    // -- Pure-codec fixed point -----------------------------------------------------------------
     //
     // A small RFC 5424 grammar generator run through the real decoder and this encoder. For
     // every generated line: `decode(encode(decode(line))) == decode(line)` (receipt-time

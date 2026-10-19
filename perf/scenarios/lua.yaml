@@ -2,7 +2,7 @@
 # script logit-bench measures at the component level, null_out discards. Measures the cost of
 # crossing into the LuaJIT OS thread and back (the event proxy's field access and write, the round
 # trip through `ScriptWorker`) for a whole graph rather than one constructed event
-# (crates/logit-bench/benches/pipeline.rs). Scenario table: docs/plans/load-test-harness.md,
+# (crates/logit-bench/benches/pipeline.rs). Scenario table: docs/design/performance.md,
 # "Scenarios".
 #
 #   script/perf run --scenario lua

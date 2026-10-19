@@ -1,5 +1,5 @@
 """One trivial model, existing only to give `/work` (pages/views.py) a real write and a real
-count (`docs/plans/demo-richer-traces.md`).
+count.
 
 The schema doesn't matter. What matters is that `psycopg` issues a genuine `INSERT`/`SELECT`
 against Postgres, each producing its own driver-level CLIENT span

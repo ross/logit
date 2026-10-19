@@ -13,7 +13,7 @@
 #
 # Two taps only where there is a real chain to measure across. The syslog leg gets both: `set`
 # stamps a resource identity and `json` merges a JSON body's fields into attributes, the widening
-# docs/plans/data-shape-survey.md's "at two taps" row is after. Every other corpus is metrics or
+# docs/design/data-shapes.md's "Dimensions and their weight units" measures at two taps. Every other corpus is metrics or
 # OTLP, whose events arrive finished; a second tap there would measure an identity function
 # (tools/shape-survey/README.md, "The config pattern"). A corpus that grows a real chain later gets
 # its second tap then.

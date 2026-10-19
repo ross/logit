@@ -1,9 +1,9 @@
 # kafka-interop
 
 `script/kafka-interop` checks `kafka_out` against a real Apache Kafka and a real Redpanda. It runs
-the legs in [`docs/plans/kafka-output.md`](../../docs/plans/kafka-output.md)'s "Interop plan
-(W4)" against each broker, reads every topic back with the Java client and kcat, and prints one
-row per leg and broker. The plan's "Findings" section records what a run showed.
+the legs in [What it runs](#what-it-runs) against each broker, reads every topic back with the
+Java client and kcat, and prints one row per leg and broker. [Recorded runs](#recorded-runs)
+records what a run showed.
 
 The script runs on the host and drives docker (`$DOCKER`, `sudo docker` by default), like
 `script/victoria-interop` and `script/splunk-interop`. It isn't part of `script/cibuild`, and no
@@ -124,7 +124,7 @@ At 20 events a second nothing drops, and a drop would show as a missing item.
 7. Clears the netem rules and tears the project down (`down -v --remove-orphans`) on every
    exit.
 
-A row is `PASS` (the leg did what the plan expects), `GAP` (the broker differs from Apache Kafka
+A row is `PASS` (the leg did what the table above says it checks), `GAP` (the broker differs from Apache Kafka
 in a way [`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md) records), or `FAIL`. Only
 Redpanda's `timestamp` and OAUTHBEARER rows can read `GAP`; Apache Kafka is the reference, so any other outcome
 there is a `FAIL`. The script exits 1 on any `FAIL`.
@@ -154,6 +154,41 @@ A run writes `perf/results/kafka-interop/<timestamp>/` (gitignored, or under
 | `redpanda-oidc.txt` | `ok` once Redpanda took the OAUTHBEARER settings, else `failed` |
 | `exits.txt`, `timeline.log`, `netem.log` | each leg's exit code, the run's phases, and the qdiscs and filters each netem step set |
 | `provenance.txt`, `logs/<service>.log`, `tls/` | image digests and versions, every service's log, and the run's certificates |
+
+## Recorded runs
+
+### 2026-10-11: the core legs
+
+Against `apache/kafka:4.2.0` and `redpandadata/redpanda:v26.2.3`
+(`perf/results/kafka-interop/20261011T212530Z/`), before the SASL and OTLP legs existed: 21 of
+22 rows `PASS`, one `GAP`, no `FAIL`, and no `kafka_out` bug.
+
+| Leg | Apache Kafka 4.2.0 | Redpanda v26.2.3 |
+|---|---|---|
+| Partition parity | `PASS`: all 50 keys on the console producer's partition, 6 of 6 partitions used | `PASS`, the same |
+| Codecs `none`, `gzip`, `snappy`, `lz4`, `zstd` | `PASS` each: 100 records, each event once, in both the Java consumer and kcat; `kafka-dump-log.sh` shows all 10 stored batches under the named codec | `PASS` each: the same read-back; rpk shows all 100 records' batches under the named codec |
+| Idempotent dedup | `PASS`: 800 records for 800 events after one `Ambiguous` attempt; the non-idempotent control stored 10 duplicates | `PASS`, the same |
+| TLS, mutual TLS | `PASS`: 50 records each; with no client certificate, 0 records and only `clean` attempts | `PASS`, the same |
+| Timestamps | `PASS`: 90 of 100 records landed, the 10 stamped at 2100-01-01 dropped and counted as `invalid_timestamp` | `GAP`: 0 landed; Redpanda answers `INVALID_TIMESTAMP` naming no record, so each batch of 10 was rejected whole, counted as `rejected` |
+
+What the run showed:
+
+- **The codec rows read what the broker stored.** Forcing one leg's sink to `compression: none`
+  turns its `codec-zstd` row `FAIL` on both brokers.
+- **The dedup leg isn't vacuous.** During the 8 s drop the broker appended a batch whose response
+  never came. Both sinks timed out once (`Ambiguous`) and resent after the drop cleared. The
+  idempotent sink's resend carried its first attempt's sequence, and the broker discarded it; the
+  control sink's resend was appended again. With the netem drop skipped (`NETEM_FOR=0`), both
+  brokers' rows `FAIL`.
+- **Redpanda agrees with Kafka on every leg but one.** It places keyed records where the Java
+  partitioner does, takes all five codecs, deduplicates an idempotent resend, and enforces mutual
+  TLS. Like Kafka 4.x, it refuses a record more than an hour ahead
+  (`message.timestamp.after.max.ms`, 3,600,000 by default), but it fills no `record_errors`, so
+  `kafka_out` rejects the whole partition batch
+  ([`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md)).
+
+The `kafka-broker-restart` soak scenario's run is in
+[`docs/plans/soak-harness.md`](../../docs/plans/soak-harness.md)'s "Findings".
 
 ## Cleanup and a shared daemon
 

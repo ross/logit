@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-10-14
+updated: 2026-10-18
 ---
 
 # Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment
@@ -8,11 +8,12 @@ updated: 2026-10-14
 ## Status
 Accepted
 
-Realized as of 2026-09-25: the plan's W1 through W6 built the pair this record decides, and
-W5 verified it against four recorded HEC clients and Splunk Enterprise 10.4.3, and a later run
-checked it against Splunk Cloud Platform 10.5.2605.9; see
-[`docs/plans/splunk-relay.md`](../plans/splunk-relay.md)'s closing assessment for the proof and
-what stays open.
+Realized as of 2026-09-25: the pair this record decides is built, verified against four
+recorded HEC clients and Splunk Enterprise 10.4.3, and checked by a later run against Splunk
+Cloud Platform 10.5.2605.9. It relays losslessly modulo the permitted normalizations
+`crates/logit-proto/src/splunk/mod.rs` lists. [Verified destination
+behavior](#verified-destination-behavior) has the evidence, and
+[`docs/known-gaps/splunk.md`](../known-gaps/splunk.md) what stays open.
 
 ## Context
 
@@ -20,8 +21,8 @@ what stays open.
 reach Splunk Observability Cloud, but neither is what Splunk's own tooling speaks today: every
 third-party integration with Splunk Enterprise and Splunk Cloud Platform is a client of the HTTP
 Event Collector (HEC), a JSON-over-HTTPS listener on every indexer and heavy forwarder.
-[`docs/plans/splunk-relay.md`](../plans/splunk-relay.md) has the survey, the coverage table, and
-the workstreams; this record holds the decisions.
+[Verified destination behavior](#verified-destination-behavior) has the survey, and
+[`docs/splunk.md`](../splunk.md) the topologies; this record holds the decisions.
 
 Four facts from the survey drive the shape of the decision:
 
@@ -167,9 +168,10 @@ Four facts from the survey drive the shape of the decision:
 18. **A `400` code 6 drops one object and resends the rest, once.** When Splunk names
     `invalid-event-number: N`, the sink drops object `N` of that body (counted, with a
     diagnostic) and resends objects `N+1` onward, once; a second code 6 is permanent. This
-    assumes Splunk indexed the objects before `N`, which Splunk doesn't document: UNVERIFIED item
-    8 in the plan, and W5 settles it against a real Splunk. The rule sits behind one function so
-    W5 can change it without touching the rest of the sink.
+    assumes Splunk indexed the objects before `N`, which Splunk doesn't document; 10.4.3 confirmed
+    it ([Splunk Enterprise 10.4.3](#splunk-enterprise-1043-2026-09-25), item 8). The rule sits
+    behind one function, `after_invalid_event`, so it can change without touching the rest of the
+    sink.
 
 19. **Graph rules 69 and 70** validate the two kinds: 69 for `splunk_hec_in` (a non-empty
     `bind`, no empty or whitespace-padded token, a positive `max_request_bytes`), 70 for
@@ -245,6 +247,189 @@ Four facts from the survey drive the shape of the decision:
   so a client's retry duplicates the batches already delivered: the Datadog listener's trade-off,
   documented in W2's module doc.
 
+## Verified destination behavior
+
+What Splunk accepts and emits, surveyed on 2026-09-24 from `help.splunk.com`, the OpenTelemetry
+Collector contrib repository (`exporter/splunkhecexporter`, `receiver/splunkhecreceiver`,
+`pkg/translator/splunk`), Vector's reference docs, and the Splunk OTel Collector's default agent
+config. Four recorded HEC clients
+([`testdata/interop/splunk/`](../../testdata/interop/splunk/README.md)) and `script/splunk-interop`
+runs against Splunk Enterprise 10.4.3 and a Splunk Cloud Platform 10.5.2605.9 trial stack then
+checked it; [`tools/splunk-interop/README.md`](../../tools/splunk-interop/README.md)'s "What the
+run showed" holds the evidence, and the last two subsections list what each run settled.
+
+### What Splunk accepts over HEC
+
+HEC is an HTTPS listener on every indexer or heavy forwarder (`:8088` on Enterprise; on Splunk
+Cloud `https://http-inputs-<stack>.splunkcloud.com:443`, or `http-inputs.<stack>` on GCP and
+Azure stacks; a trial stack serves `https://<stack>.splunkcloud.com:8088` instead). Every
+third-party Splunk integration is a HEC client. The Platform has no native OTLP endpoint: the
+2026 announcements of OpenTelemetry log ingestion are about the Splunk OTel Collector
+distribution, whose default config sends logs to the Platform through the `splunk_hec` exporter.
+
+| Endpoint | Body and limits | Notes |
+|---|---|---|
+| `POST /services/collector/event` (also `/services/collector`, `/event/1.0`) | JSON envelope: `time` (epoch seconds, decimals allowed), `host`, `source`, `sourcetype`, `index`, `event` (any JSON), `fields` (a flat object; nesting is rejected). A batch is concatenated objects or a JSON array, each carrying its own metadata. Header `Authorization: Splunk <token>`. `Content-Encoding: gzip` accepted, and `deflate` answered `415` (10.4.3; the OTel exporter gzips every body and Vector offers gzip, zlib, zstd, and snappy) | `index` must be one the token allows. `fields` are indexed fields, searchable without extraction. `limits.conf [http_input] max_content_length` caps a request (1,000,000 bytes on old releases; 838,860,800, 800 MiB, on 10.4.3; which release changed it is still open); over it returns 413, except on Splunk Cloud, which answers code 6 naming object 0 |
+| `POST /services/collector/raw` | Raw bytes; metadata as query parameters (`host`, `source`, `sourcetype`, `index`); requires a channel GUID (`X-Splunk-Request-Channel` header or `?channel=`); line breaking follows the sourcetype's `props.conf` | What SC4S and the Docker driver's `raw` format use |
+| `POST /services/collector/ack` | `{"acks":[<ackId>…]}` → `{"acks":{"<ackId>":true|false}}` | Only with `useACK=true` on the token, which makes every `/event` and `/raw` POST return `{"text":"Success","code":0,"ackId":N}` (the key is `ackId`; ids count from 0 per channel) and require a channel (code 10 without one). `true` means replicated to the configured replication factor, not fully indexed. Splunk's docs say Splunk Cloud supports HEC acknowledgment only on its Kinesis Firehose path; the 10.5.2605.9 trial stack offered and honored it, and answers code 28 without a channel |
+| `GET /services/collector/health` | `{"text":"HEC is healthy","code":17}` | Also `/health/1.0`; the OTel exporter probes it at startup and can send heartbeats |
+| `POST /services/collector/s2s` | S2S framing over HTTP | What a universal forwarder's `[httpout]` sends. Not HEC JSON, so not something `splunk_hec_in` can accept |
+
+Responses are `{"text":…,"code":N}`. The codes that matter to a sender: 0 success; 1–4 (401/403)
+token disabled, missing, invalid; 5–7, 12–13, 15 (400) malformed data, wrong index, missing
+`event`; 6 adds `invalid-event-number`, the index of the first bad object in a batch; 9 (503)
+server busy; 10–11 (400) channel missing or invalid; 14 (400) ack disabled; 18–20, 23 (503)
+unhealthy or shutting down; 26–27 (429) capacity limits exceeded; 28 (400) channel missing, from
+Splunk Cloud.
+
+**Metrics over HEC.** A metric event is `"event": "metric"` with the measurement in `fields`:
+
+- multi-metric form (8.0+): `"metric_name:<name>": <number>`, any number of them per event;
+- single-metric form: `"metric_name": "<name>"` and `"_value": <number>`, which Splunk merges
+  into the same on-disk shape;
+- every other key in `fields` is a dimension; `host`, `source`, and `sourcetype` are added as
+  dimensions automatically.
+
+Values are integers or doubles. Names are `[A-Za-z0-9_.:]`, no leading digit or `_`, may not
+contain `metric_name`, case-sensitive. There is no native histogram, summary, or set type; the
+convention Splunk's own histogram docs and the OTel exporter follow is Prometheus-style
+`<name>_bucket` with an `le` dimension (including `+Inf`), `<name>_sum`, and `<name>_count`,
+queried with `mstats rate()` and the `histperc` macro. `metric_type` is an ordinary dimension
+the OTel exporter writes (`Gauge`, `Sum`), and Splunk gives it no other meaning. A metric event
+with 1,000 dimensions is indexed whole on 10.4.3; no cap was reached. An object with no `event`
+whose `fields` carry a measurement is indexed as a metric too, and a measurement written as a
+numeric string as its number: SC4S sends its own metrics that way.
+
+### Observability Cloud ingest
+
+`https://ingest.<realm>.observability.splunkcloud.com` (the legacy `ingest.<realm>.signalfx.com`
+still works), authenticated by an `X-SF-Token` header carrying an org access token:
+
+- traces: OTLP/HTTP protobuf at `/v2/trace/otlp`, or OTLP/gRPC on `:443` with `X-SF-Token` as
+  metadata (documented for traces only);
+- metrics: OTLP/HTTP protobuf at `/v2/datapoint/otlp`; the docs say the gRPC scheme is not
+  supported and mention only explicit-bucket histograms;
+- logs: none. Splunk's original Log Observer ingest was retired in January 2024; Log Observer
+  Connect queries the Platform.
+
+`otlp_out`'s per-signal `paths:` overrides and `headers:` block cover this without a new kind.
+No run has checked it ([`docs/known-gaps/splunk.md`](../known-gaps/splunk.md)).
+
+### Third-party HEC conventions
+
+The OTel Collector's `splunk_hec` exporter is the de facto schema for OTel data in Splunk, and
+its `splunk_hec` receiver is the inverse.
+
+| Data | Exporter encoding | Notes |
+|---|---|---|
+| Envelope | resource attributes `com.splunk.source` → `source`, `com.splunk.sourcetype` → `sourcetype`, `com.splunk.index` → `index`, `host.name` → `host` | the receiver maps them back to the same names, and can keep the token as `com.splunk.hec.access_token` |
+| Logs | `event` = the body as-is (string or object); `fields` = resource and record attributes, nested maps flattened to dotted keys; severity as `otel.log.severity.text` and `otel.log.severity.number`; the event name as `otel.log.name`; `trace_id` and `span_id` when present; `time` = the record timestamp, falling back to the observed timestamp | gzip on by default; `max_content_length_logs` 2 MiB, `max_event_size` 5 MiB |
+| Metrics | gauge and sum → one `metric_name:<n>` field with a `metric_type` dimension (`Gauge`, `Sum`); histogram → `_sum`, `_count`, cumulative `_bucket` with `le`; summary → `_sum`, `_count`, `<n>_<q>` with a `qt` dimension; exponential histogram dropped; ±Inf as the strings `"+Inf"`/`"-Inf"` | `use_multi_metric_format` defaults to off, so one metric per event |
+| Traces | `event` = a span object, members in `hecSpan` order: `trace_id`, `span_id`, `parent_span_id`, `name`, `attributes`, `end_time` (raw nanoseconds), `kind` (`SPAN_KIND_*`), `status{message,code}` (`STATUS_CODE_*`), `start_time`, then `events[]` and `links[]`; `time` = start in epoch seconds | the receiver keeps a span object as a log record with a `Map` body (0.161.0) |
+
+Vector's `splunk_hec_logs` sink adds templated `index`/`source`/`sourcetype`, `indexed_fields`,
+and automatic ack use with 30 polls at 10 s. Its `splunk_hec_metrics` sink sends counters and
+gauges only and always sends a random request channel. Its `splunk_hec` source serves `/event`,
+`/raw`, and `/health` with a `valid_tokens` allowlist and produces logs only. Docker's `splunk`
+log driver (`splunk-format: inline | json | raw`, optional gzip) and the Splunk Java logging
+library (Logback, Log4j 2, JUL appenders) are HEC clients; the .NET library has been dormant
+since 2023.
+
+### What Splunk sends out
+
+The Platform pushes to a non-Splunk receiver in few ways, none of them HEC:
+
+- a heavy forwarder's `outputs.conf [syslog]` stanza: RFC 3164 over UDP (default) or TCP, priority
+  `<13>` by default, `maxEventSize`, `timestampformat`. Universal forwarders can't;
+- any forwarder's `[tcpout]` with `sendCookedData = false`: "raw and untouched" events over TCP,
+  each event's `_raw` followed by one LF and nothing else, so an event with an embedded newline
+  arrives as two lines (10.4.3);
+- Edge Processor (Splunk Cloud, and a Splunk Enterprise 10.x edition) and Ingest Processor: to
+  the connected Splunk Cloud, to another Splunk platform over S2S or HEC, to Amazon S3 (Parquet
+  or gzip) or Azure Blob, and, for Ingest Processor, to Observability Cloud. Pointing the HEC
+  destination at a non-Splunk receiver is unverified; the docs describe it only for Splunk
+  targets and require ack off on the destination token;
+- Ingest Actions route to S3 or a file system;
+- REST `search/jobs/export` on the management port `:8089` streams results as CSV, JSON, or raw;
+  Splunk Cloud needs a support ticket to open it.
+
+Edge Processor's inputs are S2S, HEC (`/event` and, since 2026-06, `/raw`), and syslog over UDP
+or TCP; no OTLP input appears in its docs or release notes.
+
+### Splunk Enterprise 10.4.3 (2026-09-25)
+
+Each of these was unconfirmed by the survey:
+
+1. **`Content-Encoding: gzip` on `/event` and `/raw`: accepted.** Both answer `200` and index
+   the body; `deflate` is `415`. The OTel exporter gzips every body, and the Docker driver with
+   `splunk-gzip`.
+2. **`max_content_length`: 838,860,800 bytes (800 MiB).** Which release raised it from
+   1,000,000 is open: only one release was run.
+3. **An Edge Processor's HEC destination: unverified.** Edge Processor runs in Splunk Cloud
+   (and a Splunk Enterprise 10.x edition the `splunk/splunk` image isn't), so no container here
+   has one.
+4. **`metric_type`: an ordinary dimension.** `mcatalog values(metric_type)` lists it, `mstats …
+   by metric_type` groups by it, and a `Sum`'s value is stored as sent.
+5. **Dimension count: no cap reached at 1,000.** A metric event with 200 and one with 1,000
+   dimensions were both indexed with every dimension.
+6. **The OTel `splunk_hec` receiver doesn't decode span objects.** Posted the recorded exporter
+   span body, Collector contrib 0.161.0's receiver made a log record with a `Map` body and no
+   trace or span id (`script/record-fixtures splunk-otel` prints it).
+7. **`[tcpout] sendCookedData = false`: each event's `_raw` and one LF.** No header, length, or
+   metadata; an embedded newline passes through, so a line-oriented receiver splits that event.
+   Splunk forwarded its own logs from every index to the one output group too, whatever
+   `defaultGroup` and the `forwardedindex` filters said, so no capture is committed.
+8. **Code 6: the objects before `invalid-event-number` are indexed, and none from it on.**
+   `invalid-event-number` is the 0-based index of the object that failed to parse. That is the
+   assumption decision 18 made: `splunk_hec_out` drops object `N` and resends `N+1` onward.
+   Codes 12, 13, and 15 carry an `invalid-event-number` with the same prefix-indexed meaning;
+   code 7 names the object after the one with the bad index. The sink resends only after code 6.
+
+The same probes found that `/event` runs a sourcetype's `TRANSFORMS-*` (index routing and
+sourcetype renaming both applied) and skips only timestamp extraction, which
+`/event?auto_extract_timestamp=true` restores. So a `/raw` egress mode on `splunk_hec_out` would
+add only line-breaking props.
+
+### Splunk Cloud Platform 10.5.2605.9 (2026-09-26)
+
+A trial stack, with `SPLUNK_INTEROP_TARGET=cloud`. A trial has no REST API, so arrival was
+confirmed by searching in Splunk Web.
+
+1. **Every leg landed, as on 10.4.3.** Logs with every field indexed, 21 metric series with
+   `metric_type` and `histperc` answering 2.8, the span object with every member, the ack leg,
+   and the whole recorded corpus relayed through `splunk_hec_in`.
+2. **The trial's HEC endpoint is `https://<stack>.splunkcloud.com:8088/services/collector`.**
+   The `http-inputs-<stack>.splunkcloud.com` form doesn't resolve for this stack. The certificate
+   is Splunk's default self-signed one (`CN=SplunkServerDefaultCert`, issuer `SplunkCommonCA`), so
+   a client needs `tls: {insecure_skip_verify: true}`; a `ca_file` with Splunk's CA would still
+   fail hostname verification. `/health` answers without a token. Open: whether a paid stack's
+   `http-inputs-` form presents a public CA.
+3. **Acknowledgment works on the trial stack.** The token settings offer "Enable indexer
+   acknowledgment", and the ack leg counted `acked=78 timeout=0 unsupported=0`. `ackId` counts
+   from 0 per channel, a poll answers `true` within about a second, and another channel sees
+   `false`. Splunk's docs say Splunk Cloud supports acknowledgment only for its Firehose path;
+   this stack contradicts them, and a customer stack may differ.
+4. **A `useACK` token without a channel answers `400` code 28**, text `Data channel is missing.
+   If you have multiple indexers, sticky session load balancers must be provisioned and client
+   requests must be routed accordingly.` (10.4.3: code 10 `Data channel is missing`).
+5. **No `Set-Cookie` on any reply**, so this stack needs no load-balancer stickiness for ack
+   polls.
+6. **The body cap is between 5,242,881 and 6,000,000 bytes, and over it the answer is `400` code
+   6 naming object 0, not `413`.** Bodies up to 5,242,881 bytes uncompressed, and 2,000,000
+   gzipped, were accepted and indexed.
+7. **Everything else matches 10.4.3**: gzip accepted and `deflate` `415`; the prefix semantics
+   of codes 6, 7, 12, 13, and 15; the lenient cases; `OPTIONS`; the `404` and `405` bodies;
+   `/raw` without a channel; 200 and 1,000 dimensions; both metric forms; `metric_type` a
+   dimension.
+8. **Edge Processor and Ingest Processor: not provisioned on the trial stack.** Data Management
+   shows only a link to request them, which takes a support case or the account team. Ingest
+   Processor's destinations are Splunk indexes, S3, and Observability Cloud, so it has nothing
+   that reaches `logit`.
+
+Not settled by either run: Observability Cloud, the paid-stack `http-inputs-` form and its
+certificate, which Enterprise release raised `max_content_length`, Vector, and a `useACK` client
+against `splunk_hec_in`.
+
 ## Amendment: what the listener settled (2026-09-25)
 
 Building `splunk_hec_in` (W2) fixed the details below. `crates/logit-inputs/src/splunk.rs`'s
@@ -319,8 +504,8 @@ W5 recorded four real HEC clients (the Collector contrib 0.161.0 `splunk_hec` ex
 29.8.1's `splunk` log driver, SC4S 3.40.0, and splunk-library-javalogging 1.11.11) into
 `testdata/interop/splunk/`, and ran `splunk_hec_out` and `splunk_hec_in` against Splunk
 Enterprise 10.4.3 with `script/splunk-interop`. `testdata/interop/splunk/README.md` and
-`tools/splunk-interop/README.md` hold the evidence; `docs/plans/splunk-relay.md`'s "Settled by
-W5" section maps it to the survey's open items. By decision:
+`tools/splunk-interop/README.md` hold the evidence; [Splunk Enterprise 10.4.3
+(2026-09-25)](#splunk-enterprise-1043-2026-09-25) maps it to the survey's open items. By decision:
 
 - **Decision 2, the listener:** Docker's driver checks its endpoint with
   `OPTIONS /services/collector/event/1.0` and starts no container without a `200`, and Splunk
@@ -378,8 +563,8 @@ W5" section maps it to the survey's open items. By decision:
 trial stack that Splunk Web reports as `Splunk 10.5.2605.9`. A trial has no REST API, so each
 leg's arrival was confirmed by searching in Splunk Web. Every leg landed as it did on 10.4.3, and
 every probe the two runs share answered the same, except as below.
-`tools/splunk-interop/README.md` holds the evidence; `docs/plans/splunk-relay.md`'s "Settled by
-the Cloud run" section maps it item by item. By decision:
+`tools/splunk-interop/README.md` holds the evidence; [Splunk Cloud Platform 10.5.2605.9
+(2026-09-26)](#splunk-cloud-platform-10526059-2026-09-26) maps it item by item. By decision:
 
 - **Decision 5, acknowledgment:** the premise that Splunk Cloud doesn't support it doesn't hold for
   this stack. Its token settings offer "Enable indexer acknowledgment", the `hec-ack` leg counted
@@ -443,7 +628,8 @@ Two answers the sink misread under its default at-most-once posture. By decision
 Decision 11 said a syntax error in any object rejects the whole body "and nothing is delivered,
 as Splunk does". Splunk doesn't: Splunk Enterprise 10.4.3 and Splunk Cloud Platform 10.5.2605.9
 both index every object before the one a `400` code 6 names and none from it on
-(`docs/plans/splunk-relay.md`, "Settled by W5" item 8 and "Settled by the Cloud run"), and
+([Splunk Enterprise 10.4.3](#splunk-enterprise-1043-2026-09-25) item 8, and
+[Splunk Cloud Platform 10.5.2605.9](#splunk-cloud-platform-10526059-2026-09-26)), and
 Vector's `splunk_hec` source delivers what it parsed before answering `400`. A client that follows
 Splunk's semantics resends only the objects after the named one, so against the old listener it
 lost the objects before it. `splunk_hec_out`'s decision 18 rule is such a client, so a

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-25
+updated: 2026-10-18
 ---
 
 # Hand-rolled unary gRPC over `hyper`, not `tonic`
@@ -65,8 +65,8 @@ gRPC response needs exactly one.
 
 ## Consequences
 
-- `otlp_in`'s gRPC server is the largest single risk item in this PR (`docs/plans/
-  otlp-end-to-end.md` budgets it as roughly half the PR's effort) — HTTP/2 trailers,
+- `otlp_in`'s gRPC server is the largest single risk item in this PR (roughly half the PR's
+  effort) — HTTP/2 trailers,
   per-method routing, and gRPC status-code mapping are all things `tonic` would have supplied for
   free. The round-trip tests (`otlp_output_to_otlp_input_round_trips_a_batch_through_http`/
   `_through_grpc`, `crates/logit-cli/tests/otlp_round_trip.rs`) are the confidence check this buys

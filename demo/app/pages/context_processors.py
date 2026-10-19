@@ -1,5 +1,5 @@
 """Hands this request's server span context to the template as a W3C `traceparent`
-(https://www.w3.org/TR/trace-context/; docs/plans/browser-tracing.md).
+(https://www.w3.org/TR/trace-context/).
 
 The template renders it into <meta name="traceparent"> (pages/templates/pages/index.html), which
 `@opentelemetry/instrumentation-document-load` reads to associate its `documentLoad` span with

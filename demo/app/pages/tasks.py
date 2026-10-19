@@ -1,5 +1,5 @@
 """The demo's one background task, enqueued by `pages/views.py`'s `work` and run by the
-`worker` service, not a gunicorn worker (`docs/plans/demo-richer-traces.md`).
+`worker` service, not a gunicorn worker.
 
 Deliberately ordinary: a brief sleep, one DB write, one log line. The point is that this task's
 real Celery CONSUMER span (opentelemetry-instrumentation-celery, `demoproj/telemetry.py`) lands
