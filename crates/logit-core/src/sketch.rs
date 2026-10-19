@@ -323,6 +323,28 @@ impl DdSketch {
         sketch
     }
 
+    /// [`DdSketch::from_parts`] with the summary taken as written and [`DdSketch::stats_exact`]
+    /// set to `stats_exact`: the inverse of [`DdSketch::stored_stats`] plus the bins, for a codec
+    /// that carries the whole sketch.
+    pub fn from_stored(
+        mapping: Mapping,
+        positive: Vec<Bin>,
+        negative: Vec<Bin>,
+        zero_count: f64,
+        stats: SketchStats,
+        stats_exact: bool,
+    ) -> Self {
+        let mut sketch = Self::from_parts(mapping, positive, negative, zero_count, Some(stats));
+        sketch.exact_stats = stats_exact;
+        sketch
+    }
+
+    /// The summary as stored: `count` unrounded, and an empty sketch's `min`/`max` as `+∞`/`-∞`.
+    /// [`DdSketch::count`], [`DdSketch::min`], and [`DdSketch::max`] are the reading forms.
+    pub fn stored_stats(&self) -> SketchStats {
+        SketchStats { count: self.count, min: self.min, max: self.max, sum: self.sum }
+    }
+
     pub fn mapping(&self) -> &Mapping {
         &self.mapping
     }
@@ -592,15 +614,14 @@ impl DdSketch {
         if r.pos != bytes.len() {
             return Err(SketchDecodeError::Malformed);
         }
-        let mut sketch = Self::from_parts(
+        Ok(Self::from_stored(
             mapping,
             positive,
             negative,
             zero_count,
-            Some(SketchStats { count, min, max, sum }),
-        );
-        sketch.exact_stats = exact_stats;
-        Ok(sketch)
+            SketchStats { count, min, max, sum },
+            exact_stats,
+        ))
     }
 }
 
