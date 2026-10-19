@@ -10,6 +10,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: a transit spec — reference inputs, flows, and a mapping table that generates the docs](transit-spec.md) | 2026-10-19 | 2026-10-19 |
 | [Enabling plan: native encode without per-field scratch buffers](native-encode-allocations.md) | 2026-10-15 | 2026-10-15 |
 | [Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger](soak-harness.md) | 2026-10-08 | 2026-10-18 |
 | [Research note: live reload, socket handover, and what each deployment world needs](live-reload-and-socket-handover.md) | 2026-10-05 | 2026-10-07 |
