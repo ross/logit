@@ -3,10 +3,18 @@
 //! run against `mapping.yaml` (`super::classes`). `spec/transit/README.md` is the reader's account.
 //!
 //! Under `TRANSIT_UPDATE=1` ([`UPDATE`]) it rewrites what's generated: a wire case's `.json`
-//! from its wire file, each `expected/<flow>/<case>.json`, and `coverage.md`, and removes an
-//! expectation no flow and case produce. Unset, it compares, and a stale or missing file fails
-//! with a diff and the command that regenerates it. An expectation whose run fails the class
-//! check isn't rewritten, and a case `.json` with no `.meta.yaml` (and named by no `wire:`) fails.
+//! from its wire file, each flow's `expected/<flow>.json`, and `coverage.md`, and removes an
+//! expectation file no flow produces. Unset, it compares, and a stale or missing file or case
+//! fails with a diff and the command that regenerates it. A case `.json` with no `.meta.yaml` (and
+//! named by no `wire:`) fails.
+//!
+//! **Expectations.** `expected/<flow>.json` is one JSON object mapping each case's name to its
+//! driver document (`super::report`), keys sorted, each document's lines indented under its key so
+//! a diff stays inside the case that changed ([`render_flow`]). One file per flow grows with the
+//! flows alone, where a file per case would grow with flows times cases. A missing file, a missing
+//! or stale case, and a key no case has each fail, naming the flow and the case. `gen` writes a
+//! flow's file once every case in the flow has run, and only when none of them failed the class
+//! check: a class failure leaves the whole file untouched.
 //!
 //! **Cases.** A case is `cases/<system>/<case>.meta.yaml` beside `<case>.json`. The meta names
 //! the features from `features/<system>.yaml` the case `exercises`, an optional `wire:` file
@@ -295,6 +303,115 @@ fn agrees(actual: &str, expected: &str, tolerances: &[Tolerance]) -> bool {
     actual == expected
 }
 
+/// A flow's expectation file: `{`, then each case's `"<name>": <document>` with the document's
+/// later lines indented two spaces, joined by `,`, then `}`.
+fn render_flow(docs: &BTreeMap<String, String>) -> String {
+    let mut out = String::from("{\n");
+    for (i, (name, doc)) in docs.iter().enumerate() {
+        if i > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&format!("  {}: ", Value::from(name.as_str())));
+        for (j, line) in doc.trim_end().lines().enumerate() {
+            if j > 0 {
+                out.push_str("\n  ");
+            }
+            out.push_str(line);
+        }
+    }
+    if !docs.is_empty() {
+        out.push('\n');
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// [`render_flow`]'s inverse: each case's document, ending in a newline as the driver writes it.
+/// A case's key is the one line indented two spaces that opens with a `"`; a document's own lines
+/// sit at four spaces or open with `]`.
+fn split_flow(text: &str) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("  \"") {
+            if let Some((key, doc)) = rest.split_once("\": ") {
+                let name: String =
+                    serde_json::from_str(&format!("\"{key}\"")).unwrap_or_else(|_| key.to_string());
+                out.insert(name.clone(), format!("{doc}\n"));
+                current = Some(name);
+                continue;
+            }
+        }
+        let Some(name) = &current else { continue };
+        if line == "}" {
+            current = None;
+            continue;
+        }
+        let doc = out.get_mut(name).expect("the case was inserted");
+        doc.push_str(line.strip_prefix("  ").unwrap_or(line));
+        doc.push('\n');
+    }
+    // A document but the last is followed by the `,` that joins it to the next.
+    for doc in out.values_mut() {
+        if doc.ends_with("}},\n") {
+            doc.truncate(doc.len() - 2);
+            doc.push('\n');
+        }
+    }
+    out
+}
+
+/// Compares, or under `update` writes, one flow's expectation file (module doc); one failure
+/// per missing, stale, or unknown case.
+fn sync_flow(
+    path: &Path,
+    flow: &str,
+    docs: &BTreeMap<String, (String, Vec<Tolerance>)>,
+    update: bool,
+) -> Vec<String> {
+    let texts: BTreeMap<String, String> =
+        docs.iter().map(|(name, (doc, _))| (name.clone(), doc.clone())).collect();
+    let generated = render_flow(&texts);
+    let Ok(committed) = std::fs::read_to_string(path) else {
+        if update {
+            std::fs::write(path, &generated).expect("write a flow's expectations");
+            return Vec::new();
+        }
+        return vec![format!("{} is missing; run `{REGENERATE}`", path.display())];
+    };
+    if committed == generated {
+        return Vec::new();
+    }
+    let have = split_flow(&committed);
+    let mut failures = Vec::new();
+    for (name, (doc, tolerances)) in docs {
+        match have.get(name) {
+            None => failures.push(format!(
+                "{flow} × {name}: {} has no expectation for the case; run `{REGENERATE}`",
+                path.display()
+            )),
+            Some(committed) if !agrees(doc, committed, tolerances) => failures.push(format!(
+                "{flow} × {name}: the expectation in {} is stale; run `{REGENERATE}` and review \
+                 the diff:\n{}",
+                path.display(),
+                diff(doc, committed)
+            )),
+            Some(_) => {}
+        }
+    }
+    for name in have.keys().filter(|name| !docs.contains_key(*name)) {
+        failures.push(format!(
+            "{flow} × {name}: {} holds an expectation for no case; run `{REGENERATE}` to remove it",
+            path.display()
+        ));
+    }
+    if update {
+        std::fs::write(path, &generated).expect("write a flow's expectations");
+        return Vec::new();
+    }
+    failures
+}
+
 /// Compares, or under `update` writes, one generated file; `None` when it's current.
 fn sync(path: &Path, generated: &str, tolerances: &[Tolerance], update: bool) -> Option<String> {
     let committed = std::fs::read_to_string(path).ok();
@@ -406,17 +523,20 @@ fn generate(spec: &Path, update: bool) -> Vec<String> {
     let mut ledger = Ledger::default();
     let mut produced: Vec<PathBuf> = Vec::new();
     for flow in &flows {
+        let mut docs = BTreeMap::new();
+        let mut class_failed = false;
         for case in by_system.get(&flow.system).into_iter().flatten() {
-            failures.extend(run_one(
-                spec,
-                &mapping,
-                flow,
-                case,
-                update,
-                &mut ledger,
-                &mut produced,
-            ));
+            let (doc, class_failures) = run_one(&mapping, flow, case, &mut ledger);
+            class_failed |= !class_failures.is_empty();
+            failures.extend(class_failures);
+            if let Some(doc) = doc {
+                docs.insert(case.name.clone(), (doc, case.meta.tolerance.clone()));
+            }
         }
+        let path = spec.join("expected").join(format!("{}.json", flow.name));
+        // A class failure is a finding, so the flow's expectations aren't rewritten over it.
+        failures.extend(sync_flow(&path, &flow.name, &docs, update && !class_failed));
+        produced.push(path);
     }
     failures.extend(ledger.finish());
     for line in ledger.unspecified() {
@@ -433,56 +553,43 @@ fn generate(spec: &Path, update: bool) -> Vec<String> {
     failures
 }
 
-/// One flow and one case: the document against its expectation, then the class check.
+/// One flow and one case: the run's document, or `None` when the driver refused the run, and
+/// every failure, the class check's included.
 fn run_one(
-    spec: &Path,
     mapping: &Mapping,
     flow: &Flow,
     case: &Case,
-    update: bool,
     ledger: &mut Ledger,
-    produced: &mut Vec<PathBuf>,
-) -> Vec<String> {
+) -> (Option<String>, Vec<String>) {
     let here = format!("{} × {}", flow.name, case.name);
     let traced = match run_traced(&flow.path, &case.json(), Options::default()) {
         Ok(traced) => traced,
-        Err(err) => return vec![format!("{here}: {err:#}")],
+        Err(err) => return (None, vec![format!("{here}: {err:#}")]),
     };
-    let expected = spec.join("expected").join(&flow.name).join(format!("{}.json", case.name));
-    produced.push(expected.clone());
     let at = At { flow: &flow.name, case: &case.name };
-    let mut failures = classes::check(mapping, &at, &traced, ledger);
-    // A class failure is a finding, so the expectation isn't rewritten over it.
-    let update = update && failures.is_empty();
-    failures.extend(sync(&expected, &traced.outcome.document(), &case.meta.tolerance, update));
-    failures
+    let failures = classes::check(mapping, &at, &traced, ledger);
+    (Some(traced.outcome.document()), failures)
 }
 
-/// Expectations no flow and case produced: removed under `update`, else failures.
+/// Entries under `expected/` that aren't a flow's file: removed under `update`, else failures.
 fn stale_expectations(spec: &Path, produced: &[PathBuf], update: bool) -> Vec<String> {
     let mut failures = Vec::new();
-    let root = spec.join("expected");
-    let Ok(dirs) = std::fs::read_dir(&root) else { return failures };
-    for dir in dirs.flatten().map(|e| e.path()) {
-        let files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-            Ok(files) => files.flatten().map(|e| e.path()).collect(),
-            Err(_) => vec![dir.clone()],
-        };
-        for file in files {
-            if produced.contains(&file) {
-                continue;
-            }
-            if update {
-                std::fs::remove_file(&file).expect("remove a stale expectation");
-            } else {
-                failures.push(format!(
-                    "{} matches no flow and case; run `{REGENERATE}` to remove it",
-                    file.display()
-                ));
-            }
+    let Ok(entries) = std::fs::read_dir(spec.join("expected")) else { return failures };
+    for path in entries.flatten().map(|e| e.path()) {
+        if produced.contains(&path) {
+            continue;
         }
-        if update && std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_none()) {
-            std::fs::remove_dir(&dir).expect("remove an empty expectation directory");
+        if update {
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).expect("remove a stale expectation directory");
+            } else {
+                std::fs::remove_file(&path).expect("remove a stale expectation");
+            }
+        } else {
+            failures.push(format!(
+                "{} matches no flow; run `{REGENERATE}` to remove it",
+                path.display()
+            ));
         }
     }
     failures
@@ -576,24 +683,73 @@ mod tests {
         assert!(failures.iter().any(|f| f.contains(want)), "{failures:#?}");
     }
 
-    /// An expectation edited by hand fails the comparison, with the command that regenerates it.
-    #[test]
-    fn an_edited_expectation_fails_the_comparison() {
+    /// The counter case's document through the relay flow, keyed for [`sync_flow`].
+    fn counter_docs() -> BTreeMap<String, (String, Vec<Tolerance>)> {
         let (flow, case) = relay();
-        let path = spec_dir().join("expected").join(&flow.name).join("counter.json");
-        let committed = std::fs::read_to_string(&path).expect("the committed expectation");
         let document = run_traced(&flow.path, &case.json(), Options::default())
             .expect("runs")
             .outcome
             .document();
-        assert_eq!(sync(&path, &document, &[], false), None, "the committed file is current");
+        BTreeMap::from([("counter".to_string(), (document, Vec::new()))])
+    }
 
-        let edited = committed.replacen("\"value\":3.0", "\"value\":4.0", 1);
-        assert_ne!(edited, committed, "the expectation holds the counter's 3.0");
-        let scratch = logit_pipeline::test_util::scratch_dir("transit-edited").join("counter.json");
-        std::fs::write(&scratch, edited).expect("write the edited copy");
-        let failure = sync(&scratch, &document, &[], false).expect("the edit is caught");
-        assert!(failure.contains(REGENERATE) && failure.contains("\"value\":4.0"), "{failure}");
+    /// The committed relay expectations hold the counter case's document as the driver writes it.
+    #[test]
+    fn a_flow_file_reads_back_each_case() {
+        let committed = std::fs::read_to_string(spec_dir().join("expected/statsd-relay.json"))
+            .expect("the committed expectations");
+        let docs = counter_docs();
+        assert_eq!(split_flow(&committed).get("counter"), Some(&docs["counter"].0));
+        let texts = docs.iter().map(|(k, (d, _))| (k.clone(), d.clone())).collect();
+        let rendered = render_flow(&texts);
+        assert_eq!(split_flow(&rendered).get("counter"), Some(&docs["counter"].0));
+        assert!(serde_json::from_str::<Value>(&rendered).is_ok(), "{rendered}");
+    }
+
+    /// An expectation edited by hand fails the comparison, naming the flow and the case, with the
+    /// command that regenerates it.
+    #[test]
+    fn an_edited_expectation_fails_the_comparison() {
+        let docs = counter_docs();
+        let texts = docs.iter().map(|(k, (d, _))| (k.clone(), d.clone())).collect();
+        let current = render_flow(&texts);
+        let path = logit_pipeline::test_util::scratch_dir("transit-edited").join("relay.json");
+        std::fs::write(&path, &current).expect("write the current file");
+        assert_eq!(sync_flow(&path, "statsd-relay", &docs, false), Vec::<String>::new());
+
+        let edited = current.replacen("\"value\":3.0", "\"value\":4.0", 1);
+        assert_ne!(edited, current, "the expectation holds the counter's 3.0");
+        std::fs::write(&path, edited).expect("write the edited copy");
+        let failures = sync_flow(&path, "statsd-relay", &docs, false);
+        assert!(
+            failures.iter().any(|f| f.starts_with("statsd-relay × counter: the expectation")
+                && f.contains(REGENERATE)
+                && f.contains("\"value\":4.0")),
+            "{failures:#?}"
+        );
+    }
+
+    /// A case with no key in its flow's file, a key with no case, and a missing file each fail.
+    #[test]
+    fn a_missing_or_unknown_case_fails() {
+        let docs = counter_docs();
+        let path = logit_pipeline::test_util::scratch_dir("transit-keys").join("relay.json");
+        let missing = sync_flow(&path, "statsd-relay", &docs, false);
+        assert!(missing.iter().any(|f| f.contains("is missing") && f.contains(REGENERATE)));
+
+        let other = BTreeMap::from([("gone".to_string(), docs["counter"].0.clone())]);
+        std::fs::write(&path, render_flow(&other)).expect("write a file without the case");
+        let failures = sync_flow(&path, "statsd-relay", &docs, false);
+        assert!(
+            failures.iter().any(|f| f.starts_with("statsd-relay × counter:")
+                && f.contains("has no expectation for the case")),
+            "{failures:#?}"
+        );
+        assert!(
+            failures.iter().any(|f| f.starts_with("statsd-relay × gone:")
+                && f.contains("an expectation for no case")),
+            "{failures:#?}"
+        );
     }
 
     /// A scratch copy of the spec holding only `flows/statsd-relay.yaml` and the `counter` case,
@@ -601,7 +757,7 @@ mod tests {
     fn small_spec(label: &str, edit: impl Fn(String) -> String) -> PathBuf {
         let from = spec_dir();
         let to = logit_pipeline::test_util::scratch_dir(label).join("transit");
-        for dir in ["features", "flows", "cases/statsd", "expected/statsd-relay"] {
+        for dir in ["features", "flows", "cases/statsd", "expected"] {
             std::fs::create_dir_all(to.join(dir)).expect("create a scratch directory");
         }
         let copy = |path: &str| {
@@ -613,7 +769,7 @@ mod tests {
             "cases/statsd/counter.meta.yaml",
             "cases/statsd/counter.statsd",
             "cases/statsd/counter.json",
-            "expected/statsd-relay/counter.json",
+            "expected/statsd-relay.json",
         ] {
             copy(path);
         }
@@ -622,13 +778,12 @@ mod tests {
         std::fs::write(to.join("cases/statsd/mixed.meta.yaml"), "wire: mixed.statsd\n")
             .expect("write a meta");
         copy("cases/statsd/mixed.statsd");
-        copy("expected/statsd-relay/mixed.json");
         let mapping = std::fs::read_to_string(from.join("mapping.yaml")).expect("the table");
         std::fs::write(to.join("mapping.yaml"), edit(mapping)).expect("write the table");
         to
     }
 
-    /// `gen` leaves an expectation alone when its run fails the class check.
+    /// `gen` leaves a flow's expectations alone when any of its runs fails the class check.
     #[test]
     fn gen_never_rewrites_over_a_class_failure() {
         let spec = small_spec("transit-gen-class", |table| {
@@ -637,7 +792,7 @@ mod tests {
                 "    feature: delta_monotonic\n    cells:\n      statsd_out:\n        class: degraded\n",
             )
         });
-        let expected = spec.join("expected/statsd-relay/counter.json");
+        let expected = spec.join("expected/statsd-relay.json");
         std::fs::write(&expected, "stale\n").expect("write a stale expectation");
         let failures = generate(&spec, true);
         assert!(failures.iter().any(|f| f.contains("the table expects degraded")), "{failures:#?}");

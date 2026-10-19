@@ -1,4 +1,0 @@
-{"events": [], "counters": {
-  "logit.output.metrics.skipped{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 2,
-  "logit.output.metrics.skipped{component=out,kind=statsd_out,metric_kind=non_monotonic_delta_sum,role=sink}": 1
-}}

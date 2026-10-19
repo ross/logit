@@ -1,7 +1,0 @@
-{"events": [
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"http_requests_total","kind":"gauge","value":1.0}],"attributes":{"route":"/api"}},
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":3.0}]}
-], "counters": {
-  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2,
-  "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1
-}}

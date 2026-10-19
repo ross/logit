@@ -14,6 +14,12 @@ limits, and [the plan](../../docs/plans/transit-spec.md) the workstreams.
 
 ## Layout
 
+Expectations are one file per flow, not one per case: a file per case grows as flows times cases,
+which reaches thousands once every source meets every sink column, while a file per flow grows
+with the flows alone. Each case's document sits under its own key on its own lines, so a diff
+still shows which case changed. A missing file, a case with no key, a stale document, and a key
+no case has each fail, naming the flow and the case.
+
 | Path | What it holds |
 |---|---|
 | `mapping.yaml` | The table: the class vocabulary, the sinks, and one row per kind and feature |
@@ -22,7 +28,7 @@ limits, and [the plan](../../docs/plans/transit-spec.md) the workstreams.
 | `cases/<system>/<case>.json` | The case's events, one `format: json` line each |
 | `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from, such as `.statsd` |
 | `flows/<flow>.yaml` | A runnable config: `replay_in -> [stages] -> <sink>` |
-| `expected/<flow>/<case>.json` | The run's document: the events read back and the counters moved (generated) |
+| `expected/<flow>.json` | Each case's run through the flow, keyed by case name: the events read back and the counters moved (generated) |
 | `coverage.md` | Each system's features and the cases that exercise them, and each sink's cells no flow reaches (generated) |
 
 ## Running it
@@ -34,8 +40,9 @@ The spec's generator is an ordinary test, so `script/test` and CI run it. Three 
   `git diff spec/transit/` and commit the result.
 - `script/transit coverage` does what `gen` does, then prints `coverage.md`.
 
-`gen` never rewrites an expectation whose run fails the class check. A failure means the code or
-the table is wrong, and a person decides which. A cell `coverage.md` lists as reached by no flow
+`gen` writes a flow's expectations only after every case in the flow has run, and only when none
+of them failed the class check; one class failure leaves the flow's whole file untouched. A
+failure means the code or the table is wrong, and a person decides which. A cell `coverage.md` lists as reached by no flow
 is one nothing checks: add a case or a flow that reaches it.
 
 ## The classes
@@ -135,7 +142,7 @@ pointer, in each event of the document, differ from the committed one by up to `
 Write `flows/<flow>.yaml` with one `replay_in` whose `path:` names a case, such as
 `../cases/statsd/mixed.json`. That case's directory is the flow's source, and every case in it runs
 through the flow; naming a real case keeps the flow runnable by hand with `logit run`. Then run
-`script/transit gen`. `script/validate` and `every_shipped_config_loads_and_validates` load every
+`script/transit gen`, which writes `expected/<flow>.json`. `script/validate` and `every_shipped_config_loads_and_validates` load every
 flow.
 
 ## Adding a sink column

@@ -1,7 +1,0 @@
-{"events": [
-  {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","_logit.statsd.container_id":"in-82046","_logit.statsd.external_data":"it-false,cn-web","_logit.statsd.cardinality":"high","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
-  {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"_logit.statsd.container_id":"ci-abc","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[5.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.container_id":"in-1","_logit.statsd.cardinality":"low","_logit.statsd.type":"ms"}}
-], "counters": {
-  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 3
-}}

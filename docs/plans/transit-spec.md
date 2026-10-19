@@ -89,7 +89,7 @@ spec/transit/
   cases/<system>/<case>.<wire>  the wire bytes a generated case decodes from (optional)
   cases/<system>/<case>.headers the request headers beside an HTTP wire file (optional)
   flows/<flow>.yaml             a runnable logit config: replay_in -> [stages] -> <sink>
-  expected/<flow>/<case>.json   the re-decoded output and the counters, generated
+  expected/<flow>.json          each case's re-decoded output and counters, keyed by case, generated
   coverage.md                   each system's features and the cases exercising them, generated
 ```
 
@@ -358,3 +358,8 @@ Recorded per workstream as each lands.
   sink sanitizes, and logs. A flow's `replay_in` names one case file rather than a directory, so
   `logit run` can run it by hand; the file's directory is the flow's source. Coverage is a
   generated, committed `coverage.md`, checked like the expectations, rather than a printout.
+
+  Expectations are one file per flow, `expected/<flow>.json`, each case's document under its
+  name, rather than one file per flow and case. The per-case layout grows as flows times cases,
+  224 files already, and reaches thousands once every source meets every sink column; one file
+  per flow grows with the flows alone, and a diff inside it still shows which case changed.

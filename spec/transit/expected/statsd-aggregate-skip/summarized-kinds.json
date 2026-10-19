@@ -1,6 +1,0 @@
-{"events": [], "counters": {
-  "logit.output.metrics.skipped{component=out,kind=statsd_out,metric_kind=exponential_histogram,role=sink}": 2,
-  "logit.output.metrics.skipped{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 2,
-  "logit.output.metrics.skipped{component=out,kind=statsd_out,metric_kind=summary,role=sink}": 1,
-  "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=no_merge_rule,role=transform}": 5
-}}

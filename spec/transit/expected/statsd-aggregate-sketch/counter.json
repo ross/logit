@@ -1,6 +1,0 @@
-{"events": [
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"jobs.started","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":3.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/api"}}
-], "counters": {
-  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2
-}}

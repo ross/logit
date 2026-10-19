@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: script/transit gen|check|coverage
 #   gen       run the class check and regenerate every generated file under spec/transit/: each
-#             wire case's .json, each expected/<flow>/<case>.json, and coverage.md
+#             wire case's .json, each flow's expected/<flow>.json, and coverage.md
 #   check     run the class check and compare them, failing on anything stale (what script/test
 #             runs)
 #   coverage  as gen, then print spec/transit/coverage.md: each system's features and the cases
@@ -9,9 +9,9 @@
 #
 # The spec's generator is a test in the `logit` binary's transit module
 # (crates/logit-cli/src/transit/spec.rs), since only the binary's tests reach the kind registry;
-# TRANSIT_UPDATE=1 turns its comparisons into rewrites. An expectation whose run fails the class
-# check is never rewritten: fix the code or mapping.yaml. Review `git diff spec/transit/` after `gen` and commit. See
-# spec/transit/README.md.
+# TRANSIT_UPDATE=1 turns its comparisons into rewrites. A flow's expectations are written only
+# when no case in the flow fails the class check: fix the code or mapping.yaml. Review
+# `git diff spec/transit/` after `gen` and commit. See spec/transit/README.md.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"

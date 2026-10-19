@@ -1,7 +1,0 @@
-{"events": [
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"visitors","kind":"set_members","members":["a_b"]}]},
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"visitors","kind":"set_members","members":["c_d"]}]}
-], "counters": {
-  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1,
-  "logit.output.messages.normalized{component=out,kind=statsd_out,reason=member_sanitized,role=sink}": 2
-}}

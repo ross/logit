@@ -1,9 +1,0 @@
-{"events": [
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"hits","kind":"sum","value":6.0,"temporality":"delta","monotonic":true}]},
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[1.0,2.0,3.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms"}},
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"level","kind":"gauge","value":5.0}]},
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"visitors","kind":"set_members","members":["a"]}]},
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"visitors","kind":"set_members","members":["b"]}]}
-], "counters": {
-  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 7
-}}

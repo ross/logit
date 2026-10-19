@@ -1,3 +1,0 @@
-{"events": [], "counters": {
-  "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 1
-}}

@@ -1,7 +1,0 @@
-{"events": [
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"balance","kind":"gauge","value":0.0}]},
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"balance","kind":"gauge_delta","delta":-3.0}]},
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"connections","kind":"gauge","value":12.0}]}
-], "counters": {
-  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 5
-}}

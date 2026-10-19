@@ -1,6 +1,0 @@
-{"events": [
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[12.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms"}},
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[7.5],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms"}}
-], "counters": {
-  "logit.output.tags.omitted{component=out,kind=statsd_out,reason=dialect,role=sink}": 2
-}}

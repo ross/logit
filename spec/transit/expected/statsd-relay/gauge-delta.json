@@ -1,6 +1,0 @@
-{"events": [
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"balance","kind":"gauge","value":5.0}]},
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"connections","kind":"gauge","value":10.0}]}
-], "counters": {
-  "logit.output.messages.dropped{component=out,kind=statsd_out,reason=unresolved_gauge_delta,role=sink}": 3
-}}

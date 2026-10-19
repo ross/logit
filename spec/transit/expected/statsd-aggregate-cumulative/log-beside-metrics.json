@@ -1,5 +1,0 @@
-{"events": [
-  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests.inflight","kind":"gauge","value":3.0}],"attributes":{"route":"/api"}}
-], "counters": {
-  "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 1
-}}
