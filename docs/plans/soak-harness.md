@@ -197,10 +197,10 @@ on = "logit"
 for = "45s"
 ```
 
-An optional top-level `rss_settle` (default `60s`) is how long past `recovery_bound` the
+An optional top-level `rss_settle` (default `0s`) is how long past `recovery_bound` the
 `rss_slope` row alone keeps excusing each fault (§6). Every other row's recovery is
-`recovery_bound`. A scenario whose schedule leaves no gap past `recovery_bound` sets it to
-`0s`, so `rss_slope` keeps something to judge.
+`recovery_bound`. It's opt-in: most schedules leave so little past `recovery_bound` that a
+settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`.
 
 `validate()` enforces these rules:
 
@@ -925,8 +925,8 @@ returned nonzero has none, so nothing after it is excused.
   `logit.process.fds` at the end minus the warmup median is at most `fd_growth`, and returns to
   baseline at the first steady-state sample after each recovery. `docker stats` RSS is the
   fallback series. Judged slopes covering under 5% of the run after warmup WARN.
-  `rss_slope` widens each fault window by the scenario's `rss_settle` (default 60 s), because
-  a process returns a backlog's memory in steps over minutes: `fanin`'s generator held 62.6,
+  `rss_slope` widens each fault window by the scenario's `rss_settle` (default 0 s), because
+  a process can return a backlog's memory in steps over minutes: `fanin`'s generator held 62.6,
   then 52.6, then about 32 MiB for over 100 s after a 45 s partition, and a fit over those
   plateaus beside its 18 MiB baseline read +240 MiB/h. `fd_slope` keeps `recovery_bound`: it
   compares single samples with the warmup median rather than fitting a line, and a connection's
@@ -5279,11 +5279,12 @@ from +330.6 s to +375.5 s:
 The allocator returns the backlog's memory in steps; nothing leaks. `recovery_bound` ends the
 excusal 45 s after the revert, so the plateaus sat in the fit beside the baseline. A
 `tcp-ingress` run, `20261018T184246Z`, WARNed `logit` life 0 at +74.0 MiB/h over 12 samples in
-400 s, which reads as the same effect. `rss_settle` (§2, §6) excuses 60 s more after each
-fault, for `rss_slope` only.
+400 s, which reads as the same effect. `rss_settle` (§2, §6) excuses more after each fault,
+for `rss_slope` only. It's opt-in, 0 s by default, and these two scenarios set 60 s.
 
-Re-scored with `soak.py check`, in MiB/h per life, with the share of the run after warmup
-judged:
+Re-scored with `soak.py check` on copies with `"rss_settle": 60` added to each
+`scenario.resolved.json`, as a run of the scenario now records it, in MiB/h per life with the
+share of the run after warmup judged:
 
 | Run | Service | Before | After |
 |---|---|---|---|
@@ -5293,35 +5294,30 @@ judged:
 | `tcp-ingress` `20261018T184246Z` | `generator` | life 0 +30.5, 21% | life 0 +14.0, 10% (PASS) |
 | | `logit` | life 0 +74.0, life 2 -5.3, 20% (WARN) | life 2 -17.2, 10% (PASS) |
 
-Both rows PASS, and every other row of both runs re-scores unchanged. A life missing from the
-After column has no sample outside the widened windows: neither schedule leaves more than 75 s
-between one fault's end and the next fault's start, under `recovery_bound` plus `rss_settle`.
-In `fanin` the generator's RSS stays near 32 MiB until its next life, so a leftover step can
-stay in a life's fit; in this run the 60 s settle covers every gap in life 0, so that step
-reaches no fit, and a schedule with longer gaps could still fit it.
+Both rows PASS, and every other row of both runs re-scores unchanged. Without the key, each
+copy scores as it did on `main`. A life missing from the After column has no sample outside
+the widened windows: neither schedule leaves more than 75 s between one fault's end and the
+next fault's start, under `recovery_bound` plus `rss_settle`. In `fanin` the generator's RSS
+stays near 32 MiB until its next life, so a leftover step can stay in a life's fit; in this run
+the 60 s settle covers every gap in life 0, so that step reaches no fit, and a schedule with
+longer gaps could still fit it.
 
-A first default of 120 s left both runs with no fittable life, 0% judged, and a coverage WARN.
-At 60 s, across the shipped scenarios at their own durations, the share of the run after warmup
-outside the widened windows is 2 to 82%, against 11 to 85% with `recovery_bound` alone; most
-keep 10% or more. The estimate predicted the re-scored runs' 12% and 10%. Seven scenarios
-would fall under 5% and WARN on coverage, so they set `rss_settle = "0s"`, which the estimate
-confirms returns each to its coverage without the key: `native-hop` and `native-hop-spans` 11%,
-`standin-datadog` 41%, and `standin-remote-write` and the three `standin-influxdb` scenarios
-41%. Each fitted a life on every service before, so the row's new coverage rule changes none
-of their verdicts from SKIP to WARN.
-
-A run directory recorded before the key existed has no `rss_settle` in
-`scenario.resolved.json` and re-scores at the 60 s default, even for the seven. Re-scoring the
-three preserved `standin-influxdb` runs (`20261018T024144Z`, `20261018T024204Z`,
-`20261018T024224Z`) gives PASS at 36% judged on `main` and at `0s`, and WARN on coverage at 0 to
-3% judged at the default.
+Counting only time that can hold a fit, 6 samples over 60 s per life, at each scenario's own
+duration: `fanin` keeps a fit on every service with about 11% judged, against 25% with
+`recovery_bound` alone, and `tcp-ingress` about 9%, against 14%. A 60 s default would have left
+seven other scenarios with a service and no fittable life (`kafka-broker-restart`,
+`kafka-sasl-reauth`, `statsd-vm-lost-total`, `fanout-stop-outage`, `spool-kill-replay`,
+`standin-at-most-once`, and `statsd-datadog`), and a recorded `kafka-sasl-reauth` run,
+`20261018T153250Z`, went from PASS at 29% judged to none. An earlier estimate that counted all
+time outside the windows missed them. Every other shipped scenario keeps `recovery_bound` alone.
 
 What the work showed about the harness:
 
 - With every sample excused, `rss_slope` SKIPped: a service with no steady sample read SKIP and
   the row SKIPped with no life fitted. A service with samples after warmup now WARNs on
   coverage, and the row SKIPs for want of a fit only when the run after warmup is under 60 s.
-- The self-test fixtures failed with each change reverted (three reverts): with the settle window
+- The self-test fixtures failed with each change reverted (five reverts): with the settle window
   off, the stepped-recovery fixture WARNed at +71.0 MiB/h against 64; with a window swallowing
-  the whole run, the `cardinality`-shaped leak fixture WARNed instead of FAILing; and with the
-  old SKIP rule, the all-excused fixture SKIPped.
+  the whole run, the `cardinality`-shaped leak fixture WARNed instead of FAILing; with the old
+  SKIP rule, the all-excused fixture SKIPped; with a missing key read as 60 s, the unkeyed run
+  directory fixture PASSed; and with `fanin`'s key removed, its load expectation failed.

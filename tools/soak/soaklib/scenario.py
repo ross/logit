@@ -221,9 +221,11 @@ FAN_OUT_KIND = "line_protocol"
 # or HTTP requests a listener answers.
 WIRES = ("udp", "tcp", "file", "http")
 DEFAULT_WIRE = "udp"
-# `rss_settle` when a scenario doesn't set it: how long past `recovery_bound` `rss_slope` keeps
-# excusing a fault, while the allocator returns what the fault's backlog took.
-DEFAULT_RSS_SETTLE_S = 60.0
+# `rss_settle` when a scenario doesn't set it, and for a run directory recorded before the key:
+# how long past `recovery_bound` `rss_slope` keeps excusing a fault, while the allocator returns
+# what the fault's backlog took. Opt-in, because most schedules leave no gap past
+# `recovery_bound` that a settle window wouldn't swallow.
+DEFAULT_RSS_SETTLE_S = 0.0
 FILE_WIRE = "file"
 HTTP_WIRE = "http"
 # A file wire's writer: a generator sink whose G is `events.delivered` (checks.py's `WIRES`),

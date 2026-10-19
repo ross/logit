@@ -282,7 +282,8 @@ class RunData:
         self.stats = collect.read_jsonl(self.run_dir / "stats.ndjson")
         self.freshness = collect.read_jsonl(self.run_dir / "vm-freshness.jsonl")
         self.recovery_bound = float(self.resolved.get("recovery_bound", 0))
-        # A run directory from before `rss_settle` existed takes the default.
+        # A run directory from before `rss_settle` existed takes the default, 0 s, and scores as
+        # it did then.
         self.rss_settle = float(self.resolved.get("rss_settle", DEFAULT_RSS_SETTLE_S))
         self.warmup = float(self.resolved.get("warmup", 0))
         self.thresholds = self.resolved.get("thresholds", {})

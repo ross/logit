@@ -504,30 +504,28 @@ gap. So the driver rejects the run instead of running out its schedule:
 
 ## Amendment: `rss_slope` excuses a settle window past `recovery_bound` (2026-10-18)
 
-A process gives back a fault's backlog memory in steps, over minutes. After a 45 s partition,
-`fanin`'s generator went from about 18 MiB to 86 MiB, then held 62.6 MiB from 14 s after the
-revert, 52.6 MiB from 84 s, and about 32 MiB from 104 s. `recovery_bound` ends the excusal at
-45 s, so the plateaus sat in the fit beside the baseline, and `rss_slope` WARNed at +240 MiB/h
-on memory the allocator was returning. Widening `recovery_bound` would have widened every row's
-excusal, and the ledger and `recovery` need it tight.
+A process can give back a fault's backlog memory in steps, over minutes. After a 45 s
+partition, `fanin`'s generator went from about 18 MiB to 86 MiB, then held 62.6 MiB from 14 s
+after the revert, 52.6 MiB from 84 s, and about 32 MiB from 104 s. `recovery_bound` ends the
+excusal at 45 s, so the plateaus sat in the fit beside the baseline, and `rss_slope` WARNed at
++240 MiB/h on memory the allocator was returning. Widening `recovery_bound` would have widened
+every row's excusal, and the ledger and `recovery` need it tight.
 
 - **`rss_slope` alone widens each fault window by `rss_settle`**, an optional top-level
-  scenario duration, 60 s by default. It applies after every fault, as `recovery_bound` does
-  for this row, and a run directory recorded before the key existed takes the default.
+  scenario duration. It applies after every fault, as `recovery_bound` does for this row.
+- **It's opt-in, 0 s by default.** A life needs 6 samples over 60 s outside the windows to be
+  fitted, and most shipped schedules leave so little past `recovery_bound` that any settle
+  window leaves some service no fit: a 60 s default took `kafka-broker-restart`,
+  `kafka-sasl-reauth`, `statsd-vm-lost-total`, `fanout-stop-outage`, `spool-kill-replay`,
+  `standin-at-most-once`, and `statsd-datadog` to no fittable life, and a recorded
+  `kafka-sasl-reauth` run from 29% judged to none. `fanin` and `tcp-ingress`, whose generator or
+  SUT showed the stepped release, set 60 s and keep a fit on every service.
+- **A run directory recorded before the key existed reads 0 s**, so it scores as it did.
 - **`fd_slope` keeps `recovery_bound`.** It compares single samples with the warmup median, and
   a closed connection releases its fd with no allocator in between.
 - **Coverage stays visible.** A service whose samples after warmup all fall in the widened
   windows WARNs on coverage instead of SKIPping, and the row SKIPs for want of a fit only when
   the run after warmup is shorter than one fit's 60 s.
 
-The cost is coverage on fault-dense schedules. A 120 s default covered every gap between
-faults in most shipped scenarios and left `rss_slope` nothing to judge, so the default is 60 s.
-Across the shipped scenarios at their own durations, the share of the run after warmup that
-`rss_slope` can judge falls from 11 to 85% with `recovery_bound` alone to 2 to 82% with the
-default. Most keep 10% or more. Seven would fall under 5% and WARN on coverage, so they set
-`rss_settle = "0s"` and keep the coverage they had: `native-hop`, `native-hop-spans`,
-`standin-datadog`, `standin-remote-write`, and the three `standin-influxdb` scenarios. Their
-schedules leave no gap past `recovery_bound` for a settle window. A run directory carries its
-settle in `scenario.resolved.json`, so one recorded before the key existed re-scores at the 60 s
-default, whatever its scenario now sets. Growth across a whole run still FAILs: a fixture of `cardinality`'s +73 and +61 MiB/h leak FAILs with the settle
-window in force.
+Growth across a whole run still FAILs under a settle window: a fixture of `cardinality`'s +73
+and +61 MiB/h leak FAILs with 60 s in force.

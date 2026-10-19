@@ -3412,7 +3412,7 @@ def _slope_edges():
 
 
 def _rss_settle_rules(root):
-    """`rss_settle` defaults to 60 s, loads a duration, reaches the resolved scenario, and is
+    """`rss_settle` defaults to 0 s, loads a duration, reaches the resolved scenario, and is
     refused negative or unparsable."""
     path, base = _base(root)
 
@@ -3422,9 +3422,9 @@ def _rss_settle_rules(root):
         return raw
 
     loaded = scenario.from_dict(copy.deepcopy(base), path)
-    expect(loaded.rss_settle == scenario.DEFAULT_RSS_SETTLE_S == 60.0
-           and loaded.to_json()["rss_settle"] == 60.0,
-           f"rss_settle defaults to 60s in the resolved scenario, got {loaded.rss_settle}")
+    expect(loaded.rss_settle == scenario.DEFAULT_RSS_SETTLE_S == 0.0
+           and loaded.to_json()["rss_settle"] == 0.0,
+           f"rss_settle defaults to 0s in the resolved scenario, got {loaded.rss_settle}")
     for value, seconds in (("90s", 90.0), ("0s", 0.0), ("2m30s", 150.0)):
         loaded = scenario.from_dict(with_settle(value), path)
         expect(loaded.rss_settle == seconds and loaded.to_json()["rss_settle"] == seconds,
@@ -3432,13 +3432,14 @@ def _rss_settle_rules(root):
     for value in ("-30s", "soon", "30", 30):
         _refused(path, with_settle(value), "scenario.rss_settle: not a duration",
                  f"rss_settle = {value!r}")
-    # These schedules leave no gap past recovery_bound, so they opt out of the settle window.
-    opted_out = ("native-hop", "native-hop-spans", "standin-datadog", "standin-remote-write",
-                 "standin-influxdb", "standin-influxdb-carried", "standin-influxdb-mixed")
-    for name in opted_out:
-        shipped = scenario.load(root / "scenarios" / name / "scenario.toml")
-        expect(shipped.rss_settle == 0.0 and shipped.to_json()["rss_settle"] == 0.0,
-               f"{name} loads rss_settle = 0s, got {shipped.rss_settle}")
+    # Only these schedules opt in; every other shipped scenario keeps recovery_bound alone.
+    opted_in = {"fanin": 60.0, "tcp-ingress": 60.0}
+    for path_one in sorted((root / "scenarios").glob("*/scenario.toml")):
+        name = path_one.parent.name
+        want = opted_in.get(name, 0.0)
+        shipped = scenario.load(path_one)
+        expect(shipped.rss_settle == want and shipped.to_json()["rss_settle"] == want,
+               f"{name} loads rss_settle = {want:g}s, got {shipped.rss_settle}")
     loaded = scenario.from_dict(copy.deepcopy(base), path)
     loaded.rss_settle = -1.0
     try:
@@ -3491,7 +3492,8 @@ def _rss_settle_checks():
                 return 32 * mib
             return 18 * mib
         partition = [("c0s1", "partition", "generator", 330, 375)]
-        settled = _settle_run(tmp, "settle-bump", partition, 600, flat, stepped)
+        settled = _settle_run(tmp, "settle-bump", partition, 600, flat, stepped,
+                              rss_settle=60.0)
         result = _status(settled, checks.check_rss_slope)
         expect(result.status == checks.PASS and "generator PASS" in result.detail,
                f"a fault's RSS returned within rss_settle PASSes, got {result}")
@@ -3500,6 +3502,12 @@ def _rss_settle_checks():
         result = _status(unsettled, checks.check_rss_slope)
         expect(result.status == checks.WARN and "generator WARN" in result.detail,
                f"the same RSS with rss_settle 0s WARNs on its slope, got {result}")
+        # A run directory recorded before the key scores as it did then, with no settle.
+        unkeyed = _settle_run(tmp, "settle-bump-unkeyed", partition, 600, flat, stepped)
+        data = checks.RunData(unkeyed)
+        result = checks.check_rss_slope(data)
+        expect(data.rss_settle == 0.0 and result.status == checks.WARN,
+               f"a run directory with no rss_settle reads 0s, got {data.rss_settle}, {result}")
 
         # cardinality's leak (20261012T215005Z): the SUT +73 and the generator +61 MiB/h for
         # 75 minutes against a 48 MiB/h limit, its five faults each adding 40 MiB that comes
@@ -3518,7 +3526,7 @@ def _rss_settle_checks():
         thresholds = {**RESOLVED["thresholds"], "rss_growth_mib_per_hour": 48}
         leak = _settle_run(tmp, "settle-leak", faults_at, 4500, leaking(50, 73),
                            leaking(30, 61), warmup=120.0, cooldown=180.0,
-                           thresholds=thresholds)
+                           thresholds=thresholds, rss_settle=60.0)
         data = checks.RunData(leak)
         result = checks.check_rss_slope(data)
         expect(data.rss_settle == 60.0 and result.status == checks.FAIL
@@ -3530,13 +3538,13 @@ def _rss_settle_checks():
         # life fits over 30 s judged of the 900 s after warmup.
         dense = [(f"c{i}s1", "netem", "generator", start, start + 30)
                  for i, start in enumerate(range(60, 811, 150))]
-        covered = _settle_run(tmp, "settle-dense", dense, 960, flat, flat)
+        covered = _settle_run(tmp, "settle-dense", dense, 960, flat, flat, rss_settle=60.0)
         result = _status(covered, checks.check_rss_slope)
         expect(result.status == checks.WARN and "cover little" in " ".join(result.lines)
                and "every sample after warmup in a fault window" not in result.detail,
                f"a schedule rss_settle leaves too little of WARNs on coverage, got {result}")
         whole = [("c0s1", "netem", "generator", 60, 1000)]
-        excused = _settle_run(tmp, "settle-whole", whole, 1000, flat, flat)
+        excused = _settle_run(tmp, "settle-whole", whole, 1000, flat, flat, rss_settle=60.0)
         result = _status(excused, checks.check_rss_slope)
         expect(result.status == checks.WARN
                and "every sample after warmup in a fault window" in result.detail,

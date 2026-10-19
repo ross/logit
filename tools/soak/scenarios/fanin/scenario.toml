@@ -11,6 +11,7 @@ duration = "16m30s"       # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "120s"         # >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+rss_settle = "60s"        # the generator or SUT releases partition-time memory over about 100 s
 cycle = "13m30s"          # >= last recovery (12m30s) + 2 x progress_window
 compose = "compose.override.yaml"   # adds generator-lines
 

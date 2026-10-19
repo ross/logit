@@ -10,7 +10,6 @@ duration = "35m40s"       # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "60s"          # >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
-rss_settle = "0s"         # the schedule leaves no room for a settle window past recovery_bound
 cycle = "33m40s"          # the last step, its recovery, and two progress windows
 
 [configs]

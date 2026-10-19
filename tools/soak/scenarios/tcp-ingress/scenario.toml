@@ -11,6 +11,7 @@ duration = "20m30s"       # warmup + one cycle + cooldown; --duration overrides
 warmup = "60s"            # no faults: baseline rate, RSS, fds
 cooldown = "120s"         # no faults at the end; >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+rss_settle = "60s"        # the generator or SUT releases partition-time memory over about 100 s
 cycle = "17m30s"          # >= last recovery (16m30s) + 2 x progress_window
 compose = "compose.override.yaml"   # caps both ends' TCP socket buffers
 
