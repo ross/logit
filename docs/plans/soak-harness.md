@@ -5349,3 +5349,67 @@ What the work showed about the harness:
   the whole run, the `cardinality`-shaped leak fixture WARNed instead of FAILing; with the old
   SKIP rule, the all-excused fixture SKIPped; with a missing key read as 60 s, the unkeyed run
   directory fixture PASSed; and with `fanin`'s key removed, its load expectation failed.
+
+### W20: an `otlp_proto` topic (2026-10-19)
+
+`kafka-otlp-broker-restart` ran for 20 minutes on the development host, against `logit:soak`
+(`sha256:10a901b9…`) built from `soak/w20` at `3c370071`, whose release binary is `main`'s at
+`33da7d62`: the branch's Rust change is a test. The run is
+`perf/results/soak/20261019T010146Z`, exit 0. A 1-hour run follows the table.
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 18 apply/revert action(s) returned 0; 0 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 2 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 6 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 9 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 80 readiness sample(s) read ok outside fault windows; 0 start(s) or unpause(s) ready in time |
+| `progress` | PASS | 7 30s window(s) outside fault windows, judged per sink (kafka target: no VictoriaMetrics): kafka: deliveries in 7 of 7, no freshness samples; 180s of 1140s after warmup judged (16%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +3.7 (limit 64); 300s of 1140s after warmup judged (26%; WARN under 5%) \| logit PASS: MiB/h life 0 -0.6 (limit 64); 300s of 1140s after warmup judged (26%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 11 -> end 12 (limit +8) \| logit PASS: warmup median 13 -> end 13 (limit +8) |
+| `ledger.wire` | PASS | G 2,412,100 = W 2,412,100 + K 0 + wire 0 (by design: 0 in UDP-affecting windows, -1 steady, 1 at the end; steady loss judged 0, each run at 0 or more, against limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 2,412,100 vs E + B 2,412,100 (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E 2,412,100 == A 2,412,100 (listener to aggregate); A_sent 60,400 == S_in[kafka] 60,400 (aggregate to kafka) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 0: Ab 2,412,100 == A 2,412,100 (every event absorbed) |
+| `ledger.egress` | PASS | kafka: life 0 (final): Ab 2,412,100 − V[kafka] 2,412,100 = 0, ok (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | kafka target: no VictoriaMetrics |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[kafka] 0; wire G − (W + K) 0 over the run, by design |
+| `ledger.sent` | PASS | to kafka: every batch received ended in an accepted response; kafka: requests ambiguous 3, clean 40, ok 604; records accepted 604; kafka life 0 at +1209s: received 604 vs delivered 604 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed); ledger.egress and ledger.topic read the topic back |
+| `ledger.topic` | PASS | T 604 distinct records in the topic (604 read, 0 duplicate copies) vs A 604 records the sink saw accepted, T − A 0 |
+| `ledger.standin` | SKIP | kafka target: no stand-in |
+| `identity.sink` | PASS | final life 0 at +1209s: kafka: received 604 vs delivered 604 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 9 of 9 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served` | SKIP | the scenario has no probe step |
+| `expect.no-drop-restart` | PASS | delta of logit.component.batches.dropped{component=kafka} on logit, through c0s1: c0s1 (+60s, +135s]: 0 (over 15 drain(s)), want <= 0 |
+| `expect.no-drop-pause` | PASS | delta of logit.component.batches.dropped{component=kafka} on logit, through c0s2: c0s2 (+165s, +250s]: 0 (over 17 drain(s)), want <= 0 |
+| `expect.no-drop-stop` | PASS | delta of logit.component.batches.dropped{component=kafka} on logit, through c0s3: c0s3 (+285s, +390s]: 0 (over 21 drain(s)), want <= 0 |
+| `expect.pause-is-ambiguous` | PASS | delta of logit.output.requests{class=ambiguous, component=kafka} on logit, through c0s2: c0s2 (+165s, +250s]: 1 (over 17 drain(s)), want >= 1 |
+| `expect.retrying-during-stop` | PASS | max of logit.component.retrying{component=kafka} on logit, during c0s3: c0s3 (+285s, +345s]: 1 (1 sample(s) and the value in force at its start), want >= 1 |
+| `expect.retrying-clears` | PASS | last of logit.component.retrying{component=kafka} on logit, after c0s3: c0s3 (+345s, +390s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
+
+- **The escaped read-back holds.** The consumer printed 604 records on 604 lines through
+  `BytesDeserializer`, every one unescaped and decoded, none unparsed. Each line averaged
+  11,593 characters for a 4,600-byte request: the escaped form is 2.5 times the request,
+  because most of a protobuf request's bytes aren't printable.
+- **V matched to the event.** The topic's `Sum` points summed to 2,412,100, Ab, with no
+  duplicate copy and no repeated point. One record per 2 s window, holding all 100 series,
+  so T is 604 records against `kafka-broker-restart`'s one record per series per window.
+- **The pauses still left resends.** The run counted three `ambiguous` attempts over its three
+  pauses, and the topic held no copy of any of them.
+
+Run `20261019T012708Z`: the same scenario at `--duration 1h`, on the same image, on the
+development host. Overall PASS, with only inapplicable SKIPs. It confirms the 20-minute run.
+
+- **No loss and no duplicate across 27 faults.** Ab and V are both 7,212,200, and T and A both
+  1,804 records. Nine `ambiguous` attempts over nine pauses left no duplicate copy and no
+  repeated point.
+- **The read-back is fast at this size.** 1,804 records, 20.9 MB of escaped text, read in about
+  6 s after the SUT stopped. At the escaped size an 8-hour run's topic would be about 167 MB,
+  which the 180 s consumer bound should still cover, but no run has measured it.
+- **RSS and descriptors were flat.** `rss_slope` read +1.7 MiB/h on the SUT and −0.0 on the
+  generator, and both kept their descriptor count.
