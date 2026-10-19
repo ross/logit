@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 mod construct;
+pub mod gapprobe;
 mod heartbeat;
 mod memory;
 mod pairs;
@@ -416,16 +417,23 @@ impl ScriptWorker {
             return Ok(Vec::new());
         };
         let flush: mlua::Function = self.lua.registry_value(flush_key)?;
+        let probe_start = gapprobe::now_ns();
+        gapprobe::begin();
         let result: LuaValue =
             flush.call(now.to_string()).map_err(proxy::clarify_destructed_handle_use)?;
         Ok(match result {
             LuaValue::Nil => Vec::new(),
-            LuaValue::Table(table) => events_from_table(
-                &self.lua,
-                table,
-                Returner::Flush,
-                self.heartbeat.borrow().as_deref(),
-            )?,
+            LuaValue::Table(table) => {
+                let r = events_from_table(
+                    &self.lua,
+                    table,
+                    Returner::Flush,
+                    self.heartbeat.borrow().as_deref(),
+                )?;
+                gapprobe::PHASE.store(5, std::sync::atomic::Ordering::Relaxed);
+                gapprobe::end(probe_start);
+                r
+            }
             // `borrow`, not `is`: `is` answers `false` for a destructed event, which would report
             // a stale event as "a userdata that isn't an event".
             LuaValue::UserData(ud) => match ud.borrow::<EventProxy>() {
@@ -535,6 +543,7 @@ fn events_from_table(
             returner.name()
         ))));
     };
+    gapprobe::PHASE.store(4, std::sync::atomic::Ordering::Relaxed);
     let mut events = Vec::with_capacity(len);
     for i in 1..=len {
         if let Some(heartbeat) = heartbeat {

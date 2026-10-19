@@ -28,12 +28,14 @@ impl Heartbeat {
 
     /// Marks the thread busy and counts one step. Calling it while already busy still advances.
     pub fn enter(&self) {
+        crate::gapprobe::on_update();
         let v = self.0.load(Ordering::Relaxed);
         self.0.store((v | Self::BUSY).wrapping_add(Self::STEP), Ordering::Relaxed);
     }
 
     /// Counts one step without changing the busy bit.
     pub fn tick(&self) {
+        crate::gapprobe::on_update();
         let v = self.0.load(Ordering::Relaxed);
         self.0.store(v.wrapping_add(Self::STEP), Ordering::Relaxed);
     }
@@ -41,6 +43,7 @@ impl Heartbeat {
     /// Clears the busy bit. The value still changes (when it was busy), which the watcher reads
     /// as progress.
     pub fn leave(&self) {
+        crate::gapprobe::on_update();
         let v = self.0.load(Ordering::Relaxed);
         self.0.store(v & !Self::BUSY, Ordering::Relaxed);
     }

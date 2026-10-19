@@ -233,6 +233,11 @@ pub(crate) fn validated_sequence_len_ticking(
     table: &Table,
     heartbeat: Option<&Heartbeat>,
 ) -> mlua::Result<Option<usize>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let probe = heartbeat.is_some();
+    if probe {
+        crate::gapprobe::PHASE.store(2, Relaxed);
+    }
     let mut keys: Vec<i64> = Vec::new();
     for pair in table.clone().pairs::<LuaValue, LuaValue>() {
         if let Some(heartbeat) = heartbeat {
@@ -244,7 +249,14 @@ pub(crate) fn validated_sequence_len_ticking(
             _ => return Ok(None),
         }
     }
+    if probe {
+        crate::gapprobe::PHASE.store(3, Relaxed);
+    }
+    let t0 = crate::gapprobe::now_ns();
     keys.sort_unstable();
+    if probe {
+        crate::gapprobe::SORT_NS.store(crate::gapprobe::now_ns() - t0, Relaxed);
+    }
     let is_contiguous_from_one = keys.iter().enumerate().all(|(idx, &k)| k == idx as i64 + 1);
     Ok(is_contiguous_from_one.then_some(keys.len()))
 }

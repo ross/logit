@@ -10340,6 +10340,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_progressing_flush_emitting_many_events_is_never_stalled() {
+        let mut stalled_runs = Vec::new();
+        for run in 0..5 {
+            if progressing_flush_once().await {
+                stalled_runs.push(run);
+            }
+        }
+        let report = logit_script::gapprobe::REPORT.lock().unwrap().join("\n");
+        panic!("GAPREPORT-BEGIN (stalled runs: {stalled_runs:?})\n{report}\nGAPREPORT-END");
+    }
+
+    /// Returns whether the node was ever seen stalled.
+    async fn progressing_flush_once() -> bool {
         let script = r#"
             function process(event) return nil end
             function flush(now)
@@ -10423,14 +10435,9 @@ mod tests {
 
         let emitted: usize = out_rx.try_iter().map(|b| b.events.len()).sum();
         assert_eq!(emitted, 100_000);
-        assert!(!seen_stalled.await.unwrap(), "a flush making progress was reported stalled");
-        assert_eq!(
-            Totals::of(registry.drain(0)).sum(
-                "logit.component.diagnostics",
-                &[("component", "enrich"), ("key", "script_stalled")]
-            ),
-            0.0
-        );
+        let seen = seen_stalled.await.unwrap();
+        let _ = Totals::of(registry.drain(0));
+        seen
     }
 
     /// Batches a wedged node never read are destroyed with its inbox on revocation; each must be
