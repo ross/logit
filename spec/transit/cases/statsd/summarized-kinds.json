@@ -1,0 +1,4 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.size","kind":"histogram","temporality":"delta","buckets":[{"bound":100.0,"count":3},{"bound":1000.0,"count":1}],"sum":850.0,"min":10.0,"max":400.0}]}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":30},{"bound":1000.0,"count":12}],"sum":9000.0}]}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency.exp","kind":"exponential_histogram","scale":2,"temporality":"delta","count":5,"zero_count":1,"zero_threshold":0.0,"positive":{"offset":0,"counts":[1,2,1]},"sum":12.5}]}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"rpc.duration","kind":"summary","count":10,"sum":55.0,"quantiles":[{"quantile":0.5,"value":5.0},{"quantile":0.99,"value":9.9}]}]}

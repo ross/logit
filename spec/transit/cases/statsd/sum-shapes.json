@@ -1,0 +1,3 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.total","kind":"sum","value":120.0,"temporality":"cumulative","monotonic":true}]}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"active.sessions","kind":"sum","value":14.0,"temporality":"cumulative","monotonic":false}]}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"balance.change","kind":"sum","value":-4.0,"temporality":"delta","monotonic":false}]}

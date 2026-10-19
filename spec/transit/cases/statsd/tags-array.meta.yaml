@@ -1,0 +1,2 @@
+wire: tags-array.statsd
+exercises: [counter, tags, tags_repeated_key]

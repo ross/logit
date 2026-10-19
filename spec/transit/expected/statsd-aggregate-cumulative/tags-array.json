@@ -1,0 +1,6 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"gauge","value":1.0}],"attributes":{"team":["a","b"],"urgent":[true,"1"]}}
+], "counters": {
+  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1,
+  "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1
+}}

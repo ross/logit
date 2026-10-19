@@ -1,0 +1,5 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[12.0,7.5],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms","route":"/api"}}
+], "counters": {
+  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2
+}}

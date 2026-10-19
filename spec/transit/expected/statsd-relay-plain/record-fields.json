@@ -1,0 +1,8 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"hits","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.duration","kind":"gauge","value":0.25}]}
+], "counters": {
+  "logit.output.messages.skipped{component=out,kind=statsd_out,reason=no_recorded_value,role=sink}": 1,
+  "logit.output.tags.omitted{component=out,kind=statsd_out,reason=dialect,role=sink}": 2
+}}

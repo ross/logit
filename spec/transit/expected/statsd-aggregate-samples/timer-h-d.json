@@ -1,0 +1,6 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size","kind":"samples","values":[512.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"h"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size","kind":"samples","values":[60196.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"d","endpoint":"/orders"}}
+], "counters": {
+  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2
+}}

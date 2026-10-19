@@ -1,0 +1,2 @@
+wire: gauge-delta.statsd
+exercises: [gauge, gauge_delta]

@@ -1,0 +1,29 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.cache.lookups","kind":"sum","value":10.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.db.select_user.duration.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.db.select_user.duration.max","kind":"gauge","value":0.333136}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.db.select_user.duration.min","kind":"gauge","value":0.333136}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.db.select_user.duration.q0_5","kind":"gauge","value":0.333136}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.db.select_user.duration.q0_75","kind":"gauge","value":0.333136}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.db.select_user.duration.q0_9","kind":"gauge","value":0.333136}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.db.select_user.duration.q0_95","kind":"gauge","value":0.333136}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.db.select_user.duration.q0_99","kind":"gauge","value":0.333136}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.db.select_user.duration.sum","kind":"sum","value":0.333136,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.200.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration.max","kind":"gauge","value":0.05}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration.min","kind":"gauge","value":0.05}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration.q0_5","kind":"gauge","value":0.05}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration.q0_75","kind":"gauge","value":0.05}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration.q0_9","kind":"gauge","value":0.05}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration.q0_95","kind":"gauge","value":0.05}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration.q0_99","kind":"gauge","value":0.05}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration.sum","kind":"sum","value":0.05,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.render.calls","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.worker.email.depth","kind":"gauge","value":234.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.worker.reindex.depth","kind":"gauge","value":90.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.worker.webhooks.depth","kind":"gauge","value":110.0}]}
+], "counters": {
+  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 8,
+  "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=distribution,role=sink}": 2
+}}

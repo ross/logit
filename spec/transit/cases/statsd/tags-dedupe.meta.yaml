@@ -1,0 +1,2 @@
+wire: tags-dedupe.statsd
+exercises: [counter, tags, tags_duplicate]

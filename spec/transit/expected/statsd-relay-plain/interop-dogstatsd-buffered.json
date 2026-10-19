@@ -1,0 +1,17 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.db.query.duration_ms","kind":"samples","values":[0.33313615206930347],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[0.05],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[23.483176616760144],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.response.size_bytes","kind":"samples","values":[60196.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.render.calls.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.users.active","kind":"set_members","members":["2665"]}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":110.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":210.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":90.0}]}
+], "counters": {
+  "logit.output.fields.omitted{component=out,kind=statsd_out,reason=dialect,role=sink}": 11,
+  "logit.output.messages.normalized{component=out,kind=statsd_out,reason=dialect,role=sink}": 3,
+  "logit.output.tags.omitted{component=out,kind=statsd_out,reason=dialect,role=sink}": 61
+}}

@@ -1,0 +1,23 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size.max","kind":"gauge","value":512.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size.min","kind":"gauge","value":512.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size.q0_5","kind":"gauge","value":512.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size.q0_75","kind":"gauge","value":512.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size.q0_9","kind":"gauge","value":512.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size.q0_95","kind":"gauge","value":512.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size.q0_99","kind":"gauge","value":512.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size.sum","kind":"sum","value":512.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/orders"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size.max","kind":"gauge","value":60196.0}],"attributes":{"endpoint":"/orders"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size.min","kind":"gauge","value":60196.0}],"attributes":{"endpoint":"/orders"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size.q0_5","kind":"gauge","value":60196.0}],"attributes":{"endpoint":"/orders"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size.q0_75","kind":"gauge","value":60196.0}],"attributes":{"endpoint":"/orders"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size.q0_9","kind":"gauge","value":60196.0}],"attributes":{"endpoint":"/orders"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size.q0_95","kind":"gauge","value":60196.0}],"attributes":{"endpoint":"/orders"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size.q0_99","kind":"gauge","value":60196.0}],"attributes":{"endpoint":"/orders"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size.sum","kind":"sum","value":60196.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/orders"}}
+], "counters": {
+  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2,
+  "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=distribution,role=sink}": 2
+}}

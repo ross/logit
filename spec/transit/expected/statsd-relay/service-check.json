@@ -1,0 +1,4 @@
+{"events": [
+  {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"env":"prod","_logit.statsd.timestamp":1799999970,"_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"_logit.statsd.service_check.host":"web-07","_logit.statsd.service_check.message":"all good"},"types":{"/attributes/_logit.statsd.timestamp":"u64","/attributes/_logit.statsd.service_check.status":"u64"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cache.up","kind":"gauge","value":2.0}],"attributes":{"_logit.statsd.service_check.name":"cache.up","_logit.statsd.service_check.status":2,"_logit.statsd.service_check.message":"down"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}}
+], "counters": {}}

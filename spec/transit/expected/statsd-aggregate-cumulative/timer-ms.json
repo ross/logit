@@ -1,0 +1,14 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/api"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.max","kind":"gauge","value":12.0}],"attributes":{"route":"/api"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.min","kind":"gauge","value":7.5}],"attributes":{"route":"/api"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.q0_5","kind":"gauge","value":7.504810760734267}],"attributes":{"route":"/api"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.q0_75","kind":"gauge","value":11.949265902703198}],"attributes":{"route":"/api"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.q0_9","kind":"gauge","value":11.949265902703198}],"attributes":{"route":"/api"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.q0_95","kind":"gauge","value":11.949265902703198}],"attributes":{"route":"/api"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.q0_99","kind":"gauge","value":11.949265902703198}],"attributes":{"route":"/api"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.sum","kind":"sum","value":19.5,"temporality":"delta","monotonic":true}],"attributes":{"route":"/api"}}
+], "counters": {
+  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2,
+  "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=distribution,role=sink}": 1
+}}

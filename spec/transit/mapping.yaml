@@ -1,0 +1,472 @@
+# The transit mapping table: what each sink does with each metric kind and each feature that
+# changes its fate. It's the canonical copy; spec/transit/README.md explains the schema and how a
+# flow checks it. `crates/logit-cli/src/transit/mapping.rs` validates it.
+
+# The class vocabulary, the canonical copy. A record-level row's class is one of exact,
+# normalized, degraded, skipped, or dropped, best to worst; a field-level row's (`record` rows for
+# unit, description, start_timestamp, and exemplars, and every `attributes` row) is one of exact,
+# normalized, or lost.
+classes:
+  exact: The pair's decoder reads back the same kind, value, and field.
+  normalized: >-
+    A permitted normalization applied, named by the cell's reason; a record or field the
+    normalization doesn't touch reads back exact.
+  degraded: >-
+    The value survives in a lesser kind, such as a sketch written as dotted count and quantile
+    series.
+  lost: >-
+    A field the record loses while the record itself survives; the cell names the counter that
+    counts it, or says it's uncounted.
+  skipped: >-
+    The record leaves no wire form, because the sink has none for it or the config chose none,
+    counted under the cell's skipped counter.
+  dropped: >-
+    The record is lost for a reason the config didn't ask for, counted under the cell's dropped
+    counter.
+
+sinks: [statsd_out]
+
+rows:
+  # --- sum: temporality and monotonicity -------------------------------------------------------
+  - kind: sum
+    feature: delta_monotonic
+    cells:
+      statsd_out:
+        class: exact
+        text: >-
+          A `|c` counter line, with its sample rate divided out when statsd_in decoded it, so no
+          `@rate` is written.
+  - kind: sum
+    feature: delta_nonmonotonic
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=non_monotonic_delta_sum}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=non_monotonic_delta_sum}
+          text: >-
+            A signed `|c` increment. A statsd counter has no monotonic flag, so it reads back
+            monotonic.
+  - kind: sum
+    feature: cumulative_monotonic
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=cumulative_sum}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
+          text: >-
+            The running total as a bare `|g` gauge, never `|c`, which a statsd server would add to
+            itself on every flush.
+  - kind: sum
+    feature: cumulative_nonmonotonic
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=cumulative_sum}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
+          text: The running total as a bare `|g` gauge.
+
+  # --- sum: scalar type ------------------------------------------------------------------------
+  - kind: sum
+    feature: f64
+    cells:
+      statsd_out:
+        class: exact
+        text: The value is written as the shortest float that reads back to the same bits.
+  - kind: sum
+    feature: i64
+    cells:
+      statsd_out:
+        class: normalized
+        reason: f64_value
+        text: >-
+          statsd_out writes every digit, and statsd_in reads the number back as an f64, so an
+          integer reads back as a float and one beyond 2^53 rounds.
+  - kind: sum
+    feature: u64
+    cells:
+      statsd_out:
+        class: normalized
+        reason: f64_value
+        text: >-
+          statsd_out writes every digit, and statsd_in reads the number back as an f64, so an
+          integer reads back as a float and one beyond 2^53 rounds.
+  - kind: sum
+    feature: bool
+    cells:
+      statsd_out:
+        class: normalized
+        reason: bool_value
+        counter: logit.output.metrics.normalized{reason=bool_value}
+        text: A boolean is written as `1` or `0` and reads back as that number.
+
+  # --- gauge -----------------------------------------------------------------------------------
+  - kind: gauge
+    feature: f64
+    cells:
+      statsd_out:
+        class: exact
+        text: An absolute `|g` gauge line.
+  - kind: gauge
+    feature: i64
+    cells:
+      statsd_out:
+        class: normalized
+        reason: f64_value
+        text: >-
+          statsd_out writes every digit, and statsd_in reads the number back as an f64, so an
+          integer reads back as a float and one beyond 2^53 rounds.
+  - kind: gauge
+    feature: u64
+    cells:
+      statsd_out:
+        class: normalized
+        reason: f64_value
+        text: >-
+          statsd_out writes every digit, and statsd_in reads the number back as an f64, so an
+          integer reads back as a float and one beyond 2^53 rounds.
+  - kind: gauge
+    feature: bool
+    cells:
+      statsd_out:
+        class: normalized
+        reason: bool_value
+        counter: logit.output.metrics.normalized{reason=bool_value}
+        text: A boolean is written as `1` or `0` and reads back as that number.
+  - kind: gauge
+    feature: negative
+    cells:
+      statsd_out:
+        class: degraded
+        text: >-
+          statsd has no negative absolute gauge, so statsd_out writes `0|g` then `-v|g` in one
+          datagram. A statsd server ends at the right value, but statsd_in reads the pair as a
+          gauge of 0 and a relative adjustment, uncounted.
+
+  # --- gauge_delta -----------------------------------------------------------------------------
+  - kind: gauge_delta
+    feature: f64
+    cells:
+      statsd_out:
+        - when: {relative_gauges: true}
+          class: exact
+          text: A relative `+v|g` or `-v|g` line.
+        - class: dropped
+          counter: logit.output.messages.dropped{reason=unresolved_gauge_delta}
+          text: >-
+            An unresolved relative adjustment is dropped unless `relative_gauges: true`; an
+            `aggregate` upstream resolves it into a gauge.
+  - kind: gauge_delta
+    feature: i64
+    cells:
+      statsd_out:
+        - when: {relative_gauges: true}
+          class: normalized
+          reason: f64_value
+          text: A relative line, read back as an f64.
+        - class: dropped
+          counter: logit.output.messages.dropped{reason=unresolved_gauge_delta}
+          text: 'Dropped unless `relative_gauges: true`, as for a float adjustment.'
+  - kind: gauge_delta
+    feature: u64
+    cells:
+      statsd_out:
+        - when: {relative_gauges: true}
+          class: normalized
+          reason: f64_value
+          text: A relative line, read back as an f64.
+        - class: dropped
+          counter: logit.output.messages.dropped{reason=unresolved_gauge_delta}
+          text: 'Dropped unless `relative_gauges: true`, as for a float adjustment.'
+  - kind: gauge_delta
+    feature: bool
+    cells:
+      statsd_out:
+        - when: {relative_gauges: true}
+          class: normalized
+          reason: bool_value
+          counter: logit.output.metrics.normalized{reason=bool_value}
+          text: A relative line of `1` or `0`.
+        - class: dropped
+          counter: logit.output.messages.dropped{reason=unresolved_gauge_delta}
+          text: 'Dropped unless `relative_gauges: true`, as for a float adjustment.'
+
+  # --- raw multi-value kinds -------------------------------------------------------------------
+  - kind: samples
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: normalized
+          reason: dialect
+          counter: logit.output.messages.normalized{reason=dialect}
+          text: >-
+            Under `format: statsd`, a multi-value line splits into one line per value and an `h`
+            or `d` timer is written as `ms`, counted per line it renames.
+        - class: exact
+          text: >-
+            One `|ms`, `|h`, or `|d` line holding every value, the type letter from the
+            `_logit.statsd.type` carrier and `@rate` written when it isn't 1.
+  - kind: set_members
+    cells:
+      statsd_out:
+        class: normalized
+        reason: member_per_line
+        text: >-
+          One `|s` line per member, under either dialect and uncounted, so a multi-member set
+          line reads back as one record per member; a statsd server counts the same distinct
+          members either way.
+
+  # --- summarized kinds ------------------------------------------------------------------------
+  - kind: distribution
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=distribution}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=distribution}
+          text: >-
+            Dotted `.count` and `.sum` counters and `.min`, `.max`, and `.q0_5` to `.q0_99`
+            gauges. Counts and sums merge across senders at a statsd server; quantiles and
+            extremes are the last sender's.
+  - kind: set
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=set}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=set}
+          text: >-
+            The estimate as a `.count` gauge; two senders' estimates don't add, and the registers
+            are gone.
+  - kind: histogram
+    feature: delta
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=histogram}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Dotted `.count`, `.sum`, and `.bucket_<bound>` counters and `.min` and `.max`
+            gauges.
+  - kind: histogram
+    feature: cumulative
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=histogram}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            The same dotted series, every one a gauge, since a running total sent as `|c` would
+            be added to itself.
+  - kind: exponential_histogram
+    feature: delta
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=exponential_histogram}
+          text: >-
+            Dotted `.count`, `.sum`, and `.zero_count` counters and `.min` and `.max` gauges. Its
+            buckets aren't written, since each scale would mint its own series names.
+  - kind: exponential_histogram
+    feature: cumulative
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=exponential_histogram}
+          text: The same dotted series, every one a gauge, and no buckets.
+  - kind: summary
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=summary}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=summary}
+          text: Dotted `.count`, `.sum`, and per-quantile gauges.
+
+  # --- record fields ---------------------------------------------------------------------------
+  - kind: record
+    feature: unit
+    cells:
+      statsd_out:
+        class: lost
+        reason: uncounted
+        text: statsd has no unit; it isn't written or counted.
+  - kind: record
+    feature: description
+    cells:
+      statsd_out:
+        class: lost
+        reason: uncounted
+        text: statsd has no description; it isn't written or counted.
+  - kind: record
+    feature: start_timestamp
+    cells:
+      statsd_out:
+        class: lost
+        reason: uncounted
+        text: statsd has no start time; it isn't written or counted.
+  - kind: record
+    feature: exemplars
+    cells:
+      statsd_out:
+        class: lost
+        reason: uncounted
+        text: statsd has no exemplars; they aren't written or counted.
+  - kind: record
+    feature: no_recorded_value
+    cells:
+      statsd_out:
+        class: skipped
+        counter: logit.output.messages.skipped{reason=no_recorded_value}
+        text: A point flagged as holding no recorded value has no statsd line.
+  - kind: record
+    feature: service_check
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: skipped
+          counter: logit.output.messages.skipped{reason=dialect}
+          text: Plain statsd has no service check, so none is written.
+        - class: exact
+          text: >-
+            A gauge carrying the `_logit.statsd.service_check.*` carriers is a DogStatsD `_sc`
+            line again.
+  - kind: record
+    feature: name_unsafe
+    cells:
+      statsd_out:
+        class: normalized
+        reason: name_sanitized
+        text: >-
+          Every `:`, `|`, `@`, `#`, `,`, control, and whitespace character in a name is written as
+          `_`, so the record reads back under the sanitized name, uncounted.
+
+  # --- attributes ------------------------------------------------------------------------------
+  - kind: attributes
+    feature: string_value
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags; each is counted once per wire tag.
+        - class: exact
+          text: A DogStatsD `key:value` tag.
+  - kind: attributes
+    feature: bool_value
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags.
+        - class: normalized
+          reason: bool_tag
+          text: >-
+            `true` is a bare tag and reads back `true`; `false` is `key:false` and reads back as
+            the string.
+  - kind: attributes
+    feature: number_value
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags.
+        - class: normalized
+          reason: stringified
+          text: A number is a `key:digits` tag and reads back as a string.
+  - kind: attributes
+    feature: array_value
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags; each element is counted as a wire tag.
+        - class: exact
+          text: >-
+            One tag per element in order, which statsd_in folds back into the same array.
+  - kind: attributes
+    feature: private_carrier
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.fields.omitted{reason=dialect}
+          text: >-
+            Plain statsd has no `|c:`, `|e:`, `|card:`, or `|T` segment, so those carriers are
+            omitted, counted per line; the type carrier survives as the line's type, `h` and `d`
+            as `ms`.
+        - class: exact
+          text: >-
+            A `_logit.statsd.*` carrier is written as its own segment or field and statsd_in
+            stamps it back.
+  - kind: attributes
+    feature: foreign_carrier
+    cells:
+      statsd_out:
+        class: lost
+        reason: uncounted
+        text: Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted.
+  - kind: attributes
+    feature: resource_attribute
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: lost
+          counter: logit.output.tags.omitted{reason=dialect}
+          text: Plain statsd has no tags.
+        - class: normalized
+          reason: resource_merged
+          text: >-
+            A resource attribute is written as a tag, the event's value winning on a shared key,
+            and reads back as an event attribute.
+
+  # --- logs ------------------------------------------------------------------------------------
+  - kind: log
+    feature: dogstatsd_event
+    cells:
+      statsd_out:
+        - when: {format: statsd}
+          class: skipped
+          counter: logit.output.messages.skipped{reason=dialect}
+          text: Plain statsd has no event, so none is written.
+        - class: exact
+          text: >-
+            A log carrying the `_logit.statsd.event.*` carriers is a DogStatsD `_e` line again.
+  - kind: log
+    feature: plain
+    cells:
+      statsd_out:
+        class: skipped
+        counter: logit.output.events.skipped
+        text: Any other log has no statsd form and isn't written.

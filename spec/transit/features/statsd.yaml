@@ -1,0 +1,49 @@
+# The statsd and DogStatsD wire features a case under cases/statsd/ can exercise, from
+# crates/logit-proto/src/statsd/mod.rs's grammar and docs/design/telemetry-landscape.md's statsd
+# and DogStatsD sections. A case names the ones it exercises in its `.meta.yaml`.
+- name: counter
+  text: A `|c` counter line, decoded to a delta monotonic sum.
+- name: counter_sample_rate
+  text: A counter with `@rate`, extrapolated to `value / rate` at decode.
+- name: gauge
+  text: An absolute `|g` gauge line.
+- name: gauge_delta
+  text: A `|g` value with a leading `+` or `-`, decoded to an unresolved relative adjustment.
+- name: timer_ms
+  text: A `|ms` timer line, decoded to raw samples with the `ms` type carrier.
+- name: timer_h
+  text: A `|h` histogram line, decoded to raw samples with the `h` type carrier.
+- name: timer_d
+  text: A `|d` distribution line, decoded to raw samples with the `d` type carrier.
+- name: timer_sample_rate
+  text: A timer with `@rate`, carried on the samples verbatim, not extrapolated.
+- name: set
+  text: A `|s` set line, decoded to set members in wire order.
+- name: multi_value_line
+  text: >-
+    Several `:`-separated values on one line: one event per value for `c` and `g`, one event
+    holding them all for a timer or a set.
+- name: tags
+  text: A DogStatsD `|#` tag segment, valued and bare tags both.
+- name: tags_repeated_key
+  text: A tag key given more than once, folded into an array in wire order.
+- name: tags_duplicate
+  text: An exact duplicate tag token, deduplicated at decode.
+- name: container_id
+  text: A `|c:<container-id>` segment, stamped as the `_logit.statsd.container_id` carrier.
+- name: external_data
+  text: A `|e:<external-data>` segment, stamped as the `_logit.statsd.external_data` carrier.
+- name: cardinality
+  text: A `|card:<cardinality>` segment, stamped as the `_logit.statsd.cardinality` carrier.
+- name: timestamp_T
+  text: >-
+    A `|T<unix-seconds>` segment (or an event's or service check's `d:`), which sets the event
+    timestamp and stamps the `_logit.statsd.timestamp` carrier.
+- name: service_check
+  text: A DogStatsD `_sc` service check, decoded to a gauge of its status with its carriers.
+- name: event
+  text: A DogStatsD `_e` event, decoded to a log with its carriers.
+- name: name_sanitized
+  text: >-
+    A metric name holding a byte the statsd grammar reserves (`:`, `|`, a newline), which the
+    wire can't carry and statsd_out writes as `_`.

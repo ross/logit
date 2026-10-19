@@ -1,0 +1,2 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":3.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/api"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"jobs.started","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]}

@@ -1,0 +1,23 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.query.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.query.max","kind":"gauge","value":3.2}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.query.min","kind":"gauge","value":3.2}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.query.q0_5","kind":"gauge","value":3.2}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.query.q0_75","kind":"gauge","value":3.2}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.query.q0_9","kind":"gauge","value":3.2}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.query.q0_95","kind":"gauge","value":3.2}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.query.q0_99","kind":"gauge","value":3.2}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.query.sum","kind":"sum","value":6.4,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.time.count","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/home"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.time.max","kind":"gauge","value":40.0}],"attributes":{"route":"/home"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.time.min","kind":"gauge","value":40.0}],"attributes":{"route":"/home"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.time.q0_5","kind":"gauge","value":40.0}],"attributes":{"route":"/home"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.time.q0_75","kind":"gauge","value":40.0}],"attributes":{"route":"/home"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.time.q0_9","kind":"gauge","value":40.0}],"attributes":{"route":"/home"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.time.q0_95","kind":"gauge","value":40.0}],"attributes":{"route":"/home"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.time.q0_99","kind":"gauge","value":40.0}],"attributes":{"route":"/home"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.time.sum","kind":"sum","value":160.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/home"}}
+], "counters": {
+  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2,
+  "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=distribution,role=sink}": 2
+}}

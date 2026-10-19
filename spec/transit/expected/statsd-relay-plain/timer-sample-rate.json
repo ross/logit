@@ -1,0 +1,7 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db.query","kind":"samples","values":[3.2],"sample_rate":0.5}],"attributes":{"_logit.statsd.type":"ms"}},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.time","kind":"samples","values":[40.0],"sample_rate":0.25}],"attributes":{"_logit.statsd.type":"ms"}}
+], "counters": {
+  "logit.output.messages.normalized{component=out,kind=statsd_out,reason=dialect,role=sink}": 1,
+  "logit.output.tags.omitted{component=out,kind=statsd_out,reason=dialect,role=sink}": 1
+}}

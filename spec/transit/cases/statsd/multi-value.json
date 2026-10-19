@@ -1,0 +1,7 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}]}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":3.0,"temporality":"delta","monotonic":true}]}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"level","kind":"gauge","value":4.0}]}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"level","kind":"gauge","value":5.0}]}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[1.0,2.0,3.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"visitors","kind":"set_members","members":["a","b"]}]}

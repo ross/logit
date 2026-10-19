@@ -1,0 +1,10 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"active.sessions","kind":"gauge","value":14.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"balance.change","kind":"gauge","value":0.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"balance.change","kind":"gauge_delta","delta":-4.0}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests.total","kind":"gauge","value":120.0}]}
+], "counters": {
+  "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1,
+  "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 3,
+  "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=no_merge_rule,role=transform}": 2
+}}

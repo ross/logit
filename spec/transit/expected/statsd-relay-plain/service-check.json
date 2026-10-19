@@ -1,0 +1,4 @@
+{"events": [], "counters": {
+  "logit.output.messages.skipped{component=out,kind=statsd_out,reason=dialect,role=sink}": 2,
+  "logit.output.tags.omitted{component=out,kind=statsd_out,reason=dialect,role=sink}": 1
+}}

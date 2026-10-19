@@ -1,0 +1,2 @@
+wire: counter.statsd
+exercises: [counter, tags]

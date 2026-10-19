@@ -1,0 +1,2 @@
+wire: carriers.statsd
+exercises: [counter, gauge, timer_ms, tags, container_id, external_data, cardinality, timestamp_T]

@@ -1,0 +1,2 @@
+wire: gauge.statsd
+exercises: [gauge, tags]

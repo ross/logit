@@ -1,0 +1,2 @@
+wire: multi-value.statsd
+exercises: [multi_value_line, counter, gauge, timer_ms, set]

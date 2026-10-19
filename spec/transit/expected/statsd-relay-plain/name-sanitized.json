@@ -1,0 +1,6 @@
+{"events": [
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"http_requests_total","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
+  {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":3.0}]}
+], "counters": {
+  "logit.output.tags.omitted{component=out,kind=statsd_out,reason=dialect,role=sink}": 1
+}}

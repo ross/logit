@@ -1,0 +1,19 @@
+# statsd_in's cases through a 10s `aggregate` that keeps raw samples and set members, into
+# statsd_out, which writes them as the timer and set lines they came from.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/statsd/mixed.json
+  window:
+    type: aggregate
+    sources: [case]
+    interval: 10s
+    distributions: samples
+    sets: members
+  out:
+    type: statsd_out
+    sources: [window]
+    endpoint: 127.0.0.1:8125
+    format: dogstatsd
