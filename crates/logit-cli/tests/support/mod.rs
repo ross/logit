@@ -191,14 +191,28 @@ impl Lines {
 
     /// Reads a `--log-format json` child's startup lines until each of `names` has reported the
     /// address it bound, and returns those addresses in `names`' order. A name is a component id,
-    /// matched against its `bound` line, or [`ADMIN`] for the `admin bound` line. Every one of
-    /// these is logged before `ready`, once its socket is bound and, for TCP, listening, so a
-    /// test can connect or send to the address at once. Panics after [`PROCESS_DEADLINE`] or
-    /// once the output closes, as [`Lines::wait_for`] does.
+    /// matched against its `bound` line, or [`ADMIN`] for the `admin bound` line. A name keeps
+    /// the first address it reports: with `admin.bind` and `admin.socket` both set, [`ADMIN`] is
+    /// the TCP address, logged before the socket's path. Every one of these lines is logged
+    /// before `ready`, once its socket is bound and, for TCP, listening, so a test can connect or
+    /// send to the address at once. Panics after [`PROCESS_DEADLINE`] or once the output closes,
+    /// naming the names still unresolved and every line read.
     pub fn wait_for_bound(&self, names: &[&str]) -> Vec<String> {
+        let deadline = std::time::Instant::now() + PROCESS_DEADLINE;
         let mut found: Vec<Option<String>> = vec![None; names.len()];
+        let mut read = Vec::new();
         while found.iter().any(Option::is_none) {
-            let line = self.wait_for("bound");
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let line = self.0.recv_timeout(left).unwrap_or_else(|err| {
+                let missing: Vec<&str> = names
+                    .iter()
+                    .zip(&found)
+                    .filter(|(_, f)| f.is_none())
+                    .map(|(n, _)| *n)
+                    .collect();
+                panic!("no bound address for {missing:?} ({err}); read: {read:#?}")
+            });
+            read.push(line.clone());
             let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
             let (name, address) = if event["message"] == "admin bound" {
                 (ADMIN, event["address"].as_str())
@@ -211,7 +225,7 @@ impl Lines {
             } else {
                 continue;
             };
-            if let Some(i) = names.iter().position(|n| *n == name) {
+            if let Some(i) = names.iter().position(|n| *n == name).filter(|&i| found[i].is_none()) {
                 found[i] = Some(address.unwrap_or_else(|| panic!("no address in {line}")).into());
             }
         }

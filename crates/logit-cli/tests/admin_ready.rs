@@ -236,6 +236,26 @@ async fn a_stale_admin_socket_file_is_replaced() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// With `admin.bind` and `admin.socket` both set, the child logs `admin bound` twice, the TCP
+/// address first. [`support::Lines::wait_for_bound`] keeps that first address for [`ADMIN`] while
+/// it reads on for `in`'s line, which follows both.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_for_bound_keeps_the_admin_tcp_address_beside_a_socket() {
+    let dir = logit_pipeline::test_util::scratch_dir("admin-socket-first-address");
+    let path = dir.join("admin.sock");
+    let (_config, _child, stderr) = spawn_with_admin(
+        "admin-socket-first-address",
+        &format!("  bind: \"{ANY_PORT}\"\n  socket: \"{}\"\n", path.display()),
+    )
+    .await;
+    let addrs = stderr.wait_for_bound(&[ADMIN, "in"]);
+    let admin: std::net::SocketAddr =
+        addrs[0].parse().expect("the TCP address, not the socket path");
+    assert_ne!(admin.port(), 0, "{admin}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_bind_and_socket_together_both_serve() {
