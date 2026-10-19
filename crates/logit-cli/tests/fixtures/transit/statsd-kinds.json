@@ -1,0 +1,4 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":3.0,"temporality":"delta","monotonic":true}],"attributes":{"route":"/api"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"room":"lab"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[12.0],"sample_rate":1.0}],"attributes":{"route":"/api","_logit.statsd.type":"ms"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"users","kind":"set_members","members":["alice"]}]}
