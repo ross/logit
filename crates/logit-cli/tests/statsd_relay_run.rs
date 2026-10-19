@@ -6,7 +6,7 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,45 +14,35 @@ use bytes::Bytes;
 use logit_core::{MetricKind, Resource, Temporality};
 use logit_proto::statsd::StatsdDecoder;
 use logit_proto::Decoder;
-use support::{ephemeral_addr, wait_until_ready, KillOnDrop, TempConfig, PROCESS_DEADLINE};
+use support::{spawn_run, wait_until_ready, TempConfig, ADMIN, ANY_PORT, PROCESS_DEADLINE};
 use tokio::net::UdpSocket;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_default_statsd_relay_expands_an_aggregated_timer_and_set() {
     let capture = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let capture_addr = capture.local_addr().unwrap();
-    let statsd_addr = {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket.local_addr().unwrap().to_string()
-    };
-    let admin_addr = ephemeral_addr().await;
     let config = TempConfig::write(
         "statsd-relay-default-multi-value",
         format!(
-            "admin:\n  bind: \"{admin_addr}\"\ncomponents:\n  in:\n    type: statsd_in\n    \
-             bind: \"{statsd_addr}\"\n  agg:\n    type: aggregate\n    sources: [in]\n    \
+            "admin:\n  bind: \"{ANY_PORT}\"\ncomponents:\n  in:\n    type: statsd_in\n    \
+             bind: \"{ANY_PORT}\"\n  agg:\n    type: aggregate\n    sources: [in]\n    \
              interval: 200ms\n  out:\n    type: statsd_out\n    sources: [agg]\n    endpoint: \
              \"{capture_addr}\"\n"
         ),
     );
 
-    let child = Command::new(env!("CARGO_BIN_EXE_logit"))
-        .arg("run")
-        .arg(&config.0)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawning logit run");
-    let _child = KillOnDrop(child);
+    let (_child, stderr) = spawn_run(&config, Stdio::null());
+    let addrs = stderr.wait_for_bound(&[ADMIN, "in"]);
+    let (admin_addr, statsd_addr) = (&addrs[0], &addrs[1]);
     // Ready means every listener is bound, so the datagram below can't reach an unbound port.
-    wait_until_ready(&admin_addr).await;
+    wait_until_ready(admin_addr).await;
 
     // One datagram, so every line lands in one decode and one aggregation window.
     let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     sender
         .send_to(
             b"req.latency:10|ms\nreq.latency:20|ms\nuniq.users:alice|s\nuniq.users:bob|s",
-            &statsd_addr,
+            statsd_addr,
         )
         .await
         .unwrap();

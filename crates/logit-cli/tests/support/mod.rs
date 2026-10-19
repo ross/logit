@@ -5,7 +5,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use logit_pipeline::test_util::wait_until_within;
@@ -84,12 +84,27 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// A free loopback port, bound and released. This is the child-process exception to
-/// `docs/adr/test-timing-and-observables.md`'s bind-before-spawn rule: the port is handed to a
-/// `logit run` child through its config, and the child binds it.
-pub async fn ephemeral_addr() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().to_string()
+/// A `bind:` value for a `logit run` child's config: port `0`, so the child's own bind picks a
+/// free port and [`Lines::wait_for_bound`] reads it back. A port picked by the test and released
+/// before the child binds it can be taken in between by any other test process
+/// (`docs/adr/test-timing-and-observables.md`'s "Amendment: a child process picks its own port").
+pub const ANY_PORT: &str = "127.0.0.1:0";
+
+/// The name [`Lines::wait_for_bound`] takes for the `admin.bind` socket's `admin bound` line.
+pub const ADMIN: &str = "admin";
+
+/// Spawns `logit --log-format json run <config>` with `stdout` as given and stderr piped through
+/// [`Lines`], so a test can read the startup lines [`Lines::wait_for_bound`] parses.
+pub fn spawn_run(config: &TempConfig, stdout: Stdio) -> (KillOnDrop, Lines) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_logit"))
+        .args(["--log-format", "json", "run"])
+        .arg(&config.0)
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning logit run");
+    let stderr = Lines::spawn(child.stderr.take().expect("piped stderr"));
+    (KillOnDrop(child), stderr)
 }
 
 /// Runs `logit ready` against the TCP admin address `admin` once.
@@ -172,6 +187,35 @@ impl Lines {
                 Err(err) => panic!("no line containing {needle:?} ({err}); read: {skipped:#?}"),
             }
         }
+    }
+
+    /// Reads a `--log-format json` child's startup lines until each of `names` has reported the
+    /// address it bound, and returns those addresses in `names`' order. A name is a component id,
+    /// matched against its `bound` line, or [`ADMIN`] for the `admin bound` line. Every one of
+    /// these is logged before `ready`, once its socket is bound and, for TCP, listening, so a
+    /// test can connect or send to the address at once. Panics after [`PROCESS_DEADLINE`] or
+    /// once the output closes, as [`Lines::wait_for`] does.
+    pub fn wait_for_bound(&self, names: &[&str]) -> Vec<String> {
+        let mut found: Vec<Option<String>> = vec![None; names.len()];
+        while found.iter().any(Option::is_none) {
+            let line = self.wait_for("bound");
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            let (name, address) = if event["message"] == "admin bound" {
+                (ADMIN, event["address"].as_str())
+            } else if event["key"] == "bound" {
+                let address = event["message"]
+                    .as_str()
+                    .and_then(|m| m.strip_prefix("listening on "))
+                    .and_then(|rest| rest.split_whitespace().next());
+                (event["component"].as_str().unwrap_or_default(), address)
+            } else {
+                continue;
+            };
+            if let Some(i) = names.iter().position(|n| *n == name) {
+                found[i] = Some(address.unwrap_or_else(|| panic!("no address in {line}")).into());
+            }
+        }
+        found.into_iter().map(Option::unwrap).collect()
     }
 }
 
