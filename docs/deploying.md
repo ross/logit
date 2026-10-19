@@ -589,7 +589,7 @@ so a log collector can parse it instead of scraping text.
 
 Every component-scoped diagnostic carries a `component` field naming the component that reported
 it. A throttled diagnostic, or a component-owned lifecycle message like `bound`/`recovered`, also
-carries a `key` naming *why*. The process-level lifecycle events (`starting`, `ready`,
+carries a `key` naming *why*. The process-level lifecycle events (`starting`, `admin bound`, `ready`,
 `shutdown signal received`, `shutdown delay elapsed`, `reopen signal received`,
 `drain complete`, `exiting`) carry neither, because they describe the process, not a component.
 `telemetry left undrained at exit` is the exception: it carries `component`, naming the component
@@ -600,7 +600,8 @@ that recorded the point.
 | Event | Level | When |
 |---|---|---|
 | `starting` | info | Config loaded, before graph resolution — named even if the config goes on to fail. |
-| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`lines_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`/`influxdb_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
+| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`lines_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`/`influxdb_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. The message names the address the socket bound, so a `bind` on port `0` reports the port the kernel assigned. |
+| `admin bound` | info | The `admin:` endpoint's socket opened, before the pipeline's pre-bind pass. Carries `address`: the TCP address `admin.bind` bound (the assigned port when it names port `0`), or `admin.socket`'s path. One line per socket. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `shutdown delay elapsed` | info | `shutdown.delay` has run out after a SIGTERM/SIGINT and the drain is starting. Carries `delay`. Not logged when the delay is `0s`, when the signal arrived before `ready`, or when a node failure started the drain first. |

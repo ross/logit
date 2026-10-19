@@ -9,38 +9,29 @@
 mod support;
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use logit_pipeline::test_util::{scratch_dir, wait_until_within};
 use support::{
-    ephemeral_addr, logit_ready, send_signal, wait_for_exit, wait_until_ready, KillOnDrop, Lines,
-    TempConfig, PROCESS_DEADLINE,
+    logit_ready, send_signal, wait_for_exit, wait_until_ready, KillOnDrop, Lines, TempConfig,
+    ADMIN, ANY_PORT, PROCESS_DEADLINE,
 };
 
 fn spawn_run(config: &TempConfig) -> (KillOnDrop, Lines) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_logit"))
-        .args(["--log-format", "json", "run"])
-        .arg(&config.0)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawning logit run");
-    let stderr = Lines::spawn(child.stderr.take().expect("piped stderr"));
-    (KillOnDrop(child), stderr)
+    support::spawn_run(config, Stdio::null())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sighup_keeps_the_process_running_and_doesnt_count_toward_the_second_signal_exit() {
-    let admin_addr = ephemeral_addr().await;
-    let statsd_addr = ephemeral_addr().await;
     let config = TempConfig::write(
         "hup-then-term",
         format!(
-            "admin:\n  bind: \"{admin_addr}\"\ncomponents:\n  in:\n    type: statsd_in\n    \
-             bind: \"{statsd_addr}\"\n  out:\n    type: stdio_out\n    sources: [in]\n"
+            "admin:\n  bind: \"{ANY_PORT}\"\ncomponents:\n  in:\n    type: statsd_in\n    \
+             bind: \"{ANY_PORT}\"\n  out:\n    type: stdio_out\n    sources: [in]\n"
         ),
     );
     let (mut child, stderr) = spawn_run(&config);
+    let admin_addr = stderr.wait_for_bound(&[ADMIN]).remove(0);
     wait_until_ready(&admin_addr).await;
 
     send_signal(&child.0, libc::SIGHUP);
@@ -101,14 +92,10 @@ async fn a_sigterm_exports_a_drop_the_data_drain_counts_through_internal() {
     let path = dir.join("telemetry.ndjson");
     let influx = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let influx_addr = influx.local_addr().unwrap();
-    let statsd_addr = {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket.local_addr().unwrap().to_string()
-    };
     let config = TempConfig::write(
         "term-last-drain",
         format!(
-            "components:\n  data_in:\n    type: statsd_in\n    bind: \"{statsd_addr}\"\n  \
+            "components:\n  data_in:\n    type: statsd_in\n    bind: \"{ANY_PORT}\"\n  \
              data_out:\n    type: influxdb_out\n    sources: [data_in]\n    url: \
              \"http://{influx_addr}\"\n    org: o\n    bucket: b\n    token: t\n    buffer:\n      \
              shutdown_grace: 1s\n  self:\n    type: internal\n    interval: 100ms\n  \
@@ -118,6 +105,7 @@ async fn a_sigterm_exports_a_drop_the_data_drain_counts_through_internal() {
         ),
     );
     let (mut child, stderr) = spawn_run(&config);
+    let statsd_addr = stderr.wait_for_bound(&["data_in"]).remove(0);
     stderr.wait_for("ready");
     let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     sender.send_to(b"hits:1|c\n", &statsd_addr).unwrap();
@@ -152,11 +140,10 @@ async fn a_sigterm_exports_a_drop_the_data_drain_counts_through_internal() {
 async fn a_sigterm_logs_a_mixed_pipelines_undrained_shutdown_drop_at_exit() {
     let influx = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let influx_addr = influx.local_addr().unwrap();
-    let statsd_addr = ephemeral_addr().await;
     let config = TempConfig::write(
         "term-undrained",
         format!(
-            "components:\n  data_in:\n    type: statsd_in\n    bind: \"{statsd_addr}\"\n  \
+            "components:\n  data_in:\n    type: statsd_in\n    bind: \"{ANY_PORT}\"\n  \
              self:\n    type: internal\n    interval: 100ms\n  data_out:\n    type: \
              influxdb_out\n    sources: [data_in, self]\n    url: \"http://{influx_addr}\"\n    \
              org: o\n    bucket: b\n    token: t\n    buffer:\n      shutdown_grace: 1s\n"
@@ -189,14 +176,13 @@ async fn a_sigterm_logs_a_mixed_pipelines_undrained_shutdown_drop_at_exit() {
 /// load is blocked on it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sigterm_during_config_load_drains_and_exits_0() {
-    let statsd_addr = ephemeral_addr().await;
     let config = TempConfig::fifo("term-during-load");
     let (mut child, stderr) = spawn_run(&config);
     let mut writer = config.wait_for_reader().await;
     send_signal(&child.0, libc::SIGTERM);
     write!(
         writer,
-        "components:\n  in:\n    type: statsd_in\n    bind: \"{statsd_addr}\"\n  out:\n    type: \
+        "components:\n  in:\n    type: statsd_in\n    bind: \"{ANY_PORT}\"\n  out:\n    type: \
          stdio_out\n    sources: [in]\n"
     )
     .unwrap();
@@ -239,21 +225,18 @@ async fn a_sighup_after_an_external_rename_reopens_a_file_out_target() {
     let dir = scratch_dir("hup-reopen");
     let path = dir.join("events.log");
     let renamed = dir.join("events.log.1");
-    let udp_addr = {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket.local_addr().unwrap().to_string()
-    };
     let config = TempConfig::write(
         "hup-reopen",
         format!(
             "components:\n  in:\n    type: lines_in\n    transport: udp\n    bind: \
-             \"{udp_addr}\"\n  out:\n    type: file_out\n    sources: [in]\n    format: json\n    \
+             \"{ANY_PORT}\"\n  out:\n    type: file_out\n    sources: [in]\n    format: json\n    \
              path: \"{}\"\n    rotate:\n      max_bytes: 1MiB\n",
             path.display()
         ),
     );
     let (child, stderr) = spawn_run(&config);
-    // `ready` means every listener is bound, so the first datagram can't hit an unbound port.
+    let udp_addr = stderr.wait_for_bound(&["in"]).remove(0);
+    // `ready` means every node is running, so the first datagram is read once it arrives.
     stderr.wait_for("ready");
     let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
     let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -286,13 +269,11 @@ async fn a_sighup_checks_tls_files_with_polling_off() {
     let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls");
     std::fs::copy(fixtures.join("server.pem"), dir.join("cert.pem")).unwrap();
     std::fs::copy(fixtures.join("server.key"), dir.join("key.pem")).unwrap();
-    let admin_addr = ephemeral_addr().await;
-    let lines_addr = ephemeral_addr().await;
     let config = TempConfig::write(
         "hup-tls",
         format!(
-            "admin:\n  bind: \"{admin_addr}\"\ntls_reload_interval: 0s\ncomponents:\n  in:\n    \
-             type: lines_in\n    transport: tcp\n    bind: \"{lines_addr}\"\n    tls:\n      \
+            "admin:\n  bind: \"{ANY_PORT}\"\ntls_reload_interval: 0s\ncomponents:\n  in:\n    \
+             type: lines_in\n    transport: tcp\n    bind: \"{ANY_PORT}\"\n    tls:\n      \
              cert_file: \"{cert}\"\n      key_file: \"{key}\"\n  out:\n    type: null_out\n    \
              sources: [in]\n",
             cert = dir.join("cert.pem").display(),
@@ -300,6 +281,7 @@ async fn a_sighup_checks_tls_files_with_polling_off() {
         ),
     );
     let (child, stderr) = spawn_run(&config);
+    let admin_addr = stderr.wait_for_bound(&[ADMIN]).remove(0);
     wait_until_ready(&admin_addr).await;
 
     std::fs::copy(fixtures.join("server-b.pem"), dir.join("cert.pem")).unwrap();
