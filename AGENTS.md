@@ -732,7 +732,9 @@ the operator-facing account of all of this.
   Docker lifecycle faults from a scenario's TOML timeline (`tools/soak/scenarios/`), and scores crashes,
   restarts, self-log errors, hangs, RSS and fd growth, and uncounted loss from each container's
   NDJSON telemetry and JSON stderr and VictoriaMetrics' reset-aware totals, hop by hop per process
-  life. `statsd-vm-lost-total` is a short negative control for the ledger's counted-loss rule. A
+  life. `statsd-vm-lost-total` is a short negative control for the ledger's counted-loss rule.
+  `partition-rss` partitions the generator once and then runs 13 quiet minutes, judging whether
+  its RSS settles and holds flat (`rss_settle`, and an `[[expect]]` bounding the plateau's rise). A
   scenario's `[[expect]]` tables assert its own telemetry around a step, as the four sink-outage
   and UDP-flood scenarios do for queue fill, counted drops, kernel drops, and drain.
   `spool-kill-replay` kills the SUT with SIGKILL during a sink outage and checks that its
