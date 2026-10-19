@@ -251,7 +251,7 @@ Sources: `statsd_in`, `influxdb_in`, `prometheus_in`. Sinks: `statsd_out`, `prom
 | W4 | `transit/w4` | `transit/w4: spec/transit, the mapping table, and the first pairs` | L | W3 |
 | W5 | `transit/w5` | `transit/w5: module-doc and known-gaps tables generated from the spec` | M | W4 |
 
-- **W0**: ADR `transit-spec` (W0, not yet written) (the spec is the canonical copy of every
+- **W0**: [ADR `transit-spec`](../adr/transit-spec.md) (the spec is the canonical copy of every
   transition's class; docs are generated regions; ADR tables are decision records), this plan,
   and a row in each README.
 - **W1**: the additive extension to `ndjson.rs` (§2), its module-doc grammar, the Rust reader,
