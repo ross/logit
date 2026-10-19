@@ -247,13 +247,17 @@ Enough to prove the framework on every kind of transition, not to cover the matr
 | `statsd_in -> statsd_out` | a like pair reads as `exact` or a named normalization, under `format: dogstatsd` |
 | `statsd_in -> aggregate -> statsd_out` | raw kinds through a stage, in each `distributions:` and `sets:` mode |
 | `influxdb_in -> prometheus_out` | typed scalars, a Gauge per field, the measurement carrier, Ross's motivating example |
-| `influxdb_in -> aggregate(cumulative) -> prometheus_out` | a delta sum that `prometheus_out` drops bare and carries cumulative |
+| `influxdb_in -> aggregate(cumulative) -> prometheus_out` | gauges through a cumulative window; the delta sum this row was meant to show is `statsd_in -> prometheus_out`'s |
 | `prometheus_in -> influxdb_out` | histogram and summary into a wire with one number per field |
 | `statsd_in -> otlp_out` | samples as a summary, set members skipped |
 
 Sources: `statsd_in`, `influxdb_in`, `prometheus_in`. Sinks: `statsd_out`, `prometheus_out`,
 `influxdb_out`, `otlp_out`. Later pairs follow `spec/transit/README.md`'s "Adding a sink
 column" and "Adding a source" steps, one PR each.
+
+W4b landed these with three more flows: `influxdb_in -> prometheus_out` as remote-write 2.0, and
+`statsd_in -> prometheus_out` and `statsd_in -> influxdb_out`, so every kind the statsd cases
+hold reaches each new column.
 
 ### 8. Not in this stack
 
@@ -370,3 +374,41 @@ Recorded per workstream as each lands.
   it writes or compares JSON; the encoder, `AttrMap`, and the interner are unchanged. Pre-interning
   every key in the committed cases at the start of `generate` was rejected: it depends on global
   interner state and on scanning the whole case set.
+- **W4b**: `influxdb_in` (15 cases) and `prometheus_in`'s scrape (12 cases) joined `statsd_in` (30
+  cases, two of them new), and `prometheus_out`, `influxdb_out`, and `otlp_out` joined
+  `statsd_out` in all 51 rows: 15 flows, 387 expectations. Every cell is reached but
+  `prometheus_out`'s two remote-write cells for an exponential histogram, since no remote-write
+  flow reads a source that makes one. Prometheus remote-write cases aren't written: a protobuf body
+  can't be hand-written, and no feature needs one until a native histogram can be decoded.
+
+  The class check now reads each sink's spelling (`classes.rs`'s "Pairing"): `prometheus_out`'s
+  sanitized names, `_total`, and label keys, `influxdb_out`'s `<name>.value`, the last element of
+  an array for both, and `otlp_out`'s timestamp attribute as an integer. The schema gained
+  `record/non_finite`, `record/superseded`, `attributes/map_value`, `bytes_value`,
+  `timestamp_value`, and `attributes/scope`; a resource attribute under `_logit.` now reaches the
+  carrier rows; and a `skipped` or `dropped` cell may say its loss is `uncounted`. The `otlp_out`
+  driver arm reads the wall-clock observed time the encoder stamps on a log back as the run's
+  clock. The attribute-order churn the new cases caused is W4a's fix above.
+
+  Every cell agreed with its sink's module doc and `docs/known-gaps/mappings.md` except these,
+  each recorded as the code behaves. None is fixed here:
+  - `prometheus_out` and `influxdb_out` skip a log or a span on an event with no metrics without
+    counting it (`log/*`, `span/alone`: `skipped`, `uncounted`), where `statsd_out` counts
+    `events.skipped`. Neither the Prometheus encode table nor `mappings.md` names the loss;
+    InfluxDB's table writes it with no counter.
+  - `prometheus_out`'s exposition registry holds one sample per series, so an earlier point of a
+    series in the same run is replaced, uncounted (`record/superseded`: `skipped`, `uncounted`).
+    Remote-write sends each. Neither the codec's normalization list nor `mappings.md` names it.
+  - `prometheus_out` writes no start time for a gauge: `_created` is a counter's, histogram's,
+    or summary's, so a gauge's `start_timestamp` is lost uncounted. The encode table doesn't say.
+  - Under OpenMetrics, `prometheus_out` writes a gauge whose `_logit.prometheus.type` is
+    `untyped` as `unknown`, so the carrier reads back changed (`private_carrier`: `normalized`).
+  - `influxdb_out` writes a `sum` as a `value` field that `influxdb_in` reads back as a gauge
+    named `<name>.value`. The codec calls dropping the temporality normalization 10; since the
+    kind changes, the table reads it `degraded`, and a gauge, renamed, `normalized`
+    (`value_field`).
+  - §7's `influxdb_in -> aggregate(cumulative) -> prometheus_out` can't show a delta sum:
+    `influxdb_in` decodes every field to a gauge, so the window emits each series' latest value.
+    `statsd_in -> prometheus_out` reaches the delta-sum rows instead.
+
+  None of the first four is in `docs/known-gaps/mappings.md`, which W5 generates from the table.
