@@ -22,8 +22,8 @@ sink: `statsd-relay` is the like pair, and `influxdb-to-prometheus` a cross-prot
 Expectations are one file per flow, not one per case: a file per case grows as flows times cases,
 which reaches thousands once every source meets every sink column, while a file per flow grows
 with the flows alone. Each case's document sits under its own key on its own lines, so a diff
-still shows which case changed. A missing file, a case with no key, a stale document, and a key
-no case has each fail, naming the flow and the case.
+still shows which case changed. A missing file fails naming the flow and its path; a case with no
+key, a stale document, and a key no case has each fail naming the flow and the case.
 
 | Path | What it holds |
 |---|---|
