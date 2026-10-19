@@ -192,13 +192,24 @@ fn the_driver_rejects_a_flow_it_cant_run_naming_the_component() {
             "component 'case': a flow's input is a replay_in, not statsd_in",
         ),
         (
+            "stale",
+            format!(
+                "components:
+  case: {{type: replay_in, path: case.json}}
+  fresh: {{type: drop_stale, sources: [case], max_age: 1h}}
+  out: {{{sink}, sources: [fresh]}}
+"
+            ),
+            "component 'fresh': a drop_stale reads the wall clock",
+        ),
+        (
             "sink",
             "components:
   case: {type: replay_in, path: case.json}
   out: {type: null_out, sources: [case]}
 "
             .to_string(),
-            "null_out has no encoder this driver reaches",
+            "component 'out': null_out has no encoder this driver reaches",
         ),
     ];
     for (label, yaml, want) in cases {
@@ -237,4 +248,77 @@ fn every_sink_shape_round_trips_the_gauge() {
         });
         assert!(gauge, "{label}: {doc}");
     }
+}
+
+/// A flow of `CASE` into `influxdb_out` with `fields` added to its required ones.
+fn influxdb_flow(label: &str, fields: &str) -> PathBuf {
+    flow(
+        label,
+        &format!(
+            "components:\n  case: {{type: replay_in, path: case.json}}\n  out: {{type: \
+             influxdb_out, url: 'http://127.0.0.1:8086', token: t, sources: [case]{fields}}}\n"
+        ),
+    )
+}
+
+/// Every event's resource attributes in `doc`.
+fn resources(doc: &Value) -> Vec<Value> {
+    let events = doc["events"].as_array().expect("events");
+    events.iter().map(|event| event["resource"]["attributes"].clone()).collect()
+}
+
+/// With no `bucket:`, no `default_bucket:`, and no carried bucket, `influxdb_out` sends nothing
+/// and counts every metric `no_bucket`.
+#[test]
+fn influxdb_out_with_no_bucket_drops_the_batch_counted() {
+    let flow = influxdb_flow("transit-influx-no-bucket", "");
+    let want = json!({
+        "events": [],
+        "counters": {
+            "logit.output.metrics.dropped{component=out,kind=influxdb_out,reason=no_bucket,role=sink}": 4,
+        },
+    });
+    assert_eq!(document(&flow), want);
+}
+
+/// A configured `bucket:` and `org:` reach `influxdb_in` as its resource carriers.
+#[test]
+fn influxdb_out_writes_to_its_configured_bucket_and_org() {
+    let doc = document(&influxdb_flow("transit-influx-fixed", ", bucket: b, org: o"));
+    let carriers = json!({"_logit.influxdb.org": "o", "_logit.influxdb.bucket": "b"});
+    assert_eq!(resources(&doc), vec![carriers; 3], "{doc}");
+}
+
+/// With no `bucket:`, a bucket the case's resource carries is the one written to and read back.
+#[test]
+fn influxdb_out_follows_a_carried_bucket() {
+    let case = std::fs::read_to_string(fixture(CASE)).expect("read the case");
+    // Each line's closing brace becomes a resource carrying the bucket.
+    let carried = r#","resource":{"attributes":{"_logit.influxdb.bucket":"carried"}}}"#;
+    let case: String =
+        case.lines().map(|line| format!("{}{carried}\n", &line[..line.len() - 1])).collect();
+    let flow = influxdb_flow("transit-influx-carried", "");
+    let path = flow.with_file_name("case.json");
+    std::fs::write(&path, case).expect("write the case");
+    let outcome = run(&flow, &path, Options::default()).expect("the flow runs");
+    let doc: Value = serde_json::from_str(&outcome.document()).expect("JSON");
+    assert_eq!(resources(&doc), vec![json!({"_logit.influxdb.bucket": "carried"}); 3], "{doc}");
+}
+
+/// Exposition holds the registry to `max_series:` as the sink does: of the series the case
+/// leaves on the wire, one reads back and the rest are counted evicted.
+#[test]
+fn exposition_reads_back_what_max_series_leaves() {
+    let flow = flow(
+        "transit-expose-cap",
+        "components:
+  case: {type: replay_in, path: case.json}
+  out: {type: prometheus_out, bind: '127.0.0.1:0', max_series: 1, sources: [case]}
+",
+    );
+    let doc = document(&flow);
+    assert_eq!(doc["events"].as_array().expect("events").len(), 1, "{doc}");
+    let evicted = "logit.output.series.evicted{component=out,kind=prometheus_out,\
+                   reason=cardinality,role=sink}";
+    assert_eq!(doc["counters"][evicted], 2, "{doc}");
 }

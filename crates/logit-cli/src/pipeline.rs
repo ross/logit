@@ -1679,13 +1679,19 @@ pub(crate) enum SinkEncoder {
     /// `statsd_out`: one line per [`logit_proto::MessageBuf`] entry, line-capped as the sink's
     /// transport caps it.
     Framed(StatsdEncoder),
-    /// `influxdb_out`: one line-protocol body per batch.
-    Blob(logit_proto::influxdb::encode::InfluxLineEncoder),
+    /// `influxdb_out`: one line-protocol body per batch, written to the org and bucket the sink
+    /// resolves for it (`logit_outputs::influxdb::destination`).
+    Blob {
+        encoder: logit_proto::influxdb::encode::InfluxLineEncoder,
+        organization: Organization,
+        destination: Destination,
+    },
     /// `otlp_out`: one protobuf request per signal.
     Signal(logit_proto::otlp::OtlpEncoder),
     /// `prometheus_out` with `bind:`: an exposition body, in the dialect a scraper negotiates
-    /// (`logit_outputs::prometheus::render_batches`). The config doesn't choose one.
-    PrometheusExpose(logit_proto::prometheus::PrometheusEncoder),
+    /// (`logit_outputs::prometheus::render_batches`), held to `max_series`. The config doesn't
+    /// choose a dialect.
+    PrometheusExpose { encoder: logit_proto::prometheus::PrometheusEncoder, max_series: usize },
     /// `prometheus_out` with `endpoint:`: one compressed request per batch
     /// (`logit_outputs::prometheus::encode_remote_write`).
     PrometheusRemoteWrite {
@@ -1717,20 +1723,23 @@ pub(crate) fn sink_encoder(
                     .with_diagnostics(diag.clone()),
             )
         }
-        InfluxDbOut { .. } => SinkEncoder::Blob(
-            logit_proto::influxdb::encode::InfluxLineEncoder::default()
+        InfluxDbOut { org, default_org, bucket, default_bucket, .. } => SinkEncoder::Blob {
+            encoder: logit_proto::influxdb::encode::InfluxLineEncoder::default()
                 .with_diagnostics(diag.clone()),
-        ),
+            organization: Organization::from_config(org.clone(), default_org.clone()),
+            destination: Destination::from_config(bucket.clone(), default_bucket.clone()),
+        },
         OtlpOut { .. } => SinkEncoder::Signal(
             logit_proto::otlp::OtlpEncoder::new()
                 .with_telemetry(telemetry.clone())
                 .with_diagnostics(diag.clone()),
         ),
-        PrometheusOut { bind: Some(_), .. } => SinkEncoder::PrometheusExpose(
-            logit_proto::prometheus::PrometheusEncoder::new()
+        PrometheusOut { bind: Some(_), max_series, .. } => SinkEncoder::PrometheusExpose {
+            encoder: logit_proto::prometheus::PrometheusEncoder::new()
                 .with_telemetry(telemetry.clone())
                 .with_diagnostics(diag.clone()),
-        ),
+            max_series: *max_series,
+        },
         PrometheusOut { bind: None, version, compression, .. } => {
             SinkEncoder::PrometheusRemoteWrite {
                 encoder: logit_outputs::prometheus::sender_encoder()

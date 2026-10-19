@@ -246,3 +246,22 @@ impl Precision {
         ns - ns.rem_euclid(self.factor())
     }
 }
+
+/// The resource `influxdb_in` decodes a write under: `org`, `orgID`, and `bucket` as
+/// [`RESOURCE_ATTR_ORG`], [`RESOURCE_ATTR_ORG_ID`], and [`RESOURCE_ATTR_BUCKET`], each only
+/// when the request named it.
+pub fn write_resource(
+    org: Option<&str>,
+    org_id: Option<&str>,
+    bucket: &str,
+) -> logit_core::Resource {
+    let mut resource = logit_core::Resource::default();
+    if let Some(org) = org {
+        resource.attributes.insert(RESOURCE_ATTR_ORG, logit_core::Value::str(org));
+    }
+    if let Some(org_id) = org_id {
+        resource.attributes.insert(RESOURCE_ATTR_ORG_ID, logit_core::Value::str(org_id));
+    }
+    resource.attributes.insert(RESOURCE_ATTR_BUCKET, logit_core::Value::str(bucket));
+    resource
+}

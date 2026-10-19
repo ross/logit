@@ -1047,12 +1047,14 @@ pub fn encode_remote_write(
 }
 
 /// The exposition body a scrape in `dialect` would read after `batches` were sent, in order, to
-/// a fresh [`ExposeOutput`]: each upserted, latest wins, with no expiry and no series cap.
-/// `encoder` counts the conversion's and the render's drops, `telemetry` the registry's. Public
-/// so a caller can reach the bytes this sink serves without a listener.
+/// a fresh [`ExposeOutput`] with `max_series`: each upserted, latest wins, then held to the cap
+/// as `send` holds it. No expiry: `expire_after` reads a clock. `encoder` counts the
+/// conversion's and the render's drops, `telemetry` the registry's. Public so a caller can reach
+/// the bytes this sink serves without a listener.
 pub fn render_batches(
     batches: &[EventBatch],
     dialect: Dialect,
+    max_series: usize,
     encoder: &mut PrometheusEncoder,
     telemetry: &Telemetry,
 ) -> Vec<u8> {
@@ -1065,6 +1067,7 @@ pub fn render_batches(
         {
             registry.upsert(family, now, telemetry);
         }
+        registry.enforce_cap(max_series, telemetry);
     }
     registry.render(dialect, encoder)
 }

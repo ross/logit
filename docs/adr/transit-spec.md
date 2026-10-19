@@ -124,6 +124,7 @@ config mapping `build_spec` uses, and calls the public functions the sink itself
 step between the encoder and the wire. Giving every `Output` an in-memory transport was the
 alternative; it puts test plumbing into each sink for a layer the spec excludes (sink behavior
 above the encoder). The driver lives in a `#[cfg(test)]` module of the `logit` binary,
-`crates/logit-cli/src/transit/`, since only the binary's own tests reach the registry, and the
-generator that writes the expectations is a test in that module, rewriting under
-`TRANSIT_UPDATE=1` and comparing otherwise.
+`crates/logit-cli/src/transit/`, since only the binary's own tests reach the registry. W4's
+generator will be a `#[test]` in the same module, rewriting the expectations under
+`TRANSIT_UPDATE=1` and comparing them otherwise: a test reaches `build_spec` where a script or a
+separate binary can't, and the `--check` mode is the same test with the variable unset.

@@ -1,12 +1,12 @@
 //! A sink's encoder to its pair's decoder: the bytes each [`SinkEncoder`] shape writes, read back
-//! as the pair's listener reads them, with the resource a listener starts from (an empty one).
+//! as the pair's listener reads them, with the resource that listener would decode under.
 //!
 //! | Encoder | Bytes | Decoder |
 //! |---|---|---|
 //! | `statsd_out` | each `MessageBuf` entry: one line, or an event's indivisible lines | `StatsdDecoder`, one entry at a time |
-//! | `influxdb_out` | one body per batch, `precision=ns` as the sink sends it | `InfluxDecoder::decode_body` |
+//! | `influxdb_out` | one body per batch, to the org and bucket the sink resolves for it, `precision=ns`; a batch with no bucket is dropped and counted as the sink drops it | `InfluxDecoder::decode_body`, under the resource `influxdb_in` builds from that org and bucket |
 //! | `otlp_out` | one protobuf request per signal per batch | `OtlpDecoder::decode_signal` |
-//! | `prometheus_out`, `bind:` | one scrape after the last batch, in the run's dialect | `text::parse_with`, then `families_to_events` |
+//! | `prometheus_out`, `bind:` | one scrape after the last batch, in the run's dialect, held to `max_series:` (no expiry: it reads a clock) | `text::parse_with`, then `families_to_events` |
 //! | `prometheus_out`, `endpoint:` | one compressed request per batch | `decompress_bounded`, `remote_write::decode`, then `families_to_events` per timestamp group |
 //!
 //! The statsd and InfluxDB encoders return their counts, so this counts them through the sink's
@@ -18,7 +18,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use logit_core::{Diagnostics, EventBatch, Resource, Telemetry};
 use logit_pipeline::test_util::TelemetryProbe;
-use logit_proto::influxdb::{InfluxDecoder, Precision};
+use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::prometheus::compression::decompress_bounded;
 use logit_proto::prometheus::{families_to_events, remote_write, text, Dialect, PrometheusDecoder};
@@ -53,6 +53,7 @@ pub(super) fn round_trip(
     encoder: SinkEncoder,
     batches: &[EventBatch],
     sink: &Telemetry,
+    sink_diag: &Diagnostics,
     decode: &Decode<'_>,
 ) -> anyhow::Result<Vec<EventBatch>> {
     let empty = || Arc::new(Resource::default());
@@ -77,19 +78,28 @@ pub(super) fn round_trip(
                 }
             }
         }
-        SinkEncoder::Blob(mut encoder) => {
+        SinkEncoder::Blob { mut encoder, organization, destination } => {
+            let mut sink_diag = sink_diag.clone();
             let (telemetry, _) = decode.handles("influxdb_in");
             let mut decoder = InfluxDecoder::new().with_telemetry(telemetry);
             for batch in batches {
+                let Some((org, org_id, bucket)) = logit_outputs::influxdb::destination(
+                    &organization,
+                    &destination,
+                    &batch.resource,
+                ) else {
+                    logit_outputs::influxdb::drop_no_bucket(sink, &mut sink_diag, batch);
+                    continue;
+                };
+                let resource = Arc::new(write_resource(org, org_id, bucket));
                 let body = encoder.encode(batch)?;
                 logit_outputs::influxdb::emit_encode_stats(sink, encoder.stats());
                 if body.is_empty() {
                     continue;
                 }
-                let batch =
-                    decoder
-                        .decode_body(body, Precision::Ns, decode.received_at, empty())
-                        .map_err(|err| anyhow::anyhow!("influxdb_in refused the body: {err}"))?;
+                let batch = decoder
+                    .decode_body(body, Precision::Ns, decode.received_at, resource)
+                    .map_err(|err| anyhow::anyhow!("influxdb_in refused the body: {err}"))?;
                 out.push(batch);
             }
         }
@@ -107,10 +117,11 @@ pub(super) fn round_trip(
                 }
             }
         }
-        SinkEncoder::PrometheusExpose(mut encoder) => {
+        SinkEncoder::PrometheusExpose { mut encoder, max_series } => {
             let body = logit_outputs::prometheus::render_batches(
                 batches,
                 decode.dialect,
+                max_series,
                 &mut encoder,
                 sink,
             );

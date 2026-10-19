@@ -22,9 +22,17 @@ use std::fmt::Write;
 
 /// The name suffixes `counters` keeps: the loss and normalization vocabulary
 /// (`docs/design/internal-telemetry.md`'s "Loss vocabulary"), plus `omitted`, a field or tag
-/// left off a record that was still written.
-const OUTCOMES: [&str; 7] =
-    ["dropped", "skipped", "degraded", "normalized", "discarded", "passed_through", "omitted"];
+/// left off a record that was still written, and `evicted`, a series a cap removed.
+const OUTCOMES: [&str; 8] = [
+    "dropped",
+    "skipped",
+    "degraded",
+    "normalized",
+    "discarded",
+    "passed_through",
+    "omitted",
+    "evicted",
+];
 
 /// What one run produced.
 #[derive(Debug, Clone, PartialEq)]

@@ -27,13 +27,16 @@
 //! flush's `now` and every decode's `received_at`, so a wire with no timestamp (a statsd line
 //! without `|T`) reads back at it. Events are sorted by timestamp, then first metric or span
 //! name, then their rendered line, so batching and reordering, both permitted normalizations,
-//! don't change the document. Every component counts into a `TelemetryProbe` registry under its
+//! don't change the document. One part of a sink isn't reproduced: `prometheus_out`'s
+//! `expire_after:`, which reads a clock, so exposition reads back every series not evicted by
+//! `max_series:`. Every component counts into a `TelemetryProbe` registry under its
 //! real id, kind, and role; the pair decoder counts under the id `transit.decode` and its own
 //! kind, as a listener.
 //!
 //! **What it rejects**, each naming the component: an input other than one `replay_in` with
 //! `format: json`; a component with more than one consumer or more than one source; `lua`,
-//! `lua_file`, `route`, `route_signals`, and `target`; and a sink [`sink_encoder`] has no arm
+//! `lua_file`, `route`, `route_signals`, and `target`; `has_stale` and `drop_stale`, which read
+//! the wall clock per batch; and a sink [`sink_encoder`] has no arm
 //! for (today `statsd_out`, `influxdb_out`, `otlp_out`, and `prometheus_out` in both modes).
 //!
 //! Exposition has no configured dialect: a scraper negotiates one, so the driver takes it as
@@ -160,7 +163,7 @@ pub(crate) fn run(flow: &Path, case: &Path, options: Options) -> anyhow::Result<
     let encoder = sink_encoder(&sink.kind, &telemetry, &diag)
         .with_context(|| format!("component '{}'", chain.sink))?;
     let decode = wire::Decode { probe: &probe, received_at: now, dialect: options.dialect };
-    let decoded = wire::round_trip(encoder, &out, &telemetry, &decode)
+    let decoded = wire::round_trip(encoder, &out, &telemetry, &diag, &decode)
         .with_context(|| format!("round-tripping through '{}'", chain.sink))?;
 
     let mut probe = probe;
@@ -254,6 +257,12 @@ fn chain(graph: &Graph) -> anyhow::Result<Chain> {
             | ComponentKind::RouteSignals { .. } => {
                 anyhow::bail!(
                     "component '{next}': the driver doesn't run a {}",
+                    component.kind_name()
+                )
+            }
+            ComponentKind::HasStale { .. } | ComponentKind::DropStale { .. } => {
+                anyhow::bail!(
+                    "component '{next}': a {} reads the wall clock, which the driver doesn't fix",
                     component.kind_name()
                 )
             }
