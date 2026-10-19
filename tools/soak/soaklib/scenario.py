@@ -34,9 +34,9 @@ stored (docs/plans/soak-harness.md's "Stand-in targets").
 
 Services are known by role, from each compose service's `soak.role` label: `sut` (a `logit`
 under test), `generator`, `backend`, `broker` (a Kafka target's broker), `standin` (a
-stand-in target's destination), or `netns` (a rolling overlap's namespace holder). A scenario may
-add
-services with a `compose` override file, a second generator or a second SUT included, so the
+stand-in target's destination), `idp` (a token endpoint the SUT reaches on loopback), or `netns`
+(a namespace holder: a rolling overlap's, or the one `logit` and an `idp` share). A scenario may
+add services with a `compose` override file, a second generator or a second SUT included, so the
 role map comes from the merged compose config,
 which only the driver can read (`docker compose config`). `load()` checks what needs no service
 list; `service_problems()` checks the rest against a role map: the driver's in `prepare()`
@@ -62,11 +62,14 @@ from . import standin as standin_mod
 ROLE_LABEL = "soak.role"
 SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE = "sut", "generator", "backend", "broker"
 STANDIN_ROLE = "standin"
-# A rolling overlap's namespace holder (`[overlap] holder`): a container that runs nothing but
-# owns the network namespace its `instances` join, so a stopped instance doesn't take the port's
-# address with it.
+# A namespace holder: a container that runs nothing but owns a network namespace other services
+# join, so a stopped member doesn't take the address with it. Under `[overlap]` it is the
+# `holder` the `instances` join; with no `[overlap]` it is the one `logit` and each `idp` join.
 NETNS_ROLE = "netns"
-ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE, NETNS_ROLE)
+# A token endpoint a SUT's sink fetches credentials from, such as OAUTHBEARER's: in `logit`'s
+# namespace, through its holder, because a sink takes a plain-HTTP endpoint on loopback only.
+IDP_ROLE = "idp"
+ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE, STANDIN_ROLE, NETNS_ROLE, IDP_ROLE)
 LOGIT_ROLES = (SUT_ROLE, GENERATOR_ROLE)
 # The ingress SUT: the service every generator sends to, whose config `[configs]` names under
 # `sut`. A scenario's override can add one more SUT service, named by its own `[configs]` key
@@ -254,9 +257,10 @@ LISTENER_WIRES = {
 OVERLAP_KEYS = {"holder", "instances", "label"}
 # A Prometheus label name, which the label becomes on the backend.
 _LABEL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-# The actions allowed on the holder, and refused on an instance: an instance shares the holder's
+# The actions allowed on a namespace holder, and refused on a service in its namespace (an
+# overlap's instance, or `logit` or an `idp` beside one): a member shares the holder's
 # namespace, so a netem or a partition of it is one of the holder, and a lifecycle fault of the
-# holder would take every instance's network away at once.
+# holder would take every member's network away at once.
 HOLDER_ACTIONS = ("netem", "partition")
 # The actions that hold an instance's port or process, which may not overlap across instances:
 # with every instance held at once nothing reads the port.
@@ -1791,6 +1795,41 @@ def _overlap_step_problems(scenario):
     return problems
 
 
+def _idp_namespace_problems(scenario, roles, modes=None):
+    """What an `idp`'s namespace breaks, with no `[overlap]`: with `modes`, `logit` and each
+    `idp` in the holder's namespace; on the holder only `netem` and `partition`, and on a member
+    neither. A member shares the holder's namespace, so a netem or a partition of it is one of
+    the holder, and a lifecycle fault of the holder takes every member's network away. A
+    `[random]` fault is held to the same."""
+    netns = [n for n, r in roles.items() if r == NETNS_ROLE]
+    idps = sorted(n for n, r in roles.items() if r == IDP_ROLE)
+    if scenario.overlap is not None or not idps or len(netns) != 1:
+        return []
+    holder = netns[0]
+    members = [SUT_SERVICE] + idps
+    problems = []
+    if modes is not None:
+        want = f"service:{holder}"
+        for member in members:
+            if modes.get(member) != want:
+                problems.append(f"{member} needs network_mode \"{want}\", so {SUT_SERVICE} "
+                                f"reaches {', '.join(idps)} on loopback, and has "
+                                f"{modes.get(member) or 'none'}")
+    entries = [(f"step {spec.index + 1} ({spec.action} on {spec.on})", spec.action, spec.on)
+               for spec in scenario.steps]
+    if scenario.random is not None:
+        entries += [(f"random.fault {t.index + 1} ({t.action} on {t.on})", t.action, t.on)
+                    for t in scenario.random.faults]
+    for where, action, on in entries:
+        if on == holder and action not in HOLDER_ACTIONS:
+            problems.append(f"{where}: the holder takes {' and '.join(HOLDER_ACTIONS)} only; "
+                            f"any other fault on it takes {', '.join(members)}'s network away")
+        elif on in members and action in HOLDER_ACTIONS:
+            problems.append(f"{where}: {on} shares {holder}'s network namespace, so put "
+                            f"{action} on {holder}")
+    return problems
+
+
 def _extra_sut_problems(services, ledger):
     """What the `[configs]` keys naming further SUT services break: each a slug, none `logit`,
     whose config is `[configs] sut`, and none whose `config_env()` is `SUT_CONFIG_ENV`, a
@@ -2772,15 +2811,33 @@ def role_problems(roles, suts=(SUT_SERVICE,), holder=None):
     """What a role map breaks: every service labeled with a known role, the SUT services
     `suts` (`Scenario.suts`: `SUT_SERVICE` and each further one `[configs]` names, or the
     overlap's instances) and no other with the role `sut`, at least one generator, and the
-    `[overlap]` `holder` and no other service with the role `netns`."""
+    `[overlap]` `holder` and no other service with the role `netns`. With no `[overlap]`, a
+    `netns` service is the one holder that `logit` and every `idp` share, so the stack has one
+    only beside an `idp`, an `idp` only beside one, and no SUT but `logit`."""
     problems = []
     netns = sorted(n for n, r in roles.items() if r == NETNS_ROLE)
-    if holder is None and netns:
+    idps = sorted(n for n, r in roles.items() if r == IDP_ROLE)
+    if holder is None and netns and not idps:
         problems.append(f"compose service {', '.join(netns)}: the {NETNS_ROLE} role is an "
-                        "[overlap] holder's, and the scenario has no [overlap]")
+                        f"[overlap] holder's or an {IDP_ROLE}'s, and the scenario has no "
+                        f"[overlap] and the stack no {IDP_ROLE} service")
+    elif holder is None and len(netns) > 1:
+        problems.append(f"the {IDP_ROLE} service {', '.join(idps)} shares {SUT_SERVICE}'s "
+                        f"namespace through one {NETNS_ROLE} holder, and the stack has "
+                        f"{', '.join(netns)}")
     elif holder is not None and netns != [holder]:
         problems.append(f"overlap.holder {holder} must be the stack's one {NETNS_ROLE} service, "
                         f"and the stack's are {', '.join(netns) or 'none'}")
+    if idps and holder is not None:
+        problems.append(f"compose service {', '.join(idps)}: an {IDP_ROLE} and [overlap] can't "
+                        "be combined; an overlap's holder is its instances' alone")
+    elif idps and not netns:
+        problems.append(f"compose service {', '.join(idps)}: an {IDP_ROLE} shares "
+                        f"{SUT_SERVICE}'s network namespace through a {NETNS_ROLE} holder, and "
+                        "the stack has none")
+    elif idps and list(suts) != [SUT_SERVICE]:
+        problems.append(f"an {IDP_ROLE}'s namespace holds {SUT_SERVICE} alone, and the "
+                        f"scenario has the SUT services {', '.join(suts)}")
     for name, role in sorted(roles.items()):
         if role not in ROLES:
             problems.append(f"compose service {name}: label {ROLE_LABEL} must be one of "
@@ -2808,9 +2865,11 @@ def service_problems(scenario, roles, modes=None):
     broker `kafka`; for a stand-in target, the stand-in `standin`; each `[[ledger.source]]`
     service a generator, and every generator a source's; and each local sink's `backend` a
     backend service. With `modes`, `{service: network_mode}` from the merged compose config, each
-    overlap instance is in its holder's namespace."""
+    overlap instance is in its holder's namespace, and `logit` and each `idp` in theirs. The
+    steps on an `idp`'s holder and its members follow `_idp_namespace_problems()`."""
     problems = role_problems(roles, scenario.suts,
                              None if scenario.overlap is None else scenario.overlap["holder"])
+    problems += _idp_namespace_problems(scenario, roles, modes)
     if scenario.overlap is not None and modes is not None:
         want = f"service:{scenario.overlap['holder']}"
         for instance in scenario.overlap["instances"]:

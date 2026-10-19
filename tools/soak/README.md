@@ -208,6 +208,21 @@ expired session's connection on its next request, so a second rate catches that 
 and that the sink dropped no batch over the whole run. Ten series keep an 8-hour
 topic at 144,000 records, inside the read-back's bound.
 
+`kafka-oauth-reauth` (15 minutes 30 seconds, up to 8 hours) is `kafka-sasl-reauth` over
+OAUTHBEARER with the client-credentials grant. Its token endpoint, `idp`, is
+`tools/kafka-interop`'s `mock-oauth2-server`, and it and the SUT share a namespace holder (see
+[A token endpoint beside the SUT](#a-token-endpoint-beside-the-sut)). Each token lives 60 s and
+ends its broker session when it expires, so the sink fetches a token and redials about every
+50 s. After the broker's restart, pause, and stop, the cycle stops the endpoint for 2 minutes,
+then pauses it for 2 minutes, each longer than a token lives. The stop shows the fallback: a
+redial whose refresh fails keeps the cached token, and the sink's `token_refresh_failed`
+diagnostic counts it. Once the token expires, both faults fail each dial `Clean`, and the sink
+holds its queue and retries until the endpoint is back. Beside W17's rows, it asserts the
+diagnostic inside the stop, `clean` attempts and `retrying` inside both endpoint faults, and
+`retrying` clearing after each. The reconnect rate is bounded to 25 to 220 an hour and the
+`ambiguous` rate to 20 an hour, both derived in its `scenario.toml`. No attempt is `refused`:
+the sink never sends a token it knows has expired.
+
 Six scenarios run a sink against a scripted stand-in in place of VictoriaMetrics (see
 [Stand-in targets](#stand-in-targets)):
 
@@ -452,6 +467,38 @@ and the new `ledger.overlap` judge the instances together, since flows move betw
 `progress` counts deliveries from the instances not held, and `ledger.overlap` holds the run's
 wire loss to what the instances' socket closes could discard. The plan's "Rolling overlap
 (W12b)" has the rules.
+
+### A token endpoint beside the SUT
+
+`kafka_out` takes a plain-HTTP `token_endpoint` on loopback only, so a token server in the stack
+shares the SUT's network namespace. Its role is `idp`. As in a rolling overlap, a holder with
+the role `netns` owns the namespace, so a stop of the `idp` leaves the SUT's network up, and the
+override puts `logit` and the `idp` in it:
+
+```yaml
+services:
+  sut-net:
+    image: logit-soak-netem:local
+    entrypoint: ["sleep", "infinity"]
+    labels: { soak.role: netns }
+    stop_signal: SIGKILL
+  idp:
+    image: ghcr.io/navikt/mock-oauth2-server:6.0.2@sha256:…
+    labels: { soak.role: idp }
+    network_mode: "service:sut-net"
+  logit:
+    network_mode: "service:sut-net"
+```
+
+The SUT reaches the `idp` at `127.0.0.1`, and every other service reaches either at the holder's
+name: the generator sends to `sut-net:8125`, and the broker fetches the JWKS from `sut-net`.
+With no `[overlap]`, a `netns` service needs an `idp` and an `idp` needs one, the stack runs no
+SUT but `logit`, and `logit`'s and the `idp`'s `network_mode` must name the holder. Put `netem`
+and `partition` on the holder, which then shape or cut the SUT's network, and neither on
+`logit` or the `idp`; the holder takes no other fault. A `pause`, `stop`, or `restart` of the
+`idp` affects egress only. `self_log` counts a `token_refresh_failed` warning inside a fault
+window on an `idp` and WARNs one outside every such window. The plan's "A token endpoint in the
+SUT's namespace (W19)" has the rules.
 
 ### TLS certificates
 
