@@ -1,8 +1,8 @@
 #!/bin/bash
 # Usage: script/transit gen|check|docs|coverage
 #   gen       run the class check and regenerate every generated file: under spec/transit/, each
-#             wire case's .json, each flow's expected/<flow>.json, and coverage.md; and every
-#             generated docs region
+#             wire case's .json, each flow's expected/<flow>.json and ledger/<flow>.json, and
+#             coverage.md; and every generated docs region
 #   check     run the class check and compare them, failing on anything stale (what script/test
 #             runs)
 #   docs      rewrite only the generated docs regions: each spec'd sink's module-doc mapping
@@ -12,15 +12,22 @@
 #
 # The spec's generator and the docs renderer are tests in the `logit` binary's transit module
 # (crates/logit-cli/src/transit/spec.rs and docs.rs), since only the binary's tests reach the
-# kind registry; TRANSIT_UPDATE=1 turns their comparisons into rewrites. A flow's expectations are
-# written only when no case in the flow fails the class check: fix the code or mapping.yaml.
-# Review `git diff` after `gen` or `docs` and commit. See spec/transit/README.md.
+# kind registry; TRANSIT_UPDATE=1 turns their comparisons into rewrites. The spec is three kinds
+# of test: `cases` (the case files and stale outputs), one `flow::<flow>` per flow, and `ledger`
+# (the checks across every flow, and coverage.md). A flow test reads the case files `cases`
+# writes, and `ledger` reads the ledger files the flow tests write, so `gen` runs the three in
+# that order, each its own nextest run; `check` only compares, so it runs them at once. A flow's
+# expectations and ledger file are written only when no case in the flow fails the class check:
+# fix the code or mapping.yaml. Review `git diff` after `gen` or `docs` and commit. See
+# spec/transit/README.md.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
-SPEC='test(=transit::spec::transit_spec)'
+CASES='test(=transit::spec::cases)'
+FLOWS='test(/^transit::spec::flow::/)'
+LEDGER='test(=transit::spec::ledger)'
 DOCS='test(=transit::docs::transit_docs)'
 
 transit_test() {
@@ -29,18 +36,25 @@ transit_test() {
     run "$@" cargo nextest run -p logit-cli --bin logit --no-tests=fail -E "${filter}"
 }
 
+# Each phase reads what the one before it wrote.
+regenerate() {
+    transit_test "${CASES}" env TRANSIT_UPDATE=1
+    transit_test "${FLOWS}" env TRANSIT_UPDATE=1
+    transit_test "${LEDGER} | ${DOCS}" env TRANSIT_UPDATE=1
+}
+
 case "${1:-}" in
     gen)
-        transit_test "${SPEC} | ${DOCS}" env TRANSIT_UPDATE=1
+        regenerate
         ;;
     check)
-        transit_test "${SPEC} | ${DOCS}" env
+        transit_test "${CASES} | ${FLOWS} | ${LEDGER} | ${DOCS}" env
         ;;
     docs)
         transit_test "${DOCS}" env TRANSIT_UPDATE=1
         ;;
     coverage)
-        transit_test "${SPEC} | ${DOCS}" env TRANSIT_UPDATE=1
+        regenerate
         cat spec/transit/coverage.md
         ;;
     *)

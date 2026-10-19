@@ -508,3 +508,10 @@ Recorded per workstream as each lands.
   uncounted loss of a log or span beside metrics, of the instrumentation scope, and of a foreign
   carrier; `otlp_out`'s uncounted loss of a `_logit.` carrier; and each sink's `when:` variants,
   such as `statsd_out`'s `format: statsd` tag and carrier omissions, side by side.
+- **Split tests** (`transit/split-tests`, after W5): the generator ran every case through every
+  flow in one `#[test]`, so nextest couldn't spread it across workers and its time grew with
+  cases times flows. On CI it took 2.3 s at 8 flows (#769), 2.5 s at 16 (#770), and 5.0 s at 16 on
+  a slow runner (#772), past nextest's 5 s `slow-timeout`; CI's runners run about 16 tests at once
+  and vary up to about 9x in speed. It's now a test per flow beside a `cases` test and a `ledger`
+  test, with each flow's observations committed as `ledger/<flow>.json` so the checks across
+  flows need no flow run ([ADR `transit-spec`](../adr/transit-spec.md)'s per-flow amendment).

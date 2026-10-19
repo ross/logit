@@ -2,20 +2,35 @@
 //! its source system, compares each run's document with its committed expectation, and checks the
 //! run against `mapping.yaml` (`super::classes`). `spec/transit/README.md` is the reader's account.
 //!
-//! Under `TRANSIT_UPDATE=1` ([`UPDATE`]) it rewrites what's generated: a wire case's `.json`
-//! from its wire file, each flow's `expected/<flow>.json`, and `coverage.md`, and removes an
-//! expectation file no flow produces. Unset, it compares, and a stale or missing file or case
-//! fails with a diff and the command that regenerates it. A case `.json` with no `.meta.yaml` (and
-//! named by no `wire:`) fails.
+//! **Tests.** The generator is three kinds of test, so nextest spreads the flows across workers:
+//!
+//! - `cases` ([`check_cases`]): the table loads, each case's `.json` is current, nothing under
+//!   `expected/` or `ledger/` belongs to no flow, and the `flow_tests!` list names each
+//!   `flows/*.yaml` once, under its stem with `-` as `_`.
+//! - `flow::<flow>`, one per entry of `flow_tests!` ([`check_flow`]): the flow's cases, the class
+//!   check, `expected/<flow>.json`, and `ledger/<flow>.json`, the [`classes::Fragment`] of what
+//!   the flow's runs fed the class check's [`Ledger`].
+//! - `ledger` ([`check_ledger`]): every flow's committed ledger file merged into one `Ledger`, its
+//!   checks across flows (`super::classes`'s "Across every flow"), and `coverage.md`. It runs no
+//!   flow. Since a flow's test fails when its ledger file is stale, every test passing means the
+//!   merged files hold what one run of every flow would have built.
+//!
+//! Under `TRANSIT_UPDATE=1` ([`UPDATE`]) each rewrites what it generates: `cases` a wire case's
+//! `.json` from its wire file, removing a file under `expected/` or `ledger/` no flow produces; a
+//! flow test its expectation and ledger files; `ledger` `coverage.md`. A flow reads the case files
+//! and `ledger` reads the ledger files, so `script/transit gen` runs `cases`, the flows, and
+//! `ledger` in that order. Unset, each compares, and a stale or missing file or case fails with a
+//! diff and the command that regenerates it. A case `.json` with no `.meta.yaml` (and named by no
+//! `wire:`) fails.
 //!
 //! **Expectations.** `expected/<flow>.json` is one JSON object mapping each case's name to its
 //! driver document (`super::report`), keys sorted, each document's lines indented under its key so
 //! a diff stays inside the case that changed ([`render_flow`]). One file per flow grows with the
 //! flows alone, where a file per case would grow with flows times cases. A missing file fails
 //! naming the flow and its path; a missing or stale case and a key no case has each fail naming
-//! the flow and the case. `gen` writes a
-//! flow's file once every case in the flow has run, and only when none of them failed the class
-//! check: a class failure leaves the whole file untouched.
+//! the flow and the case. `gen` writes a flow's expectation and ledger files once every case in
+//! the flow has run, and only when none of them failed the class check: a class failure leaves
+//! both untouched.
 //!
 //! **Cases.** A case is `cases/<system>/<case>.meta.yaml` beside `<case>.json`. The meta names
 //! the features from `features/<system>.yaml` the case `exercises`, an optional `wire:` file
@@ -37,7 +52,7 @@
 //! directory holding that case is the flow's source, and every case in it runs through the flow
 //! with [`Options::default`]. The flow driver's module doc (`super`) lists what a flow may hold.
 
-use super::classes::{self, At, Ledger};
+use super::classes::{self, At, Fragment, Ledger};
 use super::mapping::{self, Mapping};
 use super::report::canonical_line;
 use super::{run_traced, Options};
@@ -166,7 +181,7 @@ fn systems(spec: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// A system's cases, by name, each `exercises:` checked against its features.
-fn cases(spec: &Path, system: &str) -> anyhow::Result<Vec<Case>> {
+fn system_cases(spec: &Path, system: &str) -> anyhow::Result<Vec<Case>> {
     let dir = spec.join("cases").join(system);
     let known = features(spec, system)?;
     let mut cases = Vec::new();
@@ -588,18 +603,14 @@ fn flows(spec: &Path) -> anyhow::Result<Vec<Flow>> {
     paths.iter().map(|p| flow(spec, p)).collect()
 }
 
-/// Runs the whole spec under `spec`, returning every failure.
-fn generate(spec: &Path, update: bool) -> Vec<String> {
+/// A system's cases by system, and a failure per system whose cases don't load.
+fn all_cases(spec: &Path) -> (BTreeMap<String, Vec<Case>>, Vec<String>) {
     let mut failures = Vec::new();
-    let mapping = match mapping::load(&spec.join("mapping.yaml")) {
-        Ok(mapping) => mapping,
-        Err(err) => return vec![format!("{err:#}")],
-    };
-    let mut by_system: BTreeMap<String, Vec<Case>> = BTreeMap::new();
+    let mut by_system = BTreeMap::new();
     match systems(spec) {
         Ok(systems) => {
             for system in systems {
-                match cases(spec, &system) {
+                match system_cases(spec, &system) {
                     Ok(cases) => {
                         by_system.insert(system, cases);
                     }
@@ -609,6 +620,37 @@ fn generate(spec: &Path, update: bool) -> Vec<String> {
         }
         Err(err) => failures.push(format!("reading spec/transit/cases: {err:#}")),
     }
+    (by_system, failures)
+}
+
+/// A flow's expectation file.
+fn expected_path(spec: &Path, flow: &str) -> PathBuf {
+    spec.join("expected").join(format!("{flow}.json"))
+}
+
+/// A flow's ledger file.
+fn ledger_path(spec: &Path, flow: &str) -> PathBuf {
+    spec.join("ledger").join(format!("{flow}.json"))
+}
+
+/// Each failure once: a check that fails once per run of a flow, such as a misspelled `when:`
+/// key, reports once.
+fn dedupe(mut failures: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    failures.retain(|failure| seen.insert(failure.clone()));
+    failures
+}
+
+/// The `cases` test's work under `spec` (module doc): the table loads, each case's `.json` is
+/// current, nothing under `expected/` or `ledger/` belongs to no flow, and `tested`, the
+/// `(test name, flow)` pairs of the per-flow tests, names each flow under `flows/` once.
+fn check_cases(spec: &Path, tested: &[(&str, &str)], update: bool) -> Vec<String> {
+    let mut failures = Vec::new();
+    if let Err(err) = mapping::load(&spec.join("mapping.yaml")) {
+        failures.push(format!("{err:#}"));
+    }
+    let (by_system, load_failures) = all_cases(spec);
+    failures.extend(load_failures);
     for case in by_system.values().flatten() {
         match canonical(case) {
             Err(err) => failures.push(format!("case {}/{}: {err:#}", case.system, case.name)),
@@ -626,45 +668,120 @@ fn generate(spec: &Path, update: bool) -> Vec<String> {
             }
         }
     }
-
     let flows = match flows(spec) {
         Ok(flows) => flows,
         Err(err) => {
             failures.push(format!("{err:#}"));
-            return failures;
+            return dedupe(failures);
         }
     };
-    let mut ledger = Ledger::default();
-    let mut produced: Vec<PathBuf> = Vec::new();
-    for flow in &flows {
-        let mut docs = BTreeMap::new();
-        let mut class_failed = false;
-        for case in by_system.get(&flow.system).into_iter().flatten() {
-            let (doc, class_failures) = run_one(&mapping, flow, case, &mut ledger);
-            class_failed |= !class_failures.is_empty();
-            failures.extend(class_failures);
-            if let Some(doc) = doc {
-                docs.insert(case.name.clone(), (doc, case.meta.tolerance.clone()));
-            }
-        }
-        let path = spec.join("expected").join(format!("{}.json", flow.name));
-        // A class failure is a finding, so the flow's expectations aren't rewritten over it.
-        failures.extend(sync_flow(&path, &flow.name, &docs, update && !class_failed));
-        produced.push(path);
+    let names: Vec<&str> = flows.iter().map(|f| f.name.as_str()).collect();
+    for name in names.iter().filter(|name| !tested.iter().any(|(_, flow)| flow == *name)) {
+        failures.push(format!(
+            "flows/{name}.yaml has no test: add `{} => \"{name}\"` to spec.rs's flow_tests! list",
+            name.replace('-', "_")
+        ));
     }
-    failures.extend(ledger.finish());
+    for (i, (test, flow)) in tested.iter().enumerate() {
+        if !names.contains(flow) {
+            failures.push(format!(
+                "spec.rs's flow_tests! list names {flow}, which has no flows/{flow}.yaml; remove it"
+            ));
+        }
+        if tested[..i].iter().any(|(_, other)| other == flow) {
+            failures.push(format!("spec.rs's flow_tests! list names {flow} twice"));
+        }
+        if *test != flow.replace('-', "_") {
+            failures.push(format!(
+                "spec.rs's flow_tests! list runs {flow} as {test}; name it {}",
+                flow.replace('-', "_")
+            ));
+        }
+    }
+    for (dir, path) in
+        [("expected", expected_path as fn(&Path, &str) -> PathBuf), ("ledger", ledger_path)]
+    {
+        let produced: Vec<PathBuf> = names.iter().map(|name| path(spec, name)).collect();
+        failures.extend(stale_outputs(spec, dir, &produced, update));
+    }
+    dedupe(failures)
+}
+
+/// One flow's test under `spec` (module doc): every case of its source through it, the class
+/// check, and its expectation and ledger files compared, or under `update` rewritten when no
+/// case failed the class check.
+fn check_flow(spec: &Path, name: &str, update: bool) -> Vec<String> {
+    let mapping = match mapping::load(&spec.join("mapping.yaml")) {
+        Ok(mapping) => mapping,
+        Err(err) => return vec![format!("{err:#}")],
+    };
+    let flow = match flow(spec, &spec.join("flows").join(format!("{name}.yaml"))) {
+        Ok(flow) => flow,
+        Err(err) => return vec![format!("{err:#}")],
+    };
+    let cases = match system_cases(spec, &flow.system) {
+        Ok(cases) => cases,
+        Err(err) => return vec![format!("{err:#}")],
+    };
+    let mut failures = Vec::new();
+    let mut ledger = Ledger::default();
+    let mut docs = BTreeMap::new();
+    let mut class_failed = false;
+    for case in &cases {
+        let (doc, class_failures) = run_one(&mapping, &flow, case, &mut ledger);
+        class_failed |= !class_failures.is_empty();
+        failures.extend(class_failures);
+        if let Some(doc) = doc {
+            docs.insert(case.name.clone(), (doc, case.meta.tolerance.clone()));
+        }
+    }
+    // A class failure is a finding, so neither file is rewritten over it.
+    let write = update && !class_failed;
+    failures.extend(sync_flow(&expected_path(spec, name), name, &docs, write));
+    let fragment = ledger.fragment().render();
+    failures.extend(sync(&ledger_path(spec, name), &fragment, &[], write));
+    dedupe(failures)
+}
+
+/// The `ledger` test's work under `spec` (module doc): every flow's committed ledger file merged,
+/// the checks across flows, and `coverage.md`.
+fn check_ledger(spec: &Path, update: bool) -> Vec<String> {
+    let mapping = match mapping::load(&spec.join("mapping.yaml")) {
+        Ok(mapping) => mapping,
+        Err(err) => return vec![format!("{err:#}")],
+    };
+    let flows = match flows(spec) {
+        Ok(flows) => flows,
+        Err(err) => return vec![format!("{err:#}")],
+    };
+    let mut failures = Vec::new();
+    let mut ledger = Ledger::default();
+    for flow in &flows {
+        let path = ledger_path(spec, &flow.name);
+        let fragment = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))
+            .and_then(|text| {
+                serde_json::from_str::<Fragment>(&text)
+                    .with_context(|| format!("in {}", path.display()))
+            });
+        match fragment {
+            Ok(fragment) => ledger.merge(fragment),
+            Err(err) => failures.push(format!("{}: {err:#}; run `{REGENERATE}`", flow.name)),
+        }
+    }
+    // A merge short of a flow would misreport the table and the coverage.
+    if !failures.is_empty() {
+        return failures;
+    }
+    failures.extend(ledger.finish(&mapping));
     for line in ledger.unspecified() {
         eprintln!("transit: {line}");
     }
-    failures.extend(stale_expectations(spec, &produced, update));
     match coverage(spec, &mapping, &ledger) {
         Ok(text) => failures.extend(sync(&spec.join("coverage.md"), &text, &[], update)),
         Err(err) => failures.push(format!("coverage.md: {err:#}")),
     }
-    // A failure a check reports once per run of a flow, such as a misspelled `when:` key, once.
-    let mut seen = std::collections::BTreeSet::new();
-    failures.retain(|failure| seen.insert(failure.clone()));
-    failures
+    dedupe(failures)
 }
 
 /// One flow and one case: the run's document, or `None` when the driver refused the run, and
@@ -685,19 +802,19 @@ fn run_one(
     (Some(traced.outcome.document()), failures)
 }
 
-/// Entries under `expected/` that aren't a flow's file: removed under `update`, else failures.
-fn stale_expectations(spec: &Path, produced: &[PathBuf], update: bool) -> Vec<String> {
+/// Entries under `spec/<dir>/` that aren't in `produced`: removed under `update`, else failures.
+fn stale_outputs(spec: &Path, dir: &str, produced: &[PathBuf], update: bool) -> Vec<String> {
     let mut failures = Vec::new();
-    let Ok(entries) = std::fs::read_dir(spec.join("expected")) else { return failures };
+    let Ok(entries) = std::fs::read_dir(spec.join(dir)) else { return failures };
     for path in entries.flatten().map(|e| e.path()) {
         if produced.contains(&path) {
             continue;
         }
         if update {
             if path.is_dir() {
-                std::fs::remove_dir_all(&path).expect("remove a stale expectation directory");
+                std::fs::remove_dir_all(&path).expect("remove a stale directory");
             } else {
-                std::fs::remove_file(&path).expect("remove a stale expectation");
+                std::fs::remove_file(&path).expect("remove a stale generated file");
             }
         } else {
             failures.push(format!(
@@ -720,7 +837,7 @@ fn coverage(spec: &Path, mapping: &Mapping, ledger: &Ledger) -> anyhow::Result<S
     );
     for system in systems(spec)? {
         let features = features(spec, &system)?;
-        let cases = cases(spec, &system)?;
+        let cases = system_cases(spec, &system)?;
         out.push_str(&format!("\n## {system}\n\n| Feature | Cases | Count |\n|---|---|---|\n"));
         for feature in &features {
             let names: Vec<String> = cases
@@ -748,11 +865,63 @@ fn coverage(spec: &Path, mapping: &Mapping, ledger: &Ledger) -> anyhow::Result<S
     Ok(out)
 }
 
-/// The spec under `spec/transit/` (module doc).
-#[test]
-fn transit_spec() {
-    let failures = generate(&spec_dir(), updating());
+/// Fails listing every failure, when there are any.
+fn assert_none(failures: Vec<String>) {
     assert!(failures.is_empty(), "{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+}
+
+/// The case files, stale outputs, and the flow tests' list (module doc).
+#[test]
+fn cases() {
+    assert_none(check_cases(&spec_dir(), FLOWS, updating()));
+}
+
+/// The checks across every flow, from the committed ledger files, and `coverage.md` (module doc).
+#[test]
+fn ledger() {
+    assert_none(check_ledger(&spec_dir(), updating()));
+}
+
+/// One test per flow, `flow::<flow>` with each `-` of the file's stem as `_`, and [`FLOWS`]
+/// listing them for the `cases` test's comparison with `flows/`.
+macro_rules! flow_tests {
+    ($($test:ident => $flow:literal),* $(,)?) => {
+        /// Each per-flow test's name and the flow it runs.
+        const FLOWS: &[(&str, &str)] = &[$((stringify!($test), $flow)),*];
+
+        /// A test per flow under `spec/transit/flows/` (module doc).
+        mod flow {
+            $(
+                #[test]
+                fn $test() {
+                    super::assert_none(super::check_flow(
+                        &super::spec_dir(),
+                        $flow,
+                        super::updating(),
+                    ));
+                }
+            )*
+        }
+    };
+}
+
+flow_tests! {
+    influxdb_aggregate_to_prometheus => "influxdb-aggregate-to-prometheus",
+    influxdb_to_prometheus_remote_write => "influxdb-to-prometheus-remote-write",
+    influxdb_to_prometheus => "influxdb-to-prometheus",
+    prometheus_to_influxdb => "prometheus-to-influxdb",
+    statsd_aggregate_cumulative => "statsd-aggregate-cumulative",
+    statsd_aggregate_samples => "statsd-aggregate-samples",
+    statsd_aggregate_sketch => "statsd-aggregate-sketch",
+    statsd_aggregate_skip => "statsd-aggregate-skip",
+    statsd_relay_plain => "statsd-relay-plain",
+    statsd_relay_relative => "statsd-relay-relative",
+    statsd_relay_skip => "statsd-relay-skip",
+    statsd_relay => "statsd-relay",
+    statsd_to_influxdb => "statsd-to-influxdb",
+    statsd_to_otlp => "statsd-to-otlp",
+    statsd_to_prometheus_remote_write => "statsd-to-prometheus-remote-write",
+    statsd_to_prometheus => "statsd-to-prometheus",
 }
 
 #[cfg(test)]
@@ -762,7 +931,7 @@ mod tests {
     fn relay() -> (Flow, Case) {
         let spec = spec_dir();
         let flow = flow(&spec, &spec.join("flows/statsd-relay.yaml")).expect("the relay flow");
-        let case = cases(&spec, "statsd")
+        let case = system_cases(&spec, "statsd")
             .expect("statsd cases")
             .into_iter()
             .find(|c| c.name == "counter")
@@ -776,7 +945,7 @@ mod tests {
     fn a_degraded_records_field_rows_arent_looked_up() {
         let spec = spec_dir();
         let flow = flow(&spec, &spec.join("flows/statsd-relay.yaml")).expect("the relay flow");
-        let case = cases(&spec, "statsd")
+        let case = system_cases(&spec, "statsd")
             .expect("statsd cases")
             .into_iter()
             .find(|c| c.name == "cross-kinds")
@@ -838,7 +1007,7 @@ mod tests {
             2,
         );
         let flow = flow(&spec, &spec.join("flows/statsd-to-prometheus.yaml")).expect("the flow");
-        let case = cases(&spec, "statsd")
+        let case = system_cases(&spec, "statsd")
             .expect("statsd cases")
             .into_iter()
             .find(|c| c.name == "log-only")
@@ -939,7 +1108,7 @@ mod tests {
     fn small_spec(label: &str, edit: impl Fn(String) -> String) -> PathBuf {
         let from = spec_dir();
         let to = logit_pipeline::test_util::scratch_dir(label).join("transit");
-        for dir in ["features", "flows", "cases/statsd", "expected"] {
+        for dir in ["features", "flows", "cases/statsd", "expected", "ledger"] {
             std::fs::create_dir_all(to.join(dir)).expect("create a scratch directory");
         }
         let copy = |path: &str| {
@@ -965,20 +1134,94 @@ mod tests {
         to
     }
 
-    /// `gen` leaves a flow's expectations alone when any of its runs fails the class check.
+    /// `gen` leaves a flow's expectations and ledger file alone when any of its runs fails the
+    /// class check, and writes both once none does.
     #[test]
     fn gen_never_rewrites_over_a_class_failure() {
+        let delta = "    feature: delta_monotonic\n    cells:\n      statsd_out:\n        class: ";
         let spec = small_spec("transit-gen-class", |table| {
-            table.replace(
-                "    feature: delta_monotonic\n    cells:\n      statsd_out:\n        class: exact\n",
-                "    feature: delta_monotonic\n    cells:\n      statsd_out:\n        class: degraded\n",
-            )
+            table.replace(&format!("{delta}exact\n"), &format!("{delta}degraded\n"))
         });
         let expected = spec.join("expected/statsd-relay.json");
-        std::fs::write(&expected, "stale\n").expect("write a stale expectation");
-        let failures = generate(&spec, true);
+        let ledger = spec.join("ledger/statsd-relay.json");
+        for path in [&expected, &ledger] {
+            std::fs::write(path, "stale\n").expect("write a stale file");
+        }
+        let failures = check_flow(&spec, "statsd-relay", true);
         assert!(failures.iter().any(|f| f.contains("the table expects degraded")), "{failures:#?}");
-        assert_eq!(std::fs::read_to_string(&expected).expect("read it"), "stale\n");
+        for path in [&expected, &ledger] {
+            assert_eq!(std::fs::read_to_string(path).expect("read it"), "stale\n");
+        }
+
+        let table = std::fs::read_to_string(spec_dir().join("mapping.yaml")).expect("the table");
+        std::fs::write(spec.join("mapping.yaml"), table).expect("restore the table");
+        assert_eq!(check_flow(&spec, "statsd-relay", true), Vec::<String>::new());
+        for path in [&expected, &ledger] {
+            assert_ne!(std::fs::read_to_string(path).expect("read it"), "stale\n");
+        }
+    }
+
+    /// The flow tests' list must name each flow under `flows/` once, under its own name.
+    #[test]
+    fn the_flow_test_list_matches_the_flows() {
+        let spec = small_spec("transit-flow-list", |table| table);
+        let right = [("statsd_relay", "statsd-relay")];
+        assert_eq!(check_cases(&spec, &right, false), Vec::<String>::new());
+
+        let failures = check_cases(&spec, &[], false);
+        assert!(
+            failures.iter().any(|f| f.contains("flows/statsd-relay.yaml has no test")),
+            "{failures:#?}"
+        );
+        let failures =
+            check_cases(&spec, &[("statsd_relay", "statsd-relay"), ("gone", "gone")], false);
+        assert!(
+            failures.iter().any(|f| f.contains("names gone, which has no flows/gone.yaml")),
+            "{failures:#?}"
+        );
+        let failures = check_cases(&spec, &[("relay", "statsd-relay")], false);
+        assert!(
+            failures.iter().any(|f| f.contains("as relay; name it statsd_relay")),
+            "{failures:#?}"
+        );
+    }
+
+    /// A ledger file reads back as the ledger that wrote it, and a merged ledger whose
+    /// `normalized` cell never reads `normalized` fails as a stale table.
+    #[test]
+    fn a_ledger_file_reads_back_and_merges() {
+        let spec = spec_dir();
+        let table = mapping::load(&spec.join("mapping.yaml")).expect("the table");
+        let (flow, case) = relay();
+        let traced = run_traced(&flow.path, &case.json(), Options::default()).expect("runs");
+        let at = At { flow: &flow.name, case: &case.name };
+        let mut ledger = Ledger::default();
+        assert_eq!(classes::check(&table, &at, &traced, &mut ledger), Vec::<String>::new());
+        let text = ledger.fragment().render();
+        let read: Fragment = serde_json::from_str(&text).expect("the file parses");
+        assert_eq!(read, ledger.fragment());
+        let mut merged = Ledger::default();
+        merged.merge(read);
+        assert_eq!(merged.fragment().render(), text);
+        assert_eq!(merged.finish(&table), Vec::<String>::new());
+
+        let (sink, row, index, _) = table
+            .cells()
+            .into_iter()
+            .find(|(_, _, _, cell)| cell.class == mapping::Class::Normalized)
+            .expect("the table has a normalized cell");
+        let entry = format!(
+            "{{\"cells\":[{{\"sink\":\"{sink}\",\"row\":\"{row}\",\"cell\":{index},\
+             \"observed\":[\"exact\"]}}],\"unspecified\":[]}}"
+        );
+        let mut stale = Ledger::default();
+        stale.merge(serde_json::from_str(&entry).expect("the entry parses"));
+        let failures = stale.finish(&table);
+        assert!(
+            failures.iter().any(|f| f.contains(&format!("mapping row {row}, {sink} cell {index}"))
+                && f.contains("the table may be stale")),
+            "{failures:#?}"
+        );
     }
 
     /// A case `.json` with no `.meta.yaml` fails rather than never running.
@@ -986,7 +1229,7 @@ mod tests {
     fn a_case_json_without_a_meta_fails() {
         let spec = small_spec("transit-orphan", |table| table);
         std::fs::write(spec.join("cases/statsd/orphan.json"), "").expect("write an orphan");
-        let failures = generate(&spec, false);
+        let failures = check_cases(&spec, &[("statsd_relay", "statsd-relay")], false);
         assert!(
             failures.iter().any(|f| f.contains("orphan.json: no orphan.meta.yaml beside it")),
             "{failures:#?}"
