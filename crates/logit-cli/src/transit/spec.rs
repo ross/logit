@@ -770,6 +770,29 @@ mod tests {
         (flow, case)
     }
 
+    /// A record the sink writes only in a lesser form has its field rows left unlooked-up, so a
+    /// field row with no cell for that sink (`record/min_max` at `statsd_out`) isn't reached.
+    #[test]
+    fn a_degraded_records_field_rows_arent_looked_up() {
+        let spec = spec_dir();
+        let flow = flow(&spec, &spec.join("flows/statsd-relay.yaml")).expect("the relay flow");
+        let case = cases(&spec, "statsd")
+            .expect("statsd cases")
+            .into_iter()
+            .find(|c| c.name == "cross-kinds")
+            .expect("the cross-kinds case");
+        let traced = run_traced(&flow.path, &case.json(), Options::default()).expect("runs");
+        let table = mapping::load(&spec.join("mapping.yaml")).expect("the table");
+        let at = At { flow: &flow.name, case: &case.name };
+        let mut ledger = Ledger::default();
+        assert_eq!(classes::check(&table, &at, &traced, &mut ledger), Vec::<String>::new());
+        let unspecified = ledger.unspecified();
+        assert!(
+            !unspecified.iter().any(|line| line.contains("record/min_max")),
+            "{unspecified:#?}"
+        );
+    }
+
     /// A cell that disagrees with what the flow does fails the class check, naming the case, the
     /// row, the table's class, and the flow's.
     #[test]

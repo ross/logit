@@ -30,9 +30,10 @@
 //! sink. `record/min_max` is a histogram's `min` and `max`, which the record's own comparison
 //! leaves to this row.
 //!
-//! A row may have no cell for a sink no record can reach it at, such as `name_unsafe` at a sink
-//! that rewrites no name, or a field row at a sink that writes the kind only in a lesser form, so
-//! its fields are never compared; `mapping.yaml` says why beside the row.
+//! A row may have no cell for a sink where no record is compared against it, such as
+//! `name_unsafe` at a sink that rewrites no name, or a field row at a sink that writes the kind
+//! only in a lesser form, so its fields are never compared; `mapping.yaml` says why beside the
+//! row.
 //!
 //! A record-level row's class is `exact`, `normalized`, `degraded`, `skipped`, or `dropped`; a
 //! field-level row's is `exact`, `normalized`, or `lost`.

@@ -164,7 +164,8 @@ The cross-protocol columns settled two more things:
   sink as it behaves, so an uncounted loss needs a cell that says so; refusing the cell would hide
   the loss instead. The check accepts such a cell's class for a record nothing reads back. Each
   is a finding for the sink, not an endorsement.
-- **A row may omit a sink's cell when no record can reach it there**, and `mapping.yaml` says why
-  beside the row: `name_unsafe` at a sink that rewrites no name, or a field row at a sink that
-  writes the kind only in a lesser form, so the field is never compared. A cell nothing can reach
+- **A row may omit a sink's cell when no record is compared against it there**, and
+  `mapping.yaml` says why beside the row: `name_unsafe` at a sink that rewrites no name, or a
+  field row at a sink that writes the kind only in a lesser form, so the field is never compared.
+  A field row is reached only where its record is compared. A cell nothing is compared against
   would sit in `coverage.md`'s unreached list forever.

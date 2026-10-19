@@ -419,8 +419,8 @@ Recorded per workstream as each lands.
   - §7's `influxdb_in -> aggregate(cumulative) -> prometheus_out` can't show a delta sum:
     `influxdb_in` decodes every field to a gauge, so the window emits each series' latest value.
     `statsd_in -> prometheus_out` reaches the delta-sum rows instead.
-
-  - `prometheus_out` writes no histogram `min` or `max`, uncounted (`record/min_max`: `lost`);
-    the encode table says so, `mappings.md` doesn't.
+  - `prometheus_out` writes no histogram `min` or `max`, uncounted (`record/min_max`: `lost`).
+    The encode table and `mappings.md` both name it; the table records it as a field row of its
+    own, since the rest of the histogram survives.
 
   None of the first five is in `docs/known-gaps/mappings.md`, which W5 generates from the table.

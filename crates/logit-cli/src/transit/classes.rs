@@ -67,8 +67,8 @@
 //! but changed, moved (a resource attribute read back as an event attribute), or under the
 //! sink's spelling of its key is `normalized`,
 //! and absent is `lost`. The observed class may be better than the cell's but never worse. A
-//! degraded record's fields aren't checked: the carriers that describe its wire form describe a
-//! shape that's gone.
+//! degraded, skipped, or dropped record's field rows aren't looked up, so they're neither reached
+//! nor unspecified there: the carriers that describe its wire form describe a shape that's gone.
 //!
 //! **Counters.** Every sink series a run moved whose name ends in `dropped`, `skipped`,
 //! `degraded`, `normalized`, `omitted`, or `evicted` must be named by a cell the case reached. A
@@ -1197,6 +1197,9 @@ pub(super) fn check(
         let first = pairing.claimed[i].first().copied();
         let checked = matches!(observed, Class::Exact | Class::Normalized);
         for (kind, feature, field) in field_rows(input, &protocol) {
+            // A field row is reached only where its record is compared: a record written in a
+            // lesser form, or not at all, has no field to compare.
+            let Some(first) = first.filter(|_| checked) else { continue };
             let label = mapping::row_label(&kind, feature.as_deref());
             let (cell, index) = match mapping.lookup(&kind, feature.as_deref(), &sink, &traced.sink)
             {
@@ -1218,7 +1221,6 @@ pub(super) fn check(
                 }
                 Lookup::Cell(cell, index) => (cell, index),
             };
-            let Some(first) = first.filter(|_| checked) else { continue };
             let seen = observe_field(&field, input, &outs[first], spelling);
             let fits = if cell.class == Class::Exact {
                 seen == Class::Exact
