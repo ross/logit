@@ -159,7 +159,7 @@
 //! | `attributes/map_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A map has no label form and is left off, counted. |
 //! | `attributes/bytes_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A bytes value has no label form and is left off, counted. |
 //! | `attributes/timestamp_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A timestamp value has no label form and is left off, counted. |
-//! | `attributes/private_carrier` | normalized | `dialect` | A `_logit.prometheus.*` carrier is consumed into the wire form (the family type, the sample's timestamp) and prometheus_in stamps it back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. |
+//! | `attributes/private_carrier` | normalized | `dialect` | The family type and timestamp carriers are consumed into the wire form and a scrape stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp carrier. The resource's `_logit.prometheus.target` isn't written: a scrape of prometheus_out stamps its own URL, and the original target survives only as the `instance` label. |
 //! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a label and is left off, uncounted. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged` | A label, the event's value winning on a shared key, read back as an event attribute. |
 //! | `attributes/scope` | lost | uncounted | Prometheus has no instrumentation scope; it isn't written or counted. |
