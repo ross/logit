@@ -1,0 +1,4 @@
+# A hand-written OTLP/JSON body: `"NaN"` and `"-Infinity"` gauge points and an `"Infinity"`
+# cumulative `Sum`.
+wire: non-finite.bin
+exercises: [otlp_json, non_finite, gauge_double, sum_cumulative_monotonic, sum_double, several_data_points, attribute_string]

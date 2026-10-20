@@ -1,0 +1,97 @@
+{
+ "resourceMetrics": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "checkout"
+      }
+     },
+     {
+      "key": "host.name",
+      "value": {
+       "stringValue": "web-1"
+      }
+     }
+    ]
+   },
+   "scopeMetrics": [
+    {
+     "scope": {
+      "name": "io.opentelemetry.contrib.runtime",
+      "version": "1.2.0",
+      "attributes": [
+       {
+        "key": "library.language",
+        "value": {
+         "stringValue": "go"
+        }
+       }
+      ]
+     },
+     "metrics": [
+      {
+       "name": "orders.placed",
+       "unit": "{order}",
+       "sum": {
+        "aggregationTemporality": 2,
+        "isMonotonic": true,
+        "dataPoints": [
+         {
+          "startTimeUnixNano": "1799999930000000000",
+          "timeUnixNano": "1799999990000000000",
+          "asInt": "118",
+          "exemplars": [
+           {
+            "timeUnixNano": "1799999987000000000",
+            "asInt": "1",
+            "traceId": "5b8efff798038103d269b633813fc60c",
+            "spanId": "eee19b7ec3c1b174",
+            "filteredAttributes": [
+             {
+              "key": "customer.tier",
+              "value": {
+               "stringValue": "gold"
+              }
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      },
+      {
+       "name": "cart.value",
+       "unit": "USD",
+       "gauge": {
+        "dataPoints": [
+         {
+          "timeUnixNano": "1799999990000000000",
+          "asDouble": 42.5,
+          "exemplars": [
+           {
+            "timeUnixNano": "1799999989000000000",
+            "asDouble": 99.0,
+            "filteredAttributes": [
+             {
+              "key": "cart.id",
+              "value": {
+               "stringValue": "c-19"
+              }
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

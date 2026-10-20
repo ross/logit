@@ -14,7 +14,10 @@
 //! `start_timestamp`, `exemplars` (`exemplars_on_summary` for a `summary`), and `no_recorded_value` (`no_recorded_value_delta_sum` for a delta `sum`,
 //! `no_recorded_value_other_kind` for a kind other than `sum` and `gauge`) it carries,
 //! `service_check` when it carries `_logit.statsd.service_check.name`, `name_unsafe` when the
-//! sink's wire rewrites a character of its name ([`Spelling`]), `sample_rate` for a `samples`
+//! sink's wire rewrites a character of its name ([`Spelling`]), `exemplar_key_unsafe` for a
+//! monotonic `sum` (`exemplar_key_unsafe_histogram` for a `histogram`) when one of its exemplars
+//! carries an attribute key `prometheus_out` would rewrite as a label name, `sample_rate` for a
+//! `samples`
 //! record whose rate rounds to a weight above 1, `non_finite` for a `sum` or
 //! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
 //! another point of its series (the same name, kind, and public attributes), with `same_instant`
@@ -311,6 +314,31 @@ impl Spelling {
                 name.to_string()
             }
         }
+    }
+
+    /// The `record/exemplar_key_unsafe*` row `rec` reaches when one of its exemplars carries a
+    /// public attribute key the sink writes as a label name it would have to rewrite:
+    /// `exemplar_key_unsafe` for a monotonic `sum`, `exemplar_key_unsafe_histogram` for a
+    /// `histogram`, the two kinds whose exposition lines carry an exemplar. Only `prometheus_out`
+    /// writes an exemplar's attributes under a name rule; `otlp_out` writes them as is, and the
+    /// other sinks write no exemplars.
+    fn exemplar_key_unsafe(self, rec: &Rec) -> Option<&'static str> {
+        if self != Spelling::Prometheus {
+            return None;
+        }
+        let feature = match rec.kind.as_str() {
+            "sum" if rec.body["monotonic"] == Value::Bool(true) => "exemplar_key_unsafe",
+            "histogram" => "exemplar_key_unsafe_histogram",
+            _ => return None,
+        };
+        let unsafe_key =
+            |key: &String| !key.starts_with("_logit.") && sanitize_label_name(key) != key.as_str();
+        let reaches = rec.body["exemplars"].as_array().is_some_and(|exemplars| {
+            exemplars
+                .iter()
+                .any(|e| e["attributes"].as_object().is_some_and(|a| a.keys().any(unsafe_key)))
+        });
+        reaches.then_some(feature)
     }
 
     /// The name the sink's pair decoder reads `rec`, a sink input, back under.
@@ -1103,6 +1131,9 @@ fn record_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
     }
     if spelling.sanitize(&rec.name) != rec.name {
         features.push("name_unsafe");
+    }
+    if let Some(feature) = spelling.exemplar_key_unsafe(rec) {
+        features.push(feature);
     }
     if rec.kind == "samples" && weight(rec) > 1 {
         features.push("sample_rate");

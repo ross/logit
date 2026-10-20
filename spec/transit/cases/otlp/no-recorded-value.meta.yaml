@@ -1,0 +1,5 @@
+# A hand-written OTLP/JSON body: one point of each kind flagged `NO_RECORDED_VALUE`, a
+# cumulative and a delta `Sum`, a `Gauge`, a `Histogram`, an `ExponentialHistogram`, and a
+# `Summary`, as an SDK reports a series that stopped. No unflagged point shares a kind with them.
+wire: no-recorded-value.bin
+exercises: [otlp_json, no_recorded_value, sum_cumulative_monotonic, sum_delta_monotonic, gauge_int, histogram_cumulative, exponential_histogram_cumulative, summary, start_time, unit]

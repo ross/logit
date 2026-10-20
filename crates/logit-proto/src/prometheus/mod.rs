@@ -124,6 +124,10 @@
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A flagged record of a kind other than `Gauge` or `Sum` isn't written in either mode. It would be several series, and the flag doesn't say which of them existed, so a stale marker would name a series that may never have been sent. |
 //! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't labels. |
 //! | `record/name_unsafe` | normalized | `name_sanitized` | A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record reads back under the sanitized name, uncounted. |
+//! | `record/exemplar_key_unsafe`, with `bind:` unset | exact | -- | Remote-write carries an exemplar's label names as written, unsanitized, and prometheus_in reads them back. |
+//! | `record/exemplar_key_unsafe`, otherwise | dropped | uncounted | An exemplar's attribute keys are written as label names unsanitized, so a key such as `customer.tier` makes the counter's `_total` line invalid OpenMetrics, and prometheus_in drops the line and the counter with it. The sink counts nothing. |
+//! | `record/exemplar_key_unsafe_histogram`, with `bind:` unset | exact | -- | Remote-write carries an exemplar's label names as written, unsanitized, and prometheus_in reads them back. |
+//! | `record/exemplar_key_unsafe_histogram`, otherwise | degraded | -- | An exemplar's attribute keys are written as label names unsanitized, so a key such as `db.operation.name` makes the `_bucket` line its value falls in invalid OpenMetrics. prometheus_in drops that line, so the bucket's count reads back in the next bucket, uncounted. |
 //! | `record/sample_rate` | exact | -- | Each value is weighted by its inverse rate in the sketch the `samples` row describes. |
 //! | `record/superseded`, with `bind:` unset | exact | -- | Remote-write sends each sample with its own timestamp. |
 //! | `record/superseded`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so a later record of the series replaces an earlier one before a scrape reads it, uncounted. |

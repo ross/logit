@@ -1,0 +1,3 @@
+# A hand-written OTLP/JSON body sent gzip-compressed: one delta `Sum`.
+wire: gzip.bin
+exercises: [otlp_json, gzip, sum_delta_monotonic, sum_int, start_time, resource_attributes, scope, scope_attributes]

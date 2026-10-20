@@ -1,0 +1,3 @@
+# A hand-written OTLP/JSON body: one gauge point with an attribute of each `AnyValue` type.
+wire: attributes.bin
+exercises: [otlp_json, gauge_int, attribute_string, attribute_bool, attribute_int, attribute_double, attribute_bytes, attribute_array, attribute_kvlist]

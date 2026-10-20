@@ -1,0 +1,13 @@
+# otlp_in's metrics cases into statsd_out under DogStatsD, with nothing between: a cumulative
+# sum as a gauge, and a histogram, exponential histogram, or summary as dotted series.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/otlp/sums.json
+  out:
+    type: statsd_out
+    sources: [case]
+    endpoint: 127.0.0.1:8125
+    format: dogstatsd

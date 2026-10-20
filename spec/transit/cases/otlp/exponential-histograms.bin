@@ -1,0 +1,120 @@
+{
+ "resourceMetrics": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "checkout"
+      }
+     },
+     {
+      "key": "host.name",
+      "value": {
+       "stringValue": "web-1"
+      }
+     }
+    ]
+   },
+   "scopeMetrics": [
+    {
+     "scope": {
+      "name": "io.opentelemetry.contrib.runtime",
+      "version": "1.2.0",
+      "attributes": [
+       {
+        "key": "library.language",
+        "value": {
+         "stringValue": "go"
+        }
+       }
+      ]
+     },
+     "metrics": [
+      {
+       "name": "rpc.server.duration",
+       "unit": "ms",
+       "exponentialHistogram": {
+        "aggregationTemporality": 1,
+        "dataPoints": [
+         {
+          "startTimeUnixNano": "1799999980000000000",
+          "timeUnixNano": "1799999990000000000",
+          "count": "6",
+          "sum": 12.3,
+          "scale": 2,
+          "zeroCount": "1",
+          "zeroThreshold": 0.001,
+          "positive": {
+           "offset": 3,
+           "bucketCounts": [
+            "1",
+            "2",
+            "1"
+           ]
+          },
+          "negative": {
+           "offset": 1,
+           "bucketCounts": [
+            "1"
+           ]
+          },
+          "min": -1.6,
+          "max": 3.4,
+          "attributes": [
+           {
+            "key": "rpc.method",
+            "value": {
+             "stringValue": "GetCart"
+            }
+           }
+          ],
+          "exemplars": [
+           {
+            "timeUnixNano": "1799999989000000000",
+            "asInt": "3",
+            "traceId": "5b8efff798038103d269b633813fc60c",
+            "spanId": "eee19b7ec3c1b174"
+           }
+          ]
+         }
+        ]
+       }
+      },
+      {
+       "name": "messaging.payload.size",
+       "unit": "By",
+       "exponentialHistogram": {
+        "aggregationTemporality": 2,
+        "dataPoints": [
+         {
+          "startTimeUnixNano": "1799999930000000000",
+          "timeUnixNano": "1799999990000000000",
+          "count": "5",
+          "sum": 40.0,
+          "scale": -1,
+          "positive": {
+           "bucketCounts": [
+            "2",
+            "3"
+           ]
+          },
+          "attributes": [
+           {
+            "key": "messaging.system",
+            "value": {
+             "stringValue": "kafka"
+            }
+           }
+          ]
+         }
+        ]
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

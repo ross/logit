@@ -38,8 +38,11 @@ differ between runs. `../README.md`'s "Consuming these fixtures" section explain
   marshaler output.
 - `crates/logit-proto/tests/robustness.rs`'s `otlp_json_peak_memory_per_input_byte_is_documented`
   measures decoding `logs.json`.
+- The transit spec's `telemetrygen` case (`spec/transit/cases/otlp/telemetrygen.meta.yaml`)
+  decodes `metrics.json` through `otlp_in`'s request decoding and pins the events it decodes to
+  in `telemetrygen.json`.
 
-No `interop_fixture_*`-style test checks the `EventBatch` these files decode to yet.
+No test checks the events `logs.json` and `traces.json` decode to yet.
 
 ## What isn't covered here (yet)
 

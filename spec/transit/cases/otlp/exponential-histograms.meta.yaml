@@ -1,0 +1,5 @@
+# A hand-written OTLP/JSON body: a delta `ExponentialHistogram` at scale 2 with positive and
+# negative buckets, a zero count, a zero threshold, `min`, `max`, and an `asInt` exemplar, and a
+# cumulative one at scale -1 with positive buckets only.
+wire: exponential-histograms.bin
+exercises: [otlp_json, exponential_histogram_delta, exponential_histogram_cumulative, exponential_histogram_positive, exponential_histogram_negative, exponential_histogram_zero, exponential_histogram_scale, exponential_histogram_min_max, exemplars_exponential_histogram, exemplar_trace, exemplar_int, start_time, unit, attribute_string]

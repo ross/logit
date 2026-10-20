@@ -14,10 +14,11 @@ limits, and [the plan](../../docs/plans/transit-spec.md) the workstreams.
 
 The sources are `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape (remote-write cases
 aren't written yet), `datadog_in`'s metrics routes, with one case each for its logs, events, and
-service checks (no APM cases yet), and `collectd_in`. The sink columns are `statsd_out`,
-`prometheus_out` (exposition and remote-write), `influxdb_out`, `otlp_out`, and `datadog_out`.
-Each flow's name says which source meets which sink: `statsd-relay`, `influxdb-relay`, and
-`datadog-relay` are like pairs, and `influxdb-to-prometheus` a cross-protocol one.
+service checks (no APM cases yet), `collectd_in`, and `otlp_in`'s metrics (no log or trace cases
+yet). The sink columns are `statsd_out`, `prometheus_out` (exposition and remote-write),
+`influxdb_out`, `otlp_out`, and `datadog_out`. Each flow's name says which source meets which
+sink: `statsd-relay`, `influxdb-relay`, `datadog-relay`, and `otlp-relay` are like pairs, and
+`influxdb-to-prometheus` a cross-protocol one.
 
 `datadog_out` makes four drops above its encoders: `stale` and `too_many_tags`, which read the
 wall clock or apply an intake limit, and `needs_agent_processing` and `not_datadog_origin`, which
@@ -41,8 +42,8 @@ key, a stale document, and a key no case has each fail naming the flow and the c
 | `features/<system>.yaml` | The wire features a source's cases can exercise, one `{name, text}` each |
 | `cases/<system>/<case>.meta.yaml` | What the case exercises, and its wire file, a collectd case's `types_db:` file, and tolerances if any |
 | `cases/<system>/<case>.json` | The case's events, one `format: json` line each |
-| `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from, recorded, written as text, or hand-built ("Adding a case"): `.statsd` lines, InfluxDB line protocol in `.lp`, a Prometheus scrape body in `.prom`, a Datadog request body, compressed as sent, in `.bin`, or one collectd datagram in `.raw` |
-| `cases/<system>/<case>.headers` | The request beside an HTTP wire file, one `name: value` per line as `testdata/interop/` records it: `path:` with an InfluxDB write's `org`, `orgID`, `bucket`, and `precision`, a scrape's `content-type:` choosing its dialect, or a Datadog request's `path:`, `content-type:`, and `content-encoding:` |
+| `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from, recorded, written as text, or hand-built ("Adding a case"): `.statsd` lines, InfluxDB line protocol in `.lp`, a Prometheus scrape body in `.prom`, a Datadog or OTLP/HTTP request body, compressed as sent, in `.bin`, or one collectd datagram in `.raw` |
+| `cases/<system>/<case>.headers` | The request beside an HTTP wire file, one `name: value` per line as `testdata/interop/` records it: `path:` with an InfluxDB write's `org`, `orgID`, `bucket`, and `precision`, a scrape's `content-type:` choosing its dialect, or a Datadog or OTLP/HTTP request's `path:`, `content-type:`, and `content-encoding:` |
 | `flows/<flow>.yaml` | A runnable config: `replay_in -> [stages] -> <sink>` |
 | `expected/<flow>.json` | Each case's run through the flow, keyed by case name: the events read back and the counters moved (generated) |
 | `ledger/<flow>.json` | What the flow's runs fed the checks across flows: each cell reached and the classes observed there, and each row a sink has no cell in yet with the runs that reached it (generated) |
@@ -92,16 +93,19 @@ is one nothing checks: add a case or a flow that reaches it.
   point whose fields are all strings, its measurement carrier intact, else
   `event/attributes_only`), and the `record` rows that decide a record's fate
   (`no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`,
-  `service_check`, `name_unsafe`, `sample_rate`, `non_finite`, `superseded`, `same_instant`,
-  `same_millisecond`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
+  `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`,
+  `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_millisecond`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
   `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row, and a log or span beside metrics
   (`beside_metrics`), which is a field of its event: `exact`, `normalized`, or `lost`.
 
 Where a sink's outcome depends on the record's kind, the kind is in the feature's name, since a
 `when:` key names sink config only: `no_recorded_value` is a flagged cumulative `sum` or
-`gauge`, `no_recorded_value_delta_sum` a flagged delta `sum`, and `exemplars_on_summary` a
-summary's exemplars, and `unit_on_distribution` a `samples` or `distribution` record's unit. Some
+`gauge`, `no_recorded_value_delta_sum` a flagged delta `sum`, `exemplars_on_summary` a
+summary's exemplars, `unit_on_distribution` a `samples` or `distribution` record's unit, and
+`exemplar_key_unsafe` and `exemplar_key_unsafe_histogram` a monotonic `sum` and a `histogram`
+whose exemplar has an attribute key `prometheus_out` would have to rewrite as a label name, the
+only sink that writes an exemplar's keys under a name rule. Some
 rows name a shape one sink treats apart, and every sink that compares the record reaches them: `record/sample_rate` (a
 `samples` record whose rate rounds to a weight above 1) and `record/sample_rate_unweighted` (a
 rate below 1 that rounds to weight 1), `span/no_wire_form` (a span field a Datadog span has no
@@ -239,7 +243,10 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
    as `influxdb_in` requires; a Prometheus case reads text 0.0.4 unless its `.headers` gives an
    OpenMetrics `content-type:`. A Datadog case's `.headers` gives the request's `path:`, which
    picks the route, and its `content-type:` and `content-encoding:`, and the body decodes through
-   `datadog_in`'s own request decoding. A `wire:` path may point at a capture under `testdata/interop/`
+   `datadog_in`'s own request decoding. An OTLP case's `.headers` does the same for `otlp_in`:
+   `path:` picks the signal, `content-type:` protobuf or OTLP/JSON, and `content-encoding:`
+   gzip; a capture with no `.headers`, as `testdata/interop/otlp/` records them, is read as the
+   OTel Collector `file` exporter's lines, one OTLP/JSON metrics request each. A `wire:` path may point at a capture under `testdata/interop/`
    instead of copying it, and its `.headers` comes with it; an InfluxDB body sent with
    `content-encoding: gzip` is decompressed first, as `influxdb_in` does. A collectd case may name
    a `types.db` file in `types_db:`, relative to its directory, to name its data sources as

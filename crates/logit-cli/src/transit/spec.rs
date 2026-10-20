@@ -67,11 +67,12 @@ use logit_proto::collectd::{CollectdDecoder, TypesDb};
 use logit_proto::datadog::DatadogDecoder;
 use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
+use logit_proto::otlp::OtlpDecoder;
 use logit_proto::prometheus::{
     families_to_events, text, Dialect, PrometheusDecoder, ATTR_TARGET, LABEL_INSTANCE,
 };
 use logit_proto::statsd::StatsdDecoder;
-use logit_proto::Decoder;
+use logit_proto::{Decoder, Signal};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -322,6 +323,11 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 /// - `datadog`: one request body through `datadog_in`'s own `decode_request`, which picks the
 ///   route from `path:`, the body form from `content-type:`, and the decompression from
 ///   `content-encoding:`, as the listener does.
+/// - `otlp`: one request body through `otlp_in`'s own `decode_request`, which picks the signal
+///   from `path:`, the body encoding from `content-type:` (protobuf when absent), and the
+///   decompression from `content-encoding:`, as the listener does. A wire file with no `.headers`
+///   is the OTel Collector `file` exporter's output, as `testdata/interop/otlp/` records it: one
+///   OTLP/JSON metrics request per line.
 /// - `collectd`: one datagram through `CollectdDecoder`, under an empty resource, naming data
 ///   sources from the meta's `types_db:` file when it names one.
 fn decode_wire(
@@ -408,6 +414,42 @@ fn decode_wire(
                 decoder,
             )
             .map_err(|err| anyhow::anyhow!("datadog_in refused the request: {err}"))?
+        }
+        "otlp" => {
+            let telemetry = probe.telemetry(id, "otlp_in", "listener");
+            let decode = |path: &str, request: &http::HeaderMap, body: &[u8]| {
+                let decoder = OtlpDecoder::new().with_telemetry(telemetry.clone());
+                logit_inputs::otlp::decode_request(
+                    path,
+                    request,
+                    Bytes::copy_from_slice(body),
+                    decoder,
+                )
+                .map_err(|err| anyhow::anyhow!("otlp_in refused the request: {err}"))
+            };
+            match headers.get("path") {
+                Some(path) => {
+                    let mut request = http::HeaderMap::new();
+                    for name in [http::header::CONTENT_TYPE, http::header::CONTENT_ENCODING] {
+                        if let Some(value) = headers.get(name.as_str()) {
+                            request.insert(name, http::HeaderValue::from_str(value)?);
+                        }
+                    }
+                    decode(path, &request, &bytes)?
+                }
+                None => {
+                    let mut request = http::HeaderMap::new();
+                    request.insert(
+                        http::header::CONTENT_TYPE,
+                        http::HeaderValue::from_static("application/json"),
+                    );
+                    let mut batches = Vec::new();
+                    for line in bytes.split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
+                        batches.extend(decode(Signal::Metrics.path(), &request, line)?);
+                    }
+                    batches
+                }
+            }
         }
         "collectd" => {
             let telemetry = probe.telemetry(id, "collectd_in", "listener");
@@ -987,6 +1029,12 @@ flow_tests! {
     influxdb_to_prometheus => "influxdb-to-prometheus",
     influxdb_to_otlp => "influxdb-to-otlp",
     influxdb_to_statsd => "influxdb-to-statsd",
+    otlp_relay => "otlp-relay",
+    otlp_to_datadog => "otlp-to-datadog",
+    otlp_to_influxdb => "otlp-to-influxdb",
+    otlp_to_prometheus_remote_write => "otlp-to-prometheus-remote-write",
+    otlp_to_prometheus => "otlp-to-prometheus",
+    otlp_to_statsd => "otlp-to-statsd",
     prometheus_aggregate_to_influxdb => "prometheus-aggregate-to-influxdb",
     prometheus_to_datadog => "prometheus-to-datadog",
     prometheus_to_influxdb => "prometheus-to-influxdb",

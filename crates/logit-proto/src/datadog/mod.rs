@@ -177,7 +177,7 @@
 //! | `attributes/string_value` | normalized | `host_tag` | A `key:value` tag. A `host` attribute on a metric with no `host.name` is the host and not a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check with no non-empty host carrier, `host.name`, else `host`, is the host and not a tag, which datadog_in reads back as that carrier. |
 //! | `attributes/bool_value` | lost | uncounted | `true` is a bare `key` tag, read back as `true`; `false` writes no tag at all, uncounted. |
 //! | `attributes/number_value` | normalized | `stringified` | A `key:<number>` tag, read back as a string. |
-//! | `attributes/array_value` | exact | -- | One tag per element in order, which datadog_in folds back into the same array. |
+//! | `attributes/array_value` | normalized | `stringified` | One tag per element in order, which datadog_in folds back into an array of strings, so a number element reads back as its text. |
 //! | `attributes/map_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no nested form, so a map is left off, counted. |
 //! | `attributes/bytes_value` | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no bytes form, so the value is left off, counted. |
 //! | `attributes/timestamp_value` | normalized | `stringified` | A `key:<RFC 3339>` tag, read back as a string. |

@@ -283,7 +283,7 @@
 //! | `attributes/number_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/number_value`, otherwise | normalized | `stringified` | A number is a `key:digits` tag and reads back as a string. |
 //! | `attributes/array_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each element is counted as a wire tag. |
-//! | `attributes/array_value`, otherwise | exact | -- | One tag per element in order, which statsd_in folds back into the same array. |
+//! | `attributes/array_value`, otherwise | normalized | `stringified` | One tag per element in order, which statsd_in folds back into an array of strings, so a number element reads back as its text. |
 //! | `attributes/map_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/map_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A map has no tag form and is left off, counted. |
 //! | `attributes/bytes_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |

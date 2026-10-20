@@ -10,7 +10,7 @@
 //! | `gauge_delta` | `f64`, `i64`, `u64`, `bool` | record |
 //! | `histogram`, `exponential_histogram` | `delta`, `cumulative` | record |
 //! | `samples`, `set_members`, `distribution`, `set`, `summary` | none | record |
-//! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
+//! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
 //! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `unit_on_distribution`, `min_max`, `sample_rate_unweighted` | field |
 //! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `foreign_carrier`, `datadog_carrier_log`, `resource_attribute`, `scope` | field |
 //! | `attributes` | `no_host`, `log_status`, `span_kind`, `trace_id_high` (a record `datadog_out` writes an attribute for from the record's own fields) | field |
@@ -31,7 +31,9 @@
 //! point shares its timestamp, and `record/same_millisecond` one whose later point falls at
 //! another nanosecond of its millisecond, which a wire stamping milliseconds can't tell apart.
 //! `record/name_unsafe` is a name holding a character the sink's wire rewrites, which differs by
-//! sink. `record/sample_rate` is a `samples` record whose rate rounds to a weight above 1, and
+//! sink, and `record/exemplar_key_unsafe` a monotonic `sum` whose exemplar has an attribute key
+//! holding a character the sink's label names can't carry, `exemplar_key_unsafe_histogram` such a
+//! `histogram`. `record/sample_rate` is a `samples` record whose rate rounds to a weight above 1, and
 //! `record/sample_rate_unweighted` the rate of one below 1 that rounds to weight 1, which the
 //! record's own comparison leaves to that row. `record/unit_on_distribution` is a `samples` or
 //! `distribution` record's unit, where `record/unit` is every other kind's. `record/min_max` is a histogram's `min` and `max`, which the record's own comparison
@@ -104,6 +106,8 @@ const KINDS: [(&str, &[&str]); 15] = [
             "no_recorded_value_other_kind",
             "service_check",
             "name_unsafe",
+            "exemplar_key_unsafe",
+            "exemplar_key_unsafe_histogram",
             "sample_rate",
             "non_finite",
             "superseded",

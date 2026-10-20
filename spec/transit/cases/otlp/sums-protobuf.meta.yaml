@@ -1,0 +1,5 @@
+# `sums.bin`'s request as a protobuf body: the `MetricsData` the OTLP/JSON decoder reads from
+# that file, encoded with the committed `prost` types, so its `.json` equals `sums.json`. No
+# capture holds a protobuf body (testdata/interop/otlp/README.md says why).
+wire: sums-protobuf.bin
+exercises: [protobuf, sum_delta_monotonic, sum_delta_nonmonotonic, sum_cumulative_monotonic, sum_cumulative_nonmonotonic, sum_double, sum_int, start_time, unit, description, several_data_points, resource_attributes, scope, scope_attributes, attribute_string]

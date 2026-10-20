@@ -1,0 +1,121 @@
+# The OTLP metrics wire features a case under cases/otlp/ can exercise, from
+# crates/logit-proto/src/otlp/metrics.rs's "Decode", crates/logit-proto/src/otlp/common.rs's
+# `Value` ↔ `AnyValue` and resource and scope mapping, crates/logit-proto/src/otlp/mod.rs's
+# "Nesting", and crates/logit-inputs/src/otlp.rs's OTLP/HTTP request handling. A case names the
+# ones it exercises in its `.meta.yaml`. Logs and traces have none yet.
+- name: otlp_json
+  text: An OTLP/JSON `/v1/metrics` body, chosen by an `application/json` `content-type`.
+- name: protobuf
+  text: A protobuf `/v1/metrics` body, chosen by an `application/x-protobuf` `content-type`.
+- name: gzip
+  text: 'A body sent with `content-encoding: gzip`, inflated before it''s decoded.'
+- name: collector_file_export
+  text: >-
+    The OTel Collector `file` exporter's OTLP/JSON lines, one request per line, as
+    `testdata/interop/otlp/` records them.
+- name: gauge_double
+  text: A `Gauge` data point's `asDouble`, decoded to an `f64` gauge.
+- name: gauge_int
+  text: A `Gauge` data point's `asInt`, decoded to an `i64` gauge.
+- name: gauge_negative
+  text: A `Gauge` data point below zero.
+- name: sum_delta_monotonic
+  text: A `Sum` with delta temporality and `isMonotonic`, decoded to a delta monotonic sum.
+- name: sum_delta_nonmonotonic
+  text: A `Sum` with delta temporality, not monotonic.
+- name: sum_cumulative_monotonic
+  text: A `Sum` with cumulative temporality and `isMonotonic`.
+- name: sum_cumulative_nonmonotonic
+  text: A `Sum` with cumulative temporality, not monotonic.
+- name: sum_double
+  text: A `Sum` data point's `asDouble`, decoded to an `f64` value.
+- name: sum_int
+  text: A `Sum` data point's `asInt`, decoded to an `i64` value.
+- name: histogram_delta
+  text: A `Histogram` with delta temporality.
+- name: histogram_cumulative
+  text: A `Histogram` with cumulative temporality.
+- name: histogram_explicit_bounds
+  text: >-
+    A `Histogram` data point's `explicitBounds` and one more `bucketCounts` entry, the last read
+    as the `+Inf` bucket.
+- name: histogram_min_max
+  text: A `Histogram` data point with `min` and `max`.
+- name: histogram_no_min_max
+  text: A `Histogram` data point with neither `min` nor `max`.
+- name: exponential_histogram_delta
+  text: An `ExponentialHistogram` with delta temporality.
+- name: exponential_histogram_cumulative
+  text: An `ExponentialHistogram` with cumulative temporality.
+- name: exponential_histogram_positive
+  text: An `ExponentialHistogram` data point's `positive` buckets, with a nonzero `offset`.
+- name: exponential_histogram_negative
+  text: An `ExponentialHistogram` data point's `negative` buckets.
+- name: exponential_histogram_zero
+  text: An `ExponentialHistogram` data point's `zeroCount` and a nonzero `zeroThreshold`.
+- name: exponential_histogram_scale
+  text: An `ExponentialHistogram` data point's `scale`, positive or negative.
+- name: exponential_histogram_min_max
+  text: An `ExponentialHistogram` data point with `min` and `max`.
+- name: summary
+  text: A `Summary` data point's `count`, `sum`, and `quantileValues`, `0` and `1` included.
+- name: exemplars_sum
+  text: Exemplars on a `Sum` data point.
+- name: exemplars_gauge
+  text: Exemplars on a `Gauge` data point.
+- name: exemplars_histogram
+  text: Exemplars on a `Histogram` data point.
+- name: exemplars_exponential_histogram
+  text: Exemplars on an `ExponentialHistogram` data point.
+- name: exemplar_trace
+  text: An exemplar's `traceId` and `spanId`.
+- name: exemplar_filtered_attributes
+  text: An exemplar's `filteredAttributes`.
+- name: exemplar_int
+  text: An exemplar's `asInt`, decoded to an `i64` value.
+- name: start_time
+  text: A data point's `startTimeUnixNano`, decoded to the record's start timestamp.
+- name: gauge_start_time
+  text: A `Gauge` data point with a `startTimeUnixNano`, which OTLP permits and the model keeps.
+- name: no_recorded_value
+  text: A data point whose `flags` carry `NO_RECORDED_VALUE`, decoded flagged.
+- name: unit
+  text: A `Metric`'s `unit`.
+- name: description
+  text: A `Metric`'s `description`.
+- name: non_finite
+  text: A `"NaN"`, `"Infinity"`, or `"-Infinity"` double.
+- name: several_data_points
+  text: Several data points in one `Metric`, each decoded to its own event.
+- name: several_points_of_a_series
+  text: >-
+    Several points of one series (the same name and attributes) in one request, at different
+    instants.
+- name: resource_attributes
+  text: A `Resource`'s attributes, kept on the batch's resource.
+- name: schema_url
+  text: A `ResourceMetrics` or `ScopeMetrics` `schemaUrl`.
+- name: several_resources
+  text: Several `ResourceMetrics` in one request, each its own batch.
+- name: scope
+  text: An `InstrumentationScope`'s `name` and `version`.
+- name: scope_attributes
+  text: An `InstrumentationScope`'s attributes.
+- name: empty_scope
+  text: An empty `scope`, decoded as no scope.
+- name: several_scopes
+  text: Several `ScopeMetrics` under one resource, each its own batch.
+- name: attribute_string
+  text: A data point attribute's `stringValue`.
+- name: attribute_bool
+  text: A data point attribute's `boolValue`.
+- name: attribute_int
+  text: A data point attribute's `intValue`, decoded to an `i64`.
+- name: attribute_double
+  text: A data point attribute's `doubleValue`.
+- name: attribute_bytes
+  text: A data point attribute's `bytesValue`, base64 in OTLP/JSON.
+- name: attribute_array
+  text: A data point attribute's `arrayValue`.
+- name: attribute_kvlist
+  text: A data point attribute's `kvlistValue`, decoded to a map.

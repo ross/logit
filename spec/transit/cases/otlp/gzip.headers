@@ -1,0 +1,4 @@
+method: POST
+path: /v1/metrics
+content-type: application/json
+content-encoding: gzip
