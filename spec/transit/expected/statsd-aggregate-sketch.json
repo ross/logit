@@ -334,6 +334,11 @@
   ], "counters": {
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1
   }},
+  "tags-reserved": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"a:b","my_key":"a_b_c"}}
+  ], "counters": {
+    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1
+  }},
   "timer-h-d": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size.max","kind":"gauge","value":512.0}]},

@@ -313,6 +313,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (OTLP) | `set` → **skipped** | `logit.output.metrics.skipped{metric_kind=set}` | OTLP has no cardinality type, so a set estimate isn't written, with a throttled `otlp_set_metric_skipped` warning. |
   | encode (OTLP) | field `record/exemplars_on_summary` → **lost** | none (uncounted) | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off, uncounted. |
   | encode (OTLP) | field `attributes/foreign_carrier` → **lost** | none (uncounted) | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
+  | encode (OTLP) | `event/no_record` → **skipped** | none (uncounted) | An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted, so an InfluxDB point whose fields are all strings is lost with its fields. |
 
   <!-- transit:end -->
 

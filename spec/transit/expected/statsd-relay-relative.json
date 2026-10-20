@@ -202,6 +202,9 @@
   "tags-dedupe": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"team":"a","urgent":true}}
   ], "counters": {}},
+  "tags-reserved": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"a:b","my_key":"a_b_c"}}
+  ], "counters": {}},
   "timer-h-d": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request.size","kind":"samples","values":[512.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"h"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response.size","kind":"samples","values":[60196.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"d","endpoint":"/orders"}}

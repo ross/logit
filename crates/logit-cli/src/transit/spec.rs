@@ -907,8 +907,10 @@ macro_rules! flow_tests {
 
 flow_tests! {
     influxdb_aggregate_to_prometheus => "influxdb-aggregate-to-prometheus",
+    influxdb_relay => "influxdb-relay",
     influxdb_to_prometheus_remote_write => "influxdb-to-prometheus-remote-write",
     influxdb_to_prometheus => "influxdb-to-prometheus",
+    influxdb_to_otlp => "influxdb-to-otlp",
     influxdb_to_statsd => "influxdb-to-statsd",
     prometheus_to_influxdb => "prometheus-to-influxdb",
     prometheus_to_statsd => "prometheus-to-statsd",
@@ -1205,9 +1207,11 @@ mod tests {
         let mut merged = Ledger::default();
         merged.merge(read);
         assert_eq!(merged.fragment().render(), text);
-        // One case's run needn't observe every `normalized` cell it reaches at that class, so the
-        // merged ledger is held to the checks the run's own ledger gives, not to none.
-        assert_eq!(merged.finish(&table), ledger.finish(&table));
+        // The relay's `mixed` case writes no tag `statsd_out` sanitizes, so another flow's
+        // observation of that `normalized` cell is merged in, as the `ledger` test would.
+        let tags = r#"{"cells":[{"sink":"statsd_out","row":"attributes/string_value","cell":1,"observed":["normalized"]}],"unspecified":[]}"#;
+        merged.merge(serde_json::from_str(tags).expect("the entry parses"));
+        assert_eq!(merged.finish(&table), Vec::<String>::new());
 
         let (sink, row, index, _) = table
             .cells()

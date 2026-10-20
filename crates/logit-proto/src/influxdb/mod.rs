@@ -146,6 +146,7 @@
 //! | `log/dogstatsd_event` | skipped | uncounted | A log has no line-protocol form and isn't written, uncounted. |
 //! | `log/plain` | skipped | uncounted | A log has no line-protocol form and isn't written, uncounted. |
 //! | `span/alone` | skipped | uncounted | A span has no line-protocol form and isn't written, uncounted. |
+//! | `event/no_record` | exact | -- | An event carrying the `_logit.influxdb.measurement` carrier is a line of its `influxdb.field.*` string fields under that measurement, read back as the same event. One with no measurement carrier has nothing to write and isn't written, uncounted; no source makes one. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
