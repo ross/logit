@@ -246,7 +246,7 @@ pub struct Aggregator {
 /// timestamp would open its own series.
 ///
 /// A wire where every point carries a time (OTLP, Graphite, collectd, InfluxDB, Datadog series,
-/// Prometheus remote-write) stamps no carrier, and its records merge as before.
+/// Prometheus remote-write) stamps no carrier, and its records merge into a series.
 struct SourceTimeKeys {
     statsd: Symbol,
     prometheus: Symbol,
@@ -4714,7 +4714,7 @@ mod tests {
 
     /// An event carrying a source-timestamp carrier keeps every record, its timestamp, and its
     /// attributes, opens no series, and counts each record `timestamped`; a carrier its sink
-    /// wouldn't read as one merges as before.
+    /// wouldn't read as one merges into a series.
     #[test]
     fn a_source_timestamped_event_passes_through_untouched() {
         let resource = default_resource();

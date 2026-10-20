@@ -909,7 +909,7 @@ reason, so a timestamped cumulative counter counts `timestamped`, not `no_merge_
 No other carrier means "this point has its own source time". A wire where every point carries a
 time stamps no marker: OTLP, Graphite, collectd, InfluxDB line protocol (an absent timestamp
 becomes the request's arrival time, unmarked), Datadog series, and Prometheus remote-write, whose
-decoder runs with the marker off. Those records merge as before. Treating them as timestamped would
+decoder runs with the marker off. Those records merge into a series. Treating them as timestamped would
 leave `aggregate` nothing to do for those sources.
 
 ### Why
@@ -924,7 +924,8 @@ timestamped record broke both halves of that contract:
   and collided at the destination.
 
 The Datadog Agent makes the same choice for DogStatsD. Its datagram documentation says that for a
-metric with a timestamp, "the Agent skips aggregation and only enriches the metric with tags"
+metric with a timestamp, "the Datadog Agent doesn't do any processing with the metrics (no
+aggregation) except from enriching the metrics with tags"
 (<https://docs.datadoghq.com/developers/dogstatsd/datagram_shell/>). In its source,
 `comp/dogstatsd/server/impl/server.go` routes a sample with `Timestamp > 0` to `appendLateSample`,
 and `pkg/aggregator/no_aggregation_stream_worker.go` forwards those samples unaggregated.
