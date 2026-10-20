@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 23eaab6abfff78fcc3d4c6036abfeb5fa09ef8a640e82d103a63721057a7cdaf # shrinks to config = ModelConfig { temporality: Delta, samples_cap: None, members_cap: None, series_retention: 0, max_retained_series: 0 }, ops = [Batch { resource: 0, scope: 0, context: 0, events: [EventSpec { timestamp: -9223372036854775808, attributes: 5, records: [RecordSpec { name: "m0", unit: None, description: None, kind: Plain(Sum(Sum { value: F64(0.0), temporality: Delta, monotonic: false })), no_recorded_value: false }], log: false }] }, Batch { resource: 0, scope: 0, context: 0, events: [EventSpec { timestamp: -9223372036854775808, attributes: 0, records: [], log: false }] }]
