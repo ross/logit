@@ -7,7 +7,7 @@ updated: 2026-10-19
 
 ## Status
 Accepted. On 2026-10-19, [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)'s
-"Amendment: string fields are private" moved InfluxDB string fields from the public
+"Amendment: string fields are private (2026-10-19)" moved InfluxDB string fields from the public
 `influxdb.field.<key>` to `_logit.influxdb.field.<key>`; the lists below are amended to match.
 
 ## Context

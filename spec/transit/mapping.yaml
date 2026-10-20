@@ -1478,9 +1478,12 @@ rows:
         class: normalized
         reason: dialect
         text: >-
-          A `_logit.prometheus.*` carrier is consumed into the wire form (the family type, the
-          sample's timestamp) and prometheus_in stamps it back; OpenMetrics has no `untyped`, so
-          that type reads back as `unknown`.
+          The family type and timestamp carriers are consumed into the wire form and a scrape
+          stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`.
+          Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp
+          carrier. The resource's `_logit.prometheus.target` isn't written: a scrape of
+          prometheus_out stamps its own URL, and the original target survives only as the
+          `instance` label.
       datadog_out:
         class: lost
         counter: logit.output.tags.omitted{reason=no_wire_form}

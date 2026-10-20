@@ -159,7 +159,7 @@
 //! | `attributes/map_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A map has no label form and is left off, counted. |
 //! | `attributes/bytes_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A bytes value has no label form and is left off, counted. |
 //! | `attributes/timestamp_value` | lost | `logit.output.labels.omitted{reason=unrepresentable}` | A timestamp value has no label form and is left off, counted. |
-//! | `attributes/private_carrier` | normalized | `dialect` | A `_logit.prometheus.*` carrier is consumed into the wire form (the family type, the sample's timestamp) and prometheus_in stamps it back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. |
+//! | `attributes/private_carrier` | normalized | `dialect` | The family type and timestamp carriers are consumed into the wire form and a scrape stamps them back; OpenMetrics has no `untyped`, so that type reads back as `unknown`. Remote-write gives every sample a timestamp, so prometheus_in stamps no timestamp carrier. The resource's `_logit.prometheus.target` isn't written: a scrape of prometheus_out stamps its own URL, and the original target survives only as the `instance` label. |
 //! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a label and is left off, uncounted. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged` | A label, the event's value winning on a shared key, read back as an event attribute. |
 //! | `attributes/scope` | lost | uncounted | Prometheus has no instrumentation scope; it isn't written or counted. |
@@ -194,9 +194,8 @@
 //! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)):
 //! the encode side never renders it as a label, and every other protocol sink leaves it off its
 //! tags, labels, and fields. Like any private `_logit.` attribute, it's never counted. A
-//! whole-event render (`stdio_out`, `file_out`, `kafka_out`'s `json`, `msgpack`, and `native`
-//! formats, and the native hop) keeps it. An attribute spelled
-//! `prometheus.<name>` without the prefix is an ordinary label.
+//! whole-event render keeps it; that ADR's "The ignore rule" lists the renders. An attribute
+//! spelled `prometheus.<name>` without the prefix is an ordinary label.
 //! `docs/design/data-model.md`'s well-known-attribute table is the canonical list; in short:
 //! [`ATTR_TYPE`] (`Value::Str`) names the wire family type the model has no distinct kind for;
 //! [`ATTR_TIMESTAMP`] (`Value::Bool(true)`) means "this sample carried its own timestamp";
