@@ -1,0 +1,23 @@
+{
+  "cells": [
+    {"sink":"datadog_out","row":"attributes/bytes_value","cell":0,"observed":["lost"]},
+    {"sink":"datadog_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"datadog_out","row":"attributes/map_value","cell":0,"observed":["lost"]},
+    {"sink":"datadog_out","row":"attributes/no_host","cell":0,"observed":["normalized"]},
+    {"sink":"datadog_out","row":"attributes/number_value","cell":0,"observed":["normalized"]},
+    {"sink":"datadog_out","row":"attributes/resource_attribute","cell":0,"observed":["normalized"]},
+    {"sink":"datadog_out","row":"attributes/scope","cell":0,"observed":["lost"]},
+    {"sink":"datadog_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
+    {"sink":"datadog_out","row":"attributes/timestamp_value","cell":0,"observed":["normalized"]},
+    {"sink":"datadog_out","row":"gauge/f64","cell":0,"observed":["exact"]},
+    {"sink":"datadog_out","row":"gauge/negative","cell":0,"observed":["exact"]},
+    {"sink":"datadog_out","row":"histogram/cumulative","cell":0,"observed":["skipped"]},
+    {"sink":"datadog_out","row":"record/description","cell":0,"observed":["lost"]},
+    {"sink":"datadog_out","row":"record/non_finite","cell":0,"observed":["dropped"]},
+    {"sink":"datadog_out","row":"record/unit","cell":0,"observed":["exact"]},
+    {"sink":"datadog_out","row":"sum/cumulative_monotonic","cell":0,"observed":["skipped"]},
+    {"sink":"datadog_out","row":"sum/f64","cell":0,"observed":[]},
+    {"sink":"datadog_out","row":"summary","cell":0,"observed":["skipped"]}
+  ],
+  "unspecified": []
+}

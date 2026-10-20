@@ -1,0 +1,4 @@
+{"series": [
+  {"metric": "request.latency", "points": [[1799999990, [0.012, 0.034, 0.034, 0.25]]], "host": "web-1", "tags": ["env:prod", "route:/orders"]},
+  {"metric": "request.size", "points": [[1799999990, [512, 2048]]], "host": "", "tags": ["env:prod"]}
+]}

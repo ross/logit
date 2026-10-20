@@ -1,0 +1,4 @@
+# The Datadog Agent's startup event in its /intake/ envelope, JSON and zstd, read in place from
+# testdata/interop/ with its .headers.
+wire: ../../../../testdata/interop/datadog/agent-intake-001.bin
+exercises: [event, zstd]

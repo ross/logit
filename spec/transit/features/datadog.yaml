@@ -1,0 +1,84 @@
+# The Datadog intake wire features a case under cases/datadog/ can exercise, from
+# crates/logit-proto/src/datadog/mod.rs's "Decode: series and distribution points → events" and
+# "Decode: sketches → events" tables and crates/logit-inputs/src/datadog.rs's routes. A case names
+# the ones it exercises in its `.meta.yaml`. Logs, events, and service checks have one feature
+# each; APM traces and stats have none yet.
+- name: series_v1
+  text: A `/api/v1/series` JSON body, each point `[timestamp, value]`.
+- name: series_v2_json
+  text: A `/api/v2/series` JSON body, each point `{timestamp, value}` and the type an integer.
+- name: series_v2_protobuf
+  text: >-
+    A `/api/v2/series` protobuf `MetricPayload`, chosen by an `application/x-protobuf`
+    `content-type`.
+- name: count
+  text: A `count` series, decoded to a delta monotonic sum.
+- name: rate
+  text: A `rate` series, decoded to a gauge with the `_logit.datadog.type` carrier `rate`.
+- name: gauge
+  text: A `gauge` series, or a v1 series with no `type`, decoded to a gauge.
+- name: unspecified
+  text: >-
+    An `unspecified` series (v1 `""`, v2 `0`), decoded to a gauge with the type carrier
+    `unspecified`.
+- name: distribution_points
+  text: >-
+    A `/api/v1/distribution_points` body, each point `[timestamp, [values]]`, decoded to raw
+    samples.
+- name: sketch
+  text: >-
+    A `/api/beta/sketches` `Dogsketch`, decoded to a distribution under the Agent's mapping with
+    its exact count, sum, minimum, and maximum.
+- name: tags
+  text: A `tags` list, valued and bare tags both.
+- name: tags_repeated_key
+  text: >-
+    A tag key given more than once, folded into an array in wire order, with an exact duplicate
+    deduplicated.
+- name: reserved_tag
+  text: >-
+    A tag whose key is under `_logit.`, omitted at decode and counted
+    `logit.input.tags.omitted{reason="reserved_prefix"}`.
+- name: host
+  text: A series' `host`, or its first named `host` resource, decoded to `host.name`.
+- name: hostless
+  text: >-
+    A `host` of `""`, or a `host` resource with no name, the Agent's hostless sample: the
+    `_logit.datadog.hostless` carrier or a `host` entry in `_logit.datadog.resources`.
+- name: device
+  text: A v1 `device` or a `device` resource, stamped as the `_logit.datadog.device` carrier.
+- name: resources
+  text: >-
+    A v2 resource other than the first named `host` and `device`, kept in order in the
+    `_logit.datadog.resources` carrier.
+- name: source_type_name
+  text: A `source_type_name`, stamped as the `_logit.datadog.source_type_name` carrier.
+- name: interval
+  text: A nonzero `interval`, stamped as the `_logit.datadog.interval` carrier.
+- name: unit
+  text: A series' `unit`, decoded to the record's unit.
+- name: origin
+  text: >-
+    A series' `metadata.origin` codes, stamped as the `_logit.datadog.origin.*` carriers.
+- name: multi_point
+  text: A series with several points, decoded to one event per point.
+- name: fractional_timestamp
+  text: A v1 point timestamp with a fraction, truncated to its second.
+- name: no_timestamp
+  text: >-
+    A point with no timestamp, stamped with the request's arrival truncated to its second and
+    counted `logit.input.metrics.degraded{reason="no_timestamp"}`.
+- name: zstd
+  text: A body sent with `Content-Encoding` `zstd`, the Agent's default, decompressed first.
+- name: gzip
+  text: A body sent with `Content-Encoding` `gzip`, decompressed first.
+- name: service_check
+  text: >-
+    A `/api/v1/check_run` service check, decoded to a gauge of its status with the
+    `_logit.statsd.service_check.*` carriers.
+- name: event
+  text: >-
+    An event in the Agent's `/intake/` envelope, decoded to a log with the
+    `_logit.statsd.event.*` carriers.
+- name: log
+  text: A `/api/v2/logs` log object, decoded to a log with its fields as attributes.

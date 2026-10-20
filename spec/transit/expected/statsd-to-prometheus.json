@@ -124,7 +124,9 @@
   "span-beside-metrics": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests_inflight","kind":"gauge","value":3.0}]}
   ], "counters": {}},
+  "span-client": {"events": [], "counters": {}},
   "span-only": {"events": [], "counters": {}},
+  "span-pair": {"events": [], "counters": {}},
   "sub-millisecond": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000500Z","metrics":[{"name":"queue_depth","kind":"gauge","value":4.0}]}
   ], "counters": {}},
@@ -176,6 +178,11 @@
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 2
   }},
+  "timer-sample-rate-unweighted": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"api_latency","kind":"summary","count":1,"sum":12.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":12.0},{"quantile":0.9,"value":12.0},{"quantile":0.95,"value":12.0},{"quantile":0.99,"value":12.0}]}]}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 1
+  }},
   "timestamped": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":5.0}]}
   ], "counters": {
@@ -194,5 +201,11 @@
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 3,
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_gauge_delta,role=sink}": 3,
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=bool_value,role=sink}": 1
+  }},
+  "unit-on-samples": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"upload_size","kind":"summary","count":2,"sum":2560.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":2048.0},{"quantile":0.9,"value":2048.0},{"quantile":0.95,"value":2048.0},{"quantile":0.99,"value":2048.0}]}]}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1
   }}
 }

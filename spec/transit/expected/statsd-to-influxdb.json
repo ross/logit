@@ -117,7 +117,9 @@
   "span-beside-metrics": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.inflight.value","kind":"gauge","value":3.0}],"attributes":{"_logit.influxdb.measurement":"requests.inflight"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}},
+  "span-client": {"events": [], "counters": {}},
   "span-only": {"events": [], "counters": {}},
+  "span-pair": {"events": [], "counters": {}},
   "sub-millisecond": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000100Z","metrics":[{"name":"queue.depth.value","kind":"gauge","value":3.0}],"attributes":{"_logit.influxdb.measurement":"queue.depth"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000500Z","metrics":[{"name":"queue.depth.value","kind":"gauge","value":4.0}],"attributes":{"_logit.influxdb.measurement":"queue.depth"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
@@ -163,6 +165,9 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"db.query.count","kind":"gauge","value":2},{"name":"db.query.sum","kind":"gauge","value":6.4},{"name":"db.query.p50","kind":"gauge","value":3.2},{"name":"db.query.p90","kind":"gauge","value":3.2},{"name":"db.query.p99","kind":"gauge","value":3.2}],"attributes":{"_logit.influxdb.measurement":"db.query"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}},"types":{"/metrics/0/value":"u64"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"render.time.count","kind":"gauge","value":4},{"name":"render.time.sum","kind":"gauge","value":160.0},{"name":"render.time.p50","kind":"gauge","value":40.0},{"name":"render.time.p90","kind":"gauge","value":40.0},{"name":"render.time.p99","kind":"gauge","value":40.0}],"attributes":{"_logit.influxdb.measurement":"render.time","route":"/home"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}},"types":{"/metrics/0/value":"u64"}}
   ], "counters": {}},
+  "timer-sample-rate-unweighted": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"api.latency.count","kind":"gauge","value":1},{"name":"api.latency.sum","kind":"gauge","value":12.0},{"name":"api.latency.p50","kind":"gauge","value":12.0},{"name":"api.latency.p90","kind":"gauge","value":12.0},{"name":"api.latency.p99","kind":"gauge","value":12.0}],"attributes":{"_logit.influxdb.measurement":"api.latency"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}},"types":{"/metrics/0/value":"u64"}}
+  ], "counters": {}},
   "timestamped": {"events": [
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth.value","kind":"gauge","value":7.0}],"attributes":{"_logit.influxdb.measurement":"queue.depth"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests.value","kind":"gauge","value":1.0}],"attributes":{"_logit.influxdb.measurement":"requests"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
@@ -185,5 +190,8 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"retries.value","kind":"gauge","value":7}],"attributes":{"_logit.influxdb.measurement":"retries"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {
     "logit.output.metrics.dropped{component=out,kind=influxdb_out,reason=unresolved_gauge_delta,role=sink}": 3
-  }}
+  }},
+  "unit-on-samples": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"upload.size.count","kind":"gauge","value":2},{"name":"upload.size.sum","kind":"gauge","value":2560.0},{"name":"upload.size.p50","kind":"gauge","value":512.0},{"name":"upload.size.p90","kind":"gauge","value":2048.0},{"name":"upload.size.p99","kind":"gauge","value":2048.0}],"attributes":{"_logit.influxdb.measurement":"upload.size"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}},"types":{"/metrics/0/value":"u64"}}
+  ], "counters": {}}
 }

@@ -3,6 +3,7 @@
     {"sink":"statsd_out","row":"attributes/bytes_value","cell":1,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/map_value","cell":1,"observed":["lost"]},
+    {"sink":"statsd_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"attributes/number_value","cell":1,"observed":["normalized"]},
     {"sink":"statsd_out","row":"attributes/resource_attribute","cell":1,"observed":["normalized"]},
     {"sink":"statsd_out","row":"attributes/scope","cell":0,"observed":["lost"]},

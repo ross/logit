@@ -205,7 +205,7 @@
 //! | `gauge_delta/bool`, under `relative_gauges: true` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | A relative line of `1` or `0`. |
 //! | `gauge_delta/bool`, otherwise | dropped | `logit.output.messages.dropped{reason=unresolved_gauge_delta}` | Dropped unless `relative_gauges: true`, as for a float adjustment. |
 //! | `samples`, under `format: statsd` | normalized | `dialect`; `logit.output.messages.normalized{reason=dialect}` | Under `format: statsd`, a multi-value line splits into one line per value, uncounted, and an `h` or `d` timer is written as `ms`, counted once per record it renames. |
-//! | `samples`, otherwise | exact | -- | One `\|ms`, `\|h`, or `\|d` line holding every value, the type letter from the `_logit.statsd.type` carrier and `@rate` written when it isn't 1. |
+//! | `samples`, otherwise | exact | -- | One `\|ms`, `\|h`, or `\|d` line holding every value, the type letter from the `_logit.statsd.type` carrier, or `ms` with no carrier, so a Datadog distribution point leaves as a timer, not `\|d`. `@rate` is written when it isn't 1. |
 //! | `set_members` | normalized | `member_per_line`; `logit.output.messages.normalized{reason=member_sanitized}` | One `\|s` line per member, under either dialect and uncounted, so a multi-member set line reads back as one record per member; a statsd server counts the same distinct members either way. A member holding `:`, `\|`, or a control character is written with `_` in its place, counted once per member. |
 //! | `distribution`, under `multi_value: skip` | skipped | `logit.output.metrics.skipped{metric_kind=distribution}` | Under `multi_value: skip`, no line is written. |
 //! | `distribution`, otherwise | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | Dotted `.count` and `.sum` counters and `.min`, `.max`, and `.q0_5` to `.q0_99` gauges. Counts and sums merge across senders at a statsd server; quantiles and extremes are the last sender's. |
@@ -227,6 +227,7 @@
 //! | `record/service_check`, under `format: statsd` | skipped | `logit.output.messages.skipped{reason=dialect}` | Plain statsd has no service check, so none is written. |
 //! | `record/service_check`, otherwise | exact | -- | A gauge carrying the `_logit.statsd.service_check.*` carriers is a DogStatsD `_sc` line again. |
 //! | `record/name_unsafe` | normalized | `name_sanitized` | Every `:`, `\|`, `@`, `#`, `,`, control, and whitespace character in a name is written as `_`, so the record reads back under the sanitized name, uncounted. |
+//! | `record/sample_rate` | exact | -- | The rate is written as `@rate` on the line. |
 //! | `record/superseded` | exact | -- | Each record is its own line; a statsd server applies them in order. |
 //! | `record/same_instant` | exact | -- | Each record is its own line. |
 //! | `record/same_millisecond` | exact | -- | Each record is its own line. |
@@ -235,6 +236,7 @@
 //! | `log/dogstatsd_event`, otherwise | exact | -- | A log carrying the `_logit.statsd.event.*` carriers is a DogStatsD `_e` line again. |
 //! | `log/plain` | skipped | `logit.output.events.skipped` | Any other log on an event with no metrics has no statsd form and isn't written. |
 //! | `span/alone` | skipped | `logit.output.events.skipped` | A span on an event with no metrics has no statsd form and isn't written. |
+//! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
 //! | `event/attributes_only` | skipped | `logit.output.events.skipped` | An event with no metric, log, or span has no statsd line and isn't written. |
 //! | `event/string_only` | skipped | `logit.output.events.skipped` | An InfluxDB point whose fields are all strings has no metric, so it has no statsd line and isn't written. |
 //!
@@ -246,6 +248,8 @@
 //! | `record/description` | lost | uncounted | statsd has no description; it isn't written or counted. |
 //! | `record/start_timestamp` | lost | uncounted | statsd has no start time; it isn't written or counted. |
 //! | `record/exemplars` | lost | uncounted | statsd has no exemplars; they aren't written or counted. |
+//! | `record/unit_on_distribution` | lost | uncounted | statsd has no unit; it isn't written or counted. |
+//! | `record/sample_rate_unweighted` | exact | -- | The rate is written as `@rate` on the line. |
 //! | `attributes/string_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
 //! | `attributes/string_value`, otherwise | normalized | `tag_sanitized` | A DogStatsD `key:value` tag. Each `:`, `\|`, `@`, `#`, `,`, control, and whitespace character in the key, and each but `:` in the value, is written as `_`, uncounted. |
 //! | `attributes/bool_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
@@ -266,6 +270,8 @@
 //! | `attributes/resource_attribute`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged` | A resource attribute is written as a tag, the event's value winning on a shared key, and reads back as an event attribute. |
 //! | `attributes/scope` | lost | uncounted | statsd has no instrumentation scope; it isn't written or counted. |
+//! | `attributes/datadog_carrier_log` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
+//! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that also carries metrics is left off while the metrics are written, uncounted. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that also carries metrics is left off while the metrics are written, uncounted. |
 //!

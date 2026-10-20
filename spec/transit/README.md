@@ -13,10 +13,19 @@ a backend stores. [ADR `transit-spec`](../../docs/adr/transit-spec.md) records t
 limits, and [the plan](../../docs/plans/transit-spec.md) the workstreams.
 
 The sources are `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape (remote-write cases
-aren't written yet), and `collectd_in`. The sink columns are `statsd_out`, `prometheus_out`
-(exposition and remote-write), `influxdb_out`, and `otlp_out`. Each flow's name says which source
-meets which sink: `statsd-relay` and `influxdb-relay` are like pairs, and `influxdb-to-prometheus`
-a cross-protocol one.
+aren't written yet), `datadog_in`'s metrics routes, with one case each for its logs, events, and
+service checks (no APM cases yet), and `collectd_in`. The sink columns are `statsd_out`,
+`prometheus_out` (exposition and remote-write), `influxdb_out`, `otlp_out`, and `datadog_out`.
+Each flow's name says which source meets which sink: `statsd-relay`, `influxdb-relay`, and
+`datadog-relay` are like pairs, and `influxdb-to-prometheus` a cross-protocol one.
+
+`datadog_out` makes four drops above its encoders: `stale` and `too_many_tags`, which read the
+wall clock or apply an intake limit, and `needs_agent_processing` and `not_datadog_origin`, which
+judge a whole trace chunk. It also cuts a route's events into requests by size, dropping an event
+too large to send alone as `oversize`. None of these has a row, and the driver encodes each route
+in one request without them, so a span a real `datadog_out` would drop as `not_datadog_origin`
+reaches its cells here. The APM stats routes have no case. `crates/logit-outputs/src/datadog.rs`'s
+module doc has the drops and the cuts.
 
 ## Layout
 
@@ -32,8 +41,8 @@ key, a stale document, and a key no case has each fail naming the flow and the c
 | `features/<system>.yaml` | The wire features a source's cases can exercise, one `{name, text}` each |
 | `cases/<system>/<case>.meta.yaml` | What the case exercises, and its wire file, a collectd case's `types_db:` file, and tolerances if any |
 | `cases/<system>/<case>.json` | The case's events, one `format: json` line each |
-| `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from, recorded, written as text, or hand-built ("Adding a case"): `.statsd` lines, InfluxDB line protocol in `.lp`, a Prometheus scrape body in `.prom`, or one collectd datagram in `.raw` |
-| `cases/<system>/<case>.headers` | The request beside an HTTP wire file, one `name: value` per line as `testdata/interop/` records it: `path:` with an InfluxDB write's `org`, `orgID`, `bucket`, and `precision`, or a scrape's `content-type:` choosing its dialect |
+| `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from, recorded, written as text, or hand-built ("Adding a case"): `.statsd` lines, InfluxDB line protocol in `.lp`, a Prometheus scrape body in `.prom`, a Datadog request body, compressed as sent, in `.bin`, or one collectd datagram in `.raw` |
+| `cases/<system>/<case>.headers` | The request beside an HTTP wire file, one `name: value` per line as `testdata/interop/` records it: `path:` with an InfluxDB write's `org`, `orgID`, `bucket`, and `precision`, a scrape's `content-type:` choosing its dialect, or a Datadog request's `path:`, `content-type:`, and `content-encoding:` |
 | `flows/<flow>.yaml` | A runnable config: `replay_in -> [stages] -> <sink>` |
 | `expected/<flow>.json` | Each case's run through the flow, keyed by case name: the events read back and the counters moved (generated) |
 | `ledger/<flow>.json` | What the flow's runs fed the checks across flows: each cell reached and the classes observed there, and each row a sink has no cell in yet with the runs that reached it (generated) |
@@ -78,21 +87,27 @@ is one nothing checks: add a case or a flow that reaches it.
 `mapping.yaml`'s `classes:` is the canonical vocabulary: `exact`, `normalized`, `degraded`, `lost`,
 `skipped`, and `dropped`. They apply at two levels:
 
-- **Record level**, for a metric kind, a log or span on an event with no metrics, an event with
-  no metric, log, or span (`event/string_only` for an InfluxDB point whose fields are all strings,
-  its measurement carrier intact, else `event/attributes_only`), and the `record` rows that decide
-  a record's fate (`no_recorded_value`, `no_recorded_value_delta_sum`,
-  `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `non_finite`, `superseded`,
-  `same_instant`, `same_millisecond`): `exact`, `normalized`, `degraded`, `skipped`, or
-  `dropped`, best to worst.
+- **Record level**, for a metric kind, a log or span on an event with no metrics,
+  `span/no_wire_form`, an event with no metric, log, or span (`event/string_only` for an InfluxDB
+  point whose fields are all strings, its measurement carrier intact, else
+  `event/attributes_only`), and the `record` rows that decide a record's fate
+  (`no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`,
+  `service_check`, `name_unsafe`, `sample_rate`, `non_finite`, `superseded`, `same_instant`,
+  `same_millisecond`): `exact`, `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
-  `exemplars_on_summary`, and `min_max`, every `attributes` row, and a log or span beside metrics
+  `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row, and a log or span beside metrics
   (`beside_metrics`), which is a field of its event: `exact`, `normalized`, or `lost`.
 
 Where a sink's outcome depends on the record's kind, the kind is in the feature's name, since a
 `when:` key names sink config only: `no_recorded_value` is a flagged cumulative `sum` or
 `gauge`, `no_recorded_value_delta_sum` a flagged delta `sum`, and `exemplars_on_summary` a
-summary's exemplars. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
+summary's exemplars, and `unit_on_distribution` a `samples` or `distribution` record's unit. Some
+rows name a shape one sink treats apart, and every sink that compares the record reaches them: `record/sample_rate` (a
+`samples` record whose rate rounds to a weight above 1) and `record/sample_rate_unweighted` (a
+rate below 1 that rounds to weight 1), `span/no_wire_form` (a span field a Datadog span has no
+form for), `attributes/datadog_carrier_log` (a `_logit.datadog.*` carrier on a log, a Datadog
+event, or a service check), and the attributes `datadog_out` writes from a record's own fields,
+`attributes/no_host`, `log_status`, `span_kind`, and `trace_id_high`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
 loss where that loss's counter didn't move, since most sinks test the flag first
 (`classes.rs`'s "Counters").
 
@@ -128,7 +143,8 @@ records that reach it, and doesn't fail. The table's kinds, features, and rules 
 For each flow and case, the check pairs every record that reached the sink with the records read
 back, reading names, attribute keys, and values as that sink writes them (`prometheus_out`'s
 sanitized names and `_total`, `influxdb_out`'s `<name>.value` field, `otlp_out`'s integer
-timestamps), then compares what it observed with the table. A record's expected class is the worst of
+timestamps, `datadog_out`'s `host` tag read back as `host.name` and the attributes it writes from a
+record's own fields), then compares what it observed with the table. A record's expected class is the worst of
 the record-level cells it reaches, and the observed class must equal it. A `normalized` cell also
 accepts `exact`, because a normalization touches only the shapes it names. A field may read back
 better than its cell, never worse. Every sink counter the run moved must be named by a cell the
@@ -188,6 +204,7 @@ Each sink column has two regions:
 | `doc:prometheus_out` | `crates/logit-proto/src/prometheus/mod.rs` | Every cell of the column |
 | `doc:influxdb_out` | `crates/logit-proto/src/influxdb/mod.rs` | Every cell of the column |
 | `doc:otlp_out` | `crates/logit-proto/src/otlp/metrics.rs` | Every cell of the column |
+| `doc:datadog_out` | `crates/logit-proto/src/datadog/mod.rs` | Every cell of the column |
 | `gaps:<sink>`, one per sink | `docs/known-gaps/mappings.md` | The column's `degraded`, `lost`, `skipped`, and `dropped` cells, in that file's row format |
 
 A region opens on a line ending `<!-- transit:doc:<sink> -->` or `<!-- transit:gaps:<sink> -->`
@@ -216,10 +233,12 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
 
 1. Pick the source system's directory under `cases/`.
 2. For a case that starts on the wire, write the wire file (`<case>.statsd`, `<case>.lp`,
-   `<case>.prom`, or `<case>.raw`) and `<case>.meta.yaml` with `wire: <case>.statsd`. An
-   InfluxDB case needs a `<case>.headers` beside its wire file whose `path:` names a `bucket` and an `org` or `orgID`,
+   `<case>.prom`, `<case>.bin`, or `<case>.raw`) and `<case>.meta.yaml` with `wire: <case>.statsd`.
+   An InfluxDB case needs a `<case>.headers` beside its wire file whose `path:` names a `bucket` and an `org` or `orgID`,
    as `influxdb_in` requires; a Prometheus case reads text 0.0.4 unless its `.headers` gives an
-   OpenMetrics `content-type:`. A `wire:` path may point at a capture under `testdata/interop/`
+   OpenMetrics `content-type:`. A Datadog case's `.headers` gives the request's `path:`, which
+   picks the route, and its `content-type:` and `content-encoding:`, and the body decodes through
+   `datadog_in`'s own request decoding. A `wire:` path may point at a capture under `testdata/interop/`
    instead of copying it, and its `.headers` comes with it; an InfluxDB body sent with
    `content-encoding: gzip` is decompressed first, as `influxdb_in` does. A collectd case may name
    a `types.db` file in `types_db:`, relative to its directory, to name its data sources as

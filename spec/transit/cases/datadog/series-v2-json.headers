@@ -1,0 +1,3 @@
+method: POST
+path: /api/v2/series
+content-type: application/json

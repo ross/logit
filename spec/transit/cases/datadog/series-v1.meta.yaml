@@ -1,0 +1,4 @@
+# A hand-written /api/v1/series body: each type, the v1 host, device, and source fields, and the
+# tag forms. No capture holds one, since the Agent sends v2.
+wire: series-v1.bin
+exercises: [series_v1, count, rate, gauge, unspecified, tags, tags_repeated_key, reserved_tag, host, device, source_type_name, interval, unit, multi_point, fractional_timestamp]

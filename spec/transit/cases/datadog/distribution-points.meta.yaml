@@ -1,0 +1,4 @@
+# A hand-written /api/v1/distribution_points body, one series with a host and one hostless.
+# The recorded Agent sent its distribution as a sketch.
+wire: distribution-points.bin
+exercises: [distribution_points, tags, host, hostless]

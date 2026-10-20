@@ -142,6 +142,7 @@
 //! | `record/no_recorded_value_delta_sum` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't written, with a throttled `no_recorded_value` warning. |
 //! | `record/service_check` | normalized | `value_field` | The status gauge as a `value` field; the check's carriers aren't tags. |
+//! | `record/sample_rate` | exact | -- | Each value is weighted by its inverse rate in the sketch the `samples` row describes. |
 //! | `record/superseded` | exact | -- | Each point is its own line at its own timestamp. |
 //! | `record/same_instant` | normalized | `next_nanosecond` | A point sharing a series and a timestamp with one already in the batch takes the next free nanosecond, so both are kept. |
 //! | `record/same_millisecond` | exact | -- | Each point is its own line at its own nanosecond. |
@@ -149,6 +150,7 @@
 //! | `log/dogstatsd_event` | skipped | uncounted | A log has no line-protocol form and isn't written, uncounted. |
 //! | `log/plain` | skipped | uncounted | A log has no line-protocol form and isn't written, uncounted. |
 //! | `span/alone` | skipped | uncounted | A span has no line-protocol form and isn't written, uncounted. |
+//! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
 //! | `event/attributes_only` | skipped | uncounted | An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has no measurement to write under and isn't written, uncounted. A stage that drops the carrier leaves an InfluxDB point whose fields are all strings this way: a `remove` of it, or a `keep` under `private: drop`, which drops the string fields too. |
 //! | `event/string_only` | exact | -- | A line of the event's `_logit.influxdb.field.*` string fields under the measurement its `_logit.influxdb.measurement` carrier names, read back as the same event. |
 //!
@@ -171,6 +173,8 @@
 //! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged` | A tag, the event's value winning on a shared key, read back as an event attribute. |
 //! | `attributes/scope` | lost | uncounted | Line protocol has no instrumentation scope; it isn't written or counted. |
+//! | `attributes/datadog_carrier_log` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
+//! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
 //!

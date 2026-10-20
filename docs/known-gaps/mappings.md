@@ -95,8 +95,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | decode (Graphite) | A pickle or plaintext timestamp carbon reads differently: `-1.5` (any value whose `int()` is `-1`) → `bad_timestamp`, where carbon substitutes the receipt time; `0` or negative → `bad_timestamp`, where carbon passes it to storage | `logit.input.metrics.dropped{reason="bad_timestamp"}` | The decoder's sentinel is the value `-1.0` (CODEC-03 in `docs/plans/critical-sections-inventory.md`), which every sender that means "now" writes. A timestamp at or below zero is 1970 or earlier; whisper discards it as outside every retention, so carbon stores nothing either. |
   | encode (Datadog) | OTel-only span fields (`status: Ok`, span `flags`, `SpanExt`'s status message, `trace_state`, and dropped counts, and a link's or span event's dropped-attribute count) → dropped | `logit.output.spans.degraded{reason="no_wire_form"}`, one per field | A Datadog span has no field for any of them. `kind` survives as `meta["span.kind"]`, and a span with no `service.name`/`resource.name`/`span.type` goes out with those fields empty (the "`datadog_trace_out` derives no Datadog fields from an OTel span" entry). |
   | encode (Datadog) | A span attribute that is an `Array`, `Map`, or `Null` → a `meta` string of its JSON text; an integer an `f64` can't hold exactly → `metrics` as the nearest `f64` | `logit.output.spans.degraded{reason="json_text"\|"int_as_f64"}` | `meta` is string-to-string and `metrics` string-to-`f64`: the only typed homes a span attribute has. |
-  | encode (Datadog) | `Histogram`, `ExponentialHistogram`, `Summary`, `SetMembers`, and a cumulative or non-monotonic `Sum` → **skipped** (a `GaugeDelta` is the every-sink row's) | `logit.output.metrics.skipped{metric_kind}` | A series is `count`, `rate`, `gauge`, or unspecified; a delta monotonic `Sum` is the only sum a `count` can carry. The "`datadog_out` sends no Agent-style `h`/`ms` aggregates" entry has the follow-up. |
-  | encode (Datadog) | `Set` → a `gauge` of `estimate()`; a `Distribution` under a logarithmic mapping → re-binned into `Mapping::agent`; a `Samples` with `sample_rate < 1` → each value repeated `weight()` times | `logit.output.metrics.degraded{reason="set_estimate"\|"rebinned"\|"sample_rate_expanded"}` | A set gauge is the Agent's own `s`. A metrics sketch carries no mapping, so the receiver assumes the Agent's. Distribution points have no rate field. |
+  | encode (Datadog) | A `Distribution` under a logarithmic mapping → re-binned into `Mapping::agent` | `logit.output.metrics.degraded{reason="rebinned"}` | A metrics sketch carries no mapping, so the receiver assumes the Agent's. |
   | encode/decode (Splunk) | A resource attribute other than the four envelope carriers → an object's `fields`, and back as an **event** attribute (a span's `fields` return to the resource) | none (documented) | Every HEC object carries one flat `fields` map; only `host`, `source`, `sourcetype`, and `index` have an envelope slot. The Graphite resource row's loss, one protocol over. |
   | encode (Splunk) | `Samples`, `Distribution`, `Set`, `SetMembers`, `Histogram`, `Summary` → **skipped** under `multi_value: skip` (the default), or **expanded** into the exporter's `_sum`/`_count`/`_bucket{le}`/`<n>_<q>{qt}` and a count/sum/min/max/percentile series set under `expand`; `ExponentialHistogram` skipped under both | `logit.output.metrics.skipped{metric_kind}` / `logit.output.metrics.degraded{metric_kind}` | A Splunk metric is one number per name. `expand` is a naming convention `mstats`/`histperc` know, and loses mergeability; the exporter drops exponential histograms too. |
   | encode (Splunk) | A `Sum`'s temporality and monotonicity → `metric_type` `Sum` only; a delta or non-monotonic `Sum` comes back `Sum{Cumulative, monotonic}` | `logit.output.metrics.degraded{metric_kind="delta_sum"\|"non_monotonic_sum"}` | HEC has no carrier for either: `metric_type` is an ordinary dimension. The Graphite `Sum` row's loss. |
@@ -134,18 +133,21 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | decode (InfluxDB) | A string field value over 1 MiB, or a series key over 65,535 bytes → **accepted** | none | `influxd` answers `422` and `400`. `influxdb_in` enforces neither and bounds the body with `max_request_bytes`; `influxdb_out` reads the destination's `422` or `400` as `Rejected`, so the batch drops there, counted `batches.dropped{reason="rejected"}`, and the producer got its `204` already. |
   | decode (InfluxDB) | A body with several bad lines → an error naming the **first** bad line only | none (the request fails) | `influxd` lists every bad line, joined by `\n`. A producer fixing a batch learns of one bad line per resend. |
   | decode (InfluxDB) | The request's `precision` → **not carried**; every point leaves `influxdb_out` in nanoseconds | none (documented) | A timestamp is scaled to nanoseconds at decode, and a timestamp-less point takes the receipt time truncated to `precision`. The destination stores the same instant; only the wire spelling changes (normalization 7). |
+  | encode (statsd) | A `Samples` record with no `_logit.statsd.type` carrier, such as a `datadog_in` distribution point → a `\|ms` timer line | none (documented) | `statsd_out` takes the type letter from the carrier statsd_in stamps, and `ms` is its default. A Datadog Agent aggregates a `\|ms` line on its own host as a histogram, where the intake's distribution point was a global distribution, `\|d` on DogStatsD. |
+  | encode (statsd) | `host.name` → an ordinary `host.name:<value>` DogStatsD tag, never the `host:` tag; `datadog_in`'s hostless mark, `_logit.datadog.hostless`, → dropped | none (documented) | A Datadog Agent reads a line's host from its `host:` tag (statsd_in's reading of one is the `host` attribute), so a sample from another host or a hostless one is stamped with the Agent's own host, and `host.name` stays a tag. The hostless mark is another protocol's carrier, which `statsd_out` omits. |
 
   The tables below are generated from [`spec/transit/mapping.yaml`](../../spec/transit/mapping.yaml)
   by `script/transit docs`, one per sink with a column there, and a test fails when one is stale:
   change the mapping table, not these. Each holds that sink's `degraded`, `lost`, `skipped`, and
   `dropped` cells in the table's row order, a cell that depends on the sink's config naming its
-  condition. The hand-written rows above for the same four sinks are the outcomes the spec has no
+  condition. The hand-written rows above for the same five sinks are the outcomes the spec has no
   row for, or details its cells don't state. A generated row states the mapping and its counter;
   why the wire or the destination forces it is in the sink's module doc: the Prometheus rows'
   in `crates/logit-proto/src/prometheus/` (`mod.rs`, `text.rs`, `remote_write.rs`), the
   InfluxDB rows' in `crates/logit-proto/src/influxdb/mod.rs`, the OTLP rows' in
-  `crates/logit-proto/src/otlp/metrics.rs`, and the statsd rows' in
-  `crates/logit-outputs/src/statsd.rs`.
+  `crates/logit-proto/src/otlp/metrics.rs`, the statsd rows' in
+  `crates/logit-outputs/src/statsd.rs`, and the Datadog rows' in
+  `crates/logit-proto/src/datadog/mod.rs`.
 
   <!-- transit:gaps:statsd_out -->
 
@@ -180,6 +182,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (statsd) | field `record/description` → **lost** | none (uncounted) | statsd has no description; it isn't written or counted. |
   | encode (statsd) | field `record/start_timestamp` → **lost** | none (uncounted) | statsd has no start time; it isn't written or counted. |
   | encode (statsd) | field `record/exemplars` → **lost** | none (uncounted) | statsd has no exemplars; they aren't written or counted. |
+  | encode (statsd) | field `record/unit_on_distribution` → **lost** | none (uncounted) | statsd has no unit; it isn't written or counted. |
   | encode (statsd) | `record/no_recorded_value` → **skipped** | `logit.output.messages.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value has no statsd line. |
   | encode (statsd) | `record/no_recorded_value_delta_sum` → **skipped** | `logit.output.messages.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value has no statsd line. |
   | encode (statsd) | `record/no_recorded_value_other_kind` → **skipped** | `logit.output.messages.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value has no statsd line. |
@@ -199,6 +202,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (statsd) | field `attributes/foreign_carrier` → **lost** | none (uncounted) | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
   | encode (statsd) | field `attributes/resource_attribute`, under `format: statsd` → **lost** | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
   | encode (statsd) | field `attributes/scope` → **lost** | none (uncounted) | statsd has no instrumentation scope; it isn't written or counted. |
+  | encode (statsd) | field `attributes/datadog_carrier_log` → **lost** | none (uncounted) | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
   | encode (statsd) | `log/dogstatsd_event`, under `format: statsd` → **skipped** | `logit.output.messages.skipped{reason=dialect}` | Plain statsd has no event, so none is written. |
   | encode (statsd) | `log/plain` → **skipped** | `logit.output.events.skipped` | Any other log on an event with no metrics has no statsd form and isn't written. |
   | encode (statsd) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that also carries metrics is left off while the metrics are written, uncounted. |
@@ -232,6 +236,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Prometheus) | field `record/unit`, with `bind:` set → **lost** | `logit.output.metrics.degraded{reason=unit_not_suffix}` | OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left off, counted. |
   | encode (Prometheus) | field `record/start_timestamp` → **lost** | none (uncounted) | OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge's start time is left off, uncounted. |
   | encode (Prometheus) | field `record/exemplars` → **lost** | `logit.output.metrics.degraded{reason=exemplar_omitted}` | In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at most one per line. One with no line to sit on, such as a gauge's, is left off, counted. |
+  | encode (Prometheus) | field `record/unit_on_distribution`, with `bind:` set → **lost** | `logit.output.metrics.degraded{reason=unit_not_suffix}` | OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left off, counted. |
   | encode (Prometheus) | field `record/exemplars_on_summary` → **lost** | `logit.output.metrics.degraded{reason=exemplar_omitted}` | A summary has no `_total` or bucket line for an exemplar to sit on, so its exemplars are left off, counted. |
   | encode (Prometheus) | field `record/min_max` → **lost** | none (uncounted) | A histogram's `min` and `max` have no Prometheus series and aren't written, uncounted. |
   | encode (Prometheus) | `record/no_recorded_value`, with `bind:` set → **skipped** | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
@@ -248,6 +253,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Prometheus) | field `attributes/timestamp_value` → **lost** | `logit.output.labels.omitted{reason=unrepresentable}` | A timestamp value has no label form and is left off, counted. |
   | encode (Prometheus) | field `attributes/foreign_carrier` → **lost** | none (uncounted) | Another protocol's `_logit.` carrier isn't a label and is left off, uncounted. |
   | encode (Prometheus) | field `attributes/scope` → **lost** | none (uncounted) | Prometheus has no instrumentation scope; it isn't written or counted. |
+  | encode (Prometheus) | field `attributes/datadog_carrier_log` → **lost** | none (uncounted) | Another protocol's `_logit.` carrier isn't a label and is left off, uncounted. |
   | encode (Prometheus) | `log/dogstatsd_event` → **skipped** | none (uncounted) | A log has no Prometheus form and isn't written, uncounted. |
   | encode (Prometheus) | `log/plain` → **skipped** | none (uncounted) | A log has no Prometheus form and isn't written, uncounted. |
   | encode (Prometheus) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
@@ -293,6 +299,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (InfluxDB) | field `attributes/timestamp_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
   | encode (InfluxDB) | field `attributes/foreign_carrier` → **lost** | none (uncounted) | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
   | encode (InfluxDB) | field `attributes/scope` → **lost** | none (uncounted) | Line protocol has no instrumentation scope; it isn't written or counted. |
+  | encode (InfluxDB) | field `attributes/datadog_carrier_log` → **lost** | none (uncounted) | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
   | encode (InfluxDB) | `log/dogstatsd_event` → **skipped** | none (uncounted) | A log has no line-protocol form and isn't written, uncounted. |
   | encode (InfluxDB) | `log/plain` → **skipped** | none (uncounted) | A log has no line-protocol form and isn't written, uncounted. |
   | encode (InfluxDB) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
@@ -316,8 +323,50 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (OTLP) | `set` → **skipped** | `logit.output.metrics.skipped{metric_kind=set}` | OTLP has no cardinality type, so a set estimate isn't written, with a throttled `otlp_set_metric_skipped` warning. |
   | encode (OTLP) | field `record/exemplars_on_summary` → **lost** | none (uncounted) | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off, uncounted. |
   | encode (OTLP) | field `attributes/foreign_carrier` → **lost** | none (uncounted) | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
+  | encode (OTLP) | field `attributes/datadog_carrier_log` → **lost** | none (uncounted) | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
   | encode (OTLP) | `event/attributes_only` → **skipped** | none (uncounted) | An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted. |
   | encode (OTLP) | `event/string_only` → **skipped** | none (uncounted) | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, uncounted, so its fields are lost. |
+
+  <!-- transit:end -->
+
+  <!-- transit:gaps:datadog_out -->
+
+  | Direction | Mapping | Counter | Why |
+  |---|---|---|---|
+  | encode (Datadog) | `sum/delta_nonmonotonic` → **skipped** | `logit.output.metrics.skipped{metric_kind=non_monotonic_delta_sum}` | A Datadog `count` is a monotonic per-interval value, so a non-monotonic delta sum isn't written. |
+  | encode (Datadog) | `sum/cumulative_monotonic` → **skipped** | `logit.output.metrics.skipped{metric_kind=cumulative_sum}` | A Datadog `count` carries a per-interval value, so a running total isn't written. |
+  | encode (Datadog) | `sum/cumulative_nonmonotonic` → **skipped** | `logit.output.metrics.skipped{metric_kind=cumulative_sum}` | A running total isn't written, as for a monotonic one. |
+  | encode (Datadog) | `gauge_delta/f64` → **dropped** | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
+  | encode (Datadog) | `gauge_delta/i64` → **dropped** | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
+  | encode (Datadog) | `gauge_delta/u64` → **dropped** | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
+  | encode (Datadog) | `gauge_delta/bool` → **dropped** | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | Nothing upstream resolved the relative gauge to an absolute one, so the series encoders drop it. |
+  | encode (Datadog) | `set_members` → **skipped** | `logit.output.metrics.skipped{metric_kind=set_members}` | The series encoders have no form for set members, so none is written. |
+  | encode (Datadog) | `set` → **degraded** | `logit.output.metrics.degraded{reason=set_estimate}` | A series `gauge` of the estimate, the Agent's `s`; the registers are gone. |
+  | encode (Datadog) | `histogram/delta` → **skipped** | `logit.output.metrics.skipped{metric_kind=histogram}` | The series encoders have no histogram, so none is written; `docs/known-gaps/datadog.md`'s "`datadog_out` sends no Agent-style `h`/`ms` aggregates" entry has the follow-up. |
+  | encode (Datadog) | `histogram/cumulative` → **skipped** | `logit.output.metrics.skipped{metric_kind=histogram}` | The series encoders have no histogram, so none is written. |
+  | encode (Datadog) | `exponential_histogram/delta` → **skipped** | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | The series encoders have no exponential histogram, so none is written. |
+  | encode (Datadog) | `exponential_histogram/cumulative` → **skipped** | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | The series encoders have no exponential histogram, so none is written. |
+  | encode (Datadog) | `summary` → **skipped** | `logit.output.metrics.skipped{metric_kind=summary}` | The series encoders have no summary, so none is written. |
+  | encode (Datadog) | field `record/description` → **lost** | none (uncounted) | Datadog's intake has no description; it isn't written or counted. |
+  | encode (Datadog) | field `record/start_timestamp` → **lost** | none (uncounted) | A series point has no start time; it isn't written or counted. |
+  | encode (Datadog) | field `record/exemplars` → **lost** | none (uncounted) | Datadog's intake has no exemplars; they aren't written or counted. |
+  | encode (Datadog) | field `record/unit_on_distribution` → **lost** | none (uncounted) | Distribution points and sketches have no unit field, so a `samples` or `distribution` record's unit is left off, uncounted; only the series routes write one. |
+  | encode (Datadog) | `record/no_recorded_value` → **skipped** | `logit.output.metrics.skipped{reason=no_recorded_value}` | Datadog has no marker for a point with no recorded value, so it isn't written. |
+  | encode (Datadog) | `record/no_recorded_value_delta_sum` → **skipped** | `logit.output.metrics.skipped{reason=no_recorded_value}` | Datadog has no marker for a point with no recorded value, so it isn't written. |
+  | encode (Datadog) | `record/no_recorded_value_other_kind` → **skipped** | `logit.output.metrics.skipped{reason=no_recorded_value}` | Datadog has no marker for a point with no recorded value, so it isn't written. |
+  | encode (Datadog) | `record/sample_rate` → **degraded** | `logit.output.metrics.degraded{reason=sample_rate_expanded}` | The distribution route has no sample rate, so each value is repeated by its weight, the inverse of the rate rounded, and datadog_in reads the values back at rate 1. |
+  | encode (Datadog) | field `record/sample_rate_unweighted` → **lost** | none (uncounted) | A rate below 1 that rounds to weight 1, such as 0.8, writes each value once on the distribution route, which has no rate, so datadog_in reads it back at rate 1, uncounted. |
+  | encode (Datadog) | `record/non_finite` → **dropped** | `logit.output.metrics.dropped{reason=non_finite_value}` | JSON has no `NaN` or infinity, so the point isn't written. |
+  | encode (Datadog) | field `attributes/bool_value` → **lost** | none (uncounted) | `true` is a bare `key` tag, read back as `true`; `false` writes no tag at all, uncounted. |
+  | encode (Datadog) | field `attributes/map_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no nested form, so a map is left off, counted. |
+  | encode (Datadog) | field `attributes/bytes_value` → **lost** | `logit.output.tags.omitted{reason=unrepresentable}` | A tag has no bytes form, so the value is left off, counted. |
+  | encode (Datadog) | field `attributes/private_carrier` → **lost** | `logit.output.tags.omitted{reason=no_wire_form}` | A `_logit.datadog.*` carrier rides in its own wire field; one the route has no field for is left off, counted. |
+  | encode (Datadog) | field `attributes/foreign_carrier` → **lost** | none (uncounted) | Another protocol's `_logit.` carrier is never a tag; it isn't written or counted. The `_logit.statsd.event.*` and `_logit.statsd.service_check.*` carriers are read as the Datadog fields they name. |
+  | encode (Datadog) | field `attributes/scope` → **lost** | none (uncounted) | Datadog has no instrumentation scope; it isn't written or counted. |
+  | encode (Datadog) | field `attributes/datadog_carrier_log` → **lost** | none (uncounted) | A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the route has no field for is left off, uncounted, where the metrics routes count one as `no_wire_form`; the events route's public form has no field for the Agent envelope's `_logit.datadog.agent.hostname`. |
+  | encode (Datadog) | `span/no_wire_form` → **degraded** | `logit.output.spans.degraded{reason=no_wire_form}` | Datadog has no field for `status: ok`, a status message, `trace_state`, span flags, or a dropped count, so each is dropped, counted, and the span reads back without it. |
+  | encode (Datadog) | `event/attributes_only` → **skipped** | none (uncounted) | An event with no metric, log, or span takes none of the intake's routes, so no request carries it, uncounted. |
+  | encode (Datadog) | `event/string_only` → **skipped** | none (uncounted) | An InfluxDB point whose fields are all strings has no metric, so it takes none of the intake's routes and no request carries it, uncounted. |
 
   <!-- transit:end -->
 

@@ -124,6 +124,7 @@
 //! | `record/no_recorded_value_other_kind` | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A flagged record of a kind other than `Gauge` or `Sum` isn't written in either mode. It would be several series, and the flag doesn't say which of them existed, so a stale marker would name a series that may never have been sent. |
 //! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't labels. |
 //! | `record/name_unsafe` | normalized | `name_sanitized` | A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record reads back under the sanitized name, uncounted. |
+//! | `record/sample_rate` | exact | -- | Each value is weighted by its inverse rate in the sketch the `samples` row describes. |
 //! | `record/superseded`, with `bind:` unset | exact | -- | Remote-write sends each sample with its own timestamp. |
 //! | `record/superseded`, otherwise | skipped | uncounted | The exposition registry holds one sample per series, so a later record of the series replaces an earlier one before a scrape reads it, uncounted. |
 //! | `record/same_instant`, with `bind:` unset | dropped | uncounted | One series can't hold two samples at one timestamp, so the later point wins and the earlier is dropped, uncounted. |
@@ -134,6 +135,7 @@
 //! | `log/dogstatsd_event` | skipped | uncounted | A log has no Prometheus form and isn't written, uncounted. |
 //! | `log/plain` | skipped | uncounted | A log has no Prometheus form and isn't written, uncounted. |
 //! | `span/alone` | skipped | uncounted | A span has no Prometheus form and isn't written, uncounted. |
+//! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
 //! | `event/attributes_only` | skipped | uncounted | An event with no metric, log, or span has no sample and isn't written, uncounted. |
 //! | `event/string_only` | skipped | uncounted | An InfluxDB point whose fields are all strings has no metric, so it has no sample and isn't written, uncounted. |
 //!
@@ -146,6 +148,8 @@
 //! | `record/description` | exact | -- | The family's `# HELP` line. |
 //! | `record/start_timestamp` | lost | uncounted | OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge's start time is left off, uncounted. |
 //! | `record/exemplars` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at most one per line. One with no line to sit on, such as a gauge's, is left off, counted. |
+//! | `record/unit_on_distribution`, with `bind:` unset | exact | -- | Remote-write carries the unit in its metadata. |
+//! | `record/unit_on_distribution`, otherwise | lost | `logit.output.metrics.degraded{reason=unit_not_suffix}` | OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left off, counted. |
 //! | `record/exemplars_on_summary` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | A summary has no `_total` or bucket line for an exemplar to sit on, so its exemplars are left off, counted. |
 //! | `record/min_max` | lost | uncounted | A histogram's `min` and `max` have no Prometheus series and aren't written, uncounted. |
 //! | `attributes/string_value` | normalized | `label_sanitized` | A label; its name is forced into `[a-zA-Z_][a-zA-Z0-9_]*`, so a key holding `.` or another character reads back under the sanitized name. |
@@ -159,6 +163,8 @@
 //! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a label and is left off, uncounted. |
 //! | `attributes/resource_attribute` | normalized | `resource_merged` | A label, the event's value winning on a shared key, read back as an event attribute. |
 //! | `attributes/scope` | lost | uncounted | Prometheus has no instrumentation scope; it isn't written or counted. |
+//! | `attributes/datadog_carrier_log` | lost | uncounted | Another protocol's `_logit.` carrier isn't a label and is left off, uncounted. |
+//! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
 //!

@@ -1,0 +1,2 @@
+{"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"request.latency","kind":"samples","values":[0.012,0.034,0.034,0.25],"sample_rate":1.0}],"attributes":{"env":"prod","host.name":"web-1","route":"/orders"}}
+{"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"request.size","kind":"samples","values":[512.0,2048.0],"sample_rate":1.0}],"attributes":{"_logit.datadog.hostless":true,"env":"prod"}}

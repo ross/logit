@@ -64,6 +64,7 @@ use logit_core::{Diagnostics, EventBatch, Resource};
 use logit_outputs::ndjson::render_ndjson;
 use logit_pipeline::test_util::TelemetryProbe;
 use logit_proto::collectd::{CollectdDecoder, TypesDb};
+use logit_proto::datadog::DatadogDecoder;
 use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
 use logit_proto::prometheus::{
@@ -318,6 +319,9 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 ///   dialect `content-type:` selects (text 0.0.4 when absent), under the resource
 ///   `prometheus_in` stamps for the target [`SCRAPE_URL`]: `instance` and
 ///   `_logit.prometheus.target`.
+/// - `datadog`: one request body through `datadog_in`'s own `decode_request`, which picks the
+///   route from `path:`, the body form from `content-type:`, and the decompression from
+///   `content-encoding:`, as the listener does.
 /// - `collectd`: one datagram through `CollectdDecoder`, under an empty resource, naming data
 ///   sources from the meta's `types_db:` file when it names one.
 fn decode_wire(
@@ -383,6 +387,27 @@ fn decode_wire(
             resource.attributes.insert(LABEL_INSTANCE, logit_core::Value::str(SCRAPE_INSTANCE));
             resource.attributes.insert(ATTR_TARGET, logit_core::Value::str(SCRAPE_URL));
             vec![EventBatch { resource: Arc::new(resource), scope: None, events }]
+        }
+        "datadog" => {
+            let telemetry = probe.telemetry(id, "datadog_in", "listener");
+            let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
+            let path = headers.get("path").context("the .headers names no path:")?;
+            let path = path.split_once('?').map_or(path, |(path, _)| path);
+            let mut request = http::HeaderMap::new();
+            for name in [http::header::CONTENT_TYPE, http::header::CONTENT_ENCODING] {
+                if let Some(value) = headers.get(name.as_str()) {
+                    request.insert(name, http::HeaderValue::from_str(value)?);
+                }
+            }
+            let decoder = DatadogDecoder::new().with_telemetry(telemetry).with_diagnostics(diag);
+            logit_inputs::datadog::decode_request(
+                path,
+                &request,
+                Bytes::from(bytes),
+                RECEIVED_AT,
+                decoder,
+            )
+            .map_err(|err| anyhow::anyhow!("datadog_in refused the request: {err}"))?
         }
         "collectd" => {
             let telemetry = probe.telemetry(id, "collectd_in", "listener");
@@ -949,13 +974,21 @@ flow_tests! {
     collectd_to_prometheus_remote_write => "collectd-to-prometheus-remote-write",
     collectd_to_prometheus => "collectd-to-prometheus",
     collectd_to_statsd => "collectd-to-statsd",
+    datadog_relay => "datadog-relay",
+    datadog_to_influxdb => "datadog-to-influxdb",
+    datadog_to_otlp => "datadog-to-otlp",
+    datadog_to_prometheus_remote_write => "datadog-to-prometheus-remote-write",
+    datadog_to_prometheus => "datadog-to-prometheus",
+    datadog_to_statsd => "datadog-to-statsd",
     influxdb_aggregate_to_prometheus => "influxdb-aggregate-to-prometheus",
     influxdb_relay => "influxdb-relay",
     influxdb_to_prometheus_remote_write => "influxdb-to-prometheus-remote-write",
+    influxdb_to_datadog => "influxdb-to-datadog",
     influxdb_to_prometheus => "influxdb-to-prometheus",
     influxdb_to_otlp => "influxdb-to-otlp",
     influxdb_to_statsd => "influxdb-to-statsd",
     prometheus_aggregate_to_influxdb => "prometheus-aggregate-to-influxdb",
+    prometheus_to_datadog => "prometheus-to-datadog",
     prometheus_to_influxdb => "prometheus-to-influxdb",
     prometheus_to_statsd => "prometheus-to-statsd",
     statsd_aggregate_cumulative => "statsd-aggregate-cumulative",
@@ -966,6 +999,7 @@ flow_tests! {
     statsd_relay_relative => "statsd-relay-relative",
     statsd_relay_skip => "statsd-relay-skip",
     statsd_relay => "statsd-relay",
+    statsd_to_datadog => "statsd-to-datadog",
     statsd_to_influxdb => "statsd-to-influxdb",
     statsd_to_otlp => "statsd-to-otlp",
     statsd_to_prometheus_remote_write => "statsd-to-prometheus-remote-write",

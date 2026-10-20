@@ -1,0 +1,3 @@
+# A hand-written /api/v2/series JSON body sent gzip-compressed.
+wire: gzip.bin
+exercises: [series_v2_json, count, tags, host, gzip]

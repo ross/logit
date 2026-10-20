@@ -1,0 +1,4 @@
+# A hand-written /api/v2/series JSON body: each integer type, the resource forms, origin codes,
+# and a point with no timestamp. The recorded Agent sent protobuf only.
+wire: series-v2-json.bin
+exercises: [series_v2_json, count, rate, gauge, unspecified, tags, host, hostless, device, resources, source_type_name, interval, unit, origin, no_timestamp]

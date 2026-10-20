@@ -1,0 +1,12 @@
+# datadog_in's cases into otlp_out with nothing between: a count as a delta `Sum`, a sketch as
+# a `Summary`, and logs and events as log records.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/datadog/series-v1.json
+  out:
+    type: otlp_out
+    sources: [case]
+    endpoint: http://127.0.0.1:4318

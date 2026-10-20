@@ -1,0 +1,2 @@
+wire: timer-sample-rate-unweighted.statsd
+exercises: [timer_ms, timer_sample_rate]
