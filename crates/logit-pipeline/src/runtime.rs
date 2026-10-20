@@ -10378,10 +10378,16 @@ mod tests {
                 InputRuntimeConfig::default(),
             ),
         );
-        // Well above scheduling noise on a loaded test run; the flush takes over a second in a
-        // debug build. The bound is not asserted, so a faster machine can't fail the test.
+        // The flush's longest gap between heartbeat ticks is tens of milliseconds, even on a
+        // slow shared runner. 1 s is far above that, so a scheduler pause on a loaded runner
+        // doesn't read as a stall, and below the flush's duration on a slow runner, so a
+        // tickless phase of the return check could still trip the detector. The per-key tick
+        // count is pinned by `flush_ticks_the_heartbeat_per_construction_key_and_element` in
+        // `logit-script`. The flush takes about 1.2 s in a debug build on a fast machine, where
+        // the margin is thin; the bound is not asserted there, so a faster machine can't fail
+        // the test.
         let runtime = LuaRuntimeConfig {
-            stall_after: Duration::from_millis(200),
+            stall_after: Duration::from_secs(1),
             shutdown_grace: Duration::from_millis(50),
             ..Default::default()
         };
