@@ -734,7 +734,13 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             vec![Some("dogstatsd_event".to_string())]
         }
         "log" => vec![Some("plain".to_string())],
-        "event" if rec.attributes.get(ATTR_MEASUREMENT).and_then(Value::as_str).is_some() => {
+        "event"
+            if rec
+                .attributes
+                .get(ATTR_MEASUREMENT)
+                .and_then(Value::as_str)
+                .is_some_and(|m| !m.is_empty()) =>
+        {
             vec![Some("no_record_carried".to_string())]
         }
         "event" => vec![Some("no_record".to_string())],
