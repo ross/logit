@@ -1355,7 +1355,7 @@ connection refused for its PROXY header.
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `oversize` (`413`, as sent or decompressed), `auth` (`401`), `encoding` (`415`, anything but identity or lowercase gzip), `malformed_encoding` (`400`, a gzip stream that doesn't decompress), `precision` (`400`), `no_bucket` (`404`), `no_org` (`400`), `malformed` (`400`, a line that fails to parse), `stalled` (`408`, only with `idle_timeout:` set), or `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload) |
 | `logit.input.batches.deferred` | count | batches a busy `503` left with the client to resend, disjoint from `logit.component.batches.sent` |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | batches no consumer took, answered `503`. The refused batch is also counted in `logit.component.batches.sent` and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}` |
-| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | tags the decoder left off a point because their key starts with `_logit.`, the private carrier prefix, or `influxdb.field.`, which would read back as a string field. The point is delivered. Counted by the codec, under this component's id |
+| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | tags the decoder left off a point because their key starts with `_logit.`, the private carrier prefix, string fields' `_logit.influxdb.field.` included. The point is delivered. Counted by the codec, under this component's id |
 
 **A busy request is not a lost one**, as on `splunk_hec_in`: after 5 seconds without the pipeline
 taking the request's batch, the request gets `503` with `Retry-After: 1`, counted `class="busy"`
@@ -1778,7 +1778,7 @@ text:
 |---|---|
 | `logit.transform.lines.dropped{reason="malformed"}` | a bad line in a message whose log doesn't go on: under the default `keep_source: false`, in a message with at least one good point. The line's text has left the pipeline, so it's loss |
 | `logit.transform.lines.skipped{reason="malformed"}` | a bad line in a message whose log goes on, under `keep_source: true` or in a message with no good point. The text is still in the pipeline |
-| `logit.transform.tags.omitted{reason="reserved_prefix"}` | a tag left off a point because its key starts with `_logit.` or `influxdb.field.`, as `influxdb_in`'s `logit.input.tags.omitted` counts. The point is emitted |
+| `logit.transform.tags.omitted{reason="reserved_prefix"}` | a tag left off a point because its key starts with `_logit.`, as `influxdb_in`'s `logit.input.tags.omitted` counts. The point is emitted |
 
 A parent discarded after its points are emitted counts as
 `logit.component.events.discarded`, and its points count in `logit.component.events.sent`. Each

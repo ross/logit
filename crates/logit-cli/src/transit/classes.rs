@@ -1473,17 +1473,17 @@ mod tests {
     #[test]
     fn prometheus_pairs_a_sanitized_name_and_key_and_a_total_suffix() {
         let ins = recs(&[
-            r#"{{T},"metrics":[{"name":"cpu.usage","kind":"gauge","value":1.5}],"attributes":{"influxdb.field.note":"x"}}"#,
+            r#"{{T},"metrics":[{"name":"cpu.usage","kind":"gauge","value":1.5}],"attributes":{"deploy.note":"x"}}"#,
             r#"{{T},"metrics":[{"name":"jobs","kind":"sum","value":3.0,"temporality":"cumulative","monotonic":true}]}"#,
         ]);
         let outs = recs(&[
-            r#"{{T},"metrics":[{"name":"cpu_usage","kind":"gauge","value":1.5}],"attributes":{"influxdb_field_note":"x"}}"#,
+            r#"{{T},"metrics":[{"name":"cpu_usage","kind":"gauge","value":1.5}],"attributes":{"deploy_note":"x"}}"#,
             r#"{{T},"metrics":[{"name":"jobs_total","kind":"sum","value":3.0,"temporality":"cumulative","monotonic":true}]}"#,
         ]);
         let pairing = pair(&ins, &outs, Spelling::Prometheus);
         assert_eq!(pairing.seen, [Some(Class::Normalized), Some(Class::Normalized)]);
         assert!(pairing.unclaimed.is_empty());
-        let note = Field::Attribute { key: "influxdb.field.note".to_string(), resource: false };
+        let note = Field::Attribute { key: "deploy.note".to_string(), resource: false };
         assert_eq!(
             observe_field(&note, &ins[0], &outs[0], Spelling::Prometheus),
             Class::Normalized
@@ -1564,7 +1564,7 @@ mod tests {
     /// reaching `event/attributes_only`.
     #[test]
     fn an_event_with_attributes_only_is_an_event_record() {
-        let ins = recs(&[r#"{{T},"attributes":{"influxdb.field.s":"x"}}"#]);
+        let ins = recs(&[r#"{{T},"attributes":{"_logit.influxdb.field.s":"x"}}"#]);
         assert_eq!(ins.len(), 1);
         assert_eq!((ins[0].kind.as_str(), ins[0].family()), ("event", "event"));
         assert_eq!(kind_features(&ins[0]), [Some("attributes_only".to_string())]);
@@ -1575,7 +1575,7 @@ mod tests {
     #[test]
     fn an_event_with_a_measurement_is_string_only() {
         let ins = recs(&[
-            r#"{{T},"attributes":{"_logit.influxdb.measurement":"m","influxdb.field.s":"x"}}"#,
+            r#"{{T},"attributes":{"_logit.influxdb.measurement":"m","_logit.influxdb.field.s":"x"}}"#,
         ]);
         assert_eq!(kind_features(&ins[0]), [Some("string_only".to_string())]);
     }

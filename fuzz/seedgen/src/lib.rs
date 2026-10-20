@@ -692,7 +692,8 @@ fn influxdb_line_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)
         (
             "reserved",
             b"m,_measurement=x f=1i\nm,time=x f=1i\nm time=1i\n\
-              m,_logit.influxdb.measurement=x,influxdb.field.y=1,influxdb.z=1 f=1i\n\
+              m,_logit.influxdb.measurement=x,_logit.influxdb.field.y=1,\
+              influxdb.field.y=1,influxdb.z=1 f=1i\n\
               _m,_time=x _value=1i",
         ),
         (

@@ -3242,10 +3242,10 @@ pipeline didn't take the body within 5 seconds and nothing of it was taken, coun
 
 **What arrives.** Each point becomes one event with its tags as attributes and the private
 attribute `_logit.influxdb.measurement` naming the measurement. Each numeric or boolean field
-becomes a gauge named `MEASUREMENT.FIELD`, and each string field an `influxdb.field.FIELD`
-attribute. `org`, `orgID`, and `bucket` become the private resource attributes
-`_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. No sink writes a
-`_logit.` attribute as a tag or label.
+becomes a gauge named `MEASUREMENT.FIELD`, and each string field the private attribute
+`_logit.influxdb.field.FIELD`. `org`, `orgID`, and `bucket` become the private resource
+attributes `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. No sink
+but `influxdb_out` writes a `_logit.influxdb.` attribute, and none writes one as a tag or label.
 `crates/logit-proto/src/influxdb/mod.rs`'s module doc has the mapping table.
 
 **Relaying to the client's bucket.** An `influxdb_out` with no `bucket:` writes each batch to the
@@ -3292,9 +3292,10 @@ choosing the carried form, know what it costs:
 `influxdb-line-protocol-relay`](adr/influxdb-line-protocol-relay.md)'s 2026-10-15 amendment has
 the reasoning.
 
-**Remove string fields ahead of other sinks.** `influxdb.field.*` attributes are ordinary
-attributes everywhere but `influxdb_out`, so `prometheus_out` and `graphite_out` write them as
-labels or tags. Add a `remove` stage for them on any leg that doesn't end in `influxdb_out`.
+**String fields reach `influxdb_out` alone.** Every other sink leaves a string field off,
+uncounted, because its free-text value as a tag or label would start a series per value. A `keep`
+with its default `private: drop` strips string fields too, so set `private: keep` on a `keep`
+ahead of `influxdb_out`. To send one elsewhere, copy it to a public attribute in a `lua` stage.
 
 **A destination fault never reaches the producer.** `influxdb_in` answers `204` once the batch is
 in every downstream inbox, before `influxdb_out` writes it. A `422` for a field type conflict
@@ -3305,8 +3306,8 @@ bucket or org came from the client), and a `401` (the sink holds and retries), a
 **What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
 answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened. A nonzero
 `logit.input.tags.omitted{reason="reserved_prefix"}` means a producer sends a tag key starting
-with `_logit.` or `influxdb.field.`, which the decoder leaves off the point because it would
-collide with a carrier or a string field. `statsd_in`, `graphite_in`, `datadog_in`, and
+with `_logit.`, which the decoder leaves off the point because it would collide with a carrier or
+a string field. `statsd_in`, `graphite_in`, `datadog_in`, and
 `prometheus_in`'s remote-write receiver emit the same counter for a `_logit.` key. A sustained
 `logit.input.batches.deferred` means the pipeline isn't keeping up. A nonzero
 `logit.input.connections.rejected{reason="limit"}` means the `max_connections` cap is binding.

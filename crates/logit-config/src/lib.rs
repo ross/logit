@@ -3013,8 +3013,9 @@ pub enum ComponentKind {
     /// Parses a log message as InfluxDB line protocol and emits one event per point, in the shape
     /// `influxdb_in` gives one: the measurement as `_logit.influxdb.measurement`, tags as
     /// attributes, each numeric or boolean field as a gauge named `<measurement>.<field>`, and
-    /// each string field as the attribute `influxdb.field.<key>`. Points in one message with the
-    /// same measurement, tag set, and timestamp merge into one event.
+    /// each string field as the attribute `_logit.influxdb.field.<key>`, which only `influxdb_out`
+    /// writes. Points in one message with the same measurement, tag set, and timestamp merge into
+    /// one event.
     ///
     /// Each point's event starts from a copy of the parent's attributes, with the point's own
     /// tags winning a collision, so every inherited attribute reaches `influxdb_out` as a tag;

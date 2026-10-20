@@ -15,14 +15,14 @@ the same date, write the record, then add a row here.
 | [`route_signals`: a native signal router that splits a mixed event into one part per target](route-signals.md) | 2026-10-16 | 2026-10-16 |
 | [LuaJIT's trace compiler is off by default, and `jit: true` turns it on per component](lua-jit-opt-in.md) | 2026-10-16 | 2026-10-16 |
 | [Lua in-place edits: writable log fields, `= nil` deletes an attribute, and `pairs` enumerates a proxy](lua-in-place-edits.md) | 2026-10-16 | 2026-10-18 |
-| [`line_protocol`: parse a log message as InfluxDB line protocol into one event per point, skipping bad lines](line-protocol-transform.md) | 2026-10-16 | 2026-10-18 |
+| [`line_protocol`: parse a log message as InfluxDB line protocol into one event per point, skipping bad lines](line-protocol-transform.md) | 2026-10-16 | 2026-10-19 |
 | [Native transform fan-out: `Transform::process_into` emits extra events into the same batch](transform-fan-out.md) | 2026-10-16 | 2026-10-18 |
 | [`syslog_in` UDP framing: `framing: lines \| datagram`, with today's per-line split as the default](syslog-udp-datagram-framing.md) | 2026-10-16 | 2026-10-18 |
 | [Native hop trace context: the hop trailer carries a sampled batch's trace context, and `logit_in` continues it](native-hop-trace-context.md) | 2026-10-15 | 2026-10-15 |
 | [Process hostname: one resolved name, `host.name` on `internal`'s resource](process-hostname.md) | 2026-10-14 | 2026-10-14 |
 | [CI saves the cargo cache from `main` only, and every run restores it with a prefix fallback](ci-cargo-cache-saved-on-main.md) | 2026-10-14 | 2026-10-14 |
 | [CI runs no advisory check: Dependabot files the bump PRs, and `script/audit` checks locally](advisories-off-ci.md) | 2026-10-14 | 2026-10-14 |
-| [Private attribute namespace: protocol carriers live under `_logit.<protocol>.`, and every other protocol's sink ignores them](private-attribute-namespace.md) | 2026-10-13 | 2026-10-13 |
+| [Private attribute namespace: protocol carriers live under `_logit.<protocol>.`, and every other protocol's sink ignores them](private-attribute-namespace.md) | 2026-10-13 | 2026-10-19 |
 | [Stale events are filtered by a `drop_stale`/`has_stale` transform pair](stale-event-filtering.md) | 2026-10-13 | 2026-10-13 |
 | [InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write](influxdb-line-protocol-relay.md) | 2026-10-13 | 2026-10-19 |
 | [Typed metric scalar: `MetricValue { F64, I64, U64, Bool }` replaces the `f64` in `Gauge`, `GaugeDelta`, and `Sum`](typed-metric-scalar.md) | 2026-10-13 | 2026-10-18 |

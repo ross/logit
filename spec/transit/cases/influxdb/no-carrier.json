@@ -1,1 +1,1 @@
-{"timestamp":"2027-01-15T08:00:00.000000000Z","attributes":{"host":"web-01","influxdb.field.status":"ok"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","attributes":{"_logit.influxdb.field.status":"ok","host":"web-01"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
