@@ -861,9 +861,9 @@ the operator-facing account of all of this.
   marked regions: each spec'd sink's module-doc mapping table and `docs/known-gaps/mappings.md`'s
   gap tables, so a row changes in `mapping.yaml`, never in a region (the README's "Generated
   docs"). `script/transit gen|check|docs|coverage` wraps both; `script/test` runs them.
-  Cases come from `statsd_in`, `influxdb_in`, and `prometheus_in`'s scrape; the columns are
-  `statsd_out`, `prometheus_out`, `influxdb_out`, and `otlp_out`, through the statsd like pair and
-  eight cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
+  Cases come from `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape, and `collectd_in`; the
+  columns are `statsd_out`, `prometheus_out`, `influxdb_out`, and `otlp_out`, through the statsd
+  like pair and thirteen cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
 
 ### Not yet built
 

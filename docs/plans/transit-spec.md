@@ -94,8 +94,9 @@ spec/transit/
 ```
 
 A case's wire file is the authoring form where one exists: statsd lines, line protocol,
-exposition text, carbon plaintext, and OTLP/JSON are readable text; collectd, pickle, remote-write,
-and Datadog protobuf are `.bin` with a `.headers` sidecar, as `testdata/interop/` does. A
+exposition text, carbon plaintext, and OTLP/JSON are readable text; a collectd datagram is `.raw`,
+and pickle, remote-write, and Datadog protobuf are `.bin` with a `.headers` sidecar, as
+`testdata/interop/` does. A
 recorded capture under `testdata/interop/` joins by reference, as the `wire:` path in the case's
 `.meta.yaml`, not by copy. A hand-written edge case is the JSON alone. Both are "as `X_in` would produce it," so a flow
 reads one form.
@@ -271,6 +272,10 @@ column" and "Adding a source" steps, one PR each.
 W4b landed these with four more flows: `influxdb_in -> prometheus_out` as remote-write 2.0,
 `statsd_in -> prometheus_out` both as exposition and as remote-write 1.0, and `statsd_in ->
 influxdb_out`, so every kind the statsd cases hold reaches each new column in each mode.
+
+`tcoll/w1b` added `collectd_in` as a source, with flows into each column:
+`collectd-to-influxdb`, `collectd-to-prometheus`, `collectd-to-prometheus-remote-write`,
+`collectd-to-statsd`, and `collectd-to-otlp`.
 
 ### 8. Not in this stack
 
@@ -515,3 +520,27 @@ Recorded per workstream as each lands.
   and vary up to about 9x in speed. It's now a test per flow beside a `cases` test and a `ledger`
   test, with each flow's observations committed as `ledger/<flow>.json` so the checks across
   flows need no flow run ([ADR `transit-spec`](../adr/transit-spec.md)'s per-flow amendment).
+- **`collectd_in` source** (`tcoll/w1b`): five cases. `value-lists` and `notification` read
+  `testdata/interop/collectd/`'s captures in place, and `types-db` reads the value-list capture
+  again with the stock `types.db` entries for its types, named in the meta's new `types_db:`
+  field. Two hand-built datagrams cover what no capture has: `counter-absolute` (COUNTER, one of
+  them above `i64::MAX`, ABSOLUTE, and a NaN GAUGE) and `legacy-time` (the second-resolution Time
+  and Interval parts). Every record reached an existing row at the class it states, so the table
+  gained no row. What the flows show about collectd's data at the four sinks, each as the table
+  already states it:
+  - `influxdb_out` writes a COUNTER, DERIVE, or ABSOLUTE value as a plain `value` field, so its
+    cumulative or delta reading is gone, uncounted (`sum/*`: `degraded`, no counter). Each data
+    source of a multi-data-source list becomes its own measurement, `load.load.0` to
+    `load.load.2`, rather than one measurement with a field per data source.
+  - `prometheus_out` drops an ABSOLUTE value, counted, as for any bare delta sum, and writes a
+    DERIVE value as a gauge, counted `degraded`. Its exposition registry keeps only the later of
+    the two read cycles a datagram can carry, uncounted (`record/superseded`).
+  - `statsd_out` writes a COUNTER or DERIVE running total as a `|g` gauge, counted `degraded`.
+  - Every sink but `collectd_out` leaves off the `_logit.collectd.interval`, `plugin`, `type`, and
+    `severity` carriers, uncounted (`attributes/foreign_carrier`). On a value list the plugin and
+    type survive in the record name. A notification has no record name, so its plugin and type
+    are gone at `otlp_out`, the one sink that writes a notification.
+  - `influxdb_out` and `prometheus_out` skip a notification uncounted, and `statsd_out` counts it
+    `events.skipped` (`log/plain`).
+  - A `types_db:` changes only the record names (`load.load.0` against `load.load.shortterm`), so
+    each sink writes the same values under other series names; no class differs.
