@@ -1,0 +1,20 @@
+# prometheus_in's scrape cases through a 10s `aggregate` in its default modes into influxdb_out,
+# which writes every point's timestamp. A sample with its own timestamp, a non-finite gauge, and a
+# cumulative counter pass through the window unmerged; the other gauges merge.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/prometheus/gauge-timestamp.json
+  window:
+    type: aggregate
+    sources: [case]
+    interval: 10s
+  out:
+    type: influxdb_out
+    sources: [window]
+    url: http://127.0.0.1:8086
+    token: unused
+    bucket: metrics
+    org: acme

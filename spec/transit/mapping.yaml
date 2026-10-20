@@ -1007,8 +1007,11 @@ rows:
           class: lost
           counter: logit.output.tags.omitted{reason=dialect}
           text: Plain statsd has no tags; each is counted once per wire tag.
-        - class: exact
-          text: A DogStatsD `key:value` tag.
+        - class: normalized
+          reason: tag_sanitized
+          text: >-
+            A DogStatsD `key:value` tag. Each `:`, `|`, `@`, `#`, `,`, control, and whitespace
+            character in the key, and each but `:` in the value, is written as `_`, uncounted.
       prometheus_out:
         class: normalized
         reason: label_sanitized
@@ -1183,7 +1186,7 @@ rows:
         class: exact
         text: >-
           A `_logit.influxdb.*` carrier is consumed into the wire form (the measurement, the
-          write's org and bucket) and influxdb_in stamps it back.
+          string fields, the write's org and bucket) and influxdb_in stamps it back.
       prometheus_out:
         class: normalized
         reason: dialect
@@ -1365,3 +1368,58 @@ rows:
       otlp_out:
         class: exact
         text: An OTLP span in the traces request, beside the metrics in theirs.
+
+  # --- events with no metric, log, or span ------------------------------------------------------
+  # `string_only` is an InfluxDB point whose fields are all strings, its measurement carrier
+  # intact, which influxdb_out writes back. `attributes_only` is any other such event, such as a
+  # string-only point whose carrier a `remove` or `keep` stripped, or a Lua `Event.new`, which it
+  # can't.
+  - kind: event
+    feature: attributes_only
+    cells:
+      statsd_out:
+        class: skipped
+        counter: logit.output.events.skipped
+        text: An event with no metric, log, or span has no statsd line and isn't written.
+      prometheus_out:
+        class: skipped
+        reason: uncounted
+        text: An event with no metric, log, or span has no sample and isn't written, uncounted.
+      influxdb_out:
+        class: skipped
+        reason: uncounted
+        text: >-
+          An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has
+          no measurement to write under and isn't written, uncounted. A stage that drops the
+          carrier leaves an InfluxDB point whose fields are all strings this way: a `remove` of
+          it, or a `keep` under `private: drop`, which drops the string fields too.
+      otlp_out:
+        class: skipped
+        reason: uncounted
+        text: An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted.
+  - kind: event
+    feature: string_only
+    cells:
+      statsd_out:
+        class: skipped
+        counter: logit.output.events.skipped
+        text: >-
+          An InfluxDB point whose fields are all strings has no metric, so it has no statsd line
+          and isn't written.
+      prometheus_out:
+        class: skipped
+        reason: uncounted
+        text: >-
+          An InfluxDB point whose fields are all strings has no metric, so it has no sample and
+          isn't written, uncounted.
+      influxdb_out:
+        class: exact
+        text: >-
+          A line of the event's `_logit.influxdb.field.*` string fields under the measurement
+          its `_logit.influxdb.measurement` carrier names, read back as the same event.
+      otlp_out:
+        class: skipped
+        reason: uncounted
+        text: >-
+          An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent,
+          uncounted, so its fields are lost.

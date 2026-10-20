@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-10-18
+updated: 2026-10-19
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -58,7 +58,8 @@ either still see exactly one distinct resource across the batches they receive).
 
 **Emitted timestamp is flush wall-clock**, i.e. when the window closed — not a source event's
 timestamp, and not the gauge's internally-tracked "latest write" timestamp (used only to pick the
-winner, then discarded).
+winner, then discarded). A record that carries its source's own timestamp isn't merged at all;
+see "Amendment: timestamped records, APM stats, and non-finite gauges pass through (2026-10-19)".
 
 **Windows are wall-clock-driven, not event-time.** A flush fires when the pipeline's clock reaches
 the deadline, regardless of what timestamps the accumulated events actually carry. There is no
@@ -538,6 +539,8 @@ contract.
 ### Series identity
 
 **A series is `(name, unit, attribute set)`, compared structurally, not by IEEE-754 `==`.**
+The attribute set leaves out InfluxDB string fields (`_logit.influxdb.field.*`); see
+"Amendment: InfluxDB string fields aren't series identity (2026-10-19)" below.
 `SeriesKey`'s `PartialEq` and `Hash` walk the attribute set through `value_key_eq` and
 `hash_value`, and the rules are:
 
@@ -626,15 +629,16 @@ total zero is ignored for the fold. Keeping whichever side has a value would let
 **A non-finite delta `Sum` passes through.** A delta `Sum` whose value is `NaN` or ±infinity is
 forwarded unmerged and counted `passed_through{reason="non_finite"}`, so a cumulative total stays
 finite. A statsd `1e308|c|@0.5` extrapolates to infinity, and merged in cumulative mode that
-infinity would stay in the series' total for as long as the series lives.
+infinity would stay in the series' total for as long as the series lives. The 2026-10-19
+amendment on timestamped records extends this to `Gauge` and `GaugeDelta`.
 
 ### Accounting identities
 
 Two identities hold for every `aggregate`:
 
 - **Records:** `metrics_in == absorbed + passed_through{reason}`, where `metrics_in` is every
-  metric record `process` receives. The reasons are `no_recorded_value`, `no_merge_rule`,
-  `kind_conflict`, `histogram_bounds_mismatch`, and `non_finite`, each defined in
+  metric record `process` receives. The reasons are `bucketed`, `timestamped`, `no_recorded_value`,
+  `no_merge_rule`, `kind_conflict`, `histogram_bounds_mismatch`, and `non_finite`, each defined in
   [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md)'s "Transforms",
   "`aggregate`" table. `absorbed` is `logit.transform.metrics.absorbed`, and each reason is
   `logit.transform.metrics.passed_through{reason}`, totaled per `process` call: one count per
@@ -861,3 +865,123 @@ The cumulative-mode amendment's "Who needs it" says `prometheus_out` skips a del
 `Histogram`. It's counted as loss, `logit.output.metrics.dropped{reason="unresolved_delta"}`,
 because a config with a cumulative `aggregate` upstream would have delivered it
 ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)).
+
+## Amendment: InfluxDB string fields aren't series identity (2026-10-19)
+
+`aggregate` leaves every `_logit.influxdb.field.*` attribute out of a series' key and out of what
+it flushes. Every other attribute, private ones included, stays in the key.
+
+[ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)'s "Amendment: string fields
+are private (2026-10-19)" made a string field a private attribute that only `influxdb_out` among
+the protocol sinks writes. Keyed on it, two readings of one InfluxDB series that differ only in a
+string, such as Telegraf's `system` measurement with its changing `uptime_format`, became two
+series. Every other protocol sink then wrote both with identical labels, so they overwrote each
+other at the destination. A string field isn't series identity at InfluxDB either: it's a field
+of the point, and an aggregate summarizes numbers, so the flushed series drops it.
+
+The exception is limited to that prefix. `_logit.influxdb.measurement`, the statsd type, the
+collectd plugin and type, and the Datadog type and stats dimensions are identity that a sink reads
+after this stage, so they stay in the key and the output. A record that passes through unmerged
+keeps its event's attributes, string fields included.
+
+## Amendment: timestamped records, APM stats, and non-finite gauges pass through (2026-10-19)
+
+`aggregate` forwards every metric record on an event that carries its source's own timestamp,
+unmerged, with its timestamp and carriers intact, and counts each one
+`logit.transform.metrics.passed_through{reason="timestamped"}`. It also forwards a `Gauge` or
+`GaugeDelta` whose value is `NaN` or ±infinity, counted `passed_through{reason="non_finite"}`
+with a throttled `gauge_non_finite` diagnostic, as it already did for a delta `Sum`. And it
+forwards a Datadog APM stats group whole, counted `passed_through{reason="bucketed"}`. None of
+these records is dropped, and there's no option to drop one: "Pass through, never drop" stands.
+
+### Which events count as timestamped
+
+An event is timestamped when it carries one of the two carriers a decoder stamps for a wire
+where a per-point timestamp is optional, read the way that protocol's sink reads it:
+
+| Carrier | Value | Stamped by |
+|---|---|---|
+| `_logit.statsd.timestamp` | `Value::U64` | `statsd_in`, for a DogStatsD `\|T<unix-seconds>` line or a service check's `d:<unix-seconds>` field |
+| `_logit.prometheus.timestamp` | `Value::Bool(true)` | `prometheus_in`'s scrape, for an exposition sample with its own timestamp |
+
+The rule applies to every record on the event, whatever its kind, and comes before every other
+reason, so a timestamped cumulative counter counts `timestamped`, not `no_merge_rule`.
+
+No other carrier means "this point has its own source time". A wire where every point carries a
+time stamps no marker: OTLP, Graphite, collectd, InfluxDB line protocol (an absent timestamp
+becomes the request's arrival time, unmarked), Datadog series, and Prometheus remote-write, whose
+decoder runs with the marker off. Those records merge into a series. Treating them as timestamped would
+leave `aggregate` nothing to do for those sources.
+
+### Why
+
+`aggregate` windows on the wall clock and stamps a flushed series with the flush time. A
+timestamped record broke both halves of that contract:
+
+- Its carrier is part of the series key, so each distinct source timestamp opened its own series,
+  and records rarely merged.
+- The flush replaced the source time with the flush time, the one fact the producer chose to send.
+- At a sink that drops the private carrier, the per-timestamp series left with identical labels
+  and collided at the destination.
+
+The Datadog Agent makes the same choice for DogStatsD. Its datagram documentation says that for a
+metric with a timestamp, "the Datadog Agent doesn't do any processing with the metrics (no
+aggregation) except from enriching the metrics with tags"
+(<https://docs.datadoghq.com/developers/dogstatsd/datagram_shell/>). In its source,
+`comp/dogstatsd/server/impl/server.go` routes a sample with `Timestamp > 0` to `appendLateSample`,
+and `pkg/aggregator/no_aggregation_stream_worker.go` forwards those samples unaggregated.
+
+A non-finite gauge had no check at all. A `NaN` or infinite `Gauge` won last-write-wins, and a
+non-finite `GaugeDelta` poisoned every later delta. Under `series_retention` either value then
+outlived its window. The delta `Sum` rule already existed for the same reason, so the gauge kinds
+now follow it.
+
+### APM stats groups: `bucketed`
+
+`datadog_in` and `datadog_trace_in` decode each `ClientGroupedStats` of an APM stats bucket into
+one event. The event's timestamp is the bucket's `Start`, the bucket's `Duration` and nonzero
+`AgentTimeShift` ride on it as `_logit.datadog.stats.bucket.duration` and
+`.bucket.agent_time_shift`, `_logit.datadog.stats.name` marks it as stats, and its records are four
+delta `U64` `Sum`s (`hits`, `errors`, `top_level_hits`, `duration`) and up to two `Distribution`s
+under the stats wire's logarithmic mapping (`crates/logit-proto/src/datadog/stats.rs`,
+`group_event`). `datadog_out` and `datadog_trace_out` rebuild the payload by grouping events into
+buckets on `(timestamp, duration, shift)` and turning each event into one group
+(`client_payload`, `group`). [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)
+relays stats rather than recomputing them.
+
+Each stats record already summarizes its own time bucket, so a window corrupts it in three ways:
+
+- The series key holds no timestamp, so the same group's consecutive buckets merge into one
+  series, and the counts of two 10 s buckets leave under one 10 s `Duration`.
+- A flush emits one event per series, which is one per record, stamped with the flush time. The
+  sink then writes up to six groups with the same grouping key, each carrying one of the counts,
+  in a bucket that starts at the flush time instead of a bucket boundary.
+- Under `temporality: cumulative` the counts leave cumulative, and the stats encoders drop every
+  non-delta count as `unrecognized_record`.
+
+So the event passes through whole, and each record counts `bucketed`. The name says the criterion:
+the record belongs to a time bucket its source closed and the sink rebuilds. `pre_aggregated` would
+overstate it, because `aggregate` still merges other summaries, such as the Agent's per-interval
+sketches. The check is `logit_proto::datadog::is_datadog_stats_sym`, the symbol form of the
+predicate the stats routes use, so the two can't disagree about what's stats. It runs before the
+timestamped check.
+
+Passing stats through doesn't change how sketches merge. A series opens with an empty sketch
+that adopts the first incoming sketch's mapping, so stats sketches in a series of their own merge
+bin-for-bin even if an upstream stage removes the marker. `DdSketch::merge` re-bins only when a
+series holds sketches under two mappings: an unmarked stats sketch that shares its name and
+attributes with a locally built sketch from `Samples`, or with an Agent sketch. That merge stays
+bounded-error, as `DdSketch::merge` documents.
+
+### Consequences
+
+- The check costs two binary searches of the event's sorted attributes, on symbols interned once
+  when the `Aggregator` is built. No attribute is resolved to a string.
+- `metrics_in == absorbed + passed_through{reason}` still holds, with `bucketed` and
+  `timestamped` as its sixth and seventh reasons.
+- A `keep` ahead of `aggregate` drops `_logit.*` attributes unless it sets `private: keep`. That
+  removes the stats marker, so the stats merge again and no stats route sends them.
+- A relay of DogStatsD `|T` lines or timestamped scrape samples through `aggregate` now keeps each
+  point's time at the sink, and `statsd_out` re-emits the `|T` from the carrier.
+- A pipeline that wants such points summarized has to remove the carrier first, for example with
+  `remove`, and accept the flush time in place of the source time.

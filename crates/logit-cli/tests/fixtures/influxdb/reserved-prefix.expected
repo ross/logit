@@ -1,1 +1,1 @@
-cpu,host=a,influxdb.foo=b f=1i 1700000000000000000
+cpu,host=a,influxdb.field.f=x,influxdb.foo=b f=1i 1700000000000000000

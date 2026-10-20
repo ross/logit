@@ -1,0 +1,7 @@
+# Two points of one series whose string field differs, as Telegraf's `system` measurement
+# sends `uptime_format`, so an `aggregate` downstream has one series to fold them into. A point's
+# fields are gauges, and which of two colliding series a sink keeps follows the aggregate's flush
+# order, so this case can't pin the fold on its own: `aggregate`'s unit test
+# `an_influxdb_string_field_is_not_series_identity` is the deterministic pin.
+wire: string-field-series.lp
+exercises: [measurement, tags, string_field, integer_field, multi_field, carriers]

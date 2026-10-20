@@ -138,7 +138,7 @@ fn the_seeds_cover_every_metric_value_a_string_field_and_escaping() {
     assert_eq!(gauge(&typed, "cpu.down"), MetricValue::Bool(false));
     let cpu = &typed.events[0].attributes;
     assert_eq!(
-        cpu.get("influxdb.field.note").and_then(Value::as_str),
+        cpu.get("_logit.influxdb.field.note").and_then(Value::as_str),
         Some(r#"a "quoted", spaced = string \ done"#)
     );
 
@@ -149,7 +149,7 @@ fn the_seeds_cover_every_metric_value_a_string_field_and_escaping() {
     assert_eq!(attrs.get("path").and_then(Value::as_str), Some(r"C:\temp"));
     assert_eq!(attrs.get("z").and_then(Value::as_str), Some(r"first\x"));
     assert_eq!(gauge(&escaped, "disk io,x=y.field key,c=d"), MetricValue::I64(7));
-    assert_eq!(attrs.get("influxdb.field.s").and_then(Value::as_str), Some(r"one\ttwo"));
+    assert_eq!(attrs.get("_logit.influxdb.field.s").and_then(Value::as_str), Some(r"one\ttwo"));
 }
 
 /// Every seed relays unchanged, whole-`EventBatch` equal, and each write is counted `ok` on both

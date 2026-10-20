@@ -116,6 +116,19 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Trade-off:** under `temporality: cumulative`, merging a late delta keeps the running total
     correct (`increase()` is right, `rate()` spikes), while discarding it leaves the total low by
     the counted amount.
+- **`aggregate` doesn't summarize a point that carries its own source time.** A DogStatsD `|T`
+  line or a Prometheus sample with a timestamp passes through unmerged
+  (`passed_through{reason="timestamped"}`), as the Datadog Agent does, because a wall-clock window
+  would replace that time with the flush time. Points from a wire where every point has a time
+  (OTLP, InfluxDB, Graphite, collectd, Datadog series, Prometheus remote-write) carry no marker,
+  so they merge and take the flush time.
+  - **Workaround:** to summarize a timestamped point anyway, `remove` its
+    `_logit.statsd.timestamp` or `_logit.prometheus.timestamp` attribute ahead of `aggregate`.
+- **A `keep` ahead of `aggregate` turns Datadog APM stats into ordinary metrics.** `aggregate`
+  passes a stats group through whole (`passed_through{reason="bucketed"}`), detected by its
+  `_logit.datadog.stats.name` marker. `keep` drops `_logit.*` attributes unless `private: keep`
+  is set, so the marker goes, the groups merge across buckets, and no stats route sends them.
+  - **Workaround:** set `private: keep` on that `keep`.
 - **Nothing bounds how many series one window holds.** `max_retained_series` caps only what
   survives a flush. Within a window every distinct `(name, unit, attribute set)` opens a series,
   and memory grows with that count until the flush drains it.

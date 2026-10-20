@@ -25,6 +25,10 @@
     holding them all for a timer or a set.
 - name: tags
   text: A DogStatsD `|#` tag segment, valued and bare tags both.
+- name: tags_reserved
+  text: >-
+    A tag key or value holding a space, `@`, or another character the line grammar doesn't split
+    a tag on, read as written.
 - name: tags_repeated_key
   text: A tag key given more than once, folded into an array in wire order.
 - name: tags_duplicate

@@ -12,7 +12,8 @@
 //! stray end marker each fail.
 //!
 //! - **`doc:<sink>`** is the sink's whole column: a table of the record-level rows (every metric
-//!   kind, the `record` rows that decide a record's fate, and a log or span alone), then one of
+//!   kind, the `record` rows that decide a record's fate, a log or span alone, or an event with no
+//!   record), then one of
 //!   the field-level rows ([`mapping::is_field_row`]). A row is its label, the cell's class, its
 //!   reason and counter, and its `text` verbatim. Each cell of a `when:` list is its own row, the
 //!   condition after the label ([`condition`]); the last cell of such a list reads "otherwise".

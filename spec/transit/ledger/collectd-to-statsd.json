@@ -1,0 +1,16 @@
+{
+  "cells": [
+    {"sink":"statsd_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"statsd_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
+    {"sink":"statsd_out","row":"gauge/f64","cell":0,"observed":["exact"]},
+    {"sink":"statsd_out","row":"log/plain","cell":0,"observed":["skipped"]},
+    {"sink":"statsd_out","row":"record/no_recorded_value","cell":0,"observed":["skipped"]},
+    {"sink":"statsd_out","row":"record/superseded","cell":0,"observed":["exact"]},
+    {"sink":"statsd_out","row":"sum/cumulative_monotonic","cell":1,"observed":["degraded"]},
+    {"sink":"statsd_out","row":"sum/cumulative_nonmonotonic","cell":1,"observed":["degraded"]},
+    {"sink":"statsd_out","row":"sum/delta_monotonic","cell":0,"observed":[]},
+    {"sink":"statsd_out","row":"sum/i64","cell":0,"observed":[]},
+    {"sink":"statsd_out","row":"sum/u64","cell":0,"observed":["normalized"]}
+  ],
+  "unspecified": []
+}

@@ -35,9 +35,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
     DogStatsD's `|T<unix-seconds>` segment (`format: dogstatsd` only) round-trips: `statsd_in`
     sets `Event::timestamp` from it and stamps a `_logit.statsd.timestamp: Value::U64(secs)` carrier
     with the raw wire value. `statsd_out` re-emits `|T<secs>` from that carrier, never from
-    `Event::timestamp`, so a stage that rebuilds `Event::timestamp` (notably `aggregate`'s flush)
-    can't fabricate or collapse a `|T`. The classic grammar has no timestamp segment, so
-    `format: statsd` omits `|T` and counts it (`fields.omitted{reason="dialect"}`).
+    `Event::timestamp`, so a stage that rewrites `Event::timestamp` can't fabricate or collapse a
+    `|T`. `aggregate` passes a `|T` record through unmerged with its own timestamp. The classic
+    grammar has no timestamp segment, so `format: statsd` omits `|T` and counts it
+    (`fields.omitted{reason="dialect"}`).
   - **Unit:** `MetricRecord::unit` has no statsd wire representation and is dropped.
   - **Renaming:** there's no native, sink-level way to rename or namespace a metric on egress.
     `docs/adr/statsd-output.md`'s Alternatives rejects a sink-side `prefix` field in favor of a

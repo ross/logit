@@ -1,0 +1,4 @@
+# A recorded collectd 5.12 threshold notification, read in place from testdata/interop/: a log
+# event with no metrics, severity FAILURE.
+wire: ../../../../testdata/interop/collectd/collectd-notification-000.raw
+exercises: [notification, identity, time_hr]

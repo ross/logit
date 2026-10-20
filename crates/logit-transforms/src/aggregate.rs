@@ -13,10 +13,15 @@
 //! stage absorbs every mergeable metric off an event and forwards what's left (the unmergeable
 //! metrics, plus any log or span). Two functions decide by kind, each alone: [`opener_for`] whether
 //! a record merges and what a new series opens with, and [`Accumulator::retained_kind`] whether a
-//! series survives a flush. A delta `Sum` whose value is `NaN` or infinite passes through too, so a
-//! cumulative total stays finite. Every record is counted once, as
-//! `logit.transform.metrics.absorbed` or `logit.transform.metrics.passed_through{reason}` (see
-//! [`Tally`]).
+//! series survives a flush. A delta `Sum`, `Gauge`, or `GaugeDelta` whose value is `NaN` or
+//! infinite passes through too, so a total or a held gauge stays finite. So does every record on an
+//! event whose timestamp is its source's own, a DogStatsD `|T` line or a Prometheus sample with its
+//! own timestamp ([`SourceTimeKeys`]): it keeps that timestamp and its carriers instead of taking
+//! the flush time, as the Datadog Agent leaves a `|T` metric unaggregated. A Datadog APM stats
+//! group passes through whole too: it already summarizes its own time bucket, which a window would
+//! merge with other buckets and restamp. Every record is counted
+//! once, as `logit.transform.metrics.absorbed` or `logit.transform.metrics.passed_through{reason}`
+//! (see [`Tally`]).
 //!
 //! # Temporality: what a flushed `Sum`/`Histogram` means
 //!
@@ -50,6 +55,14 @@
 //! An incoming *cumulative* `Sum` passes through in both modes: re-summing a running total would
 //! double-count it. `docs/adr/prometheus-scrape-and-exposition.md` covers the consumer that needs
 //! this mode (`prometheus_out` drops delta records).
+//!
+//! # Series identity
+//!
+//! A series is its record's name and unit and its event's attributes, minus InfluxDB string
+//! fields (`_logit.influxdb.field.*`, [`StringFieldKeys`]), which a flushed series doesn't
+//! carry either. Every other private attribute is identity and stays. A record that passes
+//! through keeps its event's attributes whole. The ADR's "Amendment: InfluxDB string fields aren't
+//! series identity (2026-10-19)" has the reasoning.
 
 use bytes::Bytes;
 use logit_core::interner::Symbol;
@@ -58,6 +71,11 @@ use logit_core::{
     SpanLink, Sum, Telemetry, Temporality, Value,
 };
 use logit_pipeline::{FlushOutput, TraceContext, Transform};
+use logit_proto::datadog::events::ATTR_STATSD_TIMESTAMP;
+use logit_proto::datadog::is_datadog_stats_sym;
+use logit_proto::datadog::stats::ATTR_STATS_NAME;
+use logit_proto::influxdb::FIELD_ATTR_PREFIX;
+use logit_proto::prometheus::ATTR_TIMESTAMP as PROMETHEUS_ATTR_TIMESTAMP;
 use smallvec::SmallVec;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -217,6 +235,43 @@ pub struct Aggregator {
     /// The `SeriesState::open_seq` the next opened series gets. Never reused, so it orders every
     /// series this `Aggregator` has held, across groups and flushes.
     next_open_seq: u64,
+    /// The carrier keys that mark an event's timestamp as the source's own, interned once so
+    /// `process` compares symbols (see [`SourceTimeKeys`]).
+    source_time: SourceTimeKeys,
+    /// `_logit.datadog.stats.name` interned, the marker [`is_datadog_stats_sym`] reads: a Datadog
+    /// APM stats group, which passes through as `bucketed`.
+    datadog_stats_name: Symbol,
+    string_field_keys: StringFieldKeys,
+}
+
+/// The event attributes that say a metric event's timestamp came from its source, one per
+/// protocol whose wire makes a per-point timestamp optional: DogStatsD's `|T` segment
+/// (`_logit.statsd.timestamp`, a `U64`, which a service check's `d:` also stamps) and a
+/// Prometheus exposition sample's own timestamp (`_logit.prometheus.timestamp`, `true`). Each is
+/// read as its own sink reads it. A record on such an event passes through, because a flush would
+/// restamp it with the flush time and its series key holds the carrier, so each distinct
+/// timestamp would open its own series.
+///
+/// A wire where every point carries a time (OTLP, Graphite, collectd, InfluxDB, Datadog series,
+/// Prometheus remote-write) stamps no carrier, and its records merge into a series.
+struct SourceTimeKeys {
+    statsd: Symbol,
+    prometheus: Symbol,
+}
+
+impl SourceTimeKeys {
+    fn new() -> Self {
+        Self {
+            statsd: logit_core::interner::intern(ATTR_STATSD_TIMESTAMP),
+            prometheus: logit_core::interner::intern(PROMETHEUS_ATTR_TIMESTAMP),
+        }
+    }
+
+    /// Two binary searches of the event's sorted attributes; no key is resolved.
+    fn present(&self, attributes: &AttrMap) -> bool {
+        matches!(attributes.get_sym(self.statsd), Some(Value::U64(_)))
+            || matches!(attributes.get_sym(self.prometheus), Some(Value::Bool(true)))
+    }
 }
 
 /// `Aggregator::last_group`'s entry: the `Arc`s `group_for` was asked with, and the index of the
@@ -420,6 +475,8 @@ impl Opener<'_> {
 #[derive(Default)]
 struct Tally {
     absorbed: u32,
+    bucketed: u32,
+    timestamped: u32,
     no_recorded_value: u32,
     no_merge_rule: u32,
     kind_conflict: u32,
@@ -435,6 +492,8 @@ impl Tally {
             telemetry.count("logit.transform.metrics.absorbed", f64::from(self.absorbed), &[]);
         }
         for (reason, n) in [
+            ("bucketed", self.bucketed),
+            ("timestamped", self.timestamped),
             ("no_recorded_value", self.no_recorded_value),
             ("no_merge_rule", self.no_merge_rule),
             ("kind_conflict", self.kind_conflict),
@@ -560,6 +619,9 @@ impl Aggregator {
             current_scope: None,
             window_start: None,
             next_open_seq: 0,
+            source_time: SourceTimeKeys::new(),
+            datadog_stats_name: logit_core::interner::intern(ATTR_STATS_NAME),
+            string_field_keys: StringFieldKeys::default(),
         }
     }
 
@@ -652,6 +714,24 @@ impl Aggregator {
             return true;
         }
 
+        // A Datadog APM stats group summarizes its own time bucket, whose start is the event's
+        // timestamp and whose duration and grouping key ride as carriers. The series key has no
+        // timestamp, so two buckets would merge, and a flush would split the group into one
+        // event per record at the flush time, which `datadog_out` sends as that many groups.
+        if is_datadog_stats_sym(resource, event, self.datadog_stats_name) {
+            let bucketed = u32::try_from(event.metrics.len()).unwrap_or(u32::MAX);
+            Tally { bucketed, ..Tally::default() }.report(&self.telemetry);
+            return true;
+        }
+
+        // A source-timestamped event keeps every record, unmerged: a flush would replace its
+        // time with the flush clock (`SourceTimeKeys`). Checked per event, since the carrier is.
+        if self.source_time.present(&event.attributes) {
+            let timestamped = u32::try_from(event.metrics.len()).unwrap_or(u32::MAX);
+            Tally { timestamped, ..Tally::default() }.report(&self.telemetry);
+            return true;
+        }
+
         // Copied out once: they're per-batch, and the merge match below can't borrow `self`
         // alongside `state`.
         let ctx = self.current_batch_context;
@@ -672,6 +752,9 @@ impl Aggregator {
         // Only `group_for` pushes to `groups` and nothing in the loop removes one, so it stays
         // valid for the whole call.
         let mut group_index: Option<usize> = None;
+        // Found on the event's first keyed record, and empty unless an InfluxDB point carries a
+        // string field, so an event without one clones its attributes into each key as before.
+        let mut string_fields: Option<SmallVec<[Symbol; 4]>> = None;
         for record in metrics {
             // An OTLP `NO_RECORDED_VALUE` record has no reading to fold in; its default numeric
             // payload would count as a real sample (`MetricRecord::flags`'s doc).
@@ -688,16 +771,25 @@ impl Aggregator {
             };
 
             // Checked before the series key, so no series opens for it. A non-finite increment
-            // would pin a cumulative total at `NaN` or infinity for the series' whole life.
-            // Only a delta `Sum` gets here: `opener_for` passed a cumulative one through.
-            let non_finite =
-                matches!(record.kind, MetricKind::Sum(Sum { value, .. }) if !value.is_finite());
-            if non_finite {
+            // would pin a cumulative total at `NaN` or infinity for the series' whole life, and
+            // a non-finite gauge would win last-write-wins or poison every later delta, then
+            // persist through retention. Only a delta `Sum` gets here: `opener_for` passed a
+            // cumulative one through.
+            let non_finite = match record.kind {
+                MetricKind::Sum(Sum { value, .. }) if !value.is_finite() => {
+                    Some(("sum_non_finite", "sum"))
+                }
+                MetricKind::Gauge(value) | MetricKind::GaugeDelta(value) if !value.is_finite() => {
+                    Some(("gauge_non_finite", "gauge"))
+                }
+                _ => None,
+            };
+            if let Some((key, noun)) = non_finite {
                 tally.non_finite += 1;
                 self.diag.warn_throttled(
-                    "sum_non_finite",
+                    key,
                     format_args!(
-                        "sum '{}' has a non-finite value -- forwarding it untouched",
+                        "{noun} '{}' has a non-finite value -- forwarding it untouched",
                         logit_core::interner::resolve(record.name)
                     ),
                 );
@@ -705,11 +797,13 @@ impl Aggregator {
                 continue;
             }
 
-            let key = SeriesKey {
-                name: record.name,
-                unit: record.unit,
-                attributes: event.attributes.clone(),
-            };
+            let string_fields =
+                string_fields.get_or_insert_with(|| self.string_field_keys.of(&event.attributes));
+            let mut attributes = event.attributes.clone();
+            for &key in string_fields.iter() {
+                attributes.remove_sym(key);
+            }
+            let key = SeriesKey { name: record.name, unit: record.unit, attributes };
             let open_seq = self.next_open_seq;
             let gi = match group_index {
                 Some(gi) => gi,
@@ -1352,6 +1446,46 @@ fn record_temporality(temporality: AggregateTemporality) -> Temporality {
     match temporality {
         AggregateTemporality::Delta => Temporality::Delta,
         AggregateTemporality::Cumulative => Temporality::Cumulative,
+    }
+}
+
+/// Which attribute keys are InfluxDB string fields (`_logit.influxdb.field.*`), which a series key
+/// leaves out: a string field isn't series identity at InfluxDB, where it's a field of the point,
+/// and an aggregate summarizes numbers. Keyed on them, two readings of one series that differ only
+/// in a string such as Telegraf's `uptime_format` would flush as two series that every protocol
+/// sink but `influxdb_out` renders with the same labels. Every other private key stays in the key:
+/// `_logit.influxdb.measurement` and other protocols' carriers are identity that a sink reads after
+/// this stage.
+///
+/// Memoized by the key's interner index, so only a key's first sighting resolves it: `resolve`
+/// takes a shard lock and a hash. One byte per index up to the highest key seen, which the
+/// process-wide interner bounds.
+#[derive(Default)]
+struct StringFieldKeys {
+    /// Per interner index: [`UNSEEN`], [`STRING_FIELD`], or [`OTHER_KEY`].
+    seen: Vec<u8>,
+}
+
+const UNSEEN: u8 = 0;
+const STRING_FIELD: u8 = 1;
+const OTHER_KEY: u8 = 2;
+
+impl StringFieldKeys {
+    /// The string-field keys among `attributes`.
+    fn of(&mut self, attributes: &AttrMap) -> SmallVec<[Symbol; 4]> {
+        attributes.iter().map(|(key, _)| key).filter(|&key| self.is_string_field(key)).collect()
+    }
+
+    fn is_string_field(&mut self, key: Symbol) -> bool {
+        let i = logit_core::interner::index(key);
+        if i >= self.seen.len() {
+            self.seen.resize(i + 1, UNSEEN);
+        }
+        if self.seen[i] == UNSEEN {
+            let field = logit_core::interner::resolve(key).starts_with(FIELD_ATTR_PREFIX);
+            self.seen[i] = if field { STRING_FIELD } else { OTHER_KEY };
+        }
+        self.seen[i] == STRING_FIELD
     }
 }
 
@@ -2183,6 +2317,34 @@ mod tests {
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
         assert_eq!(events.len(), 2, "different tag values should be different series");
+    }
+
+    /// Two readings of one InfluxDB series that differ only in a string field are one series: the
+    /// string field is left out of the key and the output, and every other private key stays.
+    #[test]
+    fn an_influxdb_string_field_is_not_series_identity() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        for (value, uptime, at) in [(1.0, "1 day", 10), (2.0, "2 days", 20)] {
+            let mut event = metric_event("system.uptime", MetricKind::gauge(value), at);
+            event.attributes.insert("host", "a");
+            event.attributes.insert("_logit.influxdb.measurement", "system");
+            event.attributes.insert("_logit.influxdb.field.uptime_format", uptime);
+            feed(&mut agg, &resource, event);
+        }
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        assert_eq!(events.len(), 1, "a string field shouldn't split the series");
+        assert_eq!(*kind_of(&events[0]), MetricKind::gauge(2.0), "the later reading wins");
+        let attributes = &events[0].attributes;
+        assert_eq!(attributes.get("_logit.influxdb.field.uptime_format"), None);
+        assert_eq!(attributes.get("host").and_then(Value::as_str), Some("a"));
+        assert_eq!(
+            attributes.get("_logit.influxdb.measurement").and_then(Value::as_str),
+            Some("system"),
+            "the measurement carrier is identity and stays"
+        );
     }
 
     /// Identical `Value::Array` tags (a repeated DogStatsD tag key) fold into one series.
@@ -4394,9 +4556,11 @@ mod tests {
                 MetricKind::SetMembers(m.iter().map(|m| Bytes::from_static(m)).collect())
             };
 
-            // gauge_delta_unseeded, kind_conflict, sample_rate_clamped, sum_non_finite.
+            // gauge_delta_unseeded, kind_conflict, sample_rate_clamped, sum_non_finite,
+            // gauge_non_finite.
             let mut agg = Aggregator::new(Duration::from_secs(10));
             feed(&mut agg, &resource, metric_event("n", MetricKind::counter(f64::NAN), 0));
+            feed(&mut agg, &resource, metric_event("ng", MetricKind::gauge(f64::NAN), 0));
             feed(
                 &mut agg,
                 &resource,
@@ -4427,7 +4591,7 @@ mod tests {
         });
 
         let messages = captured.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        assert_eq!(messages.len(), 9, "one report per diagnostic key: {messages:#?}");
+        assert_eq!(messages.len(), 10, "one report per diagnostic key: {messages:#?}");
         for message in &messages {
             assert!(!message.contains("  "), "a run of spaces in {message:?}");
         }
@@ -4502,7 +4666,21 @@ mod tests {
         assert!(agg.process(&resource, &mut event));
         assert_eq!(event.metrics.len(), 7, "the passed-through records stay on the event");
 
+        // A timestamped event's records count `timestamped` whatever else they'd count.
+        let mut stamped = Event::metric(
+            0,
+            AttrMap::new(),
+            MetricRecord::new(intern("t"), MetricKind::gauge(1.0)),
+        );
+        stamped.attributes.insert("_logit.statsd.timestamp", Value::U64(1));
+        let mut flagged = MetricRecord::new(intern("t"), MetricKind::gauge(0.0));
+        flagged.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        stamped.metrics.push(flagged);
+        assert!(agg.process(&resource, &mut stamped));
+        let metrics_in = metrics_in + 2.0;
+
         let events = registry.drain(0);
+        assert_eq!(passed_through(&events, "timestamped"), 2.0);
         assert_eq!(absorbed(&events), 4.0);
         assert_eq!(passed_through(&events, "no_recorded_value"), 1.0);
         assert_eq!(passed_through(&events, "no_merge_rule"), 2.0);
@@ -4510,6 +4688,8 @@ mod tests {
         assert_eq!(passed_through(&events, "histogram_bounds_mismatch"), 1.0);
         assert_eq!(passed_through(&events, "non_finite"), 2.0);
         let reasons = [
+            "bucketed",
+            "timestamped",
             "no_recorded_value",
             "no_merge_rule",
             "kind_conflict",
@@ -4518,6 +4698,117 @@ mod tests {
         ];
         let passed: f64 = reasons.iter().map(|r| passed_through(&events, r)).sum();
         assert_eq!(metrics_in, absorbed(&events) + passed);
+    }
+
+    /// A non-finite gauge would win last-write-wins and a non-finite gauge delta would poison every
+    /// later one, so each passes through, counted and diagnosed like a non-finite delta `Sum`.
+    #[test]
+    fn a_non_finite_gauge_or_gauge_delta_passes_through_and_leaves_the_gauge_finite() {
+        let (mut agg, registry) =
+            with_registry(Aggregator::new(Duration::from_secs(10)).with_series_retention(2, 10));
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("g", MetricKind::gauge(1.0), 0));
+        for (bad, at) in [
+            (MetricKind::gauge(f64::NAN), 5),
+            (MetricKind::GaugeDelta(MetricValue::F64(f64::INFINITY)), 5),
+            (MetricKind::GaugeDelta(MetricValue::F64(f64::NEG_INFINITY)), 5),
+        ] {
+            let forwarded = feed(&mut agg, &resource, metric_event("g", bad.clone(), at))
+                .expect("a non-finite gauge is forwarded");
+            assert_eq!(forwarded.metrics.len(), 1);
+            // Debug, since `NaN != NaN`.
+            assert_eq!(format!("{:?}", forwarded.metrics[0].kind), format!("{bad:?}"));
+        }
+        feed(
+            &mut agg,
+            &resource,
+            metric_event("g", MetricKind::GaugeDelta(MetricValue::F64(2.0)), 6),
+        );
+        let flushed = flush_events(&mut agg, 10);
+        assert_eq!(*kind_of(&flushed[0].1[0]), MetricKind::gauge(3.0));
+
+        let events = registry.drain(0);
+        assert_eq!(passed_through(&events, "non_finite"), 3.0);
+        assert_eq!(diagnostic_count(&events, "gauge_non_finite"), Some(3.0));
+        assert_eq!(diagnostic_count(&events, "sum_non_finite"), None);
+    }
+
+    /// An event carrying a source-timestamp carrier keeps every record, its timestamp, and its
+    /// attributes, opens no series, and counts each record `timestamped`; a carrier its sink
+    /// wouldn't read as one merges into a series.
+    #[test]
+    fn a_source_timestamped_event_passes_through_untouched() {
+        let resource = default_resource();
+        for (key, value) in [
+            ("_logit.statsd.timestamp", Value::U64(1_799_999_970)),
+            ("_logit.prometheus.timestamp", Value::Bool(true)),
+        ] {
+            let (mut agg, registry) = with_registry(Aggregator::new(Duration::from_secs(10)));
+            let mut event = metric_event("g", MetricKind::gauge(7.0), 1_799_999_970_000_000_000);
+            event.attributes.insert(key, value.clone());
+            event.attributes.insert("room", "lab");
+            event.metrics.push(MetricRecord::new(intern("c"), MetricKind::counter(1.0)));
+            let original = event.clone();
+
+            let forwarded = feed(&mut agg, &resource, event).expect("nothing is absorbed");
+            assert_eq!(forwarded, original, "{key}: forwarded untouched");
+            assert!(flush_events(&mut agg, 1_800_000_000_000_000_000).is_empty(), "{key}");
+            let events = registry.drain(0);
+            assert_eq!(passed_through(&events, "timestamped"), 2.0, "{key}");
+            assert_eq!(absorbed(&events), 0.0, "{key}");
+        }
+
+        for (key, value) in [
+            ("_logit.statsd.timestamp", Value::Bool(true)),
+            ("_logit.prometheus.timestamp", Value::Bool(false)),
+        ] {
+            let (mut agg, registry) = with_registry(Aggregator::new(Duration::from_secs(10)));
+            let mut event = metric_event("g", MetricKind::gauge(7.0), 0);
+            event.attributes.insert(key, value);
+            assert!(feed(&mut agg, &resource, event).is_none(), "{key}: absorbed");
+            assert_eq!(passed_through(&registry.drain(0), "timestamped"), 0.0, "{key}");
+        }
+    }
+
+    /// A Datadog APM stats group, marked on the event or the resource, keeps its bucket start,
+    /// its records, and its carriers, opens no series, and counts each record `bucketed`. Two
+    /// buckets of one group would otherwise share a series key and merge.
+    #[test]
+    fn a_datadog_apm_stats_group_passes_through_untouched() {
+        let count = |v: u64| {
+            MetricKind::Sum(Sum {
+                value: MetricValue::U64(v),
+                temporality: Temporality::Delta,
+                monotonic: true,
+            })
+        };
+        for on_resource in [false, true] {
+            let mut resource = Resource::default();
+            let mut attrs = AttrMap::new();
+            attrs.insert("_logit.datadog.stats.bucket.duration", Value::U64(10_000_000_000));
+            if on_resource {
+                resource.attributes.insert("_logit.datadog.stats.name", "web.request");
+            } else {
+                attrs.insert("_logit.datadog.stats.name", "web.request");
+            }
+            let resource = Arc::new(resource);
+            let (mut agg, registry) = with_registry(cumulative_agg());
+            for start in [1_700_000_000_000_000_000, 1_700_000_010_000_000_000] {
+                let mut event = Event::metric(
+                    start,
+                    attrs.clone(),
+                    MetricRecord::new(intern("datadog.stats.hits"), count(3)),
+                );
+                event.metrics.push(MetricRecord::new(intern("datadog.stats.errors"), count(1)));
+                let original = event.clone();
+                let forwarded = feed(&mut agg, &resource, event).expect("nothing is absorbed");
+                assert_eq!(forwarded, original, "on the resource: {on_resource}");
+            }
+            assert!(flush_events(&mut agg, 1_800_000_000_000_000_000).is_empty());
+            let events = registry.drain(0);
+            assert_eq!(passed_through(&events, "bucketed"), 4.0, "on the resource: {on_resource}");
+            assert_eq!(absorbed(&events), 0.0);
+        }
     }
 
     /// A statsd `1e308|c|@0.5` extrapolates to infinity. It passes through instead of merging, so

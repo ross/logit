@@ -1,12 +1,14 @@
 ---
 created: 2026-10-16
-updated: 2026-10-18
+updated: 2026-10-19
 ---
 
 # `line_protocol`: parse a log message as InfluxDB line protocol into one event per point, skipping bad lines
 
 ## Status
-Accepted
+Accepted. String fields follow [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)'s
+"Amendment: string fields are private (2026-10-19)", and the decode mapping below is amended to
+match.
 
 ## Context
 Some producers put InfluxDB line protocol inside another protocol rather than POSTing it to a write
@@ -48,11 +50,11 @@ as `json` treats one.
 `crates/logit-proto/src/influxdb/mod.rs`, unchanged:
 
 - The measurement becomes the private attribute `_logit.influxdb.measurement`.
-- Tags become event attributes, `Value::Str`. A tag key under `_logit.` or `influxdb.field.` is
-  omitted and counted `logit.transform.tags.omitted{reason="reserved_prefix"}`.
+- Tags become event attributes, `Value::Str`. A tag key under `_logit.` is omitted and counted
+  `logit.transform.tags.omitted{reason="reserved_prefix"}`.
 - Each numeric or boolean field becomes a typed `Gauge` named `<measurement>.<field>`, in wire
   order.
-- Each string field becomes the attribute `influxdb.field.<key>`.
+- Each string field becomes the private attribute `_logit.influxdb.field.<key>`.
 - Points in one message with the same measurement, tag set, and timestamp merge into one event,
   field by field, as `influxdb_in` merges them within one body (that ADR's normalization 2).
   Points in different messages never merge.
@@ -139,8 +141,8 @@ writes its points to its configured `bucket:` and `org:`, else its `default_buck
   `syslog.tag` from `syslog_in`, for example, and a nil RFC 5424 TIMESTAMP's `Value::Null`
   `syslog.timestamp`, which `influxdb_out` omits and counts. An operator places `keep`, `remove`,
   or a Lua stage to choose the tags.
-- A child's attribute under `influxdb.field.` inherited from the parent leaves `influxdb_out` as a
-  string field.
+- A child's attribute under `_logit.influxdb.field.` inherited from the parent leaves
+  `influxdb_out` as a string field.
 - The existing `influxdb_line` fuzz target covers the shared construction path, and the skip mode
   joins it.
 - The canonical copy of the per-line rules, the counters, and the parent's fate is the

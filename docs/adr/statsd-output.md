@@ -300,9 +300,9 @@ only under `Format::DogStatsd` (`append_dialect_extras`), appended after the tag
 multi-line `Samples`/`SetMembers` record carries them on each line. `|T` renders **only** when the
 carrier is present and holds a `Value::U64` (a wire `|T<secs>` segment always produces exactly
 that), never derived from `Event::timestamp` — a receipt-time stamp is not a wire-supplied
-timestamp, and a stage that rebuilds `Event::timestamp` after decode (`aggregate`'s flush,
-notably) can't fabricate or collapse a `|T` this way, since the carrier rides on the series key
-like any other attribute. A `_logit.statsd.timestamp` present but not a `Value::U64` (never produced
+timestamp, and a stage that rewrites `Event::timestamp` after decode can't fabricate or collapse
+a `|T` this way. (`aggregate` passes a `|T` record through unmerged, per
+[ADR `aggregation-window-semantics`](aggregation-window-semantics.md)'s 2026-10-19 amendment.) A `_logit.statsd.timestamp` present but not a `Value::U64` (never produced
 by `statsd_in` itself, but reachable from a cross-protocol relay or a Lua-authored attribute) is
 simply not emitted (`a_non_u64_statsd_timestamp_value_is_not_emitted`). Under `format: statsd`,
 neither field has anywhere to go — both are dropped and counted once per field per emitted

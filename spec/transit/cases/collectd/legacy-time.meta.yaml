@@ -1,0 +1,5 @@
+# Hand-built, since collectd has written TimeHR and IntervalHR since 5.0: one datagram with Host
+# `logit-fixture`, Time 1799999990 s, Interval 10 s, Plugin and Type `load`, and a Values part of
+# three GAUGEs (0.25, 0.5, 0.75).
+wire: legacy-time.raw
+exercises: [value_list, gauge, multi_data_source, identity, time_legacy]

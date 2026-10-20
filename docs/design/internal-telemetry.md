@@ -1355,7 +1355,7 @@ connection refused for its PROXY header.
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `oversize` (`413`, as sent or decompressed), `auth` (`401`), `encoding` (`415`, anything but identity or lowercase gzip), `malformed_encoding` (`400`, a gzip stream that doesn't decompress), `precision` (`400`), `no_bucket` (`404`), `no_org` (`400`), `malformed` (`400`, a line that fails to parse), `stalled` (`408`, only with `idle_timeout:` set), or `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload) |
 | `logit.input.batches.deferred` | count | batches a busy `503` left with the client to resend, disjoint from `logit.component.batches.sent` |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | batches no consumer took, answered `503`. The refused batch is also counted in `logit.component.batches.sent` and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}` |
-| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | tags the decoder left off a point because their key starts with `_logit.`, the private carrier prefix, or `influxdb.field.`, which would read back as a string field. The point is delivered. Counted by the codec, under this component's id |
+| `logit.input.tags.omitted{reason="reserved_prefix"}` | count | tags the decoder left off a point because their key starts with `_logit.`, the private carrier prefix, string fields' `_logit.influxdb.field.` included. The point is delivered. Counted by the codec, under this component's id |
 
 **A busy request is not a lost one**, as on `splunk_hec_in`: after 5 seconds without the pipeline
 taking the request's batch, the request gets `503` with `Retry-After: 1`, counted `class="busy"`
@@ -1567,11 +1567,13 @@ ordinary consumer.
 | `logit.transform.samples.weight_clamped` | count | a record's sample rate implied more than `Samples::MAX_WEIGHT` observations per value (`Samples::is_clamped`), counted when its weight is applied: on absorb into a sketch, or when a raw `distributions: samples` series falls back |
 | `logit.transform.samples.omitted{reason="non_finite"}` | count | `NaN` or infinite `Samples` values left out of a sketch, since they have no bin; the record's other values still merge |
 | `logit.transform.metrics.absorbed` | count | metric records merged into a series. With `.passed_through` it accounts for every record `process` receives: `metrics_in == absorbed + passed_through` summed over every reason |
+| `logit.transform.metrics.passed_through{reason="bucketed"}` | count | a record of a Datadog APM stats group (`_logit.datadog.stats.name` on the event or its resource), forwarded whole with its bucket start, duration, and grouping key, because it already summarizes its own time bucket |
+| `logit.transform.metrics.passed_through{reason="timestamped"}` | count | a record on an event that carries its source's own timestamp (`_logit.statsd.timestamp` from a DogStatsD `\|T` line, or `_logit.prometheus.timestamp` from a Prometheus sample with a timestamp), forwarded unmerged with that timestamp, whatever its kind |
 | `logit.transform.metrics.passed_through{reason="no_recorded_value"}` | count | an OTLP `NO_RECORDED_VALUE`-flagged record forwarded unmerged, because it has no reading to fold into a series |
 | `logit.transform.metrics.passed_through{reason="no_merge_rule"}` | count | a record of a kind this stage doesn't merge, forwarded: a cumulative `Sum`, an `ExponentialHistogram`, a `Summary`, and a `Histogram` outside `temporality: cumulative` or already cumulative |
 | `logit.transform.metrics.passed_through{reason="kind_conflict"}` | count | a record forwarded because its series holds another kind |
 | `logit.transform.metrics.passed_through{reason="histogram_bounds_mismatch"}` | count | a histogram forwarded because its bucket bounds differ from its series' |
-| `logit.transform.metrics.passed_through{reason="non_finite"}` | count | a delta `Sum` whose value is `NaN` or infinite, forwarded so a cumulative total stays finite |
+| `logit.transform.metrics.passed_through{reason="non_finite"}` | count | a delta `Sum`, `Gauge`, or `GaugeDelta` whose value is `NaN` or infinite, forwarded so a total or a held gauge stays finite |
 | `logit.transform.links.omitted{reason="contexts"}` | count | contributing span contexts past the fixed per-series cap (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8) that a flushed event's links can't carry, one per merged record whose context the full series doesn't link, so a context seen in two batches counts twice. Unrelated to `max_retained_series`: no series is lost |
 
 Series retention across the window boundary comes from
@@ -1588,8 +1590,10 @@ and `sample_rate_clamped` (mirroring the raw-retention counters); `kind_conflict
 kind conflicts with an already-accumulating series under the same name/unit/tags, forwarded
 untouched); `histogram_bounds_mismatch` (a histogram whose bucket bounds differ from the
 accumulating series', also forwarded untouched, under its own key so an operator knows it's a
-producer that re-bucketed rather than two kinds colliding); and `sum_non_finite` (a delta `Sum`
-whose value is `NaN` or infinite, forwarded untouched).
+producer that re-bucketed rather than two kinds colliding); `sum_non_finite` (a delta `Sum`
+whose value is `NaN` or infinite, forwarded untouched); and `gauge_non_finite` (the same for a
+`Gauge` or `GaugeDelta`). A bucketed or timestamped record has no diagnostic: it's the configured behavior,
+not a fault.
 
 ##### `kv_metrics`
 
@@ -1778,7 +1782,7 @@ text:
 |---|---|
 | `logit.transform.lines.dropped{reason="malformed"}` | a bad line in a message whose log doesn't go on: under the default `keep_source: false`, in a message with at least one good point. The line's text has left the pipeline, so it's loss |
 | `logit.transform.lines.skipped{reason="malformed"}` | a bad line in a message whose log goes on, under `keep_source: true` or in a message with no good point. The text is still in the pipeline |
-| `logit.transform.tags.omitted{reason="reserved_prefix"}` | a tag left off a point because its key starts with `_logit.` or `influxdb.field.`, as `influxdb_in`'s `logit.input.tags.omitted` counts. The point is emitted |
+| `logit.transform.tags.omitted{reason="reserved_prefix"}` | a tag left off a point because its key starts with `_logit.`, as `influxdb_in`'s `logit.input.tags.omitted` counts. The point is emitted |
 
 A parent discarded after its points are emitted counts as
 `logit.component.events.discarded`, and its points count in `logit.component.events.sent`. Each

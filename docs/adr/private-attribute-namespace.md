@@ -1,12 +1,14 @@
 ---
 created: 2026-10-13
-updated: 2026-10-13
+updated: 2026-10-19
 ---
 
 # Private attribute namespace: protocol carriers live under `_logit.<protocol>.`, and every other protocol's sink ignores them
 
 ## Status
-Accepted
+Accepted. On 2026-10-19, [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)'s
+"Amendment: string fields are private" moved InfluxDB string fields from the public
+`influxdb.field.<key>` to `_logit.influxdb.field.<key>`; the lists below are amended to match.
 
 ## Context
 
@@ -67,13 +69,12 @@ By protocol, these move under `_logit.`:
 | Prometheus | every `prometheus.*` attribute: `type`, `timestamp`, and the resource attribute `target` |
 | collectd | `plugin`, `type`, `interval`, and `severity` |
 | Datadog | every `datadog.*` attribute: series, events, service checks, Agent fields, trace chunk, stats, tracer headers, `span.error`, and `source` |
-| InfluxDB | `influxdb.measurement`, and the resource attributes `influxdb.org`, `influxdb.org_id`, and `influxdb.bucket` |
+| InfluxDB | `influxdb.measurement`, `influxdb.field.<key>` (since 2026-10-19), and the resource attributes `influxdb.org`, `influxdb.org_id`, and `influxdb.bucket` |
 | syslog | `syslog.severity` |
 | OTLP | `otel.severity_number` and `otel.severity_text` |
 
 These stay public:
 
-- `influxdb.field.<key>`: a string field's content, which is data, not a carrier.
 - `collectd.host`, `collectd.plugin_instance`, and `collectd.type_instance`: identity with no
   other home. The record name holds only the plugin and type, and the host stays off the
   resource, so hiding them would merge different hosts' and instances' lists into one series.

@@ -1,0 +1,50 @@
+# The collectd binary-protocol wire features a case under cases/collectd/ can exercise, from
+# crates/logit-proto/src/collectd/mod.rs's "Decode: bytes → events" and "Notifications" tables. A
+# case names the ones it exercises in its `.meta.yaml`.
+- name: value_list
+  text: >-
+    A Values part, decoded to one event whose records are its data sources in wire order, each
+    named `<plugin>.<type>`, or `<plugin>.<type>.<i>` on a list of several.
+- name: counter
+  text: A COUNTER data source, decoded to a cumulative monotonic sum holding a `u64`.
+- name: derive
+  text: A DERIVE data source, decoded to a cumulative non-monotonic sum holding an `i64`.
+- name: absolute
+  text: An ABSOLUTE data source, decoded to a delta monotonic sum holding a `u64`.
+- name: gauge
+  text: A GAUGE data source, decoded to a gauge holding an `f64`.
+- name: gauge_nan
+  text: >-
+    A GAUGE data source holding NaN, collectd's "no value this interval", decoded to a gauge of
+    `0` flagged as holding no recorded value.
+- name: multi_data_source
+  text: A list of several data sources, one record each on the one event.
+- name: identity
+  text: >-
+    The Host, Plugin, and Type, stamped as `collectd.host`, `_logit.collectd.plugin`, and
+    `_logit.collectd.type`.
+- name: plugin_instance
+  text: A PluginInstance, stamped as the public event attribute `collectd.plugin_instance`.
+- name: type_instance
+  text: A TypeInstance, stamped as the public event attribute `collectd.type_instance`.
+- name: identity_elision
+  text: >-
+    Identity parts written only when they change, so later lists in the datagram inherit the
+    sticky host, plugin, and type.
+- name: interval
+  text: An IntervalHR part, stamped as the `_logit.collectd.interval` carrier in seconds.
+- name: time_hr
+  text: A TimeHR part in 2^-30 s ticks, converted to the event's nanosecond timestamp.
+- name: time_legacy
+  text: >-
+    The second-resolution Time and Interval parts a collectd before 5.0 writes, read as the
+    high-resolution ones.
+- name: notification
+  text: >-
+    A Message part with its Severity, decoded to a log event with no metrics: the message, a
+    severity of `Error`, `Warn`, or `Info`, and the raw severity as the
+    `_logit.collectd.severity` carrier.
+- name: types_db
+  text: >-
+    Data sources named from a `types_db:` file, `<plugin>.<type>.<ds_name>`, or `<plugin>.<type>`
+    for a type with one.
