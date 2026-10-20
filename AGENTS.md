@@ -863,7 +863,7 @@ the operator-facing account of all of this.
   docs"). `script/transit gen|check|docs|coverage` wraps both; `script/test` runs them.
   Cases come from `statsd_in`, `influxdb_in`, and `prometheus_in`'s scrape; the columns are
   `statsd_out`, `prometheus_out`, `influxdb_out`, and `otlp_out`, through the statsd and InfluxDB
-  like pairs and eleven cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
+  like pairs and twelve cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
 
 ### Not yet built
 
