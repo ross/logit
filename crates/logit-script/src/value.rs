@@ -215,8 +215,7 @@ fn lua_to_value_at(value: LuaValue, depth: usize) -> mlua::Result<Value> {
     })
 }
 
-/// The length `n` if `table`'s keys are exactly `1..=n` (`Some(0)` for an empty table), else
-/// `None`.
+/// The length `n` if `table`'s keys are `1..=n` (`Some(0)` for an empty table), else `None`.
 ///
 /// Shared by [`lua_table_to_value`] and `ScriptWorker::process`/`flush`'s check of a returned
 /// table of events. Checks every key rather than comparing the pair count with `raw_len()`: `#`
@@ -229,24 +228,32 @@ pub(crate) fn validated_sequence_len(table: &Table) -> mlua::Result<Option<usize
 /// [`validated_sequence_len`], ticking `heartbeat` once per key walked. The walk is a pass over
 /// the whole table before any element is converted, so a large returned table would otherwise
 /// sit this long with its heartbeat unchanged.
+///
+/// The walk is the only pass: it counts the keys and keeps the largest rather than collecting
+/// them, because a pass after it that didn't tick would read as a stall once the table is large
+/// enough. A table's keys are distinct, and mlua reads a number key as an `Integer` only when
+/// it's integral (or below 1, which the `>= 1` test rejects), so `count` distinct integers in
+/// `1..=max` are `1..=count` when `max == count`.
 pub(crate) fn validated_sequence_len_ticking(
     table: &Table,
     heartbeat: Option<&Heartbeat>,
 ) -> mlua::Result<Option<usize>> {
-    let mut keys: Vec<i64> = Vec::new();
+    let mut count: i64 = 0;
+    let mut max: i64 = 0;
     for pair in table.clone().pairs::<LuaValue, LuaValue>() {
         if let Some(heartbeat) = heartbeat {
             heartbeat.tick();
         }
         let (key, _value) = pair?;
         match key {
-            LuaValue::Integer(i) if i >= 1 => keys.push(i),
+            LuaValue::Integer(i) if i >= 1 => {
+                count += 1;
+                max = max.max(i);
+            }
             _ => return Ok(None),
         }
     }
-    keys.sort_unstable();
-    let is_contiguous_from_one = keys.iter().enumerate().all(|(idx, &k)| k == idx as i64 + 1);
-    Ok(is_contiguous_from_one.then_some(keys.len()))
+    Ok((max == count).then_some(count as usize))
 }
 
 /// `table`, found `depth` tables below the attribute value; its children convert at `depth + 1`.
@@ -280,6 +287,74 @@ fn lua_table_to_attrmap(table: Table, depth: usize) -> mlua::Result<AttrMap> {
         map.insert(key.to_str()?, lua_to_value_at(value, depth + 1)?);
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::*;
+    use mlua::Lua;
+
+    /// [`validated_sequence_len_ticking`] over the table `source` evaluates to, and how many times
+    /// it ticked the heartbeat.
+    fn sequence_len(source: &str) -> (Option<usize>, u64) {
+        let lua = Lua::new();
+        let table: Table = lua.load(source).eval().expect("source should evaluate to a table");
+        let heartbeat = Heartbeat::new();
+        let len = validated_sequence_len_ticking(&table, Some(&heartbeat)).unwrap();
+        // Idle throughout, so each tick adds 2.
+        (len, heartbeat.read() / 2)
+    }
+
+    #[test]
+    fn a_sequence_from_one_is_its_length() {
+        assert_eq!(sequence_len("return {'a', 'b', 'c'}"), (Some(3), 3));
+    }
+
+    #[test]
+    fn an_empty_table_is_length_zero() {
+        assert_eq!(sequence_len("return {}"), (Some(0), 0));
+    }
+
+    #[test]
+    fn a_hole_is_not_a_sequence() {
+        assert_eq!(sequence_len("return {[1] = 'a', [2] = 'b', [4] = 'd'}").0, None);
+    }
+
+    #[test]
+    fn a_sequence_not_starting_at_one_is_not_a_sequence() {
+        assert_eq!(sequence_len("return {[2] = 'b', [3] = 'c'}").0, None);
+        assert_eq!(sequence_len("return {[0] = 'z', [1] = 'a'}").0, None);
+    }
+
+    #[test]
+    fn a_string_key_beside_a_sequence_is_not_a_sequence() {
+        assert_eq!(sequence_len("return {'a', 'b', extra = 'c'}").0, None);
+        // `#` reads 4 here, so a count check against `raw_len()` would pass it.
+        assert_eq!(sequence_len("return {[1] = 'a', [2] = 'b', [4] = 'd', extra = 'c'}").0, None);
+    }
+
+    #[test]
+    fn a_fractional_key_is_not_a_sequence() {
+        assert_eq!(sequence_len("return {[1] = 'a', [1.5] = 'b'}").0, None);
+    }
+
+    #[test]
+    fn insertion_order_does_not_matter() {
+        assert_eq!(
+            sequence_len("local t = {}; t[3] = 'c'; t[1] = 'a'; t[2] = 'b'; return t"),
+            (Some(3), 3)
+        );
+    }
+
+    #[test]
+    fn a_large_sequence_is_its_length_with_one_tick_per_key() {
+        let n = 100_000;
+        let src = format!("local t = {{}}; for i = {n}, 1, -1 do t[i] = i end; return t");
+        assert_eq!(sequence_len(&src), (Some(n), n as u64));
+        let holed =
+            format!("local t = {{}}; for i = 1, {n} do t[i] = i end; t[{n} / 2] = nil; return t");
+        assert_eq!(sequence_len(&holed).0, None);
+    }
 }
 
 /// An `Array` attribute (a repeated DogStatsD tag key, `statsd_in`'s `insert_tags`) seen through

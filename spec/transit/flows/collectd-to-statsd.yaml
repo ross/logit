@@ -1,0 +1,13 @@
+# collectd_in's cases into statsd_out as DogStatsD, with nothing between: COUNTER and DERIVE
+# running totals as gauges, ABSOLUTE as a counter, a notification not written.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/collectd/value-lists.json
+  out:
+    type: statsd_out
+    sources: [case]
+    endpoint: 127.0.0.1:8125
+    format: dogstatsd
