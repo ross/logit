@@ -1207,7 +1207,7 @@ mod tests {
         let mut merged = Ledger::default();
         merged.merge(read);
         assert_eq!(merged.fragment().render(), text);
-        // The relay's `mixed` case writes no tag `statsd_out` sanitizes, so another flow's
+        // The relay's `counter` case writes no tag `statsd_out` sanitizes, so another flow's
         // observation of that `normalized` cell is merged in, as the `ledger` test would.
         let tags = r#"{"cells":[{"sink":"statsd_out","row":"attributes/string_value","cell":1,"observed":["normalized"]}],"unspecified":[]}"#;
         merged.merge(serde_json::from_str(tags).expect("the entry parses"));
