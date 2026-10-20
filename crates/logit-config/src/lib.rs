@@ -3022,8 +3022,8 @@ pub enum ComponentKind {
     /// `influxdb_in` gives one: the measurement as `_logit.influxdb.measurement`, tags as
     /// attributes, each numeric or boolean field as a gauge named `<measurement>.<field>`, and
     /// each string field as the attribute `_logit.influxdb.field.<key>`, which `influxdb_out`
-    /// writes and every other protocol sink leaves off. `stdio_out`, `file_out`, `kafka_out` under
-    /// `json`, `msgpack`, or `native`, and `logit_out` carry it with the rest of the event. Points in one message with the same measurement, tag set, and timestamp merge into
+    /// writes and every other protocol sink leaves off. Every sink that renders the whole event
+    /// carries it. Points in one message with the same measurement, tag set, and timestamp merge into
     /// one event.
     ///
     /// Each point's event starts from a copy of the parent's attributes, with the point's own

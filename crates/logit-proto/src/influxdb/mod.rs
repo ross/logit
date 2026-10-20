@@ -58,9 +58,8 @@
 //! under `_logit.influxdb.`
 //! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
 //! Among the protocol sinks only `influxdb_out` writes them, and every other one leaves them off
-//! its wire, uncounted; the renders of a whole event (`stdio_out` and `file_out` in every format,
-//! `kafka_out` under `json`, `msgpack`, and `native`, `logit_out`, and a `buffer.disk:` spool)
-//! carry them, as they carry every private key. A string field's value is free text, and as a tag
+//! its wire, uncounted; a whole-event render carries them, as it carries every private key (that
+//! ADR's "The ignore rule" lists the renders). A string field's value is free text, and as a tag
 //! or label at another sink each distinct value would start a series. Lua and transforms still
 //! read a string field by its full key, and `aggregate` leaves it out of a series.
 //!

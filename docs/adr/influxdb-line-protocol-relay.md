@@ -641,8 +641,8 @@ carried mode; `default_org:` is now the setting for that case, and `org:` stays 
 A string field decodes to the private attribute `_logit.influxdb.field.<key>`, so `influxdb_out`
 is the only protocol sink that writes it. Every other protocol sink leaves it off its wire,
 uncounted, under [ADR `private-attribute-namespace`](private-attribute-namespace.md)'s ignore
-rule, as it does the measurement, org, and bucket carriers. The renders of a whole event carry it,
-as they carry every private key: `stdio_out` and `file_out` in every format, `kafka_out` under `json`, `msgpack`, and `native`, `logit_out`, and a `buffer.disk:` spool.
+rule, as it does the measurement, org, and bucket carriers. A whole-event render carries it, as
+it carries every private key; that ADR's "The ignore rule" lists the renders.
 
 ### Why
 
