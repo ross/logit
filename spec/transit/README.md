@@ -12,8 +12,9 @@ doesn't cover sink behavior above the encoder (retries, request packing, stale-p
 a backend stores. [ADR `transit-spec`](../../docs/adr/transit-spec.md) records the decision and its
 limits, and [the plan](../../docs/plans/transit-spec.md) the workstreams.
 
-The sources are `statsd_in`, `influxdb_in`, and `prometheus_in`'s scrape (remote-write cases
-aren't written yet). The sink columns are `statsd_out`, `prometheus_out` (exposition and
+The sources are `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape (remote-write cases
+aren't written yet), and `datadog_in`'s metrics routes, with one case each for its logs, events,
+and service checks (no APM cases yet). The sink columns are `statsd_out`, `prometheus_out` (exposition and
 remote-write), `influxdb_out`, and `otlp_out`. Each flow's name says which source meets which
 sink: `statsd-relay` is the like pair, and `influxdb-to-prometheus` a cross-protocol one.
 
@@ -31,8 +32,8 @@ key, a stale document, and a key no case has each fail naming the flow and the c
 | `features/<system>.yaml` | The wire features a source's cases can exercise, one `{name, text}` each |
 | `cases/<system>/<case>.meta.yaml` | What the case exercises, and its wire file and tolerances if any |
 | `cases/<system>/<case>.json` | The case's events, one `format: json` line each |
-| `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from: `.statsd` lines, InfluxDB line protocol in `.lp`, or a Prometheus scrape body in `.prom` |
-| `cases/<system>/<case>.headers` | The request beside an HTTP wire file, one `name: value` per line as `testdata/interop/` records it: `path:` with an InfluxDB write's `org`, `orgID`, `bucket`, and `precision`, or a scrape's `content-type:` choosing its dialect |
+| `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from: `.statsd` lines, InfluxDB line protocol in `.lp`, a Prometheus scrape body in `.prom`, or a Datadog request body, compressed as sent, in `.bin` |
+| `cases/<system>/<case>.headers` | The request beside an HTTP wire file, one `name: value` per line as `testdata/interop/` records it: `path:` with an InfluxDB write's `org`, `orgID`, `bucket`, and `precision`, a scrape's `content-type:` choosing its dialect, or a Datadog request's `path:`, `content-type:`, and `content-encoding:` |
 | `flows/<flow>.yaml` | A runnable config: `replay_in -> [stages] -> <sink>` |
 | `expected/<flow>.json` | Each case's run through the flow, keyed by case name: the events read back and the counters moved (generated) |
 | `ledger/<flow>.json` | What the flow's runs fed the checks across flows: each cell reached and the classes observed there, and each row a sink has no cell in yet with the runs that reached it (generated) |
@@ -212,11 +213,13 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
 ## Adding a case
 
 1. Pick the source system's directory under `cases/`.
-2. For a case that starts on the wire, write the wire file (`<case>.statsd`, `<case>.lp`, or
-   `<case>.prom`) and `<case>.meta.yaml` with `wire: <case>.statsd`. An InfluxDB case needs a
+2. For a case that starts on the wire, write the wire file (`<case>.statsd`, `<case>.lp`,
+   `<case>.prom`, or `<case>.bin`) and `<case>.meta.yaml` with `wire: <case>.statsd`. An InfluxDB case needs a
    `<case>.headers` beside its wire file whose `path:` names a `bucket` and an `org` or `orgID`,
    as `influxdb_in` requires; a Prometheus case reads text 0.0.4 unless its `.headers` gives an
-   OpenMetrics `content-type:`. A `wire:` path may point at a capture under `testdata/interop/`
+   OpenMetrics `content-type:`. A Datadog case's `.headers` gives the request's `path:`, which
+   picks the route, and its `content-type:` and `content-encoding:`, and the body decodes through
+   `datadog_in`'s own request decoding. A `wire:` path may point at a capture under `testdata/interop/`
    instead of copying it, and its `.headers` comes with it; an InfluxDB body sent with
    `content-encoding: gzip` is decompressed first, as `influxdb_in` does. Run `script/transit gen` to write
    `<case>.json`.

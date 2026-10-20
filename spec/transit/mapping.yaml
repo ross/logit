@@ -441,7 +441,8 @@ rows:
         - class: exact
           text: >-
             One `|ms`, `|h`, or `|d` line holding every value, the type letter from the
-            `_logit.statsd.type` carrier and `@rate` written when it isn't 1.
+            `_logit.statsd.type` carrier, or `ms` with no carrier, so a Datadog distribution point
+            leaves as a timer, not `|d`. `@rate` is written when it isn't 1.
       prometheus_out:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=samples}

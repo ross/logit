@@ -1,0 +1,4 @@
+# The Datadog Agent's /api/v2/logs batch of three tailed lines, JSON and zstd, read in place
+# from testdata/interop/ with its .headers.
+wire: ../../../../testdata/interop/datadog/agent-api-v2-logs-001.bin
+exercises: [log, zstd]

@@ -1,0 +1,1 @@
+{"timestamp":"2026-09-24T22:40:41.000000000Z","log":{"format":"raw","message":"Version 7.83.3"},"attributes":{"_logit.datadog.event_type":"Agent Startup","_logit.statsd.event.host":"record-fixtures","_logit.statsd.event.source_type":"System","_logit.statsd.event.title":"Agent Startup"},"resource":{"attributes":{"_logit.datadog.agent.hostname":"record-fixtures"}}}

@@ -62,6 +62,7 @@ use logit_config::ComponentKind;
 use logit_core::{Diagnostics, EventBatch, Resource};
 use logit_outputs::ndjson::render_ndjson;
 use logit_pipeline::test_util::TelemetryProbe;
+use logit_proto::datadog::DatadogDecoder;
 use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
 use logit_proto::prometheus::{
@@ -303,6 +304,9 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 ///   dialect `content-type:` selects (text 0.0.4 when absent), under the resource
 ///   `prometheus_in` stamps for the target [`SCRAPE_URL`]: `instance` and
 ///   `_logit.prometheus.target`.
+/// - `datadog`: one request body through `datadog_in`'s own `decode_request`, which picks the
+///   route from `path:`, the body form from `content-type:`, and the decompression from
+///   `content-encoding:`, as the listener does.
 fn decode_wire(system: &str, bytes: Vec<u8>, headers: &Headers) -> anyhow::Result<String> {
     let mut probe = TelemetryProbe::new();
     let id = "transit.case";
@@ -361,6 +365,27 @@ fn decode_wire(system: &str, bytes: Vec<u8>, headers: &Headers) -> anyhow::Resul
             resource.attributes.insert(LABEL_INSTANCE, logit_core::Value::str(SCRAPE_INSTANCE));
             resource.attributes.insert(ATTR_TARGET, logit_core::Value::str(SCRAPE_URL));
             vec![EventBatch { resource: Arc::new(resource), scope: None, events }]
+        }
+        "datadog" => {
+            let telemetry = probe.telemetry(id, "datadog_in", "listener");
+            let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
+            let path = headers.get("path").context("the .headers names no path:")?;
+            let path = path.split_once('?').map_or(path, |(path, _)| path);
+            let mut request = http::HeaderMap::new();
+            for name in [http::header::CONTENT_TYPE, http::header::CONTENT_ENCODING] {
+                if let Some(value) = headers.get(name.as_str()) {
+                    request.insert(name, http::HeaderValue::from_str(value)?);
+                }
+            }
+            let decoder = DatadogDecoder::new().with_telemetry(telemetry).with_diagnostics(diag);
+            logit_inputs::datadog::decode_request(
+                path,
+                &request,
+                Bytes::from(bytes),
+                RECEIVED_AT,
+                decoder,
+            )
+            .map_err(|err| anyhow::anyhow!("datadog_in refused the request: {err}"))?
         }
         other => bail!("no wire decoder for a {other} case yet"),
     };
@@ -906,6 +931,11 @@ macro_rules! flow_tests {
 }
 
 flow_tests! {
+    datadog_to_influxdb => "datadog-to-influxdb",
+    datadog_to_otlp => "datadog-to-otlp",
+    datadog_to_prometheus_remote_write => "datadog-to-prometheus-remote-write",
+    datadog_to_prometheus => "datadog-to-prometheus",
+    datadog_to_statsd => "datadog-to-statsd",
     influxdb_aggregate_to_prometheus => "influxdb-aggregate-to-prometheus",
     influxdb_to_prometheus_remote_write => "influxdb-to-prometheus-remote-write",
     influxdb_to_prometheus => "influxdb-to-prometheus",

@@ -1,0 +1,4 @@
+# The Datadog Agent's /api/v2/series flush of three DogStatsD gauges sent with |T, protobuf and
+# zstd, read in place from testdata/interop/ with its .headers.
+wire: ../../../../testdata/interop/datadog/agent-api-v2-series-003.bin
+exercises: [series_v2_protobuf, gauge, tags, host, interval, origin, zstd]

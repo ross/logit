@@ -1,0 +1,4 @@
+# The Datadog Agent's /api/beta/sketches flush of one DogStatsD distribution, protobuf and zstd,
+# read in place from testdata/interop/ with its .headers.
+wire: ../../../../testdata/interop/datadog/agent-api-beta-sketches-000.bin
+exercises: [sketch, tags, host, origin, zstd]

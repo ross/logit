@@ -1,0 +1,7 @@
+{"series": [
+  {"metric": "web.requests", "points": [[1799999990, 12]], "type": "count", "interval": 10, "host": "web-1", "tags": ["env:prod", "region:us-east-1", "canary"], "unit": "request"},
+  {"metric": "web.requests.rate", "points": [[1799999990, 1.2]], "type": "rate", "interval": 10, "host": "web-1", "tags": ["env:prod"]},
+  {"metric": "disk.used", "points": [[1799999990.75, 0.42]], "type": "gauge", "host": "web-1", "device": "/dev/sda1", "source_type_name": "disk", "unit": "fraction", "tags": ["env:prod"]},
+  {"metric": "queue.depth", "points": [[1799999990, 7], [1799999995, 9]], "tags": ["env:prod", "team:a", "team:b", "team:a"]},
+  {"metric": "legacy.unspecified", "points": [[1799999990, 3]], "type": "", "host": "web-1", "tags": ["_logit.datadog.type:rate", "env:prod"]}
+]}

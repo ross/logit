@@ -1,0 +1,4 @@
+# The Datadog Agent's own datadog.agent.up check on /api/v1/check_run, JSON and zstd, read in
+# place from testdata/interop/ with its .headers.
+wire: ../../../../testdata/interop/datadog/agent-api-v1-check-run-001.bin
+exercises: [service_check, zstd]

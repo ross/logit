@@ -1,0 +1,3 @@
+method: POST
+path: /api/v1/distribution_points
+content-type: application/json

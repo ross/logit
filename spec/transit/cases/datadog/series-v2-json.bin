@@ -1,0 +1,8 @@
+{"series": [
+  {"metric": "app.jobs", "type": 1, "interval": 10, "points": [{"timestamp": 1799999990, "value": 4}], "resources": [{"type": "host", "name": "worker-2"}, {"type": "device", "name": "sdb"}, {"type": "db", "name": "users"}], "tags": ["env:prod", "service:jobs"], "unit": "job", "metadata": {"origin": {"product": 10, "service": 3, "metric_type": 2}}},
+  {"metric": "app.jobs.per_s", "type": 2, "interval": 10, "points": [{"timestamp": 1799999990, "value": 0.4}], "resources": [{"type": "host", "name": "worker-2"}], "tags": ["env:prod"]},
+  {"metric": "app.heap", "type": 3, "points": [{"timestamp": 1799999990, "value": 1048576.5}], "resources": [{"type": "host", "name": "worker-2"}], "source_type_name": "jvm", "unit": "byte", "tags": ["env:prod"]},
+  {"metric": "app.temperature", "type": 3, "points": [{"timestamp": 1799999990, "value": -4.25}], "resources": [{"type": "host", "name": "worker-2"}], "tags": ["env:prod"]},
+  {"metric": "app.unspecified", "type": 0, "points": [{"timestamp": 1799999990, "value": 2}], "resources": [{"type": "host", "name": ""}], "tags": ["env:prod"]},
+  {"metric": "app.late", "type": 3, "points": [{"value": 5}], "resources": [{"type": "host", "name": "worker-2"}], "tags": ["env:prod"]}
+]}
