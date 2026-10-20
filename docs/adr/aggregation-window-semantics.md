@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-10-18
+updated: 2026-10-19
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -538,6 +538,8 @@ contract.
 ### Series identity
 
 **A series is `(name, unit, attribute set)`, compared structurally, not by IEEE-754 `==`.**
+The attribute set leaves out InfluxDB string fields (`_logit.influxdb.field.*`); see
+"Amendment: InfluxDB string fields aren't series identity (2026-10-19)" below.
 `SeriesKey`'s `PartialEq` and `Hash` walk the attribute set through `value_key_eq` and
 `hash_value`, and the rules are:
 
@@ -861,3 +863,21 @@ The cumulative-mode amendment's "Who needs it" says `prometheus_out` skips a del
 `Histogram`. It's counted as loss, `logit.output.metrics.dropped{reason="unresolved_delta"}`,
 because a config with a cumulative `aggregate` upstream would have delivered it
 ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)).
+
+## Amendment: InfluxDB string fields aren't series identity (2026-10-19)
+
+`aggregate` leaves every `_logit.influxdb.field.*` attribute out of a series' key and out of what
+it flushes. Every other attribute, private ones included, stays in the key.
+
+[ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)'s "Amendment: string fields
+are private (2026-10-19)" made a string field a private attribute that only `influxdb_out` among
+the protocol sinks writes. Keyed on it, two readings of one InfluxDB series that differ only in a
+string, such as Telegraf's `system` measurement with its changing `uptime_format`, became two
+series. Every other protocol sink then wrote both with identical labels, so they overwrote each
+other at the destination. A string field isn't series identity at InfluxDB either: it's a field
+of the point, and an aggregate summarizes numbers, so the flushed series drops it.
+
+The exception is limited to that prefix. `_logit.influxdb.measurement`, the statsd type, the
+collectd plugin and type, and the Datadog type and stats dimensions are identity that a sink reads
+after this stage, so they stay in the key and the output. A record that passes through unmerged
+keeps its event's attributes, string fields included.

@@ -50,6 +50,14 @@
 //! An incoming *cumulative* `Sum` passes through in both modes: re-summing a running total would
 //! double-count it. `docs/adr/prometheus-scrape-and-exposition.md` covers the consumer that needs
 //! this mode (`prometheus_out` drops delta records).
+//!
+//! # Series identity
+//!
+//! A series is its record's name and unit and its event's attributes, minus InfluxDB string
+//! fields (`_logit.influxdb.field.*`, [`string_field_keys`]), which a flushed series doesn't
+//! carry either. Every other private attribute is identity and stays. A record that passes
+//! through keeps its event's attributes whole. The ADR's "Amendment: InfluxDB string fields aren't
+//! series identity (2026-10-19)" has the reasoning.
 
 use bytes::Bytes;
 use logit_core::interner::Symbol;
@@ -58,6 +66,7 @@ use logit_core::{
     SpanLink, Sum, Telemetry, Temporality, Value,
 };
 use logit_pipeline::{FlushOutput, TraceContext, Transform};
+use logit_proto::influxdb::FIELD_ATTR_PREFIX;
 use smallvec::SmallVec;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -672,6 +681,9 @@ impl Aggregator {
         // Only `group_for` pushes to `groups` and nothing in the loop removes one, so it stays
         // valid for the whole call.
         let mut group_index: Option<usize> = None;
+        // Found once per event, and empty unless an InfluxDB point carries a string field, so an
+        // event without one clones its attributes into each key as before.
+        let string_fields = string_field_keys(&event.attributes);
         for record in metrics {
             // An OTLP `NO_RECORDED_VALUE` record has no reading to fold in; its default numeric
             // payload would count as a real sample (`MetricRecord::flags`'s doc).
@@ -705,11 +717,11 @@ impl Aggregator {
                 continue;
             }
 
-            let key = SeriesKey {
-                name: record.name,
-                unit: record.unit,
-                attributes: event.attributes.clone(),
-            };
+            let mut attributes = event.attributes.clone();
+            for &key in &string_fields {
+                attributes.remove_sym(key);
+            }
+            let key = SeriesKey { name: record.name, unit: record.unit, attributes };
             let open_seq = self.next_open_seq;
             let gi = match group_index {
                 Some(gi) => gi,
@@ -1353,6 +1365,21 @@ fn record_temporality(temporality: AggregateTemporality) -> Temporality {
         AggregateTemporality::Delta => Temporality::Delta,
         AggregateTemporality::Cumulative => Temporality::Cumulative,
     }
+}
+
+/// The event's InfluxDB string-field attributes (`_logit.influxdb.field.*`), which a series key
+/// leaves out: a string field isn't series identity at InfluxDB, where it's a field of the point,
+/// and an aggregate summarizes numbers. Keyed on them, two readings of one series that differ only
+/// in a string such as Telegraf's `uptime_format` would flush as two series that every sink renders
+/// with the same labels, since every protocol sink but `influxdb_out` leaves a string field off. Every other
+/// private key stays in the key: `_logit.influxdb.measurement` and other protocols' carriers are
+/// identity that a sink reads after this stage.
+fn string_field_keys(attributes: &AttrMap) -> SmallVec<[Symbol; 4]> {
+    attributes
+        .iter()
+        .map(|(key, _)| key)
+        .filter(|&key| logit_core::interner::resolve(key).starts_with(FIELD_ATTR_PREFIX))
+        .collect()
 }
 
 /// A metric series' identity: name, unit, and attribute set.
@@ -2183,6 +2210,34 @@ mod tests {
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
         assert_eq!(events.len(), 2, "different tag values should be different series");
+    }
+
+    /// Two readings of one InfluxDB series that differ only in a string field are one series: the
+    /// string field is left out of the key and the output, and every other private key stays.
+    #[test]
+    fn an_influxdb_string_field_is_not_series_identity() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        for (value, uptime, at) in [(1.0, "1 day", 10), (2.0, "2 days", 20)] {
+            let mut event = metric_event("system.uptime", MetricKind::gauge(value), at);
+            event.attributes.insert("host", "a");
+            event.attributes.insert("_logit.influxdb.measurement", "system");
+            event.attributes.insert("_logit.influxdb.field.uptime_format", uptime);
+            feed(&mut agg, &resource, event);
+        }
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        assert_eq!(events.len(), 1, "a string field shouldn't split the series");
+        assert_eq!(*kind_of(&events[0]), MetricKind::gauge(2.0), "the later reading wins");
+        let attributes = &events[0].attributes;
+        assert_eq!(attributes.get("_logit.influxdb.field.uptime_format"), None);
+        assert_eq!(attributes.get("host").and_then(Value::as_str), Some("a"));
+        assert_eq!(
+            attributes.get("_logit.influxdb.measurement").and_then(Value::as_str),
+            Some("system"),
+            "the measurement carrier is identity and stays"
+        );
     }
 
     /// Identical `Value::Array` tags (a repeated DogStatsD tag key) fold into one series.

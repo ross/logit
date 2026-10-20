@@ -451,7 +451,7 @@ Per pair:
   `_logit.influxdb.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as
   `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. `influxdb_out` writes
   each batch there unless its own `bucket:` or `org:` overrides the matching carrier. The presence of `_logit.influxdb.measurement` selects the carrier path on
-  `influxdb_out`. Every other sink ignores the private carriers, string fields included, since a
+  `influxdb_out`. Every other protocol sink ignores the private carriers, string fields included, since a
   free-text value as a tag or label starts a series per value; a `keep` under its default
   `private: drop` strips them too. A tag key under `_logit.` is omitted, counted. `influxdb_in` parses the whole body before building any
   event, so a bad line delivers nothing and the whole request is one batch, delivered all or

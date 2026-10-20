@@ -13,8 +13,9 @@ unless its config fixes them, and reads a `403` or `404` about a carried bucket 
 Amended the same day by "Amendment: `influxdb_out`'s `default_org:` (2026-10-15)", which gives a
 batch that carries no org a configured fallback.
 Amended on 2026-10-19 by "Amendment: string fields are private (2026-10-19)": a string field
-rides as `_logit.influxdb.field.<key>`, so only `influxdb_out` writes it. The sections above that
-amendment describe the amended form.
+rides as `_logit.influxdb.field.<key>`, so `influxdb_out` is the only protocol sink that writes
+it, and `aggregate` leaves it out of a series. The sections above that amendment describe the
+amended form.
 
 ## Context
 
@@ -638,9 +639,10 @@ carried mode; `default_org:` is now the setting for that case, and `org:` stays 
 ## Amendment: string fields are private (2026-10-19)
 
 A string field decodes to the private attribute `_logit.influxdb.field.<key>`, so `influxdb_out`
-is the only sink that writes it. Every other sink leaves it off its wire, uncounted, under
-[ADR `private-attribute-namespace`](private-attribute-namespace.md)'s ignore rule, as it does the
-measurement, org, and bucket carriers.
+is the only protocol sink that writes it. Every other protocol sink leaves it off its wire,
+uncounted, under [ADR `private-attribute-namespace`](private-attribute-namespace.md)'s ignore
+rule, as it does the measurement, org, and bucket carriers. The renders of a whole event carry it,
+as they carry every private key: `stdio_out` and `file_out` in every format, `kafka_out` under `json`, `msgpack`, and `native`, `logit_out`, and a `buffer.disk:` spool.
 
 ### Why
 
@@ -665,8 +667,14 @@ Any other sink that wants one needs an explicit choice, so the default is to lea
   `lua` stage that copies one to a public attribute sends it to other sinks.
 - A `keep` under its default `private: drop` strips string fields along with the measurement
   carrier. A `keep` ahead of `influxdb_out` needs `private: keep` to keep them.
-- `aggregate` still keys series on private keys, so a string field upstream of `aggregate` still
-  splits its series there; only the sink's rendering changes.
+- `aggregate` leaves string fields out of a series' key and out of what it flushes. Keyed on
+  them, two readings of one series that differ only in a string, such as Telegraf's
+  `uptime_format`, would flush as two series that every other protocol sink writes with the same
+  labels, so one overwrites the other. A string field isn't series identity at InfluxDB, and an
+  aggregate summarizes numbers. Only this prefix is left out; other private keys, the measurement
+  carrier included, are identity a sink reads after `aggregate`
+  ([ADR `aggregation-window-semantics`](aggregation-window-semantics.md)'s 2026-10-19
+  amendment).
 - There's no alias and no decode path for the old public key, because `logit` is pre-release.
 
 ### The reserved tag prefix

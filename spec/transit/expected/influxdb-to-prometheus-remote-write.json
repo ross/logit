@@ -53,6 +53,10 @@
   "string-field": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"deploy_count","kind":"gauge","value":1.0}],"attributes":{"host":"web-01"}}
   ], "counters": {}},
+  "string-field-series": {"events": [
+    {"timestamp":"2027-01-15T07:59:40.000000000Z","metrics":[{"name":"system_uptime","kind":"gauge","value":3600.0}],"attributes":{"host":"web-01"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"system_uptime","kind":"gauge","value":3610.0}],"attributes":{"host":"web-01"}}
+  ], "counters": {}},
   "tags": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http_requests","kind":"gauge","value":5.0}],"attributes":{"host":"web-01","method":"GET","status":"200"}}
   ], "counters": {}},

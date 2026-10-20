@@ -56,10 +56,13 @@
 //!
 //! The measurement, the string fields, and the three resource attributes are private carriers
 //! under `_logit.influxdb.`
-//! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)), so
-//! only `influxdb_out` writes them and every other sink leaves them off its wire, uncounted. A
-//! string field's value is free text, and as a tag or label at another sink each distinct value
-//! would start a series. Lua and transforms still read a string field by its full key.
+//! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)).
+//! Among the protocol sinks only `influxdb_out` writes them, and every other one leaves them off
+//! its wire, uncounted; the renders of a whole event (`stdio_out` and `file_out` in every format,
+//! `kafka_out` under `json`, `msgpack`, and `native`, `logit_out`, and a `buffer.disk:` spool)
+//! carry them, as they carry every private key. A string field's value is free text, and as a tag
+//! or label at another sink each distinct value would start a series. Lua and transforms still
+//! read a string field by its full key, and `aggregate` leaves it out of a series.
 //!
 //! A sender's tag never becomes a carrier or a string field, because every key under `_logit.` is
 //! private to `logit`. Any other tag, one under `influxdb.` or `influxdb.field.` included, is an
@@ -260,8 +263,8 @@ pub use line::LineError;
 /// cross-protocol egress keeps the measurement in the record name (`<measurement>.<field>`).
 pub const ATTR_MEASUREMENT: &str = "_logit.influxdb.measurement";
 /// A string field rides as `_logit.influxdb.field.<key>` (`Value::Str`); strings are not metrics.
-/// The key is private, so the decoder refuses a tag under it and no sink writes one as a tag, and
-/// a tag and a string field can't trade places.
+/// The key is private, so the decoder refuses a tag under it and no protocol sink writes one as a
+/// tag, and a tag and a string field can't trade places.
 pub const FIELD_ATTR_PREFIX: &str = "_logit.influxdb.field.";
 pub const RESOURCE_ATTR_ORG: &str = "_logit.influxdb.org";
 pub const RESOURCE_ATTR_ORG_ID: &str = "_logit.influxdb.org_id";

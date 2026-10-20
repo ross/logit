@@ -1,0 +1,4 @@
+# Two points of one series whose string field differs, as Telegraf's `system` measurement
+# sends `uptime_format`, so an `aggregate` downstream has one series to fold them into.
+wire: string-field-series.lp
+exercises: [measurement, tags, string_field, integer_field, multi_field, carriers]

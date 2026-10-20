@@ -2463,6 +2463,9 @@ pub enum ComponentKind {
     },
     /// The windowed aggregator (counters, gauges, sets, distributions). Flushes every `interval`;
     /// `0s` is rejected.
+    ///
+    /// A series is a metric's name, unit, and attributes. InfluxDB string fields are the
+    /// exception: they don't split a series, and an aggregated series doesn't carry them.
     Aggregate {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
@@ -3013,8 +3016,9 @@ pub enum ComponentKind {
     /// Parses a log message as InfluxDB line protocol and emits one event per point, in the shape
     /// `influxdb_in` gives one: the measurement as `_logit.influxdb.measurement`, tags as
     /// attributes, each numeric or boolean field as a gauge named `<measurement>.<field>`, and
-    /// each string field as the attribute `_logit.influxdb.field.<key>`, which only `influxdb_out`
-    /// writes. Points in one message with the same measurement, tag set, and timestamp merge into
+    /// each string field as the attribute `_logit.influxdb.field.<key>`, which `influxdb_out`
+    /// writes and every other protocol sink leaves off. `stdio_out`, `file_out`, `kafka_out` under
+    /// `json`, `msgpack`, or `native`, and `logit_out` carry it with the rest of the event. Points in one message with the same measurement, tag set, and timestamp merge into
     /// one event.
     ///
     /// Each point's event starts from a copy of the parent's attributes, with the point's own

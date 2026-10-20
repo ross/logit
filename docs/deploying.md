@@ -3244,8 +3244,9 @@ pipeline didn't take the body within 5 seconds and nothing of it was taken, coun
 attribute `_logit.influxdb.measurement` naming the measurement. Each numeric or boolean field
 becomes a gauge named `MEASUREMENT.FIELD`, and each string field the private attribute
 `_logit.influxdb.field.FIELD`. `org`, `orgID`, and `bucket` become the private resource
-attributes `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. No sink
-but `influxdb_out` writes a `_logit.influxdb.` attribute, and none writes one as a tag or label.
+attributes `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. No
+protocol sink but `influxdb_out` writes a `_logit.influxdb.` attribute, and none writes one as a
+tag or label.
 `crates/logit-proto/src/influxdb/mod.rs`'s module doc has the mapping table.
 
 **Relaying to the client's bucket.** An `influxdb_out` with no `bucket:` writes each batch to the
@@ -3292,10 +3293,13 @@ choosing the carried form, know what it costs:
 `influxdb-line-protocol-relay`](adr/influxdb-line-protocol-relay.md)'s 2026-10-15 amendment has
 the reasoning.
 
-**String fields reach `influxdb_out` alone.** Every other sink leaves a string field off,
-uncounted, because its free-text value as a tag or label would start a series per value. A `keep`
-with its default `private: drop` strips string fields too, so set `private: keep` on a `keep`
-ahead of `influxdb_out`. To send one elsewhere, copy it to a public attribute in a `lua` stage.
+**String fields reach `influxdb_out` alone among the protocol sinks.** Every other protocol sink
+leaves a string field off, uncounted, because its free-text value as a tag or label would start a
+series per value. Sinks that write the whole event keep it, as they keep every private
+attribute: `stdio_out` and `file_out` in every format, `kafka_out` under `json`, `msgpack`, and `native`, `logit_out`, and a `buffer.disk:` spool. A `keep` with its default `private: drop` strips string fields
+too, so set `private: keep` on a `keep` ahead of `influxdb_out`. An `aggregate` leaves them out
+of the series it flushes, so two readings that differ only in a string field are one series. To
+send one elsewhere, copy it to a public attribute in a `lua` stage.
 
 **A destination fault never reaches the producer.** `influxdb_in` answers `204` once the batch is
 in every downstream inbox, before `influxdb_out` writes it. A `422` for a field type conflict
