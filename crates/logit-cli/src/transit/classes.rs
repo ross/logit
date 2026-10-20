@@ -93,9 +93,11 @@
 //! A `when:` key that names no field of the sink's serialized config fails, naming the row, the
 //! cell, and the key: a misspelled key would otherwise never match.
 //!
-//! **Across the whole run** ([`Ledger`]), every `normalized` or `lost` cell some record reached
-//! must be observed at its class at least once, so a bound can't hide an improvement forever, and
-//! `coverage.md` lists every cell no record was checked against.
+//! **Across every flow** ([`Ledger`]), every `normalized` or `lost` cell some record reached must
+//! be observed at its class at least once, so a bound can't hide an improvement forever, and
+//! `coverage.md` lists every cell no record was checked against. Each flow's test writes what its
+//! runs fed the ledger as a [`Fragment`], and the spec's `ledger` test merges the committed
+//! fragments to run these checks (`super::spec`'s module doc).
 
 use super::mapping::{self, Class, Lookup, Mapping, Series};
 use super::Traced;
@@ -103,6 +105,7 @@ use logit_core::EventBatch;
 use logit_outputs::ndjson::render_ndjson;
 use logit_proto::influxdb::ATTR_MEASUREMENT;
 use logit_proto::prometheus::{sanitize_label_name, sanitize_metric_name};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -944,31 +947,47 @@ pub(super) struct At<'a> {
     pub case: &'a str,
 }
 
-/// What the whole run has seen of each bound cell (module doc).
+/// What the checked runs have seen of each cell (module doc).
 #[derive(Default)]
 pub(super) struct Ledger {
-    /// `(sink, row, cell index)` to the cell's class and the classes observed under it.
-    cells: BTreeMap<(String, String, usize), (Class, BTreeSet<Class>)>,
-    /// Rows a sink has no cell in yet, and the cases that reached them.
+    /// Every `(sink, row, cell index)` some record was checked against, and the classes observed
+    /// under it, empty for a cell reached with no class observed.
+    cells: BTreeMap<(String, String, usize), BTreeSet<Class>>,
+    /// Rows a sink has no cell in yet, and the runs that reached them.
     unspecified: BTreeMap<(String, String), BTreeSet<String>>,
-    /// Every `(sink, row, cell index)` some record was checked against.
-    reached: BTreeSet<(String, String, usize)>,
 }
 
 impl Ledger {
-    fn saw(&mut self, sink: &str, row: &str, index: usize, cell: Class, observed: Class) {
-        self.reached.insert((sink.to_string(), row.to_string(), index));
-        let entry = self
-            .cells
-            .entry((sink.to_string(), row.to_string(), index))
-            .or_insert_with(|| (cell, BTreeSet::new()));
-        entry.1.insert(observed);
+    fn reach(&mut self, sink: &str, row: &str, index: usize) -> &mut BTreeSet<Class> {
+        self.cells.entry((sink.to_string(), row.to_string(), index)).or_default()
     }
 
-    /// One failure per bound cell never observed at its class.
-    pub(super) fn finish(&self) -> Vec<String> {
+    fn saw(&mut self, sink: &str, row: &str, index: usize, observed: Class) {
+        self.reach(sink, row, index).insert(observed);
+    }
+
+    /// One failure per `normalized` or `lost` cell of `mapping` observed, but never at its class,
+    /// and one per cell the ledger names that `mapping` doesn't have.
+    pub(super) fn finish(&self, mapping: &Mapping) -> Vec<String> {
+        let classes: BTreeMap<(String, String, usize), Class> = mapping
+            .cells()
+            .into_iter()
+            .map(|(sink, row, index, cell)| ((sink, row, index), cell.class))
+            .collect();
         let mut failures = Vec::new();
-        for ((sink, row, index), (class, observed)) in &self.cells {
+        for (key, observed) in &self.cells {
+            let (sink, row, index) = key;
+            let Some(class) = classes.get(key) else {
+                failures.push(format!(
+                    "mapping row {row}, {sink} cell {index}: a ledger file names the cell, which \
+                     mapping.yaml doesn't have; the ledger file is stale"
+                ));
+                continue;
+            };
+            // A cell reached with no class observed was compared through another cell.
+            if observed.is_empty() {
+                continue;
+            }
             if matches!(class, Class::Normalized | Class::Lost) && !observed.contains(class) {
                 let observed: Vec<&str> = observed.iter().map(|c| c.as_str()).collect();
                 failures.push(format!(
@@ -989,7 +1008,7 @@ impl Ledger {
     ) -> BTreeMap<String, Vec<(String, usize, String)>> {
         let mut out: BTreeMap<String, Vec<(String, usize, String)>> = BTreeMap::new();
         for (sink, row, index, cell) in mapping.cells() {
-            if !self.reached.contains(&(sink.clone(), row.clone(), index)) {
+            if !self.cells.contains_key(&(sink.clone(), row.clone(), index)) {
                 let when = if cell.when.is_empty() {
                     "otherwise".to_string()
                 } else {
@@ -1010,6 +1029,89 @@ impl Ledger {
                 format!("{sink} has no cell for row {row} yet (reached by {})", cases.join(", "))
             })
             .collect()
+    }
+
+    /// What this ledger holds, sorted, as a ledger file stores it.
+    pub(super) fn fragment(&self) -> Fragment {
+        let cells = self
+            .cells
+            .iter()
+            .map(|((sink, row, cell), observed)| FragmentCell {
+                sink: sink.clone(),
+                row: row.clone(),
+                cell: *cell,
+                observed: observed.iter().copied().collect(),
+            })
+            .collect();
+        let unspecified = self
+            .unspecified
+            .iter()
+            .map(|((sink, row), runs)| FragmentRow {
+                sink: sink.clone(),
+                row: row.clone(),
+                reached_by: runs.iter().cloned().collect(),
+            })
+            .collect();
+        Fragment { cells, unspecified }
+    }
+
+    /// Adds what `fragment` saw to what this ledger has seen.
+    pub(super) fn merge(&mut self, fragment: Fragment) {
+        for cell in fragment.cells {
+            self.reach(&cell.sink, &cell.row, cell.cell).extend(cell.observed);
+        }
+        for row in fragment.unspecified {
+            self.unspecified.entry((row.sink, row.row)).or_default().extend(row.reached_by);
+        }
+    }
+}
+
+/// What one flow's runs fed a [`Ledger`], as `spec/transit/ledger/<flow>.json` holds it. It stores
+/// no cell's class, which the merged ledger takes from the current table.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Fragment {
+    cells: Vec<FragmentCell>,
+    unspecified: Vec<FragmentRow>,
+}
+
+/// A cell some record was checked against, and the classes observed under it.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FragmentCell {
+    sink: String,
+    row: String,
+    cell: usize,
+    observed: Vec<Class>,
+}
+
+/// A row a sink has no cell in yet, and the runs (`<flow> × <case>`) that reached it.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FragmentRow {
+    sink: String,
+    row: String,
+    reached_by: Vec<String>,
+}
+
+impl Fragment {
+    /// The ledger file's text: one entry per line, so a diff names the cell that changed.
+    pub(super) fn render(&self) -> String {
+        fn list<T: Serialize>(entries: &[T]) -> String {
+            if entries.is_empty() {
+                return "[]".to_string();
+            }
+            let lines: Vec<String> = entries
+                .iter()
+                .map(|e| format!("    {}", serde_json::to_string(e).expect("an entry serializes")))
+                .collect();
+            format!("[\n{}\n  ]", lines.join(",\n"))
+        }
+        format!(
+            "{{\n  \"cells\": {},\n  \"unspecified\": {}\n}}\n",
+            list(&self.cells),
+            list(&self.unspecified)
+        )
     }
 }
 
@@ -1080,7 +1182,7 @@ pub(super) fn check(
                         None => Class::Lost,
                     };
                     failures.extend(field_verdict(&here, input, &label, cell, seen, &did_move));
-                    ledger.saw(&sink, &label, index, cell.class, seen);
+                    ledger.saw(&sink, &label, index, seen);
                 }
             }
             continue;
@@ -1133,7 +1235,7 @@ pub(super) fn check(
             continue;
         }
         for (label, _, index) in &cells {
-            ledger.reached.insert((sink.clone(), label.clone(), *index));
+            ledger.reach(&sink, label, *index);
         }
         // A sink that tests the flag before the kind skips or stale-marks a flagged record without
         // reaching the kind's loss, so a counted loss cell whose counter didn't move doesn't
@@ -1219,7 +1321,7 @@ pub(super) fn check(
             continue;
         }
         if let Some((label, cell, index)) = deciding {
-            ledger.saw(&sink, label, *index, cell.class, observed);
+            ledger.saw(&sink, label, *index, observed);
             let loss = matches!(cell.class, Class::Degraded | Class::Skipped | Class::Dropped);
             if let (true, Some(counter)) = (loss && observed == cell.class, &cell.counter) {
                 if !did_move(counter) {
@@ -1236,7 +1338,7 @@ pub(super) fn check(
         for (label, cell, index) in &cells {
             if *label != deciding.map(|d| d.0.clone()).unwrap_or_default() && cell.class == observed
             {
-                ledger.saw(&sink, label, *index, cell.class, observed);
+                ledger.saw(&sink, label, *index, observed);
             }
         }
 
@@ -1287,7 +1389,7 @@ pub(super) fn check(
                 ));
                 continue;
             }
-            ledger.saw(&sink, &label, index, cell.class, seen);
+            ledger.saw(&sink, &label, index, seen);
             if let (Class::Lost, Class::Lost, Some(counter)) = (cell.class, seen, &cell.counter) {
                 if !did_move(counter) {
                     failures.push(format!(

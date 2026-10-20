@@ -3,8 +3,8 @@
 This directory states what each sink does with each metric kind it receives, and checks that
 statement against the code. A **case** is a batch of events as a source's listener produces them.
 A **flow** is a `logit` config that runs cases through stages into a sink. The **mapping table**,
-[`mapping.yaml`](mapping.yaml), gives every kind and feature a class per sink. A test runs every
-case through every flow, reads the sink's bytes back through its pair's decoder, pins the result,
+[`mapping.yaml`](mapping.yaml), gives every kind and feature a class per sink. A test per flow runs
+every case through the flow, reads the sink's bytes back through its pair's decoder, pins the result,
 and fails when the result disagrees with the table.
 
 The spec covers the codec layer: an encoder's bytes and the pair decoder's reading of them. It
@@ -35,21 +35,40 @@ key, a stale document, and a key no case has each fail naming the flow and the c
 | `cases/<system>/<case>.headers` | The request beside an HTTP wire file, one `name: value` per line as `testdata/interop/` records it: `path:` with an InfluxDB write's `org`, `orgID`, `bucket`, and `precision`, or a scrape's `content-type:` choosing its dialect |
 | `flows/<flow>.yaml` | A runnable config: `replay_in -> [stages] -> <sink>` |
 | `expected/<flow>.json` | Each case's run through the flow, keyed by case name: the events read back and the counters moved (generated) |
+| `ledger/<flow>.json` | What the flow's runs fed the checks across flows: each cell reached and the classes observed there, and each row a sink has no cell in yet with the runs that reached it (generated) |
 | `coverage.md` | Each system's features and the cases that exercise them, and each sink's cells no flow reaches (generated) |
 
 ## Running it
 
 The spec's generator and the docs renderer are ordinary tests, so `script/test` and CI run them.
+The generator is three kinds of test in `crates/logit-cli/src/transit/spec.rs`, so nextest runs
+the flows in parallel and a failure names its flow:
+
+- `transit::spec::cases` checks the case files, removes or reports a generated file no flow
+  produces, and fails when the list of flow tests doesn't match `flows/*.yaml`.
+- `transit::spec::flow::<flow>`, one per flow with `-` spelled `_`, runs the flow's cases, runs
+  the class check, and compares `expected/<flow>.json` and `ledger/<flow>.json`.
+- `transit::spec::ledger` merges every `ledger/<flow>.json` and runs the checks across flows
+  ("The class check" below), then compares `coverage.md`. It runs no flow.
+
+The checks across flows read the committed ledger files, not a live run. Each flow test fails
+when its ledger file is stale, so when every test passes, the merged files hold what one run of
+every flow would have seen.
+
 Four wrappers drive them:
 
 - `script/transit check` compares every generated file and docs region, and runs the class check.
 - `script/transit gen` rewrites every generated file and docs region, then runs the class check.
-  Review `git diff` and commit the result.
+  Review `git diff` and commit the result. Each kind of test reads what the one before it writes,
+  so `gen` runs `cases`, then every `flow::`, then `ledger` and the docs test, as three nextest
+  runs. A failing run doesn't stop the next, so one `gen` reports every failure and rewrites what
+  it can, then exits with the first failure; a failing `flow::` leaves `ledger` reading that
+  flow's committed file.
 - `script/transit docs` rewrites only the docs regions ("Generated docs" below).
 - `script/transit coverage` does what `gen` does, then prints `coverage.md`.
 
-`gen` writes a flow's expectations only after every case in the flow has run, and only when none
-of them failed the class check; one class failure leaves the flow's whole file untouched. A
+`gen` writes a flow's expectations and ledger file only after every case in the flow has run, and
+only when none of them failed the class check; one class failure leaves both files untouched. A
 failure means the code or the table is wrong, and a person decides which. A cell `coverage.md` lists as reached by no flow
 is one nothing checks: add a case or a flow that reaches it.
 
@@ -110,9 +129,9 @@ timestamps), then compares what it observed with the table. A record's expected 
 the record-level cells it reaches, and the observed class must equal it. A `normalized` cell also
 accepts `exact`, because a normalization touches only the shapes it names. A field may read back
 better than its cell, never worse. Every sink counter the run moved must be named by a cell the
-case reached, and a loss cell observed at its class must see its counter move. Across the whole
-run, every `normalized` or `lost` cell a record reached must be observed at that class at least
-once.
+case reached, and a loss cell observed at its class must see its counter move. Across every
+flow, every `normalized` or `lost` cell a record reached must be observed at that class at least
+once; the `ledger` test checks this from the flows' ledger files.
 
 `crates/logit-cli/src/transit/classes.rs`'s module doc has the rules in full: which rows a record
 reaches, how records pair, and what each failure message names.
@@ -211,8 +230,10 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
 
 Write `flows/<flow>.yaml` with one `replay_in` whose `path:` names a case, such as
 `../cases/statsd/mixed.json`. That case's directory is the flow's source, and every case in it runs
-through the flow; naming a real case keeps the flow runnable by hand with `logit run`. Then run
-`script/transit gen`, which writes `expected/<flow>.json`. `script/validate` and `every_shipped_config_loads_and_validates` load every
+through the flow; naming a real case keeps the flow runnable by hand with `logit run`. Add the
+flow to the `flow_tests!` list in `crates/logit-cli/src/transit/spec.rs`, since nothing runs a
+flow the list leaves out and the `cases` test fails naming it. Then run `script/transit gen`,
+which writes `expected/<flow>.json` and `ledger/<flow>.json`. `script/validate` and `every_shipped_config_loads_and_validates` load every
 flow.
 
 ## Adding a sink column
