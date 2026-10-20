@@ -48,6 +48,11 @@
   ], "counters": {
     "logit.output.metrics.dropped{component=out,kind=otlp_out,reason=unresolved_gauge_delta,role=sink}": 3
   }},
+  "host-name-tag": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"v2.1","observed_timestamp":"2027-01-15T08:00:01.000000000Z"},"attributes":{"host.name":"web-1"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"web-1"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.tagged","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-2","host.name":"web-1"}}
+  ], "counters": {}},
   "interop-dogstatsd-buffered": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.db.query.duration_ms","kind":"summary","count":1,"sum":0.33313615206930347,"quantiles":[{"quantile":0.5,"value":0.33313615206930347},{"quantile":0.75,"value":0.33313615206930347},{"quantile":0.9,"value":0.33313615206930347},{"quantile":0.95,"value":0.33313615206930347},{"quantile":0.99,"value":0.33313615206930347}]}],"attributes":{"db":"primary","env":"prod","host":"web-07","query":"select_user","region":"us-east-1","service":"checkout-api"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"summary","count":1,"sum":0.05,"quantiles":[{"quantile":0.5,"value":0.05},{"quantile":0.75,"value":0.05},{"quantile":0.9,"value":0.05},{"quantile":0.95,"value":0.05},{"quantile":0.99,"value":0.05}]}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},

@@ -141,7 +141,8 @@ records that reach it, and doesn't fail. The table's kinds, features, and rules 
 ## The class check
 
 For each flow and case, the check pairs every record that reached the sink with the records read
-back, reading names, attribute keys, and values as that sink writes them (`prometheus_out`'s
+back, reading names, attribute keys, and values as that sink writes them (`statsd_out`'s
+`host.name` and hostless mark read back as the DogStatsD `host`, `prometheus_out`'s
 sanitized names and `_total`, `influxdb_out`'s `<name>.value` field, `otlp_out`'s integer
 timestamps, `datadog_out`'s `host` tag read back as `host.name` and the attributes it writes from a
 record's own fields), then compares what it observed with the table. A record's expected class is the worst of

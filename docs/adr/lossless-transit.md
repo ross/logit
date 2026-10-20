@@ -355,3 +355,14 @@ reads back as two records. A statsd server counts the same distinct members eith
 a permitted normalization, the per-member form of "multi-value lines split", and it applies under
 both dialects. The transit spec's `set_members` row records it
 ([ADR `transit-spec`](transit-spec.md)).
+
+## Amendment: a DogStatsD `host.name:` tag relays as the `host:` tag (2026-10-19)
+
+Under `format: dogstatsd`, `statsd_out` writes a non-empty `host.name` as the `host:` tag on a line
+with no `host:` tag and no non-empty `h:` field, because a DogStatsD Agent takes a line's host
+from that tag. A `statsd_in -> statsd_out` relay therefore sends `#host.name:web-1` as
+`#host:web-1`. That's a permitted normalization of the pair: the sender named a host, and the
+relay sends it where the destination reads one. [ADR `statsd-output`](statsd-output.md)'s
+amendment of the same date records the decision, and the transit spec's `string_value` row the
+class.
+

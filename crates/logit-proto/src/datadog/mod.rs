@@ -174,7 +174,7 @@
 //! | `record/exemplars` | lost | uncounted | Datadog's intake has no exemplars; they aren't written or counted. |
 //! | `record/unit_on_distribution` | lost | uncounted | Distribution points and sketches have no unit field, so a `samples` or `distribution` record's unit is left off, uncounted; only the series routes write one. |
 //! | `record/sample_rate_unweighted` | lost | uncounted | A rate below 1 that rounds to weight 1, such as 0.8, writes each value once on the distribution route, which has no rate, so datadog_in reads it back at rate 1, uncounted. |
-//! | `attributes/string_value` | normalized | `host_tag` | A `key:value` tag. A `host` attribute on a metric, Datadog event, or service check with no `host.name` is the host and not a tag, which datadog_in reads back as `host.name`. |
+//! | `attributes/string_value` | normalized | `host_tag` | A `key:value` tag. A `host` attribute on a metric with no `host.name` is the host and not a tag, which datadog_in reads back as `host.name`. On a Datadog event or service check with no non-empty host carrier, `host.name`, else `host`, is the host and not a tag, which datadog_in reads back as that carrier. |
 //! | `attributes/bool_value` | lost | uncounted | `true` is a bare `key` tag, read back as `true`; `false` writes no tag at all, uncounted. |
 //! | `attributes/number_value` | normalized | `stringified` | A `key:<number>` tag, read back as a string. |
 //! | `attributes/array_value` | exact | -- | One tag per element in order, which datadog_in folds back into the same array. |

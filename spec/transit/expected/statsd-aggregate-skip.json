@@ -58,6 +58,13 @@
   ], "counters": {
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 5
   }},
+  "host-name-tag": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"v2.1"},"attributes":{"_logit.statsd.event.host":"","_logit.statsd.event.title":"deploy","host":"web-1"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host":"web-1"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests.tagged","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-2","host.name":"web-1"}}
+  ], "counters": {
+    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2
+  }},
   "interop-dogstatsd-buffered": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.container_id":"in-82046","endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.container_id":"in-82046","endpoint":"/healthz","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},

@@ -1,0 +1,3 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"web-1"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.tagged","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-2","host.name":"web-1"}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"v2.1"},"attributes":{"_logit.statsd.event.host":"","_logit.statsd.event.title":"deploy","host.name":"web-1"}}

@@ -45,6 +45,11 @@
   ], "counters": {
     "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_gauge_delta,role=sink}": 3
   }},
+  "host-name-tag": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"v2.1"},"attributes":{"_logit.statsd.event.host":"web-1","_logit.statsd.event.title":"deploy"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"web-1"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.tagged","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host":"web-2","host.name":"web-1"}}
+  ], "counters": {}},
   "interop-dogstatsd-buffered": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.db.query.duration_ms","kind":"samples","values":[0.33313615206930347],"sample_rate":1.0}],"attributes":{"db":"primary","env":"prod","host.name":"web-07","query":"select_user","region":"us-east-1","service":"checkout-api"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[0.05],"sample_rate":1.0}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},

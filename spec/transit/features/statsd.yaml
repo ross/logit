@@ -29,6 +29,10 @@
   text: >-
     A tag key or value holding a space, `@`, or another character the line grammar doesn't split
     a tag on, read as written.
+- name: tags_host_name
+  text: >-
+    A `host.name:` tag, which a DogStatsD Agent stores as an ordinary tag beside the host it takes
+    from a `host:` tag or stamps itself.
 - name: tags_repeated_key
   text: A tag key given more than once, folded into an array in wire order.
 - name: tags_duplicate
