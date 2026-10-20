@@ -147,7 +147,7 @@ left open:
   finding, as an unexplained record is.
 - **A bound passes an improvement once, not forever.** A `normalized` cell also accepts a record
   that reads back `exact`, since a normalization rewrites only the shapes it names, and a field
-  may read back better than its cell. Across the whole run, each such cell a record reached must
+  may read back better than its cell. Across every flow, each such cell a record reached must
   be observed at its own class at least once, so a fix that removes the normalization or the loss
   fails the check until the table follows.
 
@@ -196,3 +196,29 @@ Rendering the table into the docs settled what a region is and how much of a doc
 
 `crates/logit-cli/src/transit/docs.rs`'s module doc has the rules, and
 [`spec/transit/README.md`](../../spec/transit/README.md)'s "Generated docs" the reader's account.
+
+## Amendment: a test per flow, and committed ledger files (2026-10-19)
+
+The generator was one `#[test]` running every case through every flow, so nextest couldn't spread
+it across workers, and its time grew with cases times flows: 2.3 s at 8 flows and 5.0 s at 16 on
+a slow CI runner, past nextest's `slow-timeout`. It's now a test per flow, which spreads the work
+and names the failing flow, with two more tests beside them:
+
+- **`transit::spec::flow::<flow>`** runs one flow's cases, the class check, and the comparison of
+  `expected/<flow>.json`. A `macro_rules!` list names the flows; `transit::spec::cases` fails when
+  the list and `flows/*.yaml` differ, so a new flow can't go unrun. A build script that generated
+  the list was the alternative; it adds a build step for a list that changes once per flow.
+- **The checks across flows read committed files.** "Each `normalized` or `lost` cell observed at
+  its own class at least once" and `coverage.md`'s unreached cells need every flow's
+  observations, and nextest runs each test in its own process in no order. Each flow test
+  compares what its runs fed the check with `ledger/<flow>.json`, generated and committed beside
+  its expectations, and `transit::spec::ledger` merges those files and runs the checks with no
+  flow run. A file holds the observations, not the cells' classes, which `ledger` takes from the
+  current `mapping.yaml`. Since a flow test fails when its file is stale, every test passing means
+  the merged files equal what one run of every flow would have built. Recomputing every flow
+  inside `ledger` was the alternative; it would restore the single slow test.
+- **`gen` runs in three phases.** Under `TRANSIT_UPDATE=1` a flow reads the case files `cases`
+  rewrites, and `ledger` reads the files the flows rewrite, so `script/transit gen` runs `cases`,
+  then every flow, then `ledger` and the docs test, each as its own nextest run, running every
+  phase and every test even when one fails so one run reports every failure. `check` compares
+  only, so it runs everything at once.

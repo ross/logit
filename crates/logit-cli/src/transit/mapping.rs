@@ -57,7 +57,7 @@
 //!   the sink doesn't count, which the class check accepts for a record nothing reads back.
 
 use anyhow::{bail, ensure, Context};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -133,7 +133,7 @@ const KINDS: [(&str, &[&str]); 14] = [
 pub(super) const RECORD_FIELDS: [&str; 4] = ["unit", "description", "start_timestamp", "exemplars"];
 
 /// A cell's class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Class {
     Exact,
