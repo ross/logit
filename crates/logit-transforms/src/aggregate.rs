@@ -17,7 +17,9 @@
 //! infinite passes through too, so a total or a held gauge stays finite. So does every record on an
 //! event whose timestamp is its source's own, a DogStatsD `|T` line or a Prometheus sample with its
 //! own timestamp ([`SourceTimeKeys`]): it keeps that timestamp and its carriers instead of taking
-//! the flush time, as the Datadog Agent leaves a `|T` metric unaggregated. Every record is counted
+//! the flush time, as the Datadog Agent leaves a `|T` metric unaggregated. A Datadog APM stats
+//! group passes through whole too: it already summarizes its own time bucket, which a window would
+//! merge with other buckets and restamp. Every record is counted
 //! once, as `logit.transform.metrics.absorbed` or `logit.transform.metrics.passed_through{reason}`
 //! (see [`Tally`]).
 //!
@@ -70,6 +72,8 @@ use logit_core::{
 };
 use logit_pipeline::{FlushOutput, TraceContext, Transform};
 use logit_proto::datadog::events::ATTR_STATSD_TIMESTAMP;
+use logit_proto::datadog::is_datadog_stats_sym;
+use logit_proto::datadog::stats::ATTR_STATS_NAME;
 use logit_proto::influxdb::FIELD_ATTR_PREFIX;
 use logit_proto::prometheus::ATTR_TIMESTAMP as PROMETHEUS_ATTR_TIMESTAMP;
 use smallvec::SmallVec;
@@ -234,6 +238,9 @@ pub struct Aggregator {
     /// The carrier keys that mark an event's timestamp as the source's own, interned once so
     /// `process` compares symbols (see [`SourceTimeKeys`]).
     source_time: SourceTimeKeys,
+    /// `_logit.datadog.stats.name` interned, the marker [`is_datadog_stats_sym`] reads: a Datadog
+    /// APM stats group, which passes through as `bucketed`.
+    datadog_stats_name: Symbol,
     string_field_keys: StringFieldKeys,
 }
 
@@ -468,6 +475,7 @@ impl Opener<'_> {
 #[derive(Default)]
 struct Tally {
     absorbed: u32,
+    bucketed: u32,
     timestamped: u32,
     no_recorded_value: u32,
     no_merge_rule: u32,
@@ -484,6 +492,7 @@ impl Tally {
             telemetry.count("logit.transform.metrics.absorbed", f64::from(self.absorbed), &[]);
         }
         for (reason, n) in [
+            ("bucketed", self.bucketed),
             ("timestamped", self.timestamped),
             ("no_recorded_value", self.no_recorded_value),
             ("no_merge_rule", self.no_merge_rule),
@@ -611,6 +620,7 @@ impl Aggregator {
             window_start: None,
             next_open_seq: 0,
             source_time: SourceTimeKeys::new(),
+            datadog_stats_name: logit_core::interner::intern(ATTR_STATS_NAME),
             string_field_keys: StringFieldKeys::default(),
         }
     }
@@ -701,6 +711,16 @@ impl Aggregator {
     /// compare only where the hashes match.
     pub fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
         if event.metrics.is_empty() {
+            return true;
+        }
+
+        // A Datadog APM stats group summarizes its own time bucket, whose start is the event's
+        // timestamp and whose duration and grouping key ride as carriers. The series key has no
+        // timestamp, so two buckets would merge, and a flush would split the group into one
+        // event per record at the flush time, which `datadog_out` sends as that many groups.
+        if is_datadog_stats_sym(resource, event, self.datadog_stats_name) {
+            let bucketed = u32::try_from(event.metrics.len()).unwrap_or(u32::MAX);
+            Tally { bucketed, ..Tally::default() }.report(&self.telemetry);
             return true;
         }
 
@@ -4668,6 +4688,7 @@ mod tests {
         assert_eq!(passed_through(&events, "histogram_bounds_mismatch"), 1.0);
         assert_eq!(passed_through(&events, "non_finite"), 2.0);
         let reasons = [
+            "bucketed",
             "timestamped",
             "no_recorded_value",
             "no_merge_rule",
@@ -4746,6 +4767,47 @@ mod tests {
             event.attributes.insert(key, value);
             assert!(feed(&mut agg, &resource, event).is_none(), "{key}: absorbed");
             assert_eq!(passed_through(&registry.drain(0), "timestamped"), 0.0, "{key}");
+        }
+    }
+
+    /// A Datadog APM stats group, marked on the event or the resource, keeps its bucket start,
+    /// its records, and its carriers, opens no series, and counts each record `bucketed`. Two
+    /// buckets of one group would otherwise share a series key and merge.
+    #[test]
+    fn a_datadog_apm_stats_group_passes_through_untouched() {
+        let count = |v: u64| {
+            MetricKind::Sum(Sum {
+                value: MetricValue::U64(v),
+                temporality: Temporality::Delta,
+                monotonic: true,
+            })
+        };
+        for on_resource in [false, true] {
+            let mut resource = Resource::default();
+            let mut attrs = AttrMap::new();
+            attrs.insert("_logit.datadog.stats.bucket.duration", Value::U64(10_000_000_000));
+            if on_resource {
+                resource.attributes.insert("_logit.datadog.stats.name", "web.request");
+            } else {
+                attrs.insert("_logit.datadog.stats.name", "web.request");
+            }
+            let resource = Arc::new(resource);
+            let (mut agg, registry) = with_registry(cumulative_agg());
+            for start in [1_700_000_000_000_000_000, 1_700_000_010_000_000_000] {
+                let mut event = Event::metric(
+                    start,
+                    attrs.clone(),
+                    MetricRecord::new(intern("datadog.stats.hits"), count(3)),
+                );
+                event.metrics.push(MetricRecord::new(intern("datadog.stats.errors"), count(1)));
+                let original = event.clone();
+                let forwarded = feed(&mut agg, &resource, event).expect("nothing is absorbed");
+                assert_eq!(forwarded, original, "on the resource: {on_resource}");
+            }
+            assert!(flush_events(&mut agg, 1_800_000_000_000_000_000).is_empty());
+            let events = registry.drain(0);
+            assert_eq!(passed_through(&events, "bucketed"), 4.0, "on the resource: {on_resource}");
+            assert_eq!(absorbed(&events), 0.0);
         }
     }
 

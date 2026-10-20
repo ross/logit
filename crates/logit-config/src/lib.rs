@@ -2469,7 +2469,8 @@ pub enum ComponentKind {
     ///
     /// A metric that carries its own source timestamp, a DogStatsD `|T` line or a Prometheus
     /// exposition sample with a timestamp, passes through unaggregated and keeps that timestamp.
-    /// So does a counter increment, gauge, or gauge adjustment whose value is NaN or infinite.
+    /// So does a Datadog APM stats group, which already summarizes its own time bucket, and a
+    /// counter increment, gauge, or gauge adjustment whose value is NaN or infinite.
     /// Neither is dropped.
     Aggregate {
         #[serde(with = "humantime_serde_duration")]

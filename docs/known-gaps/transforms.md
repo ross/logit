@@ -124,6 +124,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
   so they merge and take the flush time.
   - **Workaround:** to summarize a timestamped point anyway, `remove` its
     `_logit.statsd.timestamp` or `_logit.prometheus.timestamp` attribute ahead of `aggregate`.
+- **A `keep` ahead of `aggregate` turns Datadog APM stats into ordinary metrics.** `aggregate`
+  passes a stats group through whole (`passed_through{reason="bucketed"}`), detected by its
+  `_logit.datadog.stats.name` marker. `keep` drops `_logit.*` attributes unless `private: keep`
+  is set, so the marker goes, the groups merge across buckets, and no stats route sends them.
+  - **Workaround:** set `private: keep` on that `keep`.
 - **Nothing bounds how many series one window holds.** `max_retained_series` caps only what
   survives a flush. Within a window every distinct `(name, unit, attribute set)` opens a series,
   and memory grows with that count until the flush drains it.

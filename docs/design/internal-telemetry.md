@@ -1567,6 +1567,7 @@ ordinary consumer.
 | `logit.transform.samples.weight_clamped` | count | a record's sample rate implied more than `Samples::MAX_WEIGHT` observations per value (`Samples::is_clamped`), counted when its weight is applied: on absorb into a sketch, or when a raw `distributions: samples` series falls back |
 | `logit.transform.samples.omitted{reason="non_finite"}` | count | `NaN` or infinite `Samples` values left out of a sketch, since they have no bin; the record's other values still merge |
 | `logit.transform.metrics.absorbed` | count | metric records merged into a series. With `.passed_through` it accounts for every record `process` receives: `metrics_in == absorbed + passed_through` summed over every reason |
+| `logit.transform.metrics.passed_through{reason="bucketed"}` | count | a record of a Datadog APM stats group (`_logit.datadog.stats.name` on the event or its resource), forwarded whole with its bucket start, duration, and grouping key, because it already summarizes its own time bucket |
 | `logit.transform.metrics.passed_through{reason="timestamped"}` | count | a record on an event that carries its source's own timestamp (`_logit.statsd.timestamp` from a DogStatsD `\|T` line, or `_logit.prometheus.timestamp` from a Prometheus sample with a timestamp), forwarded unmerged with that timestamp, whatever its kind |
 | `logit.transform.metrics.passed_through{reason="no_recorded_value"}` | count | an OTLP `NO_RECORDED_VALUE`-flagged record forwarded unmerged, because it has no reading to fold into a series |
 | `logit.transform.metrics.passed_through{reason="no_merge_rule"}` | count | a record of a kind this stage doesn't merge, forwarded: a cumulative `Sum`, an `ExponentialHistogram`, a `Summary`, and a `Histogram` outside `temporality: cumulative` or already cumulative |
@@ -1591,7 +1592,7 @@ untouched); `histogram_bounds_mismatch` (a histogram whose bucket bounds differ 
 accumulating series', also forwarded untouched, under its own key so an operator knows it's a
 producer that re-bucketed rather than two kinds colliding); `sum_non_finite` (a delta `Sum`
 whose value is `NaN` or infinite, forwarded untouched); and `gauge_non_finite` (the same for a
-`Gauge` or `GaugeDelta`). A timestamped record has no diagnostic: it's the configured behavior,
+`Gauge` or `GaugeDelta`). A bucketed or timestamped record has no diagnostic: it's the configured behavior,
 not a fault.
 
 ##### `kv_metrics`

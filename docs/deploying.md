@@ -2576,7 +2576,12 @@ sample or set member doesn't share (see
 ## Metrics `aggregate` doesn't merge
 
 `aggregate` forwards some metrics unmerged instead of dropping them, each counted under
-`logit.transform.metrics.passed_through{reason}`. Two reasons depend on what a producer sends:
+`logit.transform.metrics.passed_through{reason}`. Three reasons depend on what a producer sends:
+
+- **`bucketed`**: a Datadog APM stats group passes through whole, with its bucket's start,
+  duration, and grouping key, because it already summarizes its own time bucket. A `keep` ahead of
+  `aggregate` needs `private: keep`, or it removes the `_logit.datadog.stats.name` marker and the
+  stats merge as ordinary metrics that no stats route sends.
 
 - **`timestamped`**: a metric that carries its own source timestamp, a DogStatsD `|T` line (or a
   service check's `d:`) or a Prometheus exposition sample with a timestamp, passes through with
