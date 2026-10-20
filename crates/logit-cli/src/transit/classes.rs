@@ -35,7 +35,8 @@
 //! `_logit.statsd.event.title`, else `log/plain`, and its attribute rows; a span there reaches
 //! `span/alone`, and also `span/no_wire_form` when it carries a field a Datadog span has no form
 //! for. A record reaches an `attributes` field row for each attribute [`derived`] lists, at every
-//! sink: a sink that writes none reads it `exact` when nothing stands in its place. A log or span
+//! sink that compares the record; a sink that writes none reads it `exact` when nothing stands in
+//! its place. A log or span
 //! on an event that carries metrics is a field of that event: it
 //! reaches `log/beside_metrics` or `span/beside_metrics` alone, read as `exact` when it pairs
 //! unchanged, `normalized` when it pairs changed, and `lost` when nothing read back pairs with
@@ -397,8 +398,8 @@ impl Spelling {
 
 /// The attributes `datadog_out` writes from `rec`'s own fields, which `datadog_in` reads back as
 /// attributes `rec` lacks: each one's `attributes` field row, key, and value as text. Every sink
-/// reaches the rows, chosen from the record alone; only [`Spelling::derived`] predicts the values
-/// (`logit_proto::datadog`'s encode tables):
+/// that compares the record reaches the rows, chosen from the record alone; only
+/// [`Spelling::derived`] predicts the values (`logit_proto::datadog`'s encode tables):
 ///
 /// - `no_host`: the run's hostname, on a record but a span that carries no host and no hostless
 ///   mark (the encoder's default host), under the key `datadog_in` reads the route's host back as

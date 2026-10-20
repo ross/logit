@@ -100,13 +100,12 @@ Where a sink's outcome depends on the record's kind, the kind is in the feature'
 `when:` key names sink config only: `no_recorded_value` is a flagged cumulative `sum` or
 `gauge`, `no_recorded_value_delta_sum` a flagged delta `sum`, and `exemplars_on_summary` a
 summary's exemplars, and `unit_on_distribution` a `samples` or `distribution` record's unit. Some
-rows name a shape one sink treats apart, and every sink reaches them: `record/sample_rate` (a
+rows name a shape one sink treats apart, and every sink that compares the record reaches them: `record/sample_rate` (a
 `samples` record whose rate rounds to a weight above 1) and `record/sample_rate_unweighted` (a
 rate below 1 that rounds to weight 1), `span/no_wire_form` (a span field a Datadog span has no
 form for), `attributes/datadog_carrier_log` (a `_logit.datadog.*` carrier on a log, a Datadog
 event, or a service check), and the attributes `datadog_out` writes from a record's own fields,
-`attributes/no_host`, `log_status`, `span_kind`, and `trace_id_high`, which another sink reads
-as `exact`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
+`attributes/no_host`, `log_status`, `span_kind`, and `trace_id_high`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
 loss where that loss's counter didn't move, since most sinks test the flag first
 (`classes.rs`'s "Counters").
 
