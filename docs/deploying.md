@@ -2573,6 +2573,24 @@ sample or set member doesn't share (see
   re-sketch, which reports the records the series held as well as the incoming one). `aggregate` is the only place the `sample_rate_clamped` diagnostic fires; `statsd_in`
   doesn't emit it ([ADR `lossless-transit`](adr/lossless-transit.md), W3).
 
+## Metrics `aggregate` doesn't merge
+
+`aggregate` forwards some metrics unmerged instead of dropping them, each counted under
+`logit.transform.metrics.passed_through{reason}`. Two reasons depend on what a producer sends:
+
+- **`timestamped`**: a metric that carries its own source timestamp, a DogStatsD `|T` line (or a
+  service check's `d:`) or a Prometheus exposition sample with a timestamp, passes through with
+  that timestamp, as the Datadog Agent leaves a `|T` metric unaggregated. A window would replace
+  the producer's time with the flush time and split the series by timestamp. If you want such
+  metrics summarized anyway, drop the `_logit.statsd.timestamp` or `_logit.prometheus.timestamp`
+  attribute with `remove` ahead of `aggregate`, and they take the flush time.
+- **`non_finite`**: a counter increment, gauge, or gauge adjustment whose value is `NaN` or
+  infinite passes through, so a running total or a held gauge stays finite. The throttled
+  `sum_non_finite` and `gauge_non_finite` diagnostics name the metric.
+
+The full list of reasons is in [internal-telemetry.md](design/internal-telemetry.md)'s
+`aggregate` table.
+
 ## Measuring a flow's shape with `shape`
 
 `shape` answers "what do the events on this leg look like?": how many attributes they carry, how

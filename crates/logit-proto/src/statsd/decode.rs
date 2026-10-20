@@ -312,8 +312,9 @@ fn parse_line(
             // DogStatsD v1.3+ point timestamp, accepted on every type.
             let (nanos, secs) = parse_wire_seconds(secs, line)?;
             line_timestamp = nanos;
-            // `statsd_out` emits `|T` from this carrier, not `event.timestamp`, which a stage
-            // like `aggregate` rebuilds; so a `|T` the wire never sent can't be fabricated.
+            // `statsd_out` emits `|T` from this carrier, not `event.timestamp`, which a later
+            // stage may rewrite; so a `|T` the wire never sent can't be fabricated. `aggregate`
+            // reads it as "this point has its own time" and passes the record through.
             attributes.insert_sym(KEYS.timestamp, Value::U64(secs));
         }
         // Any other segment is ignored, for forward compatibility.

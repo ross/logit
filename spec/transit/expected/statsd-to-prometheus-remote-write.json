@@ -179,6 +179,13 @@
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 2
   }},
+  "timestamped": {"events": [
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":7.0}]},
+    {"timestamp":"2027-01-15T07:59:40.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":9.0}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":5.0}]}
+  ], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 3
+  }},
   "typed-attributes": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"count":"7","room":"lab"}}
   ], "counters": {

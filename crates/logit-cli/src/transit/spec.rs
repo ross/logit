@@ -912,6 +912,7 @@ flow_tests! {
     influxdb_to_prometheus => "influxdb-to-prometheus",
     influxdb_to_otlp => "influxdb-to-otlp",
     influxdb_to_statsd => "influxdb-to-statsd",
+    prometheus_aggregate_to_influxdb => "prometheus-aggregate-to-influxdb",
     prometheus_to_influxdb => "prometheus-to-influxdb",
     prometheus_to_statsd => "prometheus-to-statsd",
     statsd_aggregate_cumulative => "statsd-aggregate-cumulative",

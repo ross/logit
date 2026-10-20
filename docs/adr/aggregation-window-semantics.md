@@ -58,7 +58,8 @@ either still see exactly one distinct resource across the batches they receive).
 
 **Emitted timestamp is flush wall-clock**, i.e. when the window closed — not a source event's
 timestamp, and not the gauge's internally-tracked "latest write" timestamp (used only to pick the
-winner, then discarded).
+winner, then discarded). A record that carries its source's own timestamp isn't merged at all;
+see "Amendment: timestamped records and non-finite gauges pass through (2026-10-19)".
 
 **Windows are wall-clock-driven, not event-time.** A flush fires when the pipeline's clock reaches
 the deadline, regardless of what timestamps the accumulated events actually carry. There is no
@@ -628,15 +629,16 @@ total zero is ignored for the fold. Keeping whichever side has a value would let
 **A non-finite delta `Sum` passes through.** A delta `Sum` whose value is `NaN` or ±infinity is
 forwarded unmerged and counted `passed_through{reason="non_finite"}`, so a cumulative total stays
 finite. A statsd `1e308|c|@0.5` extrapolates to infinity, and merged in cumulative mode that
-infinity would stay in the series' total for as long as the series lives.
+infinity would stay in the series' total for as long as the series lives. The 2026-10-19
+amendment on timestamped records extends this to `Gauge` and `GaugeDelta`.
 
 ### Accounting identities
 
 Two identities hold for every `aggregate`:
 
 - **Records:** `metrics_in == absorbed + passed_through{reason}`, where `metrics_in` is every
-  metric record `process` receives. The reasons are `no_recorded_value`, `no_merge_rule`,
-  `kind_conflict`, `histogram_bounds_mismatch`, and `non_finite`, each defined in
+  metric record `process` receives. The reasons are `timestamped`, `no_recorded_value`,
+  `no_merge_rule`, `kind_conflict`, `histogram_bounds_mismatch`, and `non_finite`, each defined in
   [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md)'s "Transforms",
   "`aggregate`" table. `absorbed` is `logit.transform.metrics.absorbed`, and each reason is
   `logit.transform.metrics.passed_through{reason}`, totaled per `process` call: one count per
@@ -881,3 +883,64 @@ The exception is limited to that prefix. `_logit.influxdb.measurement`, the stat
 collectd plugin and type, and the Datadog type and stats dimensions are identity that a sink reads
 after this stage, so they stay in the key and the output. A record that passes through unmerged
 keeps its event's attributes, string fields included.
+
+## Amendment: timestamped records and non-finite gauges pass through (2026-10-19)
+
+`aggregate` forwards every metric record on an event that carries its source's own timestamp,
+unmerged, with its timestamp and carriers intact, and counts each one
+`logit.transform.metrics.passed_through{reason="timestamped"}`. It also forwards a `Gauge` or
+`GaugeDelta` whose value is `NaN` or ±infinity, counted `passed_through{reason="non_finite"}`
+with a throttled `gauge_non_finite` diagnostic, as it already did for a delta `Sum`. Neither
+record is dropped, and there's no option to drop one: "Pass through, never drop" stands.
+
+### Which events count as timestamped
+
+An event is timestamped when it carries one of the two carriers a decoder stamps for a wire
+where a per-point timestamp is optional, read the way that protocol's sink reads it:
+
+| Carrier | Value | Stamped by |
+|---|---|---|
+| `_logit.statsd.timestamp` | `Value::U64` | `statsd_in`, for a DogStatsD `\|T<unix-seconds>` line or a service check's `d:<unix-seconds>` field |
+| `_logit.prometheus.timestamp` | `Value::Bool(true)` | `prometheus_in`'s scrape, for an exposition sample with its own timestamp |
+
+The rule applies to every record on the event, whatever its kind, and comes before every other
+reason, so a timestamped cumulative counter counts `timestamped`, not `no_merge_rule`.
+
+No other carrier means "this point has its own source time". A wire where every point carries a
+time stamps no marker: OTLP, Graphite, collectd, InfluxDB line protocol (an absent timestamp
+becomes the request's arrival time, unmarked), Datadog series, and Prometheus remote-write, whose
+decoder runs with the marker off. Those records merge as before. Treating them as timestamped would
+leave `aggregate` nothing to do for those sources.
+
+### Why
+
+`aggregate` windows on the wall clock and stamps a flushed series with the flush time. A
+timestamped record broke both halves of that contract:
+
+- Its carrier is part of the series key, so each distinct source timestamp opened its own series,
+  and records rarely merged.
+- The flush replaced the source time with the flush time, the one fact the producer chose to send.
+- At a sink that drops the private carrier, the per-timestamp series left with identical labels
+  and collided at the destination.
+
+The Datadog Agent makes the same choice for DogStatsD. Its datagram documentation says that for a
+metric with a timestamp, "the Agent skips aggregation and only enriches the metric with tags"
+(<https://docs.datadoghq.com/developers/dogstatsd/datagram_shell/>). In its source,
+`comp/dogstatsd/server/impl/server.go` routes a sample with `Timestamp > 0` to `appendLateSample`,
+and `pkg/aggregator/no_aggregation_stream_worker.go` forwards those samples unaggregated.
+
+A non-finite gauge had no check at all. A `NaN` or infinite `Gauge` won last-write-wins, and a
+non-finite `GaugeDelta` poisoned every later delta. Under `series_retention` either value then
+outlived its window. The delta `Sum` rule already existed for the same reason, so the gauge kinds
+now follow it.
+
+### Consequences
+
+- The check costs two binary searches of the event's sorted attributes, on symbols interned once
+  when the `Aggregator` is built. No attribute is resolved to a string.
+- `metrics_in == absorbed + passed_through{reason}` still holds, with `timestamped` as a sixth
+  reason.
+- A relay of DogStatsD `|T` lines or timestamped scrape samples through `aggregate` now keeps each
+  point's time at the sink, and `statsd_out` re-emits the `|T` from the carrier.
+- A pipeline that wants such points summarized has to remove the carrier first, for example with
+  `remove`, and accept the flush time in place of the source time.

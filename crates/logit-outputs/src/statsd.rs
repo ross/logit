@@ -381,8 +381,9 @@
 //! a tag value so an embedded `:` survives. `_logit.statsd.timestamp == Value::U64(secs)` (the raw
 //! wire seconds `statsd_in` stamps alongside setting `Event::timestamp`) renders as `|T<secs>`
 //! **from the carrier, never from `event.timestamp`**: a stage that rebuilds `Event::timestamp`
-//! after decode (`aggregate`'s flush) can't fabricate or collapse a `|T`, since the carrier rides
-//! on the series key like any other attribute. A `_logit.statsd.timestamp` that isn't a
+//! after decode (a `timestamp` transform, or a Lua script) can't fabricate or collapse a `|T`.
+//! `aggregate` passes a record carrying it through unmerged, with its own timestamp. A
+//! `_logit.statsd.timestamp` that isn't a
 //! `Value::U64` (reachable from a cross-protocol relay or Lua, never from `statsd_in`) isn't
 //! emitted.
 //!

@@ -1,0 +1,3 @@
+# TYPE queue_depth gauge
+queue_depth{q="a"} 7 1799999970000
+queue_depth{q="b"} 9

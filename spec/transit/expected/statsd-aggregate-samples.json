@@ -4,7 +4,8 @@
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"_logit.statsd.container_id":"ci-abc","_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[5.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.cardinality":"low","_logit.statsd.container_id":"in-1","_logit.statsd.type":"ms"}}
   ], "counters": {
-    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 3
+    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1,
+    "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=timestamped,role=transform}": 2
   }},
   "counter": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"jobs.started","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
@@ -40,13 +41,14 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"shards":["a","b"]}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"users.count","kind":"gauge","value":2.0}]}
   ], "counters": {
-    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 5,
+    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 4,
     "logit.output.messages.dropped{component=out,kind=statsd_out,reason=unencodable_value,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=distribution,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=set,role=sink}": 1,
-    "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=no_merge_rule,role=transform}": 2
+    "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=no_merge_rule,role=transform}": 2,
+    "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=non_finite,role=transform}": 1
   }},
   "event": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"abc"},"attributes":{"_logit.statsd.event.title":"Plain"}},
@@ -122,7 +124,8 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"users","kind":"set_members","members":["alice"]}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"users","kind":"set_members","members":["bob"]}]}
   ], "counters": {
-    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 11
+    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 10,
+    "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=timestamped,role=transform}": 1
   }},
   "multi-value": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"hits","kind":"sum","value":6.0,"temporality":"delta","monotonic":true}]},
@@ -152,7 +155,8 @@
     {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"_logit.statsd.service_check.host":"web-07","_logit.statsd.service_check.message":"all good","_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"_logit.statsd.timestamp":1799999970,"env":"prod"},"types":{"/attributes/_logit.statsd.service_check.status":"u64","/attributes/_logit.statsd.timestamp":"u64"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"cache.up","kind":"gauge","value":2.0}],"attributes":{"_logit.statsd.service_check.message":"down","_logit.statsd.service_check.name":"cache.up","_logit.statsd.service_check.status":2},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}}
   ], "counters": {
-    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2
+    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1,
+    "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=timestamped,role=transform}": 1
   }},
   "set": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"users","kind":"set_members","members":["alice"]}]},
@@ -262,6 +266,17 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render.time","kind":"samples","values":[40.0],"sample_rate":0.25}],"attributes":{"_logit.statsd.type":"h","route":"/home"}}
   ], "counters": {
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2
+  }},
+  "timestamped": {"events": [
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"_logit.statsd.timestamp":1799999970},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
+    {"timestamp":"2027-01-15T07:59:40.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":9.0}],"attributes":{"_logit.statsd.timestamp":1799999980},"types":{"/attributes/_logit.statsd.timestamp":"u64"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":5.0}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"requests","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}]}
+  ], "counters": {
+    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2,
+    "logit.transform.metrics.passed_through{component=window,kind=aggregate,reason=timestamped,role=transform}": 4
   }},
   "typed-attributes": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"count":"7","room":"lab"}}

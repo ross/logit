@@ -20,6 +20,10 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge","value":21.5}],"attributes":{"instance":"transit:9100","room":"lab"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge_delta","delta":-4.5}],"attributes":{"instance":"transit:9100","room":"cold"}}
   ], "counters": {}},
+  "gauge-timestamp": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":7.0}],"attributes":{"instance":"transit:9100","q":"a"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":9.0}],"attributes":{"instance":"transit:9100","q":"b"}}
+  ], "counters": {}},
   "help-unit": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"disk_bytes","kind":"gauge","value":1024.0}],"attributes":{"dev":"sda","instance":"transit:9100"}}
   ], "counters": {}},

@@ -2466,6 +2466,11 @@ pub enum ComponentKind {
     ///
     /// A series is a metric's name, unit, and attributes. InfluxDB string fields are the
     /// exception: they don't split a series, and an aggregated series doesn't carry them.
+    ///
+    /// A metric that carries its own source timestamp, a DogStatsD `|T` line or a Prometheus
+    /// exposition sample with a timestamp, passes through unaggregated and keeps that timestamp.
+    /// So does a counter increment, gauge, or gauge adjustment whose value is NaN or infinite.
+    /// Neither is dropped.
     Aggregate {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
