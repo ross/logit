@@ -171,6 +171,9 @@
   "tags-dedupe": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"team":"a","urgent":true}}
   ], "counters": {}},
+  "tags-reserved": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"a:b","my key":"a@b c"}}
+  ], "counters": {}},
   "timer-h-d": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.size","kind":"summary","count":1,"sum":512.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":512.0},{"quantile":0.9,"value":512.0},{"quantile":0.95,"value":512.0},{"quantile":0.99,"value":512.0}]}]},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size","kind":"summary","count":1,"sum":60196.0,"quantiles":[{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0}]}],"attributes":{"endpoint":"/orders"}}
@@ -194,6 +197,14 @@
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=otlp_out,metric_kind=samples,role=sink}": 1
   }},
+  "timestamped": {"events": [
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}]},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}]},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}]},
+    {"timestamp":"2027-01-15T07:59:40.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":9.0}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":5.0}]},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}]}
+  ], "counters": {}},
   "typed-attributes": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"blob":"b\"ab\"","count":7,"labels":{"rack":2,"zone":"a"},"room":"lab","seen":1799996400000000000},"scope":{"name":"transit.scope","version":"1.0"},"types":{"/attributes/blob":"bytes"}}
   ], "counters": {}},

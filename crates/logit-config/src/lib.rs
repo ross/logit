@@ -2463,6 +2463,15 @@ pub enum ComponentKind {
     },
     /// The windowed aggregator (counters, gauges, sets, distributions). Flushes every `interval`;
     /// `0s` is rejected.
+    ///
+    /// A series is a metric's name, unit, and attributes. InfluxDB string fields are the
+    /// exception: they don't split a series, and an aggregated series doesn't carry them.
+    ///
+    /// A metric that carries its own source timestamp, a DogStatsD `|T` line or a Prometheus
+    /// exposition sample with a timestamp, passes through unaggregated and keeps that timestamp.
+    /// So does a Datadog APM stats group, which already summarizes its own time bucket, and a
+    /// counter increment, gauge, or gauge adjustment whose value is NaN or infinite.
+    /// None is dropped.
     Aggregate {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
@@ -3013,8 +3022,10 @@ pub enum ComponentKind {
     /// Parses a log message as InfluxDB line protocol and emits one event per point, in the shape
     /// `influxdb_in` gives one: the measurement as `_logit.influxdb.measurement`, tags as
     /// attributes, each numeric or boolean field as a gauge named `<measurement>.<field>`, and
-    /// each string field as the attribute `influxdb.field.<key>`. Points in one message with the
-    /// same measurement, tag set, and timestamp merge into one event.
+    /// each string field as the attribute `_logit.influxdb.field.<key>`, which `influxdb_out`
+    /// writes and every other protocol sink leaves off. Every sink that renders the whole event
+    /// carries it. Points in one message with the same measurement, tag set, and timestamp merge into
+    /// one event.
     ///
     /// Each point's event starts from a copy of the parent's attributes, with the point's own
     /// tags winning a collision, so every inherited attribute reaches `influxdb_out` as a tag;

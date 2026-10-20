@@ -42,7 +42,7 @@
 //! |---|---|
 //! | `logit.transform.lines.dropped{reason="malformed"}` | a bad line in a message whose log doesn't go on: its text has left the pipeline, so it's loss |
 //! | `logit.transform.lines.skipped{reason="malformed"}` | a bad line in a message whose log goes on (`keep_source: true`, or no point) |
-//! | `logit.transform.tags.omitted{reason="reserved_prefix"}` | a tag key under `_logit.` or `influxdb.field.`, left off its point |
+//! | `logit.transform.tags.omitted{reason="reserved_prefix"}` | a tag key under `_logit.`, left off its point |
 //!
 //! Each bad line also reports the throttled diagnostic `parse_error`, with its 1-based line number
 //! and the parser's reason. It doesn't quote the whole line, since a diagnostic is the process's
@@ -304,7 +304,7 @@ mod tests {
 
         let version = &events[4];
         assert!(version.metrics.is_empty(), "a string field isn't a metric");
-        assert_eq!(str_attr(version, "influxdb.field.v"), Some("7.0.0+16903"));
+        assert_eq!(str_attr(version, "_logit.influxdb.field.v"), Some("7.0.0+16903"));
 
         assert_eq!(run.discarded(), 1.0, "the parent, with nothing left, is discarded");
         assert_eq!(run.sum("logit.transform.lines.dropped", "malformed"), 0.0);
@@ -451,8 +451,9 @@ mod tests {
             drive(Precision::Ns, false, vec![parent("m,_logit.x=1,influxdb.field.y=2,t=3 f=1i 1")]);
         let event = &run.events[0];
         assert_eq!(event.attributes.get("_logit.x"), None);
-        assert_eq!(event.attributes.get("influxdb.field.y"), None);
+        assert_eq!(str_attr(event, "influxdb.field.y"), Some("2"), "an ordinary tag");
+        assert_eq!(event.attributes.get("_logit.influxdb.field.y"), None);
         assert_eq!(str_attr(event, "t"), Some("3"));
-        assert_eq!(run.sum("logit.transform.tags.omitted", "reserved_prefix"), 2.0);
+        assert_eq!(run.sum("logit.transform.tags.omitted", "reserved_prefix"), 1.0);
     }
 }

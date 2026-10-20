@@ -817,122 +817,56 @@ async fn statsd_in_default_aggregate_statsd_out_under_skip_drops_timers_and_sets
     assert_eq!(gauge_value(&decoded["temp"].0), Some(21.0));
 }
 
-// ---- `|T` carrier survives `aggregate`'s flush-time rebuild -------------------------------------
+// ---- `statsd_in -> aggregate -> statsd_out` with a `|T` or `d:` timestamp ----------------------
 
-/// The `|T` value survives `aggregate`, which sets `Event::timestamp` to the flush clock: the
-/// sink must read the `_logit.statsd.timestamp` carrier's `Value::U64`, which rides on the series
-/// key, never `Event::timestamp`.
+/// Runs `raw` through `statsd_in` and an `aggregate`, asserts every event passed through
+/// untouched and nothing flushed, and returns what `statsd_out` writes for the forwarded batch.
+async fn relay_timestamped_through_aggregate(raw: &[u8]) -> String {
+    let mut harness = Harness::new().await;
+    let batch = harness.send_raw_and_decode(raw).await;
+
+    let mut aggregator = Aggregator::new(Duration::from_secs(10));
+    let mut forwarded = Vec::new();
+    for mut event in batch.events.clone() {
+        if aggregator.process(&batch.resource, &mut event) {
+            forwarded.push(event);
+        }
+    }
+    assert_eq!(forwarded, batch.events, "a timestamped record passes through untouched");
+    assert!(
+        aggregator.flush(1_800_000_000_000_000_000).is_empty(),
+        "a timestamped record opens no series"
+    );
+
+    let out_batch = EventBatch { resource: batch.resource, scope: batch.scope, events: forwarded };
+    let captured = harness.capture_only(&out_batch, StatsdEncoder::new(Format::DogStatsd)).await;
+    String::from_utf8(captured).expect("ascii output")
+}
+
+/// A `|T` record passes through `aggregate` with its own timestamp, as the Datadog Agent leaves
+/// it unaggregated, so the relay writes the line back as it arrived.
 #[tokio::test]
 async fn statsd_in_aggregate_statsd_out_relay_preserves_the_wire_timestamp() {
-    let mut harness = Harness::new().await;
-
-    let batch = harness.send_raw_and_decode(b"hits:1|c|T1700000000").await;
-    assert_eq!(batch.events.len(), 1);
-
-    let mut aggregator = Aggregator::new(Duration::from_secs(10));
-    let resource = batch.resource.clone();
-    let mut forwarded = Vec::new();
-    for mut event in batch.events {
-        if aggregator.process(&resource, &mut event) {
-            forwarded.push(event);
-        }
-    }
-    assert!(forwarded.is_empty(), "a delta Counter is always absorbed by aggregate");
-
-    // A different second from the wire value, so a sink reading `Event::timestamp` would emit
-    // 1_800_000_000 instead of 1_700_000_000.
-    let mut flushed = aggregator.flush(1_800_000_000_000_000_000);
-    assert_eq!(flushed.len(), 1, "one (resource, scope) group");
-    let (flush_resource, flush_scope, events) = flushed.remove(0);
-    let out_batch = EventBatch {
-        resource: flush_resource,
-        scope: flush_scope,
-        events: events.into_iter().map(|(event, _links)| event).collect(),
-    };
-    assert_eq!(out_batch.events.len(), 1);
-
-    let captured = harness.capture_only(&out_batch, StatsdEncoder::new(Format::DogStatsd)).await;
-    assert_eq!(std::str::from_utf8(&captured).expect("ascii output"), "hits:1|c|T1700000000");
+    let captured = relay_timestamped_through_aggregate(b"hits:1|c|T1700000000").await;
+    assert_eq!(captured, "hits:1|c|T1700000000");
 }
 
-/// Two lines differing only in their `|T` value are distinct series, since the carrier is part
-/// of the series key, so they flush as two lines.
+/// Two lines differing only in their `|T` value pass through as two lines, each at its own time.
 #[tokio::test]
-async fn statsd_in_aggregate_statsd_out_relay_keeps_distinct_timestamps_as_distinct_series() {
-    let mut harness = Harness::new().await;
-
-    let raw = b"hits:1|c|T1700000000\nhits:1|c|T1700000100";
-    let batch = harness.send_raw_and_decode(raw).await;
-    assert_eq!(batch.events.len(), 2, "one event per line");
-
-    let mut aggregator = Aggregator::new(Duration::from_secs(10));
-    let resource = batch.resource.clone();
-    for mut event in batch.events {
-        assert!(
-            !aggregator.process(&resource, &mut event),
-            "a delta Counter is always absorbed by aggregate"
-        );
-    }
-
-    let mut flushed = aggregator.flush(1_800_000_000_000_000_000);
-    assert_eq!(flushed.len(), 1, "one (resource, scope) group");
-    let (flush_resource, flush_scope, events) = flushed.remove(0);
-    let out_batch = EventBatch {
-        resource: flush_resource,
-        scope: flush_scope,
-        events: events.into_iter().map(|(event, _links)| event).collect(),
-    };
-    assert_eq!(out_batch.events.len(), 2, "distinct |T values must stay distinct series");
-
-    let captured = harness.capture_only(&out_batch, StatsdEncoder::new(Format::DogStatsd)).await;
-    let mut lines: Vec<&str> =
-        std::str::from_utf8(&captured).expect("ascii output").split('\n').collect();
+async fn statsd_in_aggregate_statsd_out_relay_keeps_distinct_timestamps_as_distinct_lines() {
+    let captured =
+        relay_timestamped_through_aggregate(b"hits:1|c|T1700000000\nhits:1|c|T1700000100").await;
+    let mut lines: Vec<&str> = captured.split('\n').collect();
     lines.sort_unstable();
-    let mut expected = vec!["hits:1|c|T1700000000", "hits:1|c|T1700000100"];
-    expected.sort_unstable();
-    assert_eq!(lines, expected, "both |T values must survive the flush as separate lines");
+    assert_eq!(lines, ["hits:1|c|T1700000000", "hits:1|c|T1700000100"]);
 }
 
-// ---- `statsd_in -> aggregate -> statsd_out`, a service check ------------------------------------
-
-/// A service check is a `MetricKind::Gauge`, so `aggregate` absorbs it. Its
-/// `_logit.statsd.service_check.*` carriers ride on the series key, so `_sc|name|status` and its
-/// `d:`/`m:` fields survive the window unchanged.
+/// A service check's `d:` stamps the same carrier as `|T`, so the check passes through `aggregate`
+/// and its line survives unchanged, `d:` and `m:` included.
 #[tokio::test]
 async fn statsd_in_aggregate_statsd_out_relay_is_exact_for_a_service_check() {
-    let mut harness = Harness::new().await;
-
-    let raw =
-        b"_sc|Redis connection|2|d:1700000000|#env:dev|m:Redis connection timed out after 10s";
-    let batch = harness.send_raw_and_decode(raw).await;
-    assert_eq!(batch.events.len(), 1);
-
-    let mut aggregator = Aggregator::new(Duration::from_secs(10));
-    let resource = batch.resource.clone();
-    let mut forwarded = Vec::new();
-    for mut event in batch.events {
-        if aggregator.process(&resource, &mut event) {
-            forwarded.push(event);
-        }
-    }
-    assert!(forwarded.is_empty(), "a Gauge (the service check's own shape) is always absorbed");
-
-    let mut flushed = aggregator.flush(1_800_000_000_000_000_000);
-    assert_eq!(flushed.len(), 1, "one (resource, scope) group");
-    let (flush_resource, flush_scope, events) = flushed.remove(0);
-    let out_batch = EventBatch {
-        resource: flush_resource,
-        scope: flush_scope,
-        events: events.into_iter().map(|(event, _links)| event).collect(),
-    };
-    assert_eq!(out_batch.events.len(), 1, "one flushed event for the one series");
-
-    let captured = harness.capture_only(&out_batch, StatsdEncoder::new(Format::DogStatsd)).await;
-    assert_eq!(
-        std::str::from_utf8(&captured).expect("ascii output"),
-        "_sc|Redis connection|2|d:1700000000|#env:dev|m:Redis connection timed out after 10s",
-        "the _sc line should survive the window exactly, d: and m: included"
-    );
+    let raw = "_sc|Redis connection|2|d:1700000000|#env:dev|m:Redis connection timed out after 10s";
+    assert_eq!(relay_timestamped_through_aggregate(raw.as_bytes()).await, raw);
 }
 
 // ---- transport: tcp -----------------------------------------------------------------------

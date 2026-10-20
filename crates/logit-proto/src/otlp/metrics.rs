@@ -61,6 +61,8 @@
 //! | `log/plain` | normalized | `observed_timestamp` | An OTLP log record. otlp_out stamps an observed time on a log that has none, and otlp_in stamps the `_logit.otel.severity_*` carriers. |
 //! | `span/alone` | exact | -- | An OTLP span. |
 //! | `span/no_wire_form` | exact | -- | OTLP carries the status, its message, `trace_state`, flags, and dropped counts. |
+//! | `event/attributes_only` | skipped | uncounted | An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted. |
+//! | `event/string_only` | skipped | uncounted | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, uncounted, so its fields are lost. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!

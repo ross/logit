@@ -1,0 +1,21 @@
+{
+  "cells": [
+    {"sink":"otlp_out","row":"attributes/bytes_value","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"otlp_out","row":"attributes/map_value","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"attributes/number_value","cell":0,"observed":["normalized"]},
+    {"sink":"otlp_out","row":"attributes/scope","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"attributes/timestamp_value","cell":0,"observed":["normalized"]},
+    {"sink":"otlp_out","row":"event/attributes_only","cell":0,"observed":["skipped"]},
+    {"sink":"otlp_out","row":"event/string_only","cell":0,"observed":["skipped"]},
+    {"sink":"otlp_out","row":"gauge/bool","cell":0,"observed":["normalized"]},
+    {"sink":"otlp_out","row":"gauge/f64","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"gauge/i64","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"gauge/negative","cell":0,"observed":["exact"]},
+    {"sink":"otlp_out","row":"gauge/u64","cell":0,"observed":["normalized"]},
+    {"sink":"otlp_out","row":"record/superseded","cell":0,"observed":["exact"]}
+  ],
+  "unspecified": []
+}

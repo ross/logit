@@ -1,0 +1,22 @@
+{
+  "cells": [
+    {"sink":"statsd_out","row":"attributes/bytes_value","cell":1,"observed":["lost"]},
+    {"sink":"statsd_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"statsd_out","row":"attributes/map_value","cell":1,"observed":["lost"]},
+    {"sink":"statsd_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
+    {"sink":"statsd_out","row":"attributes/number_value","cell":1,"observed":["normalized"]},
+    {"sink":"statsd_out","row":"attributes/scope","cell":0,"observed":["lost"]},
+    {"sink":"statsd_out","row":"attributes/string_value","cell":1,"observed":["exact","normalized"]},
+    {"sink":"statsd_out","row":"attributes/timestamp_value","cell":1,"observed":["lost"]},
+    {"sink":"statsd_out","row":"event/attributes_only","cell":0,"observed":["skipped"]},
+    {"sink":"statsd_out","row":"event/string_only","cell":0,"observed":["skipped"]},
+    {"sink":"statsd_out","row":"gauge/bool","cell":0,"observed":["normalized"]},
+    {"sink":"statsd_out","row":"gauge/f64","cell":0,"observed":["exact"]},
+    {"sink":"statsd_out","row":"gauge/i64","cell":0,"observed":["normalized"]},
+    {"sink":"statsd_out","row":"gauge/negative","cell":0,"observed":["degraded"]},
+    {"sink":"statsd_out","row":"gauge/u64","cell":0,"observed":["normalized"]},
+    {"sink":"statsd_out","row":"record/name_unsafe","cell":0,"observed":["normalized"]},
+    {"sink":"statsd_out","row":"record/superseded","cell":0,"observed":["exact"]}
+  ],
+  "unspecified": []
+}

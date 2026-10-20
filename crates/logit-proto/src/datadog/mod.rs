@@ -161,6 +161,8 @@
 //! | `log/plain` | exact | -- | One object of a `/api/v2/logs` body, its attributes as top-level keys. |
 //! | `span/alone` | exact | -- | A span of an `AgentPayload` chunk on the trace route, read back with its kind as a `span.kind` attribute and its trace id's high half as `_dd.p.tid` (the `attributes` rows). |
 //! | `span/no_wire_form` | degraded | `logit.output.spans.degraded{reason=no_wire_form}` | Datadog has no field for `status: ok`, a status message, `trace_state`, span flags, or a dropped count, so each is dropped, counted, and the span reads back without it. |
+//! | `event/attributes_only` | skipped | uncounted | An event with no metric, log, or span takes none of the intake's routes, so no request carries it, uncounted. |
+//! | `event/string_only` | skipped | uncounted | An InfluxDB point whose fields are all strings has no metric, so it takes none of the intake's routes and no request carries it, uncounted. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
@@ -794,7 +796,16 @@ pub fn is_datadog_event(resource: &Resource, event: &Event) -> bool {
 /// [`DatadogEncoder::encode_client_stats_v06`] and [`DatadogEncoder::encode_stats_payload`] send.
 /// Every metrics route skips such an event whole: its records are a stats group's, not series.
 pub fn is_datadog_stats(resource: &Resource, event: &Event) -> bool {
-    merged_get(resource, event, stats::ATTR_STATS_NAME).is_some()
+    logit_core::interner::lookup(stats::ATTR_STATS_NAME)
+        .is_some_and(|name| is_datadog_stats_sym(resource, event, name))
+}
+
+/// [`is_datadog_stats`] by `stats_name`, the interned [`stats::ATTR_STATS_NAME`], for a caller
+/// that tests every event and interns the key once (`aggregate`): two binary searches, no
+/// interner probe.
+pub fn is_datadog_stats_sym(resource: &Resource, event: &Event, stats_name: Symbol) -> bool {
+    event.attributes.get_sym(stats_name).is_some()
+        || resource.attributes.get_sym(stats_name).is_some()
 }
 
 /// `_top_level`: the span metric the Agent writes (`1`) on every root, orphan, and

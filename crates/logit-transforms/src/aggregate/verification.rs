@@ -700,6 +700,11 @@ fn scalar() -> impl Strategy<Value = f64> {
     ]
 }
 
+/// [`scalar`] without its non-finite values.
+fn finite_scalar() -> impl Strategy<Value = f64> {
+    prop_oneof![12 => -1e3..1e3f64, 1 => Just(-0.0)]
+}
+
 /// `{0} ∪ ±[1e-6, 1e9]`, the range whose agent-mapping bins stay under the sketch's bin limit,
 /// with a rare non-finite value a sketch drops.
 fn sample_value() -> impl Strategy<Value = f64> {
@@ -821,15 +826,29 @@ fn record_spec() -> impl Strategy<Value = RecordSpec> {
         })
 }
 
-/// Attribute sets an event draws from: two distinct series keys and a `NaN` one.
+/// Attribute sets an event draws from: two distinct series keys, a `NaN` one, one per
+/// source-timestamp carrier, and an APM stats group's marker.
 fn event_attributes(i: usize) -> AttrMap {
     let mut attrs = AttrMap::new();
     match i {
         0 => {}
         1 => attrs.insert("k0", Value::Str(Bytes::from_static(b"a"))),
-        _ => attrs.insert("k0", Value::F64(f64::NAN)),
+        2 => attrs.insert("k0", Value::F64(f64::NAN)),
+        3 => attrs.insert("_logit.statsd.timestamp", Value::U64(1)),
+        4 => attrs.insert("_logit.prometheus.timestamp", Value::Bool(true)),
+        _ => attrs.insert("_logit.datadog.stats.name", Value::str("web.request")),
     }
     attrs
+}
+
+/// Whether `event_attributes(i)` carries a source timestamp: the ADR's carriers, restated.
+fn timestamped(i: usize) -> bool {
+    i == 3 || i == 4
+}
+
+/// Whether `event_attributes(i)` marks a Datadog APM stats group.
+fn bucketed(i: usize) -> bool {
+    i == 5
 }
 
 #[derive(Debug, Clone)]
@@ -863,7 +882,8 @@ fn event_spec() -> impl Strategy<Value = EventSpec> {
     (
         // 1000 runs ahead of every flush clock a run reaches, for the start-time clamp.
         prop_oneof![1 => Just(i64::MIN), 6 => 0..=5i64, 1 => Just(1_000)],
-        0..3usize,
+        // The two carrier sets are rarer, so most events still reach a series.
+        prop_oneof![6 => 0..3usize, 1 => 3..6usize],
         prop::collection::vec(record_spec(), 0..=3),
         prop::bool::weighted(0.2),
     )
@@ -1154,13 +1174,24 @@ impl Model {
         spec: &RecordSpec,
     ) -> Fate {
         let kind = spec.kind.build();
+        if bucketed(event.attributes) {
+            return Fate::Passed("bucketed");
+        }
+        if timestamped(event.attributes) {
+            return Fate::Passed("timestamped");
+        }
         if spec.no_recorded_value {
             return Fate::Passed("no_recorded_value");
         }
         if self.no_merge_rule(&kind) {
             return Fate::Passed("no_merge_rule");
         }
-        if matches!(kind, MetricKind::Sum(s) if !s.value.is_finite()) {
+        let non_finite = match &kind {
+            MetricKind::Sum(s) => !s.value.is_finite(),
+            MetricKind::Gauge(v) | MetricKind::GaugeDelta(v) => !v.is_finite(),
+            _ => false,
+        };
+        if non_finite {
             return Fate::Passed("non_finite");
         }
 
@@ -1587,7 +1618,9 @@ fn telemetry_gauge(events: &[Event], name: &str) -> Option<f64> {
 }
 
 /// Tag values the tagged counters are read under.
-const TAG_VALUES: [&str; 8] = [
+const TAG_VALUES: [&str; 10] = [
+    "bucketed",
+    "timestamped",
     "no_recorded_value",
     "no_merge_rule",
     "kind_conflict",
@@ -2075,10 +2108,11 @@ proptest! {
     }
 
     /// A relay of gauges agrees with one stage when every upstream timestamp is at or before the
-    /// first stage's flush and the later record's is at or after it.
+    /// first stage's flush and the later record's is at or after it. Finite values only: a
+    /// non-finite gauge passes through and never reaches a series.
     #[test]
     fn a_gauge_relay_matches_one_stage_when_the_later_record_follows_the_flush(
-        a in scalar(), b in scalar(), c in scalar(),
+        a in finite_scalar(), b in finite_scalar(), c in finite_scalar(),
         ta in 0..=10i64, tb in 0..=10i64, tc in 10..=15i64,
     ) {
         let resource = Arc::new(Resource::default());

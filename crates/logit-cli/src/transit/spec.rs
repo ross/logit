@@ -36,8 +36,9 @@
 //! the features from `features/<system>.yaml` the case `exercises`, an optional `wire:` file
 //! (relative to the case's directory) the `.json` is decoded from by `<system>_in`'s decoder at
 //! [`RECEIVED_AT`] (with the request's `name: value` headers from a `.headers` sidecar beside
-//! the wire file, as [`decode_wire`] reads them), and optional `tolerance:` entries (`{path, abs}`: an RFC 6901 pointer into
-//! each event of the document, and the most the number there may differ by). A hand-written case
+//! the wire file, and for a collectd case the `types.db` file an optional `types_db:` names, as
+//! [`decode_wire`] reads them), and optional `tolerance:` entries (`{path, abs}`: an RFC 6901
+//! pointer into each event of the document, and the most the number there may differ by). A hand-written case
 //! has no `wire:`, and its `.json` must read back to itself through `logit_proto::event_json`
 //! and `format: json`, so each case has one spelling.
 //!
@@ -62,6 +63,7 @@ use logit_config::ComponentKind;
 use logit_core::{Diagnostics, EventBatch, Resource};
 use logit_outputs::ndjson::render_ndjson;
 use logit_pipeline::test_util::TelemetryProbe;
+use logit_proto::collectd::{CollectdDecoder, TypesDb};
 use logit_proto::datadog::DatadogDecoder;
 use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
@@ -102,6 +104,8 @@ struct Meta {
     exercises: Vec<String>,
     #[serde(default)]
     wire: Option<String>,
+    #[serde(default)]
+    types_db: Option<String>,
     #[serde(default)]
     tolerance: Vec<Tolerance>,
 }
@@ -250,7 +254,18 @@ fn canonical(case: &Case) -> anyhow::Result<String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Headers::default(),
         Err(err) => return Err(err).with_context(|| format!("reading {}", sidecar.display())),
     };
-    decode_wire(&case.system, bytes, &headers)
+    let types_db = match &case.meta.types_db {
+        None => None,
+        Some(file) => {
+            ensure!(case.system == "collectd", "types_db: names a collectd_in setting");
+            let path = case.dir.join(file);
+            Some(
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?,
+            )
+        }
+    };
+    decode_wire(&case.system, bytes, &headers, types_db.as_deref())
         .with_context(|| format!("decoding {}", path.display()))
 }
 
@@ -307,7 +322,14 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 /// - `datadog`: one request body through `datadog_in`'s own `decode_request`, which picks the
 ///   route from `path:`, the body form from `content-type:`, and the decompression from
 ///   `content-encoding:`, as the listener does.
-fn decode_wire(system: &str, bytes: Vec<u8>, headers: &Headers) -> anyhow::Result<String> {
+/// - `collectd`: one datagram through `CollectdDecoder`, under an empty resource, naming data
+///   sources from the meta's `types_db:` file when it names one.
+fn decode_wire(
+    system: &str,
+    bytes: Vec<u8>,
+    headers: &Headers,
+    types_db: Option<&str>,
+) -> anyhow::Result<String> {
     let mut probe = TelemetryProbe::new();
     let id = "transit.case";
     let batches = match system {
@@ -386,6 +408,22 @@ fn decode_wire(system: &str, bytes: Vec<u8>, headers: &Headers) -> anyhow::Resul
                 decoder,
             )
             .map_err(|err| anyhow::anyhow!("datadog_in refused the request: {err}"))?
+        }
+        "collectd" => {
+            let telemetry = probe.telemetry(id, "collectd_in", "listener");
+            let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
+            let mut decoder = CollectdDecoder::new(Arc::new(Resource::default()))
+                .with_telemetry(telemetry)
+                .with_diagnostics(diag);
+            if let Some(text) = types_db {
+                let parsed =
+                    TypesDb::parse(text).map_err(|err| anyhow::anyhow!("types_db: {err}"))?;
+                decoder = decoder.with_types_db(Arc::new(parsed));
+            }
+            let mut events = Vec::new();
+            let (resource, scope) =
+                decoder.decode_into(Bytes::from(bytes), RECEIVED_AT, &mut events)?;
+            vec![EventBatch { resource, scope, events }]
         }
         other => bail!("no wire decoder for a {other} case yet"),
     };
@@ -931,6 +969,11 @@ macro_rules! flow_tests {
 }
 
 flow_tests! {
+    collectd_to_influxdb => "collectd-to-influxdb",
+    collectd_to_otlp => "collectd-to-otlp",
+    collectd_to_prometheus_remote_write => "collectd-to-prometheus-remote-write",
+    collectd_to_prometheus => "collectd-to-prometheus",
+    collectd_to_statsd => "collectd-to-statsd",
     datadog_relay => "datadog-relay",
     datadog_to_influxdb => "datadog-to-influxdb",
     datadog_to_otlp => "datadog-to-otlp",
@@ -938,11 +981,16 @@ flow_tests! {
     datadog_to_prometheus => "datadog-to-prometheus",
     datadog_to_statsd => "datadog-to-statsd",
     influxdb_aggregate_to_prometheus => "influxdb-aggregate-to-prometheus",
+    influxdb_relay => "influxdb-relay",
     influxdb_to_prometheus_remote_write => "influxdb-to-prometheus-remote-write",
     influxdb_to_datadog => "influxdb-to-datadog",
     influxdb_to_prometheus => "influxdb-to-prometheus",
+    influxdb_to_otlp => "influxdb-to-otlp",
+    influxdb_to_statsd => "influxdb-to-statsd",
+    prometheus_aggregate_to_influxdb => "prometheus-aggregate-to-influxdb",
     prometheus_to_datadog => "prometheus-to-datadog",
     prometheus_to_influxdb => "prometheus-to-influxdb",
+    prometheus_to_statsd => "prometheus-to-statsd",
     statsd_aggregate_cumulative => "statsd-aggregate-cumulative",
     statsd_aggregate_samples => "statsd-aggregate-samples",
     statsd_aggregate_sketch => "statsd-aggregate-sketch",
@@ -1237,6 +1285,10 @@ mod tests {
         let mut merged = Ledger::default();
         merged.merge(read);
         assert_eq!(merged.fragment().render(), text);
+        // The relay's `counter` case writes no tag `statsd_out` sanitizes, so another flow's
+        // observation of that `normalized` cell is merged in, as the `ledger` test would.
+        let tags = r#"{"cells":[{"sink":"statsd_out","row":"attributes/string_value","cell":1,"observed":["normalized"]}],"unspecified":[]}"#;
+        merged.merge(serde_json::from_str(tags).expect("the entry parses"));
         assert_eq!(merged.finish(&table), Vec::<String>::new());
 
         let (sink, row, index, _) = table

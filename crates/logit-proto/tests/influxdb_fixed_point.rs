@@ -6,7 +6,7 @@
 //!
 //! 1. **`decode(encode(b)) == b`**, whole-event `PartialEq`. Every fixture has the shape a real
 //!    decode produces (the measurement carrier, `Value::Str` tags, typed `Gauge`s named
-//!    `<measurement>.<field>`, string fields as `influxdb.field.*`), so the check isn't a
+//!    `<measurement>.<field>`, string fields as `_logit.influxdb.field.*`), so the check isn't a
 //!    tautology.
 //! 2. **`encode(decode(encode(b))) == encode(b)`** on bytes, which catches a codec that writes two
 //!    byte strings for one batch.
@@ -15,9 +15,8 @@
 //!
 //! - a measurement that starts with a letter (a leading `#` would make a comment) and may hold
 //!   `,`, `=`, and spaces, which the encoder escapes;
-//! - 0-4 tags with distinct keys outside the reserved names, the private `_logit.` prefix, and
-//!   the `influxdb.field.` string-field prefix, keys and values that may hold `,`, `=`, spaces,
-//!   and `"`; no backslash in any name, since a backslash before a delimiter has no spelling
+//! - 0-4 tags with distinct keys outside the reserved names and the private `_logit.` prefix,
+//!   keys and values that may hold `,`, `=`, spaces, and `"`; no backslash in any name, since a backslash before a delimiter has no spelling
 //!   (normalization 6);
 //! - 1-4 numeric or boolean fields of every type, any finite `f64` (normalization 5), and 0-2
 //!   string fields with any characters, quotes, backslashes, and newlines included, all keys
@@ -177,9 +176,9 @@ fn a_wire_shape_the_encoder_never_emits_is_a_fixed_point_once_decoded() {
     }
 }
 
-/// The measurement and the request's org and bucket ride as private `_logit.influxdb.*` carriers:
-/// `influxdb_out` rebuilds the line from them, and a foreign sink (`prometheus_out`,
-/// `graphite_out`) writes none of them as a label or tag.
+/// The measurement, the string fields, and the request's org and bucket ride as private
+/// `_logit.influxdb.*` carriers: `influxdb_out` rebuilds the line from them, and a foreign sink
+/// (`prometheus_out`, `graphite_out`) writes none of them as a label or tag.
 #[test]
 fn the_carriers_reach_influxdb_out_and_no_foreign_sink() {
     let mut resource = Resource::default();
@@ -187,7 +186,7 @@ fn the_carriers_reach_influxdb_out_and_no_foreign_sink() {
     resource.attributes.insert(RESOURCE_ATTR_ORG_ID, "0123456789abcdef");
     resource.attributes.insert(RESOURCE_ATTR_BUCKET, "metrics");
     let resource = Arc::new(resource);
-    let wire = "cpu,host=a usage=1.5,idle=98.5 1700000000000000000\n";
+    let wire = "cpu,host=a usage=1.5,idle=98.5,note=\"free text\" 1700000000000000000\n";
     let decoded = decode(Bytes::from_static(wire.as_bytes()), &resource);
     assert_eq!(decoded.len(), 1);
     let batch = EventBatch { resource: resource.clone(), scope: None, events: decoded };
@@ -242,9 +241,7 @@ fn metric_value_strategy() -> impl Strategy<Value = MetricValue> {
 
 /// Whether a tag key is one the decoder rejects or drops, or the encoder skips.
 fn reserved_tag(key: &str) -> bool {
-    matches!(key, "time" | "_measurement" | "_field")
-        || logit_core::attrs::is_private(key)
-        || key.starts_with(FIELD_ATTR_PREFIX)
+    matches!(key, "time" | "_measurement" | "_field") || logit_core::attrs::is_private(key)
 }
 
 #[derive(Debug, Clone)]

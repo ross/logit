@@ -12,6 +12,10 @@ unless its config fixes them, and reads a `403` or `404` about a carried bucket 
 `Rejected`.
 Amended the same day by "Amendment: `influxdb_out`'s `default_org:` (2026-10-15)", which gives a
 batch that carries no org a configured fallback.
+Amended on 2026-10-19 by "Amendment: string fields are private (2026-10-19)": a string field
+rides as `_logit.influxdb.field.<key>`, so `influxdb_out` is the only protocol sink that writes
+it, and `aggregate` leaves it out of a series. The sections above that amendment describe the
+amended form.
 
 ## Context
 
@@ -78,7 +82,7 @@ One point decodes to one `Event`:
 | integer field `f=1i` | `<measurement>.f`, `Gauge(I64(1))` |
 | unsigned field `f=1u` | `<measurement>.f`, `Gauge(U64(1))` |
 | boolean field `f=true` | `<measurement>.f`, `Gauge(Bool(true))` |
-| string field `f="x"` | event attribute `influxdb.field.f`, `Value::Str("x")` |
+| string field `f="x"` | event attribute `_logit.influxdb.field.f`, `Value::Str("x")` |
 | N numeric or boolean fields | N records on the one `Event`, in wire order |
 | timestamp | `event.timestamp`, scaled to nanoseconds by `precision` |
 | no timestamp | `event.timestamp` = the request's receipt time |
@@ -105,33 +109,32 @@ the transit spec's flows and rendered into the codec's module doc and
 ### The `_logit.influxdb.*` carrier
 
 Rule (b) of [ADR `lossless-transit`](lossless-transit.md): the protocol's own spelling rides on
-attributes that `influxdb_out` reads. The measurement, org, and bucket are private carriers under
-`_logit.influxdb.`, which every other sink leaves off its wire
-([ADR `private-attribute-namespace`](private-attribute-namespace.md)). A string field is data, so
-it stays public under `influxdb.field.`, and any sink may render it.
+attributes that `influxdb_out` reads. The measurement, the string fields, the org, and the bucket
+are private carriers under `_logit.influxdb.`, which every other sink leaves off its wire
+([ADR `private-attribute-namespace`](private-attribute-namespace.md)).
 
 | Attribute | Scope | Value | Meaning |
 |---|---|---|---|
 | `_logit.influxdb.measurement` | event | `Str` | the point's measurement; its presence selects the carrier path on `influxdb_out` |
-| `influxdb.field.<key>` | event | `Str` | a string field named `<key>`; public |
+| `_logit.influxdb.field.<key>` | event | `Str` | a string field named `<key>` |
 | `_logit.influxdb.org` | resource | `Str` | the request's `org` query parameter |
 | `_logit.influxdb.org_id` | resource | `Str` | the request's `orgID` query parameter |
 | `_logit.influxdb.bucket` | resource | `Str` | the request's `bucket` query parameter |
 
 A tag key under the private `_logit.` prefix is omitted, counted
 `logit.input.tags.omitted{reason="reserved_prefix"}` (normalization 12), as on each of the five
-tag-bearing metric wires (the private namespace ADR's inbound guard). A tag key under
-`influxdb.field.` would read back as a string field, so it's omitted and counted the same way. Any other tag key under
-`influxdb.` is an ordinary tag.
+tag-bearing metric wires (the private namespace ADR's inbound guard). That guard covers the
+string-field prefix too. Any other tag key, one under `influxdb.` or `influxdb.field.` included,
+is an ordinary tag.
 
 ### Egress, with and without the carrier
 
 **With `_logit.influxdb.measurement`**, `influxdb_out` writes one line per event. The measurement
 comes from the carrier. Each record whose name starts with `<measurement>.` becomes a field whose
 key is the rest of the name, in record order, with its typed suffix
-([ADR `typed-metric-scalar`](typed-metric-scalar.md)). Each `influxdb.field.<key>` attribute
-becomes a string field `<key>`, never a tag. Every private `_logit.` attribute and every
-`influxdb.field.` attribute is skipped as a tag, uncounted. An event with string fields and no
+([ADR `typed-metric-scalar`](typed-metric-scalar.md)). Each `_logit.influxdb.field.<key>`
+attribute becomes a string field `<key>`, never a tag. Every private `_logit.` attribute is
+skipped as a tag, uncounted. An event with string fields and no
 metrics still writes a line. A record that
 doesn't match the prefix, or isn't a scalar kind, takes the path below, counted
 `logit.output.metrics.normalized{reason="carrier_mismatch"}`.
@@ -146,15 +149,15 @@ writes each batch to the org and bucket it carries.]
 
 Other sinks see the decoded shape. A record named `cpu.usage_user` reaches `prometheus_out` as
 `cpu_usage_user` after sanitizing, the name Telegraf's own Prometheus output uses. The measurement
-and the org and bucket never reach another sink's wire, because they're private. A string-only
-point has no metrics, so metric sinks skip it, and `influxdb.field.*` reaches them as ordinary tags
-or labels unless a `remove` drops it.
+and the org and bucket never reach another sink's wire, because they're private, and neither do
+string fields. A string-only point has no metrics, so metric sinks skip it.
 
 ### Strings are attributes, not metrics
 
-A string field decodes to the event attribute `influxdb.field.<key>` and leaves `influxdb_out` as a
-string field. No other sink's metric wire can carry a string value, and `aggregate` can't merge one,
-so a string metric variant would cost every metric sink and transform a skip arm. See
+A string field decodes to the event attribute `_logit.influxdb.field.<key>` and leaves
+`influxdb_out` as a string field. No other sink's metric wire can carry a string value, and
+`aggregate` can't merge one, so a string metric variant would cost every metric sink and
+transform a skip arm. See
 [ADR `typed-metric-scalar`](typed-metric-scalar.md)'s alternatives.
 
 ### One request, one batch
@@ -280,8 +283,7 @@ the same list with the same numbers, and the two lists must stay numbered alike:
     always a `Gauge`, so this applies only to an event from another protocol.
 11. A listener's sender attributes (`network.peer.*`, `client.*`) are added under `peer:`,
     `proxy_protocol:`, or `forwarded:`.
-12. A tag key under the private `_logit.` prefix or the string-field prefix `influxdb.field.` is
-    omitted, counted.
+12. A tag key under the private `_logit.` prefix is omitted, counted.
 13. A duplicate field key within one line: the last value wins.
 14. An absent timestamp: the request's arrival time truncated to `precision`, one instant for every
     such point in the request.
@@ -390,7 +392,8 @@ list; this section summarizes it. Each deviation is a choice or a consequence of
 - Known-gaps rows, added with the codec and the listener: what `influxdb_out` drops or reshapes
   from other protocols (`SetMembers`, `ExponentialHistogram`, `unit`, `description`, exemplars, a
   sketch leaving as `count`/`sum`/`p50`/`p90`/`p99`, and the rest), string fields leaking as tags
-  at other sinks, a string-only point skipped at other sinks, the v1 `/write` route, no query or
+  at other sinks [lost there instead since "Amendment: string fields are private (2026-10-19)"],
+  a string-only point skipped at other sinks, the v1 `/write` route, no query or
   delete API, org and bucket not routed, and destination faults not reaching the producer. [The
   org and bucket row is replaced by the gaps that "Amendment: `influxdb_out` follows the carried
   destination (2026-10-15)" lists.]
@@ -486,7 +489,9 @@ The measurement and the org, org ID, and bucket carriers are private under `_log
 leak as tags or labels at other sinks and no `remove` is needed ahead of one. `influxdb.field.<key>`
 stays public. The decoder's reserved tag prefix narrows from `influxdb.` to `influxdb.field.`,
 beside the private `_logit.` guard, so a wire tag such as `influxdb.host` now decodes as an
-ordinary tag. The sections above describe the amended form.
+ordinary tag. The sections above describe the amended form. [Amended by "Amendment: string
+fields are private (2026-10-19)": string fields move under `_logit.influxdb.field.`, and the
+`influxdb.field.` guard is gone.]
 
 ## Amendment: `influxdb_out` follows the carried destination (2026-10-15)
 
@@ -630,3 +635,57 @@ org-related rows `Rejected`. The module doc's "Response classes" has the rows.
 
 The amendment above advised setting `org:` when a source that carries no org feeds the sink in
 carried mode; `default_org:` is now the setting for that case, and `org:` stays the override.
+
+## Amendment: string fields are private (2026-10-19)
+
+A string field decodes to the private attribute `_logit.influxdb.field.<key>`, so `influxdb_out`
+is the only protocol sink that writes it. Every other protocol sink leaves it off its wire,
+uncounted, under [ADR `private-attribute-namespace`](private-attribute-namespace.md)'s ignore
+rule, as it does the measurement, org, and bucket carriers. A whole-event render carries it, as
+it carries every private key; that ADR's "The ignore rule" lists the renders.
+
+### Why
+
+A string field's value is free text: a version, a status message, a hostname, a log line. As a
+public attribute, `statsd_out` wrote it as an `influxdb.field.f:x` tag, `prometheus_out` and
+`graphite_out` as a label or tag, and `otlp_out` as an attribute. At every metric sink but
+`influxdb_out`, each distinct value starts a new series, so one Telegraf input that reports a
+string per sample can grow a destination's series count without bound. The operator's remedy was
+a `remove` of each string field ahead of every non-InfluxDB sink, which needs the field names in
+advance, the same burden the private namespace removed for the carriers.
+
+InfluxDB is the only destination where a string field is a field rather than series identity.
+Any other sink that wants one needs an explicit choice, so the default is to leave it off.
+
+### What changes
+
+- The decoder writes `_logit.influxdb.field.<key>`, and `influxdb_out` reads that prefix. The
+  `line_protocol` transform shares the decoder and changes with it.
+- `influxdb_in -> influxdb_out` stays a fixed point: the encoder still writes each string field
+  as a field.
+- Lua and transforms still read a string field by its full key, as they read any private key. A
+  `lua` stage that copies one to a public attribute sends it to other sinks.
+- A `keep` under its default `private: drop` strips string fields along with the measurement
+  carrier. A `keep` ahead of `influxdb_out` needs `private: keep` to keep them.
+- `aggregate` leaves string fields out of a series' key and out of what it flushes. Keyed on
+  them, two readings of one series that differ only in a string, such as Telegraf's
+  `uptime_format`, would flush as two series that every other protocol sink writes with the same
+  labels, so one overwrites the other. A string field isn't series identity at InfluxDB, and an
+  aggregate summarizes numbers. Only this prefix is left out; other private keys, the measurement
+  carrier included, are identity a sink reads after `aggregate`
+  ([ADR `aggregation-window-semantics`](aggregation-window-semantics.md)'s 2026-10-19
+  amendment).
+- There's no alias and no decode path for the old public key, because `logit` is pre-release.
+
+### The reserved tag prefix
+
+The decoder's separate guard on a wire tag under `influxdb.field.` is gone. It existed so a
+sender's tag couldn't read back as a string field. With string fields under
+`_logit.influxdb.field.`, the private `_logit.` guard covers that, and nothing public lives under
+`influxdb.field.`. A wire tag such as `influxdb.field.f=x` now decodes as an ordinary tag, and
+`influxdb_out` writes it back as a tag, so the pair stays a fixed point for it too. The encoder's
+matching skip of a public `influxdb.field.` attribute is gone for the same reason. Normalization
+12 narrows to the `_logit.` prefix alone, the same guard the other four tag-bearing wires have.
+
+Keeping the guard would have omitted and counted a tag that no longer collides with anything,
+which loses a sender's data for no reason.

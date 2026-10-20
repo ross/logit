@@ -447,13 +447,13 @@ Per pair:
   permitted-normalization list, and "Deviations from influxd". A point decodes to one `Event`: the
   measurement as the private attribute `_logit.influxdb.measurement`, tags as event attributes,
   each numeric or boolean field as a typed `Gauge` named `<measurement>.<field>` ([ADR
-  `typed-metric-scalar`](docs/adr/typed-metric-scalar.md)), and each string field as the public
-  `influxdb.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as
+  `typed-metric-scalar`](docs/adr/typed-metric-scalar.md)), and each string field as the private
+  `_logit.influxdb.field.<key>`. `org`, `orgID`, and `bucket` ride on the resource as
   `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. `influxdb_out` writes
   each batch there unless its own `bucket:` or `org:` overrides the matching carrier. The presence of `_logit.influxdb.measurement` selects the carrier path on
-  `influxdb_out`. Every other sink ignores the private carriers and renders `influxdb.field.*` as
-  ordinary labels, so a `remove` of those belongs ahead of one. A tag key under `_logit.` or
-  `influxdb.field.` is dropped, counted. `influxdb_in` parses the whole body before building any
+  `influxdb_out`. Every other protocol sink ignores the private carriers, string fields included, since a
+  free-text value as a tag or label starts a series per value; a `keep` under its default
+  `private: drop` strips them too. A tag key under `_logit.` is omitted, counted. `influxdb_in` parses the whole body before building any
   event, so a bad line delivers nothing and the whole request is one batch, delivered all or
   nothing. It acknowledges with `204` once the batch is in every downstream inbox, so a
   destination's `422`, `404`, or `401` reaches `influxdb_out`'s fault classes and never the
@@ -861,9 +861,9 @@ the operator-facing account of all of this.
   marked regions: each spec'd sink's module-doc mapping table and `docs/known-gaps/mappings.md`'s
   gap tables, so a row changes in `mapping.yaml`, never in a region (the README's "Generated
   docs"). `script/transit gen|check|docs|coverage` wraps both; `script/test` runs them.
-  Cases come from `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape, and `datadog_in`; the
-  columns are `statsd_out`, `prometheus_out`, `influxdb_out`, `otlp_out`, and `datadog_out`,
-  through the statsd and Datadog like pairs and 16 cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
+  Cases come from `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape, `datadog_in`, and
+  `collectd_in`; the columns are `statsd_out`, `prometheus_out`, `influxdb_out`, `otlp_out`, and
+  `datadog_out`, through the statsd, InfluxDB, and Datadog like pairs and 25 cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
 
 ### Not yet built
 

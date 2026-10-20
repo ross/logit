@@ -8,6 +8,8 @@
     {"sink":"prometheus_out","row":"attributes/scope","cell":0,"observed":["lost"]},
     {"sink":"prometheus_out","row":"attributes/string_value","cell":0,"observed":["exact","normalized"]},
     {"sink":"prometheus_out","row":"attributes/timestamp_value","cell":0,"observed":["lost"]},
+    {"sink":"prometheus_out","row":"event/attributes_only","cell":0,"observed":["skipped"]},
+    {"sink":"prometheus_out","row":"event/string_only","cell":0,"observed":["skipped"]},
     {"sink":"prometheus_out","row":"gauge/bool","cell":0,"observed":["normalized"]},
     {"sink":"prometheus_out","row":"gauge/f64","cell":0,"observed":["exact"]},
     {"sink":"prometheus_out","row":"gauge/i64","cell":0,"observed":["normalized"]},

@@ -1,0 +1,4 @@
+# A gauge sample with its own timestamp beside one without: a window passes the first through
+# at its own time and merges the second.
+wire: gauge-timestamp.prom
+exercises: [gauge, sample_timestamp, target]

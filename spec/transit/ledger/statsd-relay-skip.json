@@ -10,7 +10,7 @@
     {"sink":"statsd_out","row":"attributes/private_carrier","cell":1,"observed":["exact"]},
     {"sink":"statsd_out","row":"attributes/resource_attribute","cell":1,"observed":["normalized"]},
     {"sink":"statsd_out","row":"attributes/scope","cell":0,"observed":["lost"]},
-    {"sink":"statsd_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
+    {"sink":"statsd_out","row":"attributes/string_value","cell":1,"observed":["exact","normalized"]},
     {"sink":"statsd_out","row":"attributes/timestamp_value","cell":1,"observed":["lost"]},
     {"sink":"statsd_out","row":"distribution","cell":0,"observed":["skipped"]},
     {"sink":"statsd_out","row":"exponential_histogram/cumulative","cell":0,"observed":["skipped"]},

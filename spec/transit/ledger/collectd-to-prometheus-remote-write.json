@@ -1,0 +1,18 @@
+{
+  "cells": [
+    {"sink":"prometheus_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"prometheus_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
+    {"sink":"prometheus_out","row":"attributes/string_value","cell":0,"observed":["normalized"]},
+    {"sink":"prometheus_out","row":"gauge/f64","cell":0,"observed":[]},
+    {"sink":"prometheus_out","row":"log/plain","cell":0,"observed":["skipped"]},
+    {"sink":"prometheus_out","row":"record/name_unsafe","cell":0,"observed":["normalized"]},
+    {"sink":"prometheus_out","row":"record/no_recorded_value","cell":0,"observed":[]},
+    {"sink":"prometheus_out","row":"record/superseded","cell":0,"observed":[]},
+    {"sink":"prometheus_out","row":"sum/cumulative_monotonic","cell":0,"observed":["normalized"]},
+    {"sink":"prometheus_out","row":"sum/cumulative_nonmonotonic","cell":0,"observed":["degraded"]},
+    {"sink":"prometheus_out","row":"sum/delta_monotonic","cell":0,"observed":["dropped"]},
+    {"sink":"prometheus_out","row":"sum/i64","cell":0,"observed":[]},
+    {"sink":"prometheus_out","row":"sum/u64","cell":0,"observed":["normalized"]}
+  ],
+  "unspecified": []
+}

@@ -237,6 +237,8 @@
 //! | `log/plain` | skipped | `logit.output.events.skipped` | Any other log on an event with no metrics has no statsd form and isn't written. |
 //! | `span/alone` | skipped | `logit.output.events.skipped` | A span on an event with no metrics has no statsd form and isn't written. |
 //! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
+//! | `event/attributes_only` | skipped | `logit.output.events.skipped` | An event with no metric, log, or span has no statsd line and isn't written. |
+//! | `event/string_only` | skipped | `logit.output.events.skipped` | An InfluxDB point whose fields are all strings has no metric, so it has no statsd line and isn't written. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
@@ -249,7 +251,7 @@
 //! | `record/unit_on_distribution` | lost | uncounted | statsd has no unit; it isn't written or counted. |
 //! | `record/sample_rate_unweighted` | exact | -- | The rate is written as `@rate` on the line. |
 //! | `attributes/string_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
-//! | `attributes/string_value`, otherwise | exact | -- | A DogStatsD `key:value` tag. |
+//! | `attributes/string_value`, otherwise | normalized | `tag_sanitized` | A DogStatsD `key:value` tag. Each `:`, `\|`, `@`, `#`, `,`, control, and whitespace character in the key, and each but `:` in the value, is written as `_`, uncounted. |
 //! | `attributes/bool_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/bool_value`, otherwise | normalized | `bool_tag` | `true` is a bare tag and reads back `true`; `false` is `key:false` and reads back as the string. |
 //! | `attributes/number_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
@@ -385,8 +387,9 @@
 //! a tag value so an embedded `:` survives. `_logit.statsd.timestamp == Value::U64(secs)` (the raw
 //! wire seconds `statsd_in` stamps alongside setting `Event::timestamp`) renders as `|T<secs>`
 //! **from the carrier, never from `event.timestamp`**: a stage that rebuilds `Event::timestamp`
-//! after decode (`aggregate`'s flush) can't fabricate or collapse a `|T`, since the carrier rides
-//! on the series key like any other attribute. A `_logit.statsd.timestamp` that isn't a
+//! after decode (a `timestamp` transform, or a Lua script) can't fabricate or collapse a `|T`.
+//! `aggregate` passes a record carrying it through unmerged, with its own timestamp. A
+//! `_logit.statsd.timestamp` that isn't a
 //! `Value::U64` (reachable from a cross-protocol relay or Lua, never from `statsd_in`) isn't
 //! emitted.
 //!

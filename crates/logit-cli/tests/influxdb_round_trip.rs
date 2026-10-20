@@ -37,7 +37,7 @@
 //! | `field-order` | **4** | string fields leave after the numeric ones |
 //! | `comments` | **8** | comments, blank lines, and runs of spaces drop |
 //! | `precision-s` | **7** | a body posted at `precision=s` leaves in nanoseconds, a negative timestamp included |
-//! | `reserved-prefix` | **12** | a tag under `_logit.` or `influxdb.field.` drops, counted; any other `influxdb.` tag passes |
+//! | `reserved-prefix` | **12** | a tag under `_logit.` drops, counted, a string field's `_logit.influxdb.field.` included; a tag under `influxdb.` or `influxdb.field.` passes |
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -66,8 +66,8 @@ const TOKEN: &str = "logit-round-trip-token";
 
 /// Every tag key the corpus names, in string order. See the module doc for why [`Harness::new`]
 /// interns them before anything else.
-const CORPUS_TAG_KEYS: [&str; 8] =
-    ["b", "city", "country", "cpu", "host", "influxdb.foo", "t,k", "w"];
+const CORPUS_TAG_KEYS: [&str; 9] =
+    ["b", "city", "country", "cpu", "host", "influxdb.field.f", "influxdb.foo", "t,k", "w"];
 
 /// `influxdb_in` delivers a request's batch, or refuses it, before it answers, so nothing a
 /// request caused is in flight once its response is read; the window is a margin against a stray
@@ -336,7 +336,10 @@ async fn merged_duplicates_leave_as_one_line_per_point() {
     let paris = &delivered.events[0];
     let names: Vec<&str> = paris.metrics.iter().map(|m| interner::resolve(m.name)).collect();
     assert_eq!(names, ["weather.temp", "weather.wind"], "hum left the metrics for a string");
-    assert_eq!(paris.attributes.get("influxdb.field.hum").and_then(|v| v.as_str()), Some("high"));
+    assert_eq!(
+        paris.attributes.get("_logit.influxdb.field.hum").and_then(|v| v.as_str()),
+        Some("high")
+    );
 
     let body = String::from_utf8(h.relay(&delivered).await.body).unwrap();
     assert_eq!(

@@ -44,8 +44,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     (`crates/logit-proto/src/influxdb/`, its module doc's "Encode" and "Decode" sections,
     [ADR `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md)). The `encode`
     rows cover what another protocol's data loses through `influxdb_out`, and what reaches other
-    sinks from `influxdb_in`: the private `_logit.influxdb.*` carriers never render there, and
-    `influxdb.field.*` string fields do. The `decode` rows cover what `influxdb_in` refuses
+    sinks from `influxdb_in`: the private `_logit.influxdb.*` carriers, string fields among them,
+    never render there. The `decode` rows cover what `influxdb_in` refuses
     or drops that `influxd` accepts, or the reverse; the module doc's "Deviations from influxd"
     is the full list. The `line_protocol` transform decodes through the same code, but skips a
     bad line instead of failing the message and counts under `logit.transform.`; its module doc
@@ -121,10 +121,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (InfluxDB) | A measurement starting `#` → **dropped** | `logit.output.metrics.dropped{reason="comment_measurement"}`, throttled diagnostic key `encode_error` | `influxd` reads the line as a comment and answers `204`, so writing it would lose the point silently. |
   | encode (InfluxDB) | A same-series point already in the sink batch → moved to the next free nanosecond | none (normalization 9 in the codec's list) | InfluxDB keeps one point per measurement, tag set, and timestamp, the later fields winning, so two readings from another protocol with one timestamp would overwrite each other. A 1 ns nudge keeps both and is below any input's timing resolution. Within the pair the listener merges duplicates first, so the nudge never fires on one body. |
   | encode (InfluxDB) | An `_logit.influxdb.measurement` carrier event with only string fields → one line; at every other sink it has no metrics and is **skipped** | each sink's own skip counter, if any | Strings aren't metrics ([ADR `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md)'s "Strings are attributes, not metrics"); no other metric wire carries a string value. |
-  | encode (InfluxDB) | `influxdb.field.*` → read by `influxdb_out` as string fields and never tags there; at every other sink, **ordinary attributes**: a tag or label, free text included | none (documented) | A string field is data, not a carrier, so it stays public ([ADR `private-attribute-namespace`](../adr/private-attribute-namespace.md)). A `remove` component ahead of another sink drops it. |
+  | encode (InfluxDB) | `_logit.influxdb.field.*` → read by `influxdb_out` as string fields; at every other protocol sink, **lost**, and left out of an `aggregate`'s series | none (uncounted) | A string field is private, so `influxdb_out` is the only protocol sink that writes it; a whole-event render carries it, as the private-namespace ADR's "The ignore rule" lists ([ADR `influxdb-line-protocol-relay`](../adr/influxdb-line-protocol-relay.md)'s "Amendment: string fields are private"). Its value is free text, and as a tag or label each distinct value would start a series. A `lua` stage that copies one to a public attribute sends it on. |
   | encode (InfluxDB) | A series key over 65,535 bytes → written, and the whole write rejected by `influxd` with a `400` | none (documented) | `influxd`'s `max key length exceeded` (item 13 of the ADR's "Verified `influxd` behavior"). The encoder doesn't measure the key; a `400` is `Rejected` at `influxdb_out`, so the batch drops, counted `batches.dropped{reason="rejected"}`. |
   | decode (InfluxDB) | A measurement, tag key, tag value, field key, or string field value that isn't UTF-8 → the **whole body fails** with a `400` | none (the request fails) | `influxd` stores the bytes; `Value::Str` is UTF-8. The sender sees the `400`. |
-  | decode (InfluxDB) | A tag key under the `influxdb.field.` prefix or the private `_logit.` prefix → **omitted** | `logit.input.tags.omitted{reason="reserved_prefix"}` | `influxdb.field.` is the string-field namespace `influxdb_out` reads, and `_logit.` is every protocol's private carrier namespace ([ADR `private-attribute-namespace`](../adr/private-attribute-namespace.md)); a sender's tag there would be read back as carrier data. The point is otherwise kept. `influxd` stores the tag. |
+  | decode (InfluxDB) | A tag key under the private `_logit.` prefix → **omitted** | `logit.input.tags.omitted{reason="reserved_prefix"}` | `_logit.` is every protocol's private carrier namespace, string fields' `_logit.influxdb.field.` included ([ADR `private-attribute-namespace`](../adr/private-attribute-namespace.md)); a sender's tag there would be read back as carrier data. The point is otherwise kept. `influxd` stores the tag. |
   | decode (statsd) | A DogStatsD `\|#` tag key under the private `_logit.` prefix, on a metric, event, or service-check line → **omitted** | `logit.input.tags.omitted{reason="reserved_prefix"}` | The Datadog Agent stores the tag. `_logit.` is every protocol's private carrier namespace ([ADR `private-attribute-namespace`](../adr/private-attribute-namespace.md)), so a sender's tag there would be read back as carrier data at that carrier's own sink. The line is otherwise kept. |
   | decode (Datadog) | A series, sketch, event, or service-check tag key under the private `_logit.` prefix → **omitted** | `logit.input.tags.omitted{reason="reserved_prefix"}` | Datadog's intake stores the tag; `datadog_in` omits it for the statsd row's reason. The series or check is otherwise kept. |
   | decode (Prometheus) | A remote-write label name under the private `_logit.` prefix → **omitted** | `logit.input.tags.omitted{reason="reserved_prefix"}` | A Prometheus 3 receiver stores the label, whose name is valid UTF-8; `prometheus_in` omits it for the statsd row's reason. The exposition grammar has no `.` in a label name, so only remote-write reaches this row. |
@@ -208,6 +208,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (statsd) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that also carries metrics is left off while the metrics are written, uncounted. |
   | encode (statsd) | `span/alone` → **skipped** | `logit.output.events.skipped` | A span on an event with no metrics has no statsd form and isn't written. |
   | encode (statsd) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that also carries metrics is left off while the metrics are written, uncounted. |
+  | encode (statsd) | `event/attributes_only` → **skipped** | `logit.output.events.skipped` | An event with no metric, log, or span has no statsd line and isn't written. |
+  | encode (statsd) | `event/string_only` → **skipped** | `logit.output.events.skipped` | An InfluxDB point whose fields are all strings has no metric, so it has no statsd line and isn't written. |
 
   <!-- transit:end -->
 
@@ -257,6 +259,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Prometheus) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
   | encode (Prometheus) | `span/alone` → **skipped** | none (uncounted) | A span has no Prometheus form and isn't written, uncounted. |
   | encode (Prometheus) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
+  | encode (Prometheus) | `event/attributes_only` → **skipped** | none (uncounted) | An event with no metric, log, or span has no sample and isn't written, uncounted. |
+  | encode (Prometheus) | `event/string_only` → **skipped** | none (uncounted) | An InfluxDB point whose fields are all strings has no metric, so it has no sample and isn't written, uncounted. |
 
   <!-- transit:end -->
 
@@ -301,6 +305,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (InfluxDB) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
   | encode (InfluxDB) | `span/alone` → **skipped** | none (uncounted) | A span has no line-protocol form and isn't written, uncounted. |
   | encode (InfluxDB) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
+  | encode (InfluxDB) | `event/attributes_only` → **skipped** | none (uncounted) | An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has no measurement to write under and isn't written, uncounted. A stage that drops the carrier leaves an InfluxDB point whose fields are all strings this way: a `remove` of it, or a `keep` under `private: drop`, which drops the string fields too. |
 
   <!-- transit:end -->
 
@@ -319,6 +324,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (OTLP) | field `record/exemplars_on_summary` → **lost** | none (uncounted) | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off, uncounted. |
   | encode (OTLP) | field `attributes/foreign_carrier` → **lost** | none (uncounted) | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
   | encode (OTLP) | field `attributes/datadog_carrier_log` → **lost** | none (uncounted) | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
+  | encode (OTLP) | `event/attributes_only` → **skipped** | none (uncounted) | An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted. |
+  | encode (OTLP) | `event/string_only` → **skipped** | none (uncounted) | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, uncounted, so its fields are lost. |
 
   <!-- transit:end -->
 
@@ -358,6 +365,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Datadog) | field `attributes/scope` → **lost** | none (uncounted) | Datadog has no instrumentation scope; it isn't written or counted. |
   | encode (Datadog) | field `attributes/datadog_carrier_log` → **lost** | none (uncounted) | A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check that the route has no field for is left off, uncounted, where the metrics routes count one as `no_wire_form`; the events route's public form has no field for the Agent envelope's `_logit.datadog.agent.hostname`. |
   | encode (Datadog) | `span/no_wire_form` → **degraded** | `logit.output.spans.degraded{reason=no_wire_form}` | Datadog has no field for `status: ok`, a status message, `trace_state`, span flags, or a dropped count, so each is dropped, counted, and the span reads back without it. |
+  | encode (Datadog) | `event/attributes_only` → **skipped** | none (uncounted) | An event with no metric, log, or span takes none of the intake's routes, so no request carries it, uncounted. |
+  | encode (Datadog) | `event/string_only` → **skipped** | none (uncounted) | An InfluxDB point whose fields are all strings has no metric, so it takes none of the intake's routes and no request carries it, uncounted. |
 
   <!-- transit:end -->
 

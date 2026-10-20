@@ -158,6 +158,9 @@
   "tags-dedupe": {"events": [], "counters": {
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
   }},
+  "tags-reserved": {"events": [], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
+  }},
   "timer-h-d": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request_size","kind":"summary","count":1,"sum":512.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":512.0},{"quantile":0.9,"value":512.0},{"quantile":0.95,"value":512.0},{"quantile":0.99,"value":512.0}]}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response_size","kind":"summary","count":1,"sum":60196.0,"quantiles":[{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0}]}],"attributes":{"endpoint":"/orders"}}
@@ -179,6 +182,11 @@
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"api_latency","kind":"summary","count":1,"sum":12.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":12.0},{"quantile":0.9,"value":12.0},{"quantile":0.95,"value":12.0},{"quantile":0.99,"value":12.0}]}]}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 1
+  }},
+  "timestamped": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":5.0}]}
+  ], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 3
   }},
   "typed-attributes": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"count":"7","room":"lab"}}
