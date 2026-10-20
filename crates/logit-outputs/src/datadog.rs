@@ -566,20 +566,12 @@ struct Plan {
     not_datadog_origin: usize,
 }
 
-/// Each route's items for `batch` (module doc's "Routes") at send time `now`, after the stale
-/// filter, the tag limit, and the trace readiness gate. Counts nothing:
-/// [`DatadogOutput::count_plan_drops`] counts the drops, so the sink can skip them when a retry
-/// repeats the plan.
-fn plan(batch: &EventBatch, now: i64) -> Plan {
+/// Each route's items for `batch` (module doc's "Routes"), indexed by `Route as usize`, before
+/// any filter: the routing alone, which [`plan`] filters and [`encode_routes`] encodes.
+fn partition(batch: &EventBatch) -> [Vec<Item>; 8] {
     let resource = &batch.resource;
-    let readiness = if batch.events.iter().any(|e| e.span.is_some()) {
-        trace_readiness(batch)
-    } else {
-        Vec::new()
-    };
-    let mut plan = Plan::default();
+    let mut routes: [Vec<Item>; 8] = Default::default();
     for (index, event) in batch.events.iter().enumerate() {
-        let routes = &mut plan.routes;
         let mut push = |route: Route, weight: usize| {
             routes[route as usize].push(Item { index, weight });
         };
@@ -587,23 +579,13 @@ fn plan(batch: &EventBatch, now: i64) -> Plan {
             push(Route::Stats, 1);
             continue;
         }
-        let stale = &mut plan.stale;
-        let age = now.saturating_sub(event.timestamp);
         let check = is_service_check(resource, event);
         if check {
-            if age > CHECK_MAX_AGE {
-                stale[Route::CheckRun as usize] += 1;
-            } else {
-                push(Route::CheckRun, 1);
-            }
+            push(Route::CheckRun, 1);
         }
         let datadog_event = is_datadog_event(resource, event);
         if datadog_event {
-            if age > LOG_MAX_AGE {
-                stale[Route::Events as usize] += 1;
-            } else {
-                push(Route::Events, 1);
-            }
+            push(Route::Events, 1);
         }
         // A service check's record 0 is the check route's alone.
         let (mut series, mut samples, mut sketches) = (0, 0, 0);
@@ -614,56 +596,124 @@ fn plan(batch: &EventBatch, now: i64) -> Plan {
                 _ => series += 1,
             }
         }
-        let metric_stale =
-            age > METRIC_MAX_AGE || event.timestamp.saturating_sub(now) > METRIC_MAX_AHEAD;
-        // Every metrics route writes the same `tags` list for each of the event's records.
-        let mut tag_count = None;
         for (route, n) in [
             (Route::Series, series),
             (Route::DistributionPoints, samples),
             (Route::Sketches, sketches),
         ] {
-            if n == 0 {
-                continue;
-            }
-            if metric_stale {
-                stale[route as usize] += n;
-                continue;
-            }
-            let tags = *tag_count.get_or_insert_with(|| metric_tag_count(resource, event));
-            if tags > MAX_METRIC_TAGS {
-                plan.too_many_tags[route as usize] += n;
-                let first = &mut plan.too_many_tags_first[route as usize];
-                if first.is_none() {
-                    let record =
-                        event.metrics[usize::from(check)..].iter().find(|r| match r.kind {
-                            MetricKind::Samples(_) => route == Route::DistributionPoints,
-                            MetricKind::Distribution(_) => route == Route::Sketches,
-                            _ => route == Route::Series,
-                        });
-                    *first = record.map(|r| (r.name, tags));
-                }
-            } else {
+            if n > 0 {
                 push(route, n);
             }
         }
         if event.log.is_some() && !datadog_event {
-            if age > LOG_MAX_AGE {
-                stale[Route::Logs as usize] += 1;
-            } else {
-                push(Route::Logs, 1);
-            }
+            push(Route::Logs, 1);
         }
         if event.span.is_some() {
-            match readiness[index] {
-                Some(TraceReadiness::Ready) => push(Route::Traces, 1),
-                Some(TraceReadiness::NeedsAgentProcessing) => plan.needs_agent_processing += 1,
-                Some(TraceReadiness::NotDatadogOrigin) => plan.not_datadog_origin += 1,
-                None => unreachable!("trace_readiness gives every span event a verdict"),
+            push(Route::Traces, 1);
+        }
+    }
+    routes
+}
+
+/// Each route's items for `batch` at send time `now`: [`partition`]'s, after the stale filter,
+/// the tag limit, and the trace readiness gate. Counts nothing:
+/// [`DatadogOutput::count_plan_drops`] counts the drops, so the sink can skip them when a retry
+/// repeats the plan.
+fn plan(batch: &EventBatch, now: i64) -> Plan {
+    let resource = &batch.resource;
+    let readiness = if batch.events.iter().any(|e| e.span.is_some()) {
+        trace_readiness(batch)
+    } else {
+        Vec::new()
+    };
+    let mut plan = Plan::default();
+    for (route, items) in ROUTES.into_iter().zip(partition(batch)) {
+        let r = route as usize;
+        for item in items {
+            let event = &batch.events[item.index];
+            let age = now.saturating_sub(event.timestamp);
+            let kept = match route {
+                Route::Stats => true,
+                Route::CheckRun => age <= CHECK_MAX_AGE,
+                Route::Events | Route::Logs => age <= LOG_MAX_AGE,
+                Route::Series | Route::DistributionPoints | Route::Sketches => {
+                    age <= METRIC_MAX_AGE && event.timestamp.saturating_sub(now) <= METRIC_MAX_AHEAD
+                }
+                Route::Traces => {
+                    match readiness[item.index] {
+                        Some(TraceReadiness::Ready) => plan.routes[r].push(item),
+                        Some(TraceReadiness::NeedsAgentProcessing) => {
+                            plan.needs_agent_processing += 1;
+                        }
+                        Some(TraceReadiness::NotDatadogOrigin) => plan.not_datadog_origin += 1,
+                        None => unreachable!("trace_readiness gives every span event a verdict"),
+                    }
+                    continue;
+                }
+            };
+            if !kept {
+                plan.stale[r] += item.weight;
+                continue;
             }
+            if matches!(route, Route::Series | Route::DistributionPoints | Route::Sketches) {
+                // Every metrics route writes the same `tags` list for each of the event's records.
+                let tags = metric_tag_count(resource, event);
+                if tags > MAX_METRIC_TAGS {
+                    plan.too_many_tags[r] += item.weight;
+                    let first = &mut plan.too_many_tags_first[r];
+                    if first.is_none() {
+                        let check = usize::from(is_service_check(resource, event));
+                        let record = event.metrics[check..].iter().find(|r| match r.kind {
+                            MetricKind::Samples(_) => route == Route::DistributionPoints,
+                            MetricKind::Distribution(_) => route == Route::Sketches,
+                            _ => route == Route::Series,
+                        });
+                        *first = record.map(|r| (r.name, tags));
+                    }
+                    continue;
+                }
+            }
+            plan.routes[r].push(item);
         }
     }
     plan
+}
+
+/// One request [`encode_routes`] writes: the route's path, its `Content-Type`, and its body,
+/// uncompressed.
+#[derive(Debug, Clone)]
+pub struct RouteRequest {
+    pub path: &'static str,
+    pub content_type: &'static str,
+    pub body: Bytes,
+}
+
+/// The requests `batch` encodes to on each route, in route order: [`partition`]'s routing and
+/// [`Route::encode`]'s bodies, one per route and one per event on the events route, with no
+/// stale filter, tag limit, trace readiness gate, or size cut, which sit above the encoder. A
+/// caller that needs the bytes this sink would send without its transport (the transit flow
+/// driver) reads them here.
+pub fn encode_routes(encoder: &mut DatadogEncoder, batch: &EventBatch) -> Vec<RouteRequest> {
+    let mut out = Vec::new();
+    for (route, items) in ROUTES.into_iter().zip(partition(batch)) {
+        if items.is_empty() {
+            continue;
+        }
+        let chunks: Vec<&[Item]> = match route {
+            Route::Events => items.chunks(1).collect(),
+            _ => vec![&items[..]],
+        };
+        for chunk in chunks {
+            if let Some(body) = route.encode(encoder, &sub_batch(batch, chunk)) {
+                out.push(RouteRequest {
+                    path: route.path(),
+                    content_type: route.content_type(),
+                    body,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The Datadog intake client (module doc).
