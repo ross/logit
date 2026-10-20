@@ -3296,10 +3296,11 @@ the reasoning.
 **String fields reach `influxdb_out` alone among the protocol sinks.** Every other protocol sink
 leaves a string field off, uncounted, because its free-text value as a tag or label would start a
 series per value. Sinks that write the whole event keep it, as they keep every private
-attribute: `stdio_out` and `file_out` in every format, `kafka_out` under `json`, `msgpack`, and `native`, `logit_out`, and a `buffer.disk:` spool. A `keep` with its default `private: drop` strips string fields
-too, so set `private: keep` on a `keep` ahead of `influxdb_out`. An `aggregate` leaves them out
-of the series it flushes, so two readings that differ only in a string field are one series. To
-send one elsewhere, copy it to a public attribute in a `lua` stage.
+attribute; [ADR `private-attribute-namespace`](adr/private-attribute-namespace.md)'s "The ignore
+rule" lists them. A `keep` with its default `private: drop` strips string fields too, so set
+`private: keep` on a `keep` ahead of `influxdb_out`. An `aggregate` leaves them out of the series
+it flushes, so two readings that differ only in a string field are one series. To send one
+elsewhere, copy it to a public attribute in a `lua` stage.
 
 **A destination fault never reaches the producer.** `influxdb_in` answers `204` once the batch is
 in every downstream inbox, before `influxdb_out` writes it. A `422` for a field type conflict

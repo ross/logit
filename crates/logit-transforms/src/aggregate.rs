@@ -54,7 +54,7 @@
 //! # Series identity
 //!
 //! A series is its record's name and unit and its event's attributes, minus InfluxDB string
-//! fields (`_logit.influxdb.field.*`, [`string_field_keys`]), which a flushed series doesn't
+//! fields (`_logit.influxdb.field.*`, [`StringFieldKeys`]), which a flushed series doesn't
 //! carry either. Every other private attribute is identity and stays. A record that passes
 //! through keeps its event's attributes whole. The ADR's "Amendment: InfluxDB string fields aren't
 //! series identity (2026-10-19)" has the reasoning.
@@ -226,6 +226,7 @@ pub struct Aggregator {
     /// The `SeriesState::open_seq` the next opened series gets. Never reused, so it orders every
     /// series this `Aggregator` has held, across groups and flushes.
     next_open_seq: u64,
+    string_field_keys: StringFieldKeys,
 }
 
 /// `Aggregator::last_group`'s entry: the `Arc`s `group_for` was asked with, and the index of the
@@ -569,6 +570,7 @@ impl Aggregator {
             current_scope: None,
             window_start: None,
             next_open_seq: 0,
+            string_field_keys: StringFieldKeys::default(),
         }
     }
 
@@ -681,9 +683,9 @@ impl Aggregator {
         // Only `group_for` pushes to `groups` and nothing in the loop removes one, so it stays
         // valid for the whole call.
         let mut group_index: Option<usize> = None;
-        // Found once per event, and empty unless an InfluxDB point carries a string field, so an
-        // event without one clones its attributes into each key as before.
-        let string_fields = string_field_keys(&event.attributes);
+        // Found on the event's first keyed record, and empty unless an InfluxDB point carries a
+        // string field, so an event without one clones its attributes into each key as before.
+        let mut string_fields: Option<SmallVec<[Symbol; 4]>> = None;
         for record in metrics {
             // An OTLP `NO_RECORDED_VALUE` record has no reading to fold in; its default numeric
             // payload would count as a real sample (`MetricRecord::flags`'s doc).
@@ -717,8 +719,10 @@ impl Aggregator {
                 continue;
             }
 
+            let string_fields =
+                string_fields.get_or_insert_with(|| self.string_field_keys.of(&event.attributes));
             let mut attributes = event.attributes.clone();
-            for &key in &string_fields {
+            for &key in string_fields.iter() {
                 attributes.remove_sym(key);
             }
             let key = SeriesKey { name: record.name, unit: record.unit, attributes };
@@ -1367,19 +1371,44 @@ fn record_temporality(temporality: AggregateTemporality) -> Temporality {
     }
 }
 
-/// The event's InfluxDB string-field attributes (`_logit.influxdb.field.*`), which a series key
+/// Which attribute keys are InfluxDB string fields (`_logit.influxdb.field.*`), which a series key
 /// leaves out: a string field isn't series identity at InfluxDB, where it's a field of the point,
 /// and an aggregate summarizes numbers. Keyed on them, two readings of one series that differ only
-/// in a string such as Telegraf's `uptime_format` would flush as two series that every sink renders
-/// with the same labels, since every protocol sink but `influxdb_out` leaves a string field off. Every other
-/// private key stays in the key: `_logit.influxdb.measurement` and other protocols' carriers are
-/// identity that a sink reads after this stage.
-fn string_field_keys(attributes: &AttrMap) -> SmallVec<[Symbol; 4]> {
-    attributes
-        .iter()
-        .map(|(key, _)| key)
-        .filter(|&key| logit_core::interner::resolve(key).starts_with(FIELD_ATTR_PREFIX))
-        .collect()
+/// in a string such as Telegraf's `uptime_format` would flush as two series that every protocol
+/// sink but `influxdb_out` renders with the same labels. Every other private key stays in the key:
+/// `_logit.influxdb.measurement` and other protocols' carriers are identity that a sink reads after
+/// this stage.
+///
+/// Memoized by the key's interner index, so only a key's first sighting resolves it: `resolve`
+/// takes a shard lock and a hash. One byte per index up to the highest key seen, which the
+/// process-wide interner bounds.
+#[derive(Default)]
+struct StringFieldKeys {
+    /// Per interner index: [`UNSEEN`], [`STRING_FIELD`], or [`OTHER_KEY`].
+    seen: Vec<u8>,
+}
+
+const UNSEEN: u8 = 0;
+const STRING_FIELD: u8 = 1;
+const OTHER_KEY: u8 = 2;
+
+impl StringFieldKeys {
+    /// The string-field keys among `attributes`.
+    fn of(&mut self, attributes: &AttrMap) -> SmallVec<[Symbol; 4]> {
+        attributes.iter().map(|(key, _)| key).filter(|&key| self.is_string_field(key)).collect()
+    }
+
+    fn is_string_field(&mut self, key: Symbol) -> bool {
+        let i = logit_core::interner::index(key);
+        if i >= self.seen.len() {
+            self.seen.resize(i + 1, UNSEEN);
+        }
+        if self.seen[i] == UNSEEN {
+            let field = logit_core::interner::resolve(key).starts_with(FIELD_ATTR_PREFIX);
+            self.seen[i] = if field { STRING_FIELD } else { OTHER_KEY };
+        }
+        self.seen[i] == STRING_FIELD
+    }
 }
 
 /// A metric series' identity: name, unit, and attribute set.
