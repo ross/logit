@@ -1,0 +1,8 @@
+# Hand-built, since the recorded plugins send no COUNTER or ABSOLUTE: the lists a `tail` plugin
+# with `DSType "CounterInc"` and `"AbsoluteSet"` writes. One datagram: Host `logit-fixture`,
+# TimeHR 2027-01-15T07:59:50.5Z, IntervalHR 10 s, Plugin `tail`, PluginInstance `nginx`, then
+# Type `counter` with TypeInstance `requests` (COUNTER 48213) and `bytes_wrapped` (COUNTER
+# 18446744073709551000, above i64::MAX), Type `absolute` with TypeInstance `errors` (ABSOLUTE 7),
+# and Type `gauge` with TypeInstance `latency` (GAUGE NaN).
+wire: counter-absolute.raw
+exercises: [value_list, counter, absolute, gauge_nan, identity, plugin_instance, type_instance, identity_elision, interval, time_hr]
