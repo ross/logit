@@ -194,9 +194,8 @@
 //! ([ADR `private-attribute-namespace`](../../../../docs/adr/private-attribute-namespace.md)):
 //! the encode side never renders it as a label, and every other protocol sink leaves it off its
 //! tags, labels, and fields. Like any private `_logit.` attribute, it's never counted. A
-//! whole-event render (`stdio_out`, `file_out`, `kafka_out`'s `json`, `msgpack`, and `native`
-//! formats, and the native hop) keeps it. An attribute spelled
-//! `prometheus.<name>` without the prefix is an ordinary label.
+//! whole-event render keeps it; that ADR's "The ignore rule" lists the renders. An attribute
+//! spelled `prometheus.<name>` without the prefix is an ordinary label.
 //! `docs/design/data-model.md`'s well-known-attribute table is the canonical list; in short:
 //! [`ATTR_TYPE`] (`Value::Str`) names the wire family type the model has no distinct kind for;
 //! [`ATTR_TIMESTAMP`] (`Value::Bool(true)`) means "this sample carried its own timestamp";

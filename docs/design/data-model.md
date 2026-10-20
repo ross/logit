@@ -119,10 +119,9 @@ private, which stay public, and why. The prefix has one definition,
   which it reads by exact name. The skip is silent: no `omitted`, `no_wire_form`, `dialect`, or
   `unrepresentable` counter counts another protocol's private key, and no diagnostic names one. A
   `_logit.` key nested inside a map value is data and renders.
-- **Whole-event renders carry everything**: `stdio_out` and `file_out` in every format, `kafka_out`
-  under `json`, `msgpack`, and `native`, and the native wire (`logit_out`, `logit_in`, the
-  `buffer.disk:` spool). `kafka_out`'s `otlp_proto` and `otlp_json` follow the ignore rule, as
-  `otlp_out` does.
+- **Whole-event renders carry everything**, private keys included. The
+  [private-namespace ADR](../adr/private-attribute-namespace.md#the-ignore-rule)'s "The ignore
+  rule" lists them, and the `kafka_out` formats that follow the rule instead.
 - **Any component may read any private key**, sinks included, for information another protocol
   left there: `datadog_out` reads `_logit.statsd.event.*` to send a DogStatsD event to Datadog's
   events API. The ignore rule governs generic rendering only.

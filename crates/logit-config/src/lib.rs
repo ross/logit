@@ -3028,8 +3028,9 @@ pub enum ComponentKind {
     /// one event.
     ///
     /// Each point's event starts from a copy of the parent's attributes, with the point's own
-    /// tags winning a collision, so every inherited attribute reaches `influxdb_out` as a tag;
-    /// place `keep` or `remove` to choose them. A point with no timestamp takes the parent's.
+    /// tags winning a collision. `influxdb_out` writes each inherited attribute outside `_logit.`
+    /// as a tag, and an inherited `_logit.influxdb.field.<key>` as the string field `<key>`; place
+    /// `keep` or `remove` to choose them. A point with no timestamp takes the parent's.
     ///
     /// A line that doesn't parse, or whose timestamp is out of range, is skipped and counted, and
     /// the rest of the message is still parsed. An event with no log, or whose message isn't text
