@@ -1370,31 +1370,54 @@ rows:
         text: An OTLP span in the traces request, beside the metrics in theirs.
 
   # --- events with no record -------------------------------------------------------------------
+  # An event with no metric, log, or span, split by whether it carries influxdb_in's measurement
+  # carrier, which decides whether influxdb_out has a line to write.
   - kind: event
     feature: no_record
     cells:
       statsd_out:
         class: skipped
         counter: logit.output.events.skipped
+        text: An event with no metric, log, or span has no statsd line and isn't written.
+      prometheus_out:
+        class: skipped
+        reason: uncounted
+        text: An event with no metric, log, or span has no sample and isn't written, uncounted.
+      influxdb_out:
+        class: skipped
+        reason: uncounted
         text: >-
-          An event with no metric, log, or span, such as an InfluxDB point whose fields are all
-          strings, has no statsd line and isn't written.
+          An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has
+          no measurement to write under and isn't written, uncounted. A stage that drops the
+          carrier, such as `keep` under `private: drop`, leaves an InfluxDB point whose fields
+          are all strings this way.
+      otlp_out:
+        class: skipped
+        reason: uncounted
+        text: An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted.
+  - kind: event
+    feature: no_record_carried
+    cells:
+      statsd_out:
+        class: skipped
+        counter: logit.output.events.skipped
+        text: >-
+          An InfluxDB point whose fields are all strings has no metric, so it has no statsd line
+          and isn't written.
       prometheus_out:
         class: skipped
         reason: uncounted
         text: >-
-          An event with no metric, log, or span, such as an InfluxDB point whose fields are all
-          strings, has no sample and isn't written, uncounted.
+          An InfluxDB point whose fields are all strings has no metric, so it has no sample and
+          isn't written, uncounted.
       influxdb_out:
         class: exact
         text: >-
-          An event carrying the `_logit.influxdb.measurement` carrier is a line of its
-          `influxdb.field.*` string fields under that measurement, read back as the same event.
-          One with no measurement carrier has nothing to write and isn't written, uncounted; no
-          source makes one.
+          A line of the event's `influxdb.field.*` string fields under the measurement its
+          `_logit.influxdb.measurement` carrier names, read back as the same event.
       otlp_out:
         class: skipped
         reason: uncounted
         text: >-
-          An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted, so
-          an InfluxDB point whose fields are all strings is lost with its fields.
+          An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent,
+          uncounted, so its fields are lost.

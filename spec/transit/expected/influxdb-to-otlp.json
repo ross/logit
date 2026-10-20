@@ -37,6 +37,7 @@
   ], "counters": {
     "logit.output.metrics.normalized{component=out,kind=otlp_out,reason=bool_value,role=sink}": 1
   }},
+  "no-carrier": {"events": [], "counters": {}},
   "precision-ms": {"events": [
     {"timestamp":"2027-01-15T07:59:50.123000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":1.5}],"attributes":{"host":"web-01"}}
   ], "counters": {}},

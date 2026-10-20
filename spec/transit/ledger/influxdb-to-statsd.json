@@ -8,6 +8,7 @@
     {"sink":"statsd_out","row":"attributes/string_value","cell":1,"observed":["exact","normalized"]},
     {"sink":"statsd_out","row":"attributes/timestamp_value","cell":1,"observed":["lost"]},
     {"sink":"statsd_out","row":"event/no_record","cell":0,"observed":["skipped"]},
+    {"sink":"statsd_out","row":"event/no_record_carried","cell":0,"observed":["skipped"]},
     {"sink":"statsd_out","row":"gauge/bool","cell":0,"observed":["normalized"]},
     {"sink":"statsd_out","row":"gauge/f64","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"gauge/i64","cell":0,"observed":["normalized"]},

@@ -29,7 +29,8 @@
 //! record on an event with no metrics reaches `log/dogstatsd_event` when it carries
 //! `_logit.statsd.event.title`, else `log/plain`, and its attribute rows; a span there reaches
 //! `span/alone`. An event with no metric, log, or span is a record of kind `event` that reaches
-//! `event/no_record` and its attribute rows. A log or span on an event that carries metrics is a field of that event: it
+//! `event/no_record_carried` when it carries `_logit.influxdb.measurement`, else
+//! `event/no_record`, and its attribute rows. A log or span on an event that carries metrics is a field of that event: it
 //! reaches `log/beside_metrics` or `span/beside_metrics` alone, read as `exact` when it pairs
 //! unchanged, `normalized` when it pairs changed, and `lost` when nothing read back pairs with
 //! it.
@@ -733,6 +734,9 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             vec![Some("dogstatsd_event".to_string())]
         }
         "log" => vec![Some("plain".to_string())],
+        "event" if rec.attributes.get(ATTR_MEASUREMENT).and_then(Value::as_str).is_some() => {
+            vec![Some("no_record_carried".to_string())]
+        }
         "event" => vec![Some("no_record".to_string())],
         _ => vec![None],
     }
@@ -1557,6 +1561,16 @@ mod tests {
         assert_eq!(ins.len(), 1);
         assert_eq!((ins[0].kind.as_str(), ins[0].family()), ("event", "event"));
         assert_eq!(kind_features(&ins[0]), [Some("no_record".to_string())]);
+    }
+
+    /// An event with no record that carries the InfluxDB measurement reaches its own row, since
+    /// `influxdb_out` writes it only then.
+    #[test]
+    fn an_event_with_no_record_and_a_measurement_is_carried() {
+        let ins = recs(&[
+            r#"{{T},"attributes":{"_logit.influxdb.measurement":"m","influxdb.field.s":"x"}}"#,
+        ]);
+        assert_eq!(kind_features(&ins[0]), [Some("no_record_carried".to_string())]);
     }
 
     /// The latest point of a series claims what a sink holding one value per series read back,

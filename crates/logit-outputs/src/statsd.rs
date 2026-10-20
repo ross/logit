@@ -235,7 +235,8 @@
 //! | `log/dogstatsd_event`, otherwise | exact | -- | A log carrying the `_logit.statsd.event.*` carriers is a DogStatsD `_e` line again. |
 //! | `log/plain` | skipped | `logit.output.events.skipped` | Any other log on an event with no metrics has no statsd form and isn't written. |
 //! | `span/alone` | skipped | `logit.output.events.skipped` | A span on an event with no metrics has no statsd form and isn't written. |
-//! | `event/no_record` | skipped | `logit.output.events.skipped` | An event with no metric, log, or span, such as an InfluxDB point whose fields are all strings, has no statsd line and isn't written. |
+//! | `event/no_record` | skipped | `logit.output.events.skipped` | An event with no metric, log, or span has no statsd line and isn't written. |
+//! | `event/no_record_carried` | skipped | `logit.output.events.skipped` | An InfluxDB point whose fields are all strings has no metric, so it has no statsd line and isn't written. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!

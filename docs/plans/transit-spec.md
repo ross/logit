@@ -531,6 +531,10 @@ Recorded per workstream as each lands.
     now, the check's `statsd_out` spelling rewrites keys and values as the encoder does, and
     `attributes/string_value` reads `normalized` (`tag_sanitized`) under DogStatsD.
   - An InfluxDB point whose fields are all strings decodes to an event with no metric, log, or
-    span, and no row covered a record that isn't one. `event/no_record` is that row:
-    `statsd_out` skips it under `logit.output.events.skipped`, `prometheus_out` and `otlp_out`
-    skip it uncounted, and `influxdb_out` writes its line back.
+    span, and no row covered a record that isn't one. Two rows do now, split by the
+    measurement carrier, since `influxdb_out` writes such a point's line only under it:
+    `event/no_record_carried` and `event/no_record`, which a stage that drops the carrier (`keep`
+    under `private: drop`) leaves, and the hand-written `no-carrier` case reaches. `statsd_out`
+    skips either under `logit.output.events.skipped`, `prometheus_out` and `otlp_out` skip either
+    uncounted, and `influxdb_out` writes the carried one's line back and skips the other,
+    uncounted.

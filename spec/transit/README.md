@@ -15,7 +15,8 @@ limits, and [the plan](../../docs/plans/transit-spec.md) the workstreams.
 The sources are `statsd_in`, `influxdb_in`, and `prometheus_in`'s scrape (remote-write cases
 aren't written yet). The sink columns are `statsd_out`, `prometheus_out` (exposition and
 remote-write), `influxdb_out`, and `otlp_out`. Each flow's name says which source meets which
-sink: `statsd-relay` is the like pair, and `influxdb-to-prometheus` a cross-protocol one.
+sink: `statsd-relay` and `influxdb-relay` are like pairs, and `influxdb-to-prometheus` a
+cross-protocol one.
 
 ## Layout
 
@@ -78,8 +79,9 @@ is one nothing checks: add a case or a flow that reaches it.
 `skipped`, and `dropped`. They apply at two levels:
 
 - **Record level**, for a metric kind, a log or span on an event with no metrics, an event with
-  no metric, log, or span (`event/no_record`, such as an InfluxDB point whose fields are all
-  strings), and the `record` rows that decide a record's fate (`no_recorded_value`, `no_recorded_value_delta_sum`,
+  no metric, log, or span (`event/no_record_carried` when it carries
+  `_logit.influxdb.measurement`, as an InfluxDB point whose fields are all strings does, else
+  `event/no_record`), and the `record` rows that decide a record's fate (`no_recorded_value`, `no_recorded_value_delta_sum`,
   `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `non_finite`, `superseded`,
   `same_instant`, `same_millisecond`): `exact`, `normalized`, `degraded`, `skipped`, or
   `dropped`, best to worst.
