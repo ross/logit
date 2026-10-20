@@ -199,6 +199,11 @@ a v2 `host` resource with no name, or `"host":""` on the v1, distribution-point,
 routes. An empty sketch `host` always reads as hostless, because protobuf can't tell it from a
 missing one.
 
+Through a local Agent, `statsd_out` under `format: dogstatsd` sends the host where the Agent
+reads it: a `host` attribute as the `host:` tag, else a non-empty `host.name`, else an empty
+`host:` tag for a sample `datadog_in` read as hostless. A line with none of them gets the Agent's
+own hostname.
+
 ### `at_least_once` can duplicate a request, and everything but series is stored twice
 
 The default posture is `at_least_once`, so a `5xx` or a timeout is retried. One batch goes out

@@ -855,3 +855,44 @@ omits every tag key under `_logit.`.
 so a `logit` downstream of this sink receives two records, the second of which a sink without
 `relative_gauges: true` drops. The transit spec's `gauge/negative` row records it as degraded
 ([ADR `transit-spec`](transit-spec.md)).
+
+## Amendment (2026-10-19): the host leaves as the DogStatsD `host:` tag
+
+Under `format: dogstatsd`, `statsd_out` writes a line's host where a DogStatsD Agent reads it. The
+Agent takes the host from the `host:` tag, an empty one included, and otherwise stamps its own
+hostname; an event's or service check's `h:` field outranks the tag (`extractTagsMetadata`,
+`enrichEvent`, and `enrichServiceCheck` in datadog-agent's `comp/dogstatsd/server/impl/enrich.go`).
+Before this, `host.name` left as an ordinary `host.name:<v>` tag and `datadog_in`'s hostless mark
+was dropped, so an Agent stamped its own hostname on a sample from another host or one its sender
+made hostless.
+
+On the merged resource⊕event view:
+
+1. **A `host` attribute is written as today**, `host:<v>` for a string, and a `host.name` beside
+   it stays an ordinary `host.name:<v>` tag. That keeps `statsd_in -> statsd_out` a fixed point.
+2. **With no `host` attribute and no `h:` field, a non-empty string `host.name` is the `host:`
+   tag**, written in place of the `host.name:<v>` tag. `statsd_in` reads it back as `host`.
+3. **With neither and no `h:` field, `_logit.datadog.hostless` set to `true` is an empty `host:`
+   tag.** `statsd_in` reads it back as an empty `Str` `host`, and `datadog_out` reads that as a
+   hostless sample, so `datadog_in -> statsd_out -> statsd_in -> datadog_out` keeps it hostless.
+
+Any other `host.name` (empty, or not a string) is an ordinary tag as before. `format: statsd`
+writes no tags, so it's unchanged.
+
+**The precedence is the reverse of `datadog_out`'s.** There, `host.name` is the host and a `host`
+attribute stays a tag (the process-hostname amendment of
+[ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)). Here `host` wins,
+because it's the value `statsd_in` decoded from this protocol's own `host:` tag, and writing
+`host.name` over it would change a like-pair relay's output. A DogStatsD line has one host either
+way, and the other value stays a tag, so nothing is lost.
+
+**An event or a service check keeps its `h:` field from the carrier alone.** The tag rule above
+covers both: with no `h:` field, the Agent reads the `host:` tag on an event or check as it does
+on a metric. Writing `host.name` into `h:` as well would put the host on the wire twice, and a
+check's trailing metric lines, which share its tag segment, would go without it. A `host`
+attribute never fills `h:`, since its `host:` tag already names the host and an added `h:` would
+read back as a carrier the input didn't have.
+
+The transit spec's `Spelling::Statsd` reads `host.name` and the hostless mark back as `host` under
+`format: dogstatsd` (`crates/logit-cli/src/transit/classes.rs`), and `statsd_out`'s module doc
+section "The host" is the canonical copy of the rules.
