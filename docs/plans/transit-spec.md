@@ -533,8 +533,9 @@ Recorded per workstream as each lands.
   - An InfluxDB point whose fields are all strings decodes to an event with no metric, log, or
     span, and no row covered a record that isn't one. Two rows do now, split by the
     measurement carrier, since `influxdb_out` writes such a point's line only under it:
-    `event/no_record_carried` and `event/no_record`, which a stage that drops the carrier (`keep`
-    under `private: drop`) leaves, and the hand-written `no-carrier` case reaches. `statsd_out`
-    skips either under `logit.output.events.skipped`, `prometheus_out` and `otlp_out` skip either
-    uncounted, and `influxdb_out` writes the carried one's line back and skips the other,
+    `event/string_only`, the point with its carrier intact, and `event/attributes_only`, any
+    other such event, which a stage that drops the carrier (`keep` under `private: drop`) or a
+    Lua `Event.new` leaves, and the hand-written `no-carrier` case reaches. `statsd_out` skips
+    either under `logit.output.events.skipped`, `prometheus_out` and `otlp_out` skip either
+    uncounted, and `influxdb_out` writes the string-only point's line back and skips the other,
     uncounted.

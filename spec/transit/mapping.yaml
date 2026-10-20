@@ -1369,11 +1369,12 @@ rows:
         class: exact
         text: An OTLP span in the traces request, beside the metrics in theirs.
 
-  # --- events with no record -------------------------------------------------------------------
-  # An event with no metric, log, or span, split by whether it carries influxdb_in's measurement
-  # carrier, which decides whether influxdb_out has a line to write.
+  # --- events with no metric, log, or span ------------------------------------------------------
+  # `string_only` is an InfluxDB point whose fields are all strings, its measurement carrier
+  # intact, which influxdb_out writes back. `attributes_only` is any other such event, such as a
+  # string-only point whose carrier a `keep` stripped, or a Lua `Event.new`, which it can't.
   - kind: event
-    feature: no_record
+    feature: attributes_only
     cells:
       statsd_out:
         class: skipped
@@ -1396,7 +1397,7 @@ rows:
         reason: uncounted
         text: An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted.
   - kind: event
-    feature: no_record_carried
+    feature: string_only
     cells:
       statsd_out:
         class: skipped

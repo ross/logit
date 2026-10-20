@@ -29,9 +29,9 @@
 //! record on an event with no metrics reaches `log/dogstatsd_event` when it carries
 //! `_logit.statsd.event.title`, else `log/plain`, and its attribute rows; a span there reaches
 //! `span/alone`. An event with no metric, log, or span is a record of kind `event` that reaches
-//! `event/no_record_carried` when it carries `_logit.influxdb.measurement`, else
-//! `event/no_record`, and its attribute rows. A log or span on an event that carries metrics is a field of that event: it
-//! reaches `log/beside_metrics` or `span/beside_metrics` alone, read as `exact` when it pairs
+//! `event/string_only` when it carries a non-empty `_logit.influxdb.measurement`, else
+//! `event/attributes_only`, and its attribute rows. A log or span on an event that carries
+//! metrics is a field of that event: it reaches `log/beside_metrics` or `span/beside_metrics` alone, read as `exact` when it pairs
 //! unchanged, `normalized` when it pairs changed, and `lost` when nothing read back pairs with
 //! it.
 //!
@@ -741,9 +741,9 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
                 .and_then(Value::as_str)
                 .is_some_and(|m| !m.is_empty()) =>
         {
-            vec![Some("no_record_carried".to_string())]
+            vec![Some("string_only".to_string())]
         }
-        "event" => vec![Some("no_record".to_string())],
+        "event" => vec![Some("attributes_only".to_string())],
         _ => vec![None],
     }
 }
@@ -1560,23 +1560,24 @@ mod tests {
         assert_eq!(observe_field(&field, &ins[0], &outs[0], Spelling::Statsd), Class::Normalized);
     }
 
-    /// An event with no metric, log, or span is one `event` record reaching `event/no_record`.
+    /// An event with no metric, log, or span and no measurement carrier is one `event` record
+    /// reaching `event/attributes_only`.
     #[test]
-    fn an_event_with_no_record_is_an_event_record() {
+    fn an_event_with_attributes_only_is_an_event_record() {
         let ins = recs(&[r#"{{T},"attributes":{"influxdb.field.s":"x"}}"#]);
         assert_eq!(ins.len(), 1);
         assert_eq!((ins[0].kind.as_str(), ins[0].family()), ("event", "event"));
-        assert_eq!(kind_features(&ins[0]), [Some("no_record".to_string())]);
+        assert_eq!(kind_features(&ins[0]), [Some("attributes_only".to_string())]);
     }
 
-    /// An event with no record that carries the InfluxDB measurement reaches its own row, since
-    /// `influxdb_out` writes it only then.
+    /// An event with no metric, log, or span that carries the InfluxDB measurement is a
+    /// string-only point, which `influxdb_out` writes only then.
     #[test]
-    fn an_event_with_no_record_and_a_measurement_is_carried() {
+    fn an_event_with_a_measurement_is_string_only() {
         let ins = recs(&[
             r#"{{T},"attributes":{"_logit.influxdb.measurement":"m","influxdb.field.s":"x"}}"#,
         ]);
-        assert_eq!(kind_features(&ins[0]), [Some("no_record_carried".to_string())]);
+        assert_eq!(kind_features(&ins[0]), [Some("string_only".to_string())]);
     }
 
     /// The latest point of a series claims what a sink holding one value per series read back,

@@ -204,8 +204,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (statsd) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that also carries metrics is left off while the metrics are written, uncounted. |
   | encode (statsd) | `span/alone` → **skipped** | `logit.output.events.skipped` | A span on an event with no metrics has no statsd form and isn't written. |
   | encode (statsd) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that also carries metrics is left off while the metrics are written, uncounted. |
-  | encode (statsd) | `event/no_record` → **skipped** | `logit.output.events.skipped` | An event with no metric, log, or span has no statsd line and isn't written. |
-  | encode (statsd) | `event/no_record_carried` → **skipped** | `logit.output.events.skipped` | An InfluxDB point whose fields are all strings has no metric, so it has no statsd line and isn't written. |
+  | encode (statsd) | `event/attributes_only` → **skipped** | `logit.output.events.skipped` | An event with no metric, log, or span has no statsd line and isn't written. |
+  | encode (statsd) | `event/string_only` → **skipped** | `logit.output.events.skipped` | An InfluxDB point whose fields are all strings has no metric, so it has no statsd line and isn't written. |
 
   <!-- transit:end -->
 
@@ -253,8 +253,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Prometheus) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
   | encode (Prometheus) | `span/alone` → **skipped** | none (uncounted) | A span has no Prometheus form and isn't written, uncounted. |
   | encode (Prometheus) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
-  | encode (Prometheus) | `event/no_record` → **skipped** | none (uncounted) | An event with no metric, log, or span has no sample and isn't written, uncounted. |
-  | encode (Prometheus) | `event/no_record_carried` → **skipped** | none (uncounted) | An InfluxDB point whose fields are all strings has no metric, so it has no sample and isn't written, uncounted. |
+  | encode (Prometheus) | `event/attributes_only` → **skipped** | none (uncounted) | An event with no metric, log, or span has no sample and isn't written, uncounted. |
+  | encode (Prometheus) | `event/string_only` → **skipped** | none (uncounted) | An InfluxDB point whose fields are all strings has no metric, so it has no sample and isn't written, uncounted. |
 
   <!-- transit:end -->
 
@@ -298,7 +298,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (InfluxDB) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
   | encode (InfluxDB) | `span/alone` → **skipped** | none (uncounted) | A span has no line-protocol form and isn't written, uncounted. |
   | encode (InfluxDB) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
-  | encode (InfluxDB) | `event/no_record` → **skipped** | none (uncounted) | An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has no measurement to write under and isn't written, uncounted. A stage that drops the carrier, such as `keep` under `private: drop`, leaves an InfluxDB point whose fields are all strings this way. |
+  | encode (InfluxDB) | `event/attributes_only` → **skipped** | none (uncounted) | An event with no metric, log, or span and no `_logit.influxdb.measurement` carrier has no measurement to write under and isn't written, uncounted. A stage that drops the carrier, such as `keep` under `private: drop`, leaves an InfluxDB point whose fields are all strings this way. |
 
   <!-- transit:end -->
 
@@ -316,8 +316,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (OTLP) | `set` → **skipped** | `logit.output.metrics.skipped{metric_kind=set}` | OTLP has no cardinality type, so a set estimate isn't written, with a throttled `otlp_set_metric_skipped` warning. |
   | encode (OTLP) | field `record/exemplars_on_summary` → **lost** | none (uncounted) | A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off, uncounted. |
   | encode (OTLP) | field `attributes/foreign_carrier` → **lost** | none (uncounted) | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
-  | encode (OTLP) | `event/no_record` → **skipped** | none (uncounted) | An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted. |
-  | encode (OTLP) | `event/no_record_carried` → **skipped** | none (uncounted) | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, uncounted, so its fields are lost. |
+  | encode (OTLP) | `event/attributes_only` → **skipped** | none (uncounted) | An event with no metric, log, or span has no OTLP signal and isn't sent, uncounted. |
+  | encode (OTLP) | `event/string_only` → **skipped** | none (uncounted) | An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, uncounted, so its fields are lost. |
 
   <!-- transit:end -->
 

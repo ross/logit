@@ -16,7 +16,7 @@
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics) | record |
 //! | `span` | `alone` (on an event with no metrics) | record |
 //! | `log`, `span` | `beside_metrics` (on an event that carries metrics) | field |
-//! | `event` | `no_record`, `no_record_carried` (an event that carries no metric, log, or span; the second with the `_logit.influxdb.measurement` carrier) | record |
+//! | `event` | `string_only` (an InfluxDB point whose fields are all strings, its measurement carrier intact), `attributes_only` (any other event with no metric, log, or span) | record |
 //!
 //! `attributes/scope` is the batch's instrumentation scope, a field of every record in the batch
 //! like a resource attribute, so it's an `attributes` row rather than a kind of its own. A
@@ -128,7 +128,7 @@ const KINDS: [(&str, &[&str]); 15] = [
     ),
     ("log", &["dogstatsd_event", "plain", "beside_metrics"]),
     ("span", &["alone", "beside_metrics"]),
-    ("event", &["no_record", "no_record_carried"]),
+    ("event", &["attributes_only", "string_only"]),
 ];
 
 /// The `record` features that are field-level (module doc).
