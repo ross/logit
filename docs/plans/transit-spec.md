@@ -289,6 +289,9 @@ field.
 - `kafka_out` and `splunk_hec_out` columns: their metric forms are JSON documents with their own
   readers, and neither has a `_in` pair that reads metrics back the same way (`splunk_hec_in`
   does; it joins when a flow asks).
+- A `prometheus_in -> prometheus_out` flow. Every scrape case fails `attributes/private_carrier`
+  on `prometheus_in`'s target carrier, which no read-back restores, so the flow waits on a
+  decision about that cell ([the mappings known gaps](../known-gaps/mappings.md) has the cause).
 - Compressed JSON archives: gzip on `file_out`'s `format: json` rotation and `replay_in` reading a
   `.gz` file by its extension, added together in one follow-up (`docs/known-gaps/tailing.md`).
 
@@ -558,9 +561,9 @@ Recorded per workstream as each lands.
   remote-write protobuf body doesn't, which is why those cases aren't written. The README's
   "Adding a case" states the rule.
 
-  Every record reached an existing row at the class it states, so the table
-  gained no row. What the flows show about collectd's data at the four sinks, each as the table
-  already states it:
+  Every record reached an existing row at the class it states, so `collectd_in` added no row to
+  the table; the `event/*` rows in the bullet above came with `tcoll/w1a`. What the flows show
+  about collectd's data at the four sinks, each as the table already states it:
   - `influxdb_out` writes a COUNTER, DERIVE, or ABSOLUTE value as a plain `value` field, so its
     cumulative or delta reading is gone, uncounted (`sum/*`: `degraded`, no counter). Each data
     source of a multi-data-source list becomes its own measurement, `load.load.0` to
@@ -577,3 +580,8 @@ Recorded per workstream as each lands.
     `events.skipped` (`log/plain`).
   - A `types_db:` changes only the record names (`load.load.0` against `load.load.shortterm`), so
     each sink writes the same values under other series names; no class differs.
+
+  Two of these are gaps no cell states, and [the mappings known gaps](../known-gaps/mappings.md)
+  records each: a list's data sources as separate measurements at `influxdb_out`, and a
+  notification's plugin and type at `otlp_out`. It also records a wrapped COUNTER reading as a
+  reset at `prometheus_out`, which no flow can show, since it's outside the codec layer.
