@@ -1,0 +1,4 @@
+# A point whose fields are all strings after a stage dropped its measurement carrier, as a
+# `remove` of `_logit.influxdb.measurement` does, so it reaches the sinks as an event with no
+# record and no carrier.
+exercises: []

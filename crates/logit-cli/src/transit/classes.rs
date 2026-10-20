@@ -28,8 +28,10 @@
 //! `resource_attribute`; and `attributes/scope` when its batch has a scope. A log
 //! record on an event with no metrics reaches `log/dogstatsd_event` when it carries
 //! `_logit.statsd.event.title`, else `log/plain`, and its attribute rows; a span there reaches
-//! `span/alone`. A log or span on an event that carries metrics is a field of that event: it
-//! reaches `log/beside_metrics` or `span/beside_metrics` alone, read as `exact` when it pairs
+//! `span/alone`. An event with no metric, log, or span is a record of kind `event` that reaches
+//! `event/string_only` when it carries a non-empty `_logit.influxdb.measurement`, else
+//! `event/attributes_only`, and its attribute rows. A log or span on an event that carries
+//! metrics is a field of that event: it reaches `log/beside_metrics` or `span/beside_metrics` alone, read as `exact` when it pairs
 //! unchanged, `normalized` when it pairs changed, and `lost` when nothing read back pairs with
 //! it.
 //!
@@ -47,7 +49,7 @@
 //! one left over.
 //!
 //! [`Spelling`] holds each sink's rewrites, from its codec's module doc: `statsd_out`'s reserved
-//! characters as `_`; `prometheus_out`'s `sanitize_metric_name`, `_total` on a counter, a label
+//! characters as `_` in a name, a tag key, and a tag value (`:` allowed there); `prometheus_out`'s `sanitize_metric_name`, `_total` on a counter, a label
 //! key's `sanitize_label_name`, and an array's last element; `influxdb_out`'s `<name>.value` for
 //! a `sum`, `gauge`, or `set` off the carrier path, and an array's last element; `otlp_out`'s
 //! timestamp value as an integer of nanoseconds. A candidate's public attributes (no `_logit.`
@@ -119,11 +121,11 @@ const OUTCOMES: [&str; 6] = ["dropped", "skipped", "degraded", "normalized", "om
 /// One metric, log, or span record, as `format: json` writes it.
 #[derive(Debug, Clone)]
 struct Rec {
-    /// The metric kind, `log`, or `span`.
+    /// The metric kind, `log`, `span`, or `event` for an event that carries none of them.
     kind: String,
-    /// The metric name, the log's message, or the span's name.
+    /// The metric name, the log's message, or the span's name; empty for an `event`.
     name: String,
-    /// The metric object, or the `log` or `span` object.
+    /// The metric object, or the `log` or `span` object; an empty object for an `event`.
     body: Value,
     /// Whether the record's event also carries metrics: a log or span beside them is a field of
     /// that event, not a record of its own.
@@ -143,10 +145,10 @@ struct Rec {
 
 impl Rec {
     fn is_metric(&self) -> bool {
-        !matches!(self.kind.as_str(), "log" | "span")
+        !matches!(self.kind.as_str(), "log" | "span" | "event")
     }
 
-    /// `metric`, `log`, or `span`: only records of one family pair.
+    /// `metric`, `log`, `span`, or `event`: only records of one family pair.
     fn family(&self) -> &str {
         if self.is_metric() {
             "metric"
@@ -235,7 +237,9 @@ impl Rec {
 /// sink's encoder and its pair's decoder, cited from the codec's module doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Spelling {
-    /// `statsd_out`: a name with each character outside `[A-Za-z0-9._/-]` as `_`, on both sides.
+    /// `statsd_out`: a name with each character outside `[A-Za-z0-9._/-]` as `_`, on both sides;
+    /// a tag key with each of `statsd_out`'s reserved characters as `_`, and a tag value the
+    /// same but for `:`.
     Statsd,
     /// `prometheus_out`: `sanitize_metric_name`, plus `_total` on a counter that lacks it;
     /// `sanitize_label_name` on every key; an array's last element as its label value.
@@ -320,6 +324,9 @@ impl Spelling {
             Spelling::Prometheus if !key.starts_with("_logit.") => {
                 sanitize_label_name(key).into_owned()
             }
+            Spelling::Statsd if !key.starts_with("_logit.") => {
+                key.chars().map(|c| if statsd_reserved(c) { '_' } else { c }).collect()
+            }
             _ => key.to_string(),
         }
     }
@@ -334,6 +341,9 @@ impl Spelling {
             (Spelling::Otlp, Value::String(s)) if tags.contains("=timestamp") => {
                 logit_core::time::parse_rfc3339_to_nanos(s)
                     .map_or_else(|_| s.clone(), |nanos| nanos.to_string())
+            }
+            (Spelling::Statsd, Value::String(s)) => {
+                s.chars().map(|c| if c != ':' && statsd_reserved(c) { '_' } else { c }).collect()
             }
             _ => text(value),
         }
@@ -373,6 +383,13 @@ fn sanitized(name: &str) -> String {
 
 fn safe(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')
+}
+
+/// A character `statsd_out` writes as `_` in a tag key, and in a tag value but for `:`
+/// (`crates/logit-outputs/src/statsd.rs`'s "Sanitization"). Unlike [`sanitized`], it's the
+/// encoder's own set, since a read-back value is compared as written.
+fn statsd_reserved(c: char) -> bool {
+    matches!(c, ':' | '|' | '@' | '#' | ',') || c.is_control() || c.is_whitespace()
 }
 
 /// RFC 6901's unescaping of one pointer token.
@@ -459,6 +476,12 @@ fn records(batches: &[EventBatch]) -> Vec<Rec> {
             let kind = metric["kind"].as_str().unwrap_or("").to_string();
             let name = metric["name"].as_str().unwrap_or("").to_string();
             out.push(rec(kind, name, metric.clone(), types));
+        }
+        // An event with no metric, log, or span still has attributes a sink may write or skip,
+        // such as an InfluxDB point whose fields are all strings.
+        if !beside_metrics && event.get("log").is_none() && event.get("span").is_none() {
+            let body = Value::Object(Map::new());
+            out.push(rec("event".to_string(), String::new(), body, BTreeMap::new()));
         }
     }
     out
@@ -711,6 +734,16 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
             vec![Some("dogstatsd_event".to_string())]
         }
         "log" => vec![Some("plain".to_string())],
+        "event"
+            if rec
+                .attributes
+                .get(ATTR_MEASUREMENT)
+                .and_then(Value::as_str)
+                .is_some_and(|m| !m.is_empty()) =>
+        {
+            vec![Some("string_only".to_string())]
+        }
+        "event" => vec![Some("attributes_only".to_string())],
         _ => vec![None],
     }
 }
@@ -1440,17 +1473,17 @@ mod tests {
     #[test]
     fn prometheus_pairs_a_sanitized_name_and_key_and_a_total_suffix() {
         let ins = recs(&[
-            r#"{{T},"metrics":[{"name":"cpu.usage","kind":"gauge","value":1.5}],"attributes":{"influxdb.field.note":"x"}}"#,
+            r#"{{T},"metrics":[{"name":"cpu.usage","kind":"gauge","value":1.5}],"attributes":{"deploy.note":"x"}}"#,
             r#"{{T},"metrics":[{"name":"jobs","kind":"sum","value":3.0,"temporality":"cumulative","monotonic":true}]}"#,
         ]);
         let outs = recs(&[
-            r#"{{T},"metrics":[{"name":"cpu_usage","kind":"gauge","value":1.5}],"attributes":{"influxdb_field_note":"x"}}"#,
+            r#"{{T},"metrics":[{"name":"cpu_usage","kind":"gauge","value":1.5}],"attributes":{"deploy_note":"x"}}"#,
             r#"{{T},"metrics":[{"name":"jobs_total","kind":"sum","value":3.0,"temporality":"cumulative","monotonic":true}]}"#,
         ]);
         let pairing = pair(&ins, &outs, Spelling::Prometheus);
         assert_eq!(pairing.seen, [Some(Class::Normalized), Some(Class::Normalized)]);
         assert!(pairing.unclaimed.is_empty());
-        let note = Field::Attribute { key: "influxdb.field.note".to_string(), resource: false };
+        let note = Field::Attribute { key: "deploy.note".to_string(), resource: false };
         assert_eq!(
             observe_field(&note, &ins[0], &outs[0], Spelling::Prometheus),
             Class::Normalized
@@ -1509,6 +1542,42 @@ mod tests {
         let outs = recs(&[r#"{{T},"metrics":[{"name":"a_b","kind":"gauge","value":1.0}]}"#]);
         assert_eq!(pair(&ins, &outs, Spelling::Statsd).seen, [Some(Class::Normalized)]);
         assert_eq!(pair(&ins, &outs, Spelling::Verbatim).seen, [None]);
+    }
+
+    /// `statsd_out` writes a reserved character in a tag key as `_`, and in a tag value too but
+    /// for `:`, and the field row reads the rewrite as a change.
+    #[test]
+    fn statsd_pairs_a_sanitized_tag() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"a b":"c:d e"}}"#,
+        ]);
+        let outs = recs(&[
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}],"attributes":{"a_b":"c:d_e"}}"#,
+        ]);
+        assert_eq!(pair(&ins, &outs, Spelling::Statsd).seen, [Some(Class::Exact)]);
+        assert_eq!(pair(&ins, &outs, Spelling::Verbatim).seen, [None]);
+        let field = Field::Attribute { key: "a b".to_string(), resource: false };
+        assert_eq!(observe_field(&field, &ins[0], &outs[0], Spelling::Statsd), Class::Normalized);
+    }
+
+    /// An event with no metric, log, or span and no measurement carrier is one `event` record
+    /// reaching `event/attributes_only`.
+    #[test]
+    fn an_event_with_attributes_only_is_an_event_record() {
+        let ins = recs(&[r#"{{T},"attributes":{"_logit.influxdb.field.s":"x"}}"#]);
+        assert_eq!(ins.len(), 1);
+        assert_eq!((ins[0].kind.as_str(), ins[0].family()), ("event", "event"));
+        assert_eq!(kind_features(&ins[0]), [Some("attributes_only".to_string())]);
+    }
+
+    /// An event with no metric, log, or span that carries the InfluxDB measurement is a
+    /// string-only point, which `influxdb_out` writes only then.
+    #[test]
+    fn an_event_with_a_measurement_is_string_only() {
+        let ins = recs(&[
+            r#"{{T},"attributes":{"_logit.influxdb.measurement":"m","_logit.influxdb.field.s":"x"}}"#,
+        ]);
+        assert_eq!(kind_features(&ins[0]), [Some("string_only".to_string())]);
     }
 
     /// The latest point of a series claims what a sink holding one value per series read back,

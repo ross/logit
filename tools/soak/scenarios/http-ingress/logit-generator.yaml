@@ -16,7 +16,7 @@ components:
       attributes:
         _logit.influxdb.measurement: soak_requests
         series: "{seq%100}"
-        influxdb.field.n: "1"
+        _logit.influxdb.field.n: "1"
   influx:
     type: influxdb_out
     sources: [load]

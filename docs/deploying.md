@@ -2573,6 +2573,29 @@ sample or set member doesn't share (see
   re-sketch, which reports the records the series held as well as the incoming one). `aggregate` is the only place the `sample_rate_clamped` diagnostic fires; `statsd_in`
   doesn't emit it ([ADR `lossless-transit`](adr/lossless-transit.md), W3).
 
+## Metrics `aggregate` doesn't merge
+
+`aggregate` forwards some metrics unmerged instead of dropping them, each counted under
+`logit.transform.metrics.passed_through{reason}`. Three reasons depend on what a producer sends:
+
+- **`bucketed`**: a Datadog APM stats group passes through whole, with its bucket's start,
+  duration, and grouping key, because it already summarizes its own time bucket. A `keep` ahead of
+  `aggregate` needs `private: keep`, or it removes the `_logit.datadog.stats.name` marker and the
+  stats merge as ordinary metrics that no stats route sends.
+
+- **`timestamped`**: a metric that carries its own source timestamp, a DogStatsD `|T` line (or a
+  service check's `d:`) or a Prometheus exposition sample with a timestamp, passes through with
+  that timestamp, as the Datadog Agent leaves a `|T` metric unaggregated. A window would replace
+  the producer's time with the flush time and split the series by timestamp. If you want such
+  metrics summarized anyway, drop the `_logit.statsd.timestamp` or `_logit.prometheus.timestamp`
+  attribute with `remove` ahead of `aggregate`, and they take the flush time.
+- **`non_finite`**: a counter increment, gauge, or gauge adjustment whose value is `NaN` or
+  infinite passes through, so a running total or a held gauge stays finite. The throttled
+  `sum_non_finite` and `gauge_non_finite` diagnostics name the metric.
+
+The full list of reasons is in [internal-telemetry.md](design/internal-telemetry.md)'s
+`aggregate` table.
+
 ## Measuring a flow's shape with `shape`
 
 `shape` answers "what do the events on this leg look like?": how many attributes they carry, how
@@ -3242,10 +3265,11 @@ pipeline didn't take the body within 5 seconds and nothing of it was taken, coun
 
 **What arrives.** Each point becomes one event with its tags as attributes and the private
 attribute `_logit.influxdb.measurement` naming the measurement. Each numeric or boolean field
-becomes a gauge named `MEASUREMENT.FIELD`, and each string field an `influxdb.field.FIELD`
-attribute. `org`, `orgID`, and `bucket` become the private resource attributes
-`_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. No sink writes a
-`_logit.` attribute as a tag or label.
+becomes a gauge named `MEASUREMENT.FIELD`, and each string field the private attribute
+`_logit.influxdb.field.FIELD`. `org`, `orgID`, and `bucket` become the private resource
+attributes `_logit.influxdb.org`, `_logit.influxdb.org_id`, and `_logit.influxdb.bucket`. No
+protocol sink but `influxdb_out` writes a `_logit.influxdb.` attribute, and none writes one as a
+tag or label.
 `crates/logit-proto/src/influxdb/mod.rs`'s module doc has the mapping table.
 
 **Relaying to the client's bucket.** An `influxdb_out` with no `bucket:` writes each batch to the
@@ -3292,9 +3316,14 @@ choosing the carried form, know what it costs:
 `influxdb-line-protocol-relay`](adr/influxdb-line-protocol-relay.md)'s 2026-10-15 amendment has
 the reasoning.
 
-**Remove string fields ahead of other sinks.** `influxdb.field.*` attributes are ordinary
-attributes everywhere but `influxdb_out`, so `prometheus_out` and `graphite_out` write them as
-labels or tags. Add a `remove` stage for them on any leg that doesn't end in `influxdb_out`.
+**String fields reach `influxdb_out` alone among the protocol sinks.** Every other protocol sink
+leaves a string field off, uncounted, because its free-text value as a tag or label would start a
+series per value. Sinks that write the whole event keep it, as they keep every private
+attribute; [ADR `private-attribute-namespace`](adr/private-attribute-namespace.md)'s "The ignore
+rule" lists them. A `keep` with its default `private: drop` strips string fields too, so set
+`private: keep` on a `keep` ahead of `influxdb_out`. An `aggregate` leaves them out of the series
+it flushes, so two readings that differ only in a string field are one series. To send one
+elsewhere, copy it to a public attribute in a `lua` stage.
 
 **A destination fault never reaches the producer.** `influxdb_in` answers `204` once the batch is
 in every downstream inbox, before `influxdb_out` writes it. A `422` for a field type conflict
@@ -3305,8 +3334,8 @@ bucket or org came from the client), and a `401` (the sink holds and retries), a
 **What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
 answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened. A nonzero
 `logit.input.tags.omitted{reason="reserved_prefix"}` means a producer sends a tag key starting
-with `_logit.` or `influxdb.field.`, which the decoder leaves off the point because it would
-collide with a carrier or a string field. `statsd_in`, `graphite_in`, `datadog_in`, and
+with `_logit.`, which the decoder leaves off the point because it would collide with a carrier or
+a string field. `statsd_in`, `graphite_in`, `datadog_in`, and
 `prometheus_in`'s remote-write receiver emit the same counter for a `_logit.` key. A sustained
 `logit.input.batches.deferred` means the pipeline isn't keeping up. A nonzero
 `logit.input.connections.rejected{reason="limit"}` means the `max_connections` cap is binding.

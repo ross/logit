@@ -1,0 +1,2 @@
+{"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":7.0}],"attributes":{"_logit.prometheus.timestamp":true,"q":"a"},"resource":{"attributes":{"_logit.prometheus.target":"http://transit:9100/metrics","instance":"transit:9100"}}}
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":9.0}],"attributes":{"q":"b"},"resource":{"attributes":{"_logit.prometheus.target":"http://transit:9100/metrics","instance":"transit:9100"}}}

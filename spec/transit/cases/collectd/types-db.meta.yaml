@@ -1,0 +1,6 @@
+# The datagram value-lists reads, its data sources named from the stock types.db entries in
+# types.db. Only the record names differ, so each sink writes the same values under other series
+# names.
+wire: ../../../../testdata/interop/collectd/collectd-000.raw
+types_db: types.db
+exercises: [value_list, derive, gauge, multi_data_source, identity, plugin_instance, type_instance, identity_elision, interval, time_hr, types_db]

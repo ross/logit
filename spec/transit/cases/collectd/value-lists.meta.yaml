@@ -1,0 +1,4 @@
+# A recorded collectd 5.12 datagram, read in place from testdata/interop/: 26 value lists from the
+# load, memory, and interface plugins, named by index with no types_db.
+wire: ../../../../testdata/interop/collectd/collectd-000.raw
+exercises: [value_list, derive, gauge, multi_data_source, identity, plugin_instance, type_instance, identity_elision, interval, time_hr]

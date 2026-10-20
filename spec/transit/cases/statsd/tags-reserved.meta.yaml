@@ -1,0 +1,4 @@
+# A tag key holding a space and a value holding `@` and a space, both of which statsd_in reads
+# as written and statsd_out rewrites as `_`, and a value holding a second `:`, which it keeps.
+wire: tags-reserved.statsd
+exercises: [counter, tags, tags_reserved]

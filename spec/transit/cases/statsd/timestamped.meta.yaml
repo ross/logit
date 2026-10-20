@@ -1,0 +1,4 @@
+# A gauge and a counter sent twice with |T and once without: a window passes the |T lines
+# through at their own times and merges the rest.
+wire: timestamped.statsd
+exercises: [counter, gauge, timestamp_T]

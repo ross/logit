@@ -715,7 +715,16 @@ pub fn is_datadog_event(resource: &Resource, event: &Event) -> bool {
 /// [`DatadogEncoder::encode_client_stats_v06`] and [`DatadogEncoder::encode_stats_payload`] send.
 /// Every metrics route skips such an event whole: its records are a stats group's, not series.
 pub fn is_datadog_stats(resource: &Resource, event: &Event) -> bool {
-    merged_get(resource, event, stats::ATTR_STATS_NAME).is_some()
+    logit_core::interner::lookup(stats::ATTR_STATS_NAME)
+        .is_some_and(|name| is_datadog_stats_sym(resource, event, name))
+}
+
+/// [`is_datadog_stats`] by `stats_name`, the interned [`stats::ATTR_STATS_NAME`], for a caller
+/// that tests every event and interns the key once (`aggregate`): two binary searches, no
+/// interner probe.
+pub fn is_datadog_stats_sym(resource: &Resource, event: &Event, stats_name: Symbol) -> bool {
+    event.attributes.get_sym(stats_name).is_some()
+        || resource.attributes.get_sym(stats_name).is_some()
 }
 
 /// `_top_level`: the span metric the Agent writes (`1`) on every root, orphan, and

@@ -1,0 +1,7 @@
+# The entries from collectd 5.12's stock types.db for the types the recorded value lists carry.
+if_dropped		rx:DERIVE:0:U, tx:DERIVE:0:U
+if_errors		rx:DERIVE:0:U, tx:DERIVE:0:U
+if_octets		rx:DERIVE:0:U, tx:DERIVE:0:U
+if_packets		rx:DERIVE:0:U, tx:DERIVE:0:U
+load			shortterm:GAUGE:0:5000, midterm:GAUGE:0:5000, longterm:GAUGE:0:5000
+memory			value:GAUGE:0:281474976710656

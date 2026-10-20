@@ -11,6 +11,10 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature_celsius.value","kind":"gauge","value":-4.5}],"attributes":{"_logit.influxdb.measurement":"temperature_celsius","instance":"transit:9100","room":"cold"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature_celsius.value","kind":"gauge","value":21.5}],"attributes":{"_logit.influxdb.measurement":"temperature_celsius","instance":"transit:9100","room":"lab"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}},
+  "gauge-timestamp": {"events": [
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue_depth.value","kind":"gauge","value":7.0}],"attributes":{"_logit.influxdb.measurement":"queue_depth","instance":"transit:9100","q":"a"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue_depth.value","kind":"gauge","value":9.0}],"attributes":{"_logit.influxdb.measurement":"queue_depth","instance":"transit:9100","q":"b"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
+  ], "counters": {}},
   "help-unit": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"disk_bytes.value","kind":"gauge","value":1024.0}],"attributes":{"_logit.influxdb.measurement":"disk_bytes","dev":"sda","instance":"transit:9100"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}},
