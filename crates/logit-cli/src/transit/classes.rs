@@ -1300,6 +1300,15 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             // A key the sink respells reads back under its wire spelling, which is a change.
             let wire = spelling.key_for(key, input);
             let respelled = wire != *key;
+            // A key respelled into a private carrier (`datadog_out`'s host of an event or a check)
+            // is outside every public comparison, so its value is compared here.
+            if respelled && wire.starts_with("_logit.") {
+                let found = either_side(out, &wire, *resource);
+                return match found {
+                    Some(read) if text(read) == text(want) => Class::Normalized,
+                    _ => Class::Lost,
+                };
+            }
             let key = &wire;
             let (same, same_tags, other) = if *resource {
                 (out.resource.get(key), out.resource_types.get(key), out.attributes.get(key))
@@ -1315,6 +1324,16 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             }
         }
     }
+}
+
+/// `out`'s attribute `key`, on the side `resource` names first, else on the other.
+fn either_side<'a>(out: &'a Rec, key: &str, resource: bool) -> Option<&'a Value> {
+    let (same, other) = if resource {
+        (out.resource.get(key), out.attributes.get(key))
+    } else {
+        (out.attributes.get(key), out.resource.get(key))
+    };
+    same.or(other)
 }
 
 /// Whether a field observed as `seen` fits `cell`, and its counter moved if it's lost.
@@ -2172,6 +2191,61 @@ mod tests {
         )]);
         let field = Field::Attribute { key: "host.name".to_string(), resource: false };
         assert_eq!(observe_field(&field, &own[0], &read[0], Spelling::Datadog), Class::Lost);
+    }
+
+    /// A host read back under a Datadog event's or check's host carrier must hold the input's
+    /// value: another value there is the host lost.
+    #[test]
+    fn datadog_reads_a_carrier_holding_another_host_as_lost() {
+        let event = |attributes: &str| {
+            format!(r#"{{{{T}},"log":{{"format":"raw","message":"m"}},"attributes":{attributes}}}"#)
+        };
+        let check = |attributes: &str| {
+            format!(
+                r#"{{{{T}},"metrics":[{{"name":"c","kind":"gauge","value":0.0}}],"attributes":{attributes}}}"#
+            )
+        };
+        let cases = [
+            (
+                event(r#"{"_logit.statsd.event.title":"t","host.name":"h"}"#),
+                "host.name",
+                event(r#"{"_logit.statsd.event.title":"t","_logit.statsd.event.host":"x"}"#),
+            ),
+            (
+                event(r#"{"_logit.statsd.event.title":"t","host":"h"}"#),
+                "host",
+                event(r#"{"_logit.statsd.event.title":"t","_logit.statsd.event.host":"x"}"#),
+            ),
+            (
+                check(r#"{"_logit.statsd.service_check.name":"c","host.name":"h"}"#),
+                "host.name",
+                check(
+                    r#"{"_logit.statsd.service_check.name":"c","_logit.statsd.service_check.host":"x"}"#,
+                ),
+            ),
+            (
+                check(r#"{"_logit.statsd.service_check.name":"c","host":"h"}"#),
+                "host",
+                check(
+                    r#"{"_logit.statsd.service_check.name":"c","_logit.statsd.service_check.host":"x"}"#,
+                ),
+            ),
+        ];
+        for (input, key, read) in cases {
+            let (ins, outs) = (recs(&[&input]), recs(&[&read]));
+            let field = Field::Attribute { key: key.to_string(), resource: false };
+            assert_eq!(
+                observe_field(&field, &ins[0], &outs[0], Spelling::Datadog),
+                Class::Lost,
+                "{input}"
+            );
+            let same = recs(&[&read.replace(r#""x""#, r#""h""#)]);
+            assert_eq!(
+                observe_field(&field, &ins[0], &same[0], Spelling::Datadog),
+                Class::Normalized,
+                "{input}"
+            );
+        }
     }
 
     /// A log leaves with `status` set to its severity's name, read back as an attribute; a
