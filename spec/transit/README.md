@@ -31,7 +31,7 @@ key, a stale document, and a key no case has each fail naming the flow and the c
 | `features/<system>.yaml` | The wire features a source's cases can exercise, one `{name, text}` each |
 | `cases/<system>/<case>.meta.yaml` | What the case exercises, and its wire file, a collectd case's `types_db:` file, and tolerances if any |
 | `cases/<system>/<case>.json` | The case's events, one `format: json` line each |
-| `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from: `.statsd` lines, InfluxDB line protocol in `.lp`, a Prometheus scrape body in `.prom`, or one collectd datagram in `.raw` |
+| `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from, recorded, written as text, or hand-built ("Adding a case"): `.statsd` lines, InfluxDB line protocol in `.lp`, a Prometheus scrape body in `.prom`, or one collectd datagram in `.raw` |
 | `cases/<system>/<case>.headers` | The request beside an HTTP wire file, one `name: value` per line as `testdata/interop/` records it: `path:` with an InfluxDB write's `org`, `orgID`, `bucket`, and `precision`, or a scrape's `content-type:` choosing its dialect |
 | `flows/<flow>.yaml` | A runnable config: `replay_in -> [stages] -> <sink>` |
 | `expected/<flow>.json` | Each case's run through the flow, keyed by case name: the events read back and the counters moved (generated) |
@@ -213,8 +213,8 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
 
 1. Pick the source system's directory under `cases/`.
 2. For a case that starts on the wire, write the wire file (`<case>.statsd`, `<case>.lp`,
-   `<case>.prom`, or `<case>.raw`) and `<case>.meta.yaml` with `wire: <case>.statsd`. An InfluxDB case needs a
-   `<case>.headers` beside its wire file whose `path:` names a `bucket` and an `org` or `orgID`,
+   `<case>.prom`, or `<case>.raw`) and `<case>.meta.yaml` with `wire: <case>.statsd`. An
+   InfluxDB case needs a `<case>.headers` beside its wire file whose `path:` names a `bucket` and an `org` or `orgID`,
    as `influxdb_in` requires; a Prometheus case reads text 0.0.4 unless its `.headers` gives an
    OpenMetrics `content-type:`. A `wire:` path may point at a capture under `testdata/interop/`
    instead of copying it, and its `.headers` comes with it; an InfluxDB body sent with
@@ -224,6 +224,13 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
 3. For an edge case no producer sends, write `<case>.json` by hand and leave `wire:` out. The check
    requires it to read back to itself through `format: json`, and prints the form to use when it
    doesn't.
+
+   The exception is a wire feature no capture has and a `.json` can't state, such as a collectd
+   data-source type or a legacy time part: build the wire file by hand instead, because the case
+   then runs through the real decoder. Describe the bytes part by part in the meta's comment, so
+   a reviewer can check them without a hex dump. Only a wire with a fixed, hand-readable layout
+   qualifies. A collectd datagram does, since it's a flat run of type-length-value parts; a
+   remote-write protobuf body doesn't, so it waits for a recorded capture.
 4. List the features it exercises in `exercises:`. Each must be in `features/<system>.yaml`.
 5. Run `script/transit gen`, review the new expectations, and commit.
 
