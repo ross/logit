@@ -16,6 +16,7 @@
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics) | record |
 //! | `span` | `alone` (on an event with no metrics) | record |
 //! | `log`, `span` | `beside_metrics` (on an event that carries metrics) | field |
+//! | `event` | `no_record` (an event that carries no metric, log, or span) | record |
 //!
 //! `attributes/scope` is the batch's instrumentation scope, a field of every record in the batch
 //! like a resource attribute, so it's an `attributes` row rather than a kind of its own. A
@@ -66,7 +67,7 @@ pub(super) const CLASSES: [&str; 6] =
     ["exact", "normalized", "degraded", "lost", "skipped", "dropped"];
 
 /// Each row kind and its features (module doc).
-const KINDS: [(&str, &[&str]); 14] = [
+const KINDS: [(&str, &[&str]); 15] = [
     (
         "sum",
         &[
@@ -127,6 +128,7 @@ const KINDS: [(&str, &[&str]); 14] = [
     ),
     ("log", &["dogstatsd_event", "plain", "beside_metrics"]),
     ("span", &["alone", "beside_metrics"]),
+    ("event", &["no_record"]),
 ];
 
 /// The `record` features that are field-level (module doc).

@@ -134,6 +134,7 @@
 //! | `log/dogstatsd_event` | skipped | uncounted | A log has no Prometheus form and isn't written, uncounted. |
 //! | `log/plain` | skipped | uncounted | A log has no Prometheus form and isn't written, uncounted. |
 //! | `span/alone` | skipped | uncounted | A span has no Prometheus form and isn't written, uncounted. |
+//! | `event/no_record` | skipped | uncounted | An event with no metric, log, or span, such as an InfluxDB point whose fields are all strings, has no sample and isn't written, uncounted. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!

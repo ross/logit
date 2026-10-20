@@ -77,8 +77,9 @@ is one nothing checks: add a case or a flow that reaches it.
 `mapping.yaml`'s `classes:` is the canonical vocabulary: `exact`, `normalized`, `degraded`, `lost`,
 `skipped`, and `dropped`. They apply at two levels:
 
-- **Record level**, for a metric kind, a log or span on an event with no metrics, and the
-  `record` rows that decide a record's fate (`no_recorded_value`, `no_recorded_value_delta_sum`,
+- **Record level**, for a metric kind, a log or span on an event with no metrics, an event with
+  no metric, log, or span (`event/no_record`, such as an InfluxDB point whose fields are all
+  strings), and the `record` rows that decide a record's fate (`no_recorded_value`, `no_recorded_value_delta_sum`,
   `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `non_finite`, `superseded`,
   `same_instant`, `same_millisecond`): `exact`, `normalized`, `degraded`, `skipped`, or
   `dropped`, best to worst.

@@ -271,6 +271,9 @@ column" and "Adding a source" steps, one PR each.
 W4b landed these with four more flows: `influxdb_in -> prometheus_out` as remote-write 2.0,
 `statsd_in -> prometheus_out` both as exposition and as remote-write 1.0, and `statsd_in ->
 influxdb_out`, so every kind the statsd cases hold reaches each new column in each mode.
+`influxdb_in -> statsd_out` and `prometheus_in -> statsd_out` followed, so the `statsd_out`
+column sees a cumulative counter, a histogram, a summary, a typed InfluxDB field, and a string
+field.
 
 ### 8. Not in this stack
 
@@ -515,3 +518,18 @@ Recorded per workstream as each lands.
   and vary up to about 9x in speed. It's now a test per flow beside a `cases` test and a `ledger`
   test, with each flow's observations committed as `ledger/<flow>.json` so the checks across
   flows need no flow run ([ADR `transit-spec`](../adr/transit-spec.md)'s per-flow amendment).
+- **InfluxDB and Prometheus into `statsd_out`** (`tcoll/w1a`): `influxdb-to-statsd` and
+  `prometheus-to-statsd`, each `replay_in -> statsd_out` under DogStatsD. An `aggregate` variant
+  would reach no cell these don't: the statsd variants exist to make distributions, set
+  estimates, and running totals from raw statsd kinds, and these sources already carry running
+  totals and gauges. Every `statsd_out` cell they reached agreed with the table but two, each a
+  gap in what the table could say rather than in the code:
+  - `statsd_out` writes each reserved character in a tag key, and each but `:` in a tag value, as
+    `_`, uncounted. No statsd case holds one, since `statsd_in` can't decode one. The check's
+    `statsd_out` spelling now rewrites keys and values as the encoder does, and
+    `attributes/string_value` reads `normalized` (`tag_sanitized`) under DogStatsD.
+  - An InfluxDB point whose fields are all strings decodes to an event with no metric, log, or
+    span. `statsd_out` skips it under `logit.output.events.skipped`, and no row covered a record
+    that isn't one. `event/no_record` is that row: `statsd_out` skips it counted, and
+    `prometheus_out` skips it uncounted. `influxdb_out`, which writes such a point's line, and
+    `otlp_out` have no cell until a flow takes InfluxDB cases to them.

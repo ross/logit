@@ -909,7 +909,9 @@ flow_tests! {
     influxdb_aggregate_to_prometheus => "influxdb-aggregate-to-prometheus",
     influxdb_to_prometheus_remote_write => "influxdb-to-prometheus-remote-write",
     influxdb_to_prometheus => "influxdb-to-prometheus",
+    influxdb_to_statsd => "influxdb-to-statsd",
     prometheus_to_influxdb => "prometheus-to-influxdb",
+    prometheus_to_statsd => "prometheus-to-statsd",
     statsd_aggregate_cumulative => "statsd-aggregate-cumulative",
     statsd_aggregate_samples => "statsd-aggregate-samples",
     statsd_aggregate_sketch => "statsd-aggregate-sketch",
@@ -1203,7 +1205,9 @@ mod tests {
         let mut merged = Ledger::default();
         merged.merge(read);
         assert_eq!(merged.fragment().render(), text);
-        assert_eq!(merged.finish(&table), Vec::<String>::new());
+        // One case's run needn't observe every `normalized` cell it reaches at that class, so the
+        // merged ledger is held to the checks the run's own ledger gives, not to none.
+        assert_eq!(merged.finish(&table), ledger.finish(&table));
 
         let (sink, row, index, _) = table
             .cells()

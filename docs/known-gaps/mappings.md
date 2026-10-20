@@ -204,6 +204,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (statsd) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that also carries metrics is left off while the metrics are written, uncounted. |
   | encode (statsd) | `span/alone` → **skipped** | `logit.output.events.skipped` | A span on an event with no metrics has no statsd form and isn't written. |
   | encode (statsd) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that also carries metrics is left off while the metrics are written, uncounted. |
+  | encode (statsd) | `event/no_record` → **skipped** | `logit.output.events.skipped` | An event with no metric, log, or span, such as an InfluxDB point whose fields are all strings, has no statsd line and isn't written. |
 
   <!-- transit:end -->
 
@@ -251,6 +252,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   | encode (Prometheus) | field `log/beside_metrics` → **lost** | none (uncounted) | A log on an event that carries metrics is left off while the metrics are written, uncounted. |
   | encode (Prometheus) | `span/alone` → **skipped** | none (uncounted) | A span has no Prometheus form and isn't written, uncounted. |
   | encode (Prometheus) | field `span/beside_metrics` → **lost** | none (uncounted) | A span on an event that carries metrics is left off while the metrics are written, uncounted. |
+  | encode (Prometheus) | `event/no_record` → **skipped** | none (uncounted) | An event with no metric, log, or span, such as an InfluxDB point whose fields are all strings, has no sample and isn't written, uncounted. |
 
   <!-- transit:end -->
 

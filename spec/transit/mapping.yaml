@@ -1007,8 +1007,11 @@ rows:
           class: lost
           counter: logit.output.tags.omitted{reason=dialect}
           text: Plain statsd has no tags; each is counted once per wire tag.
-        - class: exact
-          text: A DogStatsD `key:value` tag.
+        - class: normalized
+          reason: tag_sanitized
+          text: >-
+            A DogStatsD `key:value` tag. Each `:`, `|`, `@`, `#`, `,`, control, and whitespace
+            character in the key, and each but `:` in the value, is written as `_`, uncounted.
       prometheus_out:
         class: normalized
         reason: label_sanitized
@@ -1365,3 +1368,22 @@ rows:
       otlp_out:
         class: exact
         text: An OTLP span in the traces request, beside the metrics in theirs.
+
+  # --- events with no record -------------------------------------------------------------------
+  # Only influxdb_in makes one, from a point whose fields are all strings, and no flow takes its
+  # cases into influxdb_out or otlp_out yet, so neither has a cell.
+  - kind: event
+    feature: no_record
+    cells:
+      statsd_out:
+        class: skipped
+        counter: logit.output.events.skipped
+        text: >-
+          An event with no metric, log, or span, such as an InfluxDB point whose fields are all
+          strings, has no statsd line and isn't written.
+      prometheus_out:
+        class: skipped
+        reason: uncounted
+        text: >-
+          An event with no metric, log, or span, such as an InfluxDB point whose fields are all
+          strings, has no sample and isn't written, uncounted.

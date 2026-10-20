@@ -1,0 +1,78 @@
+{
+  "counter": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"http_requests_total","kind":"gauge","value":1027.0}],"attributes":{"code":"200","instance":"transit:9100","method":"get"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"http_requests_total","kind":"gauge","value":3.0}],"attributes":{"code":"200","instance":"transit:9100","method":"post"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 2
+  }},
+  "exemplars": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"hits_total","kind":"gauge","value":10.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.bucket_0_1","kind":"gauge","value":2.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.bucket_inf","kind":"gauge","value":1.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.count","kind":"gauge","value":3.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency.sum","kind":"gauge","value":0.4}],"attributes":{"instance":"transit:9100"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 1
+  }},
+  "gauge": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge","value":0.0}],"attributes":{"instance":"transit:9100","room":"cold"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge","value":21.5}],"attributes":{"instance":"transit:9100","room":"lab"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge_delta","delta":-4.5}],"attributes":{"instance":"transit:9100","room":"cold"}}
+  ], "counters": {}},
+  "help-unit": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"disk_bytes","kind":"gauge","value":1024.0}],"attributes":{"dev":"sda","instance":"transit:9100"}}
+  ], "counters": {}},
+  "histogram": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request_duration_seconds.bucket_0_1","kind":"gauge","value":3.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request_duration_seconds.bucket_0_5","kind":"gauge","value":4.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request_duration_seconds.bucket_inf","kind":"gauge","value":2.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request_duration_seconds.count","kind":"gauge","value":9.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request_duration_seconds.sum","kind":"gauge","value":2.75}],"attributes":{"instance":"transit:9100"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 1
+  }},
+  "label-escaping": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"escaped","kind":"gauge","value":1.0}],"attributes":{"instance":"transit:9100","nl":"a_b","path":"C:\\dir","quote":"say_\"hi\""}}
+  ], "counters": {}},
+  "mixed": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"instance":"transit:9100","version":"1.2.3"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"feature":"b","instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":1.0}],"attributes":{"feature":"a","instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"mystery","kind":"gauge","value":3.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue.bucket_1","kind":"gauge","value":2.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue.bucket_inf","kind":"gauge","value":3.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue.count","kind":"gauge","value":5.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue.sum","kind":"gauge","value":7.5}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"reqs_total","kind":"gauge","value":5.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"up","kind":"gauge","value":1.0}],"attributes":{"instance":"transit:9100"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1,
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=histogram,role=sink}": 1
+  }},
+  "nan-inf": {"events": [], "counters": {
+    "logit.output.messages.dropped{component=out,kind=statsd_out,reason=unencodable_value,role=sink}": 3
+  }},
+  "openmetrics-total-created": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"jobs_total","kind":"gauge","value":42.0}],"attributes":{"instance":"transit:9100"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=cumulative_sum,role=sink}": 1
+  }},
+  "summary": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc_duration_seconds.count","kind":"gauge","value":140.0}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc_duration_seconds.q0_5","kind":"gauge","value":0.05}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc_duration_seconds.q0_99","kind":"gauge","value":0.2}],"attributes":{"instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc_duration_seconds.sum","kind":"gauge","value":12.5}],"attributes":{"instance":"transit:9100"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=statsd_out,metric_kind=summary,role=sink}": 1
+  }},
+  "typed-attributes": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"count":"7","room":"lab"}}
+  ], "counters": {
+    "logit.output.tags.omitted{component=out,kind=statsd_out,reason=unrepresentable,role=sink}": 3
+  }},
+  "untyped": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"legacy_value","kind":"gauge","value":7.0}],"attributes":{"instance":"transit:9100","source":"old"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"no_metadata","kind":"gauge","value":1.5}],"attributes":{"instance":"transit:9100"}}
+  ], "counters": {}}
+}
