@@ -1,7 +1,9 @@
 {
   "cells": [
     {"sink":"influxdb_out","row":"attributes/array_value","cell":0,"observed":["normalized"]},
+    {"sink":"influxdb_out","row":"attributes/datadog_carrier_log","cell":0,"observed":["lost"]},
     {"sink":"influxdb_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"influxdb_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
     {"sink":"influxdb_out","row":"attributes/string_value","cell":0,"observed":["exact"]},
     {"sink":"influxdb_out","row":"distribution","cell":0,"observed":["degraded"]},
     {"sink":"influxdb_out","row":"gauge/f64","cell":0,"observed":["normalized"]},

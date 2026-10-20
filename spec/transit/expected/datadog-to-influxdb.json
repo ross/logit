@@ -36,5 +36,8 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.temperature.value","kind":"gauge","value":-4.25}],"attributes":{"_logit.influxdb.measurement":"app.temperature","env":"prod","host.name":"worker-2"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.unspecified.value","kind":"gauge","value":2.0}],"attributes":{"_logit.influxdb.measurement":"app.unspecified","env":"prod"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.late.value","kind":"gauge","value":5.0}],"attributes":{"_logit.influxdb.measurement":"app.late","env":"prod","host.name":"worker-2"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
+  ], "counters": {}},
+  "service-check-carrier": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.ready.value","kind":"gauge","value":0.0}],"attributes":{"_logit.influxdb.measurement":"app.ready"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}}
 }

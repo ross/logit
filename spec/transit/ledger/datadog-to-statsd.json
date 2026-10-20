@@ -2,7 +2,9 @@
   "cells": [
     {"sink":"statsd_out","row":"attributes/array_value","cell":1,"observed":["exact"]},
     {"sink":"statsd_out","row":"attributes/bool_value","cell":1,"observed":["exact"]},
+    {"sink":"statsd_out","row":"attributes/datadog_carrier_log","cell":0,"observed":["lost"]},
     {"sink":"statsd_out","row":"attributes/foreign_carrier","cell":0,"observed":["lost"]},
+    {"sink":"statsd_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
     {"sink":"statsd_out","row":"attributes/private_carrier","cell":1,"observed":["exact"]},
     {"sink":"statsd_out","row":"attributes/string_value","cell":1,"observed":["exact"]},
     {"sink":"statsd_out","row":"distribution","cell":1,"observed":["degraded"]},

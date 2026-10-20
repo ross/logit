@@ -39,5 +39,8 @@
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app_late","kind":"gauge","value":5.0}],"attributes":{"env":"prod","host_name":"worker-2"}}
   ], "counters": {
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
-  }}
+  }},
+  "service-check-carrier": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app_ready","kind":"gauge","value":0.0}]}
+  ], "counters": {}}
 }

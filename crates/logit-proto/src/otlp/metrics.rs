@@ -52,6 +52,7 @@
 //! | `record/no_recorded_value_delta_sum` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
 //! | `record/no_recorded_value_other_kind` | exact | -- | The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
 //! | `record/service_check` | exact | -- | The status gauge; the check's carriers aren't attributes. |
+//! | `record/sample_rate` | exact | -- | Each value is weighted by its inverse rate in the sketch the `samples` row describes. |
 //! | `record/superseded` | exact | -- | Each record is its own data point. |
 //! | `record/same_instant` | exact | -- | Each record is its own data point. |
 //! | `record/same_millisecond` | exact | -- | Each record is its own data point, at its own nanosecond. |
@@ -59,6 +60,7 @@
 //! | `log/dogstatsd_event` | normalized | `observed_timestamp` | An OTLP log record. Its `_logit.statsd.event.*` carriers aren't attributes; otlp_out stamps an observed time on a log that has none, and otlp_in stamps the `_logit.otel.severity_*` carriers. |
 //! | `log/plain` | normalized | `observed_timestamp` | An OTLP log record. otlp_out stamps an observed time on a log that has none, and otlp_in stamps the `_logit.otel.severity_*` carriers. |
 //! | `span/alone` | exact | -- | An OTLP span. |
+//! | `span/no_wire_form` | exact | -- | OTLP carries the status, its message, `trace_state`, flags, and dropped counts. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
@@ -80,6 +82,11 @@
 //! | `attributes/foreign_carrier` | lost | uncounted | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
 //! | `attributes/resource_attribute` | exact | -- | A resource attribute. |
 //! | `attributes/scope` | exact | -- | The `InstrumentationScope` of the batch. |
+//! | `attributes/datadog_carrier_log` | lost | uncounted | A `_logit.` carrier is private and isn't an OTLP attribute, uncounted. |
+//! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
+//! | `attributes/log_status` | exact | -- | The severity is the `LogRecord`'s own; no `status` attribute is written. |
+//! | `attributes/span_kind` | exact | -- | The kind is the `Span`'s own; no `span.kind` attribute is written. |
+//! | `attributes/trace_id_high` | exact | -- | The 128-bit trace id is the `Span`'s own; no `_dd.p.tid` attribute is written. |
 //! | `log/beside_metrics` | normalized | `observed_timestamp` | An OTLP log record in the logs request, beside the metrics in theirs, with an observed time stamped when it has none. |
 //! | `span/beside_metrics` | exact | -- | An OTLP span in the traces request, beside the metrics in theirs. |
 //!

@@ -11,25 +11,29 @@
 //! | `histogram`, `exponential_histogram` | `delta`, `cumulative` | record |
 //! | `samples`, `set_members`, `distribution`, `set`, `summary` | none | record |
 //! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
-//! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `min_max` | field |
-//! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `foreign_carrier`, `resource_attribute`, `scope` | field |
-//! | `attributes` | `private_carrier_log` (a `_logit.datadog.*` carrier on a log, Datadog event, or service check), and `no_host`, `log_status`, `span_kind`, `trace_id_high` (an attribute the sink writes from the record's own fields); only `datadog_out` reaches them | field |
+//! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `unit_on_distribution`, `min_max`, `sample_rate_unweighted` | field |
+//! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `foreign_carrier`, `datadog_carrier_log`, `resource_attribute`, `scope` | field |
+//! | `attributes` | `no_host`, `log_status`, `span_kind`, `trace_id_high` (a record `datadog_out` writes an attribute for from the record's own fields) | field |
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics) | record |
-//! | `span` | `alone` (on an event with no metrics); `no_wire_form` (one of those carrying a field a Datadog span has no form for; only `datadog_out` reaches it) | record |
+//! | `span` | `alone` (on an event with no metrics); `no_wire_form` (one of those carrying a field a Datadog span has no form for) | record |
 //! | `log`, `span` | `beside_metrics` (on an event that carries metrics) | field |
 //!
 //! `attributes/scope` is the batch's instrumentation scope, a field of every record in the batch
 //! like a resource attribute, so it's an `attributes` row rather than a kind of its own. A
 //! resource attribute under `_logit.` reaches `private_carrier` or `foreign_carrier`, as an event
-//! attribute does, not `resource_attribute`. `record/non_finite` is a `sum` or `gauge` holding
+//! attribute does, not `resource_attribute`; a `_logit.datadog.*` carrier on a log, a Datadog event,
+//! or a service check reaches `datadog_carrier_log` in their place, at every sink.
+//! `record/non_finite` is a `sum` or `gauge` holding
 //! `NaN` or an infinity, a value some wires can't write. `record/superseded` is a metric record a
 //! later record of the same series (name, kind, and public attributes) follows in the same run,
 //! which a sink holding one value per series replaces; `record/same_instant` is one whose later
 //! point shares its timestamp, and `record/same_millisecond` one whose later point falls at
 //! another nanosecond of its millisecond, which a wire stamping milliseconds can't tell apart.
 //! `record/name_unsafe` is a name holding a character the sink's wire rewrites, which differs by
-//! sink. `record/sample_rate` is a `samples` record below rate 1 at `datadog_out`, whose
-//! distribution route has no rate. `record/min_max` is a histogram's `min` and `max`, which the record's own comparison
+//! sink. `record/sample_rate` is a `samples` record whose rate rounds to a weight above 1, and
+//! `record/sample_rate_unweighted` the rate of one below 1 that rounds to weight 1, which the
+//! record's own comparison leaves to that row. `record/unit_on_distribution` is a `samples` or
+//! `distribution` record's unit, where `record/unit` is every other kind's. `record/min_max` is a histogram's `min` and `max`, which the record's own comparison
 //! leaves to this row.
 //!
 //! A `when:` key names sink config only, so where a sink's outcome for a feature depends on the
@@ -109,7 +113,9 @@ const KINDS: [(&str, &[&str]); 14] = [
             "start_timestamp",
             "exemplars",
             "exemplars_on_summary",
+            "unit_on_distribution",
             "min_max",
+            "sample_rate_unweighted",
         ],
     ),
     (
@@ -126,7 +132,7 @@ const KINDS: [(&str, &[&str]); 14] = [
             "foreign_carrier",
             "resource_attribute",
             "scope",
-            "private_carrier_log",
+            "datadog_carrier_log",
             "no_host",
             "log_status",
             "span_kind",
@@ -274,7 +280,14 @@ pub(super) fn is_field_row(kind: &str, feature: Option<&str>) -> bool {
         || kind == "attributes"
         || (kind == "record"
             && feature.is_some_and(|f| {
-                RECORD_FIELDS.contains(&f) || f == "exemplars_on_summary" || f == "min_max"
+                RECORD_FIELDS.contains(&f)
+                    || matches!(
+                        f,
+                        "exemplars_on_summary"
+                            | "unit_on_distribution"
+                            | "min_max"
+                            | "sample_rate_unweighted"
+                    )
             }))
 }
 

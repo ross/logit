@@ -44,5 +44,8 @@
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.temperature","kind":"gauge","value":-4.25}],"attributes":{"env":"prod","host.name":"worker-2"}},
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.unspecified","kind":"gauge","value":2.0}],"attributes":{"env":"prod"}},
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.late","kind":"gauge","value":5.0}],"attributes":{"env":"prod","host.name":"worker-2"}}
+  ], "counters": {}},
+  "service-check-carrier": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.ready","kind":"gauge","value":0.0}]}
   ], "counters": {}}
 }

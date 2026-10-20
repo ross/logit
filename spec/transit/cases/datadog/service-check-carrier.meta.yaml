@@ -1,0 +1,3 @@
+# A service check carrying a `_logit.datadog.*` carrier, which datadog_in's check route never
+# stamps, so each sink's handling of one on a check is compared.
+exercises: [service_check]

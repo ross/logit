@@ -10,30 +10,33 @@
 //! temporality and monotonicity and its scalar type; for a `gauge` or `gauge_delta`, its scalar
 //! type, and `negative` for a gauge below zero; for a `histogram` or `exponential_histogram`,
 //! its temporality; any other kind, its kind's one row. It also reaches a `record` row for each of
-//! `unit`, `description`, `start_timestamp`, `exemplars` (`exemplars_on_summary` for a
-//! `summary`), and `no_recorded_value` (`no_recorded_value_delta_sum` for a delta `sum`,
+//! `unit` (`unit_on_distribution` for a `samples` or `distribution`), `description`,
+//! `start_timestamp`, `exemplars` (`exemplars_on_summary` for a `summary`), and `no_recorded_value` (`no_recorded_value_delta_sum` for a delta `sum`,
 //! `no_recorded_value_other_kind` for a kind other than `sum` and `gauge`) it carries,
 //! `service_check` when it carries `_logit.statsd.service_check.name`, `name_unsafe` when the
 //! sink's wire rewrites a character of its name ([`Spelling`]), `sample_rate` for a `samples`
-//! record below rate 1 at `datadog_out`, `non_finite` for a `sum` or
+//! record whose rate rounds to a weight above 1, `non_finite` for a `sum` or
 //! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
 //! another point of its series (the same name, kind, and public attributes), with `same_instant`
 //! when that point shares its timestamp or else `same_millisecond` when it shares its
 //! millisecond. A `histogram` or `exponential_histogram` reaches the field row `record/min_max`
 //! for its `min` and `max`, which its own comparison leaves out, as a flagged point's leaves out
-//! its value: a stale marker reads back as `NaN`. It reaches an
+//! its value: a stale marker reads back as `NaN`, and a `samples` record below rate 1 that rounds
+//! to weight 1 the field row `record/sample_rate_unweighted` for its rate, left out the same way.
+//! It reaches an
 //! `attributes` row for each attribute, event or resource: a `_logit.<protocol>.` carrier of the
-//! sink's own protocol is `private_carrier`, any other `_logit.` key `foreign_carrier`, an event
+//! sink's own protocol is `private_carrier`, a `_logit.datadog.` carrier on a log, a Datadog
+//! event, or a service check `datadog_carrier_log`, any other `_logit.` key `foreign_carrier`, an
+//! event
 //! attribute by its value (`string_value`, `bool_value`, `number_value`, `array_value`,
 //! `map_value`, `bytes_value`, `timestamp_value`), and any other resource attribute
 //! `resource_attribute`; and `attributes/scope` when its batch has a scope. A log
 //! record on an event with no metrics reaches `log/dogstatsd_event` when it carries
 //! `_logit.statsd.event.title`, else `log/plain`, and its attribute rows; a span there reaches
-//! `span/alone`, and at `datadog_out` also `span/no_wire_form` when it carries a field a Datadog
-//! span has no form for. At `datadog_out`, a `_logit.datadog.` carrier on a log, Datadog event, or
-//! service check reaches `private_carrier_log` in place of `private_carrier`, and a record reaches
-//! a field row for each attribute [`Spelling::derived`] lists. A log or span on an event that
-//! carries metrics is a field of that event: it
+//! `span/alone`, and also `span/no_wire_form` when it carries a field a Datadog span has no form
+//! for. A record reaches an `attributes` field row for each attribute [`derived`] lists, at every
+//! sink: a sink that writes none reads it `exact` when nothing stands in its place. A log or span
+//! on an event that carries metrics is a field of that event: it
 //! reaches `log/beside_metrics` or `span/beside_metrics` alone, read as `exact` when it pairs
 //! unchanged, `normalized` when it pairs changed, and `lost` when nothing read back pairs with
 //! it.
@@ -148,6 +151,9 @@ struct Rec {
     scope: Option<Value>,
     /// The event's RFC 3339 timestamp.
     timestamp: String,
+    /// Whether this span is the one of its trace, in its batch, that `datadog_out` gives a
+    /// synthesized `_dd.p.tid` ([`mark_tid_due`]).
+    tid_due: bool,
 }
 
 impl Rec {
@@ -195,6 +201,11 @@ impl Rec {
             // marker reads back as `NaN`.
             if self.body["no_recorded_value"] == Value::Bool(true) {
                 object.remove("value");
+            }
+            // An unweighted rate below 1 is a field row of its own
+            // (`record/sample_rate_unweighted`).
+            if unweighted_rate(self) {
+                object.remove("sample_rate");
             }
             // A histogram's extremes are a field row of their own (`record/min_max`).
             if matches!(self.kind.as_str(), "histogram" | "exponential_histogram") {
@@ -358,50 +369,14 @@ impl Spelling {
         self.key(key)
     }
 
-    /// The attributes the sink writes from `rec`'s own fields, which its pair decoder reads back
-    /// as attributes `rec` lacks: each one's `attributes` field row, key, and value as text.
-    /// Empty for every sink but `datadog_out` (`logit_proto::datadog`'s encode tables):
-    ///
-    /// - `no_host`: the run's hostname, on a record but a span that carries no host and no
-    ///   hostless mark (the encoder's default host), under the key `datadog_in` reads the route's
-    ///   host back as ([`datadog::Route::host_key`]);
-    /// - `log_status`: `status` as the severity's name, on a log, not a Datadog event, with a
-    ///   severity and no `status` attribute;
-    /// - `span_kind`: `span.kind` as the kind's name, on a span whose kind isn't `internal` and
-    ///   that has no `span.kind` attribute;
-    /// - `trace_id_high`: `_dd.p.tid` as the trace id's high 64 bits in hex, on a span whose high
-    ///   half is nonzero and that has no `_dd.p.tid` attribute.
+    /// [`derived`] where the sink writes those attributes, which only `datadog_out` does; empty
+    /// for every other sink.
     fn derived(self, rec: &Rec) -> Vec<(&'static str, &'static str, String)> {
-        if self != Spelling::Datadog {
-            return Vec::new();
+        if self == Spelling::Datadog {
+            derived(rec)
+        } else {
+            Vec::new()
         }
-        let has = |key: &str| rec.attributes.contains_key(key) || rec.resource.contains_key(key);
-        let mut out = Vec::new();
-        match datadog::Route::of(rec) {
-            datadog::Route::Span => {
-                let kind = rec.body["kind"].as_str().unwrap_or("internal");
-                if kind != "internal" && !has("span.kind") {
-                    out.push(("span_kind", "span.kind", kind.to_string()));
-                }
-                let trace = rec.body["trace_id"].as_str().unwrap_or("");
-                let high = trace.get(..16).unwrap_or("");
-                if trace.len() == 32 && high.bytes().any(|b| b != b'0') && !has("_dd.p.tid") {
-                    out.push(("trace_id_high", "_dd.p.tid", high.to_string()));
-                }
-            }
-            route => {
-                if !datadog::carries_host(rec, route) {
-                    out.push(("no_host", route.host_key(), super::HOSTNAME.to_string()));
-                }
-                let severity = rec.body["severity"].as_str();
-                if let (datadog::Route::Log, Some(severity)) = (route, severity) {
-                    if !has("status") {
-                        out.push(("log_status", "status", severity.to_string()));
-                    }
-                }
-            }
-        }
-        out
     }
 
     /// An attribute value as text, as the sink's pair decoder reads it back; `tags` is its
@@ -417,6 +392,70 @@ impl Spelling {
             }
             _ => text(value),
         }
+    }
+}
+
+/// The attributes `datadog_out` writes from `rec`'s own fields, which `datadog_in` reads back as
+/// attributes `rec` lacks: each one's `attributes` field row, key, and value as text. Every sink
+/// reaches the rows, chosen from the record alone; only [`Spelling::derived`] predicts the values
+/// (`logit_proto::datadog`'s encode tables):
+///
+/// - `no_host`: the run's hostname, on a record but a span that carries no host and no hostless
+///   mark (the encoder's default host), under the key `datadog_in` reads the route's host back as
+///   ([`datadog::Route::host_key`]);
+/// - `log_status`: `status` as the severity's name, on a log, not a Datadog event, with a severity
+///   and no `status` attribute;
+/// - `span_kind`: `span.kind` as the kind's name, on a span whose kind isn't `internal` and that
+///   has no `span.kind` attribute;
+/// - `trace_id_high`: `_dd.p.tid` as the trace id's high 64 bits in hex, on the first span of its
+///   trace in the batch, when the high half is nonzero and no span of the trace carries one
+///   ([`Rec::tid_due`]).
+fn derived(rec: &Rec) -> Vec<(&'static str, &'static str, String)> {
+    let has = |key: &str| rec.attributes.contains_key(key) || rec.resource.contains_key(key);
+    let mut out = Vec::new();
+    match datadog::Route::of(rec) {
+        datadog::Route::Span => {
+            let kind = rec.body["kind"].as_str().unwrap_or("internal");
+            if kind != "internal" && !has("span.kind") {
+                out.push(("span_kind", "span.kind", kind.to_string()));
+            }
+            if rec.tid_due {
+                let high = rec.body["trace_id"].as_str().and_then(|t| t.get(..16)).unwrap_or("");
+                out.push(("trace_id_high", "_dd.p.tid", high.to_string()));
+            }
+        }
+        route => {
+            if !datadog::carries_host(rec, route) {
+                out.push(("no_host", route.host_key(), super::HOSTNAME.to_string()));
+            }
+            let severity = rec.body["severity"].as_str();
+            if let (datadog::Route::Log, Some(severity)) = (route, severity) {
+                if !has("status") {
+                    out.push(("log_status", "status", severity.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Marks the first span of each trace in one batch's records as due a synthesized `_dd.p.tid`
+/// when its trace id's high half is nonzero and no span of the trace carries one: the chunk
+/// `datadog_out` groups a batch's spans into, by 128-bit trace id.
+fn mark_tid_due(recs: &mut [Rec]) {
+    let trace = |rec: &Rec| rec.body["trace_id"].as_str().unwrap_or("").to_string();
+    let carried: BTreeSet<String> = recs
+        .iter()
+        .filter(|r| r.kind == "span")
+        .filter(|r| r.attributes.contains_key("_dd.p.tid") || r.resource.contains_key("_dd.p.tid"))
+        .map(trace)
+        .collect();
+    let mut seen = BTreeSet::new();
+    for rec in recs.iter_mut().filter(|r| r.kind == "span") {
+        let id = trace(rec);
+        let high = id.get(..16).unwrap_or("");
+        let nonzero = id.len() == 32 && high.bytes().any(|b| b != b'0');
+        rec.tid_due = nonzero && !carried.contains(&id) && seen.insert(id.clone());
     }
 }
 
@@ -505,7 +544,10 @@ mod datadog {
         let host_str = get(rec, "host").is_some_and(Value::is_string);
         let own = carrier(route).is_some_and(has);
         match route {
-            Route::Log => has("hostname") || named(rec) || has("syslog.hostname") || has("host"),
+            // The log encoder takes any `host.name`, an empty one included, as the host.
+            Route::Log => {
+                has("hostname") || has("host.name") || has("syslog.hostname") || has("host")
+            }
             Route::Event | Route::Check => own || named(rec) || host_str,
             Route::Metric => {
                 let hostless = get(rec, "_logit.datadog.hostless") == Some(&Value::Bool(true));
@@ -561,10 +603,19 @@ fn unescape(token: &str) -> String {
 
 /// Every record in `batches`, in batch order.
 fn records(batches: &[EventBatch]) -> Vec<Rec> {
-    let mut lines = String::new();
+    let mut out = Vec::new();
     for batch in batches {
-        render_ndjson(&mut lines, batch);
+        let start = out.len();
+        out.extend(batch_records(batch));
+        mark_tid_due(&mut out[start..]);
     }
+    out
+}
+
+/// One batch's records, in order.
+fn batch_records(batch: &EventBatch) -> Vec<Rec> {
+    let mut lines = String::new();
+    render_ndjson(&mut lines, batch);
     let mut out = Vec::new();
     for line in lines.lines() {
         let event: Value = serde_json::from_str(line).expect("format: json lines parse");
@@ -604,6 +655,7 @@ fn records(batches: &[EventBatch]) -> Vec<Rec> {
             resource_types: resource_types.clone(),
             scope: scope.clone(),
             timestamp: event["timestamp"].as_str().unwrap_or("").to_string(),
+            tid_due: false,
         };
         if let Some(log) = event.get("log") {
             let name = log.get("message").map(text).unwrap_or_default();
@@ -691,7 +743,15 @@ fn pair(ins: &[Rec], outs: &[Rec], spelling: Spelling) -> Pairing {
                 continue;
             }
             let core = ins[i].core();
-            if let Some(o) = candidates(i, &used).into_iter().find(|&o| outs[o].core() == core) {
+            // A read-back record holds whatever rate it reads; the input left its own out.
+            let same_core = |o: usize| {
+                let mut read = outs[o].core();
+                if unweighted_rate(&ins[i]) {
+                    read.0.as_object_mut().map(|object| object.remove("sample_rate"));
+                }
+                read == core
+            };
+            if let Some(o) = candidates(i, &used).into_iter().find(|&o| same_core(o)) {
                 used[o] = true;
                 claimed[i] = vec![o];
                 seen[i] = Some(if renamed(i, o) { Class::Normalized } else { Class::Exact });
@@ -852,7 +912,7 @@ fn gather(input: &Rec, candidates: &[usize], outs: &[Rec]) -> Vec<usize> {
 }
 
 /// The kind-level features `rec` reaches (module doc); `None` is the kind's one row.
-fn kind_features(rec: &Rec, spelling: Spelling) -> Vec<Option<String>> {
+fn kind_features(rec: &Rec) -> Vec<Option<String>> {
     let scalar = |key: &str| -> String {
         match &rec.body[key] {
             Value::Bool(_) => "bool",
@@ -885,9 +945,7 @@ fn kind_features(rec: &Rec, spelling: Spelling) -> Vec<Option<String>> {
         "gauge_delta" => vec![Some(scalar("delta"))],
         "histogram" | "exponential_histogram" => vec![Some(temporality())],
         "log" | "span" if rec.beside_metrics => vec![Some("beside_metrics".to_string())],
-        // `datadog_out` drops a span's fields Datadog has no form for, a lesser form only that
-        // sink writes.
-        "span" if spelling == Spelling::Datadog && datadog::otel_only(rec) => {
+        "span" if datadog::otel_only(rec) => {
             vec![Some("alone".to_string()), Some("no_wire_form".to_string())]
         }
         "span" => vec![Some("alone".to_string())],
@@ -918,10 +976,7 @@ fn record_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
     if spelling.sanitize(&rec.name) != rec.name {
         features.push("name_unsafe");
     }
-    // `datadog_out`'s distribution route has no sample rate, so the encoder repeats each value by
-    // its weight: a lesser form only that sink writes.
-    let below_one = number(&rec.body["sample_rate"]).is_some_and(|rate| rate < 1.0);
-    if spelling == Spelling::Datadog && rec.kind == "samples" && below_one {
+    if rec.kind == "samples" && weight(rec) > 1 {
         features.push("sample_rate");
     }
     let non_finite = |value: &Value| matches!(value.as_str(), Some("NaN" | "inf" | "-inf"));
@@ -964,23 +1019,49 @@ enum Field {
     Attribute { key: String, resource: bool },
     /// The batch's scope.
     Scope,
-    /// An attribute the sink derives from the record's own fields ([`Spelling::derived`]).
+    /// An attribute `datadog_out` derives from the record's own fields ([`derived`]).
     Derived { key: &'static str, value: String },
+    /// A `samples` record's rate below 1 that rounds to weight 1 ([`unweighted_rate`]).
+    SampleRate,
+}
+
+/// A `samples` record's weight, as `Samples::weight` rounds it: the inverse of its rate, 1 for a
+/// rate that isn't a finite positive number.
+fn weight(rec: &Rec) -> u64 {
+    match number(&rec.body["sample_rate"]) {
+        Some(rate) if rate.is_finite() && rate > 0.0 => ((1.0 / rate).round() as u64).max(1),
+        _ => 1,
+    }
+}
+
+/// Whether `rec` is a `samples` record whose rate is below 1 but rounds to weight 1, so a sink
+/// that weights by the rate writes each value once: `record/sample_rate_unweighted`'s field,
+/// which the record's own comparison leaves out.
+fn unweighted_rate(rec: &Rec) -> bool {
+    rec.kind == "samples"
+        && number(&rec.body["sample_rate"]).is_some_and(|rate| rate < 1.0)
+        && weight(rec) == 1
 }
 
 /// The field rows `rec` reaches, for a sink of `protocol`.
 fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)> {
-    let spelling = Spelling::of(&format!("{protocol}_out"));
     let mut rows = Vec::new();
     if rec.is_metric() {
         for key in mapping::RECORD_FIELDS {
             if rec.body.get(key).is_some() {
                 let feature = match key {
                     "exemplars" if rec.kind == "summary" => "exemplars_on_summary",
+                    "unit" if matches!(rec.kind.as_str(), "samples" | "distribution") => {
+                        "unit_on_distribution"
+                    }
                     key => key,
                 };
                 rows.push(("record".to_string(), Some(feature.to_string()), Field::Body(key)));
             }
+        }
+        if unweighted_rate(rec) {
+            let feature = Some("sample_rate_unweighted".to_string());
+            rows.push(("record".to_string(), feature, Field::SampleRate));
         }
         if matches!(rec.kind.as_str(), "histogram" | "exponential_histogram") {
             for key in ["min", "max"] {
@@ -995,16 +1076,16 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
         }
     }
     let own = format!("_logit.{protocol}.");
-    // `datadog_out`'s logs, events, and check routes skip a `_logit.datadog.*` carrier they have
-    // no field for without counting it, where its metrics routes count one.
-    let json_route = spelling == Spelling::Datadog
-        && matches!(
-            datadog::Route::of(rec),
-            datadog::Route::Log | datadog::Route::Event | datadog::Route::Check
-        );
+    // A `_logit.datadog.*` carrier on a log, a Datadog event, or a service check: `datadog_out`'s
+    // routes for those skip one they have no field for without counting it, where its metrics
+    // routes count one.
+    let json_route = matches!(
+        datadog::Route::of(rec),
+        datadog::Route::Log | datadog::Route::Event | datadog::Route::Check
+    );
     let carrier = |key: &str| {
-        if key.starts_with(&own) && json_route {
-            Some("private_carrier_log")
+        if key.starts_with("_logit.datadog.") && json_route {
+            Some("datadog_carrier_log")
         } else if key.starts_with(&own) {
             Some("private_carrier")
         } else if key.starts_with("_logit.") {
@@ -1042,7 +1123,7 @@ fn field_rows(rec: &Rec, protocol: &str) -> Vec<(String, Option<String>, Field)>
     if rec.scope.is_some() {
         rows.push(("attributes".to_string(), Some("scope".to_string()), Field::Scope));
     }
-    for (feature, key, value) in spelling.derived(rec) {
+    for (feature, key, value) in derived(rec) {
         let field = Field::Derived { key, value };
         rows.push(("attributes".to_string(), Some(feature.to_string()), field));
     }
@@ -1058,11 +1139,24 @@ fn observe_field(field: &Field, input: &Rec, out: &Rec, spelling: Spelling) -> C
             None => Class::Lost,
         },
         // An attribute the input lacks, read back with the value derived for it, is the sink's
-        // rewrite of a field the record already holds.
+        // rewrite of a field the record already holds. A sink that derives none reads back
+        // nothing in its place.
         Field::Derived { key, value } => match out.attributes.get(*key) {
             Some(read) if text(read) == *value => Class::Normalized,
-            _ => Class::Lost,
+            Some(_) => Class::Lost,
+            None if spelling.derived(input).is_empty() => Class::Exact,
+            None => Class::Lost,
         },
+        // A rate read back as 1 is the rate gone.
+        Field::SampleRate => {
+            let read = number(&out.body["sample_rate"]);
+            match (read, number(&input.body["sample_rate"])) {
+                (Some(read), Some(want)) if read == want => Class::Exact,
+                (Some(1.0), _) => Class::Lost,
+                (Some(_), _) => Class::Normalized,
+                (None, _) => Class::Lost,
+            }
+        }
         Field::Body(key) => match out.body.get(*key) {
             Some(value) if *value == input.body[*key] => Class::Exact,
             Some(_) => Class::Normalized,
@@ -1402,7 +1496,7 @@ pub(super) fn check(
 
         // Record level.
         let mut rows: Vec<(String, Option<String>)> =
-            kind_features(input, spelling).into_iter().map(|f| (input.kind.clone(), f)).collect();
+            kind_features(input).into_iter().map(|f| (input.kind.clone(), f)).collect();
         let mut features = record_features(input, spelling);
         let later: Vec<usize> = (i + 1..ins.len())
             .filter(|&j| input.is_metric() && same_series(input, &ins[j]))
@@ -1825,6 +1919,86 @@ mod tests {
         let ins = recs(&[&span("{}")]);
         let wrong_tid = recs(&[&span(r#"{"span.kind":"client","_dd.p.tid":"0000000000000001"}"#)]);
         assert_eq!(pair(&ins, &wrong_tid, Spelling::Datadog).seen, [None]);
+    }
+
+    /// Every sink reaches the rows for what `datadog_out` derives, chosen from the record alone;
+    /// a sink that derives nothing reads them `exact`.
+    #[test]
+    fn every_sink_reaches_the_rows_datadog_out_derives() {
+        let ins = recs(&[r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0}]}"#]);
+        let rows = field_rows(&ins[0], "statsd");
+        let (_, _, field) = rows.iter().find(|(_, f, _)| f.as_deref() == Some("no_host")).unwrap();
+        assert_eq!(observe_field(field, &ins[0], &ins[0], Spelling::Statsd), Class::Exact);
+        let span = recs(&[
+            r#"{{T},"span":{"name":"s","trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","kind":"server","status":"ok","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.000000000Z","duration_ns":0}}"#,
+        ]);
+        assert!(kind_features(&span[0]).contains(&Some("no_wire_form".to_string())));
+    }
+
+    /// `datadog_out` synthesizes `_dd.p.tid` on the first span of a trace in a batch only, and
+    /// on none when a span of the trace carries one.
+    #[test]
+    fn only_a_traces_first_span_without_a_tid_is_due_one() {
+        let span = |id: &str, attributes: &str| {
+            format!(
+                r#"{{{{T}},"span":{{"name":"s","trace_id":"0a0b0c0d0e0f10110102030405060708","span_id":"{id}","kind":"internal","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.000000000Z","duration_ns":0}},"attributes":{attributes}}}"#
+            )
+        };
+        let pair = recs(&[&span("1112131415161718", "{}"), &span("2122232425262728", "{}")]);
+        assert_eq!(pair.iter().map(|r| r.tid_due).collect::<Vec<_>>(), [true, false]);
+        let carried = recs(&[
+            &span("1112131415161718", "{}"),
+            &span("2122232425262728", r#"{"_dd.p.tid":"0a0b0c0d0e0f1011"}"#),
+        ]);
+        assert_eq!(carried.iter().map(|r| r.tid_due).collect::<Vec<_>>(), [false, false]);
+    }
+
+    /// A rate that rounds to a weight above 1 reaches `record/sample_rate`; one below 1 that rounds
+    /// to weight 1 reaches the field row `record/sample_rate_unweighted`, read `lost` when it reads
+    /// back as 1.
+    #[test]
+    fn a_sample_rate_is_selected_by_its_weight() {
+        let samples = |rate: f64| {
+            format!(
+                r#"{{{{T}},"metrics":[{{"name":"t","kind":"samples","values":[12.0],"sample_rate":{rate:?}}}]}}"#
+            )
+        };
+        let half = recs(&[&samples(0.5)]);
+        assert!(record_features(&half[0], Spelling::Datadog).contains(&"sample_rate"));
+        let unweighted = recs(&[&samples(0.8)]);
+        assert!(!record_features(&unweighted[0], Spelling::Datadog).contains(&"sample_rate"));
+        let rows = field_rows(&unweighted[0], "datadog");
+        let (_, _, field) =
+            rows.iter().find(|(_, f, _)| f.as_deref() == Some("sample_rate_unweighted")).unwrap();
+        let read = recs(&[&samples(1.0)]);
+        assert_eq!(pair(&unweighted, &read, Spelling::Datadog).seen, [Some(Class::Exact)]);
+        assert_eq!(observe_field(field, &unweighted[0], &read[0], Spelling::Datadog), Class::Lost);
+    }
+
+    /// A `samples` record's unit reaches `record/unit_on_distribution`, a gauge's `record/unit`.
+    #[test]
+    fn a_samples_unit_has_its_own_row() {
+        let ins = recs(&[
+            r#"{{T},"metrics":[{"name":"t","kind":"samples","values":[1.0],"sample_rate":1.0,"unit":"By"}]}"#,
+            r#"{{T},"metrics":[{"name":"g","kind":"gauge","value":1.0,"unit":"By"}]}"#,
+        ]);
+        let unit_row = |rec: &Rec| {
+            field_rows(rec, "datadog")
+                .into_iter()
+                .filter_map(|(_, f, _)| f)
+                .find(|f| f.starts_with("unit"))
+        };
+        assert_eq!(unit_row(&ins[0]).as_deref(), Some("unit_on_distribution"));
+        assert_eq!(unit_row(&ins[1]).as_deref(), Some("unit"));
+    }
+
+    /// The log encoder takes any `host.name`, an empty one included, as the host, so a log with
+    /// one is due no default host.
+    #[test]
+    fn a_log_with_an_empty_host_name_is_due_no_default_host() {
+        let log =
+            recs(&[r#"{{T},"log":{"format":"raw","message":"m"},"attributes":{"host.name":""}}"#]);
+        assert!(!derived(&log[0]).iter().any(|(feature, _, _)| *feature == "no_host"));
     }
 
     /// The latest point of a series claims what a sink holding one value per series read back,

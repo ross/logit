@@ -40,5 +40,8 @@
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1,
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
-  }}
+  }},
+  "service-check-carrier": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_ready","kind":"gauge","value":0.0}]}
+  ], "counters": {}}
 }

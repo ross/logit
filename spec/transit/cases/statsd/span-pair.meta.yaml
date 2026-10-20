@@ -1,0 +1,3 @@
+# Two spans of one 128-bit trace with no `_dd.p.tid`, which datadog_out writes as one chunk with a
+# synthesized `_dd.p.tid` on its first span only.
+exercises: []

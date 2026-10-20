@@ -178,6 +178,9 @@
   "span-only": {"events": [], "counters": {
     "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 1
   }},
+  "span-pair": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 2
+  }},
   "sub-millisecond": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000500Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}]}
   ], "counters": {
@@ -261,6 +264,11 @@
   ], "counters": {
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 2
   }},
+  "timer-sample-rate-unweighted": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"api.latency","kind":"samples","values":[12.0],"sample_rate":0.8}],"attributes":{"_logit.statsd.type":"ms"}}
+  ], "counters": {
+    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1
+  }},
   "typed-attributes": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"count":"7","room":"lab"}}
   ], "counters": {
@@ -281,5 +289,10 @@
   ], "counters": {
     "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 9,
     "logit.output.metrics.normalized{component=out,kind=statsd_out,reason=bool_value,role=sink}": 3
+  }},
+  "unit-on-samples": {"events": [
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"upload.size","kind":"samples","values":[512.0,2048.0],"sample_rate":1.0}],"attributes":{"_logit.statsd.type":"ms"}}
+  ], "counters": {
+    "logit.component.events.discarded{component=window,kind=aggregate,role=transform}": 1
   }}
 }

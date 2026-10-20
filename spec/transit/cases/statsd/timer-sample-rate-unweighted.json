@@ -1,0 +1,1 @@
+{"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"api.latency","kind":"samples","values":[12.0],"sample_rate":0.8}],"attributes":{"_logit.statsd.type":"ms"}}

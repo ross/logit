@@ -227,6 +227,7 @@
 //! | `record/service_check`, under `format: statsd` | skipped | `logit.output.messages.skipped{reason=dialect}` | Plain statsd has no service check, so none is written. |
 //! | `record/service_check`, otherwise | exact | -- | A gauge carrying the `_logit.statsd.service_check.*` carriers is a DogStatsD `_sc` line again. |
 //! | `record/name_unsafe` | normalized | `name_sanitized` | Every `:`, `\|`, `@`, `#`, `,`, control, and whitespace character in a name is written as `_`, so the record reads back under the sanitized name, uncounted. |
+//! | `record/sample_rate` | exact | -- | The rate is written as `@rate` on the line. |
 //! | `record/superseded` | exact | -- | Each record is its own line; a statsd server applies them in order. |
 //! | `record/same_instant` | exact | -- | Each record is its own line. |
 //! | `record/same_millisecond` | exact | -- | Each record is its own line. |
@@ -235,6 +236,7 @@
 //! | `log/dogstatsd_event`, otherwise | exact | -- | A log carrying the `_logit.statsd.event.*` carriers is a DogStatsD `_e` line again. |
 //! | `log/plain` | skipped | `logit.output.events.skipped` | Any other log on an event with no metrics has no statsd form and isn't written. |
 //! | `span/alone` | skipped | `logit.output.events.skipped` | A span on an event with no metrics has no statsd form and isn't written. |
+//! | `span/no_wire_form` | exact | -- | Nothing beyond `span/alone`'s outcome. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
@@ -244,6 +246,8 @@
 //! | `record/description` | lost | uncounted | statsd has no description; it isn't written or counted. |
 //! | `record/start_timestamp` | lost | uncounted | statsd has no start time; it isn't written or counted. |
 //! | `record/exemplars` | lost | uncounted | statsd has no exemplars; they aren't written or counted. |
+//! | `record/unit_on_distribution` | lost | uncounted | statsd has no unit; it isn't written or counted. |
+//! | `record/sample_rate_unweighted` | exact | -- | The rate is written as `@rate` on the line. |
 //! | `attributes/string_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
 //! | `attributes/string_value`, otherwise | exact | -- | A DogStatsD `key:value` tag. |
 //! | `attributes/bool_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
@@ -264,6 +268,8 @@
 //! | `attributes/resource_attribute`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged` | A resource attribute is written as a tag, the event's value winning on a shared key, and reads back as an event attribute. |
 //! | `attributes/scope` | lost | uncounted | statsd has no instrumentation scope; it isn't written or counted. |
+//! | `attributes/datadog_carrier_log` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. |
+//! | `attributes/no_host` | exact | -- | A record with no host leaves with none. |
 //! | `log/beside_metrics` | lost | uncounted | A log on an event that also carries metrics is left off while the metrics are written, uncounted. |
 //! | `span/beside_metrics` | lost | uncounted | A span on an event that also carries metrics is left off while the metrics are written, uncounted. |
 //!

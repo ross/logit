@@ -684,7 +684,8 @@ rows:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=histogram}
         text: >-
-          The series encoders have no histogram, so none is written.
+          The series encoders have no histogram, so none is written; `docs/known-gaps/datadog.md`'s
+          "`datadog_out` sends no Agent-style `h`/`ms` aggregates" entry has the follow-up.
   - kind: histogram
     feature: cumulative
     cells:
@@ -916,6 +917,31 @@ rows:
         reason: uncounted
         text: >-
           Datadog's intake has no exemplars; they aren't written or counted.
+  # influxdb_out and otlp_out write a `samples` or `distribution` record only in a lesser form, so
+  # its fields are never compared there and neither has a cell. prometheus_out's summary is a
+  # lesser form too, but its cell names the counter its exposition moves for the unit.
+  - kind: record
+    feature: unit_on_distribution
+    cells:
+      prometheus_out:
+        - when: {bind: null}
+          class: exact
+          text: Remote-write carries the unit in its metadata.
+        - class: lost
+          counter: logit.output.metrics.degraded{reason=unit_not_suffix}
+          text: >-
+            OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's
+            left off, counted.
+      statsd_out:
+        class: lost
+        reason: uncounted
+        text: statsd has no unit; it isn't written or counted.
+      datadog_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          Distribution points and sketches have no unit field, so a `samples` or `distribution`
+          record's unit is left off, uncounted; only the series routes write one.
   # statsd_out and influxdb_out write a summary only as dotted series or fields, a lesser kind, and
   # datadog_out skips it, so its fields are never compared there and none of them has a cell.
   - kind: record
@@ -1081,17 +1107,41 @@ rows:
         text: >-
           A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record
           reads back under the sanitized name, uncounted.
-  # Only datadog_out reaches this row: its distribution route has no sample rate. Every other
-  # sink carries the rate or weights the values by it in a form its own row classes.
   - kind: record
     feature: sample_rate
     cells:
+      statsd_out:
+        class: exact
+        text: The rate is written as `@rate` on the line.
+      prometheus_out:
+        class: exact
+        text: Each value is weighted by its inverse rate in the sketch the `samples` row describes.
+      influxdb_out:
+        class: exact
+        text: Each value is weighted by its inverse rate in the sketch the `samples` row describes.
+      otlp_out:
+        class: exact
+        text: Each value is weighted by its inverse rate in the sketch the `samples` row describes.
       datadog_out:
         class: degraded
         counter: logit.output.metrics.degraded{reason=sample_rate_expanded}
         text: >-
           The distribution route has no sample rate, so each value is repeated by its weight,
-          the inverse of the rate, and datadog_in reads the values back at rate 1.
+          the inverse of the rate rounded, and datadog_in reads the values back at rate 1.
+  # A sink that writes a `samples` record only in a lesser form, as prometheus_out, influxdb_out,
+  # and otlp_out do, never compares its fields, so none of them has a cell.
+  - kind: record
+    feature: sample_rate_unweighted
+    cells:
+      statsd_out:
+        class: exact
+        text: The rate is written as `@rate` on the line.
+      datadog_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          A rate below 1 that rounds to weight 1, such as 0.8, writes each value once on the
+          distribution route, which has no rate, so datadog_in reads it back at rate 1, uncounted.
   - kind: record
     feature: superseded
     cells:
@@ -1514,13 +1564,25 @@ rows:
         text: >-
           Datadog has no instrumentation scope; it isn't written or counted.
 
-  # --- attributes a sink writes from a record's own fields ----------------------------------------
-  # Only datadog_out reaches these rows, so the other columns have no cell: a private carrier on one
-  # of its JSON routes, and attributes its pair decoder reads back that the input lacks, which no
-  # other sink writes.
   - kind: attributes
-    feature: private_carrier_log
+    feature: datadog_carrier_log
     cells:
+      statsd_out:
+        class: lost
+        reason: uncounted
+        text: Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted.
+      prometheus_out:
+        class: lost
+        reason: uncounted
+        text: Another protocol's `_logit.` carrier isn't a label and is left off, uncounted.
+      influxdb_out:
+        class: lost
+        reason: uncounted
+        text: Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted.
+      otlp_out:
+        class: lost
+        reason: uncounted
+        text: A `_logit.` carrier is private and isn't an OTLP attribute, uncounted.
       datadog_out:
         class: lost
         reason: uncounted
@@ -1529,28 +1591,54 @@ rows:
           route has no field for is left off, uncounted, where the metrics routes count one as
           `no_wire_form`; the events route's public form has no field for the Agent envelope's
           `_logit.datadog.agent.hostname`.
+
+  # --- attributes datadog_out writes from a record's own fields ----------------------------------
+  # Every sink reaches these rows; only datadog_out writes the attribute, which its pair decoder
+  # reads back beside the field it came from.
   - kind: attributes
     feature: no_host
     cells:
+      statsd_out:
+        class: exact
+        text: A record with no host leaves with none.
+      prometheus_out:
+        class: exact
+        text: A record with no host leaves with none.
+      influxdb_out:
+        class: exact
+        text: A record with no host leaves with none.
+      otlp_out:
+        class: exact
+        text: A record with no host leaves with none.
       datadog_out:
         class: normalized
         reason: default_host
         text: >-
           A record with no host and no hostless mark leaves with the process hostname as its host,
-          which datadog_in reads back as `hostname` on a log and `host.name` on anything else; a span
-          keeps its own hostnames.
+          which datadog_in reads back as `host.name`, a log's `hostname`, or an event's or service
+          check's host carrier; a span keeps its own hostnames.
+  # statsd_out, prometheus_out, and influxdb_out don't write a log on an event with no metrics, so
+  # its fields are never compared there and none of them has a cell.
   - kind: attributes
     feature: log_status
     cells:
+      otlp_out:
+        class: exact
+        text: The severity is the `LogRecord`'s own; no `status` attribute is written.
       datadog_out:
         class: normalized
         reason: status_from_severity
         text: >-
           A log with a severity and no `status` attribute leaves with `status` set to the
           severity's name, which datadog_in reads back as a `status` attribute beside the severity.
+  # statsd_out, prometheus_out, and influxdb_out don't write a span, so its fields are never
+  # compared there and none of them has a cell.
   - kind: attributes
     feature: span_kind
     cells:
+      otlp_out:
+        class: exact
+        text: The kind is the `Span`'s own; no `span.kind` attribute is written.
       datadog_out:
         class: normalized
         reason: span_kind_meta
@@ -1558,15 +1646,21 @@ rows:
           A span whose kind isn't internal, with no `span.kind` attribute, leaves with
           `meta["span.kind"]`, which datadog_in reads back as a `span.kind` attribute beside the
           kind.
+  # statsd_out, prometheus_out, and influxdb_out don't write a span, so its fields are never
+  # compared there and none of them has a cell.
   - kind: attributes
     feature: trace_id_high
     cells:
+      otlp_out:
+        class: exact
+        text: The 128-bit trace id is the `Span`'s own; no `_dd.p.tid` attribute is written.
       datadog_out:
         class: normalized
         reason: trace_id_high_tag
         text: >-
-          A 128-bit trace id's high 64 bits leave as `meta["_dd.p.tid"]`, which datadog_in reads
-          back as a `_dd.p.tid` attribute beside the trace id.
+          On the first span of a trace in a batch, when no span of the trace carries
+          `_dd.p.tid`, a 128-bit trace id's high 64 bits leave as `meta["_dd.p.tid"]`, which
+          datadog_in reads back as a `_dd.p.tid` attribute beside the trace id.
 
   # --- logs ------------------------------------------------------------------------------------
   - kind: log
@@ -1679,10 +1773,21 @@ rows:
           A span of an `AgentPayload` chunk on the trace route, read back with its kind as a
           `span.kind` attribute and its trace id's high half as `_dd.p.tid` (the `attributes`
           rows).
-  # Only datadog_out reaches this row: every other sink's span/alone cell covers these fields.
   - kind: span
     feature: no_wire_form
     cells:
+      statsd_out:
+        class: exact
+        text: Nothing beyond `span/alone`'s outcome.
+      prometheus_out:
+        class: exact
+        text: Nothing beyond `span/alone`'s outcome.
+      influxdb_out:
+        class: exact
+        text: Nothing beyond `span/alone`'s outcome.
+      otlp_out:
+        class: exact
+        text: OTLP carries the status, its message, `trace_state`, flags, and dropped counts.
       datadog_out:
         class: degraded
         counter: logit.output.spans.degraded{reason=no_wire_form}

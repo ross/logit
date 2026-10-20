@@ -21,9 +21,11 @@ meets which sink: `statsd-relay` and `datadog-relay` are the like pairs, and
 
 `datadog_out` makes four drops above its encoders: `stale` and `too_many_tags`, which read the
 wall clock or apply an intake limit, and `needs_agent_processing` and `not_datadog_origin`, which
-judge a whole trace chunk. None of them has a row, and the driver encodes every route without
-them, so a span a real `datadog_out` would drop as `not_datadog_origin` reaches its cells here.
-`crates/logit-outputs/src/datadog.rs`'s module doc has the drops.
+judge a whole trace chunk. It also cuts a route's events into requests by size, dropping an event
+too large to send alone as `oversize`. None of these has a row, and the driver encodes each route
+in one request without them, so a span a real `datadog_out` would drop as `not_datadog_origin`
+reaches its cells here. The APM stats routes have no case. `crates/logit-outputs/src/datadog.rs`'s
+module doc has the drops and the cuts.
 
 ## Layout
 
@@ -91,18 +93,20 @@ is one nothing checks: add a case or a flow that reaches it.
   `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_millisecond`): `exact`,
   `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
-  `exemplars_on_summary`, and `min_max`, every `attributes` row, and a log or span beside metrics
+  `exemplars_on_summary`, `unit_on_distribution`, `min_max`, and `sample_rate_unweighted`, every `attributes` row, and a log or span beside metrics
   (`beside_metrics`), which is a field of its event: `exact`, `normalized`, or `lost`.
 
 Where a sink's outcome depends on the record's kind, the kind is in the feature's name, since a
 `when:` key names sink config only: `no_recorded_value` is a flagged cumulative `sum` or
 `gauge`, `no_recorded_value_delta_sum` a flagged delta `sum`, and `exemplars_on_summary` a
-summary's exemplars. A few rows only one sink reaches, because only that sink writes the shape
-they name: `datadog_out`'s `record/sample_rate` (a `samples` record below rate 1, whose values it
-repeats), `span/no_wire_form` (a span field it drops), `attributes/private_carrier_log` (a
-`_logit.datadog.*` carrier on its JSON routes, which skip one uncounted), and the attributes it
-writes from a record's own fields: `attributes/no_host`, `log_status`, `span_kind`, and
-`trace_id_high`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
+summary's exemplars, and `unit_on_distribution` a `samples` or `distribution` record's unit. Some
+rows name a shape one sink treats apart, and every sink reaches them: `record/sample_rate` (a
+`samples` record whose rate rounds to a weight above 1) and `record/sample_rate_unweighted` (a
+rate below 1 that rounds to weight 1), `span/no_wire_form` (a span field a Datadog span has no
+form for), `attributes/datadog_carrier_log` (a `_logit.datadog.*` carrier on a log, a Datadog
+event, or a service check), and the attributes `datadog_out` writes from a record's own fields,
+`attributes/no_host`, `log_status`, `span_kind`, and `trace_id_high`, which another sink reads
+as `exact`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
 loss where that loss's counter didn't move, since most sinks test the flag first
 (`classes.rs`'s "Counters").
 
