@@ -966,10 +966,11 @@ sketches. The check is `logit_proto::datadog::is_datadog_stats_sym`, the symbol 
 predicate the stats routes use, so the two can't disagree about what's stats. It runs before the
 timestamped check.
 
-Passing stats through also keeps their logarithmic-mapping sketches out of any series, so
-`DdSketch::merge` no longer re-bins a relayed stats sketch into an Agent-mapping one. A
-cross-mapping merge can still happen if a stage upstream removes the stats marker, such as a
-`keep` without `private: keep`, or a Lua script builds a sketch under another mapping. It stays
+Passing stats through doesn't change how sketches merge. A series opens with an empty sketch
+that adopts the first incoming sketch's mapping, so stats sketches in a series of their own merge
+bin-for-bin even if an upstream stage removes the marker. `DdSketch::merge` re-bins only when a
+series holds sketches under two mappings: an unmarked stats sketch that shares its name and
+attributes with a locally built sketch from `Samples`, or with an Agent sketch. That merge stays
 bounded-error, as `DdSketch::merge` documents.
 
 ### Consequences

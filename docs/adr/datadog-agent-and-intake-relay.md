@@ -253,10 +253,10 @@ Three facts from the survey drive the shape of the decision:
   bytes changed shape, which is fine pre-release; `sketches-ddsketch` is no longer a dependency.
 - `Mapping::agent`'s constants are part of the Datadog wire contract: changing them breaks
   bin-for-bin relay silently, since the wire carries no parameters.
-- A merge across mappings is bounded-error, not exact. `aggregate` passes APM stats through
-  whole ([ADR `aggregation-window-semantics`](aggregation-window-semantics.md)'s 2026-10-19
-  amendment), so it happens only when a stage upstream removes the stats marker or a script
-  builds a sketch under another mapping.
+- A merge across mappings is bounded-error, not exact; it only happens when a relayed stats
+  sketch shares a series with a locally built one. `aggregate` passes APM stats through whole
+  ([ADR `aggregation-window-semantics`](aggregation-window-semantics.md)'s 2026-10-19
+  amendment), so that takes a stage upstream that removes the stats marker as well.
 - The Agent-equivalent trace processor (normalization, `_top_level`, sampler tags, a stats
   concentrator) for the no-Agent topology is a follow-up plan, not this one; until it exists the
   tracer-direct topology runs through `datadog_trace_out` and a real Agent.

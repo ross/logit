@@ -2471,7 +2471,7 @@ pub enum ComponentKind {
     /// exposition sample with a timestamp, passes through unaggregated and keeps that timestamp.
     /// So does a Datadog APM stats group, which already summarizes its own time bucket, and a
     /// counter increment, gauge, or gauge adjustment whose value is NaN or infinite.
-    /// Neither is dropped.
+    /// None is dropped.
     Aggregate {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
