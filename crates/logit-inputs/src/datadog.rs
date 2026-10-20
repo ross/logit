@@ -80,6 +80,9 @@
 //!    has already counted any items it dropped while the rest decoded.
 //! 6. **Delivery**, bounded (below), then the route's `2xx`.
 //!
+//! [`decode_request`] runs steps 4 and 5 on a recorded request, so the transit spec's Datadog
+//! cases (`spec/transit/cases/datadog/`) decode through this listener's own code.
+//!
 //! A body that stops arriving mid-upload gets `408` and the connection closes, when `idle_timeout`
 //! is set: the per-frame stall bound `otlp_in` derives from it.
 //!
@@ -830,55 +833,30 @@ async fn respond(
         return (name, OK, route.success());
     }
 
-    let body = match decompress(encoding, body, route.decompressed_cap()) {
-        Ok(body) => body,
-        Err(DecompressError::TooLarge) => {
+    // Built per request: requests are served concurrently, and the handles are clones of one
+    // registry and one throttled diagnostics sink, as in `prometheus_in`.
+    let decoder = DatadogDecoder::new()
+        .with_telemetry(shared.telemetry.clone())
+        .with_diagnostics(shared.diag.clone());
+    let mut batches = match decode_body(route, protobuf, encoding, body, now_nanos(), decoder) {
+        Ok(Decoded::Batches(batches)) => batches,
+        Ok(Decoded::HostMetadata) => {
+            acknowledge(shared, name);
+            return (name, OK, route.success());
+        }
+        Err(DecodeFailure::TooLarge) => {
             let message =
                 format!("decompressed request exceeds the {}-byte limit", route.decompressed_cap());
             let response =
                 reject(shared, "oversize", StatusCode::PAYLOAD_TOO_LARGE, &message, true);
             return (name, REJECTED, response);
         }
-        Err(DecompressError::Malformed(message)) => {
+        Err(DecodeFailure::MalformedEncoding(message)) => {
             let response =
                 reject(shared, "malformed_encoding", StatusCode::BAD_REQUEST, &message, true);
             return (name, REJECTED, response);
         }
-    };
-
-    if route == Route::Intake && is_host_metadata(&body) {
-        acknowledge(shared, name);
-        return (name, OK, route.success());
-    }
-
-    let received_at = now_nanos();
-    // Built per request: requests are served concurrently, and the handles are clones of one
-    // registry and one throttled diagnostics sink, as in `prometheus_in`.
-    let mut decoder = DatadogDecoder::new()
-        .with_telemetry(shared.telemetry.clone())
-        .with_diagnostics(shared.diag.clone());
-    let decoded: Result<Vec<EventBatch>, CodecError> = match route {
-        Route::SeriesV2 if protobuf => {
-            decoder.decode_series_v2_protobuf(&body, received_at).map(|b| vec![b])
-        }
-        Route::SeriesV2 => decoder.decode_series_v2_json(&body, received_at).map(|b| vec![b]),
-        Route::SeriesV1 => decoder.decode_series_v1(&body, received_at).map(|b| vec![b]),
-        Route::DistributionPoints => {
-            decoder.decode_distribution_points(&body, received_at).map(|b| vec![b])
-        }
-        Route::Sketches => decoder.decode_sketches(&body, received_at).map(|b| vec![b]),
-        Route::ServiceChecks => decoder.decode_service_checks(&body, received_at).map(|b| vec![b]),
-        Route::Events | Route::Intake => decoder.decode_events(&body, received_at).map(|b| vec![b]),
-        Route::Logs => decoder.decode_logs(&body, received_at).map(|b| vec![b]),
-        Route::Traces => decoder.decode_agent_payload(&body, received_at),
-        Route::Stats => decoder.decode_stats_payload(&body, received_at),
-        Route::Validate | Route::Health | Route::Acknowledged(_) => {
-            unreachable!("answered above")
-        }
-    };
-    let mut batches: Vec<EventBatch> = match decoded {
-        Ok(batches) => batches.into_iter().filter(|batch| !batch.events.is_empty()).collect(),
-        Err(err) => {
+        Err(DecodeFailure::Malformed(err)) => {
             let response =
                 reject(shared, "malformed", StatusCode::BAD_REQUEST, &err.to_string(), true);
             return (name, REJECTED, response);
@@ -919,6 +897,94 @@ async fn respond(
             response.headers_mut().insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
             (name, reason, response)
         }
+    }
+}
+
+/// What a request body decoded to: [`decode_body`]'s success.
+enum Decoded {
+    /// The route's batches, each holding at least one event.
+    Batches(Vec<EventBatch>),
+    /// An `/intake/` body that is host metadata, acknowledged without a send.
+    HostMetadata,
+}
+
+/// Why a request body didn't decode: [`decode_body`]'s failure, one rejection reason each.
+enum DecodeFailure {
+    TooLarge,
+    MalformedEncoding(String),
+    Malformed(CodecError),
+}
+
+/// "Request handling" steps 4 and 5 for a body already read: decompress it under the route's
+/// cap, set host metadata aside on `/intake/`, decode it on the route's decoder, and drop the
+/// batches that hold no event. `route` is a decoding route, never a probe or an acknowledged one.
+fn decode_body(
+    route: Route,
+    protobuf: bool,
+    encoding: Encoding,
+    body: Bytes,
+    received_at: i64,
+    mut decoder: DatadogDecoder,
+) -> Result<Decoded, DecodeFailure> {
+    let body = match decompress(encoding, body, route.decompressed_cap()) {
+        Ok(body) => body,
+        Err(DecompressError::TooLarge) => return Err(DecodeFailure::TooLarge),
+        Err(DecompressError::Malformed(message)) => {
+            return Err(DecodeFailure::MalformedEncoding(message))
+        }
+    };
+    if route == Route::Intake && is_host_metadata(&body) {
+        return Ok(Decoded::HostMetadata);
+    }
+    let decoded: Result<Vec<EventBatch>, CodecError> = match route {
+        Route::SeriesV2 if protobuf => {
+            decoder.decode_series_v2_protobuf(&body, received_at).map(|b| vec![b])
+        }
+        Route::SeriesV2 => decoder.decode_series_v2_json(&body, received_at).map(|b| vec![b]),
+        Route::SeriesV1 => decoder.decode_series_v1(&body, received_at).map(|b| vec![b]),
+        Route::DistributionPoints => {
+            decoder.decode_distribution_points(&body, received_at).map(|b| vec![b])
+        }
+        Route::Sketches => decoder.decode_sketches(&body, received_at).map(|b| vec![b]),
+        Route::ServiceChecks => decoder.decode_service_checks(&body, received_at).map(|b| vec![b]),
+        Route::Events | Route::Intake => decoder.decode_events(&body, received_at).map(|b| vec![b]),
+        Route::Logs => decoder.decode_logs(&body, received_at).map(|b| vec![b]),
+        Route::Traces => decoder.decode_agent_payload(&body, received_at),
+        Route::Stats => decoder.decode_stats_payload(&body, received_at),
+        Route::Validate | Route::Health | Route::Acknowledged(_) => {
+            unreachable!("answered before the body is decoded")
+        }
+    };
+    let batches = decoded.map_err(DecodeFailure::Malformed)?;
+    Ok(Decoded::Batches(batches.into_iter().filter(|batch| !batch.events.is_empty()).collect()))
+}
+
+/// One recorded request decoded as this listener decodes it, at `received_at`: the route from
+/// `path`, the body form from `Content-Type`, and the compression from `Content-Encoding` in
+/// `headers`, then [`decode_body`]. A replay of a captured request reads it through this, so it
+/// takes the listener's own path; the HTTP steps around it (method, size, authentication,
+/// delivery) don't apply to a body already read. `Err` names why the listener would have answered
+/// something other than its route's success, or that the route decodes no body.
+pub fn decode_request(
+    path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    received_at: i64,
+    decoder: DatadogDecoder,
+) -> Result<Vec<EventBatch>, String> {
+    let route = Route::from_path(path).ok_or_else(|| format!("{path} is no datadog_in route"))?;
+    if route.is_probe() || matches!(route, Route::Acknowledged(_)) {
+        return Err(format!("{path} decodes no body"));
+    }
+    let encoding = Encoding::from_headers(headers)
+        .map_err(|sent| format!("unsupported Content-Encoding {sent:?}"))?;
+    let protobuf = route == Route::SeriesV2 && media_type(headers) == MediaType::Protobuf;
+    match decode_body(route, protobuf, encoding, body, received_at, decoder) {
+        Ok(Decoded::Batches(batches)) => Ok(batches),
+        Ok(Decoded::HostMetadata) => Err("the /intake/ body is host metadata".to_string()),
+        Err(DecodeFailure::TooLarge) => Err("the decompressed body is over the cap".to_string()),
+        Err(DecodeFailure::MalformedEncoding(message)) => Err(message),
+        Err(DecodeFailure::Malformed(err)) => Err(err.to_string()),
     }
 }
 
