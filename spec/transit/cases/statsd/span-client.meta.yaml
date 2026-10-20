@@ -1,0 +1,3 @@
+# A client span with an unset status and a 128-bit trace id, which datadog_out writes with no
+# dropped field, so its kind and trace id's high half are compared.
+exercises: []

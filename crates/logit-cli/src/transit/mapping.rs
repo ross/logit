@@ -10,11 +10,12 @@
 //! | `gauge_delta` | `f64`, `i64`, `u64`, `bool` | record |
 //! | `histogram`, `exponential_histogram` | `delta`, `cumulative` | record |
 //! | `samples`, `set_members`, `distribution`, `set`, `summary` | none | record |
-//! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
+//! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
 //! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `min_max` | field |
 //! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `foreign_carrier`, `resource_attribute`, `scope` | field |
+//! | `attributes` | `private_carrier_log` (a `_logit.datadog.*` carrier on a log, Datadog event, or service check), and `no_host`, `log_status`, `span_kind`, `trace_id_high` (an attribute the sink writes from the record's own fields); only `datadog_out` reaches them | field |
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics) | record |
-//! | `span` | `alone` (on an event with no metrics) | record |
+//! | `span` | `alone` (on an event with no metrics); `no_wire_form` (one of those carrying a field a Datadog span has no form for; only `datadog_out` reaches it) | record |
 //! | `log`, `span` | `beside_metrics` (on an event that carries metrics) | field |
 //!
 //! `attributes/scope` is the batch's instrumentation scope, a field of every record in the batch
@@ -27,7 +28,8 @@
 //! point shares its timestamp, and `record/same_millisecond` one whose later point falls at
 //! another nanosecond of its millisecond, which a wire stamping milliseconds can't tell apart.
 //! `record/name_unsafe` is a name holding a character the sink's wire rewrites, which differs by
-//! sink. `record/min_max` is a histogram's `min` and `max`, which the record's own comparison
+//! sink. `record/sample_rate` is a `samples` record below rate 1 at `datadog_out`, whose
+//! distribution route has no rate. `record/min_max` is a histogram's `min` and `max`, which the record's own comparison
 //! leaves to this row.
 //!
 //! A `when:` key names sink config only, so where a sink's outcome for a feature depends on the
@@ -97,6 +99,7 @@ const KINDS: [(&str, &[&str]); 14] = [
             "no_recorded_value_other_kind",
             "service_check",
             "name_unsafe",
+            "sample_rate",
             "non_finite",
             "superseded",
             "same_instant",
@@ -123,10 +126,15 @@ const KINDS: [(&str, &[&str]); 14] = [
             "foreign_carrier",
             "resource_attribute",
             "scope",
+            "private_carrier_log",
+            "no_host",
+            "log_status",
+            "span_kind",
+            "trace_id_high",
         ],
     ),
     ("log", &["dogstatsd_event", "plain", "beside_metrics"]),
-    ("span", &["alone", "beside_metrics"]),
+    ("span", &["alone", "no_wire_form", "beside_metrics"]),
 ];
 
 /// The `record` features that are field-level (module doc).

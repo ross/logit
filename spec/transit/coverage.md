@@ -121,3 +121,7 @@ None.
 ## Cells no flow reaches: otlp_out
 
 None.
+
+## Cells no flow reaches: datadog_out
+
+None.

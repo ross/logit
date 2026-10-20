@@ -8,16 +8,19 @@
 //! | `otlp_out` | one protobuf request per signal per batch; a log with no observed time is stamped with the wall clock, which the driver reads back as the run's clock | `OtlpDecoder::decode_signal` |
 //! | `prometheus_out`, `bind:` | one scrape after the last batch, in the run's dialect, held to `max_series:` (no expiry: it reads a clock) | `text::parse_with`, then `families_to_events` |
 //! | `prometheus_out`, `endpoint:` | one compressed request per batch | `decompress_bounded`, `remote_write::decode`, then `families_to_events` per timestamp group |
+//! | `datadog_out` | one uncompressed request per route per batch, one per event on the events route, with the sink's routing (`encode_routes`) and none of its stale filter, tag limit, trace readiness gate, or size cuts | `datadog_in`'s `decode_request`, by the request's path and `Content-Type` |
 //!
 //! The statsd and InfluxDB encoders return their counts, so this counts them through the sink's
-//! own reporting functions; the OTLP and Prometheus encoders count through the handle they hold.
+//! own reporting functions; the OTLP, Prometheus, and Datadog encoders count through the handle they hold.
 //! A decode error fails the run: the pair's decoder refusing its own sink's bytes is a finding.
 
 use crate::pipeline::SinkEncoder;
 use anyhow::Context;
 use bytes::Bytes;
+use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use logit_core::{Diagnostics, EventBatch, Resource, Telemetry};
 use logit_pipeline::test_util::TelemetryProbe;
+use logit_proto::datadog::DatadogDecoder;
 use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::prometheus::compression::decompress_bounded;
@@ -159,6 +162,28 @@ pub(super) fn round_trip(
             let events = families_to_events(&families, decode.received_at, &mut decoder);
             if !events.is_empty() {
                 out.push(EventBatch { resource: empty(), scope: None, events });
+            }
+        }
+        SinkEncoder::Datadog(mut encoder) => {
+            for batch in batches {
+                for request in logit_outputs::datadog::encode_routes(&mut encoder, batch) {
+                    let (telemetry, diag) = decode.handles("datadog_in");
+                    let decoder =
+                        DatadogDecoder::new().with_telemetry(telemetry).with_diagnostics(diag);
+                    let mut headers = HeaderMap::new();
+                    headers.insert(CONTENT_TYPE, HeaderValue::from_static(request.content_type));
+                    let decoded = logit_inputs::datadog::decode_request(
+                        request.path,
+                        &headers,
+                        request.body,
+                        decode.received_at,
+                        decoder,
+                    )
+                    .map_err(|err| {
+                        anyhow::anyhow!("datadog_in refused a {} request: {err}", request.path)
+                    })?;
+                    out.extend(decoded);
+                }
             }
         }
         SinkEncoder::PrometheusRemoteWrite { mut encoder, version, compression } => {

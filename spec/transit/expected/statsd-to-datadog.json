@@ -1,0 +1,195 @@
+{
+  "carriers": {"events": [
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"transit"}},
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[5.0],"sample_rate":1.0}],"attributes":{"host.name":"transit"}}
+  ], "counters": {}},
+  "counter": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"jobs.started","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":3.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit","route":"/api"}}
+  ], "counters": {}},
+  "counter-sample-rate": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cache.lookups","kind":"sum","value":10.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"render.calls","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit","route":"/home"}}
+  ], "counters": {}},
+  "cross-kinds": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"balance","kind":"gauge","value":-3.5}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"distribution","count":2,"sum":27.0,"min":12.0,"max":15.0,"avg":13.5,"p50":12.0,"p90":15.0,"p95":15.0,"p99":15.0,"sketch":{"mapping":"agent","stats_exact":true,"count":2.0,"min":12.0,"max":15.0,"positive":[{"key":1498,"count":1.0},{"key":1513,"count":1.0}]}}],"attributes":{"host.name":"transit","route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"host.name":"transit","shards":["a","b"]}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"users","kind":"gauge","value":2.0}],"attributes":{"host.name":"transit"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=datadog_out,reason=set_estimate,role=sink}": 1,
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=non_finite_value,role=sink}": 1,
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 1,
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1
+  }},
+  "event": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"abc"},"attributes":{"_logit.statsd.event.host":"transit","_logit.statsd.event.title":"Plain"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"warn","format":"raw","message":"first\nline"},"attributes":{"_logit.statsd.event.aggregation_key":"deploy","_logit.statsd.event.alert_type":"warning","_logit.statsd.event.host":"web-07","_logit.statsd.event.priority":"low","_logit.statsd.event.source_type":"ci","_logit.statsd.event.title":"Hello","env":"prod"}}
+  ], "counters": {}},
+  "flagged-histogram": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1
+  }},
+  "flagged-kinds": {"events": [], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_gauge_delta,role=sink}": 1,
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=exponential_histogram,role=sink}": 1,
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,reason=no_recorded_value,role=sink}": 1
+  }},
+  "gauge": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":234.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"host.name":"transit","room":"lab"}}
+  ], "counters": {}},
+  "gauge-delta": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"balance","kind":"gauge","value":5.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"connections","kind":"gauge","value":10.0}],"attributes":{"host.name":"transit"}}
+  ], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_gauge_delta,role=sink}": 3
+  }},
+  "interop-dogstatsd-buffered": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.db.query.duration_ms","kind":"samples","values":[0.33313615206930347],"sample_rate":1.0}],"attributes":{"db":"primary","env":"prod","host.name":"web-07","query":"select_user","region":"us-east-1","service":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[0.05],"sample_rate":1.0}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.request.duration_ms","kind":"samples","values":[23.483176616760144],"sample_rate":1.0}],"attributes":{"endpoint":"/healthz","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.requests.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/healthz","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.http.response.size_bytes","kind":"samples","values":[60196.0],"sample_rate":1.0}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.render.calls.count","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host.name":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":110.0}],"attributes":{"env":"prod","host.name":"web-07","queue":"email","region":"us-east-1","service":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":210.0}],"attributes":{"env":"prod","host.name":"web-07","queue":"reindex","region":"us-east-1","service":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.worker.queue.depth","kind":"gauge","value":90.0}],"attributes":{"env":"prod","host.name":"web-07","queue":"webhooks","region":"us-east-1","service":"checkout-api"}}
+  ], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=set_members,role=sink}": 1
+  }},
+  "interop-plain-pipeline": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.cache.lookups","kind":"sum","value":10.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.db.select_user.duration","kind":"samples","values":[0.333136],"sample_rate":1.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.200.count","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration","kind":"samples","values":[0.05],"sample_rate":1.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.render.calls","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.worker.email.depth","kind":"gauge","value":234.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.worker.reindex.depth","kind":"gauge","value":90.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.checkout_api.web_07.us_east_1.worker.webhooks.depth","kind":"gauge","value":110.0}],"attributes":{"host.name":"transit"}}
+  ], "counters": {}},
+  "log-beside-metrics": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"request served"},"attributes":{"hostname":"transit","route":"/api","status":"info"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.inflight","kind":"gauge","value":3.0}],"attributes":{"host.name":"transit","route":"/api"}}
+  ], "counters": {}},
+  "log-only": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"request served"},"attributes":{"hostname":"transit","route":"/api","status":"info"}}
+  ], "counters": {}},
+  "mixed": {"events": [
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"severity":"info","format":"raw","message":"v1.2"},"attributes":{"_logit.statsd.event.alert_type":"info","_logit.statsd.event.host":"transit","_logit.statsd.event.title":"Deploy"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"bytes","kind":"samples","values":[60196.0,60196.0],"sample_rate":1.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":1.0}],"attributes":{"_logit.statsd.service_check.host":"transit","_logit.statsd.service_check.message":"slow","_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":1},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[12.0,15.0],"sample_rate":1.0}],"attributes":{"host.name":"transit","route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit","route":"/api","team":["a","b"]}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"size","kind":"samples","values":[512.0],"sample_rate":1.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"host.name":"transit","room":"lab"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=datadog_out,reason=sample_rate_expanded,role=sink}": 1,
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_gauge_delta,role=sink}": 1,
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=set_members,role=sink}": 1
+  }},
+  "multi-value": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":2.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":3.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[1.0,2.0,3.0],"sample_rate":1.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"level","kind":"gauge","value":4.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"level","kind":"gauge","value":5.0}],"attributes":{"host.name":"transit"}}
+  ], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=set_members,role=sink}": 1
+  }},
+  "name-sanitized": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"http:requests|total","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit","route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue depth","kind":"gauge","value":3.0}],"attributes":{"host.name":"transit"}}
+  ], "counters": {}},
+  "record-fields": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cpu.usage","kind":"gauge","value":0.5}],"attributes":{"host.name":"web-07"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"hits","kind":"sum","value":4.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.duration","kind":"gauge","value":0.25,"unit":"s"}],"attributes":{"host.name":"transit","service.name":"checkout"}}
+  ], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,reason=no_recorded_value,role=sink}": 1
+  }},
+  "service-check": {"events": [
+    {"timestamp":"2027-01-15T07:59:30.000000000Z","metrics":[{"name":"db.up","kind":"gauge","value":0.0}],"attributes":{"_logit.statsd.service_check.host":"web-07","_logit.statsd.service_check.message":"all good","_logit.statsd.service_check.name":"db.up","_logit.statsd.service_check.status":0,"env":"prod"},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"cache.up","kind":"gauge","value":2.0}],"attributes":{"_logit.statsd.service_check.host":"transit","_logit.statsd.service_check.message":"down","_logit.statsd.service_check.name":"cache.up","_logit.statsd.service_check.status":2},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}}
+  ], "counters": {}},
+  "set": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=set_members,role=sink}": 3
+  }},
+  "set-sanitized": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=set_members,role=sink}": 1
+  }},
+  "span-beside-metrics": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","span":{"name":"GET /api","trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","kind":"server","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.250000000Z","duration_ns":250000000},"attributes":{"_dd.p.tid":"0102030405060708","span.kind":"server"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.inflight","kind":"gauge","value":3.0}],"attributes":{"host.name":"transit"}}
+  ], "counters": {
+    "logit.output.spans.degraded{component=out,kind=datadog_out,reason=no_wire_form,role=sink}": 1
+  }},
+  "span-client": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","span":{"name":"GET /orders","trace_id":"0a0b0c0d0e0f10110102030405060708","span_id":"1112131415161718","kind":"client","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.100000000Z","duration_ns":100000000},"attributes":{"_dd.p.tid":"0a0b0c0d0e0f1011","span.kind":"client"}}
+  ], "counters": {}},
+  "span-only": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","span":{"name":"GET /api","trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","kind":"server","status":"unset","start":"2027-01-15T08:00:00.000000000Z","end":"2027-01-15T08:00:00.250000000Z","duration_ns":250000000},"attributes":{"_dd.p.tid":"0102030405060708","span.kind":"server"}}
+  ], "counters": {
+    "logit.output.spans.degraded{component=out,kind=datadog_out,reason=no_wire_form,role=sink}": 1
+  }},
+  "sub-millisecond": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":3.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":4.0}],"attributes":{"host.name":"transit"}}
+  ], "counters": {}},
+  "sum-shapes": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 2,
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=non_monotonic_delta_sum,role=sink}": 1
+  }},
+  "summarized-kinds": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=exponential_histogram,role=sink}": 2,
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 2,
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=summary,role=sink}": 1
+  }},
+  "summary-exemplars": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=summary,role=sink}": 1
+  }},
+  "tags": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"transit","service":"api","urgent":true}}
+  ], "counters": {}},
+  "tags-array": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit","team":["a","b"],"urgent":[true,"1"]}}
+  ], "counters": {}},
+  "tags-dedupe": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit","team":"a","urgent":true}}
+  ], "counters": {}},
+  "timer-h-d": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"request.size","kind":"samples","values":[512.0],"sample_rate":1.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"response.size","kind":"samples","values":[60196.0],"sample_rate":1.0}],"attributes":{"endpoint":"/orders","host.name":"transit"}}
+  ], "counters": {}},
+  "timer-ms": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[12.0],"sample_rate":1.0}],"attributes":{"host.name":"transit","route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"latency","kind":"samples","values":[7.5],"sample_rate":1.0}],"attributes":{"host.name":"transit","route":"/api"}}
+  ], "counters": {}},
+  "timer-sample-rate": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"db.query","kind":"samples","values":[3.2,3.2],"sample_rate":1.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"render.time","kind":"samples","values":[40.0,40.0,40.0,40.0],"sample_rate":1.0}],"attributes":{"host.name":"transit","route":"/home"}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=datadog_out,reason=sample_rate_expanded,role=sink}": 2
+  }},
+  "typed-attributes": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"count":"7","host.name":"transit","room":"lab","seen":"2027-01-15T07:00:00.000000000Z"}}
+  ], "counters": {
+    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=unrepresentable,role=sink}": 2
+  }},
+  "typed-scalars": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"bytes.sent","kind":"sum","value":9007199254740992.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"disk.bytes","kind":"gauge","value":1.8446744073709552e19}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"flag.flips","kind":"sum","value":1.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"healthy","kind":"gauge","value":1.0}],"attributes":{"host.name":"transit"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"open.files","kind":"gauge","value":42.0}],"attributes":{"debug":true,"host.name":"transit","pid":"4242","ratio":"0.5"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"retries","kind":"sum","value":7.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"transit"}}
+  ], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=unresolved_gauge_delta,role=sink}": 3,
+    "logit.output.metrics.normalized{component=out,kind=datadog_out,reason=bool_value,role=sink}": 2
+  }}
+}

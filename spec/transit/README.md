@@ -15,8 +15,15 @@ limits, and [the plan](../../docs/plans/transit-spec.md) the workstreams.
 The sources are `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape (remote-write cases
 aren't written yet), and `datadog_in`'s metrics routes, with one case each for its logs, events,
 and service checks (no APM cases yet). The sink columns are `statsd_out`, `prometheus_out` (exposition and
-remote-write), `influxdb_out`, and `otlp_out`. Each flow's name says which source meets which
-sink: `statsd-relay` is the like pair, and `influxdb-to-prometheus` a cross-protocol one.
+remote-write), `influxdb_out`, `otlp_out`, and `datadog_out`. Each flow's name says which source
+meets which sink: `statsd-relay` and `datadog-relay` are the like pairs, and
+`influxdb-to-prometheus` a cross-protocol one.
+
+`datadog_out` makes four drops above its encoders: `stale` and `too_many_tags`, which read the
+wall clock or apply an intake limit, and `needs_agent_processing` and `not_datadog_origin`, which
+judge a whole trace chunk. None of them has a row, and the driver encodes every route without
+them, so a span a real `datadog_out` would drop as `not_datadog_origin` reaches its cells here.
+`crates/logit-outputs/src/datadog.rs`'s module doc has the drops.
 
 ## Layout
 
@@ -78,11 +85,11 @@ is one nothing checks: add a case or a flow that reaches it.
 `mapping.yaml`'s `classes:` is the canonical vocabulary: `exact`, `normalized`, `degraded`, `lost`,
 `skipped`, and `dropped`. They apply at two levels:
 
-- **Record level**, for a metric kind, a log or span on an event with no metrics, and the
-  `record` rows that decide a record's fate (`no_recorded_value`, `no_recorded_value_delta_sum`,
-  `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `non_finite`, `superseded`,
-  `same_instant`, `same_millisecond`): `exact`, `normalized`, `degraded`, `skipped`, or
-  `dropped`, best to worst.
+- **Record level**, for a metric kind, a log or span on an event with no metrics, `span/no_wire_form`,
+  and the `record` rows that decide a record's fate (`no_recorded_value`,
+  `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`,
+  `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_millisecond`): `exact`,
+  `normalized`, `degraded`, `skipped`, or `dropped`, best to worst.
 - **Field level**, for the `record` rows `unit`, `description`, `start_timestamp`, `exemplars`,
   `exemplars_on_summary`, and `min_max`, every `attributes` row, and a log or span beside metrics
   (`beside_metrics`), which is a field of its event: `exact`, `normalized`, or `lost`.
@@ -90,7 +97,12 @@ is one nothing checks: add a case or a flow that reaches it.
 Where a sink's outcome depends on the record's kind, the kind is in the feature's name, since a
 `when:` key names sink config only: `no_recorded_value` is a flagged cumulative `sum` or
 `gauge`, `no_recorded_value_delta_sum` a flagged delta `sum`, and `exemplars_on_summary` a
-summary's exemplars. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
+summary's exemplars. A few rows only one sink reaches, because only that sink writes the shape
+they name: `datadog_out`'s `record/sample_rate` (a `samples` record below rate 1, whose values it
+repeats), `span/no_wire_form` (a span field it drops), `attributes/private_carrier_log` (a
+`_logit.datadog.*` carrier on its JSON routes, which skip one uncounted), and the attributes it
+writes from a record's own fields: `attributes/no_host`, `log_status`, `span_kind`, and
+`trace_id_high`. A flagged record's `no_recorded_value` row goes ahead of its kind's counted
 loss where that loss's counter didn't move, since most sinks test the flag first
 (`classes.rs`'s "Counters").
 
@@ -126,7 +138,8 @@ records that reach it, and doesn't fail. The table's kinds, features, and rules 
 For each flow and case, the check pairs every record that reached the sink with the records read
 back, reading names, attribute keys, and values as that sink writes them (`prometheus_out`'s
 sanitized names and `_total`, `influxdb_out`'s `<name>.value` field, `otlp_out`'s integer
-timestamps), then compares what it observed with the table. A record's expected class is the worst of
+timestamps, `datadog_out`'s `host` tag read back as `host.name` and the attributes it writes from a
+record's own fields), then compares what it observed with the table. A record's expected class is the worst of
 the record-level cells it reaches, and the observed class must equal it. A `normalized` cell also
 accepts `exact`, because a normalization touches only the shapes it names. A field may read back
 better than its cell, never worse. Every sink counter the run moved must be named by a cell the
@@ -186,6 +199,7 @@ Each sink column has two regions:
 | `doc:prometheus_out` | `crates/logit-proto/src/prometheus/mod.rs` | Every cell of the column |
 | `doc:influxdb_out` | `crates/logit-proto/src/influxdb/mod.rs` | Every cell of the column |
 | `doc:otlp_out` | `crates/logit-proto/src/otlp/metrics.rs` | Every cell of the column |
+| `doc:datadog_out` | `crates/logit-proto/src/datadog/mod.rs` | Every cell of the column |
 | `gaps:<sink>`, one per sink | `docs/known-gaps/mappings.md` | The column's `degraded`, `lost`, `skipped`, and `dropped` cells, in that file's row format |
 
 A region opens on a line ending `<!-- transit:doc:<sink> -->` or `<!-- transit:gaps:<sink> -->`

@@ -1,0 +1,50 @@
+{
+  "counter": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 2
+  }},
+  "exemplars": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 1,
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1
+  }},
+  "gauge": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge","value":-4.5}],"attributes":{"host.name":"transit","instance":"transit:9100","room":"cold"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature_celsius","kind":"gauge","value":21.5}],"attributes":{"host.name":"transit","instance":"transit:9100","room":"lab"}}
+  ], "counters": {}},
+  "help-unit": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"disk_bytes","kind":"gauge","value":1024.0,"unit":"bytes"}],"attributes":{"dev":"sda","host.name":"transit","instance":"transit:9100"}}
+  ], "counters": {}},
+  "histogram": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1
+  }},
+  "label-escaping": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"escaped","kind":"gauge","value":1.0}],"attributes":{"host.name":"transit","instance":"transit:9100","nl":"a\nb","path":"C:\\dir","quote":"say \"hi\""}}
+  ], "counters": {}},
+  "mixed": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"build","kind":"gauge","value":1.0}],"attributes":{"host.name":"transit","instance":"transit:9100","version":"1.2.3"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":0.0}],"attributes":{"feature":"b","host.name":"transit","instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"feature","kind":"gauge","value":1.0}],"attributes":{"feature":"a","host.name":"transit","instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"mystery","kind":"gauge","value":3.0}],"attributes":{"host.name":"transit","instance":"transit:9100"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"up","kind":"gauge","value":1.0}],"attributes":{"host.name":"transit","instance":"transit:9100"}}
+  ], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 1,
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1
+  }},
+  "nan-inf": {"events": [], "counters": {
+    "logit.output.metrics.dropped{component=out,kind=datadog_out,reason=non_finite_value,role=sink}": 3
+  }},
+  "openmetrics-total-created": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=cumulative_sum,role=sink}": 1
+  }},
+  "summary": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=summary,role=sink}": 1
+  }},
+  "typed-attributes": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"count":"7","host.name":"transit","room":"lab","seen":"2027-01-15T07:00:00.000000000Z"}}
+  ], "counters": {
+    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=unrepresentable,role=sink}": 2
+  }},
+  "untyped": {"events": [
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"legacy_value","kind":"gauge","value":7.0}],"attributes":{"host.name":"transit","instance":"transit:9100","source":"old"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"no_metadata","kind":"gauge","value":1.5}],"attributes":{"host.name":"transit","instance":"transit:9100"}}
+  ], "counters": {}}
+}

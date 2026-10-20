@@ -265,6 +265,9 @@
   ], "counters": {
     "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 1
   }},
+  "span-client": {"events": [], "counters": {
+    "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 1
+  }},
   "span-only": {"events": [], "counters": {
     "logit.output.events.skipped{component=out,kind=statsd_out,role=sink}": 1
   }},

@@ -1,0 +1,46 @@
+{
+  "agent-events": {"events": [
+    {"timestamp":"2026-09-24T22:40:41.000000000Z","log":{"format":"raw","message":"Version 7.83.3"},"attributes":{"_logit.datadog.event_type":"Agent Startup","_logit.statsd.event.host":"record-fixtures","_logit.statsd.event.source_type":"System","_logit.statsd.event.title":"Agent Startup"}}
+  ], "counters": {}},
+  "agent-logs": {"events": [
+    {"timestamp":"2026-09-24T22:40:41.787000000Z","log":{"severity":"info","format":"raw","message":"2026-09-24 10:00:00,000 INFO record-fixtures started on port 5050"},"attributes":{"ddsource":"python","ddtags":"filename:app.log,dirname:/var/log/record","hostname":"record-fixtures","service":"record-fixtures","status":"info"}},
+    {"timestamp":"2026-09-24T22:40:41.787000000Z","log":{"severity":"info","format":"raw","message":"{\"timestamp\":\"2026-09-24T10:00:01Z\",\"level\":\"warn\",\"message\":\"slow upstream\",\"upstream\":\"payments\",\"duration_ms\":812}"},"attributes":{"ddsource":"python","ddtags":"filename:app.log,dirname:/var/log/record","hostname":"record-fixtures","service":"record-fixtures","status":"info"}},
+    {"timestamp":"2026-09-24T22:40:42.787000000Z","log":{"severity":"info","format":"raw","message":"2026-09-24 10:00:02,000 ERROR record-fixtures request failed: status=500 path=/fail"},"attributes":{"ddsource":"python","ddtags":"filename:app.log,dirname:/var/log/record","hostname":"record-fixtures","service":"record-fixtures","status":"info"}}
+  ], "counters": {}},
+  "agent-series-timestamped": {"events": [
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"_logit.datadog.interval":10,"_logit.datadog.origin.product":10,"env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"},"types":{"/attributes/_logit.datadog.origin.product":"u64"}},
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"_logit.datadog.interval":10,"_logit.datadog.origin.product":10,"env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"},"types":{"/attributes/_logit.datadog.origin.product":"u64"}},
+    {"timestamp":"2026-09-21T14:13:20.000000000Z","metrics":[{"name":"record.batch.lag","kind":"gauge","value":2.5}],"attributes":{"_logit.datadog.interval":10,"_logit.datadog.origin.product":10,"env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"},"types":{"/attributes/_logit.datadog.origin.product":"u64"}}
+  ], "counters": {}},
+  "agent-service-check": {"events": [
+    {"timestamp":"2026-09-24T22:41:05.000000000Z","metrics":[{"name":"datadog.agent.up","kind":"gauge","value":0.0}],"attributes":{"_logit.statsd.service_check.host":"record-fixtures","_logit.statsd.service_check.name":"datadog.agent.up","_logit.statsd.service_check.status":0},"types":{"/attributes/_logit.statsd.service_check.status":"u64"}}
+  ], "counters": {}},
+  "agent-sketches": {"events": [
+    {"timestamp":"2026-09-24T22:41:00.000000000Z","metrics":[{"name":"record.response.size","kind":"distribution","count":3,"sum":5490.0,"min":1830.0,"max":1830.0,"avg":1830.0,"p50":1830.0,"p90":1830.0,"p95":1830.0,"p99":1830.0,"sketch":{"mapping":"agent","stats_exact":true,"count":3.0,"min":1830.0,"max":1830.0,"positive":[{"key":1823,"count":3.0}]}}],"attributes":{"_logit.datadog.origin.category":10,"_logit.datadog.origin.product":10,"env":"record","host.name":"record-fixtures","service":"record-fixtures","team":"obs","version":"1.2.3"},"types":{"/attributes/_logit.datadog.origin.category":"u64","/attributes/_logit.datadog.origin.product":"u64"}}
+  ], "counters": {}},
+  "distribution-points": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"request.latency","kind":"samples","values":[0.012,0.034,0.034,0.25],"sample_rate":1.0}],"attributes":{"env":"prod","host.name":"web-1","route":"/orders"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"request.size","kind":"samples","values":[512.0,2048.0],"sample_rate":1.0}],"attributes":{"_logit.datadog.hostless":true,"env":"prod"}}
+  ], "counters": {}},
+  "gzip": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"batch.records","kind":"sum","value":250.0,"temporality":"delta","monotonic":true}],"attributes":{"env":"prod","host.name":"etl-1","pipeline":"nightly"}}
+  ], "counters": {}},
+  "series-v1": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"disk.used","kind":"gauge","value":0.42,"unit":"fraction"}],"attributes":{"_logit.datadog.device":"/dev/sda1","_logit.datadog.source_type_name":"disk","env":"prod","host.name":"web-1"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"legacy.unspecified","kind":"gauge","value":3.0}],"attributes":{"_logit.datadog.type":"unspecified","env":"prod","host.name":"web-1"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":7.0}],"attributes":{"env":"prod","host.name":"transit","team":["a","b"]}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"web.requests","kind":"sum","value":12.0,"temporality":"delta","monotonic":true,"unit":"request"}],"attributes":{"_logit.datadog.interval":10,"canary":true,"env":"prod","host.name":"web-1","region":"us-east-1"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"web.requests.rate","kind":"gauge","value":1.2}],"attributes":{"_logit.datadog.interval":10,"_logit.datadog.type":"rate","env":"prod","host.name":"web-1"}},
+    {"timestamp":"2027-01-15T07:59:55.000000000Z","metrics":[{"name":"queue.depth","kind":"gauge","value":9.0}],"attributes":{"env":"prod","host.name":"transit","team":["a","b"]}}
+  ], "counters": {}},
+  "series-v2-json": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.heap","kind":"gauge","value":1048576.5,"unit":"byte"}],"attributes":{"_logit.datadog.source_type_name":"jvm","env":"prod","host.name":"worker-2"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.jobs","kind":"sum","value":4.0,"temporality":"delta","monotonic":true,"unit":"job"}],"attributes":{"_logit.datadog.device":"sdb","_logit.datadog.interval":10,"_logit.datadog.origin.product":10,"_logit.datadog.origin.service":3,"_logit.datadog.resources":[{"name":"users","type":"db"}],"env":"prod","host.name":"worker-2","service":"jobs"},"types":{"/attributes/_logit.datadog.origin.product":"u64","/attributes/_logit.datadog.origin.service":"u64"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.jobs.per_s","kind":"gauge","value":0.4}],"attributes":{"_logit.datadog.interval":10,"_logit.datadog.type":"rate","env":"prod","host.name":"worker-2"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.temperature","kind":"gauge","value":-4.25}],"attributes":{"env":"prod","host.name":"worker-2"}},
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"app.unspecified","kind":"gauge","value":2.0}],"attributes":{"_logit.datadog.resources":[{"name":"","type":"host"}],"_logit.datadog.type":"unspecified","env":"prod"}},
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"app.late","kind":"gauge","value":5.0}],"attributes":{"env":"prod","host.name":"worker-2"}}
+  ], "counters": {
+    "logit.output.tags.omitted{component=out,kind=datadog_out,reason=no_wire_form,role=sink}": 1
+  }}
+}

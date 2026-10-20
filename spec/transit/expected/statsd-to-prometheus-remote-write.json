@@ -125,6 +125,7 @@
   "span-beside-metrics": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests_inflight","kind":"gauge","value":3.0}]}
   ], "counters": {}},
+  "span-client": {"events": [], "counters": {}},
   "span-only": {"events": [], "counters": {}},
   "sub-millisecond": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":4.0}]}

@@ -117,6 +117,7 @@
   "span-beside-metrics": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000000Z","metrics":[{"name":"requests.inflight.value","kind":"gauge","value":3.0}],"attributes":{"_logit.influxdb.measurement":"requests.inflight"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}},
+  "span-client": {"events": [], "counters": {}},
   "span-only": {"events": [], "counters": {}},
   "sub-millisecond": {"events": [
     {"timestamp":"2027-01-15T08:00:00.000000100Z","metrics":[{"name":"queue.depth.value","kind":"gauge","value":3.0}],"attributes":{"_logit.influxdb.measurement":"queue.depth"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}},

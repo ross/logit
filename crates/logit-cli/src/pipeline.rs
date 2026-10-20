@@ -1702,6 +1702,10 @@ pub(crate) enum SinkEncoder {
         version: logit_proto::prometheus::remote_write::Version,
         compression: logit_proto::prometheus::compression::Encoding,
     },
+    /// `datadog_out`: one request per route the batch needs, each with its own path,
+    /// `Content-Type`, and body (`logit_outputs::datadog::encode_routes`), filling the host of
+    /// anything that carries none with the process hostname, as the sink does.
+    Datadog(logit_proto::datadog::DatadogEncoder),
 }
 
 /// The [`SinkEncoder`] for `kind`, its codec counting through `telemetry` and `diag`. Every
@@ -1712,6 +1716,7 @@ pub(crate) fn sink_encoder(
     kind: &logit_config::ComponentKind,
     telemetry: &Telemetry,
     diag: &Diagnostics,
+    hostname: &Arc<str>,
 ) -> anyhow::Result<SinkEncoder> {
     use logit_config::ComponentKind::*;
     Ok(match kind {
@@ -1752,6 +1757,12 @@ pub(crate) fn sink_encoder(
                 compression: to_remote_write_encoding(*compression),
             }
         }
+        DatadogOut { .. } => SinkEncoder::Datadog(
+            logit_proto::datadog::DatadogEncoder::new()
+                .with_telemetry(telemetry.clone())
+                .with_diagnostics(diag.clone())
+                .with_default_host(Some(hostname.clone())),
+        ),
         other => anyhow::bail!("{} has no encoder this driver reaches", graph::kind_name(other)),
     })
 }

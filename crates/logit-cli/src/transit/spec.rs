@@ -931,6 +931,7 @@ macro_rules! flow_tests {
 }
 
 flow_tests! {
+    datadog_relay => "datadog-relay",
     datadog_to_influxdb => "datadog-to-influxdb",
     datadog_to_otlp => "datadog-to-otlp",
     datadog_to_prometheus_remote_write => "datadog-to-prometheus-remote-write",
@@ -938,7 +939,9 @@ flow_tests! {
     datadog_to_statsd => "datadog-to-statsd",
     influxdb_aggregate_to_prometheus => "influxdb-aggregate-to-prometheus",
     influxdb_to_prometheus_remote_write => "influxdb-to-prometheus-remote-write",
+    influxdb_to_datadog => "influxdb-to-datadog",
     influxdb_to_prometheus => "influxdb-to-prometheus",
+    prometheus_to_datadog => "prometheus-to-datadog",
     prometheus_to_influxdb => "prometheus-to-influxdb",
     statsd_aggregate_cumulative => "statsd-aggregate-cumulative",
     statsd_aggregate_samples => "statsd-aggregate-samples",
@@ -948,6 +951,7 @@ flow_tests! {
     statsd_relay_relative => "statsd-relay-relative",
     statsd_relay_skip => "statsd-relay-skip",
     statsd_relay => "statsd-relay",
+    statsd_to_datadog => "statsd-to-datadog",
     statsd_to_influxdb => "statsd-to-influxdb",
     statsd_to_otlp => "statsd-to-otlp",
     statsd_to_prometheus_remote_write => "statsd-to-prometheus-remote-write",

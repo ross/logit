@@ -38,7 +38,8 @@
 //! `format: json`; a component with more than one consumer or more than one source; `lua`,
 //! `lua_file`, `route`, `route_signals`, and `target`; `has_stale` and `drop_stale`, which read
 //! the wall clock per batch; and a sink [`sink_encoder`] has no arm
-//! for (today `statsd_out`, `influxdb_out`, `otlp_out`, and `prometheus_out` in both modes).
+//! for (today `statsd_out`, `influxdb_out`, `otlp_out`, `prometheus_out` in both modes, and
+//! `datadog_out`).
 //!
 //! Exposition has no configured dialect: a scraper negotiates one, so the driver takes it as
 //! [`Options::dialect`], OpenMetrics by default, which is what a Prometheus scrape negotiates.
@@ -70,6 +71,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub(crate) use report::Outcome;
+
+/// The process hostname every run builds its components with, which `datadog_out` writes as the
+/// host of a record that carries none.
+pub(super) const HOSTNAME: &str = "transit";
 
 /// One second in Unix nanoseconds: the default gap between a case's last event and the run's
 /// clock.
@@ -148,7 +153,7 @@ pub(crate) fn run_traced(flow: &Path, case: &Path, options: Options) -> anyhow::
     let probe = TelemetryProbe::new();
     let registry = Arc::clone(probe.registry());
     let reloader = TlsReloader::new();
-    let hostname: Arc<str> = Arc::from("transit");
+    let hostname: Arc<str> = Arc::from(HOSTNAME);
     let mut stages = Vec::with_capacity(chain.transforms.len());
     for id in &chain.transforms {
         let component = &graph.components[id];
@@ -186,7 +191,7 @@ pub(crate) fn run_traced(flow: &Path, case: &Path, options: Options) -> anyhow::
     let sink = &graph.components[&chain.sink];
     let telemetry = probe.telemetry(&chain.sink, sink.kind_name(), sink.role().as_str());
     let diag = Diagnostics::new(&chain.sink).with_telemetry(telemetry.clone());
-    let encoder = sink_encoder(&sink.kind, &telemetry, &diag)
+    let encoder = sink_encoder(&sink.kind, &telemetry, &diag, &hostname)
         .with_context(|| format!("component '{}'", chain.sink))?;
     let decode = wire::Decode { probe: &probe, received_at: now, dialect: options.dialect };
     let decoded = wire::round_trip(encoder, &out, &telemetry, &diag, &decode)

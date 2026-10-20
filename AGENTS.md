@@ -862,8 +862,8 @@ the operator-facing account of all of this.
   gap tables, so a row changes in `mapping.yaml`, never in a region (the README's "Generated
   docs"). `script/transit gen|check|docs|coverage` wraps both; `script/test` runs them.
   Cases come from `statsd_in`, `influxdb_in`, `prometheus_in`'s scrape, and `datadog_in`; the
-  columns are `statsd_out`, `prometheus_out`, `influxdb_out`, and `otlp_out`, through the statsd
-  like pair and 13 cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
+  columns are `statsd_out`, `prometheus_out`, `influxdb_out`, `otlp_out`, and `datadog_out`,
+  through the statsd and Datadog like pairs and 16 cross-protocol flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
 
 ### Not yet built
 

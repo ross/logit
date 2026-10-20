@@ -1,0 +1,16 @@
+# statsd_in's cases into datadog_out with nothing between: samples as distribution points, set
+# members skipped.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/statsd/mixed.json
+  out:
+    type: datadog_out
+    sources: [case]
+    api_key: transit-unused   # the spec sends nothing; a real config reads !env DD_API_KEY
+    endpoints:
+      api: http://127.0.0.1:8080
+      logs: http://127.0.0.1:8080
+      traces: http://127.0.0.1:8080
