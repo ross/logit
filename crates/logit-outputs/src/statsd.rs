@@ -108,22 +108,26 @@
 //! Under `Format::DogStatsd`, the tag segment carries the host as a DogStatsD Agent reads it: the
 //! Agent takes a line's host from its `host:` tag (an empty one included, which leaves the sample
 //! hostless) and stamps its own hostname on a line without one. An event's or service check's
-//! `h:` field outranks the tag. [`build_tag_suffix`] writes, on the merged resource⊕event view:
+//! non-empty `h:` field outranks the tag; the Agent reads an empty `h:` as none.
+//! [`build_tag_suffix`] writes, on the merged resource⊕event view:
 //!
-//! 1. Any `host` attribute as an ordinary tag, `host:<v>` for a string, so a
-//!    `statsd_in -> statsd_out` relay stays a fixed point. A `host.name` beside it stays a
-//!    `host.name:<v>` tag.
-//! 2. With no `host` attribute and no `h:` field, a `host.name` that's a non-empty string as the
-//!    `host:` tag in its place. `statsd_in` reads it back as `host`.
-//! 3. With no `host` attribute, no such `host.name`, and no `h:` field, `datadog_in`'s hostless
-//!    mark (`_logit.datadog.hostless`, `Bool(true)`) as an empty `host:` tag. `statsd_in` reads it
-//!    back as an empty `host`, which `datadog_out` reads as a hostless sample.
+//! 1. Any `host` attribute as an ordinary tag, `host:<v>` for a string, so a DogStatsD `host:`
+//!    tag relays as itself. A `host.name` beside it stays a `host.name:<v>` tag.
+//! 2. With no `host` attribute and no non-empty `h:` field, a `host.name` that's a non-empty
+//!    string as the `host:` tag in its place. `statsd_in` reads it back as `host`, so a
+//!    `statsd_in -> statsd_out` relay turns a `host.name:` tag into the `host:` tag, a permitted
+//!    normalization of the pair (`crates/logit-cli/tests/statsd_round_trip.rs`'s list, (10)).
+//! 3. With no `host` attribute, no such `host.name`, and no non-empty `h:` field, `datadog_in`'s
+//!    hostless mark (`_logit.datadog.hostless`, `Bool(true)`) as an empty `host:` tag.
+//!    `statsd_in` reads it back as an empty `host`, which `datadog_out` reads as a hostless
+//!    sample.
 //!
 //! A non-empty string `host.name` goes after the other tags under either rule. Any other
 //! `host.name` (empty, or not a string) is an ordinary tag in its place, and `Format::Statsd` writes
 //! no tags at all. The precedence is the reverse of `datadog_out`'s, where `host.name` is the host
-//! and `host` the tag: a DogStatsD line has one host, the other value stays a tag, and keeping
-//! `host` first keeps the like pair a fixed point (`docs/adr/statsd-output.md`'s host amendment).
+//! and `host` the tag: a DogStatsD line has one host, the other value stays a tag, and `host` is
+//! what `statsd_in` decoded from this protocol's own `host:` tag (`docs/adr/statsd-output.md`'s
+//! host amendment).
 //!
 //! ## Metric-kind coverage
 //!
@@ -273,7 +277,7 @@
 //! | `record/unit_on_distribution` | lost | uncounted | statsd has no unit; it isn't written or counted. |
 //! | `record/sample_rate_unweighted` | exact | -- | The rate is written as `@rate` on the line. |
 //! | `attributes/string_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags; each is counted once per wire tag. |
-//! | `attributes/string_value`, otherwise | normalized | `tag_sanitized` | A DogStatsD `key:value` tag. Each `:`, `\|`, `@`, `#`, `,`, control, and whitespace character in the key, and each but `:` in the value, is written as `_`, uncounted. A non-empty `host.name` on a record with no `host` and no `h:` field is the `host:` tag, which statsd_in reads back as `host`. |
+//! | `attributes/string_value`, otherwise | normalized | `tag_rewritten` | A DogStatsD `key:value` tag. Each `:`, `\|`, `@`, `#`, `,`, control, and whitespace character in the key, and each but `:` in the value, is written as `_`, uncounted. A non-empty `host.name` on a record with no `host` and no non-empty `h:` field is the `host:` tag, which statsd_in reads back as `host`. |
 //! | `attributes/bool_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/bool_value`, otherwise | normalized | `bool_tag` | `true` is a bare tag and reads back `true`; `false` is `key:false` and reads back as the string. |
 //! | `attributes/number_value`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
@@ -288,7 +292,7 @@
 //! | `attributes/timestamp_value`, otherwise | lost | `logit.output.tags.omitted{reason=unrepresentable}` | A timestamp value has no tag form and is left off, counted. |
 //! | `attributes/private_carrier`, under `format: statsd` | lost | `logit.output.fields.omitted{reason=dialect}` | Plain statsd has no `\|c:`, `\|e:`, `\|card:`, or `\|T` segment, so those carriers are omitted, counted once per carrier per line; the type carrier survives as the line's type, `h` and `d` as `ms`. |
 //! | `attributes/private_carrier`, otherwise | exact | -- | A `_logit.statsd.*` carrier is written as its own segment or field and statsd_in stamps it back. |
-//! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no host is an empty `host:` tag, which statsd_in reads back as an empty `host`. |
+//! | `attributes/foreign_carrier` | lost | uncounted | Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. Under `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads back as an empty `host`. |
 //! | `attributes/resource_attribute`, under `format: statsd` | lost | `logit.output.tags.omitted{reason=dialect}` | Plain statsd has no tags. |
 //! | `attributes/resource_attribute`, otherwise | normalized | `resource_merged` | A resource attribute is written as a tag, the event's value winning on a shared key, and reads back as an event attribute. |
 //! | `attributes/scope` | lost | uncounted | statsd has no instrumentation scope; it isn't written or counted. |
@@ -1116,7 +1120,8 @@ fn build_tag_suffix<'a>(
         }
     }
     if format == Format::DogStatsd {
-        // Only the line's own `h:` field outranks a `host:` tag where the Agent reads the host.
+        // Only the line's own non-empty `h:` field outranks a `host:` tag where the Agent reads
+        // the host; the Agent reads an empty `h:` as none.
         let line_host = if event.metrics.is_empty() {
             carriers.event_host
         } else if carriers.service_check_name.is_some() {
@@ -1124,7 +1129,7 @@ fn build_tag_suffix<'a>(
         } else {
             None
         };
-        let tag_is_host = !has_host && line_host.is_none();
+        let tag_is_host = !has_host && line_host.is_none_or(str::is_empty);
         match host_name {
             Some(value) => {
                 let key = if tag_is_host { "host" } else { ATTR_HOST_NAME };
@@ -4120,6 +4125,26 @@ mod tests {
         );
         let (dog, _) = encode(vec![event, check]);
         assert_eq!(dog, vec!["_e{1,1}:t|x|h:e1|#host.name:h1", "_sc|c|0|h:s1"]);
+    }
+
+    /// An empty `h:` field is no host at the Agent, so the `host:` tag still carries one.
+    #[test]
+    fn an_empty_h_field_leaves_the_host_to_the_tag() {
+        let event = event_line_event(
+            "t",
+            "x",
+            &[("_logit.statsd.event.host", Value::str("")), ("host.name", Value::str("h1"))],
+        );
+        let check = service_check_event(
+            "c",
+            MetricKind::gauge(0.0),
+            &[
+                ("_logit.statsd.service_check.host", Value::str("")),
+                ("_logit.datadog.hostless", Value::Bool(true)),
+            ],
+        );
+        let (dog, _) = encode(vec![event, check]);
+        assert_eq!(dog, vec!["_e{1,1}:t|x|h:|#host:h1", "_sc|c|0|h:|#host:"]);
     }
 
     #[test]

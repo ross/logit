@@ -1260,12 +1260,12 @@ rows:
           counter: logit.output.tags.omitted{reason=dialect}
           text: Plain statsd has no tags; each is counted once per wire tag.
         - class: normalized
-          reason: tag_sanitized
+          reason: tag_rewritten
           text: >-
             A DogStatsD `key:value` tag. Each `:`, `|`, `@`, `#`, `,`, control, and whitespace
             character in the key, and each but `:` in the value, is written as `_`, uncounted. A
-            non-empty `host.name` on a record with no `host` and no `h:` field is the `host:` tag,
-            which statsd_in reads back as `host`.
+            non-empty `host.name` on a record with no `host` and no non-empty `h:` field is the
+            `host:` tag, which statsd_in reads back as `host`.
       prometheus_out:
         class: normalized
         reason: label_sanitized
@@ -1500,8 +1500,9 @@ rows:
         reason: uncounted
         text: >-
           Another protocol's `_logit.` carrier isn't a tag and is left off, uncounted. Under
-          `format: dogstatsd`, `_logit.datadog.hostless` on a record with no host is an empty
-          `host:` tag, which statsd_in reads back as an empty `host`.
+          `format: dogstatsd`, `_logit.datadog.hostless` on a record with no `host`, no non-empty
+          `host.name`, and no non-empty `h:` field is an empty `host:` tag, which statsd_in reads
+          back as an empty `host`.
       prometheus_out:
         class: lost
         reason: uncounted

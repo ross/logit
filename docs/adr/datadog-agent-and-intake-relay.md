@@ -612,7 +612,7 @@ of the codec's permitted-normalization lists (`crates/logit-proto/src/datadog/mo
 ## Amendment: `statsd_out` writes the DogStatsD host (2026-10-19)
 
 `statsd_out` under `format: dogstatsd` now writes the host as an Agent reads it, so a sample sent
-through a local Agent keeps its host. With no `host` attribute and no `h:` field, a non-empty
+through a local Agent keeps its host. With no `host` attribute and no non-empty `h:` field, a non-empty
 `host.name` leaves as the `host:` tag, and `_logit.datadog.hostless` as an empty `host:` tag. A
 `host` attribute wins over `host.name` there, the reverse of `datadog_out`'s order above.
 [ADR `statsd-output`](statsd-output.md)'s amendment of the same date records the rule and why.
