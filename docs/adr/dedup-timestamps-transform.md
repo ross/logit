@@ -150,7 +150,7 @@ An `Event` carries any mix of metrics, a log, and a span, and `dedup_timestamps`
 collapses within one batch too: `RemoteWriteOutput::send` encodes one batch into one `POST`, and
 nothing in the runtime coalesces batches on the way to a sink. A router or `route_signals`
 between `dedup_timestamps` and the sink only splits a batch, so every batch the sink sees is a subset of one
-batch `dedup` saw, and its same-millisecond pairs are already gone.
+batch `dedup_timestamps` saw, and its same-millisecond pairs are already gone.
 
 A window across batches was considered and isn't recommended. Once a batch leaves, its reading
 has left too, so a later batch's reading of the same instant can only be dropped, which keeps the
