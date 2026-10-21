@@ -24,6 +24,11 @@
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"uploads.completed.value","kind":"gauge","value":5}],"attributes":{"_logit.influxdb.measurement":"uploads.completed","host.name":"web-1","service.name":"checkout"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {}},
+  "histogram-neg-inf-bound": {"events": [
+    {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.duration.count","kind":"gauge","value":27.0},{"name":"http.server.duration.1","kind":"gauge","value":9.0},{"name":"http.server.duration.5","kind":"gauge","value":11.0},{"name":"http.server.duration.+Inf","kind":"gauge","value":27.0}],"attributes":{"_logit.influxdb.measurement":"http.server.duration","host.name":"web-1","http.route":"/cart","service.name":"checkout"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
+  ], "counters": {
+    "logit.output.metrics.degraded{component=out,kind=influxdb_out,reason=non_finite_component,role=sink}": 1
+  }},
   "histogram-non-finite-bounds": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"http.server.duration.count","kind":"gauge","value":31.0},{"name":"http.server.duration.1","kind":"gauge","value":9.0},{"name":"http.server.duration.5","kind":"gauge","value":11.0},{"name":"http.server.duration.+Inf","kind":"gauge","value":31.0}],"attributes":{"_logit.influxdb.measurement":"http.server.duration","host.name":"web-1","http.route":"/cart","service.name":"checkout"},"resource":{"attributes":{"_logit.influxdb.bucket":"metrics","_logit.influxdb.org":"acme"}}}
   ], "counters": {

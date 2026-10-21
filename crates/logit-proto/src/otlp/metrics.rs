@@ -45,7 +45,8 @@
 //! | `set` | skipped | `logit.output.metrics.skipped{metric_kind=set}` | OTLP has no cardinality type, so a set estimate isn't written, with a throttled `otlp_set_metric_skipped` warning. |
 //! | `histogram/delta` | exact | -- | An OTLP `Histogram` with delta temporality. |
 //! | `histogram/cumulative` | exact | -- | An OTLP `Histogram` with cumulative temporality. |
-//! | `histogram/non_finite_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | OTLP bounds are finite and increasing, so the finite bounds are sorted, a `-Inf` bound's count joins the first bucket, and a `NaN` bound's joins the overflow bucket. `count` and every cumulative count are kept. |
+//! | `histogram/nan_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | OTLP bounds are finite, so a `NaN` bound's count joins the overflow bucket. `count` and every cumulative count are kept. |
+//! | `histogram/neg_inf_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | OTLP bounds are finite, so a `-Inf` bound's count joins the first bucket. `count` and every cumulative count are kept. |
 //! | `exponential_histogram/delta` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `exponential_histogram/cumulative` | exact | -- | An OTLP `ExponentialHistogram`, field for field. |
 //! | `summary` | exact | -- | An OTLP `Summary`. |

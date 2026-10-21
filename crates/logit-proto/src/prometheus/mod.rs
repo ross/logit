@@ -112,7 +112,8 @@
 //! | `set` | degraded | `logit.output.metrics.degraded{metric_kind=set}` | A `gauge` of the estimate; the registers are gone. |
 //! | `histogram/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | A delta histogram is dropped, with a throttled `delta_temporality_unresolved` warning; an `aggregate` with `temporality: cumulative` upstream makes it a running one. |
 //! | `histogram/cumulative` | normalized | `inf_bucket` | A `histogram` family of running-sum buckets and `_sum` when it has one, or a `gaugehistogram` under the type carrier. `+Inf` states the total, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. `min` and `max` are `record/min_max`'s. |
-//! | `histogram/non_finite_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | The bounds are sorted, `le="-Inf"` first. A `NaN` bound has no place in that order, so it has no bucket, and its count reaches only `+Inf` and `_count`. |
+//! | `histogram/nan_bound` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | A `NaN` bound has no place among the sorted bounds, so it has no bucket, and its count reaches only `+Inf` and `_count`. |
+//! | `histogram/neg_inf_bound` | exact | -- | `-Inf` is an ordinary bound: an `le="-Inf"` bucket, first. |
 //! | `exponential_histogram/delta`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Remote-write carries native histograms, but the sender doesn't map them yet, so one is dropped. |
 //! | `exponential_histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
 //! | `exponential_histogram/cumulative`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Dropped, as for a delta one. |

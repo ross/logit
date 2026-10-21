@@ -731,10 +731,11 @@ rows:
         counter: logit.output.metrics.skipped{metric_kind=histogram}
         text: >-
           The series encoders have no histogram, so none is written.
-  # A histogram with a `NaN` or `-Inf` bucket bound, in any order. A sink's other histogram
-  # outcomes are its temporality row's.
+  # A histogram with a `NaN` bucket bound, in any order. A record holding both a `NaN` and a
+  # `-Inf` bound reaches this row and `neg_inf_bound`. A sink's other histogram outcomes are its
+  # temporality row's.
   - kind: histogram
-    feature: non_finite_bound
+    feature: nan_bound
     cells:
       statsd_out:
         - when: {multi_value: skip}
@@ -744,28 +745,60 @@ rows:
         - class: degraded
           counter: logit.output.metrics.degraded{metric_kind=histogram}
           text: >-
-            Each bucket is its own dotted series, as for any other bound: `.bucket_NaN` and
-            `.bucket_-inf`, each holding that bucket's own count.
+            Each bucket is its own dotted series, as for any other bound: `.bucket_NaN` holds
+            that bucket's own count.
       prometheus_out:
         class: degraded
         counter: logit.output.metrics.degraded{reason=non_finite_component}
         text: >-
-          The bounds are sorted, `le="-Inf"` first. A `NaN` bound has no place in that order, so
-          it has no bucket, and its count reaches only `+Inf` and `_count`.
+          A `NaN` bound has no place among the sorted bounds, so it has no bucket, and its count
+          reaches only `+Inf` and `_count`.
       influxdb_out:
         class: degraded
         counter: logit.output.metrics.degraded{reason=non_finite_component}
         text: >-
-          No field key spells a `NaN` or `-Inf` bound, so neither is written. The finite bounds'
-          fields are sorted, a `-Inf` count reaches each of them, and a `NaN` count reaches only
+          No field key spells a `NaN` bound, so none is written, and its count reaches only
           `count` and `+Inf`.
       otlp_out:
         class: degraded
         counter: logit.output.metrics.degraded{reason=non_finite_component}
         text: >-
-          OTLP bounds are finite and increasing, so the finite bounds are sorted, a `-Inf`
-          bound's count joins the first bucket, and a `NaN` bound's joins the overflow bucket.
-          `count` and every cumulative count are kept.
+          OTLP bounds are finite, so a `NaN` bound's count joins the overflow bucket. `count`
+          and every cumulative count are kept.
+      datadog_out:
+        class: skipped
+        counter: logit.output.metrics.skipped{metric_kind=histogram}
+        text: >-
+          The series encoders have no histogram, so none is written.
+  # A histogram with a `-Inf` bucket bound.
+  - kind: histogram
+    feature: neg_inf_bound
+    cells:
+      statsd_out:
+        - when: {multi_value: skip}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=histogram}
+          text: 'Under `multi_value: skip`, no line is written.'
+        - class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=histogram}
+          text: >-
+            Each bucket is its own dotted series, as for any other bound: `.bucket_-inf` holds
+            that bucket's own count.
+      prometheus_out:
+        class: exact
+        text: '`-Inf` is an ordinary bound: an `le="-Inf"` bucket, first.'
+      influxdb_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{reason=non_finite_component}
+        text: >-
+          No field key spells a `-Inf` bound, so none is written, and its count reaches every
+          finite bound's field.
+      otlp_out:
+        class: degraded
+        counter: logit.output.metrics.degraded{reason=non_finite_component}
+        text: >-
+          OTLP bounds are finite, so a `-Inf` bound's count joins the first bucket. `count` and
+          every cumulative count are kept.
       datadog_out:
         class: skipped
         counter: logit.output.metrics.skipped{metric_kind=histogram}

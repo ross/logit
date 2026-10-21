@@ -43,6 +43,8 @@
   text: >-
     `explicit_bounds` out of order and holding a `NaN` and a `-Inf`, which `otlp_in` keeps as
     sent.
+- name: histogram_neg_inf_bound
+  text: An increasing `explicit_bounds` whose first bound is `-Inf`.
 - name: histogram_min_max
   text: A `Histogram` data point with `min` and `max`.
 - name: histogram_no_min_max

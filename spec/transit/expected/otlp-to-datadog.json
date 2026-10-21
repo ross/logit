@@ -24,6 +24,9 @@
   "gzip": {"events": [
     {"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{"name":"uploads.completed","kind":"sum","value":5.0,"temporality":"delta","monotonic":true}],"attributes":{"host.name":"web-1","service.name":"checkout"}}
   ], "counters": {}},
+  "histogram-neg-inf-bound": {"events": [], "counters": {
+    "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1
+  }},
   "histogram-non-finite-bounds": {"events": [], "counters": {
     "logit.output.metrics.skipped{component=out,kind=datadog_out,metric_kind=histogram,role=sink}": 1
   }},
