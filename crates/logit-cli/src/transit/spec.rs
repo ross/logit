@@ -1011,6 +1011,7 @@ macro_rules! flow_tests {
 }
 
 flow_tests! {
+    collectd_to_datadog => "collectd-to-datadog",
     collectd_to_influxdb => "collectd-to-influxdb",
     collectd_to_otlp => "collectd-to-otlp",
     collectd_to_prometheus_remote_write => "collectd-to-prometheus-remote-write",
@@ -1042,6 +1043,7 @@ flow_tests! {
     prometheus_delta_to_statsd => "prometheus-delta-to-statsd",
     prometheus_to_datadog => "prometheus-to-datadog",
     prometheus_to_influxdb => "prometheus-to-influxdb",
+    prometheus_to_otlp => "prometheus-to-otlp",
     prometheus_to_statsd => "prometheus-to-statsd",
     statsd_aggregate_cumulative => "statsd-aggregate-cumulative",
     statsd_aggregate_samples => "statsd-aggregate-samples",
