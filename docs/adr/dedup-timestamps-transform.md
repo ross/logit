@@ -3,17 +3,10 @@ created: 2026-10-21
 updated: 2026-10-21
 ---
 
-# `dedup`: collapse readings of one series that share a timestamp, within a batch, before a sink that can't hold both
+# `dedup_timestamps`: collapse readings of one series that share a timestamp, within a batch, before a sink that can't hold both
 
 ## Status
 Proposed.
-
-**The component's name is a placeholder.** `dedup` names a kind that
-[ADR `routing-by-condition-is-lua`](routing-by-condition-is-lua.md) retired, and the maintainer
-hasn't chosen a name yet (the first [open question](#open-questions)). To rename it, replace
-`` `dedup` `` in code font everywhere in this file except the section
-[Why this isn't the retired kind](#why-this-isnt-the-retired-kind) and the Consequences list of
-documents that call the kind retired, where it names the retired kind. Then rename this file.
 
 ## Context
 A remote-write series can't hold two samples at one millisecond. `prometheus_out` keeps the later
@@ -62,7 +55,7 @@ The other metric sinks, read from code on 2026-10-21:
 timestamp-faithful relay ([Alternatives considered](#alternatives-considered)).
 
 ## Decision
-**A new native transform, `dedup`, collapses the metric records in one batch that share a series
+**A new native transform, `dedup_timestamps`, collapses the metric records in one batch that share a series
 and a timestamp bucket of a configured `precision:` into one record, the later reading, with
 delta kinds summed into it.** An operator places it in front of a sink whose destination can't
 hold two readings of one series at one instant. Separately, `prometheus_out`'s collapse becomes
@@ -72,7 +65,7 @@ counted loss.
 
 ```yaml
 before_remote_write:
-  type: dedup
+  type: dedup_timestamps
   sources: [statsd_in]
   precision: 1ms
 ```
@@ -142,7 +135,7 @@ On a merged record:
 
 ### Events, not records
 
-An `Event` carries any mix of metrics, a log, and a span, and `dedup` acts only on metric records:
+An `Event` carries any mix of metrics, a log, and a span, and `dedup_timestamps` acts only on metric records:
 
 - An event whose records all collapse into later events, and that carries no log and no span, is
   removed from the batch and counted `logit.component.events.discarded`.
@@ -153,10 +146,10 @@ An `Event` carries any mix of metrics, a log, and a span, and `dedup` acts only 
 
 ### Scope: one batch, and no added latency
 
-`dedup` holds no state between batches. That's enough for `prometheus_out`, because the sink
+`dedup_timestamps` holds no state between batches. That's enough for `prometheus_out`, because the sink
 collapses within one batch too: `RemoteWriteOutput::send` encodes one batch into one `POST`, and
 nothing in the runtime coalesces batches on the way to a sink. A router or `route_signals`
-between `dedup` and the sink only splits a batch, so every batch the sink sees is a subset of one
+between `dedup_timestamps` and the sink only splits a batch, so every batch the sink sees is a subset of one
 batch `dedup` saw, and its same-millisecond pairs are already gone.
 
 A window across batches was considered and isn't recommended. Once a batch leaves, its reading
@@ -169,9 +162,9 @@ whether a window is ever needed.
 
 Two placement rules follow, for the operator docs:
 
-- **Place `dedup` last before the sink.** A stage after it can create new collisions: a `lua`
+- **Place `dedup_timestamps` last before the sink.** A stage after it can create new collisions: a `lua`
   stage, `line_protocol`'s fan-out, or a `set` that makes two keys equal.
-- **A `dedup` with several `sources:` sees each source's batches separately.** Two sources'
+- **A `dedup_timestamps` with several `sources:` sees each source's batches separately.** Two sources'
   readings of one series never meet in one batch, so they also never meet in one sink request.
 
 ### Mechanism: a batch-level hook on `Transform`
@@ -185,13 +178,13 @@ default is a no-op, so no other transform's hot path changes, which keeps the tr
 `process_batch` counts the events the hook removed under `events.discarded`, as it counts a
 `false` from `process`.
 
-`dedup` makes two passes: one hashes each keyed record's key and bucket into a table cleared per
+`dedup_timestamps` makes two passes: one hashes each keyed record's key and bucket into a table cleared per
 batch, and only a collision triggers the second, which writes the surviving record and removes the
 rest. A batch with no collision pays one hash and one probe per metric record.
 
 ### Telemetry
 
-Names follow [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md). Nothing `dedup`
+Names follow [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md). Nothing `dedup_timestamps`
 does is loss: the operator asked for each outcome, so it emits no `*.dropped`.
 
 | Name | Meaning |
@@ -225,6 +218,9 @@ that. It removes no event because it was seen before. It collapses metric *readi
 *series* at one *instant*, keeps the later one, and sums deltas, and an event leaves only when
 nothing is left on it.
 
+Plain `dedup` stays free for a possible future event-level component, such as one suppressing a log
+message that repeats continually.
+
 A `lua` component can keep a table keyed by a series it computes, since a script's globals persist
 across calls ([`docs/design/lua-api.md`](../design/lua-api.md)'s "Script contract"). What it can't
 do is choose the later reading without adding latency:
@@ -251,7 +247,7 @@ last one, or sum two, within a batch at no latency. That's the same kind of grou
   an event that carries its source's own timestamp, and every kind it has no merge rule for, such
   as an OTLP cumulative `Sum` (that ADR's 2026-10-19 timestamped pass-through amendment), so the
   duplicates it's asked to remove pass through it. `aggregate` stays right for a live delta flow
-  that needs a window anyway. `dedup` is for a relay that keeps source timestamps.
+  that needs a window anyway. `dedup_timestamps` is for a relay that keeps source timestamps.
 - **A sink-side option** (`prometheus_out` merging deltas, or a `duplicates:` field). Every sink
   that needs it would carry its own copy of the key, the per-kind rules, and the counters, and an
   encoder would stop being a pure rendering of its batch. The rule that summarization is opt-in
@@ -270,7 +266,7 @@ last one, or sum two, within a batch at no latency. That's the same kind of grou
   destination dialect. Not needed until a counted residue shows up in practice.
 
 ## Consequences
-- **Operators add `dedup` to every timestamp-faithful flow into remote-write or `datadog_out`**
+- **Operators add `dedup_timestamps` to every timestamp-faithful flow into remote-write or `datadog_out`**
   whose source can stamp two readings of one series inside one bucket, at `precision: 1ms` or
   `1s`. That's almost every such flow from a sub-millisecond source: `statsd_in` gauges,
   `internal`, and any relay with no `aggregate` in it. A flow through `aggregate` doesn't need
@@ -281,11 +277,11 @@ last one, or sum two, within a batch at no latency. That's the same kind of grou
   `script/schema` regenerates `schema/logit.schema.json`.
 - [`docs/design/memory.md`](../design/memory.md) gets a row for the per-batch table, and
   `crates/logit-bench/tests/allocations.rs` a pin, when the transform lands.
-- The transit spec gains flows with `dedup` in front of `prometheus_out` and `datadog_out`, and the
+- The transit spec gains flows with `dedup_timestamps` in front of `prometheus_out` and `datadog_out`, and the
   `same_instant` and `same_millisecond` rows change with the sink counter.
 - If this record is accepted, these must change, in the PR that builds the component:
   - [ADR `routing-by-condition-is-lua`](routing-by-condition-is-lua.md) gets an amendment beside
-    its `sample` one, saying `dedup` (under whatever name) is back for series-level collapse and
+    its `sample` one, saying `dedup_timestamps` is back for series-level collapse and
     the event-level seen-set stays retired.
   - [ADR `consistent-sampling-component`](consistent-sampling-component.md)'s two statements that
     `dedup` stays retired.
@@ -300,21 +296,18 @@ last one, or sum two, within a batch at no latency. That's the same kind of grou
     as retired.
 
 ## Open questions
-1. **The name.** `dedup` is a placeholder and collides with the retired kind's name. Candidates
-   include `collapse`, `dedup_points`, and `last_write`. The file's slug should follow the name
-   before this merges, since a slug is permanent once written.
-2. **Cross-request duplicates.** Do Prometheus and Mimir reject a sample whose series and
+1. **Cross-request duplicates.** Do Prometheus and Mimir reject a sample whose series and
    millisecond were written by an *earlier* request, and what do they store from a request they
    answer `400` for a duplicate? If they store the rest of the request, the sink's `Rejected`
    reading over-counts loss. Neither has been verified here, and the answer decides whether a
    window is ever needed.
-3. **Datadog in one request.** Measure what Datadog stores for two points of one series in one
+2. **Datadog in one request.** Measure what Datadog stores for two points of one series in one
    second within one request: one, both, or a sum, for a gauge and for a delta `count`. If it keeps
    one, should `datadog_out` count it as `dropped{reason="duplicate_timestamp"}` too?
-4. **The counter names.** `absorbed{reason}` reuses `aggregate`'s untagged counter with a new tag,
+3. **The counter names.** `absorbed{reason}` reuses `aggregate`'s untagged counter with a new tag,
    and `aggregate`'s identity (`metrics_in == absorbed + passed_through`) doesn't hold here, since
-   a record with no collision isn't counted. Is that acceptable, or does `dedup` want its own word?
-5. **Observation kinds.** Should `Samples`, `SetMembers`, `Distribution`, and `Set` merge too, for
+   a record with no collision isn't counted. Is that acceptable, or does `dedup_timestamps` want its own word?
+4. **Observation kinds.** Should `Samples`, `SetMembers`, `Distribution`, and `Set` merge too, for
    a destination that turns out to overwrite them? Each has an exact merge.
-6. **The exposition registry.** Should its replacement of a series' value get a non-loss counter,
+5. **The exposition registry.** Should its replacement of a series' value get a non-loss counter,
    or stay uncounted as a scrape's own semantics?
