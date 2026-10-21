@@ -52,18 +52,19 @@
 //! value, and type tags (`exact`); (2) the same name, kind, temporality, and monotonicity and the
 //! same value read as a number, or for `samples` and `set_members` several read-back records whose
 //! values together are the input's (`normalized`); a histogram that gained an empty `+Inf`
-//! bucket is the same value; (3) the same name in another kind, or names under `<name>.`, the
-//! dotted series of an expansion, one of each dotted name per record when several points of a
-//! series expand (`degraded`); a read-back histogram (or exponential histogram) pairs with an
-//! input histogram there only when it holds the same total count and, where both carry a sum,
-//! the same sum, a non-finite sum matching only the same non-finite value. Merged or dropped
-//! bounds, an added overflow bucket, and a folded `NaN` or `-Inf` bound change no total, so they
-//! pair as `degraded`, and where each count lands is the snapshot's to pin; a sink that loses or
-//! invents observations leaves the input unread and the read-back record unclaimed. Passes (1) and (2) run by name and then by the name as the sink
-//! writes it, where an `exact` pairing reads as `normalized`, before pass (3) runs either way, so
-//! a dotted expansion never claims a record a respelling reads back whole. Within a pass the
-//! latest record goes first, so where a sink keeps one point per series, the earlier point is the
-//! one left over.
+//! bucket is the same value; (3) once neither found a match, the same name in any metric kind,
+//! the input's own included, or names under `<name>.`, the dotted series of an expansion, one of
+//! each dotted name per record when several points of a series expand (`degraded`). Where both
+//! the input and the read-back record are histograms (or exponential histograms), pass (3) also
+//! needs the same total count and, where both carry a sum, the same sum, a non-finite sum
+//! matching only the same non-finite value. Merged or dropped bounds, an added overflow bucket,
+//! and a folded `NaN` or `-Inf` bound change no total, so they pair as `degraded`, and where each
+//! count lands is the snapshot's to pin; a sink that loses or invents observations leaves the
+//! input unread and the read-back record unclaimed. Passes (1) and (2) run by name and then by
+//! the name as the sink writes it, where an `exact` pairing reads as `normalized`, before pass
+//! (3) runs either way, so a dotted expansion never claims a record a respelling reads back
+//! whole. Within a pass the latest record goes first, so where a sink keeps one point per series,
+//! the earlier point is the one left over.
 //!
 //! [`Spelling`] holds each sink's rewrites, from its codec's module doc: `statsd_out`'s reserved
 //! characters as `_` in a name, a tag key, and a tag value (`:` allowed there), and under
