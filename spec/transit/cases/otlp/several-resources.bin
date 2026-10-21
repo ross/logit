@@ -1,0 +1,113 @@
+{
+ "resourceMetrics": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "billing"
+      }
+     },
+     {
+      "key": "service.instance.id",
+      "value": {
+       "intValue": "3"
+      }
+     }
+    ]
+   },
+   "schemaUrl": "https://opentelemetry.io/schemas/1.26.0",
+   "scopeMetrics": [
+    {
+     "scope": {
+      "name": "billing.invoices"
+     },
+     "schemaUrl": "https://opentelemetry.io/schemas/1.26.0",
+     "metrics": [
+      {
+       "name": "invoices.open",
+       "gauge": {
+        "dataPoints": [
+         {
+          "timeUnixNano": "1799999990000000000",
+          "asInt": "17"
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "scope": {
+      "name": "billing.payments",
+      "version": "0.9.0"
+     },
+     "metrics": [
+      {
+       "name": "payments.pending",
+       "gauge": {
+        "dataPoints": [
+         {
+          "timeUnixNano": "1799999990000000000",
+          "asInt": "4"
+         }
+        ]
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "shipping"
+      }
+     }
+    ]
+   },
+   "scopeMetrics": [
+    {
+     "scope": {},
+     "metrics": [
+      {
+       "name": "parcels.queued",
+       "gauge": {
+        "dataPoints": [
+         {
+          "timeUnixNano": "1799999985000000000",
+          "asInt": "9",
+          "attributes": [
+           {
+            "key": "depot",
+            "value": {
+             "stringValue": "north"
+            }
+           }
+          ]
+         },
+         {
+          "timeUnixNano": "1799999990000000000",
+          "asInt": "11",
+          "attributes": [
+           {
+            "key": "depot",
+            "value": {
+             "stringValue": "north"
+            }
+           }
+          ]
+         }
+        ]
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

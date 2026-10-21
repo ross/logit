@@ -1,0 +1,4 @@
+# A hand-written OTLP/JSON body: `Gauge` points as `asDouble` and `asInt`, one below zero, and
+# one with a start time.
+wire: gauges.bin
+exercises: [otlp_json, gauge_double, gauge_int, gauge_negative, gauge_start_time, unit, description, resource_attributes, scope, scope_attributes, attribute_string]

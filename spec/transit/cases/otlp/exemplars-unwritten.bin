@@ -1,0 +1,129 @@
+{
+ "resourceMetrics": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "checkout"
+      }
+     },
+     {
+      "key": "host.name",
+      "value": {
+       "stringValue": "web-1"
+      }
+     }
+    ]
+   },
+   "scopeMetrics": [
+    {
+     "scope": {
+      "name": "io.opentelemetry.contrib.runtime",
+      "version": "1.2.0",
+      "attributes": [
+       {
+        "key": "library.language",
+        "value": {
+         "stringValue": "go"
+        }
+       }
+      ]
+     },
+     "metrics": [
+      {
+       "name": "orders.shipped",
+       "unit": "{order}",
+       "sum": {
+        "aggregationTemporality": 2,
+        "isMonotonic": true,
+        "dataPoints": [
+         {
+          "startTimeUnixNano": "1799999930000000000",
+          "timeUnixNano": "1799999990000000000",
+          "asInt": "64",
+          "exemplars": [
+           {
+            "timeUnixNano": "1799999987000000000",
+            "asInt": "1",
+            "filteredAttributes": [
+             {
+              "key": "carrier",
+              "value": {
+               "stringValue": "ups"
+              }
+             }
+            ]
+           },
+           {
+            "timeUnixNano": "1799999988000000000",
+            "asInt": "2",
+            "filteredAttributes": [
+             {
+              "key": "carrier.id",
+              "value": {
+               "stringValue": "c-4"
+              }
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      },
+      {
+       "name": "queue.wait",
+       "unit": "ms",
+       "histogram": {
+        "aggregationTemporality": 2,
+        "dataPoints": [
+         {
+          "startTimeUnixNano": "1799999930000000000",
+          "timeUnixNano": "1799999990000000000",
+          "count": "7",
+          "sum": 140.0,
+          "bucketCounts": [
+           "3",
+           "4"
+          ],
+          "explicitBounds": [
+           10.0
+          ],
+          "exemplars": [
+           {
+            "timeUnixNano": "1799999986000000000",
+            "asDouble": 4.0,
+            "filteredAttributes": [
+             {
+              "key": "queue",
+              "value": {
+               "stringValue": "orders"
+              }
+             }
+            ]
+           },
+           {
+            "timeUnixNano": "1799999987000000000",
+            "asDouble": 6.0,
+            "filteredAttributes": [
+             {
+              "key": "queue.name",
+              "value": {
+               "stringValue": "orders"
+              }
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,119 @@
+{
+ "resourceMetrics": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "checkout"
+      }
+     },
+     {
+      "key": "host.name",
+      "value": {
+       "stringValue": "web-1"
+      }
+     }
+    ]
+   },
+   "scopeMetrics": [
+    {
+     "scope": {
+      "name": "io.opentelemetry.contrib.runtime",
+      "version": "1.2.0",
+      "attributes": [
+       {
+        "key": "library.language",
+        "value": {
+         "stringValue": "go"
+        }
+       }
+      ]
+     },
+     "metrics": [
+      {
+       "name": "build.info",
+       "gauge": {
+        "dataPoints": [
+         {
+          "timeUnixNano": "1799999990000000000",
+          "asInt": "1",
+          "attributes": [
+           {
+            "key": "version",
+            "value": {
+             "stringValue": "2.4.1"
+            }
+           },
+           {
+            "key": "debug",
+            "value": {
+             "boolValue": false
+            }
+           },
+           {
+            "key": "shard",
+            "value": {
+             "intValue": "12"
+            }
+           },
+           {
+            "key": "weight",
+            "value": {
+             "doubleValue": 0.75
+            }
+           },
+           {
+            "key": "digest",
+            "value": {
+             "bytesValue": "AAEC/w=="
+            }
+           },
+           {
+            "key": "regions",
+            "value": {
+             "arrayValue": {
+              "values": [
+               {
+                "stringValue": "us-east"
+               },
+               {
+                "intValue": "2"
+               }
+              ]
+             }
+            }
+           },
+           {
+            "key": "owner",
+            "value": {
+             "kvlistValue": {
+              "values": [
+               {
+                "key": "team",
+                "value": {
+                 "stringValue": "payments"
+                }
+               },
+               {
+                "key": "oncall",
+                "value": {
+                 "boolValue": true
+                }
+               }
+              ]
+             }
+            }
+           }
+          ]
+         }
+        ]
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

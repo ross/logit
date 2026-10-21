@@ -1,0 +1,43 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "a",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "a_total",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "c",
+   "value": "counter"
+  },
+  {
+   "exemplar": {
+    "labels": [
+     [
+      "customer.tier",
+      "gold"
+     ]
+    ],
+    "value": "0x3ff0000000000000"
+   },
+   "kind": "series",
+   "labels": [],
+   "name": "c_total",
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xa4275784",
+  "len": 89,
+  "path": "differential/prometheus-text/cases/om-exemplar-label-quoted.om"
+ },
+ "parser": "openmetrics"
+}

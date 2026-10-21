@@ -1,0 +1,12 @@
+# otlp_in's metrics cases exposed by prometheus_out for a scrape, with nothing between: a bare
+# delta sum has no counter to fold into, and an exponential histogram has no exposition form.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/otlp/sums.json
+  out:
+    type: prometheus_out
+    sources: [case]
+    bind: 127.0.0.1:9464

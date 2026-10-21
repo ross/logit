@@ -280,6 +280,10 @@ field.
 `collectd-to-influxdb`, `collectd-to-prometheus`, `collectd-to-prometheus-remote-write`,
 `collectd-to-statsd`, and `collectd-to-otlp`.
 
+`totlp/w1` added `otlp_in`'s metrics as a source, with flows into each column: `otlp-relay`,
+`otlp-to-statsd`, `otlp-to-prometheus`, `otlp-to-prometheus-remote-write`, `otlp-to-influxdb`,
+and `otlp-to-datadog`. OTLP logs and traces wait for a later workstream.
+
 ### 8. Not in this stack
 
 - A backend layer: the same corpus through a real sink to a real backend, with the backend's
@@ -585,3 +589,48 @@ Recorded per workstream as each lands.
   records each: a list's data sources as separate measurements at `influxdb_out`, and a
   notification's plugin and type at `otlp_out`. It also records a wrapped COUNTER reading as a
   reset at `prometheus_out`, which no flow can show, since it's outside the codec layer.
+- **`otlp_in` source, metrics** (`totlp/w1`): 14 cases over 56 features. Thirteen are hand-written
+  OTLP/HTTP bodies in `.bin` beside a `.headers` naming `path:`, `content-type:`, and
+  `content-encoding:`, decoded through `otlp_in`'s own `decode_request`. One of them is protobuf
+  (`sums-protobuf`, the `MetricsData` the JSON decoder reads from `sums.bin`, so its `.json`
+  equals `sums.json`), and one is gzip-compressed. The fourteenth, `telemetrygen`, reads
+  `testdata/interop/otlp/metrics.json` in place: a capture with no `.headers` is read as the
+  Collector `file` exporter's lines, one OTLP/JSON request each. OTLP/JSON is readable text, so a
+  hand-written body runs the real decoder and needs no `.json` written by hand.
+
+  `otlp-relay` is a fixed point for every case, schema URLs and scopes included. Every other
+  record reached an existing row at the class it states but these, each recorded as the code
+  behaves. None is fixed here:
+  - `prometheus_out` writes an exemplar's attribute keys as label names unsanitized
+    (`text::exemplar_labels`). Under OpenMetrics a key such as `customer.tier` makes the line
+    invalid, and `prometheus_in` drops it, counted only at the decoder
+    (`input.metrics.dropped{reason=malformed_line}`): a counter is lost
+    (`record/exemplar_key_unsafe`: `dropped`, uncounted), and a histogram's count for that bucket
+    reads back in the next one (`record/exemplar_key_unsafe_histogram`: `degraded`). Remote-write
+    carries the key as written and `prometheus_in` reads it back. No row could say this, so the
+    two rows and their reach rule in `classes.rs` are new; only `prometheus_out` writes
+    exemplar keys under a name rule, so no other sink has a cell. The rule reads only the
+    exemplars the writer puts on a line, through `text::exposed_exemplar_keys`, so a second
+    exemplar the writer leaves off doesn't reach the rows (case `exemplars-unwritten`).
+    `prometheus_out` now sanitizes those keys as it does a series label's, in both modes, so both
+    rows read `normalized`.
+  - `statsd_out` and `datadog_out` write each element of an array attribute as its own tag, so a
+    number element reads back as a string (`attributes/array_value`: `normalized`,
+    `stringified`). The statsd and Datadog cases held only string arrays, so the cells read
+    `exact`.
+
+  What the flows show about OTLP's metric model at each sink, each as the table already states
+  it:
+  - `datadog_out` writes only a delta monotonic sum and a gauge: a cumulative or non-monotonic
+    sum, a histogram, an exponential histogram, and a summary are skipped, counted.
+  - `influxdb_out` writes a histogram's finite buckets without its count, sum, min, max, or `+Inf`
+    bucket, and a summary's quantiles without its count or sum, uncounted.
+  - `statsd_out` writes an exponential histogram's count, sum, zero count, min, and max but no
+    bucket, and a negative `.min` leaves as the `0|g` then `-v|g` pair.
+  - `prometheus_out` writes no start time for a gauge, drops a delta sum or histogram, skips an
+    exponential histogram, and leaves off the scope; exposition keeps one point per series, and
+    remote-write collapses telemetrygen's two points in one millisecond.
+
+  No feature row covers a resource's or scope's schema URL, which every sink but `otlp_out`
+  leaves off uncounted; the hand-written rows beside the regions name it (W5's list above).
+

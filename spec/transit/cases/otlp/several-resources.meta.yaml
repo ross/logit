@@ -1,0 +1,4 @@
+# A hand-written OTLP/JSON body: two `ResourceMetrics`, the first with a schema URL and two
+# named scopes, the second with an empty scope and two points of one series five seconds apart.
+wire: several-resources.bin
+exercises: [otlp_json, several_resources, several_scopes, scope, empty_scope, schema_url, resource_attributes, gauge_int, several_data_points, several_points_of_a_series, attribute_string]

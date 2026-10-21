@@ -2471,7 +2471,9 @@ it takes (the class table above).
   neither text dialect has a form for one, and `{reason="no_recorded_value"}`.
 - `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"|"distribution"|"samples"|"set"|
   "set_members"}` and `{reason="exemplar_omitted"|"unit_not_suffix"}` (render-side).
-- `logit.output.labels.omitted{reason="unrepresentable"|"reserved"|"collision"}`.
+- `logit.output.labels.omitted{reason="unrepresentable"|"reserved"|"collision"}`. An exemplar
+  key's `collision` or `reserved` is render-side in registry mode, counted once per OpenMetrics
+  scrape.
 - `logit.output.labels.normalized{reason="multi_value"}`: a multi-valued attribute collapsed to its
   last representable element, because a Prometheus label set has no multi-value label. Lossy; see
   above.

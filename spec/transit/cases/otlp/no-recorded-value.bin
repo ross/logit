@@ -1,0 +1,128 @@
+{
+ "resourceMetrics": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "checkout"
+      }
+     },
+     {
+      "key": "host.name",
+      "value": {
+       "stringValue": "web-1"
+      }
+     }
+    ]
+   },
+   "scopeMetrics": [
+    {
+     "scope": {
+      "name": "io.opentelemetry.contrib.runtime",
+      "version": "1.2.0",
+      "attributes": [
+       {
+        "key": "library.language",
+        "value": {
+         "stringValue": "go"
+        }
+       }
+      ]
+     },
+     "metrics": [
+      {
+       "name": "process.restarts",
+       "sum": {
+        "aggregationTemporality": 2,
+        "isMonotonic": true,
+        "dataPoints": [
+         {
+          "startTimeUnixNano": "1799999930000000000",
+          "timeUnixNano": "1799999990000000000",
+          "asDouble": 0,
+          "flags": 1
+         }
+        ]
+       }
+      },
+      {
+       "name": "jobs.started",
+       "sum": {
+        "aggregationTemporality": 1,
+        "isMonotonic": true,
+        "dataPoints": [
+         {
+          "startTimeUnixNano": "1799999980000000000",
+          "timeUnixNano": "1799999990000000000",
+          "asDouble": 0,
+          "flags": 1
+         }
+        ]
+       }
+      },
+      {
+       "name": "disk.free",
+       "unit": "By",
+       "gauge": {
+        "dataPoints": [
+         {
+          "timeUnixNano": "1799999990000000000",
+          "asInt": "0",
+          "flags": 1
+         }
+        ]
+       }
+      },
+      {
+       "name": "lock.wait",
+       "unit": "s",
+       "histogram": {
+        "aggregationTemporality": 2,
+        "dataPoints": [
+         {
+          "startTimeUnixNano": "1799999930000000000",
+          "timeUnixNano": "1799999990000000000",
+          "count": "0",
+          "flags": 1
+         }
+        ]
+       }
+      },
+      {
+       "name": "lock.wait.exp",
+       "unit": "s",
+       "exponentialHistogram": {
+        "aggregationTemporality": 2,
+        "dataPoints": [
+         {
+          "startTimeUnixNano": "1799999930000000000",
+          "timeUnixNano": "1799999990000000000",
+          "count": "0",
+          "scale": 1,
+          "flags": 1
+         }
+        ]
+       }
+      },
+      {
+       "name": "gc.pause",
+       "unit": "s",
+       "summary": {
+        "dataPoints": [
+         {
+          "startTimeUnixNano": "1799999930000000000",
+          "timeUnixNano": "1799999990000000000",
+          "count": "0",
+          "flags": 1
+         }
+        ]
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

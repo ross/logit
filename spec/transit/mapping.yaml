@@ -1107,6 +1107,31 @@ rows:
         text: >-
           A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record
           reads back under the sanitized name, uncounted.
+  # statsd_out, influxdb_out, and datadog_out write no exemplars, and otlp_out writes an
+  # exemplar's keys as is, so no record reaches these two rows there and none of them has a cell.
+  # A monotonic sum reaches the first, a histogram the second, each only through an exemplar the
+  # OpenMetrics writer puts on a line (a counter's first, a histogram's first per bucket); another
+  # kind's exemplar has no line to sit on in exposition (record/exemplars).
+  - kind: record
+    feature: exemplar_key_unsafe
+    cells:
+      prometheus_out:
+        class: normalized
+        reason: name_sanitized
+        text: >-
+          An exemplar's attribute key is written as a label name forced into
+          `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the
+          exemplar reads back under the sanitized key, uncounted.
+  - kind: record
+    feature: exemplar_key_unsafe_histogram
+    cells:
+      prometheus_out:
+        class: normalized
+        reason: name_sanitized
+        text: >-
+          An exemplar's attribute key is written as a label name forced into
+          `[a-zA-Z_][a-zA-Z0-9_]*`, each other character `_`, as a series label's is, so the
+          exemplar reads back on its bucket under the sanitized key, uncounted.
   - kind: record
     feature: sample_rate
     cells:
@@ -1356,9 +1381,11 @@ rows:
           class: lost
           counter: logit.output.tags.omitted{reason=dialect}
           text: Plain statsd has no tags; each element is counted as a wire tag.
-        - class: exact
+        - class: normalized
+          reason: stringified
           text: >-
-            One tag per element in order, which statsd_in folds back into the same array.
+            One tag per element in order, which statsd_in folds back into an array of strings, so
+            a number element reads back as its text.
       prometheus_out:
         class: normalized
         reason: multi_value
@@ -1373,9 +1400,11 @@ rows:
         class: exact
         text: An array attribute.
       datadog_out:
-        class: exact
+        class: normalized
+        reason: stringified
         text: >-
-          One tag per element in order, which datadog_in folds back into the same array.
+          One tag per element in order, which datadog_in folds back into an array of strings, so a
+          number element reads back as its text.
   - kind: attributes
     feature: map_value
     cells:

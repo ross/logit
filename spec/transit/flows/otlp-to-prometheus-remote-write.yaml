@@ -1,0 +1,12 @@
+# otlp_in's metrics cases sent by prometheus_out as remote-write 2.0, with nothing between.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/otlp/sums.json
+  out:
+    type: prometheus_out
+    sources: [case]
+    endpoint: http://127.0.0.1:9090/api/v1/write
+    version: 2

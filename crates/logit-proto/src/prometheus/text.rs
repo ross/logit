@@ -132,9 +132,10 @@
 //! producer that is the bucket it arrived on, and for a non-conforming one it is a relocation, which
 //! is on [`super`]'s permitted-normalization list. Everything with no line left to sit on is dropped
 //! and counted `logit.output.metrics.degraded{reason="exemplar_omitted"}` (a counter's second
-//! exemplar, two in one bucket's range, one over OpenMetrics' 128-code-point label budget). In text
-//! 0.0.4 every exemplar is dropped and none of it is counted: that is the operator's dialect choice,
-//! not a lossy mapping.
+//! exemplar, two in one bucket's range, one over OpenMetrics' 128-code-point label budget, measured
+//! on its label names as sanitized). An exemplar's attribute keys are sanitized as a series
+//! label's are ([`super`]'s encode table). In text 0.0.4 every exemplar is dropped and none of it
+//! is counted: that is the operator's dialect choice, not a lossy mapping.
 
 use super::assemble::{self, Assembler, Sample};
 use super::{
@@ -573,15 +574,17 @@ fn parse_timestamp(s: &str, dialect: Dialect) -> Option<i64> {
 /// dialects, if only as its nearest text 0.0.4 shape.
 ///
 /// Counters go nowhere: this is the no-telemetry convenience over [`write_with`], the mirror of
-/// [`parse`]'s relationship to [`parse_with`]. A sink renders through `write_with` so the two
-/// OpenMetrics-only degradations this pass can make -- an unusable `# UNIT`, an exemplar with no line
-/// to sit on -- are counted rather than silent.
+/// [`parse`]'s relationship to [`parse_with`]. A sink renders through `write_with` so what this
+/// pass leaves off in OpenMetrics alone -- an unusable `# UNIT`, an exemplar with no line to sit on,
+/// an exemplar key colliding after sanitizing or landing on a trace label -- is counted rather than
+/// silent.
 pub fn write(families: &[MetricFamily], dialect: Dialect, out: &mut Vec<u8>) {
     write_with(families, dialect, out, &mut PrometheusEncoder::new());
 }
 
 /// [`write`], counting what it has to drop on `encoder`'s telemetry:
 /// `logit.output.metrics.degraded{reason="unit_not_suffix"|"exemplar_omitted"}`,
+/// `logit.output.labels.omitted{reason="collision"|"reserved"}` for a written exemplar's keys,
 /// `logit.output.metrics.skipped{reason="stale"}`, and
 /// `logit.output.metrics.dropped{reason="name_collision"}`. Text 0.0.4's wholesale exemplar and
 /// `_created`/`# UNIT` drops are *not* counted -- those are the operator's dialect choice, listed with the permitted normalizations rather than as lossy mappings.
@@ -871,15 +874,18 @@ impl Writer<'_> {
             push_instant(&mut self.number, ts, self.dialect);
             self.out.extend_from_slice(self.number.as_bytes());
         }
-        if self.dialect.is_openmetrics() {
-            if exemplar.is_some_and(|e| !exemplar_fits(e)) {
+        if let Some(exemplar) = exemplar.filter(|_| self.dialect.is_openmetrics()) {
+            let (labels, omitted) = exemplar_labels(exemplar);
+            if !exemplar_fits(&labels) {
                 // Over OpenMetrics' 128-code-point exemplar label budget: emitting it would make the
                 // line invalid, and truncating a trace id would make it a lie.
                 self.encoder.degraded_reason("exemplar_omitted");
-            }
-            if let Some(exemplar) = exemplar.filter(|e| exemplar_fits(e)) {
+            } else {
+                for reason in omitted {
+                    self.encoder.label_omitted(reason);
+                }
                 self.out.extend_from_slice(b" # ");
-                push_exemplar_labels(self.out, exemplar);
+                push_exemplar_labels(self.out, &labels);
                 self.out.push(b' ');
                 self.number.clear();
                 push_float_str(&mut self.number, self.encoder.scalar(exemplar.value));
@@ -909,26 +915,69 @@ impl Writer<'_> {
         self.out.push(b'\n');
     }
 
-    /// The first not-yet-placed exemplar whose value falls in `(previous, le]` -- OpenMetrics allows
-    /// at most one per bucket, and an exemplar belongs on the bucket its own value lands in.
+    /// The first not-yet-placed exemplar whose value falls in `(previous, le]` ([`claim`]).
     fn claim_exemplar<'e>(
         &mut self,
         series: &'e Series,
         previous: f64,
         le: f64,
     ) -> Option<&'e Exemplar> {
-        for (i, exemplar) in series.exemplars.iter().enumerate() {
-            if self.used.get(i).copied().unwrap_or(true) || exemplar.value.as_f64().is_nan() {
-                continue;
-            }
-            let value = exemplar.value.as_f64();
-            if value > previous && value <= le {
-                self.used[i] = true;
-                return Some(exemplar);
-            }
-        }
-        None
+        claim(&series.exemplars, &mut self.used, previous, le).map(|i| &series.exemplars[i])
     }
+}
+
+/// The index of the first exemplar not yet placed (`used`) whose value falls in `(previous, le]`,
+/// marked placed: OpenMetrics allows at most one per bucket, and an exemplar belongs on the bucket
+/// its own value lands in. A `NaN` value lands in none.
+fn claim(exemplars: &[Exemplar], used: &mut [bool], previous: f64, le: f64) -> Option<usize> {
+    for (i, exemplar) in exemplars.iter().enumerate() {
+        if used.get(i).copied().unwrap_or(true) || exemplar.value.as_f64().is_nan() {
+            continue;
+        }
+        let value = exemplar.value.as_f64();
+        if value > previous && value <= le {
+            used[i] = true;
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// The exemplars of `record` the OpenMetrics writer puts on a line, each as the original attribute
+/// keys of the labels it writes, before [`exemplar_labels`] sanitizes them: a monotonic `Sum`'s
+/// first, as a counter's `_total` line holds one, and a `Histogram`'s each placed on the bucket its
+/// value falls in, one per bucket. One over the label budget, and every exemplar of any other kind,
+/// is left off, as the writer leaves it off. A key the writer leaves off (private, with no label
+/// form for its value, or omitted as a `collision` or `reserved`) isn't listed. It reads the record
+/// alone, so it assumes the record reaches a family of that shape: a delta one is dropped before
+/// it's written.
+pub fn exposed_exemplar_keys(record: &logit_core::MetricRecord) -> Vec<Vec<String>> {
+    let exemplars = &record.exemplars;
+    let placed: Vec<&Exemplar> = match &record.kind {
+        logit_core::MetricKind::Sum(sum) if sum.monotonic => {
+            exemplars.first().into_iter().collect()
+        }
+        logit_core::MetricKind::Histogram(h) => {
+            let (buckets, _) = super::cumulative_counts(&h.buckets);
+            let mut used = vec![false; exemplars.len()];
+            let mut previous = f64::NEG_INFINITY;
+            let mut placed = Vec::new();
+            for (le, _) in buckets {
+                if let Some(i) = claim(exemplars, &mut used, previous, le) {
+                    placed.push(&exemplars[i]);
+                }
+                previous = le;
+            }
+            placed
+        }
+        _ => Vec::new(),
+    };
+    placed
+        .into_iter()
+        .map(build_exemplar_labels)
+        .filter(|built| exemplar_fits(&built.labels))
+        .map(|built| built.keys.into_iter().map(str::to_string).collect())
+        .collect()
 }
 
 /// The name a family's `# TYPE` line carries in `dialect`, which is not always the model name
@@ -1044,61 +1093,82 @@ fn push_label(out: &mut Vec<u8>, key: &str, value: &str) {
     out.push(b'"');
 }
 
-/// OpenMetrics caps an exemplar's label set at 128 UTF-8 code points, names and values together.
-/// One that doesn't fit is dropped rather than emitted invalid.
-fn exemplar_fits(exemplar: &Exemplar) -> bool {
-    let mut total = 0usize;
-    if let Some(trace) = &exemplar.trace {
-        total += "trace_id".len() + trace.trace_id.len() * 2;
-        if let Some(span) = trace.span_id {
-            total += "span_id".len() + span.len() * 2;
-        }
-    }
-    for (key, value) in exemplar.filtered_attributes.iter() {
-        let key = resolve(key);
-        if logit_core::attrs::is_private(key) {
-            continue;
-        }
-        if let Some(rendered) = super::label_value(value) {
-            total += key.chars().count() + rendered.chars().count();
-        }
-    }
+/// OpenMetrics caps an exemplar's label set at 128 UTF-8 code points, names and values together,
+/// measured on the names as sanitized. One that doesn't fit is dropped rather than emitted invalid.
+fn exemplar_fits(labels: &[(String, String)]) -> bool {
+    let total: usize =
+        labels.iter().map(|(name, value)| name.chars().count() + value.chars().count()).sum();
     total <= 128
 }
 
-/// An [`Exemplar`]'s labels, sorted by name: a [`logit_core::TraceRef`] becomes the two id labels
-/// it arrived as, and every other exemplar attribute renders like any label (an unrepresentable one
-/// is dropped, the way the encode side's own labels are, and a private `_logit.` one is skipped). The inverse of
-/// [`super::assemble::exemplar_from_labels`].
+/// An [`Exemplar`]'s labels as [`exemplar_labels`] builds them, with the original attribute key
+/// of each label written from an attribute.
+struct ExemplarLabels {
+    /// Sorted by name.
+    labels: Vec<(String, String)>,
+    /// The reason for each attribute left off: `collision` or `reserved`.
+    omitted: Vec<&'static str>,
+    /// The original key of each attribute written, in no particular order.
+    keys: Vec<&'static str>,
+}
+
+/// An [`Exemplar`]'s labels, sorted by name, and the reason for each attribute left off: a
+/// [`logit_core::TraceRef`] becomes the id labels it arrived as (`trace_id`, and `span_id` when
+/// it has a span), and every other exemplar attribute renders like a series label
+/// ([`super::sanitize_label_name`], an unrepresentable one dropped and a private `_logit.` one
+/// skipped). Two keys sanitizing onto one name keep the one whose original key sorts first, and
+/// the rest are `collision`; one sanitizing onto a trace label the exemplar writes is `reserved`,
+/// as a series label sanitizing onto `le` is. The caller counts the reasons, so an exemplar that
+/// isn't written counts none. The inverse of [`super::assemble::exemplar_from_labels`].
 ///
 /// Shared with [`super::remote_write`], which puts the same pairs in a protobuf field rather than
 /// between braces -- the *spelling* of an exemplar's trace reference is a Prometheus convention,
 /// not an exposition one.
-pub(super) fn exemplar_labels(exemplar: &Exemplar) -> Vec<(String, String)> {
+pub(super) fn exemplar_labels(exemplar: &Exemplar) -> (Vec<(String, String)>, Vec<&'static str>) {
+    let built = build_exemplar_labels(exemplar);
+    (built.labels, built.omitted)
+}
+
+fn build_exemplar_labels(exemplar: &Exemplar) -> ExemplarLabels {
     let mut labels: Vec<(String, String)> = Vec::new();
+    let mut omitted = Vec::new();
+    let mut keys = Vec::new();
     if let Some(trace) = &exemplar.trace {
         labels.push(("trace_id".to_string(), to_hex(&trace.trace_id)));
         if let Some(span) = trace.span_id {
             labels.push(("span_id".to_string(), to_hex(&span)));
         }
     }
+    let mut candidates: Vec<(&'static str, std::borrow::Cow<'static, str>, String)> = Vec::new();
     for (key, value) in exemplar.filtered_attributes.iter() {
         let key = resolve(key);
         if logit_core::attrs::is_private(key) {
             continue;
         }
         if let Some(rendered) = super::label_value(value) {
-            labels.push((key.to_string(), rendered));
+            candidates.push((key, super::sanitize_label_name(key), rendered));
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(b.0));
+    let traced = labels.len();
+    for (key, name, value) in candidates {
+        match labels.iter().position(|(existing, _)| existing.as_str() == name.as_ref()) {
+            Some(i) if i < traced => omitted.push("reserved"),
+            Some(_) => omitted.push("collision"),
+            None => {
+                labels.push((name.into_owned(), value));
+                keys.push(key);
+            }
         }
     }
     labels.sort_by(|a, b| a.0.cmp(&b.0));
-    labels
+    ExemplarLabels { labels, omitted, keys }
 }
 
 /// `{trace_id="...",span_id="...",<other>}` -- [`exemplar_labels`] between braces.
-fn push_exemplar_labels(out: &mut Vec<u8>, exemplar: &Exemplar) {
+fn push_exemplar_labels(out: &mut Vec<u8>, labels: &[(String, String)]) {
     out.push(b'{');
-    for (i, (key, value)) in exemplar_labels(exemplar).iter().enumerate() {
+    for (i, (key, value)) in labels.iter().enumerate() {
         if i > 0 {
             out.push(b',');
         }
@@ -2420,6 +2490,130 @@ mod tests {
             ..Series::new(vec![("state".to_string(), "on".to_string())], Point::StateSet(true))
         }];
         let (_, counts) = write_counted(&[state], Dialect::OpenMetrics1_0);
+        assert_eq!(counts, vec![("exemplar_omitted".to_string(), 1.0)]);
+    }
+
+    /// An exemplar attribute key outside the label-name grammar is written sanitized, as a series
+    /// label is, so the `_total` line stays valid OpenMetrics and reads back with the counter and
+    /// its exemplar, uncounted.
+    #[test]
+    fn a_dotted_exemplar_key_is_sanitized_and_its_counter_reads_back() {
+        let family =
+            counter_with_exemplars(vec![exemplar(0.1, &[("customer.tier", "gold"), ("n", "1")])]);
+        let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
+        assert_eq!(
+            body,
+            "# TYPE requests counter\nrequests_total 17 # {customer_tier=\"gold\",n=\"1\"} 0.1\n# EOF\n"
+        );
+        assert!(counts.is_empty(), "{counts:?}");
+
+        let registry = Registry::new();
+        let mut decoder = PrometheusDecoder::new().with_telemetry(registry.telemetry_for(
+            "prometheus",
+            "prometheus_in",
+            "source",
+        ));
+        let families = parse_with(body.as_bytes(), Dialect::OpenMetrics1_0, &mut decoder)
+            .expect("body must parse");
+        assert!(registry.drain(0).is_empty(), "the decoder counted a skip");
+        assert_eq!(family_names(&families), vec!["requests_total"]);
+        let series = &families[0].series;
+        assert_eq!(series.len(), 1);
+        assert!(matches!(series[0].point, Point::Counter(v) if v == 17.0));
+        let read: Vec<(String, String)> = series[0].exemplars[0]
+            .filtered_attributes
+            .iter()
+            .map(|(k, v)| (resolve(k).to_string(), v.as_str().unwrap_or_default().to_string()))
+            .collect();
+        assert!(read.contains(&("customer_tier".to_string(), "gold".to_string())), "{read:?}");
+    }
+
+    /// Same for a histogram: the bucket line the exemplar sits on keeps its own count rather than
+    /// being dropped into the next bucket's.
+    #[test]
+    fn a_dotted_exemplar_key_keeps_its_bucket_line() {
+        let mut family = MetricFamily::new("latency", FamilyType::Histogram);
+        family.series = vec![Series {
+            exemplars: vec![exemplar(0.05, &[("db.operation.name", "SELECT")])],
+            ..Series::new(
+                vec![],
+                Point::Histogram {
+                    buckets: vec![(0.1, 2), (f64::INFINITY, 3)],
+                    sum: None,
+                    count: 3,
+                },
+            )
+        }];
+        let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
+        assert!(
+            body.contains("latency_bucket{le=\"0.1\"} 2 # {db_operation_name=\"SELECT\"} 0.05\n"),
+            "{body}"
+        );
+        assert!(counts.is_empty(), "{counts:?}");
+        let families = parsed(&body, Dialect::OpenMetrics1_0);
+        let Point::Histogram { buckets, .. } = &families[0].series[0].point else {
+            panic!("{families:?}");
+        };
+        assert_eq!(buckets, &vec![(0.1, 2), (f64::INFINITY, 3)]);
+    }
+
+    /// Two exemplar keys sanitizing onto one name keep the one whose original key sorts first and
+    /// count the other `labels.omitted{reason="collision"}`; a key sanitizing onto a trace label
+    /// beside a trace is `reserved`, as `le` is beside a histogram's bucket.
+    #[test]
+    fn exemplar_keys_colliding_after_sanitizing_keep_the_first_and_count_the_rest() {
+        let family =
+            counter_with_exemplars(vec![exemplar(0.1, &[("a.b", "dot"), ("a-b", "dash")])]);
+        let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
+        assert_eq!(
+            body,
+            "# TYPE requests counter\nrequests_total 17 # {a_b=\"dash\"} 0.1\n# EOF\n"
+        );
+        assert_eq!(counts, vec![("collision".to_string(), 1.0)]);
+
+        let ex = Exemplar {
+            trace: Some(logit_core::TraceRef { trace_id: [0xab; 16], span_id: None, flags: 0 }),
+            ..exemplar(0.1, &[("trace.id", "x")])
+        };
+        let (body, counts) =
+            write_counted(&[counter_with_exemplars(vec![ex])], Dialect::OpenMetrics1_0);
+        assert_eq!(
+            body,
+            "# TYPE requests counter\nrequests_total 17 # {trace_id=\"abababababababababababababababab\"} 0.1\n# EOF\n"
+        );
+        assert_eq!(counts, vec![("reserved".to_string(), 1.0)]);
+    }
+
+    /// A trace with no span writes no `span_id` label, so a `span_id` attribute beside it is an
+    /// ordinary label, not `reserved`.
+    #[test]
+    fn a_span_id_attribute_beside_a_spanless_trace_is_written() {
+        let ex = Exemplar {
+            trace: Some(logit_core::TraceRef { trace_id: [0xab; 16], span_id: None, flags: 0 }),
+            ..exemplar(0.1, &[("span_id", "xyz")])
+        };
+        let (body, counts) =
+            write_counted(&[counter_with_exemplars(vec![ex])], Dialect::OpenMetrics1_0);
+        assert_eq!(
+            body,
+            "# TYPE requests counter\nrequests_total 17 # {span_id=\"xyz\",trace_id=\"abababababababababababababababab\"} 0.1\n# EOF\n"
+        );
+        assert!(counts.is_empty(), "{counts:?}");
+    }
+
+    /// The 128-code-point budget is measured on the names as sanitized: a key that sanitizing
+    /// lengthens (a leading digit gains `_`) can push an exemplar over it.
+    #[test]
+    fn the_exemplar_budget_is_measured_on_sanitized_names() {
+        // `1` plus 126 code points is 127 before sanitizing and 128 after: still fits.
+        let fits = counter_with_exemplars(vec![exemplar(0.1, &[("1", &"x".repeat(126))])]);
+        let (body, counts) = write_counted(&[fits], Dialect::OpenMetrics1_0);
+        assert!(body.contains(" # {_1="), "{body}");
+        assert!(counts.is_empty(), "{counts:?}");
+        // One more code point: 128 before sanitizing, 129 after.
+        let over = counter_with_exemplars(vec![exemplar(0.1, &[("1", &"x".repeat(127))])]);
+        let (body, counts) = write_counted(&[over], Dialect::OpenMetrics1_0);
+        assert_eq!(body, "# TYPE requests counter\nrequests_total 17\n# EOF\n");
         assert_eq!(counts, vec![("exemplar_omitted".to_string(), 1.0)]);
     }
 

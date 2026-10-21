@@ -1,0 +1,6 @@
+# A hand-written OTLP/JSON body: a cumulative `Sum` with two exemplars and a cumulative
+# `Histogram` with two exemplars in its first bucket, the second of each with a dotted attribute
+# key. OpenMetrics holds one exemplar per line, so prometheus_out writes only the first of each,
+# and the dotted key never reaches the wire.
+wire: exemplars-unwritten.bin
+exercises: [otlp_json, several_exemplars, exemplars_sum, exemplars_histogram, exemplar_filtered_attributes, exemplar_int, sum_cumulative_monotonic, sum_int, histogram_cumulative, histogram_explicit_bounds, histogram_no_min_max, start_time, unit]

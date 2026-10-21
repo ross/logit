@@ -652,6 +652,51 @@ fn histogram_exemplars_are_placed_on_the_bucket_their_value_falls_in() {
     );
 }
 
+/// An exemplar's attribute keys are sent sanitized in both versions, as the series' own label
+/// names are, and two keys sanitizing onto one name keep the one whose original key sorts first,
+/// the other counted `labels.omitted{reason="collision"}`.
+#[test]
+fn exemplar_label_names_are_sanitized_as_series_label_names_are() {
+    let mut filtered_attributes = AttrMap::new();
+    filtered_attributes.insert("customer.tier", Value::str("gold"));
+    filtered_attributes.insert("a.b", Value::str("dot"));
+    filtered_attributes.insert("a-b", Value::str("dash"));
+    let families = vec![vec![MetricFamily {
+        series: vec![Series {
+            timestamp: Some(TIMESTAMP),
+            exemplars: vec![Exemplar {
+                timestamp: TIMESTAMP,
+                value: MetricValue::F64(0.5),
+                trace: None,
+                filtered_attributes,
+            }],
+            ..Series::new(vec![], Point::Counter(3.0))
+        }],
+        ..MetricFamily::new("requests_total", FamilyType::Counter)
+    }]];
+    for version in [Version::V1, Version::V2] {
+        let (body, reasons) = encode_reasons(&families, version);
+        assert_eq!(reasons, [("collision".to_string(), 1)], "{version:?}");
+        let decoded = decode(&body, version, &mut PrometheusDecoder::new()).expect("must decode");
+        let exemplars = &decoded.groups[0][0].series[0].exemplars;
+        assert_eq!(exemplars.len(), 1, "{version:?}");
+        let mut read: Vec<(String, String)> = exemplars[0]
+            .filtered_attributes
+            .iter()
+            .map(|(k, v)| (resolve(k).to_string(), v.as_str().unwrap_or_default().to_string()))
+            .collect();
+        read.sort();
+        assert_eq!(
+            read,
+            [
+                ("a_b".to_string(), "dash".to_string()),
+                ("customer_tier".to_string(), "gold".to_string())
+            ],
+            "{version:?}"
+        );
+    }
+}
+
 /// Encodes with telemetry attached and returns every `logit.output.*` reason it recorded --
 /// `metrics.{dropped,skipped,degraded}` and `labels.omitted` alike -- alongside the body.
 fn encode_reasons(groups: &[Vec<MetricFamily>], version: Version) -> (Vec<u8>, Vec<(String, u64)>) {

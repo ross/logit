@@ -1,0 +1,4 @@
+# A hand-written OTLP/JSON body: a `Summary` with its count, sum, and the 0, 0.5, 0.99, and 1
+# quantiles.
+wire: summary.bin
+exercises: [otlp_json, summary, start_time, unit, description, attribute_string]

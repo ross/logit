@@ -179,6 +179,10 @@
 //! generated). Every error response, on both encodings, is `text/plain`, where the spec wants a
 //! protobuf-encoded `Status`; tracked in `docs/known-gaps/otlp.md`.
 //!
+//! [`decode_request`] runs an OTLP/HTTP body already read through the same signal, encoding, and
+//! gzip steps `handle_http` takes, so the transit spec's OTLP cases (`spec/transit/cases/otlp/`)
+//! decode through this listener's own code.
+//!
 //! **Size and concurrency limits.** [`MAX_REQUEST_BYTES`] (4 MiB) matches the OTel collector's
 //! default `max_recv_msg_size`; a larger request is rejected (`413`/`grpc-status: 8`,
 //! `RESOURCE_EXHAUSTED`) before it can grow an unbounded buffer. That bounds one request;
@@ -212,12 +216,12 @@ use hyper::service::service_fn;
 #[cfg(test)]
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
-use logit_core::{Diagnostics, Telemetry};
+use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::listen::BindOptions;
 use logit_pipeline::Fanout;
 use logit_proto::otlp::grpc::{self, InflateError};
 use logit_proto::otlp::OtlpDecoder;
-use logit_proto::{Signal, SignalDecoder};
+use logit_proto::{CodecError, Signal, SignalDecoder};
 // Only the test module's `tls_connector` reads PEM files directly; server TLS is
 // `logit_pipeline::tls`.
 #[cfg(test)]
@@ -770,28 +774,8 @@ async fn handle_http(
             ))
         }
     };
-    let bytes = if gzip_encoded {
-        match grpc::inflate_bounded(&bytes, MAX_REQUEST_BYTES) {
-            Ok(inflated) => inflated,
-            Err(InflateError::TooLarge) => {
-                return Ok(text_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "decompressed request exceeds the maximum allowed size",
-                ));
-            }
-            Err(InflateError::Malformed) => {
-                return Ok(text_response(StatusCode::BAD_REQUEST, "invalid gzip body"));
-            }
-        }
-    } else {
-        bytes
-    };
-
-    let mut decoder = OtlpDecoder::new().with_telemetry(telemetry.clone());
-    let result = match encoding {
-        RequestEncoding::Protobuf => decoder.decode_signal(signal, bytes),
-        RequestEncoding::Json => decoder.decode_signal_json(signal, bytes),
-    };
+    let decoder = OtlpDecoder::new().with_telemetry(telemetry.clone());
+    let result = decode_body(signal, &encoding, gzip_encoded, bytes, decoder);
     match result {
         Ok(mut batches) => {
             request_peer.stamp_batches(&mut batches);
@@ -817,7 +801,76 @@ async fn handle_http(
                 .body(Full::new(Bytes::from(body)))
                 .expect("a well-formed response always builds"))
         }
-        Err(err) => Ok(text_response(StatusCode::BAD_REQUEST, &err.to_string())),
+        Err(DecodeFailure::TooLarge) => Ok(text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "decompressed request exceeds the maximum allowed size",
+        )),
+        Err(DecodeFailure::BadGzip) => {
+            Ok(text_response(StatusCode::BAD_REQUEST, "invalid gzip body"))
+        }
+        Err(DecodeFailure::Malformed(err)) => {
+            Ok(text_response(StatusCode::BAD_REQUEST, &err.to_string()))
+        }
+    }
+}
+
+/// Why [`decode_body`] decoded nothing, each answered with its own status.
+enum DecodeFailure {
+    /// The gzip body inflates past [`MAX_REQUEST_BYTES`].
+    TooLarge,
+    /// The gzip body doesn't inflate.
+    BadGzip,
+    /// The payload isn't a valid OTLP message in its encoding.
+    Malformed(CodecError),
+}
+
+/// A request body already read, inflated when `gzip` and decoded as `signal` in `encoding`.
+fn decode_body(
+    signal: Signal,
+    encoding: &RequestEncoding,
+    gzip: bool,
+    bytes: Bytes,
+    mut decoder: OtlpDecoder,
+) -> Result<Vec<EventBatch>, DecodeFailure> {
+    let bytes = if gzip {
+        match grpc::inflate_bounded(&bytes, MAX_REQUEST_BYTES) {
+            Ok(inflated) => inflated,
+            Err(InflateError::TooLarge) => return Err(DecodeFailure::TooLarge),
+            Err(InflateError::Malformed) => return Err(DecodeFailure::BadGzip),
+        }
+    } else {
+        bytes
+    };
+    let decoded = match encoding {
+        RequestEncoding::Protobuf => decoder.decode_signal(signal, bytes),
+        RequestEncoding::Json => decoder.decode_signal_json(signal, bytes),
+    };
+    decoded.map_err(DecodeFailure::Malformed)
+}
+
+/// One recorded OTLP/HTTP request decoded as this listener decodes it: the signal from `path`,
+/// the body encoding from `Content-Type`, and the compression from `Content-Encoding` in
+/// `headers`, then [`decode_body`]. A replay of a captured request reads it through this, so it
+/// takes the listener's own path; the HTTP steps around it (method, size, delivery) don't apply
+/// to a body already read. `Err` names why the listener would have answered other than `200`.
+pub fn decode_request(
+    path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    decoder: OtlpDecoder,
+) -> Result<Vec<EventBatch>, String> {
+    let signal = route_path(path).ok_or_else(|| format!("{path} is no otlp_in route"))?;
+    let encoding = request_encoding(headers)?;
+    let gzip = match crate::http::Encoding::from_headers(headers) {
+        Ok(crate::http::Encoding::Identity) => false,
+        Ok(crate::http::Encoding::Gzip) => true,
+        Ok(_) | Err(_) => return Err("unsupported Content-Encoding".to_string()),
+    };
+    match decode_body(signal, &encoding, gzip, body, decoder) {
+        Ok(batches) => Ok(batches),
+        Err(DecodeFailure::TooLarge) => Err("the decompressed body is over the cap".to_string()),
+        Err(DecodeFailure::BadGzip) => Err("invalid gzip body".to_string()),
+        Err(DecodeFailure::Malformed(err)) => Err(err.to_string()),
     }
 }
 

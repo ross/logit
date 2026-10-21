@@ -1,0 +1,4 @@
+# The recorded capture: telemetrygen's three `gen` gauge points through a Collector's `file`
+# exporter, each in its own empty scope under one resource, two of them in one millisecond.
+wire: ../../../../testdata/interop/otlp/metrics.json
+exercises: [collector_file_export, otlp_json, gauge_int, several_scopes, empty_scope, schema_url, resource_attributes, several_points_of_a_series]

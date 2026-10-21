@@ -1,0 +1,5 @@
+# A hand-written OTLP/JSON body: a `Sum` in each temporality and monotonicity, as `asDouble`
+# and `asInt`, with a start time, units, descriptions, and two data points in one `Metric`,
+# under a resource and a scope with attributes.
+wire: sums.bin
+exercises: [otlp_json, sum_delta_monotonic, sum_delta_nonmonotonic, sum_cumulative_monotonic, sum_cumulative_nonmonotonic, sum_double, sum_int, start_time, unit, description, several_data_points, resource_attributes, scope, scope_attributes, attribute_string]

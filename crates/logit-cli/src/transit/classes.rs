@@ -14,7 +14,10 @@
 //! `start_timestamp`, `exemplars` (`exemplars_on_summary` for a `summary`), and `no_recorded_value` (`no_recorded_value_delta_sum` for a delta `sum`,
 //! `no_recorded_value_other_kind` for a kind other than `sum` and `gauge`) it carries,
 //! `service_check` when it carries `_logit.statsd.service_check.name`, `name_unsafe` when the
-//! sink's wire rewrites a character of its name ([`Spelling`]), `sample_rate` for a `samples`
+//! sink's wire rewrites a character of its name ([`Spelling`]), `exemplar_key_unsafe` for a
+//! monotonic `sum` (`exemplar_key_unsafe_histogram` for a `histogram`) when an exemplar
+//! `prometheus_out` writes carries an attribute key it would rewrite as a label name, `sample_rate` for a
+//! `samples`
 //! record whose rate rounds to a weight above 1, `non_finite` for a `sum` or
 //! `gauge` holding `NaN` or an infinity, and `superseded` when a later record of the run is
 //! another point of its series (the same name, kind, and public attributes), with `same_instant`
@@ -118,7 +121,9 @@ use super::mapping::{self, Class, Lookup, Mapping, Series};
 use super::Traced;
 use logit_core::EventBatch;
 use logit_outputs::ndjson::render_ndjson;
+use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::influxdb::ATTR_MEASUREMENT;
+use logit_proto::prometheus::text::exposed_exemplar_keys;
 use logit_proto::prometheus::{sanitize_label_name, sanitize_metric_name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -311,6 +316,32 @@ impl Spelling {
                 name.to_string()
             }
         }
+    }
+
+    /// The `record/exemplar_key_unsafe*` row `rec` reaches when an exemplar the OpenMetrics
+    /// writer puts on a line writes a label from an attribute key it sanitizes:
+    /// `exemplar_key_unsafe` for a monotonic `sum`, `exemplar_key_unsafe_histogram` for a
+    /// `histogram`, the two kinds whose exposition lines carry an exemplar. The selection is the
+    /// OpenMetrics writer's (`exposed_exemplar_keys`): a counter's first, a histogram's first per
+    /// bucket, each within the label budget. Remote-write writes every exemplar, so the cell is
+    /// reached only through those exemplars there too, whatever the others carry. Only
+    /// `prometheus_out` writes an exemplar's attributes under a name rule; `otlp_out` writes them
+    /// as is, and the other sinks write no exemplars.
+    fn exemplar_key_unsafe(self, rec: &Rec) -> Option<&'static str> {
+        if self != Spelling::Prometheus {
+            return None;
+        }
+        let feature = match rec.kind.as_str() {
+            "sum" if rec.body["monotonic"] == Value::Bool(true) => "exemplar_key_unsafe",
+            "histogram" => "exemplar_key_unsafe_histogram",
+            _ => return None,
+        };
+        let record = model_record(rec)?;
+        let reaches = exposed_exemplar_keys(&record)
+            .iter()
+            .flatten()
+            .any(|key| sanitize_label_name(key) != key.as_str());
+        reaches.then_some(feature)
     }
 
     /// The name the sink's pair decoder reads `rec`, a sink input, back under.
@@ -1085,6 +1116,13 @@ fn kind_features(rec: &Rec) -> Vec<Option<String>> {
     }
 }
 
+/// `rec`'s metric record in the model, read back from its `format: json` body.
+fn model_record(rec: &Rec) -> Option<logit_core::MetricRecord> {
+    let line = serde_json::json!({"timestamp": rec.timestamp, "metrics": [rec.body]});
+    let batches = EventJsonDecoder::new().decode_batches(line.to_string().as_bytes()).ok()?;
+    batches.into_iter().next()?.events.into_iter().next()?.metrics.into_iter().next()
+}
+
 /// The record-level `record` features `rec` reaches.
 fn record_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
     let mut features = Vec::new();
@@ -1103,6 +1141,9 @@ fn record_features(rec: &Rec, spelling: Spelling) -> Vec<&'static str> {
     }
     if spelling.sanitize(&rec.name) != rec.name {
         features.push("name_unsafe");
+    }
+    if let Some(feature) = spelling.exemplar_key_unsafe(rec) {
+        features.push(feature);
     }
     if rec.kind == "samples" && weight(rec) > 1 {
         features.push("sample_rate");
@@ -1877,7 +1918,6 @@ pub(super) fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_proto::event_json::EventJsonDecoder;
 
     /// The records of `format: json` lines, each holding `{T}` for a fixed timestamp.
     fn recs(lines: &[&str]) -> Vec<Rec> {
