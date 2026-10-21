@@ -1,0 +1,22 @@
+{
+  "name": "single-bucket",
+  "kind": "explicit",
+  "input": {
+    "bounds": [],
+    "counts": [7],
+    "count": 7,
+    "sum": "21",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [-1],
+    "n": [7],
+    "cnt": 7,
+    "sum": "21",
+    "min": "-9.941854089121368e-10",
+    "max": "-9.941854089121368e-10",
+    "avg": "3"
+  }
+}

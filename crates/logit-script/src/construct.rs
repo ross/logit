@@ -538,6 +538,7 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
             )?,
             count: count_field(t.raw_get("count")?, path, "count")?,
             sum: finite_field(t.raw_get("sum")?, path, "sum")?,
+            temporality: temporality_field(&t, path)?,
         }),
     };
     Ok(MetricRecord { name, unit, description, start_timestamp, exemplars, flags, kind })
@@ -619,7 +620,7 @@ impl Kind {
                 "min",
                 "max",
             ],
-            Kind::Summary => &["quantiles", "count", "sum"],
+            Kind::Summary => &["quantiles", "count", "sum", "temporality"],
         }
     }
 }
@@ -1735,6 +1736,7 @@ mod tests {
             quantiles: vec![(0.5, 10.0), (0.99, 99.0)],
             count: 42,
             sum: 500.0,
+            temporality: Temporality::Cumulative,
         })
     }
 
@@ -2747,7 +2749,7 @@ mod tests {
         // Both ends of `[0, 1]` are in, and the rows need not be sorted.
         for q in ["1.5", "-0.1"] {
             let err = metric_err(&format!(
-                r#"name = "m", kind = "summary", quantiles = {{{{quantile = {q}, value = 3}}}}, count = 1, sum = 3"#
+                r#"name = "m", kind = "summary", temporality = "cumulative", quantiles = {{{{quantile = {q}, value = 3}}}}, count = 1, sum = 3"#
             ));
             assert!(
                 err.contains(&format!(
@@ -2757,14 +2759,15 @@ mod tests {
             );
         }
         let out = mint_metric(
-            r#"kind = "summary", quantiles = {{quantile = 1, value = 3}, {quantile = 0, value = 1}}, count = 1, sum = 3"#,
+            r#"kind = "summary", temporality = "cumulative", quantiles = {{quantile = 1, value = 3}, {quantile = 0, value = 1}}, count = 1, sum = 3"#,
         );
         assert_eq!(
             out.metrics[0].kind,
             MetricKind::Summary(Summary {
                 quantiles: vec![(1.0, 3.0), (0.0, 1.0)],
                 count: 1,
-                sum: 3.0
+                sum: 3.0,
+                temporality: Temporality::Cumulative
             })
         );
     }
@@ -3034,7 +3037,7 @@ mod tests {
     #[test]
     fn a_quantile_row_without_a_value_is_required_with_its_indexed_path() {
         let err = metric_err(
-            r#"name = "m", kind = "summary", quantiles = {{quantile = 0.5}}, count = 1, sum = 1"#,
+            r#"name = "m", kind = "summary", temporality = "cumulative", quantiles = {{quantile = 0.5}}, count = 1, sum = 1"#,
         );
         assert!(err.contains("Event.new: metrics[1].quantiles[1].value is required"), "got: {err}");
     }
@@ -3408,7 +3411,12 @@ mod tests {
                     min: None,
                     max: None,
                 }),
-                MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: big, sum: 1.0 }),
+                MetricKind::Summary(Summary {
+                    quantiles: vec![(0.5, 1.0)],
+                    count: big,
+                    sum: 1.0,
+                    temporality: Temporality::Cumulative,
+                }),
             ];
             for kind in kinds {
                 let event = metric_event(kind);
@@ -3421,7 +3429,7 @@ mod tests {
     #[test]
     fn a_count_string_that_is_not_decimal_digits_is_rejected() {
         let err = new_err(
-            r#"{timestamp = "1", metrics = {{name = "m", kind = "summary", quantiles = {}, count = "-1", sum = 0}}}"#,
+            r#"{timestamp = "1", metrics = {{name = "m", kind = "summary", temporality = "cumulative", quantiles = {}, count = "-1", sum = 0}}}"#,
         );
         assert!(
             err.contains(r#"Event.new: metrics[1].count must be a non-negative integer, got "-1""#),

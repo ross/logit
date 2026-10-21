@@ -1,0 +1,84 @@
+{
+  "name": "seeded-25",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["486.2399524380159", "574.4568493815827", "576.6606024547546", "1176.0840639697544", "1176.278437767314", "1214.8865022432578"],
+    "counts": [1400, 974, 7, 1014, 1917, 0, 1816],
+    "count": 7128,
+    "sum": "43890.72334758704",
+    "min": null,
+    "max": "1221.9829200122854"
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "7128",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "43890.72334758704",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.max",
+      "tags": [],
+      "type": "gauge",
+      "value": "1221.9829200122854",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:486.2399524380159"],
+      "type": "count",
+      "value": "1400",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:486.2399524380159", "upper_bound:574.4568493815827"],
+      "type": "count",
+      "value": "974",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:574.4568493815827", "upper_bound:576.6606024547546"],
+      "type": "count",
+      "value": "7",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:576.6606024547546", "upper_bound:1176.0840639697544"],
+      "type": "count",
+      "value": "1014",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1176.0840639697544", "upper_bound:1176.278437767314"],
+      "type": "count",
+      "value": "1917",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1176.278437767314", "upper_bound:1214.8865022432578"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:1214.8865022432578", "upper_bound:inf"],
+      "type": "count",
+      "value": "1816",
+      "unit": ""
+    }
+  ]
+}

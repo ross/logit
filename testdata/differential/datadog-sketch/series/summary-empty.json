@@ -1,0 +1,10 @@
+{
+  "name": "empty",
+  "kind": "summary",
+  "input": {
+    "quantiles": [],
+    "count": 0,
+    "sum": "0"
+  },
+  "series": []
+}

@@ -1,0 +1,22 @@
+{
+  "name": "point-mass-over-uint16",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["4", "4.0000001"],
+    "counts": [0, 131071, 0],
+    "count": 131071,
+    "sum": "524284",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1427, 1427, 1427],
+    "n": [1, 65535, 65535],
+    "cnt": 131071,
+    "sum": "524284",
+    "min": "4",
+    "max": "4.0000001",
+    "avg": "4"
+  }
+}

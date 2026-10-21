@@ -1,0 +1,30 @@
+{
+  "name": "tiny-values",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": -40,
+      "counts": [3, 4]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 7,
+    "sum": "1e-11",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [0],
+    "n": [7],
+    "cnt": 7,
+    "sum": "1e-11",
+    "min": "9.134793967995264e-13",
+    "max": "3.63052818844176e-12",
+    "avg": "1.4285714285714285e-12"
+  }
+}

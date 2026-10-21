@@ -1,0 +1,20 @@
+# otlp_in's metrics cases into datadog_out under `histograms.mode: nobuckets`, which needs the
+# aggregation metrics on: a delta histogram as its `.count`, `.sum`, `.min`, and `.max` series
+# alone, and a delta exponential histogram as a sketch beside them.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/otlp/histograms.json
+  out:
+    type: datadog_out
+    sources: [case]
+    api_key: transit-unused   # the spec sends nothing; a real config reads !env DD_API_KEY
+    endpoints:
+      api: http://127.0.0.1:8080
+      logs: http://127.0.0.1:8080
+      traces: http://127.0.0.1:8080
+    histograms:
+      mode: nobuckets
+      send_aggregation_metrics: true

@@ -61,7 +61,7 @@
 //! | `gauge` | `Gauge(v)` |
 //! | `histogram` (`_bucket{le}` cumulative, `_sum`, `_count`) | `Histogram { buckets: per-bucket counts by successive difference, trailing `(+Inf, n)`, Cumulative, sum, min/max: None }` |
 //! | `gaugehistogram` (OM, `_gsum`/`_gcount`) | the same `Histogram`, plus `_logit.prometheus.type: "gaugehistogram"` |
-//! | `summary` (`{quantile}`, `_sum`, `_count`) | `Summary { quantiles, count, sum }` |
+//! | `summary` (`{quantile}`, `_sum`, `_count`) | `Summary { quantiles, count, sum }`, `Cumulative` |
 //! | `untyped` (text) / `unknown` (OM) / no `# TYPE` | `Gauge(v)` + `_logit.prometheus.type: "untyped"` \| `"unknown"` |
 //! | `info` (OM, `X_info{...} 1`) | `Gauge(1)` + `_logit.prometheus.type: "info"`, `name = X` (`_info` stripped) |
 //! | `stateset` (OM) | one `Gauge(0\|1)` per state line + `_logit.prometheus.type: "stateset"` |
@@ -118,7 +118,8 @@
 //! | `exponential_histogram/delta`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
 //! | `exponential_histogram/cumulative`, with `bind:` unset | dropped | `logit.output.metrics.dropped{reason=native_histogram}` | Dropped, as for a delta one. |
 //! | `exponential_histogram/cumulative`, otherwise | skipped | `logit.output.metrics.skipped{metric_kind=exponential_histogram}` | Neither exposition dialect has native-histogram syntax, so none is written. |
-//! | `summary` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
+//! | `summary/delta` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | A Prometheus summary is a running total, so a delta one, which only `cumulative_to_delta` makes, is dropped, with a throttled `delta_summary_unresolved` warning; send this sink the summary from ahead of that component. |
+//! | `summary/cumulative` | exact | -- | A `summary` family of its quantiles, `_sum`, and `_count`. |
 //! | `record/no_recorded_value`, with `bind:` unset | exact | -- | Remote-write writes a flagged `Gauge` or cumulative `Sum` as Prometheus's stale marker, read back flagged; a flagged non-monotonic `Sum`'s goes on a `gauge`, as its value would. |
 //! | `record/no_recorded_value`, otherwise | skipped | `logit.output.metrics.skipped{reason=no_recorded_value}` | A point flagged as holding no recorded value isn't exposed. |
 //! | `record/no_recorded_value_delta_sum`, with `bind:` unset | degraded | -- | Remote-write writes a flagged delta `Sum` as a stale marker, its temporality ignored, since a marker holds no reading to be delta about: a monotonic one on a `counter`, read back as a flagged cumulative counter, uncounted, and a non-monotonic one on a `gauge`, counted `logit.output.metrics.degraded{metric_kind=non_monotonic_sum}`. An unflagged delta `Sum` is dropped. |
@@ -151,7 +152,7 @@
 //! | `record/unit`, otherwise | lost | `logit.output.metrics.degraded{reason=unit_not_suffix}` | OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left off, counted. |
 //! | `record/description` | exact | -- | The family's `# HELP` line. |
 //! | `record/start_timestamp` | lost | uncounted | OpenMetrics' `_created` sample, written for a counter, histogram, or summary; a gauge's start time is left off, uncounted. |
-//! | `record/exemplars` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at most one per line. One with no line to sit on, such as a gauge's, is left off, counted. |
+//! | `record/exemplars` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | In OpenMetrics, on a counter's `_total` line or the bucket line its value falls in, at most one per line. One with no line to sit on, such as a gauge's, or one over the 128-code-point label budget, on either wire, is left off, counted. |
 //! | `record/unit_on_distribution`, with `bind:` unset | exact | -- | Remote-write carries the unit in its metadata. |
 //! | `record/unit_on_distribution`, otherwise | lost | `logit.output.metrics.degraded{reason=unit_not_suffix}` | OpenMetrics writes `# UNIT` only when `_<unit>` ends the family name; otherwise it's left off, counted. |
 //! | `record/exemplars_on_summary` | lost | `logit.output.metrics.degraded{reason=exemplar_omitted}` | A summary has no `_total` or bucket line for an exemplar to sit on, so its exemplars are left off, counted. |
@@ -607,7 +608,8 @@ pub(crate) enum NotEncoded {
     /// An `ExponentialHistogram` bound for remote-write, which carries native histograms this
     /// codec doesn't map yet.
     NativeHistogram,
-    /// A delta `Sum` or `Histogram` with no cumulative `aggregate` upstream.
+    /// A delta `Sum` or `Histogram` with no cumulative `aggregate` upstream, or a delta
+    /// `Summary`, which only `cumulative_to_delta` makes.
     UnresolvedDelta,
     /// A `GaugeDelta` with no `aggregate` upstream.
     UnresolvedGaugeDelta,
@@ -888,6 +890,7 @@ fn point_to_kind(
                 quantiles: quantiles.clone(),
                 count: count.unwrap_or(0),
                 sum: sum.unwrap_or(0.0),
+                temporality: Temporality::Cumulative,
             }),
             // Handled above, before any of the value-bearing arms can be reached.
             Point::Stale => unreachable!("stale markers return early"),
@@ -919,9 +922,12 @@ fn stale_kind(family: FamilyType) -> MetricKind {
             min: None,
             max: None,
         }),
-        FamilyType::Summary => {
-            MetricKind::Summary(Summary { quantiles: Vec::new(), count: 0, sum: 0.0 })
-        }
+        FamilyType::Summary => MetricKind::Summary(Summary {
+            quantiles: Vec::new(),
+            count: 0,
+            sum: 0.0,
+            temporality: Temporality::Cumulative,
+        }),
         FamilyType::Gauge
         | FamilyType::Info
         | FamilyType::StateSet
@@ -1179,14 +1185,21 @@ fn record_to_point(
             }
             return None;
         }
-        MetricKind::Summary(s) => (
-            FamilyType::Summary,
-            Point::Summary {
-                quantiles: s.quantiles.clone(),
-                sum: Some(s.sum),
-                count: Some(s.count),
-            },
-        ),
+        MetricKind::Summary(s) => {
+            if s.temporality == Temporality::Delta {
+                encoder.not_encoded(NotEncoded::UnresolvedDelta);
+                warn_delta_summary(encoder, resolve(record.name));
+                return None;
+            }
+            (
+                FamilyType::Summary,
+                Point::Summary {
+                    quantiles: s.quantiles.clone(),
+                    sum: Some(s.sum),
+                    count: Some(s.count),
+                },
+            )
+        }
         MetricKind::Distribution(sketch) => {
             encoder.degraded("distribution");
             (FamilyType::Summary, sketch_summary(sketch))
@@ -1259,6 +1272,19 @@ fn warn_delta(encoder: &mut PrometheusEncoder, name: &str) {
         format_args!(
             "metric '{name}' has delta temporality, which Prometheus exposition cannot express -- \
              add an `aggregate` component with `temporality: cumulative` before this output"
+        ),
+    );
+}
+
+/// A delta `Summary`'s diagnostic, under its own key because its fix differs from
+/// [`warn_delta`]'s: `aggregate` doesn't make a summary cumulative, and only
+/// `cumulative_to_delta` makes one delta.
+fn warn_delta_summary(encoder: &mut PrometheusEncoder, name: &str) {
+    encoder.diagnostics.warn_throttled(
+        "delta_summary_unresolved",
+        format_args!(
+            "metric '{name}' is a delta summary, which Prometheus cannot express -- route the \
+             summary to this output from ahead of the `cumulative_to_delta` component"
         ),
     );
 }
@@ -1648,6 +1674,7 @@ mod tests {
                 quantiles: vec![(0.5, 4773.0), (0.99, 76656.0)],
                 count: 2693,
                 sum: 1.7560473e7,
+                temporality: Temporality::Cumulative,
             })
         );
     }
@@ -1661,7 +1688,12 @@ mod tests {
         let families = vec![family("s", FamilyType::Summary, vec![Series::new(vec![], point)])];
         assert_eq!(
             decode_kind(&families),
-            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 0, sum: 0.0 })
+            MetricKind::Summary(Summary {
+                quantiles: vec![(0.5, 1.0)],
+                count: 0,
+                sum: 0.0,
+                temporality: Temporality::Cumulative
+            })
         );
     }
 
@@ -1852,6 +1884,23 @@ mod tests {
         assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "unresolved_delta")));
     }
 
+    /// A Prometheus summary is a running total, so a delta one, which only `cumulative_to_delta`
+    /// makes, is dropped and counted.
+    #[test]
+    fn a_delta_summary_is_dropped_and_counted() {
+        let kind = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 1.0)],
+            count: 2,
+            sum: 3.0,
+            temporality: Temporality::Delta,
+        });
+        let (families, registry, diag) =
+            encode_counted(&Resource::default(), &event_with(&[], record("m", kind)));
+        assert!(families.is_empty());
+        assert!(counted(&registry, "logit.output.metrics.dropped", ("reason", "unresolved_delta")));
+        assert!(counted(&diag, "logit.component.diagnostics", ("key", "delta_summary_unresolved")));
+    }
+
     #[test]
     fn a_gauges_family_type_follows_its_prometheus_type_attribute() {
         for (marker, expected_kind, expected_point) in [
@@ -2029,8 +2078,12 @@ mod tests {
 
     #[test]
     fn a_summary_encodes_with_its_sum_and_count() {
-        let kind =
-            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 7, sum: 42.0 });
+        let kind = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 1.0)],
+            count: 7,
+            sum: 42.0,
+            temporality: Temporality::Cumulative,
+        });
         assert_eq!(
             encode_kind(kind)[0].series[0].point,
             Point::Summary { quantiles: vec![(0.5, 1.0)], sum: Some(42.0), count: Some(7) }
@@ -2483,8 +2536,12 @@ mod tests {
         assert!(families[0].series[0].labels.is_empty(), "`le` belongs to the bucket lines");
         assert!(counted(&registry, "logit.output.labels.omitted", ("reason", "reserved")));
 
-        let summary =
-            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 });
+        let summary = MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 1.0)],
+            count: 1,
+            sum: 1.0,
+            temporality: Temporality::Cumulative,
+        });
         let event = event_with(&[("quantile", Value::from("0.5"))], record("m", summary));
         let (families, registry, _) = encode_counted(&Resource::default(), &event);
         assert!(families[0].series[0].labels.is_empty());
@@ -2821,7 +2878,12 @@ mod tests {
                 min: None,
                 max: None,
             }),
-            MetricKind::Summary(Summary { quantiles: vec![], count: 1, sum: 1.0 }),
+            MetricKind::Summary(Summary {
+                quantiles: vec![],
+                count: 1,
+                sum: 1.0,
+                temporality: Temporality::Cumulative,
+            }),
             MetricKind::Set(HyperLogLog::new()),
         ];
         for kind in kinds {

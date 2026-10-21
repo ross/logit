@@ -1,0 +1,22 @@
+{
+  "name": "remainder-narrow",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["100", "103"],
+    "counts": [0, 1001, 0],
+    "count": 1001,
+    "sum": "101500",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1635, 1636],
+    "n": [521, 480],
+    "cnt": 1001,
+    "sum": "101500",
+    "min": "100",
+    "max": "103",
+    "avg": "101.3986013986014"
+  }
+}

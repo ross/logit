@@ -403,7 +403,10 @@ pub struct ExpHistogram {
     pub sum: Option<f64>, pub min: Option<f64>, pub max: Option<f64>,
 }
 
-pub struct Summary { pub quantiles: Vec<(f64, f64)>, pub count: u64, pub sum: f64 }
+pub struct Summary {
+    pub quantiles: Vec<(f64, f64)>, pub count: u64, pub sum: f64,
+    pub temporality: Temporality,   // `Cumulative` from every decoder; `Delta` only from `cumulative_to_delta`
+}
 
 pub struct Exemplar {
     pub timestamp: i64, pub value: MetricValue, pub trace: Option<TraceRef>,

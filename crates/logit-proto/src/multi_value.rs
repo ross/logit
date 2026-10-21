@@ -348,6 +348,7 @@ mod tests {
                     quantiles: vec![(0.5, 1.0), (0.99, 9.0)],
                     count: 4,
                     sum: 12.0,
+                    temporality: Temporality::Cumulative,
                 }),
                 vec![(".count", Count), (".sum", Sum), (".q0_5", Quantile), (".q0_99", Quantile)],
             ),
@@ -413,6 +414,7 @@ mod tests {
             quantiles: vec![(0.5, 1.0), (0.9, f64::NAN), (0.99, f64::INFINITY)],
             count: 3,
             sum: f64::NAN,
+            temporality: Temporality::Cumulative,
         });
         assert_eq!(
             suffixes_and_parts(&summary),

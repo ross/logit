@@ -1,0 +1,22 @@
+{
+  "name": "non-monotonic-same-key",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1", "0.9999999"],
+    "counts": [0, 3, 0],
+    "count": 3,
+    "sum": "3",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1338],
+    "n": [3],
+    "cnt": 3,
+    "sum": "3",
+    "min": "0.9999999",
+    "max": "0.9999999",
+    "avg": "1"
+  }
+}

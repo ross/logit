@@ -1,0 +1,42 @@
+{
+  "name": "one-bucket-over-uint16",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["3"],
+    "counts": [0, 200000],
+    "count": 200000,
+    "sum": "1e+06",
+    "min": null,
+    "max": null
+  },
+  "series": [
+    {
+      "name": "case.count",
+      "tags": [],
+      "type": "count",
+      "value": "200000",
+      "unit": ""
+    },
+    {
+      "name": "case.sum",
+      "tags": [],
+      "type": "count",
+      "value": "1e+06",
+      "unit": "millisecond"
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:-inf", "upper_bound:3.0"],
+      "type": "count",
+      "value": "0",
+      "unit": ""
+    },
+    {
+      "name": "case.bucket",
+      "tags": ["lower_bound:3.0", "upper_bound:inf"],
+      "type": "count",
+      "value": "200000",
+      "unit": ""
+    }
+  ]
+}

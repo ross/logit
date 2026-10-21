@@ -166,8 +166,9 @@ components:
 
   # --- Windows -------------------------------------------------------------------------------
 
-  # Datadog takes each window's increment and skips a running total, and has no histogram form,
-  # so an OTel SDK's histograms reach VictoriaMetrics only.
+  # Datadog takes each window's increment and skips a running total, so an OTel SDK's default
+  # cumulative counters and histograms reach VictoriaMetrics only; set the SDK to delta
+  # temporality to send them to Datadog too.
   delta_10s:
     type: aggregate
     sources: [metric_events, nginx_series]

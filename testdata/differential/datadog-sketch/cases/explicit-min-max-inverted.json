@@ -1,0 +1,22 @@
+{
+  "name": "min-max-inverted",
+  "kind": "explicit",
+  "input": {
+    "bounds": ["1", "2"],
+    "counts": [0, 4, 0],
+    "count": 4,
+    "sum": "6",
+    "min": "1.9",
+    "max": "1.1"
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1338, 1353, 1365, 1375],
+    "n": [1, 1, 1, 1],
+    "cnt": 4,
+    "sum": "6",
+    "min": "1.9",
+    "max": "1.9",
+    "avg": "1.5"
+  }
+}

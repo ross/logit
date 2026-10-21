@@ -20,7 +20,10 @@
 use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
 use logit_core::subslice::within;
-use logit_core::{AttrMap, EventBatch, Registry, Resource, Severity, Telemetry, TraceRef, Value};
+use logit_core::{
+    AttrMap, EventBatch, MetricKind, MetricValue, Registry, Resource, Severity, Telemetry,
+    TraceRef, Value,
+};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::kafka::{KafkaEncoder, RecordFormat, RecordKey, RecordMode};
 use logit_outputs::statsd::{Format as StatsdFormat, StatsdEncoder};
@@ -1162,6 +1165,25 @@ fn kv_metrics_one_event() {
     assert!(forwarded, "kv_metrics forwards");
     assert_eq!(event.metrics.len(), 4);
     expect_allocs("kv_metrics: derive 4 metrics", stats, 1);
+}
+
+/// Zero: a tracked series' point is looked up by a hash of its key, with no key built, and
+/// differenced in place; the update queue reuses its capacity.
+#[test]
+fn cumulative_to_delta_one_converted_record() {
+    let mut t = fixtures::cumulative_to_delta();
+    let resource = fixtures::resource();
+    for i in 1..=8 {
+        let mut warm = fixtures::cumulative_counter_event(i, i as f64 * 10.0);
+        assert!(t.process(&resource, &mut warm));
+        t.end_batch();
+    }
+    let mut event = fixtures::cumulative_counter_event(9, 95.0);
+    let (forwarded, stats) = measure(|| t.process(&resource, &mut event));
+    assert!(forwarded, "a converted record is forwarded");
+    let MetricKind::Sum(sum) = &event.metrics[0].kind else { panic!("expected a Sum") };
+    assert_eq!(sum.value, MetricValue::F64(15.0));
+    expect_allocs("cumulative_to_delta: convert 1 record", stats, 0);
 }
 
 /// Zero: `filtered` rebuilds the map, but three surviving attributes fit inline. Its per-key

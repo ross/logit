@@ -494,7 +494,7 @@ config asked for never uses the word:
 | Name | Meaning | Tags |
 |---|---|---|
 | `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
-| `logit.component.events.discarded` | A filter, `sample`, `aggregate`, `route_signals`, or Lua script removed an event because the config asked it to. | None. |
+| `logit.component.events.discarded` | A filter, `sample`, `aggregate`, `cumulative_to_delta`, `route_signals`, or Lua script removed an event because the config asked it to. A record `cumulative_to_delta` dropped is counted under its own `*.dropped` as well. | None. |
 | `logit.component.events.copied` | A router delivered an event to more than one destination, or `route_signals` split one into a part per target; counts the deliveries past each event's first. Nothing is lost. | None. |
 | `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, sample value, or a metric record or span beside a log body) removed from a record that's still delivered. | `reason` where more than one cause exists. |
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
@@ -1595,6 +1595,30 @@ whose value is `NaN` or infinite, forwarded untouched); and `gauge_non_finite` (
 `Gauge` or `GaugeDelta`). A bucketed or timestamped record has no diagnostic: it's the configured behavior,
 not a fault.
 
+##### `cumulative_to_delta`
+
+`crates/logit-transforms/src/cumulative_to_delta.rs`,
+[ADR `cumulative-to-delta-transform`](../adr/cumulative-to-delta-transform.md). Counted per batch,
+each only when nonzero.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.transform.metrics.converted{metric_kind="sum"\|"histogram"\|"exponential_histogram"\|"summary"}` | count | records replaced by a delta, a first or reset point emitted in full included |
+| `logit.transform.metrics.skipped{reason="initial"}` | count | a series' first point that only recorded its baseline, as `initial_value` asked |
+| `logit.transform.metrics.skipped{reason="duplicate"\|"out_of_order"}` | count | a point timestamped at, or before, its series' last one, which carries nothing new |
+| `logit.transform.metrics.dropped{reason="layout_changed"}` | count | a `Histogram` whose bounds changed, or an `ExponentialHistogram` whose scale went up or zero threshold went down, with no reset: the counts since the previous point are lost, and the point is the new baseline |
+| `logit.transform.metrics.dropped{reason="non_finite"}` | count | a cumulative `Sum` whose value is `NaN` or infinite; its baseline is unchanged |
+| `logit.transform.series.reset{cause="decrease"\|"restarted"}` | count | a counter restart, emitted in full: a value that went down, else a start moved past the previous point |
+| `logit.transform.series.start_adjusted` | count | a start change that wasn't a restart, differenced and stored; nothing is lost |
+| `logit.transform.series.evicted{reason="idle"\|"cardinality"}` | count | a series idle past `max_staleness` by the wall clock, or the least recently updated one evicted for a new series past `max_series`. `aggregate`'s names, without its `state` tag. The evicted series' next point is a first point, so a nonzero `cardinality` count means `max_series` is too small |
+| `logit.transform.series.tracked` | gauge | series in the table, sampled at the end of a batch that held a convertible record |
+
+An event left with no metric, log, or span counts `logit.component.events.discarded`; a record
+removed from an event that keeps another payload counts only under its reason above.
+
+`Diagnostics` keys: `max_series_full` (a cardinality eviction), `layout_changed`, and
+`non_finite_sum`, each mirroring its counter.
+
 ##### `kv_metrics`
 
 `crates/logit-transforms/src/kv_metrics.rs`.
@@ -2239,7 +2263,9 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   `logit.output.metrics.skipped{metric_kind="set_members"|"set"}`, each with a throttled
   diagnostic (`otlp_set_members_metric_skipped`, `otlp_set_metric_skipped`), and
   `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` for a relative gauge no
-  `aggregate` resolved, with the shared `gauge_delta_unresolved` diagnostic.
+  `aggregate` resolved, with the shared `gauge_delta_unresolved` diagnostic, and
+  `logit.output.metrics.dropped{reason="unresolved_delta"}` for a delta `Summary`, which OTLP
+  defines no form for, with a `delta_summary_unresolved` diagnostic.
 
 There's no `logit.output.request.duration`; layer 2's `logit.component.send.duration` times each
 attempt. The class table above says which of this sink's counters count once per batch and which
@@ -2257,8 +2283,8 @@ One `send` is up to eight routes' requests, so every point carries `route`: `ser
 | `logit.output.request.duration{route}` | timing | one per request |
 | `logit.output.request.bytes{route}` | count | the body as sent, after compression, for a request that got an answer or failed after it may have left (a timeout); a refused connection counts none |
 | `logit.output.records{route}` | count | entries in a request Datadog accepted: series points, samples records, and sketches by record; logs, events, checks, spans, and stats groups by event. On the series route, less the series the `202` body names as dropped |
-| `logit.output.records.dropped{route, reason="stale"}` | count | a record outside Datadog's window at the batch's send time, read once per batch: a metric more than 1h old or 10 min ahead, a log or event more than 18h old, a check more than 10 min old; once per batch |
-| `logit.output.records.dropped{route, reason="too_many_tags"}` | count | a series, distribution point, or sketch record whose `tags` list holds more than 100 strings, over Datadog's limit; once per batch |
+| `logit.output.records.dropped{route, reason="stale"}` | count | an entry outside Datadog's window at the batch's send time (on the series route, each series a record would write and each record or point the series encoder would skip or drop, such as a cumulative monotonic `Sum` or a summary's non-finite quantile; a distribution-points or sketch record; an event on the other routes), read once per batch: a metric more than 1h old or 10 min ahead, a log or event more than 18h old, a check more than 10 min old; once per batch |
+| `logit.output.records.dropped{route, reason="too_many_tags"}` | count | a distribution point or sketch record whose `tags` list holds more than 100 strings, over Datadog's limit, or a series whose list does with its own tags (a `.bucket` series' bounds, a `.quantile` series' quantile) added, one per series; once per batch |
 | `logit.output.records.dropped{route, reason="oversize"}` | count | an event whose body alone is over the route's byte limit, once per batch; or every entry of a request Datadog answered `413`, once per batch |
 | `logit.output.records.dropped{route, reason="rejected"}` | count | every entry of a request Datadog answered with a 3xx or a `Rejected` 4xx (a `400`, say), once per batch, because a rejected request isn't resent. The send goes on to the next request. A `413` counts as `oversize` instead; a `401`, `403`, `404`, `405`, or `407` is `Refused` and a `408` or `429` `Ambiguous`, and none of them counts here. On the series route, also a series Datadog accepted the request for but dropped, one per `errors` entry in its `202` body (a point too far in the future, say), at most the request's entries, and taken out of `records`; once per batch, because an accepted request isn't resent |
 | `logit.output.records.dropped{route, reason="ambiguous_at_most_once"}` | count | under `buffer.delivery: at_most_once`, the entries an `Ambiguous` stop drops: the failed request's, the rest of its route's unsettled requests', and every later route's. A later route's count is the plan's weight, an upper bound that includes entries its encode would have skipped or dropped `oversize` or `too_many_tags` |
@@ -2468,14 +2494,17 @@ it takes (the class table above).
 
 - `logit.output.metrics.dropped{reason="unresolved_delta"|"unresolved_gauge_delta"|
   "type_conflict"|"name_collision"}`: a delta `Sum` or `Histogram`, or a `GaugeDelta`, with no
-  `aggregate` upstream to resolve it, and two records that can't share one family. The last two
+  `aggregate` upstream to resolve it, a delta `Summary`, which only `cumulative_to_delta` makes
+  and no Prometheus family can carry, and two records that can't share one family. The last two
   reasons are *within* one batch, distinct from the cross-batch `type_conflict` counter above.
 - `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` in registry mode, where
   neither text dialect has a form for one, and `{reason="no_recorded_value"}`.
 - `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"|"distribution"|"samples"|"set"|
   "set_members"}`, `{reason="non_finite_component"}` for a `Histogram` with a `NaN` bound, which
   gets no `le` bucket, once per record, and `{reason="exemplar_omitted"|"unit_not_suffix"}`
-  (render-side).
+  (render-side). Sender mode counts `exemplar_omitted` too, for an exemplar with no `_total` or
+  `_bucket` series to ride or over OpenMetrics' 128-code-point label budget, which Prometheus's
+  receiver would drop without failing the request.
 - `logit.output.labels.omitted{reason="unrepresentable"|"reserved"|"collision"}`. An exemplar
   key's `collision` or `reserved` is render-side in registry mode, counted once per OpenMetrics
   scrape.
@@ -2500,8 +2529,9 @@ Some reasons exist only on one path:
   as a stale marker rather than skipped. Only a flagged `Histogram`/`Summary`/sketch, kinds that
   expand to several derived series, still counts.
 
-`Diagnostics` keys: `delta_temporality_unresolved` (both delta arms, naming the `aggregate` with
-`temporality: cumulative` fix); the shared `gauge_delta_unresolved` key `influxdb_out`/`statsd_out`
+`Diagnostics` keys: `delta_temporality_unresolved` (a delta `Sum` or `Histogram`, naming the
+`aggregate` with `temporality: cumulative` fix); `delta_summary_unresolved` (a delta `Summary`,
+naming the `cumulative_to_delta` it came through); the shared `gauge_delta_unresolved` key `influxdb_out`/`statsd_out`
 use; `prometheus_exponential_histogram_skipped`; `prometheus_accept_failed` from the
 registry-mode listener's accept loop; and `remote_write_rejected`, one per non-2xx answer in
 sender mode (`crates/logit-outputs/src/prometheus.rs`'s module doc, "Faults, retries and duplicate
@@ -2538,10 +2568,15 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.input.metrics.skipped{reason="empty_sketch"}` | count | a `Dogsketch` with no bins and zero count |
 | `logit.input.metrics.degraded{reason="no_timestamp"}` | count | a point or sketch with no timestamp, stamped with `received_at` |
 | `logit.input.tags.omitted{reason="reserved_prefix"}` | count | a tag whose key starts with `_logit.`, the private carrier prefix, left off a delivered series, sketch, event, or service check, counted per tag: once per series or sketch however many points it delivers |
-| `logit.output.metrics.skipped{metric_kind="cumulative_sum"\|"non_monotonic_delta_sum"\|"set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` | count | a metric kind no Datadog route carries; counted by the series encoders only |
+| `logit.output.metrics.dropped{reason="unresolved_cumulative"}` | count | a cumulative monotonic `Sum`, `Histogram`, or `ExponentialHistogram`, which Datadog's exporter differences into a delta first, with no `cumulative_to_delta` upstream to do it; counted by the series encoders only, with an `unresolved_cumulative` diagnostic |
+| `logit.output.metrics.skipped{metric_kind="set_members"}` | count | a kind no Datadog route carries; counted by the series encoders only |
+| `logit.output.fields.dropped{reason="unresolved_cumulative"}` | count | a cumulative `Summary`'s `.count` and `.sum`, running totals that need differencing first, left off while its `.quantile` gauges go out; once per summary, with an `unresolved_cumulative` diagnostic. A delta `Summary`, which `cumulative_to_delta` makes, sends both |
+| `logit.output.fields.omitted{reason="no_sum"}` | count | under `histograms.send_aggregation_metrics`, a delta histogram or exponential histogram whose sum is absent or non-finite, so no `.count`, `.sum`, `.min`, or `.max` series; once per record that the series route writes or the sketches route takes under the tag limit, so also for one the sketches route then skips or drops (a conversion error, `empty_sketch`, `oversized_sketch`, or the sink's `oversize`) |
+| `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"\|"histogram"\|"exponential_histogram"}` | count | a non-monotonic `Sum` sent as a `count` (delta) or `gauge` (cumulative), a delta `Histogram` sent as a sketch or as `.bucket` and aggregation series, or a delta `ExponentialHistogram` sent as a sketch; once per record that leaves |
 | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` | count | a `GaugeDelta` nothing upstream resolved to a gauge; counted by the series encoders only |
 | `logit.output.metrics.skipped{reason="no_recorded_value"\|"empty_sketch"}` | count | a flagged record, or a sketch with nothing in it |
-| `logit.output.metrics.dropped{reason="non_finite_value"\|"oversized_sketch"}` | count | a non-finite value, or a sketch whose counts split into more than `MAX_DOGSKETCH_ENTRIES` `k`/`n` entries |
+| `logit.output.metrics.dropped{reason="non_finite_value"\|"oversized_sketch"}` | count | a non-finite value, a sketch whose counts split into more than `MAX_DOGSKETCH_ENTRIES` `k`/`n` entries, or a histogram or exponential histogram of more than 4,096 × 65,535 observations, which Datadog's exporter abandons too |
+| `logit.output.metrics.dropped{reason="non_monotonic_bounds"\|"sketch_range"}` | count | a delta `Histogram` with a bucket whose upper bound keys below its lower one, or a delta `ExponentialHistogram` whose scale or buckets fall outside the Agent sketch's range (a key past 32,766, or a boundary that overflows) |
 | `logit.output.metrics.degraded{reason="set_estimate"\|"sample_rate_expanded"\|"rebinned"\|"fractional_count"}` | count | a `Set` sent as a gauge of its estimate, a sampled `Samples` expanded into repeated values, a non-Agent sketch re-binned into the Agent mapping, or a fractional bin count rounded |
 | `logit.output.tags.omitted{reason="unrepresentable"\|"no_wire_form"}` | count | a tag value with no tag form (`Map`, `Bytes`, `Null`) or a carrier attribute of the wrong type; a `_logit.datadog.*` carrier the target route has no field for |
 | `logit.input.logs.dropped{reason="not_an_object"\|"no_message"}` | count | a log array element that isn't an object, or a log with no `message` |
@@ -2565,7 +2600,9 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 timestamp that is neither a number nor RFC 3339, stamped with `received_at`), `malformed_event`,
 `malformed_service_check`; `malformed_stats` (a dropped stats payload, bucket, or group) and
 `bad_stats_sketch` (a dropped stats summary); `malformed_span` (a dropped span, trace array, or
-chunk); `oversized_sketch` (an outgoing sketch dropped past the entry cap).
+chunk); `oversized_sketch` (an outgoing sketch dropped past the entry cap, or a histogram past
+the observation cap); `unresolved_cumulative` (a cumulative kind dropped, or a summary's count and
+sum left off, naming `cumulative_to_delta`).
 
 A counter for a batch-resource attribute or a stats bucket counts once per request body the
 encoder writes, not once per record; the paragraph after the sink class table names them and says

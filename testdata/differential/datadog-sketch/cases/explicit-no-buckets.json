@@ -1,0 +1,13 @@
+{
+  "name": "no-buckets",
+  "kind": "explicit",
+  "input": {
+    "bounds": [],
+    "counts": [],
+    "count": 0,
+    "sum": "0",
+    "min": null,
+    "max": null
+  },
+  "outcome": "empty"
+}

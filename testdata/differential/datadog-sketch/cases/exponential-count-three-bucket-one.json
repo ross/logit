@@ -1,0 +1,30 @@
+{
+  "name": "count-three-bucket-one",
+  "kind": "exponential",
+  "input": {
+    "scale": 0,
+    "zero_count": 0,
+    "positive": {
+      "offset": 2,
+      "counts": [1]
+    },
+    "negative": {
+      "offset": 0,
+      "counts": []
+    },
+    "count": 3,
+    "sum": "15",
+    "min": null,
+    "max": null
+  },
+  "outcome": "sketch",
+  "sketch": {
+    "k": [1446],
+    "n": [1],
+    "cnt": 3,
+    "sum": "15",
+    "min": "5.3357107437971525",
+    "max": "5.3357107437971525",
+    "avg": "5"
+  }
+}

@@ -1,6 +1,6 @@
 {
   "carriers": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","count":1,"sum":5.0,"quantiles":[{"quantile":0.5,"value":5.0},{"quantile":0.75,"value":5.0},{"quantile":0.9,"value":5.0},{"quantile":0.95,"value":5.0},{"quantile":0.99,"value":5.0}]}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":1,"sum":5.0,"quantiles":[{"quantile":0.5,"value":5.0},{"quantile":0.75,"value":5.0},{"quantile":0.9,"value":5.0},{"quantile":0.95,"value":5.0},{"quantile":0.99,"value":5.0}]}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":20.0}]}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 1,
@@ -15,7 +15,7 @@
   "cross-kinds": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"balance","kind":"gauge","value":-3.5}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"jobs_done_total","kind":"sum","value":12.0,"temporality":"cumulative","monotonic":true,"exemplars":[{"timestamp":"2027-01-15T07:59:59.000000000Z","value":1.0,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","trace_flags":0}]}]},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","count":2,"sum":27.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":15.0},{"quantile":0.9,"value":15.0},{"quantile":0.95,"value":15.0},{"quantile":0.99,"value":15.0}]}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":2,"sum":27.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":15.0},{"quantile":0.9,"value":15.0},{"quantile":0.95,"value":15.0},{"quantile":0.99,"value":15.0}]}],"attributes":{"route":"/api"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"payload_size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":3},{"bound":"inf","count":1}],"sum":250.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":7.0}],"attributes":{"_logit.prometheus.type":"unknown","shards":"b"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"reading","kind":"gauge","value":"NaN"}]},
@@ -47,10 +47,10 @@
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 2
   }},
   "interop-dogstatsd-buffered": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_db_query_duration_ms","kind":"summary","count":1,"sum":0.33313615206930347,"quantiles":[{"quantile":0.5,"value":0.33313615206930347},{"quantile":0.75,"value":0.33313615206930347},{"quantile":0.9,"value":0.33313615206930347},{"quantile":0.95,"value":0.33313615206930347},{"quantile":0.99,"value":0.33313615206930347}]}],"attributes":{"db":"primary","env":"prod","host":"web-07","query":"select_user","region":"us-east-1","service":"checkout-api"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_http_request_duration_ms","kind":"summary","count":1,"sum":0.05,"quantiles":[{"quantile":0.5,"value":0.05},{"quantile":0.75,"value":0.05},{"quantile":0.9,"value":0.05},{"quantile":0.95,"value":0.05},{"quantile":0.99,"value":0.05}]}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_http_request_duration_ms","kind":"summary","count":1,"sum":23.483176616760144,"quantiles":[{"quantile":0.5,"value":23.483176616760144},{"quantile":0.75,"value":23.483176616760144},{"quantile":0.9,"value":23.483176616760144},{"quantile":0.95,"value":23.483176616760144},{"quantile":0.99,"value":23.483176616760144}]}],"attributes":{"endpoint":"/healthz","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_http_response_size_bytes","kind":"summary","count":1,"sum":60196.0,"quantiles":[{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0}]}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_db_query_duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":0.33313615206930347,"quantiles":[{"quantile":0.5,"value":0.33313615206930347},{"quantile":0.75,"value":0.33313615206930347},{"quantile":0.9,"value":0.33313615206930347},{"quantile":0.95,"value":0.33313615206930347},{"quantile":0.99,"value":0.33313615206930347}]}],"attributes":{"db":"primary","env":"prod","host":"web-07","query":"select_user","region":"us-east-1","service":"checkout-api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_http_request_duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":0.05,"quantiles":[{"quantile":0.5,"value":0.05},{"quantile":0.75,"value":0.05},{"quantile":0.9,"value":0.05},{"quantile":0.95,"value":0.05},{"quantile":0.99,"value":0.05}]}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_http_request_duration_ms","kind":"summary","temporality":"cumulative","count":1,"sum":23.483176616760144,"quantiles":[{"quantile":0.5,"value":23.483176616760144},{"quantile":0.75,"value":23.483176616760144},{"quantile":0.9,"value":23.483176616760144},{"quantile":0.95,"value":23.483176616760144},{"quantile":0.99,"value":23.483176616760144}]}],"attributes":{"endpoint":"/healthz","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_http_response_size_bytes","kind":"summary","temporality":"cumulative","count":1,"sum":60196.0,"quantiles":[{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0}]}],"attributes":{"endpoint":"/api/v1/orders","env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api","status":"200"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_users_active","kind":"gauge","value":1.0}],"attributes":{"env":"prod","host":"web-07","region":"us-east-1","service":"checkout-api"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_worker_queue_depth","kind":"gauge","value":110.0}],"attributes":{"env":"prod","host":"web-07","queue":"email","region":"us-east-1","service":"checkout-api"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_worker_queue_depth","kind":"gauge","value":210.0}],"attributes":{"env":"prod","host":"web-07","queue":"reindex","region":"us-east-1","service":"checkout-api"}},
@@ -61,8 +61,8 @@
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 3
   }},
   "interop-plain-pipeline": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_checkout_api_web_07_us_east_1_db_select_user_duration","kind":"summary","count":1,"sum":0.333136,"quantiles":[{"quantile":0.5,"value":0.333136},{"quantile":0.75,"value":0.333136},{"quantile":0.9,"value":0.333136},{"quantile":0.95,"value":0.333136},{"quantile":0.99,"value":0.333136}]}]},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_checkout_api_web_07_us_east_1_http_api_v1_orders_duration","kind":"summary","count":1,"sum":0.05,"quantiles":[{"quantile":0.5,"value":0.05},{"quantile":0.75,"value":0.05},{"quantile":0.9,"value":0.05},{"quantile":0.95,"value":0.05},{"quantile":0.99,"value":0.05}]}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_checkout_api_web_07_us_east_1_db_select_user_duration","kind":"summary","temporality":"cumulative","count":1,"sum":0.333136,"quantiles":[{"quantile":0.5,"value":0.333136},{"quantile":0.75,"value":0.333136},{"quantile":0.9,"value":0.333136},{"quantile":0.95,"value":0.333136},{"quantile":0.99,"value":0.333136}]}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_checkout_api_web_07_us_east_1_http_api_v1_orders_duration","kind":"summary","temporality":"cumulative","count":1,"sum":0.05,"quantiles":[{"quantile":0.5,"value":0.05},{"quantile":0.75,"value":0.05},{"quantile":0.9,"value":0.05},{"quantile":0.95,"value":0.05},{"quantile":0.99,"value":0.05}]}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_checkout_api_web_07_us_east_1_worker_email_depth","kind":"gauge","value":234.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_checkout_api_web_07_us_east_1_worker_reindex_depth","kind":"gauge","value":90.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"app_checkout_api_web_07_us_east_1_worker_webhooks_depth","kind":"gauge","value":110.0}]}
@@ -75,11 +75,11 @@
   ], "counters": {}},
   "log-only": {"events": [], "counters": {}},
   "mixed": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"bytes","kind":"summary","count":2,"sum":120392.0,"quantiles":[{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0}]}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"bytes","kind":"summary","temporality":"cumulative","count":2,"sum":120392.0,"quantiles":[{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0}]}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db_up","kind":"gauge","value":1.0}]},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","count":2,"sum":27.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":15.0},{"quantile":0.9,"value":15.0},{"quantile":0.95,"value":15.0},{"quantile":0.99,"value":15.0}]}],"attributes":{"route":"/api"}},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":2,"sum":27.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":15.0},{"quantile":0.9,"value":15.0},{"quantile":0.95,"value":15.0},{"quantile":0.99,"value":15.0}]}],"attributes":{"route":"/api"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"queue_depth","kind":"gauge","value":7.0}]},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"size","kind":"summary","count":1,"sum":512.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":512.0},{"quantile":0.9,"value":512.0},{"quantile":0.95,"value":512.0},{"quantile":0.99,"value":512.0}]}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"size","kind":"summary","temporality":"cumulative","count":1,"sum":512.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":512.0},{"quantile":0.9,"value":512.0},{"quantile":0.95,"value":512.0},{"quantile":0.99,"value":512.0}]}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"temperature","kind":"gauge","value":21.5}],"attributes":{"room":"lab"}},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"users","kind":"gauge","value":2.0}]}
   ], "counters": {
@@ -89,7 +89,7 @@
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_gauge_delta,role=sink}": 1
   }},
   "multi-value": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","count":3,"sum":6.0,"quantiles":[{"quantile":0.5,"value":2.009103080990281},{"quantile":0.75,"value":3.0},{"quantile":0.9,"value":3.0},{"quantile":0.95,"value":3.0},{"quantile":0.99,"value":3.0}]}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":3,"sum":6.0,"quantiles":[{"quantile":0.5,"value":2.009103080990281},{"quantile":0.75,"value":3.0},{"quantile":0.9,"value":3.0},{"quantile":0.95,"value":3.0},{"quantile":0.99,"value":3.0}]}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"level","kind":"gauge","value":5.0}]},
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"visitors","kind":"gauge","value":2.0}]}
   ], "counters": {
@@ -142,13 +142,13 @@
   }},
   "summarized-kinds": {"events": [
     {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response_size","kind":"histogram","temporality":"cumulative","buckets":[{"bound":100.0,"count":30},{"bound":1000.0,"count":12},{"bound":"inf","count":0}],"sum":9000.0}]},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc_duration","kind":"summary","count":10,"sum":55.0,"quantiles":[{"quantile":0.5,"value":5.0},{"quantile":0.99,"value":9.9}]}]}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc_duration","kind":"summary","temporality":"cumulative","count":10,"sum":55.0,"quantiles":[{"quantile":0.5,"value":5.0},{"quantile":0.99,"value":9.9}]}]}
   ], "counters": {
-    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1,
+    "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 2,
     "logit.output.metrics.skipped{component=out,kind=prometheus_out,metric_kind=exponential_histogram,role=sink}": 2
   }},
   "summary-exemplars": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc_latency","kind":"summary","count":4,"sum":2.0,"quantiles":[{"quantile":0.5,"value":0.4},{"quantile":0.99,"value":0.9}]}]}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"rpc_latency","kind":"summary","temporality":"cumulative","count":4,"sum":2.0,"quantiles":[{"quantile":0.5,"value":0.4},{"quantile":0.99,"value":0.9}]}]}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=exemplar_omitted,role=sink}": 1
   }},
@@ -165,24 +165,24 @@
     "logit.output.metrics.dropped{component=out,kind=prometheus_out,reason=unresolved_delta,role=sink}": 1
   }},
   "timer-h-d": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request_size","kind":"summary","count":1,"sum":512.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":512.0},{"quantile":0.9,"value":512.0},{"quantile":0.95,"value":512.0},{"quantile":0.99,"value":512.0}]}]},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response_size","kind":"summary","count":1,"sum":60196.0,"quantiles":[{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0}]}],"attributes":{"endpoint":"/orders"}}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"request_size","kind":"summary","temporality":"cumulative","count":1,"sum":512.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":512.0},{"quantile":0.9,"value":512.0},{"quantile":0.95,"value":512.0},{"quantile":0.99,"value":512.0}]}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"response_size","kind":"summary","temporality":"cumulative","count":1,"sum":60196.0,"quantiles":[{"quantile":0.5,"value":60196.0},{"quantile":0.75,"value":60196.0},{"quantile":0.9,"value":60196.0},{"quantile":0.95,"value":60196.0},{"quantile":0.99,"value":60196.0}]}],"attributes":{"endpoint":"/orders"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 2
   }},
   "timer-ms": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","count":1,"sum":7.5,"quantiles":[{"quantile":0.5,"value":7.5},{"quantile":0.75,"value":7.5},{"quantile":0.9,"value":7.5},{"quantile":0.95,"value":7.5},{"quantile":0.99,"value":7.5}]}],"attributes":{"route":"/api"}}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"latency","kind":"summary","temporality":"cumulative","count":1,"sum":7.5,"quantiles":[{"quantile":0.5,"value":7.5},{"quantile":0.75,"value":7.5},{"quantile":0.9,"value":7.5},{"quantile":0.95,"value":7.5},{"quantile":0.99,"value":7.5}]}],"attributes":{"route":"/api"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 2
   }},
   "timer-sample-rate": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db_query","kind":"summary","count":2,"sum":6.4,"quantiles":[{"quantile":0.5,"value":3.2},{"quantile":0.75,"value":3.2},{"quantile":0.9,"value":3.2},{"quantile":0.95,"value":3.2},{"quantile":0.99,"value":3.2}]}]},
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render_time","kind":"summary","count":4,"sum":160.0,"quantiles":[{"quantile":0.5,"value":40.0},{"quantile":0.75,"value":40.0},{"quantile":0.9,"value":40.0},{"quantile":0.95,"value":40.0},{"quantile":0.99,"value":40.0}]}],"attributes":{"route":"/home"}}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"db_query","kind":"summary","temporality":"cumulative","count":2,"sum":6.4,"quantiles":[{"quantile":0.5,"value":3.2},{"quantile":0.75,"value":3.2},{"quantile":0.9,"value":3.2},{"quantile":0.95,"value":3.2},{"quantile":0.99,"value":3.2}]}]},
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"render_time","kind":"summary","temporality":"cumulative","count":4,"sum":160.0,"quantiles":[{"quantile":0.5,"value":40.0},{"quantile":0.75,"value":40.0},{"quantile":0.9,"value":40.0},{"quantile":0.95,"value":40.0},{"quantile":0.99,"value":40.0}]}],"attributes":{"route":"/home"}}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 2
   }},
   "timer-sample-rate-unweighted": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"api_latency","kind":"summary","count":1,"sum":12.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":12.0},{"quantile":0.9,"value":12.0},{"quantile":0.95,"value":12.0},{"quantile":0.99,"value":12.0}]}]}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"api_latency","kind":"summary","temporality":"cumulative","count":1,"sum":12.0,"quantiles":[{"quantile":0.5,"value":12.0},{"quantile":0.75,"value":12.0},{"quantile":0.9,"value":12.0},{"quantile":0.95,"value":12.0},{"quantile":0.99,"value":12.0}]}]}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 1
   }},
@@ -206,7 +206,7 @@
     "logit.output.metrics.normalized{component=out,kind=prometheus_out,reason=bool_value,role=sink}": 1
   }},
   "unit-on-samples": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"upload_size","kind":"summary","count":2,"sum":2560.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":2048.0},{"quantile":0.9,"value":2048.0},{"quantile":0.95,"value":2048.0},{"quantile":0.99,"value":2048.0}]}]}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","metrics":[{"name":"upload_size","kind":"summary","temporality":"cumulative","count":2,"sum":2560.0,"quantiles":[{"quantile":0.5,"value":512.0},{"quantile":0.75,"value":2048.0},{"quantile":0.9,"value":2048.0},{"quantile":0.95,"value":2048.0},{"quantile":0.99,"value":2048.0}]}]}
   ], "counters": {
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,metric_kind=samples,role=sink}": 1,
     "logit.output.metrics.degraded{component=out,kind=prometheus_out,reason=unit_not_suffix,role=sink}": 1

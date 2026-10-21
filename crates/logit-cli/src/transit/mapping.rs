@@ -9,8 +9,8 @@
 //! | `gauge` | `f64`, `i64`, `u64`, `bool`, `negative` | record |
 //! | `gauge_delta` | `f64`, `i64`, `u64`, `bool` | record |
 //! | `histogram` | `delta`, `cumulative`, `nan_bound`, `neg_inf_bound` (a `NaN` or a `-Inf` bucket bound) | record |
-//! | `exponential_histogram` | `delta`, `cumulative` | record |
-//! | `samples`, `set_members`, `distribution`, `set`, `summary` | none | record |
+//! | `exponential_histogram`, `summary` | `delta`, `cumulative` | record |
+//! | `samples`, `set_members`, `distribution`, `set` | none | record |
 //! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_millisecond` | record |
 //! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `unit_on_distribution`, `min_max`, `sample_rate_unweighted` | field |
 //! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `private_carrier`, `foreign_carrier`, `datadog_carrier_log`, `resource_attribute`, `scope` | field |
@@ -98,7 +98,7 @@ const KINDS: [(&str, &[&str]); 15] = [
     ("set_members", &[]),
     ("distribution", &[]),
     ("set", &[]),
-    ("summary", &[]),
+    ("summary", &["delta", "cumulative"]),
     (
         "record",
         &[

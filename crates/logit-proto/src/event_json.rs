@@ -620,6 +620,7 @@ fn read_kind(obj: &Map<String, Json>, types: &mut Types) -> Result<MetricKind, C
                 .collect::<Result<Vec<_>, CodecError>>()?,
             count: req_u64(obj, "count")?,
             sum: req_f64(obj, "sum")?,
+            temporality: temporality(obj)?,
         }),
         other => return Err(malformed(format!("unknown metric kind {other}"))),
     })

@@ -257,6 +257,7 @@ pub(crate) mod tests {
                 quantiles: vec![(0.5, 1.0), (0.99, 4.25)],
                 count: 10,
                 sum: 12.0,
+                temporality: Temporality::Cumulative,
             }),
         ];
         let mut metric_event = Event::empty(1_700_000_000_000_000_002, AttrMap::new());
