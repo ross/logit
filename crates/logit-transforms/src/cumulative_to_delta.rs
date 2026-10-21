@@ -35,7 +35,7 @@
 //! wall clock, is evicted at the next batch; a new series past `max_series` evicts the least
 //! recently touched one. Both orders come from one update-ordered queue with lazily discarded
 //! entries, so a steady-state point allocates nothing. Under `auto`, an evicted series that
-//! `auto` would let through keeps its last start and timestamp in a record of at most
+//! `auto` would let through keeps its last timestamp in a record of at most
 //! `max_series` entries, oldest out first, so its next point re-sends its total only after a
 //! restart (the ADR's "Staleness and the series bound").
 //!
@@ -286,10 +286,10 @@ pub struct CumulativeToDelta {
     /// `(seq, slot)` in update order; an entry whose seq isn't its series' is stale.
     queue: VecDeque<(u64, usize)>,
     next_seq: u64,
-    /// Under `InitialValue::Auto`, the last `(start, ts)` of each evicted series that would pass
+    /// Under `InitialValue::Auto`, the last timestamp of each evicted series that would pass
     /// `auto`, by key hash, with the sequence of its `evicted_order` entry. Without it, such a
     /// series' next point passes `auto` again and re-sends its whole total.
-    evicted: HashMap<u64, (i64, i64, u64)>,
+    evicted: HashMap<u64, (i64, u64)>,
     /// `(seq, hash)` in eviction order, capped at `max_series` live entries; an entry whose seq
     /// isn't its hash's in `evicted` is stale.
     evicted_order: VecDeque<(u64, u64)>,
@@ -442,18 +442,18 @@ impl CumulativeToDelta {
             return;
         }
         self.next_seq += 1;
-        self.evicted.insert(hash, (start, ts, self.next_seq));
+        self.evicted.insert(hash, (ts, self.next_seq));
         self.evicted_order.push_back((self.next_seq, hash));
         while self.evicted.len() > self.max_series {
             let Some((seq, hash)) = self.evicted_order.pop_front() else { break };
-            if self.evicted.get(&hash).is_some_and(|e| e.2 == seq) {
+            if self.evicted.get(&hash).is_some_and(|e| e.1 == seq) {
                 self.evicted.remove(&hash);
             }
         }
         // Entries a re-inserted series left behind are stale; compact when they dominate.
         if self.evicted_order.len() > 2 * self.evicted.len() + 64 {
             let evicted = &self.evicted;
-            self.evicted_order.retain(|(seq, hash)| evicted.get(hash).is_some_and(|e| e.2 == *seq));
+            self.evicted_order.retain(|(seq, hash)| evicted.get(hash).is_some_and(|e| e.1 == *seq));
         }
     }
 
@@ -536,15 +536,30 @@ impl CumulativeToDelta {
         let hash = self.key_hash(resource, record, kind, attributes);
         let start = record.start_timestamp;
         let Some(slot) = self.find(hash, resource, record, kind, attributes) else {
-            let emit = match self.initial {
-                InitialValue::Keep => true,
-                InitialValue::Drop => false,
-                // A series this component evicted already sent its total up to its last point,
-                // so it emits in full only after a restart, rule 3's test against that point.
-                InitialValue::Auto => match self.evicted.remove(&hash) {
-                    Some((_, last_ts, _)) => start != 0 && start > last_ts && start != ts,
-                    None => self.passes_auto(start, ts),
-                },
+            // A series this component evicted already sent its total up to its last point. A
+            // point at or before that one carries nothing new, as rule 2 says of a tracked
+            // series, and keeps the record; a later one emits in full only after a restart,
+            // rule 3's test against that point.
+            let evicted = match self.initial {
+                InitialValue::Auto => self.evicted.get(&hash).map(|e| e.0),
+                InitialValue::Keep | InitialValue::Drop => None,
+            };
+            if let Some(last_ts) = evicted {
+                if ts <= last_ts {
+                    if ts == last_ts {
+                        self.tally.skipped_duplicate += 1;
+                    } else {
+                        self.tally.skipped_out_of_order += 1;
+                    }
+                    return false;
+                }
+                self.evicted.remove(&hash);
+            }
+            let emit = match (self.initial, evicted) {
+                (InitialValue::Keep, _) => true,
+                (InitialValue::Drop, _) => false,
+                (InitialValue::Auto, Some(last_ts)) => start != 0 && start > last_ts && start != ts,
+                (InitialValue::Auto, None) => self.passes_auto(start, ts),
             };
             let key = Key {
                 resource: resource.clone(),
@@ -1477,6 +1492,24 @@ mod tests {
         rig.clock.store(T0 + 400 * S, Ordering::SeqCst);
         let rec = rig.one(event(T0 + 400 * S, T0 + 300 * S, cum(4.0))).expect("restarted");
         assert_eq!(sum_of(&rec).0, MetricValue::F64(4.0));
+    }
+
+    /// A point at or before an evicted series' last one is skipped and keeps the record, so a
+    /// later point isn't differenced against an older baseline.
+    #[test]
+    fn an_older_point_for_an_evicted_series_is_skipped_and_keeps_the_record() {
+        let mut rig = Rig::bounded(InitialValue::Auto, Duration::from_secs(60), 10);
+        rig.one(event(T0 + 10 * S, T0, cum(10.0)));
+        rig.one(event(T0 + 20 * S, T0, cum(50.0)));
+        rig.clock.store(T0 + 200 * S, Ordering::SeqCst);
+        assert!(rig.one(event(T0 + 15 * S, T0, cum(30.0))).is_none(), "an older point");
+        assert!(rig.one(event(T0 + 20 * S, T0, cum(50.0))).is_none(), "a resend");
+        assert!(rig.one(event(T0 + 30 * S, T0, cum(60.0))).is_none(), "seeds at 60");
+        let rec = rig.one(event(T0 + 40 * S, T0, cum(65.0))).expect("differenced");
+        assert_eq!(sum_of(&rec).0, MetricValue::F64(5.0), "no part of 50 sent twice");
+        assert_eq!(rig.sum("logit.transform.metrics.skipped", &[("reason", "out_of_order")]), 1.0);
+        assert_eq!(rig.sum("logit.transform.metrics.skipped", &[("reason", "duplicate")]), 1.0);
+        assert_eq!(rig.t.live, 1);
     }
 
     /// The same for a series pushed out by `max_series`.

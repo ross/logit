@@ -149,7 +149,7 @@ pub(super) enum MetricOut {
 impl MetricOut {
     #[cfg(test)]
     const ALL: [MetricOut; 10] = [
-        MetricOut::Kind("cumulative_sum"),
+        MetricOut::Kind("set_members"),
         MetricOut::GaugeDelta,
         MetricOut::NoRecordedValue,
         MetricOut::EmptySketch,
@@ -208,7 +208,7 @@ mod tests {
             assert_eq!(outcome.metric(), want, "{outcome:?}");
         }
         let want_out = [
-            (OUTPUT_METRICS_SKIPPED, ("metric_kind", "cumulative_sum")),
+            (OUTPUT_METRICS_SKIPPED, ("metric_kind", "set_members")),
             (OUTPUT_METRICS_DROPPED, ("reason", "unresolved_gauge_delta")),
             (OUTPUT_METRICS_SKIPPED, ("reason", "no_recorded_value")),
             (OUTPUT_METRICS_SKIPPED, ("reason", "empty_sketch")),

@@ -176,15 +176,16 @@ is judged alone.
   without limit
   ([ADR `deployment-threat-model`](deployment-threat-model.md)).
 
-An evicted series' next point is a first point, so under `auto` it records a baseline and emits
-nothing: the counts since its last point are lost. A nonzero cardinality eviction count means
-`max_series` is too small for the traffic.
+An evicted series' next point is a first point. Unless it restarted after its last point, under
+`auto` it records a baseline and emits nothing: the counts since its last point are lost. A
+nonzero cardinality eviction count means `max_series` is too small for the traffic.
 
 `auto` alone would let such a point through when the series began after the component started,
 re-sending a total whose deltas already went out. So under `auto` an eviction keeps a record of
-the evicted series, by key hash: its last start and timestamp, kept only for a series `auto`
-would pass. A first point that matches a record removes it and is emitted in full only on rule
-3's restart test against the recorded timestamp; otherwise it seeds a baseline. The record holds
+the evicted series, by key hash: its last timestamp, kept only for a series `auto` would pass. A
+first point at or before the recorded timestamp is skipped as rule 2 skips one, and the record
+stays. A later one removes the record and is emitted in full only on rule 3's restart test
+against the recorded timestamp; otherwise it seeds a baseline. The record holds
 at most `max_series` entries, oldest out first, and an entry pushed out returns its series to
 first-point handling, where `auto` could re-send its total. The component's start time is never
 moved, so a series first seen after an eviction is judged as before.
